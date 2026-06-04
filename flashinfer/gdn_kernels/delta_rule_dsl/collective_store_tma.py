@@ -36,7 +36,6 @@ class CollectiveStoreTma:
         num_blocks: cutlass.Int32,
         num_seqs: cutlass.Int32,
     ):
-
         # 1. Intermediate full tiles always use the base descriptor.
         # 2. A full last tile also uses the base descriptor.
         # 3. The final sequence can rely on TMA OOB handling at allocation end.
@@ -79,15 +78,16 @@ class CollectiveStoreTma:
         blk: cutlass.Int32,
         stage_idx: cutlass.Int32,
     ):
-
         mO = cute.domain_offset(
             (cutlass.Int32(0), work_desc.tok_offset + blk * cutlass.Int32(self.BLK_Q)),
             tma_tensor_o[None, None, o_head_idx],
         )
-        gO = cute.zipped_divide(mO, (self.D, self.BLK_Q))[(
-            (None, None),
-            (cutlass.Int32(0), cutlass.Int32(0)),
-        )]
+        gO = cute.zipped_divide(mO, (self.D, self.BLK_Q))[
+            (
+                (None, None),
+                (cutlass.Int32(0), cutlass.Int32(0)),
+            )
+        ]
         sO_pipe = sO[None, None, stage_idx]
         return cpasync.tma_partition(
             tma_atom_o,
@@ -110,7 +110,8 @@ class CollectiveStoreTma:
     ):
         cute.arch.fence_view_async_shared()
         tOsO, tOgO = self.partition_sd(
-            sO, tma_atom_o, tma_tensor_o, work_desc, o_head_idx, blk, stage_idx)
+            sO, tma_atom_o, tma_tensor_o, work_desc, o_head_idx, blk, stage_idx
+        )
         cute.copy(tma_atom_o, tOsO, tOgO)
         cute.arch.cp_async_bulk_commit_group()
 
@@ -128,7 +129,8 @@ class CollectiveStoreTma:
     ):
         cute.arch.fence_view_async_shared()
         tOsO, tOgO = self.partition_sd(
-            sO, tma_atom_o, tma_tensor_o, work_desc, o_head_idx, blk, stage_idx)
+            sO, tma_atom_o, tma_tensor_o, work_desc, o_head_idx, blk, stage_idx
+        )
         tail_gmem_ptr = self.tail_tensormap_gmem_ptr(g_tensormaps)
         tail_generic_ptr = self.tail_tensormap_generic_ptr(g_tensormaps)
         cpasync.fence_tma_desc_acquire(tail_gmem_ptr)
@@ -167,12 +169,23 @@ class CollectiveStoreTma:
         o_pipeline.consumer_wait(o_consumer_state)
         if self.can_process(sO, work_desc, blk, num_blocks, num_seqs):
             self.issue_store(
-                sO, tma_atom_o, tma_tensor_o, work_desc, o_head_idx, blk,
+                sO,
+                tma_atom_o,
+                tma_tensor_o,
+                work_desc,
+                o_head_idx,
+                blk,
                 o_consumer_state.index,
             )
         else:
             self.issue_tail_store(
-                sO, tma_atom_o, tma_tensor_o, g_tensormaps, work_desc, o_head_idx, blk,
+                sO,
+                tma_atom_o,
+                tma_tensor_o,
+                g_tensormaps,
+                work_desc,
+                o_head_idx,
+                blk,
                 o_consumer_state.index,
             )
         cute.arch.cp_async_bulk_wait_group(0)
@@ -197,10 +210,19 @@ class CollectiveStoreTma:
     ):
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         o_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, o_stage)
+            pipeline.PipelineUserType.Consumer, o_stage
+        )
         for blk in cutlass.range(num_blocks, unroll=1):
             o_consumer_state = self.step(
-                sO, tma_atom_o, tma_tensor_o, g_tensormaps,
-                o_pipeline, o_consumer_state, work_desc, o_head_idx,
-                blk, num_blocks, num_seqs,
+                sO,
+                tma_atom_o,
+                tma_tensor_o,
+                g_tensormaps,
+                o_pipeline,
+                o_consumer_state,
+                work_desc,
+                o_head_idx,
+                blk,
+                num_blocks,
+                num_seqs,
             )

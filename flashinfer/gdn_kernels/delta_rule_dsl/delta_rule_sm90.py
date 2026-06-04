@@ -16,10 +16,11 @@ from .schedule import WorkDesc
 # ─── Named-barrier IDs used by the compute kernel ────────────────────────────
 # Must not conflict with each other or with pipeline barrier storage.
 
+
 class NamedBarrier(IntEnum):
-    MATH_WG0 = 4   # OrderedMathBarriers: StreamkBarrier0
-    MATH_WG1 = 5   # OrderedMathBarriers: StreamkBarrier1
-    KK_SYNC  = 13  # sync all 128 WG0 threads before collective_inverse
+    MATH_WG0 = 4  # OrderedMathBarriers: StreamkBarrier0
+    MATH_WG1 = 5  # OrderedMathBarriers: StreamkBarrier1
+    KK_SYNC = 13  # sync all 128 WG0 threads before collective_inverse
 
 
 class WarpGroupRole(IntEnum):
@@ -43,6 +44,7 @@ class MathWarpGroupRole(IntEnum):
     KK = 0
     QK = 1
 
+
 # ─── Warp-specialized delta-rule kernel ───────────────────────────────────────
 # Grid: (num_seqs * num_sab_heads, 1, 1)
 # Block: 512 threads → WG0=LD/ST, WG1/WG2=state math, WG3=aux math.
@@ -51,8 +53,8 @@ class MathWarpGroupRole(IntEnum):
 # The JIT compiler specialises per instance, so they are compile-time booleans
 # inside the kernel without any parameter-passing trickery.
 
-class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
+class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @staticmethod
     def get_register_requirements(
         max_threads_per_block: int,
@@ -123,22 +125,22 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
     ):
-        self.needs_alpha      = needs_alpha
-        self.needs_beta       = needs_beta
+        self.needs_alpha = needs_alpha
+        self.needs_beta = needs_beta
         self.needs_init_state = needs_init_state
         self.needs_checkpointing = needs_checkpointing
-        self.dtype            = dtype
-        self.acc_dtype        = acc_dtype
-        self.inverse_dtype    = cutlass.Float16
-        self.BLK_Q           = 64
-        self.BLK_KV          = 64
-        self.D               = 128
-        self.q_stage          = 2
-        self.k_stage          = 3
-        self.v_stage          = 2
-        self.o_stage          = 2
-        self.qk_stage         = 2
-        self.kk_stage         = 2
+        self.dtype = dtype
+        self.acc_dtype = acc_dtype
+        self.inverse_dtype = cutlass.Float16
+        self.BLK_Q = 64
+        self.BLK_KV = 64
+        self.D = 128
+        self.q_stage = 2
+        self.k_stage = 3
+        self.v_stage = 2
+        self.o_stage = 2
+        self.qk_stage = 2
+        self.kk_stage = 2
         self.alpha_beta_stage = 5
 
     def get_next_work(
@@ -149,12 +151,12 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         num_sab_heads: cutlass.Int32,
     ) -> WorkDesc:
         bx, _, _ = cute.arch.block_idx()
-        seq_idx      = bx // num_sab_heads
-        o_head_idx   = bx  % num_sab_heads
-        q_head_idx   = o_head_idx * num_q_heads // num_sab_heads
-        v_head_idx   = o_head_idx * num_v_heads // num_sab_heads
-        tok_start    = cutlass.Int32(cu_seqlens[seq_idx])
-        tok_end      = cutlass.Int32(cu_seqlens[seq_idx + 1])
+        seq_idx = bx // num_sab_heads
+        o_head_idx = bx % num_sab_heads
+        q_head_idx = o_head_idx * num_q_heads // num_sab_heads
+        v_head_idx = o_head_idx * num_v_heads // num_sab_heads
+        tok_start = cutlass.Int32(cu_seqlens[seq_idx])
+        tok_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
 
         return WorkDesc(
             seq_idx=seq_idx,
@@ -174,50 +176,52 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         """Pre-arrive at WG0's barrier so WG0 is unblocked on the first wait."""
         if wg_idx == MathWarpGroupRole.QK:
             cute.arch.barrier_arrive(
-                barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256)
+                barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256
+            )
 
     @cute.jit
     def _math_order_wait(self, wg_idx: cutlass.Int32):
         """Arrive+wait on this WG's own ordered barrier."""
         if wg_idx == MathWarpGroupRole.KK:
-            cute.arch.barrier(
-                barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256)
+            cute.arch.barrier(barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256)
         else:
-            cute.arch.barrier(
-                barrier_id=NamedBarrier.MATH_WG1, number_of_threads=256)
+            cute.arch.barrier(barrier_id=NamedBarrier.MATH_WG1, number_of_threads=256)
 
     @cute.jit
     def _math_order_notify(self, wg_idx: cutlass.Int32):
         """Arrive at the other WG's barrier to unblock it."""
         if wg_idx == MathWarpGroupRole.KK:
             cute.arch.barrier_arrive(
-                barrier_id=NamedBarrier.MATH_WG1, number_of_threads=256)
+                barrier_id=NamedBarrier.MATH_WG1, number_of_threads=256
+            )
         else:
             cute.arch.barrier_arrive(
-                barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256)
+                barrier_id=NamedBarrier.MATH_WG0, number_of_threads=256
+            )
 
     # ─── kk_store_and_inv ─────────────────────────────────────────────────────
 
     @cute.jit
     def _kk_store_and_inv(
         self,
-        tKKrKK: cute.Tensor,      # fp32 KK accumulator (from 128-thread kk_tiled_mma)
+        tKKrKK: cute.Tensor,  # fp32 KK accumulator (from 128-thread kk_tiled_mma)
         kk_tiled_mma,
         kk_thread_idx: cutlass.Int32,
-        sKK_inv: cute.Tensor,     # (BlkKV, BlkKV) 8×8-tiled smem
-        sKK_opd: cute.Tensor,     # sKK_inv storage recast as Element for MMA operand
-        sBeta: cute.Tensor,       # (BlkKV, StagesBeta) - used when needs_beta
+        sKK_inv: cute.Tensor,  # (BlkKV, BlkKV) 8×8-tiled smem
+        sKK_opd: cute.Tensor,  # sKK_inv storage recast as Element for MMA operand
+        sBeta: cute.Tensor,  # (BlkKV, StagesBeta) - used when needs_beta
         beta_pipe_idx: cutlass.Int32,
-        tKKcMkk: cute.Tensor,     # coordinate mapping for KK fragment
+        tKKcMkk: cute.Tensor,  # coordinate mapping for KK fragment
     ):
         """Store tKKrKK → sKK_inv, Inverse, optionally reload+beta."""
         stsm_atom = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.inverse_dtype)
+            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.inverse_dtype
+        )
         tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
-        thr_store   = tiled_store.get_slice(kk_thread_idx)
-        tKKsKK      = thr_store.partition_D(sKK_inv)
-        tKKrKK_cv   = thr_store.retile(tKKrKK)
-        tKKrKK_inv  = cute.make_fragment_like(tKKrKK_cv, self.inverse_dtype)
+        thr_store = tiled_store.get_slice(kk_thread_idx)
+        tKKsKK = thr_store.partition_D(sKK_inv)
+        tKKrKK_cv = thr_store.retile(tKKrKK)
+        tKKrKK_inv = cute.make_fragment_like(tKKrKK_cv, self.inverse_dtype)
         for i in cutlass.range_constexpr(cute.size(tKKrKK_cv)):
             tKKrKK_inv[i] = self.inverse_dtype(tKKrKK_cv[i])
         cute.copy(tiled_store, tKKrKK_inv, tKKsKK)
@@ -227,10 +231,12 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         if cutlass.const_expr(self.needs_beta or self.dtype != self.inverse_dtype):
             cute.arch.barrier(barrier_id=NamedBarrier.KK_SYNC, number_of_threads=128)
-            ldsm_atom  = cute.make_copy_atom(
-                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.inverse_dtype)
+            ldsm_atom = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                self.inverse_dtype,
+            )
             tiled_load = cute.make_tiled_copy_C(ldsm_atom, kk_tiled_mma)
-            thr_load   = tiled_load.get_slice(kk_thread_idx)
+            thr_load = tiled_load.get_slice(kk_thread_idx)
             tKKrKK_cpy = cute.make_fragment_like(tKKrKK_inv)
             tKKrKK_cvt = cute.make_fragment_like(tKKrKK_inv, self.dtype)
             cute.copy(tiled_load, thr_load.partition_S(sKK_inv), tKKrKK_cpy)
@@ -240,7 +246,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 if cutlass.const_expr(self.needs_beta):
                     _, t = tKKcMkk_cv[i]
                     tKKrKK_cvt[i] = self.dtype(
-                        cutlass.Float32(tKKrKK_cpy[i]) * cutlass.Float32(sBeta[t, beta_pipe_idx])
+                        cutlass.Float32(tKKrKK_cpy[i])
+                        * cutlass.Float32(sBeta[t, beta_pipe_idx])
                     )
                 else:
                     tKKrKK_cvt[i] = self.dtype(tKKrKK_cpy[i])
@@ -253,17 +260,17 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def qk_and_kk_epi(
         self,
-        tQKrQK:          cute.Tensor,
-        tKKrKK:          cute.Tensor,
-        tQKcMqk:         cute.Tensor,
-        tKKcMkk:         cute.Tensor,
-        sAlpha:          cute.Tensor,
-        sBeta:           cute.Tensor,
-        alpha_stage:     cutlass.Int32,
-        beta_stage:      cutlass.Int32,
-        is_final_block:  bool,
-        B:               cutlass.Int32,
-        scale:           cutlass.Float32,
+        tQKrQK: cute.Tensor,
+        tKKrKK: cute.Tensor,
+        tQKcMqk: cute.Tensor,
+        tKKcMkk: cute.Tensor,
+        sAlpha: cute.Tensor,
+        sBeta: cute.Tensor,
+        alpha_stage: cutlass.Int32,
+        beta_stage: cutlass.Int32,
+        is_final_block: bool,
+        B: cutlass.Int32,
+        scale: cutlass.Float32,
     ):
         if cutlass.const_expr(self.needs_beta):
             beta_row = sBeta[None, beta_stage]
@@ -278,7 +285,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 s, t = tQKcMqk[i]
                 alpha = cute.math.exp2(
                     cutlass.Float32(alpha_cumlog[s]) - cutlass.Float32(alpha_cumlog[t]),
-                    fastmath=True)
+                    fastmath=True,
+                )
                 tQKrQK[i] = tQKrQK[i] * alpha * scale
                 tKKrKK[i] = tKKrKK[i] * alpha
         else:
@@ -301,17 +309,18 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def qk_store(
         self,
-        tQKrQK:        cute.Tensor,
-        sQK:           cute.Tensor,
+        tQKrQK: cute.Tensor,
+        sQK: cute.Tensor,
         qk_tiled_mma,
         qk_thread_idx: cutlass.Int32,
     ):
-        stsm_atom    = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype)
+        stsm_atom = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
+        )
         qk_tiled_copy = cute.make_tiled_copy_C(stsm_atom, qk_tiled_mma)
-        qk_thr_copy   = qk_tiled_copy.get_slice(qk_thread_idx)
-        tQKsQK        = qk_thr_copy.partition_D(sQK)
-        tQKrQK_cvt    = cute.make_fragment_like(tQKrQK, self.dtype)
+        qk_thr_copy = qk_tiled_copy.get_slice(qk_thread_idx)
+        tQKsQK = qk_thr_copy.partition_D(sQK)
+        tQKrQK_cvt = cute.make_fragment_like(tQKrQK, self.dtype)
         tQKrQK_cvt_cv = qk_thr_copy.retile(tQKrQK_cvt)
         for i in cutlass.range_constexpr(cute.size(tQKrQK)):
             tQKrQK_cvt[i] = self.dtype(tQKrQK[i])
@@ -322,11 +331,11 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def o1_epi(
         self,
-        tOrO:        cute.Tensor,
-        tOcO:        cute.Tensor,
-        sAlpha:      cute.Tensor,
+        tOrO: cute.Tensor,
+        tOcO: cute.Tensor,
+        sAlpha: cute.Tensor,
         alpha_stage: cutlass.Int32,
-        scale:       cutlass.Float32,
+        scale: cutlass.Float32,
     ):
         if cutlass.const_expr(self.needs_alpha):
             alpha_cpscale = sAlpha[None, AlphaProcessor.CUMPROD_SCALE, alpha_stage]
@@ -342,9 +351,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def sk_epi(
         self,
-        tSKrSK:      cute.Tensor,
-        tSKcSK:      cute.Tensor,
-        sAlpha:      cute.Tensor,
+        tSKrSK: cute.Tensor,
+        tSKcSK: cute.Tensor,
+        sAlpha: cute.Tensor,
         alpha_stage: cutlass.Int32,
     ):
         if cutlass.const_expr(self.needs_alpha):
@@ -358,15 +367,15 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def sk_load_v(
         self,
-        tSKrSK:  cute.Tensor,
-        sV_DS:   cute.Tensor,
+        tSKrSK: cute.Tensor,
+        sV_DS: cute.Tensor,
         sk_tiled_copy_C,
         sk_thr_copy_C,
         v_stage: cutlass.Int32,
     ) -> cute.Tensor:
-        tSKrV    = cute.make_fragment_like(tSKrSK, self.dtype)
+        tSKrV = cute.make_fragment_like(tSKrSK, self.dtype)
         tSKrV_cv = sk_thr_copy_C.retile(tSKrV)
-        tSKsV    = sk_thr_copy_C.partition_S(sV_DS)
+        tSKsV = sk_thr_copy_C.partition_S(sV_DS)
         cute.copy(sk_tiled_copy_C, tSKsV[None, None, None, v_stage], tSKrV_cv)
         return tSKrV
 
@@ -375,20 +384,21 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def kv_decay_v(
         self,
-        tKVrV:          cute.Tensor,
-        tKVcV:          cute.Tensor,
-        sAlpha:         cute.Tensor,
-        alpha_stage:    cutlass.Int32,
+        tKVrV: cute.Tensor,
+        tKVcV: cute.Tensor,
+        sAlpha: cute.Tensor,
+        alpha_stage: cutlass.Int32,
         is_final_block: bool,
-        B:              cutlass.Int32,
+        B: cutlass.Int32,
     ):
         if cutlass.const_expr(self.needs_alpha):
             alpha_cumlog = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
-            block_log    = cutlass.Float32(alpha_cumlog[B - cutlass.Int32(1)])
+            block_log = cutlass.Float32(alpha_cumlog[B - cutlass.Int32(1)])
             for i in cutlass.range_constexpr(cute.size(tKVrV)):
                 _, tok = tKVcV[i]
                 coeff = cute.math.exp2(
-                    block_log - cutlass.Float32(alpha_cumlog[tok]), fastmath=True)
+                    block_log - cutlass.Float32(alpha_cumlog[tok]), fastmath=True
+                )
                 if cutlass.const_expr(is_final_block):
                     if tok >= B:
                         coeff = cutlass.Float32(0.0)
@@ -405,8 +415,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def o_store(
         self,
-        tOrO:    cute.Tensor,
-        tOsO:    cute.Tensor,
+        tOrO: cute.Tensor,
+        tOsO: cute.Tensor,
         o_tiled_copy_r2s,
         o_thr_copy_r2s,
     ):
@@ -438,13 +448,12 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         k_producer_state,
         v_pipeline,
         v_producer_state,
-        blk:          cutlass.Int32,
-        tok_start:    cutlass.Int32,
-        q_head_idx:   cutlass.Int32,
-        k_head_idx:   cutlass.Int32,
-        v_head_idx:   cutlass.Int32,
+        blk: cutlass.Int32,
+        tok_start: cutlass.Int32,
+        q_head_idx: cutlass.Int32,
+        k_head_idx: cutlass.Int32,
+        v_head_idx: cutlass.Int32,
     ):
-
         blk_tok = tok_start + blk * cutlass.Int32(self.BLK_KV)
 
         sK = sK_DS[None, None, k_producer_state.index]
@@ -452,7 +461,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             (cutlass.Int32(0), blk_tok),
             tma_tensor_k[None, None, k_head_idx],
         )
-        gK = cute.zipped_divide(mK, (self.D, self.BLK_KV))[((None, None), (cutlass.Int32(0), cutlass.Int32(0)))]
+        gK = cute.zipped_divide(mK, (self.D, self.BLK_KV))[
+            ((None, None), (cutlass.Int32(0), cutlass.Int32(0)))
+        ]
         tKsK, tKgK = cpasync.tma_partition(
             tma_atom_k,
             0,
@@ -462,7 +473,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         )
         k_pipeline.producer_acquire(k_producer_state)
         cute.copy(
-            tma_atom_k, tKgK, tKsK,
+            tma_atom_k,
+            tKgK,
+            tKsK,
             tma_bar_ptr=k_pipeline.producer_get_barrier(k_producer_state),
         )
         k_pipeline.producer_commit(k_producer_state)
@@ -473,7 +486,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             (blk_tok, cutlass.Int32(0)),
             tma_tensor_q[None, None, q_head_idx],
         )
-        gQ = cute.zipped_divide(mQ, (self.BLK_Q, self.D))[((None, None), (cutlass.Int32(0), cutlass.Int32(0)))]
+        gQ = cute.zipped_divide(mQ, (self.BLK_Q, self.D))[
+            ((None, None), (cutlass.Int32(0), cutlass.Int32(0)))
+        ]
         tQsQ, tQgQ = cpasync.tma_partition(
             tma_atom_q,
             0,
@@ -483,7 +498,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         )
         q_pipeline.producer_acquire(q_producer_state)
         cute.copy(
-            tma_atom_q, tQgQ, tQsQ,
+            tma_atom_q,
+            tQgQ,
+            tQsQ,
             tma_bar_ptr=q_pipeline.producer_get_barrier(q_producer_state),
         )
         q_pipeline.producer_commit(q_producer_state)
@@ -494,7 +511,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             (cutlass.Int32(0), blk_tok),
             tma_tensor_v[None, None, v_head_idx],
         )
-        gV = cute.zipped_divide(mV, (self.D, self.BLK_KV))[((None, None), (cutlass.Int32(0), cutlass.Int32(0)))]
+        gV = cute.zipped_divide(mV, (self.D, self.BLK_KV))[
+            ((None, None), (cutlass.Int32(0), cutlass.Int32(0)))
+        ]
         tVsV, tVgV = cpasync.tma_partition(
             tma_atom_v,
             0,
@@ -504,7 +523,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         )
         v_pipeline.producer_acquire(v_producer_state)
         cute.copy(
-            tma_atom_v, tVgV, tVsV,
+            tma_atom_v,
+            tVgV,
+            tVsV,
             tma_bar_ptr=v_pipeline.producer_get_barrier(v_producer_state),
         )
         v_pipeline.producer_commit(v_producer_state)
@@ -518,13 +539,13 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def load_alpha(
         self,
-        sAlpha:       cute.Tensor,
-        g_alpha:      cute.Tensor,
-        blk_tok:      cutlass.Int32,
-        tok_end:      cutlass.Int32,
+        sAlpha: cute.Tensor,
+        g_alpha: cute.Tensor,
+        blk_tok: cutlass.Int32,
+        tok_end: cutlass.Int32,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
-        alpha_stage:  cutlass.Int32,
+        alpha_stage: cutlass.Int32,
     ):
         lane_id = cute.arch.lane_idx()
         sAlpha_k = sAlpha[None, None, alpha_stage]
@@ -534,7 +555,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             tok = blk_tok + row
             if tok < tok_end:
                 sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = g_alpha[
-                    tok * num_sab_heads + sab_head_idx]
+                    tok * num_sab_heads + sab_head_idx
+                ]
             else:
                 sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = cutlass.Float32(1.0)
 
@@ -544,13 +566,13 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def load_beta(
         self,
-        sBeta:        cute.Tensor,
-        g_beta:       cute.Tensor,
-        blk_tok:      cutlass.Int32,
-        tok_end:      cutlass.Int32,
+        sBeta: cute.Tensor,
+        g_beta: cute.Tensor,
+        blk_tok: cutlass.Int32,
+        tok_end: cutlass.Int32,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
-        beta_stage:   cutlass.Int32,
+        beta_stage: cutlass.Int32,
     ):
         lane_id = cute.arch.lane_idx()
         sBeta_k = sBeta[None, beta_stage]
@@ -568,13 +590,14 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def kv_load(
         self,
-        tKVrKV:      cute.Tensor,
-        gKV:         cute.Tensor,
+        tKVrKV: cute.Tensor,
+        gKV: cute.Tensor,
         kv_tiled_mma,
-        thread_idx:  cutlass.Int32,
+        thread_idx: cutlass.Int32,
     ):
         copy_atom_kv = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), gKV.element_type)
+            cute.nvgpu.CopyUniversalOp(), gKV.element_type
+        )
         tiled_copy_kv = cute.make_tiled_copy_C(copy_atom_kv, kv_tiled_mma)
         thr_copy_kv = tiled_copy_kv.get_slice(thread_idx)
         tKVgKV = thr_copy_kv.partition_S(select_tensor_10(gKV))
@@ -583,13 +606,14 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def kv_store(
         self,
-        tKVrKV:    cute.Tensor,
-        gKV:       cute.Tensor,
+        tKVrKV: cute.Tensor,
+        gKV: cute.Tensor,
         kv_tiled_mma,
         thread_idx: cutlass.Int32,
     ):
         copy_atom_kv = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), gKV.element_type)
+            cute.nvgpu.CopyUniversalOp(), gKV.element_type
+        )
         tiled_copy_kv = cute.make_tiled_copy_C(copy_atom_kv, kv_tiled_mma)
         thr_copy_kv = tiled_copy_kv.get_slice(thread_idx)
         tKVgKV = thr_copy_kv.partition_D(select_tensor_10(gKV))
@@ -612,7 +636,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         seq_len: cutlass.Int32,
     ):
         if cutlass.const_expr(self.needs_checkpointing):
-            if block_end <= seq_len and block_end % checkpoint_every_n_tokens == cutlass.Int32(0):
+            if (
+                block_end <= seq_len
+                and block_end % checkpoint_every_n_tokens == cutlass.Int32(0)
+            ):
                 checkpoint_idx = (
                     cutlass.Int32(checkpoint_cu_starts[seq_idx])
                     + block_end // checkpoint_every_n_tokens
@@ -622,7 +649,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     (self.D, self.D, num_sab_heads, total_checkpoints),
                     order=(0, 1, 2, 3),
                 )
-                mCheckpoint = cute.make_tensor(g_state_checkpoints.iterator, checkpoint_layout)
+                mCheckpoint = cute.make_tensor(
+                    g_state_checkpoints.iterator, checkpoint_layout
+                )
                 gCheckpointKV = mCheckpoint[None, None, o_head_idx, checkpoint_idx]
                 self.kv_store(tKVrKV, gCheckpointKV, kv_tiled_mma, thread_idx)
 
@@ -634,15 +663,15 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     def compute_loop_body(
         self,
         # Smem tensors (staged; caller indexes the active stage)
-        sQ_SD:   cute.Tensor,    # (BlkQ, D, StagesQ)  – row-major atom, swizzled
-        sK_SD:   cute.Tensor,    # (BlkKV, D, StagesK) – same atom
-        sK_DS:   cute.Tensor,    # (D, BlkKV, StagesK) – K transposed
-        sV_DS:   cute.Tensor,    # (D, BlkKV, StagesV) – V transposed
-        sQK:     cute.Tensor,    # (BlkQ, BlkKV, StagesQK)
-        sKK_inv: cute.Tensor,    # (BlkKV, BlkKV, StagesKK)
-        sKK_opd: cute.Tensor,    # sKK_inv storage recast as Element
-        sO:      cute.Tensor,    # O output smem (staged)
-        sAlpha:  cute.Tensor,    # (BlkQ, AlphaProcessor.NUM_CHANNELS, StagesAlpha) or zero-shaped
+        sQ_SD: cute.Tensor,  # (BlkQ, D, StagesQ)  – row-major atom, swizzled
+        sK_SD: cute.Tensor,  # (BlkKV, D, StagesK) – same atom
+        sK_DS: cute.Tensor,  # (D, BlkKV, StagesK) – K transposed
+        sV_DS: cute.Tensor,  # (D, BlkKV, StagesV) – V transposed
+        sQK: cute.Tensor,  # (BlkQ, BlkKV, StagesQK)
+        sKK_inv: cute.Tensor,  # (BlkKV, BlkKV, StagesKK)
+        sKK_opd: cute.Tensor,  # sKK_inv storage recast as Element
+        sO: cute.Tensor,  # O output smem (staged)
+        sAlpha: cute.Tensor,  # (BlkQ, AlphaProcessor.NUM_CHANNELS, StagesAlpha) or zero-shaped
         kv_tiled_mma,
         # Mainloop pipelines and active read states
         q_pipeline,
@@ -672,67 +701,76 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         wg_idx: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        thread_idx    = tidx - cutlass.Int32(128)        # relative to compute threads
+        thread_idx = tidx - cutlass.Int32(128)  # relative to compute threads
         # ── TiledMMAs ─────────────────────────────────────────────────────────
-        blk_q  = cute.size(sQ_SD, mode=[0])
+        blk_q = cute.size(sQ_SD, mode=[0])
         blk_kv = cute.size(sK_SD, mode=[0])
-        d      = cute.size(sQ_SD, mode=[1])
-        tile_shape_o1 = (d, blk_q, d)
-        tile_shape_o2 = (d, blk_q, blk_kv)
-        tile_shape_sk = (d, blk_kv, d)
-        tile_shape_newv = (d, blk_kv, blk_kv)
-        mma_atom_o1 = cute.make_mma_atom(warpgroup.MmaF16BF16Op(
-            self.dtype, self.acc_dtype, (64, blk_q, 16),
-            warpgroup.OperandSource.RMEM,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.K,
-        ))
-        mma_atom_o2 = cute.make_mma_atom(warpgroup.MmaF16BF16Op(
-            self.dtype, self.acc_dtype, (64, blk_q, 16),
-            warpgroup.OperandSource.RMEM,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.K,
-        ))
-        mma_atom_sk = cute.make_mma_atom(warpgroup.MmaF16BF16Op(
-            self.dtype, self.acc_dtype, (64, blk_kv, 16),
-            warpgroup.OperandSource.RMEM,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.K,
-        ))
-        mma_atom_newv = cute.make_mma_atom(warpgroup.MmaF16BF16Op(
-            self.dtype, self.acc_dtype, (64, blk_kv, 16),
-            warpgroup.OperandSource.RMEM,
-            cute.nvgpu.OperandMajorMode.K,
-            cute.nvgpu.OperandMajorMode.K,
-        ))
+        d = cute.size(sQ_SD, mode=[1])
+        mma_atom_o1 = cute.make_mma_atom(
+            warpgroup.MmaF16BF16Op(
+                self.dtype,
+                self.acc_dtype,
+                (64, blk_q, 16),
+                warpgroup.OperandSource.RMEM,
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
+            )
+        )
+        mma_atom_o2 = cute.make_mma_atom(
+            warpgroup.MmaF16BF16Op(
+                self.dtype,
+                self.acc_dtype,
+                (64, blk_q, 16),
+                warpgroup.OperandSource.RMEM,
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
+            )
+        )
+        mma_atom_sk = cute.make_mma_atom(
+            warpgroup.MmaF16BF16Op(
+                self.dtype,
+                self.acc_dtype,
+                (64, blk_kv, 16),
+                warpgroup.OperandSource.RMEM,
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
+            )
+        )
+        mma_atom_newv = cute.make_mma_atom(
+            warpgroup.MmaF16BF16Op(
+                self.dtype,
+                self.acc_dtype,
+                (64, blk_kv, 16),
+                warpgroup.OperandSource.RMEM,
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
+            )
+        )
 
         # O1/O2/SK/NewV: two state warpgroups cooperate as in the C++ Hopper GMMA path.
-        o1_tiled_mma = cute.make_tiled_mma(
-            mma_atom_o1, cute.make_layout((2, 1, 1)))
-        o2_tiled_mma = cute.make_tiled_mma(
-            mma_atom_o2, cute.make_layout((2, 1, 1)))
-        sk_tiled_mma = cute.make_tiled_mma(
-            mma_atom_sk, cute.make_layout((2, 1, 1)))
-        newv_tiled_mma = cute.make_tiled_mma(
-            mma_atom_newv, cute.make_layout((2, 1, 1)))
+        o1_tiled_mma = cute.make_tiled_mma(mma_atom_o1, cute.make_layout((2, 1, 1)))
+        o2_tiled_mma = cute.make_tiled_mma(mma_atom_o2, cute.make_layout((2, 1, 1)))
+        sk_tiled_mma = cute.make_tiled_mma(mma_atom_sk, cute.make_layout((2, 1, 1)))
+        newv_tiled_mma = cute.make_tiled_mma(mma_atom_newv, cute.make_layout((2, 1, 1)))
 
         # ── Thread slices ─────────────────────────────────────────────────────
-        sk_thr_mma   = sk_tiled_mma.get_slice(thread_idx)
+        sk_thr_mma = sk_tiled_mma.get_slice(thread_idx)
         newv_thr_mma = newv_tiled_mma.get_slice(thread_idx)
-        o1_thr_mma   = o1_tiled_mma.get_slice(thread_idx)
-        o2_thr_mma   = o2_tiled_mma.get_slice(thread_idx)
-        kv_thr_mma   = kv_tiled_mma.get_slice(thread_idx)
+        o1_thr_mma = o1_tiled_mma.get_slice(thread_idx)
+        o2_thr_mma = o2_tiled_mma.get_slice(thread_idx)
+        kv_thr_mma = kv_tiled_mma.get_slice(thread_idx)
 
         # ── Copy atoms ────────────────────────────────────────────────────────
         ldsm_t4 = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=4), self.dtype)
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
+        )
 
         # ── SK copies ─────────────────────────────────────────────────────────
         # SK C: V loaded from sV_DS (col-major D×BlkKV) with LDSM_T.
         sk_tiled_copy_C = cute.make_tiled_copy_C(ldsm_t4, sk_tiled_mma)
         sk_thr_copy_C = sk_tiled_copy_C.get_slice(thread_idx)
-        tSKsK    = sk_thr_mma.partition_B(sK_SD)
-        tSKrK    = sk_thr_mma.make_fragment_B(tSKsK)
+        tSKsK = sk_thr_mma.partition_B(sK_SD)
+        tSKrK = sk_thr_mma.make_fragment_B(tSKsK)
 
         # ── NewV copies ───────────────────────────────────────────────────────
         tNewVsB = newv_thr_mma.partition_B(sKK_opd)
@@ -743,33 +781,33 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tKVrK = kv_thr_mma.make_fragment_B(tKVsK)
 
         # ── O1/O2 copies ──────────────────────────────────────────────────────
-        tOsQ  = o1_thr_mma.partition_B(sQ_SD)
-        tOrQ  = o1_thr_mma.make_fragment_B(tOsQ)
+        tOsQ = o1_thr_mma.partition_B(sQ_SD)
+        tOrQ = o1_thr_mma.make_fragment_B(tOsQ)
         tOsQK = o2_thr_mma.partition_B(sQK)
         tOrQK = o2_thr_mma.make_fragment_B(tOsQK)
 
         # ── O store (R→S STSM) ────────────────────────────────────────────────
-        o_stsm   = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype)
+        o_stsm = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
+        )
         o_tiled_copy_r2s = cute.make_tiled_copy_C(o_stsm, o1_tiled_mma)
         o_thr_copy_r2s = o_tiled_copy_r2s.get_slice(thread_idx)
         tOsO = o_thr_copy_r2s.partition_D(sO)
 
         # ── Coordinate tensors for masking / alpha/beta indexing ──────────────
-        cO      = cute.make_identity_tensor((d, blk_q))
-        tOcO    = o1_thr_mma.partition_C(cO)
-        cSK     = cute.make_identity_tensor((d, blk_kv))
-        tSKcSK  = sk_thr_mma.partition_C(cSK)
-        cV      = cute.make_identity_tensor((d, blk_kv))
-        tKVcV   = kv_thr_mma.partition_A(cV)
+        cO = cute.make_identity_tensor((d, blk_q))
+        tOcO = o1_thr_mma.partition_C(cO)
+        cSK = cute.make_identity_tensor((d, blk_kv))
+        tSKcSK = sk_thr_mma.partition_C(cSK)
+        cV = cute.make_identity_tensor((d, blk_kv))
+        tKVcV = kv_thr_mma.partition_A(cV)
 
         # ── O1: KV_state @ Q (both state WGs, skip on first block) ───────────
         q_pipeline.consumer_wait(q_consumer_state)
         if cutlass.const_expr(self.needs_alpha):
             alpha_pipeline.consumer_wait(alpha_consumer_state)
             cute.arch.fence_view_async_shared()
-        tOrO = o1_thr_mma.make_fragment_C(
-            o1_thr_mma.partition_shape_C((d, blk_q)))
+        tOrO = o1_thr_mma.make_fragment_C(o1_thr_mma.partition_shape_C((d, blk_q)))
         if cutlass.const_expr(not is_first_block):
             tOrKV = SM90.make_acc_into_op(tKVrKV, o1_tiled_mma, self.dtype)
             SM90.warpgroup_fence_operand(tOrKV)
@@ -791,8 +829,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         # ── SK: KV_state @ K^T (result negated below via V - SK) ─────────────
         k_pipeline.consumer_wait(k_consumer_state)
-        tSKrSK = sk_thr_mma.make_fragment_C(
-            sk_thr_mma.partition_shape_C((d, blk_kv)))
+        tSKrSK = sk_thr_mma.make_fragment_C(sk_thr_mma.partition_shape_C((d, blk_kv)))
         if cutlass.const_expr(not is_first_block):
             tSKrS = SM90.make_acc_into_op(tKVrKV, sk_tiled_mma, self.dtype)
             SM90.warpgroup_fence_operand(tSKrSK)
@@ -812,7 +849,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         # ── Load V from smem ──────────────────────────────────────────────────
         v_pipeline.consumer_wait(v_consumer_state)
         tSKrV = self.sk_load_v(
-            tSKrSK, sV_DS, sk_tiled_copy_C, sk_thr_copy_C,
+            tSKrSK,
+            sV_DS,
+            sk_tiled_copy_C,
+            sk_thr_copy_C,
             v_consumer_state.index,
         )
 
@@ -825,7 +865,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         # ── NewV = (V - SK) @ T^T  (ordered: WG0 first) ──────────────────────
         tNewVrA = SM90.make_acc_into_op(tSKrV, newv_tiled_mma, self.dtype)
         tNewVrC = newv_thr_mma.make_fragment_C(
-            newv_thr_mma.partition_shape_C((d, blk_kv)))
+            newv_thr_mma.partition_shape_C((d, blk_kv))
+        )
         kk_pipeline.consumer_wait(kk_consumer_state)
         SM90.warpgroup_fence_operand(tNewVrA)
         SM90.warpgroup_fence_operand(tNewVrC)
@@ -868,8 +909,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         # ── O store to smem ───────────────────────────────────────────────────
         o_pipeline.producer_acquire(o_producer_state)
         self.o_store(
-            tOrO, tOsO[None, None, None, o_producer_state.index],
-            o_tiled_copy_r2s, o_thr_copy_r2s,
+            tOrO,
+            tOsO[None, None, None, o_producer_state.index],
+            o_tiled_copy_r2s,
+            o_thr_copy_r2s,
         )
         o_pipeline.producer_commit(o_producer_state)
         o_producer_state.advance()
@@ -882,14 +925,15 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     B - cutlass.Int32(1),
                     AlphaProcessor.CUMPROD,
                     alpha_consumer_state.index,
-                ])
+                ]
+            )
 
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             tKVrKV[i] = block_coeff * tKVrKV[i]
 
         self.kv_decay_v(
-            tOrV_or_tKVrV, tKVcV, sAlpha,
-            alpha_consumer_state.index, is_final_block, B)
+            tOrV_or_tKVrV, tKVcV, sAlpha, alpha_consumer_state.index, is_final_block, B
+        )
 
         # KV += NewV @ K
         SM90.warpgroup_fence_operand(tOrV_or_tKVrV)
@@ -947,26 +991,40 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         v_head_idx: cutlass.Int32,
     ):
         q_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.q_stage)
+            pipeline.PipelineUserType.Producer, self.q_stage
+        )
         k_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.k_stage)
+            pipeline.PipelineUserType.Producer, self.k_stage
+        )
         v_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.v_stage)
+            pipeline.PipelineUserType.Producer, self.v_stage
+        )
         for blk in cutlass.range(num_blocks, unroll=1):
             (
                 q_producer_state,
                 k_producer_state,
                 v_producer_state,
             ) = self.load_qkv_tma(
-                sQ_SD, sK_DS, sV_DS,
-                tma_atom_q, tma_tensor_q,
-                tma_atom_k, tma_tensor_k,
-                tma_atom_v, tma_tensor_v,
-                q_pipeline, q_producer_state,
-                k_pipeline, k_producer_state,
-                v_pipeline, v_producer_state,
-                blk, tok_start,
-                q_head_idx, k_head_idx, v_head_idx,
+                sQ_SD,
+                sK_DS,
+                sV_DS,
+                tma_atom_q,
+                tma_tensor_q,
+                tma_atom_k,
+                tma_tensor_k,
+                tma_atom_v,
+                tma_tensor_v,
+                q_pipeline,
+                q_producer_state,
+                k_pipeline,
+                k_producer_state,
+                v_pipeline,
+                v_producer_state,
+                blk,
+                tok_start,
+                q_head_idx,
+                k_head_idx,
+                v_head_idx,
             )
 
     @cute.jit
@@ -983,17 +1041,25 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         num_sab_heads: cutlass.Int32,
     ):
         alpha_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.alpha_beta_stage)
+            pipeline.PipelineUserType.Producer, self.alpha_beta_stage
+        )
         for blk in cutlass.range(num_blocks, unroll=1):
             blk_tok = tok_start + blk * cutlass.Int32(self.BLK_Q)
             if cutlass.const_expr(self.needs_alpha):
                 alpha_pipeline.producer_acquire(alpha_producer_state)
                 cute.arch.fence_view_async_shared()
                 self.load_alpha(
-                    sAlpha, g_alpha, blk_tok, tok_end, sab_head_idx,
-                    num_sab_heads, alpha_producer_state.index,
+                    sAlpha,
+                    g_alpha,
+                    blk_tok,
+                    tok_end,
+                    sab_head_idx,
+                    num_sab_heads,
+                    alpha_producer_state.index,
                 )
-                AlphaProcessor().run(sAlpha[None, None, alpha_producer_state.index], scale)
+                AlphaProcessor().run(
+                    sAlpha[None, None, alpha_producer_state.index], scale
+                )
                 cute.arch.fence_view_async_shared()
                 alpha_pipeline.producer_commit(alpha_producer_state)
                 alpha_producer_state.advance()
@@ -1011,15 +1077,21 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         num_sab_heads: cutlass.Int32,
     ):
         beta_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.alpha_beta_stage)
+            pipeline.PipelineUserType.Producer, self.alpha_beta_stage
+        )
         for blk in cutlass.range(num_blocks, unroll=1):
             blk_tok = tok_start + blk * cutlass.Int32(self.BLK_KV)
             if cutlass.const_expr(self.needs_beta):
                 beta_pipeline.producer_acquire(beta_producer_state)
                 cute.arch.fence_view_async_shared()
                 self.load_beta(
-                    sBeta, g_beta, blk_tok, tok_end, sab_head_idx,
-                    num_sab_heads, beta_producer_state.index,
+                    sBeta,
+                    g_beta,
+                    blk_tok,
+                    tok_end,
+                    sab_head_idx,
+                    num_sab_heads,
+                    beta_producer_state.index,
                 )
                 cute.arch.fence_view_async_shared()
                 beta_pipeline.producer_commit(beta_producer_state)
@@ -1062,31 +1134,44 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     ):
         self._math_order_init(wg_idx)
         q_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.q_stage)
+            pipeline.PipelineUserType.Consumer, self.q_stage
+        )
         k_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.k_stage)
+            pipeline.PipelineUserType.Consumer, self.k_stage
+        )
         v_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.v_stage)
+            pipeline.PipelineUserType.Consumer, self.v_stage
+        )
         o_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.o_stage)
+            pipeline.PipelineUserType.Producer, self.o_stage
+        )
         qk_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.qk_stage)
+            pipeline.PipelineUserType.Consumer, self.qk_stage
+        )
         kk_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.kk_stage)
+            pipeline.PipelineUserType.Consumer, self.kk_stage
+        )
         alpha_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage)
+            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage
+        )
 
         kv_tiled_mma = cute.make_tiled_mma(
-            cute.make_mma_atom(warpgroup.MmaF16BF16Op(
-                self.dtype, self.acc_dtype, (64, self.D, 16),
-                warpgroup.OperandSource.RMEM,
-                cute.nvgpu.OperandMajorMode.K,
-                cute.nvgpu.OperandMajorMode.MN,
-            )),
+            cute.make_mma_atom(
+                warpgroup.MmaF16BF16Op(
+                    self.dtype,
+                    self.acc_dtype,
+                    (64, self.D, 16),
+                    warpgroup.OperandSource.RMEM,
+                    cute.nvgpu.OperandMajorMode.K,
+                    cute.nvgpu.OperandMajorMode.MN,
+                )
+            ),
             cute.make_layout((2, 1, 1)),
         )
         kv_thr_mma = kv_tiled_mma.get_slice(math_tidx)
-        tKVrKV = kv_thr_mma.make_fragment_C(kv_thr_mma.partition_shape_C((self.D, self.D)))
+        tKVrKV = kv_thr_mma.make_fragment_C(
+            kv_thr_mma.partition_shape_C((self.D, self.D))
+        )
         tKVrKV.fill(self.acc_dtype(0.0))
 
         state_layout = cute.make_ordered_layout(
@@ -1094,14 +1179,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         )
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         mState = cute.make_tensor(g_state.iterator, state_layout)
-        gStateKV = mState[
-            None, None, o_head_idx, work_desc.seq_idx
-        ]
+        gStateKV = mState[None, None, o_head_idx, work_desc.seq_idx]
         if cutlass.const_expr(self.needs_init_state):
             mInitState = cute.make_tensor(g_init_state.iterator, state_layout)
-            gInitKV = mInitState[
-                None, None, o_head_idx, work_desc.seq_idx
-            ]
+            gInitKV = mInitState[None, None, o_head_idx, work_desc.seq_idx]
             self.kv_load(tKVrKV, gInitKV, kv_tiled_mma, math_tidx)
 
         first_B = work_desc.seq_len
@@ -1117,17 +1198,36 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 kk_consumer_state,
                 alpha_consumer_state,
             ) = self.compute_loop_body(
-                sQ_SD, sK_SD, sK_DS, sV_DS, sQK, sKK_inv, sKK_opd, sO, sAlpha,
+                sQ_SD,
+                sK_SD,
+                sK_DS,
+                sV_DS,
+                sQK,
+                sKK_inv,
+                sKK_opd,
+                sO,
+                sAlpha,
                 kv_tiled_mma,
-                q_pipeline, q_consumer_state,
-                k_pipeline, k_consumer_state,
-                v_pipeline, v_consumer_state,
-                o_pipeline, o_producer_state,
-                qk_pipeline, qk_consumer_state,
-                kk_pipeline, kk_consumer_state,
-                alpha_pipeline, alpha_consumer_state,
-                False, True, first_B,
-                tKVrKV, scale, wg_idx,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                v_pipeline,
+                v_consumer_state,
+                o_pipeline,
+                o_producer_state,
+                qk_pipeline,
+                qk_consumer_state,
+                kk_pipeline,
+                kk_consumer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                False,
+                True,
+                first_B,
+                tKVrKV,
+                scale,
+                wg_idx,
             )
         else:
             (
@@ -1139,25 +1239,55 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 kk_consumer_state,
                 alpha_consumer_state,
             ) = self.compute_loop_body(
-                sQ_SD, sK_SD, sK_DS, sV_DS, sQK, sKK_inv, sKK_opd, sO, sAlpha,
+                sQ_SD,
+                sK_SD,
+                sK_DS,
+                sV_DS,
+                sQK,
+                sKK_inv,
+                sKK_opd,
+                sO,
+                sAlpha,
                 kv_tiled_mma,
-                q_pipeline, q_consumer_state,
-                k_pipeline, k_consumer_state,
-                v_pipeline, v_consumer_state,
-                o_pipeline, o_producer_state,
-                qk_pipeline, qk_consumer_state,
-                kk_pipeline, kk_consumer_state,
-                alpha_pipeline, alpha_consumer_state,
-                True, True, first_B,
-                tKVrKV, scale, wg_idx,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                v_pipeline,
+                v_consumer_state,
+                o_pipeline,
+                o_producer_state,
+                qk_pipeline,
+                qk_consumer_state,
+                kk_pipeline,
+                kk_consumer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                True,
+                True,
+                first_B,
+                tKVrKV,
+                scale,
+                wg_idx,
             )
         self.maybe_store_checkpoint(
-            tKVrKV, g_state_checkpoints, checkpoint_cu_starts, checkpoint_every_n_tokens,
-            kv_tiled_mma, math_tidx, work_desc.seq_idx, o_head_idx, num_sab_heads, total_checkpoints,
-            cutlass.Int32(self.BLK_KV), work_desc.seq_len,
+            tKVrKV,
+            g_state_checkpoints,
+            checkpoint_cu_starts,
+            checkpoint_every_n_tokens,
+            kv_tiled_mma,
+            math_tidx,
+            work_desc.seq_idx,
+            o_head_idx,
+            num_sab_heads,
+            total_checkpoints,
+            cutlass.Int32(self.BLK_KV),
+            work_desc.seq_len,
         )
 
-        for blk in cutlass.range(cutlass.Int32(1), num_blocks - cutlass.Int32(1), cutlass.Int32(1), unroll=1):
+        for blk in cutlass.range(
+            cutlass.Int32(1), num_blocks - cutlass.Int32(1), cutlass.Int32(1), unroll=1
+        ):
             (
                 q_consumer_state,
                 k_consumer_state,
@@ -1167,22 +1297,50 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 kk_consumer_state,
                 alpha_consumer_state,
             ) = self.compute_loop_body(
-                sQ_SD, sK_SD, sK_DS, sV_DS, sQK, sKK_inv, sKK_opd, sO, sAlpha,
+                sQ_SD,
+                sK_SD,
+                sK_DS,
+                sV_DS,
+                sQK,
+                sKK_inv,
+                sKK_opd,
+                sO,
+                sAlpha,
                 kv_tiled_mma,
-                q_pipeline, q_consumer_state,
-                k_pipeline, k_consumer_state,
-                v_pipeline, v_consumer_state,
-                o_pipeline, o_producer_state,
-                qk_pipeline, qk_consumer_state,
-                kk_pipeline, kk_consumer_state,
-                alpha_pipeline, alpha_consumer_state,
-                False, False, cutlass.Int32(self.BLK_KV),
-                tKVrKV, scale, wg_idx,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                v_pipeline,
+                v_consumer_state,
+                o_pipeline,
+                o_producer_state,
+                qk_pipeline,
+                qk_consumer_state,
+                kk_pipeline,
+                kk_consumer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                False,
+                False,
+                cutlass.Int32(self.BLK_KV),
+                tKVrKV,
+                scale,
+                wg_idx,
             )
             self.maybe_store_checkpoint(
-                tKVrKV, g_state_checkpoints, checkpoint_cu_starts, checkpoint_every_n_tokens,
-                kv_tiled_mma, math_tidx, work_desc.seq_idx, o_head_idx, num_sab_heads, total_checkpoints,
-                (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV), work_desc.seq_len,
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_tiled_mma,
+                math_tidx,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
             )
 
         if num_blocks != cutlass.Int32(1):
@@ -1197,22 +1355,50 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 kk_consumer_state,
                 alpha_consumer_state,
             ) = self.compute_loop_body(
-                sQ_SD, sK_SD, sK_DS, sV_DS, sQK, sKK_inv, sKK_opd, sO, sAlpha,
+                sQ_SD,
+                sK_SD,
+                sK_DS,
+                sV_DS,
+                sQK,
+                sKK_inv,
+                sKK_opd,
+                sO,
+                sAlpha,
                 kv_tiled_mma,
-                q_pipeline, q_consumer_state,
-                k_pipeline, k_consumer_state,
-                v_pipeline, v_consumer_state,
-                o_pipeline, o_producer_state,
-                qk_pipeline, qk_consumer_state,
-                kk_pipeline, kk_consumer_state,
-                alpha_pipeline, alpha_consumer_state,
-                False, True, last_B,
-                tKVrKV, scale, wg_idx,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                v_pipeline,
+                v_consumer_state,
+                o_pipeline,
+                o_producer_state,
+                qk_pipeline,
+                qk_consumer_state,
+                kk_pipeline,
+                kk_consumer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                False,
+                True,
+                last_B,
+                tKVrKV,
+                scale,
+                wg_idx,
             )
             self.maybe_store_checkpoint(
-                tKVrKV, g_state_checkpoints, checkpoint_cu_starts, checkpoint_every_n_tokens,
-                kv_tiled_mma, math_tidx, work_desc.seq_idx, o_head_idx, num_sab_heads, total_checkpoints,
-                (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV), work_desc.seq_len,
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_tiled_mma,
+                math_tidx,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
             )
         self.kv_store(tKVrKV, gStateKV, kv_tiled_mma, math_tidx)
 
@@ -1250,7 +1436,6 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tKKcMkk: cute.Tensor,
         aux_tidx: cutlass.Int32,
     ):
-
         B = cutlass.Int32(self.BLK_KV)
         if cutlass.const_expr(is_final_block):
             B = work_desc.seq_len - blk * cutlass.Int32(self.BLK_KV)
@@ -1258,7 +1443,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         k_pipeline.consumer_wait(k_consumer_state)
 
         tKKrKK = kk_tiled_mma.get_slice(aux_tidx).make_fragment_C(
-            kk_tiled_mma.get_slice(aux_tidx).partition_shape_C((self.BLK_KV, self.BLK_KV)))
+            kk_tiled_mma.get_slice(aux_tidx).partition_shape_C(
+                (self.BLK_KV, self.BLK_KV)
+            )
+        )
         cute.nvgpu.warpgroup.fence()
         SM90.wgmma_gemm_zero_acc(
             kk_tiled_mma,
@@ -1270,7 +1458,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         q_pipeline.consumer_wait(q_consumer_state)
         tQKrQK = qk_tiled_mma.get_slice(aux_tidx).make_fragment_C(
-            qk_tiled_mma.get_slice(aux_tidx).partition_shape_C((self.BLK_Q, self.BLK_KV)))
+            qk_tiled_mma.get_slice(aux_tidx).partition_shape_C(
+                (self.BLK_Q, self.BLK_KV)
+            )
+        )
         cute.nvgpu.warpgroup.fence()
         SM90.wgmma_gemm_zero_acc(
             qk_tiled_mma,
@@ -1293,17 +1484,29 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         cute.arch.fence_view_async_shared()
 
         self.qk_and_kk_epi(
-            tQKrQK, tKKrKK, tQKcMqk, tKKcMkk, sAlpha, sBeta,
-            alpha_consumer_state.index, beta_consumer_state.index,
-            is_final_block, B, scale,
+            tQKrQK,
+            tKKrKK,
+            tQKcMqk,
+            tKKcMkk,
+            sAlpha,
+            sBeta,
+            alpha_consumer_state.index,
+            beta_consumer_state.index,
+            is_final_block,
+            B,
+            scale,
         )
 
         kk_pipeline.producer_acquire(kk_producer_state)
         self._kk_store_and_inv(
-            tKKrKK, kk_tiled_mma, aux_tidx,
+            tKKrKK,
+            kk_tiled_mma,
+            aux_tidx,
             sKK_inv[None, None, kk_producer_state.index],
             sKK_opd[None, None, kk_producer_state.index],
-            sBeta, beta_consumer_state.index, tKKcMkk,
+            sBeta,
+            beta_consumer_state.index,
+            tKKcMkk,
         )
         cute.arch.fence_view_async_shared()
         kk_pipeline.producer_commit(kk_producer_state)
@@ -1359,24 +1562,30 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     ):
         aux_tidx = math_tidx % cutlass.Int32(128)
 
-        tile_shape_qk = (self.BLK_Q, self.BLK_KV, self.D)
-        tile_shape_kk = tile_shape_qk
         qk_tiled_mma = cute.make_tiled_mma(
-            cute.make_mma_atom(warpgroup.MmaF16BF16Op(
-                self.dtype, self.acc_dtype, (self.BLK_Q, self.BLK_KV, 16),
-                warpgroup.OperandSource.SMEM,
-                cute.nvgpu.OperandMajorMode.K,
-                cute.nvgpu.OperandMajorMode.K,
-            )),
+            cute.make_mma_atom(
+                warpgroup.MmaF16BF16Op(
+                    self.dtype,
+                    self.acc_dtype,
+                    (self.BLK_Q, self.BLK_KV, 16),
+                    warpgroup.OperandSource.SMEM,
+                    cute.nvgpu.OperandMajorMode.K,
+                    cute.nvgpu.OperandMajorMode.K,
+                )
+            ),
             cute.make_layout((1, 1, 1)),
         )
         kk_tiled_mma = cute.make_tiled_mma(
-            cute.make_mma_atom(warpgroup.MmaF16BF16Op(
-                self.dtype, self.acc_dtype, (self.BLK_KV, self.BLK_KV, 16),
-                warpgroup.OperandSource.SMEM,
-                cute.nvgpu.OperandMajorMode.K,
-                cute.nvgpu.OperandMajorMode.K,
-            )),
+            cute.make_mma_atom(
+                warpgroup.MmaF16BF16Op(
+                    self.dtype,
+                    self.acc_dtype,
+                    (self.BLK_KV, self.BLK_KV, 16),
+                    warpgroup.OperandSource.SMEM,
+                    cute.nvgpu.OperandMajorMode.K,
+                    cute.nvgpu.OperandMajorMode.K,
+                )
+            ),
             cute.make_layout((1, 1, 1)),
         )
 
@@ -1398,17 +1607,23 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tKKcMkk = kk_thr_mma.partition_C(cMqk)
 
         q_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.q_stage)
+            pipeline.PipelineUserType.Consumer, self.q_stage
+        )
         k_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.k_stage)
+            pipeline.PipelineUserType.Consumer, self.k_stage
+        )
         qk_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.qk_stage)
+            pipeline.PipelineUserType.Producer, self.qk_stage
+        )
         kk_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.kk_stage)
+            pipeline.PipelineUserType.Producer, self.kk_stage
+        )
         alpha_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage)
+            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage
+        )
         beta_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage)
+            pipeline.PipelineUserType.Consumer, self.alpha_beta_stage
+        )
 
         for blk in cutlass.range(num_blocks - cutlass.Int32(1), unroll=1):
             (
@@ -1419,18 +1634,36 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 alpha_consumer_state,
                 beta_consumer_state,
             ) = self.run_aux_loop_body(
-                sQK, sKK_inv, sKK_opd, sAlpha, sBeta,
-                q_pipeline, q_consumer_state,
-                k_pipeline, k_consumer_state,
-                qk_pipeline, qk_producer_state,
-                kk_pipeline, kk_producer_state,
-                alpha_pipeline, alpha_consumer_state,
-                beta_pipeline, beta_consumer_state,
-                work_desc, scale, blk, False,
-                qk_tiled_mma, kk_tiled_mma,
-                tQKrQ, tQKrK,
-                tKKrA, tKKrB,
-                tQKcMqk, tKKcMkk, aux_tidx,
+                sQK,
+                sKK_inv,
+                sKK_opd,
+                sAlpha,
+                sBeta,
+                q_pipeline,
+                q_consumer_state,
+                k_pipeline,
+                k_consumer_state,
+                qk_pipeline,
+                qk_producer_state,
+                kk_pipeline,
+                kk_producer_state,
+                alpha_pipeline,
+                alpha_consumer_state,
+                beta_pipeline,
+                beta_consumer_state,
+                work_desc,
+                scale,
+                blk,
+                False,
+                qk_tiled_mma,
+                kk_tiled_mma,
+                tQKrQ,
+                tQKrK,
+                tKKrA,
+                tKKrB,
+                tQKcMqk,
+                tKKcMkk,
+                aux_tidx,
             )
 
         last_blk = num_blocks - cutlass.Int32(1)
@@ -1442,18 +1675,36 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             alpha_consumer_state,
             beta_consumer_state,
         ) = self.run_aux_loop_body(
-            sQK, sKK_inv, sKK_opd, sAlpha, sBeta,
-            q_pipeline, q_consumer_state,
-            k_pipeline, k_consumer_state,
-            qk_pipeline, qk_producer_state,
-            kk_pipeline, kk_producer_state,
-            alpha_pipeline, alpha_consumer_state,
-            beta_pipeline, beta_consumer_state,
-            work_desc, scale, last_blk, True,
-            qk_tiled_mma, kk_tiled_mma,
-            tQKrQ, tQKrK,
-            tKKrA, tKKrB,
-            tQKcMqk, tKKcMkk, aux_tidx,
+            sQK,
+            sKK_inv,
+            sKK_opd,
+            sAlpha,
+            sBeta,
+            q_pipeline,
+            q_consumer_state,
+            k_pipeline,
+            k_consumer_state,
+            qk_pipeline,
+            qk_producer_state,
+            kk_pipeline,
+            kk_producer_state,
+            alpha_pipeline,
+            alpha_consumer_state,
+            beta_pipeline,
+            beta_consumer_state,
+            work_desc,
+            scale,
+            last_blk,
+            True,
+            qk_tiled_mma,
+            kk_tiled_mma,
+            tQKrQ,
+            tQKrK,
+            tKKrA,
+            tKKrB,
+            tQKcMqk,
+            tKKcMkk,
+            aux_tidx,
         )
 
     # ─── Kernel entry point ───────────────────────────────────────────────────
@@ -1461,30 +1712,29 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.jit
     def __call__(
         self,
-        g_q:          cute.Tensor,
-        g_k:          cute.Tensor,
-        g_v:          cute.Tensor,
-        g_o:          cute.Tensor,
-        g_alpha:      cute.Tensor,
-        g_beta:       cute.Tensor,
-        g_state:      cute.Tensor,
+        g_q: cute.Tensor,
+        g_k: cute.Tensor,
+        g_v: cute.Tensor,
+        g_o: cute.Tensor,
+        g_alpha: cute.Tensor,
+        g_beta: cute.Tensor,
+        g_state: cute.Tensor,
         g_init_state: cute.Tensor,
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
-        cu_seqlens:   cute.Tensor,
-        scale:        cutlass.Float32,
-        num_q_heads:   cutlass.Int32,
-        num_k_heads:   cutlass.Int32,
-        num_v_heads:   cutlass.Int32,
+        cu_seqlens: cute.Tensor,
+        scale: cutlass.Float32,
+        num_q_heads: cutlass.Int32,
+        num_k_heads: cutlass.Int32,
+        num_v_heads: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
-        num_seqs:      cutlass.Int32,
+        num_seqs: cutlass.Int32,
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
         grid_x: int,
         stream,
     ):
-
         qkv_smem_layout_atom = warpgroup.make_smem_layout_atom(
             warpgroup.SmemLayoutAtomKind.K_SW128,
             self.dtype,
@@ -1531,15 +1781,19 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
         tma_atom_q, tma_tensor_q = cpasync.make_tiled_tma_atom(
-            tma_load_op, g_q, q_smem_layout, (self.BLK_Q, self.D))
+            tma_load_op, g_q, q_smem_layout, (self.BLK_Q, self.D)
+        )
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
-            tma_load_op, g_k, k_smem_layout, (self.D, self.BLK_KV))
+            tma_load_op, g_k, k_smem_layout, (self.D, self.BLK_KV)
+        )
         tma_atom_v, tma_tensor_v = cpasync.make_tiled_tma_atom(
-            tma_load_op, g_v, v_smem_layout, (self.D, self.BLK_KV))
+            tma_load_op, g_v, v_smem_layout, (self.D, self.BLK_KV)
+        )
 
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
         tma_atom_o, tma_tensor_o = cpasync.make_tiled_tma_atom(
-            tma_store_op, g_o, o_smem_layout, (self.D, self.BLK_Q))
+            tma_store_op, g_o, o_smem_layout, (self.D, self.BLK_Q)
+        )
 
         dtype_bytes = self.dtype.width // 8
         self.tma_load_q_bytes = cute.size(q_smem_layout) * dtype_bytes
@@ -1548,11 +1802,14 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         qk_layout_atom = cute.make_layout((8, 8), stride=(8, 1))
         qk_storage_layout = cute.tile_to_shape(
-            qk_layout_atom, (self.BLK_Q, self.BLK_KV, self.qk_stage), order=(0, 1, 2))
+            qk_layout_atom, (self.BLK_Q, self.BLK_KV, self.qk_stage), order=(0, 1, 2)
+        )
         kk_storage_layout = cute.tile_to_shape(
-            qk_layout_atom, (self.BLK_KV, self.BLK_KV, self.kk_stage), order=(0, 1, 2))
+            qk_layout_atom, (self.BLK_KV, self.BLK_KV, self.kk_stage), order=(0, 1, 2)
+        )
         alpha_storage_layout = cute.make_layout(
-            (self.BLK_Q, AlphaProcessor.NUM_CHANNELS, self.alpha_beta_stage))
+            (self.BLK_Q, AlphaProcessor.NUM_CHANNELS, self.alpha_beta_stage)
+        )
         beta_storage_layout = cute.make_layout((self.BLK_KV, self.alpha_beta_stage))
 
         @cute.struct
@@ -1563,8 +1820,12 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             o_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.o_stage * 2]
             qk_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.qk_stage * 2]
             kk_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.kk_stage * 2]
-            alpha_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.alpha_beta_stage * 2]
-            beta_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.alpha_beta_stage * 2]
+            alpha_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.alpha_beta_stage * 2
+            ]
+            beta_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.alpha_beta_stage * 2
+            ]
 
             smem_q: cute.struct.Align[
                 cute.struct.MemRange[self.dtype, cute.cosize(q_storage_layout)],
@@ -1583,7 +1844,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 16,
             ]
             smem_kk: cute.struct.Align[
-                cute.struct.MemRange[self.inverse_dtype, cute.cosize(kk_storage_layout)],
+                cute.struct.MemRange[
+                    self.inverse_dtype, cute.cosize(kk_storage_layout)
+                ],
                 16,
             ]
             smem_o: cute.struct.Align[
@@ -1591,7 +1854,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 128,
             ]
             smem_alpha: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, cute.cosize(alpha_storage_layout)],
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(alpha_storage_layout)
+                ],
                 16,
             ]
             smem_beta: cute.struct.Align[
@@ -1602,15 +1867,30 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         self.shared_storage = SharedStorage
 
         self.kernel(
-            g_alpha, g_beta,
-            tma_atom_q, tma_tensor_q,
-            tma_atom_k, tma_tensor_k,
-            tma_atom_v, tma_tensor_v,
-            tma_atom_o, tma_tensor_o,
-            g_state, g_init_state, g_state_checkpoints, checkpoint_cu_starts,
-            g_tensormaps, cu_seqlens,
-            scale, num_q_heads, num_k_heads, num_v_heads, num_sab_heads, num_seqs,
-            total_checkpoints, checkpoint_every_n_tokens,
+            g_alpha,
+            g_beta,
+            tma_atom_q,
+            tma_tensor_q,
+            tma_atom_k,
+            tma_tensor_k,
+            tma_atom_v,
+            tma_tensor_v,
+            tma_atom_o,
+            tma_tensor_o,
+            g_state,
+            g_init_state,
+            g_state_checkpoints,
+            checkpoint_cu_starts,
+            g_tensormaps,
+            cu_seqlens,
+            scale,
+            num_q_heads,
+            num_k_heads,
+            num_v_heads,
+            num_sab_heads,
+            num_seqs,
+            total_checkpoints,
+            checkpoint_every_n_tokens,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(512, 1, 1),
@@ -1622,28 +1902,28 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
     @cute.kernel
     def kernel(
         self,
-        g_alpha:      cute.Tensor,
-        g_beta:       cute.Tensor,
-        tma_atom_q:   cute.CopyAtom,
+        g_alpha: cute.Tensor,
+        g_beta: cute.Tensor,
+        tma_atom_q: cute.CopyAtom,
         tma_tensor_q: cute.Tensor,
-        tma_atom_k:   cute.CopyAtom,
+        tma_atom_k: cute.CopyAtom,
         tma_tensor_k: cute.Tensor,
-        tma_atom_v:   cute.CopyAtom,
+        tma_atom_v: cute.CopyAtom,
         tma_tensor_v: cute.Tensor,
-        tma_atom_o:   cute.CopyAtom,
+        tma_atom_o: cute.CopyAtom,
         tma_tensor_o: cute.Tensor,
-        g_state:      cute.Tensor,
+        g_state: cute.Tensor,
         g_init_state: cute.Tensor,
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
-        cu_seqlens:   cute.Tensor,
-        scale:        cutlass.Float32,
-        num_q_heads:   cutlass.Int32,
-        num_k_heads:   cutlass.Int32,
-        num_v_heads:   cutlass.Int32,
+        cu_seqlens: cute.Tensor,
+        scale: cutlass.Float32,
+        num_q_heads: cutlass.Int32,
+        num_k_heads: cutlass.Int32,
+        num_v_heads: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
-        num_seqs:      cutlass.Int32,
+        num_seqs: cutlass.Int32,
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
     ):
@@ -1654,9 +1934,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         WARPS_PER_WARP_GROUP = 4
         MIN_BLOCKS_PER_MP = 1
         MAX_THREADS_PER_BLOCK = (
-            NUM_LOAD_WARP_GROUPS
-            + NUM_STATE_MMA_WARP_GROUPS
-            + NUM_AUX_MMA_WARP_GROUPS
+            NUM_LOAD_WARP_GROUPS + NUM_STATE_MMA_WARP_GROUPS + NUM_AUX_MMA_WARP_GROUPS
         ) * THREADS_PER_WARP_GROUP
         (
             load_registers,
@@ -1672,9 +1950,11 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         warp_group_idx = cute.arch.make_warp_uniform(
-            tidx // cutlass.Int32(THREADS_PER_WARP_GROUP))
+            tidx // cutlass.Int32(THREADS_PER_WARP_GROUP)
+        )
         ldst_warp_role = cute.arch.make_warp_uniform(
-            warp_idx % cutlass.Int32(WARPS_PER_WARP_GROUP))
+            warp_idx % cutlass.Int32(WARPS_PER_WARP_GROUP)
+        )
 
         if warp_idx == LoadStoreWarpRole.LOAD_QKV:
             cpasync.prefetch_descriptor(tma_atom_q)
@@ -1683,7 +1963,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             cpasync.prefetch_descriptor(tma_atom_o)
 
         work_desc = self.get_next_work(
-            cu_seqlens, num_q_heads, num_v_heads, num_sab_heads,
+            cu_seqlens,
+            num_q_heads,
+            num_v_heads,
+            num_sab_heads,
         )
         tok_end = work_desc.tok_offset + work_desc.seq_len
         num_blocks = (
@@ -1692,7 +1975,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         # math_tidx / wg_idx: valid for Math WG threads; LdSt WG gets negative values (unused)
         math_tidx = tidx - cutlass.Int32(THREADS_PER_WARP_GROUP)
-        wg_idx    = math_tidx // cutlass.Int32(THREADS_PER_WARP_GROUP)
+        wg_idx = math_tidx // cutlass.Int32(THREADS_PER_WARP_GROUP)
 
         # ── Smem allocation ───────────────────────────────────────────────────
         allocator = cutlass.utils.SmemAllocator()
@@ -1737,11 +2020,13 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         qk_layout_atom = cute.make_layout((8, 8), stride=(8, 1))
         qk_layout = cute.tile_to_shape(
-            qk_layout_atom, (self.BLK_Q, self.BLK_KV, self.qk_stage), order=(0, 1, 2))
+            qk_layout_atom, (self.BLK_Q, self.BLK_KV, self.qk_stage), order=(0, 1, 2)
+        )
         sQK = storage.smem_qk.get_tensor(qk_layout)
 
         kk_layout = cute.tile_to_shape(
-            qk_layout_atom, (self.BLK_KV, self.BLK_KV, self.kk_stage), order=(0, 1, 2))
+            qk_layout_atom, (self.BLK_KV, self.BLK_KV, self.kk_stage), order=(0, 1, 2)
+        )
         sKK_inv = storage.smem_kk.get_tensor(kk_layout)
         kk_opd_ptr = cute.recast_ptr(storage.smem_kk.data_ptr(), dtype=self.dtype)
         sKK_opd = cute.make_tensor(kk_opd_ptr, kk_layout)
@@ -1757,7 +2042,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         )
         sO = storage.smem_o.get_tensor(o_layout.outer, swizzle=o_layout.inner)
         alpha_layout = cute.make_layout(
-            (self.BLK_Q, AlphaProcessor.NUM_CHANNELS, self.alpha_beta_stage))
+            (self.BLK_Q, AlphaProcessor.NUM_CHANNELS, self.alpha_beta_stage)
+        )
         sAlpha = storage.smem_alpha.get_tensor(alpha_layout)
 
         beta_layout = cute.make_layout((self.BLK_KV, self.alpha_beta_stage))
@@ -1767,7 +2053,8 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         # PipelineTmaAsync release is signalled by one lane per consumer warp.
         qk_load_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            (NUM_STATE_MMA_WARP_GROUPS + NUM_AUX_MMA_WARP_GROUPS) * WARPS_PER_WARP_GROUP,
+            (NUM_STATE_MMA_WARP_GROUPS + NUM_AUX_MMA_WARP_GROUPS)
+            * WARPS_PER_WARP_GROUP,
         )
         v_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
@@ -1855,56 +2142,124 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
-        if work_desc.seq_len != cutlass.Int32(0) and warp_group_idx == WarpGroupRole.LDST:
+        if (
+            work_desc.seq_len != cutlass.Int32(0)
+            and warp_group_idx == WarpGroupRole.LDST
+        ):
             cute.arch.setmaxregister_decrease(load_registers)
             if ldst_warp_role == LoadStoreWarpRole.LOAD_QKV:
                 self.run_load_qkv_role(
-                    sQ_SD, sK_DS, sV_DS,
-                    tma_atom_q, tma_tensor_q,
-                    tma_atom_k, tma_tensor_k,
-                    tma_atom_v, tma_tensor_v,
-                    q_pipeline, k_pipeline, v_pipeline,
-                    num_blocks, work_desc.tok_offset,
+                    sQ_SD,
+                    sK_DS,
+                    sV_DS,
+                    tma_atom_q,
+                    tma_tensor_q,
+                    tma_atom_k,
+                    tma_tensor_k,
+                    tma_atom_v,
+                    tma_tensor_v,
+                    q_pipeline,
+                    k_pipeline,
+                    v_pipeline,
+                    num_blocks,
+                    work_desc.tok_offset,
                     work_desc.q_head_idx(),
                     work_desc.k_head_idx(num_q_heads, num_v_heads),
                     work_desc.v_head_idx(),
                 )
             elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
                 CollectiveStoreTma(self.BLK_Q, self.D).run(
-                    sO, tma_atom_o, tma_tensor_o, g_tensormaps,
-                    o_pipeline, num_blocks, work_desc, num_seqs, self.o_stage,
-                    num_q_heads, num_v_heads,
+                    sO,
+                    tma_atom_o,
+                    tma_tensor_o,
+                    g_tensormaps,
+                    o_pipeline,
+                    num_blocks,
+                    work_desc,
+                    num_seqs,
+                    self.o_stage,
+                    num_q_heads,
+                    num_v_heads,
                 )
             elif ldst_warp_role == LoadStoreWarpRole.LOAD_BETA:
                 self.run_load_beta_role(
-                    sBeta, g_beta, beta_pipeline, num_blocks, work_desc.tok_offset, tok_end,
-                    work_desc.o_head_idx(num_q_heads, num_v_heads), num_sab_heads,
+                    sBeta,
+                    g_beta,
+                    beta_pipeline,
+                    num_blocks,
+                    work_desc.tok_offset,
+                    tok_end,
+                    work_desc.o_head_idx(num_q_heads, num_v_heads),
+                    num_sab_heads,
                 )
             elif ldst_warp_role == LoadStoreWarpRole.LOAD_ALPHA:
                 self.run_load_alpha_role(
-                    sAlpha, g_alpha, alpha_pipeline, scale, num_blocks, work_desc.tok_offset,
-                    tok_end, work_desc.o_head_idx(num_q_heads, num_v_heads), num_sab_heads,
+                    sAlpha,
+                    g_alpha,
+                    alpha_pipeline,
+                    scale,
+                    num_blocks,
+                    work_desc.tok_offset,
+                    tok_end,
+                    work_desc.o_head_idx(num_q_heads, num_v_heads),
+                    num_sab_heads,
                 )
         elif work_desc.seq_len != cutlass.Int32(0):
             if warp_group_idx == WarpGroupRole.MATH_AUX:
                 cute.arch.setmaxregister_decrease(aux_mma_registers)
                 self.run_aux_math_role(
-                    sQ_SD, sK_SD, sQK, sKK_inv, sKK_opd, sAlpha, sBeta,
-                    q_pipeline, k_pipeline, qk_pipeline, kk_pipeline,
-                    alpha_pipeline, beta_pipeline,
-                    work_desc, scale, math_tidx, num_blocks,
+                    sQ_SD,
+                    sK_SD,
+                    sQK,
+                    sKK_inv,
+                    sKK_opd,
+                    sAlpha,
+                    sBeta,
+                    q_pipeline,
+                    k_pipeline,
+                    qk_pipeline,
+                    kk_pipeline,
+                    alpha_pipeline,
+                    beta_pipeline,
+                    work_desc,
+                    scale,
+                    math_tidx,
+                    num_blocks,
                 )
             else:
                 cute.arch.setmaxregister_increase(state_mma_registers)
                 self.run_state_math_role(
-                    sQ_SD, sK_SD, sK_DS, sV_DS, sQK, sKK_inv, sKK_opd,
-                    sO, sAlpha,
-                    q_pipeline, k_pipeline, v_pipeline, o_pipeline,
-                    qk_pipeline, kk_pipeline, alpha_pipeline,
-                    g_state, g_init_state, g_state_checkpoints, checkpoint_cu_starts, work_desc,
-                    scale, wg_idx, math_tidx, num_blocks,
-                    num_q_heads, num_v_heads, num_sab_heads, num_seqs,
-                    total_checkpoints, checkpoint_every_n_tokens,
+                    sQ_SD,
+                    sK_SD,
+                    sK_DS,
+                    sV_DS,
+                    sQK,
+                    sKK_inv,
+                    sKK_opd,
+                    sO,
+                    sAlpha,
+                    q_pipeline,
+                    k_pipeline,
+                    v_pipeline,
+                    o_pipeline,
+                    qk_pipeline,
+                    kk_pipeline,
+                    alpha_pipeline,
+                    g_state,
+                    g_init_state,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    work_desc,
+                    scale,
+                    wg_idx,
+                    math_tidx,
+                    num_blocks,
+                    num_q_heads,
+                    num_v_heads,
+                    num_sab_heads,
+                    num_seqs,
+                    total_checkpoints,
+                    checkpoint_every_n_tokens,
                 )
 
 
@@ -1912,16 +2267,16 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
 
 def delta_rule_prefill_dsl_sm90(
-    o:          torch.Tensor,          # (total_seqlen, num_o_heads, D) fp16/bf16, output
-    state:      torch.Tensor,          # (num_seqs, num_sab_heads, D, D) fp32, output
-    q:          torch.Tensor,          # (total_seqlen, num_q_heads, D)
-    k:          torch.Tensor,          # (total_seqlen, num_k_heads, D)
-    v:          torch.Tensor,          # (total_seqlen, num_v_heads, D)
-    init_state: torch.Tensor | None,   # (num_seqs, num_sab_heads, D, D) fp32, optional
-    alpha:      torch.Tensor | None,
-    beta:       torch.Tensor | None,
-    cu_seqlens: torch.Tensor,          # (num_seqs+1,) int64
-    scale:      float,
+    o: torch.Tensor,  # (total_seqlen, num_o_heads, D) fp16/bf16, output
+    state: torch.Tensor,  # (num_seqs, num_sab_heads, D, D) fp32, output
+    q: torch.Tensor,  # (total_seqlen, num_q_heads, D)
+    k: torch.Tensor,  # (total_seqlen, num_k_heads, D)
+    v: torch.Tensor,  # (total_seqlen, num_v_heads, D)
+    init_state: torch.Tensor | None,  # (num_seqs, num_sab_heads, D, D) fp32, optional
+    alpha: torch.Tensor | None,
+    beta: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,  # (num_seqs+1,) int64
+    scale: float,
     state_checkpoints: torch.Tensor | None = None,
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
@@ -1931,10 +2286,10 @@ def delta_rule_prefill_dsl_sm90(
 
     D = q.shape[-1]
 
-    num_seqs      = cu_seqlens.shape[0] - 1
-    num_q_heads   = q.shape[1]
-    num_k_heads   = k.shape[1]
-    num_v_heads   = v.shape[1]
+    num_seqs = cu_seqlens.shape[0] - 1
+    num_q_heads = q.shape[1]
+    num_k_heads = k.shape[1]
+    num_v_heads = v.shape[1]
     num_sab_heads = max(num_q_heads, num_v_heads)
 
     if not _FullyFusedDeltaRuleSm90.can_implement(
@@ -1944,8 +2299,8 @@ def delta_rule_prefill_dsl_sm90(
     if D != 128:
         raise RuntimeError(f"DSL kernel only supports D=128, got {D}")
 
-    needs_alpha      = alpha      is not None
-    needs_beta       = beta       is not None
+    needs_alpha = alpha is not None
+    needs_beta = beta is not None
     needs_init_state = init_state is not None
     needs_checkpointing = checkpoint_every_n_tokens > 0
     kernel_dtype = {
@@ -1956,19 +2311,32 @@ def delta_rule_prefill_dsl_sm90(
         raise RuntimeError(f"DSL kernel only supports fp16/bf16 inputs, got {q.dtype}")
 
     if k.dtype != q.dtype or v.dtype != q.dtype or o.dtype != q.dtype:
-        raise RuntimeError(f"q/k/v/o dtypes must match, got {q.dtype}, {k.dtype}, {v.dtype}, {o.dtype}")
+        raise RuntimeError(
+            f"q/k/v/o dtypes must match, got {q.dtype}, {k.dtype}, {v.dtype}, {o.dtype}"
+        )
     if alpha is not None and alpha.dtype != torch.float32:
         raise RuntimeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
     if beta is not None and beta.dtype != torch.float32:
         raise RuntimeError(f"beta must have dtype torch.float32, got {beta.dtype}")
     if init_state is not None and init_state.dtype != torch.float32:
-        raise RuntimeError(f"init_state must have dtype torch.float32, got {init_state.dtype}")
+        raise RuntimeError(
+            f"init_state must have dtype torch.float32, got {init_state.dtype}"
+        )
     if state.dtype != torch.float32:
         raise RuntimeError(f"state must have dtype torch.float32, got {state.dtype}")
     if cu_seqlens.dtype != torch.int64:
-        raise RuntimeError(f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}")
+        raise RuntimeError(
+            f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+        )
 
-    for name, tensor in (("q", q), ("k", k), ("v", v), ("o", o), ("state", state), ("cu_seqlens", cu_seqlens)):
+    for name, tensor in (
+        ("q", q),
+        ("k", k),
+        ("v", v),
+        ("o", o),
+        ("state", state),
+        ("cu_seqlens", cu_seqlens),
+    ):
         if not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
     for name, tensor in (("alpha", alpha), ("beta", beta), ("init_state", init_state)):
@@ -1994,32 +2362,50 @@ def delta_rule_prefill_dsl_sm90(
         (1, num_o_heads * D, D),
     )
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
-    sm_count     = torch.cuda.get_device_properties(q.device).multi_processor_count
+    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     tensormaps_t = torch.empty(sm_count * 128, dtype=torch.uint8, device=q.device)
 
     stream_val = torch.cuda.current_stream().cuda_stream
-    stream     = cuda_driver.CUstream(stream_val)
+    stream = cuda_driver.CUstream(stream_val)
 
     enable_tvm_ffi = True
     if enable_tvm_ffi:
-        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(*args, **{**kwargs, "enable_tvm_ffi": True})
+        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
+            *args, **{**kwargs, "enable_tvm_ffi": True}
+        )
 
     # Keep head counts and varlen extents runtime values across cached compiles.
     q_cute = from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1)
     k_cute = from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
     v_cute = from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
     o_cute = from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    alpha_cute = from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic() if needs_alpha else None
-    beta_cute = from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic() if needs_beta else None
+    alpha_cute = (
+        from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic()
+        if needs_alpha
+        else None
+    )
+    beta_cute = (
+        from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic()
+        if needs_beta
+        else None
+    )
     state_cute = from_dlpack(state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-    init_state_cute = from_dlpack(init_state.reshape(-1), assumed_align=16).mark_layout_dynamic() if needs_init_state else None
+    init_state_cute = (
+        from_dlpack(init_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
+        if needs_init_state
+        else None
+    )
     state_checkpoints_cute = (
-        from_dlpack(state_checkpoints.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_checkpointing else None
+        from_dlpack(
+            state_checkpoints.reshape(-1), assumed_align=16
+        ).mark_layout_dynamic()
+        if needs_checkpointing
+        else None
     )
     checkpoint_cu_cute = (
         from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
-        if needs_checkpointing else None
+        if needs_checkpointing
+        else None
     )
     tensormaps_cute = from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic()
     cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
@@ -2042,8 +2428,10 @@ def delta_rule_prefill_dsl_sm90(
         tensormaps_cute,
         cu_cute,
         cutlass.Float32(scale),
-        cutlass.Int32(num_q_heads), cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_v_heads), cutlass.Int32(num_sab_heads),
+        cutlass.Int32(num_q_heads),
+        cutlass.Int32(num_k_heads),
+        cutlass.Int32(num_v_heads),
+        cutlass.Int32(num_sab_heads),
         cutlass.Int32(num_seqs),
         cutlass.Int32(total_checkpoints),
         cutlass.Int32(checkpoint_every_n_tokens),

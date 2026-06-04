@@ -4,7 +4,7 @@ import typing
 import cutlass.cute as cute
 
 
-_in_mem_compile_cache = {}
+_in_mem_compile_cache: dict = {}
 
 
 def _as_options_tuple(options):
@@ -38,7 +38,7 @@ class KeyedCompileMixin:
                     collected_attrs.append((attr_name, attr_value))
 
             compile_key = (str(type(self).__mro__),) + tuple(collected_attrs)
-            setattr(self, "_KeyedCompileMixin_compile_key", compile_key)
+            setattr(self, "_KeyedCompileMixin_compile_key", compile_key)  # noqa: B010
 
         return compile_key
 
@@ -52,7 +52,7 @@ def _compile_options_key(options):
 
 def cached_compile(func, *args, compile_options=None, **kwargs):
     cache_key = (func._get_compile_key(), _compile_options_key(compile_options))
-    compiled_fn = _in_mem_compile_cache.get(cache_key, None)
+    compiled_fn = _in_mem_compile_cache.get(cache_key)
 
     if compiled_fn is None:
         compiler = cute.compile

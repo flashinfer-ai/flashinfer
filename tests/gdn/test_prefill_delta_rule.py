@@ -259,7 +259,9 @@ def test_prefill_kernel_nonfull(
     )
 
 
-@pytest.mark.parametrize("num_q_heads,num_k_heads,num_v_heads", [(1, 1, 1), (16, 16, 64)])
+@pytest.mark.parametrize(
+    "num_q_heads,num_k_heads,num_v_heads", [(1, 1, 1), (16, 16, 64)]
+)
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_zero_length_sequence(
     qkv_factory,
@@ -284,21 +286,43 @@ def test_prefill_kernel_zero_length_sequence(
     device = torch.device("cuda")
 
     with device:
-        q, k, v = qkv_factory([seq_len], num_q_heads, num_k_heads, num_v_heads, head_size, dtype)
+        q, k, v = qkv_factory(
+            [seq_len], num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+        )
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
         alpha = torch.rand(seq_len, num_sab_heads)
         beta = torch.rand(seq_len, num_sab_heads)
         cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int64)
         cu_seq_lens_with_empty = torch.tensor([0, seq_len, seq_len], dtype=torch.int64)
 
-    ref_o = torch.empty([seq_len, num_o_heads, head_size], dtype=q.dtype, device=q.device)
+    ref_o = torch.empty(
+        [seq_len, num_o_heads, head_size], dtype=q.dtype, device=q.device
+    )
     our_o = torch.empty_like(ref_o)
     chunk_gated_delta_rule(
-        q, k, v, alpha, beta, scale, None, False, cu_seq_lens, True,
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        False,
+        cu_seq_lens,
+        True,
         output=ref_o,
     )
     chunk_gated_delta_rule(
-        q, k, v, alpha, beta, scale, None, False, cu_seq_lens_with_empty, True,
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        False,
+        cu_seq_lens_with_empty,
+        True,
         output=our_o,
     )
     torch.cuda.synchronize()

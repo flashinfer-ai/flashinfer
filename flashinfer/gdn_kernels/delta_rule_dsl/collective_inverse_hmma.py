@@ -43,8 +43,7 @@ class CollectiveInverse:
         for j in cutlass.range_constexpr(N):
             raw = cutlass.Float32(row[j])
             if cutlass.const_expr(
-                self.garbage_filled_diagonal
-                or self.garbage_filled_upper_triangular
+                self.garbage_filled_diagonal or self.garbage_filled_upper_triangular
             ):
                 if tid_in_group == cutlass.Int32(j):
                     frag[j] = cutlass.Float32(1.0)
@@ -72,7 +71,6 @@ class CollectiveInverse:
             row_out[j] = cutlass.Float16(frag[j])
         cute.autovec_copy(row_out, mat[tid_in_group, None])
 
-
     # ── Level 2: 8×8 blocks → 16×16 blockwise inverse ───────────────────────────
     # Translates blockwise_diagonal_inversed_8x8_to_16x16 (col-major path).
     # Called by all 32 threads of one warp.
@@ -90,9 +88,9 @@ class CollectiveInverse:
 
         mat_2x2 = cute.flat_divide(mat, (8, 8))
         sDinv = mat_2x2[None, None, 1, 1]
-        sC    = select_tensor_10(mat_2x2[None, None, 1, 0])
+        sC = select_tensor_10(mat_2x2[None, None, 1, 0])
         sAinv = select_tensor_10(mat_2x2[None, None, 0, 0])
-        sO    = mat_2x2[None, None, 1, 0]
+        sO = mat_2x2[None, None, 1, 0]
 
         # Broadcast sDinv (8,8) → (16,8) by stride-0 on the extra M dimension
         sDinv_bcast = cute.make_tensor(
@@ -112,15 +110,25 @@ class CollectiveInverse:
 
         thr_mma = tiled_mma.get_slice(lane_id)
         tOrDinv = thr_mma.make_fragment_A(thr_mma.partition_A(sDinv_bcast))
-        tOrC    = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
+        tOrC = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
         tOrAinv = thr_mma.make_fragment_B(thr_mma.partition_B(sAinv))
-        tDCrDC  = cute.make_rmem_tensor(thr_mma.partition_shape_C((16, 8)), cutlass.Float32)
-        tOrO    = cute.make_rmem_tensor(thr_mma.partition_shape_C((16, 8)), cutlass.Float32)
+        tDCrDC = cute.make_rmem_tensor(
+            thr_mma.partition_shape_C((16, 8)), cutlass.Float32
+        )
+        tOrO = cute.make_rmem_tensor(
+            thr_mma.partition_shape_C((16, 8)), cutlass.Float32
+        )
 
         # Row-major copy atoms: A→LdMatrix_N, B→LdMatrix_T, C→StMatrix_N
-        dinv_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=1), cutlass.Float16)
-        b_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=1), cutlass.Float16)
-        o_atom = cute.make_copy_atom(warp.StMatrix8x8x16bOp(transpose=False, num_matrices=1), cutlass.Float16)
+        dinv_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=1), cutlass.Float16
+        )
+        b_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=1), cutlass.Float16
+        )
+        o_atom = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=1), cutlass.Float16
+        )
 
         D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma)
         C_tiled_copy = cute.make_tiled_copy_B(b_atom, tiled_mma)
@@ -132,15 +140,15 @@ class CollectiveInverse:
         A_thr_copy = A_tiled_copy.get_slice(lane_id)
         O_thr_copy = O_tiled_copy.get_slice(lane_id)
 
-        tOsDinv    = D_thr_copy.partition_S(sDinv_bcast)
+        tOsDinv = D_thr_copy.partition_S(sDinv_bcast)
         tOrDinv_cv = D_thr_copy.retile(tOrDinv)
-        tOsC       = C_thr_copy.partition_S(sC)
-        tOrC_cv    = C_thr_copy.retile(tOrC)
-        tOsAinv    = A_thr_copy.partition_S(sAinv)
+        tOsC = C_thr_copy.partition_S(sC)
+        tOrC_cv = C_thr_copy.retile(tOrC)
+        tOsAinv = A_thr_copy.partition_S(sAinv)
         tOrAinv_cv = A_thr_copy.retile(tOrAinv)
-        tOsO       = O_thr_copy.partition_D(sO_bcast)
-        tOrO_f16   = cute.make_fragment_like(tOrO, cutlass.Float16)
-        tOrO_cv    = O_thr_copy.retile(tOrO_f16)
+        tOsO = O_thr_copy.partition_D(sO_bcast)
+        tOrO_f16 = cute.make_fragment_like(tOrO, cutlass.Float16)
+        tOrO_cv = O_thr_copy.retile(tOrO_f16)
 
         # ── Step 1: tDCrDC = -inv(D) @ C ─────────────────────────────────────────
         # Load only the first MMA_M slice of D_inv (rows 0-7 of the 16-row broadcast)
@@ -162,7 +170,6 @@ class CollectiveInverse:
         tOrO_f16.store(tOrO.load().to(cutlass.Float16))
         cute.copy(O_tiled_copy, tOrO_cv[None, None, 0], tOsO[None, None, 0])
 
-
     # ── Level 3: 16×16 blocks → 32×32 blockwise inverse ─────────────────────────
     # Called by one warp (thread_idx 0-31 or 32-63, i.e. thread_idx<64 in the WG).
     # mat: (32, 32) smem slice.
@@ -179,20 +186,30 @@ class CollectiveInverse:
 
         mat_2x2 = cute.flat_divide(mat, (16, 16))
         sDinv = mat_2x2[None, None, 1, 1]
-        sC    = select_tensor_10(mat_2x2[None, None, 1, 0])
+        sC = select_tensor_10(mat_2x2[None, None, 1, 0])
         sAinv = select_tensor_10(mat_2x2[None, None, 0, 0])
-        sO    = mat_2x2[None, None, 1, 0]
+        sO = mat_2x2[None, None, 1, 0]
 
         thr_mma = tiled_mma.get_slice(lane_id)
         tOrDinv = thr_mma.make_fragment_A(thr_mma.partition_A(sDinv))
-        tOrC    = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
+        tOrC = thr_mma.make_fragment_B(thr_mma.partition_B(sC))
         tOrAinv = thr_mma.make_fragment_B(thr_mma.partition_B(sAinv))
-        tDCrDC  = cute.make_rmem_tensor(thr_mma.partition_shape_C((16, 16)), cutlass.Float32)
-        tOrO    = cute.make_rmem_tensor(thr_mma.partition_shape_C((16, 16)), cutlass.Float32)
+        tDCrDC = cute.make_rmem_tensor(
+            thr_mma.partition_shape_C((16, 16)), cutlass.Float32
+        )
+        tOrO = cute.make_rmem_tensor(
+            thr_mma.partition_shape_C((16, 16)), cutlass.Float32
+        )
 
-        dinv_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=2), cutlass.Float16)
-        b_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=2), cutlass.Float16)
-        o_atom = cute.make_copy_atom(warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2), cutlass.Float16)
+        dinv_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=2), cutlass.Float16
+        )
+        b_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=2), cutlass.Float16
+        )
+        o_atom = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2), cutlass.Float16
+        )
 
         D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma)
         C_tiled_copy = cute.make_tiled_copy_B(b_atom, tiled_mma)
@@ -204,15 +221,15 @@ class CollectiveInverse:
         A_thr_copy = A_tiled_copy.get_slice(lane_id)
         O_thr_copy = O_tiled_copy.get_slice(lane_id)
 
-        tOsDinv    = D_thr_copy.partition_S(sDinv)
+        tOsDinv = D_thr_copy.partition_S(sDinv)
         tOrDinv_cv = D_thr_copy.retile(tOrDinv)
-        tOsC       = C_thr_copy.partition_S(sC)
-        tOrC_cv    = C_thr_copy.retile(tOrC)
-        tOsAinv    = A_thr_copy.partition_S(sAinv)
+        tOsC = C_thr_copy.partition_S(sC)
+        tOrC_cv = C_thr_copy.retile(tOrC)
+        tOsAinv = A_thr_copy.partition_S(sAinv)
         tOrAinv_cv = A_thr_copy.retile(tOrAinv)
-        tOsO       = O_thr_copy.partition_D(sO)
-        tOrO_f16   = cute.make_fragment_like(tOrO, cutlass.Float16)
-        tOrO_cv    = O_thr_copy.retile(tOrO_f16)
+        tOsO = O_thr_copy.partition_D(sO)
+        tOrO_f16 = cute.make_fragment_like(tOrO, cutlass.Float16)
+        tOrO_cv = O_thr_copy.retile(tOrO_f16)
 
         # ── Step 1: tDCrDC = -inv(D) @ C ─────────────────────────────────────────
         cute.copy(D_tiled_copy, tOsDinv, tOrDinv_cv)
@@ -232,17 +249,16 @@ class CollectiveInverse:
         tOrO_f16.store(tOrO.load().to(cutlass.Float16))
         cute.copy(O_tiled_copy, tOrO_cv, tOsO)
 
-
     # ── Level 4: 32×32 blocks → 64×64 blockwise inverse ─────────────────────────
     # Called by all 4 warps (128 threads).
     # sT: (64, 64) smem tensor (the full matrix).
 
     @cute.jit
     def blockwise_32x32_to_64x64(self, sT: cute.Tensor, barrier_id: cutlass.Int32):
-        lane_id   = cute.arch.lane_idx()
-        warp_id   = cute.arch.warp_idx() % 4      # WG-local warp ID 0..3
-        x = warp_id // 2                          # 0 or 1
-        y = warp_id % 2                           # 0 or 1
+        lane_id = cute.arch.lane_idx()
+        warp_id = cute.arch.warp_idx() % 4  # WG-local warp ID 0..3
+        x = warp_id // 2  # 0 or 1
+        y = warp_id % 2  # 0 or 1
 
         # TiledMMA1: 16×16×32  (for -inv(D)@C, 1 K-pass of K=32)
         tiled_mma1 = cute.make_tiled_mma(
@@ -257,53 +273,67 @@ class CollectiveInverse:
             permutation_mnk=(16, 32, 16),
         )
 
-        mat_2x2     = cute.flat_divide(sT, (32, 32))
+        mat_2x2 = cute.flat_divide(sT, (32, 32))
         mat_16x2_2x2 = cute.logical_divide(mat_2x2, (16, 16))
 
         # Per-warp tile slices (each warp handles one 16×32 or 32×16 sub-tile)
         sDinv = mat_16x2_2x2[(None, y), None, 1, 1]
-        sC    = select_tensor_10(mat_16x2_2x2[None, (None, x), 1, 0])
+        sC = select_tensor_10(mat_16x2_2x2[None, (None, x), 1, 0])
         sAinv = select_tensor_10(mat_16x2_2x2[(None, x), None, 0, 0])
-        sO    = mat_16x2_2x2[(None, y), None, 1, 0]
+        sO = mat_16x2_2x2[(None, y), None, 1, 0]
 
         thr_mma1 = tiled_mma1.get_slice(lane_id)
         thr_mma2 = tiled_mma2.get_slice(lane_id)
 
         tOrDinv = thr_mma1.make_fragment_A(thr_mma1.partition_A(sDinv))
-        tOrC    = thr_mma1.make_fragment_B(thr_mma1.partition_B(sC))
+        tOrC = thr_mma1.make_fragment_B(thr_mma1.partition_B(sC))
         tOrAinv = thr_mma2.make_fragment_B(thr_mma2.partition_B(sAinv))
 
-        tDCrDC = cute.make_rmem_tensor(thr_mma1.partition_shape_C((16, 16)), cutlass.Float32)
-        tOrO   = cute.make_rmem_tensor(thr_mma2.partition_shape_C((16, 32)), cutlass.Float32)
+        tDCrDC = cute.make_rmem_tensor(
+            thr_mma1.partition_shape_C((16, 16)), cutlass.Float32
+        )
+        tOrO = cute.make_rmem_tensor(
+            thr_mma2.partition_shape_C((16, 32)), cutlass.Float32
+        )
 
-        dinv_atom  = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16)
-        c_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=4), cutlass.Float16)
-        ainv_atom  = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=2), cutlass.Float16)
-        O_atom_s2r   = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16)
-        O_atom_r2s   = cute.make_copy_atom(warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16)
+        dinv_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16
+        )
+        c_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), cutlass.Float16
+        )
+        ainv_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=2), cutlass.Float16
+        )
+        O_atom_s2r = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16
+        )
+        O_atom_r2s = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16
+        )
 
-        D_tiled_copy = cute.make_tiled_copy_A(dinv_atom,  tiled_mma1)
+        D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma1)
         C_tiled_copy = cute.make_tiled_copy_B(c_atom, tiled_mma1)
-        A_tiled_copy = cute.make_tiled_copy_B(ainv_atom,  tiled_mma2)
-        O_tiled_s2r  = cute.make_tiled_copy_C(O_atom_s2r,   tiled_mma2)
-        O_tiled_r2s  = cute.make_tiled_copy_C(O_atom_r2s,   tiled_mma2)
+        A_tiled_copy = cute.make_tiled_copy_B(ainv_atom, tiled_mma2)
+        O_tiled_s2r = cute.make_tiled_copy_C(O_atom_s2r, tiled_mma2)
+        O_tiled_r2s = cute.make_tiled_copy_C(O_atom_r2s, tiled_mma2)
 
         D_thr_copy = D_tiled_copy.get_slice(lane_id)
         C_thr_copy = C_tiled_copy.get_slice(lane_id)
         A_thr_copy = A_tiled_copy.get_slice(lane_id)
-        O_thr_s2r  = O_tiled_s2r.get_slice(lane_id)
-        O_thr_r2s  = O_tiled_r2s.get_slice(lane_id)
+        O_thr_s2r = O_tiled_s2r.get_slice(lane_id)
+        O_thr_r2s = O_tiled_r2s.get_slice(lane_id)
 
-        tOsDinv    = D_thr_copy.partition_S(sDinv)
+        tOsDinv = D_thr_copy.partition_S(sDinv)
         tOrDinv_cv = D_thr_copy.retile(tOrDinv)
-        tOsC       = C_thr_copy.partition_S(sC)
-        tOrC_cv    = C_thr_copy.retile(tOrC)
-        tOsAinv    = A_thr_copy.partition_S(sAinv)
+        tOsC = C_thr_copy.partition_S(sC)
+        tOrC_cv = C_thr_copy.retile(tOrC)
+        tOsAinv = A_thr_copy.partition_S(sAinv)
         tOrAinv_cv = A_thr_copy.retile(tOrAinv)
 
         # ── Step 1: tDCrDC = -inv(D) @ C ─────────────────────────────────────────
         cute.copy(D_tiled_copy, tOsDinv, tOrDinv_cv)
-        cute.copy(C_tiled_copy, tOsC,    tOrC_cv)
+        cute.copy(C_tiled_copy, tOsC, tOrC_cv)
         tDCrDC.fill(0.0)
         cute.gemm(tiled_mma1, tDCrDC, tOrDinv, tOrC, tDCrDC)
         for i in cutlass.range_constexpr(cute.size(tDCrDC)):
@@ -322,7 +352,7 @@ class CollectiveInverse:
         # ── Cross-warp reduction: warps with x=0 write first, x=1 reads+adds+writes
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
 
-        tOsO    = O_thr_r2s.partition_D(sO)
+        tOsO = O_thr_r2s.partition_D(sO)
         tOrO_cv = O_thr_r2s.retile(tOrO_f16)
         if x == 0:
             cute.copy(O_tiled_r2s, tOrO_cv, tOsO)
@@ -330,14 +360,13 @@ class CollectiveInverse:
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
 
         if x == 1:
-            tOrO_red    = cute.make_fragment_like(tOrO_f16)
-            tOsO_s      = O_thr_s2r.partition_S(sO)
+            tOrO_red = cute.make_fragment_like(tOrO_f16)
+            tOsO_s = O_thr_s2r.partition_S(sO)
             tOrO_red_cv = O_thr_s2r.retile(tOrO_red)
             cute.copy(O_tiled_s2r, tOsO_s, tOrO_red_cv)
             for i in cutlass.range_constexpr(cute.size(tOrO_f16)):
                 tOrO_f16[i] = tOrO_f16[i] + tOrO_red[i]
             cute.copy(O_tiled_r2s, tOrO_cv, tOsO)
-
 
     @cute.jit
     def run(self, sT: cute.Tensor, barrier_id: cutlass.Int32):
@@ -351,7 +380,8 @@ class CollectiveInverse:
         if thread_idx < 64:
             blk = thread_idx // 8
             self.compute_diagonal_inverse_NxN(
-                t8x8[None, None, blk, blk], thread_idx % 8, 8)
+                t8x8[None, None, blk, blk], thread_idx % 8, 8
+            )
 
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
 

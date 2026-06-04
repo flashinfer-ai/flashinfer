@@ -66,14 +66,18 @@ def load_tensor_as_c(
     if cutlass.const_expr(dst_dtype is None):
         dst_dtype = src_dtype
     if cutlass.const_expr(is_src_n_major):
-        ldsm_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), src_dtype)
+        ldsm_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), src_dtype
+        )
     else:
-        ldsm_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=4), src_dtype)
+        ldsm_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), src_dtype
+        )
     tiled_copy = cute.make_tiled_copy_C(ldsm_atom, tiled_mma)
-    thr_copy   = tiled_copy.get_slice(thread_idx)
-    tCrSrc     = cute.make_rmem_tensor(tiled_mma.partition_shape_C(c_shape), src_dtype)
-    tCrSrc_cv  = thr_copy.retile(tCrSrc)
-    tCsC       = thr_copy.partition_S(sTensor)
+    thr_copy = tiled_copy.get_slice(thread_idx)
+    tCrSrc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(c_shape), src_dtype)
+    tCrSrc_cv = thr_copy.retile(tCrSrc)
+    tCsC = thr_copy.partition_S(sTensor)
     cute.copy(tiled_copy, tCsC, tCrSrc_cv)
     if cutlass.const_expr(dst_dtype is src_dtype):
         return tCrSrc
@@ -96,14 +100,18 @@ def load_tensor_as_a(
     if cutlass.const_expr(dst_dtype is None):
         dst_dtype = src_dtype
     if cutlass.const_expr(is_src_k_major):
-        ldsm_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), src_dtype)
+        ldsm_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), src_dtype
+        )
     else:
-        ldsm_atom = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=4), src_dtype)
+        ldsm_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), src_dtype
+        )
     tiled_copy = cute.make_tiled_copy_A(ldsm_atom, tiled_mma)
-    thr_copy   = tiled_copy.get_slice(thread_idx)
-    tArSrc     = cute.make_rmem_tensor(tiled_mma.partition_shape_A(a_shape), src_dtype)
-    tArSrc_cv  = thr_copy.retile(tArSrc)
-    tAsA       = thr_copy.partition_S(sTensor)
+    thr_copy = tiled_copy.get_slice(thread_idx)
+    tArSrc = cute.make_rmem_tensor(tiled_mma.partition_shape_A(a_shape), src_dtype)
+    tArSrc_cv = thr_copy.retile(tArSrc)
+    tAsA = thr_copy.partition_S(sTensor)
     cute.copy(tiled_copy, tAsA, tArSrc_cv)
     if cutlass.const_expr(dst_dtype is src_dtype):
         return tArSrc
@@ -233,7 +241,10 @@ class SM90:
             (
                 operand_layout,
                 c_layout.shape[1],
-                (c_layout.shape[2], cute.size(c_layout, mode=[0]) // cute.size(operand_layout)),
+                (
+                    c_layout.shape[2],
+                    cute.size(c_layout, mode=[0]) // cute.size(operand_layout),
+                ),
             ),
             stride=(
                 c_layout.stride[0],

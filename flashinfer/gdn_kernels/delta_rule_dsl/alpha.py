@@ -14,7 +14,12 @@ class AlphaProcessor:
     NUM_CHANNELS = 3
 
     @cute.jit
-    def run(self, vecs: cute.Tensor, scale: cutlass.Float32, channel2_neg_end_rcp: cutlass.Constexpr = False):
+    def run(
+        self,
+        vecs: cute.Tensor,
+        scale: cutlass.Float32,
+        channel2_neg_end_rcp: cutlass.Constexpr = False,
+    ):
         WARP_SIZE = 32
         blk_q = cute.size(vecs.shape[0])
         num_iters = blk_q // WARP_SIZE
@@ -47,6 +52,8 @@ class AlphaProcessor:
             cumprod = cute.math.exp2(frag[i], fastmath=True)
             vecs_32[lane_id, i, AlphaProcessor.CUMPROD] = cumprod
             if cutlass.const_expr(channel2_neg_end_rcp):
-                vecs_32[lane_id, i, AlphaProcessor.CUMPROD_NEG_END_RCP] = -cute.math.exp2(end_log - frag[i], fastmath=True)
+                vecs_32[
+                    lane_id, i, AlphaProcessor.CUMPROD_NEG_END_RCP
+                ] = -cute.math.exp2(end_log - frag[i], fastmath=True)
             else:
                 vecs_32[lane_id, i, AlphaProcessor.CUMPROD_SCALE] = cumprod * scale
