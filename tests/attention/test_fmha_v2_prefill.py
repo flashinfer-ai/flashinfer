@@ -499,8 +499,15 @@ def run_trtllm_fmha_v2_prefill_case(
         pytest.skip(
             "SEPARATE_Q_K_V requires SM90 warp-specialization, not available on SM12x"
         )
-    if is_sm12x and mask_mode is not None and mask_mode.upper() == "SLIDING_WINDOW":
-        pytest.skip("SLIDING_WINDOW mask not yet supported on SM12x (only causal)")
+    # head_dim 512 (full-attention layers) is only enabled/validated on SM12x,
+    # for fp16/bf16 and non-SEPARATE layouts.
+    if head_dim > 256:
+        if not is_sm12x:
+            pytest.skip("head_dim > 256 FMHAv2 is only supported on SM12x")
+        if dtype == torch.float8_e4m3fn:
+            pytest.skip("head_dim > 256 FMHAv2 does not support fp8")
+        if input_layout == "SEPARATE_Q_K_V":
+            pytest.skip("head_dim > 256 FMHAv2 does not support SEPARATE_Q_K_V")
     if input_layout == "SEPARATE_Q_K_V" and logits_soft_cap > 0:
         pytest.skip("Logits soft capping not supported for SEPARATE_Q_K_V layout")
     # save_softmax_stats only supported for CONTIGUOUS_Q_KV (normal attention)
@@ -840,6 +847,74 @@ def test_trtllm_fmha_v2_prefill(
         logits_soft_cap=logits_soft_cap,
         pos_encoding_mode=pos_encoding_mode,
         save_softmax_stats=save_softmax_stats,
+        skip_softmax_threshold_scale_factor=0.0,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("max_seq_len", [1024])
+@pytest.mark.parametrize("num_qo_heads", [8])
+@pytest.mark.parametrize("num_kv_heads", [2])
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("input_layout", "page_size"),
+    [
+        ("CONTIGUOUS_Q_KV", None),
+        ("Q_PAGED_KV_NHD", 32),
+        ("Q_PAGED_KV_NHD", 128),
+    ],
+)
+@pytest.mark.parametrize(
+    ("causal", "window_left", "mask_mode"),
+    [
+        (True, -1, "CAUSAL"),
+        (False, -1, "PADDING"),
+        (True, 127, "SLIDING_WINDOW"),
+        (True, 1024, "SLIDING_WINDOW"),
+    ],
+)
+def test_trtllm_fmha_v2_prefill_sm120_large_head_dim(
+    input_layout: str,
+    batch_size: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: Optional[int],
+    dtype: torch.dtype,
+    causal: bool,
+    window_left: int,
+    mask_mode: str,
+) -> None:
+    """SM120 (Blackwell) coverage for large head dims with mixed mask modes.
+
+    Exercises GQA at ``head_dim`` 256 and 512 with ``CAUSAL``, ``PADDING``
+    (bidirectional), and ``SLIDING_WINDOW`` (windowed causal) masks, over the
+    contiguous and paged-KV (NHD) layouts.
+
+    These cover the newly-enabled paths: hd512 on SM120 and the
+    SLIDING_OR_CHUNKED_CAUSAL tiled-noloop kernel variant (previously the tiled
+    launcher silently ran the maskless dense kernel for sliding requests).
+    """
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("This test targets SM12x (Blackwell) FMHAv2.")
+    run_trtllm_fmha_v2_prefill_case(
+        input_layout=input_layout,
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        dtype=dtype,
+        o_dtype=dtype,
+        causal=causal,
+        mask_mode=mask_mode,
+        window_left=window_left,
+        logits_soft_cap=0.0,
+        pos_encoding_mode=None,
+        save_softmax_stats=False,
         skip_softmax_threshold_scale_factor=0.0,
     )
 

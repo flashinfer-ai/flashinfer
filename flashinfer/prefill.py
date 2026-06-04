@@ -4625,13 +4625,6 @@ def trtllm_fmha_v2_prefill(
     uses_chunked = chunked_attention_size is not None and chunked_attention_size > 0
     is_non_causal = mask_mode is not None and mask_mode.lower() == "padding"
 
-    if (uses_sliding_window or uses_chunked) and is_sm12x_supported(query.device):
-        feature = "Sliding window" if uses_sliding_window else "Chunked"
-        raise ValueError(
-            f"{feature} attention is not yet supported for FMHAv2 on SM120 (Blackwell). "
-            "Only CAUSAL masks are available. "
-        )
-
     if (uses_sliding_window or uses_chunked) and is_non_causal:
         feature = "Sliding window" if uses_sliding_window else "Chunked"
         raise ValueError(
