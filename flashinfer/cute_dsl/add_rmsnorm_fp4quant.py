@@ -1139,6 +1139,12 @@ def add_rmsnorm_fp4quant(
         Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
         for UE8M0 format. If ``None``, will be allocated automatically when
         ``output_both_sf_layouts=True``.
+    enable_pdl : bool, optional
+        Whether to launch with Programmatic Dependent Launch (PDL). When
+        ``None`` (default) or ``True``, PDL is enabled only if the current
+        device supports it (probed via :func:`device_support_pdl`). Pass
+        ``False`` to force-disable. See
+        https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
 
     Returns
     -------

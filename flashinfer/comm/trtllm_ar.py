@@ -1006,6 +1006,14 @@ def trtllm_allreduce_fusion(
     - metadata: optional workspace metadata dict from create_ipc_workspace_for_all_reduce_fusion.
                 If provided, validates that token_num <= max_token_num, world_size == tp_size,
                 and hidden_dim == workspace hidden_dim. Raises ValueError if validation fails.
+    - block_quant_group_size: group size (in elements along hidden_dim) for per-token-group
+                              block-wise FP8 quantization patterns
+                              (e.g. ``kPerTokenGroupFP8Packed`` / DeepSeek-style FP8 with
+                              UE8M0 packed scales). Number of consecutive elements that
+                              share a single scale factor. Must be > 0 and divide
+                              ``hidden_dim`` when the pattern requires it; ignored
+                              (treated as 0 / unused) for patterns that do not perform
+                              block-quantization.
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
