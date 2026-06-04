@@ -67,12 +67,13 @@ def _make_gates(total_seqlen, num_heads, baseline, device):
 
 
 @torch.inference_mode()
-def _run_cp_kernel_chain(q, k, v, alpha, beta, cu_seqlens, total_seqlen, cp_chunk_len, scale):
+def _run_cp_kernel_chain(q, k, v, alpha, beta, cu_seqlens, total_seqlen, cp_chunk_len, scale, initial_state=None):
     t = cp_delta_rule_t_precompute_dsl_sm90(k, beta, cu_seqlens, total_seqlen)
     local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm90(
         k, v, t, alpha, cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len)
     fixed_state = cp_delta_rule_fixup_dsl_sm90(
-        local_transfer, local_state, cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len)
+        local_transfer, local_state, cu_seqlens, total_seqlen,
+        cp_chunk_len=cp_chunk_len, initial_state=initial_state)
 
     our_o = torch.empty((total_seqlen, max(q.shape[1], v.shape[1]), q.shape[2]), dtype=q.dtype, device=q.device)
     our_state = torch.empty(
@@ -85,12 +86,12 @@ def _run_cp_kernel_chain(q, k, v, alpha, beta, cu_seqlens, total_seqlen, cp_chun
     )
     cp_delta_rule_prefill_dsl_sm90(
         our_o, our_state, q, k, v, t, fixed_state, alpha, scale,
-        cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len)
+        cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len, initial_state=initial_state)
     return our_o, our_state
 
 
 @torch.inference_mode()
-def _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale):
+def _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale, initial_state=None):
     ref_o = torch.empty((q.shape[0], max(q.shape[1], v.shape[1]), q.shape[2]), dtype=q.dtype, device=q.device)
     ref_state = torch.empty(
         cu_seqlens.numel() - 1,
@@ -100,7 +101,9 @@ def _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale):
         dtype=torch.float32,
         device=q.device,
     )
-    chunk_gated_delta_rule(q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, output=ref_o, output_state=ref_state, use_cp=False)
+    chunk_gated_delta_rule(
+        q, k, v, alpha, beta, scale, initial_state, True, cu_seqlens, True,
+        output=ref_o, output_state=ref_state, use_cp=False)
     return ref_o, ref_state
 
 
@@ -257,12 +260,14 @@ def test_cp_delta_rule_mn_precompute(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("use_initial_state", [False, True])
 @pytest.mark.parametrize("num_heads", [1, 3])
 @pytest.mark.parametrize("seq_lens, cp_chunk_len", [([96, 0, 300], 128), ([1], 1), ([2], 1), ([5], 1)])
 def test_cp_delta_rule_fixup(
     seq_lens,
     cp_chunk_len,
     num_heads,
+    use_initial_state,
     seed = int(os.environ.get("SEED", "0")),
 ):
     _skip_without_cp_kernel_device()
@@ -281,6 +286,11 @@ def test_cp_delta_rule_fixup(
     ) * 0.1
     diag = torch.arange(head_size, device=device)
     local_transfer[:, :, diag, diag] += 0.9
+    initial_state = None
+    if use_initial_state:
+        initial_state = torch.randn(
+            len(seq_lens), num_heads, head_size, head_size, dtype=torch.float32, device=device,
+        ) * 0.03
 
     our_fixed_state = cp_delta_rule_fixup_dsl_sm90(
         local_transfer.contiguous(),
@@ -288,12 +298,14 @@ def test_cp_delta_rule_fixup(
         cu_seqlens,
         total_seqlen,
         cp_chunk_len=cp_chunk_len,
+        initial_state=initial_state,
     )
     torch.cuda.synchronize()
 
     valid_slots = set()
     ref_transfers_by_seq = []
     ref_states_by_seq = []
+    ref_initial_states_by_seq = []
     ref_seq_indices = []
     for seq_idx, seq_len in enumerate(seq_lens):
         seq_start = int(cu_seqlens[seq_idx].item())
@@ -307,9 +319,15 @@ def test_cp_delta_rule_fixup(
         if seq_slots:
             ref_transfers_by_seq.append(local_transfer[seq_slots])
             ref_states_by_seq.append(local_state[seq_slots])
+            if use_initial_state:
+                ref_initial_states_by_seq.append(initial_state[seq_idx])
             ref_seq_indices.append(seq_idx)
 
-    _, ref_by_seq = reference.cp_delta_rule_fixup_transposed(ref_transfers_by_seq, ref_states_by_seq)
+    _, ref_by_seq = reference.cp_delta_rule_fixup_transposed(
+        ref_transfers_by_seq,
+        ref_states_by_seq,
+        ref_initial_states_by_seq if use_initial_state else None,
+    )
     for seq_idx, seq_fixed in zip(ref_seq_indices, ref_by_seq):
         seq_start = int(cu_seqlens[seq_idx].item())
         chunk_start = chunk_bound_host(seq_idx, seq_start, cp_chunk_len)
@@ -492,6 +510,61 @@ def test_cp_delta_rule_kernel_chain_long_small_bh_matches_non_cp_prefill(
     our_o, our_state = _run_cp_kernel_chain(q, k, v, alpha, beta, cu_seqlens, total_seqlen, cp_chunk_len, scale)
     torch.cuda.synchronize()
     ref_o, ref_state = _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(our_o, ref_o, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(our_state, ref_state, atol=5e-2, rtol=5e-2)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("seq_lens", [[192, 64], [1025]])
+def test_cp_delta_rule_e2e_with_initial_state(
+    qkv_factory,
+    dtype,
+    seq_lens,
+    seed = int(os.environ.get("SEED", "0")),
+):
+    _skip_without_cp_kernel_device()
+    _seed_all(seed)
+    device = torch.device("cuda")
+    head_size = 128
+    total_seqlen = sum(seq_lens)
+    cu_seqlens = _make_cu_seqlens(seq_lens, device)
+    scale = 1.0
+    dtype = getattr(torch, dtype)
+    num_heads = 1
+
+    with torch.device(device):
+        q, k, v = qkv_factory(seq_lens, num_heads, num_heads, num_heads, head_size, dtype=dtype)
+    q = q.contiguous()
+    k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
+    v = v.contiguous()
+    alpha = _make_gates(total_seqlen, num_heads, 0.99, device)
+    beta = _make_gates(total_seqlen, num_heads, 0.99, device)
+    initial_state = torch.randn(
+        len(seq_lens), num_heads, head_size, head_size, dtype=torch.float32, device=device,
+    ) * 0.02
+
+    our_o = torch.empty([total_seqlen, num_heads, head_size], dtype=q.dtype, device=q.device)
+    our_state = torch.empty_like(initial_state)
+    cp_delta_rule_dsl_sm90(
+        our_o,
+        our_state,
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        cu_seqlens,
+        scale,
+        initial_state=initial_state,
+        max_seqlen=max(seq_lens),
+        cp_chunk_len=128,
+    )
+    torch.cuda.synchronize()
+
+    ref_o, ref_state = _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale, initial_state=initial_state)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(our_o, ref_o, atol=5e-2, rtol=5e-2)
