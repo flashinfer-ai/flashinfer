@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import sys
+import time
 
 import numpy as np
 import torch
@@ -63,6 +64,9 @@ HEAD_CONFIGS = [
 SEQ_CONFIGS = [
     # (cu_seqlen_endpoints, label)
     # endpoints are cumulative positions (leading 0 added automatically)
+    ((65536,), "1x65536"),
+    ((32768,), "1x32768"),
+    ((16384,), "1x16384"),
     ((8192,), "1x8192"),
     ((4096,), "1x4096"),
     ((2048,), "1x2048"),
@@ -72,6 +76,9 @@ SEQ_CONFIGS = [
     ((1024 * 1, 8192), "1024+7168"),
     ((2048, 2048 * 2, 2048 * 3, 8192), "2048x4"),
     (tuple(1024 * (i + 1) for i in range(8)), "1024x8"),
+    (tuple(8192 * (i + 1) for i in range(8)), "8192x8"),
+    (tuple(8192 * (i + 1) for i in range(16)), "8192x16"),
+    (tuple(8192 * (i + 1) for i in range(32)), "8192x32"),
 ]
 
 
@@ -81,7 +88,7 @@ def _gdn_tflops(total_tokens, h_v, d, time_ms):
     return flops / time_ms / 1e9
 
 
-def bench_fi(endpoints, h_qk, h_v, d, warmup, iters):
+def bench_fi(args, endpoints, h_qk, h_v, d):
     """Benchmark FlashInfer GDN prefill."""
     device = "cuda"
     dtype = torch.float16
@@ -106,13 +113,17 @@ def bench_fi(endpoints, h_qk, h_v, d, warmup, iters):
         q, k, v, g, beta, None, h0, True, cu_seqlens, False, None, state_out
     )
     times = bench_gpu_time(
-        fn, enable_cupti=True, dry_run_iters=warmup, repeat_iters=iters
+        fn,
+        enable_cupti=args.use_cupti,
+        dry_run_iters=args.warmup,
+        repeat_iters=args.iters,
+        use_cuda_graph=args.use_cuda_graph,
     )
     torch.cuda.empty_cache()
     return np.average(times)
 
 
-def bench_fla(endpoints, h_qk, h_v, d, warmup, iters):
+def bench_fla(args, endpoints, h_qk, h_v, d):
     """Benchmark FLA baseline."""
     device = "cuda"
     dtype = torch.float16
@@ -142,7 +153,11 @@ def bench_fla(endpoints, h_qk, h_v, d, warmup, iters):
         cu_seqlens=cu_seqlens,
     )
     times = bench_gpu_time(
-        fn, enable_cupti=True, dry_run_iters=warmup, repeat_iters=iters
+        fn,
+        enable_cupti=args.use_cupti,
+        dry_run_iters=args.warmup,
+        repeat_iters=args.iters,
+        use_cuda_graph=args.use_cuda_graph,
     )
     torch.cuda.empty_cache()
     return np.average(times)
@@ -152,6 +167,9 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark GDN Prefill Kernel")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--cooling-time", type=float, default=0.1)
+    parser.add_argument("--use-cupti", action="store_true")
+    parser.add_argument("--use-cuda-graph", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -186,7 +204,10 @@ def main():
     for h_qk, h_v, d, h_label in HEAD_CONFIGS:
         for endpoints, s_label in SEQ_CONFIGS:
             T = endpoints[-1]
-            fi_ms = bench_fi(endpoints, h_qk, h_v, d, args.warmup, args.iters)
+            fi_ms = bench_fi(args, endpoints, h_qk, h_v, d)
+            time.sleep(args.cooling_time)
+            fla_ms = bench_fla(args, endpoints, h_qk, h_v, d)
+            time.sleep(args.cooling_time)
             tflops = _gdn_tflops(T, h_v, d, fi_ms)
             row = (
                 f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
