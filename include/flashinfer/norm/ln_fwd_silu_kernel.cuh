@@ -371,7 +371,11 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
         y_ij = __fdividef(y_ij, 1.0f + __expf(-y_ij));
 
         if constexpr (isFP8Out) {
-          if (hasAmax) {
+          // Skip amax update on partial-tail OOB lanes: their y_ij is derived
+          // from uninitialized gamma/beta and would poison amax with garbage
+          // or NaN. The matching z store is already predicated, so dropping
+          // these samples is safe.
+          if (hasAmax && iter_valid) {
             __builtin_assume(amax >= 0);
             amax = fmaxf(amax, fabsf(y_ij));
           }

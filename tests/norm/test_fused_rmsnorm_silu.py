@@ -559,6 +559,7 @@ def test_epsilon_sensitivity():
 
 
 def test_uniform_weight():
+    """RMSNorm+SiLU on bf16 with uniform (all-ones) gamma."""
     import flashinfer
 
     num_tokens, hidden_size = 1560, 256
