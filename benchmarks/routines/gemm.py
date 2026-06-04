@@ -1431,10 +1431,10 @@ def testMmW4A16Fp4(args):
 
         backend_runners[backend] = make_runner(b_p, sf_p, alpha_p, backend)
 
-    # Only the cuDNN backend integrates the autotuner (it sweeps cuDNN
-    # execution plans + M buckets via mm_w4a16_fp4's TunableRunner).  The
-    # cute-dsl and torch backends pick a single kernel/path and ignore it.
-    autotune_supported_backends = ["cudnn"]
+    # cuDNN sweeps its execution plans + M buckets; cute-dsl sweeps its tile
+    # shape + perf-knob config space (both via mm_w4a16_fp4's TunableRunners).
+    # The torch backend has a single path and ignores the autotuner.
+    autotune_supported_backends = ["cudnn", "cute-dsl"]
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
         warmup_iters = (

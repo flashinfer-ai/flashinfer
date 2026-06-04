@@ -1289,6 +1289,8 @@ def _get_cute_dsl_w4a16_gemm(
     a_dtype: torch.dtype,
     c_dtype: torch.dtype,
     atom_layout: Tuple[int, int, int] = (2, 2, 1),
+    pipeline_depth: int = 1,
+    use_fp16_mma: int = 1,
 ):
     """Compile (or fetch from cache) the cute-DSL W4A16 GEMM kernel.
 
@@ -1298,10 +1300,23 @@ def _get_cute_dsl_w4a16_gemm(
       mB_sf     : (k // 16, n)        uint8 -- FP8-E4M3 scales
       mC        : (m, n)              c_dtype
       mAlpha    : (1,)                float32 scalar
+
+    ``pipeline_depth`` (K-block dequant prefetch depth, 0/1) and
+    ``use_fp16_mma`` (1 = fp16 MMA path, 0 = bf16 MMA path) are
+    autotuner-selectable perf knobs; see ``BlackwellDenseGemmW4A16Kernel``.
     """
     # Normalize to a tuple (callers may pass a list) so the cache key is hashable.
     atom_layout = cast(Tuple[int, int, int], tuple(atom_layout))
-    cache_key = (tile_shape_mnk, a_dtype, c_dtype, atom_layout)
+    pipeline_depth = int(pipeline_depth)
+    use_fp16_mma = int(use_fp16_mma)
+    cache_key = (
+        tile_shape_mnk,
+        a_dtype,
+        c_dtype,
+        atom_layout,
+        pipeline_depth,
+        use_fp16_mma,
+    )
     cached = _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -1349,6 +1364,8 @@ def _get_cute_dsl_w4a16_gemm(
         acc_dtype=cutlass.Float32,
         tile_shape_mnk=tile_shape_mnk,
         atom_layout=atom_layout,
+        pipeline_depth=pipeline_depth,
+        use_fp16_mma=use_fp16_mma,
     )
     max_active_clusters = get_max_active_clusters(1)
 
@@ -1401,6 +1418,181 @@ def _prepare_cute_dsl(
     return b_marlin, sf_ksf_n, alpha
 
 
+# =============================================================================
+# cute-DSL autotuner integration
+# =============================================================================
+#
+# The cute-DSL kernel is compiled shape-generically (M/N/K are runtime sym_int
+# args), so a single compiled kernel handles any problem size -- the only thing
+# to "tune" is the *config*: the CTA tile shape, the MMA atom layout, and two
+# perf knobs (``pipeline_depth`` = K-block dequant prefetch, ``use_fp16_mma`` =
+# fp16 vs bf16 MMA datapath).  ``_w4a16_cute_dsl_tactic_configs`` enumerates a
+# small, shape-dependent candidate set; the AutoTuner profiles each and caches
+# the fastest per (M-bucket, N, K).  Tactic ``-1`` (the autotuner fallback used
+# when tuning is off / on a cache miss) routes to the M-aware
+# ``_select_w4a16_tile_shape`` heuristic, so behaviour without ``autotune(True)``
+# is byte-for-byte the pre-autotuner path.
+#
+# Notes on the candidate set:
+#   * The MMA atom layout is coupled to tile_M: (1,2,1) requires tile_M == 16
+#     (Permutation_m = 16); tile_M >= 32 uses (2,2,1).  See
+#     ``_select_w4a16_tile_shape``.
+#   * tile_K = 128 when K % 128 == 0 (the common case), else 64; the (1,2,1)
+#     tile_M=16 path is only used at tile_K == 128 (matching the heuristic).
+#   * tile_N is FIXED at 64.  The Marlin weight is packed in 64-wide N blocks
+#     and the MMA atom layouts assume tile_N == 64; a wider tile_N *compiles and
+#     runs without error but produces incorrect (NaN) output*, so it is not a
+#     candidate.
+#   * CRITICAL: the AutoTuner ranks tactics by *latency only* -- it never checks
+#     correctness.  A config that is fast but wrong would be silently selected.
+#     Every config enumerated here must therefore be numerically verified
+#     against the torch reference before being added.  The set below is exactly
+#     the tile shapes ``_select_w4a16_tile_shape`` already emits (the kernel's
+#     validated production tiles) varied only over ``pipeline_depth`` (K-block
+#     dequant prefetch), which changes the dequant schedule but not the result.
+#   * ``use_fp16_mma`` is NOT swept: it is a compute-datapath knob (fp16 vs bf16
+#     MMA) and per-config isolation measured it inert (<=1.5%, never a winner)
+#     for the memory-bound small-M W4A16 regime, so a fp16=0 tactic would only
+#     add profiling cost.  It stays at the kernel default (1).
+#   * Infeasible configs (e.g. a tile that overflows SMEM -> ab_stage == 0)
+#     raise during profiling; the AutoTuner records inf time and never selects
+#     them, so an occasionally-infeasible config is harmless (but a
+#     silently-wrong one is not -- see above).
+
+
+def _w4a16_cute_dsl_tactic_configs(
+    n: int, k: int
+) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int]]:
+    """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
+
+    Returns a list of ``(tile_shape_mnk, atom_layout, pipeline_depth,
+    use_fp16_mma)`` tuples.  The list is intentionally independent of ``M`` so
+    that a tactic index profiled for one M-bucket stays valid when the chosen
+    index is replayed for a runtime ``M`` in the same bucket.  The AutoTuner
+    selects the best (tile_M, perf-knob) combo for each M-bucket from the
+    candidates here.  ``n`` is currently unused (tile_N is fixed at 64) but is
+    kept in the signature so the key/validity surface can grow if a wider-N
+    path is ever validated.
+    """
+    tile_k = 128 if k % 128 == 0 else 64
+
+    # (tile_M, atom_layout) shapes the kernel is designed/validated for, with
+    # tile_N fixed at 64 (see the module-banner notes above).
+    tile_m_atoms: List[Tuple[int, Tuple[int, int, int]]] = []
+    if tile_k == 128:
+        tile_m_atoms.append((16, (1, 2, 1)))
+    tile_m_atoms.append((32, (2, 2, 1)))
+    tile_m_atoms.append((64, (2, 2, 1)))
+
+    configs: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int]] = []
+    seen = set()
+
+    def add(tile_m, atom, pdepth, fp16):
+        cfg = ((tile_m, 64, tile_k), atom, pdepth, fp16)
+        key = (cfg[0], cfg[1], pdepth, fp16)
+        if key not in seen:
+            seen.add(key)
+            configs.append(cfg)
+
+    # Index 0 is the default config (matches the small-M heuristic at
+    # tile_K == 128) so the autotuner fallback / first candidate is the proven
+    # baseline.  pipeline_depth=0 is swept on the smallest tile, where the
+    # short-K cold-start it targets dominates; larger tile_M shapes (which the
+    # heuristic uses at bigger M) are offered with default knobs.
+    base_tile_m, base_atom = tile_m_atoms[0]
+    add(base_tile_m, base_atom, 1, 1)  # 0: baseline
+    add(base_tile_m, base_atom, 0, 1)  # no dequant prefetch (helps short-K)
+    for tile_m, atom in tile_m_atoms[1:]:
+        add(tile_m, atom, 1, 1)
+
+    return configs
+
+
+# Autotuner sweeps M (token count) of the bf16 activation ``a`` and keeps the
+# output ``out`` in lockstep.  The Marlin weight ``b``, its scale, and ``alpha``
+# are M-independent and stay fixed during profiling.
+#
+# inputs layout (see _compute_cute_dsl):
+#   [0]=a  [1]=b (marlin int32)  [2]=b_sf (uint8)  [3]=alpha
+#   [4]=out_dtype  [5]=out  [6]=block_size
+_W4A16_CUTE_DSL_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (0,),  # M dimension
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            5,  # out_tensor_index follows M
+            0,
+            lambda shapes: shapes[0][0],
+        ),
+    ),
+)
+
+
+def _cute_dsl_w4a16_fp4_runner() -> TunableRunner:
+    """Build a ``CuteDslW4a16Fp4Runner`` for the cute-DSL W4A16 GEMM.
+
+    Each tactic is an index into :func:`_w4a16_cute_dsl_tactic_configs` for the
+    runtime ``(N, K)``.  Tactic ``-1`` is the fallback: it routes to the M-aware
+    ``_select_w4a16_tile_shape`` heuristic with default knobs (i.e. the
+    pre-autotuner behaviour), so an un-tuned call is unchanged.
+    """
+
+    class CuteDslW4a16Fp4Runner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, _, _, out_dtype, _, block_size = inputs
+            n = int(b.shape[1]) // 2
+            k = int(b.shape[0]) * int(block_size)
+            return (out_dtype, n, k)
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            _, b, _, _, _, _, block_size = inputs
+            n = int(b.shape[1]) // 2
+            k = int(b.shape[0]) * int(block_size)
+            return list(range(len(_w4a16_cute_dsl_tactic_configs(n, k))))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, b_sf_u8, alpha_for_launch, out_dtype, out, block_size = inputs
+            n = int(b.shape[1]) // 2
+            k = int(b.shape[0]) * int(block_size)
+            m = int(a.shape[0])
+            if tactic < 0:
+                # Fallback == pre-autotuner heuristic (M-aware), default knobs.
+                tile_shape_mnk, atom_layout = _select_w4a16_tile_shape(m, n, k)
+                pipeline_depth, use_fp16_mma = 1, 1
+            else:
+                tile_shape_mnk, atom_layout, pipeline_depth, use_fp16_mma = (
+                    _w4a16_cute_dsl_tactic_configs(n, k)[tactic]
+                )
+            compiled = _get_cute_dsl_w4a16_gemm(
+                tile_shape_mnk,
+                a.dtype,
+                out_dtype,
+                atom_layout,
+                pipeline_depth,
+                use_fp16_mma,
+            )
+            compiled(a, b, b_sf_u8, out, alpha_for_launch)
+            return out
+
+    return CuteDslW4a16Fp4Runner()
+
+
 def _compute_cute_dsl(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1451,11 +1643,23 @@ def _compute_cute_dsl(
         if out.dtype != out_dtype:
             raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
 
-    tile_shape_mnk, atom_layout = _select_w4a16_tile_shape(m, n, k)
-    compiled = _get_cute_dsl_w4a16_gemm(tile_shape_mnk, a.dtype, out_dtype, atom_layout)
     b_sf_u8 = b_descale.view(torch.uint8).contiguous()
     alpha_for_launch = _prepare_w4a16_alpha(alpha, a.device)
-    compiled(a, b, b_sf_u8, out, alpha_for_launch)
+
+    # Config selection (tile shape + perf knobs) goes through the AutoTuner.
+    # Outside an ``autotune(True)`` context (or on a cache miss) ``choose_one``
+    # returns tactic -1, which the runner maps to the M-aware
+    # ``_select_w4a16_tile_shape`` heuristic -- i.e. the pre-autotuner path.
+    tuner = AutoTuner.get()
+    runner = _cute_dsl_w4a16_fp4_runner()
+    inputs = [a, b, b_sf_u8, alpha_for_launch, out_dtype, out, block_size]
+    chosen_runner, tactic = tuner.choose_one(
+        "w4a16_fp4_cute_dsl_gemm",
+        [runner],
+        _W4A16_CUTE_DSL_TUNING_CONFIG,
+        inputs,
+    )
+    chosen_runner(inputs=inputs, tactic=tactic)
     return out
 
 
