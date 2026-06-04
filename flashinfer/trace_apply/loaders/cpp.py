@@ -56,8 +56,9 @@ def load(solution: Solution) -> Callable:
         )
 
     name = f"trace_apply_{solution.hash()[:16]}"
-    include_paths = sorted({(sol_dir / src.path).parent for src in solution.sources})
-    include_paths.append(sol_dir)
+    include_paths = sorted(
+        {(sol_dir / src.path).parent for src in solution.sources} | {sol_dir}
+    )
 
     spec = gen_jit_spec(name, sources, extra_include_paths=list(include_paths))
     module = spec.build_and_load()

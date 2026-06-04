@@ -14,25 +14,23 @@
 
 """Runtime kernel substitution for fi_trace definitions.
 
-Enable by pointing ``FLASHINFER_TRACE_APPLY=1`` and ``FLASHINFER_TRACE_PATH`` at
-a folder of solution files, or call :func:`enable_apply` explicitly.
+Call :func:`enable_apply` with a ``{definition_name: callable_or_Solution}``
+mapping, or set ``FLASHINFER_TRACE_APPLY=1`` (+ ``FLASHINFER_TRACE_APPLY_PATH``) so
+the import-time hook enables it automatically.
 """
 
 from __future__ import annotations
 
 from flashinfer.trace_apply.apply import (
-    author_stats_snapshot,
     current_sm,
     disable_apply,
     enable_apply,
-    enable_apply_from_env,
-    get_index,
-    get_policy,
     is_enabled,
-    reset_stats,
     stats_snapshot,
 )
-from flashinfer.trace_apply.config import ApplyPolicy
+
+# Internal: called only by the flashinfer package import (see flashinfer/__init__.py).
+from flashinfer.trace_apply.apply import _enable_apply_from_env  # noqa: F401
 
 
 def stats() -> dict:
@@ -42,32 +40,9 @@ def stats() -> dict:
     return stats_snapshot()
 
 
-def explain(fi_api: str, const_axes: dict, input_dtypes=None, sm_arch: str | None = None) -> dict:
-    """Show how a ``(fi_api, const_axes, input_dtypes)`` lookup resolves against
-    the installed routing table. For debugging which solution would dispatch."""
-    from flashinfer.trace_apply.routing import explain as _explain  # noqa: PLC0415
-
-    idx = get_index()
-    if idx is None:
-        raise RuntimeError("Trace Apply is not enabled. Call enable_apply() first.")
-    return _explain(
-        idx,
-        fi_api,
-        dict(const_axes),
-        frozenset(input_dtypes or ()),
-        sm_arch or current_sm(),
-        get_policy(),
-    )
-
-
 __all__ = [
-    "enable_apply",
     "disable_apply",
-    "enable_apply_from_env",
+    "enable_apply",
     "is_enabled",
-    "ApplyPolicy",
     "stats",
-    "explain",
-    "author_stats_snapshot",
-    "reset_stats",
 ]

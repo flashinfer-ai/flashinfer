@@ -14,7 +14,7 @@
 
 """Loading the apply config: a folder of solution (and definition) JSON files.
 
-Trace Apply is fed by pointing ``FLASHINFER_TRACE_PATH`` at a directory in the
+Trace Apply is fed by pointing ``FLASHINFER_TRACE_APPLY_PATH`` at a directory in the
 flashinfer-bench layout::
 
     <root>/
@@ -37,7 +37,7 @@ from typing import Any
 from flashinfer.trace.solution import Solution
 
 ENABLE_ENV = "FLASHINFER_TRACE_APPLY"
-PATH_ENV = "FLASHINFER_TRACE_PATH"
+PATH_ENV = "FLASHINFER_TRACE_APPLY_PATH"
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,9 @@ class IOSpec:
     shape: list[str] | None  # axis names; None for scalars
     dtype: str
     optional: bool = False
+    # For outputs: the API parameter this output is written into (``out=`` buffer
+    # or, for in-place APIs, an input buffer).
+    param: str | None = None
     description: str = ""
 
 
@@ -83,11 +86,15 @@ class Definition:
                 for k, v in d.get("axes", {}).items()
             },
             inputs={
-                k: IOSpec(**_pick(v, "shape", "dtype", "optional", "description"))
+                k: IOSpec(
+                    **_pick(v, "shape", "dtype", "optional", "param", "description")
+                )
                 for k, v in d.get("inputs", {}).items()
             },
             outputs={
-                k: IOSpec(**_pick(v, "shape", "dtype", "optional", "description"))
+                k: IOSpec(
+                    **_pick(v, "shape", "dtype", "optional", "param", "description")
+                )
                 for k, v in d.get("outputs", {}).items()
             },
             tags=list(d.get("tags", [])),
@@ -127,18 +134,6 @@ class Definition:
 
 
 # ---------------------------------------------------------------------------
-# Policy
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class ApplyPolicy:
-    """Optional dispatch filters. Defaults accept everything."""
-
-    allowed_authors: list[str] | None = None  # None = accept all
-
-
-# ---------------------------------------------------------------------------
 # Folder loading
 # ---------------------------------------------------------------------------
 
@@ -152,7 +147,7 @@ class TraceConfig:
 
 
 def resolve_trace_path(explicit: str | os.PathLike | None = None) -> Path:
-    """Resolve the folder, preferring the explicit arg over ``FLASHINFER_TRACE_PATH``."""
+    """Resolve the folder, preferring the explicit arg over ``FLASHINFER_TRACE_APPLY_PATH``."""
     if explicit is not None:
         return Path(explicit).expanduser().resolve()
     env = os.environ.get(PATH_ENV)
@@ -166,7 +161,7 @@ def resolve_trace_path(explicit: str | os.PathLike | None = None) -> Path:
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError as e:
         raise ValueError(f"Malformed JSON at {path}: {e}") from e
@@ -199,6 +194,11 @@ def load_config(path: str | os.PathLike | None = None) -> TraceConfig:
     solutions: dict[tuple[str, str], Solution] = {}
     for p in sorted(sols_dir.rglob("*.json")):
         sol = Solution.from_dict(_load_json(p))
+        if sol.definition not in definitions:
+            raise ValueError(
+                f"Solution {(sol.definition, sol.name)!r} references unknown "
+                f"definition {sol.definition!r} (in {p})"
+            )
         key = (sol.definition, sol.name)
         if key in solutions:
             raise ValueError(f"Duplicate solution {key} (in {p})")
@@ -211,10 +211,9 @@ __all__ = [
     "ENABLE_ENV",
     "PATH_ENV",
     "Axis",
-    "IOSpec",
     "Definition",
-    "ApplyPolicy",
+    "IOSpec",
     "TraceConfig",
-    "resolve_trace_path",
     "load_config",
+    "resolve_trace_path",
 ]

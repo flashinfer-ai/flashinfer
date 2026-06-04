@@ -4,113 +4,102 @@ Trace Apply
 ===========
 
 Trace Apply substitutes selected FlashInfer API calls with custom *solutions* at
-runtime, with no changes to the calling code (SGLang, vLLM, your own script).
-It is the consumer side of the FlashInfer Trace: you collect ``fi_trace``
-definitions, author solutions for them, and Trace Apply dispatches the matching
-solution whenever the corresponding API is called.
-
-It is deterministic and explicit: there is **one solution per definition** — no
-workload filtering, autotuning, speed ranking, or policy selection.
+runtime, with no changes to the calling code (SGLang, vLLM, or other engines).
+It is the consumer side of the FlashInfer Trace: you provide a mapping from
+**definition name** to the solution to run for it, and Trace Apply dispatches
+that solution whenever the corresponding API is called with the matching shape.
+For any single definition there is exactly one solution — the one you registered.
 
 Enabling
 --------
 
-Trace Apply is driven entirely by two environment variables (no other hidden
-knobs):
-
-================================ ===========================================================
-Variable                         Meaning
-================================ ===========================================================
-``FLASHINFER_TRACE_APPLY``       ``1`` enables Trace Apply at ``import flashinfer``.
-``FLASHINFER_TRACE_PATH``        Path to the folder of solutions to apply (see below).
-``FLASHINFER_TRACE_APPLY_DEBUG`` ``1`` logs the extracted axes + dtypes on each newly
-                                 resolved shape (for authoring/debugging solutions).
-================================ ===========================================================
-
-.. code-block:: bash
-
-   export FLASHINFER_TRACE_APPLY=1
-   export FLASHINFER_TRACE_PATH=/path/to/solutions_folder
-   python my_serving_script.py    # FlashInfer calls are transparently substituted
-
-Enabling at import is best-effort: a bad or missing config emits a warning and
-``import flashinfer`` still succeeds (Trace Apply simply stays off).
-
-Programmatic control:
+Register solutions explicitly with :func:`enable_apply`. The argument is a
+mapping ``{definition_name: solution}``, where a solution is either a Python
+callable or a first-class :class:`~flashinfer.trace.Solution`:
 
 .. code-block:: python
 
-   import flashinfer.trace_apply as ta
+   import flashinfer
+   import flashinfer.trace_apply as fi_trace_apply
 
-   ta.enable_apply("/path/to/solutions_folder")  # returns # of wrapped attributes
+   def my_rmsnorm(hidden_states, weight, eps=1e-6):
+       x = hidden_states.float()
+       y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+       return (y * weight.float()).to(hidden_states.dtype)
+
+   fi_trace_apply.enable_apply({"rmsnorm_h4096": my_rmsnorm})  # returns the # of wrapped APIs
    ...
-   ta.stats()                 # per-API dispatch counts (hit / fallback / error)
-   ta.explain("flashinfer.norm.rmsnorm", {"hidden_size": 4096})  # why a call routes
-   ta.disable_apply()         # restore the original FlashInfer APIs
+   flashinfer.rmsnorm(x, w)          # routed to my_rmsnorm when hidden_size == 4096
+   fi_trace_apply.stats()            # per-API dispatch counts (hit / fallback / error)
+   fi_trace_apply.disable_apply()    # restore the original FlashInfer APIs
 
-The folder layout
------------------
+``enable_apply`` is idempotent — calling it again replaces the previous mapping.
+With no argument (``enable_apply()``) it uses the environment configuration
+below; if nothing is configured it is a no-op.
 
-``FLASHINFER_TRACE_PATH`` points at a directory in the flashinfer-bench layout::
+There is also an import-time hook controlled by environment variables:
 
-    <root>/
-      definitions/**/*.json    # problem specs: axes, inputs (incl. dtype), fi_api tag
-      solutions/**/*.json       # implementations — one solution per file
-      workloads/ traces/ ...    # ignored by apply
+=================================== ==============================================================
+Variable                            Meaning
+=================================== ==============================================================
+``FLASHINFER_TRACE_APPLY``          Set to ``1`` to enable Trace Apply when FlashInfer is imported.
+``FLASHINFER_TRACE_APPLY_PATH``     Directory the deployment-configured solutions are loaded from.
+=================================== ==============================================================
 
-``solutions/`` provides the kernels to substitute; ``definitions/`` provides the
-routing identity. Other subdirectories are ignored. A folder may hold many
-solutions, and **all of them are applied at once** — one kernel substituted per
-definition (this is how multiple kernels are replaced in a single model run).
-The active set is exactly what is present under ``solutions/``.
+If the configuration is missing or invalid, Trace Apply stays disabled and
+FlashInfer continues to work normally, with a warning describing the problem.
 
-Loading is strict: a malformed definition or solution file raises (Trace Apply
-never silently skips something you asked it to apply). Two solutions for the
-same definition keep the first and warn.
+``FLASHINFER_TRACE_APPLY_PATH`` must point at a *curated* solutions folder — its
+``solutions/`` subtree is scanned recursively for one solution per definition (a
+duplicate definition is an error). It is **not** the raw extraction bundle, which
+also contains baseline solutions and several backends per definition.
 
 Routing
 -------
 
-A call is routed by its **definition identity** ``(fi_api, const-axes,
-input-dtypes)``:
+A call is routed by **definition name**. On each call the wrapper extracts the
+call's *const* axes and recomputes the definition name from the live
+``TraceTemplate`` — the same ``name_prefix`` + const-axis convention the trace
+collector uses (e.g. ``rmsnorm`` at ``hidden_size=4096`` → ``"rmsnorm_h4096"``).
+If that name is in the registered mapping, the call dispatches to its solution;
+otherwise it falls back to the original FlashInfer kernel.
 
-* ``const-axes`` are the compile-time shape a definition is specialized for
-  (``hidden_size=4096``, ``head_dim=128`` …). *Var* axes (``batch_size``,
-  sequence lengths, …) are **not** part of the identity — one solution handles
-  all of them.
-* ``input-dtypes`` distinguishes dtype-specialized solutions (fp16 vs bf16) for
-  the same shape.
-
-The routing decision is cached per shape, so steady-state dispatch is a dict
-lookup. Inside a CUDA-graph capture, only already-resolved shapes apply (warm up
-eagerly before capturing).
+* **Const axes** are the compile-time shape a definition is specialized for
+  (``hidden_size``, ``head_dim``, …) and form the name. **Variable axes** (batch
+  size, sequence length, …) are *not* part of the name, so a single solution
+  serves all of their values.
+* The decision is cached per name, so steady-state dispatch is a dictionary
+  lookup. During CUDA-graph capture only already-resolved shapes are applied, so
+  warm up eagerly before capturing.
 
 Solutions
 ---------
 
-A solution is a :class:`flashinfer.trace.Solution`: a name, the definition it
-implements, an author, a :class:`flashinfer.trace.BuildSpec`, and inlined source
-files. Loaders are chosen by language *family*:
+A solution value is either:
 
-* **Python family** (``python``, ``triton``, ``cutedsl``, ``tilelang``) — the
-  entry-point source is imported and the entry function is called by keyword
-  (Definition input names).
-* **C++/CUDA family** (``cpp``, ``cuda``, ``cutlass``, ``cutile``) — built via
-  ``flashinfer.jit`` and called positionally (the ``TVM_FFI_DLL_EXPORT_TYPED_FUNC``
-  symbol).
+* a **Python callable** — invoked directly with the definition's inputs by
+  keyword (value-returning); or
+* a first-class :class:`~flashinfer.trace.Solution` — loaded by language family:
+  the **Python family** (``python``, ``triton``, ``cutedsl``, ``cutile``,
+  ``tilelang``) is imported and called by keyword; the **C++/CUDA family**
+  (``cpp``, ``cuda``, ``cutlass``) is built via ``flashinfer.jit`` and called
+  positionally.
 
-Output adaptation reconciles the solution's outputs with the API's convention:
-value-returning, ``out=`` buffers, in-place / destination-passing, and optional
-outputs gated by a runtime flag (e.g. ``return_lse``).
+Trace Apply reconciles a solution's outputs with the calling API's convention:
+value-returning outputs, caller-provided ``out=`` / ``lse=`` buffers, in-place
+writes (e.g. ``fused_add_rmsnorm`` writing back into its input/residual buffers),
+and data-dependent arity (e.g. ``return_lse``). If a caller passes ``out=`` (e.g.
+``rmsnorm(x, w, out=buf)``), the substituted solution's result is written into
+``buf`` and ``buf`` is returned, exactly like the original kernel.
 
-Arch safety: if a solution's ``target_hardware`` lists explicit ``sm<NN>``
-targets, it is only applied on a matching GPU (compute capability is read from
-the device — there is no GPU product-name table).
+The ``out=`` / ``lse=`` bindings are **auto-derived from the live API signature**
+(a uniform FlashInfer convention), so they are *not* recorded in the trace. Only
+the non-derivable in-place bindings (which input a result is written back into)
+are declared in the trace via the output ``param``.
 
 Error policy
 ------------
 
-Trace Apply is **strict**: a *matched* solution that fails to build or run
-re-raises, so a broken registered solution surfaces immediately. A genuine miss
-(no registered solution for the call's identity, or filtered out by arch/author)
-falls back to the original FlashInfer API.
+Trace Apply is strict. A matched solution that fails to build or run raises, so a
+broken solution is reported immediately rather than masked. A call with no
+matching registered name falls back to the original FlashInfer API.

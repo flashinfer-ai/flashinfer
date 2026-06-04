@@ -48,7 +48,11 @@ class StatefulAdapter:
 STATEFUL_ADAPTERS: dict[str, StatefulAdapter] = {
     "flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run": StatefulAdapter(
         plan_attr="plan",
-        plan_inputs={"kv_indptr": "indptr", "kv_indices": "indices", "sm_scale": "sm_scale"},
+        plan_inputs={
+            "kv_indptr": "indptr",
+            "kv_indices": "indices",
+            "sm_scale": "sm_scale",
+        },
         self_attrs={
             "kv_indptr": "_paged_kv_indptr_buf",
             "kv_indices": "_paged_kv_indices_buf",
@@ -66,11 +70,19 @@ STATEFUL_ADAPTERS: dict[str, StatefulAdapter] = {
     ),
     "flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper.run": StatefulAdapter(
         plan_attr="plan",
-        plan_inputs={"qo_indptr": "qo_indptr", "kv_indptr": "kv_indptr", "sm_scale": "sm_scale"},
+        plan_inputs={
+            "qo_indptr": "qo_indptr",
+            "kv_indptr": "kv_indptr",
+            "sm_scale": "sm_scale",
+        },
     ),
     "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run": StatefulAdapter(
         plan_attr="plan",
-        plan_inputs={"kv_indptr": "kv_indptr", "kv_indices": "kv_indices", "sm_scale": "sm_scale"},
+        plan_inputs={
+            "kv_indptr": "kv_indptr",
+            "kv_indices": "kv_indices",
+            "sm_scale": "sm_scale",
+        },
     ),
 }
 
@@ -88,7 +100,9 @@ def is_stateful(fi_api: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _plan_lock = Lock()
-_plan_by_instance: "weakref.WeakKeyDictionary[Any, dict[str, Any]]" = weakref.WeakKeyDictionary()
+_plan_by_instance: "weakref.WeakKeyDictionary[Any, dict[str, Any]]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def stash_plan_kwargs(instance: Any, kwargs: dict[str, Any]) -> None:
@@ -141,11 +155,11 @@ def augment_namespace(
 
 
 __all__ = [
-    "StatefulAdapter",
     "STATEFUL_ADAPTERS",
+    "StatefulAdapter",
     "adapter_for",
+    "augment_namespace",
+    "fetch_plan_kwargs",
     "is_stateful",
     "stash_plan_kwargs",
-    "fetch_plan_kwargs",
-    "augment_namespace",
 ]

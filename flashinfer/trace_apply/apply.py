@@ -16,9 +16,10 @@
 
 A single wrapper handles both stateless free functions and stateful plan/run
 Wrapper APIs — the only difference is how the call *namespace* is built. From
-the namespace everything is shared: extract the axis vector + input dtypes, form
-the routing key ``(fi_api, const-axes, input-dtypes)``, look up the one
-registered solution (cached per shape), and adapt its outputs to the API.
+the namespace everything is shared: extract the const axes, recompute the
+definition name (``name_prefix`` + const-axis abbrevs, the same convention the
+trace collector uses), look it up in the registered ``{definition_name:
+solution}`` mapping (cached per name), and adapt its outputs to the API.
 
 Error policy is strict: a *matched* solution that fails to load or run re-raises
 (a broken registered solution must surface); a genuine miss falls back to the
@@ -41,21 +42,12 @@ from typing import Any, Callable
 
 import torch
 
-from flashinfer.trace_apply import adapt, plan_state
-from flashinfer.trace_apply.config import (
-    ENABLE_ENV,
-    ApplyPolicy,
-    load_config,
-    resolve_trace_path,
-)
+from flashinfer.trace.solution import Solution
+from flashinfer.trace_apply import adapt, plan_capture
+from flashinfer.trace_apply.config import ENABLE_ENV, PATH_ENV
 from flashinfer.trace_apply.loaders import load as load_solution
-from flashinfer.trace_apply.routing import Candidate, Index, build_index, lookup
 
 _log = logging.getLogger("flashinfer.trace_apply")
-
-# Opt-in: log the full extracted axis vector + dtypes on every newly-resolved
-# shape (hit or miss), to author/debug matching solutions.
-_DEBUG = os.environ.get("FLASHINFER_TRACE_APPLY_DEBUG", "0") not in ("0", "", "false", "False")
 
 _MISSING = object()
 
@@ -76,6 +68,8 @@ def current_sm(device: Any = None) -> str | None:
 
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
+        elif isinstance(device, int):
+            device = torch.device("cuda", device)
         elif not isinstance(device, torch.device):
             device = torch.device(device)
         major, minor = get_compute_capability(device)
@@ -97,7 +91,9 @@ def _signature(fn: Callable) -> inspect.Signature | None:
         return None
 
 
-def bind_namespace(original: Callable, args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
+def bind_namespace(
+    original: Callable, args: tuple, kwargs: dict[str, Any]
+) -> dict[str, Any]:
     """Bind args/kwargs to ``original``'s signature → flat ``{param: value}``."""
     sig = _signature(original)
     if sig is None:
@@ -121,7 +117,9 @@ def build_extractor_maps(templates: list) -> list[dict[str, Callable]]:
     return maps
 
 
-def extract_axes(extractor_maps: list[dict[str, Callable]], namespace: dict[str, Any]) -> dict[str, int]:
+def extract_axes(
+    extractor_maps: list[dict[str, Callable]], namespace: dict[str, Any]
+) -> dict[str, int]:
     """Run extractors over a (param → value) namespace → full concrete axis vector.
     Multiple templates merge: each axis is filled by the first that resolves it."""
     axes: dict[str, int] = {}
@@ -139,20 +137,17 @@ def extract_axes(extractor_maps: list[dict[str, Callable]], namespace: dict[str,
 
 
 # ---------------------------------------------------------------------------
-# Stats (per (fi_api, status) and (author, status))
+# Stats (per (fi_api, status))
 # ---------------------------------------------------------------------------
 
 _stats_lock = Lock()
 _stats: Counter[tuple[str, str]] = Counter()
-_author_stats: Counter[tuple[str, str]] = Counter()
 _logged_dispatch: set[str] = set()
 
 
-def bump_stat(fi_api: str, status: str, author: str | None = None) -> None:
+def bump_stat(fi_api: str, status: str) -> None:
     with _stats_lock:
         _stats[(fi_api, status)] += 1
-        if author is not None:
-            _author_stats[(author, status)] += 1
 
 
 def stats_snapshot() -> dict[str, dict[str, int]]:
@@ -163,18 +158,9 @@ def stats_snapshot() -> dict[str, dict[str, int]]:
     return out
 
 
-def author_stats_snapshot() -> dict[str, dict[str, int]]:
-    out: dict[str, dict[str, int]] = {}
-    with _stats_lock:
-        for (author, status), count in _author_stats.items():
-            out.setdefault(author, {})[status] = count
-    return out
-
-
-def reset_stats() -> None:
+def _reset_stats() -> None:
     with _stats_lock:
         _stats.clear()
-        _author_stats.clear()
         _logged_dispatch.clear()
 
 
@@ -187,8 +173,8 @@ _loaded: dict[tuple[str, str], Callable] = {}
 _loading_locks: dict[tuple[str, str], Lock] = {}
 
 
-def _get_loaded(cand: Candidate) -> Callable:
-    key = (cand.solution.definition, cand.solution.name)
+def _get_loaded_solution(solution: Solution) -> Callable:
+    key = (solution.definition, solution.name)
     with _loaded_lock:
         cached = _loaded.get(key)
         if cached is not None:
@@ -203,7 +189,7 @@ def _get_loaded(cand: Candidate) -> Callable:
             cached = _loaded.get(key)
             if cached is not None:
                 return cached
-        fn = load_solution(cand.solution)
+        fn = load_solution(solution)
         with _loaded_lock:
             _loaded[key] = fn
         return fn
@@ -212,6 +198,31 @@ def _get_loaded(cand: Candidate) -> Callable:
 def reset_loaded() -> None:
     with _loaded_lock:
         _loaded.clear()
+
+
+# A resolved dispatch entry: (callable, dps, positional).
+_Entry = tuple
+
+
+def _resolve_entry(value: Any) -> _Entry:
+    """Resolve a ``solutions`` mapping value into ``(fn, dps, positional)``.
+
+    A plain Python callable is used directly (value-returning, keyword-called); a
+    first-class ``Solution`` is loaded via the loaders (its language family
+    decides positional-vs-keyword and destination-passing-style).
+    """
+    if isinstance(value, Solution):
+        fn = _get_loaded_solution(value)
+        return (
+            fn,
+            bool(value.spec.destination_passing_style),
+            not value.spec.is_python_family,
+        )
+    if callable(value):
+        return (value, False, False)
+    raise TypeError(
+        f"solutions values must be a callable or a Solution, got {type(value).__name__}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -226,59 +237,50 @@ def _make_wrapper(
     build_namespace: Callable[[tuple, dict], dict[str, Any]],
     extractor_maps: list,
     template: Any,
-    const_names: set[str],
     dests: dict,
-    activation: dict,
     is_inplace: bool,
-    index: Index,
-    policy: ApplyPolicy,
+    solutions_by_name: dict[str, Any],
 ) -> Callable:
-    """Thin wrapper around ``original`` routing to the registered solution.
+    """Wrapper that routes a call to a registered solution by *definition name*.
 
-    Routing key = the call's const axes + input dtypes (the definition identity);
-    var axes do not gate dispatch. Per-key decision is cached, so later calls for
-    the same shape are a dict lookup. Inside CUDA-graph capture only the cached
-    path runs."""
+    Per call: build the namespace, extract the const axes, compute this
+    template's definition name (``name_prefix`` + const-axis abbrevs — the same
+    logic the trace collector uses), and look it up in ``solutions_by_name``. The
+    per-name decision (resolved entry or miss) is cached, so later calls for the
+    same shape are a dict lookup. Inside CUDA-graph capture only the cached path
+    runs (eager warmup populates the cache before capture)."""
     cache_lock = Lock()
-    # cache key = (const-axes frozenset, input-dtypes frozenset)
-    by_key: dict[tuple, tuple[Callable, str, bool, bool] | None] = {}
+    by_name: dict[str, _Entry | None] = {}
 
     @functools.wraps(original)
     def wrapper(*args, **kwargs):
         try:
             namespace = build_namespace(args, kwargs)
             axes = extract_axes(extractor_maps, namespace)
-            dtypes = adapt.extract_input_dtypes(template, namespace)
+            name = template.definition_name(axes)
         except Exception:  # noqa: BLE001 — never let extraction break the engine
             return original(*args, **kwargs)
 
-        const_axes = {k: v for k, v in axes.items() if k in const_names}
-        key = (frozenset(const_axes.items()), dtypes)
         with cache_lock:
-            cached = by_key.get(key, _MISSING)
+            cached = by_name.get(name, _MISSING)
 
         if cached is _MISSING:
             if torch.cuda.is_current_stream_capturing():
-                # Cannot resolve/JIT inside capture; eager warmup populates the
-                # cache before capture.
                 bump_stat(fi_api, "fallback_unwarmed_in_capture")
                 return original(*args, **kwargs)
-            cached = _resolve_and_cache(
+            cached = _resolve_name(
                 fi_api=fi_api,
-                const_axes=const_axes,
-                input_dtypes=dtypes,
-                index=index,
-                policy=policy,
-                cache=by_key,
+                name=name,
+                solutions_by_name=solutions_by_name,
+                cache=by_name,
                 cache_lock=cache_lock,
-                key=key,
             )
 
         if cached is None:
             bump_stat(fi_api, "fallback_no_candidate")
             return original(*args, **kwargs)
 
-        fn, author, dps, positional = cached
+        fn, dps, positional = cached
         # Strict: a *matched* solution that raises is NOT masked by falling back.
         try:
             result = adapt.adapt_and_call(
@@ -288,11 +290,10 @@ def _make_wrapper(
                 dps=dps,
                 is_inplace=is_inplace,
                 dests=dests,
-                activation=activation,
                 positional=positional,
             )
         except Exception:
-            bump_stat(fi_api, "error", author)
+            bump_stat(fi_api, "error")
             _log.error(
                 "Trace Apply: applied solution for %s raised (strict mode → re-raising; "
                 "the registered solution is broken for these inputs).",
@@ -300,67 +301,52 @@ def _make_wrapper(
             )
             raise
 
-        bump_stat(fi_api, "hit", author)
+        bump_stat(fi_api, "hit")
         return result
 
-    wrapper._trace_apply = True  # type: ignore[attr-defined] — idempotency marker
+    # idempotency marker (so install() won't double-wrap)
+    wrapper._trace_apply = True  # type: ignore[attr-defined]
     return wrapper
 
 
-def _resolve_and_cache(
+def _resolve_name(
     *,
     fi_api: str,
-    const_axes: dict[str, int],
-    input_dtypes: frozenset,
-    index: Index,
-    policy: ApplyPolicy,
+    name: str,
+    solutions_by_name: dict[str, Any],
     cache: dict,
     cache_lock: Lock,
-    key: tuple,
-) -> tuple[Callable, str, bool, bool] | None:
-    sm = current_sm()
-    cand = lookup(index, fi_api, const_axes, input_dtypes, sm, policy)
-    if _DEBUG:
-        _log.info(
-            "Trace Apply [debug]: resolve %s sm=%s const_axes=%s dtypes=%s -> %s",
+) -> _Entry | None:
+    value = solutions_by_name.get(name)
+    if _log.isEnabledFor(logging.DEBUG):
+        _log.debug(
+            "Trace Apply: resolve %s name=%s -> %s",
             fi_api,
-            sm,
-            dict(sorted(const_axes.items())),
-            dict(sorted(input_dtypes)),
-            "HIT(" + cand.solution.name + ")" if cand else "miss",
+            name,
+            "HIT" if value is not None else "miss",
         )
-    if cand is None:
+    if value is None:
         with cache_lock:
-            cache[key] = None
+            cache[name] = None
         return None
+    _mark_fired(name)  # this registered solution actually matched a live call
     # Strict: a matched solution that fails to load/build is an error, not a miss.
     try:
-        fn = _get_loaded(cand)
+        entry = _resolve_entry(value)
     except Exception as e:
-        bump_stat(fi_api, "error", cand.solution.author)
+        bump_stat(fi_api, "error")
         raise RuntimeError(
-            f"Trace Apply: failed to load solution {cand.solution.name!r} "
-            f"(language={cand.solution.spec.language.value}) for {fi_api}: {e}"
+            f"Trace Apply: failed to load solution for definition {name!r} on {fi_api}: {e}"
         ) from e
-    positional = not cand.solution.spec.is_python_family
-    entry = (
-        fn,
-        cand.solution.author,
-        bool(cand.solution.spec.destination_passing_style),
-        positional,
-    )
     with cache_lock:
-        cache[key] = entry
+        cache[name] = entry
     if fi_api not in _logged_dispatch:
         _logged_dispatch.add(fi_api)
         _log.info(
-            "Trace Apply: applying solution %r (author=%s, lang=%s, dps=%s) for %s const_axes=%s",
-            cand.solution.name,
-            cand.solution.author,
-            cand.solution.spec.language.value,
-            entry[2],
+            "Trace Apply: applying solution for definition %r on %s (dps=%s).",
+            name,
             fi_api,
-            dict(sorted(const_axes.items())),
+            entry[2],
         )
     return entry
 
@@ -370,18 +356,22 @@ def _resolve_and_cache(
 # ---------------------------------------------------------------------------
 
 
-def _stateless_namespace_builder(bind_target: Callable) -> Callable[[tuple, dict], dict]:
+def _stateless_namespace_builder(
+    bind_target: Callable,
+) -> Callable[[tuple, dict], dict]:
     def build(args: tuple, kwargs: dict) -> dict:
         return bind_namespace(bind_target, args, kwargs)
 
     return build
 
 
-def _stateful_namespace_builder(bind_target: Callable, template: Any, adapter) -> Callable[[tuple, dict], dict]:
+def _stateful_namespace_builder(
+    bind_target: Callable, template: Any, adapter
+) -> Callable[[tuple, dict], dict]:
     def build(args: tuple, kwargs: dict) -> dict:
         ns = bind_namespace(bind_target, args, kwargs)
         self_obj = args[0] if args else None
-        return plan_state.augment_namespace(adapter, template, ns, self_obj)
+        return plan_capture.augment_namespace(adapter, template, ns, self_obj)
 
     return build
 
@@ -392,7 +382,7 @@ def _make_plan_wrapper(plan_original: Callable) -> Callable:
         try:
             bound = bind_namespace(plan_original, (self,) + args, kwargs)
             bound.pop("self", None)
-            plan_state.stash_plan_kwargs(self, bound)
+            plan_capture.stash_plan_kwargs(self, bound)
         except Exception:  # noqa: BLE001 — stashing must never break plan()
             _log.debug("Trace Apply: failed to stash plan kwargs", exc_info=True)
         return plan_original(self, *args, **kwargs)
@@ -407,6 +397,31 @@ def _is_inplace_api(original: Callable) -> bool:
         return inspect.signature(original).return_annotation is None
     except (TypeError, ValueError):
         return False
+
+
+def _derive_output_dests(template: Any, original: Callable) -> dict[str, str]:
+    """Output ``{name: destination API param}``: the trace-declared bindings plus
+    caller output buffers (``out=``/``lse=``) auto-derived from the live API
+    signature.
+
+    The trace only declares bindings that *can't* be derived (in-place writes,
+    e.g. ``fused_add_rmsnorm`` → ``input``/``residual``). The ``out=``/``lse=``
+    buffers, by contrast, are a uniform FlashInfer convention readable straight
+    off ``original``'s signature, so they're derived here rather than stored in
+    the trace. A trace ``param`` always wins (so a non-conventional buffer can be
+    declared explicitly)."""
+    dests = dict(adapt.output_dests(template))
+    sig = _signature(original)
+    if sig is None:
+        return dests
+    params = sig.parameters
+    for json_key in adapt._tensor_output_keys(template):
+        if json_key in dests:
+            continue
+        buf = "lse" if json_key == "lse" else "out"
+        if buf in params:
+            dests[json_key] = buf
+    return dests
 
 
 # ---------------------------------------------------------------------------
@@ -495,28 +510,94 @@ class _Patch:
 
 _patches: list[_Patch] = []
 _install_lock = Lock()
-_index: Index | None = None
-_policy: ApplyPolicy | None = None
+_solutions: dict[str, Any] = {}
+# Names registered in the current solutions map that have not yet matched a live
+# call (each is cleared as it fires). Surfaced on disable to catch silent no-ops.
+_unfired: set[str] = set()
+_unfired_lock = Lock()
 
 
-def enable_apply(path: str | None = None, policy: ApplyPolicy | None = None) -> int:
-    """Load the solution folder, build the routing table, and wrap every public
-    flashinfer API that has a registered solution for the running SM. Returns the
-    number of attributes wrapped. Idempotent (re-enabling re-reads the folder)."""
-    global _index, _policy
+def _mark_fired(name: str) -> None:
+    with _unfired_lock:
+        _unfired.discard(name)
+
+
+def _template_matches_any(template: Any, sol_map: dict[str, Any]) -> bool:
+    """True if some registered definition name could be produced by this template
+    (equals ``name_prefix``, or starts with ``name_prefix`` + ``'_'``). Used to
+    skip-wrap APIs that no registered solution can ever target."""
+    prefix = (
+        template.name_prefix if template.name_prefix is not None else template.op_type
+    )
+    if not prefix:
+        return False
+    return any(k == prefix or k.startswith(prefix + "_") for k in sol_map)
+
+
+def _solutions_from_env() -> dict[str, Any]:
+    """Load a ``{definition_name: Solution}`` mapping from ``FLASHINFER_TRACE_APPLY_PATH``.
+
+    Scans ``<path>/solutions/**/*.json`` (first-class Solution JSON) and keys each
+    by the definition it targets — one solution per definition (duplicate →
+    error). Returns ``{}`` if the path is unset or has no ``solutions/`` dir. This
+    is the entry used by deployments (and spawned worker processes) that configure
+    Trace Apply via the environment rather than an in-memory mapping."""
+    import json as _json
+    from pathlib import Path
+
+    path = os.environ.get(PATH_ENV)
+    if not path:
+        return {}
+    sols_dir = Path(path).expanduser() / "solutions"
+    if not sols_dir.is_dir():
+        return {}
+    out: dict[str, Any] = {}
+    for p in sorted(sols_dir.rglob("*.json")):
+        sol = Solution.from_dict(_json.loads(p.read_text(encoding="utf-8")))
+        if sol.definition in out:
+            raise ValueError(
+                f"Trace Apply: duplicate solution for definition {sol.definition!r} "
+                f"(in {p}); the folder must hold one solution per definition."
+            )
+        out[sol.definition] = sol
+    return out
+
+
+def enable_apply(solutions: dict[str, Any] | None = None) -> int:
+    """Substitute kernels at runtime, selected by definition name.
+
+    ``solutions`` maps a definition name (e.g. ``"rmsnorm_h1536"``) to either a
+    Python callable or a first-class :class:`~flashinfer.trace.Solution`. Every
+    public FlashInfer API whose template could produce one of those names is
+    wrapped; a call whose computed definition name is in the mapping dispatches
+    to the registered solution, otherwise it falls back to the original kernel.
+    Returns the number of attributes wrapped. Idempotent (re-enabling replaces
+    the previous mapping).
+
+    If ``solutions`` is ``None``, the environment configuration is used; if
+    nothing is configured this is a no-op.
+    """
+    global _solutions, _unfired
     with _install_lock:
         if _patches:
             _disable_locked()
-        config = load_config(path)
-        index = build_index(config)
-        pol = policy or ApplyPolicy()
+        if solutions is None:
+            solutions = _solutions_from_env()
+        sol_map = {str(k): v for k, v in dict(solutions).items()}
+        if not sol_map:
+            _log.info("Trace Apply: no solutions provided; nothing to apply.")
+            return 0
         registry = _registry_by_fi_api()
         alias_map = _build_alias_map()
 
         wrapped = 0
+        matched_apis = 0
         for fi_api, (original, templates) in registry.items():
-            if not index.has_candidates_for(fi_api):
-                continue  # skip-wrap: no registered solution for this API
+            template0 = templates[0] if templates else None
+            if template0 is None:
+                continue
+            if not _template_matches_any(template0, sol_map):
+                continue  # skip-wrap: no registered solution can target this API
             resolved = _resolve_target(fi_api)
             if resolved is None:
                 _log.debug("Trace Apply: cannot resolve target %s; skipping.", fi_api)
@@ -526,10 +607,9 @@ def enable_apply(path: str | None = None, policy: ApplyPolicy | None = None) -> 
             if getattr(current, "_trace_apply", False):
                 continue
 
+            matched_apis += 1
             extractor_maps = build_extractor_maps(templates)
-            template0 = templates[0] if templates else None
-
-            dests = adapt.output_dests(fi_api)
+            dests = _derive_output_dests(template0, original)
             is_inplace = _is_inplace_api(original)
             if is_inplace and not dests:
                 _log.warning(
@@ -539,14 +619,22 @@ def enable_apply(path: str | None = None, policy: ApplyPolicy | None = None) -> 
                 )
                 continue
 
-            if plan_state.is_stateful(fi_api):
-                adapter = plan_state.adapter_for(fi_api)
+            if plan_capture.is_stateful(fi_api):
+                adapter = plan_capture.adapter_for(fi_api)
                 build_ns = _stateful_namespace_builder(original, template0, adapter)
                 if hasattr(owner, adapter.plan_attr):
                     plan_current = getattr(owner, adapter.plan_attr)
                     if not getattr(plan_current, "_trace_apply", False):
-                        setattr(owner, adapter.plan_attr, _make_plan_wrapper(plan_current))
-                        _patches.append(_Patch(owner=owner, attr=adapter.plan_attr, original=plan_current))
+                        setattr(
+                            owner, adapter.plan_attr, _make_plan_wrapper(plan_current)
+                        )
+                        _patches.append(
+                            _Patch(
+                                owner=owner,
+                                attr=adapter.plan_attr,
+                                original=plan_current,
+                            )
+                        )
             else:
                 build_ns = _stateless_namespace_builder(original)
 
@@ -556,12 +644,9 @@ def enable_apply(path: str | None = None, policy: ApplyPolicy | None = None) -> 
                 build_namespace=build_ns,
                 extractor_maps=extractor_maps,
                 template=template0,
-                const_names=index.const_names(fi_api),
                 dests=dests,
-                activation=adapt.output_activation(fi_api),
                 is_inplace=is_inplace,
-                index=index,
-                policy=pol,
+                solutions_by_name=sol_map,
             )
             # Patch the canonical target + module-level aliases for the same
             # callable object (free functions only; methods have none).
@@ -576,12 +661,14 @@ def enable_apply(path: str | None = None, policy: ApplyPolicy | None = None) -> 
                 _patches.append(_Patch(owner=o, attr=a, original=current))
                 wrapped += 1
 
-        _index = index
-        _policy = pol
+        _solutions = sol_map
+        with _unfired_lock:
+            _unfired = set(sol_map)
         _log.info(
-            "Trace Apply: wrapped %d attributes for %d routed APIs.",
+            "Trace Apply: wrapped %d attributes across %d APIs for %d registered solution(s).",
             wrapped,
-            sum(1 for fi in registry if index.has_candidates_for(fi)),
+            matched_apis,
+            len(sol_map),
         )
         return wrapped
 
@@ -592,34 +679,39 @@ def disable_apply() -> None:
 
 
 def _disable_locked() -> None:
-    global _index, _policy
+    global _solutions, _unfired
     while _patches:
         p = _patches.pop()
         try:
             setattr(p.owner, p.attr, p.original)
         except Exception:  # noqa: BLE001
-            _log.warning("Trace Apply: failed to revert %s.%s", p.owner, p.attr, exc_info=True)
-    _index = None
-    _policy = None
+            _log.warning(
+                "Trace Apply: failed to revert %s.%s", p.owner, p.attr, exc_info=True
+            )
+    with _unfired_lock:
+        never = sorted(_unfired)
+        _unfired = set()
+    if never:
+        _log.warning(
+            "Trace Apply: %d registered solution(s) never matched a call: %s. "
+            "Check the definition names/shapes — these were NOT applied.",
+            len(never),
+            never,
+        )
+    _solutions = {}
     reset_loaded()
-    reset_stats()
+    _reset_stats()
 
 
 def is_enabled() -> bool:
     return bool(_patches)
 
 
-def get_index() -> Index | None:
-    return _index
-
-
-def get_policy() -> ApplyPolicy | None:
-    return _policy
-
-
-def enable_apply_from_env() -> None:
-    """Enable apply at import time if ``FLASHINFER_TRACE_APPLY=1``. Warning-only:
-    a bad config never makes ``import flashinfer`` fail."""
+def _enable_apply_from_env() -> None:
+    """Import-time hook: enable apply if ``FLASHINFER_TRACE_APPLY=1``, loading the
+    solutions from ``FLASHINFER_TRACE_APPLY_PATH``. Internal — called only by the
+    ``flashinfer`` package import. Warning-only: a bad config never makes
+    ``import flashinfer`` fail."""
     enabled = os.environ.get(ENABLE_ENV, "0")
     if enabled in ("", "0"):
         return
@@ -630,8 +722,13 @@ def enable_apply_from_env() -> None:
         )
         return
     try:
-        resolve_trace_path(None)  # validate FLASHINFER_TRACE_PATH is set
-        enable_apply()
+        n = enable_apply()  # solutions=None → loaded from the environment
+        if n == 0:
+            warnings.warn(
+                f"{ENABLE_ENV}=1 but no solutions were loaded from {PATH_ENV}; "
+                "set it to a curated solutions folder.",
+                stacklevel=2,
+            )
     except Exception as exc:  # noqa: BLE001
         warnings.warn(
             f"Failed to enable trace apply: {type(exc).__name__}: {exc}", stacklevel=2
@@ -639,14 +736,9 @@ def enable_apply_from_env() -> None:
 
 
 __all__ = [
-    "enable_apply",
-    "disable_apply",
-    "enable_apply_from_env",
-    "is_enabled",
-    "get_index",
-    "get_policy",
     "current_sm",
+    "disable_apply",
+    "enable_apply",
+    "is_enabled",
     "stats_snapshot",
-    "author_stats_snapshot",
-    "reset_stats",
 ]

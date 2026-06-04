@@ -208,7 +208,7 @@ if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "Fal
     try:
         from . import trace_apply as trace_apply
 
-        trace_apply.enable_apply_from_env()
+        trace_apply._enable_apply_from_env()
     except Exception as _trace_apply_err:  # noqa: BLE001
         import logging as _logging
 

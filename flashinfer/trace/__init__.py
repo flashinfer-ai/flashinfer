@@ -40,18 +40,18 @@ from .template import (
 )
 
 __all__ = [
-    "TraceTemplate",
-    "Var",
+    "_TRACE_DUMP_DIR",
+    "BuildSpec",
     "Const",
-    "Tensor",
     "Scalar",
     "Solution",
-    "BuildSpec",
     "SourceFile",
-    "SupportedLanguages",
     "SupportedBindings",
+    "SupportedLanguages",
+    "Tensor",
+    "TraceTemplate",
+    "Var",
     "default_check",
     "default_tolerances",
     "standard_check",
-    "_TRACE_DUMP_DIR",
 ]

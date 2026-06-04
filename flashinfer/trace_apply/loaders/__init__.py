@@ -35,4 +35,4 @@ def load(solution: Solution) -> Callable:
     return cpp.load(solution)
 
 
-__all__ = ["load", "python", "cpp"]
+__all__ = ["cpp", "load", "python"]

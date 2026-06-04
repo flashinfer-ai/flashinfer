@@ -57,6 +57,7 @@ _PYTHON_FAMILY = frozenset(
         SupportedLanguages.PYTHON,
         SupportedLanguages.TRITON,
         SupportedLanguages.CUTEDSL,
+        SupportedLanguages.CUTILE,
         SupportedLanguages.TILELANG,
     }
 )
@@ -100,7 +101,9 @@ class BuildSpec:
         try:
             language = SupportedLanguages(self.language)
         except ValueError as exc:
-            raise ValueError(f"Unsupported solution language: {self.language!r}") from exc
+            raise ValueError(
+                f"Unsupported solution language: {self.language!r}"
+            ) from exc
 
         if self.entry_point.count("::") != 1:
             raise ValueError(
@@ -115,7 +118,9 @@ class BuildSpec:
             try:
                 binding = SupportedBindings(self.binding)
             except ValueError as exc:
-                raise ValueError(f"Unsupported solution binding: {self.binding!r}") from exc
+                raise ValueError(
+                    f"Unsupported solution binding: {self.binding!r}"
+                ) from exc
 
         object.__setattr__(self, "language", language)
         object.__setattr__(self, "target_hardware", tuple(self.target_hardware))
@@ -247,6 +252,10 @@ class Solution:
             self.spec.language.value,
             self.spec.entry_point,
             self.spec.binding.value if self.spec.binding else "",
+            # Build-affecting spec fields: a different SM target or call ABI must
+            # not share a build-cache key with otherwise-identical sources.
+            *self.spec.target_hardware,
+            str(int(self.spec.destination_passing_style)),
             *self.spec.dependencies,
             *(item for s in sorted_sources for item in (s.path, s.content)),
         ):
@@ -267,9 +276,9 @@ class Solution:
 
 
 __all__ = [
-    "SupportedLanguages",
-    "SupportedBindings",
-    "SourceFile",
     "BuildSpec",
     "Solution",
+    "SourceFile",
+    "SupportedBindings",
+    "SupportedLanguages",
 ]

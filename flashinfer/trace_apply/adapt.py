@@ -31,34 +31,25 @@ from typing import Any, Callable
 
 import torch
 
-# OUTPUT_DESTS maps, per fi_api, each Definition output -> the API parameter
-# holding its destination buffer (an input tensor for in-place APIs; ``out=`` /
-# ``lse`` for value-returning ones). OUTPUT_ACTIVATION gates optional outputs by
-# a runtime flag (``lse`` is active only when ``return_lse=True``) so the
-# returned arity matches the API.
-OUTPUT_DESTS: dict[str, dict[str, str]] = {
-    "flashinfer.norm.rmsnorm": {"output": "out"},
-    "flashinfer.norm.fused_add_rmsnorm": {"output": "input", "residual": "residual"},
-    "flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run": {"output": "out", "lse": "lse"},
-    "flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.run": {"output": "out", "lse": "lse"},
-    "flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper.run": {"output": "out", "lse": "lse"},
-    "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run": {"output": "out", "lse": "lse"},
-}
-
-OUTPUT_ACTIVATION: dict[str, dict[str, str]] = {
-    "flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run": {"lse": "return_lse"},
-    "flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.run": {"lse": "return_lse"},
-    "flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper.run": {"lse": "return_lse"},
-    "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run": {"lse": "return_lse"},
-}
+# Output binding is read straight from the TraceTemplate's output descriptors —
+# no hardcoded per-API tables. ``param`` is the API parameter an output is
+# written into (an ``out=`` buffer, or an input buffer for in-place APIs).
+#
+# Data-dependent behavior (e.g. an ``lse`` output produced only when
+# ``return_lse=True``) is NOT modeled here: the runtime flag is passed to the
+# solution as an ordinary input and the solution returns the matching arity,
+# exactly like the real kernel. adapt_and_call is a transparent pass-through.
 
 
-def output_dests(fi_api: str) -> dict[str, str]:
-    return OUTPUT_DESTS.get(fi_api, {})
-
-
-def output_activation(fi_api: str) -> dict[str, str]:
-    return OUTPUT_ACTIVATION.get(fi_api, {})
+def output_dests(template: Any) -> dict[str, str]:
+    """``{output_name: destination API param}`` from the template's outputs.
+    Empty for pure value-returning APIs (no output declares a ``param``)."""
+    out: dict[str, str] = {}
+    for json_key, desc in template.outputs.items():
+        param = getattr(desc, "param", None)
+        if param:
+            out[json_key] = param
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +114,9 @@ def ordered_input_values(template: Any, namespace: dict[str, Any]) -> list[Any]:
     return out
 
 
-def extract_input_dtypes(template: Any, namespace: dict[str, Any]) -> frozenset[tuple[str, str]]:
+def extract_input_dtypes(
+    template: Any, namespace: dict[str, Any]
+) -> frozenset[tuple[str, str]]:
     """``{(input_name, dtype_str)}`` over **required tensor** inputs present in
     the call. Mirrors ``Definition.input_dtypes`` so the routing key matches.
 
@@ -163,7 +156,9 @@ def _tensor_output_keys(template: Any) -> list[str]:
     return [k for k, d in template.outputs.items() if isinstance(d, Tensor)]
 
 
-def _alloc_like(template: Any, json_key: str, namespace: dict[str, Any]) -> torch.Tensor:
+def _alloc_like(
+    template: Any, json_key: str, namespace: dict[str, Any]
+) -> torch.Tensor:
     """Best-effort output buffer allocation for a DPS solution when the caller
     provided none. Uses the output's ``dtype_from`` input."""
     desc = template.outputs[json_key]
@@ -184,29 +179,26 @@ def adapt_and_call(
     dps: bool,
     is_inplace: bool,
     dests: dict[str, str],
-    activation: dict[str, str] | None = None,
     positional: bool = False,
 ) -> Any:
     """Invoke the solution and reconcile its outputs with the API convention.
 
-    - value-returning: copy each returned output into its destination buffer
-      when one exists (``out=`` / in-place input).
-    - DPS: locate/allocate output buffers for the *active* outputs, pass them,
-      let the solution write them.
-    - ``activation`` gates optional outputs by a runtime flag (``lse`` active
-      only when ``return_lse=True``) so the returned arity matches the API.
-    - ``positional``: C++/CUDA (TVM-FFI) solutions take positional args
-      ``(inputs..., active outputs...)``; Python-family take keyword.
+    Transparent pass-through: any data-dependent behavior (e.g. ``return_lse``)
+    is the solution's responsibility — it receives the flag as an input and
+    returns the matching arity, just like the real kernel. We only bind outputs
+    to their destination buffers and return the same arity the solution produced.
+
+    - value-returning: ``fn`` returns one value or a tuple; each is copied into
+      its destination buffer (``out=`` / in-place input) when one exists, and the
+      same arity is returned.
+    - DPS: pass output buffers (caller-provided, else allocated) for every
+      non-optional output plus any optional output the caller supplied a buffer
+      for; the solution writes them; return them.
+    - ``positional``: C++/CUDA (TVM-FFI) solutions take positional args; Python
+      take keyword.
     Returns ``None`` for in-place APIs, else the (single or tuple) output value.
     """
-    activation = activation or {}
     out_keys = _tensor_output_keys(template)
-
-    def is_active(json_key: str) -> bool:
-        flag = activation.get(json_key)
-        return True if flag is None else bool(namespace.get(flag))
-
-    active_keys = [jk for jk in out_keys if is_active(jk)]
 
     def dest_buf(json_key: str):
         param = dests.get(json_key)
@@ -216,55 +208,51 @@ def adapt_and_call(
         return b if isinstance(b, torch.Tensor) else None
 
     if dps:
+        # Materialize non-optional outputs always; optional outputs only when the
+        # caller supplied a destination buffer for them.
         out_bufs: dict[str, Any] = {}
-        for jk in active_keys:
+        for jk in out_keys:
             buf = dest_buf(jk)
-            out_bufs[jk] = buf if buf is not None else _alloc_like(template, jk, namespace)
+            if buf is None:
+                if getattr(template.outputs[jk], "optional", False):
+                    continue
+                buf = _alloc_like(template, jk, namespace)
+            out_bufs[jk] = buf
         if positional:
-            fn(*ordered_input_values(template, namespace), *[out_bufs[jk] for jk in active_keys])
+            fn(*ordered_input_values(template, namespace), *out_bufs.values())
         else:
             fn(**build_candidate_kwargs(template, namespace), **out_bufs)
-        produced_active: list[Any] = [out_bufs[jk] for jk in active_keys]
+        produced = list(out_bufs.values())
     else:
         if positional:
             ret = fn(*ordered_input_values(template, namespace))
         else:
             ret = fn(**build_candidate_kwargs(template, namespace))
-        produced = list(ret) if isinstance(ret, (tuple, list)) else [ret]
-        # Map solution outputs to template outputs by position; copy into any
-        # destination buffer; collect the active subset for the return value.
-        produced_active = []
-        for i, jk in enumerate(out_keys):
-            val = produced[i] if i < len(produced) else None
-            if val is not None:
-                buf = dest_buf(jk)
-                if buf is not None and isinstance(val, torch.Tensor) and val.data_ptr() != buf.data_ptr():
+        values = list(ret) if isinstance(ret, (tuple, list)) else [ret]
+        # Copy each returned value into its destination buffer (if any); keep the
+        # solution's own arity as the returned arity.
+        produced = []
+        for i, val in enumerate(values):
+            if i < len(out_keys) and isinstance(val, torch.Tensor):
+                buf = dest_buf(out_keys[i])
+                if buf is not None and val.data_ptr() != buf.data_ptr():
                     buf.copy_(val)
                     val = buf
-            if jk in active_keys:
-                produced_active.append(val)
-        if any(v is None for v in produced_active):
-            missing = [jk for jk, v in zip(active_keys, produced_active) if v is None]
-            raise RuntimeError(
-                f"Trace Apply: solution did not return required active output(s) {missing}."
-            )
+            produced.append(val)
 
     if is_inplace:
         return None
-    if not produced_active:
+    if not produced:
         return None
-    if len(produced_active) == 1:
-        return produced_active[0]
-    return tuple(produced_active)
+    if len(produced) == 1:
+        return produced[0]
+    return tuple(produced)
 
 
 __all__ = [
-    "OUTPUT_DESTS",
-    "OUTPUT_ACTIVATION",
-    "output_dests",
-    "output_activation",
-    "build_candidate_kwargs",
-    "ordered_input_values",
-    "extract_input_dtypes",
     "adapt_and_call",
+    "build_candidate_kwargs",
+    "extract_input_dtypes",
+    "ordered_input_values",
+    "output_dests",
 ]

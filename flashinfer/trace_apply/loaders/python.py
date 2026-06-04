@@ -72,10 +72,10 @@ def materialize(solution: Solution) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         # Only (re)write when content differs, via a temp file + os.replace so
         # concurrent readers never observe a partial write.
-        if not target.exists() or target.read_text() != src.content:
+        if not target.exists() or target.read_text(encoding="utf-8") != src.content:
             fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
             try:
-                with os.fdopen(fd, "w") as f:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(src.content)
                 os.replace(tmp, target)
             except BaseException:
@@ -100,7 +100,12 @@ def load(solution: Solution) -> Callable:
         raise ImportError(f"Could not build import spec for {entry_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        # Don't leave a partially-initialized module behind on import failure.
+        sys.modules.pop(module_name, None)
+        raise
     if not hasattr(module, func_part):
         raise AttributeError(
             f"Solution {solution.name!r} entry-point missing function {func_part!r}"
