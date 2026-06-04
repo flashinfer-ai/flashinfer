@@ -1457,29 +1457,35 @@ def tgv_gemm_sm100(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    Perform TGV GEMM on SM100 architecture with automatic dtype detection.
+    r"""Perform TGV GEMM on SM100 architecture with automatic dtype detection.
 
-    Computes: A @ B + bias
+    Computes ``out = a @ b + bias``.  Both ``a`` and ``b`` must share the same
+    floating-point dtype (``torch.bfloat16`` or ``torch.float16``).
 
-    Args:
-        a: First input tensor of shape (M, K) in row-major layout
-        b: Second input tensor of shape (K, N) in column-major layout
-        bias: Bias tensor of shape (N,)
-        pdl: Whether to use PDL (persistent data loader), defaults to False
-        out: Optional output tensor, shape (M, N), defaults to None.
+    Parameters
+    ----------
+    a : torch.Tensor
+        First input tensor of shape ``(M, K)`` in row-major layout.
+    b : torch.Tensor
+        Second input tensor of shape ``(K, N)`` in column-major layout
+        (transposed from the typical PyTorch row-major convention).
+    bias : torch.Tensor
+        Bias tensor of shape ``(N,)`` to add to each row of ``a @ b``.
+    pdl : bool
+        Whether to use PDL (Programmatic Dependent Launch).  Defaults to ``False``.
+    out : Optional[torch.Tensor]
+        Pre-allocated output tensor of shape ``(M, N)``.  If ``None``, a new
+        tensor is allocated.
 
-    Returns:
-        Output tensor of shape (M, N) in row-major layout
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape ``(M, N)`` in row-major layout.
 
-    Supported dtypes:
-        - torch.bfloat16
-        - torch.float16
-
-    Note:
-        - Requires SM100, SM103, or SM110 architecture
-        - Input tensors a and b must have the same dtype
-        - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
+    Notes
+    -----
+    Requires SM100 or SM103 architecture.  Supported dtypes are
+    ``torch.bfloat16`` and ``torch.float16``.
     """
     # Verify SM100 architecture support
     if not _match_sm_version(a.device, ["100", "103"]):
@@ -1800,8 +1806,15 @@ class SegmentGEMMWrapper:
         Parameters
         ----------
         float_workspace_buffer : torch.Tensor
-            The workspace buffer for the kernels, we use it for storing intermediate results in cutlass
-            segment GEMM kernels. Encouraged size is 128MB.
+            The workspace buffer for the kernels, we use it for storing intermediate
+            results in cutlass segment GEMM kernels.  Encouraged size is 128 MiB.
+        backend : str
+            Backend selector.  ``"auto"`` (default) lets the runtime pick the best
+            available implementation (CUTLASS Hopper if available, otherwise the
+            Ampere-compatible kernel).  Explicit values are ``"sm80"`` for the
+            SM80/Ampere CUTLASS path and ``"sm90"`` for the SM90 Hopper
+            specialization (see :func:`run` dispatch in
+            ``flashinfer/gemm/gemm_base.py``).
         """
         self._int_workspace_buffer = torch.empty(
             (1024 * 1024,), dtype=torch.int8, device=float_workspace_buffer.device
@@ -6926,8 +6939,36 @@ def gemm_fp8_nt_blockscaled(
 ) -> torch.Tensor:
     r"""Performs matrix multiplication with FP8 data types using block-scaled scaling.
 
-    Block-scaled scaling is a special case of groupwise scaling where the scale granularity
-    is (128, 128, 128).
+    Block-scaled scaling is a special case of groupwise scaling where the scale
+    granularity is ``(128, 128, 128)``.  See :func:`gemm_fp8_nt_groupwise` for the
+    semantics of each parameter.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        FP8 input tensor.  Shape ``(M, K)``.
+    b : torch.Tensor
+        FP8 input tensor (transposed weight).  Shape ``(N, K)``.
+    a_scale : torch.Tensor
+        FP32 block-scale tensor for ``a``, layout determined by ``scale_major_mode``.
+    b_scale : torch.Tensor
+        FP32 block-scale tensor for ``b``, layout determined by ``scale_major_mode``.
+    scale_major_mode : Optional[Literal["MN", "K"]]
+        Storage order for the scale tensors.  ``"MN"`` (default) places the
+        non-contracted dimension in the major direction; ``"K"`` places the
+        contracted dimension in the major direction.
+    mma_sm : int
+        Number of SMs to fuse per MMA (``1`` or ``2``).  Defaults to ``1``.
+    out : Optional[torch.Tensor]
+        Pre-allocated output tensor of shape ``(M, N)``.  If ``None``, a new tensor
+        is allocated.
+    out_dtype : Optional[torch.dtype]
+        Output data type.  Defaults to ``torch.bfloat16``.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape ``(M, N)`` with dtype ``out_dtype``.
     """
     return gemm_fp8_nt_groupwise(
         a,
@@ -7539,8 +7580,9 @@ def group_gemm_nvfp4_nt_groupwise(
     tile_k: int
         The tile size for the K dimension, must be 128 or 256.
 
-    swap_ab:
-        Whether to compute ``Output^T = Weight^T Activation^T`` instead of ``Output = Activation Weight``.
+    swap_ab : bool
+        Whether to compute ``Output^T = Weight^T Activation^T`` instead of
+        ``Output = Activation Weight``.  Defaults to ``True``.
 
     out: Optional[torch.Tensor]
         The output tensor, shape ``(cum_m, n)``. If not specified, we will create an output tensor explicitly.
