@@ -1030,6 +1030,45 @@ def single_prefill_with_kv_cache_with_jit_module(
     window_left: int = -1,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    r"""Single-request prefill / append attention using a pre-compiled JIT module.
+
+    Low-level entry point used by :func:`single_prefill_with_kv_cache` after backend
+    dispatch; user code should normally call ``single_prefill_with_kv_cache`` directly.
+    Exposed for advanced users who already hold a compiled JIT module (for example to
+    customize the attention variant via extra kernel arguments).
+
+    Parameters
+    ----------
+    jit_module : Any
+        Compiled JIT module returned by one of the ``gen_*_module`` factories.
+    q : torch.Tensor
+        Query tensor, shape ``[qo_len, num_qo_heads, head_dim_qk]``.
+    k : torch.Tensor
+        Key tensor, shape ``[kv_len, num_kv_heads, head_dim_qk]`` (``NHD``) or
+        ``[num_kv_heads, kv_len, head_dim_qk]`` (``HND``).
+    v : torch.Tensor
+        Value tensor, layout matches ``k``; last dimension may differ when
+        ``head_dim_vo != head_dim_qk``.
+    *args
+        Extra positional arguments forwarded to the JIT module's ``run`` symbol
+        (e.g. soft-cap, sink, or custom-mask buffers required by the chosen variant).
+    kv_layout : str
+        Layout of ``k`` and ``v``, either ``"NHD"`` or ``"HND"``.  Defaults to ``"NHD"``.
+    mask_mode : int
+        Mask mode, one of the values defined by :class:`~flashinfer.utils.MaskMode`.
+        Defaults to ``MaskMode.NON_CAUSAL.value``.
+    window_left : int
+        Left window size for sliding-window attention; ``-1`` disables it.
+    return_lse : bool
+        Whether to allocate and return the log-sum-exp tensor.  Defaults to ``False``.
+
+    Returns
+    -------
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If ``return_lse`` is ``False``, the attention output tensor.  Otherwise the
+        ``(output, lse)`` pair, where ``lse`` has shape
+        ``[qo_len, num_qo_heads]`` and dtype ``float32``.
+    """
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
@@ -1384,6 +1423,21 @@ def single_prefill_with_kv_cache(
 single_prefill_with_kv_cache_return_lse = functools.partial(
     single_prefill_with_kv_cache, return_lse=True
 )
+single_prefill_with_kv_cache_return_lse.__doc__ = """Convenience wrapper for :func:`single_prefill_with_kv_cache` that always returns LSE.
+
+    Equivalent to calling
+    :func:`single_prefill_with_kv_cache` with ``return_lse=True``; accepts the
+    same arguments and forwards them unchanged. See
+    :func:`single_prefill_with_kv_cache` for the full parameter list (including
+    FP8 / NVFP4 quantization scales such as ``scale_q``, ``scale_k``,
+    ``scale_v``, ``o_dtype``, ``kv_cache_sf``, ``k_scale``, and ``v_scale``).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        A pair ``(output, lse)`` where ``output`` is the attention output and
+        ``lse`` is the log-sum-exp tensor used for cascade merging.
+    """
 
 
 def _compute_page_mask_indptr(
@@ -2237,6 +2291,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        window_left : Optional[int]
+            Per-call override for the left (inclusive) sliding-window size.  When
+            ``None``, the value supplied to :meth:`plan` is used.  Pass ``-1`` to
+            disable the sliding window for this call.
+        sinks : Optional[torch.Tensor]
+            Per-head attention-sink logits.  When provided, the kernel applies the
+            attention-with-sink variant: an additional virtual token whose logit is
+            ``sinks[head_idx]`` is appended to each row of the softmax denominator.
+            Shape: ``[num_qo_heads]``, dtype ``float32``.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV cache. Accepts the same formats as
             ``paged_kv_cache``:
@@ -2259,6 +2322,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             to HND internally (incurring a copy). Use ``HND`` for better performance.
 
             Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+        skip_softmax_threshold_scale_factor : Optional[float]
+            Threshold scale factor for skipping softmax operations.  Providing a
+            value enables skip-softmax sparsity as described in
+            https://arxiv.org/abs/2512.12087.  Defaults to ``None`` (standard
+            attention).  Higher values yield faster kernels at the cost of accuracy;
+            the effective threshold equals the supplied factor divided by the
+            context length.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -3291,6 +3361,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
+            Per-block scale factors for NVFP4 KV input.  Accepts either a single
+            packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
+            structure expected by the chosen backend.  When ``None`` (default), the
+            kernel runs without NVFP4 KV scaling.  See
+            :func:`flashinfer.fp4_quantization.nvfp4_quantize` for layout details.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -3821,6 +3897,10 @@ def trtllm_ragged_attention_deepseek(
         enable pdl
     is_causal : bool
         is causal
+    return_lse : bool
+        Whether to allocate and return the log-sum-exp tensor in addition to the
+        attention output.  When ``True`` the function returns
+        ``(out, lse)``; when ``False`` only ``out`` is returned.
     attention_sinks : Optional[torch.Tensor]
         attention sinks
     skip_softmax_threshold_scale_factor : Optional[float]
@@ -3833,6 +3913,16 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+    sage_attn_sfs : Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]
+        SageAttention scale-factor tensors for the four sub-blocks
+        ``(q_sf, k_sf, v_block_sum, p_block_sum)``.  Defaults to ``(None, None,
+        None, None)`` which disables SageAttention.  Currently only consulted by
+        the ``trtllm-gen`` backend.
+    num_elts_per_sage_attn_blk : Tuple[int, int, int, int]
+        Per-block element counts for the SageAttention scale-factor tensors,
+        matching the order of ``sage_attn_sfs``.  Defaults to ``(0, 0, 0, 0)``,
+        which disables SageAttention.  Only consulted when ``sage_attn_sfs``
+        contains non-``None`` tensors.
     backend : str
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
 
