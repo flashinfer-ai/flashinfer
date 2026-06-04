@@ -247,9 +247,7 @@ def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
     return permute(x)
 
 
-def convert_to_block_layout(
-    input_tensor: torch.Tensor, blockK: int
-) -> torch.Tensor:
+def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Tensor:
     r"""Reshape a 2-D tensor into a 3-D block layout.
 
     Splits the inner ``K`` dimension into ``K // blockK`` blocks of size
