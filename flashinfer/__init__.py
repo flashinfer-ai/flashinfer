@@ -88,6 +88,7 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
 # CuteDSL MoE high-level APIs (conditionally if cute_dsl available)
