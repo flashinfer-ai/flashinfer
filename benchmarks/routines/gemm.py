@@ -1375,8 +1375,11 @@ def testMmW4A16Fp4(args):
         raise ValueError(
             f"mm_w4a16_fp4 benchmark requires out_dtype in (bfloat16, float16), got {args.out_dtype}"
         )
-    if n % 128 != 0:
-        raise ValueError("mm_w4a16_fp4 benchmark requires n % 128 == 0 (SF swizzle)")
+    if n % 64 != 0:
+        # The real constraint is the Marlin tile width (_MARLIN_TILE_N=64);
+        # the 128x4 SF swizzle only *pads* N to 128, and prepare_w4a16_fp4_weights
+        # unswizzles the padded tail, so any n % 64 == 0 works.
+        raise ValueError("mm_w4a16_fp4 benchmark requires n % 64 == 0 (Marlin tile N)")
     if k % 16 != 0:
         raise ValueError("mm_w4a16_fp4 benchmark requires k % 16 == 0 (FP4 block size)")
 
