@@ -1423,8 +1423,7 @@ def single_prefill_with_kv_cache(
 single_prefill_with_kv_cache_return_lse = functools.partial(
     single_prefill_with_kv_cache, return_lse=True
 )
-single_prefill_with_kv_cache_return_lse.__doc__ = (
-    """Convenience wrapper for :func:`single_prefill_with_kv_cache` that always returns LSE.
+single_prefill_with_kv_cache_return_lse.__doc__ = """Convenience wrapper for :func:`single_prefill_with_kv_cache` that always returns LSE.
 
     Equivalent to calling
     :func:`single_prefill_with_kv_cache` with ``return_lse=True``; accepts the
@@ -1439,7 +1438,6 @@ single_prefill_with_kv_cache_return_lse.__doc__ = (
         A pair ``(output, lse)`` where ``output`` is the attention output and
         ``lse`` is the log-sum-exp tensor used for cascade merging.
     """
-)
 
 
 def _compute_page_mask_indptr(
