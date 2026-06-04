@@ -1952,6 +1952,41 @@ def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def cvt_e4m3_to_f16x2_broadcast(fp8_val: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Convert one E4M3 byte to f16 and broadcast it to both lanes of an f16x2.
+
+    ``cvt.rn.f16x2.e4m3x2`` converts the low byte to f16 in the low lane;
+    ``prmt`` (selector 0x1010) then copies that f16 (bytes 0-1) into both
+    halves, giving an f16x2 with both lanes equal to ``f16(byte)`` in 3
+    instructions.  Replaces the ``cvt_e4m3_to_f32_via_f16`` +
+    ``f16x2_pack_broadcast`` pair (which detoured through f32 only to
+    fold in ``alpha``); when ``alpha`` is applied once in the epilogue
+    the scale never needs an f32 representation.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 fp8_pair;
+                .reg .b32 h2;
+                cvt.u16.u32 fp8_pair, $1;
+                cvt.rn.f16x2.e4m3x2 h2, fp8_pair;
+                prmt.b32 $0, h2, 0, 0x1010;
+            }
+            """,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def fp4_decode_4bytes(
     packed_u32: Uint32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:

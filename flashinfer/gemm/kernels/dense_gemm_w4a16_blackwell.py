@@ -41,9 +41,11 @@ The B fragment is filled in-register by:
      ``flashinfer/gemm/marlin_repack.py`` for the layout).
   2. Decoding each ``int32`` via ``cvt.rn.f16x2.e2m1x2`` -> 4 ``fp16x2``
      (= 8 fp16) using ``fp4_decode_4bytes``.
-  3. Multiplying each pair by its per-group E4M3 scale (gmem-direct
-     load, converted via ``cvt_e4m3_to_f32_via_f16``) and the scalar
-     ``alpha``.
+  3. Multiplying each pair by its per-group E4M3 scale (loaded from
+     SMEM, converted to an f16x2 broadcast via
+     ``cvt_e4m3_to_f16x2_broadcast``).  The global scalar ``alpha`` is
+     *not* folded in here -- it is applied once to the fp32 accumulator
+     in the epilogue.
   4. Casting back to the compute dtype and writing into ``tCrB``.
 
 Everything else (TMA pipeline for A, persistent tile scheduler,
@@ -62,6 +64,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Float32, Int32, Uint32
 
 from ...cute_dsl.fp4_common import (
+    cvt_e4m3_to_f16x2_broadcast,
     cvt_e4m3_to_f32_via_f16,
     f16x2_to_f32x2,
     fp4_decode_4bytes,
@@ -133,30 +136,6 @@ def f16x2_unpack(
     return (
         Float16(llvm.extractvalue(T.f16(), res, [0], loc=loc, ip=ip)),
         Float16(llvm.extractvalue(T.f16(), res, [1], loc=loc, ip=ip)),
-    )
-
-
-@dsl_user_op
-def f16x2_pack_broadcast(v: Float32, *, loc=None, ip=None) -> Uint32:
-    """Broadcast a single fp32 value to both lanes of an fp16x2 register."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(v).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .b16 h;
-                cvt.rn.f16.f32 h, $1;
-                mov.b32 $0, {h, h};
-            }
-            """,
-            "=r,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
     )
 
 
@@ -827,7 +806,6 @@ class BlackwellDenseGemmW4A16Kernel:
                         sB_marlin,
                         sB_sf,
                         tCrB,
-                        alpha_val,
                         tidx,
                         mainloop_consumer_state.index,
                         mainloop_consumer_state.count,
@@ -861,7 +839,6 @@ class BlackwellDenseGemmW4A16Kernel:
                                 sB_marlin,
                                 sB_sf,
                                 tCrB,
-                                alpha_val,
                                 tidx,
                                 mainloop_consumer_state.index,
                                 mainloop_consumer_state.count,
@@ -932,7 +909,6 @@ class BlackwellDenseGemmW4A16Kernel:
                                 sB_marlin,
                                 sB_sf,
                                 tCrB,
-                                alpha_val,
                                 tidx,
                                 mainloop_consumer_state.index,
                                 mainloop_consumer_state.count,
@@ -973,7 +949,6 @@ class BlackwellDenseGemmW4A16Kernel:
                             sB_marlin,
                             sB_sf,
                             tCrB,
-                            alpha_val,
                             tidx,
                             mainloop_consumer_state.index,
                             mainloop_consumer_state.count,
@@ -1015,7 +990,6 @@ class BlackwellDenseGemmW4A16Kernel:
                                 sB_marlin,
                                 sB_sf,
                                 tCrB,
-                                alpha_val,
                                 tidx,
                                 mainloop_consumer_state.index,
                                 mainloop_consumer_state.count,
@@ -1148,8 +1122,12 @@ class BlackwellDenseGemmW4A16Kernel:
                                 tRS_rD_out = cute.make_rmem_tensor(
                                     tRS_rD_layout.shape, self.c_dtype
                                 )
+                                # Apply the global alpha here, once, on the
+                                # fp32 accumulator (hoisted out of the
+                                # per-K-block dequant): one rounding instead
+                                # of folding alpha into every B scale.
                                 acc_vec = tRS_rD.load()
-                                tRS_rD_out.store(acc_vec.to(self.c_dtype))
+                                tRS_rD_out.store((alpha_val * acc_vec).to(self.c_dtype))
 
                                 epi_buffer = kept_count % cute.size(tRS_sD, mode=[3])
                                 if cutlass.const_expr(
@@ -1450,7 +1428,6 @@ class BlackwellDenseGemmW4A16Kernel:
         sB_marlin: cute.Tensor,
         sB_sf: cute.Tensor,
         tCrB: cute.Tensor,
-        alpha_val: Float32,
         tidx: Int32,
         stage_idx: Int32,
         k_tile_idx: Int32,
@@ -1528,15 +1505,13 @@ class BlackwellDenseGemmW4A16Kernel:
             h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
             h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
 
-            scale_n0_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_0) * alpha_val
-            scale_n1_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_1) * alpha_val
-            scale_n2_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_2) * alpha_val
-            scale_n3_f32 = cvt_e4m3_to_f32_via_f16(sf_byte_3) * alpha_val
-
-            sc_n0 = f16x2_pack_broadcast(scale_n0_f32)
-            sc_n1 = f16x2_pack_broadcast(scale_n1_f32)
-            sc_n2 = f16x2_pack_broadcast(scale_n2_f32)
-            sc_n3 = f16x2_pack_broadcast(scale_n3_f32)
+            # Per-group E4M3 scale -> f16x2 broadcast directly (3 PTX ops,
+            # no f32 detour).  The global ``alpha`` is applied once to the
+            # fp32 accumulator in the epilogue, not folded into each scale.
+            sc_n0 = cvt_e4m3_to_f16x2_broadcast(sf_byte_0)
+            sc_n1 = cvt_e4m3_to_f16x2_broadcast(sf_byte_1)
+            sc_n2 = cvt_e4m3_to_f16x2_broadcast(sf_byte_2)
+            sc_n3 = cvt_e4m3_to_f16x2_broadcast(sf_byte_3)
 
             if cutlass.const_expr(self.use_fp16_mma == 1):
                 # fp16-MMA path: scaled_h2 (f16x2) -> 2 fp16 -> tCrB.
@@ -1573,10 +1548,12 @@ class BlackwellDenseGemmW4A16Kernel:
         h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
         h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
 
-        scale_n0 = cvt_e4m3_to_f32_via_f16(sf_byte_0) * alpha_val
-        scale_n1 = cvt_e4m3_to_f32_via_f16(sf_byte_1) * alpha_val
-        scale_n2 = cvt_e4m3_to_f32_via_f16(sf_byte_2) * alpha_val
-        scale_n3 = cvt_e4m3_to_f32_via_f16(sf_byte_3) * alpha_val
+        # alpha applied once on the fp32 accumulator in the epilogue (not
+        # folded per-scale); these are the raw per-group E4M3 scales in f32.
+        scale_n0 = cvt_e4m3_to_f32_via_f16(sf_byte_0)
+        scale_n1 = cvt_e4m3_to_f32_via_f16(sf_byte_1)
+        scale_n2 = cvt_e4m3_to_f32_via_f16(sf_byte_2)
+        scale_n3 = cvt_e4m3_to_f32_via_f16(sf_byte_3)
 
         def _write_pair(h2, scale, mma_i_low, nn):
             f_lo, f_hi = f16x2_to_f32x2(h2)
