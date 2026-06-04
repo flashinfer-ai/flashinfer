@@ -16,10 +16,12 @@ import torch
 
 import flashinfer
 from flashinfer.gemm.gemm_w4a16 import (
+    _CUDNN_W4A16_MIN_BACKEND_VERSION,
     _dequantize_w4a16_fp4_torch,
     mm_w4a16_fp4,
     prepare_w4a16_fp4_weights,
 )
+from flashinfer.utils import get_compute_capability
 
 
 # =============================================================================
@@ -29,19 +31,45 @@ from flashinfer.gemm.gemm_w4a16 import (
 
 # Backends covered by the cross-backend contract tests.  Real backends
 # (cute-dsl, ...) get appended here as they land.
-ALL_BACKENDS = ["torch", "cudnn"]
+ALL_BACKENDS = ["torch", "cudnn", "cute-dsl"]
 
 
 # Each backend consumes a specific SF layout (see ``is_sf_swizzled`` on
 # ``mm_w4a16_fp4``): the torch reference unswizzles internally so it needs
 # the canonical 128x4-swizzled SF, while cuDNN requires a non-swizzled
-# (linear) SF.  ``prepare_w4a16_fp4_weights`` already emits the right
-# layout per backend; this maps the matching ``is_sf_swizzled`` flag.
-_IS_SF_SWIZZLED = {"torch": True, "cudnn": False}
+# (linear) SF.  The cute-DSL backend takes a fully bespoke layout produced
+# by ``prepare_w4a16_fp4_weights`` and ignores the flag.
+# ``prepare_w4a16_fp4_weights`` already emits the right layout per backend;
+# this maps the matching ``is_sf_swizzled`` flag.
+_IS_SF_SWIZZLED = {"torch": True, "cudnn": False, "cute-dsl": False}
 
 
 def _sf_swizzled(backend: str) -> bool:
     return _IS_SF_SWIZZLED[backend]
+
+
+def _skip_if_backend_unavailable(backend: str) -> None:
+    """Skip the current test if ``backend`` can't run on this device.
+
+    Gates on compute-capability support (via the ``@backend_requirement``
+    introspection) plus runtime availability that the cc check doesn't
+    cover -- notably the cuDNN W4A16 minimum backend version.
+    """
+    device = torch.device("cuda")
+    cc = get_compute_capability(device)
+    cc_number = cc[0] * 10 + cc[1]
+    if not mm_w4a16_fp4.is_backend_supported(backend, cc_number):
+        pytest.skip(f"{backend} not supported on compute capability {cc_number}")
+    if backend == "cudnn":
+        try:
+            import cudnn
+        except ImportError:
+            pytest.skip("cuDNN not available")
+        if cudnn.backend_version() < _CUDNN_W4A16_MIN_BACKEND_VERSION:
+            pytest.skip(
+                f"cuDNN W4A16 needs backend >= {_CUDNN_W4A16_MIN_BACKEND_VERSION}, "
+                f"found {cudnn.backend_version()}"
+            )
 
 
 # (M, N, K) grid for numerical correctness.  Biased toward small M
@@ -91,12 +119,41 @@ RTOL = 5e-3
 
 _BACKEND_TOL = {
     "torch": {"atol": 5e-3, "rtol": 5e-3},
+    # cute-dsl, like cudnn, dequantizes the FP4 weight to bf16 before the
+    # tensor-core matmul, so it carries ~1 bf16 ULP of weight rounding vs
+    # the fp32 reference -- same tolerance budget as cudnn.
     "cudnn": {"atol": 1.5e-2, "rtol": 1.5e-2},
+    "cute-dsl": {"atol": 1.5e-2, "rtol": 1.5e-2},
 }
 
 
 def _tol(backend: str) -> dict:
     return _BACKEND_TOL.get(backend, {"atol": ATOL, "rtol": RTOL})
+
+
+def _assert_close_to_reference(out: torch.Tensor, ref: torch.Tensor, backend: str):
+    """Compare a backend's output against the fp32-accurate reference.
+
+    The ``torch`` backend runs the exact same fp32 dequant + matmul as the
+    reference, so it is checked elementwise to a tight tolerance.  The
+    ``cudnn`` / ``cute-dsl`` backends dequantize the FP4 weight to bf16
+    before a bf16 tensor-core matmul, so a handful of large-magnitude
+    output elements carry bf16 rounding that exceeds any sane elementwise
+    bound at large K.  For those we validate the relative L2-norm of the
+    error (catches decorrelation *and* scale/alpha bugs -- cosine alone is
+    scale-invariant) together with cosine similarity, mirroring
+    ``tests/gemm/test_mm_fp4.py``.
+    """
+    if backend == "torch":
+        torch.testing.assert_close(out, ref, **_tol(backend))
+        return
+    out_f = out.float().reshape(-1)
+    ref_f = ref.float().reshape(-1)
+    ref_norm = torch.linalg.vector_norm(ref_f).clamp_min(1e-6)
+    rel_l2 = (torch.linalg.vector_norm(out_f - ref_f) / ref_norm).item()
+    cos = torch.nn.functional.cosine_similarity(out_f, ref_f, dim=0).item()
+    assert rel_l2 < 2e-2, f"{backend}: relative L2 error {rel_l2:.4f} exceeds 2e-2"
+    assert cos > 0.999, f"{backend}: cosine similarity {cos:.6f} below 0.999"
 
 
 # =============================================================================
@@ -153,6 +210,7 @@ def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
     is expected to produce numerically equivalent output (up to ~1 bf16
     ULP).
     """
+    _skip_if_backend_unavailable(backend)
     device = torch.device("cuda")
     torch.manual_seed(0)
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
@@ -166,7 +224,7 @@ def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
     weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
     ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
 
-    torch.testing.assert_close(out, ref, **_tol(backend))
+    _assert_close_to_reference(out, ref, backend)
     assert out.shape == (m, n)
     assert out.dtype == torch.bfloat16
 
@@ -174,6 +232,7 @@ def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_backend_alpha_none_equals_alpha_one(backend):
     """alpha=None must produce identical output to alpha=tensor([1.0])."""
+    _skip_if_backend_unavailable(backend)
     device = torch.device("cuda")
     m, n, k = SMOKE_MNK
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
@@ -200,6 +259,11 @@ def test_backend_alpha_none_equals_alpha_one(backend):
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_backend_out_dtype_override(backend):
     """out_dtype kwarg controls return dtype independently of a.dtype."""
+    _skip_if_backend_unavailable(backend)
+    if backend == "cute-dsl":
+        # The cute-dsl kernel's MMA path requires out_dtype == a.dtype, so
+        # it cannot emit fp16 from a bf16 activation (see _compute_cute_dsl).
+        pytest.skip("cute-dsl requires out_dtype == a.dtype")
     device = torch.device("cuda")
     m, n, k = SMOKE_MNK
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
@@ -220,6 +284,7 @@ def test_backend_out_dtype_override(backend):
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_backend_preallocated_out(backend):
     """Caller-provided out tensor is written in place."""
+    _skip_if_backend_unavailable(backend)
     device = torch.device("cuda")
     m, n, k = SMOKE_MNK
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
@@ -246,6 +311,7 @@ def test_backend_preallocated_out(backend):
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_backend_shape_mismatch_raises(backend):
     """K of a must match K inferred from prepared b."""
+    _skip_if_backend_unavailable(backend)
     device = torch.device("cuda")
     m, n, k = SMOKE_MNK
     _, b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)

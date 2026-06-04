@@ -33,8 +33,14 @@ Supported backends
 * ``"cudnn"`` -- cuDNN FP4 GEMM graph (bf16 activation x FP4 weight).
   Reuses ``mm_fp4``'s cuDNN machinery and the autotuner; requires a
   cuDNN build with FP4 block-scale support on Blackwell-class GPUs.
-  No prep transformation: weights are already in the layout the graph
-  consumes.
+  ``prepare_w4a16_fp4_weights`` unswizzles the SF into a linear layout;
+  the weight bytes are passed through.
+* ``"cute-dsl"`` -- a Blackwell-class (SM100/103/110/120/121) cute-DSL kernel
+  (``BlackwellDenseGemmW4A16Kernel``).  ``prepare_w4a16_fp4_weights``
+  Marlin-repacks the weight into ``(K//16, N*2)`` int32 and unswizzles
+  the SF into a linear ``(K//16, N)`` byte tensor.  The kernel
+  dequantizes the FP4 weight to bf16 for the tensor-core matmul (fp32
+  accumulate), matching the cuDNN backend's numerics.
 
 Adding a new backend
 ====================
@@ -106,7 +112,7 @@ minimal working implementation of these two functions.
 """
 
 import functools
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple, cast
 
 import torch
 
@@ -138,7 +144,9 @@ from .gemm_base import (
     CUDNN_AVAILABLE,
     DEFAULT_WORKSPACE_SIZE,
     UIDs,
+    _TORCH_TO_CUTLASS_DTYPE_ATTR,
     _check_cudnn_fp4_availability,
+    _check_cute_dsl_availability,
     _get_cudnn_handle,
     _get_cudnn_override_shape_workspace_size,
     _get_cudnn_workspace_size,
@@ -167,7 +175,7 @@ def _check_mm_w4a16_fp4_problem_size(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn"],
+    backend: Literal["torch", "cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -199,7 +207,7 @@ def _torch_w4a16_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn"],
+    backend: Literal["torch", "cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -231,7 +239,7 @@ def _cudnn_w4a16_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn"],
+    backend: Literal["torch", "cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -267,6 +275,34 @@ def _cudnn_w4a16_fp4_requirement(
     return True
 
 
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cute_dsl_w4a16_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    *,
+    backend: Literal["torch", "cudnn", "cute-dsl"],
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    is_sf_swizzled: bool = True,
+):
+    """cute-DSL backend: a Blackwell-class (SM100/103/110/120/121) cute-DSL kernel.
+
+    The kernel consumes a fully backend-specific weight layout produced by
+    ``prepare_w4a16_fp4_weights(..., backend='cute-dsl')``: a Marlin-packed
+    ``(K // 16, N * 2)`` int32 weight and a linear ``(K // 16, N)``
+    FP8-E4M3 scale factor.  Because the prepared SF is neither the
+    canonical 128x4-swizzled layout nor the cuDNN linear ``(K_sf, N)``
+    layout, the ``is_sf_swizzled`` flag does not apply here and is
+    ignored -- the prepared tensors are opaque and only round-trip back
+    into the cute-DSL compute path.
+    """
+    _check_cute_dsl_availability()
+    return True
+
+
 # =============================================================================
 # Public dispatchers
 # =============================================================================
@@ -277,7 +313,7 @@ def prepare_w4a16_fp4_weights(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn"],
+    backend: Literal["torch", "cudnn", "cute-dsl"],
     block_size: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Prepare FP4 W4A16 weights for a specific backend.
@@ -333,13 +369,18 @@ def prepare_w4a16_fp4_weights(
         return _prepare_torch(b, b_descale, alpha, block_size)
     if backend == "cudnn":
         return _prepare_cudnn(b, b_descale, alpha, block_size)
-    raise ValueError(f"Unknown backend {backend!r}.  Supported: 'torch', 'cudnn'.")
+    if backend == "cute-dsl":
+        return _prepare_cute_dsl(b, b_descale, alpha, block_size)
+    raise ValueError(
+        f"Unknown backend {backend!r}.  Supported: 'torch', 'cudnn', 'cute-dsl'."
+    )
 
 
 @backend_requirement(
     {
         "torch": _torch_w4a16_fp4_requirement,
         "cudnn": _cudnn_w4a16_fp4_requirement,
+        "cute-dsl": _cute_dsl_w4a16_fp4_requirement,
     },
     common_check=_check_mm_w4a16_fp4_problem_size,
 )
@@ -350,7 +391,7 @@ def mm_w4a16_fp4(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn"],
+    backend: Literal["torch", "cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -376,12 +417,13 @@ def mm_w4a16_fp4(
         out: Optional preallocated ``(M, N)`` output tensor.
         block_size: SF block size.  Always 16 for FP4.
         is_sf_swizzled: Whether ``b_descale`` is in the canonical
-            128x4-swizzled SF layout.  This selects which backend is
-            supported: ``True`` (default) requires the ``torch`` backend
+            128x4-swizzled SF layout.  Used by the swizzle-sensitive
+            backends: ``True`` (default) requires the ``torch`` backend
             (cuDNN does not support swizzled SF), while ``False`` (a
             non-swizzled / linear SF, as produced by
             ``prepare_w4a16_fp4_weights(..., backend="cudnn")``) requires
-            the ``cudnn`` backend.
+            the ``cudnn`` backend.  The ``cute-dsl`` backend consumes a
+            fully bespoke prepared layout and ignores this flag.
 
     Returns:
         ``(M, N)`` tensor of ``out_dtype``.
@@ -398,7 +440,11 @@ def mm_w4a16_fp4(
         return _compute_torch(a, b, b_descale, alpha, out_dtype, out, block_size)
     if backend == "cudnn":
         return _compute_cudnn(a, b, b_descale, alpha, out_dtype, out, block_size)
-    raise ValueError(f"Unknown backend {backend!r}.  Supported: 'torch', 'cudnn'.")
+    if backend == "cute-dsl":
+        return _compute_cute_dsl(a, b, b_descale, alpha, out_dtype, out, block_size)
+    raise ValueError(
+        f"Unknown backend {backend!r}.  Supported: 'torch', 'cudnn', 'cute-dsl'."
+    )
 
 
 # =============================================================================
@@ -1145,6 +1191,271 @@ def _compute_cudnn(
         inputs,
     )
     chosen_runner(inputs=inputs, tactic=tactic)
+    return out
+
+
+# =============================================================================
+# cute-DSL backend
+# =============================================================================
+#
+# W4A16 = bf16 activation (A) x FP4 weight (B), computed by a Blackwell
+# cute-DSL kernel (``BlackwellDenseGemmW4A16Kernel``).  Unlike the cuDNN
+# path, the kernel consumes a fully bespoke weight layout, so
+# ``_prepare_cute_dsl`` does real work at model-load time:
+#
+#   * ``b`` -- the canonical ``(N, K//2)`` uint8 packed FP4 weight is
+#     transposed to ``(K//2, N)`` (byte-for-byte; the low/high nibble
+#     K-semantics are preserved) and Marlin-repacked into a
+#     ``(K//16, N*2)`` int32 tensor (128 int32 per 16Kx64N MMA block).
+#   * ``b_descale`` -- the canonical 128x4-swizzled SF is unswizzled into
+#     a linear ``(N, K//block_size)`` byte tensor and transposed to
+#     ``(K//block_size, N)`` -- the per-group scale layout the kernel
+#     loads alongside each B tile.
+#
+# The kernel dequantizes the FP4 weight to the activation dtype (bf16)
+# before the tensor-core matmul (accumulation stays fp32), so its numeric
+# behaviour matches the cuDNN backend (~1 bf16 ULP vs an fp32 reference).
+#
+# The kernel targets Blackwell-class GPUs (SM100/103/110/120/121) and is compiled once per
+# (tile_shape, a_dtype, c_dtype, atom_layout) via ``cute.compile`` and
+# cached in ``_CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE``.
+
+
+_W4A16_ALPHA_ONE_CACHE: dict = {}
+
+
+def _prepare_w4a16_alpha(
+    alpha: Optional[torch.Tensor], device: torch.device
+) -> torch.Tensor:
+    """Normalize ``alpha`` to a ``(1,) float32`` tensor for the kernel.
+
+    ``alpha=None`` means implicit ``1.0``; we cache the per-device unit
+    scalar so the hot path doesn't allocate.
+    """
+    if alpha is None:
+        cached = _W4A16_ALPHA_ONE_CACHE.get(device)
+        if cached is None:
+            cached = torch.tensor([1.0], dtype=torch.float32, device=device)
+            _W4A16_ALPHA_ONE_CACHE[device] = cached
+        return cached
+    if alpha.dim() == 0:
+        return alpha.to(torch.float32).unsqueeze(0)
+    return alpha.to(torch.float32).reshape(1)
+
+
+def _select_w4a16_tile_shape(
+    m: int, n: int, k: int
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """Pick a CTA tile shape AND MMA atom_layout for the cute-DSL W4A16 kernel.
+
+    Returns ``(tile_shape_mnk, atom_layout)``.
+
+    Tile shape selection:
+      tile_M choice
+        * M <= 16 (and tile_K=128 path): use tile_M=16 with atom_layout
+          (1,2,1).  Halves wasted M-rows vs tile_M=32, and a 1-M-warp
+          layout removes the duplicate dequant that (2,2,1) suffers from.
+        * 16 < M <= 32: use tile_M=32 with atom_layout (2,2,1).  Smaller
+          MMA + epilogue waste than tile_M=64.
+        * M > 32: use tile_M=64 with atom_layout (2,2,1) -- standard tile,
+          more rows to amortize across.
+
+      tile_K choice
+        * K % 128 == 0: tile_K=128 (halves K-tile count and barrier
+          overhead).
+        * Otherwise: tile_K=64.
+
+    Why atom_layout differs:
+      * (2,2,1) (default for tile_M >= 32): 4 MMA warps as 2 M x 2 N --
+        well-tested cute layout, but the 2 M-warps redundantly dequant
+        the same B values into their own register files (~50% waste in
+        dequant compute).
+      * (1,2,1) (used for tile_M=16): 2 MMA warps as 1 M x 2 N -- no
+        M-warp duplication.  Permutation_m = 16, so tile_M must be 16.
+    """
+    tile_k = 128 if k % 128 == 0 else 64
+    if m <= 16 and tile_k == 128:
+        return ((16, 64, 128), (1, 2, 1))
+    if m <= 32:
+        return ((32, 64, tile_k), (2, 2, 1))
+    return ((64, 64, tile_k), (2, 2, 1))
+
+
+_CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE: dict = {}
+
+
+def _get_cute_dsl_w4a16_gemm(
+    tile_shape_mnk: Tuple[int, int, int],
+    a_dtype: torch.dtype,
+    c_dtype: torch.dtype,
+    atom_layout: Tuple[int, int, int] = (2, 2, 1),
+):
+    """Compile (or fetch from cache) the cute-DSL W4A16 GEMM kernel.
+
+    The compiled kernel takes (in order) at call time:
+      mA        : (m, k)              a_dtype (bf16 / fp16)
+      mB        : (k // 16, n * 2)    int32 -- Marlin-packed FP4
+      mB_sf     : (k // 16, n)        uint8 -- FP8-E4M3 scales
+      mC        : (m, n)              c_dtype
+      mAlpha    : (1,)                float32 scalar
+    """
+    # Normalize to a tuple (callers may pass a list) so the cache key is hashable.
+    atom_layout = cast(Tuple[int, int, int], tuple(atom_layout))
+    cache_key = (tile_shape_mnk, a_dtype, c_dtype, atom_layout)
+    cached = _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    _check_cute_dsl_availability()
+
+    import cutlass
+    import cutlass.cute as cute
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    from .kernels.dense_gemm_w4a16_blackwell import (
+        BlackwellDenseGemmW4A16Kernel,
+    )
+
+    a_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[a_dtype])
+    c_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[c_dtype])
+
+    sym_m = cute.sym_int()
+    sym_k = cute.sym_int()
+    sym_n = cute.sym_int()
+    sym_k_tiles = cute.sym_int()
+    sym_n_packed = cute.sym_int()
+
+    a_fake = cute.runtime.make_fake_compact_tensor(
+        a_cutlass_dtype, (sym_m, sym_k), stride_order=(1, 0), assumed_align=16
+    )
+    b_marlin_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        (sym_k_tiles, sym_n_packed),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    b_sf_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_k_tiles, sym_n), stride_order=(1, 0), assumed_align=16
+    )
+    c_fake = cute.runtime.make_fake_compact_tensor(
+        c_cutlass_dtype, (sym_m, sym_n), stride_order=(1, 0), assumed_align=16
+    )
+    alpha_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    gemm = BlackwellDenseGemmW4A16Kernel(
+        acc_dtype=cutlass.Float32,
+        tile_shape_mnk=tile_shape_mnk,
+        atom_layout=atom_layout,
+    )
+    max_active_clusters = get_max_active_clusters(1)
+
+    compiled = cute.compile(
+        gemm.wrapper,
+        a_fake,
+        b_marlin_fake,
+        b_sf_fake,
+        c_fake,
+        alpha_fake,
+        1,  # l (batch)
+        max_active_clusters,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+    _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE[cache_key] = compiled
+    return compiled
+
+
+def _prepare_cute_dsl(
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """cute-DSL-backend prep: Marlin-repack the weight + unswizzle the SF.
+
+    Produces the bespoke layout the cute-DSL kernel consumes:
+      * weight: ``(K // 16, N * 2)`` int32 (Marlin-packed FP4).
+      * SF:     ``(K // block_size, N)`` uint8 (linear FP8-E4M3 scales).
+    ``alpha`` is passed through unchanged (the compute step normalizes it
+    to a ``(1,) float32`` scalar).  Pair the returned tensors with
+    ``mm_w4a16_fp4(..., backend='cute-dsl')``.
+    """
+    from .marlin_repack import prepare_fp4_w4a16_weight
+
+    n = int(b.shape[0])
+    k = int(b.shape[1]) * 2
+    k_sf = k // block_size
+
+    # (N, K//2) -> (K//2, N) uint8.  A transpose preserves each byte's
+    # low/high-nibble K-semantics, which is exactly what the repack expects.
+    b_kn = b.t().contiguous()
+    b_marlin = prepare_fp4_w4a16_weight(b_kn)  # (K//16, N*2) int32
+
+    # Canonical 128x4-swizzled SF -> linear (N, K_sf) -> (K_sf, N) uint8.
+    linear_sf = _unswizzle_sf_128x4(b_descale, n, k_sf)  # (N, K_sf) uint8
+    sf_ksf_n = linear_sf.t().contiguous()  # (K_sf, N) uint8
+    return b_marlin, sf_ksf_n, alpha
+
+
+def _compute_cute_dsl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+    block_size: int,
+) -> torch.Tensor:
+    """cute-DSL-backend compute: dispatch to the compiled Blackwell kernel.
+
+    ``b`` is the Marlin-packed ``(K // 16, N * 2)`` int32 weight and
+    ``b_descale`` the ``(K // 16, N)`` FP8-E4M3 SF returned by
+    :func:`_prepare_cute_dsl`.
+    """
+    if b.dtype != torch.int32:
+        raise TypeError(
+            f"cute-dsl backend expects the Marlin-packed int32 weight from "
+            f"prepare_w4a16_fp4_weights(..., backend='cute-dsl'); got {b.dtype}."
+        )
+    # The kernel's MMA path requires the output dtype to match the
+    # activation dtype (it asserts a_dtype == c_dtype internally).  With a
+    # bf16 activation, an fp16 output would need an fp16 activation, which
+    # this API does not support yet -- reject it explicitly rather than
+    # surfacing the kernel's lower-level TypeError.  (Use the cudnn backend
+    # if you need a mismatched output dtype.)
+    if out_dtype != a.dtype:
+        raise NotImplementedError(
+            f"cute-dsl backend requires out_dtype == a.dtype (got "
+            f"out_dtype={out_dtype}, a.dtype={a.dtype}).  Use the cudnn "
+            f"backend for a mismatched output dtype."
+        )
+    k_tiles = int(b.shape[0])
+    n = int(b.shape[1]) // 2
+    k = k_tiles * block_size
+    m = int(a.shape[0])
+    if a.shape[1] != k:
+        raise ValueError(
+            f"a.shape[1]={a.shape[1]} but k inferred from prepared b.shape="
+            f"{tuple(b.shape)} is {k}"
+        )
+
+    if out is None:
+        out = torch.empty((m, n), device=a.device, dtype=out_dtype)
+    else:
+        if tuple(out.shape) != (m, n):
+            raise ValueError(f"out shape {tuple(out.shape)} != expected {(m, n)}")
+        if out.dtype != out_dtype:
+            raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
+
+    tile_shape_mnk, atom_layout = _select_w4a16_tile_shape(m, n, k)
+    compiled = _get_cute_dsl_w4a16_gemm(tile_shape_mnk, a.dtype, out_dtype, atom_layout)
+    b_sf_u8 = b_descale.view(torch.uint8).contiguous()
+    alpha_for_launch = _prepare_w4a16_alpha(alpha, a.device)
+    compiled(a, b, b_sf_u8, out, alpha_for_launch)
     return out
 
 

@@ -204,7 +204,7 @@ def parse_gemm_args(line, parser):
             args.mat2_dtype = "bfloat16"
     if args.routine == "mm_w4a16_fp4":
         if not has_backends_arg:
-            args.backends = ["torch"]
+            args.backends = ["cute-dsl"]
         if not has_input_dtype_arg:
             args.input_dtype = "bfloat16"
     if args.verbose >= 1:
@@ -1346,6 +1346,10 @@ def testMmW4A16Fp4(args):
     Refcheck uses the ``torch`` backend's output as the gold reference.
     When only ``torch`` is being benchmarked the refcheck is trivially
     self-consistent.
+
+    With ``--autotune``, the cuDNN backend is profiled over its cuDNN
+    execution plans (the cute-dsl and torch backends ignore the autotuner);
+    autotuned results are tagged with an ``_autotune`` backend suffix.
     """
     if args.verbose >= 1:
         print("[INFO] Running testMmW4A16Fp4")
@@ -1424,6 +1428,29 @@ def testMmW4A16Fp4(args):
 
         backend_runners[backend] = make_runner(b_p, sf_p, alpha_p, backend)
 
+    # Only the cuDNN backend integrates the autotuner (it sweeps cuDNN
+    # execution plans + M buckets via mm_w4a16_fp4's TunableRunner).  The
+    # cute-dsl and torch backends pick a single kernel/path and ignore it.
+    autotune_supported_backends = ["cudnn"]
+    cache_path = getattr(args, "autotune_cache", None)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        for cur_backend in backends:
+            if cur_backend in autotune_supported_backends:
+                if args.verbose >= 1:
+                    print(
+                        f"[INFO] Autotune warmup for mm_w4a16_fp4 {cur_backend}: "
+                        f"{warmup_iters} iters"
+                    )
+                with autotune(True, cache=cache_path):
+                    for _ in range(warmup_iters):
+                        backend_runners[cur_backend](a)
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
+
     # Gold reference = torch backend output (fp32 dequant + matmul, cast to out_dtype).
     ref = None
     if run_refcheck:
@@ -1448,12 +1475,22 @@ def testMmW4A16Fp4(args):
         + (k // 16) * n  # FP8-E4M3 per-block SF
         + m * n * torch.tensor([], dtype=out_dtype).element_size()
     )
+    # Per-backend refcheck tolerance vs the fp32-accurate torch gold.  The
+    # cute-dsl and cudnn kernels dequantize the FP4 weight to bf16 before the
+    # tensor-core matmul, so they carry ~1 bf16 ULP of weight rounding (up to
+    # ~1.5e-2 relative) that the fp32 torch reference does not.
+    _refcheck_tol = {
+        "torch": dict(rtol=5e-3, atol=5e-3),
+        "cudnn": dict(rtol=1.5e-2, atol=1.5e-2),
+        "cute-dsl": dict(rtol=1.5e-2, atol=1.5e-2),
+    }
     for backend in backends:
         runner = backend_runners[backend]
         if run_refcheck:
             out = runner(a)
+            tol = _refcheck_tol.get(backend, dict(rtol=1.5e-2, atol=1.5e-2))
             try:
-                torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
+                torch.testing.assert_close(out, ref, **tol)
             except AssertionError as e:
                 if args.allow_output_mismatch:
                     print(f"[WARNING] {backend} output mismatch vs torch ref: {e}")
@@ -1469,7 +1506,15 @@ def testMmW4A16Fp4(args):
         std_time = float(np.std(timing))
         tflops = flops / median_time / 1e9
         tb_per_sec = bytes_accessed / median_time / 1e9
-        print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+        backend_name = backend + (
+            "_autotune"
+            if (
+                getattr(args, "autotune", False)
+                and backend in autotune_supported_backends
+            )
+            else ""
+        )
+        print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
         res.append(
             {
                 "routine": args.routine,
@@ -1477,7 +1522,7 @@ def testMmW4A16Fp4(args):
                 "std_time": std_time,
                 "tflops": tflops,
                 "tb_per_sec": tb_per_sec,
-                "backend": backend,
+                "backend": backend_name,
                 "resolved_backend": backend,
                 "m": m,
                 "n": n,

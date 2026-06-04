@@ -284,6 +284,33 @@ def get_smem_ptr_as_int32(
 
 
 @dsl_user_op
+def ld_shared_v2_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+    """Load 64 bits (2 x uint32) from shared memory via ld.shared.v2.u32.
+
+    Args:
+        smem_addr: 32-bit shared memory address (from get_smem_ptr_as_int32).
+                   Caller is responsible for ensuring 8-byte alignment.
+
+    Returns:
+        2 Uint32 values (8 bytes total).
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.u32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(v0), Uint32(v1)
+
+
+@dsl_user_op
 def ld_shared_v4_u32(
     smem_addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
