@@ -98,6 +98,31 @@ class RoutingInputMode(IntEnum):
     UnpackedPrecomputed = 2
 
 
+_TRTLLM_MOE_OUTPUT_HIDDEN_ALIGNMENT = 128
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _infer_trtllm_moe_output_hidden_size(
+    hidden_size: int, valid_hidden_size: Optional[int]
+) -> int:
+    if valid_hidden_size is None:
+        return hidden_size
+    if valid_hidden_size <= 0:
+        raise ValueError(f"valid_hidden_size must be positive, got {valid_hidden_size}")
+    output_hidden_size = _round_up(
+        valid_hidden_size, _TRTLLM_MOE_OUTPUT_HIDDEN_ALIGNMENT
+    )
+    if output_hidden_size > hidden_size:
+        raise ValueError(
+            "roundUp(valid_hidden_size, 128) must be <= padded hidden_size, "
+            f"got {output_hidden_size} > {hidden_size}"
+        )
+    return output_hidden_size
+
+
 @functools.cache
 def is_trtllm_moe_supported(
     dtype_weights: DtypeTrtllmGen,
@@ -1116,6 +1141,7 @@ def get_trtllm_moe_sm100_module():
             hidden_size: int,
             intermediate_size: int,
             activation_type: int = ActivationType.Swiglu.value,
+            hidden_size_output: Optional[int] = None,
             use_shuffled_weight: bool = False,
             weight_layout: int = WeightLayout.MajorK,
             use_packed_weights: bool = False,
@@ -1128,6 +1154,9 @@ def get_trtllm_moe_sm100_module():
             self.dtype_weights = dtype_weights
             self.fp8_quantization_type = fp8_quantization_type
             self.hidden_size = hidden_size
+            self.hidden_size_output = (
+                hidden_size if hidden_size_output is None else hidden_size_output
+            )
             self.intermediate_size = intermediate_size
             self.activation_type = ActivationType(activation_type)
             self.use_shuffled_weight = use_shuffled_weight
@@ -1254,6 +1283,7 @@ def get_trtllm_moe_sm100_module():
                 self.fp8_quantization_type,
                 self.top_k,
                 self.hidden_size,
+                self.hidden_size_output,
                 self.intermediate_size,
                 self.num_local_experts,
                 self.activation_type,
@@ -1422,6 +1452,8 @@ def get_trtllm_moe_sm100_module():
                         self.activation_type,
                         kwargs.get("norm_topk_prob", True),
                         kwargs.get("routing_replay_out"),
+                        kwargs.get("valid_hidden_size"),
+                        kwargs.get("valid_intermediate_size"),
                     )
                 else:
                     # FP8 per tensor scale
@@ -1485,6 +1517,8 @@ def get_trtllm_moe_sm100_module():
                     [-1, -1] if tactic == -1 else tactic,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    kwargs.get("valid_hidden_size"),
+                    kwargs.get("valid_intermediate_size"),
                 )
             else:
                 moe_op.trtllm_fp4_block_scale_moe(
@@ -1524,6 +1558,8 @@ def get_trtllm_moe_sm100_module():
                     [-1, -1] if tactic == -1 else tactic,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    kwargs.get("valid_hidden_size"),
+                    kwargs.get("valid_intermediate_size"),
                 )
 
     @register_custom_op(
@@ -1600,6 +1636,7 @@ def get_trtllm_moe_sm100_module():
             dtype_weights=dtype_weights,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
+            hidden_size_output=output.shape[1],
             intermediate_size=intermediate_size,
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
@@ -1773,6 +1810,7 @@ def get_trtllm_moe_sm100_module():
             dtype_weights=dtype_weights,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,  # per_tensor mode
             hidden_size=hidden_size,
+            hidden_size_output=output.shape[1],
             intermediate_size=intermediate_size,
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
@@ -1925,6 +1963,8 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        valid_hidden_size: Optional[int] = None,
+        valid_intermediate_size: Optional[int] = None,
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -1944,22 +1984,37 @@ def get_trtllm_moe_sm100_module():
 
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1]
+        output_hidden_size = _infer_trtllm_moe_output_hidden_size(
+            hidden_size, valid_hidden_size
+        )
 
         if output is None:
             output = torch.empty(
                 num_tokens,
-                hidden_size,
+                output_hidden_size,
                 dtype=torch.bfloat16,
                 device=hidden_states.device,
             )
         else:
             check_shape_dtype_device(
                 output,
-                (num_tokens, hidden_size),
+                None,
                 torch.bfloat16,
                 hidden_states.device,
                 "output",
             )
+            assert output.shape[0] == num_tokens, (
+                f"output.shape[0]={output.shape[0]} must be equal to {num_tokens}"
+            )
+            assert output.shape[1] <= hidden_size, (
+                f"output.shape[1]={output.shape[1]} must be less than or equal to {hidden_size}"
+            )
+            if valid_hidden_size is not None and output.shape[1] != output_hidden_size:
+                raise ValueError(
+                    "output.shape[1] must equal roundUp(valid_hidden_size, 128) "
+                    f"when valid_hidden_size is provided, got {output.shape[1]} "
+                    f"vs {output_hidden_size}"
+                )
 
         if routing_logits is not None:
             # When routing_logits is provided, allocate empty buffers (kernel will fill them)
@@ -2003,6 +2058,7 @@ def get_trtllm_moe_sm100_module():
             dtype_weights=dtype_weights,
             fp8_quantization_type=fp8_quantization_type,  # block_scale mode
             hidden_size=hidden_size,
+            hidden_size_output=output.shape[1],
             intermediate_size=intermediate_size,
             activation_type=activation_type,
             weight_layout=weight_layout,
@@ -2048,6 +2104,8 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
+            valid_hidden_size=valid_hidden_size,
+            valid_intermediate_size=valid_intermediate_size,
         )
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_fp8_block_scale_moe(
@@ -2081,6 +2139,8 @@ def get_trtllm_moe_sm100_module():
             activation_type,
             norm_topk_prob,
             routing_replay_out,
+            valid_hidden_size,
+            valid_intermediate_size,
         )
         result = _unpack_trtllm_moe_output(
             intermediate_output, output, do_finalize, gemm1_lora_delta
@@ -2102,7 +2162,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_lora_delta: Optional[torch.Tensor],
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -2121,12 +2181,22 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        valid_hidden_size: Optional[int] = None,
+        valid_intermediate_size: Optional[int] = None,
     ) -> List[torch.Tensor]:
-        _ = routing_replay_out
+        _ = routing_replay_out, valid_intermediate_size
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
+        output_hidden_size = (
+            output.shape[1]
+            if output is not None
+            else _infer_trtllm_moe_output_hidden_size(hidden_size, valid_hidden_size)
+        )
+
         # TODO: This is not correct for gemm1_lora_delta or do_finalize=False
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return [
+            hidden_states.new_empty([seq_len, output_hidden_size], dtype=torch.bfloat16)
+        ]
 
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
@@ -2169,6 +2239,8 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        valid_hidden_size: Optional[int] = None,
+        valid_intermediate_size: Optional[int] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -2182,6 +2254,9 @@ def get_trtllm_moe_sm100_module():
         if hidden_states.dtype == torch.uint8:
             hidden_size = hidden_size * 2
         num_tokens = hidden_states.shape[0]
+        output_hidden_size = _infer_trtllm_moe_output_hidden_size(
+            hidden_size, valid_hidden_size
+        )
 
         # workspace buffers required by trtllm-gen
         # For Mode 3 (UnpackedPrecomputed), topk_ids and topk_weights are user-provided INPUTS
@@ -2207,7 +2282,7 @@ def get_trtllm_moe_sm100_module():
         if output is None:
             output = torch.empty(
                 num_tokens,
-                hidden_size,
+                output_hidden_size,
                 dtype=torch.bfloat16,
                 device=hidden_states.device,
             )
@@ -2221,6 +2296,12 @@ def get_trtllm_moe_sm100_module():
             assert output.shape[1] <= hidden_size, (
                 f"output.shape[1]={output.shape[1]} must be less than or equal to {hidden_size}"
             )
+            if valid_hidden_size is not None and output.shape[1] != output_hidden_size:
+                raise ValueError(
+                    "output.shape[1] must equal roundUp(valid_hidden_size, 128) "
+                    f"when valid_hidden_size is provided, got {output.shape[1]} "
+                    f"vs {output_hidden_size}"
+                )
 
         tuner = AutoTuner.get()
         dtype_act = deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale)
@@ -2234,6 +2315,7 @@ def get_trtllm_moe_sm100_module():
             dtype_weights=dtype_weights,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
+            hidden_size_output=output.shape[1],
             intermediate_size=intermediate_size,
             activation_type=activation_type,
             weight_layout=WeightLayout.MajorK,
@@ -2287,6 +2369,8 @@ def get_trtllm_moe_sm100_module():
             enable_pdl=enable_pdl,
             do_finalize=do_finalize,
             activation_type=activation_type,
+            valid_hidden_size=valid_hidden_size,
+            valid_intermediate_size=valid_intermediate_size,
         )
 
         # Call the C++ function for block scale MoE
@@ -2327,6 +2411,8 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
             routing_replay_out,
+            valid_hidden_size,
+            valid_intermediate_size,
         )
         if do_finalize:
             return [output]
@@ -2375,12 +2461,23 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        valid_hidden_size: Optional[int] = None,
+        valid_intermediate_size: Optional[int] = None,
     ):
-        _ = routing_replay_out
+        _ = routing_replay_out, valid_intermediate_size
         seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
+        hidden_size = hidden_states.shape[1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size = hidden_size * 2
+        output_hidden_size = (
+            output.shape[1]
+            if output is not None
+            else _infer_trtllm_moe_output_hidden_size(hidden_size, valid_hidden_size)
+        )
 
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return [
+            hidden_states.new_empty([seq_len, output_hidden_size], dtype=torch.bfloat16)
+        ]
 
     @register_custom_op(
         "flashinfer::trtllm_mxint4_block_scale_moe",
@@ -2415,6 +2512,8 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        valid_hidden_size: Optional[int] = None,
+        valid_intermediate_size: Optional[int] = None,
     ) -> List[torch.Tensor]:
         assert routing_logits is not None or topk_ids is not None, (
             "either routing_logits or topk_ids must be provided"
@@ -2423,6 +2522,9 @@ def get_trtllm_moe_sm100_module():
         if hidden_states.dtype == torch.uint8:
             hidden_size = hidden_size * 2
         num_tokens = hidden_states.shape[0]
+        output_hidden_size = _infer_trtllm_moe_output_hidden_size(
+            hidden_size, valid_hidden_size
+        )
 
         if routing_logits is not None:
             # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
@@ -2445,10 +2547,26 @@ def get_trtllm_moe_sm100_module():
         if output is None:
             output = torch.empty(
                 num_tokens,
-                hidden_size,
+                output_hidden_size,
                 dtype=torch.bfloat16,
                 device=hidden_states.device,
             )
+        else:
+            check_shape_dtype_device(
+                output, None, torch.bfloat16, hidden_states.device, "output"
+            )
+            assert output.shape[0] == num_tokens, (
+                f"output.shape[0]={output.shape[0]} must be equal to {num_tokens}"
+            )
+            assert output.shape[1] <= hidden_size, (
+                f"output.shape[1]={output.shape[1]} must be less than or equal to {hidden_size}"
+            )
+            if valid_hidden_size is not None and output.shape[1] != output_hidden_size:
+                raise ValueError(
+                    "output.shape[1] must equal roundUp(valid_hidden_size, 128) "
+                    f"when valid_hidden_size is provided, got {output.shape[1]} "
+                    f"vs {output_hidden_size}"
+                )
 
         tuner = AutoTuner.get()
         dtype_act = DtypeTrtllmGen.Bfloat16
@@ -2460,6 +2578,7 @@ def get_trtllm_moe_sm100_module():
             dtype_weights=dtype_weights,
             fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
+            hidden_size_output=output.shape[1],
             intermediate_size=intermediate_size,
             activation_type=ActivationType.Swiglu,
             weight_layout=WeightLayout.BlockMajorK,
@@ -2505,6 +2624,8 @@ def get_trtllm_moe_sm100_module():
             routing_method_type=routing_method_type,
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
+            valid_hidden_size=valid_hidden_size,
+            valid_intermediate_size=valid_intermediate_size,
         )
 
         # Call the C++ function for block scale MoE
@@ -2537,6 +2658,8 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
             routing_replay_out,
+            valid_hidden_size,
+            valid_intermediate_size,
         )
 
         return _unpack_trtllm_moe_output(
@@ -2573,12 +2696,23 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        valid_hidden_size: Optional[int] = None,
+        valid_intermediate_size: Optional[int] = None,
     ):
-        _ = routing_replay_out
+        _ = routing_replay_out, valid_intermediate_size
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size = hidden_size * 2
+        output_hidden_size = (
+            output.shape[1]
+            if output is not None
+            else _infer_trtllm_moe_output_hidden_size(hidden_size, valid_hidden_size)
+        )
 
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return [
+            hidden_states.new_empty([seq_len, output_hidden_size], dtype=torch.bfloat16)
+        ]
 
     return SimpleNamespace(
         trtllm_bf16_moe=trtllm_bf16_moe_op,
@@ -2982,6 +3116,8 @@ def trtllm_fp8_block_scale_moe(
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation.
 
@@ -3026,6 +3162,12 @@ def trtllm_fp8_block_scale_moe(
             Column order matches topk_indices. When None (default), zero overhead - the
             kernel skips the write entirely. Buffer may be larger than num_tokens for CUDA
             graph pre-allocation; only rows [0, num_tokens) are written.
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. The returned output width is roundUp(valid_hidden_size, 128).
+            Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
     Returns:
         ``List[torch.Tensor]``, depending on ``do_finalize``:
 
@@ -3037,8 +3179,13 @@ def trtllm_fp8_block_scale_moe(
         =============  ==========================================================================
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
+    output_hidden_size = _infer_trtllm_moe_output_hidden_size(
+        hidden_states.shape[1], valid_hidden_size
+    )
     output = torch.empty(
-        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+        (hidden_states.shape[0], output_hidden_size),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
     )
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         routing_logits,
@@ -3071,6 +3218,8 @@ def trtllm_fp8_block_scale_moe(
         activation_type,
         norm_topk_prob,
         routing_replay_out,
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
     if do_finalize:
@@ -3110,6 +3259,8 @@ def trtllm_fp8_block_scale_routed_moe(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
     activation_type: int = ActivationType.Swiglu.value,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation with pre-computed routing (packed format).
 
@@ -3147,7 +3298,8 @@ def trtllm_fp8_block_scale_routed_moe(
         gemm1_lora_delta: optional MoE LoRA delta of shape ``[num_tokens, top_k, 2 * intermediate_size]``,
             bfloat16. When set for MXFP8, it is added to FC1 before the fused gated activation and
             the post-activation FC1 output is appended to the return list.
-        output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
+        output (Optional[torch.Tensor]): shape [seq_len, hidden_size], or
+            [seq_len, roundUp(valid_hidden_size, 128)] when valid_hidden_size is set.
             Optional inplace output tensor.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
@@ -3156,6 +3308,12 @@ def trtllm_fp8_block_scale_routed_moe(
             - 4: Geglu
             - 6: Relu2
             - 7: Identity
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. The output width must be roundUp(valid_hidden_size, 128).
+            Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
     Returns:
         ``List[torch.Tensor]``, depending on ``do_finalize`` and ``gemm1_lora_delta``:
 
@@ -3198,6 +3356,9 @@ def trtllm_fp8_block_scale_routed_moe(
         fp8_quantization_type,
         activation_type,
         True,  # norm_topk_prob: not used for pre-computed routing
+        None,  # routing_replay_out is not exposed by this routed wrapper
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
     if do_finalize and gemm1_lora_delta is None:
@@ -3244,6 +3405,8 @@ def trtllm_fp4_block_scale_moe(
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -3307,8 +3470,16 @@ def trtllm_fp4_block_scale_moe(
         per_token_scale (Optional[torch.Tensor]): shape [seq_len]
             Tensor of per-token scaling factors. Dtype must be float32.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
-        output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
+        output (Optional[torch.Tensor]): shape [seq_len, hidden_size], or
+            [seq_len, roundUp(valid_hidden_size, 128)] when valid_hidden_size is set.
             Optional inplace output tensor.
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. This allows tensors to be padded for alignment while computing only
+            the valid region. The output width must be roundUp(valid_hidden_size, 128).
+            Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
     Returns:
         ``List[torch.Tensor]``, depending on ``do_finalize``:
 
@@ -3357,6 +3528,8 @@ def trtllm_fp4_block_scale_moe(
         tune_max_num_tokens,
         norm_topk_prob,
         routing_replay_out,
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
 
@@ -3393,6 +3566,8 @@ def trtllm_fp4_block_scale_routed_moe(
     per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -3464,8 +3639,16 @@ def trtllm_fp4_block_scale_routed_moe(
         per_token_scale (Optional[torch.Tensor]): shape [seq_len]
             Tensor of per-token scaling factors. Dtype must be float32.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
-        output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
+        output (Optional[torch.Tensor]): shape [seq_len, hidden_size], or
+            [seq_len, roundUp(valid_hidden_size, 128)] when valid_hidden_size is set.
             Optional inplace output tensor.
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. This allows tensors to be padded for alignment while computing only
+            the valid region. The output width must be roundUp(valid_hidden_size, 128).
+            Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
 
     Returns:
         ``List[torch.Tensor]``, depending on ``do_finalize``:
@@ -3524,6 +3707,9 @@ def trtllm_fp4_block_scale_routed_moe(
         output,
         tune_max_num_tokens,
         True,  # norm_topk_prob: not used for pre-computed routing
+        None,  # routing_replay_out is not exposed by this routed wrapper
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
 
@@ -3554,6 +3740,8 @@ def trtllm_mxint4_block_scale_moe(
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """MxInt4 block scale MoE operation.
 
@@ -3597,10 +3785,17 @@ def trtllm_mxint4_block_scale_moe(
             - 8: Sigmoid (Sigmoid -> TopK)
         do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
-        output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
-            Optional inplace output tensor.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
-
+        output (Optional[torch.Tensor]): shape [seq_len, hidden_size], or
+            [seq_len, roundUp(valid_hidden_size, 128)] when valid_hidden_size is set.
+            Optional inplace output tensor.
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. This allows tensors to be padded for alignment while computing only
+            the valid region. The output width must be roundUp(valid_hidden_size, 128).
+            Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
     Returns:
         ``List[torch.Tensor]``, depending on ``do_finalize``:
 
@@ -3641,6 +3836,8 @@ def trtllm_mxint4_block_scale_moe(
         tune_max_num_tokens,
         norm_topk_prob,
         routing_replay_out,
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
 
@@ -3669,6 +3866,8 @@ def trtllm_mxint4_block_scale_routed_moe(
     gemm1_lora_delta: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """MxInt4 block-scale MoE with pre-computed routing.
 
@@ -3698,8 +3897,13 @@ def trtllm_mxint4_block_scale_routed_moe(
         gemm1_lora_delta: optional MoE LoRA delta of shape ``[num_tokens, top_k, 2 * intermediate_size]``,
             bfloat16, concatenated gate/up layout (``[gate_0..gate_{I-1}, up_0..up_{I-1}]``). When set, it is
             added to FC1 before SwiGLU and the post-activation buffer is appended to the return list.
-        output: optional in-place output tensor.
+        output: optional in-place output tensor. Its shape is ``[seq_len, hidden_size]``, or
+            ``[seq_len, roundUp(valid_hidden_size, 128)]`` when ``valid_hidden_size`` is set.
         tune_max_num_tokens: autotuning cap (default 8192).
+        valid_hidden_size: valid (unpadded) hidden dimension. If provided, the hidden_size from
+            tensor shape is treated as padded and the output width must be
+            ``roundUp(valid_hidden_size, 128)``.
+        valid_intermediate_size: valid (unpadded) intermediate dimension.
 
     Returns:
         ``List[torch.Tensor]``, depending on ``do_finalize`` and ``gemm1_lora_delta``:
@@ -3741,4 +3945,7 @@ def trtllm_mxint4_block_scale_routed_moe(
         output,
         tune_max_num_tokens,
         True,  # norm_topk_prob: not used for pre-computed routing
+        None,  # routing_replay_out
+        valid_hidden_size,
+        valid_intermediate_size,
     )

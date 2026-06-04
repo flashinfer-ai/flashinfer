@@ -227,6 +227,10 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // GEMM1: [numTokens, hiddenSize] @ [hiddenSize, 2*intermediateSize] -> [numTokens,
+  // 2*intermediateSize] validHiddenSize: valid K dimension (unpadded). If negative, uses
+  // hiddenSize. validIntermediateSize: valid N/2 dimension (unpadded). If negative, uses
+  // intermediateSize.
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* perTokenScales, void* perChannelScales, float* outputScalesScalar,
            float* outputScalesGateScalar, void* ptrBias, float* ptrGatedActAlpha,
@@ -236,7 +240,8 @@ class Runner {
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
 
  private:
   friend class MoE::Runner;
@@ -273,13 +278,17 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
+  // hiddenSize] validIntermediateSize: valid K dimension (unpadded). If negative, uses
+  // intermediateSize. validHiddenSize: valid N dimension (unpadded). If negative, uses hiddenSize.
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
            void* weightScale, void* perTokenScales, void* perChannelScales,
            float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK,
            int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
            int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           int32_t validIntermediateSize = -1, int32_t validHiddenSize = -1);
 
  private:
   friend class MoE::Runner;
@@ -322,8 +331,9 @@ struct MoERunnerArgs {
   int32_t num_experts{0};
   // Hidden dimension input of MoE block. It might be padded.
   int32_t hidden_size{0};
-  // Hidden dimension output of MoE block. It is not padded.
-  // If not provided it is the same as hidden_size.
+  // Hidden dimension output of MoE block. This is the full GEMM2 N dimension and
+  // final output row width; it may differ from the padded input hidden size.
+  // If not provided, it is the same as hidden_size.
   std::optional<int32_t> hidden_size_output;
   // TODO: only compiled routing kernel supports top_k = 8
   int32_t top_k{0};
@@ -332,6 +342,15 @@ struct MoERunnerArgs {
   int32_t topk_group{0};
   float routed_scaling_factor{0.0f};
   int32_t intermediate_size{0};
+
+  // Valid (unpadded) dimensions for GEMM computation.
+  // These allow tensor dimensions to be padded for alignment while computing only the valid region.
+  // If not provided, they default to the corresponding padded dimensions.
+  // - valid_hidden_size: Valid K dimension for GEMM1, valid N dimension for GEMM2
+  // - valid_intermediate_size: Valid N/2 dimension for GEMM1, valid K dimension for GEMM2
+  std::optional<int32_t> valid_hidden_size;
+  std::optional<int32_t> valid_intermediate_size;
+
   int32_t local_expert_offset{0};
   int32_t local_num_experts{0};
   // TODO: support other types
@@ -436,12 +455,13 @@ class Runner {
   [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t topK, int32_t hiddenSize,
                                                            int32_t intermediateSize,
                                                            int32_t numLocalExperts,
-                                                           int32_t numTokens) const;
+                                                           int32_t numTokens,
+                                                           int32_t hiddenSizeOutput = -1) const;
 
   [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                                    int32_t intermediateSize,
-                                                   int32_t numLocalExperts,
-                                                   int32_t numTokens) const;
+                                                   int32_t numLocalExperts, int32_t numTokens,
+                                                   int32_t hiddenSizeOutput = -1) const;
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
