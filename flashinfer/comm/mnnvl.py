@@ -267,9 +267,21 @@ class TorchDistBackend(CommBackend):
         return output_list
 
     def bcast(self, data: Any, root: int) -> Any:
-        """Broadcast a Python object from root to all ranks."""
+        """Broadcast a Python object from root to all ranks.
+
+        Args:
+            data: object to broadcast (only used on the root rank).
+            root: group-local rank of the sender (consistent with MPI).
+        """
         object_list = [data]
-        self._dist.broadcast_object_list(object_list, src=root, group=self._group)
+        global_root = (
+            self._dist.get_global_rank(self._group, root)
+            if self._group is not None
+            else root
+        )
+        self._dist.broadcast_object_list(
+            object_list, src=global_root, group=self._group
+        )
         return object_list[0]
 
     def barrier(self) -> None:
