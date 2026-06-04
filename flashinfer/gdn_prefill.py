@@ -50,8 +50,6 @@ def _cp_delta_rule_rejection_reason(
         return "CP delta rule is currently implemented only for SM90"
     if cp_delta_rule_dsl_sm90 is None:
         return "CP delta rule SM90 DSL kernel is unavailable"
-    if initial_state is not None:
-        return "CP delta rule does not support initial_state yet"
     if checkpoint_every_n_tokens > 0 or state_checkpoints is not None or checkpoint_cu_starts is not None:
         return "CP delta rule does not support state checkpointing yet"
     if q.shape[-1] != 128:
@@ -66,7 +64,9 @@ def _cp_delta_rule_rejection_reason(
                 return f"CP delta rule requires {name} to be float32"
             if not tensor.is_contiguous():
                 return f"CP delta rule requires {name} to be contiguous"
-    for name, tensor in (("q", q), ("k", k), ("v", v), ("output", output)):
+    for name, tensor in (("q", q), ("k", k), ("v", v), ("output", output), ("initial_state", initial_state)):
+        if tensor is None:
+            continue
         if not tensor.is_contiguous():
             return f"CP delta rule requires {name} to be contiguous"
     return None
@@ -327,6 +327,7 @@ def chunk_gated_delta_rule(
                 _beta,
                 cu_seqlens.to(torch.int64),
                 _scale,
+                initial_state=initial_state,
                 max_seqlen=total_seq_len,
             )
             if output_final_state:

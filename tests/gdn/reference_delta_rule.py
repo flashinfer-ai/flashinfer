@@ -659,6 +659,7 @@ def cp_delta_rule_fixup(
 def cp_delta_rule_fixup_transposed(
     local_transfers_by_seq: list[torch.Tensor],
     local_states_by_seq: list[torch.Tensor],
+    initial_states_by_seq: list[torch.Tensor] | None = None,
 ):
     """Fix CP chunk artifacts in CPDeltaRuleFixupSm90 workspace orientation.
 
@@ -666,18 +667,21 @@ def cp_delta_rule_fixup_transposed(
     workspace layout and applies `S_i = S_{i-1} @ M_i + N_i`.
     """
     assert len(local_transfers_by_seq) == len(local_states_by_seq)
+    if initial_states_by_seq is not None:
+        assert len(initial_states_by_seq) == len(local_transfers_by_seq)
     fixed_states_by_seq = []
     final_states = []
 
-    for local_transfers, local_states in zip(local_transfers_by_seq, local_states_by_seq):
+    for seq_idx, (local_transfers, local_states) in enumerate(zip(local_transfers_by_seq, local_states_by_seq)):
         assert local_transfers.size(0) == local_states.size(0)
         seq_fixed_states = []
+        initial_state = initial_states_by_seq[seq_idx] if initial_states_by_seq is not None else None
         if local_transfers.size(0) == 0:
             fixed_states_by_seq.append(local_states)
-            final_states.append(local_states)
+            final_states.append(local_states if initial_state is None else initial_state)
             continue
 
-        state_HKV = torch.zeros_like(local_states[0])
+        state_HKV = torch.zeros_like(local_states[0]) if initial_state is None else initial_state.clone()
         for chunk_idx in range(local_transfers.size(0)):
             state_HKV = torch.bmm(state_HKV, local_transfers[chunk_idx]) + local_states[chunk_idx]
             seq_fixed_states.append(state_HKV)
