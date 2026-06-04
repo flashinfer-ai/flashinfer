@@ -340,9 +340,7 @@ def _cudnn_mm_bf16_requirement(
     ] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
-    _check_cudnn_availability()
-
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 @supported_compute_capability([100, 103])
@@ -631,8 +629,7 @@ def _cudnn_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
-    _check_cudnn_availability()
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 def _check_bmm_bf16_problem_size(
@@ -2057,6 +2054,16 @@ def _check_cudnn_fp4_availability():
         ) from e
 
 
+def _cudnn_available_or_raise_for_backend(backend):
+    # When cudnn is not available:
+    # Return False for auto backend or raise error for explicit cuDNN backend.
+    if CUDNN_AVAILABLE:
+        return True
+    if backend == "cudnn":
+        _check_cudnn_availability()
+    return False
+
+
 def _is_cublas_fp4_available_in_cudnn():
     """Check if cuBLAS backend for FP4 GEMM is available in cuDNN."""
 
@@ -2802,6 +2809,23 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
     tactic: int = 0,
 ):
     """Execute MXFP8 GEMM cuDNN graph with dynamic-shape overrides."""
+    # Override-shape graphs require the runtime strides to match the profiled layout.
+    if a.stride(-1) != 1:
+        raise ValueError(
+            "cuDNN mxfp8 GEMM requires A to be row-major [batch, m, k] "
+            "(stride [m*k, k, 1], i.e. the K dimension contiguous); got "
+            f"a.shape={tuple(a.shape)}, a.stride()={tuple(a.stride())}."
+        )
+    if b.stride(-2) != 1:
+        raise ValueError(
+            "cuDNN mxfp8 GEMM requires B to be column-major [batch, k, n] "
+            "(stride [k*n, 1, k], i.e. the K dimension contiguous); got "
+            f"b.shape={tuple(b.shape)}, b.stride()={tuple(b.stride())}. "
+            "Quantize the contiguous [b, n, k] weight and pass the transpose of "
+            "the quantized tensor, e.g. B = mxfp8_quantize(weight)[0].transpose(-2, -1) "
+            "(do NOT call .contiguous() on the transpose)."
+        )
+
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
@@ -2809,6 +2833,29 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
         UIDs.BLOCK_DESCALE_B_UID.value: b_descale,
         UIDs.O_UID.value: c_final,
     }
+
+    # The block-scale tensors are declared 3D ([batch, dim_m, dim_k], F8_128x4
+    # reordered) in the graph, so the override must use the same 3D shape/stride
+    # recomputed for the actual runtime M -- NOT the flat 1D scale buffer shape.
+    # Passing the flat shape makes cuDNN >= 9.21 reject the call with
+    # CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE (see PR #3455).
+    batch, actual_m, k = a.shape[0], a.shape[1], a.shape[2]
+    n = b.shape[2]
+    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
+        _calculate_block_scale_dims(actual_m, n, k, 32)
+    )
+    a_descale_override_shape = [batch, block_scale_dim_m, block_scale_dim_k]
+    a_descale_override_stride = [
+        block_scale_dim_m * block_scale_dim_k,
+        block_scale_dim_k,
+        1,
+    ]
+    b_descale_override_shape = [batch, block_scale_dim_k, block_scale_dim_n]
+    b_descale_override_stride = [
+        block_scale_dim_n * block_scale_dim_k,
+        1,
+        block_scale_dim_k,
+    ]
 
     override_uids = [
         UIDs.A_UID.value,
@@ -2820,15 +2867,15 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
     override_shapes = [
         list(a.shape),
         list(b.shape),
-        list(a_descale.shape),
-        list(b_descale.shape),
+        a_descale_override_shape,
+        b_descale_override_shape,
         list(c_final.shape),
     ]
     override_strides = [
         list(a.stride()),
         list(b.stride()),
-        list(a_descale.stride()),
-        list(b_descale.stride()),
+        a_descale_override_stride,
+        b_descale_override_stride,
         list(c_final.stride()),
     ]
 
@@ -3085,6 +3132,20 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic: int = 0
 ):
     """Execute FP8 per-tensor GEMM graph with dynamic-shape overrides."""
+    # Override-shape graphs require the runtime strides to match the profiled layout.
+    if a.stride(-1) != 1:
+        raise ValueError(
+            "cuDNN fp8 GEMM requires A to be row-major [batch, m, k] "
+            "(stride [m*k, k, 1], i.e. the K dimension contiguous); got "
+            f"a.shape={tuple(a.shape)}, a.stride()={tuple(a.stride())}."
+        )
+    if b.stride(-2) != 1:
+        raise ValueError(
+            "cuDNN fp8 GEMM requires B to be column-major [batch, k, n] "
+            "(stride [k*n, 1, k], i.e. the K dimension contiguous); got "
+            f"b.shape={tuple(b.shape)}, b.stride()={tuple(b.stride())}."
+        )
+
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
@@ -4207,6 +4268,27 @@ def _cute_dsl_gemm_mxfp8_requirement(
     return True
 
 
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cudnn_mm_mxfp8_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["cudnn", "auto"] = "cudnn",
+):
+    # The cuDNN MXFP8 GEMM graph consumes block scales reordered in the
+    # F8_128x4 swizzled layout, so it requires 1D swizzled (128x4) scales and
+    # does not support 8x4 swizzled or 2D linear scales.
+    if use_8x4_sf_layout:
+        return False
+    if a_descale.ndim != 1 or b_descale.ndim != 1:
+        return False
+    return _cudnn_available_or_raise_for_backend(backend)
+
+
 # Shared helpers for CuTe DSL block-scaled GEMM runners (mxfp8 & mxfp4/nvfp4)
 _SM100_MMA_TILER_MN_CANDIDATES = [
     (128, 8),
@@ -4623,6 +4705,118 @@ def _cute_dsl_gemm_mxfp8_runner(
     return CuteDSLMxfp8GemmRunner()
 
 
+def _cudnn_mm_mxfp8_runner():
+    """Build a TunableRunner for the cuDNN MXFP8 (2D mm) backend.
+
+    The cuDNN MXFP8 GEMM graph operates on batched (3D) tensors, so the 2D mm
+    problem is promoted to a batch-size-1 bmm internally.  The runner follows
+    the ``mm_mxfp8`` inputs layout
+    ``[a, b, a_descale, b_descale, out_dtype, out, workspace_buffer]`` so it can
+    be tuned by the shared AutoTuner alongside the CUTLASS/TRTLLM/cute-dsl
+    runners.
+
+    When cuDNN supports it, the override-shape path is used: a single graph is
+    compiled per ``cache_m`` bucket and reused for any runtime M, with the real
+    shapes supplied through ``override_shapes`` at execute time.  Otherwise a
+    per-shape graph is built (HEURISTICS_CHOICE).
+    """
+
+    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
+        _MM_MXFP8_TUNING_CONFIG, spec_idx=0
+    )
+
+    class CudnnMmMxfp8GemmRunner(TunableRunner):
+        def __init__(self):
+            super().__init__()
+            self._m_bucket_mapper = m_bucket_mapper
+            self._use_override_shape = is_cudnn_override_shape_available()
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, _, _, _, out, _ = inputs
+            return (a.dtype, b.dtype, out.dtype)
+
+        def _get_override_graph(self, a, b, out):
+            # a is [m, k], b is [k, n] (2D mm promoted to batch-size-1 bmm).
+            actual_m = a.shape[0]
+            k = a.shape[1]
+            n = b.shape[1]
+            cache_m = self._m_bucket_mapper(actual_m)
+            return build_cudnn_gemm_mxfp8_graph_override_shape(
+                batch=1,
+                n=n,
+                k=k,
+                a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                block_size=32,
+                device=a.device,
+                cache_m=cache_m,
+                policy=cudnn.build_plan_policy.ALL,
+            )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            a, b, _, _, _, out, _ = inputs
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+            else:
+                a3 = a.unsqueeze(0)
+                b3 = b.unsqueeze(0)
+                graph = build_cudnn_gemm_mxfp8_graph(
+                    a_shape=a3.shape,
+                    a_stride=a3.stride(),
+                    a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                    b_shape=b3.shape,
+                    b_stride=b3.stride(),
+                    b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                    o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                    block_size=32,
+                    device=a.device,
+                    policy=cudnn.build_plan_policy.ALL,
+                )
+            return list(range(graph.get_execution_plan_count()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, a_descale, b_descale, _out_dtype, out, workspace_buffer = inputs
+            # unsqueeze(0) returns views sharing storage, so writes to the 3D
+            # output view land in the user-provided 2D ``out`` tensor.
+            if self._use_override_shape:
+                graph = self._get_override_graph(a, b, out)
+                execute_cudnn_gemm_mxfp8_graph_override_shape(
+                    graph=graph,
+                    a=a.unsqueeze(0),
+                    b=b.unsqueeze(0),
+                    a_descale=a_descale,
+                    b_descale=b_descale,
+                    c_final=out.unsqueeze(0),
+                    workspace=workspace_buffer,
+                    tactic=max(tactic, 0),
+                )
+            else:
+                _cudnn_gemm_mxfp8(
+                    a=a.unsqueeze(0),
+                    b=b.unsqueeze(0),
+                    a_descale=a_descale,
+                    b_descale=b_descale,
+                    out=out.unsqueeze(0),
+                    out_dtype=out.dtype,
+                    workspace_buffer=workspace_buffer,
+                    tactic=tactic,
+                )
+            return out
+
+    return CudnnMmMxfp8GemmRunner()
+
+
 def _heuristic_func_mm_mxfp8(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -4632,11 +4826,15 @@ def _heuristic_func_mm_mxfp8(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
-    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
 ) -> List[str]:
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
         return ["cutlass"]
+    # fall back to cudnn (e.g. on SM12x when CUTLASS scale-layout
+    # requirements are not met) when it is available.
+    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+        return ["cudnn"]
     return []
 
 
@@ -4645,6 +4843,7 @@ def _heuristic_func_mm_mxfp8(
         "cutlass": _cutlass_gemm_mxfp8_requirement,
         "trtllm": _trtllm_gemm_mxfp8_requirement,
         "cute-dsl": _cute_dsl_gemm_mxfp8_requirement,
+        "cudnn": _cudnn_mm_mxfp8_requirement,
     },
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
@@ -4658,7 +4857,7 @@ def mm_mxfp8(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -4686,7 +4885,8 @@ def mm_mxfp8(
         For 1D swizzled format, it's flattened from (N_padded, K_padded) layout.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``None``.
+        Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
+        into it (supported by the CUTLASS and cuDNN backends). Defaults to ``None``.
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
@@ -4694,9 +4894,10 @@ def mm_mxfp8(
     use_8x4_sf_layout: bool
         Whether the scale tensors for a are in 8x4 layout (vs 128x4).
 
-    backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"]
+    backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
-        ``"auto"`` selects the CUTLASS backend.
+        ``"auto"`` selects the CUTLASS backend when available and otherwise
+        falls back to the cuDNN backend.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
@@ -4704,6 +4905,8 @@ def mm_mxfp8(
         - On SM12x GPUs, the ``"cutlass"`` backend only supports
           1D swizzled scales (``SfLayout.layout_128x4``). Passing 2D linear scales will raise
           an error. Use ``mxfp8_quantize(..., sf_swizzle_layout=SfLayout.layout_128x4)``.
+        - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
+          layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
 
     Returns
     -------
@@ -4784,6 +4987,7 @@ def mm_mxfp8(
             use_8x4_sf_layout
         ),
         "cute-dsl": lambda: _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
+        "cudnn": lambda: _cudnn_mm_mxfp8_runner(),
     }
 
     runners: List[TunableRunner] = [
@@ -5148,14 +5352,25 @@ def _cudnn_gemm_fp4_requirement(
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+
+    if not _cudnn_available_or_raise_for_backend(backend):
+        return False
+
+    try:
+        _check_cudnn_fp4_availability()
+    except RuntimeError:
+        if backend == "cudnn":
+            raise
+        return False
+
     if (
         not use_nvfp4
         and _match_sm_version(a.device, ["120", "121"])
         and cudnn.backend_version() < 91400
     ):
+        if backend != "cudnn":
+            return False
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
-
-    _check_cudnn_fp4_availability()
 
     return True
 
@@ -6093,8 +6308,7 @@ def _cudnn_bmm_fp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
 ):
-    _check_cudnn_availability()
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 @supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
@@ -8298,10 +8512,9 @@ def _cudnn_bmm_mxfp8_requirement(
     B_scale: torch.Tensor,
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cudnn"] = "cudnn",
+    backend: Literal["cudnn", "auto"] = "cudnn",
 ):
-    _check_cudnn_availability()
-    return True
+    return _cudnn_available_or_raise_for_backend(backend)
 
 
 def _validate_mxfp8_output_dtype(dtype: torch.dtype):

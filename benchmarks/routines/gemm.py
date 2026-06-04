@@ -899,12 +899,13 @@ def testBmmMxfp8(args):
     input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
     input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout=True)
 
-    mat2 = (
-        torch.randn([batch_size, n, k], device=device, dtype=torch.bfloat16)
-        .transpose(-2, -1)
-        .contiguous()
-    )
-    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout=True)
+    # Quantize [b, n, k] weights, then pass their [b, k, n] transpose as B.
+    # Keep the transpose as a view so the K dimension remains contiguous.
+    mat2_weight = torch.randn([batch_size, n, k], device=device, dtype=torch.bfloat16)
+    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2_weight, is_sf_swizzled_layout=True)
+    # [b, k, n] views for the GEMM call and the reference.
+    mat2_mxfp8 = mat2_mxfp8.transpose(-2, -1)
+    mat2 = mat2_weight.transpose(-2, -1)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_mxfp8.shape = }")
@@ -1364,6 +1365,7 @@ def testMmMxfp8(args):
         "cutlass",
         "cute-dsl",
         "trtllm",
+        "cudnn",
         "auto",
     ]
     res = []
@@ -1399,11 +1401,12 @@ def testMmMxfp8(args):
     for backend in backends:
         ## Prepare input tensors
         # Use swizzled layout for optimal performance
-        is_sf_swizzled_layout = backend in ["cutlass", "trtllm"]
+        is_sf_swizzled_layout = backend in ["cutlass", "trtllm", "cudnn"]
 
         if not is_sf_swizzled_layout:
             sf_layout_input = flashinfer.SfLayout.layout_linear
-        elif backend == "cutlass" or args.use_128x4_sf_layout:
+        elif backend in ("cutlass", "cudnn") or args.use_128x4_sf_layout:
+            # CUTLASS and cuDNN use the F8_128x4 swizzled scale layout here.
             sf_layout_input = flashinfer.SfLayout.layout_128x4
         elif backend == "trtllm":
             if not args.use_128x4_sf_layout:
@@ -1447,7 +1450,7 @@ def testMmMxfp8(args):
         backend: str,
         inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        assert backend in ["cutlass", "trtllm", "cute-dsl", "auto"], (
+        assert backend in ["cutlass", "trtllm", "cute-dsl", "cudnn", "auto"], (
             f"Unsupported backend: {backend}"
         )
         input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
