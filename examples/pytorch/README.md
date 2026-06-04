@@ -203,6 +203,30 @@ python wan/pipeline_wan_flashinfer.py \
 | `use_skip_softmax_sparse` | `False` | Enables sparse attention through TRT-LLM when supported |
 | `skip_softmax_threshold_scale_factor` | `1.0` | Sparse attention threshold scale |
 
+## HunyuanImage-3.0 Example
+
+The `hunyuan_image3/` directory hosts an end-to-end driver for
+[`tencent/HunyuanImage-3.0-Instruct`](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct),
+inspired by [vllm-omni's `end2end.py`](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/hunyuan_image3):
+
+| File | Description |
+|------|-------------|
+| `hunyuan_image3/modeling_hunyuan_image3_flashinfer.py` | `replace_backbone_with_flashinfer(model, ...)` swaps RMSNorm, QK-norm, GQA attention, SwiGLU MLP, and MoE in every decoder layer of a HuggingFace-loaded model. |
+| `hunyuan_image3/pipeline_hunyuan_image3_flashinfer.py` | CLI driver for `text2img`, `img2img`, `img2text`, and `text2text` modalities. |
+
+Quick example:
+
+```bash
+python hunyuan_image3/pipeline_hunyuan_image3_flashinfer.py \
+  --modality text2img \
+  --prompts "A cute cat sitting on a windowsill" \
+  --gemm-backend bf16 \
+  --output ./out
+```
+
+See [`hunyuan_image3/README.md`](hunyuan_image3/README.md) for backend flags
+and per-modality details.
+
 ## Notes
 
 - Unsupported GEMM backends fall back to `torch` with a warning that lists the
