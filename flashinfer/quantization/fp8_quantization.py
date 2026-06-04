@@ -1,4 +1,5 @@
 import functools
+import math
 from types import SimpleNamespace
 from typing import Literal, Optional, Tuple
 
@@ -19,6 +20,24 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     padded_row = (total_row + row_size - 1) // row_size * row_size
     padded_column = (total_column + 3) // 4 * 4
     return padded_row * padded_column
+
+
+def _mxfp8_sf_shape_2d(m, k, sf_swizzle_layout, alignment=32):
+    """Rank-preserving 2D shape of the scale-factor buffer for one ``[m, k]`` matrix.
+
+    Mirrors the (row, column) padding the kernel applies to the flat 1D buffer, so
+    reshaping the 1D output to this shape is a pure view.  For the swizzled layouts
+    the row dim is padded to the swizzle block size and the column dim to a multiple
+    of 4 (matching ``_compute_swizzled_layout_sf_size``); ``layout_linear`` is
+    unpadded.  This is the 2D scale convention ``nvfp4_quantize`` already returns.
+    """
+    padded_k = (k + alignment - 1) // alignment * alignment
+    cols = padded_k // 32
+    if sf_swizzle_layout == SfLayout.layout_128x4:
+        return ((m + 127) // 128 * 128, (cols + 3) // 4 * 4)
+    if sf_swizzle_layout == SfLayout.layout_8x4:
+        return ((m + 7) // 8 * 8, (cols + 3) // 4 * 4)
+    return (m, cols)  # layout_linear
 
 
 @functools.cache
@@ -167,6 +186,7 @@ def mxfp8_quantize(
     enable_pdl: Optional[bool] = None,
     backend: Literal["cuda", "cute-dsl"] = "cuda",
     sf_swizzle_layout: Optional[SfLayout] = None,
+    rank_preserving: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to MxFP8 format.
 
@@ -184,11 +204,25 @@ def mxfp8_quantize(
             - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**)
         sf_swizzle_layout (Optional[SfLayout], optional): Swizzle layout for scale factors.
             If provided,it overrides is_sf_swizzled_layout. Defaults to None.
+        rank_preserving (bool, optional): Scale-factor output shape convention. Defaults to False.
+            - ``False`` (default, legacy): the scale factor is returned as a flat 1D
+              buffer regardless of input rank; for batched ``[B, M, K]`` input the batch
+              is folded into M (``B*M``) and the swizzle padding is applied to the
+              combined ``B*M`` dimension.
+            - ``True`` (opt-in, recommended): the scale factor's rank mirrors the input.
+              A 2D ``[M, K]`` input returns a 2D ``[M_pad, K_blocks_pad]`` scale (the same
+              convention :func:`nvfp4_quantize` uses), and a 3D ``[B, M, K]`` input returns
+              a 3D ``[B, M_pad, K_blocks_pad]`` scale that is padded **per batch** (each
+              batch's M padded to the swizzle block size independently). The per-batch form
+              is what batched consumers such as the cuDNN ``bmm`` path require. This is the
+              transition path toward unifying the mxfp8 (1D) and nvfp4 (2D) scale
+              conventions; the default will flip to ``True`` in a future release.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
-            - Scale factors tensor with shape determined by layout and sf_vec_size
+            - Scale factors tensor with shape determined by layout, sf_vec_size and
+              ``rank_preserving`` (see above)
 
     Warning:
         The "cute-dsl" backend is **experimental** and not part of the stable API.
@@ -206,6 +240,40 @@ def mxfp8_quantize(
         sf_swizzle_layout = (
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         )
+
+    if rank_preserving and backend != "cuda":
+        raise NotImplementedError(
+            "rank_preserving=True is currently only supported with backend='cuda'."
+        )
+
+    # Batched (>=3D) swizzled input with rank_preserving must be quantized per batch:
+    # the default kernel folds the batch into M and pads the combined B*M, so the
+    # per-batch padding rows simply don't exist in that flat buffer and cannot be
+    # recovered by a reshape. (2D input and the linear layout need no per-batch padding
+    # and are handled by the reshape at the end.)
+    if (
+        rank_preserving
+        and input.dim() >= 3
+        and sf_swizzle_layout != SfLayout.layout_linear
+    ):
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
+        *batch_dims, m, k = input.shape
+        bsz = math.prod(batch_dims)
+        flat_in = input.reshape(bsz, m, k)
+        module = get_mxfp8_quantization_sm100_module()
+        qs, sfs = [], []
+        for i in range(bsz):
+            q_i, sf_i = module.mxfp8_quantize_sm100(
+                flat_in[i].contiguous(), sf_swizzle_layout, alignment, enable_pdl
+            )
+            qs.append(q_i)
+            sfs.append(sf_i)
+        padded_k = (k + alignment - 1) // alignment * alignment
+        m_pad, cols = _mxfp8_sf_shape_2d(m, k, sf_swizzle_layout, alignment)
+        x_q = torch.stack(qs, 0).reshape(*batch_dims, m, padded_k)
+        sf = torch.stack(sfs, 0).reshape(*batch_dims, m_pad, cols)
+        return x_q, sf
 
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
@@ -237,6 +305,17 @@ def mxfp8_quantize(
             alignment,
             enable_pdl,
         )
+        if rank_preserving:
+            # 2D input -> 2D [M_pad, K_blocks_pad]; 3D+ here is necessarily the linear
+            # layout (swizzled 3D returned above), which needs no per-batch padding so a
+            # plain reshape mirroring the input rank is exact.
+            *batch_dims, m, k = input.shape
+            m_pad, cols = _mxfp8_sf_shape_2d(m, k, sf_swizzle_layout, alignment)
+            sf = (
+                sf.reshape(*batch_dims, m, cols)
+                if batch_dims
+                else sf.reshape(m_pad, cols)
+            )
         return x_q, sf
 
 

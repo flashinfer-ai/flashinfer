@@ -573,5 +573,103 @@ def test_cute_dsl_compilation_cache_dtype_specific(is_sf_swizzled_layout):
     cache_fn.cache_clear()
 
 
+# =============================================================================
+# rank_preserving scale-factor convention (opt-in 2D/3D output)
+# =============================================================================
+
+
+def _skip_if_not_sm100():
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+
+@pytest.mark.parametrize("m", [3, 64, 130, 256])
+@pytest.mark.parametrize("k", [128, 1024])
+@pytest.mark.parametrize("sf_layout", MXFP8_SF_LAYOUTS)
+def test_mxfp8_rank_preserving_2d_is_reshape_of_1d(m, k, sf_layout):
+    """For 2D input, rank_preserving=True must be a pure reshape of the flat buffer.
+
+    Same bytes, just shaped to the [M_pad, K_blocks_pad] 2D convention that
+    nvfp4_quantize already uses -- nothing recomputed, quantized values identical.
+    """
+    _skip_if_not_sm100()
+    from flashinfer.quantization.fp8_quantization import _mxfp8_sf_shape_2d
+
+    torch.random.manual_seed(0)
+    a = (torch.randn([m, k], dtype=torch.float) * 16).bfloat16().cuda().contiguous()
+
+    q_flat, sf_flat = mxfp8_quantize(
+        a, sf_swizzle_layout=sf_layout, rank_preserving=False
+    )
+    q_2d, sf_2d = mxfp8_quantize(a, sf_swizzle_layout=sf_layout, rank_preserving=True)
+
+    assert sf_2d.shape == _mxfp8_sf_shape_2d(m, k, sf_layout)
+    assert torch.equal(sf_2d.reshape(-1), sf_flat)
+    assert torch.equal(q_2d, q_flat)  # quantized values unaffected by the SF shape
+
+
+@pytest.mark.parametrize("b", [2, 4])
+@pytest.mark.parametrize("m", [130, 200, 256])
+@pytest.mark.parametrize("k", [128, 256])
+def test_mxfp8_rank_preserving_3d_swizzled_per_batch(b, m, k):
+    """3D swizzled rank_preserving must pad each batch's M independently.
+
+    The legacy (flat) path folds B*M and pads the combined dim, so at non-128
+    aligned M the per-batch padding rows are missing.  rank_preserving must
+    produce ``[B, round_up(M,128), K_blocks_pad]`` equal to quantizing each
+    batch slice on its own.
+    """
+    _skip_if_not_sm100()
+    from flashinfer.quantization.fp8_quantization import _mxfp8_sf_shape_2d
+
+    layout = SfLayout.layout_128x4
+    torch.random.manual_seed(0)
+    a = (torch.randn([b, m, k], dtype=torch.float) * 16).bfloat16().cuda().contiguous()
+
+    q_rp, sf_rp = mxfp8_quantize(a, sf_swizzle_layout=layout, rank_preserving=True)
+
+    m_pad, cols = _mxfp8_sf_shape_2d(m, k, layout)
+    assert sf_rp.shape == (b, m_pad, cols)
+    # The whole point: per-batch padding has MORE elements than the B*M-flattened
+    # buffer whenever M is not 128-aligned.
+    assert sf_rp.numel() == b * m_pad * cols
+
+    # Each batch slice must equal an independent 2D rank_preserving quantization.
+    for i in range(b):
+        q_i, sf_i = mxfp8_quantize(
+            a[i].contiguous(), sf_swizzle_layout=layout, rank_preserving=True
+        )
+        assert torch.equal(sf_rp[i], sf_i)
+        assert torch.equal(q_rp[i], q_i)
+
+
+@pytest.mark.parametrize("b", [2, 4])
+@pytest.mark.parametrize("m", [130, 256])
+@pytest.mark.parametrize("k", [128, 256])
+def test_mxfp8_rank_preserving_3d_linear_is_reshape(b, m, k):
+    """3D linear needs no per-batch padding -> a plain rank-mirroring reshape."""
+    _skip_if_not_sm100()
+
+    layout = SfLayout.layout_linear
+    torch.random.manual_seed(0)
+    a = (torch.randn([b, m, k], dtype=torch.float) * 16).bfloat16().cuda().contiguous()
+
+    q_flat, sf_flat = mxfp8_quantize(a, sf_swizzle_layout=layout, rank_preserving=False)
+    q_rp, sf_rp = mxfp8_quantize(a, sf_swizzle_layout=layout, rank_preserving=True)
+
+    assert sf_rp.shape == (b, m, k // 32)
+    assert torch.equal(sf_rp.reshape(-1), sf_flat)
+    assert torch.equal(q_rp, q_flat)
+
+
+def test_mxfp8_rank_preserving_rejects_cute_dsl():
+    """rank_preserving is only implemented for the CUDA backend for now."""
+    _skip_if_not_sm100()
+    a = torch.randn([128, 128], dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(NotImplementedError):
+        mxfp8_quantize(a, backend="cute-dsl", rank_preserving=True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
