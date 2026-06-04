@@ -68,17 +68,23 @@ def round_up(val: int, gran: int) -> int:
 def create_tensor_from_cuda_memory(
     ptr: int, shape: tuple, dtype: torch.dtype, device_id: int
 ) -> torch.Tensor:
-    """
-    Create a PyTorch tensor from a CUDA memory pointer using DLPack.
+    r"""Wrap a CUDA memory allocation as a PyTorch tensor via DLPack.
 
-    Args:
-        ptr: CUDA memory pointer address as integer
-        shape: Desired tensor shape
-        dtype: PyTorch data type
-        device_id: CUDA device ID
+    Parameters
+    ----------
+    ptr : int
+        CUDA memory pointer (device address) as an integer.
+    shape : tuple
+        Desired tensor shape.
+    dtype : torch.dtype
+        Element dtype of the resulting tensor.
+    device_id : int
+        CUDA device ID hosting ``ptr``.
 
-    Returns:
-        PyTorch tensor that wraps the CUDA memory
+    Returns
+    -------
+    torch.Tensor
+        A tensor that views the provided device memory.
     """
     # Calculate total size in elements
     numel = 1
@@ -131,9 +137,22 @@ def test_cuda_memory_access(ptr: int, size: int, device_id: int) -> bool:
         return False
 
 
-def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> int:
-    """
-    A helper function that allocates memory on cuda and copies the data from the host to the device.
+def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
+    r"""Allocate a device buffer holding the supplied host pointer array.
+
+    The host pointers are packed into a ``uint64`` array, copied to device,
+    and the resulting device pointer is returned.
+
+    Parameters
+    ----------
+    host_ptr_array : list[int]
+        Sequence of host-side pointer values (interpreted as ``uint64``).
+
+    Returns
+    -------
+    Optional[int]
+        Device pointer to the packed array, or ``None`` if
+        ``host_ptr_array`` is empty.
     """
     if not host_ptr_array:
         return None
