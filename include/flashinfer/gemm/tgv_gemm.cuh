@@ -587,10 +587,10 @@ CUTLASS_DEVICE void MMA_warp(SharedStorage& shared_storage, WorkTileInfo work_ti
   cutlass::arch::umma_arrive(&shared_storage.mma_epilog_full_barrier);
 
   // wait for tmem deallocation signal from epilog warp:
-  // the epilog warps arrive on tmem_allocation_result_barrier after their tcgen05.ld finishes (paired
-  // with fence_view_async_tmem_load). Together with this MMA-side arrive, the 32 (MMA) + 128
-  // (EPILOG) = 160 named-barrier arrivals are reached, both sides are released, and it is now safe
-  // for the MMA warp to free TMEM without racing against an in-flight tcgen05.ld.
+  // the epilog warps arrive on tmem_allocation_result_barrier after their tcgen05.ld finishes
+  // (paired with fence_view_async_tmem_load). Together with this MMA-side arrive, the 32 (MMA) +
+  // 128 (EPILOG) = 160 named-barrier arrivals are reached, both sides are released, and it is now
+  // safe for the MMA warp to free TMEM without racing against an in-flight tcgen05.ld.
   tmem_allocation_result_barrier.arrive_and_wait();
 
   // deallocate TMEM
@@ -640,8 +640,8 @@ CUTLASS_DEVICE void EPILOG_warp(SharedStorage& shared_storage, WorkTileInfo work
   // i.e. tcgen05.ld.16dp256b.x1 for CTA_N=8, .x2 for CTA_N=16, .x4 for CTA_N=32, .x8 for CTA_N=64.
   using AccType = typename decltype(tCtAcc)::value_type;
   constexpr int acc_col_bits = CTA_N * sizeof_bits_v<AccType>;
-  TiledCopy tiled_t2r_copy = make_tmem_copy(
-      TMEM::op_repeater<SM100_TMEM_LOAD_16dp256b1x, acc_col_bits>(), tCtAcc);
+  TiledCopy tiled_t2r_copy =
+      make_tmem_copy(TMEM::op_repeater<SM100_TMEM_LOAD_16dp256b1x, acc_col_bits>(), tCtAcc);
   // epilog tid is from 128 to 255, need to offset by -128 when getting the per thread slice
   ThrCopy thr_t2r_copy = tiled_t2r_copy.get_slice(threadIdx.x - 128);
 

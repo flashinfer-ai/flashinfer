@@ -122,36 +122,36 @@ _TGV_CUTE_EXT_CTA_K: int = 128
 _TGV_CUTE_EXT_DEFAULT_TACTIC: int = 1
 _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     # 1-CTA configs
-    (64, 8, 6, False),     # 0
-    (64, 8, 8, False),     # 1 (default)
-    (64, 8, 10, False),    # 2
-    (64, 8, 12, False),    # 3
-    (64, 16, 6, False),    # 4
-    (64, 16, 8, False),    # 5
-    (64, 16, 11, False),   # 6
-    (64, 32, 6, False),    # 7
-    (64, 32, 9, False),    # 8
-    (64, 64, 7, False),    # 9
-    (64, 128, 4, False),   # 10
-    (128, 8, 6, False),    # 11
-    (128, 16, 6, False),   # 12
-    (128, 32, 5, False),   # 13
-    (128, 64, 4, False),   # 14
+    (64, 8, 6, False),  # 0
+    (64, 8, 8, False),  # 1 (default)
+    (64, 8, 10, False),  # 2
+    (64, 8, 12, False),  # 3
+    (64, 16, 6, False),  # 4
+    (64, 16, 8, False),  # 5
+    (64, 16, 11, False),  # 6
+    (64, 32, 6, False),  # 7
+    (64, 32, 9, False),  # 8
+    (64, 64, 7, False),  # 9
+    (64, 128, 4, False),  # 10
+    (128, 8, 6, False),  # 11
+    (128, 16, 6, False),  # 12
+    (128, 32, 5, False),  # 13
+    (128, 64, 4, False),  # 14
     (128, 128, 3, False),  # 15
     # 2-CTA configs
-    (64, 16, 6, True),     # 16
-    (64, 16, 8, True),     # 17
-    (64, 16, 12, True),    # 18
-    (64, 32, 6, True),     # 19
-    (64, 32, 8, True),     # 20
-    (64, 32, 11, True),    # 21
-    (64, 64, 6, True),     # 22
-    (64, 64, 9, True),     # 23
-    (64, 128, 7, True),    # 24
-    (128, 16, 6, True),    # 25
-    (128, 32, 6, True),    # 26
-    (128, 64, 5, True),    # 27
-    (128, 128, 4, True),   # 28
+    (64, 16, 6, True),  # 16
+    (64, 16, 8, True),  # 17
+    (64, 16, 12, True),  # 18
+    (64, 32, 6, True),  # 19
+    (64, 32, 8, True),  # 20
+    (64, 32, 11, True),  # 21
+    (64, 64, 6, True),  # 22
+    (64, 64, 9, True),  # 23
+    (64, 128, 7, True),  # 24
+    (128, 16, 6, True),  # 25
+    (128, 32, 6, True),  # 26
+    (128, 64, 5, True),  # 27
+    (128, 128, 4, True),  # 28
 ]
 
 
@@ -165,6 +165,7 @@ def get_tgv_cute_ext_default_tactic() -> int:
 
 class WorkTileInfo(NamedTuple):
     """Which output tile this CTA processes. Mirrors the original WorkTileInfo."""
+
     M_idx: cutlass.Int32
     N_idx: cutlass.Int32
     L_idx: cutlass.Int32
@@ -217,7 +218,7 @@ class TgvGemmCuteExtKernel:
             )
 
         # Fixed configuration matching the C++ / DSL kernels.
-        self.threads_per_cta = 256          # 8 warps (warp 3 unused)
+        self.threads_per_cta = 256  # 8 warps (warp 3 unused)
         if use_2cta:
             # 2-CTA cluster along M; joint MMA tile = (cta_m*2, cta_n).
             self.cluster_shape = (2, 1, 1)
@@ -234,10 +235,10 @@ class TgvGemmCuteExtKernel:
     @cute.experimental.jit
     def __call__(
         self,
-        a: cute.Tensor,    # (Gemm_M, Gemm_K, Gemm_L), K-major
-        b: cute.Tensor,    # (Gemm_N, Gemm_K, Gemm_L), K-major
-        c: cute.Tensor,    # (Gemm_M, Gemm_N, Gemm_L), M-major
-        bias: cute.Tensor, # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
+        a: cute.Tensor,  # (Gemm_M, Gemm_K, Gemm_L), K-major
+        b: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
+        c: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
+        bias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
         stream: cuda.CUstream,
     ):
         # Each CTA processes one (CTA_M, CTA_N) output tile, no persistence.
@@ -265,10 +266,10 @@ class TgvGemmCuteExtKernel:
     @cute.experimental.kernel
     def kernel(
         self,
-        mA: cute.Tensor,    # (Gemm_M, Gemm_K, Gemm_L), K-major
-        mB: cute.Tensor,    # (Gemm_N, Gemm_K, Gemm_L), K-major
-        mC: cute.Tensor,    # (Gemm_M, Gemm_N, Gemm_L), M-major
-        mBias: cute.Tensor, # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
+        mA: cute.Tensor,  # (Gemm_M, Gemm_K, Gemm_L), K-major
+        mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
+        mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
+        mBias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
     ):
         """
         Device-side dispatcher: build MMA descriptor, allocate SMEM/TMEM/
@@ -282,13 +283,18 @@ class TgvGemmCuteExtKernel:
         # 2-CTA bf16 K-major (128,N): Mma_M=128 split across cluster, Mma_K=16.
         a_major = utils.LayoutEnum.from_tensor(mA).mma_major_mode()
         b_major = utils.LayoutEnum.from_tensor(mB).mma_major_mode()
-        ab_dtype = mA.element_type           # bf16
-        c_dtype = mC.element_type            # bf16
+        ab_dtype = mA.element_type  # bf16
+        c_dtype = mC.element_type  # bf16
         d_layout = utils.LayoutEnum.from_tensor(mC)
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            ab_dtype, ab_dtype, a_major, b_major,
-            self.acc_dtype, self.cta_group, self.mma_tiler_mn,
+            ab_dtype,
+            ab_dtype,
+            a_major,
+            b_major,
+            self.acc_dtype,
+            self.cta_group,
+            self.mma_tiler_mn,
         )
         num_mma_ctas = cute.size(tiled_mma.thr_id.shape)  # 1 (1-CTA) or 2 (2-CTA)
 
@@ -297,11 +303,11 @@ class TgvGemmCuteExtKernel:
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = self.cta_k // mma_inst_shape_k
 
-        mnk_tiler  = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
-        a_tiler_mk = (self.cta_m, self.cta_k)               # CTA tile of A
+        mnk_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
+        a_tiler_mk = (self.cta_m, self.cta_k)  # CTA tile of A
         # 2-CTA splits B across cluster M (each CTA loads Mma_N/2 cols).
         b_tiler_nk = (self.cta_n // num_mma_ctas, self.cta_k)
-        c_tiler_mn = (self.cta_m, self.cta_n)               # CTA tile of C
+        c_tiler_mn = (self.cta_m, self.cta_n)  # CTA tile of C
 
         # ---- WorkTileInfo (static 1-tile-per-CTA scheduler) ----
         # blockIdx maps directly to (M_tile, N_tile, batch). K_idx_start/end
@@ -329,19 +335,31 @@ class TgvGemmCuteExtKernel:
         # halves the M extent of sA and the N extent of sB internally (the SS
         # atom splits A across cluster M and B across cluster M).
         a_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            tiled_mma, mnk_tiler, ab_dtype, DMA_Stage,
+            tiled_mma,
+            mnk_tiler,
+            ab_dtype,
+            DMA_Stage,
         )  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage) — Sw<3,4,3>
         b_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            tiled_mma, mnk_tiler, ab_dtype, DMA_Stage,
+            tiled_mma,
+            mnk_tiler,
+            ab_dtype,
+            DMA_Stage,
         )  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage) — Sw<3,4,3>
 
         # sA per-CTA M extent = cta_m for both modes; sB per-CTA N extent =
         # cta_n (1-CTA) or cta_n/2 (2-CTA, SS atom splits B across cluster M).
-        sA = cute_ext.allocate(             # ((Mma_M_per_cta, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
-            ab_dtype, cute.AddressSpace.smem, a_smem_layout_staged, alignment=1024,
+        sA = cute_ext.allocate(  # ((Mma_M_per_cta, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
+            ab_dtype,
+            cute.AddressSpace.smem,
+            a_smem_layout_staged,
+            alignment=1024,
         )
-        sB = cute_ext.allocate(             # ((Mma_N_per_cta, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
-            ab_dtype, cute.AddressSpace.smem, b_smem_layout_staged, alignment=1024,
+        sB = cute_ext.allocate(  # ((Mma_N_per_cta, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
+            ab_dtype,
+            cute.AddressSpace.smem,
+            b_smem_layout_staged,
+            alignment=1024,
         )
 
         # ---- TMEM accumulator layout (manual alloc; see MMA warp) ----
@@ -351,7 +369,9 @@ class TgvGemmCuteExtKernel:
         # = (((16,4), cta_n), 1, 1, 1) for both 1-CTA and 2-CTA modes.
         # We still allocate TMEM manually (via cute.arch.alloc_tmem below) for better performance.
         acc_layout = cute_ext.make_tmem_layout_acc(
-            tiled_mma, self.mma_tiler_mn, acc_stage=1,
+            tiled_mma,
+            self.mma_tiler_mn,
+            acc_stage=1,
         )
 
         # ---- Raw mbarriers (Int64 SMEM arrays) + tmem_base_ptr Int32 slot ----
@@ -364,27 +384,39 @@ class TgvGemmCuteExtKernel:
         #      and (c) 1-arrival "wake the consumer warp" patterns.
         # Allocated as 1D tensors; .iterator gives a Pointer[Int64] supporting
         # `bar + stage` arithmetic. Arrival counts are in the module docstring.
-        bar_full_arr       = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem,
-                                               cute.make_layout(DMA_Stage), alignment=8)
-        bar_empty_arr      = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem,
-                                               cute.make_layout(DMA_Stage), alignment=8)
-        bar_tma_epilog_arr = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem,
-                                               cute.make_layout(1), alignment=8)
-        bar_mma_epilog_arr = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem,
-                                               cute.make_layout(1), alignment=8)
-        bar_tmem_alloc_arr = cute_ext.allocate(cutlass.Int64, cute.AddressSpace.smem,
-                                               cute.make_layout(1), alignment=8)
+        bar_full_arr = cute_ext.allocate(
+            cutlass.Int64,
+            cute.AddressSpace.smem,
+            cute.make_layout(DMA_Stage),
+            alignment=8,
+        )
+        bar_empty_arr = cute_ext.allocate(
+            cutlass.Int64,
+            cute.AddressSpace.smem,
+            cute.make_layout(DMA_Stage),
+            alignment=8,
+        )
+        bar_tma_epilog_arr = cute_ext.allocate(
+            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+        )
+        bar_mma_epilog_arr = cute_ext.allocate(
+            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+        )
+        bar_tmem_alloc_arr = cute_ext.allocate(
+            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+        )
         # alloc_tmem writes the TMEM base address to this slot; both MMA and
         # EPILOG read it back via retrieve_tmem_ptr.
-        tmem_base_arr      = cute_ext.allocate(cutlass.Int32, cute.AddressSpace.smem,
-                                               cute.make_layout(1), alignment=4)
+        tmem_base_arr = cute_ext.allocate(
+            cutlass.Int32, cute.AddressSpace.smem, cute.make_layout(1), alignment=4
+        )
 
-        bar_full       = bar_full_arr.iterator        # Pointer[Int64], DMA_Stage
-        bar_empty      = bar_empty_arr.iterator       # Pointer[Int64], DMA_Stage
+        bar_full = bar_full_arr.iterator  # Pointer[Int64], DMA_Stage
+        bar_empty = bar_empty_arr.iterator  # Pointer[Int64], DMA_Stage
         bar_tma_epilog = bar_tma_epilog_arr.iterator  # Pointer[Int64]
         bar_mma_epilog = bar_mma_epilog_arr.iterator  # Pointer[Int64]
         bar_tmem_alloc = bar_tmem_alloc_arr.iterator  # Pointer[Int64]
-        tmem_base_ptr  = tmem_base_arr.iterator       # Pointer[Int32]
+        tmem_base_ptr = tmem_base_arr.iterator  # Pointer[Int32]
 
         # ---- Barrier init (1 thread, PTX mbarrier.init is single-thread) ----
         # bar_full arrival = 2 * num_mma_ctas:
@@ -397,9 +429,11 @@ class TgvGemmCuteExtKernel:
                     cute.arch.mbarrier_init(bar_full + i, 2 * num_mma_ctas)
                 for i in range(DMA_Stage):
                     cute.arch.mbarrier_init(bar_empty + i, 1)  # MMA tcgen05.commit
-                cute.arch.mbarrier_init(bar_tma_epilog, 32)    # whole DMA_B warp
-                cute.arch.mbarrier_init(bar_mma_epilog, 1)     # MMA tcgen05.commit
-                cute.arch.mbarrier_init(bar_tmem_alloc, 32 + 128)  # MMA + 4 EPILOG warps
+                cute.arch.mbarrier_init(bar_tma_epilog, 32)  # whole DMA_B warp
+                cute.arch.mbarrier_init(bar_mma_epilog, 1)  # MMA tcgen05.commit
+                cute.arch.mbarrier_init(
+                    bar_tmem_alloc, 32 + 128
+                )  # MMA + 4 EPILOG warps
 
         cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.use_2cta):
@@ -434,8 +468,9 @@ class TgvGemmCuteExtKernel:
         #   gA M extent = cta_m   (both modes; SS atom splits cluster M)
         #   gB N extent = cta_n   (1-CTA) or cta_n//2 (2-CTA)
         #   gD M×N      = cta_m × cta_n (cluster N is identical for both CTAs)
-        gA_tile = cute.local_tile(             # (cta_m, cta_k, Tiles_K)
-            mA, a_tiler_mk,
+        gA_tile = cute.local_tile(  # (cta_m, cta_k, Tiles_K)
+            mA,
+            a_tiler_mk,
             (work_tile_info.M_idx, None, work_tile_info.L_idx),
         )
         # gB n-index: 1-CTA just bidy; 2-CTA each cluster N_idx covers
@@ -444,19 +479,22 @@ class TgvGemmCuteExtKernel:
             gB_n_idx = work_tile_info.N_idx * num_mma_ctas + cta_rank_in_cluster
         else:
             gB_n_idx = work_tile_info.N_idx
-        gB_tile = cute.local_tile(             # (cta_n//num_mma_ctas, cta_k, Tiles_K)
-            mB, b_tiler_nk,
+        gB_tile = cute.local_tile(  # (cta_n//num_mma_ctas, cta_k, Tiles_K)
+            mB,
+            b_tiler_nk,
             (gB_n_idx, None, work_tile_info.L_idx),
         )
-        gD_tile = cute.local_tile(             # (cta_m, cta_n)
-            mC, c_tiler_mn,
+        gD_tile = cute.local_tile(  # (cta_m, cta_n)
+            mC,
+            c_tiler_mn,
             (work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx),
         )
         # gBias_tile: same (cta_m, cta_n) shape as gD_tile but stride (1, 0)
         # — the same M element is repeated across N. local_tile preserves the
         # (1, 0, 0) stride from mBias, so this works automatically.
-        gBias_tile = cute.local_tile(          # (cta_m, cta_n) stride (1, 0)
-            mBias, c_tiler_mn,
+        gBias_tile = cute.local_tile(  # (cta_m, cta_n) stride (1, 0)
+            mBias,
+            c_tiler_mn,
             (work_tile_info.M_idx, work_tile_info.N_idx, work_tile_info.L_idx),
         )
 
@@ -468,30 +506,54 @@ class TgvGemmCuteExtKernel:
         # ---- Warp dispatch (warp 3 idle, kept for 256-thread parity) ----
         if warp_idx == 0:
             self.dma_a_warp(
-                bar_full, bar_empty, leader_rank,
-                gA_tile, sA, a_cta_v_map,
+                bar_full,
+                bar_empty,
+                leader_rank,
+                gA_tile,
+                sA,
+                a_cta_v_map,
                 k_tile_count,
             )
         elif warp_idx == 1:
             self.dma_b_warp(
-                bar_full, bar_empty, bar_tma_epilog, leader_rank,
-                gB_tile, sB, b_cta_v_map,
+                bar_full,
+                bar_empty,
+                bar_tma_epilog,
+                leader_rank,
+                gB_tile,
+                sB,
+                b_cta_v_map,
                 k_tile_count,
             )
         elif warp_idx == 2:
             self.mma_warp(
                 is_leader,
-                bar_full, bar_empty, bar_mma_epilog, bar_tmem_alloc,
-                tiled_mma, sA, sB, tmem_base_ptr, acc_layout,
-                mma_inst_tile_k, k_tile_count,
+                bar_full,
+                bar_empty,
+                bar_mma_epilog,
+                bar_tmem_alloc,
+                tiled_mma,
+                sA,
+                sB,
+                tmem_base_ptr,
+                acc_layout,
+                mma_inst_tile_k,
+                k_tile_count,
             )
         elif warp_idx >= 4:
             # Epilog tid is 128..255 in the CTA; offset to 0..127 for partition.
             epi_tid = tidx - 128
             self.epilog_warp(
-                bar_tma_epilog, bar_mma_epilog, bar_tmem_alloc,
-                tmem_base_ptr, acc_layout, gD_tile, gBias_tile,
-                epi_tid, c_dtype, d_layout,
+                bar_tma_epilog,
+                bar_mma_epilog,
+                bar_tmem_alloc,
+                tmem_base_ptr,
+                acc_layout,
+                gD_tile,
+                gBias_tile,
+                epi_tid,
+                c_dtype,
+                d_layout,
             )
 
     # ====================================================================
@@ -504,11 +566,11 @@ class TgvGemmCuteExtKernel:
     @cute.experimental.jit
     def dma_a_warp(
         self,
-        bar_full,                # Pointer[Int64], DMA_Stage entries
-        bar_empty,               # Pointer[Int64], DMA_Stage entries
+        bar_full,  # Pointer[Int64], DMA_Stage entries
+        bar_empty,  # Pointer[Int64], DMA_Stage entries
         leader_rank: cutlass.Int32,  # used for the 2-CTA arrive-peer redirect
-        gA_tile: cute.Tensor,    # (CTA_M, CTA_K, Tiles_K) — this CTA's A strip
-        sA: cute.Tensor,         # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
+        gA_tile: cute.Tensor,  # (CTA_M, CTA_K, Tiles_K) — this CTA's A strip
+        sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
         a_cta_v_map: cute.Layout,
         k_tile_count: cutlass.Int32,
     ):
@@ -550,9 +612,9 @@ class TgvGemmCuteExtKernel:
                     peer_cta_rank_in_cluster=leader_rank if self.use_2cta else None,
                 )
             cute_ext.tma_load(
-                gA_tile[None, None, k_tile],     # (CTA_M, CTA_K) GMEM slice
-                sA[None, None, None, stage],     # ((Mma_M,Mma_K),NumMma_M,NumMma_K)
-                (bar_full + stage).value,        # Pointer→ir.Value bridge
+                gA_tile[None, None, k_tile],  # (CTA_M, CTA_K) GMEM slice
+                sA[None, None, None, stage],  # ((Mma_M,Mma_K),NumMma_M,NumMma_K)
+                (bar_full + stage).value,  # Pointer→ir.Value bridge
                 cta_v_map=a_cta_v_map,
                 tma_operation_type=self.tma_op,
                 update_expect_tx=False,
@@ -587,12 +649,12 @@ class TgvGemmCuteExtKernel:
     @cute.experimental.jit
     def dma_b_warp(
         self,
-        bar_full,                # Pointer[Int64], DMA_Stage entries
-        bar_empty,               # Pointer[Int64], DMA_Stage entries
-        bar_tma_epilog,          # Pointer[Int64], 1 entry (32-arrival)
+        bar_full,  # Pointer[Int64], DMA_Stage entries
+        bar_empty,  # Pointer[Int64], DMA_Stage entries
+        bar_tma_epilog,  # Pointer[Int64], 1 entry (32-arrival)
         leader_rank: cutlass.Int32,
-        gB_tile: cute.Tensor,    # (CTA_N, CTA_K, Tiles_K) — this CTA's B strip
-        sB: cute.Tensor,         # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
+        gB_tile: cute.Tensor,  # (CTA_N, CTA_K, Tiles_K) — this CTA's B strip
+        sB: cute.Tensor,  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
         b_cta_v_map: cute.Layout,
         k_tile_count: cutlass.Int32,
     ):
@@ -621,8 +683,8 @@ class TgvGemmCuteExtKernel:
                     peer_cta_rank_in_cluster=leader_rank if self.use_2cta else None,
                 )
             cute_ext.tma_load(
-                gB_tile[None, None, k_tile],     # (CTA_N, CTA_K) GMEM slice
-                sB[None, None, None, stage],     # ((Mma_N,Mma_K),NumMma_N,NumMma_K)
+                gB_tile[None, None, k_tile],  # (CTA_N, CTA_K) GMEM slice
+                sB[None, None, None, stage],  # ((Mma_N,Mma_K),NumMma_N,NumMma_K)
                 (bar_full + stage).value,
                 cta_v_map=b_cta_v_map,
                 tma_operation_type=self.tma_op,
@@ -659,17 +721,17 @@ class TgvGemmCuteExtKernel:
     def mma_warp(
         self,
         is_leader: cutlass.Boolean,
-        bar_full,                                  # Pointer[Int64], DMA_Stage entries
-        bar_empty,                                 # Pointer[Int64], DMA_Stage entries
-        bar_mma_epilog,                            # Pointer[Int64], 1 entry
-        bar_tmem_alloc,                            # Pointer[Int64], 1 entry, 160-arrival
+        bar_full,  # Pointer[Int64], DMA_Stage entries
+        bar_empty,  # Pointer[Int64], DMA_Stage entries
+        bar_mma_epilog,  # Pointer[Int64], 1 entry
+        bar_tmem_alloc,  # Pointer[Int64], 1 entry, 160-arrival
         tiled_mma: cute.TiledMma,
-        sA: cute.Tensor,         # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
-        sB: cute.Tensor,         # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
-        tmem_base_ptr,           # Pointer[Int32] — SMEM slot for TMEM addr
-        acc_layout: cutlass.Constexpr,             # TMEM accumulator layout
-        mma_inst_tile_k: cutlass.Constexpr,        # NumMma_K — inner loop count
-        k_tile_count: cutlass.Int32,               # Tiles_K — outer loop count
+        sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
+        sB: cute.Tensor,  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
+        tmem_base_ptr,  # Pointer[Int32] — SMEM slot for TMEM addr
+        acc_layout: cutlass.Constexpr,  # TMEM accumulator layout
+        mma_inst_tile_k: cutlass.Constexpr,  # NumMma_K — inner loop count
+        k_tile_count: cutlass.Int32,  # Tiles_K — outer loop count
     ):
         DMA_Stage = self.num_ab_stage
 
@@ -693,14 +755,18 @@ class TgvGemmCuteExtKernel:
         # 2-CTA: alloc/relinquish/dealloc are cluster-coherent (is_two_cta=True).
         num_tmem_cols = 256
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta)
-        cute.arch.mbarrier_arrive(bar_tmem_alloc)            # phase 0: 32 of 160
+        cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 0: 32 of 160
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
 
         # Bind acc_layout to the just-allocated TMEM ptr. Drop the trailing
         # AccStage=1 mode so the MMA atom sees (MMA, Mma_M, Mma_N).
         tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr)
-        tAcc = cute.make_tensor(tmem_ptr, acc_layout)  # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N, AccStage)
-        acc_view = tAcc[None, None, None, 0]           # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N)
+        tAcc = cute.make_tensor(
+            tmem_ptr, acc_layout
+        )  # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N, AccStage)
+        acc_view = tAcc[
+            None, None, None, 0
+        ]  # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N)
 
         if is_leader:
             # MMA atom: each cute_ext.dot call = 1 tcgen05.mma. ACCUMULATE:
@@ -728,10 +794,12 @@ class TgvGemmCuteExtKernel:
                     else:
                         mma_atom.set(tcgen05.Field.ACCUMULATE, True)
                     a_frag = cute.append_ones(
-                        sA[None, None, k_block, stage], up_to_rank=3,
+                        sA[None, None, k_block, stage],
+                        up_to_rank=3,
                     )
                     b_frag = cute.append_ones(
-                        sB[None, None, k_block, stage], up_to_rank=3,
+                        sB[None, None, k_block, stage],
+                        up_to_rank=3,
                     )
                     cute_ext.dot(mma_atom, a_frag, b_frag, acc_view)
 
@@ -756,7 +824,7 @@ class TgvGemmCuteExtKernel:
         # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
         # cross-CTA handshake) because each CTA owns its own physical TMEM
         # half; the cluster-shared accumulator is just a logical view.
-        cute.arch.mbarrier_arrive(bar_tmem_alloc)            # phase 1: 32 of 160
+        cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
@@ -766,14 +834,14 @@ class TgvGemmCuteExtKernel:
     @cute.experimental.jit
     def epilog_warp(
         self,
-        bar_tma_epilog,                            # Pointer[Int64], 1 entry (32-arrival)
-        bar_mma_epilog,                            # Pointer[Int64], 1 entry
-        bar_tmem_alloc,                            # Pointer[Int64], 1 entry, 160-arrival
-        tmem_base_ptr,               # Pointer[Int32] — SMEM slot from MMA
+        bar_tma_epilog,  # Pointer[Int64], 1 entry (32-arrival)
+        bar_mma_epilog,  # Pointer[Int64], 1 entry
+        bar_tmem_alloc,  # Pointer[Int64], 1 entry, 160-arrival
+        tmem_base_ptr,  # Pointer[Int32] — SMEM slot from MMA
         acc_layout: cutlass.Constexpr,
-        gD_tile: cute.Tensor,        # (CTA_M, CTA_N) — this CTA's output tile
-        gBias_tile: cute.Tensor,     # (CTA_M, CTA_N) with stride (1,0) — bias broadcast
-        epi_tid: cutlass.Int32,      # 0..127 within the 4 EPILOG warps
+        gD_tile: cute.Tensor,  # (CTA_M, CTA_N) — this CTA's output tile
+        gBias_tile: cute.Tensor,  # (CTA_M, CTA_N) with stride (1,0) — bias broadcast
+        epi_tid: cutlass.Int32,  # 0..127 within the 4 EPILOG warps
         c_dtype: cutlass.Constexpr,
         d_layout: cutlass.Constexpr,
     ):
@@ -795,8 +863,10 @@ class TgvGemmCuteExtKernel:
         #     stride between subparts = 65536 × 32 = 2097152    (NumSubp=4)
         #     stride between cols     = 1                       (N is contiguous)
         tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr)
-        tCtAcc = cute.make_tensor(tmem_ptr, acc_layout)  # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N, AccStage)
-        acc_view = tCtAcc[((None, None), 0, 0, 0)]       # (Mma_M_per_cta, Mma_N)
+        tCtAcc = cute.make_tensor(
+            tmem_ptr, acc_layout
+        )  # ((Mma_M_per_cta, Mma_N), NumMma_M, NumMma_N, AccStage)
+        acc_view = tCtAcc[((None, None), 0, 0, 0)]  # (Mma_M_per_cta, Mma_N)
 
         # ---- t2r tiled-copy + per-thread RMEM layout ----
         # ``sm100_utils.get_tmem_load_op`` picks the best tcgen05.ld atom
@@ -812,7 +882,11 @@ class TgvGemmCuteExtKernel:
         epi_tile = (self.cta_m, self.cta_n)
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             (self.cta_m, self.cta_n, self.cta_k),
-            d_layout, c_dtype, self.acc_dtype, epi_tile, self.use_2cta,
+            d_layout,
+            c_dtype,
+            self.acc_dtype,
+            epi_tile,
+            self.use_2cta,
         )
         tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(copy_atom_t2r, acc_view)
 
@@ -831,11 +905,17 @@ class TgvGemmCuteExtKernel:
         # mirrors this CpyD shape but with stride (1, 2) so the registers
         # are stored contiguously.
         rmem_layout = cute_ext.make_t2r_rmem_layout(tiled_copy_t2r, gD_epi, epi_tid)
-        rAcc = cute_ext.allocate(                  # fp32, per-thread
-            self.acc_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32,
+        rAcc = cute_ext.allocate(  # fp32, per-thread
+            self.acc_dtype,
+            cute.AddressSpace.rmem,
+            rmem_layout,
+            alignment=32,
         )
-        rD = cute_ext.allocate(                    # bf16, per-thread
-            c_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32,
+        rD = cute_ext.allocate(  # bf16, per-thread
+            c_dtype,
+            cute.AddressSpace.rmem,
+            rmem_layout,
+            alignment=32,
         )
         thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
 
@@ -861,11 +941,17 @@ class TgvGemmCuteExtKernel:
                 tiled_copy_t2r,
             )
             thr_g2r = tiled_copy_g2r.get_slice(epi_tid)
-            rBias = cute_ext.allocate(             # bias dtype (e.g. bf16)
-                bias_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32,
+            rBias = cute_ext.allocate(  # bias dtype (e.g. bf16)
+                bias_dtype,
+                cute.AddressSpace.rmem,
+                rmem_layout,
+                alignment=32,
             )
-            rBiasAcc = cute_ext.allocate(          # converted to fp32
-                self.acc_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32,
+            rBiasAcc = cute_ext.allocate(  # converted to fp32
+                self.acc_dtype,
+                cute.AddressSpace.rmem,
+                rmem_layout,
+                alignment=32,
             )
 
         # ---- Wait for data: B loads done + MMA done ----
@@ -873,7 +959,7 @@ class TgvGemmCuteExtKernel:
         # waits before issuing the bias load so it hides behind MMA). Without
         # bias the bar is unused — neither arrive nor wait fires.
         if cutlass.const_expr(self.has_bias):
-            cute.arch.mbarrier_wait(bar_tma_epilog, 0)   # all activations issued
+            cute.arch.mbarrier_wait(bar_tma_epilog, 0)  # all activations issued
 
         # ---- Bias load: GMEM → RMEM (predicated ld.global) and convert to fp32 ----
         # Done before the MMA wait so the load latency hides behind MMA.
@@ -881,7 +967,7 @@ class TgvGemmCuteExtKernel:
             cute_ext.partition_and_copy(thr_g2r, gBias_epi[None, None, 0, 0], rBias)
             rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
-        cute.arch.mbarrier_wait(bar_mma_epilog, 0)   # accumulator ready
+        cute.arch.mbarrier_wait(bar_mma_epilog, 0)  # accumulator ready
 
         # TMEM → RMEM (one tcgen05.ld for the 64×8 tile).
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
@@ -934,9 +1020,9 @@ class TgvGemmCuteExtKernel:
 @cute.experimental.jit
 def _bmm_no_bias(
     gemm_op: cutlass.Constexpr,
-    a: cute.Tensor,            # (L, M, K) from PyTorch
-    b: cute.Tensor,            # (L, K, N) from PyTorch (permuted)
-    c: cute.Tensor,            # (L, M, N) from PyTorch (permuted)
+    a: cute.Tensor,  # (L, M, K) from PyTorch
+    b: cute.Tensor,  # (L, K, N) from PyTorch (permuted)
+    c: cute.Tensor,  # (L, M, N) from PyTorch (permuted)
     stream: cuda.CUstream,
 ):
     a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
@@ -950,10 +1036,10 @@ def _bmm_no_bias(
 @cute.experimental.jit
 def _bmm_bias(
     gemm_op: cutlass.Constexpr,
-    a: cute.Tensor,            # (L, M, K) from PyTorch
-    b: cute.Tensor,            # (L, K, N) from PyTorch (permuted)
-    c: cute.Tensor,            # (L, M, N) from PyTorch (permuted)
-    bias: cute.Tensor,         # (L, M, N):(0,1,0) — M-broadcast via as_strided
+    a: cute.Tensor,  # (L, M, K) from PyTorch
+    b: cute.Tensor,  # (L, K, N) from PyTorch (permuted)
+    c: cute.Tensor,  # (L, M, N) from PyTorch (permuted)
+    bias: cute.Tensor,  # (L, M, N):(0,1,0) — M-broadcast via as_strided
     stream: cuda.CUstream,
 ):
     a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
@@ -994,8 +1080,9 @@ def _detect_leading_dim(t: torch.Tensor) -> int:
     return t.dim() - 1
 
 
-def _make_layout_tensor(shape: Tuple[int, ...], dtype: torch.dtype,
-                       leading_dim: int) -> torch.Tensor:
+def _make_layout_tensor(
+    shape: Tuple[int, ...], dtype: torch.dtype, leading_dim: int
+) -> torch.Tensor:
     """Allocate a torch tensor of ``shape`` where ``leading_dim`` is the
     contiguous (stride-1) dim. Used to synthesize representative tensors at
     compile time for arbitrary layout patterns."""
@@ -1008,8 +1095,9 @@ def _make_layout_tensor(shape: Tuple[int, ...], dtype: torch.dtype,
     return t.permute(inv_perm)
 
 
-def _make_compile_repr_tensors(dtype: torch.dtype, has_bias: bool,
-                              a_leading: int, b_leading: int, c_leading: int):
+def _make_compile_repr_tensors(
+    dtype: torch.dtype, has_bias: bool, a_leading: int, b_leading: int, c_leading: int
+):
     """Build representative tensors with strides matching the requested
     leading-dim pattern. After the A↔B swap, the cute_ext kernel sees:
         A_ce: shape (L, N_pt, K)   <- (L=1, dim 1, dim 2)
@@ -1022,10 +1110,16 @@ def _make_compile_repr_tensors(dtype: torch.dtype, has_bias: bool,
     """
     # Pick aligned-but-small extents that satisfy the kernel's tile shape
     # while leaving room for either dim to be the contig one.
-    M, N, K, L = 64, 8, 128, 1   # M_pt=M, N_pt=N
-    A_t = _make_layout_tensor((L, N, K), dtype, a_leading)   # kernel A shape (L, N_pt, K)
-    B_t = _make_layout_tensor((L, K, M), dtype, b_leading)   # kernel B shape (L, K, M_pt)
-    C_t = _make_layout_tensor((L, N, M), dtype, c_leading)   # kernel C shape (L, N_pt, M_pt)
+    M, N, K, L = 64, 8, 128, 1  # M_pt=M, N_pt=N
+    A_t = _make_layout_tensor(
+        (L, N, K), dtype, a_leading
+    )  # kernel A shape (L, N_pt, K)
+    B_t = _make_layout_tensor(
+        (L, K, M), dtype, b_leading
+    )  # kernel B shape (L, K, M_pt)
+    C_t = _make_layout_tensor(
+        (L, N, M), dtype, c_leading
+    )  # kernel C shape (L, N_pt, M_pt)
 
     a_ = from_dlpack(A_t, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
     b_ = from_dlpack(B_t, assumed_align=32).mark_layout_dynamic(leading_dim=b_leading)
@@ -1062,9 +1156,19 @@ def _get_compiled_cute_ext_kernel(
     (M, N, K, L) consistent with the (a, b, c)_leading layout pattern
     thanks to ``mark_layout_dynamic``.
     """
-    key = (dtype, cta_m, cta_n, cta_k, num_ab_stage,
-           bool(use_2cta), bool(use_pdl), bool(has_bias),
-           a_leading, b_leading, c_leading)
+    key = (
+        dtype,
+        cta_m,
+        cta_n,
+        cta_k,
+        num_ab_stage,
+        bool(use_2cta),
+        bool(use_pdl),
+        bool(has_bias),
+        a_leading,
+        b_leading,
+        c_leading,
+    )
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1076,7 +1180,9 @@ def _get_compiled_cute_ext_kernel(
 
     gemm = TgvGemmCuteExtKernel(
         acc_dtype=cutlass.Float32,
-        cta_m=cta_m, cta_n=cta_n, cta_k=cta_k,
+        cta_m=cta_m,
+        cta_n=cta_n,
+        cta_k=cta_k,
         num_ab_stage=num_ab_stage,
         use_2cta=use_2cta,
         use_pdl=use_pdl,
@@ -1084,7 +1190,11 @@ def _get_compiled_cute_ext_kernel(
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
-        dtype, has_bias, a_leading, b_leading, c_leading,
+        dtype,
+        has_bias,
+        a_leading,
+        b_leading,
+        c_leading,
     )
     fake_stream = make_fake_stream()
 
@@ -1103,9 +1213,9 @@ def _get_compiled_cute_ext_kernel(
 # K-major or MN-major a/b (and either M-contig or N-contig out).
 # =====================================================================
 def _to_cute_swap(
-    a_pt: torch.Tensor,        # (..., M, K)
-    b_pt: torch.Tensor,        # (..., K, N)
-    out_pt: torch.Tensor,      # (..., M, N)
+    a_pt: torch.Tensor,  # (..., M, K)
+    b_pt: torch.Tensor,  # (..., K, N)
+    out_pt: torch.Tensor,  # (..., M, N)
     bias_pt: Optional[torch.Tensor],  # (N,) or None — bias is per-output-feature
 ):
     """Build the cute.Tensors fed to ``_bmm_no_bias`` / ``_bmm_bias`` AND
@@ -1140,9 +1250,15 @@ def _to_cute_swap(
     b_leading = _detect_leading_dim(b_swap)
     c_leading = _detect_leading_dim(c_swap)
 
-    a_ = from_dlpack(a_swap, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
-    b_ = from_dlpack(b_swap, assumed_align=32).mark_layout_dynamic(leading_dim=b_leading)
-    c_ = from_dlpack(c_swap, assumed_align=32).mark_layout_dynamic(leading_dim=c_leading)
+    a_ = from_dlpack(a_swap, assumed_align=32).mark_layout_dynamic(
+        leading_dim=a_leading
+    )
+    b_ = from_dlpack(b_swap, assumed_align=32).mark_layout_dynamic(
+        leading_dim=b_leading
+    )
+    c_ = from_dlpack(c_swap, assumed_align=32).mark_layout_dynamic(
+        leading_dim=c_leading
+    )
 
     layout = (a_leading, b_leading, c_leading)
 
@@ -1153,8 +1269,8 @@ def _to_cute_swap(
     # kernel's M-axis maps to PyTorch's N-axis, which is exactly what the
     # bias indexes — so this is a direct (0, 1, 0) broadcast.
     L = c_swap.shape[0]
-    M_ce = c_swap.shape[1]   # == PyTorch N
-    N_ce = c_swap.shape[2]   # == PyTorch M
+    M_ce = c_swap.shape[1]  # == PyTorch N
+    N_ce = c_swap.shape[2]  # == PyTorch M
     bias_3d = bias_pt.as_strided(size=(L, M_ce, N_ce), stride=(0, 1, 0))
     bias_ = from_dlpack(bias_3d, assumed_align=2).mark_layout_dynamic(leading_dim=1)
     return a_, b_, c_, bias_, layout
@@ -1191,7 +1307,10 @@ def run_tgv_cute_ext(
     # Detect the input layout first so we can fetch (or compile) a variant
     # of the kernel specialized for it.
     a_, b_, c_, bias_, (a_leading, b_leading, c_leading) = _to_cute_swap(
-        a, b, out, bias,
+        a,
+        b,
+        out,
+        bias,
     )
 
     compiled = _get_compiled_cute_ext_kernel(

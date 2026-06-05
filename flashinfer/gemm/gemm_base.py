@@ -655,9 +655,7 @@ def _tgv_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "cudnn",
 ):
     if out_dtype != torch.bfloat16:
-        raise ValueError(
-            "The TGV backend for bmm_bf16 only supports bfloat16 output."
-        )
+        raise ValueError("The TGV backend for bmm_bf16 only supports bfloat16 output.")
     # The C++ TGV kernel is 2D-only, so bmm_bf16 always dispatches to the
     # cute_ext implementation regardless of ``_TGV_DEBUG_USE_CPP``.
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
