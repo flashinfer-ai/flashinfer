@@ -5809,6 +5809,7 @@ def _b12x_gemm_fp4_runner(
 
     from .kernels.dense_blockscaled_gemm_sm120_b12x import (
         Sm120B12xBlockScaledDenseGemmKernel,
+        _select_default_dense_gemm_plan,
     )
 
     cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
@@ -5846,6 +5847,10 @@ def _b12x_gemm_fp4_runner(
             batch_size = 1
 
             valid_tactics = []
+            # Autotuner candidate set (swap_ab-free). The M=1 decode tile (16x64) and
+            # other regime-optimal tiles are applied via the deterministic expected_m
+            # plan on the default path (see forward); adding extra tiles here only made
+            # the autotuner's per-shape pick noisier, so the set is kept minimal.
             sm120_mma_tiler_candidates = [
                 (64, 64),
                 (64, 128),
@@ -5861,13 +5866,14 @@ def _b12x_gemm_fp4_runner(
                     c_cutlass_dtype,
                     mma_tiler_mn,
                     (1, 1),
-                    m,
+                    # upstream b12x can_implement is M-independent (no `m` arg)
                     n,
                     real_k,
                     batch_size,
                     "k",
                     "k",
                     "n",
+                    swap_ab=swap_ab,
                 ):
                     continue
                 for use_prefetch in (False, True):
@@ -5894,10 +5900,29 @@ def _b12x_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                tactic = (
+                # Deterministic, regime-aware plan from upstream b12x: picks the
+                # decode/prefill-optimal tile (via expected_m) and swap_ab for
+                # narrow-N, instead of the M-independent default tile. For a single
+                # call the actual m IS the representative regime, so expected_m=m.
+                plan = _select_default_dense_gemm_plan(
+                    m,
+                    n,
+                    real_k,
+                    get_device_sm_count(a.device),
+                    is_mxfp8=False,
+                    expected_m=m,
+                )
+                # swap_ab (narrow-N) is not yet supported by this wrapper; when the
+                # plan would request it, fall back to the M-independent default tile.
+                plan_tile = (
                     _select_default_sm120_mma_tiler(
                         m, n, get_device_sm_count(a.device)
-                    ),
+                    )
+                    if plan.swap_ab
+                    else plan.mma_tiler_mn
+                )
+                tactic = (
+                    plan_tile,
                     (1, 1),
                     False,
                     False,
@@ -5914,7 +5939,6 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
             ) = tactic
 
-            # b12x SM120 kernel does not support swap_ab
             kernel_m, kernel_n = m, n
             kernel_a, kernel_b = a, b.T
             kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
@@ -5935,12 +5959,15 @@ def _b12x_gemm_fp4_runner(
                 out_dtype,
             )
 
+            # NOTE: upstream b12x ctor inserts mma_k/tile_k/single_work_tile_per_cta
+            # before use_prefetch, so pass these by keyword to avoid mis-binding.
             make_kernel = lambda: Sm120B12xBlockScaledDenseGemmKernel(
                 sf_vec_size,
                 mma_tiler_mn,
                 cluster_shape_mn,
-                use_prefetch,
-                enable_pdl,
+                use_prefetch=use_prefetch,
+                enable_pdl=enable_pdl,
+                swap_ab=swap_ab,
             )
 
             compiled_gemm, _ = _compile_block_scaled_gemm(
@@ -5961,6 +5988,8 @@ def _b12x_gemm_fp4_runner(
 
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
+            # NOTE: swap_ab is always False here (narrow-N path disabled). When it is
+            # correctly supported, C must be passed as an (n, m) view of `out`.
             compiled_gemm(
                 kernel_a,
                 kernel_b,

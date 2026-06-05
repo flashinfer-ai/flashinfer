@@ -585,8 +585,10 @@ def sm120_make_smem_layout_sfb(
 
     assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
 
-    assert tile_shape_mnk[1] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[1] must be divisible by 64"
+    # Relaxed 64 -> 16 (upstream b12x commit 0daa6ab) to allow narrow-N FP4 tiles
+    # (64x32 / 64x16) used with swap_ab.
+    assert tile_shape_mnk[1] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[1] must be divisible by 16"
     )
 
     assert tile_shape_mnk[2] % sf_vec_size == 0, (
