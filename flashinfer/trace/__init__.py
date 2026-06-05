@@ -20,6 +20,26 @@ Usage::
     from flashinfer.trace import TraceTemplate, Var, Const, Tensor, Scalar
 """
 
-from .template import Const, Scalar, Tensor, TraceTemplate, Var, _TRACE_DUMP_DIR
+from .template import (
+    Const,
+    Scalar,
+    Tensor,
+    TraceTemplate,
+    Var,
+    _TRACE_DUMP_DIR,
+    default_check,
+    default_tolerances,
+    standard_check,
+)
 
-__all__ = ["TraceTemplate", "Var", "Const", "Tensor", "Scalar", "_TRACE_DUMP_DIR"]
+__all__ = [
+    "TraceTemplate",
+    "Var",
+    "Const",
+    "Tensor",
+    "Scalar",
+    "default_check",
+    "default_tolerances",
+    "standard_check",
+    "_TRACE_DUMP_DIR",
+]

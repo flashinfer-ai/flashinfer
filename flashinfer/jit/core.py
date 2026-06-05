@@ -431,6 +431,7 @@ def gen_jit_spec(
     cuda_cflags = [
         *get_nvcc_parallelism_flags(),
         "-use_fast_math",
+        "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
@@ -452,7 +453,7 @@ def gen_jit_spec(
     else:
         # non debug mode
         cuda_cflags += ["-DNDEBUG", "-O3"]
-        cflags += ["-O3"]
+        cflags += ["-DNDEBUG", "-O3"]
 
     # useful for ncu source correlation
     if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":

@@ -1176,6 +1176,11 @@ def apply_rope_with_cos_sin_cache(
         Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
     key : torch.Tensor
         Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    head_size : int
+        Per-head feature dimension. ``query`` and ``key`` are reshaped to
+        ``(nnz, num_q_heads, head_size)`` and ``(nnz, num_k_heads, head_size)``
+        respectively before applying RoPE. Must divide the trailing dimension
+        of ``query`` and ``key``.
     cos_sin_cache : torch.Tensor
         Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
         Cosine is the first half and Sine is the second half on rotary_dim.
@@ -1241,6 +1246,11 @@ def apply_rope_with_cos_sin_cache_inplace(
         Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
     key : torch.Tensor
         Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    head_size : int
+        Per-head feature dimension. ``query`` and ``key`` are reshaped to
+        ``(nnz, num_q_heads, head_size)`` and ``(nnz, num_k_heads, head_size)``
+        respectively before applying RoPE. Must divide the trailing dimension
+        of ``query`` and ``key``.
     cos_sin_cache : torch.Tensor
         Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
         Cosine is the first half and Sine is the second half on rotary_dim.

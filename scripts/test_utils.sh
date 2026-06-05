@@ -26,6 +26,11 @@ export MAX_JOBS
 # CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
 : "${PARALLEL_TESTS:=false}"  # Disable parallel test execution by default
+: "${MONITOR_TEST_MEMORY:=true}"  # Capture per-test host/GPU memory samples
+: "${MEMORY_MONITOR_INTERVAL:=2}"  # Sampling interval in seconds
+: "${MEMORY_MONITOR_LOG_INTERVAL:=0}"  # Emit periodic samples to the CI log when >0
+: "${PYTEST_FILE_TIMEOUT_SECONDS:=7200}"  # Per-test-file timeout; 0 disables
+: "${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS:=300}"  # Grace period before SIGKILL after timeout
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
@@ -46,6 +51,8 @@ PASSED_TESTS=0
 NO_RESULT_COUNT=0
 TOTAL_TEST_CASES=0
 SAMPLED_TEST_CASES=0
+LAST_MEMORY_MONITOR_PID=""
+MEMORY_CAPACITY_PRINTED=false
 # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
 EXIT_CODE=0
 
@@ -56,10 +63,24 @@ EXIT_CODE=0
 parse_args() {
     DRY_RUN=false
     SANITY_TEST=false
-    for arg in "$@"; do
-        case $arg in
+    TEST_PATH="${TEST_PATH:-}"
+    while [[ $# -gt 0 ]]; do
+        case $1 in
             --dry-run)
                 DRY_RUN=true
+                shift
+                ;;
+            --test-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "ERROR: --test-path requires an argument." >&2
+                    exit 1
+                fi
+                TEST_PATH="$2"
+                shift 2
+                ;;
+            --test-path=*)
+                TEST_PATH="${1#*=}"
+                shift
                 ;;
             --sanity-test)
                 if [ "$DISABLE_SANITY_TEST" = "true" ]; then
@@ -69,6 +90,10 @@ parse_args() {
                 else
                     SANITY_TEST=true
                 fi
+                shift
+                ;;
+            *)
+                shift
                 ;;
         esac
     done
@@ -76,6 +101,11 @@ parse_args() {
 
 # Print test mode banner
 print_test_mode_banner() {
+    if [ -n "$TEST_PATH" ]; then
+        echo "🎯 SCOPED TEST MODE - Only running tests under: ${TEST_PATH}"
+        echo ""
+    fi
+
     if [ "$DRY_RUN" = "true" ]; then
         echo "🔍 DRY RUN MODE - No tests will be executed"
         echo ""
@@ -89,6 +119,43 @@ print_test_mode_banner() {
         echo "📋 FULL TEST MODE - Running all tests from each test file"
         echo ""
     fi
+
+    if [ "$MONITOR_TEST_MEMORY" = "true" ]; then
+        if [ "$MEMORY_MONITOR_LOG_INTERVAL" -gt 0 ] 2>/dev/null; then
+            echo "📈 MEMORY MONITORING ENABLED - Sampling every ${MEMORY_MONITOR_INTERVAL}s, logging every ${MEMORY_MONITOR_LOG_INTERVAL}s"
+        else
+            echo "📈 MEMORY MONITORING ENABLED - Sampling every ${MEMORY_MONITOR_INTERVAL}s, per-test summaries only"
+        fi
+        echo ""
+    fi
+
+    if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+        echo "⏱️  PER-FILE TIMEOUT ENABLED - ${PYTEST_FILE_TIMEOUT_SECONDS}s per test file"
+        echo ""
+    fi
+}
+
+run_pytest_with_file_timeout() {
+    local -a timeout_cmd=()
+    if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout_cmd=(
+                timeout
+                "--kill-after=${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS}s"
+                "${PYTEST_FILE_TIMEOUT_SECONDS}s"
+            )
+        else
+            echo "⚠️  WARNING: timeout command not found; running pytest without a per-file timeout"
+        fi
+    fi
+
+    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
+    "${timeout_cmd[@]}" ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "$@"
+}
+
+is_pytest_file_timeout_exit() {
+    local exit_code=$1
+    [ "$exit_code" -eq 124 ] 2>/dev/null
 }
 
 # Install precompiled kernels (CI build artifacts)
@@ -198,6 +265,500 @@ collect_tests() {
     ALL_NODE_IDS=$(echo "$COLLECTION_OUTPUT" | grep "::" || true)
 }
 
+memory_report_file_for_test() {
+    local test_file=$1
+    local flattened_test_file=${test_file//\//_}
+    echo "${JUNIT_DIR}/${flattened_test_file}.memory.csv"
+}
+
+list_process_tree_pids() {
+    local root_pid=$1
+    local -a queue=("$root_pid")
+    local -a tree_pids=()
+    local idx=0
+
+    while [ $idx -lt ${#queue[@]} ]; do
+        local pid="${queue[$idx]}"
+        idx=$((idx + 1))
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            continue
+        fi
+
+        tree_pids+=("$pid")
+
+        local child_pid
+        while read -r child_pid; do
+            [ -n "$child_pid" ] && queue+=("$child_pid")
+        done < <(ps -o pid= --ppid "$pid" 2>/dev/null | awk '{print $1}')
+    done
+
+    printf '%s\n' "${tree_pids[@]}"
+}
+
+sum_rss_kib_for_pids() {
+    local -a pid_list=("$@")
+
+    if [ ${#pid_list[@]} -eq 0 ]; then
+        echo 0
+        return
+    fi
+
+    local pid_csv
+    pid_csv=$(IFS=,; echo "${pid_list[*]}")
+    ps -o rss= -p "$pid_csv" 2>/dev/null | awk '{sum += $1} END {print sum + 0}'
+}
+
+sum_gpu_mib_for_pids() {
+    local -a pid_list=("$@")
+
+    if [ ${#pid_list[@]} -eq 0 ] || ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo 0
+        return
+    fi
+
+    local pid_csv
+    pid_csv=$(IFS=,; echo "${pid_list[*]}")
+    nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null | \
+        awk -F',' -v pid_csv="$pid_csv" '
+            BEGIN {
+                split(pid_csv, pid_array, ",")
+                for (i in pid_array) {
+                    wanted[pid_array[i]] = 1
+                }
+            }
+            {
+                gsub(/^[ \t]+|[ \t]+$/, "", $1)
+                gsub(/^[ \t]+|[ \t]+$/, "", $2)
+                if ($1 in wanted) {
+                    sum += $2
+                }
+            }
+            END {
+                print sum + 0
+            }
+        '
+}
+
+read_system_mem_available_kib() {
+    awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0
+}
+
+read_system_mem_total_kib() {
+    awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0
+}
+
+read_cgroup_memory_kib() {
+    local file=$1
+
+    if [ ! -r "$file" ]; then
+        echo 0
+        return
+    fi
+
+    local value
+    value=$(cat "$file" 2>/dev/null || echo 0)
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        awk -v value="$value" 'BEGIN {
+            # v1 reports effectively-unlimited memory as a huge integer.
+            if (value >= 9223372036854771712) {
+                print 0
+            } else {
+                printf "%.0f\n", int((value + 1023) / 1024)
+            }
+        }'
+    else
+        echo 0
+    fi
+}
+
+read_cgroup_current_kib() {
+    if [ -r /sys/fs/cgroup/memory.current ]; then
+        read_cgroup_memory_kib /sys/fs/cgroup/memory.current
+    else
+        read_cgroup_memory_kib /sys/fs/cgroup/memory/memory.usage_in_bytes
+    fi
+}
+
+read_cgroup_peak_kib() {
+    if [ -r /sys/fs/cgroup/memory.peak ]; then
+        read_cgroup_memory_kib /sys/fs/cgroup/memory.peak
+    else
+        read_cgroup_memory_kib /sys/fs/cgroup/memory/memory.max_usage_in_bytes
+    fi
+}
+
+read_cgroup_max_kib() {
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        read_cgroup_memory_kib /sys/fs/cgroup/memory.max
+    else
+        read_cgroup_memory_kib /sys/fs/cgroup/memory/memory.limit_in_bytes
+    fi
+}
+
+format_memory_mib_or_unknown() {
+    local kib=${1:-0}
+
+    if [ "$kib" -gt 0 ] 2>/dev/null; then
+        echo "$(( (kib + 1023) / 1024 )) MiB"
+    else
+        echo "unknown/unlimited"
+    fi
+}
+
+memory_report_value() {
+    local key=$1
+    local report_file=$2
+
+    awk -F= -v key="$key" '$1 == key { value = $2 } END { print value }' "$report_file"
+}
+
+memory_report_header_value() {
+    local key=$1
+    local report_file=$2
+
+    awk -v prefix="# ${key}=" '
+        index($0, prefix) == 1 { value = substr($0, length(prefix) + 1) }
+        END { print value }
+    ' "$report_file"
+}
+
+print_memory_capacity_summary() {
+    if [ "$MONITOR_TEST_MEMORY" != "true" ]; then
+        return
+    fi
+
+    if [ "$MEMORY_CAPACITY_PRINTED" = "true" ]; then
+        return
+    fi
+    MEMORY_CAPACITY_PRINTED=true
+
+    local system_mem_total_kib system_mem_available_kib cgroup_current_kib cgroup_peak_kib cgroup_max_kib
+    system_mem_total_kib=$(read_system_mem_total_kib)
+    system_mem_available_kib=$(read_system_mem_available_kib)
+    cgroup_current_kib=$(read_cgroup_current_kib)
+    cgroup_peak_kib=$(read_cgroup_peak_kib)
+    cgroup_max_kib=$(read_cgroup_max_kib)
+
+    echo "📊 MEMORY CAPACITY: system total $(format_memory_mib_or_unknown "$system_mem_total_kib"), initial MemAvailable $(format_memory_mib_or_unknown "$system_mem_available_kib"), cgroup current $(format_memory_mib_or_unknown "$cgroup_current_kib"), cgroup peak $(format_memory_mib_or_unknown "$cgroup_peak_kib"), cgroup max $(format_memory_mib_or_unknown "$cgroup_max_kib")"
+}
+
+print_cgroup_memory_diagnostics() {
+    echo "⚠️  DEBUG: cgroup memory diagnostics:"
+
+    local file
+    for file in \
+        /sys/fs/cgroup/memory.current \
+        /sys/fs/cgroup/memory.peak \
+        /sys/fs/cgroup/memory.max \
+        /sys/fs/cgroup/memory.events \
+        /sys/fs/cgroup/memory.events.local \
+        /sys/fs/cgroup/memory.pressure \
+        /sys/fs/cgroup/memory/memory.usage_in_bytes \
+        /sys/fs/cgroup/memory/memory.max_usage_in_bytes \
+        /sys/fs/cgroup/memory/memory.limit_in_bytes \
+        /sys/fs/cgroup/memory/memory.oom_control \
+        /sys/fs/cgroup/memory/memory.failcnt; do
+        if [ -r "$file" ]; then
+            echo "--- $file ---"
+            cat "$file" 2>/dev/null || true
+        fi
+    done
+}
+
+start_memory_monitor() {
+    local root_pid=$1
+    local test_file=$2
+    local report_file=$3
+    local gpu_hint=$4
+
+    LAST_MEMORY_MONITOR_PID=""
+
+    if [ "$MONITOR_TEST_MEMORY" != "true" ]; then
+        return
+    fi
+
+    (
+        local peak_rss_kib=0
+        local peak_gpu_mib=0
+        local peak_cgroup_current_kib=0
+        local peak_cgroup_peak_kib=0
+        local min_system_mem_available_kib=0
+        local system_mem_total_kib
+        local cgroup_max_kib
+        local peak_proc_count=0
+        local sample_count=0
+        local start_epoch
+        local last_log_epoch=0
+        start_epoch=$(date +%s)
+        system_mem_total_kib=$(read_system_mem_total_kib)
+        cgroup_max_kib=$(read_cgroup_max_kib)
+
+        {
+            echo "# test_file=${test_file}"
+            echo "# root_pid=${root_pid}"
+            echo "# gpu_hint=${gpu_hint}"
+            echo "# sample_interval_seconds=${MEMORY_MONITOR_INTERVAL}"
+            echo "# system_mem_total_kib=${system_mem_total_kib}"
+            echo "# cgroup_max_kib=${cgroup_max_kib}"
+            echo "timestamp_utc,rss_kib,gpu_mib,system_mem_available_kib,system_mem_total_kib,cgroup_current_kib,cgroup_peak_kib,cgroup_max_kib,process_count"
+        } > "$report_file"
+
+        while kill -0 "$root_pid" 2>/dev/null; do
+            local -a tree_pids=()
+            mapfile -t tree_pids < <(list_process_tree_pids "$root_pid")
+
+            if [ ${#tree_pids[@]} -eq 0 ]; then
+                sleep "$MEMORY_MONITOR_INTERVAL"
+                continue
+            fi
+
+            local rss_kib gpu_mib system_mem_available_kib cgroup_current_kib cgroup_peak_kib proc_count timestamp
+            rss_kib=$(sum_rss_kib_for_pids "${tree_pids[@]}")
+            gpu_mib=$(sum_gpu_mib_for_pids "${tree_pids[@]}")
+            system_mem_available_kib=$(read_system_mem_available_kib)
+            cgroup_current_kib=$(read_cgroup_current_kib)
+            cgroup_peak_kib=$(read_cgroup_peak_kib)
+            proc_count=${#tree_pids[@]}
+            timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+            printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                "$timestamp" \
+                "$rss_kib" \
+                "$gpu_mib" \
+                "$system_mem_available_kib" \
+                "$system_mem_total_kib" \
+                "$cgroup_current_kib" \
+                "$cgroup_peak_kib" \
+                "$cgroup_max_kib" \
+                "$proc_count" >> "$report_file"
+
+            if [ "$rss_kib" -gt "$peak_rss_kib" ]; then
+                peak_rss_kib=$rss_kib
+            fi
+            if [ "$gpu_mib" -gt "$peak_gpu_mib" ]; then
+                peak_gpu_mib=$gpu_mib
+            fi
+            if [ "$cgroup_current_kib" -gt "$peak_cgroup_current_kib" ]; then
+                peak_cgroup_current_kib=$cgroup_current_kib
+            fi
+            if [ "$cgroup_peak_kib" -gt "$peak_cgroup_peak_kib" ]; then
+                peak_cgroup_peak_kib=$cgroup_peak_kib
+            fi
+            if [ "$system_mem_available_kib" -gt 0 ] && { [ "$min_system_mem_available_kib" -eq 0 ] || [ "$system_mem_available_kib" -lt "$min_system_mem_available_kib" ]; }; then
+                min_system_mem_available_kib=$system_mem_available_kib
+            fi
+            if [ "$proc_count" -gt "$peak_proc_count" ]; then
+                peak_proc_count=$proc_count
+            fi
+            sample_count=$((sample_count + 1))
+
+            local now_epoch
+            now_epoch=$(date +%s)
+            if [ "$MEMORY_MONITOR_LOG_INTERVAL" -gt 0 ] 2>/dev/null && [ $((now_epoch - last_log_epoch)) -ge "$MEMORY_MONITOR_LOG_INTERVAL" ]; then
+                echo "MEMORY sample: $test_file RSS $(( (rss_kib + 1023) / 1024 )) MiB, cgroup current $(format_memory_mib_or_unknown "$cgroup_current_kib"), cgroup peak $(format_memory_mib_or_unknown "$cgroup_peak_kib"), MemAvailable $(format_memory_mib_or_unknown "$system_mem_available_kib"), GPU ${gpu_mib} MiB, processes ${proc_count}, samples ${sample_count}"
+                last_log_epoch=$now_epoch
+            fi
+
+            sleep "$MEMORY_MONITOR_INTERVAL"
+        done
+
+        {
+            echo "# summary"
+            echo "peak_rss_kib=${peak_rss_kib}"
+            echo "peak_gpu_mib=${peak_gpu_mib}"
+            echo "peak_cgroup_current_kib=${peak_cgroup_current_kib}"
+            echo "peak_cgroup_peak_kib=${peak_cgroup_peak_kib}"
+            echo "min_system_mem_available_kib=${min_system_mem_available_kib}"
+            echo "system_mem_total_kib=${system_mem_total_kib}"
+            echo "cgroup_max_kib=${cgroup_max_kib}"
+            echo "peak_process_count=${peak_proc_count}"
+            echo "sample_count=${sample_count}"
+            echo "duration_seconds=$(( $(date +%s) - start_epoch ))"
+        } >> "$report_file"
+    ) &
+
+    LAST_MEMORY_MONITOR_PID=$!
+}
+
+wait_for_memory_monitor() {
+    local monitor_pid=$1
+
+    if [ -n "$monitor_pid" ]; then
+        wait "$monitor_pid" 2>/dev/null || true
+    fi
+}
+
+print_memory_summary() {
+    local test_file=$1
+    local report_file=$2
+
+    if [ "$MONITOR_TEST_MEMORY" != "true" ] || [ ! -f "$report_file" ]; then
+        return
+    fi
+
+    local peak_rss_kib peak_gpu_mib peak_cgroup_current_kib peak_cgroup_peak_kib min_system_mem_available_kib system_mem_total_kib cgroup_max_kib peak_proc_count sample_count duration_seconds
+    peak_rss_kib=$(awk -F= '/^peak_rss_kib=/{print $2}' "$report_file" | tail -1)
+    peak_gpu_mib=$(awk -F= '/^peak_gpu_mib=/{print $2}' "$report_file" | tail -1)
+    peak_cgroup_current_kib=$(awk -F= '/^peak_cgroup_current_kib=/{print $2}' "$report_file" | tail -1)
+    peak_cgroup_peak_kib=$(awk -F= '/^peak_cgroup_peak_kib=/{print $2}' "$report_file" | tail -1)
+    min_system_mem_available_kib=$(awk -F= '/^min_system_mem_available_kib=/{print $2}' "$report_file" | tail -1)
+    system_mem_total_kib=$(awk -F= '/^system_mem_total_kib=/{print $2}' "$report_file" | tail -1)
+    cgroup_max_kib=$(awk -F= '/^cgroup_max_kib=/{print $2}' "$report_file" | tail -1)
+    peak_proc_count=$(awk -F= '/^peak_process_count=/{print $2}' "$report_file" | tail -1)
+    sample_count=$(awk -F= '/^sample_count=/{print $2}' "$report_file" | tail -1)
+    duration_seconds=$(awk -F= '/^duration_seconds=/{print $2}' "$report_file" | tail -1)
+
+    peak_rss_kib=${peak_rss_kib:-0}
+    peak_gpu_mib=${peak_gpu_mib:-0}
+    peak_cgroup_current_kib=${peak_cgroup_current_kib:-0}
+    peak_cgroup_peak_kib=${peak_cgroup_peak_kib:-0}
+    min_system_mem_available_kib=${min_system_mem_available_kib:-0}
+    system_mem_total_kib=${system_mem_total_kib:-0}
+    cgroup_max_kib=${cgroup_max_kib:-0}
+    peak_proc_count=${peak_proc_count:-0}
+    sample_count=${sample_count:-0}
+    duration_seconds=${duration_seconds:-0}
+
+    echo "📊 MEMORY: $test_file summed RSS $(( (peak_rss_kib + 1023) / 1024 )) MiB, peak cgroup current $(format_memory_mib_or_unknown "$peak_cgroup_current_kib"), cgroup peak $(format_memory_mib_or_unknown "$peak_cgroup_peak_kib"), cgroup max $(format_memory_mib_or_unknown "$cgroup_max_kib"), system total $(format_memory_mib_or_unknown "$system_mem_total_kib"), min MemAvailable $(format_memory_mib_or_unknown "$min_system_mem_available_kib"), peak GPU ${peak_gpu_mib} MiB, peak processes ${peak_proc_count}, samples ${sample_count}, duration ${duration_seconds}s"
+    echo "📄 Memory report: $report_file"
+}
+
+memory_report_sample_maxima() {
+    local report_file=$1
+
+    awk -F, '
+        /^[0-9][0-9][0-9][0-9]-/ {
+            rss = $2 + 0
+            gpu = $3 + 0
+            if (rss > peak_rss_kib) {
+                peak_rss_kib = rss
+            }
+            if (gpu > peak_gpu_mib) {
+                peak_gpu_mib = gpu
+            }
+            sample_count++
+        }
+        END {
+            printf "%s\t%s\t%s\n", peak_rss_kib + 0, peak_gpu_mib + 0, sample_count + 0
+        }
+    ' "$report_file"
+}
+
+collect_memory_summary_rows() {
+    if [ "$MONITOR_TEST_MEMORY" != "true" ]; then
+        return
+    fi
+
+    local report_file
+    for report_file in "$JUNIT_DIR"/*.memory.csv; do
+        [ -f "$report_file" ] || continue
+
+        local test_file peak_rss_kib peak_gpu_mib sample_count duration_seconds status
+        test_file=$(memory_report_header_value "test_file" "$report_file")
+        test_file=${test_file:-$(basename "$report_file" .memory.csv)}
+        peak_rss_kib=$(memory_report_value "peak_rss_kib" "$report_file")
+        peak_gpu_mib=$(memory_report_value "peak_gpu_mib" "$report_file")
+        sample_count=$(memory_report_value "sample_count" "$report_file")
+        duration_seconds=$(memory_report_value "duration_seconds" "$report_file")
+        status="complete"
+
+        if [ -z "$peak_rss_kib" ] || [ -z "$peak_gpu_mib" ] || [ -z "$sample_count" ]; then
+            local sample_maxima
+            sample_maxima=$(memory_report_sample_maxima "$report_file")
+            IFS=$'\t' read -r peak_rss_kib peak_gpu_mib sample_count <<< "$sample_maxima"
+            status="partial"
+        fi
+
+        if [ -z "$duration_seconds" ]; then
+            local sample_interval
+            sample_interval=$(memory_report_header_value "sample_interval_seconds" "$report_file")
+            duration_seconds=$(awk -v samples="${sample_count:-0}" -v interval="${sample_interval:-0}" 'BEGIN { printf "%.0f\n", samples * interval }')
+            status="partial"
+        fi
+
+        if [ "${sample_count:-0}" -eq 0 ] 2>/dev/null; then
+            continue
+        fi
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${duration_seconds:-0}" \
+            "$(( (peak_rss_kib + 1023) / 1024 ))" \
+            "${peak_gpu_mib:-0}" \
+            "${sample_count:-0}" \
+            "$test_file" \
+            "$status"
+    done
+}
+
+print_top_resource_rows() {
+    local rows=$1
+    local sort_column=$2
+    local title=$3
+
+    if [ -z "$rows" ]; then
+        return
+    fi
+
+    echo "$title"
+    # Top 10 via awk (not `| head`), which would SIGPIPE `sort` and fail under pipefail.
+    printf '%s\n' "$rows" | sort -t $'\t' -k"${sort_column},${sort_column}nr" | \
+        awk -F '\t' '
+            function format_duration(seconds) {
+                seconds += 0
+                hours = int(seconds / 3600)
+                minutes = int((seconds % 3600) / 60)
+                secs = seconds % 60
+                if (hours > 0) {
+                    return sprintf("%dh%02dm%02ds", hours, minutes, secs)
+                }
+                if (minutes > 0) {
+                    return sprintf("%dm%02ds", minutes, secs)
+                }
+                return sprintf("%ds", secs)
+            }
+            function format_mib(mib) {
+                mib += 0
+                if (mib >= 1048576) {
+                    return sprintf("%.1f TiB", mib / 1048576)
+                }
+                if (mib >= 1024) {
+                    return sprintf("%.1f GiB", mib / 1024)
+                }
+                return sprintf("%d MiB", mib)
+            }
+            NR <= 10 {
+                suffix = ($6 == "partial") ? " (partial)" : ""
+                printf "  %2d. %s - duration %s, peak RSS %s, peak GPU %s, samples %s%s\n",
+                    NR, $5, format_duration($1), format_mib($2), format_mib($3), $4, suffix
+            }
+        '
+    echo ""
+}
+
+print_test_run_resource_summary() {
+    if [ "$MONITOR_TEST_MEMORY" != "true" ]; then
+        return
+    fi
+
+    local rows
+    rows=$(collect_memory_summary_rows)
+
+    if [ -z "$rows" ]; then
+        echo ""
+        echo "No memory reports found for test-run resource summary."
+        return
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "TEST RUN RESOURCE SUMMARY"
+    echo "=========================================="
+    print_top_resource_rows "$rows" 1 "Top 10 longest-running test files:"
+    print_top_resource_rows "$rows" 2 "Top 10 highest host RSS test files:"
+    print_top_resource_rows "$rows" 3 "Top 10 highest GPU memory test files:"
+}
+
 # Return the expected JUnit XML path for a test file
 junit_file_for_test() {
     local test_file=$1
@@ -220,6 +781,8 @@ record_no_result_test() {
     local test_file=$1
     NO_RESULT_TESTS="$NO_RESULT_TESTS\n  - $test_file"
     NO_RESULT_COUNT=$((NO_RESULT_COUNT + 1))
+    # Deliberately do not set EXIT_CODE. Missing result artifacts are reported
+    # for triage, but they should not fail the whole CI job.
 }
 
 # Describe which execution artifacts are missing for a test file
@@ -245,9 +808,9 @@ sample_tests() {
 
     # Sample every Nth test with random offset
     SAMPLED_NODE_IDS=$(echo "$all_node_ids" | awk "NR % $SAMPLE_RATE == $SAMPLE_OFFSET")
-    # Fallback: if no tests sampled (offset missed all tests), take the first test
+    # Fallback to first test if none sampled (param expansion avoids `| head` SIGPIPE).
     if [ -z "$SAMPLED_NODE_IDS" ] || [ "$(echo "$SAMPLED_NODE_IDS" | wc -l)" -eq 0 ]; then
-        SAMPLED_NODE_IDS=$(echo "$all_node_ids" | head -1)
+        SAMPLED_NODE_IDS="${all_node_ids%%$'\n'*}"
     fi
 }
 
@@ -296,7 +859,11 @@ dry_run_full_file() {
     junit_file=$(junit_file_for_test "$test_file")
     JUNIT_FLAG="--junitxml=${junit_file}"
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
-    echo "$TOTAL_TESTS. ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
+        echo "$TOTAL_TESTS. timeout --kill-after=${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS}s ${PYTEST_FILE_TIMEOUT_SECONDS}s ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    else
+        echo "$TOTAL_TESTS. ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    fi
 }
 
 # Print dry run summary
@@ -342,6 +909,8 @@ print_dry_run_summary() {
 run_sanity_test_file() {
     local test_file=$1
     local file_count=$2
+    local memory_report
+    memory_report=$(memory_report_file_for_test "$test_file")
     local junit_file
     junit_file=$(junit_file_for_test "$test_file")
 
@@ -389,8 +958,18 @@ run_sanity_test_file() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     rm -f "$junit_file"
 
-    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
-    if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
+    rm -f "$memory_report"
+
+    local pytest_pid monitor_pid pytest_ec=0
+    run_pytest_with_file_timeout "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}" &
+    pytest_pid=$!
+    start_memory_monitor "$pytest_pid" "$test_file" "$memory_report" "${CUDA_VISIBLE_DEVICES:-all}"
+    monitor_pid=$LAST_MEMORY_MONITOR_PID
+    wait "$pytest_pid" || pytest_ec=$?
+    wait_for_memory_monitor "$monitor_pid"
+    print_memory_summary "$test_file" "$memory_report"
+
+    if [ $pytest_ec -eq 0 ]; then
         if [ -f "$junit_file" ]; then
             echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
             PASSED_TESTS=$((PASSED_TESTS + 1))
@@ -398,9 +977,12 @@ run_sanity_test_file() {
             echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, missing JUnit XML: $junit_file)"
             record_no_result_test "$test_file"
         fi
+    elif is_pytest_file_timeout_exit "$pytest_ec"; then
+        echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+        record_no_result_test "$test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
     else
         if [ -f "$junit_file" ]; then
-            echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
+            echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, pytest exit code: $pytest_ec)"
             record_failed_test "$test_file"
         else
             echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, missing JUnit XML: $junit_file)"
@@ -414,20 +996,36 @@ run_sanity_test_file() {
 # Run a single test file in full mode
 run_full_test_file() {
     local test_file=$1
+    local memory_report
+    memory_report=$(memory_report_file_for_test "$test_file")
     local junit_file
     junit_file=$(junit_file_for_test "$test_file")
 
     echo "=========================================="
     JUNIT_FLAG="--junitxml=${junit_file}"
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
-    echo "Running: ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
+        echo "Running: timeout --kill-after=${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS}s ${PYTEST_FILE_TIMEOUT_SECONDS}s ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    else
+        echo "Running: ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    fi
     echo "=========================================="
 
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     rm -f "$junit_file"
 
-    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
-    if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
+    rm -f "$memory_report"
+
+    local pytest_pid monitor_pid pytest_ec=0
+    run_pytest_with_file_timeout "${JUNIT_FLAG}" "${test_file}" &
+    pytest_pid=$!
+    start_memory_monitor "$pytest_pid" "$test_file" "$memory_report" "${CUDA_VISIBLE_DEVICES:-all}"
+    monitor_pid=$LAST_MEMORY_MONITOR_PID
+    wait "$pytest_pid" || pytest_ec=$?
+    wait_for_memory_monitor "$monitor_pid"
+    print_memory_summary "$test_file" "$memory_report"
+
+    if [ $pytest_ec -eq 0 ]; then
         if [ -f "$junit_file" ]; then
             echo "✅ PASSED: $test_file"
             PASSED_TESTS=$((PASSED_TESTS + 1))
@@ -435,9 +1033,12 @@ run_full_test_file() {
             echo "⚠️  NO RESULT: $test_file (missing JUnit XML: $junit_file)"
             record_no_result_test "$test_file"
         fi
+    elif is_pytest_file_timeout_exit "$pytest_ec"; then
+        echo "⚠️  NO RESULT: $test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+        record_no_result_test "$test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
     else
         if [ -f "$junit_file" ]; then
-            echo "❌ FAILED: $test_file"
+            echo "❌ FAILED: $test_file (pytest exit code: $pytest_ec)"
             record_failed_test "$test_file"
         else
             echo "⚠️  NO RESULT: $test_file (missing JUnit XML: $junit_file)"
@@ -535,8 +1136,11 @@ run_tests_parallel() {
 
     # Create a results file for each test
     declare -A test_result_files
+    declare -A test_exit_codes
     declare -A test_pid_map
     declare -A test_gpu_map
+    declare -A test_memory_reports
+    declare -A test_monitor_map
 
     # Free GPU queue for proper GPU assignment
     local -a available_gpus=("${GPU_LIST[@]}")
@@ -548,6 +1152,8 @@ run_tests_parallel() {
         local file_index=$3
         local result_file="$PARALLEL_TMP_DIR/result_${file_index}"
         local log_file="$PARALLEL_TMP_DIR/log_${file_index}"
+        local memory_report
+        memory_report=$(memory_report_file_for_test "$test_file")
         local junit_file
         junit_file=$(junit_file_for_test "$test_file")
 
@@ -559,9 +1165,31 @@ run_tests_parallel() {
             exec > "$log_file" 2>&1
             rm -f "$junit_file"
 
+            # Capture unexpected exits for debugging
+            _test_exit_trap() {
+                local ec=$?
+                if [ ! -f "$result_file" ]; then
+                    echo ""
+                    echo "⚠️  DEBUG: Subshell exiting with code $ec before writing result file"
+                    echo "⚠️  DEBUG: test_file=$test_file gpu=$gpu_id pid=$$"
+                    if [ $ec -eq 137 ]; then
+                        echo "⚠️  DEBUG: Exit code 137 = SIGKILL (likely OOM killer)"
+                    elif [ $ec -eq 127 ]; then
+                        echo "⚠️  DEBUG: Exit code 127 = command not found"
+                        echo "⚠️  DEBUG: Checking if pytest is available: $(command -v pytest 2>&1 || echo 'NOT FOUND')"
+                    elif [ $ec -gt 128 ]; then
+                        echo "⚠️  DEBUG: Exit code $ec = signal $((ec - 128))"
+                    fi
+                    # Check for OOM in dmesg (may not have permission)
+                    dmesg -T 2>/dev/null | tail -5 | grep -i "oom\|kill\|memory" || true
+                fi
+            }
+            trap _test_exit_trap EXIT
+
             echo "=========================================="
             echo "[$file_index/$total_files] Processing: $test_file"
             echo "GPU: $gpu_id"
+            echo "Memory report: $memory_report"
             echo "=========================================="
 
             if [ "$mode" = "sanity" ]; then
@@ -591,10 +1219,14 @@ run_tests_parallel() {
                 mapfile -t SAMPLED_NODE_IDS_ARRAY <<< "$SAMPLED_NODE_IDS"
                 JUNIT_FLAG="--junitxml=${junit_file}"
 
-                # shellcheck disable=SC2086
-                if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
+                local pytest_ec=0
+                run_pytest_with_file_timeout "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}" || pytest_ec=$?
+                if [ $pytest_ec -eq 0 ]; then
                     echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
                     echo "PASSED:$TOTAL_IN_FILE:$SAMPLED_IN_FILE" > "$result_file"
+                elif is_pytest_file_timeout_exit "$pytest_ec"; then
+                    echo "⚠️  NO RESULT: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests, timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+                    echo "NO_RESULT:timeout:${TOTAL_IN_FILE}:${SAMPLED_IN_FILE}" > "$result_file"
                 else
                     echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
                     echo "FAILED:$TOTAL_IN_FILE:$SAMPLED_IN_FILE" > "$result_file"
@@ -603,19 +1235,30 @@ run_tests_parallel() {
                 # Run full test
                 JUNIT_FLAG="--junitxml=${junit_file}"
 
-                # shellcheck disable=SC2086
-                if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
+                local pytest_ec=0
+                run_pytest_with_file_timeout "${JUNIT_FLAG}" "${test_file}" || pytest_ec=$?
+                if [ $pytest_ec -eq 0 ]; then
                     echo "✅ PASSED: $test_file"
                     echo "PASSED" > "$result_file"
+                elif is_pytest_file_timeout_exit "$pytest_ec"; then
+                    echo "⚠️  NO RESULT: $test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+                    echo "NO_RESULT:timeout" > "$result_file"
                 else
-                    echo "❌ FAILED: $test_file"
+                    echo "❌ FAILED: $test_file (pytest exit code: $pytest_ec)"
+                    if [ $pytest_ec -eq 127 ]; then
+                        echo "⚠️  DEBUG: pytest exited 127 — likely a subprocess 'command not found'"
+                        echo "⚠️  DEBUG: PATH=$PATH"
+                        echo "⚠️  DEBUG: which pytest=$(command -v pytest 2>&1)"
+                    elif [ $pytest_ec -gt 128 ]; then
+                        echo "⚠️  DEBUG: pytest killed by signal $((pytest_ec - 128))"
+                    fi
                     echo "FAILED" > "$result_file"
                 fi
             fi
         ) &
 
         local pid=$!
-        echo "$pid:$test_file:$result_file:$log_file:$file_index:$junit_file"
+        echo "$pid:$test_file:$result_file:$log_file:$file_index:$memory_report:$junit_file"
     }
 
     # Launch tests in parallel with GPU queue
@@ -629,7 +1272,8 @@ run_tests_parallel() {
             for pid in "${!test_pid_map[@]}"; do
                 if ! kill -0 "$pid" 2>/dev/null; then
                     # Job finished, reclaim its GPU
-                    wait "$pid" 2>/dev/null || true
+                    test_exit_codes[$pid]=0; wait "$pid" 2>/dev/null || test_exit_codes[$pid]=$?
+                    wait_for_memory_monitor "${test_monitor_map[$pid]}"
                     local freed_gpu="${test_gpu_map[$pid]}"
                     local finished_test="${test_pid_map[$pid]}"
                     available_gpus+=("$freed_gpu")
@@ -638,6 +1282,7 @@ run_tests_parallel() {
                     echo "[Progress: ${completed}/${total_files} completed, ${running} running] Finished: $(basename "$finished_test") (GPU ${freed_gpu})"
                     unset "test_pid_map[$pid]"
                     unset "test_gpu_map[$pid]"
+                    unset "test_monitor_map[$pid]"
                 fi
             done
             # Small sleep to avoid busy-waiting
@@ -656,11 +1301,15 @@ run_tests_parallel() {
         job_info=$(run_single_test_background "$test_file" "$gpu_id" "$file_index")
 
         # Parse job info
-        local pid result_file log_file junit_file
-        IFS=':' read -r pid test_file result_file log_file file_index junit_file <<< "$job_info"
+        local pid result_file log_file memory_report junit_file monitor_pid
+        IFS=':' read -r pid test_file result_file log_file file_index memory_report junit_file <<< "$job_info"
         test_result_files[$pid]="$result_file:$test_file:$log_file:$file_index:$junit_file"
         test_pid_map[$pid]="$test_file"
         test_gpu_map[$pid]="$gpu_id"
+        test_memory_reports[$pid]="$memory_report"
+        start_memory_monitor "$pid" "$test_file" "$memory_report" "$gpu_id"
+        monitor_pid=$LAST_MEMORY_MONITOR_PID
+        test_monitor_map[$pid]="$monitor_pid"
 
         test_idx=$((test_idx + 1))
     done
@@ -669,7 +1318,10 @@ run_tests_parallel() {
     echo ""
     echo "All tests launched. Waiting for remaining ${#test_pid_map[@]} tests to complete..."
     for pid in "${!test_pid_map[@]}"; do
-        wait "$pid" 2>/dev/null || true
+        if [ -z "${test_exit_codes[$pid]+x}" ]; then
+            test_exit_codes[$pid]=0; wait "$pid" 2>/dev/null || test_exit_codes[$pid]=$?
+        fi
+        wait_for_memory_monitor "${test_monitor_map[$pid]}"
         local finished_test="${test_pid_map[$pid]}"
         local freed_gpu="${test_gpu_map[$pid]}"
         completed=$((completed + 1))
@@ -702,6 +1354,7 @@ run_tests_parallel() {
             cat "$log_file"
             echo ""
         fi
+        print_memory_summary "$test_file" "${test_memory_reports[$pid]}"
 
         # Process result
         if [ -f "$result_file" ]; then
@@ -713,12 +1366,22 @@ run_tests_parallel() {
 
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-            if [ "$mode" = "sanity" ] && [[ "$result" == PASSED:* || "$result" == FAILED:* ]]; then
+            if [ "$mode" = "sanity" ] && [[ "$result" == PASSED:* || "$result" == FAILED:* || "$result" == NO_RESULT:* ]]; then
                 local total_in_file sampled_in_file
-                # shellcheck disable=SC2034  # status is part of the read but unused
-                IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
+                # shellcheck disable=SC2034  # status/reason are part of the read but unused
+                if [[ "$result" == NO_RESULT:* ]]; then
+                    IFS=':' read -r _ _ total_in_file sampled_in_file <<< "$result"
+                else
+                    IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
+                fi
                 TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
                 SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
+            fi
+
+            if [[ "$result" == NO_RESULT:timeout* ]]; then
+                echo "⚠️  NO RESULT: $test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+                record_no_result_test "$test_file (timed out after ${PYTEST_FILE_TIMEOUT_SECONDS}s)"
+                continue
             fi
 
             if [ ! -f "$junit_file" ]; then
@@ -733,11 +1396,31 @@ run_tests_parallel() {
                 record_failed_test "$test_file"
             fi
         else
+            # No result file means the subprocess was killed before it could
+            # write a result. Decode the exit code to identify the signal.
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
             local missing_artifacts
             missing_artifacts=$(describe_missing_artifacts "$result_file" "$junit_file")
-            echo "⚠️  NO RESULT: $test_file (missing ${missing_artifacts})"
-            record_no_result_test "$test_file"
+            local exit_code="${test_exit_codes[$pid]:-unknown}"
+            local kill_reason="exit code $exit_code"
+            if [ "$exit_code" -gt 128 ] 2>/dev/null; then
+                local sig=$((exit_code - 128))
+                local sig_name
+                sig_name=$(kill -l "$sig" 2>/dev/null || echo "SIG$sig")
+                kill_reason="signal $sig ($sig_name)"
+                if [ "$sig" -eq 9 ]; then
+                    kill_reason="signal 9 (SIGKILL) — likely OOM killed"
+                elif [ "$sig" -eq 15 ]; then
+                    kill_reason="signal 15 (SIGTERM) — likely Slurm/container timeout"
+                fi
+            fi
+            echo "⚠️  NO RESULT: $test_file (missing ${missing_artifacts}, $kill_reason)"
+            # Check dmesg from the parent for OOM kills targeting this test's PID
+            echo "⚠️  DEBUG: Checking dmesg for OOM/kill events (pid was $pid):"
+            dmesg -T 2>/dev/null | grep -i "oom\|killed process\|out of memory" | tail -10 || echo "⚠️  DEBUG: dmesg not available or no OOM events found"
+            # Also check if the cgroup saw memory pressure or OOM events.
+            print_cgroup_memory_diagnostics
+            record_no_result_test "$test_file (no result: $kill_reason)"
         fi
     done
 }
@@ -787,6 +1470,8 @@ print_execution_summary() {
         echo "Test files with no result:"
         echo -e "$NO_RESULT_TESTS"
     fi
+
+    print_test_run_resource_summary
 }
 
 # Main execution function for dry run mode
@@ -813,18 +1498,132 @@ execute_dry_run() {
 }
 
 # Main execution function for actual test run
+# Tests that are too memory-heavy to run in parallel.
+# These get pulled out and run sequentially (one at a time, full GPU) after
+# the parallel batch finishes.
+SOLO_TEST_PATTERNS=(
+    "test_attention_sink.py"
+    "test_groupwise_scaled_gemm_fp8.py"
+    "test_trtllm_cutlass_fused_moe.py"
+    "test_trtllm_gen_routed_fused_moe.py"
+    "test_cutlass_fused_moe_reference_correctness.py"
+)
+
+# Historically long-running tests. Keep these parallel, but put them at the
+# front of the queue so they start on separate GPUs before shorter tests.
+LONG_RUNNING_TEST_PATTERNS=(
+    "test_trtllm_gen_fused_moe.py"
+    "test_trtllm_gen_attention.py"
+    "test_decode_delta_rule.py"
+)
+
+is_solo_test() {
+    local test_file=$1
+    local basename
+    local solo_pattern
+    basename=$(basename "$test_file")
+    for solo_pattern in "${SOLO_TEST_PATTERNS[@]}"; do
+        if [ "$basename" = "$solo_pattern" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_long_running_test() {
+    local test_file=$1
+    local basename
+    local long_pattern
+    basename=$(basename "$test_file")
+    for long_pattern in "${LONG_RUNNING_TEST_PATTERNS[@]}"; do
+        if [ "$basename" = "$long_pattern" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 execute_tests() {
     local test_files=$1
 
     mkdir -p "${JUNIT_DIR}"
+    if [ "$MONITOR_TEST_MEMORY" = "true" ]; then
+        rm -f "${JUNIT_DIR}"/*.memory.csv
+    fi
+    print_memory_capacity_summary
 
     # Check if parallel execution is enabled
     if [ "$PARALLEL_TESTS" == "true" ]; then
-        # Run tests in parallel
-        if [ "$SANITY_TEST" == "true" ]; then
-            run_tests_parallel "$test_files" "sanity"
-        else
-            run_tests_parallel "$test_files" "full"
+        # Split tests into front-loaded long-running, normal parallel-safe, and
+        # solo memory-heavy groups. Solo wins if a test appears in both lists.
+        local long_running_files=""
+        local parallel_files=""
+        local solo_files=""
+        local priority_pattern
+        for priority_pattern in "${LONG_RUNNING_TEST_PATTERNS[@]}"; do
+            for test_file in $test_files; do
+                if is_solo_test "$test_file"; then
+                    continue
+                fi
+                if [ "$(basename "$test_file")" = "$priority_pattern" ]; then
+                    long_running_files="$long_running_files $test_file"
+                fi
+            done
+        done
+        for test_file in $test_files; do
+            if is_solo_test "$test_file"; then
+                solo_files="$solo_files $test_file"
+            elif ! is_long_running_test "$test_file"; then
+                parallel_files="$parallel_files $test_file"
+            fi
+        done
+        # Trim leading spaces
+        long_running_files="${long_running_files# }"
+        parallel_files="${parallel_files# }"
+        solo_files="${solo_files# }"
+        local scheduled_parallel_files="${long_running_files} ${parallel_files}"
+        scheduled_parallel_files="${scheduled_parallel_files# }"
+
+        # Run parallel-safe tests
+        if [ -n "$scheduled_parallel_files" ]; then
+            if [ -n "$long_running_files" ]; then
+                echo "Prioritizing long-running tests at the front of the parallel queue:"
+                for test_file in $long_running_files; do
+                    echo "  - $test_file"
+                done
+                echo ""
+            fi
+            if [ "$SANITY_TEST" == "true" ]; then
+                run_tests_parallel "$scheduled_parallel_files" "sanity"
+            else
+                run_tests_parallel "$scheduled_parallel_files" "full"
+            fi
+        fi
+
+        # Run memory-heavy tests sequentially (one at a time, full GPU access)
+        if [ -n "$solo_files" ]; then
+            echo ""
+            echo "=========================================="
+            echo "SEQUENTIAL EXECUTION (memory-heavy tests)"
+            echo "=========================================="
+            local solo_count=0
+            for test_file in $solo_files; do
+                solo_count=$((solo_count + 1))
+            done
+            echo "Running $solo_count test file(s) sequentially to avoid OOM"
+            echo ""
+
+            if [ "$SANITY_TEST" == "true" ]; then
+                FILE_COUNT=$((FILE_COUNT + 0))  # continue from parallel count
+                for test_file in $solo_files; do
+                    FILE_COUNT=$((FILE_COUNT + 1))
+                    run_sanity_test_file "$test_file" "$FILE_COUNT"
+                done
+            else
+                for test_file in $solo_files; do
+                    run_full_test_file "$test_file"
+                done
+            fi
         fi
     else
         # Original sequential execution

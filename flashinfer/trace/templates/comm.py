@@ -34,6 +34,7 @@ def _allreduce_fusion_reference(
     residual_in=None,
     rms_gamma=None,
     rms_eps: float = 1e-6,
+    weight_bias: float = 0.0,
     **_unused,
 ):
     """Single-rank reference for allreduce_fusion.
@@ -45,7 +46,9 @@ def _allreduce_fusion_reference(
 
     - pattern 0 (kAllReduce): passthrough input.
     - pattern 1 (kARResidualRMSNorm): ``residual_out = input + residual_in``;
-      ``norm_out = rmsnorm(residual_out, rms_gamma, rms_eps)``.
+      ``norm_out = rmsnorm(residual_out, weight_bias + rms_gamma, rms_eps)``.
+      ``weight_bias=0`` is standard RMSNorm; ``weight_bias=1`` is Gemma /
+      Qwen3.5 style (``(1 + gamma) * x * rsqrt(...)``).
 
     Quantized / MoE patterns (>= 2) are outside the single-rank scope —
     this reference raises ``NotImplementedError`` for them and callers
@@ -63,7 +66,7 @@ def _allreduce_fusion_reference(
             )
         pre = input.to(torch.float32) + residual_in.to(torch.float32)
         inv_rms = torch.rsqrt(pre.pow(2).mean(dim=-1, keepdim=True) + float(rms_eps))
-        normed = (pre * inv_rms) * rms_gamma.to(torch.float32)
+        normed = (pre * inv_rms) * (float(weight_bias) + rms_gamma.to(torch.float32))
         pre_dtype = pre.to(input.dtype)
         normed_dtype = normed.to(input.dtype)
         if residual_out is not None:
@@ -75,6 +78,35 @@ def _allreduce_fusion_reference(
         f"allreduce_fusion reference does not model pattern={pattern} "
         "(quantized / MoE patterns are multi-rank-only)"
     )
+
+
+def _allreduce_fusion_init(
+    *,
+    num_tokens: int,
+    hidden_dim: int = 4096,
+    pattern: int = 1,  # AR + Residual + RMSNorm
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build per-rank inputs for ``allreduce_fusion``.
+
+    Note: ``workspace`` is an opaque multi-rank IPC handle and is **not**
+    initialized here — the caller must construct it (see
+    ``tests/comm/`` for end-to-end multi-rank examples). This init returns
+    everything else needed for the AR+Residual+RMSNorm fusion path
+    (pattern=1).
+    """
+    torch.manual_seed(seed)
+    inp = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device=device)
+    residual = torch.randn_like(inp)
+    rms_gamma = torch.randn(hidden_dim, dtype=torch.bfloat16, device=device)
+    return {
+        "input": inp,
+        "residual_in": residual,
+        "rms_gamma": rms_gamma,
+        "rms_eps": 1e-6,
+        "pattern": int(pattern),
+    }
 
 
 allreduce_fusion_trace = TraceTemplate(
@@ -122,6 +154,15 @@ allreduce_fusion_trace = TraceTemplate(
             description="RMSNorm weight (patterns 1..5).",
         ),
         "rms_eps": Scalar("float32", optional=True),
+        "weight_bias": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "Bias added to rms_gamma before scaling. 0.0 (default) is "
+                "standard RMSNorm; 1.0 selects Gemma / Qwen3.5 RMSNorm "
+                "((1 + gamma) * x * rsqrt(...))."
+            ),
+        ),
     },
     outputs={
         "output": Tensor(
@@ -132,6 +173,7 @@ allreduce_fusion_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:comm", "fused"],
     reference=_allreduce_fusion_reference,
+    init=_allreduce_fusion_init,
 )
 
 
@@ -158,6 +200,42 @@ def _decode_cp_a2a_alltoall_reference(
     ``tests/comm/``.
     """
     return partial_o.clone(), softmax_stats.clone()
+
+
+def _decode_cp_a2a_alltoall_init(
+    *,
+    batch_dim: int,
+    cp_size: int,
+    head_dim: int = 128,
+    stats_dim: int = 2,
+    ws_elems_per_rank: int = 1,
+    cp_rank: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build per-rank inputs for ``decode_cp_a2a_alltoall``.
+
+    Like ``allreduce_fusion``, the ``workspace`` is a multi-rank IPC
+    handle and not constructed here. ``cp_rank``/``cp_size`` default to
+    a single-rank dummy invocation.
+    """
+    torch.manual_seed(seed)
+    partial_o = torch.randn(
+        batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device
+    )
+    softmax_stats = torch.randn(
+        batch_dim, cp_size, stats_dim, dtype=torch.float32, device=device
+    )
+    workspace = torch.zeros(
+        cp_size, ws_elems_per_rank, dtype=torch.int64, device=device
+    )
+    return {
+        "partial_o": partial_o,
+        "softmax_stats": softmax_stats,
+        "workspace": workspace,
+        "cp_rank": int(cp_rank),
+        "cp_size": int(cp_size),
+    }
 
 
 decode_cp_a2a_alltoall_trace = TraceTemplate(
@@ -202,4 +280,5 @@ decode_cp_a2a_alltoall_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:comm"],
     reference=_decode_cp_a2a_alltoall_reference,
+    init=_decode_cp_a2a_alltoall_init,
 )

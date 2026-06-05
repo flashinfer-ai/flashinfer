@@ -43,6 +43,12 @@ def run_norm_test(args):
     """
     if args.routine == "rmsnorm":
         return testRmsnorm(args)
+    elif args.routine == "fused_add_rmsnorm":
+        return testFusedAddRmsnorm(args)
+    elif args.routine == "gemma_rmsnorm":
+        return testGemmaRmsnorm(args)
+    elif args.routine == "gemma_fused_add_rmsnorm":
+        return testGemmaFusedAddRmsnorm(args)
     elif args.routine == "rmsnorm_quant":
         return testRmsnormQuant(args)
     elif args.routine == "fused_add_rmsnorm_quant":
@@ -55,6 +61,8 @@ def run_norm_test(args):
         return testFusedRmsnormSilu(args)
     elif args.routine == "fused_dit_layernorm":
         return testFusedDitLayernorm(args)
+    elif args.routine == "fused_qk_rmsnorm_rope":
+        return testFusedQkRmsnormRope(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -102,12 +110,6 @@ def parse_norm_args(line, parser):
         required=False,
         default=1e-6,
         help="Epsilon for numerical stability.",
-    )
-    parser.add_argument(
-        "--enable_pdl",
-        action="store_true",
-        default=False,
-        help="Enable programmatic dependent launch.",
     )
     parser.add_argument(
         "--scale",
@@ -166,6 +168,29 @@ def parse_norm_args(line, parser):
         "overrides --is_sf_swizzled_layout and returns both layouts. Default: False",
     )
 
+    # fused_qk_rmsnorm_rope specific arguments
+    parser.add_argument(
+        "--ppf",
+        type=int,
+        required=False,
+        default=5,
+        help="Number of patches in frame dimension (for fused_qk_rmsnorm_rope).",
+    )
+    parser.add_argument(
+        "--pph",
+        type=int,
+        required=False,
+        default=12,
+        help="Number of patches in height dimension (for fused_qk_rmsnorm_rope).",
+    )
+    parser.add_argument(
+        "--ppw",
+        type=int,
+        required=False,
+        default=32,
+        help="Number of patches in width dimension (for fused_qk_rmsnorm_rope).",
+    )
+
     args = parser.parse_args(line)
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -202,6 +227,11 @@ def testRmsnorm(args):
 
     ## Parse input arguments
     backends = args.backends[:]  # Make a copy to avoid modifying the original
+
+    # Default backend to cute-dsl for rmsnorm variants (CuTe-DSL kernels by default)
+    if backends == ["cuda"]:
+        backends = ["cute-dsl"]
+
     batch_size = args.batch_size
     hidden_size = args.hidden_size
     num_heads = args.num_heads
@@ -238,7 +268,7 @@ def testRmsnorm(args):
         print(f"[VVERBOSE] {weight.shape = }")
 
     def run_backend(backend, input_tensor, weight):
-        if backend == "cuda":
+        if backend == "cute-dsl":
             return flashinfer.rmsnorm(
                 input_tensor, weight, eps=eps, enable_pdl=enable_pdl
             )
@@ -333,6 +363,469 @@ def testRmsnorm(args):
     return res
 
 
+def testFusedAddRmsnorm(args):
+    """
+    Test fused_add_rmsnorm API.
+
+    This test benchmarks residual += input followed by RMSNorm, with the
+    normalized output written back to input and residual updated in-place.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testFusedAddRmsnorm")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    backends = args.backends[:]
+
+    # Default backend to cute-dsl for rmsnorm variants (CuTe-DSL kernels by default)
+    if backends == ["cuda"]:
+        backends = ["cute-dsl"]
+
+    batch_size = args.batch_size
+    hidden_size = args.hidden_size
+    eps = args.eps
+    enable_pdl = args.enable_pdl
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are bfloat16, float16."
+        )
+
+    input_shape = (batch_size, hidden_size)
+    input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    residual_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_tensor.shape = }")
+        print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {residual_tensor.shape = }")
+        print(f"[VVERBOSE] {weight.shape = }")
+
+    def run_backend(backend, input_tensor, residual_tensor, weight):
+        if backend == "cute-dsl":
+            flashinfer.fused_add_rmsnorm(
+                input_tensor,
+                residual_tensor,
+                weight,
+                eps=eps,
+                enable_pdl=enable_pdl,
+            )
+            return input_tensor, residual_tensor
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    has_reference_output = False
+    if run_refcheck:
+        reference_residual = residual_tensor.float() + input_tensor.float()
+        rms = torch.sqrt(torch.mean(reference_residual**2, dim=-1, keepdim=True) + eps)
+        reference_output = (reference_residual / rms * weight.float()).to(input_dtype)
+        reference_residual = reference_residual.to(input_dtype)
+        has_reference_output = True
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    residual_outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            cur_input = input_tensor.clone()
+            cur_residual = residual_tensor.clone()
+            out, residual_out = run_backend(
+                cur_backend, cur_input, cur_residual, weight
+            )
+            outputs[cur_backend] = out.detach().clone()
+            residual_outputs[cur_backend] = residual_out.detach().clone()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(
+                cur_backend,
+                input_tensor.clone(),
+                residual_tensor.clone(),
+                weight,
+            ),
+        )
+
+    tested_backends = list(outputs.keys())
+    if len(tested_backends) > 0 and run_refcheck and has_reference_output:
+        for backend in tested_backends:
+            for name, ref, out in (
+                ("output", reference_output, outputs[backend]),
+                ("residual", reference_residual, residual_outputs[backend]),
+            ):
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(ref, out, rtol=1e-2, atol=1e-2)
+                if num_different_elements > 0:
+                    print(
+                        f"[ERROR] {name} tensor mismatch from backend {backend}: "
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                    )
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {backend} {name} mismatch with {num_different_elements} elements"
+                        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth: read input + residual + weight; write residual + normalized input
+            num_elements = np.prod(input_shape)
+            problem_bytes = (
+                num_elements * input_dtype.itemsize  # input read
+                + num_elements * input_dtype.itemsize  # residual read
+                + hidden_size * input_dtype.itemsize  # weight read
+                + num_elements * input_dtype.itemsize  # residual write
+                + num_elements * input_dtype.itemsize  # normalized input write
+            )
+            problem_flops = num_elements * 6
+            tflops = problem_flops / (10**9 * median_time)
+            tb_per_sec = problem_bytes / (10**9 * median_time)
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["eps"] = eps
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testGemmaRmsnorm(args):
+    """
+    Test gemma_rmsnorm API.
+
+    Gemma RMSNorm uses (weight + 1) instead of weight.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testGemmaRmsnorm")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    backends = args.backends[:]
+
+    # Default backend to cute-dsl for rmsnorm variants (CuTe-DSL kernels by default)
+    if backends == ["cuda"]:
+        backends = ["cute-dsl"]
+
+    batch_size = args.batch_size
+    hidden_size = args.hidden_size
+    num_heads = args.num_heads
+    eps = args.eps
+    enable_pdl = args.enable_pdl
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are bfloat16, float16."
+        )
+
+    if num_heads is not None:
+        input_shape = (batch_size, num_heads, hidden_size)
+    else:
+        input_shape = (batch_size, hidden_size)
+
+    input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_tensor.shape = }")
+        print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {weight.shape = }")
+
+    def run_backend(backend, input_tensor, weight):
+        if backend == "cute-dsl":
+            return flashinfer.gemma_rmsnorm(
+                input_tensor, weight, eps=eps, enable_pdl=enable_pdl
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    has_reference_output = False
+    if run_refcheck:
+        rms = torch.sqrt(
+            torch.mean(input_tensor.float() ** 2, dim=-1, keepdim=True) + eps
+        )
+        reference_output = (input_tensor.float() / rms * (weight.float() + 1.0)).to(
+            input_dtype
+        )
+        has_reference_output = True
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(
+                cur_backend, input_tensor, weight
+            ).detach()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, input_tensor, weight),
+        )
+
+    tested_backends = list(outputs.keys())
+    tested_outputs = list(outputs.values())
+    if len(tested_backends) > 0:
+        if run_refcheck and has_reference_output:
+            for i in range(len(tested_backends)):
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(
+                    reference_output, tested_outputs[i], rtol=1e-2, atol=1e-2
+                )
+                if num_different_elements > 0:
+                    print(
+                        f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                    )
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth: read input + weight; write output
+            num_elements = np.prod(input_shape)
+            problem_bytes = (
+                num_elements * input_dtype.itemsize  # input read
+                + hidden_size * input_dtype.itemsize  # weight read
+                + num_elements * input_dtype.itemsize  # output write
+            )
+            problem_flops = num_elements * 5
+            tflops = problem_flops / (10**9 * median_time)
+            tb_per_sec = problem_bytes / (10**9 * median_time)
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["num_heads"] = num_heads if num_heads else ""
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["eps"] = eps
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testGemmaFusedAddRmsnorm(args):
+    """
+    Test gemma_fused_add_rmsnorm API.
+
+    This is fused_add_rmsnorm with Gemma-style (weight + 1) scaling.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testGemmaFusedAddRmsnorm")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    backends = args.backends[:]
+
+    # Default backend to cute-dsl for rmsnorm variants (CuTe-DSL kernels by default)
+    if backends == ["cuda"]:
+        backends = ["cute-dsl"]
+
+    batch_size = args.batch_size
+    hidden_size = args.hidden_size
+    eps = args.eps
+    enable_pdl = args.enable_pdl
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are bfloat16, float16."
+        )
+
+    input_shape = (batch_size, hidden_size)
+    input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    residual_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
+    weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_tensor.shape = }")
+        print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {residual_tensor.shape = }")
+        print(f"[VVERBOSE] {weight.shape = }")
+
+    def run_backend(backend, input_tensor, residual_tensor, weight):
+        if backend == "cute-dsl":
+            flashinfer.gemma_fused_add_rmsnorm(
+                input_tensor,
+                residual_tensor,
+                weight,
+                eps=eps,
+                enable_pdl=enable_pdl,
+            )
+            return input_tensor, residual_tensor
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    has_reference_output = False
+    if run_refcheck:
+        reference_residual = residual_tensor.float() + input_tensor.float()
+        rms = torch.sqrt(torch.mean(reference_residual**2, dim=-1, keepdim=True) + eps)
+        reference_output = (reference_residual / rms * (weight.float() + 1.0)).to(
+            input_dtype
+        )
+        reference_residual = reference_residual.to(input_dtype)
+        has_reference_output = True
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    residual_outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            cur_input = input_tensor.clone()
+            cur_residual = residual_tensor.clone()
+            out, residual_out = run_backend(
+                cur_backend, cur_input, cur_residual, weight
+            )
+            outputs[cur_backend] = out.detach().clone()
+            residual_outputs[cur_backend] = residual_out.detach().clone()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(
+                cur_backend,
+                input_tensor.clone(),
+                residual_tensor.clone(),
+                weight,
+            ),
+        )
+
+    tested_backends = list(outputs.keys())
+    if len(tested_backends) > 0 and run_refcheck and has_reference_output:
+        for backend in tested_backends:
+            for name, ref, out in (
+                ("output", reference_output, outputs[backend]),
+                ("residual", reference_residual, residual_outputs[backend]),
+            ):
+                (
+                    num_different_elements,
+                    num_elements,
+                    num_different_elements_percentage,
+                ) = is_close_stats(ref, out, rtol=1e-2, atol=1e-2)
+                if num_different_elements > 0:
+                    print(
+                        f"[ERROR] {name} tensor mismatch from backend {backend}: "
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                    )
+                    if not args.allow_output_mismatch:
+                        raise AssertionError(
+                            f"[ERROR] Backend {backend} {name} mismatch with {num_different_elements} elements"
+                        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth: read input + residual + weight; write residual + normalized input
+            num_elements = np.prod(input_shape)
+            problem_bytes = (
+                num_elements * input_dtype.itemsize  # input read
+                + num_elements * input_dtype.itemsize  # residual read
+                + hidden_size * input_dtype.itemsize  # weight read
+                + num_elements * input_dtype.itemsize  # residual write
+                + num_elements * input_dtype.itemsize  # normalized input write
+            )
+            problem_flops = num_elements * 6
+            tflops = problem_flops / (10**9 * median_time)
+            tb_per_sec = problem_bytes / (10**9 * median_time)
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["eps"] = eps
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
 def testRmsnormQuant(args):
     """
     Test rmsnorm_quant API.
@@ -363,9 +856,18 @@ def testRmsnormQuant(args):
 
     ## Parse input arguments
     backends = args.backends[:]  # Make a copy to avoid modifying the original
+
+    # Default backend to cute-dsl for rmsnorm variants (CuTe-DSL kernels by default)
+    if backends == ["cuda"]:
+        backends = ["cute-dsl"]
+
     batch_size = args.batch_size
     hidden_size = args.hidden_size
-    scale = args.scale
+    # Pre-allocate scale on device once. Passing a Python float forces flashinfer's
+    # _normalize_scale_tensor to create a tensor on each call, which triggers a
+    # host->device copy that is illegal under CUDA graph capture (and emits a
+    # FutureWarning about the deprecated float form).
+    scale = torch.tensor([args.scale], dtype=torch.float32, device=device)
     eps = args.eps
     enable_pdl = args.enable_pdl
     is_cuda_graph_compatible = not args.no_cuda_graph
@@ -405,7 +907,7 @@ def testRmsnormQuant(args):
         print(f"[VVERBOSE] {scale = }")
 
     def run_backend(backend, out_tensor, input_tensor, weight):
-        if backend == "cuda":
+        if backend == "cute-dsl":
             flashinfer.norm.rmsnorm_quant(
                 out_tensor,
                 input_tensor,
@@ -504,7 +1006,7 @@ def testRmsnormQuant(args):
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
                 cur_res["out_dtype"] = str(out_dtype)
-                cur_res["scale"] = scale
+                cur_res["scale"] = scale.item()
                 cur_res["eps"] = eps
                 cur_res["enable_pdl"] = enable_pdl
                 cur_res["backend"] = backend
@@ -543,9 +1045,18 @@ def testFusedAddRmsnormQuant(args):
 
     ## Parse input arguments
     backends = args.backends[:]  # Make a copy to avoid modifying the original
+
+    # Default backend to cute-dsl for rmsnorm variants (CuTe-DSL kernels by default)
+    if backends == ["cuda"]:
+        backends = ["cute-dsl"]
+
     batch_size = args.batch_size
     hidden_size = args.hidden_size
-    scale = args.scale
+    # Pre-allocate scale on device once. Passing a Python float forces flashinfer's
+    # _normalize_scale_tensor to create a tensor on each call, which triggers a
+    # host->device copy that is illegal under CUDA graph capture (and emits a
+    # FutureWarning about the deprecated float form).
+    scale = torch.tensor([args.scale], dtype=torch.float32, device=device)
     eps = args.eps
     enable_pdl = args.enable_pdl
     is_cuda_graph_compatible = not args.no_cuda_graph
@@ -587,7 +1098,7 @@ def testFusedAddRmsnormQuant(args):
         print(f"[VVERBOSE] {scale = }")
 
     def run_backend(backend, out_tensor, input_tensor, residual_tensor, weight):
-        if backend == "cuda":
+        if backend == "cute-dsl":
             flashinfer.norm.fused_add_rmsnorm_quant(
                 out_tensor,
                 input_tensor,
@@ -704,7 +1215,7 @@ def testFusedAddRmsnormQuant(args):
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
                 cur_res["out_dtype"] = str(out_dtype)
-                cur_res["scale"] = scale
+                cur_res["scale"] = scale.item()
                 cur_res["eps"] = eps
                 cur_res["enable_pdl"] = enable_pdl
                 cur_res["backend"] = backend
@@ -1381,4 +1892,156 @@ def testFusedDitLayernorm(args):
         )
 
     res.append(cur_res)
+
+
+def testFusedQkRmsnormRope(args):
+    """
+    Test fused QK RMSNorm + 3D RoPE + V copy API.
+
+    Benchmarks the fused kernel for video generation DIT self-attention
+    (e.g. WAN 2.1/2.2). Compares against eager PyTorch (separate RMSNorm + RoPE).
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        list: List of dicts containing performance results
+    """
+    from flashinfer.diffusion_ops import fused_qk_rmsnorm_rope
+
+    if args.verbose >= 1:
+        print("[INFO] Running testFusedQkRmsnormRope")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+
+    cc = torch.cuda.get_device_capability(device)
+    cc_int = cc[0] * 10 + cc[1]
+    if not fused_qk_rmsnorm_rope.is_compute_capability_supported(cc_int):
+        print(f"[SKIP] fused_qk_rmsnorm_rope not supported on SM{cc_int}")
+        return []
+
+    batch_size = args.batch_size
+    hidden_size = args.hidden_size
+    num_heads = args.num_heads
+    eps = args.eps
+    ppf = args.ppf
+    pph = args.pph
+    ppw = args.ppw
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    res = []
+
+    if num_heads is None:
+        raise ValueError("--num_heads is required for fused_qk_rmsnorm_rope")
+
+    head_dim = hidden_size // num_heads
+    seq_len = ppf * pph * ppw
+
+    h_dim = w_dim = 2 * (head_dim // 6)
+    t_dim = head_dim - h_dim - w_dim
+
+    input_dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    qkv = torch.randn(
+        batch_size, seq_len, 3 * hidden_size, dtype=input_dtype, device=device
+    )
+    q_weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
+    k_weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] qkv.shape = {qkv.shape}")
+        print(f"[VVERBOSE] seq_len = {seq_len} (ppf={ppf}, pph={pph}, ppw={ppw})")
+        print(f"[VVERBOSE] head_dim = {head_dim}, t/h/w = {t_dim}/{h_dim}/{w_dim}")
+
+    kwargs = dict(
+        ppf=ppf,
+        pph=pph,
+        ppw=ppw,
+        num_frame_channels=t_dim,
+        num_height_channels=h_dim,
+        num_width_channels=w_dim,
+        num_heads_q=num_heads,
+        num_heads_k=num_heads,
+        num_heads_v=num_heads,
+        head_dim=head_dim,
+        eps=eps,
+        base=10000.0,
+        interleave=True,
+        is_qk_norm=True,
+    )
+
+    def run_fused():
+        return fused_qk_rmsnorm_rope(qkv, q_weight, k_weight, **kwargs)
+
+    # Reference check
+    if run_refcheck:
+        import torch.nn as nn
+
+        query = qkv[..., :hidden_size]
+        key = qkv[..., hidden_size : 2 * hidden_size]
+
+        norm_q = nn.RMSNorm(hidden_size, eps=eps).to(device).to(input_dtype)
+        norm_k = nn.RMSNorm(hidden_size, eps=eps).to(device).to(input_dtype)
+        with torch.no_grad():
+            norm_q.weight.copy_(q_weight)
+            norm_k.weight.copy_(k_weight)
+
+        q_ref = norm_q(query).unflatten(2, (num_heads, head_dim))
+        k_ref = norm_k(key).unflatten(2, (num_heads, head_dim))
+
+        q_fused, k_fused, _ = run_fused()
+
+        # Compare after norm, before RoPE (RoPE adds position-dependent rotation)
+        # For a rough check, compare magnitudes
+        q_diff = (q_fused.flatten(2).float() - q_ref.flatten(2).float()).abs().max()
+        k_diff = (k_fused.flatten(2).float() - k_ref.flatten(2).float()).abs().max()
+        if args.verbose >= 1:
+            print(
+                f"[INFO] Refcheck: Q max diff = {q_diff:.4f}, K max diff = {k_diff:.4f}"
+            )
+            print("[INFO] (Note: diff includes RoPE rotation, so nonzero is expected)")
+
+    backend_times = bench_gpu_time(
+        fn=run_fused,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+    )
+
+    if len(backend_times) > 0:
+        median_time = np.median(backend_times)
+        std_time = np.std(backend_times)
+
+        # Memory bandwidth: read QKV + Q/K weights, write Q + K + V
+        num_tokens = batch_size * seq_len
+        problem_bytes = (
+            num_tokens * 3 * hidden_size * input_dtype.itemsize  # QKV read
+            + 2 * hidden_size * input_dtype.itemsize  # Q/K weight read
+            + num_tokens * 3 * hidden_size * input_dtype.itemsize  # Q+K+V write
+        )
+        problem_flops = num_tokens * hidden_size * 10  # rough estimate
+        tflops = problem_flops / (10**9 * median_time)
+        tb_per_sec = problem_bytes / (10**9 * median_time)
+
+        print_perf_metrics("cuda", median_time, std_time, tflops, tb_per_sec)
+
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["num_heads"] = num_heads
+            cur_res["input_dtype"] = str(input_dtype)
+            cur_res["eps"] = eps
+            cur_res["backend"] = "cuda"
+            cur_res["ppf"] = ppf
+            cur_res["pph"] = pph
+            cur_res["ppw"] = ppw
+            cur_res["case_tag"] = args.case_tag
+            res.append(cur_res)
     return res
