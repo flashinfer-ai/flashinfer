@@ -39,7 +39,6 @@ from .delta_rule_sm90 import (
     _FullyFusedDeltaRuleSm90,
     WarpGroupRole,
     LoadStoreWarpRole,
-    MathWarpGroupRole,
 )
 from .schedule import WorkDesc
 
@@ -3017,7 +3016,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             wg_idx,
         )
 
-        for blk in cutlass.range(1, num_blocks - 1, 1, unroll=1):
+        for _ in cutlass.range(1, num_blocks - 1, 1, unroll=1):
             (
                 q_consumer_state,
                 k_consumer_state,
