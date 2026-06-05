@@ -52,6 +52,7 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -176,6 +177,21 @@ def _resolve_options(**overrides: Any) -> FlashInferBackboneOptions:
 # ----------------------------------------------------------------------------
 
 
+def _device_ctx(t: torch.Tensor):
+    """CUDA-device context for the tensor's device (no-op on CPU).
+
+    FlashInfer kernels are launched via raw pointers on the *current* CUDA
+    device. Under HuggingFace ``device_map`` sharding the model's layers live
+    on cuda:1/2/3, but accelerate's hooks move the activations without changing
+    the current device, so a kernel would launch in cuda:0's context against
+    cuda:k pointers -> ``misaligned address`` / ``invalid argument``. Wrapping
+    each swapped forward in this context pins the launch to the right GPU.
+    """
+    if t.is_cuda:
+        return torch.cuda.device(t.device)
+    return contextlib.nullcontext()
+
+
 class FlashInferHunyuanRMSNorm(nn.Module):
     """RMSNorm that delegates to ``flashinfer.rmsnorm``.
 
@@ -199,15 +215,16 @@ class FlashInferHunyuanRMSNorm(nn.Module):
         orig_shape = hidden_states.shape
         # ``flashinfer.rmsnorm`` requires 2D input and BF16/FP16 weights.
         x = hidden_states.reshape(-1, orig_shape[-1])
-        if x.dtype == torch.float32:
-            x_bf16 = x.to(torch.bfloat16)
-            w_bf16 = self.weight.to(torch.bfloat16)
-            out = _flashinfer_rmsnorm(
-                x_bf16.contiguous(), w_bf16, self.variance_epsilon
-            ).to(torch.float32)
-        else:
-            w = self.weight.to(x.dtype)
-            out = _flashinfer_rmsnorm(x.contiguous(), w, self.variance_epsilon)
+        with _device_ctx(x):
+            if x.dtype == torch.float32:
+                x_bf16 = x.to(torch.bfloat16)
+                w_bf16 = self.weight.to(torch.bfloat16)
+                out = _flashinfer_rmsnorm(
+                    x_bf16.contiguous(), w_bf16, self.variance_epsilon
+                ).to(torch.float32)
+            else:
+                w = self.weight.to(x.dtype)
+                out = _flashinfer_rmsnorm(x.contiguous(), w, self.variance_epsilon)
         return out.view(orig_shape).to(orig_dtype)
 
 
@@ -268,13 +285,19 @@ class _FlashInferHunyuanMLP(nn.Module):
         # ``silu(gate) * up``. To match upstream we swap halves before calling.
         gate, up = gate_up.chunk(2, dim=-1)
         fused_input = torch.cat([up, gate], dim=-1).contiguous()
-        if fused_input.dtype == torch.float32:
-            # ``silu_and_mul`` is BF16/FP16-only.
-            hidden = _flashinfer_silu_and_mul(fused_input.to(torch.bfloat16)).to(
-                torch.float32
-            )
-        else:
-            hidden = _flashinfer_silu_and_mul(fused_input)
+        if os.environ.get("FI_DEBUG_MLP"):
+            print(f"[FI_DEBUG_MLP] silu in shape={tuple(fused_input.shape)} "
+                  f"dtype={fused_input.dtype} dev={fused_input.device} "
+                  f"contig={fused_input.is_contiguous()} "
+                  f"cur_dev={torch.cuda.current_device()}", flush=True)
+        with _device_ctx(fused_input):
+            if fused_input.dtype == torch.float32:
+                # ``silu_and_mul`` is BF16/FP16-only.
+                hidden = _flashinfer_silu_and_mul(fused_input.to(torch.bfloat16)).to(
+                    torch.float32
+                )
+            else:
+                hidden = _flashinfer_silu_and_mul(fused_input)
         return self.down_proj(hidden)
 
 
@@ -376,12 +399,18 @@ class FlashInferHunyuanImage3Attention(nn.Module):
             _copy_linear_weights(self.o_proj, original_attn.o_proj)
 
         if self.use_qk_norm:
+            # Create on the same device/dtype as this layer's weights. ``copy_``
+            # only copies values, so without the explicit ``.to(...)`` these
+            # per-head norm weights would stay on CPU and the FlashInfer rmsnorm
+            # kernel (raw pointers, no auto host->device move) would fault with
+            # "expected device_type=cuda" — especially under device_map sharding
+            # where each layer lives on a different GPU.
             self.query_layernorm = FlashInferHunyuanRMSNorm(
                 self.head_dim, eps=cfg.rms_norm_eps
-            )
+            ).to(device=device, dtype=dtype)
             self.key_layernorm = FlashInferHunyuanRMSNorm(
                 self.head_dim, eps=cfg.rms_norm_eps
-            )
+            ).to(device=device, dtype=dtype)
             with torch.no_grad():
                 self.query_layernorm.weight.copy_(original_attn.query_layernorm.weight)
                 self.key_layernorm.weight.copy_(original_attn.key_layernorm.weight)
@@ -596,14 +625,15 @@ class FlashInferHunyuanImage3Attention(nn.Module):
         # branches in mask-less contexts (decode steps and similar).
         causal = q_len == k.shape[2]
 
-        if backend == "single":
-            attn = self._attention_single(q, k, v, causal=causal)
-        elif backend == "cudnn":
-            attn = self._attention_cudnn(q, k, v, causal=causal)
-        elif backend == "decode":
-            attn = self._attention_decode(q, k, v)
-        else:
-            attn = self._attention_sdpa(q, k, v, attn_mask=attention_mask)
+        with _device_ctx(q):
+            if backend == "single":
+                attn = self._attention_single(q, k, v, causal=causal)
+            elif backend == "cudnn":
+                attn = self._attention_cudnn(q, k, v, causal=causal)
+            elif backend == "decode":
+                attn = self._attention_decode(q, k, v)
+            else:
+                attn = self._attention_sdpa(q, k, v, attn_mask=attention_mask)
 
         attn = attn.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
         out = self.o_proj(attn)
