@@ -678,7 +678,7 @@ def cp_delta_rule_fixup(
     fixed_states_by_seq = []
     final_states = []
 
-    for local_transfers, local_states in zip(
+    for local_transfers, local_states in zip(  # noqa: B905
         local_transfers_by_seq, local_states_by_seq
     ):
         assert local_transfers.size(0) == local_states.size(0)
@@ -721,7 +721,7 @@ def cp_delta_rule_fixup_transposed(
     final_states = []
 
     for seq_idx, (local_transfers, local_states) in enumerate(
-        zip(local_transfers_by_seq, local_states_by_seq)
+        zip(local_transfers_by_seq, local_states_by_seq)  # noqa: B905
     ):
         assert local_transfers.size(0) == local_states.size(0)
         seq_fixed_states = []

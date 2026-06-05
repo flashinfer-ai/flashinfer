@@ -41,7 +41,7 @@ class KeyedCompileMixin:
         )
         compile_key = (type(self).__mro__,) + collected_attrs
         hash(compile_key)
-        setattr(self, "_KeyedCompileMixin_compile_key", compile_key)
+        setattr(self, "_KeyedCompileMixin_compile_key", compile_key)  # noqa: B010
 
     def _get_compile_key(self):
         compile_key = getattr(self, "_KeyedCompileMixin_compile_key", None)
@@ -67,7 +67,7 @@ class KeyedCompileMixin:
                     if isinstance(attr_value, Hashable)
                 )
                 compile_key = (str(type(self).__mro__),) + tuple(collected_attrs)
-            setattr(self, "_KeyedCompileMixin_compile_key", compile_key)
+            setattr(self, "_KeyedCompileMixin_compile_key", compile_key)  # noqa: B010
 
         return compile_key
 
