@@ -20,8 +20,7 @@ _TMA_CTA_LOAD = (
     "mbarrier::complete_tx::bytes.L2::cache_hint"
 )
 _TMA_TILE_STORE = (
-    "cp.async.bulk.tensor.3d.global.shared::cta.tile."
-    "bulk_group.L2::cache_hint"
+    "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group.L2::cache_hint"
 )
 _TMA_CTA_STORE = "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group"
 
@@ -95,7 +94,9 @@ def _patched_compile_options(options):
         if dump_dir:
             os.makedirs(dump_dir, exist_ok=True)
     else:
-        dump_dir = os.environ.get("FLASHINFER_DSL_TMA_PATCH_DIR", "/tmp/flashinfer_dsl_tma_patch")
+        dump_dir = os.environ.get(
+            "FLASHINFER_DSL_TMA_PATCH_DIR", "/tmp/flashinfer_dsl_tma_patch"
+        )
         os.makedirs(dump_dir, exist_ok=True)
         extras.append(DumpDir(dump_dir))
     return options + tuple(extras)
@@ -118,7 +119,7 @@ def _patch_sm120a_tma_ptx(ptx_text: str) -> str:
                 continue
 
             line_body = line.rstrip("\r\n")
-            line_end = line[len(line_body):]
+            line_end = line[len(line_body) :]
             line_body = line_body.replace(_TMA_TILE_STORE, _TMA_CTA_STORE)
             if line_body.endswith(";"):
                 operands, separator, _cache_policy = line_body[:-1].rpartition(", %rd")
@@ -233,9 +234,7 @@ def cached_compile(func, *args, compile_options=None, **kwargs):
         if effective_compile_options:
             compiler = cute.compile[effective_compile_options]
         compiled_fn = compiler(func, *args, **kwargs)
-        compiled_fn = _maybe_patch_sm120a_tma(
-            compiled_fn, effective_compile_options
-        )
+        compiled_fn = _maybe_patch_sm120a_tma(compiled_fn, effective_compile_options)
         _in_mem_compile_cache[cache_key] = compiled_fn
 
     return compiled_fn

@@ -25,7 +25,11 @@ import pytest
 
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
-from flashinfer.utils import is_sm90a_supported, is_sm100a_supported, is_sm120a_supported
+from flashinfer.utils import (
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm120a_supported,
+)
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
