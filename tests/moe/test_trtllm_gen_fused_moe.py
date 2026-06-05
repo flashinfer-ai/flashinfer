@@ -4880,8 +4880,69 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
 
 
+def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
+    """FP8 block-scale OA params are currently scoped to MxFp8 SwiGLU."""
+    kwargs = {
+        "routing_logits": torch.empty((1, 1), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((1, 1), dtype=torch.bfloat16),
+        "hidden_states_scale": torch.empty((1, 1), dtype=torch.float32),
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.bfloat16),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "num_experts": 1,
+        "top_k": 1,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": 1,
+        "local_expert_offset": 0,
+        "local_num_experts": 1,
+        "routed_scaling_factor": None,
+        "routing_method_type": RoutingMethodType.Renormalize.value,
+    }
+    per_expert = torch.ones((1,), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
+        trtllm_fp8_block_scale_moe(
+            **kwargs,
+            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            activation_type=ActivationType.Swiglu.value,
+            gemm1_alpha=per_expert,
+        )
+
+    with pytest.raises(ValueError, match="ActivationType.Swiglu"):
+        trtllm_fp8_block_scale_moe(
+            **kwargs,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=ActivationType.Geglu.value,
+            gemm1_clamp_limit=per_expert,
+        )
+
+    routed_kwargs = {
+        key: value for key, value in kwargs.items() if key != "routing_logits"
+    }
+    routed_kwargs["topk_ids"] = torch.empty((1, 1), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
+        trtllm_fp8_block_scale_routed_moe(
+            **routed_kwargs,
+            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            activation_type=ActivationType.Swiglu.value,
+            gemm1_beta=per_expert,
+        )
+
+    with pytest.raises(ValueError, match="ActivationType.Swiglu"):
+        trtllm_fp8_block_scale_routed_moe(
+            **routed_kwargs,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=ActivationType.Geglu.value,
+            gemm1_alpha=per_expert,
+        )
+
+
 def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
-    """MxFP8 MoE applies raw trtllm-gen fused FC1 SwiGLU alpha/clamp params."""
+    """TRT-LLM Gen MxFp8 MoE applies raw fused FC1 SwiGLU OA params."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
@@ -5032,16 +5093,17 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
     output_oa_ref, output_oa = run_case(
         gemm1_alpha=alpha, gemm1_clamp_limit=clamp_limit
     )
-    output_minimax_oa_ref, output_minimax_oa = run_case(
+    output_beta_oa_ref, output_beta_oa = run_case(
         gemm1_alpha=alpha, gemm1_beta=beta, gemm1_clamp_limit=clamp_limit
     )
 
+    # Match the existing MXFP8xMXFP8 MoE test tolerance. This deterministic
+    # identity-like setup still exercises MxFp8 quantization, block scales, and
+    # the fused SwiGLU epilogue, so exact arithmetic parity is not expected.
     torch.testing.assert_close(output_oa, output_oa_ref, atol=1e-1, rtol=1e-1)
-    torch.testing.assert_close(
-        output_minimax_oa, output_minimax_oa_ref, atol=1e-1, rtol=1e-1
-    )
+    torch.testing.assert_close(output_beta_oa, output_beta_oa_ref, atol=1e-1, rtol=1e-1)
     assert not torch.allclose(output_default, output_oa, atol=1e-2, rtol=1e-2)
-    assert not torch.allclose(output_oa, output_minimax_oa, atol=1e-2, rtol=1e-2)
+    assert not torch.allclose(output_oa, output_beta_oa, atol=1e-2, rtol=1e-2)
 
 
 # ====================================================================================

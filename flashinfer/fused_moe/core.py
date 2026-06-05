@@ -2044,6 +2044,13 @@ def get_trtllm_moe_sm100_module():
             raise NotImplementedError(
                 "LoRA delta is only supported for MxFp8 block-scale MoE."
             )
+        _validate_fp8_block_scale_gemm1_activation_params(
+            fp8_quantization_type,
+            activation_type,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
+        )
 
         moe_runner = MoERunner(
             top_k=top_k,
@@ -2669,6 +2676,27 @@ def _validate_routing_replay_out(
         raise ValueError("routing_replay_out must be contiguous (packed row-major)")
 
 
+def _validate_fp8_block_scale_gemm1_activation_params(
+    fp8_quantization_type: Fp8QuantizationType,
+    activation_type: int,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+) -> None:
+    if gemm1_alpha is None and gemm1_beta is None and gemm1_clamp_limit is None:
+        return
+    if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.MxFp8:
+        raise ValueError(
+            "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
+            "for Fp8QuantizationType.MxFp8 in FP8 block scale MoE."
+        )
+    if int(activation_type) != int(ActivationType.Swiglu):
+        raise ValueError(
+            "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
+            "for ActivationType.Swiglu."
+        )
+
+
 @flashinfer_api(trace=trtllm_bf16_moe_trace)
 def trtllm_bf16_moe(
     routing_logits: torch.Tensor,
@@ -3280,6 +3308,13 @@ def trtllm_fp8_block_scale_moe(
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_fp8_block_scale_gemm1_activation_params(
+        fp8_quantization_type,
+        activation_type,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+    )
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
@@ -3479,6 +3514,13 @@ def trtllm_fp8_block_scale_routed_moe(
         Return shape depends on ``do_finalize`` and ``gemm1_lora_delta``;
         see :func:`trtllm_bf16_routed_moe` for the table.
     """
+    _validate_fp8_block_scale_gemm1_activation_params(
+        fp8_quantization_type,
+        activation_type,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+    )
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         None,  # routing_logits
         topk_ids,

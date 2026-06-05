@@ -91,6 +91,27 @@ inline ActivationType validateAndCastActivationType(int64_t act_type) {
   return static_cast<ActivationType>(act_type);
 }
 
+inline bool hasOptionalGemm1ActivationParams(Optional<TensorView> const& gemm1_alpha,
+                                             Optional<TensorView> const& gemm1_beta,
+                                             Optional<TensorView> const& gemm1_clamp_limit) {
+  return gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value();
+}
+
+inline void validateFp8BlockScaleGemm1ActivationParams(
+    Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
+    Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
+    ActivationType activation_type) {
+  if (!hasOptionalGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)) {
+    return;
+  }
+  TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
+      << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
+         "Fp8QuantizationType::MxFp8 in FP8 block scale MoE.";
+  TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
+      << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
+         "ActivationType::Swiglu.";
+}
+
 // Utility function to compute the next power of two
 inline int32_t nextPowerOfTwo(float value) {
   int32_t n = static_cast<int32_t>(std::ceil(value));
@@ -2207,6 +2228,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
     int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
   auto activation_type = validateAndCastActivationType(act_type);
+  validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                                             quantization_type, activation_type);
   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
   // Fail for any other activation to avoid silently running incorrect activation behavior.
   if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&

@@ -514,19 +514,19 @@ _STANDARD_INPUTS = {
     "gemm1_alpha": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Per-expert SwiGLU alpha. Optional.",
+        description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
         optional=True,
     ),
     "gemm1_beta": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Per-expert SwiGLU beta. Optional.",
+        description="Optional MxFp8-only per-expert SwiGLU OA beta.",
         optional=True,
     ),
     "gemm1_clamp_limit": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Per-expert SwiGLU clamp limit. Optional.",
+        description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
         optional=True,
     ),
     "gemm2_weights": Tensor(
@@ -850,19 +850,19 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
         "gemm1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Per-expert SwiGLU alpha. Optional.",
+            description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
             optional=True,
         ),
         "gemm1_beta": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Per-expert SwiGLU beta. Optional.",
+            description="Optional MxFp8-only per-expert SwiGLU OA beta.",
             optional=True,
         ),
         "gemm1_clamp_limit": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Per-expert SwiGLU clamp limit. Optional.",
+            description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
             optional=True,
         ),
         "gemm2_weights": Tensor(
@@ -2445,19 +2445,19 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Per-expert SwiGLU alpha.",
+            description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
         ),
         "gemm1_beta": Tensor(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Per-expert SwiGLU beta.",
+            description="Optional MxFp8-only per-expert SwiGLU OA beta.",
         ),
         "gemm1_clamp_limit": Tensor(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Per-expert SwiGLU clamp limit.",
+            description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "intermediate_size"],
