@@ -111,6 +111,20 @@ def parse_args() -> argparse.Namespace:
         choices=["float16", "bfloat16", "float32"],
     )
     p.add_argument("--max-new-tokens", type=int, default=512)
+    p.add_argument(
+        "--device-map", default=None,
+        help="HF device_map for from_pretrained (e.g. 'auto' to shard the "
+             "168GB model across multiple GPUs). Default: load on CPU then "
+             ".cuda() onto a single GPU.",
+    )
+    p.add_argument(
+        "--max-memory-per-gpu", default="140GiB",
+        help="Per-GPU cap passed as from_pretrained(max_memory=...) when "
+             "--device-map is set. 'auto' greedily fills GPU 0 to capacity, "
+             "leaving no room for FlashInfer weight-prep caches / activations; "
+             "a cap (default 140GiB on a 178GiB B200) forces headroom on every "
+             "GPU. Set to 'none' to disable.",
+    )
 
     # FlashInfer config flags.
     p.add_argument(
@@ -135,6 +149,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--skip-flashinfer", action="store_true",
         help="Load the model but don't swap to FlashInfer (for A/B comparison).",
+    )
+
+    # torch.compile / CUDA-graph acceleration of the per-step backbone forward.
+    p.add_argument(
+        "--compile-mode",
+        default="none",
+        choices=["none", "default", "reduce-overhead", "max-autotune",
+                 "max-autotune-no-cudagraphs"],
+        help=(
+            "torch.compile mode for the HunyuanImage3Model backbone "
+            "(model.model). 'none' disables compilation. 'reduce-overhead' and "
+            "'max-autotune' enable CUDA graphs; 'default' / "
+            "'max-autotune-no-cudagraphs' are compile-only (no CUDA graph)."
+        ),
+    )
+    p.add_argument(
+        "--taylor-cache", action="store_true",
+        help=(
+            "Enable the upstream Taylor activation cache across timesteps. Off "
+            "by default; leave off for torch.compile / CUDA-graph runs (it makes "
+            "the per-step forward stateful and breaks static-shape capture)."
+        ),
+    )
+    # Benchmarking: warmup + timed repeats so compile/graph cost is amortized.
+    p.add_argument(
+        "--bench", action="store_true",
+        help="Report end-to-end and per-step latency (GPU-synced) for each run.",
+    )
+    p.add_argument(
+        "--warmup-runs", type=int, default=0,
+        help="Throwaway generations before timing (warms torch.compile / JIT / "
+             "CUDA-graph capture). Recommended >=1 when --compile-mode != none.",
+    )
+    p.add_argument(
+        "--timed-runs", type=int, default=1,
+        help="Number of timed generations to average over when --bench is set.",
     )
 
     # vae tiling / debugging.
@@ -220,16 +270,42 @@ def main() -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     print(f"Loading {args.model} (trust_remote_code=True) ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True, torch_dtype=dtype,
-    )
-    model = model.eval().cuda()
+    from_kwargs = dict(trust_remote_code=True, torch_dtype=dtype)
+    if args.skip_flashinfer:
+        # Pure-HF baseline: the model card loads with an explicit moe_impl /
+        # attn_implementation. Use the upstream eager MoE + SDPA so the
+        # baseline depends on no FlashInfer kernels at all.
+        from_kwargs["moe_impl"] = "eager"
+        from_kwargs["attn_implementation"] = "sdpa"
+    if args.device_map is not None:
+        from_kwargs["device_map"] = args.device_map
+        mm = args.max_memory_per_gpu
+        if mm and mm.lower() != "none":
+            n_gpus = torch.cuda.device_count()
+            from_kwargs["max_memory"] = {i: mm for i in range(n_gpus)}
+            print(f"[load] device_map={args.device_map} "
+                  f"max_memory={{0..{n_gpus - 1}: {mm}}}")
+    model = AutoModelForCausalLM.from_pretrained(args.model, **from_kwargs)
+    model = model.eval()
+    if args.device_map is None:
+        model = model.cuda()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     # The upstream model owns a ``_tokenizer`` slot it uses inside
-    # ``prepare_model_inputs`` / ``generate``. ``load_tokenizer`` expects the
-    # tokenizer dir, not the instance, so set the slot directly.
-    model._tokenizer = tokenizer
+    # ``prepare_model_inputs`` / ``generate`` / ``generate_image``. The
+    # canonical setup (per the model card) is ``model.load_tokenizer(path)``,
+    # which wires the HunyuanImage-3 tokenizer wrapper (special image/ratio
+    # tokens etc.). Fall back to attaching an AutoTokenizer instance if that
+    # method is unavailable.
+    if hasattr(model, "load_tokenizer"):
+        # ``load_tokenizer`` reads ``self.config.model_version`` and forwards it
+        # to the tokenizer (which ignores it). This checkpoint's config.json
+        # omits the field, so provide a default to avoid an AttributeError.
+        if getattr(model.config, "model_version", None) is None:
+            model.config.model_version = "3.0"
+        model.load_tokenizer(args.model)
+    else:
+        model._tokenizer = AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=True)
 
     # Optionally enable VAE tiling to keep peak memory down for large images.
     if args.vae_use_tiling and hasattr(model, "vae") and hasattr(model.vae, "enable_tiling"):
@@ -249,6 +325,9 @@ def main() -> None:
             prepare_weights=True,
         )
 
+    # 2b. Optionally wrap the backbone with torch.compile (+ CUDA graphs).
+    _maybe_compile_backbone(model, args)
+
     _print_config(args, opts, prompts, task, bot_task)
 
     # 3. Run the correct entry-point per modality. The upstream
@@ -266,27 +345,186 @@ def main() -> None:
         raise ValueError(f"Unsupported modality {args.modality!r}.")
 
 
+def _maybe_compile_backbone(model, args: argparse.Namespace) -> None:
+    """Wrap ``model.model`` (HunyuanImage3Model backbone) with torch.compile.
+
+    The per-timestep image-generation forward in
+    ``HunyuanImage3Text2ImagePipeline`` calls ``self.model(**inputs)``, which
+    runs ``HunyuanImage3ForCausalMM.forward`` -> ``self.model(...)`` (the
+    transformer backbone). Reassigning ``model.model`` to a compiled module
+    transparently routes that hot path through torch.compile.
+
+    ``reduce-overhead`` / ``max-autotune`` use CUDA graphs under the hood;
+    ``default`` / ``max-autotune-no-cudagraphs`` are compile-only. The image
+    branch uses a static sequence length and a fixed attention mask per
+    generation, which is what makes CUDA-graph capture viable here. The Taylor
+    activation cache is forced off unless ``--taylor-cache`` is given, because
+    it makes the per-step forward stateful and defeats graph capture.
+    """
+    # Honor the Taylor-cache toggle regardless of compilation.
+    if hasattr(model, "use_taylor_cache"):
+        model.use_taylor_cache = bool(args.taylor_cache)
+
+    if args.compile_mode == "none":
+        return
+    if args.taylor_cache:
+        print("[warn] --taylor-cache with --compile-mode may trigger frequent "
+              "recompiles / graph breaks.")
+
+    backbone = getattr(model, "model", None)
+    if backbone is None:
+        print("[warn] model has no .model backbone; skipping torch.compile.")
+        return
+
+    # A roomy dynamo cache: the first vs. later denoising step and the
+    # text-decode path specialize to different guards.
+    import torch._dynamo as dynamo
+    dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, 64)
+
+    mode = None if args.compile_mode == "default" else args.compile_mode
+    uses_cudagraph = args.compile_mode in ("reduce-overhead", "max-autotune")
+    print(f"[compile] torch.compile(model.model, mode={args.compile_mode!r}) "
+          f"(CUDA graphs: {uses_cudagraph})")
+    compiled = torch.compile(backbone, mode=mode)
+
+    if uses_cudagraph:
+        # CUDA-graph modes reuse a static output buffer, but the denoising loop
+        # reads the previous step's backbone output while preparing the next
+        # call -> "accessing tensor output of CUDAGraphs that has been
+        # overwritten". Marking a new cudagraph step before each invocation
+        # tells the runtime the prior output is consumed.
+        model.model = _CudagraphStepModule(compiled)
+    else:
+        model.model = compiled
+
+
+class _CudagraphStepModule(torch.nn.Module):
+    """Calls ``torch.compiler.cudagraph_mark_step_begin()`` before each forward,
+    delegating attribute access to the wrapped (compiled) backbone so the rest
+    of the model (which reads ``model.model.<attr>``) is unaffected."""
+
+    def __init__(self, compiled):
+        super().__init__()
+        self._compiled = compiled
+
+    def forward(self, *args, **kwargs):
+        torch.compiler.cudagraph_mark_step_begin()
+        out = self._compiled(*args, **kwargs)
+        # The denoising loop reads the backbone output while the next step's
+        # graph replay overwrites the static buffer. Clone the read-downstream
+        # hidden state (NOT the static KV cache) so callers hold a private copy.
+        try:
+            if getattr(out, "last_hidden_state", None) is not None:
+                out.last_hidden_state = out.last_hidden_state.clone()
+            elif torch.is_tensor(out):
+                out = out.clone()
+            elif isinstance(out, (tuple, list)) and out and torch.is_tensor(out[0]):
+                cloned = list(out)
+                cloned[0] = cloned[0].clone()
+                out = type(out)(cloned)
+        except Exception:
+            pass
+        return out
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._compiled, name)
+
+
+def _bench_generate(gen_fn, args: argparse.Namespace, label: str):
+    """Run ``gen_fn`` with warmup + timed repeats; print GPU-synced latency.
+
+    ``gen_fn`` must be a zero-arg callable that performs one full generation
+    and returns its result (e.g. a list of PIL images). Returns the result of
+    the final timed run.
+    """
+    import time
+
+    for w in range(args.warmup_runs):
+        print(f"[bench:{label}] warmup {w + 1}/{args.warmup_runs} ...")
+        gen_fn()
+        torch.cuda.synchronize()
+
+    if not args.bench:
+        return gen_fn()
+
+    times = []
+    result = None
+    for r in range(max(1, args.timed_runs)):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        result = gen_fn()
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        times.append(dt)
+        per_step = dt / max(1, args.steps)
+        print(f"[bench:{label}] run {r + 1}/{args.timed_runs}: "
+              f"{dt:.3f} s total, {per_step * 1e3:.1f} ms/step ({args.steps} steps)")
+
+    best = min(times)
+    mean = sum(times) / len(times)
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    print(f"[bench:{label}] SUMMARY best={best:.3f}s mean={mean:.3f}s "
+          f"per_step_best={best / max(1, args.steps) * 1e3:.1f}ms "
+          f"peak_mem={peak:.1f}GB")
+    return result
+
+
 # ----------------------------------------------------------------------------
 # Per-modality drivers
 # ----------------------------------------------------------------------------
 
 
 def _run_text2img(model, prompts: list[str], args: argparse.Namespace) -> None:
-    """Use the upstream ``HunyuanImage3Text2ImagePipeline`` for text->image."""
-    pipeline = model.pipeline
+    """Text->image via the model's canonical ``generate_image`` entrypoint.
+
+    ``HunyuanImage3ForCausalMM.generate_image`` is the documented API (model
+    card): it optionally runs a chain-of-thought / recaption *text* stage
+    (``bot_task`` in {think, recaption, think_recaption}) and then the diffusion
+    *image* stage (``mode='gen_image'`` -> ``HunyuanImage3Text2ImagePipeline``).
+    It returns ``(cot_text, samples)`` with ``samples`` a list of PIL images.
+
+    For perf isolation of the FlashInfer-accelerated denoising backbone, pass a
+    ``--bot-task`` outside the think/recaption set (e.g. ``vanilla``/``none``)
+    and an explicit ``--height/--width`` so the text stage and the auto
+    aspect-ratio decode are skipped and only the static-shape image denoising
+    runs (which is also what torch.compile / CUDA graphs target).
+    """
+    # bot_task: 'none' (driver) -> skip the chain-of-thought / recaption *text*
+    # stage and go straight to image denoising. We pass 'vanilla' rather than
+    # None because generate_image() replaces None with the generation_config
+    # default (think_recaption), which adds a long (~300s) autoregressive text
+    # stage that swamps the denoising latency we want to measure. 'vanilla' is
+    # not in {think,recaption,think_recaption}, so the CoT block is skipped; an
+    # explicit image_size also skips the auto aspect-ratio decode.
+    bt = args.bot_task
+    bot_task = "vanilla" if bt in (None, "none") else bt
+    image_size = [args.height, args.width]
+
+    # The denoising step count / guidance are read from the generation config
+    # (gen_config.diff_infer_steps / diff_guidance_scale) inside generate(),
+    # NOT from generate_image kwargs, so set them on the config directly.
+    if hasattr(model, "generation_config"):
+        model.generation_config.diff_infer_steps = args.steps
+        model.generation_config.diff_guidance_scale = args.guidance_scale
+
     for idx, prompt in enumerate(prompts):
         print(f"\n[{idx + 1}/{len(prompts)}] Generating image for: {prompt!r}")
-        images = pipeline(
-            prompt=prompt,
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance_scale,
-            seed=args.seed,
-            verbose=args.verbose,
-        )
-        # ``HunyuanImage3Text2ImagePipeline.__call__`` returns a list of PIL
-        # images (one per batch element).
+
+        def _gen():
+            cot_text, samples = model.generate_image(
+                prompt=prompt,
+                seed=args.seed,
+                image_size=image_size,
+                bot_task=bot_task,
+                system_prompt=args.sys_type,
+                verbose=args.verbose,
+            )
+            return samples
+
+        images = _bench_generate(_gen, args, label=f"text2img[{idx}]")
         for j, img in enumerate(images):
             save_path = Path(args.output) / f"output_{idx}_{j}.png"
             img.save(save_path)

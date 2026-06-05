@@ -13,6 +13,7 @@
 # limitations under the License.
 """Model-independent FlashInfer modules shared by PyTorch examples."""
 
+import contextlib
 import math
 import warnings
 from enum import Enum
@@ -796,6 +797,19 @@ class FlashInferLinear(nn.Module):
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.in_features)
 
+        # Pin FlashInfer GEMM kernel launches to the input's GPU. Under HF
+        # device_map sharding the activations live on cuda:1/2/3 while the
+        # current device may be cuda:0, so raw-pointer kernels would otherwise
+        # launch in the wrong context (-> misaligned address / invalid arg).
+        _dev = (torch.cuda.device(x_2d.device) if x_2d.is_cuda
+                else contextlib.nullcontext())
+        with _dev:
+            out = self._dispatch_backend(x_2d)
+
+        # Restore batch dimensions
+        return out.reshape(*orig_shape[:-1], self.out_features)
+
+    def _dispatch_backend(self, x_2d: torch.Tensor) -> torch.Tensor:
         if self._backend == GEMMBackend.TORCH:
             out = self._forward_torch(x_2d)
         elif self._backend == GEMMBackend.BF16:
@@ -822,9 +836,7 @@ class FlashInferLinear(nn.Module):
             out = self._forward_bmm_mxfp8(x_2d)
         else:
             out = self._forward_torch(x_2d)
-
-        # Restore batch dimensions
-        return out.reshape(*orig_shape[:-1], self.out_features)
+        return out
 
     def _forward_torch(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using standard PyTorch."""
