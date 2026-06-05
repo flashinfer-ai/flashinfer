@@ -23,12 +23,8 @@ from .trace.templates.gdn import gdn_prefill_trace
 from .utils import (
     get_compute_capability,
 )
-from .gdn_kernels import (
-    chunk_gated_delta_rule_sm100,
-    delta_rule_prefill_dsl_sm90,
-    _has_blackwell_prefill,
-    _has_sm90_delta_rule_dsl,
-)
+from .gdn_kernels import chunk_gated_delta_rule_sm100
+from .gdn_kernels.delta_rule_dsl import chunk_gated_delta_rule_sm90
 
 
 @flashinfer_api(trace=gdn_prefill_trace)
@@ -209,13 +205,13 @@ def chunk_gated_delta_rule(
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    _is_sm100a = get_compute_capability(device)[0] == 10
-    if _is_sm100a:
+    _arch_major = get_compute_capability(device)[0]
+    if _arch_major == 10:
         if _cuda_major < 13:
             raise NotImplementedError(
                 "Blackwell GDN prefill is only supported on CUDA 13+"
             )
-        if not _has_blackwell_prefill:
+        if chunk_gated_delta_rule_sm100 is None:
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
 
         # Blackwell SM100 and SM103 path (CuTe DSL kernel)
@@ -268,9 +264,8 @@ def chunk_gated_delta_rule(
             cu_checkpoints=_cu_checkpoints,
             output_checkpoints=state_checkpoints,
         )
-    else:
-        # SM90 Hopper path (CuTe DSL kernel)
-        if not _has_sm90_delta_rule_dsl or delta_rule_prefill_dsl_sm90 is None:
+    elif _arch_major == 9:
+        if chunk_gated_delta_rule_sm90 is None:
             raise NotImplementedError("SM90 GDN prefill DSL kernel is unavailable")
 
         if output_state is None:
@@ -280,7 +275,7 @@ def chunk_gated_delta_rule(
                 device=device,
             )
 
-        delta_rule_prefill_dsl_sm90(
+        chunk_gated_delta_rule_sm90(
             output,
             output_state,
             q,
@@ -297,6 +292,8 @@ def chunk_gated_delta_rule(
             else None,
             checkpoint_every_n_tokens,
         )
+    else:
+        raise NotImplementedError("GDN prefill DSL kernel is unavailable")
 
     if output_final_state:
         return output, output_state
