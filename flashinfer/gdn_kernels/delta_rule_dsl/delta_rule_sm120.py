@@ -768,9 +768,6 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         ldsm_t4 = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype
         )
-        stsm_n4 = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
-        )
 
         # ── Active smem slices (extract 2D from staged tensors) ───────────────
         sQ_k = sQ_SD[None, None, q_stage]  # (BlkQ, D)
