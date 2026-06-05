@@ -50,7 +50,11 @@ def _cp_delta_rule_rejection_reason(
         return "CP delta rule is currently implemented only for SM90"
     if cp_delta_rule_dsl_sm90 is None:
         return "CP delta rule SM90 DSL kernel is unavailable"
-    if checkpoint_every_n_tokens > 0 or state_checkpoints is not None or checkpoint_cu_starts is not None:
+    if (
+        checkpoint_every_n_tokens > 0
+        or state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+    ):
         return "CP delta rule does not support state checkpointing yet"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
@@ -64,7 +68,13 @@ def _cp_delta_rule_rejection_reason(
                 return f"CP delta rule requires {name} to be float32"
             if not tensor.is_contiguous():
                 return f"CP delta rule requires {name} to be contiguous"
-    for name, tensor in (("q", q), ("k", k), ("v", v), ("output", output), ("initial_state", initial_state)):
+    for name, tensor in (
+        ("q", q),
+        ("k", k),
+        ("v", v),
+        ("output", output),
+        ("initial_state", initial_state),
+    ):
         if tensor is None:
             continue
         if not tensor.is_contiguous():
@@ -269,9 +279,8 @@ def chunk_gated_delta_rule(
 
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     _arch_major = get_compute_capability(device)[0]
-    cp_heuristic_matches = (
-        _arch_major == 9
-        and num_seqs * num_sab_heads < max(1, torch.cuda.get_device_properties(device).multi_processor_count // 2)
+    cp_heuristic_matches = _arch_major == 9 and num_seqs * num_sab_heads < max(
+        1, torch.cuda.get_device_properties(device).multi_processor_count // 2
     )
     if use_cp is True or (use_cp == "auto" and cp_heuristic_matches):
         cp_rejection_reason = _cp_delta_rule_rejection_reason(

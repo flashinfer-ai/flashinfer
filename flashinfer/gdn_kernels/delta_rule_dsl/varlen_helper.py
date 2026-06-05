@@ -13,7 +13,9 @@ def chunk_bound_host(num_items: int, total: int, chunk_size: int) -> int:
     return m + (total - m) // chunk_size
 
 
-def workspace_num_chunks_host(cu_seqlens: torch.Tensor, chunk_size: int, total_seqlen: int) -> int:
+def workspace_num_chunks_host(
+    cu_seqlens: torch.Tensor, chunk_size: int, total_seqlen: int
+) -> int:
     if cu_seqlens.ndim != 1:
         raise RuntimeError(f"cu_seqlens must be 1D, got {tuple(cu_seqlens.shape)}")
     num_seqs = cu_seqlens.numel() - 1
@@ -44,7 +46,9 @@ def choose_cp_chunk_len_host(
     if num_sms <= 0:
         raise RuntimeError(f"num_sms must be positive, got {num_sms}")
     if chunk_len_granularity <= 0:
-        raise RuntimeError(f"chunk_len_granularity must be positive, got {chunk_len_granularity}")
+        raise RuntimeError(
+            f"chunk_len_granularity must be positive, got {chunk_len_granularity}"
+        )
     if chunk_len_granularity % 64 != 0:
         raise RuntimeError(
             f"chunk_len_granularity must be a multiple of 64, got {chunk_len_granularity}"
@@ -52,11 +56,15 @@ def choose_cp_chunk_len_host(
 
     target_chunks = max(1, num_sms // num_heads)
     min_chunk_len = (max_seqlen + target_chunks - 1) // target_chunks
-    return ((min_chunk_len + chunk_len_granularity - 1) // chunk_len_granularity) * chunk_len_granularity
+    return (
+        (min_chunk_len + chunk_len_granularity - 1) // chunk_len_granularity
+    ) * chunk_len_granularity
 
 
 @cute.jit
-def chunk_bound(seq_idx: cutlass.Int32, total: cutlass.Int32, chunk_size: cutlass.Int32) -> cutlass.Int32:
+def chunk_bound(
+    seq_idx: cutlass.Int32, total: cutlass.Int32, chunk_size: cutlass.Int32
+) -> cutlass.Int32:
     m = seq_idx
     if total < m:
         m = total
