@@ -3255,7 +3255,7 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 16,
             ]
 
-        self.shared_storage = SharedStorage
+        self.shared_storage = SharedStorage  # type: ignore
         self.kernel(
             g_alpha,
             tma_atom_q,
