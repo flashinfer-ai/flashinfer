@@ -309,7 +309,7 @@ def xqa(
 
     if k_cache.dtype == torch.uint8:
         assert get_compute_capability(torch.device(device="cuda"))[0] in [12], (
-            "XQA NVFP4 KV is only supported on SM120 GPUs"
+            "XQA NVFP4 KV is only supported on SM12x GPUs"
         )
         assert k_sf_cache is not None, "K SF cache is required when NVFP4 KV is used"
         assert v_sf_cache is not None, "V SF cache is required when NVFP4 KV is used"
