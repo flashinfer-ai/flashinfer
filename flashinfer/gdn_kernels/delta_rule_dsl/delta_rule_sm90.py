@@ -5,7 +5,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp, warpgroup, cpasync
-from ..utils import get_device_sm_count, _get_cache_buf
+from ...utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import KeyedCompileMixin, cached_compile
