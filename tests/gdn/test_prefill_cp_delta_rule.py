@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# ruff: noqa: B008
+
 import os
 import random
 import math
@@ -23,6 +25,7 @@ import torch
 
 from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
+from flashinfer.utils import is_sm90a_supported
 from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm90 import (
     cp_delta_rule_dsl_sm90,
     cp_delta_rule_fixup_dsl_sm90,
@@ -41,12 +44,11 @@ FIXUP_TF32_ATOL = 2e-3
 FIXUP_TF32_RTOL = 2e-3
 
 
-def _skip_without_cp_kernel_device():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-    major, _ = torch.cuda.get_device_capability()
-    if major < 9:
-        pytest.skip("SM90+ GPU is required")
+def _skip_if_cp_unsupported():
+    """Skip test if context parallelism is unsupported."""
+    device = torch.device("cuda")
+    if not is_sm90a_supported(device):
+        pytest.skip("CP GDN prefill requires SM90")
 
 
 def _seed_all(seed):
@@ -182,7 +184,7 @@ def test_cp_delta_rule_t_precompute(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
@@ -210,7 +212,7 @@ def test_cp_delta_rule_t_precompute(
         64,
         64,
     )
-    for seq_idx, seq_len in enumerate(seq_lens):
+    for seq_idx, _ in enumerate(seq_lens):
         seq_start = int(cu_seqlens[seq_idx].item())
         seq_end = int(cu_seqlens[seq_idx + 1].item())
         t_start = chunk_bound_host(seq_idx, seq_start, 64)
@@ -231,7 +233,7 @@ def test_cp_delta_rule_t_precompute_varlen_tail_is_projected(
     qkv_factory,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -280,7 +282,7 @@ def test_cp_delta_rule_mn_precompute(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
@@ -379,7 +381,7 @@ def test_cp_delta_rule_fixup(
     use_initial_state,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     head_size = 128
@@ -463,7 +465,7 @@ def test_cp_delta_rule_fixup(
         ref_states_by_seq,
         ref_initial_states_by_seq if use_initial_state else None,
     )
-    for seq_idx, seq_fixed in zip(ref_seq_indices, ref_by_seq):
+    for seq_idx, seq_fixed in zip(ref_seq_indices, ref_by_seq):  # noqa: B905
         seq_start = int(cu_seqlens[seq_idx].item())
         chunk_start = chunk_bound_host(seq_idx, seq_start, cp_chunk_len)
         for chunk_idx in range(seq_fixed.shape[0]):
@@ -492,7 +494,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
@@ -602,7 +604,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
     num_v_heads,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -718,7 +720,7 @@ def test_cp_delta_rule_kernel_chain_long_small_bh_matches_non_cp_prefill(
     scale,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     head_size = 128
@@ -758,7 +760,7 @@ def test_cp_delta_rule_e2e_with_initial_state(
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     head_size = 128
@@ -831,7 +833,7 @@ def test_cp_delta_rule_e2e(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     head_size = 128
@@ -925,7 +927,7 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    _skip_without_cp_kernel_device()
+    _skip_if_cp_unsupported()
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)

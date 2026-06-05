@@ -46,6 +46,13 @@ def _skip_if_unsupported():
         pytest.skip("GDN prefill requires SM90, SM100, or SM120")
 
 
+def _skip_if_cp_unsupported():
+    """Skip test if context parallelism is unsupported."""
+    device = torch.device("cuda")
+    if not is_sm90a_supported(device):
+        pytest.skip("CP GDN prefill requires SM90")
+
+
 def _skip_if_not_sm100():
     """Skip test if not SM100 (Blackwell) with CUDA 13+."""
     device = torch.device("cuda")
@@ -72,6 +79,8 @@ def _test_prefill_kernel(
     seed: int | None = None,
 ):
     _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
