@@ -24,6 +24,93 @@ from flashinfer.tllm_utils import delay_kernel
 from .jit.core import logger
 from .version import __version__ as _flashinfer_version
 
+# --- CC-safe autotuner timing (TRT-LLM PR #11657) ----------------------------
+# Under Confidential Computing, cudaEventElapsedTime is unreliable (it can even
+# return negative values on the bounce-buffer path), so the autotuner's tactic
+# ranking — which is purely min(measured_time) — degenerates to a near-random
+# pick that gets baked into the cache for the whole serving run. We instead time
+# candidate tactics with the GPU's %globaltimer register (read from a tiny stamp
+# kernel), which is CC-safe and consistent with how TRT-LLM times tactics.
+# Controlled by FLASHINFER_AUTOTUNE_TIMER:
+#   "auto" (default) — globaltimer iff CC is detected (like sglang / TRT-LLM #11657)
+#   "globaltimer"    — force globaltimer
+#   "cudaevent"      — force the legacy cudaEvent timer
+# CC detection is via NVML; override with FLASHINFER_CONFIDENTIAL_COMPUTE=1/0.
+_GT_STAMP = None
+_GT_STAMP_TRIED = False
+_GT_STAMP_CU = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+__global__ void _fi_gt_stamp(unsigned long long* out) {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  *out = t;
+}
+void fi_gt_stamp(torch::Tensor out) {
+  _fi_gt_stamp<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<unsigned long long*>(out.data_ptr<int64_t>()));
+}
+"""
+
+
+def _detect_cc() -> bool:
+    """NVIDIA Confidential Computing detected? Mirrors sglang is_confidential_compute()
+    (NVML ccFeature != 0). Override with FLASHINFER_CONFIDENTIAL_COMPUTE=1/0."""
+    forced = os.environ.get("FLASHINFER_CONFIDENTIAL_COMPUTE")
+    if forced is not None:
+        return forced == "1"
+    try:
+        if not torch.cuda.is_available():
+            return False
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            return int(getattr(state, "ccFeature", 0)) != 0
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("[Autotuner]: CC detection failed: %r", e)
+        return False
+
+
+def _get_gt_stamp():
+    """Lazily JIT-build the %globaltimer stamp kernel; None => use cudaEvent.
+
+    Mode from FLASHINFER_AUTOTUNE_TIMER: "auto" (default; globaltimer iff CC detected),
+    "globaltimer" (force), "cudaevent" (force off)."""
+    global _GT_STAMP, _GT_STAMP_TRIED
+    if _GT_STAMP_TRIED:
+        return _GT_STAMP
+    _GT_STAMP_TRIED = True
+    mode = os.environ.get("FLASHINFER_AUTOTUNE_TIMER", "auto").lower()
+    if mode == "cudaevent":
+        return None
+    if mode == "auto" and not _detect_cc():
+        return None  # off-CC: keep the legacy timer (no behavior change)
+    try:
+        from torch.utils.cpp_extension import load_inline
+
+        # per-process name so the 4 TP ranks don't race on the JIT build dir
+        tag = os.environ.get("LOCAL_RANK") or str(os.getpid())
+        mod = load_inline(
+            name=f"fi_autotune_gt_stamp_{tag}",
+            cpp_sources="void fi_gt_stamp(torch::Tensor);",
+            cuda_sources=_GT_STAMP_CU,
+            functions=["fi_gt_stamp"],
+            verbose=False,
+        )
+        _GT_STAMP = mod.fi_gt_stamp
+        logger.info("[Autotuner]: using %globaltimer timing (CC-safe).")
+    except Exception as e:
+        logger.warning(
+            f"[Autotuner]: %globaltimer stamp build failed ({e}); "
+            f"falling back to cudaEvent timing."
+        )
+        _GT_STAMP = None
+    return _GT_STAMP
+
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
 # such as when new kernels or configs are added. In such cases, the tuning configs
 # should also be updated. Currently, this process is manual, but it should be automated in the future.
@@ -1312,6 +1399,8 @@ class AutoTuner:
         stream = torch.cuda.current_stream()
         avg_time = float("inf")
 
+        gt_stamp = _get_gt_stamp()  # %globaltimer kernel (CC-safe), or None -> cudaEvent
+
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
@@ -1339,6 +1428,20 @@ class AutoTuner:
                     else self.stream_delay_micro_secs
                 )
                 delay_kernel(delay_kernel_time_usec)
+
+                if gt_stamp is not None:
+                    # CC-safe path: bracket the run with %globaltimer stamps (ns).
+                    ts = torch.zeros(
+                        2, dtype=torch.int64, device=f"cuda:{torch.cuda.current_device()}"
+                    )
+                    gt_stamp(ts[0:1])
+                    if tuning_config.use_cuda_graph:
+                        graph.replay()
+                    else:
+                        _run_kernels()
+                    gt_stamp(ts[1:2])
+                    stream.synchronize()
+                    return (ts[1].item() - ts[0].item()) / 1e6 / repeat
 
                 start.record()
 
