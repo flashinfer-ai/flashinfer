@@ -360,10 +360,10 @@ def _tgv_gemm_requirement(
             "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
         )
     # The TGV backend dispatches to the CuTeDSL (cute_ext) implementation
-    # by default (see ``_TGV_USE_CPP`` in this module), which requires
+    # by default (see ``_TGV_DEBUG_USE_CPP`` in this module), which requires
     # nvidia-cutlass-dsl. Surface a clear error here when cute_ext is the
     # active path and the dependency is missing.
-    if not _TGV_USE_CPP:
+    if not _TGV_DEBUG_USE_CPP:
         from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
         if not is_cute_dsl_available():
@@ -371,7 +371,7 @@ def _tgv_gemm_requirement(
                 "TGV backend defaults to the CuTeDSL (cute_ext) implementation, "
                 "which requires nvidia-cutlass-dsl. Install it with "
                 "`pip install 'nvidia-cutlass-dsl[cu13]'` or flip "
-                "_TGV_USE_CPP in flashinfer/gemm/gemm_base.py."
+                "_TGV_DEBUG_USE_CPP in flashinfer/gemm/gemm_base.py."
             )
     return True
 
@@ -659,7 +659,7 @@ def _tgv_bmm_bf16_requirement(
             "The TGV backend for bmm_bf16 only supports bfloat16 output."
         )
     # The C++ TGV kernel is 2D-only, so bmm_bf16 always dispatches to the
-    # cute_ext implementation regardless of ``_TGV_USE_CPP``.
+    # cute_ext implementation regardless of ``_TGV_DEBUG_USE_CPP``.
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
     if not is_cute_dsl_available():
@@ -1267,29 +1267,26 @@ def _tinygemm_bf16_gemm_runner():
     return TinyGemmBf16GemmRunner()
 
 
-# TGV-backend implementation toggle. Lives inside the unified TGV runner
-# (see ``_tgv_gemm_runner``) and is read on every forward() — flipping it
-# at runtime is supported, though the typical workflow is editing it once
-# in source for local benchmarking. Kept as a module-level constant
-# rather than a public kwarg to keep ``mm_bf16`` / ``bmm_bf16`` API
-# stable;  The C++ TGV kernel is 2D-only,
-# so the unified runner always falls back to cute_ext for batched (3D)
-# inputs even when this is True.
-_TGV_USE_CPP: bool = False
+# DEBUG-ONLY toggle (not a public knob): set True to force the legacy C++
+# TGV kernel instead of the default CuTeDSL (cute_ext) impl, for local
+# comparison/benchmarking. Edit here in source; keep the default False for
+# normal use. The C++ kernel is 2D-only, so batched (3D) inputs always fall
+# back to cute_ext even when this is True.
+_TGV_DEBUG_USE_CPP: bool = False
 
 
 @functools.cache
 def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
     """Unified TGV runner: internally dispatches to either the CuTeDSL
     (``cute_ext``) implementation or the legacy C++ kernel based on
-    ``_TGV_USE_CPP``. The 11 tactic ids match across both backends (see
+    ``_TGV_DEBUG_USE_CPP``. The 11 tactic ids match across both backends (see
     ``_TGV_CUTE_EXT_TACTIC_CONFIGS`` in ``kernels/tgv_gemm_cute_ext.py``
     and ``SUPPORTED_TGV_GEMM_CONFIGS`` in ``csrc/tgv_gemm.cu``), so a
     tactic selected by the autotuner under one impl is meaningful under
     the other.
 
     Both implementation modules are imported / built lazily on first use,
-    so flipping ``_TGV_USE_CPP`` doesn't penalize the unused side.
+    so flipping ``_TGV_DEBUG_USE_CPP`` doesn't penalize the unused side.
     """
     cpp_runner: List[TunableRunner] = []  # box for lazy init
 
@@ -1320,7 +1317,7 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
             a, b, bias, pdl, out, *_ = inputs
             # The C++ TGV kernel is 2D-only — always fall back to cute_ext
             # for batched inputs regardless of the toggle.
-            if _TGV_USE_CPP and a.dim() == 2:
+            if _TGV_DEBUG_USE_CPP and a.dim() == 2:
                 return _get_cpp_runner().forward(
                     inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
                 )
@@ -1368,7 +1365,7 @@ def bf16_gemm_sm100(
         runners.append(get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner())
     if "tgv" in runner_names:
         # Single TGV runner; dispatches to cute_ext or C++ internally
-        # based on ``_TGV_USE_CPP`` (see ``_tgv_gemm_runner``).
+        # based on ``_TGV_DEBUG_USE_CPP`` (see ``_tgv_gemm_runner``).
         runners.append(_tgv_gemm_runner(a.dtype, use_sm_100f))
     if "tinygemm" in runner_names:
         runners.append(_tinygemm_bf16_gemm_runner())

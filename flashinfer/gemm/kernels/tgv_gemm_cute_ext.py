@@ -88,7 +88,8 @@ e.g. `tDgC` = GMEM C viewed as the per-thread destination of the t2r copy.
 ## Integration with FlashInfer
 This module is wired up as the default ``"tgv"`` backend in
 :func:`flashinfer.mm_bf16` / :func:`flashinfer.bmm_bf16` (the C++ TGV path
-is reachable by flipping ``_TGV_USE_CPP`` in ``flashinfer/gemm/gemm_base.py``).
+is reachable by flipping the debug-only ``_TGV_DEBUG_USE_CPP`` toggle in
+``flashinfer/gemm/gemm_base.py``).
 See ``_TGV_CUTE_EXT_TACTIC_CONFIGS`` for the tactic table.
 
 The kernel writes M-contiguous output, so the runner does the same A↔B
