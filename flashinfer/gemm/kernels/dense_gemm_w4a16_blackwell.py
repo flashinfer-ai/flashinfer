@@ -229,6 +229,7 @@ class BlackwellDenseGemmW4A16Kernel:
         #     large activation magnitudes (|A| > ~30000) since bf16's
         #     wider exponent range avoids saturation in the A cvt.
         use_fp16_mma: int = 1,
+        enable_pdl: bool = True,
     ):
         """W4A16 kernel.
 
@@ -257,6 +258,12 @@ class BlackwellDenseGemmW4A16Kernel:
         self.pipeline_depth = int(pipeline_depth)
         self.vectorized_smem_b = int(vectorized_smem_b)
         self.use_fp16_mma = int(use_fp16_mma)
+        # Programmatic Dependent Launch: when True, the kernel is launched with
+        # use_pdl=True and emits griddepcontrol wait/launch_dependents bookends
+        # so a producer kernel's tail can overlap this kernel's prologue (and
+        # vice-versa) in a back-to-back / CUDA-graph decode sequence.  The
+        # griddepcontrol instructions are no-ops unless use_pdl is set at launch.
+        self.enable_pdl = bool(enable_pdl)
         # Optional override for the epilogue tile shape.  Smaller epi_tile_m
         # enables fine-grained skipping of OOB epilogue iterations when
         # m_actual < tile_M.  Must be a multiple of the MMA-atom shape
@@ -542,6 +549,7 @@ class BlackwellDenseGemmW4A16Kernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
         return
 
@@ -722,6 +730,11 @@ class BlackwellDenseGemmW4A16Kernel:
             cute.arch.cluster_wait()
         else:
             pipeline.sync(barrier_id=1)
+
+        # PDL bookend (start): wait for the prior grid to finish so this
+        # kernel's TMA loads see the producer kernel's writes.  Always emitted;
+        # it is a no-op unless the kernel was launched with use_pdl=True.
+        cute.arch.griddepcontrol_wait()
 
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
@@ -1218,6 +1231,10 @@ class BlackwellDenseGemmW4A16Kernel:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             mainloop_pipeline.producer_tail(mainloop_producer_state)
+        # PDL bookend (end): all warps have finished their loads/compute/store,
+        # so hint the dependent (next) kernel to begin launching -- its prologue
+        # overlaps this kernel's tail.  No-op unless launched with use_pdl=True.
+        cute.arch.griddepcontrol_launch_dependents()
         return
 
     @staticmethod
@@ -1477,83 +1494,33 @@ class BlackwellDenseGemmW4A16Kernel:
         tc_col = lane // Int32(4)
         base_n_in_tile = n_warp_idx * Int32(8) + tc_col
 
-        u32_pos_base = n_warp_idx * Int32(64) + lane * Int32(2)
-        if cutlass.const_expr(self.vectorized_smem_b == 1):
-            # Single ld.shared.v2.u32 (8-byte load) replaces 2 sequential
-            # ld.shared.u32.  u32_pos_base is always even (= n_warp*64 +
-            # lane*2), so the byte offset 4*u32_pos_base is 8-byte aligned.
-            # Targets long_scoreboard stalls (~18% per ncu).
-            smem_addr_b = get_smem_ptr_as_int32(
-                sB_marlin, sB_marlin.layout((k_block_idx, u32_pos_base, stage_idx))
-            )
-            u32_0, u32_1 = ld_shared_v2_u32(smem_addr_b)
+        # tile_N is built from tile_N // 64 independent Marlin 64-N blocks.
+        # The hand-coded byte->fragment mapping below covers exactly one such
+        # 64-N block (4 nn slots); for tile_N=128 we loop it over both blocks.
+        # Block n_blk lives at sB_marlin int32 columns [n_blk*128, +128), sB_sf
+        # N-rows [n_blk*64, +64), and writes tCrB nn in [n_blk*4, +4).  For
+        # tile_N=64 this loops once and is identical to the original path.
+        num_n_blocks = cutlass.const_expr(self.tile_shape_mnk[1] // 64)
+
+        # _write helpers are loop-invariant (they capture tCrB / k_block_idx);
+        # the N-fragment slot ``nn`` and mma-row are passed per write.  Defined
+        # once here rather than inside the (now looped) mode branch.
+        if cutlass.const_expr(self.use_fp16_mma == 1):
+            # fp16-MMA path: scaled_h2 (f16x2) -> 2 fp16 -> tCrB.
+            def _write_hmul2(h2, scale_h2, mma_i_low, nn):
+                scaled_h2 = half2_mul(h2, scale_h2)
+                f_lo, f_hi = f16x2_unpack(scaled_h2)
+                tCrB[mma_i_low, nn, k_block_idx] = f_lo
+                tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi
         else:
-            u32_0 = Uint32(sB_marlin[k_block_idx, u32_pos_base, stage_idx])
-            u32_1 = Uint32(sB_marlin[k_block_idx, u32_pos_base + Int32(1), stage_idx])
 
-        # Per-group FP8-E4M3 scale loads.  4 distinct N positions per K-block.
-        sf_byte_0 = Uint32(sB_sf[k_block_idx, base_n_in_tile + Int32(0), stage_idx])
-        sf_byte_1 = Uint32(sB_sf[k_block_idx, base_n_in_tile + Int32(16), stage_idx])
-        sf_byte_2 = Uint32(sB_sf[k_block_idx, base_n_in_tile + Int32(32), stage_idx])
-        sf_byte_3 = Uint32(sB_sf[k_block_idx, base_n_in_tile + Int32(48), stage_idx])
-
-        # ============================================================
-        # MODE 1 (default): cvt.rn.f16x2.e2m1x2 + hmul2 in fp16 + cvt to
-        # bf16 via fp32.  Saves 16 fp32 muls -> 8 hmul2 per K-block.
-        # ============================================================
-        if cutlass.const_expr(self.dequant_mode == self.DEQUANT_MODE_HMUL2_F16):
-            h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
-            h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
-
-            # Per-group E4M3 scale -> f16x2 broadcast directly (3 PTX ops,
-            # no f32 detour).  The global ``alpha`` is applied once to the
-            # fp32 accumulator in the epilogue, not folded into each scale.
-            sc_n0 = cvt_e4m3_to_f16x2_broadcast(sf_byte_0)
-            sc_n1 = cvt_e4m3_to_f16x2_broadcast(sf_byte_1)
-            sc_n2 = cvt_e4m3_to_f16x2_broadcast(sf_byte_2)
-            sc_n3 = cvt_e4m3_to_f16x2_broadcast(sf_byte_3)
-
-            if cutlass.const_expr(self.use_fp16_mma == 1):
-                # fp16-MMA path: scaled_h2 (f16x2) -> 2 fp16 -> tCrB.
-                # Saves the f16->f32->bf16 cvt chain (5 ops/pair -> 1 op/pair).
-                def _write_hmul2(h2, scale_h2, mma_i_low, nn):
-                    scaled_h2 = half2_mul(h2, scale_h2)
-                    f_lo, f_hi = f16x2_unpack(scaled_h2)
-                    tCrB[mma_i_low, nn, k_block_idx] = f_lo
-                    tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi
-            else:
-
-                def _write_hmul2(h2, scale_h2, mma_i_low, nn):
-                    # Multiply in fp16x2; convert to bf16 via fp32 (no packed
-                    # PTX for f16x2 -> bf16x2 on sm_100a, so unpack to fp32
-                    # then write).
-                    scaled_h2 = half2_mul(h2, scale_h2)
-                    f_lo, f_hi = f16x2_to_f32x2(scaled_h2)
-                    tCrB[mma_i_low, nn, k_block_idx] = f_lo.to(self.b_compute_dtype)
-                    tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi.to(self.b_compute_dtype)
-
-            _write_hmul2(h0_a, sc_n0, 0, 0)
-            _write_hmul2(h0_b, sc_n0, 2, 0)
-            _write_hmul2(h0_c, sc_n1, 0, 1)
-            _write_hmul2(h0_d, sc_n1, 2, 1)
-            _write_hmul2(h1_a, sc_n2, 0, 2)
-            _write_hmul2(h1_b, sc_n2, 2, 2)
-            _write_hmul2(h1_c, sc_n3, 0, 3)
-            _write_hmul2(h1_d, sc_n3, 2, 3)
-            return
-
-        # ============================================================
-        # MODE 0 (baseline): cvt.rn.f16x2.e2m1x2 + per-element fp32 multiply.
-        # ============================================================
-        h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
-        h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
-
-        # alpha applied once on the fp32 accumulator in the epilogue (not
-        # folded per-scale); these are the raw per-group E4M3 scales in f32.
-        scale_n0 = cvt_e4m3_to_f32_via_f16(sf_byte_0)
-        scale_n1 = cvt_e4m3_to_f32_via_f16(sf_byte_1)
-        scale_n2 = cvt_e4m3_to_f32_via_f16(sf_byte_2)
-        scale_n3 = cvt_e4m3_to_f32_via_f16(sf_byte_3)
+            def _write_hmul2(h2, scale_h2, mma_i_low, nn):
+                # Multiply in fp16x2; convert to bf16 via fp32 (no packed PTX
+                # for f16x2 -> bf16x2 on sm_100a, so unpack to fp32 then write).
+                scaled_h2 = half2_mul(h2, scale_h2)
+                f_lo, f_hi = f16x2_to_f32x2(scaled_h2)
+                tCrB[mma_i_low, nn, k_block_idx] = f_lo.to(self.b_compute_dtype)
+                tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi.to(self.b_compute_dtype)
 
         def _write_pair(h2, scale, mma_i_low, nn):
             f_lo, f_hi = f16x2_to_f32x2(h2)
@@ -1562,14 +1529,66 @@ class BlackwellDenseGemmW4A16Kernel:
                 self.b_compute_dtype
             )
 
-        _write_pair(h0_a, scale_n0, 0, 0)
-        _write_pair(h0_b, scale_n0, 2, 0)
-        _write_pair(h0_c, scale_n1, 0, 1)
-        _write_pair(h0_d, scale_n1, 2, 1)
-        _write_pair(h1_a, scale_n2, 0, 2)
-        _write_pair(h1_b, scale_n2, 2, 2)
-        _write_pair(h1_c, scale_n3, 0, 3)
-        _write_pair(h1_d, scale_n3, 2, 3)
+        for n_blk in cutlass.range_constexpr(num_n_blocks):
+            n_col_off = Int32(n_blk * 128)  # int32 column offset of this 64-N block
+            n_sf_off = Int32(n_blk * 64)  # SF N-row offset of this 64-N block
+            nn0 = n_blk * 4  # base tCrB N-fragment slot for this block
+
+            u32_pos_base = n_col_off + n_warp_idx * Int32(64) + lane * Int32(2)
+            if cutlass.const_expr(self.vectorized_smem_b == 1):
+                # Single ld.shared.v2.u32 (8-byte load) replaces 2 sequential
+                # ld.shared.u32.  u32_pos_base is always even (= n_blk*128 +
+                # n_warp*64 + lane*2), so the byte offset is 8-byte aligned.
+                smem_addr_b = get_smem_ptr_as_int32(
+                    sB_marlin, sB_marlin.layout((k_block_idx, u32_pos_base, stage_idx))
+                )
+                u32_0, u32_1 = ld_shared_v2_u32(smem_addr_b)
+            else:
+                u32_0 = Uint32(sB_marlin[k_block_idx, u32_pos_base, stage_idx])
+                u32_1 = Uint32(
+                    sB_marlin[k_block_idx, u32_pos_base + Int32(1), stage_idx]
+                )
+
+            # Per-group FP8-E4M3 scale loads.  4 distinct N positions per block.
+            sf_n = base_n_in_tile + n_sf_off
+            sf_byte_0 = Uint32(sB_sf[k_block_idx, sf_n + Int32(0), stage_idx])
+            sf_byte_1 = Uint32(sB_sf[k_block_idx, sf_n + Int32(16), stage_idx])
+            sf_byte_2 = Uint32(sB_sf[k_block_idx, sf_n + Int32(32), stage_idx])
+            sf_byte_3 = Uint32(sB_sf[k_block_idx, sf_n + Int32(48), stage_idx])
+
+            h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
+            h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
+
+            # MODE 1 (default): cvt.rn.f16x2.e2m1x2 + hmul2 in fp16.
+            if cutlass.const_expr(self.dequant_mode == self.DEQUANT_MODE_HMUL2_F16):
+                # Per-group E4M3 scale -> f16x2 broadcast directly (3 PTX ops,
+                # no f32 detour).  alpha is applied once in the epilogue.
+                sc_n0 = cvt_e4m3_to_f16x2_broadcast(sf_byte_0)
+                sc_n1 = cvt_e4m3_to_f16x2_broadcast(sf_byte_1)
+                sc_n2 = cvt_e4m3_to_f16x2_broadcast(sf_byte_2)
+                sc_n3 = cvt_e4m3_to_f16x2_broadcast(sf_byte_3)
+                _write_hmul2(h0_a, sc_n0, 0, nn0 + 0)
+                _write_hmul2(h0_b, sc_n0, 2, nn0 + 0)
+                _write_hmul2(h0_c, sc_n1, 0, nn0 + 1)
+                _write_hmul2(h0_d, sc_n1, 2, nn0 + 1)
+                _write_hmul2(h1_a, sc_n2, 0, nn0 + 2)
+                _write_hmul2(h1_b, sc_n2, 2, nn0 + 2)
+                _write_hmul2(h1_c, sc_n3, 0, nn0 + 3)
+                _write_hmul2(h1_d, sc_n3, 2, nn0 + 3)
+            else:
+                # MODE 0 (baseline): per-element fp32 multiply.
+                scale_n0 = cvt_e4m3_to_f32_via_f16(sf_byte_0)
+                scale_n1 = cvt_e4m3_to_f32_via_f16(sf_byte_1)
+                scale_n2 = cvt_e4m3_to_f32_via_f16(sf_byte_2)
+                scale_n3 = cvt_e4m3_to_f32_via_f16(sf_byte_3)
+                _write_pair(h0_a, scale_n0, 0, nn0 + 0)
+                _write_pair(h0_b, scale_n0, 2, nn0 + 0)
+                _write_pair(h0_c, scale_n1, 0, nn0 + 1)
+                _write_pair(h0_d, scale_n1, 2, nn0 + 1)
+                _write_pair(h1_a, scale_n2, 0, nn0 + 2)
+                _write_pair(h1_b, scale_n2, 2, nn0 + 2)
+                _write_pair(h1_c, scale_n3, 0, nn0 + 3)
+                _write_pair(h1_d, scale_n3, 2, nn0 + 3)
 
     # ------------------------------------------------------------------
     # TVM-FFI entry: takes (m, k) A, (k//16, n*2) B (Marlin int32),

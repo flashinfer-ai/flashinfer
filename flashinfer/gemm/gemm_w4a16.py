@@ -180,6 +180,7 @@ def _check_mm_w4a16_fp4_problem_size(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     is_sf_swizzled: bool = True,
+    enable_pdl: bool = True,
 ):
     """Common problem-size / dtype checks applied to every backend.
 
@@ -212,6 +213,7 @@ def _torch_w4a16_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     is_sf_swizzled: bool = True,
+    enable_pdl: bool = True,
 ):
     """Torch backend gated to Blackwell-class SMs (100, 103, 110, 120, 121).
 
@@ -244,6 +246,7 @@ def _cudnn_w4a16_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     is_sf_swizzled: bool = True,
+    enable_pdl: bool = True,
 ):
     """cuDNN backend: requires a cuDNN build with FP4 block-scale support.
 
@@ -287,6 +290,7 @@ def _cute_dsl_w4a16_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     is_sf_swizzled: bool = True,
+    enable_pdl: bool = True,
 ):
     """cute-DSL backend: a Blackwell-class (SM100/103/110/120/121) cute-DSL kernel.
 
@@ -396,6 +400,7 @@ def mm_w4a16_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     is_sf_swizzled: bool = True,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """W4A16 FP4 GEMM: ``out = (a @ dequant(b).T) * alpha``.
 
@@ -424,6 +429,12 @@ def mm_w4a16_fp4(
             ``prepare_w4a16_fp4_weights(..., backend="cudnn")``) requires
             the ``cudnn`` backend.  The ``cute-dsl`` backend consumes a
             fully bespoke prepared layout and ignores this flag.
+        enable_pdl: Enable `Programmatic Dependent Launch
+            <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_.
+            Only the ``cute-dsl`` backend uses it (the kernel launches with
+            ``use_pdl`` and emits griddepcontrol bookends so a producer kernel's
+            tail can overlap this kernel's prologue in a back-to-back / CUDA-graph
+            sequence).  No effect for the ``torch`` / ``cudnn`` backends.
 
     Returns:
         ``(M, N)`` tensor of ``out_dtype``.
@@ -436,12 +447,16 @@ def mm_w4a16_fp4(
         latency-sensitive code paths.
     """
     out_dtype = out_dtype or a.dtype
+    # enable_pdl is consumed only by the cute-dsl backend (Programmatic
+    # Dependent Launch); torch (reference) and cudnn (own graph) ignore it.
     if backend == "torch":
         return _compute_torch(a, b, b_descale, alpha, out_dtype, out, block_size)
     if backend == "cudnn":
         return _compute_cudnn(a, b, b_descale, alpha, out_dtype, out, block_size)
     if backend == "cute-dsl":
-        return _compute_cute_dsl(a, b, b_descale, alpha, out_dtype, out, block_size)
+        return _compute_cute_dsl(
+            a, b, b_descale, alpha, out_dtype, out, block_size, enable_pdl=enable_pdl
+        )
     raise ValueError(
         f"Unknown backend {backend!r}.  Supported: 'torch', 'cudnn', 'cute-dsl'."
     )
@@ -1291,6 +1306,7 @@ def _get_cute_dsl_w4a16_gemm(
     atom_layout: Tuple[int, int, int] = (2, 2, 1),
     pipeline_depth: int = 1,
     use_fp16_mma: int = 1,
+    enable_pdl: bool = True,
 ):
     """Compile (or fetch from cache) the cute-DSL W4A16 GEMM kernel.
 
@@ -1309,6 +1325,9 @@ def _get_cute_dsl_w4a16_gemm(
     atom_layout = cast(Tuple[int, int, int], tuple(atom_layout))
     pipeline_depth = int(pipeline_depth)
     use_fp16_mma = int(use_fp16_mma)
+    enable_pdl = bool(enable_pdl)
+    # enable_pdl is baked into the compiled kernel (the wrapper launches with
+    # use_pdl=self.enable_pdl), so it is part of the cache key.
     cache_key = (
         tile_shape_mnk,
         a_dtype,
@@ -1316,6 +1335,7 @@ def _get_cute_dsl_w4a16_gemm(
         atom_layout,
         pipeline_depth,
         use_fp16_mma,
+        enable_pdl,
     )
     cached = _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -1366,6 +1386,7 @@ def _get_cute_dsl_w4a16_gemm(
         atom_layout=atom_layout,
         pipeline_depth=pipeline_depth,
         use_fp16_mma=use_fp16_mma,
+        enable_pdl=enable_pdl,
     )
     max_active_clusters = get_max_active_clusters(1)
 
@@ -1437,12 +1458,15 @@ def _prepare_cute_dsl(
 #   * The MMA atom layout is coupled to tile_M: (1,2,1) requires tile_M == 16
 #     (Permutation_m = 16); tile_M >= 32 uses (2,2,1).  See
 #     ``_select_w4a16_tile_shape``.
-#   * tile_K = 128 when K % 128 == 0 (the common case), else 64; the (1,2,1)
-#     tile_M=16 path is only used at tile_K == 128 (matching the heuristic).
-#   * tile_N is FIXED at 64.  The Marlin weight is packed in 64-wide N blocks
-#     and the MMA atom layouts assume tile_N == 64; a wider tile_N *compiles and
-#     runs without error but produces incorrect (NaN) output*, so it is not a
-#     candidate.
+#   * tile_K defaults to 128 (K % 128 == 0) else 64.  At large N (>=8192) a
+#     tile_K=64 variant (deeper K-pipeline -> more ab_stages fit -> better
+#     TMA-latency hiding) is also offered for the (1,2,1)/tile_M=16 tile; it
+#     measured +2-4% on large-N moderate-K cells, neutral/negative elsewhere.
+#   * tile_N is 64 by default; a tile_N=128 variant (2 Marlin 64-N blocks per
+#     tile, looped in ``_dequant_b_to_register``) is offered only at very large
+#     N (>=12288), where halving the (m,n)-tile count cuts per-tile cold-start
+#     overhead without hurting the wave count (~+2-6%; neutral/negative below,
+#     so gated out).  Both tile_N values are numerically verified correct.
 #   * CRITICAL: the AutoTuner ranks tactics by *latency only* -- it never checks
 #     correctness.  A config that is fast but wrong would be silently selected.
 #     Every config enumerated here must therefore be numerically verified
@@ -1470,14 +1494,13 @@ def _w4a16_cute_dsl_tactic_configs(
     that a tactic index profiled for one M-bucket stays valid when the chosen
     index is replayed for a runtime ``M`` in the same bucket.  The AutoTuner
     selects the best (tile_M, perf-knob) combo for each M-bucket from the
-    candidates here.  ``n`` is currently unused (tile_N is fixed at 64) but is
-    kept in the signature so the key/validity surface can grow if a wider-N
-    path is ever validated.
+    candidates here.  ``n`` gates the tile_N=128 variant (offered only for very
+    large N); the rest of the set uses tile_N=64.
     """
     tile_k = 128 if k % 128 == 0 else 64
 
-    # (tile_M, atom_layout) shapes the kernel is designed/validated for, with
-    # tile_N fixed at 64 (see the module-banner notes above).
+    # (tile_M, atom_layout) shapes the kernel is designed/validated for, at the
+    # default tile_N=64; a tile_N=128 variant is added below for very large N.
     tile_m_atoms: List[Tuple[int, Tuple[int, int, int]]] = []
     if tile_k == 128:
         tile_m_atoms.append((16, (1, 2, 1)))
@@ -1487,8 +1510,8 @@ def _w4a16_cute_dsl_tactic_configs(
     configs: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int]] = []
     seen = set()
 
-    def add(tile_m, atom, pdepth, fp16):
-        cfg = ((tile_m, 64, tile_k), atom, pdepth, fp16)
+    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None):
+        cfg = ((tile_m, tile_n, tile_k if tk is None else tk), atom, pdepth, fp16)
         key = (cfg[0], cfg[1], pdepth, fp16)
         if key not in seen:
             seen.add(key)
@@ -1504,6 +1527,29 @@ def _w4a16_cute_dsl_tactic_configs(
     add(base_tile_m, base_atom, 0, 1)  # no dequant prefetch (helps short-K)
     for tile_m, atom in tile_m_atoms[1:]:
         add(tile_m, atom, 1, 1)
+
+    # tile_N=128 halves the (m,n)-tile count -> fewer per-tile cold-starts.
+    # Measured to help only at very large N (>=12288), where the halved tile
+    # count still maps to a healthy wave count (~+2-6%); below that the halved
+    # count lands on a worse wave quantization (e.g. n=8192: 128->64 tiles,
+    # wave_eff 0.89->0.67) and it is neutral/negative, so it is gated out.
+    # Both tile_N values are numerically correct, so a mis-gate only costs a
+    # few % via a wrong autotuner pick, never correctness.  Requires
+    # tile_k==128 (the (1,2,1) atom) and n % 128 == 0 (exact N tiling).
+    if tile_k == 128 and n >= 12288 and n % 128 == 0:
+        add(base_tile_m, base_atom, 1, 1, tile_n=128)
+
+    # tile_K=64 (deeper K-pipeline: more, smaller K-tiles let more ab_stages
+    # fit in SMEM -> better TMA-latency hiding).  Offered as a tile_K=128
+    # alternative only at large N (>=8192), where it measured +2-4% on
+    # moderate-K cells (e.g. n=8192 k=2048 +4.2%); it is neutral/negative for
+    # small N or long K, where the default tile_K=128 wins.  Same (1,2,1) /
+    # tile_M=16 atom as the baseline, just a finer K split -- numerically
+    # verified correct, so a wrong autotuner pick only costs a few %.  (Only
+    # meaningful when the default tile_k is 128; for k%128!=0 tile_K is already
+    # 64.)
+    if tile_k == 128 and n >= 8192:
+        add(base_tile_m, base_atom, 1, 1, tile_n=64, tk=64)
 
     return configs
 
@@ -1534,13 +1580,15 @@ _W4A16_CUTE_DSL_TUNING_CONFIG = TuningConfig(
 )
 
 
-def _cute_dsl_w4a16_fp4_runner() -> TunableRunner:
+def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
     """Build a ``CuteDslW4a16Fp4Runner`` for the cute-DSL W4A16 GEMM.
 
     Each tactic is an index into :func:`_w4a16_cute_dsl_tactic_configs` for the
     runtime ``(N, K)``.  Tactic ``-1`` is the fallback: it routes to the M-aware
     ``_select_w4a16_tile_shape`` heuristic with default knobs (i.e. the
-    pre-autotuner behaviour), so an un-tuned call is unchanged.
+    pre-autotuner behaviour), so an un-tuned call is unchanged.  ``enable_pdl``
+    is a launch-time flag (captured here, baked into the compiled kernel); it is
+    orthogonal to the tactic choice so it does not enter the tactic key.
     """
 
     class CuteDslW4a16Fp4Runner(TunableRunner):
@@ -1586,6 +1634,7 @@ def _cute_dsl_w4a16_fp4_runner() -> TunableRunner:
                 atom_layout,
                 pipeline_depth,
                 use_fp16_mma,
+                enable_pdl=enable_pdl,
             )
             compiled(a, b, b_sf_u8, out, alpha_for_launch)
             return out
@@ -1601,6 +1650,7 @@ def _compute_cute_dsl(
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor],
     block_size: int,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """cute-DSL-backend compute: dispatch to the compiled Blackwell kernel.
 
@@ -1651,7 +1701,7 @@ def _compute_cute_dsl(
     # returns tactic -1, which the runner maps to the M-aware
     # ``_select_w4a16_tile_shape`` heuristic -- i.e. the pre-autotuner path.
     tuner = AutoTuner.get()
-    runner = _cute_dsl_w4a16_fp4_runner()
+    runner = _cute_dsl_w4a16_fp4_runner(enable_pdl=enable_pdl)
     inputs = [a, b, b_sf_u8, alpha_for_launch, out_dtype, out, block_size]
     chosen_runner, tactic = tuner.choose_one(
         "w4a16_fp4_cute_dsl_gemm",
