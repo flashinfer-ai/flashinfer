@@ -23,8 +23,10 @@ from .trace.templates.gdn import gdn_prefill_trace
 from .utils import (
     get_compute_capability,
 )
-from .gdn_kernels import chunk_gated_delta_rule_sm100
-from .gdn_kernels.delta_rule_dsl import chunk_gated_delta_rule_sm90
+from .gdn_kernels import (
+    chunk_gated_delta_rule_sm90,
+    chunk_gated_delta_rule_sm100,
+)
 
 
 @flashinfer_api(trace=gdn_prefill_trace)
