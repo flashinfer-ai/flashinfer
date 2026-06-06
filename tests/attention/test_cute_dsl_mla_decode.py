@@ -50,8 +50,21 @@ def torch_reference_mla(
     softmax_scale,
     output_scale,
     page_size,
+    apply_mtp_mask=False,
+    return_lse=False,
 ):
     """PyTorch reference implementation for MLA decode.
+
+    When ``apply_mtp_mask`` is True, applies the spec-decoding (MTP) causal
+    mask the monolithic kernel uses: for q_token qi ∈ [0, q_len), valid KV
+    positions are [0, seq_len - q_len + 1 + qi). For q_len=1 this reduces
+    to the plain K-bound check (no-op).  The modular implementation does
+    not apply this mask, so callers exercising the modular path should
+    leave ``apply_mtp_mask=False``.
+
+    When ``return_lse=True``, also returns the Log-Sum-Exp of the
+    pre-softmax scores: ``LSE = log(sum(exp(QK^T * softmax_scale)))``
+    in natural log, matching the cute_dsl kernel's LSE convention.
 
     Args:
         q_nope: [B, q_len, H, latent_dim]
@@ -63,10 +76,13 @@ def torch_reference_mla(
         softmax_scale: float
         output_scale: float
         page_size: int
+        apply_mtp_mask: bool — whether to apply the MTP causal mask.
+        return_lse: bool — also return LSE [B, q_len, H] (float32).
     """
     B, q_len, H, latent_dim = q_nope.shape
 
     outputs = []
+    lses = []
     for b in range(B):
         seq_len = cache_seqs[b].item()
         num_pages_needed = (seq_len + page_size - 1) // page_size
@@ -94,6 +110,18 @@ def torch_reference_mla(
         attn_rope = torch.einsum("qhd,kd->qhk", q_rope_b.float(), k_rope.float())
         attn = (attn_latent + attn_rope) * softmax_scale
 
+        # Spec-decoding (MTP) causal mask: row qi's k_bound is seq_len-(q_len-1)+qi.
+        if apply_mtp_mask and q_len > 1:
+            mask = torch.zeros(q_len, seq_len, dtype=torch.bool, device=attn.device)
+            for qi in range(q_len):
+                upper = max(0, seq_len - q_len + 1 + qi)
+                mask[qi, :upper] = True
+            attn = attn.masked_fill(~mask.unsqueeze(1), float("-inf"))
+
+        if return_lse:
+            # LSE = logsumexp over the KV dimension (natural log).
+            lses.append(torch.logsumexp(attn, dim=-1))  # [q_len, H]
+
         # Softmax
         attn = F.softmax(attn, dim=-1)
 
@@ -103,7 +131,10 @@ def torch_reference_mla(
         out_b = out_b * output_scale
         outputs.append(out_b)
 
-    return torch.stack(outputs, dim=0)  # [B, q_len, H, latent_dim]
+    out_stack = torch.stack(outputs, dim=0)  # [B, q_len, H, latent_dim]
+    if return_lse:
+        return out_stack, torch.stack(lses, dim=0)  # ([B,q_len,H,D], [B,q_len,H])
+    return out_stack
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 32])
@@ -158,8 +189,12 @@ def test_cute_dsl_mla_decode_fp16(
     # Workspace
     workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
-    # Run kernel
-    out = cute_dsl_mla_decode(
+    # Run kernel.  Request LSE in the native 3D [B, q_len, H] shape; the
+    # wrapper also accepts [B*q_len, H] (trtllm-gen shape) which gets
+    # reshaped internally.
+    # LSE output is currently monolithic-only; the modular path raises
+    # NotImplementedError, so only request it on the monolithic path.
+    result = cute_dsl_mla_decode(
         query=query,
         kv_cache=kv_cache,
         workspace_buffer=workspace_buffer,
@@ -173,7 +208,15 @@ def test_cute_dsl_mla_decode_fp16(
         is_var_seq=False,
         enable_pdl=enable_pdl,
         cute_dsl_impl=cute_dsl_impl,
+        return_lse=(cute_dsl_impl == "monolithic"),
     )
+    if cute_dsl_impl == "monolithic":
+        out, lse = result
+        assert lse.dtype == torch.float32
+        assert lse.shape == (batch_size, q_len, num_heads)
+    else:
+        out = result
+        lse = None
 
     # Reference
     kv_flat = kv_cache.reshape(-1, latent_dim + rope_dim)
@@ -182,6 +225,132 @@ def test_cute_dsl_mla_decode_fp16(
     q_nope = query[..., :latent_dim]
     q_rope = query[..., latent_dim:]
 
+    # Monolithic applies the MTP causal mask for q_len > 1; modular does not.
+    ref = torch_reference_mla(
+        q_nope,
+        q_rope,
+        c_latent_ref,
+        c_rope_ref,
+        block_tables,
+        seq_lens,
+        softmax_scale,
+        output_scale,
+        page_size,
+        apply_mtp_mask=(cute_dsl_impl == "monolithic"),
+        return_lse=(cute_dsl_impl == "monolithic"),
+    )
+    if cute_dsl_impl == "monolithic":
+        ref_out, ref_lse = ref
+    else:
+        ref_out = ref
+        ref_lse = None
+
+    ref_out_cast = ref_out.to(dtype)
+
+    # Check with tolerance appropriate for FP16/BF16
+    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
+    if cute_dsl_impl == "monolithic":
+        # LSE is float32 — tighter tolerance.
+        torch.testing.assert_close(lse, ref_lse, atol=1e-2, rtol=1e-2)
+
+
+# Exercises the spec-decoding (MTP) causal mask + fold_sq path: num_heads < 128
+# forces the kernel to pack F = compute_fold_sq_ratio(H, q_len, 128) tokens of
+# q_len into the head dim so the 128-wide MMA-M tile is fully populated.
+# (H=128, q_len=any) → F=1 (no fold), (H=64, q_len=2) → F=2, (H=64, q_len=4) → F=2,
+# (H=32, q_len=4) → F=4, (H=32, q_len=2) → F=2.  All paths share the same
+# kernel; the MTP causal mask is applied uniformly for q_len > 1.
+# Monolithic-only: the modular path doesn't implement fold_sq or the MTP mask.
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 1024])
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
+@pytest.mark.parametrize("q_len", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float8_e4m3fn])
+def test_cute_dsl_mla_decode_fold_sq(
+    batch_size, seq_len_k, num_heads, q_len, dtype, cute_dsl_impl
+):
+    """Verify the MTP causal mask + fold_sq packing for H ≤ 128 and q_len > 1."""
+    if cute_dsl_impl != "monolithic":
+        pytest.skip("fold_sq / MTP causal mask are monolithic-only features")
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention import cute_dsl_mla_decode
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    page_size = 64
+    latent_dim = 512
+    rope_dim = 64
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+    D_qk = latent_dim + rope_dim
+
+    # torch.randn doesn't support fp8; for FP8 inputs create as fp16 then convert.
+    is_fp8 = dtype == torch.float8_e4m3fn
+    if is_fp8:
+        query = (
+            torch.randn(
+                batch_size, q_len, num_heads, D_qk, dtype=torch.float16, device=device
+            )
+            * 0.1
+        ).to(torch.float8_e4m3fn)
+    else:
+        query = torch.randn(
+            batch_size, q_len, num_heads, D_qk, dtype=dtype, device=device
+        )
+
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    if is_fp8:
+        kv_cache = (
+            torch.randn(
+                total_pages, page_size, D_qk, dtype=torch.float16, device=device
+            )
+            * 0.1
+        ).to(torch.float8_e4m3fn)
+    else:
+        kv_cache = torch.randn(total_pages, page_size, D_qk, dtype=dtype, device=device)
+
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    out = cute_dsl_mla_decode(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+        is_var_seq=False,
+        cute_dsl_impl=cute_dsl_impl,
+    )
+
+    # FP8 input → BF16 output (default), so do the reference in FP32 with wider tolerance.
+    if is_fp8:
+        kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
+        q_nope = query[..., :latent_dim].to(torch.float32)
+        q_rope = query[..., latent_dim:].to(torch.float32)
+    else:
+        kv_flat = kv_cache.reshape(-1, D_qk)
+        q_nope = query[..., :latent_dim]
+        q_rope = query[..., latent_dim:]
+    c_latent_ref = kv_flat[:, :latent_dim]
+    c_rope_ref = kv_flat[:, latent_dim:]
+
+    # Monolithic-only test — kernel always applies the MTP causal mask here.
     ref_out = torch_reference_mla(
         q_nope,
         q_rope,
@@ -192,12 +361,53 @@ def test_cute_dsl_mla_decode_fp16(
         softmax_scale,
         output_scale,
         page_size,
+        apply_mtp_mask=True,
     )
 
-    ref_out_cast = ref_out.to(dtype)
+    if is_fp8:
+        # FP8 has limited precision; compare in FP32 with wider tolerance.
+        torch.testing.assert_close(
+            out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
+        )
+    else:
+        ref_out_cast = ref_out.to(dtype)
+        torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
 
-    # Check with tolerance appropriate for FP16/BF16
-    torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
+
+def test_compute_fold_sq_ratio():
+    """Unit test the static helper used by both run() and the wrapper."""
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode_fp16 import (
+        BlackwellMultiHeadLatentAttentionForwardFP16 as FP16,
+    )
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode_fp8 import (
+        BlackwellMultiHeadLatentAttentionForwardFP8 as FP8,
+    )
+
+    cases = [
+        # (num_heads, seq_len_q, m_tile, expected)
+        (128, 1, 128, 1),  # H == M_tile → no fold
+        (128, 4, 128, 1),  # H == M_tile → no fold
+        (64, 1, 128, 1),  # seq_len_q=1 → F=1
+        (64, 2, 128, 2),  # exact divisor, H*F=128 ≤ M_tile
+        (64, 4, 128, 2),  # H*F ≤ 128 caps F at 2; 4 % 2 == 0
+        (64, 3, 128, 1),  # 3's only divisors are 1 and 3; H*3=192 > M_tile → F=1
+        (32, 4, 128, 4),  # tighter pack: F=4, H*F=128
+        (32, 8, 128, 4),  # capped by M_tile/H = 4
+        (32, 3, 128, 3),  # max_fold=min(3, 4)=3; 3 % 3 == 0 → F=3
+        (16, 8, 128, 8),  # max_fold=min(8, 8)=8; 8 % 8 == 0 → F=8
+        (16, 6, 128, 6),  # max_fold=min(6, 8)=6; 6 % 6 == 0 → F=6
+    ]
+    for H, S_q, m_tile, expected in cases:
+        assert FP16.compute_fold_sq_ratio(H, S_q, m_tile) == expected, (
+            f"FP16.compute_fold_sq_ratio({H}, {S_q}, {m_tile}) "
+            f"= {FP16.compute_fold_sq_ratio(H, S_q, m_tile)}, expected {expected}"
+        )
+        assert FP8.compute_fold_sq_ratio(H, S_q, m_tile) == expected, (
+            f"FP8.compute_fold_sq_ratio({H}, {S_q}, {m_tile}) "
+            f"= {FP8.compute_fold_sq_ratio(H, S_q, m_tile)}, expected {expected}"
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
@@ -464,7 +674,16 @@ def test_cute_dsl_mla_decode_fp8(
     seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
     workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
-    out = cute_dsl_mla_decode(
+    # Exercise the 2D trtllm-gen-style lse buffer here for coverage when
+    # available (monolithic only — the modular path raises NotImplementedError
+    # for LSE output).  The wrapper reshapes via .view to the kernel's native
+    # [B, q_len, H] layout.
+    lse_buf = (
+        torch.empty((batch_size * q_len, num_heads), dtype=torch.float32, device=device)
+        if cute_dsl_impl == "monolithic"
+        else None
+    )
+    result = cute_dsl_mla_decode(
         query=query,
         kv_cache=kv_cache,
         workspace_buffer=workspace_buffer,
@@ -477,7 +696,19 @@ def test_cute_dsl_mla_decode_fp8(
         output_scale=output_scale,
         enable_pdl=enable_pdl,
         cute_dsl_impl=cute_dsl_impl,
+        lse=lse_buf,
+        return_lse=(cute_dsl_impl == "monolithic"),
     )
+    if cute_dsl_impl == "monolithic":
+        out, lse = result
+        # Caller-supplied buffer must be returned (identity), not a copy.
+        assert lse.data_ptr() == lse_buf.data_ptr()
+        assert lse.shape == (batch_size * q_len, num_heads)
+        assert lse.dtype == torch.float32
+        assert torch.isfinite(lse).all(), "FP8 cute-dsl MLA LSE produced non-finite"
+    else:
+        out = result
+        lse = None
 
     assert out.dtype == torch.bfloat16
     assert out.shape == (batch_size, q_len, num_heads, latent_dim)
@@ -490,7 +721,7 @@ def test_cute_dsl_mla_decode_fp8(
     q_nope = query[..., :latent_dim].to(torch.float32)
     q_rope_tensor = query[..., latent_dim:].to(torch.float32)
 
-    ref_out = torch_reference_mla(
+    ref = torch_reference_mla(
         q_nope,
         q_rope_tensor,
         c_latent_ref,
@@ -500,11 +731,23 @@ def test_cute_dsl_mla_decode_fp8(
         softmax_scale,
         output_scale,
         page_size,
+        return_lse=(cute_dsl_impl == "monolithic"),
     )
+    if cute_dsl_impl == "monolithic":
+        ref_out, ref_lse = ref
+    else:
+        ref_out = ref
+        ref_lse = None
     # Compare outputs in FP32; FP8 has limited precision so use wider tolerance
     torch.testing.assert_close(
         out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
     )
+    if cute_dsl_impl == "monolithic":
+        # LSE reshaped back to native shape for comparison.  FP8 quantization
+        # noise propagates into LSE so use the same wide tolerance as `out`.
+        torch.testing.assert_close(
+            lse.view(batch_size, q_len, num_heads), ref_lse, atol=0.1, rtol=0.1
+        )
 
 
 # ---------------------------------------------------------------------------

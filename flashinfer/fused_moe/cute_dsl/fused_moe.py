@@ -370,22 +370,42 @@ class CuteDslMoEWrapper:
         device: str = "cuda",
         enable_pdl: bool = True,
     ):
-        """Initialize the MoE wrapper.
+        r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
-        Args:
-            num_experts: Total number of experts.
-            top_k: Number of experts per token.
-            hidden_size: Hidden dimension size.
-            intermediate_size: Intermediate size (after SwiGLU reduction).
-            use_cuda_graph: Pre-allocate buffers for CUDA graph compatibility.
-            max_num_tokens: Maximum tokens (only for use_cuda_graph=True).
-            num_local_experts: Local experts for EP. Default: num_experts.
-            local_expert_offset: Expert offset for EP. Default: 0.
-            tile_size: Tile size for moe_sort. Default: 128.
-            sf_vec_size: Scale factor vector size. Default: 16.
-            output_dtype: Output data type. Default: torch.bfloat16.
-            device: Device for buffer allocation. Default: "cuda".
-            enable_pdl: Enable Programmatic Dependent Launch. Default: True.
+        Parameters
+        ----------
+        num_experts : int
+            Total number of experts.
+        top_k : int
+            Number of experts routed to per token.
+        hidden_size : int
+            Hidden dimension size.
+        intermediate_size : int
+            Intermediate dimension size (after SwiGLU reduction).
+        use_cuda_graph : bool
+            If ``True``, pre-allocate workspace buffers sized for
+            ``max_num_tokens`` so the wrapper can be captured into a CUDA
+            graph.  Defaults to ``False``.
+        max_num_tokens : int
+            Maximum batch size, used when ``use_cuda_graph=True``.  Defaults
+            to ``4096``.
+        num_local_experts : Optional[int]
+            Local experts for expert parallelism.  Defaults to
+            ``num_experts``.
+        local_expert_offset : int
+            Offset of local experts in the global expert space.  Defaults
+            to ``0``.
+        tile_size : int
+            Tile size for ``moe_sort``.  Defaults to ``128``.
+        sf_vec_size : int
+            Scale-factor vector size.  Defaults to ``16``.
+        output_dtype : torch.dtype
+            Output dtype.  Defaults to ``torch.bfloat16``.
+        device : str
+            Device on which to allocate workspace buffers.  Defaults to
+            ``"cuda"``.
+        enable_pdl : bool
+            Enable Programmatic Dependent Launch.  Defaults to ``True``.
         """
         self.num_experts = num_experts
         self.top_k = top_k
@@ -620,27 +640,44 @@ class CuteDslMoEWrapper:
         w2_alpha: torch.Tensor,
         tactic: Optional[Tuple] = None,
     ) -> torch.Tensor:
-        """Run MoE computation.
+        r"""Run the CuTe-DSL NVFP4 fused-MoE forward pass.
 
-        This method is CUDA graph safe when use_cuda_graph=True.
-        Supports auto-tuning via `tactic` parameter or `autotune()` context.
+        CUDA-graph safe when the wrapper was constructed with
+        ``use_cuda_graph=True``.  Supports auto-tuning via the ``tactic``
+        argument or the surrounding :func:`autotune` context manager.
 
-        Args:
-            x: NVFP4-quantized input [num_tokens, hidden_size // 2].
-            x_sf: Scale factors for x.
-            token_selected_experts: Expert assignments [num_tokens, top_k].
-            token_final_scales: Routing weights [num_tokens, top_k].
-            w1_weight: GEMM1 weights (gate + up fused).
-            w1_weight_sf: Scale factors for w1_weight.
-            w1_alpha: Per-expert global scale for GEMM1.
-            fc2_input_scale: Global scale for GEMM2 input quantization.
-            w2_weight: GEMM2 weights (down projection).
-            w2_weight_sf: Scale factors for w2_weight.
-            w2_alpha: Per-expert global scale for GEMM2.
-            tactic: Tactic tuple or None for auto-selection.
+        Parameters
+        ----------
+        x : torch.Tensor
+            NVFP4-quantized input of shape ``[num_tokens, hidden_size // 2]``.
+        x_sf : torch.Tensor
+            Scale factors for ``x``.
+        token_selected_experts : torch.Tensor
+            Expert assignments of shape ``[num_tokens, top_k]``.
+        token_final_scales : torch.Tensor
+            Routing weights of shape ``[num_tokens, top_k]``.
+        w1_weight : torch.Tensor
+            GEMM1 weights (gate + up fused).
+        w1_weight_sf : torch.Tensor
+            Scale factors for ``w1_weight``.
+        w1_alpha : torch.Tensor
+            Per-expert global scale for GEMM1.
+        fc2_input_scale : torch.Tensor
+            Global scale for GEMM2 input quantization.
+        w2_weight : torch.Tensor
+            GEMM2 weights (down projection).
+        w2_weight_sf : torch.Tensor
+            Scale factors for ``w2_weight``.
+        w2_alpha : torch.Tensor
+            Per-expert global scale for GEMM2.
+        tactic : Optional[Tuple]
+            Tactic tuple, or ``None`` for auto-selection via the runtime
+            tuner.
 
-        Returns:
-            Output tensor [num_tokens, hidden_size].
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         num_tokens = token_selected_experts.size(0)
 
@@ -783,41 +820,64 @@ def cute_dsl_fused_moe_nvfp4(
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
-    """Run fused MoE computation using CuteDSL NVFP4 kernels.
+    r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
-    Supported architectures: SM100, SM103.
+    Supported architectures: SM100, SM103.  This is the simple functional
+    API; for CUDA-graph support use :class:`CuteDslMoEWrapper` instead.
 
-    This is the simple functional API. For CUDA graph support, use
-    `CuteDslMoEWrapper` instead.
+    Auto-tuning is controlled by the :func:`autotune` context manager::
 
-    Auto-tuning is controlled via the `autotune()` context manager:
+        with autotune(True):
+            output = cute_dsl_fused_moe_nvfp4(...)
 
-        >>> with autotune(True):
-        ...     output = cute_dsl_fused_moe_nvfp4(...)
+    Parameters
+    ----------
+    x : torch.Tensor
+        NVFP4-quantized input of shape ``[num_tokens, hidden_size // 2]``.
+    x_sf : torch.Tensor
+        Scale factors for ``x``.
+    token_selected_experts : torch.Tensor
+        Expert assignments of shape ``[num_tokens, top_k]``.
+    token_final_scales : torch.Tensor
+        Routing weights of shape ``[num_tokens, top_k]``.
+    w1_weight : torch.Tensor
+        GEMM1 weights (gate + up fused).
+    w1_weight_sf : torch.Tensor
+        Scale factors for ``w1_weight``.
+    w1_alpha : torch.Tensor
+        Per-expert global scale for GEMM1.
+    fc2_input_scale : torch.Tensor
+        Global scale for GEMM2 input quantization.
+    w2_weight : torch.Tensor
+        GEMM2 weights (down projection).
+    w2_weight_sf : torch.Tensor
+        Scale factors for ``w2_weight``.
+    w2_alpha : torch.Tensor
+        Per-expert global scale for GEMM2.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Number of experts routed to per token.
+    num_local_experts : Optional[int]
+        Local experts for expert parallelism.  Defaults to ``num_experts``.
+    local_expert_offset : int
+        Offset of local experts in the global expert space.  Defaults to ``0``.
+    output_dtype : torch.dtype
+        Output dtype.  Defaults to ``torch.bfloat16``.
+    use_fused_finalize : bool
+        Whether to use the fused finalize path.  Defaults to ``True``.
+    moe_output : Optional[torch.Tensor]
+        Pre-allocated output buffer.  Allocated internally if ``None``.
+    aux_stream : Optional[torch.cuda.Stream]
+        Optional auxiliary CUDA stream used to overlap setup work with the
+        main computation.
+    enable_pdl : bool
+        Enable Programmatic Dependent Launch.  Defaults to ``True``.
 
-    Args:
-        x: NVFP4-quantized input [num_tokens, hidden_size // 2].
-        x_sf: Scale factors for x.
-        token_selected_experts: Expert assignments [num_tokens, top_k].
-        token_final_scales: Routing weights [num_tokens, top_k].
-        w1_weight: GEMM1 weights (gate + up fused).
-        w1_weight_sf: Scale factors for w1_weight.
-        w1_alpha: Per-expert global scale for GEMM1.
-        fc2_input_scale: Global scale for GEMM2 input quantization.
-        w2_weight: GEMM2 weights (down projection).
-        w2_weight_sf: Scale factors for w2_weight.
-        w2_alpha: Per-expert global scale for GEMM2.
-        num_experts: Total number of experts.
-        top_k: Number of experts per token.
-        num_local_experts: Local experts for EP. Default: num_experts.
-        local_expert_offset: Expert offset for EP. Default: 0.
-        output_dtype: Output data type. Default: torch.bfloat16.
-        use_fused_finalize: Use fused finalize. Default: True.
-        moe_output: Pre-allocated output buffer.
-        aux_stream: Auxiliary CUDA stream.
-
-    Returns:
-        Output tensor [num_tokens, hidden_size].
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape ``[num_tokens, hidden_size]``.
     """
     if num_local_experts is None:
         num_local_experts = num_experts

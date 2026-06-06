@@ -67,6 +67,7 @@ from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
     gen_trtllm_gen_fused_moe_sm100_module,
 )
+from .jit.bgmv_moe import gen_bgmv_moe_module
 from .jit.gdn import gen_gdn_prefill_sm90_module
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
@@ -88,6 +89,7 @@ from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
 )
+from .jit.mhc import gen_mhc_module
 from .jit.mla import gen_mla_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
@@ -493,6 +495,8 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
+        # Multi-LoRA MoE BGMV kernel
+        jit_specs.append(gen_bgmv_moe_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
@@ -573,6 +577,7 @@ def gen_all_modules(
         jit_specs += [
             gen_api_log_stats_module(),
             gen_cascade_module(),
+            gen_mhc_module(),
             gen_norm_module(),
             gen_page_module(),
             gen_quantization_module(),

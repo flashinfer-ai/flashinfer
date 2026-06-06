@@ -63,10 +63,24 @@ EXIT_CODE=0
 parse_args() {
     DRY_RUN=false
     SANITY_TEST=false
-    for arg in "$@"; do
-        case $arg in
+    TEST_PATH="${TEST_PATH:-}"
+    while [[ $# -gt 0 ]]; do
+        case $1 in
             --dry-run)
                 DRY_RUN=true
+                shift
+                ;;
+            --test-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "ERROR: --test-path requires an argument." >&2
+                    exit 1
+                fi
+                TEST_PATH="$2"
+                shift 2
+                ;;
+            --test-path=*)
+                TEST_PATH="${1#*=}"
+                shift
                 ;;
             --sanity-test)
                 if [ "$DISABLE_SANITY_TEST" = "true" ]; then
@@ -76,6 +90,10 @@ parse_args() {
                 else
                     SANITY_TEST=true
                 fi
+                shift
+                ;;
+            *)
+                shift
                 ;;
         esac
     done
@@ -83,6 +101,11 @@ parse_args() {
 
 # Print test mode banner
 print_test_mode_banner() {
+    if [ -n "$TEST_PATH" ]; then
+        echo "🎯 SCOPED TEST MODE - Only running tests under: ${TEST_PATH}"
+        echo ""
+    fi
+
     if [ "$DRY_RUN" = "true" ]; then
         echo "🔍 DRY RUN MODE - No tests will be executed"
         echo ""
@@ -678,7 +701,8 @@ print_top_resource_rows() {
     fi
 
     echo "$title"
-    printf '%s\n' "$rows" | sort -t $'\t' -k"${sort_column},${sort_column}nr" | head -10 | \
+    # Top 10 via awk (not `| head`), which would SIGPIPE `sort` and fail under pipefail.
+    printf '%s\n' "$rows" | sort -t $'\t' -k"${sort_column},${sort_column}nr" | \
         awk -F '\t' '
             function format_duration(seconds) {
                 seconds += 0
@@ -703,7 +727,7 @@ print_top_resource_rows() {
                 }
                 return sprintf("%d MiB", mib)
             }
-            {
+            NR <= 10 {
                 suffix = ($6 == "partial") ? " (partial)" : ""
                 printf "  %2d. %s - duration %s, peak RSS %s, peak GPU %s, samples %s%s\n",
                     NR, $5, format_duration($1), format_mib($2), format_mib($3), $4, suffix
@@ -784,9 +808,9 @@ sample_tests() {
 
     # Sample every Nth test with random offset
     SAMPLED_NODE_IDS=$(echo "$all_node_ids" | awk "NR % $SAMPLE_RATE == $SAMPLE_OFFSET")
-    # Fallback: if no tests sampled (offset missed all tests), take the first test
+    # Fallback to first test if none sampled (param expansion avoids `| head` SIGPIPE).
     if [ -z "$SAMPLED_NODE_IDS" ] || [ "$(echo "$SAMPLED_NODE_IDS" | wc -l)" -eq 0 ]; then
-        SAMPLED_NODE_IDS=$(echo "$all_node_ids" | head -1)
+        SAMPLED_NODE_IDS="${all_node_ids%%$'\n'*}"
     fi
 }
 

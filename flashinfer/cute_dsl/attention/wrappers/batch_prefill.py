@@ -150,15 +150,43 @@ def _get_compiled_prefill_kernel(
 
 
 class BatchPrefillCuteDSLWrapper:
+    r"""PyTorch-facing wrapper for the CuTe-DSL ragged-KV batch prefill kernel.
+
+    This wrapper exposes a ``plan`` + ``run`` API compatible with
+    :class:`flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper`, but compiles a
+    CuTe-DSL kernel under the hood instead of the C++ FA2/FA3 path.
+
+    Example
+    -------
+
+    .. code-block:: python
+
+        wrapper = BatchPrefillCuteDSLWrapper(workspace_buffer)
+        wrapper.plan(qo_indptr, kv_indptr,
+                     num_qo_heads=32, num_kv_heads=8, head_dim_qk=128)
+        out = wrapper.run(q, k, v)
+    """
+
     @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool = False,
     ) -> None:
-        # Named float_workspace_buffer for compatibility with the parent
-        # BatchPrefillWithRaggedKVCacheWrapper API. Callers typically pass
-        # torch.uint8; the CuTe DSL kernel does not use this buffer.
+        r"""Initialise the wrapper and bind it to a workspace buffer.
+
+        Parameters
+        ----------
+        float_workspace_buffer : torch.Tensor
+            Pre-allocated workspace buffer on the target CUDA device.  Named for
+            API parity with :class:`BatchPrefillWithRaggedKVCacheWrapper`; callers
+            typically pass ``torch.uint8``.  The CuTe-DSL kernel itself does not
+            consume this buffer, but it is retained so the wrapper can mirror the
+            parent API.
+        use_cuda_graph : bool
+            Whether the wrapper will be used inside a CUDA graph capture.  Defaults
+            to ``False``.
+        """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
 

@@ -105,6 +105,11 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
         tileSize == mOptions.tileSize && options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
+      if (mOptions.biasType == batchedGemm::gemm::BiasType::None) {
+        // Prevent accidental fallback to MN bias, we should only fallback to M or N cubins
+        if (options.mBiasType == batchedGemm::gemm::BiasType::Mn) continue;
+      }
+
       // We can pass nullptr bias to get biasType::None for any bias kernel.
       // Therefore we only need to validate the bias type if bias is enabled
       if (mOptions.biasType != batchedGemm::gemm::BiasType::None) {

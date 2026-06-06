@@ -47,6 +47,8 @@ How to add a new template
            outputs={
                "out": Tensor(["batch_size", "hidden_size"], dtype_from="x"),
            },
+           # Optional: attach reference/check callables so generated JSON
+           # describes how to compute and validate expected outputs.
            tags=["status:verified"],
        )
 
@@ -59,6 +61,9 @@ How to add a new template
      ``param="paged_kv_cache"`` and ``tuple_idx=0`` / ``tuple_idx=1``.
    - For output dtype, prefer ``dtype_from="<input_param>"`` to copy from an
      input tensor, or set ``dtype="float32"`` for a fixed dtype.
+   - ``check(reference_outputs, actual_outputs)`` should accept output lists and
+     return ``True`` when the actual outputs pass the template's correctness
+     criteria. ``flashinfer.trace.default_check`` provides dtype-aware defaults.
 
 3. **Attach to the API.**  In the API file::
 

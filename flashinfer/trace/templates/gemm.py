@@ -26,6 +26,97 @@ from ._init_helpers import (
 )
 
 
+def _gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.99,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_mm_bf16.py, test_mm_fp8.py, test_bmm_bf16.py,
+    # and test_bmm_fp8.py, which gate these kernels by cosine similarity.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _mxfp8_gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.84,
+):
+    from flashinfer.trace import default_check
+
+    # Matches the linear-scale path in tests/gemm/test_mm_mxfp8.py, which is
+    # the scale layout modeled by this trace schema. Callers can pass
+    # min_cos_sim=0.98 for swizzled-scale traces.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _fp4_gemm_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.97,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_mm_fp4.py.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+def _bmm_mxfp8_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=100.0,
+    min_cos_sim=0.9,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/gemm/test_bmm_mxfp8.py.
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
 def _mm_reference(A, B):
     # B is physically [K, N] (column-major weight), so C = A @ B.
     return torch.matmul(A, B)
@@ -133,6 +224,7 @@ mm_bf16_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_mm_reference,
+    check=_gemm_check,
     init=_mm_bf16_init,
 )
 
@@ -197,6 +289,7 @@ mm_fp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_mm_fp8_reference,
+    check=_gemm_check,
     init=_mm_fp8_init,
 )
 
@@ -272,6 +365,7 @@ mm_mxfp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:mxfp8"],
     reference=_mm_mxfp8_reference,
+    check=_mxfp8_gemm_check,
     init=_mm_mxfp8_init,
 )
 
@@ -369,6 +463,7 @@ mm_fp4_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:fp4"],
     reference=_mm_fp4_reference,
+    check=_fp4_gemm_check,
     init=_mm_fp4_init,
 )
 
@@ -432,6 +527,7 @@ bmm_bf16_trace = TraceTemplate(
     },
     tags=["status:verified"],
     reference=_bmm_reference,
+    check=_gemm_check,
     init=_bmm_bf16_init,
 )
 
@@ -496,6 +592,7 @@ bmm_fp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_bmm_fp8_reference,
+    check=_gemm_check,
     init=_bmm_fp8_init,
 )
 bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
@@ -564,6 +661,7 @@ bmm_mxfp8_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:mxfp8"],
     reference=_bmm_mxfp8_reference,
+    check=_bmm_mxfp8_check,
     init=_bmm_mxfp8_init,
 )
 
@@ -896,6 +994,52 @@ def _gemm_fp8_nt_groupwise_reference(
     return res.to(od)
 
 
+def _gemm_fp8_nt_groupwise_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    K_div_block: int = 0,
+    N_div_block: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for TRTLLM-layout FP8 group-wise GEMM.
+
+    Matches the template's canonical layout:
+    ``a_scale=[M, K//128]`` and ``b_scale=[N//128, K//128]``.
+    """
+    del K_div_block, N_div_block
+    torch.manual_seed(seed)
+    a_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    a, a_scale = fp8_block_quant_1d(a_bf16, block=128)
+    b = torch.empty(N, K, dtype=torch.float8_e4m3fn, device=device)
+    b_scale = torch.empty(
+        (N + 127) // 128, K // 128, dtype=torch.float32, device=device
+    )
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    for row_block in range((N + 127) // 128):
+        row_slice = slice(row_block * 128, min((row_block + 1) * 128, N))
+        for col_block in range(K // 128):
+            col_slice = slice(col_block * 128, (col_block + 1) * 128)
+            block = b_bf16[row_slice, col_slice].to(torch.float32)
+            amax = block.abs().amax()
+            scale = torch.where(amax > 0, amax / finfo.max, torch.ones_like(amax))
+            b[row_slice, col_slice] = (block / scale).to(torch.float8_e4m3fn)
+            b_scale[row_block, col_block] = scale
+    return {
+        "a": a,
+        "b": b,
+        "a_scale": a_scale,
+        "b_scale": b_scale,
+        "scale_major_mode": None,
+        "scale_granularity_mnk": (1, 128, 128),
+        "out_dtype": torch.bfloat16,
+        "backend": "trtllm",
+    }
+
+
 gemm_fp8_nt_groupwise_trace = TraceTemplate(
     op_type="gemm_fp8",
     name_prefix="gemm_fp8_nt_groupwise",
@@ -930,6 +1074,7 @@ gemm_fp8_nt_groupwise_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:float8_e4m3fn"],
     reference=_gemm_fp8_nt_groupwise_reference,
+    init=_gemm_fp8_nt_groupwise_init,
 )
 
 

@@ -322,9 +322,13 @@ def get_sm_version(device=None) -> int:
 
 
 @dsl_user_op
-def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
-    """Get the memory address of tensor[offset] as Int64."""
-    elem_ptr = tensor.iterator + Int32(offset)
+def get_ptr_as_int64(tensor: cute.Tensor, offset: Int64, *, loc=None, ip=None) -> Int64:
+    """Get the memory address of tensor[offset] as Int64.
+
+    ``offset`` is a flat element index and is accepted as Int64 so it can
+    address tensors whose flat element count exceeds INT32_MAX.
+    """
+    elem_ptr = tensor.iterator + Int64(offset)
     ptr_int = llvm.ptrtoint(T.i64(), elem_ptr.llvm_ptr, loc=loc, ip=ip)
     return Int64(ptr_int)
 
