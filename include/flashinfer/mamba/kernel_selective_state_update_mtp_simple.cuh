@@ -570,7 +570,7 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int NTOKENS, int DIM, int DSTATE,
           int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int CTAS_PER_HEAD>
-__global__ void __launch_bounds__(NUM_WARPS * 32)
+__global__ void __launch_bounds__(NUM_WARPS * 32, 12)
     selective_state_update_kernel_simple_mtp(SelectiveStateMTPParams params) {
   constexpr int DSTATE_PAD = padDstate<input_t>(DSTATE);
   constexpr int DIM_PER_CTA = DIM / CTAS_PER_HEAD;

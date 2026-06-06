@@ -1476,3 +1476,62 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
                 )
 
             assert states_match, f"Intermediate state at step {t} mismatch"
+
+
+@pytest.mark.parametrize("batch", [4, 64, 256])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
+def test_simple_mtp_launch_bounds_regression(batch, state_dtype):
+    """simple-MTP SSU (launch_bounds occupancy fix) matches the Triton reference."""
+    nheads, dim, dstate, ngroups, cache_steps = 64, 64, 128, 8, 6
+    inputs = create_test_inputs(
+        batch,
+        nheads,
+        dim,
+        dstate,
+        ngroups,
+        input_dtype=torch.bfloat16,
+        weight_dtype=torch.float32,
+        matrixA_dtype=torch.float32,
+        state_dtype=state_dtype,
+        generate_z=False,
+        cache_steps=cache_steps,
+        seed=0,
+    )
+
+    state_ref = clone_preserving_strides(inputs["state_cache"])
+    y_ref = selective_state_update_triton(
+        state_ref,
+        inputs["x"],
+        inputs["dt"],
+        inputs["A"],
+        inputs["B"],
+        inputs["C"],
+        D=inputs["D"],
+        dt_bias=inputs["dt_bias"],
+        dt_softplus=True,
+        state_batch_indices=inputs["slot_idx"],
+        pad_slot_id=-1,
+    )
+
+    y_test = flashinfer.mamba.selective_state_update(
+        inputs["state_cache"],
+        inputs["x"],
+        inputs["dt"],
+        inputs["A"],
+        inputs["B"],
+        inputs["C"],
+        D=inputs["D"],
+        dt_bias=inputs["dt_bias"],
+        dt_softplus=True,
+        state_batch_indices=inputs["slot_idx"],
+        pad_slot_id=-1,
+        algorithm="simple",
+    )
+
+    atol, rtol = 1e-3, 1e-2
+    torch.testing.assert_close(y_test, y_ref, atol=atol, rtol=rtol)
+    # in-place state update must also match the reference for the touched slots
+    slot = inputs["slot_idx"]
+    torch.testing.assert_close(
+        inputs["state_cache"][slot], state_ref[slot], atol=atol, rtol=rtol
+    )
