@@ -524,6 +524,7 @@ class MoEMicroKernel:
             self.sf_dtype,
         )
         atom_layout = cute.make_layout((2, 2, 1))
+        atom_shape = (2, 2, 1)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
@@ -536,9 +537,16 @@ class MoEMicroKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * 4)
-        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
-        self.num_k_blocks = self.tile_shape_mnk[2] // 64
+        # Derive atom loop bounds from the tile shape and the warp atom layout,
+        # like the dense kernel. atom_layout=(2,2,1) => 2 M-warps, 2 N-warps.
+        # The previous hardcoded (16*4) was copied from the dense kernel's
+        # (4,2,1) layout and gave num_m_tiles=2 instead of 4, so the GEMM filled
+        # only M-tiles {0,1} and left rows 64..127 (the 2nd 64-row warp quadrant)
+        # at fill(0.0). num_n_tiles was accidentally correct (atom_shape[1]=2).
+        mma_m, mma_n, mma_k = 16, 8, 64
+        self.num_m_tiles = self.tile_shape_mnk[0] // (mma_m * atom_shape[0])
+        self.num_n_tiles = self.tile_shape_mnk[1] // (mma_n * atom_shape[1])
+        self.num_k_blocks = self.tile_shape_mnk[2] // mma_k
 
         sfa_smem = sm120_make_smem_layout_sfa(
             self.tiled_mma,
