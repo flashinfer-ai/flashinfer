@@ -24,7 +24,11 @@ import sys
 import pytest
 import torch
 
-import cutlass
+# Optional deps: skip the whole module cleanly (instead of erroring at collection) when
+# nvidia-cutlass-dsl isn't installed. SM90a is gated per-test via is_sm90a_supported.
+cutlass = pytest.importorskip("cutlass")
+
+from flashinfer.utils import is_sm90a_supported
 
 # MXFP4 (FP4 e2m1) code -> value LUT and UE8M0 baseline, matching the kernel.
 _FP4_LUT = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
@@ -178,14 +182,10 @@ def run_moe(
     return y, y_ref, frac_bad
 
 
-def _sm90():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major == 9
-
-
-@pytest.mark.skipif(not _sm90(), reason="W4A8 MXFP4 grouped GEMM requires Hopper SM90")
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="W4A8 MXFP4 grouped GEMM requires Hopper SM90",
+)
 @pytest.mark.parametrize("out_dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("top_k", [1, 2])
 @pytest.mark.parametrize("num_tokens", [64, 128])
@@ -281,7 +281,10 @@ def run_moe_fused_scatter(num_tokens=128, num_experts=8, top_k=2, k=256, n=256, 
     return output, y_ref, frac_bad
 
 
-@pytest.mark.skipif(not _sm90(), reason="W4A8 MXFP4 grouped GEMM requires Hopper SM90")
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="W4A8 MXFP4 grouped GEMM requires Hopper SM90",
+)
 @pytest.mark.parametrize("top_k", [1, 2])
 @pytest.mark.parametrize("num_tokens", [64, 128])
 def test_w4a8_mxfp4_moe_fused_scatter(num_tokens, top_k):
@@ -359,7 +362,10 @@ def run_moe_fused_gather(num_tokens=128, num_experts=8, top_k=2, k=256, n=256, s
     return max_frac
 
 
-@pytest.mark.skipif(not _sm90(), reason="W4A8 MXFP4 grouped GEMM requires Hopper SM90")
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="W4A8 MXFP4 grouped GEMM requires Hopper SM90",
+)
 @pytest.mark.parametrize("top_k", [1, 2])
 @pytest.mark.parametrize("num_tokens", [64, 128])
 def test_w4a8_mxfp4_moe_fused_gather(num_tokens, top_k):

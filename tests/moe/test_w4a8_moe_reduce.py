@@ -23,7 +23,7 @@ try:
     )
 
     _OK = True
-except Exception:
+except ImportError:
     _OK = False
 
 

@@ -31,7 +31,7 @@ try:
     from flashinfer.utils import is_sm90a_supported
 
     _OK = True
-except Exception:
+except ImportError:
     _OK = False
 
 _FP4_LUT = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]

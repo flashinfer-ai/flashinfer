@@ -26,12 +26,14 @@ import torch.nn.functional as F
 try:
     try:
         from flashinfer.fused_moe import w4a8_mxfp4_moe
-    except Exception:
+    except ImportError:
+        # The package-level re-export can lag in editable/dev installs; fall back to the
+        # cute_dsl module directly. Non-ImportError failures still propagate and fail.
         from flashinfer.fused_moe.cute_dsl import w4a8_mxfp4_moe
     from flashinfer.utils import is_sm90a_supported
 
     _OK = True
-except Exception:
+except ImportError:
     _OK = False
 
 _FP4_LUT = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
@@ -155,11 +157,8 @@ def test_w4a8_mxfp4_moe_empty_batch(top_k):
 
 
 if __name__ == "__main__":
-    for clamp in _CLAMPS:
-        for tk in (1, 2):
-            test_w4a8_mxfp4_moe(tk, clamp)
-            print(f"PASS top_k={tk} clamp={clamp}")
-    for tk in (1, 2):
-        test_w4a8_mxfp4_moe_empty_batch(tk)
-        print(f"PASS empty_batch top_k={tk}")
-    print("ALL PASS")
+    import sys
+
+    # Dispatch through pytest so the @pytest.mark.skipif (CUDA / SM90a) guards apply
+    # instead of being bypassed by direct calls.
+    sys.exit(pytest.main([__file__, "-v"]))

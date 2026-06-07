@@ -61,8 +61,12 @@ if _HAS_TRITON:
         for s in range(TOPK):
             row = tl.load(idx_ptr + t * TOPK + s).to(tl.int64)
             valid = row >= 0
+            # Sanitize the index before the address math: the masked load already skips
+            # invalid lanes, but clamping row to 0 keeps the computed address in-bounds
+            # (defensive, no functional change -- the lane is still masked out).
+            safe_row = tl.where(valid, row, 0)
             w = tl.load(w_ptr + t * TOPK + s)
-            v = tl.load(c_ptr + row * H + h, mask=mask & valid, other=0.0).to(
+            v = tl.load(c_ptr + safe_row * H + h, mask=mask & valid, other=0.0).to(
                 tl.float32
             )
             acc += tl.where(valid, w, 0.0) * v

@@ -69,12 +69,16 @@ try:
         torch.bfloat16: cutlass.BFloat16,
         torch.float32: cutlass.Float32,
     }
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     cutlass = None
     _ACC = None
     _CUTLASS_DTYPE = {}
 
 
+# Bare @flashinfer_api (no trace=), matching the W4A16 analog
+# interleave_moe_weights_for_sm90_mixed_gemm: a one-time load-time weight reshape, not a
+# benchmarkable kernel, so it carries the logging decorator but no trace template.
+@flashinfer_api
 def interleave_w4a8_fc1_gate_up(
     fc1_stacked: torch.Tensor, fc1_scale_stacked: torch.Tensor
 ) -> "tuple[torch.Tensor, torch.Tensor]":
@@ -96,37 +100,27 @@ def _check_unsupported(fc1_expert_biases, fc2_expert_biases):
         raise NotImplementedError("w4a8_mxfp4_moe does not support expert biases yet")
 
 
-# Memoizes _uniform_scalar's result per param buffer. The uniformity check
-# (torch.all) and .item() force a device->host sync, so caching keeps repeated
-# decode steps sync-free. Keyed on (data_ptr, numel): correct as long as a given
-# buffer's contents are stable, which holds for the model-constant SwiGLU
-# alpha/beta/limit (same memoization idea as _W4A8_META_CACHE in the kernel).
-# Bounded so a long-lived process can't grow it without limit.
-_UNIFORM_SCALAR_CACHE: dict = {}
-
-
 def _uniform_scalar(t, name):
     """Extract a single scalar from a per-expert SwiGLU param tensor. In practice these
     are uniform across experts (GPT-OSS / DeepSeek-V4 broadcast one value to all experts),
     and the fused epilogue bakes each as one compile-time const, so require uniformity
-    rather than silently using expert 0's value. The result is memoized per param buffer
-    (see _UNIFORM_SCALAR_CACHE) so the host sync happens once, not every forward."""
+    rather than silently using expert 0's value.
+
+    Deliberately *not* memoized: the uniformity check + ``.item()`` force a small
+    device->host sync, but it only runs on the clamped-SwiGLU path and is dwarfed by the
+    routing-side syncs (``bincount(...).tolist()``, ``argsort``). Caching the extracted
+    *value* keyed on the buffer address would go stale if the buffer's contents change or
+    the allocator reuses the storage -- a silent wrong result, a worse failure mode than
+    the tiny sync. (Unlike ``_W4A8_META_CACHE``, which caches pointer wrappers whose data
+    is re-read at launch, this would cache a content-derived value.)"""
     if t is None:
         return None
-    key = (t.data_ptr(), t.numel())
-    cached = _UNIFORM_SCALAR_CACHE.get(key)
-    if cached is not None:
-        return cached
     flat = t.reshape(-1)
     if not bool(torch.all(flat == flat[0])):
         raise NotImplementedError(
             f"w4a8_mxfp4_moe requires a uniform per-expert {name} (got non-uniform values)"
         )
-    val = float(flat[0].item())
-    if len(_UNIFORM_SCALAR_CACHE) >= 256:
-        _UNIFORM_SCALAR_CACHE.clear()
-    _UNIFORM_SCALAR_CACHE[key] = val
-    return val
+    return float(flat[0].item())
 
 
 @flashinfer_api(trace=w4a8_mxfp4_moe_trace)
