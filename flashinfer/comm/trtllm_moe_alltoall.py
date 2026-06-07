@@ -205,6 +205,32 @@ def moe_a2a_initialize(
     ep_size: int,
     max_num_tokens: int,
 ):
+    r"""Initialize the MoE all-to-all workspace and return a metainfo tensor.
+
+    The metainfo tensor encodes per-rank offsets and bookkeeping required by
+    :func:`moe_a2a_dispatch` and :func:`moe_a2a_combine`; it must be passed
+    back into those routines for the same workspace.  ``moe_a2a_initialize``
+    is idempotent and must be called once per workspace allocation before any
+    dispatch/combine.
+
+    Parameters
+    ----------
+    workspace : torch.Tensor
+        ``[ep_size, size_per_rank]`` shared workspace tensor.
+    ep_rank : int
+        Current expert-parallel rank.
+    ep_size : int
+        Total expert-parallel world size.
+    max_num_tokens : int
+        Maximum number of tokens any rank may dispatch in a single call;
+        used to size the metainfo allocation.
+
+    Returns
+    -------
+    torch.Tensor
+        Metainfo tensor opaque to callers; pass it to subsequent
+        ``moe_a2a_*`` calls.
+    """
     return get_moe_alltoall_module().moe_a2a_initialize(
         workspace, ep_rank, ep_size, max_num_tokens
     )
@@ -218,18 +244,28 @@ def moe_a2a_wrap_payload_tensor_in_workspace(
     slice_end: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """
-    Wrap an offset in the workspace into a tensor.
+    r"""Wrap a slice of the shared workspace as a typed tensor view.
 
-    Args:
-        workspace: [ep_size, size_per_rank] or [size_per_rank] workspace tensor
-        leading_shape: The leading shape to wrap the tensor with
-        slice_start: The start of the slice in the workspace
-        slice_end: The end of the slice in the workspace
-        dtype: Data type for the output tensor
+    Parameters
+    ----------
+    workspace : torch.Tensor
+        ``[ep_size, size_per_rank]`` (or ``[size_per_rank]``) workspace
+        tensor.
+    leading_shape : list[int]
+        Leading shape of the resulting view.  The trailing dimension is
+        inferred from ``slice_end - slice_start`` and ``dtype``.
+    slice_start : int
+        Start offset (in bytes from the beginning of the workspace) of the
+        slice to wrap.
+    slice_end : int
+        End offset (in bytes) of the slice.  Must lie within a single rank.
+    dtype : torch.dtype
+        Element dtype of the resulting view.
 
-    Returns:
-        tensor: [leading_shape, *] workspace-backed tensor
+    Returns
+    -------
+    torch.Tensor
+        A workspace-backed tensor of shape ``leading_shape + [-1]``.
     """
     if workspace.ndim == 1:
         workspace = workspace.unsqueeze(0)
@@ -265,23 +301,38 @@ def moe_a2a_dispatch(
     top_k: int,
     num_experts: int,
 ):
-    """
-    Dispatch tokens and payloads to expert ranks.
+    r"""Dispatch tokens and payloads to their target expert ranks.
 
-    Args:
-        token_selected_experts: [local_num_tokens, top_k] int32 tensor
-        input_payloads: List of [local_num_tokens, *] tensors to dispatch
-        workspace: [ep_size, size_per_rank] workspace tensor
-        metainfo: Metadata tensor from initialize
-        runtime_max_tokens_per_rank: Max tokens per rank in this batch
-        ep_rank: Current expert parallel rank
-        ep_size: Total expert parallel size
-        top_k: Number of experts per token
-        num_experts: Total number of experts
+    Parameters
+    ----------
+    token_selected_experts : torch.Tensor
+        ``[local_num_tokens, top_k]`` ``int32`` tensor of expert assignments.
+    input_payloads : list[torch.Tensor]
+        Per-token payload tensors, each shaped ``[local_num_tokens, *]``.
+    workspace : torch.Tensor
+        ``[ep_size, size_per_rank]`` shared workspace.
+    metainfo : torch.Tensor
+        Metainfo tensor returned by :func:`moe_a2a_initialize`.
+    runtime_max_tokens_per_rank : int
+        Maximum tokens per rank for this batch (must be ``<=`` the
+        ``max_num_tokens`` used at initialize time).
+    ep_rank : int
+        Current expert-parallel rank.
+    ep_size : int
+        Total expert-parallel world size.
+    top_k : int
+        Number of experts assigned per token.
+    num_experts : int
+        Total number of experts.
 
-    Returns:
-        output_payloads: List of payloads for this rank, backed by data in the workspace
-        combine_payload_offset: The offset to place the combine payload in the workspace
+    Returns
+    -------
+    Tuple[list[torch.Tensor], int]
+        ``(output_payloads, combine_payload_offset)``.  ``output_payloads``
+        is a list of workspace-backed views, one per ``input_payloads``
+        entry, that contains the data routed to this rank.  ``combine_payload_offset``
+        is the workspace offset reserved for the matching
+        :func:`moe_a2a_combine` call.
     """
     recv_offsets, recv_sizes, combine_payload_offset = (
         get_moe_alltoall_module().moe_a2a_dispatch(
@@ -328,6 +379,45 @@ def moe_a2a_combine(
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
 ) -> torch.Tensor:
+    r"""Combine per-expert outputs back to the originating ranks.
+
+    Inverse of :func:`moe_a2a_dispatch`: scatters the rank-local expert
+    output rows back to the ranks that supplied the original tokens.
+
+    Parameters
+    ----------
+    payload : torch.Tensor
+        Output payload to send back to the source ranks.  Shape
+        ``[ep_size, runtime_max_tokens_per_rank, *]`` regardless of
+        ``payload_in_workspace``: in both cases the payload holds the
+        per-expert-rank outputs to be combined back to the source ranks.
+        Only the backing memory differs (caller-supplied vs. workspace-backed
+        view produced by :meth:`MoeAlltoAll.get_combine_payload_tensor_in_workspace`).
+    local_num_tokens : int
+        Number of tokens originally dispatched from this rank.
+    workspace : torch.Tensor
+        Shared workspace tensor (same one passed to dispatch).
+    metainfo : torch.Tensor
+        Metainfo tensor returned by :func:`moe_a2a_initialize`.
+    runtime_max_tokens_per_rank : int
+        Same value passed to :func:`moe_a2a_dispatch`.
+    ep_rank : int
+        Current expert-parallel rank.
+    ep_size : int
+        Total expert-parallel world size.
+    top_k : int
+        Number of experts assigned per token.
+    combine_payload_offset : int
+        Offset returned by :func:`moe_a2a_dispatch`.
+    payload_in_workspace : bool
+        ``True`` if ``payload`` is already a workspace-backed view (skips
+        the staging copy).  Defaults to ``False``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[local_num_tokens, *]`` tensor with the combined outputs.
+    """
     return get_moe_alltoall_module().moe_a2a_combine(
         payload,
         local_num_tokens,
@@ -350,6 +440,23 @@ def moe_a2a_sanitize_expert_ids(
     ep_rank: int,
     invalid_expert_id: int,
 ):
+    r"""Replace expert IDs not owned by this rank with ``invalid_expert_id``.
+
+    Parameters
+    ----------
+    expert_ids : torch.Tensor
+        ``[local_num_tokens, top_k]`` ``int32`` tensor of expert assignments
+        (mutated in place).
+    workspace : torch.Tensor
+        Shared workspace tensor.
+    metainfo : torch.Tensor
+        Metainfo tensor returned by :func:`moe_a2a_initialize`.
+    ep_rank : int
+        Current expert-parallel rank.
+    invalid_expert_id : int
+        Value to write where the original expert lies outside this rank's
+        local range.
+    """
     return get_moe_alltoall_module().moe_a2a_sanitize_expert_ids(
         expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
     )
@@ -362,17 +469,25 @@ def moe_a2a_get_workspace_size_per_rank(
     total_dispatch_payload_size_per_token: int,
     combine_payload_size_per_token: int,
 ):
-    """
-    Get the workspace size per rank for the MoeAlltoAll operation.
+    r"""Compute the per-rank workspace size for the MoE all-to-all primitive.
 
-    Args:
-        ep_size: Total expert parallel size
-        max_num_tokens: Maximum number of tokens across all ranks
-        total_dispatch_payload_size_per_token: The size of the payload per token in the dispatch phase. This should be the sum of all payloads.
-        combine_payload_size_per_token: The size of the payload per token in the combine phase.
+    Parameters
+    ----------
+    ep_size : int
+        Total expert-parallel world size.
+    max_num_tokens : int
+        Maximum number of tokens across all ranks.
+    total_dispatch_payload_size_per_token : int
+        Sum (in bytes) of all per-token payloads sent during the dispatch
+        phase.
+    combine_payload_size_per_token : int
+        Per-token payload size (in bytes) sent back during the combine
+        phase.
 
-    Returns:
-        workspace_size_per_rank: Size of the workspace per rank in bytes
+    Returns
+    -------
+    int
+        Required workspace size per rank, in bytes.
     """
     aux_data_size = get_moe_alltoall_module().moe_a2a_get_aux_data_size(
         ep_size,
@@ -448,18 +563,32 @@ class MoeAlltoAll:
         hidden_size: int,
         extra_payload_bytes_per_token: int = 0,
     ) -> int:
-        """
-        Convenience wrapper to calculate the workspace size per rank for the MoeAlltoAll operation. Automatically calculates the size of the dispatch and combine payloads when using default values.
-        This allocates space assuming 16-bit float, which may overallocate for quantized models. For a tighter bound, use the base function `moe_a2a_get_workspace_size_per_rank` directly.
+        r"""Compute the per-rank workspace size for the MoE all-to-all primitive.
 
-        Args:
-            ep_size: Total expert parallel size
-            top_k: Number of experts per token
-            max_num_tokens: Maximum number of tokens across all ranks
-            hidden_size: Hidden dimension size
-            extra_payload_bytes_per_token: Extra size per token in the payload
-        Returns:
-            workspace_size_per_rank: Size of the workspace per rank in bytes
+        Convenience wrapper around :func:`moe_a2a_get_workspace_size_per_rank`
+        that derives the dispatch / combine payload sizes from
+        ``hidden_size`` and ``top_k`` assuming 16-bit hidden states.  For a
+        tighter bound on quantized models use
+        :func:`moe_a2a_get_workspace_size_per_rank` directly.
+
+        Parameters
+        ----------
+        ep_size : int
+            Total expert-parallel world size.
+        top_k : int
+            Number of experts assigned per token.
+        max_num_tokens : int
+            Maximum number of tokens across all ranks.
+        hidden_size : int
+            Hidden dimension size.
+        extra_payload_bytes_per_token : int
+            Extra payload bytes per token to reserve (e.g. for quantization
+            scales).  Defaults to ``0``.
+
+        Returns
+        -------
+        int
+            Required workspace size per rank, in bytes.
         """
         # Default to 16-bit hidden states which should work in all cases.
         element_size = 2
@@ -515,17 +644,30 @@ class MoeAlltoAll:
         hidden_size: int = None,
         mnnvl_config: Optional[MnnvlConfig] = None,
     ):
-        """
-        Initialize MoeAlltoAll with workspace allocation.
+        r"""Initialize :class:`MoeAlltoAll` and allocate the shared workspace.
 
-        Args:
-            mapping: Mapping object containing rank information
-            max_num_tokens: Maximum number of tokens supported
-            top_k: Number of experts per token
-            num_experts: Total number of experts
-            workspace_size_per_rank: Size of workspace per rank in bytes, if None hidden_size must be provided
-            hidden_size: Hidden dimension size used when calculating the workspace size, if workspace_size_per_rank is not provided
-            mnnvl_config: Used to configure the communication backend for the MNNVL memory object
+        Parameters
+        ----------
+        mapping : Mapping
+            Mapping object describing the parallel layout (must expose
+            ``moe_ep_rank`` and ``moe_ep_size``).
+        max_num_tokens : int
+            Maximum number of tokens this rank will dispatch in any single
+            call.
+        top_k : int
+            Number of experts assigned per token.
+        num_experts : int
+            Total number of experts (across all ranks).
+        workspace_size_per_rank : int, optional
+            Pre-computed workspace size in bytes per rank.  When ``None``,
+            ``hidden_size`` must be provided and the workspace is sized via
+            :meth:`get_moe_workspace_size_per_rank`.
+        hidden_size : int, optional
+            Hidden dimension size, used to derive
+            ``workspace_size_per_rank`` when the latter is omitted.
+        mnnvl_config : MnnvlConfig, optional
+            Optional configuration for the underlying MNNVL communication
+            backend.
         """
         # Initialize constants from C++
         self._init_constants()
@@ -601,18 +743,30 @@ class MoeAlltoAll:
         invalid_token_expert_id: Optional[int] = None,
         expert_id_payload_index: Optional[int] = None,
     ) -> list[torch.Tensor]:
-        """
-        Perform MoE all-to-all dispatch operation.
+        r"""Run the MoE all-to-all dispatch phase.
 
-        Args:
-            token_selected_experts: [local_num_tokens, top_k] expert indices
-            input_payloads: List of [local_num_tokens, *] tensors to dispatch
-            runtime_max_tokens_per_rank: Max tokens per rank in this batch
-            invalid_token_expert_id: If set, sanitize invalid tokens to this ID
-            expert_id_payload_index: Index of expert IDs in input_payloads (required if invalid_token_expert_id is set)
+        Parameters
+        ----------
+        token_selected_experts : torch.Tensor
+            ``[local_num_tokens, top_k]`` ``int32`` tensor of expert
+            assignments.
+        input_payloads : list[torch.Tensor]
+            Per-token payload tensors, each shaped ``[local_num_tokens, *]``.
+        runtime_max_tokens_per_rank : int
+            Maximum tokens per rank in this batch.  Must be ``<=``
+            ``max_num_tokens`` used at construction.
+        invalid_token_expert_id : int, optional
+            If supplied, expert IDs not owned by the current rank are
+            rewritten to this value.  Requires ``expert_id_payload_index``.
+        expert_id_payload_index : int, optional
+            Index into ``input_payloads`` that holds the expert IDs to
+            sanitize.  Required when ``invalid_token_expert_id`` is set.
 
-        Returns:
-            recv_tensors: List of [ep_size, max_tokens, *] tensors
+        Returns
+        -------
+        list[torch.Tensor]
+            Workspace-backed receive tensors, one per ``input_payloads``
+            entry, each shaped ``[ep_size, runtime_max_tokens_per_rank, *]``.
         """
         assert self._state.phase == "idle", "dispatch called twice without combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
@@ -659,16 +813,24 @@ class MoeAlltoAll:
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
     ) -> torch.Tensor:
-        """
-        Perform MoE all-to-all combine operation.
+        r"""Run the MoE all-to-all combine phase.
 
-        Args:
-            payload: [ep_size, max_tokens, elements_per_token] tensor
-            runtime_max_tokens_per_rank: Max tokens per rank in this batch
-            payload_in_workspace: If True, payload is workspace-backed (skip staging)
+        Parameters
+        ----------
+        payload : torch.Tensor
+            ``[ep_size, runtime_max_tokens_per_rank, elements_per_token]``
+            output payload to scatter back to source ranks.
+        runtime_max_tokens_per_rank : int
+            Maximum tokens per rank in this batch (same value passed to
+            :meth:`dispatch`).
+        payload_in_workspace : bool
+            ``True`` if ``payload`` is already a workspace-backed view (skips
+            the staging copy).  Defaults to ``False``.
 
-        Returns:
-            output: [local_num_tokens, elements_per_token] tensor
+        Returns
+        -------
+        torch.Tensor
+            ``[local_num_tokens, elements_per_token]`` combined tensor.
         """
         assert self._state.phase == "dispatched", (
             "combine called before successful dispatch"
@@ -702,19 +864,32 @@ class MoeAlltoAll:
         hidden_size: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """
-        Get combine payload tensor backed by workspace (zero-copy).
+        r"""Return a workspace-backed view to use as the combine payload.
 
-        This tensor can be written to directly by expert processing, avoiding
-        a staging copy in the combine operation.
+        Zero-copy variant of :meth:`combine`: experts can write directly
+        into the returned tensor and call :meth:`combine` with
+        ``payload_in_workspace=True``.  Must be called after a successful
+        :meth:`dispatch` and before :meth:`combine`.
 
-        Args:
-            runtime_max_tokens_per_rank: Max tokens per rank in this batch
-            hidden_size: Hidden dimension size
-            dtype: Data type for the tensor
+        Parameters
+        ----------
+        runtime_max_tokens_per_rank : int
+            Maximum tokens per rank in this batch.
+        hidden_size : int
+            Hidden dimension size.
+        dtype : torch.dtype
+            Element dtype of the resulting view.
 
-        Returns:
-            tensor: [ep_size, max_tokens, hidden_size] workspace-backed tensor
+        Returns
+        -------
+        torch.Tensor
+            ``[ep_size, runtime_max_tokens_per_rank, hidden_size]``
+            workspace-backed tensor.
+
+        Raises
+        ------
+        RuntimeError
+            If called before a successful :meth:`dispatch`.
         """
         if self._state.phase != "dispatched":
             raise RuntimeError(

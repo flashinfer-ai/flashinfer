@@ -32,6 +32,7 @@ from flashinfer.fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
 )
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
@@ -113,9 +114,11 @@ def test_routed_fused_moe(
     ].to(torch.bfloat16)
 
     # ======== Quantize =======
+    nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
+    weights_nvfp4_4over6_config = NVFP44Over6Config() if weights_use_4over6 else None
     hidden_states_global_scale_inv = nvfp4_global_decode_scale_te(
         torch.ones((), dtype=torch.float32, device=device),
-        use_4over6=use_4over6,
+        nvfp4_4over6_config,
     )
     hidden_states, hidden_states_scale, per_token_scale_inv = nvfp4_quantize(
         hidden_states_bf16,
@@ -130,10 +133,10 @@ def test_routed_fused_moe(
     w13_global_amax = w13_bf16.abs().amax().to(torch.float32)
     w2_global_amax = w2_bf16.abs().amax().to(torch.float32)
     w13_global_scale_inv = nvfp4_global_decode_scale_te(
-        w13_global_amax, use_4over6=weights_use_4over6
+        w13_global_amax, weights_nvfp4_4over6_config
     )
     w2_global_scale_inv = nvfp4_global_decode_scale_te(
-        w2_global_amax, use_4over6=weights_use_4over6
+        w2_global_amax, weights_nvfp4_4over6_config
     )
     with moe_utils.nvfp4_4over6_env(weights_use_4over6):
         w13, w13_scale = nvfp4_quantize(

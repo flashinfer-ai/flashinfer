@@ -797,6 +797,10 @@ def get_allreduce_mnnvl_workspace(
 ) -> Tuple[MNNVLAllReduceFusionWorkspace, torch.Tensor, int]:
     """Get workspace buffers needed for multi-node NVLink all-reduce operation.
 
+    Deprecated: use :class:`MNNVLAllReduceFusionWorkspace` to manage the
+    workspace instead. This legacy helper is kept for backward compatibility
+    and may be removed in a future release.
+
     Args:
         mapping: Tensor parallel mapping configuration containing rank info
         dtype: Data type of the tensors being reduced
@@ -938,6 +942,10 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
     launch_with_pdl: bool,
 ) -> None:
     """Performs MNNVL TwoShot Allreduce + RMSNorm.
+
+    Deprecated: use :func:`trtllm_mnnvl_fused_allreduce_add_rmsnorm` instead.
+    This legacy function is kept for backward compatibility and may be removed
+    in a future release.
 
     This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_all_reduce on the shard_input.
     After this, it performs RMSNorm on the all-reduced result, reading it directly from the multicast buffer.

@@ -76,6 +76,19 @@ def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
     return {}
 
 
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    """Whether the activation splits FC1 output into gate/up halves (FC1 weight has 2*intermediate
+    rows). SwigluStep's clamp limit defaults to 7.0 (the Step-3 model value) in the kernel, so no
+    swiglu_limit tensor needs to be passed.
+    """
+    return activation_type in (
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.SwigluBias,
+        ActivationType.SwigluStep,
+    )
+
+
 def run_moe_test(args):
     """
     Run a MOE test.
@@ -872,7 +885,7 @@ def testCutlassFusedMoe(args):
 
     # Create base tensors
     activation_type = args.activation_type
-    is_gated = activation_type in (ActivationType.Swiglu, ActivationType.Geglu)
+    is_gated = is_gated_activation(activation_type)
     w1_rows = (2 if is_gated else 1) * intermediate_size
 
     torch.manual_seed(args.random_seed)
@@ -1165,7 +1178,7 @@ def testCutlassFusedMoe(args):
         num_experts,
         top_k,
         median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated,
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -1181,7 +1194,7 @@ def testCutlassFusedMoe(args):
         routing_logits_dtype=router_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
