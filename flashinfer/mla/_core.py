@@ -496,7 +496,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         layout is ``[num_pages, page_size, 1, 512]``. A 3D HND shorthand
         ``[num_pages, page_size, 512]`` is also accepted.
     workspace_buffer : torch.Tensor
-        TRTLLM-GEN workspace buffer. Must be zero-initialized for first use.
+        TRTLLM-GEN workspace buffer. The first 8 MB (counter region) is automatically zero-initialised on every call.
     sparse_indices : torch.Tensor
         Flattened concatenated sparse MLA physical token indices in query-token
         order with shape ``[sum_q, sparse_topk_capacity]``. The first 128
@@ -600,6 +600,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
 
     sm_count = get_device_sm_count(query.device)
+    workspace_buffer.view(torch.uint8)[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
     run_func(
         out,
         query_flat,
@@ -1442,7 +1443,9 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         # inside forward() rather than only at dispatcher final-call time so
         # that autotune profile-loop invocations are also protected.
         # The 8 MB memset is ~5us on B200, negligible vs kernel time.
-        self.workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
+        self.workspace_buffer.view(torch.uint8)[
+            :_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES
+        ].zero_()
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
