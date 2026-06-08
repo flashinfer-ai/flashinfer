@@ -538,13 +538,11 @@ class TllmGenFmhaKernel {
         if (maxNumCtasPerSeqKv <= numCtasForAllHeadsQ * maxKvSplitsPerCgaCluster) {
           int const launchedClusters =
               flashinfer::ceil_div(numCtasX, clusterDimX) * numCtasY * numCtasZ;
-          int const residentSplitBudget =
-              std::max(4, flashinfer::ceil_div(params.mMultiProcessorCount * 13 / 20,
-                                               launchedClusters));
-          int const targetMaxNumCtasPerSeqKv = std::min(
-              maxNumCtasPerSeqKv, std::min(maxKvSplitsPerCgaCluster, residentSplitBudget));
-          if (targetMaxNumCtasPerSeqKv > 1 &&
-              targetMaxNumCtasPerSeqKv < maxNumCtasPerSeqKv) {
+          int const residentSplitBudget = std::max(
+              4, flashinfer::ceil_div(params.mMultiProcessorCount * 13 / 20, launchedClusters));
+          int const targetMaxNumCtasPerSeqKv =
+              std::min(maxNumCtasPerSeqKv, std::min(maxKvSplitsPerCgaCluster, residentSplitBudget));
+          if (targetMaxNumCtasPerSeqKv > 1 && targetMaxNumCtasPerSeqKv < maxNumCtasPerSeqKv) {
             int const targetTileSizePerCtaKv =
                 isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)
                     ? flashinfer::ceil_div(params.mAttentionWindowSize,

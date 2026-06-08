@@ -344,8 +344,7 @@ def _get_bf16q_fp8kv_transform_mode(
         return _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES[mode]
     except KeyError as err:
         raise ValueError(
-            "bf16q_fp8kv_transform_mode must be one of "
-            "'k_only' or 'separate_kv'"
+            "bf16q_fp8kv_transform_mode must be one of 'k_only' or 'separate_kv'"
         ) from err
 
 
@@ -2544,9 +2543,7 @@ def trtllm_batch_decode_with_kv_cache(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     uses_shared_paged_kv_idx: bool = True,
-    bf16q_fp8kv_transform_mode: Optional[
-        Literal["k_only", "separate_kv"]
-    ] = None,
+    bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
 ) -> Union[
@@ -2751,13 +2748,9 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
-    if (
-        backend != "trtllm-gen"
-        and bf16q_fp8kv_transform_mode is not None
-    ):
+    if backend != "trtllm-gen" and bf16q_fp8kv_transform_mode is not None:
         raise ValueError(
-            "bf16q_fp8kv_transform_mode is only supported by "
-            "backend='trtllm-gen'"
+            "bf16q_fp8kv_transform_mode is only supported by backend='trtllm-gen'"
         )
 
     if backend == "xqa":
