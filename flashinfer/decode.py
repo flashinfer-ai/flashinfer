@@ -399,14 +399,14 @@ _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES = {
 }
 
 
-def _get_trtllm_gen_bf16q_fp8kv_transform_mode(
+def _get_bf16q_fp8kv_transform_mode(
     mode: Literal["k_only", "separate_kv"],
 ) -> int:
     try:
         return _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES[mode]
     except KeyError as err:
         raise ValueError(
-            "trtllm_gen_bf16q_fp8kv_transform_mode must be one of "
+            "bf16q_fp8kv_transform_mode must be one of "
             "'k_only' or 'separate_kv'"
         ) from err
 
@@ -3060,7 +3060,7 @@ def trtllm_batch_decode_with_kv_cache(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     uses_shared_paged_kv_idx: bool = True,
-    trtllm_gen_bf16q_fp8kv_transform_mode: Optional[
+    bf16q_fp8kv_transform_mode: Optional[
         Literal["k_only", "separate_kv"]
     ] = None,
     lse: Optional[torch.Tensor] = None,
@@ -3209,7 +3209,7 @@ def trtllm_batch_decode_with_kv_cache(
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
 
-    trtllm_gen_bf16q_fp8kv_transform_mode : Optional[Literal["k_only", "separate_kv"]] = None
+    bf16q_fp8kv_transform_mode : Optional[Literal["k_only", "separate_kv"]] = None
         Transform mode for BF16 query + FP8 E4M3 KV decode. ``None`` selects the
         default separate transformed-K/V cubins and is ignored by other paths.
         ``"k_only"`` selects the optimized K-only transform cubins, and
@@ -3335,24 +3335,24 @@ def trtllm_batch_decode_with_kv_cache(
         and v_cache.dtype == torch.float8_e4m3fn
         and out_dtype_for_transform_mode == torch.bfloat16
     )
-    if trtllm_gen_bf16q_fp8kv_transform_mode is None:
-        trtllm_gen_bf16q_fp8kv_transform_mode_value = (
+    if bf16q_fp8kv_transform_mode is None:
+        bf16q_fp8kv_transform_mode_value = (
             _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES["separate_kv"]
             if backend == "trtllm-gen" and uses_bf16q_fp8kv
             else 0
         )
     else:
-        trtllm_gen_bf16q_fp8kv_transform_mode_value = (
-            _get_trtllm_gen_bf16q_fp8kv_transform_mode(
-                trtllm_gen_bf16q_fp8kv_transform_mode
+        bf16q_fp8kv_transform_mode_value = (
+            _get_bf16q_fp8kv_transform_mode(
+                bf16q_fp8kv_transform_mode
             )
         )
     if (
         backend != "trtllm-gen"
-        and trtllm_gen_bf16q_fp8kv_transform_mode is not None
+        and bf16q_fp8kv_transform_mode is not None
     ):
         raise ValueError(
-            "trtllm_gen_bf16q_fp8kv_transform_mode is only supported by "
+            "bf16q_fp8kv_transform_mode is only supported by "
             "backend='trtllm-gen'"
         )
 
@@ -3580,7 +3580,7 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens,
             lse_stride_heads,
             enable_block_sparse_attention,
-            trtllm_gen_bf16q_fp8kv_transform_mode_value,
+            bf16q_fp8kv_transform_mode_value,
         )
 
         result_out = (

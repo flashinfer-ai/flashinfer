@@ -1305,9 +1305,9 @@ def test_trtllm_batch_decode_bmm1_scale_log2(q_dtype, kv_dtype, o_dtype, device_
     )
 
 
-def test_trtllm_gen_bf16q_fp8kv_transform_mode_kwarg_exists():
+def test_bf16q_fp8kv_transform_mode_kwarg_exists():
     signature = inspect.signature(flashinfer.decode.trtllm_batch_decode_with_kv_cache)
-    assert "trtllm_gen_bf16q_fp8kv_transform_mode" in signature.parameters
+    assert "bf16q_fp8kv_transform_mode" in signature.parameters
 
 
 @pytest.mark.parametrize(
@@ -1317,24 +1317,24 @@ def test_trtllm_gen_bf16q_fp8kv_transform_mode_kwarg_exists():
         ("separate_kv", 2),
     ],
 )
-def test_trtllm_gen_bf16q_fp8kv_transform_mode_mapping(mode, expected):
+def test_bf16q_fp8kv_transform_mode_mapping(mode, expected):
     assert (
-        flashinfer.decode._get_trtllm_gen_bf16q_fp8kv_transform_mode(mode) == expected
+        flashinfer.decode._get_bf16q_fp8kv_transform_mode(mode) == expected
     )
 
 
-def test_trtllm_gen_bf16q_fp8kv_transform_mode_rejects_invalid_value():
-    with pytest.raises(ValueError, match="trtllm_gen_bf16q_fp8kv_transform_mode"):
-        flashinfer.decode._get_trtllm_gen_bf16q_fp8kv_transform_mode("split_kv")
-    with pytest.raises(ValueError, match="trtllm_gen_bf16q_fp8kv_transform_mode"):
-        flashinfer.decode._get_trtllm_gen_bf16q_fp8kv_transform_mode("full")
+def test_bf16q_fp8kv_transform_mode_rejects_invalid_value():
+    with pytest.raises(ValueError, match="bf16q_fp8kv_transform_mode"):
+        flashinfer.decode._get_bf16q_fp8kv_transform_mode("split_kv")
+    with pytest.raises(ValueError, match="bf16q_fp8kv_transform_mode"):
+        flashinfer.decode._get_bf16q_fp8kv_transform_mode("full")
 
 
-def test_trtllm_gen_bf16q_fp8kv_transform_modes_run():
+def test_bf16q_fp8kv_transform_modes_run():
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for trtllm-gen attention")
+        pytest.skip("CUDA is required for this attention test")
     if get_compute_capability(torch.device("cuda"))[0] != 10:
-        pytest.skip("trtllm-gen backend requires SM100 or SM103 GPUs")
+        pytest.skip("This attention test requires SM100 or SM103 GPUs")
 
     batch_size = 1
     q_len = 1
@@ -1449,7 +1449,7 @@ def test_trtllm_gen_bf16q_fp8kv_transform_modes_run():
             bmm2_scale=float(value_scale.item()),
             backend="trtllm-gen",
             q_len_per_req=q_len,
-            trtllm_gen_bf16q_fp8kv_transform_mode=mode,
+            bf16q_fp8kv_transform_mode=mode,
         )
         torch.cuda.synchronize()
         assert torch.isfinite(outputs[mode]).all()
