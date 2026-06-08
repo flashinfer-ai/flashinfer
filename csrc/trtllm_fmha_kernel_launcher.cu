@@ -136,8 +136,7 @@ void trtllm_paged_attention_launcher(
   TllmGenFmhaRunnerParams runner_params{};
   TVM_FFI_ICHECK(bf16q_fp8kv_transform_mode >= 0 && bf16q_fp8kv_transform_mode <= 2)
       << "bf16q_fp8kv_transform_mode must be 0, 1, or 2";
-  auto const transform_mode =
-      static_cast<Bf16QFp8KvTransformMode>(bf16q_fp8kv_transform_mode);
+  auto const transform_mode = static_cast<Bf16QFp8KvTransformMode>(bf16q_fp8kv_transform_mode);
   if (transform_mode != Bf16QFp8KvTransformMode::Full) {
     TVM_FFI_ICHECK(
         mode == TllmPagedAttentionMode::ForGen && q_data_type == Data_type::DATA_TYPE_BF16 &&

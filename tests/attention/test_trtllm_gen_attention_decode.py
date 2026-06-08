@@ -1318,9 +1318,7 @@ def test_bf16q_fp8kv_transform_mode_kwarg_exists():
     ],
 )
 def test_bf16q_fp8kv_transform_mode_mapping(mode, expected):
-    assert (
-        flashinfer.decode._get_bf16q_fp8kv_transform_mode(mode) == expected
-    )
+    assert flashinfer.decode._get_bf16q_fp8kv_transform_mode(mode) == expected
 
 
 def test_bf16q_fp8kv_transform_mode_rejects_invalid_value():
