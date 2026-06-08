@@ -18,9 +18,13 @@ separate fuzzer (different contract: m_indptr ranges, no routing/gating/scatter)
 Run with `pytest --forked` (a MoE config can IMA and corrupt the CUDA context; isolation turns each
 into one reproducible failure). Env: FLASHINFER_MOE_FUZZ_NUM_TESTS (default 100), _SEED (default 0).
 
-Status: Phase 1 wires the shared core + the CUTLASS adapter (multi-arch, unquantized SwiGLU). The
-trtllm-gen adapter (cross-API oracle) and the FP8/FP4/MXFP8 quant modes are layered on next behind
-the same `MoEAdapter` interface.
+Coverage today (all SwiGLU):
+  * cutlass_fused_moe -- bf16 / fp16 / fp8(per-tensor e4m3); arches SM89/90/100/103/110/120/121.
+  * trtllm-gen (pre-routed bf16) -- SM100/103; runs alongside cutlass on bf16 -> cross-API oracle.
+Validated false-positive-free: SM100, H100/sm90, L40S/sm89. New backends (cute-dsl, b12x) and quant
+modes (fp4/mxfp8) drop in behind the same `MoEAdapter` interface. NOTE: trtllm-gen abstains on fp8
+because its fp8-per-tensor scale + (in-kernel) routing contract is incompatible with cutlass's --
+a deliberate finding for the unified-API design, see UNIFIED_MOE_FUZZER_AND_API_DESIGN.md.
 """
 
 import os
