@@ -1313,7 +1313,6 @@ def test_trtllm_gen_bf16q_fp8kv_transform_mode_kwarg_exists():
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
-        ("full", 0),
         ("k_only", 1),
         ("separate_kv", 2),
     ],
@@ -1327,6 +1326,8 @@ def test_trtllm_gen_bf16q_fp8kv_transform_mode_mapping(mode, expected):
 def test_trtllm_gen_bf16q_fp8kv_transform_mode_rejects_invalid_value():
     with pytest.raises(ValueError, match="trtllm_gen_bf16q_fp8kv_transform_mode"):
         flashinfer.decode._get_trtllm_gen_bf16q_fp8kv_transform_mode("split_kv")
+    with pytest.raises(ValueError, match="trtllm_gen_bf16q_fp8kv_transform_mode"):
+        flashinfer.decode._get_trtllm_gen_bf16q_fp8kv_transform_mode("full")
 
 
 def test_trtllm_gen_bf16q_fp8kv_transform_modes_run():
@@ -1387,7 +1388,56 @@ def test_trtllm_gen_bf16q_fp8kv_transform_modes_run():
     workspace = torch.empty(workspace_size, dtype=torch.int8, device=GPU_DEVICE)
 
     outputs = {}
-    for mode in ("full", "k_only", "separate_kv"):
+    outputs["default"] = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query,
+        kv_cache,
+        workspace,
+        block_tables,
+        seq_lens,
+        kv_len,
+        bmm1_scale=float(key_scale.item()) / math.sqrt(head_dim),
+        bmm2_scale=float(value_scale.item()),
+        backend="trtllm-gen",
+        q_len_per_req=q_len,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(outputs["default"]).all()
+
+    workspace.zero_()
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "HND", backend="trtllm-gen"
+    )
+    kv_indptr = torch.tensor([0, num_pages], device=GPU_DEVICE, dtype=torch.int32)
+    kv_indices = torch.arange(num_pages, device=GPU_DEVICE, dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), page_size, device=GPU_DEVICE, dtype=torch.int32
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=query.dtype,
+        kv_data_type=kv_cache.dtype,
+        o_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+    )
+    outputs["wrapper_default"] = wrapper.run(
+        query,
+        kv_cache,
+        q_len_per_req=q_len,
+        q_scale=1.0 / math.sqrt(head_dim),
+        k_scale=float(key_scale.item()),
+        v_scale=float(value_scale.item()),
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(outputs["wrapper_default"]).all()
+
+    for mode in ("k_only", "separate_kv"):
+        workspace.zero_()
         outputs[mode] = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query,
             kv_cache,
@@ -1405,10 +1455,22 @@ def test_trtllm_gen_bf16q_fp8kv_transform_modes_run():
         assert torch.isfinite(outputs[mode]).all()
 
     torch.testing.assert_close(
-        outputs["k_only"].float(), outputs["full"].float(), rtol=5e-2, atol=5e-2
+        outputs["default"].float(),
+        outputs["separate_kv"].float(),
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(
-        outputs["separate_kv"].float(), outputs["full"].float(), rtol=5e-2, atol=5e-2
+        outputs["wrapper_default"].float(),
+        outputs["separate_kv"].float(),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    torch.testing.assert_close(
+        outputs["k_only"].float(),
+        outputs["separate_kv"].float(),
+        rtol=5e-2,
+        atol=5e-2,
     )
 
 
