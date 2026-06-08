@@ -66,6 +66,7 @@ from cutlass import Float32, Int32, Uint32
 from ...cute_dsl.fp4_common import (
     cvt_e4m3_to_f16x2_broadcast,
     cvt_e4m3_to_f32_via_f16,
+    cvt_s0e5m3_to_f16x2_broadcast,
     f16x2_to_f32x2,
     fp4_decode_4bytes,
     get_smem_ptr_as_int32,
@@ -230,6 +231,20 @@ class BlackwellDenseGemmW4A16Kernel:
         #     wider exponent range avoids saturation in the A cvt.
         use_fp16_mma: int = 1,
         enable_pdl: bool = True,
+        # When 1, the per-block scales are stored as S0E5M3 (host reformat of the
+        # E4M3 scale, rebiased exp 7->15) so the scale decode is a single
+        # mul.lo.u32 (``cvt_s0e5m3_to_f16x2_broadcast``) instead of the 3-op E4M3
+        # cvt+broadcast.  Memory-neutral (still 1 byte/scale); weight decode and
+        # MMA path are unchanged.  Requires the host to pass S0E5M3-formatted SF.
+        s0e5m3_scale: int = 0,
+        # Persistent-scheduler threadblock swizzle (in units of cluster=1 CTA).
+        # >1 groups the tile traversal into super-tiles for better L2 reuse of A
+        # and B -- the standard CUTLASS rasterization lever.  Targets the large-M
+        # prefill cliff (weight re-read thrashes L2 when M is large).  1 = the
+        # default col-major (M-major) raster.  raster_along_m only matters when
+        # tile_swizzle > 1.
+        tile_swizzle: int = 1,
+        raster_along_m: bool = True,
     ):
         """W4A16 kernel.
 
@@ -258,6 +273,9 @@ class BlackwellDenseGemmW4A16Kernel:
         self.pipeline_depth = int(pipeline_depth)
         self.vectorized_smem_b = int(vectorized_smem_b)
         self.use_fp16_mma = int(use_fp16_mma)
+        self.s0e5m3_scale = int(s0e5m3_scale)
+        self.tile_swizzle = int(tile_swizzle)
+        self.raster_along_m = bool(raster_along_m)
         # Programmatic Dependent Launch: when True, the kernel is launched with
         # use_pdl=True and emits griddepcontrol wait/launch_dependents bookends
         # so a producer kernel's tail can overlap this kernel's prologue (and
@@ -492,6 +510,8 @@ class BlackwellDenseGemmW4A16Kernel:
             c,
             self.tile_shape_mnk,
             max_active_clusters,
+            self.tile_swizzle,
+            self.raster_along_m,
         )
 
         @cute.struct
@@ -1364,13 +1384,18 @@ class BlackwellDenseGemmW4A16Kernel:
         c: cute.Tensor,
         tile_shape_mnk: Tuple[int, int, int],
         max_active_clusters: cutlass.Constexpr,
+        tile_swizzle: cutlass.Constexpr = 1,
+        raster_along_m: cutlass.Constexpr = True,
     ):
         c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (1, 1, 1)
         tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl
+            num_ctas_mnl,
+            cluster_shape_mnl,
+            swizzle_size=tile_swizzle,
+            raster_along_m=raster_along_m,
         )
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
@@ -1561,12 +1586,19 @@ class BlackwellDenseGemmW4A16Kernel:
 
             # MODE 1 (default): cvt.rn.f16x2.e2m1x2 + hmul2 in fp16.
             if cutlass.const_expr(self.dequant_mode == self.DEQUANT_MODE_HMUL2_F16):
-                # Per-group E4M3 scale -> f16x2 broadcast directly (3 PTX ops,
-                # no f32 detour).  alpha is applied once in the epilogue.
-                sc_n0 = cvt_e4m3_to_f16x2_broadcast(sf_byte_0)
-                sc_n1 = cvt_e4m3_to_f16x2_broadcast(sf_byte_1)
-                sc_n2 = cvt_e4m3_to_f16x2_broadcast(sf_byte_2)
-                sc_n3 = cvt_e4m3_to_f16x2_broadcast(sf_byte_3)
+                # Per-group scale -> f16x2 broadcast.  E4M3: 3 PTX ops (cvt+prmt).
+                # S0E5M3 (host-reformatted): 1 op (mul.lo.u32).  alpha is applied
+                # once in the epilogue, so the scale never needs an f32 form.
+                if cutlass.const_expr(self.s0e5m3_scale != 0):
+                    sc_n0 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_0)
+                    sc_n1 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_1)
+                    sc_n2 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_2)
+                    sc_n3 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_3)
+                else:
+                    sc_n0 = cvt_e4m3_to_f16x2_broadcast(sf_byte_0)
+                    sc_n1 = cvt_e4m3_to_f16x2_broadcast(sf_byte_1)
+                    sc_n2 = cvt_e4m3_to_f16x2_broadcast(sf_byte_2)
+                    sc_n3 = cvt_e4m3_to_f16x2_broadcast(sf_byte_3)
                 _write_hmul2(h0_a, sc_n0, 0, nn0 + 0)
                 _write_hmul2(h0_b, sc_n0, 2, nn0 + 0)
                 _write_hmul2(h0_c, sc_n1, 0, nn0 + 1)

@@ -1307,6 +1307,7 @@ def _get_cute_dsl_w4a16_gemm(
     pipeline_depth: int = 1,
     use_fp16_mma: int = 1,
     enable_pdl: bool = True,
+    tile_swizzle: int = 1,
 ):
     """Compile (or fetch from cache) the cute-DSL W4A16 GEMM kernel.
 
@@ -1326,8 +1327,13 @@ def _get_cute_dsl_w4a16_gemm(
     pipeline_depth = int(pipeline_depth)
     use_fp16_mma = int(use_fp16_mma)
     enable_pdl = bool(enable_pdl)
-    # enable_pdl is baked into the compiled kernel (the wrapper launches with
-    # use_pdl=self.enable_pdl), so it is part of the cache key.
+    tile_swizzle = int(tile_swizzle)
+    # The cute-DSL backend's prep (``_prepare_cute_dsl``) emits S0E5M3 scales when
+    # ``_CUTE_DSL_SCALE_S0E5M3``, so the kernel must decode that format -- this is
+    # not a free knob, it is locked to what prep produced.
+    s0e5m3_scale = 1 if _CUTE_DSL_SCALE_S0E5M3 else 0
+    # enable_pdl, tile_swizzle, s0e5m3_scale are baked into the compiled kernel
+    # (launch / tile-scheduler / dequant params), so they are part of the cache key.
     cache_key = (
         tile_shape_mnk,
         a_dtype,
@@ -1336,6 +1342,8 @@ def _get_cute_dsl_w4a16_gemm(
         pipeline_depth,
         use_fp16_mma,
         enable_pdl,
+        tile_swizzle,
+        s0e5m3_scale,
     )
     cached = _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -1387,6 +1395,8 @@ def _get_cute_dsl_w4a16_gemm(
         pipeline_depth=pipeline_depth,
         use_fp16_mma=use_fp16_mma,
         enable_pdl=enable_pdl,
+        tile_swizzle=tile_swizzle,
+        s0e5m3_scale=s0e5m3_scale,
     )
     max_active_clusters = get_max_active_clusters(1)
 
@@ -1407,6 +1417,33 @@ def _get_cute_dsl_w4a16_gemm(
     return compiled
 
 
+# The cute-DSL backend stores its per-block scales as S0E5M3 (a host reformat of
+# the canonical E4M3 nvfp4 scale).  This makes the in-kernel scale decode a single
+# ``mul.lo.u32`` (byte<<7 = fp16 bits; see ``cvt_s0e5m3_to_f16x2_broadcast``)
+# instead of the 3-op E4M3 cvt+broadcast -- a measured ~2-4% prefill win, decode-
+# neutral, and memory-neutral (still 1 byte/scale).  The SF format is fixed at
+# prep time and shared by every (prefill AND decode) launch on that weight, so
+# this is a single global choice for the backend, NOT a per-tactic autotuner knob.
+# ``prepare_w4a16_fp4_weights(backend='cute-dsl')`` and the cute-DSL GEMM are a
+# matched pair: prep emits S0E5M3, the kernel is always built to decode it.
+_CUTE_DSL_SCALE_S0E5M3 = True
+
+
+def _e4m3_to_s0e5m3(sf_u8: torch.Tensor) -> torch.Tensor:
+    """Reformat a uint8 tensor of E4M3 scale bytes to S0E5M3 bytes.
+
+    E4M3 (4-exp bias 7, 3-mant) -> S0E5M3 (5-exp bias 15, 3-mant).  Round-trip via
+    fp16: every E4M3 value -- including subnormals (down to 2^-9) and zero -- is a
+    *normal* fp16 (min normal 2^-14) carrying only the top 3 mantissa bits, so
+    ``fp16_bits >> 7`` is exact and yields ``[exp5 | mant3]``.  Scales are
+    non-negative, so the dropped sign bit is always 0.  This is the host side of
+    ``cvt_s0e5m3_to_f16x2_broadcast`` (which reconstructs fp16 via ``byte<<7``).
+    """
+    f16 = sf_u8.contiguous().view(torch.float8_e4m3fn).to(torch.float16)
+    bits = f16.view(torch.int16).to(torch.int32) & 0xFFFF
+    return ((bits >> 7) & 0xFF).to(torch.uint8)
+
+
 def _prepare_cute_dsl(
     b: torch.Tensor,
     b_descale: torch.Tensor,
@@ -1417,7 +1454,9 @@ def _prepare_cute_dsl(
 
     Produces the bespoke layout the cute-DSL kernel consumes:
       * weight: ``(K // 16, N * 2)`` int32 (Marlin-packed FP4).
-      * SF:     ``(K // block_size, N)`` uint8 (linear FP8-E4M3 scales).
+      * SF:     ``(K // block_size, N)`` uint8 -- per-block scales in the format
+        the cute-DSL kernel decodes (S0E5M3 when ``_CUTE_DSL_SCALE_S0E5M3``, else
+        the raw E4M3).
     ``alpha`` is passed through unchanged (the compute step normalizes it
     to a ``(1,) float32`` scalar).  Pair the returned tensors with
     ``mm_w4a16_fp4(..., backend='cute-dsl')``.
@@ -1435,7 +1474,9 @@ def _prepare_cute_dsl(
 
     # Canonical 128x4-swizzled SF -> linear (N, K_sf) -> (K_sf, N) uint8.
     linear_sf = _unswizzle_sf_128x4(b_descale, n, k_sf)  # (N, K_sf) uint8
-    sf_ksf_n = linear_sf.t().contiguous()  # (K_sf, N) uint8
+    sf_ksf_n = linear_sf.t().contiguous()  # (K_sf, N) uint8 (E4M3)
+    if _CUTE_DSL_SCALE_S0E5M3:
+        sf_ksf_n = _e4m3_to_s0e5m3(sf_ksf_n)  # -> S0E5M3, matched to the kernel decode
     return b_marlin, sf_ksf_n, alpha
 
 
@@ -1484,9 +1525,15 @@ def _prepare_cute_dsl(
 #     silently-wrong one is not -- see above).
 
 
+# GB10 (DGX Spark) L2 size in bytes; used to gate the tile_M=128 prefill tactic
+# to weights that overflow L2 (so per-M-tile weight re-reads hit HBM).  A few MB
+# off does not matter -- the AutoTuner picks tile_M=64 vs 128 per M-bucket.
+_GB10_L2_BYTES = 25 * 1024 * 1024
+
+
 def _w4a16_cute_dsl_tactic_configs(
     n: int, k: int
-) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int]]:
+) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]]:
     """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
 
     Returns a list of ``(tile_shape_mnk, atom_layout, pipeline_depth,
@@ -1507,12 +1554,18 @@ def _w4a16_cute_dsl_tactic_configs(
     tile_m_atoms.append((32, (2, 2, 1)))
     tile_m_atoms.append((64, (2, 2, 1)))
 
-    configs: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int]] = []
+    configs: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]] = []
     seen = set()
 
-    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None):
-        cfg = ((tile_m, tile_n, tile_k if tk is None else tk), atom, pdepth, fp16)
-        key = (cfg[0], cfg[1], pdepth, fp16)
+    def add(tile_m, atom, pdepth, fp16, tile_n=64, tk=None, swz=1):
+        cfg = (
+            (tile_m, tile_n, tile_k if tk is None else tk),
+            atom,
+            pdepth,
+            fp16,
+            swz,
+        )
+        key = (cfg[0], cfg[1], pdepth, fp16, swz)
         if key not in seen:
             seen.add(key)
             configs.append(cfg)
@@ -1550,6 +1603,63 @@ def _w4a16_cute_dsl_tactic_configs(
     # 64.)
     if tile_k == 128 and n >= 8192:
         add(base_tile_m, base_atom, 1, 1, tile_n=64, tk=64)
+
+    # tile_M=128 (taller M tile, atom (2,2,1)) -- the large-M *prefill* lever.
+    # The persistent kernel computes one (m,n) output tile per CTA pass and
+    # independently TMA-loads + re-dequantizes the full B weight for each
+    # M-tile, so at large M the weight is re-read M/tile_M times.  When the
+    # weight overflows L2 (GB10 L2 = 25 MB) those re-reads hit HBM and the
+    # kernel goes bandwidth-bound on redundant weight traffic -- the measured
+    # large-M throughput "cliff" (e.g. 8192x8192 M=4096: ~14 TFLOP/s vs
+    # Marlin's ~70).  Doubling tile_M halves the M-tile count -> halves the
+    # redundant weight HBM traffic: measured +48-80% at K=8192 (B=32 MB > L2),
+    # neutral when the weight fits L2 (4096^2, B=8 MB).  Gated to weights that
+    # overflow L2 (B = n*k/2 bytes >= L2); the AutoTuner then picks tile_M=64
+    # vs 128 per M-bucket (small-M decode keeps tile_M<=64).  IMPORTANT: only
+    # tile_M in {64, 128} are numerically correct -- tile_M >= 160 corrupts the
+    # output (the epilogue/MMA path breaks beyond 4 MMA M-steps), so 128 is the
+    # ceiling.  Both safe values are verified correct, so a mis-pick costs only
+    # a few %, never correctness.
+    if tile_k == 128 and (n * k) // 2 >= _GB10_L2_BYTES:
+        add(128, (2, 2, 1), 1, 1)
+
+    # Threadblock swizzle (tile_swizzle=8) -- the large-M prefill *cliff* fix.
+    # The cliff is L2 thrashing: at large M the per-M-tile weight re-reads plus
+    # the huge A-tile reads exceed L2 (25 MB), so the weight isn't resident
+    # across its re-reads -> HBM-bound.  A swizzled (super-tile) traversal order
+    # restores A+B L2 locality.  Measured (8192x8192 M=4096): tile_M=128 + swz8
+    # = 8.2 ms (~67 TFLOP/s) vs swz1 36 ms -- from 4.98x behind Marlin to ~1.05x.
+    # Swizzle only reorders tile traversal (numerically identical, cos=1.0) and
+    # is a no-op when there are few tiles (decode-neutral), so the AutoTuner can
+    # pick it freely per M-bucket: it wins at large M, costs nothing at small M.
+    # Offered (swz=8, the measured sweet spot; 16/32 slightly worse) for the
+    # tile_M=64 and tile_M=128 prefill tiles.  swz=1 versions remain available so
+    # the autotuner picks swz=8 only for the large-M buckets where it wins.
+    #
+    # tile_M=64 + swz8: gated broadly (n*k >= 16 MiB) -- it helps wherever a large
+    # M produces many tiles, INCLUDING 4096x4096 (weight fits L2, but the M=4096
+    # A-tile traffic still thrashes it; measured 1.83x).  The gate only excludes
+    # tiny decode shapes, where swizzle is a no-op and the autotuner picks swz=1.
+    if tile_k == 128 and n * k >= 16 * 1024 * 1024:
+        add(64, (2, 2, 1), 1, 1, swz=8)
+    # tile_M=128 + swz8: pairs with the weight>L2 cliff fix (where tile_M=128 is
+    # offered); it was the best config at the worst cliff (8192^2 M=4096).
+    if tile_k == 128 and (n * k) // 2 >= _GB10_L2_BYTES:
+        add(128, (2, 2, 1), 1, 1, swz=8)
+
+    # tile_N=128 (with tile_M=64, atom (2,2,1)) -- the fits-L2 / compute-bound
+    # "cluster A" fix (4096^2, 5120^2, 6144x4096: weight in L2, so not the re-read
+    # cliff -- MMA/per-tile-overhead bound, where Marlin's wider tiles win).  A
+    # wider-N tile amortizes the per-tile dequant/epilogue overhead and feeds the
+    # MMA better: measured (+ swz8) it lifted those shapes from ~73% to ~92-99% of
+    # Marlin at M>=2048.  Offered with swz8 (compute + any L2 reuse) and swz1; the
+    # autotuner picks per M-bucket.  CORRECTNESS: only (tile_M=64, tile_N=128) is
+    # valid -- tile_M=128 x tile_N=128 and tile_N=256 corrupt the output (the
+    # hand-coded dequant/epilogue ceiling, same as tile_M>128), so they are NOT
+    # offered.  Requires n % 128 == 0 (exact N tiling).
+    if tile_k == 128 and n % 128 == 0 and n >= 4096:
+        add(64, (2, 2, 1), 1, 1, tile_n=128, swz=8)
+        add(64, (2, 2, 1), 1, 1, tile_n=128, swz=1)
 
     return configs
 
@@ -1622,9 +1732,9 @@ def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             if tactic < 0:
                 # Fallback == pre-autotuner heuristic (M-aware), default knobs.
                 tile_shape_mnk, atom_layout = _select_w4a16_tile_shape(m, n, k)
-                pipeline_depth, use_fp16_mma = 1, 1
+                pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
             else:
-                tile_shape_mnk, atom_layout, pipeline_depth, use_fp16_mma = (
+                tile_shape_mnk, atom_layout, pipeline_depth, use_fp16_mma, tile_swizzle = (
                     _w4a16_cute_dsl_tactic_configs(n, k)[tactic]
                 )
             compiled = _get_cute_dsl_w4a16_gemm(
@@ -1635,6 +1745,7 @@ def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 pipeline_depth,
                 use_fp16_mma,
                 enable_pdl=enable_pdl,
+                tile_swizzle=tile_swizzle,
             )
             compiled(a, b, b_sf_u8, out, alpha_for_launch)
             return out
