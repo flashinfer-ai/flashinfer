@@ -4,9 +4,10 @@ import math
 from typing import Optional, Tuple, Union
 
 import flashinfer
+
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
-from flashinfer.utils import is_sm12x_supported, is_sm120a_supported
+from flashinfer.utils import is_sm12x_supported
 
 _WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _workspace_buffer: Optional[torch.Tensor] = None
@@ -483,27 +484,23 @@ def run_trtllm_fmha_v2_prefill_case(
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
 
-    if not is_sm90a_supported(torch.device("cuda")) and not is_sm120a_supported(
+    if not is_sm90a_supported(torch.device("cuda")) and not is_sm12x_supported(
         torch.device("cuda")
     ):
         pytest.skip("FMHA v2 requires SM90+ (Hopper) or SM12x GPUs.")
 
     # Skip invalid combinations
-    is_sm120_plus = is_sm120a_supported(torch.device("cuda"))
-    if dtype == torch.float8_e4m3fn and is_sm120_plus:
-        pytest.skip("FP8 FMHAv2 not yet supported on SM120+")
+    is_sm12x = is_sm12x_supported(torch.device("cuda"))
+    if dtype == torch.float8_e4m3fn and is_sm12x:
+        pytest.skip("FP8 FMHAv2 not yet supported on SM12x")
     if input_layout == "SEPARATE_Q_K_V" and dtype == torch.float8_e4m3fn:
         pytest.skip("FP8 not supported for SEPARATE_Q_K_V layout")
-    if input_layout == "SEPARATE_Q_K_V" and is_sm120_plus:
+    if input_layout == "SEPARATE_Q_K_V" and is_sm12x:
         pytest.skip(
-            "SEPARATE_Q_K_V requires SM90 warp-specialization, not available on SM120+"
+            "SEPARATE_Q_K_V requires SM90 warp-specialization, not available on SM12x"
         )
-    if (
-        is_sm120_plus
-        and mask_mode is not None
-        and mask_mode.upper() == "SLIDING_WINDOW"
-    ):
-        pytest.skip("SLIDING_WINDOW mask not yet supported on SM120+ (only causal)")
+    if is_sm12x and mask_mode is not None and mask_mode.upper() == "SLIDING_WINDOW":
+        pytest.skip("SLIDING_WINDOW mask not yet supported on SM12x (only causal)")
     if input_layout == "SEPARATE_Q_K_V" and logits_soft_cap > 0:
         pytest.skip("Logits soft capping not supported for SEPARATE_Q_K_V layout")
     # save_softmax_stats only supported for CONTIGUOUS_Q_KV (normal attention)
@@ -827,8 +824,6 @@ def test_trtllm_fmha_v2_prefill(
     pos_encoding_mode: str,
     save_softmax_stats: bool,
 ) -> None:
-    if dtype == torch.float8_e4m3fn:
-        pytest.skip("FP8 (e4m3) FMHA v2 kernels are known to hang on SM90")
     run_trtllm_fmha_v2_prefill_case(
         input_layout=input_layout,
         batch_size=batch_size,
@@ -859,7 +854,7 @@ def test_trtllm_fmha_v2_prefill(
     [
         (torch.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.bfloat16),
     ],
 )
 @pytest.mark.parametrize(

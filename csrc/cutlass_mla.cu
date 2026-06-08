@@ -13,16 +13,42 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cmath>
 #include <flashinfer/attention/cutlass_mla.cuh>
+#include <limits>
 
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 using namespace flashinfer::attention;
 
+template <typename CutlassIn, typename CutlassOut>
+void RunCutlassMLAPagedAttention(ffi::TensorView& workspace, ffi::TensorView& out,
+                                 ffi::TensorView& lse, ffi::TensorView& q_nope_pe,
+                                 ffi::TensorView& ckv_kpe_cache, ffi::TensorView& kv_lens,
+                                 ffi::TensorView& page_table, int batches, int page_count_per_seq,
+                                 int page_count_total, int page_size, int device_index,
+                                 cudaStream_t stream, float inv_o_scale) {
+  auto status = runMla<CutlassIn, CutlassOut>(
+      workspace.data_ptr(), out.data_ptr(), lse.data_ptr(), q_nope_pe.data_ptr(),
+      ckv_kpe_cache.data_ptr(), kv_lens.data_ptr(), page_table.data_ptr(), batches,
+      page_count_per_seq, page_count_total, page_size, device_index, stream, inv_o_scale);
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Failed to run CutlassMLAPagedAttention: " << cudaGetErrorString(status);
+}
+
 void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ffi::TensorView lse,
                               ffi::TensorView q_nope_pe, ffi::TensorView ckv_kpe_cache,
-                              ffi::TensorView kv_lens, ffi::TensorView page_table) {
+                              ffi::TensorView kv_lens, ffi::TensorView page_table, double o_scale) {
+  TVM_FFI_ICHECK(std::isfinite(o_scale) && o_scale > 0.0 &&
+                 o_scale <= static_cast<double>(std::numeric_limits<float>::max()) &&
+                 o_scale >= static_cast<double>(std::numeric_limits<float>::denorm_min()))
+      << "o_scale must be finite, positive, and representable as float, got " << o_scale;
+
+  // o_scale is the dequant scale; kernel epilogue multiplies, so pass the inverse.
+  const float inv_o_scale = static_cast<float>(1.0 / o_scale);
+
   ffi::CUDADeviceGuard device_guard(q_nope_pe.device().device_id);
   const cudaStream_t stream = get_stream(q_nope_pe.device());
 
@@ -32,15 +58,29 @@ void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ff
   int page_count_total = ckv_kpe_cache.size(0);
   int page_size = ckv_kpe_cache.size(1);
 
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_nope_pe.dtype(), c_type, [&] {
-    using cutlass_t = cutlass_dtype_t<c_type>;
-    auto status = runMla<cutlass_t>(
-        workspace.data_ptr(), out.data_ptr(), lse.data_ptr(), q_nope_pe.data_ptr(),
-        ckv_kpe_cache.data_ptr(), kv_lens.data_ptr(), page_table.data_ptr(), batches,
-        page_count_per_seq, page_count_total, page_size, device_index, stream);
+  auto in_dtype = q_nope_pe.dtype();
+  auto out_dtype = out.dtype();
 
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "Failed to run CutlassMLAPagedAttention: " << cudaGetErrorString(status);
-    return true;
-  });
+  if (encode_dlpack_dtype(in_dtype) == encode_dlpack_dtype(out_dtype)) {
+    // Input and output have the same dtype (bf16/fp16 -> bf16/fp16)
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(in_dtype, c_type, [&] {
+      using cutlass_t = cutlass_dtype_t<c_type>;
+      RunCutlassMLAPagedAttention<cutlass_t, cutlass_t>(
+          workspace, out, lse, q_nope_pe, ckv_kpe_cache, kv_lens, page_table, batches,
+          page_count_per_seq, page_count_total, page_size, device_index, stream, inv_o_scale);
+      return true;
+    });
+  } else {
+    // Input and output have different dtypes (bf16/fp16 -> fp8)
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(in_dtype, c_type_in, [&] {
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(out_dtype, c_type_out, [&] {
+        using cutlass_in = cutlass_dtype_t<c_type_in>;
+        using cutlass_out = cutlass_dtype_t<c_type_out>;
+        RunCutlassMLAPagedAttention<cutlass_in, cutlass_out>(
+            workspace, out, lse, q_nope_pe, ckv_kpe_cache, kv_lens, page_table, batches,
+            page_count_per_seq, page_count_total, page_size, device_index, stream, inv_o_scale);
+        return true;
+      });
+    });
+  }
 }

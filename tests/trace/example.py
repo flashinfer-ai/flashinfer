@@ -23,6 +23,7 @@ gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
+gemm_fp8_nt_groupwise_n1536_k7168.json
 gemm_mxfp8_N4096_K4096.json
 gemma_fused_add_rmsnorm_h4608.json
 gemma_rmsnorm_h4608.json
@@ -271,6 +272,22 @@ with contextlib.suppress(Exception):
     b_fp8 = torch.zeros(K // BS, N, BS, dtype=torch.float8_e4m3fn, device=device)
     alpha_fp8 = torch.tensor(1.0, dtype=torch.float32, device=device)
     flashinfer.mm_fp8(a_fp8, b_fp8, alpha_fp8)
+
+# ── GEMM fp8 nt groupwise (DeepSeek-V3 q_proj trtllm path: M×7168 @ [1536, 7168]) ─
+# trtllm canonical layout: a_scale = [M, K//bs], b_scale = [N//bs, K//bs]; bs=128.
+# (b_scale is transposed vs flashinfer's gemm_base.py docstring — see
+# tests/gemm/test_groupwise_scaled_gemm_fp8.py:128-129 which does
+# `b_scale.t().contiguous()` for the trtllm path.)
+# Trace is dumped before kernel launch; suppress SM-specific runtime failures.
+with contextlib.suppress(Exception):
+    M, K, N, BS = 128, 7168, 1536, 128
+    a_g = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=device)
+    b_g = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=device)
+    a_scale_g = torch.ones(M, K // BS, dtype=torch.float32, device=device)
+    b_scale_g = torch.ones(N // BS, K // BS, dtype=torch.float32, device=device)
+    flashinfer.gemm.gemm_fp8_nt_groupwise(
+        a_g, b_g, a_scale_g, b_scale_g, backend="trtllm"
+    )
 
 # ── GEMM mxfp8 (Blackwell SM100+: M×4096@4096×4096, block=32) ────────────────
 try:
@@ -801,7 +818,7 @@ with contextlib.suppress(Exception):
     )
     flashinfer.chain_speculative_sampling(_draft_p, _draft_ids, _target_p)
 
-# rope_quantize_fp8 (GQA layout) + mla_rope_quantize_fp8 (MLA: num_k_heads=1).
+# rope_quantize_fp8 (GQA layout) + mla_rope_quantize_fp8 (MLA 2D latents).
 with contextlib.suppress(Exception):
     _rqf_nnz = 32
     _rqf_Hq, _rqf_Hk = 8, 2
@@ -843,7 +860,7 @@ with contextlib.suppress(Exception):
         _rqf_k_nope,
         _rqf_cache,
         _rqf_pos,
-        is_neox=True,
+        is_neox=False,
     )
 
 with contextlib.suppress(Exception):
@@ -886,7 +903,7 @@ with contextlib.suppress(Exception):
         _mrqf_k_nope,
         _mrqf_cache,
         _mrqf_pos,
-        is_neox=True,
+        is_neox=False,
     )
 
 # trtllm_batch_decode_with_kv_cache_mla (DeepSeek MLA decode, SM100/103 only).
@@ -1095,7 +1112,7 @@ with contextlib.suppress(Exception):
         _rqfap_kv_indptr,
         _rqfap_batch_indices,
         _rqfap_positions,
-        is_neox=True,
+        is_neox=False,
         page_size=_rqfap_PS,
         kv_layout="NHD",
     )

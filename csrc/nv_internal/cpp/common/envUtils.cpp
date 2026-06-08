@@ -19,8 +19,10 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -323,15 +325,6 @@ uint16_t getEnvNixlPort() {
 
 bool getEnvDisaggBenchmarkGenOnly() { return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"); }
 
-bool getEnvMoeA2AOneBlockPerToken() {
-  // Default true; return false only if env set to "0"
-  static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
-  if (!val.has_value()) {
-    return true;
-  }
-  return val.value() != 0;
-}
-
 static int sanitizeBlockSize(std::optional<int32_t> const& val) {
   // Default 256 when not set or invalid
   int block = val.value_or(256);
@@ -344,16 +337,57 @@ static int sanitizeBlockSize(std::optional<int32_t> const& val) {
   return block;
 }
 
+// Treat malformed values as unset so debug block-size knobs never become hard failures.
+static int getSanitizedBlockSizeFromEnv(char const* name) {
+  try {
+    return sanitizeBlockSize(getIntEnv(name));
+  } catch (std::exception const&) {
+    TLLM_LOG_WARNING("Invalid value for %s. Falling back to default block size.", name);
+    return sanitizeBlockSize(std::nullopt);
+  }
+}
+
 int getEnvMoeA2ADispatchBlockSize() {
-  static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE"));
+  static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE");
   return kBlock;
 }
 
 int getEnvMoeA2ACombineBlockSize() {
-  static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
+  static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE");
   return kBlock;
 }
 
-bool getEnvEplbForceGdrcopy() { return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY"); }
+bool getEnvEplbForceGdrcopy() {
+  static bool const forceGdrcopy = getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
+  return forceGdrcopy;
+}
+
+bool getEnvDisableFP4QuantFastMath() {
+  return getBoolEnv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH") ||
+         getBoolEnv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH");
+}
+
+bool getEnvNVFP4Use4Over6() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6"); }
+
+NVFP44Over6ErrMode getEnvNVFP44Over6ErrMode() {
+  auto mode = getStrEnv("FLASHINFER_NVFP4_4OVER6_ERR_MODE");
+  if (!mode.has_value()) {
+    return NVFP44Over6ErrMode::MAE;
+  }
+  toUpper(*mode);
+  if (*mode == "MAE") {
+    return NVFP44Over6ErrMode::MAE;
+  }
+  if (*mode == "MSE") {
+    return NVFP44Over6ErrMode::MSE;
+  }
+  throw std::invalid_argument("FLASHINFER_NVFP4_4OVER6_ERR_MODE must be MAE or MSE.");
+}
+
+bool getEnvNVFP44Over6ErrUseFastMath() {
+  return getBoolEnv("FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH");
+}
+
+bool getEnvNVFP44Over6E4M3Use256() { return getBoolEnv("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256"); }
 
 }  // namespace tensorrt_llm::common

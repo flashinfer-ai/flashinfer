@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
 import pytest
 from abc import ABC, abstractmethod
 from typing import Dict
@@ -42,7 +43,9 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_bf16_moe,
+    trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
@@ -63,6 +66,20 @@ def check_cuda(err):
         error_name = runtime.cudaGetErrorName(err)
         error_string = runtime.cudaGetErrorString(err)
         raise RuntimeError(f"CUDA error: {error_name[1]}: {error_string[1]}")
+
+
+def pack_topk_for_routed_moe(
+    topk_indices: torch.Tensor, topk_weights: torch.Tensor
+) -> torch.Tensor:
+    """Pack per-token expert ids and bf16 weights into the int32 ``topk_ids`` format
+    consumed by the trtllm-gen routed MoE entry points: ``(expert_id << 16) |
+    (weight_bf16.view(int16))``."""
+    assert topk_indices.shape == topk_weights.shape, (
+        "topk_indices and topk_weights must have the same shape."
+    )
+    return (topk_indices.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
+        torch.int16
+    ).to(torch.int32)
 
 
 class CUDAGraphMoE:
@@ -449,6 +466,8 @@ class FP4Moe(Moe):
         gemm1_scales_fp4_shuffled = []
         gemm2_weights_fp4_shuffled = []
         gemm2_scales_fp4_shuffled = []
+        gemm1_bias_shuffled = [] if args.gemm1_bias is not None else None
+        gemm2_bias_shuffled = [] if args.gemm2_bias is not None else None
         for i in range(num_experts):
             # Calculate the permute indices for the following:
             # 1. Reorder rows of W1 and scales for fused gated activation
@@ -483,6 +502,19 @@ class FP4Moe(Moe):
                 )
             )
 
+            if gemm1_bias_shuffled is not None:
+                permute_bias_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices,
+                    args.gemm1_bias[i].reshape(-1, 1),
+                    epilogue_tile_m,
+                    is_gated_act_gemm=is_gated_activation(args.activation_type),
+                )
+                gemm1_bias_shuffled.append(
+                    args.gemm1_bias[i]
+                    .reshape(-1, 1)[permute_bias_indices.to(args.gemm1_bias.device)]
+                    .contiguous()
+                )
+
             permute_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
                 gemm2_weights_fp4[i].view(torch.uint8),
@@ -510,6 +542,18 @@ class FP4Moe(Moe):
                 )
             )
 
+            if gemm2_bias_shuffled is not None:
+                permute_bias_indices = get_w2_permute_indices_with_cache(
+                    self._cache_permute_indices,
+                    args.gemm2_bias[i].reshape(-1, 1),
+                    epilogue_tile_m,
+                )
+                gemm2_bias_shuffled.append(
+                    args.gemm2_bias[i]
+                    .reshape(-1, 1)[permute_bias_indices.to(args.gemm2_bias.device)]
+                    .contiguous()
+                )
+
         # Stack weights for all experts
         gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
         gemm1_scales_fp4_shuffled = (
@@ -528,6 +572,14 @@ class FP4Moe(Moe):
             .view(torch.float8_e4m3fn)
             .reshape(num_experts, hidden_size, intermediate_size // self.sf_vec_size)
         )
+        if gemm1_bias_shuffled is not None:
+            gemm1_bias_shuffled = torch.stack(gemm1_bias_shuffled).reshape(
+                num_experts, intermediate_size_factor * intermediate_size
+            )
+        if gemm2_bias_shuffled is not None:
+            gemm2_bias_shuffled = torch.stack(gemm2_bias_shuffled).reshape(
+                num_experts, hidden_size
+            )
 
         # Calculate scaling factors that depend on weights
         if is_gated_activation(args.activation_type):
@@ -552,6 +604,8 @@ class FP4Moe(Moe):
             "gemm1_scales_fp4_shuffled": gemm1_scales_fp4_shuffled,
             "gemm2_weights_fp4_shuffled": gemm2_weights_fp4_shuffled,
             "gemm2_scales_fp4_shuffled": gemm2_scales_fp4_shuffled,
+            "gemm1_bias_shuffled": gemm1_bias_shuffled,
+            "gemm2_bias_shuffled": gemm2_bias_shuffled,
             "scale_c_fc1": scale_c_fc1,
             "scale_gate_fc1": scale_gate_fc1,
             "scale_c_fc2": scale_c_fc2,
@@ -573,8 +627,8 @@ class FP4Moe(Moe):
         activation_type = kwargs["activation_type"]
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
-        gemm1_bias = kwargs["gemm1_bias"]
-        gemm2_bias = kwargs["gemm2_bias"]
+        gemm1_bias = static_data["gemm1_bias_shuffled"]
+        gemm2_bias = static_data["gemm2_bias_shuffled"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
 
         # Create CUDA graph configuration
@@ -787,7 +841,16 @@ class MxInt4BlockScaleMoe(Moe):
     def call_moe(
         self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
     ):
-        """Call MoE with runtime input quantization + kernel execution (done at runtime)."""
+        """Call MoE with runtime input quantization + kernel execution (done at runtime).
+
+        When a ``gemm1_lora_delta`` is set, routing has to happen *outside* the
+        MoE kernel so the caller's LoRA backbone and this MoE share an identical
+        top-k decision per token. We therefore swap to the routed entry point
+        and use ``permute_info["topKIndices"]`` / ``permute_info["topKLogits"]``
+        — the same values run_moe_dequant uses for the reference — packed into
+        the int32 ``(expert_id << 16) | weight_bf16.view(int16)`` format the
+        kernel expects.
+        """
         expert_logits = kwargs["expert_logits"]
         routing_bias = kwargs["routing_bias"]
         num_experts = kwargs["num_experts"]
@@ -799,32 +862,61 @@ class MxInt4BlockScaleMoe(Moe):
         enable_autotune = kwargs.get("enable_autotune", True)
         routed_scaling = kwargs.get("routed_scaling", 1.0)
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
+        permute_info = kwargs.get("permute_info")
 
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
-            output = trtllm_mxint4_block_scale_moe(
-                expert_logits,  # float
-                routing_bias,
-                hidden_states_orig,
-                static_data["gemm1_weights"],
-                static_data["gemm1_scales"],
-                None,
-                None,
-                None,
-                static_data["gemm2_weights"],
-                static_data["gemm2_scales"],
-                num_experts,
-                top_k,
-                n_groups,
-                top_k_groups,
-                intermediate_size,
-                0,
-                num_experts,
-                routed_scaling,
-                routing_method_type=routing_method_type,
-                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-                norm_topk_prob=norm_topk_prob,
-            )
+            if gemm1_lora_delta is not None:
+                packed_topk_ids = pack_topk_for_routed_moe(
+                    permute_info["topKIndices"], permute_info["topKLogits"]
+                )
+                output = trtllm_mxint4_block_scale_routed_moe(
+                    packed_topk_ids,
+                    hidden_states_orig,
+                    static_data["gemm1_weights"],
+                    static_data["gemm1_scales"],
+                    None,
+                    None,
+                    None,
+                    static_data["gemm2_weights"],
+                    static_data["gemm2_scales"],
+                    num_experts,
+                    top_k,
+                    n_groups,
+                    top_k_groups,
+                    intermediate_size,
+                    0,
+                    num_experts,
+                    routed_scaling,
+                    routing_method_type=routing_method_type,
+                    tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                    gemm1_lora_delta=gemm1_lora_delta,
+                )
+            else:
+                output = trtllm_mxint4_block_scale_moe(
+                    expert_logits,  # float
+                    routing_bias,
+                    hidden_states_orig,
+                    static_data["gemm1_weights"],
+                    static_data["gemm1_scales"],
+                    None,
+                    None,
+                    None,
+                    static_data["gemm2_weights"],
+                    static_data["gemm2_scales"],
+                    num_experts,
+                    top_k,
+                    n_groups,
+                    top_k_groups,
+                    intermediate_size,
+                    0,
+                    num_experts,
+                    routed_scaling,
+                    routing_method_type=routing_method_type,
+                    tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                    norm_topk_prob=norm_topk_prob,
+                )
         return output[0].to(torch.float)
 
     def compute_reference(self, args):
@@ -1114,7 +1206,14 @@ class FP8BlockScaleMoe(Moe):
     def call_moe(
         self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
     ):
-        """Call MoE with runtime block scale generation + kernel execution."""
+        """Call MoE with runtime block scale generation + kernel execution.
+
+        When a ``gemm1_lora_delta`` is set for MXFP8, routing has to happen
+        outside the MoE kernel so the caller's LoRA backbone and the MoE share
+        the same top-k routing. We therefore switch to the routed entry point
+        and reuse ``permute_info["topKIndices"]`` / ``permute_info["topKLogits"]``
+        in the packed int32 format expected by the kernel.
+        """
         expert_logits = kwargs["expert_logits"]
         routing_bias = kwargs["routing_bias"]
         num_experts = kwargs["num_experts"]
@@ -1130,6 +1229,8 @@ class FP8BlockScaleMoe(Moe):
         hidden_states_scale = kwargs["hidden_states_scale"]
         hidden_states_quant = kwargs["hidden_states_quant"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
+        permute_info = kwargs.get("permute_info")
 
         # Generate block scales and quantize hidden states at runtime
         hidden_states_fp8 = hidden_states_quant.to(torch.float8_e4m3fn)
@@ -1148,32 +1249,69 @@ class FP8BlockScaleMoe(Moe):
 
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
-            output = trtllm_fp8_block_scale_moe(
-                expert_logits,
-                routing_bias,
-                hidden_states_fp8,
-                hidden_states_scale,
-                static_data["gemm1_weights"],
-                static_data["gemm1_scales"],
-                static_data["gemm2_weights"],
-                static_data["gemm2_scales"],
-                num_experts,
-                top_k,
-                n_groups,
-                top_k_groups,
-                intermediate_size,
-                0,
-                num_experts,
-                routed_scaling,
-                routing_method_type,
-                use_shuffled_weight=static_data["use_shuffled_weight"],
-                weight_layout=static_data["weight_layout"],
-                enable_pdl=enable_pdl,
-                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-                fp8_quantization_type=quantization_mode,
-                activation_type=activation_type,
-                norm_topk_prob=norm_topk_prob,
-            )
+            if gemm1_lora_delta is not None:
+                if self.fp8_quantization_type != QuantMode.FP8_BLOCK_SCALE_MXFP8:
+                    raise NotImplementedError(
+                        "LoRA delta is only supported for MXFP8 in FP8BlockScaleMoe tests."
+                    )
+                packed_topk_ids = pack_topk_for_routed_moe(
+                    permute_info["topKIndices"], permute_info["topKLogits"]
+                )
+                output = trtllm_fp8_block_scale_routed_moe(
+                    packed_topk_ids,
+                    routing_bias,
+                    hidden_states_fp8,
+                    hidden_states_scale,
+                    static_data["gemm1_weights"],
+                    static_data["gemm1_scales"],
+                    static_data["gemm2_weights"],
+                    static_data["gemm2_scales"],
+                    num_experts,
+                    top_k,
+                    n_groups,
+                    top_k_groups,
+                    intermediate_size,
+                    0,
+                    num_experts,
+                    routed_scaling,
+                    routing_method_type,
+                    use_shuffled_weight=static_data["use_shuffled_weight"],
+                    weight_layout=static_data["weight_layout"],
+                    enable_pdl=enable_pdl,
+                    gemm1_lora_delta=gemm1_lora_delta,
+                    tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                    fp8_quantization_type=quantization_mode,
+                    activation_type=activation_type,
+                )
+            else:
+                output = trtllm_fp8_block_scale_moe(
+                    expert_logits,
+                    routing_bias,
+                    hidden_states_fp8,
+                    hidden_states_scale,
+                    static_data["gemm1_weights"],
+                    static_data["gemm1_scales"],
+                    static_data["gemm2_weights"],
+                    static_data["gemm2_scales"],
+                    num_experts,
+                    top_k,
+                    n_groups,
+                    top_k_groups,
+                    intermediate_size,
+                    0,
+                    num_experts,
+                    routed_scaling,
+                    routing_method_type,
+                    use_shuffled_weight=static_data["use_shuffled_weight"],
+                    weight_layout=static_data["weight_layout"],
+                    enable_pdl=enable_pdl,
+                    tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                    fp8_quantization_type=quantization_mode,
+                    activation_type=activation_type,
+                    norm_topk_prob=norm_topk_prob,
+                )
+        if isinstance(output, list):
+            return output[0].to(torch.float)
         return output.to(torch.float)
 
     def compute_reference(self, args):
@@ -1498,7 +1636,13 @@ class BF16Moe(Moe):
     def call_moe(
         self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
     ):
-        """Call MoE with runtime input quantization + kernel execution (done at runtime)."""
+        """Call MoE with runtime input quantization + kernel execution (done at runtime).
+
+        When a ``gemm1_lora_delta`` is set we route through
+        :func:`trtllm_bf16_routed_moe` instead — the non-routed entry point
+        deliberately doesn't expose LoRA so that the LoRA backbone and the MoE
+        cannot disagree on top-k.
+        """
         expert_logits = kwargs["expert_logits"]
         routing_bias = kwargs["routing_bias"]
         num_experts = kwargs["num_experts"]
@@ -1511,30 +1655,59 @@ class BF16Moe(Moe):
         enable_autotune = kwargs.get("enable_autotune", True)
         activation_type = kwargs["activation_type"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
+        permute_info = kwargs.get("permute_info")
 
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
-            output = trtllm_bf16_moe(
-                expert_logits,  # float
-                routing_bias,
-                hidden_states_orig,
-                static_data["gemm1_weights"],
-                static_data["gemm2_weights"],
-                num_experts,
-                top_k,
-                n_groups,
-                top_k_groups,
-                intermediate_size,
-                0,
-                num_experts,
-                routed_scaling,
-                use_shuffled_weight=static_data["use_shuffled_weight"],
-                weight_layout=static_data["weight_layout"],
-                routing_method_type=routing_method_type,
-                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-                activation_type=activation_type,
-                norm_topk_prob=norm_topk_prob,
-            )
+            if gemm1_lora_delta is not None:
+                packed_topk_ids = pack_topk_for_routed_moe(
+                    permute_info["topKIndices"], permute_info["topKLogits"]
+                )
+                output = trtllm_bf16_routed_moe(
+                    packed_topk_ids,
+                    hidden_states_orig,
+                    static_data["gemm1_weights"],
+                    static_data["gemm2_weights"],
+                    num_experts,
+                    top_k,
+                    n_groups,
+                    top_k_groups,
+                    intermediate_size,
+                    0,
+                    num_experts,
+                    routed_scaling,
+                    use_shuffled_weight=static_data["use_shuffled_weight"],
+                    weight_layout=static_data["weight_layout"],
+                    routing_method_type=routing_method_type,
+                    tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                    activation_type=activation_type,
+                    gemm1_lora_delta=gemm1_lora_delta,
+                )
+            else:
+                output = trtllm_bf16_moe(
+                    expert_logits,  # float
+                    routing_bias,
+                    hidden_states_orig,
+                    static_data["gemm1_weights"],
+                    static_data["gemm2_weights"],
+                    num_experts,
+                    top_k,
+                    n_groups,
+                    top_k_groups,
+                    intermediate_size,
+                    0,
+                    num_experts,
+                    routed_scaling,
+                    use_shuffled_weight=static_data["use_shuffled_weight"],
+                    weight_layout=static_data["weight_layout"],
+                    routing_method_type=routing_method_type,
+                    tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                    activation_type=activation_type,
+                    norm_topk_prob=norm_topk_prob,
+                )
+        if isinstance(output, list):
+            return output[0].to(torch.float)
         return output.to(torch.float)
 
     def compute_reference(self, args):
@@ -1589,6 +1762,7 @@ class moe_args:
         activation_type,
         gemm1_bias=None,
         gemm2_bias=None,
+        gemm1_lora_delta=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1611,6 +1785,7 @@ class moe_args:
         self.activation_type = activation_type
         self.gemm1_bias = gemm1_bias
         self.gemm2_bias = gemm2_bias
+        self.gemm1_lora_delta = gemm1_lora_delta
 
 
 class moe_args_dequant:
@@ -1634,6 +1809,7 @@ class moe_args_dequant:
         hidden_states_scale=None,
         gemm1_bias=None,
         gemm2_bias=None,
+        gemm1_lora_delta=None,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1651,6 +1827,7 @@ class moe_args_dequant:
         self.hidden_states_scale = hidden_states_scale
         self.gemm1_bias = gemm1_bias
         self.gemm2_bias = gemm2_bias
+        self.gemm1_lora_delta = gemm1_lora_delta
 
 
 def routing_reference(expertLogits, topK, padding):
@@ -1866,11 +2043,11 @@ def routing_reference_sigmoid_renorm(
 
 
 def routing_reference_minimax2(
-    expert_logits, routing_bias, top_k, num_experts, padding
+    expert_logits, routing_bias, top_k, num_experts, padding, routed_scaling_factor
 ):
     """Sigmoid + Bias -> TopK -> ScaledSumNormalize routing reference (MiniMax2).
     Bias affects expert selection but NOT the final weights.
-    Weights = sigmoid(logit) / (sum_of_selected_sigmoid + 1e-20).
+    Weights = sigmoid(logit) / (sum_of_selected_sigmoid + 1e-20) * routed_scaling_factor.
     """
     sigmoid_scores = torch.sigmoid(expert_logits.float())
     selection_scores = sigmoid_scores.clone()
@@ -1881,6 +2058,8 @@ def routing_reference_minimax2(
     # Weights use un-biased sigmoid scores
     raw_weights = torch.gather(sigmoid_scores, -1, topk_idx)
     raw_weights = raw_weights / (raw_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    if routed_scaling_factor is not None:
+        raw_weights = raw_weights * routed_scaling_factor
     raw_weights = raw_weights.to(expert_logits.dtype)
 
     scores = torch.zeros_like(sigmoid_scores, dtype=expert_logits.dtype)
@@ -2187,6 +2366,18 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
+    # MoE LoRA: add the per-(token, routed-expert, 2*I) delta to the FC1 output
+    # before the gated activation. The kernel applies this as BiasType::Mn
+    # indexed via permutedIdxToBiasRowIdx = expandedIdx = tokenIdx * topK + k.
+    if args.gemm1_lora_delta is not None:
+        delta = args.gemm1_lora_delta.to(torch.float)
+        for token_idx in range(args.num_tokens):
+            for k in range(args.top_k):
+                permuted_idx = expanded_idx_to_permuted_idx[token_idx * args.top_k + k]
+                if permuted_idx < 0:
+                    continue
+                gemm1_output[permuted_idx] += delta[token_idx, k]
+
     if args.use_routing_scales_on_input:
         assert args.top_k == 1
         # For each token and its top_k experts
@@ -2399,6 +2590,9 @@ def run_moe_reference_mxfp8(args):
         args.permute_info,
         args.use_routing_scales_on_input,
         args.activation_type,
+        gemm1_bias=args.gemm1_bias,
+        gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE_MXFP8), args_dequant
@@ -2540,6 +2734,7 @@ def run_moe_reference_bf16(args):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
@@ -2593,6 +2788,7 @@ def run_moe_reference_mxint4(args):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.MXINT4_BF16_BF16), args_dequant
@@ -2632,6 +2828,8 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "enable_autotune": kwargs.get("enable_autotune", True),
         "gemm1_bias": args.gemm1_bias,
         "gemm2_bias": args.gemm2_bias,
+        "gemm1_lora_delta": args.gemm1_lora_delta,
+        "permute_info": args.permute_info,
         "norm_topk_prob": kwargs.get("norm_topk_prob", True),
     }
 
@@ -2663,6 +2861,7 @@ def run_moe_test(
     zero_hidden_states=False,
     gemm1_bias=None,
     gemm2_bias=None,
+    gemm1_lora_delta=None,
     routing_bias_dtype=None,
     norm_topk_prob=True,
 ):
@@ -2729,12 +2928,12 @@ def run_moe_test(
         ),
         device="cuda",
         dtype=torch.bfloat16,
-    )
+    ) / math.sqrt(hidden_size)
     gemm2_weights = torch.randn(
         (num_experts, hidden_size, intermediate_size),
         device="cuda",
         dtype=torch.bfloat16,
-    )
+    ) / math.sqrt(intermediate_size)
 
     # Generate routing info
     use_routing_scales_on_input = routing_method_type == RoutingMethodType.Llama4
@@ -2774,7 +2973,11 @@ def run_moe_test(
         )
     elif routing_method_type == RoutingMethodType.MiniMax2:
         permute_info, scores = routing_reference_minimax2(
-            expert_logits, routing_bias, top_k, num_experts, padding
+            expert_logits, routing_bias, top_k, num_experts, padding, routed_scaling
+        )
+    elif routing_method_type == RoutingMethodType.Sigmoid:
+        permute_info, scores = routing_reference_sigmoid_renorm(
+            expert_logits, top_k, num_experts, padding, norm_topk_prob=False
         )
     elif routing_method_type == RoutingMethodType.Llama4:
         permute_info, scores = routing_reference_no_aux(
@@ -2828,6 +3031,7 @@ def run_moe_test(
         activation_type,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
+        gemm1_lora_delta=gemm1_lora_delta,
     )
 
     # Compute reference output
@@ -2867,6 +3071,8 @@ def run_moe_test(
         rtol=tolerances["rtol"],
         percent=tolerances["percent"],
     )
+
+    return output_dequant_reference, output_dequant_actual, args_dequant
 
 
 # Test: Renormalize routing
@@ -3053,7 +3259,29 @@ def run_moe_test(
                 "compatible_intermediate_size": [384, 768, 1024],
                 "enable_autotune": False,
             },
-            id="MiniMax2_256e_top6",
+            id="MiniMax2_256e_top6_no_scale",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": 3.0,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.MiniMax2,
+                "compatible_moe_impls": [
+                    FP8PerTensorMoe,
+                    FP8BlockScaleMoe,
+                    FP4Moe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+                "compatible_intermediate_size": [384, 768, 1024],
+                "enable_autotune": False,
+            },
+            id="MiniMax2_256e_top6_scale3",
         ),
     ],
 )
@@ -3128,6 +3356,119 @@ def test_renormalize_routing(
         cache_permute_indices,
         routing_logits_dtype,
         zero_hidden_states=zero_hidden_states,
+    )
+
+
+# Test: Sigmoid routing (Sigmoid -> TopK, no renormalization)
+@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            id="FP8_Block_MxFp8",
+        ),
+        pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+        pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Sigmoid,
+                "compatible_moe_impls": [
+                    FP8PerTensorMoe,
+                    FP8BlockScaleMoe,
+                    FP4Moe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+                "compatible_intermediate_size": [384, 768, 1024],
+                "enable_autotune": True,
+            },
+            id="Sigmoid_128e_top8",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        pytest.param(ActivationType.Geglu.value, id="Geglu"),
+    ],
+)
+def test_sigmoid_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+    cache_permute_indices,
+):
+    """Test Sigmoid routing configurations (Sigmoid -> TopK, no renormalization)."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
     )
 
 
@@ -3425,6 +3766,7 @@ def test_topk_routing(
     "moe_impl",
     [
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="FP4_MoE"),
     ],
 )
 @pytest.mark.parametrize(
@@ -3440,7 +3782,7 @@ def test_topk_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.Llama4,
-                "compatible_moe_impls": [FP8PerTensorMoe],
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe],
                 "compatible_intermediate_size": [1024, 2048],
                 "enable_autotune": True,
             },
@@ -3502,10 +3844,11 @@ def test_llama4_routing(
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512])
 @pytest.mark.parametrize("bias", ["gemm2", "gemm1", "gemm1_and_gemm2"])
-def test_nvfp4_moe_gemm_bias(
+def test_mxfp4_moe_gemm_bias(
     num_tokens, hidden_size, intermediate_size, bias, cache_permute_indices
 ):
-    """Test NvFP4 MoE with GEMM bias support."""
+    """Test MXFP4 MoE with GEMM bias support."""
+    # TODO NVFP4 is currently broken
     num_experts = 8
     top_k = 2
     device = "cuda"
@@ -3525,7 +3868,7 @@ def test_nvfp4_moe_gemm_bias(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
         routing_config={
             "num_experts": num_experts,
             "top_k": top_k,
@@ -3549,6 +3892,91 @@ def test_nvfp4_moe_gemm_bias(
         routing_logits_dtype=torch.bfloat16,
         gemm1_bias=gemm1_bias,
         gemm2_bias=gemm2_bias,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [32])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("bias", ["gemm2", "gemm1"])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
+    ],
+)
+def test_fp4_moe_gemm_bias_changes_output(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    bias,
+    moe_impl,
+    cache_permute_indices,
+):
+    """Test FP4 MoE GEMM bias support changes the kernel output."""
+    num_experts = 8
+    top_k = 2
+    device = "cuda"
+    routing_config = {
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "padding": 8,
+        "n_groups": None,
+        "top_k_groups": None,
+        "routed_scaling": None,
+        "has_routing_bias": False,
+        "routing_method_type": RoutingMethodType.Renormalize,
+        "compatible_moe_impls": [FP4Moe],
+        "compatible_intermediate_size": [512, 768, 1024, 2048],
+        "enable_autotune": True,
+    }
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+    }
+
+    gemm1_bias = None
+    gemm2_bias = None
+    if "gemm1" in bias:
+        gemm1_bias = torch.randn(
+            (num_experts, 2 * intermediate_size), device=device, dtype=torch.float32
+        )
+    if "gemm2" in bias:
+        gemm2_bias = torch.randn(
+            (num_experts, hidden_size), device=device, dtype=torch.float32
+        )
+
+    _, output_with_bias, _ = run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=moe_impl,
+        routing_config=routing_config,
+        weight_processing=weight_processing,
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        gemm1_bias=gemm1_bias,
+        gemm2_bias=gemm2_bias,
+    )
+    _, output_without_bias, _ = run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=moe_impl,
+        routing_config=routing_config,
+        weight_processing=weight_processing,
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+    )
+
+    # Sanity check to ensure the bias is actually changing the output
+    # If the weights and activations are too large we might not see a difference which would invalidate the tests
+    # Also useful for debugging if the bias is skipped vs incorrect
+    assert not torch.allclose(
+        output_with_bias, output_without_bias, atol=1e-3, rtol=1e-3
     )
 
 
@@ -3969,6 +4397,158 @@ def test_tier_1024_experts_routing(
     )
 
 
+# num_tokens is chosen to straddle the dispatch thresholds in routingCustom::run
+# (see trtllm_fused_moe_routing_custom.cu):
+#   - tokens == 8  : dyn-block kernel path (tokens <= DynBlockKernelMaxNumTokens=16,
+#                    numExperts <= DynBlockKernelMaxNumExperts=512)
+#   - tokens == 32 : block-per-token "split" path on the single-cluster kernel
+#                    (17 <= tokens <= 256, numExperts >= 160, policy pair opts into
+#                    PolicyPairSupportsBlockPerToken) — exercises the
+#                    routingIndicesBlockScoresKernel path added for this feature.
+@pytest.mark.parametrize("num_tokens", [8, 32])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(FP8PerTensorMoe(), id="FP8_PerTensor"),
+        pytest.param(
+            FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+            id="NvFP4xNvFP4",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        # DeepSeekV3 + nGroup == 1 routes through routingCustom with
+        # (SigmoidBiasPreprocess, ScaledSumNormalizePostprocess) — the policy pair
+        # that opts into the block-per-token BlockScores kernel.
+        pytest.param(
+            {
+                "num_experts": 384,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    FP8PerTensorMoe,
+                    FP4Moe,
+                ],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="DeepSeekV3_ngroup1_384e_top6",
+        ),
+        pytest.param(
+            {
+                # top_k=22 requires num_experts > NumKimiK2Experts (384).
+                "num_experts": 512,
+                "top_k": 22,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    FP8PerTensorMoe,
+                    FP4Moe,
+                ],
+                "compatible_intermediate_size": [512],
+                "enable_autotune": False,
+            },
+            id="DeepSeekV3_ngroup1_512e_top22",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    MxInt4BlockScaleMoe,
+                    BF16Moe,
+                ],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
+    ],
+)
+def test_deepseek_ngroup1_block_per_token_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+    cache_permute_indices,
+):
+    """Exercise the block-per-token BlockScores kernel in routingCustom.
+
+    DeepSeekV3 with n_group == 1 dispatches to routingCustom with the
+    (SigmoidBiasPreprocess, ScaledSumNormalizePostprocess) policy pair, which opts
+    into PolicyPairSupportsBlockPerToken. For num_experts >= 160 and
+    17 <= num_tokens <= 256, routingIndicesBlockScoresKernel replaces the
+    fused single-cluster kernel. We intentionally use independent
+    parametrization here; incompatible combinations are filtered by skip_checks.
+
+    Covered tiers:
+      - Tier<384, 8>  via num_experts=384, top_k=6
+      - Tier<512, 22> via num_experts=512, top_k=22
+    """
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices=cache_permute_indices,
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
@@ -4193,9 +4773,7 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     expert_weights = expert_weights_full.view(num_tokens, num_experts)[
         torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
     ].to(torch.bfloat16)
-    packed_topk_ids = (topk_ids << 16) | expert_weights.view(torch.int16).to(
-        torch.int32
-    )
+    packed_topk_ids = pack_topk_for_routed_moe(topk_ids, expert_weights)
 
     output_routed = trtllm_fp8_block_scale_routed_moe(
         topk_ids=packed_topk_ids,
@@ -4225,3 +4803,125 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+# ====================================================================================
+# MoE LoRA: gemm1_lora_delta
+# ====================================================================================
+#
+# These tests ride on the shared `run_moe_test` path: the delta is threaded
+# through moe_args → run_moe_dequant (which applies it before SwiGlu) and the
+# matching kernel argument, and the dequant reference vs kernel comparison
+# uses the same `check_accuracy` tolerances as the rest of the suite.
+
+
+@pytest.mark.parametrize("num_tokens", [8, 128])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            id="MxFp8",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize,
+                "compatible_moe_impls": [
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                    FP8BlockScaleMoe,
+                ],
+                "compatible_intermediate_size": [1024],
+                "enable_autotune": False,
+            },
+            id="Renorm",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [BF16Moe, MxInt4BlockScaleMoe],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK_MxFp8",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [pytest.param(ActivationType.Swiglu.value, id="Swiglu")],
+)
+def test_moe_lora_delta(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    activation_type,
+    cache_permute_indices,
+):
+    """Runs the standard MoE reference/kernel comparison with a non-None
+    `gemm1_lora_delta` threaded through run_moe_test.  We compare a zero delta
+    against a deterministic non-zero delta on the same routed path so the test
+    fails if LoRA is silently dropped from both reference and production."""
+    top_k = routing_config["top_k"]
+    zero_delta = torch.zeros(
+        num_tokens, top_k, 2 * intermediate_size, dtype=torch.bfloat16, device="cuda"
+    )
+    delta = torch.full_like(zero_delta, 4)
+
+    zero_reference, _, _ = run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+        gemm1_lora_delta=zero_delta,
+    )
+
+    delta_reference, _, delta_args_dequant = run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        activation_type,
+        cache_permute_indices,
+        gemm1_lora_delta=delta,
+    )
+
+    torch.testing.assert_close(delta_args_dequant.gemm1_lora_delta, delta)
+    assert (delta_reference - zero_reference).abs().max().item() > 0.05

@@ -152,7 +152,6 @@ class MLAConfig:
         lse_dtype,
         mma_qk_tiler_mn: Tuple[int, int],
         mma_pv_tiler_mn: Tuple[int, int],
-        split_kv: int,
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
@@ -175,7 +174,7 @@ class MLAConfig:
             return False
         if is_var_split_kv and not is_var_seq:
             return False
-        if H > 128 or (H < 128 and split_kv != 1):
+        if H > 128:
             return False
         if S < 1 or S > 4:
             return False
@@ -197,7 +196,6 @@ class MLAConfig:
         lse_dtype,
         mma_qk_tiler_mn: Tuple[int, int],
         mma_pv_tiler_mn: Tuple[int, int],
-        split_kv: int,
         is_persistent: bool,
         is_var_seq: bool,
         is_var_split_kv: bool,
@@ -220,7 +218,7 @@ class MLAConfig:
             return False
         if is_var_split_kv and not is_var_seq:
             return False
-        if H > 128 or (H < 128 and split_kv != 1):
+        if H > 128:
             return False
         if S <= 0 or S > 4:
             return False

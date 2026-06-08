@@ -83,7 +83,7 @@ class CorrectionRole:
     @cute.jit
     def rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
     ):
@@ -132,7 +132,7 @@ class CorrectionRole:
 
         tTMEM_STOREtO = thr_tmem_store.partition_D(tOtO_i)
 
-        tTMrO = cute.make_fragment(
+        tTMrO = cute.make_rmem_tensor(
             (tTMEM_LOADcO.shape, 128 // corr_tile_size), self.pv_acc_dtype
         )
         for i in range(self.cta_tiler[2] // corr_tile_size):
@@ -159,7 +159,7 @@ class CorrectionRole:
     @cute.jit
     def epilog(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
         m: Float32,
@@ -234,7 +234,7 @@ class CorrectionRole:
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
-            tTMrO = cute.make_fragment(
+            tTMrO = cute.make_rmem_tensor(
                 tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
@@ -257,7 +257,7 @@ class CorrectionRole:
                         rcp_d,
                         scale,
                     )
-            tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
+            tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
             cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
@@ -268,8 +268,8 @@ class CorrectionRole:
     @cute.jit
     def run(
         self,
-        qk_thr_mma: cute.core.ThrMma,
-        pv_thr_mma: cute.core.ThrMma,
+        qk_thr_mma: cute.ThrMma,
+        pv_thr_mma: cute.ThrMma,
         tStS: cute.Tensor,
         tOtO0: cute.Tensor,
         tOtO1: cute.Tensor,
@@ -372,7 +372,7 @@ class CorrectionRole:
                 for _i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                     # wait for vec0 (row_wise current max & previous max)
                     vec0_handle = s0_corr_consumer.wait_and_advance()
-                    tTMEM_LOAD_VECrS = cute.make_fragment(
+                    tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
                         tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                     )
                     cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)
@@ -409,7 +409,7 @@ class CorrectionRole:
 
                 # wait for vec0 (row_wise global sum)
                 vec0_handle = s0_corr_consumer.wait_and_advance()
-                tTMEM_LOAD_VECrS = cute.make_fragment(
+                tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
                     tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                 )
                 cute.copy(tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS)
