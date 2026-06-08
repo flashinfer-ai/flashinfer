@@ -5483,7 +5483,8 @@ def _b12x_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    # b12x backend requires CUDA 13+, 128x4 scale factor layout, and NVFP4 only.
+    # b12x backend requires CUDA 13+ and the 128x4 scale factor layout.
+    # Supports NVFP4 (sf_vec_size=16/E4M3) and MXFP4 (sf_vec_size=32/E8M0).
     if get_cuda_version().major < 13:
         raise ValueError(
             "b12x FP4 GEMM requires CUDA 13 or later. "
@@ -5491,8 +5492,6 @@ def _b12x_gemm_fp4_requirement(
         )
     if use_8x4_sf_layout:
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
-    if not use_nvfp4:
-        raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
     _check_cute_dsl_availability()
     return True
 
@@ -5840,9 +5839,10 @@ def _b12x_gemm_fp4_runner(
             n = b.shape[1]
             real_k = k_packed * 2
 
-            sf_vec_size = 16
+            # NVFP4 -> sf_vec_size=16/E4M3; MXFP4 -> sf_vec_size=32/E8M0.
+            sf_vec_size = 16 if use_nvfp4 else 32
             ab_dtype = cutlass.Float4E2M1FN
-            sf_dtype = cutlass.Float8E4M3FN
+            sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
 
             valid_tactics = []
@@ -5889,8 +5889,9 @@ def _b12x_gemm_fp4_runner(
             n = b.shape[1]
             real_k = k_packed * 2
 
-            sf_vec_size = 16
-            sf_dtype = cutlass.Float8E4M3FN
+            # NVFP4 -> sf_vec_size=16/E4M3; MXFP4 -> sf_vec_size=32/E8M0.
+            sf_vec_size = 16 if use_nvfp4 else 32
+            sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
 
             if tactic is None or tactic == -1:

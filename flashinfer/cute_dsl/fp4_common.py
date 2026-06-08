@@ -2436,3 +2436,119 @@ def relu2_quantize_block_fp4(
     activated = relu2_16(x)
     block_max = max_abs_16(activated)
     return quantize_block_fp4(activated, block_max, global_scale_val)
+
+
+# =============================================================================
+# MXFP4 activation quantizers: 32-element blocks, E8M0 power-of-two
+# block scale, self-scaling (no global scale). Mirror the NVFP4 16-block helpers
+# above; 32 elems -> 16 bytes -> two uint64, and return the E8M0 scale byte.
+# =============================================================================
+
+
+@cute.jit
+def quantize_and_pack_32(
+    y_f32: cute.Tensor, inv_scale: Float32
+) -> Tuple[Uint64, Uint64]:
+    """Quantize 32 float32 values to FP4 and pack into two uint64 (lo, hi)."""
+    q = cute.make_rmem_tensor((32,), Float32)
+    for i in cutlass.range_constexpr(32):
+        q[i] = y_f32[i] * inv_scale
+
+    # 32 FP4 = 16 bytes = two uint64. Each uint64 holds 16 FP4 (two cvt_e2m1x8).
+    lo_a = cvt_e2m1x8_f32(q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7])
+    lo_b = cvt_e2m1x8_f32(q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15])
+    hi_a = cvt_e2m1x8_f32(q[16], q[17], q[18], q[19], q[20], q[21], q[22], q[23])
+    hi_b = cvt_e2m1x8_f32(q[24], q[25], q[26], q[27], q[28], q[29], q[30], q[31])
+    packed_lo = (Uint64(lo_b) << Uint64(32)) | Uint64(lo_a)
+    packed_hi = (Uint64(hi_b) << Uint64(32)) | Uint64(hi_a)
+    return packed_lo, packed_hi
+
+
+@cute.jit
+def quantize_block_mxf4(
+    values: cute.Tensor,
+    max_abs: Float32,
+) -> Tuple[Uint64, Uint64, Uint8]:
+    """Quantize 32 float32 values to packed FP4 (2x uint64) + E8M0 scale byte.
+
+    Self-scaling: block scale is ``2^ceil(log2(max_abs/6))`` as a UE8M0 byte
+    (no global scale). Returns ``(packed_lo, packed_hi, scale_byte)``.
+    """
+    packed_lo = Uint64(0)
+    packed_hi = Uint64(0)
+    scale_byte = Uint8(0)
+    if max_abs > Float32(0.0):
+        # /6 so the block max maps to <= FLOAT4_E2M1_MAX, not overflow.
+        ue8m0 = cvt_f32_to_ue8m0(max_abs / Float32(FLOAT4_E2M1_MAX))
+        scale_byte = Uint8(ue8m0 & Uint32(0xFF))
+        inv_scale = ue8m0_to_output_scale(ue8m0)  # 2^(127 - ue8m0) = 1/scale
+        packed_lo, packed_hi = quantize_and_pack_32(values, inv_scale)
+    return packed_lo, packed_hi, scale_byte
+
+
+@cute.jit
+def quantize_block_mxf4_fast(
+    values: cute.Tensor,
+    max_abs: Float32,
+) -> Tuple[Uint64, Uint64, Uint8]:
+    """Alias of quantize_block_mxf4 (the E8M0 path is already single-pass).
+
+    Kept for call-site symmetry with the NVFP4 quantize_block_fp4_fast.
+    """
+    return quantize_block_mxf4(values, max_abs)
+
+
+@cute.jit
+def max_abs_32(values: cute.Tensor) -> Float32:
+    """Compute the maximum absolute value of 32 float32 values."""
+    result = fabs_f32(values[0])
+    for i in cutlass.range_constexpr(1, 32):
+        result = fmax_f32(result, fabs_f32(values[i]))
+    return result
+
+
+@cute.jit
+def silu_mul_32(
+    gate: cute.Tensor,
+    up: cute.Tensor,
+) -> cute.Tensor:
+    """Fused SiLU(gate) * up for 32 float32 element pairs."""
+    out = cute.make_rmem_tensor((32,), Float32)
+    for i in cutlass.range_constexpr(32):
+        g = gate[i]
+        sigmoid_g = cute.arch.rcp_approx(
+            Float32(1.0) + cute.math.exp(-g, fastmath=False)
+        )
+        out[i] = g * sigmoid_g * up[i]
+    return out
+
+
+@cute.jit
+def silu_mul_quantize_block_mxf4(
+    gate: cute.Tensor,
+    up: cute.Tensor,
+) -> Tuple[Uint64, Uint64, Uint8]:
+    """Fused SiLU(gate)*up + MXFP4 quantize for 32 element pairs (no global scale)."""
+    activated = silu_mul_32(gate, up)
+    block_max = max_abs_32(activated)
+    return quantize_block_mxf4(activated, block_max)
+
+
+@cute.jit
+def relu2_32(x: cute.Tensor) -> cute.Tensor:
+    """Compute ReLU²(x) = max(0, x)² for 32 float32 values."""
+    out = cute.make_rmem_tensor((32,), Float32)
+    for i in cutlass.range_constexpr(32):
+        v = fmax_f32(x[i], Float32(0.0))
+        out[i] = v * v
+    return out
+
+
+@cute.jit
+def relu2_quantize_block_mxf4(
+    x: cute.Tensor,
+) -> Tuple[Uint64, Uint64, Uint8]:
+    """Fused ReLU² + MXFP4 quantize for 32 float32 values (no global scale)."""
+    activated = relu2_32(x)
+    block_max = max_abs_32(activated)
+    return quantize_block_mxf4(activated, block_max)

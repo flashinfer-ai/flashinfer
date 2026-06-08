@@ -39,14 +39,14 @@ def _test_mm_fp4(
             pytest.skip("b12x backend only supports 128x4 SF layout")
         if compute_capability[0] != 12:
             pytest.skip("b12x backend only supports SM120/SM121 GPUs.")
-        if not use_nvfp4:
-            pytest.skip("b12x backend only supports NVFP4 (sf_vec_size=16).")
         if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
             pytest.skip("b12x backend requires CUDA 13+.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl"]:
-        pytest.skip("mx_fp4 is only supported for cudnn, cute-dsl, and auto backends")
+    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl", "b12x"]:
+        pytest.skip(
+            "mx_fp4 is only supported for cudnn, cute-dsl, b12x, and auto backends"
+        )
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
