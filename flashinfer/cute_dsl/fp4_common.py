@@ -377,6 +377,78 @@ def rcp_rn(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def fadd_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 addition."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fsub_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 subtraction."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "sub.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fmul_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 multiplication."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fdiv_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 division."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def fmin_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
     """Compute min of two float32 values using PTX min.f32."""
     return Float32(

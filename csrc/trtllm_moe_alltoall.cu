@@ -26,7 +26,6 @@
 
 #include "flashinfer/utils.cuh"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tvm_ffi_utils.h"
@@ -196,7 +195,6 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
                                               << requiredSize << " bytes but has " << sizePerRank;
 
   tl_throughput::MoeA2ADispatchParams params{};
-  params.one_block_per_token = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken();
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.num_experts_per_rank = static_cast<int>(numExperts / epSize);
@@ -317,7 +315,6 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
       alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
 
   MoeA2ACombineParams params{};
-  params.one_block_per_token = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken();
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);
