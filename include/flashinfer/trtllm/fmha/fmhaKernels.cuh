@@ -525,9 +525,40 @@ class TllmGenFmhaKernel {
       // benefits of a shorter mainloop.
       int const maxNumCtasPerSeqKv =
           (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
+      int tunedMaxNumCtasPerSeqKv = maxNumCtasPerSeqKv;
+      // Mirror TRTLLM-GEN's BF16Q+FP8KV separate-transform cap so the runtime
+      // key selects CGA reduction when the autotuner would use the smaller split.
+      if (isBf16QFp8KvGeneration() &&
+          selectKernelParams.mBf16QFp8KvTransformMode == Bf16QFp8KvTransformMode::SeparateKv &&
+          isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
+          !isGmemReductionWithSeparateKernel(selectKernelParams.mMultiCtasKvMode) &&
+          params.mHeadDimV < 512) {
+        int const clusterDimX = selectKernelParams.mUses2CtaMma ? 2 : 1;
+        int const maxKvSplitsPerCgaCluster = 16 / clusterDimX;
+        if (maxNumCtasPerSeqKv <= numCtasForAllHeadsQ * maxKvSplitsPerCgaCluster) {
+          int const launchedClusters =
+              flashinfer::ceil_div(numCtasX, clusterDimX) * numCtasY * numCtasZ;
+          int const residentSplitBudget =
+              std::max(4, flashinfer::ceil_div(params.mMultiProcessorCount * 13 / 20,
+                                               launchedClusters));
+          int const targetMaxNumCtasPerSeqKv = std::min(
+              maxNumCtasPerSeqKv, std::min(maxKvSplitsPerCgaCluster, residentSplitBudget));
+          if (targetMaxNumCtasPerSeqKv > 1 &&
+              targetMaxNumCtasPerSeqKv < maxNumCtasPerSeqKv) {
+            int const targetTileSizePerCtaKv =
+                isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)
+                    ? flashinfer::ceil_div(params.mAttentionWindowSize,
+                                           targetMaxNumCtasPerSeqKv - 1)
+                    : flashinfer::ceil_div(maxAttentionWindow, targetMaxNumCtasPerSeqKv);
+            if (targetTileSizePerCtaKv <= 1024) {
+              tunedMaxNumCtasPerSeqKv = targetMaxNumCtasPerSeqKv;
+            }
+          }
+        }
+      }
       // Compute numCtasPerSeqKv.
       numCtasPerSeqKv = std::min(
-          maxNumCtasPerSeqKv,
+          tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
