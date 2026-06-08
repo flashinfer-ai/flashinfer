@@ -133,84 +133,95 @@ def gated_delta_rule_decode_pretranspose(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
-    This implements the decode phase of gated delta rule linear attention,
+    Implements the decode phase of gated delta rule linear attention,
     processing one token at a time and updating the recurrent state.
 
-    Args:
-        q (torch.Tensor):
-            Current query of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        k (torch.Tensor):
-            Current key of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        v (torch.Tensor):
-            Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
-        state (Optional[torch.Tensor]):
-            Current state of shape ``[B, HV, V, K]`` (v-major / K-last layout).
-            Float32: legacy kernel (T=1 only). Bfloat16: BF16 state backend
-            (T=1 or MTP for T>1) when K=V=128. Will be updated in-place.
-            Pass ``None`` when using ``initial_state`` / ``initial_state_indices`` instead.
-        A_log (torch.Tensor):
-            Log decay parameter of shape ``[HV]``. Must be float32.
-        a (torch.Tensor):
-            Input-dependent decay of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        dt_bias (torch.Tensor):
-            Decay bias of shape ``[HV]``. Must be bfloat16 or float32.
-        b (torch.Tensor):
-            Update gate (beta) input of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        scale (Optional[float]):
-            Scale factor for queries. If None, defaults to ``1 / sqrt(K)``.
-        output (Optional[torch.Tensor]):
-            Pre-allocated output tensor of shape ``[B, 1, HV, V]``.
-            If None, will be allocated automatically.
-        use_qk_l2norm (bool):
-            Whether to apply L2 normalization to q and k. Default: ``True``.
-        initial_state (Optional[torch.Tensor]):
-            State pool of shape ``[pool_size, HV, V, K]`` (K-last / K-contiguous,
-            same layout as the per-batch ``state`` argument).
-            When provided, the kernel gathers directly from the pool using
-            ``initial_state_indices`` and writes updates back in-place — eliminating
-            the caller-side gather/scatter overhead.
-            Requires bfloat16 state with K=V=128 (bf16 fast path).
-        initial_state_indices (Optional[torch.Tensor]):
-            Per-batch indices of shape ``[B]`` (int32 or int64) mapping each batch
-            entry to its slot in ``initial_state``.  Required when ``initial_state``
-            is provided.
-        output_state_indices (Optional[torch.Tensor]):
-            Per-batch indices of shape ``[B]`` (int32 or int64) specifying where to write the updated state for each batch entry in the pool.
-            Requires ``initial_state`` to be provided.
-            If None, the kernel will write the updated state back to the same slot it read from (i.e., ``initial_state_indices``).
+    Parameters
+    ----------
+    q : torch.Tensor
+        Current query of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+    k : torch.Tensor
+        Current key of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+    v : torch.Tensor
+        Current value of shape ``[B, 1, HV, V]``.  Must be float16/bfloat16.
+    state : torch.Tensor, optional
+        Current state of shape ``[B, HV, V, K]`` (v-major / K-last layout).
+        Float32: legacy kernel (T=1 only).  Bfloat16: BF16 state backend
+        (T=1 or MTP for T>1) when K=V=128.  Updated in-place.  Pass ``None``
+        when using ``initial_state`` / ``initial_state_indices`` instead.
+    A_log : torch.Tensor
+        Log decay parameter of shape ``[HV]``.  Must be float32.
+    a : torch.Tensor
+        Input-dependent decay of shape ``[B, 1, HV]``.  Must be
+        float16/bfloat16.
+    dt_bias : torch.Tensor
+        Decay bias of shape ``[HV]``.  Must be bfloat16 or float32.
+    b : torch.Tensor
+        Update gate (beta) input of shape ``[B, 1, HV]``.  Must be
+        float16/bfloat16.
+    scale : float, optional
+        Scale factor for queries.  If ``None``, defaults to
+        ``1 / sqrt(K)``.
+    output : torch.Tensor, optional
+        Pre-allocated output tensor of shape ``[B, 1, HV, V]``.  Allocated
+        automatically when ``None``.
+    use_qk_l2norm : bool
+        Whether to apply L2 normalization to q and k.  Default: ``True``.
+    initial_state : torch.Tensor, optional
+        State pool of shape ``[pool_size, HV, V, K]`` (K-last /
+        K-contiguous, same layout as the per-batch ``state`` argument).
+        When provided, the kernel gathers directly from the pool using
+        ``initial_state_indices`` and writes updates back in-place,
+        eliminating the caller-side gather/scatter overhead.  Requires
+        bfloat16 state with K=V=128 (bf16 fast path).
+    initial_state_indices : torch.Tensor, optional
+        Per-batch indices of shape ``[B]`` (int32 or int64) mapping each
+        batch entry to its slot in ``initial_state``.  Required when
+        ``initial_state`` is provided.
+    output_state_indices : torch.Tensor, optional
+        Per-batch indices of shape ``[B]`` (int32 or int64) specifying
+        where to write the updated state for each batch entry in the pool.
+        Requires ``initial_state`` to be provided.  If ``None``, the kernel
+        writes the updated state back to the same slot it read from (i.e.
+        ``initial_state_indices``).
 
-            **Padding / inactive sequences**: set the index to ``-1`` for any batch
-            entry that should be treated as padding.  The two backends handle ``-1``
-            differently:
+        **Padding / inactive sequences**: set the index to ``-1`` for any
+        batch entry that should be treated as padding.  The two backends
+        handle ``-1`` differently:
 
-            - **bf16 fast path** (bfloat16 state, K=V=128): ``-1`` is redirected
-              to ``initial_state[0]``, which acts as a sacrificial *null buffer*.
-              The kernel reads from and writes back to slot 0; the output for that
-              batch entry is computed but **undefined** (caller should not use it).
-              The caller must therefore allocate the pool with an extra leading slot
-              (``pool_size = num_real_slots + 1``) and keep real slots at indices
-              ``1..pool_size-1``.
-            - **float32 legacy path** (T=1): ``-1`` entries are skipped entirely —
-              neither the state pool nor the output are touched for that batch entry;
-              the output slot is written as **zero**.
+        - **bf16 fast path** (bfloat16 state, K=V=128): ``-1`` is redirected
+          to ``initial_state[0]``, which acts as a sacrificial *null
+          buffer*.  The kernel reads from and writes back to slot 0; the
+          output for that batch entry is computed but **undefined** (caller
+          should not use it).  The caller must therefore allocate the pool
+          with an extra leading slot (``pool_size = num_real_slots + 1``)
+          and keep real slots at indices ``1..pool_size-1``.
+        - **float32 legacy path** (T=1): ``-1`` entries are skipped
+          entirely; neither the state pool nor the output are touched for
+          that batch entry; the output slot is written as **zero**.
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - output: Output tensor of shape ``[B, 1, HV, V]``
-            - state or initial_state: Updated state (in-place).
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(output, state_or_initial_state)`` where ``output`` has shape
+        ``[B, 1, HV, V]`` and the second element is the updated state
+        (mutated in place).
 
-    Note:
-        - Requires SM90+ (Hopper, Blackwell, etc.)
-        - State is always updated in-place; the pool path writes directly into
-          ``initial_state`` memory (no separate scatter step needed)
-        - State layout is v-major (K-last): [B, HV, V, K]. When state is bfloat16
-          and K=V=128, the BF16 state kernel is used (T=1 or MTP for T>1).
-          The pool+indices path routes through the MTP kernel.
-        - pool+indices (``initial_state``/``initial_state_indices``) supported on
-          both the bf16 fast path (K=V=128) and the float32 legacy path (T=1).
-          Both paths support ``-1`` padding indices (see ``initial_state_indices``
-          above for per-backend semantics).
-        - Legacy path (float32 state, T=1): K and V must be multiples of 4.
+    Notes
+    -----
+    - Requires SM90+ (Hopper, Blackwell, etc.).
+    - State is always updated in-place; the pool path writes directly into
+      ``initial_state`` memory (no separate scatter step needed).
+    - State layout is v-major (K-last): ``[B, HV, V, K]``.  When state is
+      bfloat16 and ``K = V = 128``, the BF16 state kernel is used (T=1 or
+      MTP for T>1); the pool+indices path routes through the MTP kernel.
+    - Pool+indices (``initial_state`` / ``initial_state_indices``) are
+      supported on both the bf16 fast path (K=V=128) and the float32 legacy
+      path (T=1).  Both paths support ``-1`` padding indices (see
+      ``initial_state_indices`` above for per-backend semantics).
+    - Legacy path (float32 state, T=1): ``K`` and ``V`` must each be
+      ``>= 128``, and ``V`` must be a multiple of 8 (the pretranspose tile
+      size ``TILE_V``).
     """
     # Validate input shapes
     B, T, H, K = q.shape
@@ -437,47 +448,56 @@ def gated_delta_rule_decode(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel (K-major layout, no transpose needed).
 
-    This implements the decode phase of gated delta rule linear attention,
-    processing one token at a time and updating the recurrent state.
-    This version uses K-major state layout [B, HV, K, V] which is more natural
-    and doesn't require transposition.
+    Implements the decode phase of gated delta rule linear attention,
+    processing one token at a time and updating the recurrent state.  This
+    variant uses K-major state layout ``[B, HV, K, V]`` (no transposition).
 
-    Args:
-        q (torch.Tensor):
-            Current query of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        k (torch.Tensor):
-            Current key of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        v (torch.Tensor):
-            Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
-        state (torch.Tensor):
-            Current state of shape ``[B, HV, K, V]`` (k-major layout).
-            Must be float32. Will be updated in-place.
-        A_log (torch.Tensor):
-            Log decay parameter of shape ``[HV]``. Must be float32.
-        a (torch.Tensor):
-            Input-dependent decay of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        dt_bias (torch.Tensor):
-            Decay bias of shape ``[HV]``. Must be bfloat16 or float32.
-        b (torch.Tensor):
-            Update gate (beta) input of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        scale (Optional[float]):
-            Scale factor for queries. If None, defaults to ``1 / sqrt(K)``.
-        output (Optional[torch.Tensor]):
-            Pre-allocated output tensor of shape ``[B, 1, HV, V]``.
-            If None, will be allocated automatically.
-        use_qk_l2norm (bool):
-            Whether to apply L2 normalization to q and k. Default: ``True``.
+    Parameters
+    ----------
+    q : torch.Tensor
+        Current query of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+    k : torch.Tensor
+        Current key of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+    v : torch.Tensor
+        Current value of shape ``[B, 1, HV, V]``.  Must be float16/bfloat16.
+    state : torch.Tensor
+        Current state of shape ``[B, HV, K, V]`` (k-major layout).  Must be
+        float32.  Updated in-place.
+    A_log : torch.Tensor
+        Log decay parameter of shape ``[HV]``.  Must be float32.
+    a : torch.Tensor
+        Input-dependent decay of shape ``[B, 1, HV]``.  Must be
+        float16/bfloat16.
+    dt_bias : torch.Tensor
+        Decay bias of shape ``[HV]``.  Must be bfloat16 or float32.
+    b : torch.Tensor
+        Update gate (beta) input of shape ``[B, 1, HV]``.  Must be
+        float16/bfloat16.
+    scale : float, optional
+        Scale factor for queries.  If ``None``, defaults to ``1 /
+        sqrt(K)``.
+    output : torch.Tensor, optional
+        Pre-allocated output tensor of shape ``[B, 1, HV, V]``.  Allocated
+        automatically when ``None``.
+    use_qk_l2norm : bool
+        Whether to apply L2 normalization to q and k.  Default: ``True``.
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - output: Output tensor of shape ``[B, 1, HV, V]``
-            - state: Updated state tensor of shape ``[B, HV, K, V]``
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(output, state)`` where ``output`` has shape ``[B, 1, HV, V]``
+        and ``state`` has shape ``[B, HV, K, V]`` (updated in-place).
 
-    Note:
-        - Requires SM90 (Hopper) architecture
-        - State is updated in-place
-        - K and V must be multiples of 4 for vectorized loads
-        - State layout is k-major: [B, HV, K, V] (no transpose needed)
+    Notes
+    -----
+    - Requires SM90 (Hopper) architecture.
+    - State is updated in-place.
+    - ``K`` and ``V`` must each be ``>= 128``.  ``V`` must be a multiple
+      of 32 (``TILE_V_NT``): the launcher conservatively asserts the
+      large-batch tile size to cover both code paths, even though the
+      small-batch kernel could in principle accept ``V % 16 == 0``
+      (``TILE_V_SMALL_NT``).
+    - State layout is k-major: ``[B, HV, K, V]`` (no transpose needed).
     """
     # Validate input shapes
     B, T, H, K = q.shape
@@ -579,61 +599,70 @@ def gated_delta_rule_mtp(
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Gated Delta Rule MTP Kernel (Multiple Token Processing).
+    r"""Gated Delta Rule MTP kernel (Multiple Token Processing).
 
-    This function processes multiple tokens (T > 1) in sequence, typically used for
-    speculative decoding verification. It supports intermediate state caching for
-    potential rollback scenarios.
+    Processes multiple tokens (``T > 1``) per call, typically used for
+    speculative decoding verification.  Supports intermediate state caching
+    for potential rollback scenarios.
 
-    Args:
-        q (torch.Tensor):
-            Query tensor of shape ``[B, T, H, K]``.
-        k (torch.Tensor):
-            Key tensor of shape ``[B, T, H, K]``.
-        v (torch.Tensor):
-            Value tensor of shape ``[B, T, HV, V]``.
-        initial_state (torch.Tensor):
-            Initial state tensor of shape ``[pool_size, HV, V, K]`` (K-last layout).
-        initial_state_indices (torch.Tensor):
-            Indices mapping each batch to its initial state, shape ``[B]``.
-        A_log (torch.Tensor):
-            Log decay parameter of shape ``[HV]``.
-        a (torch.Tensor):
-            Input-dependent decay of shape ``[B, T, HV]``.
-        dt_bias (torch.Tensor):
-            Decay bias of shape ``[HV]``.
-        b (torch.Tensor):
-            Update gate input of shape ``[B, T, HV]``.
-        scale (Optional[float]):
-            Scaling factor for queries. If None, uses ``1/sqrt(K)``.
-        output (Optional[torch.Tensor]):
-            Pre-allocated output tensor of shape ``[B, T, HV, V]``.
-        intermediate_states_buffer (Optional[torch.Tensor]):
-            Buffer for caching intermediate states, shape ``[pool_size, T, HV, V, K]``.
-            If None, intermediate states are not cached.
-        disable_state_update (Optional[bool]):
-            If True, the initial state is not updated. Currently defaults to ``True``.
-            Please pass this argument explicitly — the default will change to ``False``
-            in FlashInfer 0.7.0.
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape ``[B, T, H, K]``.
+    k : torch.Tensor
+        Key tensor of shape ``[B, T, H, K]``.
+    v : torch.Tensor
+        Value tensor of shape ``[B, T, HV, V]``.
+    initial_state : torch.Tensor
+        Initial state tensor of shape ``[pool_size, HV, V, K]`` (K-last
+        layout). **Must be float32** — this standalone MTP entry point
+        does not support the BF16 fast path; for a BF16 K=V=128 state
+        pool, call :func:`gated_delta_rule_decode_pretranspose` instead
+        (which dispatches into the BF16 MTP kernel when ``T > 1``).
+    initial_state_indices : torch.Tensor
+        Indices mapping each batch to its initial state, shape ``[B]``.
+    A_log : torch.Tensor
+        Log decay parameter of shape ``[HV]``.
+    a : torch.Tensor
+        Input-dependent decay of shape ``[B, T, HV]``.
+    dt_bias : torch.Tensor
+        Decay bias of shape ``[HV]``.
+    b : torch.Tensor
+        Update gate input of shape ``[B, T, HV]``.
+    scale : float, optional
+        Scaling factor for queries.  If ``None``, uses ``1 / sqrt(K)``.
+    output : torch.Tensor, optional
+        Pre-allocated output tensor of shape ``[B, T, HV, V]``.
+    intermediate_states_buffer : torch.Tensor, optional
+        Buffer for caching intermediate states, shape ``[pool_size, T, HV,
+        V, K]``.  When ``None``, intermediate states are not cached.
+    disable_state_update : bool, optional
+        If ``True``, the initial state is not updated.  Currently defaults
+        to ``True``; pass this argument explicitly to silence the
+        deprecation warning - the default will change to ``False`` in
+        FlashInfer 0.7.0.
 
-            .. deprecated::
-                The implicit default of ``True`` is deprecated and will change to
-                ``False`` in version 0.7.0. Pass ``disable_state_update=True`` or
-                ``disable_state_update=False`` explicitly to silence the warning.
-        use_qk_l2norm (bool):
-            Whether to apply L2 normalization to q and k. Default: ``True``.
+        .. deprecated::
+            The implicit default of ``True`` is deprecated and will change
+            to ``False`` in version 0.7.0.  Pass
+            ``disable_state_update=True`` or ``disable_state_update=False``
+            explicitly to silence the warning.
+    use_qk_l2norm : bool
+        Whether to apply L2 normalization to q and k.  Default: ``True``.
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - output: Output tensor of shape ``[B, T, HV, V]``
-            - initial_state: Updated state tensor (unchanged if disable_state_update=True)
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(output, initial_state)`` where ``output`` has shape
+        ``[B, T, HV, V]`` and ``initial_state`` is the updated state
+        (unchanged when ``disable_state_update=True``).
 
-    Note:
-        - Requires SM90 (Hopper) architecture
-        - Supports T > 1 (multiple token processing)
-        - State layout is K-last: [pool_size, HV, V, K]
-        - Optimized for speculative decoding verification scenarios
+    Notes
+    -----
+    - Requires SM90 (Hopper) architecture.
+    - Supports ``T > 1`` (multiple token processing).
+    - State layout is K-last: ``[pool_size, HV, V, K]``.
+    - Optimized for speculative decoding verification scenarios.
     """
     # Handle deprecation of disable_state_update default value
     if disable_state_update is None:
