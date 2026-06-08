@@ -137,9 +137,19 @@ class TllmGenFmhaKernel {
         if (mKernelMetaMap.find(hash) != mKernelMetaMap.end()) {
           // The kernelMeta of the existing kernel.
           auto const& existingKernelMeta = mKernelMeta[mKernelMetaMap.at(hash)];
-          // Some generation cubins are exported twice with equivalent Dense/Causal naming but the
-          // same metadata key. Runtime selection cannot distinguish them, so keep the first entry.
+          // Some generation cubins are exported twice with the same metadata key. Different cubin
+          // names are equivalent Dense/Causal aliases; keep the first entry. Same-name duplicates
+          // collide on the published artifact path, so use the later metadata entry that matches
+          // the file left in the artifact manifest.
           if (existingKernelMeta.mSM == kernelMeta.mSM) {
+            if (std::strcmp(existingKernelMeta.mFuncName, kernelMeta.mFuncName) == 0 &&
+                std::strcmp(existingKernelMeta.sha256, kernelMeta.sha256) != 0) {
+              mKernelMetaMap[hash] = i;
+              IKL_LOG_DEBUG(
+                  "Replacing duplicate tllmgen attention kernel metadata for shared cubin %s",
+                  kernelMeta.mFuncName);
+              continue;
+            }
             IKL_LOG_DEBUG(
                 "Skipping duplicate tllmgen attention kernel %s for key already held by "
                 "%s",
@@ -175,6 +185,17 @@ class TllmGenFmhaKernel {
       return static_cast<int>(Bf16QFp8KvTransformMode::SeparateKv);
     }
     return static_cast<int>(Bf16QFp8KvTransformMode::Full);
+  }
+
+  inline bool isBf16QFp8KvGeneration() const {
+    return mDtypeQ == DATA_TYPE_BF16 && mDtypeK == DATA_TYPE_E4M3 && mDtypeV == DATA_TYPE_E4M3 &&
+           mDtypeOut == DATA_TYPE_BF16;
+  }
+
+  inline bool supportsGqaGroupingTokensHeadsQ(SelectKernelParams const& selectKernelParams) const {
+    return mDtypeQ == mDtypeK ||
+           (isBf16QFp8KvGeneration() &&
+            selectKernelParams.mBf16QFp8KvTransformMode != Bf16QFp8KvTransformMode::Full);
   }
 
   inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler,
@@ -749,6 +770,10 @@ class TllmGenFmhaKernel {
         {8, 1.0}     // Cost factor when tileSizeQ = 8
     };
 
+    bool const isBf16QFp8KvFullTransform =
+        isBf16QFp8KvGeneration() &&
+        selectKernelParams.mBf16QFp8KvTransformMode == Bf16QFp8KvTransformMode::SeparateKv;
+
     // Define the per-tile reduction cost model for different tileSizeQ choices.
     std::unordered_map<int, float> kernelReductionCost = {
         {128, 1.32},  // Reduction cost factor when tileSizeQ = 128
@@ -758,6 +783,9 @@ class TllmGenFmhaKernel {
         {8, 1.0}      // Reduction cost factor when tileSizeQ = 8
     };
 
+    // Full-transform kernels pay conversion work in the KV mainloop, so bias the model toward
+    // keeping enough KV parallelism without changing the reduction model.
+    float const kernelMainloopCostFactor = isBf16QFp8KvFullTransform ? 2.0f : 1.0f;
     // The reduction cost emulated as a sequence length factor.
     float const kernelReductionSeqLenFactor = 128.0f;
 
@@ -818,9 +846,10 @@ class TllmGenFmhaKernel {
           kernelMeta.mStepKv;
 
       // Compute the modeling kernel time = mainloop cost + reduction cost.
-      float modelingKernelTime = kernelMainloopCost.at(tileSizeQ) * seqLenPerCtaKv +
-                                 kernelReductionCost.at(tileSizeQ) * kernelReductionSeqLenFactor *
-                                     ctaLaunchParams.mMaxNumCtasKv;
+      float modelingKernelTime =
+          kernelMainloopCostFactor * kernelMainloopCost.at(tileSizeQ) * seqLenPerCtaKv +
+          kernelReductionCost.at(tileSizeQ) * kernelReductionSeqLenFactor *
+              ctaLaunchParams.mMaxNumCtasKv;
 
       // Compute the total number of CTAs.
       int32_t numCtas =
@@ -855,8 +884,9 @@ class TllmGenFmhaKernel {
     // The tile size for Q.
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
-    // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-    if (mDtypeQ != mDtypeK || mDtypeQ != mDtypeV) {
+    // Generic mixed precision kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
+    // transform paths present BF16 K to BMM1, so they can use the grouped-token cubins.
+    if (!supportsGqaGroupingTokensHeadsQ(selectKernelParams)) {
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       return;
