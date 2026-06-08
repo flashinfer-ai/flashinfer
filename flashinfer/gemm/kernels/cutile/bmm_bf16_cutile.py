@@ -48,9 +48,36 @@ import torch
 from cuda.tile.tune import exhaustive_search
 
 
-# Module-level tune cache. Key includes (B, M, N, K, transpose_a, transpose_b,
-# a_dtype, device) — output shape and types determine kernel specialization.
-_BMM_BF16_TUNE_CACHE: dict = {}
+def make_bmm_bf16_tune_cache() -> dict:
+    """Create a fresh tune cache for :func:`bmm_bf16_cutile`.
+
+    The cache maps ``(B, M, N, K, transpose_a, transpose_b, dtype, device)``
+    shape tuples to the best cuTile tile config found by exhaustive search.
+    Pass the same dict across multiple calls to avoid re-tuning shapes already
+    seen — the first call for a new shape runs exhaustive search (typically a
+    few seconds); subsequent calls return immediately from the cache.
+
+    Example::
+
+        cache = make_bmm_bf16_tune_cache()
+
+        # First call — runs exhaustive_search for this (B, M, N, K) shape.
+        out1 = bmm_bf16_cutile(A, B, out, tune_cache=cache)
+
+        # Second call at the same shape — hits cache, near-zero overhead.
+        out2 = bmm_bf16_cutile(A, B, out, tune_cache=cache)
+
+    Leave *tune_cache* unset (or ``None``) to use the module-level default
+    cache, which persists for the lifetime of the process.
+    """
+    return {}
+
+
+# Module-level default tune cache.  Key: (B, M, N, K, transpose_a,
+# transpose_b, a_dtype, device) — output shape and types determine kernel
+# specialization.  Use :func:`make_bmm_bf16_tune_cache` to create an
+# independent cache (e.g. in tests or multi-tenant serving scenarios).
+_BMM_BF16_TUNE_CACHE: dict = make_bmm_bf16_tune_cache()
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -232,8 +259,15 @@ def _bmm_bf16_autotune_and_launch(
     K,
     transpose_a_int,
     transpose_b_int,
+    tune_cache: dict | None = None,
 ):
-    """Launch BMM kernel with exhaustive_search autotuning."""
+    """Launch BMM kernel with exhaustive_search autotuning.
+
+    *tune_cache* is the dict to read/write tuned configs.  ``None`` falls
+    back to the module-level :data:`_BMM_BF16_TUNE_CACHE`.
+    """
+    if tune_cache is None:
+        tune_cache = _BMM_BF16_TUNE_CACHE
     NUM_SMS = torch.cuda.get_device_properties(a_flat.device).multi_processor_count
     # Include ``c_flat.dtype`` because the kernel epilogue's store dtype is
     # ``c.dtype`` — different output dtypes produce different specialized kernels.
@@ -249,7 +283,7 @@ def _bmm_bf16_autotune_and_launch(
         str(a_flat.device),
     )
 
-    if cache_key not in _BMM_BF16_TUNE_CACHE:
+    if cache_key not in tune_cache:
         configs = list(_bmm_bf16_autotune_configs(a_flat.device))
 
         # Pre-allocate a single tuning output buffer reused across all trials —
@@ -317,12 +351,12 @@ def _bmm_bf16_autotune_and_launch(
             # exhaustive_search's nominal best so we still launch something.
             best_cfg = result.best.config
 
-        _BMM_BF16_TUNE_CACHE[cache_key] = (
+        tune_cache[cache_key] = (
             best_cfg,
             _bmm_bf16_kernel_cutile.replace_hints(**hints_fn(best_cfg)),
         )
 
-    best_cfg, tuned_kernel = _BMM_BF16_TUNE_CACHE[cache_key]
+    best_cfg, tuned_kernel = tune_cache[cache_key]
     BM = best_cfg.BLOCK_M
     BN = best_cfg.BLOCK_N
     num_pid_m = _cdiv(M, BM)
@@ -356,6 +390,7 @@ def bmm_bf16_cutile(
     A: torch.Tensor,  # (B, M, K) bf16, row-major
     B: torch.Tensor,  # (B, K, N) bf16, column-major (caller's view)
     out: torch.Tensor,  # (B, M, N) bf16, row-major
+    tune_cache: dict | None = None,
 ) -> torch.Tensor:
     """BF16 batched matrix multiplication via cuTile.
 
@@ -444,5 +479,6 @@ def bmm_bf16_cutile(
         K,
         transpose_a_int=0,
         transpose_b_int=1,
+        tune_cache=tune_cache,
     )
     return out
