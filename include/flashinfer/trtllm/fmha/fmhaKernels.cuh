@@ -526,8 +526,8 @@ class TllmGenFmhaKernel {
       int const maxNumCtasPerSeqKv =
           (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
       int tunedMaxNumCtasPerSeqKv = maxNumCtasPerSeqKv;
-      // Mirror TRTLLM-GEN's BF16Q+FP8KV separate-transform cap so the runtime
-      // key selects CGA reduction when the autotuner would use the smaller split.
+      // Cap BF16Q+FP8KV separate-transform splits so the runtime key selects
+      // CGA reduction when the smaller split is expected.
       if (isBf16QFp8KvGeneration() &&
           selectKernelParams.mBf16QFp8KvTransformMode == Bf16QFp8KvTransformMode::SeparateKv &&
           isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
