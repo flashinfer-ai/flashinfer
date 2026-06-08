@@ -167,17 +167,31 @@ def selective_state_update(
         Sentinel value for padded entries in state_batch_indices
     state_scale : Optional[torch.Tensor]
         Optional float32 scale tensor with shape (state_cache_size, nheads, dim)
-        for int16 state quantization with block scaling
+        for int16 state quantization with block scaling. Listed in the custom
+        op's ``mutates_args``: when ``state`` is quantized (int16), the kernel
+        writes the new per-block scales here in place — the caller dequantizes
+        ``state`` against this tensor on read-back (mirrors the
+        ``intermediate_state_scales`` contract below).
     out : Optional[torch.Tensor]
         Optional output tensor (same shape as x)
     disable_state_update : bool
         If True, skip updating the state tensor (useful for speculative decoding verification)
     intermediate_states_buffer : Optional[torch.Tensor]
         Optional buffer for caching intermediate states during speculative decoding
-        with shape (batch, cache_steps, nheads, dim, dstate)
+        with shape (batch, cache_steps, nheads, dim, dstate). Also listed in
+        ``mutates_args`` — the kernel writes intermediate states into it
+        in place.
     intermediate_state_indices : Optional[torch.Tensor]
         Optional indices mapping batch elements to intermediate state buffer positions
         with shape (batch,)
+    intermediate_state_scales : Optional[torch.Tensor]
+        Optional per-block float32 scale tensor matching ``intermediate_states_buffer``.
+        When provided alongside an int16 ``intermediate_states_buffer``, the kernel
+        writes the computed scales into this tensor (it is listed in the custom
+        op's ``mutates_args``), and the caller is responsible for *dequantizing*
+        the intermediate states using these scales when reading them back.
+        Mirrors the ``state_scale`` layout but for the speculative-decoding
+        intermediate buffer.
     rand_seed : Optional[torch.Tensor]
         Optional single-element int64 CUDA tensor for stochastic rounding seed.
     philox_rounds : int
@@ -186,8 +200,13 @@ def selective_state_update(
         Number of steps/tokens to cache for speculative decoding.
         For varlen mode (cu_seqlens provided), this specifies max_seqlen.
     cu_seqlens : Optional[torch.Tensor]
-        Cumulative sequence lengths with shape (N + 1,).
-        When provided, inputs are in varlen format (tokens flattened into batch dim).
+        Cumulative sequence lengths with shape (N + 1,), integer dtype
+        (the JIT specializes on the actual dtype, so int32 or int64 is fine;
+        int32 is the default when omitted). When provided, inputs are in
+        packed-token varlen format: ``x`` / ``dt`` are 3-D
+        ``(total_tokens, nheads, dim)``, ``B`` / ``C`` are 3-D
+        ``(total_tokens, ngroups, dstate)``, with sequence boundaries given
+        by ``cu_seqlens``.
     num_accepted_tokens : Optional[torch.Tensor]
         Number of accepted tokens per sequence with shape (N,).
         Determines which state to read as initial state for each sequence.
