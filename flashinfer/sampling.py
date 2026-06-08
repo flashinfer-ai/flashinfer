@@ -881,7 +881,7 @@ def sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for category sampling from probabilities.
 
     Parameters
@@ -921,11 +921,19 @@ def sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution.
+        Defaults to ``False``.
 
     Returns
     -------
-    samples: torch.Tensor
-        Sampled categories, shape (batch_size,).
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If ``return_valid`` is ``False`` (default), a 1-D ``samples``
+        tensor of shape ``(batch_size,)``.  If ``return_valid`` is
+        ``True``, ``(samples, valid)`` where ``valid`` is a boolean
+        tensor of shape ``(batch_size,)`` indicating which rows had a
+        valid distribution.
 
     Examples
     --------
@@ -975,7 +983,7 @@ def top_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -1024,11 +1032,19 @@ def top_p_sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution
+        after the renormalization step.  Defaults to ``False``.
 
     Returns
     -------
-    samples: torch.Tensor
-        Sampled categories, shape ``(batch_size,)``.
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If ``return_valid`` is ``False`` (default), a 1-D ``samples``
+        tensor of shape ``(batch_size,)``.  If ``return_valid`` is
+        ``True``, ``(samples, valid)`` where ``valid`` is a boolean
+        tensor of shape ``(batch_size,)`` indicating which rows had a
+        valid distribution after renormalization.
 
     Examples
     --------
@@ -1087,7 +1103,7 @@ def top_k_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k sampling from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -1136,11 +1152,19 @@ def top_k_sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution
+        after the renormalization step.  Defaults to ``False``.
 
     Returns
     -------
-    samples: torch.Tensor
-        Sampled categories, shape ``(batch_size,)``.
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If ``return_valid`` is ``False`` (default), a 1-D ``samples``
+        tensor of shape ``(batch_size,)``.  If ``return_valid`` is
+        ``True``, ``(samples, valid)`` where ``valid`` is a boolean
+        tensor of shape ``(batch_size,)`` indicating which rows had a
+        valid distribution after renormalization.
 
     Examples
     --------
@@ -1199,7 +1223,7 @@ def min_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -1249,11 +1273,19 @@ def min_p_sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution
+        after the renormalization step.  Defaults to ``False``.
 
     Returns
     -------
-    samples: torch.Tensor
-        Sampled categories, shape ``(batch_size,)``.
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If ``return_valid`` is ``False`` (default), a 1-D ``samples``
+        tensor of shape ``(batch_size,)``.  If ``return_valid`` is
+        ``True``, ``(samples, valid)`` where ``valid`` is a boolean
+        tensor of shape ``(batch_size,)`` indicating which rows had a
+        valid distribution after renormalization.
 
     Examples
     --------
@@ -1455,7 +1487,7 @@ def top_k_top_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -1513,11 +1545,19 @@ def top_k_top_p_sampling_from_probs(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    return_valid : bool
+        When ``True``, the kernel returns an additional boolean mask
+        indicating which rows had a valid (non-degenerate) distribution
+        after the renormalization step.  Defaults to ``False``.
 
     Returns
     -------
-    samples: torch.Tensor
-        Sampled categories, shape ``(batch_size,)``.
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If ``return_valid`` is ``False`` (default), a 1-D ``samples``
+        tensor of shape ``(batch_size,)``.  If ``return_valid`` is
+        ``True``, ``(samples, valid)`` where ``valid`` is a boolean
+        tensor of shape ``(batch_size,)`` indicating which rows had a
+        valid distribution after renormalization.
 
     Examples
     --------

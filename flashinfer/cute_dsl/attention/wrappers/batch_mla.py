@@ -373,6 +373,15 @@ class BatchMLADecodeCuteDSLWrapper:
 
     @flashinfer_api
     def __init__(self, workspace_buffer: torch.Tensor) -> None:
+        r"""Bind the wrapper to a user-provided workspace buffer.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            Pre-allocated workspace buffer on the target CUDA device.  Must have
+            dtype ``torch.int8``; the size determines the maximum batch this
+            wrapper can handle without re-allocation.
+        """
         assert workspace_buffer.dtype == torch.int8, (
             f"workspace_buffer must be torch.int8, got {workspace_buffer.dtype}"
         )

@@ -77,9 +77,6 @@ struct CombineKernelPointers {
 
 // Dispatch phase parameters
 struct MoeA2ADispatchParams {
-  bool one_block_per_token;  // True: one block per token, False: one warp per token
-
-  // Threading policy
   // EP configuration
   int ep_size;               // Number of EP ranks
   int ep_rank;               // Current EP rank
@@ -138,8 +135,6 @@ enum class MoeA2ACombineSwizzleSFMode : uint32_t {
 
 // Combine phase parameters
 struct MoeA2ACombineParams {
-  bool one_block_per_token;  // True: one block per token, False: one warp per token
-
   // EP configuration
   int ep_size;  // Number of EP ranks
   int ep_rank;  // Current EP rank

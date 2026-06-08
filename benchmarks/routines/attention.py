@@ -1146,7 +1146,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print(f"[VVERBOSE] {kv_last_page_len.shape = }")
         print(f"[VVERBOSE] {scale = }")
 
-    # Helper function to convert to FP8 (matches test_trtllm_gen_attention.py approach)
+    # Helper function to convert to FP8 (matches test_trtllm_gen_attention_decode.py approach)
     def to_float8(x, dtype=torch.float8_e4m3fn):
         finfo = torch.finfo(dtype)
         min_val, max_val = x.aminmax()

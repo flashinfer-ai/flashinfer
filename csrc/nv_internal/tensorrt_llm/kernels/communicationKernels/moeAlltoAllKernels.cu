@@ -120,14 +120,6 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
     }                                                                   \
   }
 
-#define SWITCH_POLICY(one_block_per_token, POLICY, ...) \
-  if (one_block_per_token) {                            \
-    using POLICY = BlockPolicy;                         \
-    __VA_ARGS__                                         \
-  } else {                                              \
-    using POLICY = WarpPolicy;                          \
-    __VA_ARGS__                                         \
-  }
 
 // Quantized combine currently only supports FP16/BF16 inputs.
 #define SWITCH_QUANT_MODE(dtype, quant_mode, QUANT_MODE, ...)                          \
@@ -206,59 +198,38 @@ __device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank) {
 // Helper Functions for Vectorized Memory Operations
 // ============================================================================
 
-struct WarpPolicy {
-  __device__ static int stride() { return warpSize; }
-
-  __device__ static int offset() { return (threadIdx.x % warpSize); }
-
-  __device__ static int token_idx() { return (blockIdx.x * blockDim.x + threadIdx.x) / warpSize; }
-
-  __device__ static void sync() { __syncwarp(); }
-};
-
-struct BlockPolicy {
-  __device__ static int stride() { return blockDim.x; }
-
-  __device__ static int offset() { return threadIdx.x; }
-
-  __device__ static int token_idx() { return blockIdx.x; }
-
-  __device__ static void sync() { __syncthreads(); }
-};
-
-template <int VEC_SIZE, typename ThreadingPolicy>
+template <int VEC_SIZE>
 __device__ void vectorized_copy_impl(void* dst, void const* src, int size) {
   using flashinfer::vec_t;
 
   uint8_t* dst_ptr = static_cast<uint8_t*>(dst);
   uint8_t const* src_ptr = static_cast<uint8_t const*>(src);
 
-  int const stride = ThreadingPolicy::stride() * VEC_SIZE;
+  int const stride = blockDim.x * VEC_SIZE;
 
-  for (int offset = ThreadingPolicy::offset() * VEC_SIZE; offset < size; offset += stride) {
+  for (int offset = threadIdx.x * VEC_SIZE; offset < size; offset += stride) {
     vec_t<uint8_t, VEC_SIZE> v;
     v.load(src_ptr + offset);
     v.store(dst_ptr + offset);
   }
 }
 
-template <typename ThreadingPolicy>
 __device__ void vectorized_copy(void* dst, void const* src, int size) {
   if (size % 16 == 0) {
-    vectorized_copy_impl<16, ThreadingPolicy>(dst, src, size);
+    vectorized_copy_impl<16>(dst, src, size);
   } else if (size % 8 == 0) {
-    vectorized_copy_impl<8, ThreadingPolicy>(dst, src, size);
+    vectorized_copy_impl<8>(dst, src, size);
   } else if (size % 4 == 0) {
-    vectorized_copy_impl<4, ThreadingPolicy>(dst, src, size);
+    vectorized_copy_impl<4>(dst, src, size);
   } else if (size % 2 == 0) {
-    vectorized_copy_impl<2, ThreadingPolicy>(dst, src, size);
+    vectorized_copy_impl<2>(dst, src, size);
   } else {
-    vectorized_copy_impl<1, ThreadingPolicy>(dst, src, size);
+    vectorized_copy_impl<1>(dst, src, size);
   }
 }
 
 // Vectorized dispatch: load one vec from source and write to up to TOP_K destinations
-template <int VEC_SIZE, int TOP_K, typename ThreadingPolicy>
+template <int VEC_SIZE, int TOP_K>
 __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
                                          int max_tokens_per_rank, int payload_idx,
                                          DispatchKernelPointers const& ptrs,
@@ -285,9 +256,8 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
   }
 
   // TODO: process all payloads. index could be reused.
-  int const stride = ThreadingPolicy::stride() * VEC_SIZE;
-  for (int offset = ThreadingPolicy::offset() * VEC_SIZE; offset < bytes_per_token;
-       offset += stride) {
+  int const stride = blockDim.x * VEC_SIZE;
+  for (int offset = threadIdx.x * VEC_SIZE; offset < bytes_per_token; offset += stride) {
     vec_t<uint8_t, VEC_SIZE> v;
     v.load(src_ptr + offset);
 
@@ -302,31 +272,26 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
   }
 }
 
-template <int TOP_K, typename ThreadingPolicy>
+template <int TOP_K>
 __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
                                     int max_tokens_per_rank, int payload_idx,
                                     DispatchKernelPointers const& ptrs,
                                     int const* topk_target_ranks, int const* topk_send_indices) {
   if (bytes_per_token % 16 == 0) {
-    vectorized_dispatch_impl<16, TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                         max_tokens_per_rank, payload_idx, ptrs,
-                                                         topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<16, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices);
   } else if (bytes_per_token % 8 == 0) {
-    vectorized_dispatch_impl<8, TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                        max_tokens_per_rank, payload_idx, ptrs,
-                                                        topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<8, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
   } else if (bytes_per_token % 4 == 0) {
-    vectorized_dispatch_impl<4, TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                        max_tokens_per_rank, payload_idx, ptrs,
-                                                        topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<4, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
   } else if (bytes_per_token % 2 == 0) {
-    vectorized_dispatch_impl<2, TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                        max_tokens_per_rank, payload_idx, ptrs,
-                                                        topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<2, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
   } else {
-    vectorized_dispatch_impl<1, TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                        max_tokens_per_rank, payload_idx, ptrs,
-                                                        topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<1, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
   }
 }
 
@@ -353,15 +318,15 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 // - Better GPU utilization and reduced synchronization overhead
 // ============================================================================
 
-template <typename ThreadingPolicy, int TOP_K>
+template <int TOP_K>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank) {
-  int thread_idx = ThreadingPolicy::offset();
-  int local_token_idx = ThreadingPolicy::token_idx();
+  int thread_idx = threadIdx.x;
+  int local_token_idx = blockIdx.x;
 
   if (local_num_tokens == 0) {
     // Special case: If local_num_tokens == 0,
@@ -374,17 +339,8 @@ __global__ void moeA2ADispatchKernel(
 
     // Prepare per-policy shared-memory tiles for this token
     extern __shared__ int smem[];
-    int* smem_topk_target_ranks;
-    int* smem_topk_send_indices;
-    int warps_per_block = blockDim.x / warpSize;
-    if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value) {
-      int lane_id = threadIdx.x / warpSize;
-      smem_topk_target_ranks = smem + lane_id * TOP_K;
-      smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
-    } else {
-      smem_topk_target_ranks = smem;
-      smem_topk_send_indices = smem + TOP_K;
-    }
+    int* smem_topk_target_ranks = smem;
+    int* smem_topk_send_indices = smem + TOP_K;
 
     uint64_t already_copied = 0;
     for (int k = 0; k < TOP_K; k++) {
@@ -417,7 +373,7 @@ __global__ void moeA2ADispatchKernel(
       already_copied |= 1ULL << target_rank;
     }
     // Sync before dispatching data
-    ThreadingPolicy::sync();
+    __syncthreads();
 
     // Read staged routing once into registers per thread
     int topk_target_ranks[TOP_K];
@@ -434,12 +390,11 @@ __global__ void moeA2ADispatchKernel(
       int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
       uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-      vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                  max_tokens_per_rank, payload_idx, ptrs,
-                                                  topk_target_ranks, topk_send_indices);
+      vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                 payload_idx, ptrs, topk_target_ranks, topk_send_indices);
     }
 
-    ThreadingPolicy::sync();
+    __syncthreads();
   }
 
   bool is_first_warp = threadIdx.x / warpSize == 0;
@@ -563,39 +518,20 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
 
   int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
-  constexpr int kWarpSize = 32;
-  int const kWarpsPerBlock = kBlockSize / kWarpSize;
 
-  // Configure kernel launch
-  if (params.one_block_per_token) {
-    int grid_size = params.local_num_tokens;
-    // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
-    // synchronization.
-    if (grid_size == 0) {
-      grid_size = 1;
-    }
-    int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-    SWITCH_TOP_K(params.top_k, TOP_K,
-                 moeA2ADispatchKernel<BlockPolicy, TOP_K>
-                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
-  } else {
-    int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
-    // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
-    // synchronization.
-    if (grid_size == 0) {
-      grid_size = 1;
-    }
-    int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int)sizeof(int);
-    SWITCH_TOP_K(params.top_k, TOP_K,
-                 moeA2ADispatchKernel<WarpPolicy, TOP_K>
-                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+  // Configure kernel launch: one block per token
+  int grid_size = params.local_num_tokens;
+  // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
+  // synchronization.
+  if (grid_size == 0) {
+    grid_size = 1;
   }
+  int shared_bytes = 2 * params.top_k * (int)sizeof(int);
+  SWITCH_TOP_K(params.top_k, TOP_K,
+               moeA2ADispatchKernel<TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
+                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                   params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                   params.ep_size, params.num_experts_per_rank))
 }
 
 // ============================================================================
@@ -611,7 +547,7 @@ __device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
 }
 
 // Accumulate across all valid ranks into registers, then store once per segment
-template <int VEC_SIZE_BYTES, int TOP_K, typename ThreadingPolicy, typename T,
+template <int VEC_SIZE_BYTES, int TOP_K, typename T,
           MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, int row_idx,
@@ -630,10 +566,10 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
                 static_cast<size_t>(row_idx) * static_cast<size_t>(row_size);
   }
 
-  int const stride = ThreadingPolicy::stride() * VEC_SIZE_BYTES;
-  int const local_token_idx = ThreadingPolicy::token_idx();
+  int const stride = blockDim.x * VEC_SIZE_BYTES;
+  int const local_token_idx = blockIdx.x;
 
-  for (int offset = ThreadingPolicy::offset() * VEC_SIZE_BYTES; offset < size_per_token;
+  for (int offset = threadIdx.x * VEC_SIZE_BYTES; offset < size_per_token;
        offset += stride) {
     int logical_offset = offset / sizeof(T);
     vec_t<uint8_t, VEC_SIZE_BYTES> acc[TOP_K];
@@ -849,37 +785,36 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
 }
 
 // Wrapper that selects vector width based on size_per_token alignment
-template <int TOP_K, typename ThreadingPolicy, typename T,
+template <int TOP_K, typename T,
           MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __device__ void vectorized_combine(void* output_buffer, void* sf_output, int row_idx, int row_size,
                                    int rank_id, int max_tokens_per_rank,
                                    CombineKernelPointers const& ptrs) {
   if constexpr (QuantMode != MoeA2ACombineQuantMode::NONE) {
-    vectorized_combine_impl<16, TOP_K, ThreadingPolicy, T, QuantMode, SwizzleMode>(
+    vectorized_combine_impl<16, TOP_K, T, QuantMode, SwizzleMode>(
         output_buffer, sf_output, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
   } else {
     if (row_size % 16 == 0) {
-      vectorized_combine_impl<16, TOP_K, ThreadingPolicy, T>(
+      vectorized_combine_impl<16, TOP_K, T>(
           output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     } else if (row_size % 8 == 0) {
-      vectorized_combine_impl<8, TOP_K, ThreadingPolicy, T>(
+      vectorized_combine_impl<8, TOP_K, T>(
           output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     } else if (row_size % 4 == 0) {
-      vectorized_combine_impl<4, TOP_K, ThreadingPolicy, T>(
+      vectorized_combine_impl<4, TOP_K, T>(
           output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     } else if (row_size % 2 == 0) {
-      vectorized_combine_impl<2, TOP_K, ThreadingPolicy, T>(
+      vectorized_combine_impl<2, TOP_K, T>(
           output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     } else {
-      vectorized_combine_impl<1, TOP_K, ThreadingPolicy, T>(
+      vectorized_combine_impl<1, TOP_K, T>(
           output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     }
   }
 }
 
-// Copy payload to recv buffer using vectorized copy; supports warp/block token mapping
-template <typename ThreadingPolicy>
+// Copy payload to recv buffer using vectorized copy; one block per token
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t const* payload_bytes,
                                            int bytes_per_token, int ep_size,
                                            int max_tokens_per_rank, uint32_t* flag_val_ptr,
@@ -891,7 +826,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 
   if (payload_bytes == nullptr) return;
 
-  int slot_idx = ThreadingPolicy::token_idx();
+  int slot_idx = blockIdx.x;
 
   int total_slots = ep_size * max_tokens_per_rank;
   if (slot_idx >= total_slots) return;
@@ -908,22 +843,22 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
   uint8_t* dst_ptr = recv_buffer_bytes + slot_offset;
   uint8_t const* src_ptr = payload_bytes + slot_offset;
 
-  // Copy one token's data using vectorized copy with policy
-  vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
+  // Copy one token's data using vectorized copy
+  vectorized_copy(dst_ptr, src_ptr, bytes_per_token);
 }
 
 // ============================================================================
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T, typename ThreadingPolicy, int TOP_K,
+template <typename T, int TOP_K,
           MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id,
     int ep_size) {
-  int local_token_idx = ThreadingPolicy::token_idx();
+  int local_token_idx = blockIdx.x;
 
   if (local_num_tokens == 0) {
     // Special case: If local_num_tokens == 0,
@@ -995,14 +930,13 @@ __global__ void moeA2ACombineKernel(
   if (local_num_tokens == 0) return;
 
   // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, ThreadingPolicy, T, QuantMode, SwizzleMode>(
+  vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(
       ptrs.src_data_ptrs[0], ptrs.output_scales, local_token_idx, elements_per_token, rank_id,
       max_tokens_per_rank, ptrs);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   constexpr int kBlockSize = 256;
-  constexpr int kWarpsPerBlock = kBlockSize / 32;  // 8 warps per block
 
   // Calculate bytes per token based on dtype
   int element_size;
@@ -1022,22 +956,13 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   }
 
   int bytes_per_token = params.elements_per_token * element_size;
-  int total_slots =
+  int grid_size_block =
       params.prepare_payload == nullptr ? 1 : params.ep_size * params.max_tokens_per_rank;
-  int grid_size_warp = ceilDiv(total_slots, kWarpsPerBlock);
-  int grid_size_block = total_slots;  // one block per token
 
-  if (params.one_block_per_token) {
-    moeA2APrepareCombineKernel<BlockPolicy><<<grid_size_block, kBlockSize, 0, params.stream>>>(
-        static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])),
-        static_cast<uint8_t const*>(params.prepare_payload), bytes_per_token, params.ep_size,
-        params.max_tokens_per_rank, params.flag_val, params.recv_counters);
-  } else {
-    moeA2APrepareCombineKernel<WarpPolicy><<<grid_size_warp, kBlockSize, 0, params.stream>>>(
-        static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])),
-        static_cast<uint8_t const*>(params.prepare_payload), bytes_per_token, params.ep_size,
-        params.max_tokens_per_rank, params.flag_val, params.recv_counters);
-  }
+  moeA2APrepareCombineKernel<<<grid_size_block, kBlockSize, 0, params.stream>>>(
+      static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])),
+      static_cast<uint8_t const*>(params.prepare_payload), bytes_per_token, params.ep_size,
+      params.max_tokens_per_rank, params.flag_val, params.recv_counters);
 }
 
 // ============================================================================
@@ -1051,16 +976,11 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   TLLM_CHECK(params.local_num_tokens >= 0);
   TLLM_CHECK(params.elements_per_token > 0);
 
-  // Configure kernel launch
+  // Configure kernel launch: one block per token
   int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
-  int const kWarpsPerBlock = kBlockSize / 32;  // warpSize
-  int grid_size_warp = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
   int grid_size_block = params.local_num_tokens;
   // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
   // synchronization.
-  if (grid_size_warp == 0) {
-    grid_size_warp = 1;
-  }
   if (grid_size_block == 0) {
     grid_size_block = 1;
   }
@@ -1089,17 +1009,13 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
 
   // Launch appropriate kernel with compact macros
   SWITCH_DTYPE(params.dtype, TKernelType, {
-    SWITCH_POLICY(params.one_block_per_token, Policy, {
-      SWITCH_TOP_K(params.top_k, TOP_K, {
-        SWITCH_QUANT_MODE(TKernelType, params.quant_mode, QUANT_MODE, {
-          SWITCH_SWIZZLE_MODE(params.swizzle_mode, SWIZZLE_MODE, {
-            uint32_t grid_size = params.one_block_per_token ? grid_size_block : grid_size_warp;
-            uint32_t block_size = kBlockSize;
-            moeA2ACombineKernel<TKernelType, Policy, TOP_K, QUANT_MODE, SWIZZLE_MODE>
-                <<<grid_size, block_size, 0, params.stream>>>(
-                    kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-                    params.local_num_tokens, params.ep_rank, params.ep_size);
-          });
+    SWITCH_TOP_K(params.top_k, TOP_K, {
+      SWITCH_QUANT_MODE(TKernelType, params.quant_mode, QUANT_MODE, {
+        SWITCH_SWIZZLE_MODE(params.swizzle_mode, SWIZZLE_MODE, {
+          moeA2ACombineKernel<TKernelType, TOP_K, QUANT_MODE, SWIZZLE_MODE>
+              <<<grid_size_block, kBlockSize, 0, params.stream>>>(
+                  kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+                  params.local_num_tokens, params.ep_rank, params.ep_size);
         });
       });
     });
