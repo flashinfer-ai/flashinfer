@@ -19,6 +19,7 @@
 #include <cuda.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
@@ -86,6 +87,7 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool usePerTokenScaling{false};
   // whether to apply row-wise scaling factors to the weights
   bool usePerChannelScaling{false};
+  std::string kernelNameFilterRegex{};
 };
 
 class TrtllmGenBatchedGemmRunner {

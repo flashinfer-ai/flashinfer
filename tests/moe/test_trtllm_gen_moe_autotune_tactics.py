@@ -333,6 +333,8 @@ def _enumerate_valid_tactics(
             False,  # use_per_token_scaling
             num_tokens,
             False,  # has_gemm1_lora_delta
+            "",  # kernel_name_filter_fc1
+            "",  # kernel_name_filter_fc2
         )
     )
 
@@ -686,8 +688,53 @@ def _enumerate_fp8_valid_tactics(
             False,  # use_per_token_scaling
             num_tokens,
             False,  # has_gemm1_lora_delta
+            "",  # kernel_name_filter_fc1
+            "",  # kernel_name_filter_fc2
         )
     )
+
+
+def test_trtllm_get_valid_moe_configs_accepts_kernel_name_filters():
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+
+    common_args = (
+        DtypeTrtllmGen.Bfloat16,
+        DtypeTrtllmGen.Bfloat16,
+        Fp8QuantizationType.NoneFp8,
+        4,  # top_k
+        4096,  # hidden_size
+        3072,  # intermediate_size
+        128,  # num_local_experts
+        ActivationType.Swiglu.value,
+        True,  # use_shuffled_weight
+        WeightLayout.BlockMajorK.value,
+        False,  # use_per_token_scaling
+        16,  # num_tokens
+        False,  # has_gemm1_lora_delta
+    )
+
+    unfiltered = [
+        list(cfg) for cfg in moe_op.trtllm_get_valid_moe_configs(*common_args, "", "")
+    ]
+    filtered = [
+        list(cfg)
+        for cfg in moe_op.trtllm_get_valid_moe_configs(*common_args, ".*", ".*")
+    ]
+
+    assert unfiltered
+    assert filtered == unfiltered
+
+    with pytest.raises(Exception, match="No kernel found"):
+        moe_op.trtllm_get_valid_moe_configs(
+            *common_args, "__flashinfer_no_matching_fc1_kernel__", ".*"
+        )
+    with pytest.raises(Exception, match="No kernel found"):
+        moe_op.trtllm_get_valid_moe_configs(
+            *common_args, ".*", "__flashinfer_no_matching_fc2_kernel__"
+        )
 
 
 @pytest.mark.parametrize("quant_mode", ["DeepSeekFp8", "MxFp8"])

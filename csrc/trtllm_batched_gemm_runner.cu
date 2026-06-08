@@ -15,6 +15,7 @@
  */
 
 #include <cstring>
+#include <regex>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -92,9 +93,23 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
 
   mPassingConfigIndices.clear();
   auto sm_version = getSMVersion();
+  auto const hasKernelNameFilter = !mOptions.kernelNameFilterRegex.empty();
+  std::regex kernelNameFilter;
+  if (hasKernelNameFilter) {
+    try {
+      kernelNameFilter = std::regex(mOptions.kernelNameFilterRegex);
+    } catch (std::regex_error const& e) {
+      FLASHINFER_CHECK(false, "Invalid TRTLLM-gen batched GEMM kernel name filter regex \"",
+                       mOptions.kernelNameFilterRegex, "\": ", e.what());
+    }
+  }
 
   for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
     auto const config = configs[i];
+    auto const* functionName = config.mFunctionName == nullptr ? "" : config.mFunctionName;
+    if (hasKernelNameFilter && !std::regex_search(functionName, kernelNameFilter)) {
+      continue;
+    }
     auto const options = config.mOptions;
     auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
     // When we include low-latency kernels we can set transposeMmaOutput via constructor
@@ -164,7 +179,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mFusedBiasShuffleMode: " << (int64_t)mOptions.fusedBiasShuffleMode
             << ", mBiasDtype: " << tg::dtypeToString(mOptions.biasDtype)
             << ", mUsePerTokenScaling: " << mOptions.usePerTokenScaling
-            << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
+            << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling
+            << ", mKernelNameFilterRegex: \"" << mOptions.kernelNameFilterRegex << "\"";
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
