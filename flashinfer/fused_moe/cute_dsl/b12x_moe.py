@@ -77,44 +77,67 @@ def b12x_fused_moe(
     quant_mode: Optional[str] = None,
     source_format: str = "modelopt",
 ) -> torch.Tensor:
-    """Run fused MoE on SM120/SM121 using b12x CuTe DSL kernels.
+    r"""Run fused MoE on SM120/SM121 using b12x CuTe-DSL kernels.
 
-    The kernel takes bf16 input and runs routing, FC1, activation, FC2,
-    and scatter through the selected backend.
-    Automatically selects micro (decode), static, or dynamic backend
-    based on routed row count.
+    The kernel takes bf16 input and runs routing, FC1, activation, FC2, and
+    scatter through the selected backend.  Automatically selects the micro
+    (decode), static, or dynamic backend based on the routed row count.
 
-    Args:
-        x: Input activations [num_tokens, hidden_size], bf16.
-        w1_weight: FC1 weights, FP4 packed.
-            Gated (SiLU): [E, 2*intermediate_size, hidden_size//2].
-            Non-gated (ReLU2): [E, intermediate_size, hidden_size//2].
-        w1_weight_sf: Scale factors for w1_weight.
-        w2_weight: FC2 weights [E, hidden_size, intermediate_size//2], FP4.
-        w2_weight_sf: Scale factors for w2_weight.
-        token_selected_experts: Expert assignments [num_tokens, top_k].
-        token_final_scales: Routing weights [num_tokens, top_k].
-        num_experts: Total number of experts.
-        top_k: Number of experts per token.
-        w1_alpha: Per-expert global scale for FC1.
-        w2_alpha: Per-expert global scale for FC2.
-        fc2_input_scale: Global scale for FC2 input quantization. Required for
-            quant_mode="nvfp4"; accepted but ignored for quant_mode="w4a16".
-        num_local_experts: Local experts for EP. Default: num_experts.
-        output: Pre-allocated output buffer [num_tokens, hidden_size], bf16.
-        output_dtype: Output data type. Only torch.bfloat16 is currently
-            supported. Default: torch.bfloat16.
-        activation: Activation function — "silu" (gated/SwiGLU) or
-            "relu2" (non-gated/Nemotron-Super). Default: "silu".
-        activation_precision: Backward-compatible alias for quant_mode.
-            "fp4" selects quant_mode="nvfp4"; "bf16" selects quant_mode="w4a16".
-        quant_mode: Quantization mode, "nvfp4"/"w4a4" or "w4a16". When set,
-            this selects the backend and internal workspace family.
-        source_format: Source weight format for quant_mode="w4a16".
-            Supports "modelopt" and "compressed_tensors". Default: "modelopt".
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input activations of shape ``[num_tokens, hidden_size]``, ``bfloat16``.
+    w1_weight : torch.Tensor
+        FC1 weights, FP4 packed.  Gated (SiLU) layout
+        ``[E, 2 * intermediate_size, hidden_size // 2]``; non-gated (ReLU2)
+        layout ``[E, intermediate_size, hidden_size // 2]``.
+    w1_weight_sf : torch.Tensor
+        Scale factors for ``w1_weight``.
+    w2_weight : torch.Tensor
+        FC2 weights of shape ``[E, hidden_size, intermediate_size // 2]``,
+        FP4.
+    w2_weight_sf : torch.Tensor
+        Scale factors for ``w2_weight``.
+    token_selected_experts : torch.Tensor
+        Expert assignments of shape ``[num_tokens, top_k]``.
+    token_final_scales : torch.Tensor
+        Routing weights of shape ``[num_tokens, top_k]``.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Number of experts routed to per token.
+    w1_alpha : torch.Tensor
+        Per-expert global scale for FC1.
+    w2_alpha : torch.Tensor
+        Per-expert global scale for FC2.
+    fc2_input_scale : Optional[torch.Tensor]
+        Global scale for FC2 input quantization.  Required for
+        ``quant_mode="nvfp4"``; accepted but ignored for
+        ``quant_mode="w4a16"``.
+    num_local_experts : Optional[int]
+        Local experts for expert parallelism.  Defaults to ``num_experts``.
+    output : Optional[torch.Tensor]
+        Pre-allocated output buffer of shape ``[num_tokens, hidden_size]``,
+        ``bfloat16``.
+    output_dtype : torch.dtype
+        Output data type.  Only ``torch.bfloat16`` is currently supported.
+    activation : str
+        Activation function — ``"silu"`` (gated SwiGLU) or ``"relu2"``
+        (non-gated Nemotron-Super).  Defaults to ``"silu"``.
+    activation_precision : str
+        Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
+        ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
+    quant_mode : Optional[str]
+        Quantization mode, ``"nvfp4"`` / ``"w4a4"`` or ``"w4a16"``.  When set,
+        selects the backend and internal workspace family.
+    source_format : str
+        Source weight format for ``quant_mode="w4a16"`` — ``"modelopt"`` or
+        ``"compressed_tensors"``.  Defaults to ``"modelopt"``.
 
-    Returns:
-        Output tensor [num_tokens, hidden_size].
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape ``[num_tokens, hidden_size]``.
     """
     from ...jit.cpp_ext import get_cuda_version
 
@@ -236,6 +259,45 @@ class B12xMoEWrapper:
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
     ):
+        r"""Configure the b12x fused-MoE wrapper.
+
+        Parameters
+        ----------
+        num_experts : int
+            Total number of experts.
+        top_k : int
+            Number of experts routed to per token.
+        hidden_size : int
+            Hidden dimension size.
+        intermediate_size : int
+            Intermediate dimension size.
+        use_cuda_graph : bool
+            If ``True``, pre-allocate workspace buffers sized for
+            ``max_num_tokens`` so the wrapper can be captured into a CUDA
+            graph.  Defaults to ``False``.
+        max_num_tokens : int
+            Maximum batch size, only used when ``use_cuda_graph=True``.
+            Defaults to ``4096``.
+        num_local_experts : Optional[int]
+            Number of local experts for expert parallelism.  Defaults to
+            ``num_experts``.
+        output_dtype : torch.dtype
+            Output dtype.  Only ``torch.bfloat16`` is currently supported.
+        device : str
+            Device on which to allocate workspace buffers.  Defaults to
+            ``"cuda"``.
+        activation : str
+            Activation function — ``"silu"`` (gated SwiGLU) or ``"relu2"``
+            (non-gated).  Defaults to ``"silu"``.
+        activation_precision : str
+            Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
+            ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
+        quant_mode : Optional[str]
+            Quantization mode, ``"nvfp4"`` / ``"w4a4"`` or ``"w4a16"``.
+        source_format : str
+            Source weight format for ``quant_mode="w4a16"`` —
+            ``"modelopt"`` (default) or ``"compressed_tensors"``.
+        """
         from ...jit.cpp_ext import get_cuda_version
         from .blackwell_sm12x.moe_dispatch import (
             _activation_precision_from_quant_mode,
@@ -395,23 +457,37 @@ class B12xMoEWrapper:
         w2_alpha: torch.Tensor,
         fc2_input_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run MoE computation.
+        r"""Run the b12x fused-MoE forward pass.
 
-        Args:
-            x: Input activations [num_tokens, hidden_size], bf16.
-            w1_weight: FC1 weights, FP4 packed.
-            w1_weight_sf: Scale factors for w1_weight.
-            w2_weight: FC2 weights, FP4 packed.
-            w2_weight_sf: Scale factors for w2_weight.
-            token_selected_experts: Expert assignments [num_tokens, top_k].
-            token_final_scales: Routing weights [num_tokens, top_k].
-            w1_alpha: Per-expert global scale for FC1.
-            w2_alpha: Per-expert global scale for FC2.
-            fc2_input_scale: Global scale for FC2 input quantization. Required
-                for quant_mode="nvfp4"; accepted but ignored for "w4a16".
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input activations of shape ``[num_tokens, hidden_size]``,
+            ``bfloat16``.
+        w1_weight : torch.Tensor
+            FC1 weights, FP4-packed.
+        w1_weight_sf : torch.Tensor
+            Scale factors for ``w1_weight``.
+        w2_weight : torch.Tensor
+            FC2 weights, FP4-packed.
+        w2_weight_sf : torch.Tensor
+            Scale factors for ``w2_weight``.
+        token_selected_experts : torch.Tensor
+            Expert assignments of shape ``[num_tokens, top_k]``.
+        token_final_scales : torch.Tensor
+            Routing weights of shape ``[num_tokens, top_k]``.
+        w1_alpha : torch.Tensor
+            Per-expert global scale for FC1.
+        w2_alpha : torch.Tensor
+            Per-expert global scale for FC2.
+        fc2_input_scale : Optional[torch.Tensor]
+            Global scale for FC2 input quantization.  Required for
+            ``quant_mode="nvfp4"``; accepted but ignored for ``"w4a16"``.
 
-        Returns:
-            Output tensor [num_tokens, hidden_size].
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         num_tokens = token_selected_experts.size(0)
 

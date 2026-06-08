@@ -197,9 +197,25 @@ cudart = CudaRTLibrary()
 def create_shared_buffer(
     size_in_bytes: int, group: Optional[ProcessGroup] = None
 ) -> List[int]:
-    """
-    Creates a shared buffer and returns a list of pointers
-    representing the buffer on all processes in the group.
+    r"""Allocate a buffer and share it across the process group via CUDA IPC.
+
+    The local rank performs ``cudaMalloc`` followed by
+    ``cudaIpcGetMemHandle``; other ranks open the resulting handle to obtain
+    a pointer mapped into their address space.
+
+    Parameters
+    ----------
+    size_in_bytes : int
+        Size of the buffer to allocate per rank.
+    group : torch.distributed.ProcessGroup, optional
+        Process group to exchange IPC handles across.  Defaults to
+        ``dist.group.WORLD``.
+
+    Returns
+    -------
+    list[int]
+        Per-rank device pointers (rank-local at position ``rank``, IPC-mapped
+        for the others).
     """
     pointer = cudart.cudaMalloc(size_in_bytes)
     handle = cudart.cudaIpcGetMemHandle(pointer)
@@ -226,8 +242,18 @@ def create_shared_buffer(
 def free_shared_buffer(
     pointers: List[int], group: Optional[ProcessGroup] = None
 ) -> None:
-    """
-    Frees a shared buffer.
+    r"""Free a shared buffer previously created by :func:`create_shared_buffer`.
+
+    Each rank releases only its rank-local allocation; the IPC-mapped peer
+    pointers must not be freed here.
+
+    Parameters
+    ----------
+    pointers : list[int]
+        Per-rank pointer list returned by :func:`create_shared_buffer`.
+    group : torch.distributed.ProcessGroup, optional
+        Process group used during allocation.  Defaults to
+        ``dist.group.WORLD``.
     """
     if group is None:
         group = dist.group.WORLD
