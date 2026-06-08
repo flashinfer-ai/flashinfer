@@ -258,6 +258,78 @@ __global__ void moe_bgmv_shrink_sliced_kernel(
 }
 
 // ============================================================
+// MoE BGMV Shrink Direct Kernel (decode fast-path)
+//
+// One CTA per (pair, rank, slice): block of NTHREADS strides the full feat_in
+// contraction with 128-bit vectorized loads (vec_t), then a warp+block reduction
+// writes the single output element. Fuses the contraction with scale+cast and
+// uses no shared-memory staging / async pipeline.
+//
+// Rationale: in the decode regime (num_pairs small), the pipelined sliced kernel
+// launches only ceil(num_pairs/PPB)*ceil(feat_out/RANK_TILE) blocks -> a few SMs
+// active, launch-starved. Mapping one block per output element raises resident
+// blocks ~feat_out-fold and removes the smem-staging overhead, which dominates
+// when there is no inter-pair reuse to amortize it. Dtype/accumulation preserved
+// (fp32 accumulate, out_T cast). Prefill keeps the pipelined kernel unchanged.
+// ============================================================
+template <int feat_in, int feat_out, int NTHREADS, size_t vec_size, typename in_T, typename out_T,
+          typename W_T>
+__global__ void moe_bgmv_shrink_direct_kernel(
+    out_T* __restrict__ Y, const in_T* __restrict__ X, W_T** __restrict__ w_ptr,
+    const int64_t* __restrict__ sorted_token_ids, const int64_t* __restrict__ expert_ids,
+    const int64_t* __restrict__ lora_indices, int64_t num_pairs, int64_t num_experts,
+    int64_t num_tokens, int64_t lora_stride, float scale) {
+  const int slice_id = blockIdx.z;
+  const int pair = blockIdx.x;
+  const int r = blockIdx.y;  // rank index in [0, feat_out)
+  const int tid = threadIdx.x;
+
+  const int64_t token_idx = sorted_token_ids[pair];
+  bool valid = (token_idx >= 0 && token_idx < num_tokens);
+  int64_t lid = -1, eid = 0;
+  if (valid) {
+    lid = lora_indices[token_idx];
+    valid = (lid >= 0);
+    if (valid) eid = expert_ids[pair];
+  }
+  if (!valid) return;  // leave the (pre-zeroed / accumulated) output element untouched
+
+  const W_T* Wrow = w_ptr[slice_id * num_experts + eid] + lid * lora_stride + (int64_t)r * feat_in;
+  const in_T* Xrow = X + token_idx * (int64_t)feat_in;
+
+  constexpr int NVEC = feat_in / vec_size;
+  float acc = 0.f;
+  vec_t<in_T, vec_size> xv;
+  vec_t<W_T, vec_size> wv;
+  for (int i = tid; i < NVEC; i += NTHREADS) {
+    xv.load(Xrow + i * vec_size);
+    wv.load(Wrow + i * vec_size);
+#pragma unroll
+    for (int j = 0; j < (int)vec_size; ++j) acc += float(xv[j]) * float(wv[j]);
+  }
+  // scalar tail — only emitted when feat_in is not a multiple of vec_size. All compiled
+  // `wide` values are multiples of 8 (== vec_size), so this is dropped at compile time and
+  // the hot loop above is purely 128-bit vectorized (verified in SASS / ncu sectors-per-req).
+  if constexpr (feat_in % vec_size != 0) {
+    for (int i = NVEC * vec_size + tid; i < feat_in; i += NTHREADS)
+      acc += float(Xrow[i]) * float(Wrow[i]);
+  }
+
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  __shared__ float warp_sum[NTHREADS / 32];
+  if ((tid & 31) == 0) warp_sum[tid >> 5] = acc;
+  __syncthreads();
+  if (tid == 0) {
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < NTHREADS / 32; ++i) s += warp_sum[i];
+    Y[slice_id * num_pairs * feat_out + (int64_t)pair * feat_out + r] +=
+        static_cast<out_T>(s * scale);
+  }
+}
+
+// ============================================================
 // MoE BGMV Expand Sliced Kernel
 // ============================================================
 template <int feat_in, int feat_out, size_t vec_size, int tx, int ty, int tz, typename in_T,
@@ -324,6 +396,20 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
   cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, dev);
   const bool extended = (sm_major >= 9);
   const bool decode = (num_pairs <= MoeShrinkKernelConfig::decode_threshold);
+
+  // Decode fast-path: one block per (pair, rank, slice) with vectorized contraction.
+  // All compiled `wide` (feat_in) values are multiples of 8, so 128-bit loads apply.
+  if (decode) {
+    constexpr int FUSED_NT = 128;
+    constexpr size_t FUSED_VEC = 8;
+    if constexpr (feat_in % FUSED_VEC == 0) {
+      dim3 gfused((int)num_pairs, feat_out, (int)num_slices);
+      moe_bgmv_shrink_direct_kernel<feat_in, feat_out, FUSED_NT, FUSED_VEC, in_T, out_T, W_T>
+          <<<gfused, FUSED_NT, 0, stream>>>(Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices,
+                                            num_pairs, num_experts, num_tokens, lora_stride, scale);
+      return;
+    }
+  }
 
   const int ppb = (extended && decode) ? MoeShrinkKernelConfig::pairs_per_block_decode
                                        : MoeShrinkKernelConfig::pairs_per_block_prefill;
