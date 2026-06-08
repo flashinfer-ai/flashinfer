@@ -2678,11 +2678,10 @@ def trtllm_batch_decode_with_kv_cache(
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
 
     trtllm_gen_bf16q_fp8kv_transform_mode : Optional[Literal["k_only", "separate_kv"]] = None
-        Transform mode for BF16 query + FP8 E4M3 KV decode with the ``trtllm-gen``
-        backend. ``None`` selects the default separate transformed-K/V cubins for
-        BF16Q+FP8KV TRTLLM-GEN decode and is ignored by other paths. ``"k_only"``
-        selects the optimized K-only transform cubins, and ``"separate_kv"``
-        selects the separate transformed-K/V cubins.
+        Transform mode for BF16 query + FP8 E4M3 KV decode. ``None`` selects the
+        default separate transformed-K/V cubins and is ignored by other paths.
+        ``"k_only"`` selects the optimized K-only transform cubins, and
+        ``"separate_kv"`` selects the separate transformed-K/V cubins.
 
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, only supported
