@@ -395,6 +395,31 @@ def _tol(cfg, ref):
     return 3e-2, 2e-2 * absmax + 1e-4  # bf16
 
 
+# NOT_SUPPORTED-class signals: a backend legitimately rejecting a shape -> skip, never a finding.
+# Deliberately tight: a CUDA error / IMA / assert is a *crash bug* and must surface, not be swallowed.
+_SKIP_SUBSTR = (
+    "not supported",
+    "unsupported",
+    "no valid",
+    "not implemented",
+    "is not divisible",
+    "must be a multiple",
+    "must be divisible",
+    "requires sm",
+    "only supported",
+)
+_CRASH_SUBSTR = ("cuda error", "illegal memory", "misaligned", "device-side assert")
+
+
+def _is_unsupported(e: Exception) -> bool:
+    if isinstance(e, NotImplementedError):
+        return True
+    msg = str(e).lower()
+    if any(c in msg for c in _CRASH_SUBSTR):  # crash bugs never count as "unsupported"
+        return False
+    return any(s in msg for s in _SKIP_SUBSTR)
+
+
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
 def test_unified_moe_fuzz(cfg):
     if not torch.cuda.is_available():
@@ -407,12 +432,21 @@ def test_unified_moe_fuzz(cfg):
     rtol, atol = _tol(cfg, ref)
 
     outputs = {}
+    skipped = []
     for ad in ADAPTERS:
         reason = ad.supports(cfg, sm)
         if reason:
+            skipped.append(f"{ad.name}:{reason}")
             continue
-        out = ad.run(m, cfg)
-        torch.cuda.synchronize()
+        try:
+            out = ad.run(m, cfg)
+            torch.cuda.synchronize()
+        except Exception as e:
+            # A backend rejecting an out-of-contract shape is a skip; a crash is a finding.
+            if _is_unsupported(e):
+                skipped.append(f"{ad.name}:rejected({type(e).__name__})")
+                continue
+            raise
 
         # (1) no NaN/Inf where the reference is finite.
         bad = int(((~torch.isfinite(out)) & torch.isfinite(ref)).sum().item())
@@ -441,7 +475,7 @@ def test_unified_moe_fuzz(cfg):
         outputs[ad.name] = out
 
     if not outputs:
-        pytest.skip(f"no adapter supports {cfg.label} on SM{sm}")
+        pytest.skip(f"no adapter ran {cfg.label} on SM{sm} [{'; '.join(skipped)}]")
 
     # (4) cross-API agreement: every pair of backends that ran must agree within combined tol.
     names = list(outputs)
