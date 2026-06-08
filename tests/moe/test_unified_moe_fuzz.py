@@ -76,12 +76,14 @@ class MoEConfig:
     quant: str  # "bf16" | "fp16" | "fp8" (per-tensor e4m3)
     activation: str  # "swiglu"
     seed: int
+    route: str = "uniform"  # routing-load regime (see MasterTensors)
 
     @property
     def label(self):
         return (
             f"{self.quant}_e{self.num_experts}_k{self.top_k}_t{self.num_tokens}_"
-            f"h{self.hidden_size}_i{self.intermediate_size}_{self.activation}_s{self.seed}"
+            f"h{self.hidden_size}_i{self.intermediate_size}_{self.activation}_"
+            f"{self.route}_s{self.seed}"
         )
 
 
@@ -108,6 +110,20 @@ class MasterTensors:
         self.router_logits = torch.randn(
             T, E, device="cuda", dtype=torch.float32, generator=g
         )
+        # Routing-load regimes: uniform random rarely produces the load patterns that break MoE
+        # scatter/gather + tile scheduling. Bias the logits to stress them while leaving the math
+        # (and reference) unchanged -- only the *distribution* of selected experts shifts:
+        #   hot1       all tokens pile onto a single expert (max load on one tile)
+        #   peaked     near-argmax per token (sharp softmax -> degenerate weights)
+        #   imbalanced zipf-ish per-expert bias -> some experts get many tokens, many get ZERO
+        #              (the empty-expert path: a classic skip-bug / OOB source)
+        if cfg.route == "hot1":
+            self.router_logits[:, 0] += 50.0
+        elif cfg.route == "peaked":
+            self.router_logits *= 50.0
+        elif cfg.route == "imbalanced":
+            bias = torch.linspace(8.0, -8.0, E, device="cuda")  # rank-skewed
+            self.router_logits += bias
         # Route ONCE on the host (softmax -> top-k -> renormalize) so every caller-routed backend
         # gets the identical selection -> a sound cross-API comparison.
         rw = F.softmax(self.router_logits, dim=1, dtype=torch.float32)
@@ -353,6 +369,7 @@ _EXPERTS = [8, 16, 32, 64, 128, 256]
 _TOPK = [1, 2, 4, 6, 8]
 _TOKENS = [1, 2, 8, 16, 64, 128, 512, 1024, 2048, 4096]
 _QUANT = ["bf16", "fp16", "fp8"]
+_ROUTE = ["uniform", "uniform", "hot1", "peaked", "imbalanced"]  # weight uniform ~2x
 
 
 def _gen(seed):
@@ -368,6 +385,7 @@ def _gen(seed):
         quant=rng.choice(_QUANT),
         activation="swiglu",
         seed=seed,
+        route=rng.choice(_ROUTE),
     )
 
 
