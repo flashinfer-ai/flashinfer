@@ -25,10 +25,12 @@ Coverage today (all SwiGLU):
   * cutlass_fused_moe -- bf16 / fp16 / fp8(per-tensor e4m3) on SM89/90/100+; nvfp4(e2m1 block16)
     on SM100+ (mirrors test_moe_nvfp4 marshalling + reuses its torch_moe_nvfp4 reference exactly).
   * trtllm-gen (pre-routed bf16) -- SM100/103; runs alongside cutlass on bf16 -> cross-API oracle.
-Validated false-positive-free: SM100, H100/sm90, L40S/sm89. New backends (cute-dsl, b12x) and quant
-modes (nvfp4-on-trtllm, mxfp8/mxfp4) drop in behind the same `MoEAdapter` interface. NOTE: trtllm-gen
-abstains on fp8 because its fp8-per-tensor scale + (in-kernel) routing contract is incompatible with
-cutlass's -- a deliberate finding for the unified-API design, see UNIFIED_MOE_FUZZER_AND_API_DESIGN.md.
+Validated false-positive-free: SM100, H100/sm90, L40S/sm89. KEY finding (UNIFIED_MOE_FUZZER_AND_API_DESIGN.md
+§5-6): the cross-API oracle is proven on bf16 but BLOCKED on every quantized mode by an intermediate-
+activation-scale-POLICY divergence -- cutlass fixes the fc2-input global scale (a2_gs=1.0) while trtllm
+computes it dynamically (c_global_sf=2688/max), data-dependent, so a single shared fp8/fp4 reference
+cannot validate both. fp8 + nvfp4 are therefore cutlass-only (vs-reference) oracles here. mxfp8/mxfp4
+are trtllm-gen-only (no 2nd backend -> no cross-API/cross-arch) and stay covered by test_moe_fuzz.py.
 """
 
 import os
