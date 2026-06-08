@@ -123,15 +123,15 @@ void trtllm_paged_attention_launcher(
       TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, kv_data_type, o_data_type);
   TllmGenFmhaRunnerParams runner_params;
   TVM_FFI_ICHECK(bf16q_fp8kv_transform_mode >= 0 && bf16q_fp8kv_transform_mode <= 2)
-      << "trtllm_gen_bf16q_fp8kv_transform_mode must be 0, 1, or 2";
+      << "bf16q_fp8kv_transform_mode must be 0, 1, or 2";
   auto const transform_mode =
       static_cast<Bf16QFp8KvTransformMode>(bf16q_fp8kv_transform_mode);
   if (transform_mode != Bf16QFp8KvTransformMode::Full) {
     TVM_FFI_ICHECK(
         mode == TllmPagedAttentionMode::ForGen && q_data_type == Data_type::DATA_TYPE_BF16 &&
         kv_data_type == Data_type::DATA_TYPE_E4M3 && o_data_type == Data_type::DATA_TYPE_BF16)
-        << "trtllm_gen_bf16q_fp8kv_transform_mode is only supported for trtllm-gen BF16 "
-           "query, FP8 E4M3 KV, BF16 output decode";
+        << "bf16q_fp8kv_transform_mode is only supported for BF16 query, FP8 E4M3 KV, "
+           "BF16 output decode";
   }
   runner_params.mBf16QFp8KvTransformMode = transform_mode;
 
