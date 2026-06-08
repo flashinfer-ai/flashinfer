@@ -161,6 +161,20 @@ struct Compute {
 
   enum { SAGE_BLOCKS_PER_STEP_V = std::max(STEP_KV / SAGE_BLOCK_SIZE_V, 1) };
 
+  // FA3-style fully deferred BMM2: BMM1[N] is committed as group A (older), then BMM2[N-1] is
+  // committed as group B (newer). warpgroup_wait<1>() drains BMM1[N] while BMM2[N-1] drains in
+  // background. Softmax[N] overlaps with BMM2[N-1] drain. warpgroup_wait<0>() before pack drains
+  // BMM2[N-1]. cbr_v.wait() for V[N] is deferred to after softmax.pack so TMA has maximum time.
+  // The last step's BMM2 is committed in the post-loop epilogue section.
+  // Requires ELEMENT_BYTES==2 (BF16/FP16), no SAGE V scaling, and non-paged KV.
+  // Note: skip_softmax early-return in FA3 !IS_FIRST_COL path drains BMM2[N-1] but leaves
+  // frag_p_cross unfilled; subsequent post-loop BMM2 would use stale data. This is safe only when
+  // skip_softmax is disabled (threshold=0, ENABLE_SKIP_SOFTMAX=false), which is the common case.
+  enum {
+    FA3_DEFERRED_BMM2 = (Kernel_traits::ELEMENT_BYTES == 2 &&
+                         Kernel_traits::SAGE_BLOCK_SIZE_V == 0 && !Kernel_traits::PAGED_KV_INPUT)
+  };
+
 #define K_TILE_WAIT()         \
   int ready_k = cbr_k.peek(); \
   if (!ready_k) {             \
@@ -173,13 +187,23 @@ struct Compute {
   cbr_k.advance();                        \
   cbr_v.advance();
 
+// FA3 deferred: K is released immediately; V release is deferred to next step's
+// compute_single_tile. fa3_prev_v_ptr saves the current V slot before advancing so the next step
+// can release it.
+#define FA3_KV_TILE_COMPLETE()            \
+  cbr_k.complete(tidx == 0, cbr_k.ptr()); \
+  cbr_k.advance();                        \
+  fa3_prev_v_ptr = cbr_v.ptr();           \
+  cbr_v.advance();
+
 #define COMPUTE_SINGLE_TILE(IS_FIRST_COL, APPLY_MASK)                                            \
   compute_single_tile<IS_FIRST_COL, APPLY_MASK>(                                                 \
       params, ctile_p, softmax, ctile_o, p_max, p_sum, tidx, actual_kv_seqlen, alibi_head_scale, \
       USE_CUSTOM_MASK ? (head_info.mask_sum_s + q_step_idx * STEP_Q + local_q_tile_offset)       \
                       : (q_step_idx * STEP_Q + head_info.q_tile_offset),                         \
       kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor,                         \
-      &shared->skip_softmax_votes[kv_step_idx & 1][warpgroup_id], kv_step_idx == kv_idx_end - 1);
+      &shared->skip_softmax_votes[kv_step_idx & 1][warpgroup_id], frag_p_cross, fa3_prev_v_ptr,  \
+      kv_step_idx == kv_idx_end - 1);
 
   ////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -346,6 +370,10 @@ struct Compute {
         float p_max[Mma_tile_p::CORES_M];
         float p_sum[Mma_tile_p::CORES_M];
 
+        // FA3 deferred BMM2 state: frag_p and prev V slot ptr carried across KV steps.
+        Fragment_p frag_p_cross[Mma_tile_o::MMAS_K];
+        int fa3_prev_v_ptr = -1;
+
         int kv_step_idx = kv_idx_start;
         // First K tiles ready to use in smem.
         K_TILE_WAIT();
@@ -355,7 +383,11 @@ struct Compute {
         } else {
           COMPUTE_SINGLE_TILE(true, false);
         }
-        KV_TILE_COMPLETE();
+        if constexpr (FA3_DEFERRED_BMM2) {
+          FA3_KV_TILE_COMPLETE();
+        } else {
+          KV_TILE_COMPLETE();
+        }
 
         for (kv_step_idx += 1; kv_step_idx < kv_right_mask_start; ++kv_step_idx) {
           // Current step's K tiles ready to use in smem.
@@ -368,7 +400,11 @@ struct Compute {
             ctile_p.increment_gmma_desc_b_group();
           }
 
-          ctile_o.increment_gmma_desc_group();
+          // For FA3 deferred: V descriptor is advanced inside compute_single_tile (after
+          // BMM2[N-1] commit). For non-FA3: advance here as before.
+          if constexpr (!FA3_DEFERRED_BMM2) {
+            ctile_o.increment_gmma_desc_group();
+          }
 
           // Apply the start mask only when sliding window attention is enabled.
           if (kv_step_idx < kv_left_mask_end) {
@@ -377,7 +413,11 @@ struct Compute {
             COMPUTE_SINGLE_TILE(false, false);
           }
 
-          KV_TILE_COMPLETE();
+          if constexpr (FA3_DEFERRED_BMM2) {
+            FA3_KV_TILE_COMPLETE();
+          } else {
+            KV_TILE_COMPLETE();
+          }
         }
 
         // Always apply the mask in the end.
@@ -392,12 +432,41 @@ struct Compute {
             ctile_p.increment_gmma_desc_b_group();
           }
 
-          ctile_o.increment_gmma_desc_group();
+          // For FA3 deferred: V descriptor is advanced inside compute_single_tile.
+          if constexpr (!FA3_DEFERRED_BMM2) {
+            ctile_o.increment_gmma_desc_group();
+          }
 
           COMPUTE_SINGLE_TILE(false, true);
 
-          KV_TILE_COMPLETE();
+          if constexpr (FA3_DEFERRED_BMM2) {
+            FA3_KV_TILE_COMPLETE();
+          } else {
+            KV_TILE_COMPLETE();
+          }
         }
+
+        // Commit the last step's BMM2 and drain it before the epilogue reads ctile_o.
+        // FA3: commit BMM2[last] using frag_p_cross, release V[last], drain.
+        // Non-FA3 non-paged: simple deferred drain (BMM2[last] already committed in last step).
+        // Paged KV: already drained inline in compute_single_tile.
+        if constexpr (FA3_DEFERRED_BMM2) {
+          warpgroup_arrive();
+#pragma unroll
+          for (int ki = 0; ki < Mma_tile_o::MMAS_K - 1; ++ki) {
+            ctile_o.fill_frag_a(frag_p_cross[ki]);
+            ctile_o.compute(ki);
+          }
+          ctile_o.fill_frag_a(frag_p_cross[Mma_tile_o::MMAS_K - 1]);
+          ctile_o.compute(Mma_tile_o::MMAS_K - 1, true, true);
+          warpgroup_commit();
+          warpgroup_wait<0>();
+          // Release V[last] after BMM2[last] SMEM reads are guaranteed complete.
+          cbr_v.complete(tidx == 0, fa3_prev_v_ptr);
+        } else if constexpr (!Kernel_traits::PAGED_KV_INPUT) {
+          warpgroup_wait<0>();
+        }
+
         if (valid_run) {
           // Final step's update.
           tile_o_epilogue.scale(ctile_o, p_max, p_sum);
@@ -434,12 +503,18 @@ struct Compute {
       int const actual_kv_seqlen, float const alibi_head_scale, int const row_offset,
       int const col_offset, int const sage_scale_row, Circular_buffer_q_reader& cbr,
       Circular_buffer_kv_reader& cbr_v, OrderedMutexAccessor& mutex, uint32_t* skip_softmax_vote,
+      Fragment_p (&frag_p_cross)[Mma_tile_o::MMAS_K],  // in/out: frag_p carried across KV steps
+      int prev_v_cbr_ptr,                              // ptr for deferred V[N-1] release
       bool complete = false) {
-    // Skip-softmax vote initialization
-    if (tidx == 0) {
-      // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before
-      // voting.
-      *skip_softmax_vote = 1;
+    // Skip-softmax vote initialization (only needed when skip-softmax is enabled).
+    // When ENABLE_SKIP_SOFTMAX=false the vote is never read, so both the write and
+    // the barrier below are dead code — omitting them saves ~200 cycles/step.
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+      if (tidx == 0) {
+        // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before
+        // voting.
+        *skip_softmax_vote = 1;
+      }
     }
 // load the scales of K/V from global memory
 #define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                            \
@@ -473,8 +548,10 @@ struct Compute {
     ctile_p.clear();
 
     // If skip_softmax is enabled, make sure there is no racing between the initialization and
-    // writing of skip_softmax_vote.
-    named_barrier_wait(Kernel_traits::SKIP_SOFTMAX_BARRIER_ID + threadIdx.x / 128, 128);
+    // writing of skip_softmax_vote.  When disabled, skip this ~200-cycle barrier entirely.
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+      named_barrier_wait(Kernel_traits::SKIP_SOFTMAX_BARRIER_ID + threadIdx.x / 128, 128);
+    }
 
     // BMM1 (Q x K').
     warpgroup_arrive();
@@ -496,8 +573,39 @@ struct Compute {
 
     ctile_p.compute(BMM1_MMAS_K_PER_GROUP - 1, true, true);
 
-    warpgroup_commit();
-    warpgroup_wait<0>();
+    warpgroup_commit();  // BMM1[N] = group A (OLDER in FA3 deferred)
+
+    // === FA3 DEFERRED BMM2: interleave BMM2[N-1] commit between BMM1[N] and its drain ===
+    // BMM1[N] is group A (older). BMM2[N-1] committed here becomes group B (newer).
+    // warpgroup_wait<1>() drains group A (BMM1[N]) while group B (BMM2[N-1]) runs in background.
+    // Softmax[N] then overlaps with BMM2[N-1] drain.
+    // warpgroup_wait<0>() before pack drains group B (BMM2[N-1]).
+    if constexpr (FA3_DEFERRED_BMM2 && !IS_FIRST_COL) {
+      // Issue BMM2[N-1] using frag_p_cross (= frag_p[N-1]), ctile_o descriptor at V[N-1].
+      // BMM2_MMAS_K_GROUPS == 1 is guaranteed for FA3 path (SAGE_BLOCK_SIZE_V == 0).
+      // V[N] is NOT waited here; it was already confirmed ready at the end of step N-1
+      // (see FA3 return block below). Deferring cbr_v.wait to after softmax.pack gives
+      // TMA the maximum time to load V[N] into SMEM before it is consumed in step N+1.
+      // NOTE: V[N-1] is NOT released here; it is released after warpgroup_wait<0>() drains
+      // BMM2[N-1], guaranteeing the WGMMA reads from V[N-1] SMEM are complete before DMA
+      // can overwrite that slot.
+      warpgroup_arrive();
+#pragma unroll
+      for (int ki = 0; ki < Mma_tile_o::MMAS_K - 1; ++ki) {
+        ctile_o.fill_frag_a(frag_p_cross[ki]);
+        ctile_o.compute(ki);
+      }
+      ctile_o.fill_frag_a(frag_p_cross[Mma_tile_o::MMAS_K - 1]);
+      ctile_o.compute(Mma_tile_o::MMAS_K - 1, true, true);
+      warpgroup_commit();  // BMM2[N-1] = group B (NEWER)
+      // Advance ctile_o descriptor from V[N-1] to V[N] (1 increment; K_GROUPS-1=0 from loop).
+      ctile_o.increment_gmma_desc_group();
+      // warpgroup_wait<1>(): drains group A (BMM1[N]); group B (BMM2[N-1]) still in flight.
+      warpgroup_wait<1>();
+    } else {
+      warpgroup_wait<0>();
+    }
+    // ====================================================================================
 
     // Arrive when the last tile consumes the q tile.
     if (complete) {
@@ -513,9 +621,6 @@ struct Compute {
       // Wait until another warpgroup has already executed QGMMA.
       mutex.named_bar_wait();
     }
-
-    // Fragment p for BMM2 input
-    Fragment_p frag_p[Mma_tile_o::MMAS_K];
 
     // Unpack the elements from bmm1 output to floats.
     softmax.unpack(ctile_p);
@@ -536,40 +641,87 @@ struct Compute {
     softmax.apply_alibi_and_mask<APPLY_MASK>(ctile_p, params.alibi_params, alibi_head_scale,
                                              actual_kv_seqlen, row_offset, col_offset);
 
-    // Softmax Exp, max/sum, and update scales. If returns false we skip the rest.
-    if (!softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum, skip_softmax_vote)) {
+    // Softmax Exp, max/sum, and update scales. Runs while BMM2[N-1] drains (FA3 overlap).
+    bool softmax_ok;
+    if constexpr (Softmax::USE_DIRECT_ACC) {
+      softmax_ok =
+          softmax.compute_and_update_scale<IS_FIRST_COL>(ctile_p, p_max, p_sum, skip_softmax_vote);
+    } else {
+      softmax_ok = softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum, skip_softmax_vote);
+    }
+    if (!softmax_ok) {
       if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
         // Notify another warpgroup to execute QGMMA.
         mutex.named_bar_arrive();
       }
-      // Need to wait V, otherwise compute-sanitizer synccheck will fail.
-      int ready2 = cbr_v.peek();
-      if (!ready2) {
-        cbr_v.wait();
+      // FA3 !IS_FIRST_COL: BMM2[N-1] was committed as group B; drain and release V[N-1].
+      if constexpr (FA3_DEFERRED_BMM2 && !IS_FIRST_COL) {
+        warpgroup_wait<0>();
+        // Safe to release V[N-1] now: BMM2[N-1] SMEM reads are complete.
+        cbr_v.complete(tidx == 0, prev_v_cbr_ptr);
+        // Wait for V[N] (placed here to mirror the normal path's late-wait strategy).
+        // frag_p_cross is NOT updated here; post-loop BMM2 will use stale data.
+        // This is safe only when skip_softmax is disabled (threshold=0).
+        int ready_v = cbr_v.peek();
+        if (!ready_v) cbr_v.wait();
       }
-
+      // Non-FA3: still need cbr_v.wait() and descriptor advance.
+      if constexpr (!FA3_DEFERRED_BMM2) {
+        // Need to wait V, otherwise compute-sanitizer synccheck will fail.
+        int ready2 = cbr_v.peek();
+        if (!ready2) {
+          cbr_v.wait();
+        }
 #pragma unroll
-      // Advance V descriptor by the same amount as the BMM2 loop would,
-      // so that the descriptor stays in sync for subsequent KV steps.
-      for (int kbi = 0; kbi < BMM2_MMAS_K_GROUPS - 1; kbi++) {
-        ctile_o.increment_gmma_desc_group();
+        // Advance V descriptor by the same amount as the BMM2 loop would,
+        // so that the descriptor stays in sync for subsequent KV steps.
+        for (int kbi = 0; kbi < BMM2_MMAS_K_GROUPS - 1; kbi++) {
+          ctile_o.increment_gmma_desc_group();
+        }
       }
-
       return;
+    }
+
+    // FA3 !IS_FIRST_COL: drain BMM2[N-1] (group B) before pack, which uses ctile_o.acc_.
+    // This wait often costs ~0 cycles if softmax (exp/max/sum) took longer than BMM2 drain.
+    // After wait<0>(), release V[N-1]: WGMMA reads from its SMEM slot are now complete,
+    // so DMA can safely overwrite it with V[N+2]. Pipeline depth (KV_BUFFERS=3) provides
+    // ~1 full KV step for DMA to fill V[N+2] before it is needed.
+    if constexpr (FA3_DEFERRED_BMM2 && !IS_FIRST_COL) {
+      warpgroup_wait<0>();
+      cbr_v.complete(tidx == 0, prev_v_cbr_ptr);
     }
 
     // experiments show that here is the best place to load scales of V
     float scales_v[SAGE_BLOCKS_PER_STEP_V];
     LOAD_SCALES_V(scales_v)
 
-    // Update flash attention scales and pack it for BMM2
-    softmax.pack<IS_FIRST_COL>(ctile_o, frag_p);
+    // Update flash attention scales and pack it for BMM2.
+    // frag_p_cross receives the packed bf16 P matrix for use as BMM2[N] input (next step).
+    if constexpr (Softmax::USE_DIRECT_ACC) {
+      softmax.pack<IS_FIRST_COL>(ctile_p, ctile_o, frag_p_cross);
+    } else {
+      softmax.pack<IS_FIRST_COL>(ctile_o, frag_p_cross);
+    }
 
     if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1) {
       // Notify another warpgroup to execute QGMMA.
       mutex.named_bar_arrive();
     }
 
+    // FA3 path: BMM2[N] is deferred to the next step (or post-loop epilogue).
+    // Wait for V[N] here — after softmax.pack — so TMA has maximum time to load V[N] into SMEM.
+    // IS_FIRST_COL: confirms V[0] ready for step 1's BMM2[0].
+    // !IS_FIRST_COL: confirms V[N] ready for step N+1's BMM2[N] (early wait was removed).
+    if constexpr (FA3_DEFERRED_BMM2) {
+      int ready = cbr_v.peek();
+      if (!ready) {
+        cbr_v.wait();
+      }
+      return;
+    }
+
+    // Non-FA3 path: issue BMM2[N] immediately after softmax.pack.
     // Wait until v buffer is ready.
     int ready = cbr_v.peek();
     if (!ready) {
@@ -619,7 +771,7 @@ struct Compute {
       for (int ki = 0; ki < BMM2_MMAS_K_PER_GROUP; ++ki) {
         int const mma_ki = kbi * BMM2_MMAS_K_PER_GROUP + ki;
         APPLY_SCALE_V(mma_ki)
-        ctile_o.fill_frag_a(frag_p[mma_ki]);
+        ctile_o.fill_frag_a(frag_p_cross[mma_ki]);
         ctile_o.compute(ki, false, ki == BMM2_MMAS_K_PER_GROUP - 1);
       }
       ctile_o.increment_gmma_desc_group();
@@ -629,16 +781,23 @@ struct Compute {
     for (int ki = 0; ki < BMM2_MMAS_K_PER_GROUP - 1; ++ki) {
       int const mma_ki = (BMM2_MMAS_K_GROUPS - 1) * BMM2_MMAS_K_PER_GROUP + ki;
       APPLY_SCALE_V(mma_ki)
-      ctile_o.fill_frag_a(frag_p[mma_ki]);
+      ctile_o.fill_frag_a(frag_p_cross[mma_ki]);
       ctile_o.compute(ki);
     }
 
     APPLY_SCALE_V((Mma_tile_o::MMAS_K - 1))
-    ctile_o.fill_frag_a(frag_p[Mma_tile_o::MMAS_K - 1]);
+    ctile_o.fill_frag_a(frag_p_cross[Mma_tile_o::MMAS_K - 1]);
     ctile_o.compute(Mma_tile_o::MMAS_K - 1, true, true);
 
     warpgroup_commit();
-    warpgroup_wait<0>();
+    // For non-paged KV paths, BMM2 wait is deferred: the NEXT call's warpgroup_wait<0>() (after
+    // BMM1 commit) drains this group simultaneously with BMM1, hiding BMM2 drain latency in the
+    // inter-step pipeline. The outer KV loop adds an explicit warpgroup_wait<0>() before the
+    // epilogue to drain the last step. Paged KV retains an immediate wait here because its longer
+    // DMA latency already hides BMM2 drain, and the deferred approach adds overhead in that case.
+    if constexpr (Kernel_traits::PAGED_KV_INPUT) {
+      warpgroup_wait<0>();
+    }
   }
 };
 

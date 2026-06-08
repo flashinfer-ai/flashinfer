@@ -102,6 +102,26 @@ def _split_scale_param(scale):
 
 
 @functools.cache
+def _get_scale_bmm2_d_tensor(
+    scale_bmm2: float, data_dtype: torch.dtype, device_str: str
+) -> torch.Tensor:
+    """Cached version of _create_scale_bmm2_d_tensor.
+
+    Caches by (scale_bmm2, data_dtype, device) so that the tensor is only
+    allocated and uploaded once per unique combination. This avoids the
+    per-call GPU allocation, fill kernel, H2D copy, and stream synchronization
+    that would otherwise occur every time trtllm_fmha_v2_prefill is called.
+
+    Args:
+        scale_bmm2: The scale value for BMM2.
+        data_dtype: The input tensor dtype.
+        device_str: String representation of the device (e.g. "cuda:0").
+    """
+    device = torch.device(device_str)
+    return _create_scale_bmm2_d_tensor(scale_bmm2, data_dtype, device)
+
+
+@functools.cache
 def get_fmha_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
