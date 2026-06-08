@@ -51,6 +51,17 @@ BASE_SEED = int(os.environ.get("FLASHINFER_MOE_FUZZ_SEED", "0"))
 # ---------------------------------------------------------------------------
 # Shared logical config + fp32 ground truth + reference (the backend-agnostic core)
 # ---------------------------------------------------------------------------
+_E4M3_MAX = 448.0
+
+
+def _pt_fp8(t):
+    """Per-tensor e4m3 quant. Returns (fp8 tensor, scale [scalar], dequantized fp32)."""
+    amax = t.abs().max().clamp_min(1e-12)
+    scale = (amax / _E4M3_MAX).float()
+    q = (t / scale).clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
+    return q, scale, q.float() * scale
+
+
 @dataclass(frozen=True)
 class MoEConfig:
     num_tokens: int
@@ -58,7 +69,7 @@ class MoEConfig:
     intermediate_size: int
     num_experts: int
     top_k: int
-    quant: str  # "bf16" | "fp16"  (fp8_*/fp4_* added in later phases)
+    quant: str  # "bf16" | "fp16" | "fp8" (per-tensor e4m3)
     activation: str  # "swiglu"
     seed: int
 
@@ -101,20 +112,55 @@ class MasterTensors:
         self.routing_weights = rw  # [T, top_k]
         self.selected_experts = sel.to(torch.int32)  # [T, top_k]
 
+        # fp8 per-tensor quantization: x once, weights per-expert (matches the cutlass
+        # fp8 MoE test convention). The dequantized views are the reference inputs so the
+        # shared reference models exactly the fp8 rounding the kernel sees.
+        if cfg.quant == "fp8":
+            self.x_fp8, self.x_scale, self.x_dq = _pt_fp8(self.x)
+            w31q, w2q, s31, s2, w31dq, w2dq = [], [], [], [], [], []
+            for e in range(E):
+                q, s, dq = _pt_fp8(self.w31[e])
+                w31q.append(q), s31.append(s), w31dq.append(dq)
+                q, s, dq = _pt_fp8(self.w2[e])
+                w2q.append(q), s2.append(s), w2dq.append(dq)
+            self.w31_fp8, self.w31_scale, self.w31_dq = (
+                torch.stack(w31q),
+                torch.stack(s31).view(E),
+                torch.stack(w31dq),
+            )
+            self.w2_fp8, self.w2_scale, self.w2_dq = (
+                torch.stack(w2q),
+                torch.stack(s2).view(E),
+                torch.stack(w2dq),
+            )
+
 
 def shared_reference(m: MasterTensors, cfg: MoEConfig) -> torch.Tensor:
-    """The one fp32 MoE reference (SwiGLU). w31 = concat[w3(linear), w1(gated)] (chunk dim 0)."""
-    x = m.x
+    """The one fp32 MoE reference (SwiGLU). w31 = concat[w3(linear), w1(gated)] (chunk dim 0).
+
+    For fp8 the reference consumes the *dequantized* per-tensor-quant inputs and quantizes the
+    intermediate to fp8 with scale 1.0 (the cutlass fc2-input-quant scale) -- i.e. it reproduces
+    the full fp8 round-trip (input + weight + intermediate), not just weight quant, so the oracle
+    stays tight rather than papering over kernel rounding with a loose tolerance.
+    """
+    fp8 = cfg.quant == "fp8"
+    x = m.x_dq if fp8 else m.x
+    w31 = m.w31_dq if fp8 else m.w31
+    w2 = m.w2_dq if fp8 else m.w2
     out = torch.zeros_like(x)
     for e in range(cfg.num_experts):
         mask = m.selected_experts == e
         if not mask.any():
             continue
         tok, nth = torch.where(mask)
-        w3, w1 = torch.chunk(m.w31[e], 2, dim=0)  # matches compute_with_experts split
+        w3, w1 = torch.chunk(w31[e], 2, dim=0)  # matches compute_with_experts split
         xe = x[tok]
         inter = F.silu(xe @ w1.t()) * (xe @ w3.t())
-        y = inter @ m.w2[e].t()
+        if (
+            fp8
+        ):  # intermediate fp8 quant, per-tensor scale 1.0 (== cutlass quant_scales[1])
+            inter = inter.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn).float()
+        y = inter @ w2[e].t()
         out[tok] += m.routing_weights[tok, nth, None] * y
     return out  # [T, H], fp32
 
@@ -143,11 +189,15 @@ class CutlassAdapter(MoEAdapter):
     def supports(self, cfg, sm):
         if sm not in (89, 90, 100, 103, 110, 120, 121):
             return f"cutlass_fused_moe unsupported on SM{sm}"
-        if cfg.quant not in ("bf16", "fp16"):
-            return f"phase-1 cutlass adapter: quant {cfg.quant} not wired yet"
+        if cfg.quant not in ("bf16", "fp16", "fp8"):
+            return f"cutlass adapter: quant {cfg.quant} not wired yet"
+        if cfg.quant == "fp8" and sm < 89:
+            return "cutlass fp8 MoE needs SM89+"
         return None
 
     def run(self, m, cfg):
+        if cfg.quant == "fp8":
+            return self._run_fp8(m, cfg)
         dt = torch.bfloat16 if cfg.quant == "bf16" else torch.float16
         x = m.x.to(dt)
         w31 = m.w31.to(dt)
@@ -165,6 +215,32 @@ class CutlassAdapter(MoEAdapter):
             activation_type=_ACT[cfg.activation],
         )
         # cutlass returns [output, num_active_experts, ...] (min-latency buffers); take output.
+        y = res[0] if isinstance(res, (list, tuple)) else res
+        return y.float()
+
+    def _run_fp8(self, m, cfg):
+        """Per-tensor fp8: pre-quantized x_fp8 + fp8 weights + positional quant_scales
+        [fc1_dequant(=w*input), fc2_quant(=1.0), fc2_dequant(=w2), fc1_input_scale]."""
+        otype = torch.bfloat16
+        dev = m.x.device
+        quant_scales = [
+            (m.w31_scale * m.x_scale).float(),  # [E] fc1 output dequant
+            torch.tensor(1.0, device=dev),  # fc2 input quant scale
+            m.w2_scale.float(),  # [E] fc2 output dequant
+            m.x_scale.float().reshape(()),  # fc1 input (pre-quant) scale
+        ]
+        out = torch.empty(cfg.num_tokens, cfg.hidden_size, device=dev, dtype=otype)
+        res = fused_moe.cutlass_fused_moe(
+            m.x_fp8,
+            m.selected_experts.to(torch.int),
+            m.routing_weights,
+            m.w31_fp8,
+            m.w2_fp8,
+            otype,
+            output=out,
+            quant_scales=quant_scales,
+            activation_type=_ACT[cfg.activation],
+        )
         y = res[0] if isinstance(res, (list, tuple)) else res
         return y.float()
 
@@ -195,8 +271,16 @@ class TrtllmGenAdapter(MoEAdapter):
     def supports(self, cfg, sm):
         if sm not in (100, 103):
             return f"trtllm-gen MoE gated to SM100/103 (not SM{sm})"
+        if cfg.quant == "fp8":
+            # trtllm fp8-per-tensor routes IN-KERNEL (no routed entry) and computes the
+            # intermediate scale internally, vs cutlass's caller-routing + explicit
+            # quant_scales[1]=1.0 -- the two fp8 scale/routing contracts are incompatible,
+            # so a forced cross-API fp8 oracle would diverge legitimately. This contract
+            # gap IS a unified-API design finding (see UNIFIED_MOE_FUZZER_AND_API_DESIGN.md);
+            # we keep fp8 as a cutlass-only (vs-reference + cross-arch) oracle for now.
+            return "trtllm fp8-per-tensor scale/routing contract diverges from cutlass"
         if cfg.quant != "bf16":
-            return f"phase-1 trtllm adapter: quant {cfg.quant} not wired yet"
+            return f"trtllm adapter: quant {cfg.quant} not wired yet"
         # BlockMajorK packs K in 128-blocks; gemm1 K=hidden, gemm2 K=intermediate.
         if cfg.hidden_size % 128 or cfg.intermediate_size % 128:
             return "trtllm BlockMajorK requires hidden/intermediate %128==0"
@@ -264,7 +348,7 @@ _INTERMED = [256, 512, 768, 1024, 1536]
 _EXPERTS = [8, 16, 32, 64, 128, 256]
 _TOPK = [1, 2, 4, 6, 8]
 _TOKENS = [1, 2, 8, 16, 64, 128, 512, 1024, 2048, 4096]
-_QUANT = ["bf16", "fp16"]
+_QUANT = ["bf16", "fp16", "fp8"]
 
 
 def _gen(seed):
@@ -300,6 +384,10 @@ def _tol(cfg, ref):
     absmax = ref.abs().max().item()
     if cfg.quant == "fp16":
         return 1e-2, 4e-3 * absmax + 1e-4
+    if (
+        cfg.quant == "fp8"
+    ):  # e4m3 ~2 mantissa bits + intermediate requant; calibrated below
+        return 8e-2, 8e-2 * absmax + 1e-3
     return 3e-2, 2e-2 * absmax + 1e-4  # bf16
 
 
