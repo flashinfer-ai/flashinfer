@@ -507,14 +507,8 @@ class MoEStaticKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        # Derive atom loop bounds from the tile shape and the (M,N,K) warp atom
-        # layout, exactly like the dense kernel. MMA atom = m16 n8 k64; with
-        # atom_layout=(2,2,1) the warp group spans m32 n16 k64. The previous
-        # hardcoded (16*4)/(8*2) was copied from the dense kernel's (4,2,1)
-        # layout and gave num_m_tiles=2 (4-warp-M) instead of 4 (this kernel's
-        # 2-warp-M) -- the GEMM loop then filled only M-tiles {0,1}, leaving the
-        # second 64-row warp quadrant (rows 64..127) at fill(0.0). num_n_tiles
-        # was accidentally correct because both layouts share atom_shape[1]=2.
+        # Derive loop bounds from atom_shape (like the dense kernel). The old
+        # hardcoded (16*4) assumed dense's (4,2,1); this kernel is (2,2,1).
         mma_m, mma_n, mma_k = 16, 8, 64
         self.num_m_tiles = self.tile_shape_mnk[0] // (mma_m * atom_shape[0])
         self.num_n_tiles = self.tile_shape_mnk[1] // (mma_n * atom_shape[1])
