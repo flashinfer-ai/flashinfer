@@ -165,8 +165,9 @@ enum class ActivationType : int64_t {
   Geglu = 4,
   SwigluBias = 5,
   Relu2 = 6,
-  Identity = 7,
-  InvalidType = 8,  // Must be last
+  SwigluStep = 7,
+  Identity = 8,
+  InvalidType = 9,  // Must be last
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -187,6 +188,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "Relu2";
     case ActivationType::Identity:
       return "Identity";
+    case ActivationType::SwigluStep:
+      return "SwigluStep";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -194,7 +197,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
 
 inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
-         activationType == ActivationType::SwigluBias;
+         activationType == ActivationType::SwigluBias ||
+         activationType == ActivationType::SwigluStep;
 }
 
 }  // namespace MoE
