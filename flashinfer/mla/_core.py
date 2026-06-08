@@ -729,21 +729,21 @@ class BatchMLAPagedAttentionWrapper:
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
             auxiliary data structures will be stored in provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
-        qo_indptr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
-            should be ``[batch_size + 1]``.
-            This argument is only effective when ``use_cuda_graph`` is ``True``.
-        kv_indptr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``kv_indptr`` array, the size of the buffer
-            should be ``[batch_size + 1]``.
-            This argument is only effective when ``use_cuda_graph`` is ``True``.
-        kv_indices_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``kv_indices`` array.
-            This argument is only effective when ``use_cuda_graph`` is ``True``.
-        kv_len_arr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``kv_len_arr`` array, the size of the buffer
-            should be ``[batch_size]``.
-            This argument is only effective when ``use_cuda_graph`` is ``True``.
+        qo_indptr : Optional[torch.Tensor]
+            User-reserved buffer to back the ``qo_indptr`` array, shape ``[batch_size + 1]``,
+            dtype ``int32``.  Only consulted when ``use_cuda_graph=True``.  The wrapper
+            copies into this buffer at :meth:`plan` time so capture-time pointers remain
+            stable.
+        kv_indptr : Optional[torch.Tensor]
+            User-reserved buffer to back the ``kv_indptr`` array, shape ``[batch_size + 1]``,
+            dtype ``int32``.  Only consulted when ``use_cuda_graph=True``.
+        kv_indices : Optional[torch.Tensor]
+            User-reserved buffer to back the ``kv_indices`` array, sized to the maximum
+            expected number of pages, dtype ``int32``.  Only consulted when
+            ``use_cuda_graph=True``.
+        kv_len_arr : Optional[torch.Tensor]
+            User-reserved buffer to back the ``kv_len_arr`` array, shape ``[batch_size]``,
+            dtype ``int32``.  Only consulted when ``use_cuda_graph=True``.
         backend : str
             The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
@@ -945,6 +945,12 @@ class BatchMLAPagedAttentionWrapper:
             The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
+        return_lse_base_on_e : bool, optional
+            Controls the base of the returned LSE values when ``return_lse=True``.
+            If ``False`` (default), the LSE is returned in base-2
+            (``log2(sum(exp2(...)))``) to match the kernel's internal log-base.
+            If ``True``, the LSE is converted to natural-log base (``log(sum(exp(...)))``)
+            for compatibility with cascade-merging APIs that expect base-e LSEs.
         o_scale : Optional[float]
             FP8 output dequantization scale (``real = quantized * o_scale``).
             When provided, ``out`` must be an FP8 tensor. Only supported with
@@ -1671,6 +1677,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+    enable_pdl : Optional[bool]
+        Programmatic Dependent Launch toggle.  When ``None`` (default), auto-detects
+        support from the query device.  Honoured by the ``trtllm-gen`` and ``xqa``
+        backends; ignored by ``cute-dsl``.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa``, ``trtllm-gen``, or ``cute-dsl``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
@@ -2008,36 +2018,75 @@ def xqa_batch_decode_with_kv_cache_mla(
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool | None = None,
 ) -> torch.Tensor:
-    """
-    Parameters:
-    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
-    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe] or [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache. Both 3D and 4D formats are supported for backward compatibility.
-    workspace_buffer: torch.Tensor. Must be initialized to 0 for its first use.
-    qk_nope_head_dim: qk_nope_head_dim, must be 128
-    kv_lora_rank: kv_lora_rank, must be 512
-    qk_rope_head_dim: qk_rope_head_dim, must be 64
-    block_tables: page_table of kv cache, [batch_size, num_pages]
-    seq_lens: query_len
-    max_seq_len: max sequence length for kv_cache
-    out: output tensor, if not provided, will be allocated internally
-    bmm1_scale: fused scale for mla bmm1 input. Can be a float or a torch.Tensor.
-    bmm2_scale: fused scale for mla bmm2 input. Can be a float or a torch.Tensor.
-    sinks: additional value per head in the denominator of the softmax.
+    r"""XQA-backend batched MLA decode.
 
-    Note:
-    In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
-    bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
-    bmm2_scale = v_scale * o_scale
+    Single-query (MTP-aware) MLA decode kernel optimized for SM120a / SM121a tensor cores.
+    Accepts the concatenated ``(q_nope || q_rope)`` query and ``(ckv || kpe)`` paged KV
+    cache layout used by DeepSeek-V3 / R1 inference.
 
-    The two scale factors should be static constant for cuda graph capture.
-    Either (bmm1_scale, bmm2_scale) or (bmm1_scale_log2_tensor, bmm2_scale_tensor) should be provided.
+    Parameters
+    ----------
+    query : torch.Tensor
+        Query tensor with shape
+        ``[batch_size, q_len_per_request, num_heads, head_dim_qk]`` where
+        ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``.  Must be the concatenation
+        ``[q_nope, q_rope]``.  ``q_len_per_request`` is the MTP query length and is
+        currently required to be ``1``.
+    kv_cache : torch.Tensor
+        Paged KV cache, either 3-D
+        ``[num_pages, page_size, kv_lora_rank + qk_rope_head_dim]`` or 4-D
+        ``[num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim]``.  The last
+        dimension is the concatenation ``[ckv_cache, kpe_cache]``.  Both shapes are
+        accepted for backward compatibility.
+    workspace_buffer : torch.Tensor
+        Pre-allocated workspace buffer.  Must be zero-initialized on first use.
+    qk_nope_head_dim : int
+        Non-RoPE head dimension.  Must be ``128``.  Will be removed in 1.0; pass
+        ``kv_lora_rank`` instead going forward.
+    kv_lora_rank : int
+        Rank of the latent KV projection.  Must be ``512``.
+    qk_rope_head_dim : int
+        RoPE head dimension appended to the latent projection.  Must be ``64``.
+    block_tables : torch.Tensor
+        Per-request paged KV block table, shape ``[batch_size, num_pages]``.
+    seq_lens : torch.Tensor
+        Per-request KV sequence length, shape ``[batch_size]``.
+    max_seq_len : int
+        Maximum KV sequence length used for kernel scheduling.  Will be removed in
+        1.0; the kernel reads the per-request lengths from ``seq_lens``.
+    out : Optional[torch.Tensor]
+        Optional output tensor of shape ``[batch_size, num_heads, kv_lora_rank]``
+        and dtype ``torch.bfloat16``.  If ``None``, it is allocated internally.
+    bmm1_scale : Union[float, torch.Tensor]
+        Fused scale for MLA BMM1 (see Note).  ``float`` for static (CUDA-graph
+        safe) scales; ``torch.Tensor`` for on-device dynamic scales (FP8 only).
+    bmm2_scale : Union[float, torch.Tensor]
+        Fused scale for MLA BMM2 (see Note).  Same typing rules as ``bmm1_scale``.
+    sinks : Optional[List[torch.Tensor]]
+        Attention-sink tensors.  Currently unsupported and must be ``None``.
+    enable_pdl : Optional[bool]
+        Programmatic Dependent Launch toggle.  When ``None``, auto-detects support
+        from the device.
 
-    For static constant scale factors, the scale factors should be provided as float.
-        - (bmm1_scale, bmm2_scale)
-    For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.
-        - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
-        - Currently, only fp8 tensor core operation supports this mode.
-    When both are provided, the dynamic scale factor tensors will be used.
+    Returns
+    -------
+    torch.Tensor
+        Attention output, shape ``[batch_size, num_heads, kv_lora_rank]``, dtype
+        ``torch.bfloat16``.
+
+    Note
+    ----
+    In MLA, the BMM1 and BMM2 scales are fused as:
+
+    .. code-block:: text
+
+        bmm1_scale = q_scale * k_scale * sm_scale / sqrt(head_dim_qk)
+        bmm2_scale = v_scale * o_scale
+
+    The scale factors must be static constants for CUDA graph capture.  Either the
+    ``(bmm1_scale, bmm2_scale)`` (float) pair or the on-device
+    ``(bmm1_scale_log2_tensor, bmm2_scale_tensor)`` tensor pair may be passed.
+    When tensor inputs are supplied, the on-device path is taken (FP8 only).
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
     sm_count = get_device_sm_count(query.device)
