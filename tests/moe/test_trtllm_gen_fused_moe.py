@@ -2441,7 +2441,11 @@ def run_moe_dequant(args, quant_mode: QuantMode):
                 )
                 my_x1 = torch.clamp(my_x1, min=-limit, max=limit)
                 my_x2 = torch.clamp(my_x2, max=limit)
-            if args.gemm1_alpha is not None or args.gemm1_beta is not None:
+            if (
+                args.gemm1_alpha is not None
+                or args.gemm1_beta is not None
+                or args.gemm1_clamp_limit is not None
+            ):
                 assert int(args.activation_type) == int(ActivationType.Swiglu)
                 alpha = (
                     1.0

@@ -1614,6 +1614,8 @@ def get_trtllm_moe_sm100_module():
             gemm1_alpha,
             gemm1_beta,
             gemm1_clamp_limit,
+            local_num_experts,
+            hidden_states.device,
         )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -2658,6 +2660,8 @@ def _validate_bf16_gemm1_activation_params(
     gemm1_alpha: Optional[torch.Tensor],
     gemm1_beta: Optional[torch.Tensor],
     gemm1_clamp_limit: Optional[torch.Tensor],
+    local_num_experts: int,
+    device: torch.device,
 ) -> None:
     if gemm1_alpha is None and gemm1_beta is None and gemm1_clamp_limit is None:
         return
@@ -2666,6 +2670,19 @@ def _validate_bf16_gemm1_activation_params(
             "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
             "for ActivationType.Swiglu."
         )
+    for name, tensor in (
+        ("gemm1_alpha", gemm1_alpha),
+        ("gemm1_beta", gemm1_beta),
+        ("gemm1_clamp_limit", gemm1_clamp_limit),
+    ):
+        if tensor is not None:
+            check_shape_dtype_device(
+                tensor,
+                (local_num_experts,),
+                torch.float32,
+                device,
+                name,
+            )
 
 
 def _validate_routing_replay_out(
@@ -2835,6 +2852,8 @@ def trtllm_bf16_moe(
         gemm1_alpha,
         gemm1_beta,
         gemm1_clamp_limit,
+        local_num_experts,
+        hidden_states.device,
     )
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
@@ -3022,6 +3041,8 @@ def trtllm_bf16_routed_moe(
         gemm1_alpha,
         gemm1_beta,
         gemm1_clamp_limit,
+        local_num_experts,
+        hidden_states.device,
     )
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         None,
