@@ -137,25 +137,6 @@ class TllmGenFmhaKernel {
         if (mKernelMetaMap.find(hash) != mKernelMetaMap.end()) {
           // The kernelMeta of the existing kernel.
           auto const& existingKernelMeta = mKernelMeta[mKernelMetaMap.at(hash)];
-          // Some generation cubins are exported twice with the same metadata key. Different cubin
-          // names are equivalent Dense/Causal aliases; keep the first entry. Same-name duplicates
-          // collide on the published artifact path, so use the later metadata entry that matches
-          // the file left in the artifact manifest.
-          if (existingKernelMeta.mSM == kernelMeta.mSM) {
-            if (std::strcmp(existingKernelMeta.mFuncName, kernelMeta.mFuncName) == 0 &&
-                std::strcmp(existingKernelMeta.sha256, kernelMeta.sha256) != 0) {
-              mKernelMetaMap[hash] = i;
-              IKL_LOG_DEBUG(
-                  "Replacing duplicate tllmgen attention kernel metadata for shared cubin %s",
-                  kernelMeta.mFuncName);
-              continue;
-            }
-            IKL_LOG_DEBUG(
-                "Skipping duplicate tllmgen attention kernel %s for key already held by "
-                "%s",
-                kernelMeta.mFuncName, existingKernelMeta.mFuncName);
-            continue;
-          }
           // Allow conflicts only if they are family/specific versions of the same architecture.
           FLASHINFER_CHECK(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
                            "Hash conflicts exist between %s and %s.", existingKernelMeta.mFuncName,
@@ -202,7 +183,8 @@ class TllmGenFmhaKernel {
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage,
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
-                         int sparseMlaType, bool skipsSoftmax, int bf16QFp8KvTransformMode) const {
+                         bool groupsTokensHeadsQ, int sparseMlaType, bool skipsSoftmax,
+                         int bf16QFp8KvTransformMode) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -238,6 +220,7 @@ class TllmGenFmhaKernel {
     // Bit 57 - 57: skipsSoftmax.
     // Bit 58 - 58: dynamicNumTokensPerPage.
     // Bit 59 - 60: BF16Q FP8KV transform mode (0=full, 1=K-only, 2=separate K/V).
+    // Bit 61 - 61: groupsTokensHeadsQ.
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
@@ -253,7 +236,8 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(sparseMlaType) << 55) |
            (static_cast<uint64_t>(skipsSoftmax) << 57) |
            (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58) |
-           (static_cast<uint64_t>(bf16QFp8KvTransformMode) << 59);
+           (static_cast<uint64_t>(bf16QFp8KvTransformMode) << 59) |
+           (static_cast<uint64_t>(groupsTokensHeadsQ) << 61);
   }
 
   inline bool isDynamicNumTokensPerPageKernel(KernelMeta const& kernelMeta) const {
@@ -267,7 +251,8 @@ class TllmGenFmhaKernel {
                   kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
                   kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
                   isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
-                  kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
+                  kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ, kernelMeta.mSparseAttn,
+                  kernelMeta.mSkipsSoftmaxWhenPossible,
                   getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
                                              kernelMeta.mSeparateTransformedKv));
   }
@@ -914,10 +899,12 @@ class TllmGenFmhaKernel {
     // Generic mixed precision kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
     // transform paths present BF16 K to BMM1, so they can use the grouped-token cubins.
     if (!supportsGqaGroupingTokensHeadsQ(selectKernelParams)) {
+      selectKernelParams.mGroupsTokensHeadsQ = false;
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       return;
     }
+    selectKernelParams.mGroupsTokensHeadsQ = true;
 
     // The number of tokensQ and headsQ that can be grouped into one CTA.
     int numTokensHeadsQ = params.mNumHeadsQPerKv * params.mMaxSeqLenQ;
@@ -1016,6 +1003,7 @@ class TllmGenFmhaKernel {
         ", dynamicNumTokensPerPage=" + std::to_string(selectKernelParams.mDynamicNumTokensPerPage) +
         ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) +
         ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma) +
+        ", groupsTokensHeadsQ=" + std::to_string(selectKernelParams.mGroupsTokensHeadsQ) +
         ", sparseMlaType=" + std::to_string(static_cast<int>(params.mSparseMlaType)) +
         ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) +
         ", bf16QFp8KvTransformMode=" +
@@ -1034,7 +1022,7 @@ class TllmGenFmhaKernel {
                selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                selectKernelParams.mNumTokensPerPage, selectKernelParams.mDynamicNumTokensPerPage,
                selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
-               static_cast<int>(params.mSparseMlaType),
+               selectKernelParams.mGroupsTokensHeadsQ, static_cast<int>(params.mSparseMlaType),
                selectKernelParams.mSkipsSoftmaxWhenPossible,
                static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)),
         info);
