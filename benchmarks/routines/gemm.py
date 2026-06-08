@@ -1342,7 +1342,9 @@ def testMmW4A16Fp4(args):
     only the ``mm_w4a16_fp4`` call is.
 
     Constraints:
-      * N must be divisible by 128 (128x4 SF swizzle alignment).
+      * N must be divisible by 64 (the weight-prepack / kernel N tile).
+        The 128x4 SF swizzle only pads N to 128; prepare_w4a16_fp4_weights
+        unswizzles the padded tail, so any N % 64 == 0 works.
       * K must be divisible by 16 (FP4 block size).
       * input_dtype must be bfloat16 (the only A dtype currently
         supported; fp16 deferred).
@@ -1379,10 +1381,11 @@ def testMmW4A16Fp4(args):
             f"mm_w4a16_fp4 benchmark requires out_dtype in (bfloat16, float16), got {args.out_dtype}"
         )
     if n % 64 != 0:
-        # The real constraint is the Marlin tile width (_MARLIN_TILE_N=64);
-        # the 128x4 SF swizzle only *pads* N to 128, and prepare_w4a16_fp4_weights
-        # unswizzles the padded tail, so any n % 64 == 0 works.
-        raise ValueError("mm_w4a16_fp4 benchmark requires n % 64 == 0 (Marlin tile N)")
+        # N must be a multiple of the 64-wide N tile used by the weight
+        # prepack and the cute-dsl kernel.  The 128x4 SF swizzle only *pads*
+        # N to 128, and prepare_w4a16_fp4_weights unswizzles the padded
+        # tail, so any n % 64 == 0 works.
+        raise ValueError("mm_w4a16_fp4 benchmark requires n % 64 == 0")
     if k % 16 != 0:
         raise ValueError("mm_w4a16_fp4 benchmark requires k % 16 == 0 (FP4 block size)")
     if "marlin" in backends:

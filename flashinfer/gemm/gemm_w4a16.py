@@ -1355,16 +1355,130 @@ def _e4m3_to_s0e5m3(sf_u8: torch.Tensor) -> torch.Tensor:
     return ((bits >> 7) & 0xFF).to(torch.uint8)
 
 
+# -----------------------------------------------------------------------------
+# Host-side FP4 weight repack for the cute-DSL kernel.
+# -----------------------------------------------------------------------------
+#
+# The packed FP4 weight is permuted on the host so the cute-DSL kernel can load
+# its B operand with a trivial, vectorizable shared-memory address.  The layout
+# is fully driven by the kernel's MMA partition.  For the atom config
+#   atom_layout      = (2, 2, 1)        # 4 MMA warps: 2 M-warps x 2 N-warps
+#   mma_inst_mnk     = (16, 8, 16)
+#   permutation_mnk  = (32, 32, 16)     # *2 trick on N
+#   tile_shape_mnk   = (M_tile, 64,  64)
+# ``thr_mma.partition_B`` gives every thread 16 fp16 slots per K-block:
+#   * K = { tc_row, tc_row+1, tc_row+8, tc_row+9 },  tc_row = (lane % 4) * 2
+#   * N = { base_n, base_n+16, base_n+32, base_n+48 },
+#         base_n = (warp_idx // 2) * 8 + (lane // 4)  in [0, 16)
+# That is 16 fp16 = 8 packed FP4 bytes = 2 int32 per thread per K-block.  Each
+# int32 packs four bytes carrying K-pairs (even/odd) at the same N, so
+# ``cvt.rn.f16x2.e2m1x2`` decodes 2 fp16 sharing one scale.  The 128 int32 of a
+# (16K x 64N) block are ordered by (n_warp_idx, lane, u32_idx) so thread
+# (warp, lane) reads ``sB[k_block, n_warp_idx * 64 + lane * 2 + u32_idx]``.
+# The kernel's ``_dequant_b_to_register`` consumes exactly this layout.
+_TILE_K: int = 16  # K-tile size = MMA K-block size
+_TILE_N: int = 64  # N-tile size = kernel tile_N
+_INTS_PER_TILE: int = 128  # int32s per (16K x 64N) repack block
+
+
+def prepare_fp4_w4a16_weight(b: torch.Tensor) -> torch.Tensor:
+    """Repack a packed FP4 weight for the W4A16 cute-DSL kernel.
+
+    Args:
+        b: ``(K // 2, N)`` ``uint8`` (or ``torch.float4_e2m1fn_x2``) tensor
+           of packed FP4 values.  Byte ``b[k_half, n]`` carries the FP4
+           value at K-index ``2 * k_half`` in its low nibble and
+           ``2 * k_half + 1`` in its high nibble.  ``K`` must be a
+           multiple of 16; ``N`` a multiple of 64.
+
+    Returns:
+        ``(K // 16, N * 2)`` ``int32`` tensor in the layout the kernel
+        expects (128 int32 per (16K x 64N) block).
+    """
+    if b.dtype != torch.uint8:
+        b = b.view(torch.uint8)
+
+    k_half, n = b.shape
+    k = k_half * 2
+    if k % _TILE_K != 0:
+        raise ValueError(f"K must be a multiple of {_TILE_K} (got K={k})")
+    if n % _TILE_N != 0:
+        raise ValueError(f"N must be a multiple of {_TILE_N} (got N={n})")
+
+    device = b.device
+    k_tiles = k // _TILE_K
+    n_tiles = n // _TILE_N
+
+    # Per-position byte-source maps (one entry per int32 in a tile).
+    u32_pos = torch.arange(_INTS_PER_TILE, device=device, dtype=torch.long)
+    # u32_pos layout: n_warp_idx in [0, 2) outer, lane in [0, 32) middle,
+    # u32_idx in [0, 2) inner.
+    u32_idx_local = u32_pos % 2
+    lane = (u32_pos // 2) % 32
+    n_warp_idx = u32_pos // 64
+
+    tc_col = lane // 4  # in [0, 8)
+    tc_row_half = lane % 4  # tc_row = tc_row_half * 2 in {0, 2, 4, 6}
+    base_n = n_warp_idx * 8 + tc_col  # in [0, 16)
+
+    # Each int32 packs 4 bytes; each byte packs 2 FP4 values (low/high nibble).
+    # Byte k-offset (K within the 16-row tile) is in K-half units (since the
+    # source ``b`` is K/2 rows).  tc_row_half is already K-half.
+    # Bytes 0,2 hit K=tc_row,tc_row+1 -> source row tc_row_half.
+    # Bytes 1,3 hit K=tc_row+8,tc_row+9 -> source row tc_row_half + 4.
+    byte_k_half_offset = torch.tensor([0, 4, 0, 4], device=device, dtype=torch.long)
+
+    # N offset per byte (within the 64-col tile).  u32_idx 0 covers
+    # N=base_n+{0, 16}; u32_idx 1 covers N=base_n+{32, 48}.
+    byte_n_offset_for_u32_0 = torch.tensor(
+        [0, 0, 16, 16], device=device, dtype=torch.long
+    )
+    byte_n_offset_for_u32_1 = torch.tensor(
+        [32, 32, 48, 48], device=device, dtype=torch.long
+    )
+    # Select per-u32 offsets via gather.
+    n_offset_stack = torch.stack(
+        [byte_n_offset_for_u32_0, byte_n_offset_for_u32_1], dim=0
+    )
+    # (u32_pos, 4)
+    byte_n_offset = n_offset_stack[u32_idx_local]
+
+    # Full source indices: (K_tiles, N_tiles, _INTS_PER_TILE, 4) -> (k_half, n)
+    kt = torch.arange(k_tiles, device=device, dtype=torch.long)
+    nt = torch.arange(n_tiles, device=device, dtype=torch.long)
+    k_half_global = (
+        kt[:, None, None, None] * (_TILE_K // 2)
+        + tc_row_half[None, None, :, None]
+        + byte_k_half_offset[None, None, None, :]
+    )
+    n_global = (
+        nt[None, :, None, None] * _TILE_N
+        + base_n[None, None, :, None]
+        + byte_n_offset[None, None, :, :]
+    )
+
+    bytes_gathered = b[k_half_global, n_global]  # (K_tiles, N_tiles, 128, 4)
+
+    # Pack 4 bytes (little-endian: byte_idx 0 in bits 0-7) into one int32.
+    out64 = torch.zeros(
+        (k_tiles, n_tiles, _INTS_PER_TILE), dtype=torch.int64, device=device
+    )
+    for byte_idx in range(4):
+        out64 |= bytes_gathered[..., byte_idx].to(torch.int64) << (byte_idx * 8)
+
+    return out64.to(torch.int32).reshape(k_tiles, n_tiles * _INTS_PER_TILE)
+
+
 def _prepare_cute_dsl(
     b: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor],
     block_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """cute-DSL-backend prep: Marlin-repack the weight + unswizzle the SF.
+    """cute-DSL-backend prep: repack the weight + unswizzle the SF.
 
     Produces the bespoke layout the cute-DSL kernel consumes:
-      * weight: ``(K // 16, N * 2)`` int32 (Marlin-packed FP4).
+      * weight: ``(K // 16, N * 2)`` int32 (see :func:`prepare_fp4_w4a16_weight`).
       * SF:     ``(K // block_size, N)`` uint8 -- per-block scales in the format
         the cute-DSL kernel decodes (S0E5M3 when ``_CUTE_DSL_SCALE_S0E5M3``, else
         the raw E4M3).
@@ -1372,8 +1486,6 @@ def _prepare_cute_dsl(
     to a ``(1,) float32`` scalar).  Pair the returned tensors with
     ``mm_w4a16_fp4(..., backend='cute-dsl')``.
     """
-    from .marlin_repack import prepare_fp4_w4a16_weight
-
     n = int(b.shape[0])
     k = int(b.shape[1]) * 2
     k_sf = k // block_size
@@ -1381,14 +1493,14 @@ def _prepare_cute_dsl(
     # (N, K//2) -> (K//2, N) uint8.  A transpose preserves each byte's
     # low/high-nibble K-semantics, which is exactly what the repack expects.
     b_kn = b.t().contiguous()
-    b_marlin = prepare_fp4_w4a16_weight(b_kn)  # (K//16, N*2) int32
+    b_packed = prepare_fp4_w4a16_weight(b_kn)  # (K//16, N*2) int32
 
     # Canonical 128x4-swizzled SF -> linear (N, K_sf) -> (K_sf, N) uint8.
     linear_sf = _unswizzle_sf_128x4(b_descale, n, k_sf)  # (N, K_sf) uint8
     sf_ksf_n = linear_sf.t().contiguous()  # (K_sf, N) uint8 (E4M3)
     if _CUTE_DSL_SCALE_S0E5M3:
         sf_ksf_n = _e4m3_to_s0e5m3(sf_ksf_n)  # -> S0E5M3, matched to the kernel decode
-    return b_marlin, sf_ksf_n, alpha
+    return b_packed, sf_ksf_n, alpha
 
 
 # =============================================================================

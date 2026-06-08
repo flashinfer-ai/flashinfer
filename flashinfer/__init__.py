@@ -105,10 +105,8 @@ from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
-from .gemm import (
-    mm_w4a16_fp4 as mm_w4a16_fp4,
-    prepare_w4a16_fp4_weights as prepare_w4a16_fp4_weights,
-)
+from .gemm import mm_w4a16_fp4 as mm_w4a16_fp4
+from .gemm import prepare_w4a16_fp4_weights as prepare_w4a16_fp4_weights
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100

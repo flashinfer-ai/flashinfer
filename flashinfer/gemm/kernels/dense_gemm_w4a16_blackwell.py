@@ -38,7 +38,8 @@ The B fragment is filled in-register by:
 
   1. Loading two ``int32`` from ``sB_marlin`` per thread per K-block
      (deterministic offsets driven by the cute partition; see
-     ``flashinfer/gemm/marlin_repack.py`` for the layout).
+     ``prepare_fp4_w4a16_weight`` in ``flashinfer/gemm/gemm_w4a16.py``
+     for the layout).
   2. Decoding each ``int32`` via ``cvt.rn.f16x2.e2m1x2`` -> 4 ``fp16x2``
      (= 8 fp16) using ``fp4_decode_4bytes``.
   3. Multiplying each pair by its per-group E4M3 scale (loaded from
@@ -140,7 +141,8 @@ def f16x2_unpack(
     )
 
 
-# Marlin packing constants (must match flashinfer/gemm/marlin_repack.py).
+# FP4 weight packing constants (must match prepare_fp4_w4a16_weight in
+# flashinfer/gemm/gemm_w4a16.py).
 _MARLIN_TILE_K: cutlass.Constexpr = 16
 _MARLIN_TILE_N: cutlass.Constexpr = 64
 _MARLIN_INTS_PER_TILE: cutlass.Constexpr = 128  # 128 int32 per (16K x 64N) block
@@ -1493,7 +1495,8 @@ class BlackwellDenseGemmW4A16Kernel:
           u32_0 @ sB_marlin[k_block_idx, n_warp_idx * 64 + lane * 2 + 0, stage]
           u32_1 @ sB_marlin[k_block_idx, n_warp_idx * 64 + lane * 2 + 1, stage]
 
-        Byte layout inside each int32 (see ``flashinfer/gemm/marlin_repack.py``):
+        Byte layout inside each int32 (see ``prepare_fp4_w4a16_weight`` in
+        ``flashinfer/gemm/gemm_w4a16.py``):
           u32_0:
             byte 0: K=tc_row,    tc_row+1 at N=base_n        -> (mma_i=0,1, nn=0)
             byte 1: K=tc_row+8,  tc_row+9 at N=base_n        -> (mma_i=2,3, nn=0)
