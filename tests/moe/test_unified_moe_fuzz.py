@@ -12,7 +12,10 @@ arch support diverge. So this fuzzer is built around:
     **cross-API agreement** (two backends, same logical config, must agree) and **cross-arch
     agreement** (the cutlass backend spans SM89..SM120).
 
-This file is the unified replacement for the per-API MoE fuzzers; `grouped_mm` is intentionally a
+This is the cross-API/cross-arch *correctness* net. It is complementary to `test_moe_fuzz.py`, the
+*crash-finder* on the trtllm in-kernel-routing + autotuner path (all routing methods, autotune
+ON/OFF, extreme expert counts) -- the two catch different classes, keep both until this fuzzer also
+folds in an in-kernel-routing variant + autotune oracle + extreme experts. `grouped_mm` stays a
 separate fuzzer (different contract: m_indptr ranges, no routing/gating/scatter).
 
 Run with `pytest --forked` (a MoE config can IMA and corrupt the CUDA context; isolation turns each
