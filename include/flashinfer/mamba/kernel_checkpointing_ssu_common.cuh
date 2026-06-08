@@ -49,25 +49,6 @@ constexpr unsigned int MASK_ALL_LANES = 0xFFFFFFFFu;
 constexpr unsigned int num_bits_uint32 = 32u;
 }  // namespace constants
 
-// ── Programmatic Dependent Launch (PDL) helpers ────────────────────────────
-// `gdc_wait` enforces no gmem access before the upstream PDL-paired kernel
-// has signaled.  `gdc_launch_dependents` hints the downstream PDL-paired
-// kernel to launch early.  Both are no-ops on SM<90 and harmless without
-// the launch-time `cudaLaunchAttributeProgrammaticStreamSerialization`
-// attribute, so the kernel can always emit them; the host-side `enable_pdl`
-// toggle is what flips the launch attribute.
-__forceinline__ __device__ void gdc_wait() {
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
-#endif
-}
-
-__forceinline__ __device__ void gdc_launch_dependents() {
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
-}
-
 // Round x up to the next multiple of Y (Y must be a power of 2).
 template <int Y>
 constexpr int next_multiple_of(int x) {
