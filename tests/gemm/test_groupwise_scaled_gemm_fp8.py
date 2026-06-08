@@ -27,7 +27,7 @@ from flashinfer.gemm import (
     group_deepgemm_fp8_nt_groupwise,
     group_gemm_fp8_nt_groupwise,
 )
-from flashinfer.gemm.kernels.cutile_common import is_cuda_tile_available
+from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
 

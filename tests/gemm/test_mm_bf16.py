@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
-from flashinfer.gemm.kernels.cutile_common import is_cuda_tile_available
+from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability
 
 

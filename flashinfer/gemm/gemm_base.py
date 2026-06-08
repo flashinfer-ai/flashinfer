@@ -608,7 +608,7 @@ def mm_bf16(
     # Handled before the SM100 dispatch table because it does not consume
     # `workspace_buffer` and ignores `bias` / `pdl`.
     if backend == "cutile":
-        from .kernels.mm_bf16_cutile import mm_bf16_cutile
+        from .kernels.cutile.mm_bf16_cutile import mm_bf16_cutile
 
         # out_dtype validation already handled by ``_cutile_mm_bf16_requirement``
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
@@ -815,7 +815,7 @@ def bmm_bf16(
     # Handled before the SM100 dispatch table because it does not consume
     # `workspace_buffer`.
     if backend == "cutile":
-        from .kernels.bmm_bf16_cutile import bmm_bf16_cutile
+        from .kernels.cutile.bmm_bf16_cutile import bmm_bf16_cutile
 
         # out_dtype validation already handled by ``_cutile_bmm_bf16_requirement``
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
@@ -6527,7 +6527,7 @@ def gemm_fp8_nt_groupwise(
             -1,
         )
     elif backend == "cutile":
-        from .kernels.gemm_fp8_nt_groupwise_cutile import gemm_fp8_nt_groupwise_cutile
+        from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import gemm_fp8_nt_groupwise_cutile
 
         gemm_fp8_nt_groupwise_cutile(
             a,
@@ -6940,6 +6940,26 @@ def group_gemm_fp8_nt_groupwise(
     out_shape = (a.shape[0], n)
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
+
+    # cuTile backend: pure cuda.tile Python kernel. Iterates over groups and
+    # dispatches the existing ``gemm_fp8_nt_groupwise_cutile`` per group.
+    # Constraints are checked by ``_cutile_group_gemm_fp8_nt_groupwise_requirement``.
+    if backend == "cutile":
+        from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import (
+            group_gemm_fp8_nt_groupwise_cutile,
+        )
+
+        return group_gemm_fp8_nt_groupwise_cutile(
+            a=a,
+            b=b,
+            a_scale=a_scale,
+            b_scale=b_scale,
+            m_indptr=m_indptr,
+            out=out,
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode or "K",
+        )
+
 
     if is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter

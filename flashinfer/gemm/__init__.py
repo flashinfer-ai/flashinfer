@@ -1,4 +1,5 @@
 from .gemm_base import SegmentGEMMWrapper as SegmentGEMMWrapper
+from .kernels.cutile.cutile_common import is_cuda_tile_available as is_cuda_tile_available
 from .gemm_base import bmm_bf16 as bmm_bf16
 from .gemm_base import bmm_fp8 as bmm_fp8
 from .gemm_base import bmm_mxfp8 as bmm_mxfp8
