@@ -43,12 +43,6 @@ enum class TllmPagedAttentionMode {
   ForGen,
 };
 
-inline Bf16QFp8KvTransformMode parse_bf16q_fp8kv_transform_mode(int64_t mode) {
-  TVM_FFI_ICHECK(mode >= 0 && mode <= 2)
-      << "trtllm_gen_bf16q_fp8kv_transform_mode must be 0, 1, or 2";
-  return static_cast<Bf16QFp8KvTransformMode>(mode);
-}
-
 // Trailing pad we add to every softmax-stats workspace allocation. Two purposes:
 //   1. Defense in depth: any kernel that drifts past the documented
 //      [batchSize, mMaxNumCtasQ, numHeadsQ] write region writes into this pad
@@ -140,7 +134,10 @@ void trtllm_paged_attention_launcher(
   auto fmha_runner =
       TllmGenFmhaRunnerCache::get(q_data_type, kv_data_type, kv_data_type, o_data_type);
   TllmGenFmhaRunnerParams runner_params{};
-  auto const transform_mode = parse_bf16q_fp8kv_transform_mode(bf16q_fp8kv_transform_mode);
+  TVM_FFI_ICHECK(bf16q_fp8kv_transform_mode >= 0 && bf16q_fp8kv_transform_mode <= 2)
+      << "trtllm_gen_bf16q_fp8kv_transform_mode must be 0, 1, or 2";
+  auto const transform_mode =
+      static_cast<Bf16QFp8KvTransformMode>(bf16q_fp8kv_transform_mode);
   if (transform_mode != Bf16QFp8KvTransformMode::Full) {
     TVM_FFI_ICHECK(
         mode == TllmPagedAttentionMode::ForGen && q_data_type == Data_type::DATA_TYPE_BF16 &&
