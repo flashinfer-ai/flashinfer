@@ -22,12 +22,13 @@ Run with `pytest --forked` (a MoE config can IMA and corrupt the CUDA context; i
 into one reproducible failure). Env: FLASHINFER_MOE_FUZZ_NUM_TESTS (default 100), _SEED (default 0).
 
 Coverage today (all SwiGLU):
-  * cutlass_fused_moe -- bf16 / fp16 / fp8(per-tensor e4m3); arches SM89/90/100/103/110/120/121.
+  * cutlass_fused_moe -- bf16 / fp16 / fp8(per-tensor e4m3) on SM89/90/100+; nvfp4(e2m1 block16)
+    on SM100+ (mirrors test_moe_nvfp4 marshalling + reuses its torch_moe_nvfp4 reference exactly).
   * trtllm-gen (pre-routed bf16) -- SM100/103; runs alongside cutlass on bf16 -> cross-API oracle.
 Validated false-positive-free: SM100, H100/sm90, L40S/sm89. New backends (cute-dsl, b12x) and quant
-modes (fp4/mxfp8) drop in behind the same `MoEAdapter` interface. NOTE: trtllm-gen abstains on fp8
-because its fp8-per-tensor scale + (in-kernel) routing contract is incompatible with cutlass's --
-a deliberate finding for the unified-API design, see UNIFIED_MOE_FUZZER_AND_API_DESIGN.md.
+modes (nvfp4-on-trtllm, mxfp8/mxfp4) drop in behind the same `MoEAdapter` interface. NOTE: trtllm-gen
+abstains on fp8 because its fp8-per-tensor scale + (in-kernel) routing contract is incompatible with
+cutlass's -- a deliberate finding for the unified-API design, see UNIFIED_MOE_FUZZER_AND_API_DESIGN.md.
 """
 
 import os
@@ -39,7 +40,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer import ActivationType, RoutingMethodType, fused_moe
+from flashinfer import ActivationType, RoutingMethodType, fp4_quantize, fused_moe
 from flashinfer.fused_moe import (
     WeightLayout,
     convert_to_block_layout,
@@ -157,6 +158,57 @@ class MasterTensors:
                 torch.stack(w2dq),
             )
 
+        # nvfp4 (e2m1, block 16, e4m3 block scales): mirror tests/moe/test_trtllm_cutlass_fused_moe
+        # test_moe_nvfp4 EXACTLY (same fp4_quantize + per-expert global scale + 6-elem quant_scales)
+        # so the marshalling matches the validated cutlass test by construction (no re-derivation).
+        if cfg.quant == "nvfp4":
+            from tests.moe.test_trtllm_cutlass_fused_moe import (
+                dequantize_nvfp4_to_dtype,
+            )
+            from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
+
+            ot = torch.bfloat16
+            self.nvfp4_x = self.x.to(
+                ot
+            )  # raw input (kernel quantizes internally, input_sf=None)
+            self.a1_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+            self.a2_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+            w1b, w2b = self.w31.to(ot), self.w2.to(ot)
+            q1l, b1l, g1l, d1l, q2l, b2l, g2l, d2l = [], [], [], [], [], [], [], []
+            for e in range(E):
+                g1 = nvfp4_global_encode_scale_te(w1b[e].abs().max().float())
+                g2 = nvfp4_global_encode_scale_te(w2b[e].abs().max().float())
+                q1, b1 = fp4_quantize(w1b[e], g1)
+                q2, b2 = fp4_quantize(w2b[e], g2)
+                q1l.append(q1), b1l.append(b1), g1l.append(g1)
+                d1l.append(
+                    dequantize_nvfp4_to_dtype(
+                        q1, b1, g1, dtype=ot, device="cuda", block_size=16
+                    )
+                )
+                q2l.append(q2), b2l.append(b2), g2l.append(g2)
+                d2l.append(
+                    dequantize_nvfp4_to_dtype(
+                        q2, b2, g2, dtype=ot, device="cuda", block_size=16
+                    )
+                )
+            self.w1_q, self.w1_bs, self.w1_gs = (
+                torch.stack(q1l),
+                torch.stack(b1l),
+                torch.stack(g1l).view(E),
+            )
+            self.w2_q, self.w2_bs, self.w2_gs = (
+                torch.stack(q2l),
+                torch.stack(b2l),
+                torch.stack(g2l).view(E),
+            )
+            self.w1_d, self.w2_d = torch.stack(d1l), torch.stack(d2l)
+            # reference input = dequant of the kernel's internal fp4 quant of x (a1_gs scale).
+            af, asf = fp4_quantize(self.nvfp4_x, self.a1_gs)
+            self.a_in = dequantize_nvfp4_to_dtype(
+                af, asf, self.a1_gs, dtype=ot, device="cuda", block_size=16
+            )
+
 
 def shared_reference(m: MasterTensors, cfg: MoEConfig) -> torch.Tensor:
     """The one fp32 MoE reference (SwiGLU). w31 = concat[w3(linear), w1(gated)] (chunk dim 0).
@@ -166,6 +218,21 @@ def shared_reference(m: MasterTensors, cfg: MoEConfig) -> torch.Tensor:
     the full fp8 round-trip (input + weight + intermediate), not just weight quant, so the oracle
     stays tight rather than papering over kernel rounding with a loose tolerance.
     """
+    if cfg.quant == "nvfp4":
+        # Reuse the validated cutlass-test reference verbatim: dequant inputs/weights, SwiGLU
+        # (silu(2nd half)*(1st half)), intermediate fp4 requant @ gs=1.0, gemm2, weighted sum.
+        from tests.moe.test_trtllm_cutlass_fused_moe import torch_moe_nvfp4
+
+        return torch_moe_nvfp4(
+            m.a_in,
+            m.w1_d,
+            m.w2_d,
+            cfg.top_k,
+            m.routing_weights,
+            m.selected_experts,
+            _ACT[cfg.activation],
+        ).float()
+
     fp8 = cfg.quant == "fp8"
     x = m.x_dq if fp8 else m.x
     w31 = m.w31_dq if fp8 else m.w31
@@ -212,15 +279,20 @@ class CutlassAdapter(MoEAdapter):
     def supports(self, cfg, sm):
         if sm not in (89, 90, 100, 103, 110, 120, 121):
             return f"cutlass_fused_moe unsupported on SM{sm}"
-        if cfg.quant not in ("bf16", "fp16", "fp8"):
+        if cfg.quant not in ("bf16", "fp16", "fp8", "nvfp4"):
             return f"cutlass adapter: quant {cfg.quant} not wired yet"
-        if cfg.quant == "fp8" and sm < 89:
-            return "cutlass fp8 MoE needs SM89+"
+        if cfg.quant == "nvfp4":
+            if sm < 100:  # nvfp4 MoE kernels require Blackwell+
+                return "cutlass nvfp4 MoE needs SM100+"
+            if cfg.hidden_size % 16 or cfg.intermediate_size % 16:
+                return "nvfp4 block-16 requires hidden/intermediate %16==0"
         return None
 
     def run(self, m, cfg):
         if cfg.quant == "fp8":
             return self._run_fp8(m, cfg)
+        if cfg.quant == "nvfp4":
+            return self._run_nvfp4(m, cfg)
         dt = torch.bfloat16 if cfg.quant == "bf16" else torch.float16
         x = m.x.to(dt)
         w31 = m.w31.to(dt)
@@ -262,6 +334,36 @@ class CutlassAdapter(MoEAdapter):
             otype,
             output=out,
             quant_scales=quant_scales,
+            activation_type=_ACT[cfg.activation],
+        )
+        y = res[0] if isinstance(res, (list, tuple)) else res
+        return y.float()
+
+    def _run_nvfp4(self, m, cfg):
+        """nvfp4 block-scale: raw bf16 x (kernel quantizes internally, input_sf=None) + packed
+        fp4 weights (.view(long)) + the 6-elem quant_scales list from test_moe_nvfp4:
+        [fc1_act_global, fc1_weight_block(int32), fc1_global=1/(a1*w1), fc2_act_global,
+         fc2_weight_block(int32), fc2_global=1/(a2*w2)]."""
+        ot = torch.bfloat16
+        quant_scales = [
+            m.a1_gs,
+            m.w1_bs.view(torch.int32),
+            1.0 / (m.a1_gs * m.w1_gs),
+            m.a2_gs,
+            m.w2_bs.view(torch.int32),
+            1.0 / (m.a2_gs * m.w2_gs),
+        ]
+        out = torch.zeros(cfg.num_tokens, cfg.hidden_size, device="cuda", dtype=ot)
+        res = fused_moe.cutlass_fused_moe(
+            m.nvfp4_x,
+            m.selected_experts.to(torch.int),
+            m.routing_weights,
+            m.w1_q.contiguous().view(torch.long),
+            m.w2_q.contiguous().view(torch.long),
+            ot,
+            quant_scales=quant_scales,
+            input_sf=None,
+            output=out,
             activation_type=_ACT[cfg.activation],
         )
         y = res[0] if isinstance(res, (list, tuple)) else res
@@ -371,7 +473,7 @@ _INTERMED = [256, 512, 768, 1024, 1536]
 _EXPERTS = [8, 16, 32, 64, 128, 256]
 _TOPK = [1, 2, 4, 6, 8]
 _TOKENS = [1, 2, 8, 16, 64, 128, 512, 1024, 2048, 4096]
-_QUANT = ["bf16", "fp16", "fp8"]
+_QUANT = ["bf16", "fp16", "fp8", "nvfp4"]
 _ROUTE = ["uniform", "uniform", "hot1", "peaked", "imbalanced"]  # weight uniform ~2x
 
 
@@ -413,6 +515,13 @@ def _tol(cfg, ref):
         cfg.quant == "fp8"
     ):  # e4m3 ~2 mantissa bits + intermediate requant; calibrated below
         return 8e-2, 8e-2 * absmax + 1e-3
+    if (
+        cfg.quant == "nvfp4"
+    ):  # e2m1 ~1 mantissa bit + block16 + intermediate fp4 requant
+        return (
+            2e-1,
+            2.5e-1 * absmax + 1e-3,
+        )  # calibrated: obs ratio ≤0.073, ~3.4x margin
     return 3e-2, 2e-2 * absmax + 1e-4  # bf16
 
 
