@@ -156,7 +156,6 @@ def parse_gemm_args(line, parser):
             "b12x",
             "auto",
             "tinygemm",
-            "torch",
             "marlin",
         ],
         help="Kernel backends to test. Default: cudnn ('marlin' = vLLM Marlin nvfp4 W4A16, for mm_w4a16_fp4 only)",
@@ -1346,13 +1345,12 @@ def testMmW4A16Fp4(args):
       * input_dtype must be bfloat16 (the only A dtype currently
         supported; fp16 deferred).
 
-    Refcheck uses the ``torch`` backend's output as the gold reference.
-    When only ``torch`` is being benchmarked the refcheck is trivially
-    self-consistent.
+    Refcheck uses an fp32 dequant + matmul of the canonical FP4 weight as
+    the gold reference.
 
-    With ``--autotune``, the cuDNN backend is profiled over its cuDNN
-    execution plans (the cute-dsl and torch backends ignore the autotuner);
-    autotuned results are tagged with an ``_autotune`` backend suffix.
+    With ``--autotune``, the cuDNN (execution plans) and cute-dsl (tile
+    shape + perf-knob configs) backends are profiled; autotuned results are
+    tagged with an ``_autotune`` backend suffix.
     """
     if args.verbose >= 1:
         print("[INFO] Running testMmW4A16Fp4")
@@ -1473,7 +1471,6 @@ def testMmW4A16Fp4(args):
 
     # cuDNN sweeps its execution plans + M buckets; cute-dsl sweeps its tile
     # shape + perf-knob config space (both via mm_w4a16_fp4's TunableRunners).
-    # The torch backend has a single path and ignores the autotuner.
     autotune_supported_backends = ["cudnn", "cute-dsl"]
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
@@ -1494,21 +1491,14 @@ def testMmW4A16Fp4(args):
         with autotune(False, cache=cache_path):
             pass
 
-    # Gold reference = torch backend output (fp32 dequant + matmul, cast to out_dtype).
+    # Gold reference: fp32 dequant of the canonical FP4 weight + matmul, cast
+    # to out_dtype (the same math the removed "torch" backend computed).
     ref = None
     if run_refcheck:
-        b_p_ref, sf_p_ref, alpha_p_ref = flashinfer.prepare_w4a16_fp4_weights(
-            b_fp4, b_sf, alpha, backend="torch"
-        )
-        ref = flashinfer.mm_w4a16_fp4(
-            a,
-            b_p_ref,
-            sf_p_ref,
-            alpha_p_ref,
-            backend="torch",
-            out_dtype=out_dtype,
-            block_size=16,
-        )
+        from flashinfer.gemm.gemm_w4a16 import _dequantize_w4a16_fp4_torch
+
+        weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+        ref = (a.float() @ weight_fp32.T).to(out_dtype)
 
     res = []
     flops = 2 * m * n * k
@@ -1518,12 +1508,11 @@ def testMmW4A16Fp4(args):
         + (k // 16) * n  # FP8-E4M3 per-block SF
         + m * n * torch.tensor([], dtype=out_dtype).element_size()
     )
-    # Per-backend refcheck tolerance vs the fp32-accurate torch gold.  The
-    # cute-dsl and cudnn kernels dequantize the FP4 weight to bf16 before the
+    # Per-backend refcheck tolerance vs the fp32-accurate gold.  The cute-dsl
+    # and cudnn kernels dequantize the FP4 weight to bf16 before the
     # tensor-core matmul, so they carry ~1 bf16 ULP of weight rounding (up to
-    # ~1.5e-2 relative) that the fp32 torch reference does not.
+    # ~1.5e-2 relative) that the fp32 reference does not.
     _refcheck_tol = {
-        "torch": dict(rtol=5e-3, atol=5e-3),
         "cudnn": dict(rtol=1.5e-2, atol=1.5e-2),
         "cute-dsl": dict(rtol=1.5e-2, atol=1.5e-2),
     }
@@ -1534,7 +1523,7 @@ def testMmW4A16Fp4(args):
             if backend == "marlin":
                 # Marlin uses independently-generated FP4 weights (perf parity,
                 # not bit-identical to FlashInfer's quantization of w), so it
-                # cannot match the FlashInfer torch gold.  Validate it against
+                # cannot match the FlashInfer fp32 gold.  Validate it against
                 # its own fp32 dequant reference with a mean-relative-error
                 # metric (as vLLM's own Marlin test does) -- robust to the few
                 # bf16 accumulation-order outliers near cancellation that a
@@ -1565,7 +1554,7 @@ def testMmW4A16Fp4(args):
                     torch.testing.assert_close(out, ref, **tol)
                 except AssertionError as e:
                     if args.allow_output_mismatch:
-                        print(f"[WARNING] {backend} output mismatch vs torch ref: {e}")
+                        print(f"[WARNING] {backend} output mismatch vs fp32 ref: {e}")
                     else:
                         raise
 

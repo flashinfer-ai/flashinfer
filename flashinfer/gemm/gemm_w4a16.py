@@ -9,12 +9,12 @@ Public API
 
     # 1) Prepare weights for a specific backend (one-time, at model load).
     b_p, sf_p, alpha_p = flashinfer.prepare_w4a16_fp4_weights(
-        b, b_descale, alpha, backend="torch",
+        b, b_descale, alpha, backend="cute-dsl",
     )
 
     # 2) Run the GEMM, passing the *same* backend tag.
     out = flashinfer.mm_w4a16_fp4(
-        a, b_p, sf_p, alpha_p, backend="torch",
+        a, b_p, sf_p, alpha_p, backend="cute-dsl",
     )
 
 The contract: the ``backend`` string must match between prepare and
@@ -27,9 +27,6 @@ is undefined.
 Supported backends
 ------------------
 
-* ``"torch"`` -- pure-PyTorch dequantize + ``torch.matmul`` reference.
-  Slow but works on any device with PyTorch.  Useful as a refcheck
-  baseline.  No prep transformation: it returns its inputs unchanged.
 * ``"cudnn"`` -- cuDNN FP4 GEMM graph (bf16 activation x FP4 weight).
   Reuses ``mm_fp4``'s cuDNN machinery and the autotuner; requires a
   cuDNN build with FP4 block-scale support on Blackwell-class GPUs.
@@ -54,14 +51,14 @@ harness:
    below).  Put them either in this file or in a sibling module that
    this file imports.
 2. In :func:`prepare_w4a16_fp4_weights`:
-     - extend the ``backend: Literal["torch"]`` annotation to include
+     - extend the ``backend: Literal[...]`` annotation to include
        the new name;
      - add ``if backend == "<name>": return _prepare_<name>(...)`` above
        the trailing ``raise ValueError``;
-     - update the ``"Supported: 'torch'."`` string in the error.
+     - update the ``"Supported: ..."`` string in the error.
 3. Do the same three edits in :func:`mm_w4a16_fp4`.
 4. Add a ``_<name>_w4a16_fp4_requirement`` function (same signature as
-   :func:`_torch_w4a16_fp4_requirement`) and register it in the
+   :func:`_cudnn_w4a16_fp4_requirement`) and register it in the
    ``@backend_requirement({...})`` dict above :func:`mm_w4a16_fp4`.
    Decorate it with ``@supported_compute_capability([...])`` listing the
    SMs your backend supports -- this powers
@@ -107,8 +104,8 @@ Backend function contract
         # already happened in the dispatcher; backend-specific shape /
         # alignment checks are the backend's responsibility.
 
-See :func:`_prepare_torch` / :func:`_compute_torch` below for a
-minimal working implementation of these two functions.
+See :func:`_prepare_cudnn` / :func:`_compute_cudnn` (or the cute-DSL
+pair) below for working implementations of these two functions.
 """
 
 import functools
@@ -175,7 +172,7 @@ def _check_mm_w4a16_fp4_problem_size(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn", "cute-dsl"],
+    backend: Literal["cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -202,46 +199,13 @@ def _check_mm_w4a16_fp4_problem_size(
 
 
 @supported_compute_capability([100, 103, 110, 120, 121])
-def _torch_w4a16_fp4_requirement(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    *,
-    backend: Literal["torch", "cudnn", "cute-dsl"],
-    out_dtype: Optional[torch.dtype] = None,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
-    is_sf_swizzled: bool = True,
-    enable_pdl: bool = True,
-):
-    """Torch backend gated to Blackwell-class SMs (100, 103, 110, 120, 121).
-
-    The implementation is pure PyTorch and would technically run on older
-    GPUs, but the API exists to support W4A16 on Blackwell GPUs.  Gating
-    here keeps the supported-capability surface honest.
-
-    The torch reference unswizzles the SF internally, so it requires the
-    canonical 128x4-swizzled layout (``is_sf_swizzled=True``); a
-    non-swizzled SF is not supported.
-    """
-    if not is_sf_swizzled:
-        raise ValueError(
-            "torch backend requires the 128x4-swizzled SF layout "
-            "(is_sf_swizzled=True); use the cudnn backend for a "
-            "non-swizzled (linear) SF."
-        )
-    return True
-
-
-@supported_compute_capability([100, 103, 110, 120, 121])
 def _cudnn_w4a16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn", "cute-dsl"],
+    backend: Literal["cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -285,7 +249,7 @@ def _cute_dsl_w4a16_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn", "cute-dsl"],
+    backend: Literal["cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -317,7 +281,7 @@ def prepare_w4a16_fp4_weights(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn", "cute-dsl"],
+    backend: Literal["cudnn", "cute-dsl"],
     block_size: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Prepare FP4 W4A16 weights for a specific backend.
@@ -345,8 +309,8 @@ def prepare_w4a16_fp4_weights(
             ``alpha`` into ``b_descale`` at prep time and return
             ``alpha=None``; callers should forward whatever this function
             returns unchanged.
-        backend: Identifier of a supported backend (currently
-            ``"torch"``).
+        backend: Identifier of a supported backend (``"cudnn"`` or
+            ``"cute-dsl"``).
         block_size: SF block size.  Always 16 for FP4.
 
     Returns:
@@ -369,20 +333,15 @@ def prepare_w4a16_fp4_weights(
             raise ValueError(f"alpha must be shape (1,); got {tuple(alpha.shape)}")
         if alpha.dtype != torch.float32:
             raise TypeError(f"alpha must be float32; got {alpha.dtype}")
-    if backend == "torch":
-        return _prepare_torch(b, b_descale, alpha, block_size)
     if backend == "cudnn":
         return _prepare_cudnn(b, b_descale, alpha, block_size)
     if backend == "cute-dsl":
         return _prepare_cute_dsl(b, b_descale, alpha, block_size)
-    raise ValueError(
-        f"Unknown backend {backend!r}.  Supported: 'torch', 'cudnn', 'cute-dsl'."
-    )
+    raise ValueError(f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl'.")
 
 
 @backend_requirement(
     {
-        "torch": _torch_w4a16_fp4_requirement,
         "cudnn": _cudnn_w4a16_fp4_requirement,
         "cute-dsl": _cute_dsl_w4a16_fp4_requirement,
     },
@@ -395,7 +354,7 @@ def mm_w4a16_fp4(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["torch", "cudnn", "cute-dsl"],
+    backend: Literal["cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -441,41 +400,37 @@ def mm_w4a16_fp4(
 
     Notes:
         ``@backend_requirement`` adds two introspection helpers to this
-        function: ``mm_w4a16_fp4.is_backend_supported("torch")`` and
+        function: ``mm_w4a16_fp4.is_backend_supported("cute-dsl")`` and
         ``mm_w4a16_fp4.is_compute_capability_supported(cc)``.  It also
         accepts a ``skip_check=True`` kwarg to bypass validation in
         latency-sensitive code paths.
     """
     out_dtype = out_dtype or a.dtype
     # enable_pdl is consumed only by the cute-dsl backend (Programmatic
-    # Dependent Launch); torch (reference) and cudnn (own graph) ignore it.
-    if backend == "torch":
-        return _compute_torch(a, b, b_descale, alpha, out_dtype, out, block_size)
+    # Dependent Launch); cudnn (own graph) ignores it.
     if backend == "cudnn":
         return _compute_cudnn(a, b, b_descale, alpha, out_dtype, out, block_size)
     if backend == "cute-dsl":
         return _compute_cute_dsl(
             a, b, b_descale, alpha, out_dtype, out, block_size, enable_pdl=enable_pdl
         )
-    raise ValueError(
-        f"Unknown backend {backend!r}.  Supported: 'torch', 'cudnn', 'cute-dsl'."
-    )
+    raise ValueError(f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl'.")
 
 
 # =============================================================================
-# Torch backend (reference implementation)
+# Reference / shared SF utilities
 # =============================================================================
 #
-# NOTE: Everything below this banner is a reference implementation kept
-# only to validate the API surface and serve as a refcheck baseline.
-# Once a real backend (cute-DSL, cuDNN, ...) lands AND a refcheck test
-# compares it directly against a ground-truth path (e.g. round-tripping
-# through ``nvfp4_quantize``), this whole section can be deleted:
-#   * _E2M1_CODEBOOK_FP32, _unswizzle_sf_128x4, _dequantize_w4a16_fp4_torch
-#   * _prepare_torch, _compute_torch
-# along with the ``"torch"`` branches in the two dispatchers above, the
-# ``"torch"`` entry in their ``backend: Literal[...]`` annotations, and
-# the torch-backend tests in tests/gemm/test_mm_w4a16_fp4.py.
+# These pure-PyTorch helpers are NOT a compute backend -- they are shared
+# infrastructure:
+#   * _unswizzle_sf_128x4 is REQUIRED by the cudnn and cute-dsl prepare
+#     paths (both consume a non-swizzled SF derived from the canonical
+#     128x4-swizzled input).
+#   * _E2M1_CODEBOOK_FP32 + _dequantize_w4a16_fp4_torch implement an fp32
+#     dequantize used as the ground-truth reference by the unit tests
+#     (tests/gemm/test_mm_w4a16_fp4.py) and the benchmark refcheck
+#     (benchmarks/routines/gemm.py).  (Named ``_torch`` for the precision
+#     it computes in, not a user-facing backend.)
 
 
 # E2M1 (FP4) codebook, signed.  Codes 0-7 = positives, 8-15 = negatives.
@@ -564,50 +519,6 @@ def _dequantize_w4a16_fp4_torch(
     return weight  # (N, K) fp32
 
 
-def _prepare_torch(
-    b: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor],
-    block_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Torch-backend prep: pass-through.  All work happens at compute time."""
-    return b, b_descale, alpha
-
-
-def _compute_torch(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor],
-    out_dtype: torch.dtype,
-    out: Optional[torch.Tensor],
-    block_size: int,
-) -> torch.Tensor:
-    """Torch-backend compute: dequant + ``torch.matmul`` in fp32."""
-    n = int(b.shape[0])
-    k = int(b.shape[1]) * 2
-    if a.shape[1] != k:
-        raise ValueError(
-            f"a.shape[1]={a.shape[1]} but k inferred from b.shape={tuple(b.shape)} "
-            f"is {k}"
-        )
-    weight_fp32 = _dequantize_w4a16_fp4_torch(b, b_descale, alpha, n, k, block_size)
-    # Match the kernel's fp32-accumulator semantics: cast a -> fp32 for
-    # the matmul, then cast the result to out_dtype.
-    result_fp32 = a.to(torch.float32) @ weight_fp32.T  # (M, N) fp32
-    result = result_fp32.to(out_dtype)
-    if out is not None:
-        if tuple(out.shape) != (a.shape[0], n):
-            raise ValueError(
-                f"out shape {tuple(out.shape)} != expected {(a.shape[0], n)}"
-            )
-        if out.dtype != out_dtype:
-            raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
-        out.copy_(result)
-        return out
-    return result
-
-
 # =============================================================================
 # cuDNN backend
 # =============================================================================
@@ -631,9 +542,9 @@ def _compute_torch(
 #   ``mm_fp4`` consumes -- it requires the per-block SF in a plain linear
 #   layout.  ``_prepare_cudnn`` unswizzles the canonical 128x4 SF into a
 #   linear ``(N, K//block_size)`` FP8 tensor, and the graph declares the SF
-#   tensor with ``tensor_reordering.NONE``.  (The ``is_sf_swizzled``
-#   attribute on :func:`mm_w4a16_fp4` gates which backend is allowed: a
-#   swizzled SF forces ``torch``; a non-swizzled SF forces ``cudnn``.)
+#   tensor with ``tensor_reordering.NONE``.  (cuDNN requires
+#   ``is_sf_swizzled=False`` on :func:`mm_w4a16_fp4`; the cute-dsl backend
+#   consumes its own prepared layout and ignores the flag.)
 
 
 # Sentinel "cache M" for override-shape graphs (any value works; this one
@@ -1734,9 +1645,13 @@ def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 tile_shape_mnk, atom_layout = _select_w4a16_tile_shape(m, n, k)
                 pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
             else:
-                tile_shape_mnk, atom_layout, pipeline_depth, use_fp16_mma, tile_swizzle = (
-                    _w4a16_cute_dsl_tactic_configs(n, k)[tactic]
-                )
+                (
+                    tile_shape_mnk,
+                    atom_layout,
+                    pipeline_depth,
+                    use_fp16_mma,
+                    tile_swizzle,
+                ) = _w4a16_cute_dsl_tactic_configs(n, k)[tactic]
             compiled = _get_cute_dsl_w4a16_gemm(
                 tile_shape_mnk,
                 a.dtype,

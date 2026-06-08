@@ -3,9 +3,9 @@
 """Tests for the W4A16 FP4 GEMM API.
 
 The cross-backend contract tests sweep over every supported backend
-listed in :data:`ALL_BACKENDS`.  When a new backend (cute-dsl, ...) is
-added, append its identifier to that list and the full numeric /
-behaviour grid runs against it automatically.
+listed in :data:`ALL_BACKENDS` (currently ``cudnn`` and ``cute-dsl``).
+When a new backend is added, append its identifier to that list and the
+full numeric / behaviour grid runs against it automatically.
 
 Inputs are bf16 throughout; fp16 activations are out of scope for the
 current API.
@@ -29,19 +29,18 @@ from flashinfer.utils import get_compute_capability
 # =============================================================================
 
 
-# Backends covered by the cross-backend contract tests.  Real backends
-# (cute-dsl, ...) get appended here as they land.
-ALL_BACKENDS = ["torch", "cudnn", "cute-dsl"]
+# Backends covered by the cross-backend contract tests.  New backends get
+# appended here as they land.
+ALL_BACKENDS = ["cudnn", "cute-dsl"]
 
 
 # Each backend consumes a specific SF layout (see ``is_sf_swizzled`` on
-# ``mm_w4a16_fp4``): the torch reference unswizzles internally so it needs
-# the canonical 128x4-swizzled SF, while cuDNN requires a non-swizzled
-# (linear) SF.  The cute-DSL backend takes a fully bespoke layout produced
-# by ``prepare_w4a16_fp4_weights`` and ignores the flag.
+# ``mm_w4a16_fp4``): cuDNN requires a non-swizzled (linear) SF, while the
+# cute-DSL backend takes a fully bespoke layout produced by
+# ``prepare_w4a16_fp4_weights`` and ignores the flag.
 # ``prepare_w4a16_fp4_weights`` already emits the right layout per backend;
 # this maps the matching ``is_sf_swizzled`` flag.
-_IS_SF_SWIZZLED = {"torch": True, "cudnn": False, "cute-dsl": False}
+_IS_SF_SWIZZLED = {"cudnn": False, "cute-dsl": False}
 
 
 def _sf_swizzled(backend: str) -> bool:
@@ -107,18 +106,17 @@ SMOKE_MNK = (16, 1024, 1024)
 
 # Tolerance for the backend output vs the fp32-accum reference.
 #
-# * ``torch`` runs the exact same fp32 dequant + matmul as the reference, so
-#   it matches to a very tight tolerance.
-# * ``cudnn`` dequantizes the FP4 weight to bf16 (to feed the bf16 tensor-core
-#   matmul; accumulation is still fp32), so its weight carries ~1 bf16 ULP of
-#   rounding vs the fp32 reference.  That shows up as up to ~2^-7 (= 0.0078)
-#   relative error on a small fraction of output elements, which exceeds the
-#   torch tolerance but is expected for a true W4A16 (bf16-activation) kernel.
+# Both backends dequantize the FP4 weight to bf16 (to feed the bf16
+# tensor-core matmul; accumulation is still fp32), so the weight carries
+# ~1 bf16 ULP of rounding vs the fp32 reference.  That shows up as up to
+# ~2^-7 (= 0.0078) relative error on a small fraction of output elements,
+# expected for a true W4A16 (bf16-activation) kernel.  The numeric grid
+# uses the norm/cosine check in ``_assert_close_to_reference``; ATOL/RTOL
+# here back the secondary same-backend behaviour tests.
 ATOL = 5e-3
 RTOL = 5e-3
 
 _BACKEND_TOL = {
-    "torch": {"atol": 5e-3, "rtol": 5e-3},
     # cute-dsl, like cudnn, dequantizes the FP4 weight to bf16 before the
     # tensor-core matmul, so it carries ~1 bf16 ULP of weight rounding vs
     # the fp32 reference -- same tolerance budget as cudnn.
@@ -134,19 +132,14 @@ def _tol(backend: str) -> dict:
 def _assert_close_to_reference(out: torch.Tensor, ref: torch.Tensor, backend: str):
     """Compare a backend's output against the fp32-accurate reference.
 
-    The ``torch`` backend runs the exact same fp32 dequant + matmul as the
-    reference, so it is checked elementwise to a tight tolerance.  The
-    ``cudnn`` / ``cute-dsl`` backends dequantize the FP4 weight to bf16
+    The ``cudnn`` / ``cute-dsl`` backends dequantize the FP4 weight to bf16
     before a bf16 tensor-core matmul, so a handful of large-magnitude
     output elements carry bf16 rounding that exceeds any sane elementwise
-    bound at large K.  For those we validate the relative L2-norm of the
-    error (catches decorrelation *and* scale/alpha bugs -- cosine alone is
+    bound at large K.  We validate the relative L2-norm of the error
+    (catches decorrelation *and* scale/alpha bugs -- cosine alone is
     scale-invariant) together with cosine similarity, mirroring
     ``tests/gemm/test_mm_fp4.py``.
     """
-    if backend == "torch":
-        torch.testing.assert_close(out, ref, **_tol(backend))
-        return
     out_f = out.float().reshape(-1)
     ref_f = ref.float().reshape(-1)
     ref_norm = torch.linalg.vector_norm(ref_f).clamp_min(1e-6)
@@ -341,10 +334,12 @@ def test_a_dtype_must_be_bfloat16(bad_dtype):
     """Only bfloat16 activations are supported (fp16 deferred)."""
     device = torch.device("cuda")
     _, b_fp4, b_sf, alpha = _make_random_fp4_weights(64, 128, device)
-    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend="torch")
+    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl"
+    )
     a_bad = torch.randn((4, 128), device=device, dtype=bad_dtype)
     with pytest.raises(TypeError):
-        mm_w4a16_fp4(a_bad, b_p, sf_p, alpha_p, backend="torch")
+        mm_w4a16_fp4(a_bad, b_p, sf_p, alpha_p, backend="cute-dsl")
 
 
 def test_b_dtype_must_be_uint8_in_prepare():
@@ -353,7 +348,7 @@ def test_b_dtype_must_be_uint8_in_prepare():
     b_bad = torch.zeros((64, 64), device=device, dtype=torch.int32)
     b_descale = torch.zeros((4096,), device=device, dtype=torch.uint8)
     with pytest.raises(TypeError):
-        prepare_w4a16_fp4_weights(b_bad, b_descale, None, backend="torch")
+        prepare_w4a16_fp4_weights(b_bad, b_descale, None, backend="cute-dsl")
 
 
 def test_alpha_dtype_must_be_float32():
@@ -362,4 +357,4 @@ def test_alpha_dtype_must_be_float32():
     _, b_fp4, b_sf, _ = _make_random_fp4_weights(64, 128, device)
     alpha_bad = torch.ones(1, device=device, dtype=torch.bfloat16)
     with pytest.raises(TypeError):
-        prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha_bad, backend="torch")
+        prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha_bad, backend="cute-dsl")
