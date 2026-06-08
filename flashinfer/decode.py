@@ -2751,33 +2751,6 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
-    out_dtype_for_transform_mode = (
-        out_dtype
-        if isinstance(out_dtype, torch.dtype)
-        else (
-            out.dtype
-            if out is not None and isinstance(out, torch.Tensor)
-            else query.dtype
-        )
-    )
-    uses_bf16q_fp8kv = (
-        query.dtype == torch.bfloat16
-        and k_cache.dtype == torch.float8_e4m3fn
-        and v_cache.dtype == torch.float8_e4m3fn
-        and out_dtype_for_transform_mode == torch.bfloat16
-    )
-    if bf16q_fp8kv_transform_mode is None:
-        bf16q_fp8kv_transform_mode_value = (
-            _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES["separate_kv"]
-            if backend == "trtllm-gen" and uses_bf16q_fp8kv
-            else 0
-        )
-    else:
-        bf16q_fp8kv_transform_mode_value = (
-            _get_bf16q_fp8kv_transform_mode(
-                bf16q_fp8kv_transform_mode
-            )
-        )
     if (
         backend != "trtllm-gen"
         and bf16q_fp8kv_transform_mode is not None
@@ -2922,6 +2895,23 @@ def trtllm_batch_decode_with_kv_cache(
             check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
         else:
             raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+        uses_bf16q_fp8kv = (
+            query.dtype == torch.bfloat16
+            and k_cache.dtype == torch.float8_e4m3fn
+            and v_cache.dtype == torch.float8_e4m3fn
+            and out_dtype == torch.bfloat16
+        )
+        if bf16q_fp8kv_transform_mode is None:
+            bf16q_fp8kv_transform_mode_value = (
+                _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES["separate_kv"]
+                if uses_bf16q_fp8kv
+                else 0
+            )
+        else:
+            bf16q_fp8kv_transform_mode_value = _get_bf16q_fp8kv_transform_mode(
+                bf16q_fp8kv_transform_mode
+            )
 
         if isinstance(bmm1_scale, torch.Tensor):
             assert bmm1_scale.dtype == torch.float32
