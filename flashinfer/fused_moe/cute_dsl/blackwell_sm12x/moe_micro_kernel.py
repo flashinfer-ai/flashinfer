@@ -523,8 +523,8 @@ class MoEMicroKernel:
             self.acc_dtype,
             self.sf_dtype,
         )
-        atom_layout = cute.make_layout((2, 2, 1))
         atom_shape = (2, 2, 1)
+        atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
