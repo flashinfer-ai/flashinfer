@@ -919,6 +919,50 @@ def test_trtllm_fmha_v2_prefill_sm120_large_head_dim(
     )
 
 
+def test_trtllm_fmha_v2_prefill_sm120_chunked_rejected() -> None:
+    """Chunked-causal masking is not implemented by the SM120 tiled kernels.
+
+    The ``SLIDING_OR_CHUNKED_CAUSAL`` mask honors only the sliding-window branch
+    on SM120 -- the tiled noloop kernels ignore ``log2_chunked_attention_size``
+    (chunked is wired only in the warp-specialized SM90 path). A chunked request
+    must therefore be rejected rather than silently mis-served. Sliding-window
+    causal (``window_left``) remains supported.
+    """
+    from flashinfer.prefill import trtllm_fmha_v2_prefill
+
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("This test targets SM12x (Blackwell) FMHAv2.")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 256
+    seq_len = 64
+
+    query = torch.randn(seq_len, num_qo_heads, head_dim, dtype=dtype, device=device)
+    kv = torch.randn(seq_len, 2, num_kv_heads, head_dim, dtype=dtype, device=device)
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    workspace = torch.zeros(8 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    with pytest.raises(ValueError, match="[Cc]hunked"):
+        trtllm_fmha_v2_prefill(
+            (query, kv),
+            "CONTIGUOUS_Q_KV",
+            workspace_buffer=workspace,
+            seq_lens=seq_lens,
+            max_q_len=seq_len,
+            max_kv_len=seq_len,
+            bmm1_scale=1.0 / math.sqrt(head_dim),
+            bmm2_scale=1.0,
+            batch_size=1,
+            cum_seq_lens_q=cu_seqlens,
+            cum_seq_lens_kv=cu_seqlens,
+            out_dtype=dtype,
+            mask_mode="chunked",
+            chunked_attention_size=32,
+        )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("max_seq_len", [16384])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
