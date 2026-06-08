@@ -46,6 +46,13 @@ def _skip_if_unsupported():
         pytest.skip("GDN prefill requires SM90, SM100, or SM120")
 
 
+def _skip_if_cp_unsupported():
+    """Skip test if context parallelism is unsupported."""
+    device = torch.device("cuda")
+    if not is_sm90a_supported(device):
+        pytest.skip("CP GDN prefill requires SM90")
+
+
 def _skip_if_not_sm100():
     """Skip test if not SM100 (Blackwell) with CUDA 13+."""
     device = torch.device("cuda")
@@ -68,9 +75,12 @@ def _test_prefill_kernel(
     scale: float,
     alpha: bool,
     beta: bool,
+    use_cp: bool,
     seed: int | None = None,
 ):
     _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
@@ -122,6 +132,7 @@ def _test_prefill_kernel(
         True,
         output=our_o,
         output_state=our_state,
+        use_cp=use_cp,
     )
 
     torch.cuda.synchronize()
@@ -161,6 +172,7 @@ def _test_prefill_kernel(
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
+@pytest.mark.parametrize("use_cp", [False, True])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
@@ -190,6 +202,7 @@ def test_prefill_kernel_basic(
     scale: float | str,
     alpha: bool,
     beta: bool,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
@@ -205,6 +218,7 @@ def test_prefill_kernel_basic(
         scale,
         alpha,
         beta,
+        use_cp,
         seed,
     )
 
@@ -212,6 +226,7 @@ def test_prefill_kernel_basic(
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
+@pytest.mark.parametrize("use_cp", [False, True])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
@@ -244,6 +259,7 @@ def test_prefill_kernel_nonfull(
     scale: float | str,
     alpha: bool,
     beta: bool,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
@@ -259,6 +275,7 @@ def test_prefill_kernel_nonfull(
         scale,
         alpha,
         beta,
+        use_cp,
         seed,
     )
 
@@ -349,6 +366,7 @@ def _test_chunked_prefill(
         True,
         output=our_o1,
         output_state=our_state1,
+        use_cp=False,
     )
     chunk_gated_delta_rule(
         q2,
@@ -363,6 +381,7 @@ def _test_chunked_prefill(
         True,
         output=our_o2,
         output_state=our_state2,
+        use_cp=False,
     )
     our_state = our_state2
 
@@ -555,6 +574,7 @@ def _test_checkpoint(
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        use_cp=False,
     )
     torch.cuda.synchronize()
 
@@ -598,6 +618,7 @@ def _test_checkpoint(
                 True,
                 output=prefix_o,
                 output_state=prefix_state,
+                use_cp=False,
             )
             torch.cuda.synchronize()
 
@@ -698,6 +719,7 @@ def test_checkpoint_noop(qkv_factory):
         True,
         output=o1,
         output_state=s1,
+        use_cp=False,
     )
 
     # Run with checkpoint_every_n_tokens=0 (disabled)
@@ -717,6 +739,7 @@ def test_checkpoint_noop(qkv_factory):
         output=o2,
         output_state=s2,
         checkpoint_every_n_tokens=0,
+        use_cp=False,
     )
 
     torch.cuda.synchronize()
@@ -874,6 +897,7 @@ def _test_prefill_kernel_bf16_state(
         True,
         output=our_o,
         output_state=our_state,
+        use_cp=False,
     )
 
     torch.cuda.synchronize()

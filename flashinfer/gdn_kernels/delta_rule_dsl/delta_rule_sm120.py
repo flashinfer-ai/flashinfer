@@ -130,6 +130,23 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         self.v_stage = 1
         self.o_stage = 1
         self.alpha_beta_stage = 2
+        self.manual_cache_key(
+            "needs_alpha",
+            "needs_beta",
+            "needs_init_state",
+            "needs_checkpointing",
+            "dtype",
+            "acc_dtype",
+            "inverse_dtype",
+            "BLK_Q",
+            "BLK_KV",
+            "D",
+            "q_stage",
+            "k_stage",
+            "v_stage",
+            "o_stage",
+            "alpha_beta_stage",
+        )
 
     def get_next_work(
         self,
@@ -1818,7 +1835,10 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
-        if warp_group_idx == WarpGroupRole.LDST:
+        if (
+            work_desc.seq_len != cutlass.Int32(0)
+            and warp_group_idx == WarpGroupRole.LDST
+        ):
             cute.arch.setmaxregister_decrease(load_registers)
             if ldst_warp_role == LoadStoreWarpRole.LOAD_QKV:
                 self.run_load_qkv_role(
@@ -1877,7 +1897,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                     work_desc.o_head_idx(num_q_heads, num_v_heads),
                     num_sab_heads,
                 )
-        else:
+        elif work_desc.seq_len != cutlass.Int32(0):
             cute.arch.setmaxregister_increase(mma_registers)
 
             self.run_math_role(
