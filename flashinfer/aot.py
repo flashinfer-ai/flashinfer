@@ -98,6 +98,8 @@ from .jit.rmsnorm_silu import (
     _compute_default_knobs,
     _SUPPORTED_C,
     _SUPPORTED_TOKENS,
+    _KNOB_RANGE_LUT_SM90,
+    _KNOB_RANGE_LUT_SM100PLUS,
 )
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
@@ -580,7 +582,7 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
-        # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
+        # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+).
         if has_sm100:
             for C in _SUPPORTED_C:
                 for tokens in _SUPPORTED_TOKENS:
@@ -593,6 +595,17 @@ def gen_all_modules(
                         jit_specs.append(
                             gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
                         )
+            for (C, _lo, _hi, dtype), (
+                wm,
+                sc,
+                kcfg,
+                occ,
+                bpl,
+            ) in _KNOB_RANGE_LUT_SM100PLUS.items():
+                cpr = _estimate_ctas_per_row(C, sc, kcfg, bpl)
+                jit_specs.append(
+                    gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
+                )
             # Fallback configs for common hidden sizes not in the LUT.
             # Fallback knobs depend only on (C, dtype), not num_tokens,
             # so one module per (C, dtype) covers all token counts.
@@ -618,6 +631,20 @@ def gen_all_modules(
                     jit_specs.append(
                         gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
                     )
+
+        # SM90 range-LUT entries: same per-entry-one-module rule.
+        if has_sm90:
+            for (C, _lo, _hi, dtype), (
+                wm,
+                sc,
+                kcfg,
+                occ,
+                bpl,
+            ) in _KNOB_RANGE_LUT_SM90.items():
+                cpr = _estimate_ctas_per_row(C, sc, kcfg, bpl)
+                jit_specs.append(
+                    gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
+                )
         # selective_state_update: one module per dtype combo per GPU arch
         _ssu_dtype_combos = [
             # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)
