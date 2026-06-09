@@ -62,7 +62,10 @@ from einops import repeat
 # Add tests/mamba to path for triton_reference imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "mamba"))
 
-from triton_reference.checkpointing_state_update import checkpointing_state_update
+from triton_reference.checkpointing_state_update import (
+    checkpointing_state_update,
+    replay_selective_state_update,
+)
 from triton_reference.selective_state_update import (
     selective_state_update_triton as selective_state_update,
 )
@@ -314,7 +317,8 @@ def _build_tensors(
 
 KernelName = Literal[
     "cuda-incr",  # cuda_checkpointing_ssu
-    "incremental",  # Triton checkpointing_state_update
+    "incremental",  # Triton checkpointing_state_update (old 4D path)
+    "triton-replay",  # Triton replay_selective_state_update (new 5D persistent path)
     "fi-dump",  # flashinfer_selective_state_update with dst_state_batch_indices
     "baseline-triton",  # Triton selective_state_update (disable_state_update)
     "baseline-flashinfer",  # flashinfer selective_state_update (disable_state_update)
@@ -366,6 +370,10 @@ class KernelInputs:
     state_scale0: torch.Tensor | None
     intermediate_update_inputs: torch.Tensor
     old_x0: torch.Tensor
+    # 5-D double-buffered old_x for the triton-replay (persistent) path, built
+    # from the 4-D old_x0 (active buffer = cache_buf_idx[slot]).  CUDA / old
+    # Triton use the 4-D old_x0; only triton-replay reads the 5-D copy.
+    old_x0_5d: torch.Tensor
     old_B0: torch.Tensor
     old_dt0: torch.Tensor
     old_cumAdt0: torch.Tensor
@@ -376,6 +384,7 @@ class KernelInputs:
     state_scale_work: torch.Tensor | None
     interm_work: torch.Tensor
     old_x_work: torch.Tensor
+    old_x_work_5d: torch.Tensor
     old_B_work: torch.Tensor
     old_dt_work: torch.Tensor
     old_cumAdt_work: torch.Tensor
@@ -412,10 +421,22 @@ class KernelInputs:
             self.state_scale_work.copy_(self.state_scale0)
         self.interm_work.copy_(self.intermediate_update_inputs)
         self.old_x_work.copy_(self.old_x0)
+        self.old_x_work_5d.copy_(self.old_x0_5d)
         self.old_B_work.copy_(self.old_B0)
         self.old_dt_work.copy_(self.old_dt0)
         self.old_cumAdt_work.copy_(self.old_cumAdt0)
         self.cache_buf_idx_work.copy_(self.cache_buf_idx0)
+
+
+def _old_x_to_5d(old_x_4d: torch.Tensor, cache_buf_idx: torch.Tensor) -> torch.Tensor:
+    """Build the 5-D double-buffered ``old_x`` the persistent (triton-replay)
+    path expects from the 4-D single-buffer ``old_x``; active buffer =
+    ``cache_buf_idx[slot]`` (the inactive buffer is left zero)."""
+    cache_size, window, nheads, dim = old_x_4d.shape
+    old_x_5d = old_x_4d.new_zeros(cache_size, 2, window, nheads, dim)
+    rows = torch.arange(cache_size, device=old_x_4d.device)
+    old_x_5d[rows, cache_buf_idx.long()] = old_x_4d
+    return old_x_5d
 
 
 def build_kernel_inputs(
@@ -462,11 +483,13 @@ def build_kernel_inputs(
         d_state,
         ngroups,
     )
+    old_x0_5d = _old_x_to_5d(old_x0, cache_buf_idx0)
     return KernelInputs(
         state0=state0,
         state_scale0=state_scale0,
         intermediate_update_inputs=intermediate_update_inputs,
         old_x0=old_x0,
+        old_x0_5d=old_x0_5d,
         old_B0=old_B0,
         old_dt0=old_dt0,
         old_cumAdt0=old_cumAdt0,
@@ -475,6 +498,7 @@ def build_kernel_inputs(
         state_scale_work=state_scale0.clone() if state_scale0 is not None else None,
         interm_work=intermediate_update_inputs.clone(),
         old_x_work=old_x0.clone(),
+        old_x_work_5d=old_x0_5d.clone(),
         old_B_work=old_B0.clone(),
         old_dt_work=old_dt0.clone(),
         old_cumAdt_work=old_cumAdt0.clone(),
@@ -587,6 +611,36 @@ def _make_run_closure(
                 state_scale=inputs.state_scale_work,
                 rand_seed=rand_seed,
                 philox_rounds=philox_rounds,
+            )
+
+        return _run
+
+    if kernel == "triton-replay":
+        # New 5D persistent path (persistent_dynamic): a single launch decides
+        # write-vs-append per slot at runtime — no per-call write_checkpoint
+        # branching.  Reads the 5D double-buffered old_x; cache stays per-slot.
+        def _run():
+            replay_selective_state_update(
+                inputs.state_work,
+                inputs.old_x_work_5d,
+                inputs.old_B_work,
+                inputs.old_dt_work,
+                inputs.old_cumAdt_work,
+                inputs.cache_buf_idx_work,
+                inputs.prev_tokens_i32,
+                x=inputs.x,
+                dt=inputs.dt,
+                A=inputs.A,
+                B=inputs.B,
+                C=inputs.C,
+                out=inputs.out_incr,
+                D=inputs.D,
+                dt_bias=inputs.dt_bias,
+                dt_softplus=True,
+                state_batch_indices=None,
+                rand_seed=rand_seed,
+                philox_rounds=philox_rounds,
+                state_scales=inputs.state_scale_work,
             )
 
         return _run
@@ -1032,7 +1086,12 @@ def _bench_config(
     # .iters, .cupti, .cuda_graph, .l2_flush.
     timing = args
 
-    show_kernel_col = baseline_fn is not None or args.flashinfer_dump or args.cuda_incr
+    show_kernel_col = (
+        baseline_fn is not None
+        or args.flashinfer_dump
+        or args.cuda_incr
+        or args.triton_replay
+    )
 
     pt_uniform_i32 = torch.zeros(batch, dtype=torch.int32, device="cuda")
 
@@ -1167,6 +1226,36 @@ def _bench_config(
                 p99_us,
             )
 
+    # --- Triton replay (new 5D persistent path) ---
+    if args.triton_replay:
+        for prev_k in prev_ks:
+            pt_uniform_i32.fill_(prev_k)
+            tag = (
+                f"triton_replay_b{batch}_mtp{mtp_len}_k{prev_k}"
+                f"_s{state_dtype_name}_a{act_dtype_name}"
+            )
+            median_us, p95_us, p99_us = time_kernel(
+                kernel="triton-replay",
+                inputs=inputs,
+                prev_tokens=pt_uniform_i32,
+                timing=timing,
+                tag=tag,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
+            )
+            _print_row(
+                show_kernel_col,
+                "triton-replay",
+                batch,
+                mtp_len,
+                prev_k,
+                state_dtype_name,
+                act_dtype_name,
+                median_us,
+                p95_us,
+                p99_us,
+            )
+
     # --- FlashInfer dynamic-dump ---
     if args.flashinfer_dump:
         for prev_k in prev_ks:
@@ -1266,7 +1355,12 @@ def _run_benchmark(args) -> None:
         torch.cuda.cudart().cudaProfilerStart()
 
     # Print header
-    show_kernel_col = baseline_fn is not None or args.flashinfer_dump or args.cuda_incr
+    show_kernel_col = (
+        baseline_fn is not None
+        or args.flashinfer_dump
+        or args.cuda_incr
+        or args.triton_replay
+    )
     if show_kernel_col:
         print(
             f"| {'kernel':>11} | {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
@@ -1485,6 +1579,13 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Run CUDA checkpointing_ssu kernel (default: on).",
+    )
+    parser.add_argument(
+        "--triton-replay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run Triton replay_selective_state_update (5D persistent path) "
+        "(default: on).",
     )
     parser.add_argument(
         "--flashinfer-dump",
