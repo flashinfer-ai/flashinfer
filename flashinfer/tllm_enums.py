@@ -44,7 +44,7 @@ class ActivationType(IntEnum):
     SwigluBias = 5
     Relu2 = 6
     SwigluStep = 7
-    GeluTanh = 8
+    GegluTanh = 8
     Identity = 9
     InvalidType = 10
 

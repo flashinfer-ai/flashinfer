@@ -489,7 +489,7 @@ def compute_with_experts_gelu_tanh(
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate_size):
-    """Gated tanh-GELU activation (ActivationType.GeluTanh) on the bf16 CUTLASS
+    """Gated tanh-GELU activation (ActivationType.GegluTanh) on the bf16 CUTLASS
     MoE path. Same shapes / weight-split convention as the SwiGLU ``test_moe``,
     but activation = GELU_tanh(gate) * linear, compared against a torch
     ``F.gelu(..., approximate="tanh")`` gated reference.
@@ -526,7 +526,7 @@ def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate
         flash_output.dtype,
         output=flash_output,
         quant_scales=None,
-        activation_type=ActivationType.GeluTanh,
+        activation_type=ActivationType.GegluTanh,
     )
 
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
