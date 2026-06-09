@@ -92,6 +92,12 @@
       "dtype": "float32",
       "optional": true,
       "description": "Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run()."
+    },
+    "return_lse": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Bool: also return LSE."
     }
   },
   "outputs": {
@@ -108,6 +114,7 @@
         "batch_size",
         "num_qo_heads"
       ],
+      "optional": true,
       "dtype": "float32",
       "description": "The 2-based log-sum-exp of attention logits."
     }

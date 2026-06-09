@@ -20,6 +20,13 @@ Usage::
     from flashinfer.trace import TraceTemplate, Var, Const, Tensor, Scalar
 """
 
+from .solution import (
+    BuildSpec,
+    Solution,
+    SourceFile,
+    SupportedBindings,
+    SupportedLanguages,
+)
 from .template import (
     Const,
     Scalar,
@@ -33,13 +40,18 @@ from .template import (
 )
 
 __all__ = [
+    "_TRACE_DUMP_DIR",
+    "BuildSpec",
+    "Const",
+    "Scalar",
+    "Solution",
+    "SourceFile",
+    "SupportedBindings",
+    "SupportedLanguages",
+    "Tensor",
     "TraceTemplate",
     "Var",
-    "Const",
-    "Tensor",
-    "Scalar",
     "default_check",
     "default_tolerances",
     "standard_check",
-    "_TRACE_DUMP_DIR",
 ]

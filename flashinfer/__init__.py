@@ -204,3 +204,26 @@ from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
 from .fi_trace import fi_trace as fi_trace
+
+# ---------------------------------------------------------------------------
+# Trace Apply (opt-in): zero-code kernel substitution from the FlashInfer Trace.
+# Activated only when FLASHINFER_TRACE_APPLY=1. This is the single edit to
+# existing flashinfer code required by the Trace Apply design — the package
+# itself lives in flashinfer/trace_apply/. Failures here must never break a
+# normal import, so the install is best-effort.
+# ---------------------------------------------------------------------------
+import os as _os
+
+if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "False"):
+    try:
+        from . import trace_apply as trace_apply
+
+        trace_apply._enable_apply_from_env()
+    except Exception as _trace_apply_err:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger("flashinfer.trace_apply").warning(
+            "FLASHINFER_TRACE_APPLY is set but enabling Trace Apply failed: %s "
+            "(continuing without Trace Apply).",
+            _trace_apply_err,
+        )
