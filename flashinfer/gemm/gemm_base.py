@@ -7143,11 +7143,31 @@ def get_gemm_sm120_module_cute_mxfp8():
     return gen_gemm_sm120_module_cute_mxfp8().build_and_load()
 
 
+def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) -> None:
+    """Validate the per-row UE8M0 ``scale_granularity_mnk`` contract shared by all
+    MXFP8 cute SM120 GEMM entries. Accepts ``(1, 1, 32)`` or ``(1, 1, 128)``.
+    """
+    if scale_granularity_mnk[0] != 1:
+        raise ValueError(
+            f"scale_granularity_mnk[0] (m_gran) must be 1; got {scale_granularity_mnk[0]}"
+        )
+    if scale_granularity_mnk[1] != 1:
+        raise ValueError(
+            f"scale_granularity_mnk[1] (n_gran) must be 1 (kernel only exposes granK "
+            f"along K; 2D block B-scale must be broadcast to per-row caller-side); "
+            f"got {scale_granularity_mnk[1]}"
+        )
+    if scale_granularity_mnk[2] not in (32, 128):
+        raise ValueError(
+            f"scale_granularity_mnk[2] (k_gran) must be 32 or 128; got {scale_granularity_mnk[2]}"
+        )
+
+
 @flashinfer_api
 def quantize_mxfp8_for_zero_padding(
     input: torch.Tensor,
     m_indptr: torch.Tensor,
-    granK: int = 128,
+    gran_k: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Per-token MXFP8 quantization for ``group_gemm_mxfp8_nt_groupwise`` zero_padding mode.
 
@@ -7164,7 +7184,7 @@ def quantize_mxfp8_for_zero_padding(
         The indptr of the segment lengths, shape ``(num_experts + 1,)``, data type is
         ``torch.int32``. ``m_indptr[0] = 0``, ``m_indptr[num_experts] = token_num``.
 
-    granK: int
+    gran_k: int
         UE8M0 K-axis block granularity. Must be ``32`` or ``128``.
 
     Returns
@@ -7176,13 +7196,13 @@ def quantize_mxfp8_for_zero_padding(
     out_scale: torch.Tensor
         Int32-packed UE8M0 scale tensor (4 UE8M0 scales packed per int32), shape
         ``(m_padded, k_align)`` where ``m_padded = (token_num + num_experts * 3) // 4 * 4``
-        and ``k_align = (k + 4 * granK - 1) // (4 * granK)``. Data type is ``torch.int32``.
+        and ``k_align = (k + 4 * gran_k - 1) // (4 * gran_k)``. Data type is ``torch.int32``.
         Underlying storage is ``(k_align, m_padded)`` contiguous; the returned view is a
         ``.transpose(0, 1)`` that aligns with the ``group_gemm_mxfp8_nt_groupwise`` caller
         convention.
     """
-    if granK not in (32, 128):
-        raise ValueError(f"granK must be 32 or 128; got {granK}")
+    if gran_k not in (32, 128):
+        raise ValueError(f"gran_k must be 32 or 128; got {gran_k}")
     if input.dtype != torch.bfloat16:
         raise ValueError(f"input must be bfloat16; got {input.dtype}")
     if input.dim() != 2:
@@ -7195,7 +7215,7 @@ def quantize_mxfp8_for_zero_padding(
     if k % 16 != 0:
         raise ValueError(f"k must be multiple of 16; got k={k}")
 
-    pack_nk = granK * 4
+    pack_nk = gran_k * 4
     m_padded = (token_num + num_experts * 3) // 4 * 4
     k_align = (k + pack_nk - 1) // pack_nk
 
@@ -7207,7 +7227,7 @@ def quantize_mxfp8_for_zero_padding(
     )
 
     get_gemm_sm120_module_cute_mxfp8().quantize_mxfp8_for_zero_padding(
-        input, m_indptr, out_fp8, out_scale_raw, granK
+        input, m_indptr, out_fp8, out_scale_raw, gran_k
     )
 
     out_scale = out_scale_raw.transpose(0, 1)
@@ -7315,20 +7335,7 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
         raise ValueError(
             f'Only scale_major_mode="MN" is supported; got "{scale_major_mode}"'
         )
-    if scale_granularity_mnk[0] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[0] (m_gran) must be 1; got {scale_granularity_mnk[0]}"
-        )
-    if scale_granularity_mnk[1] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[1] (n_gran) must be 1 (kernel only exposes granK "
-            f"along K; 2D block B-scale must be broadcast to per-row caller-side); "
-            f"got {scale_granularity_mnk[1]}"
-        )
-    if scale_granularity_mnk[2] not in (32, 128):
-        raise ValueError(
-            f"scale_granularity_mnk[2] (k_gran) must be 32 or 128; got {scale_granularity_mnk[2]}"
-        )
+    _check_scale_granularity_mnk(scale_granularity_mnk)
     if backend != "cute":
         raise NotImplementedError(
             f'Only backend="cute" is currently implemented; got backend="{backend}"'
@@ -7369,6 +7376,7 @@ def group_gemm_mxfp8_nt_groupwise(
     m_indices: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
     use_psum_layout: bool = False,
+    backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -7425,19 +7433,10 @@ def group_gemm_mxfp8_nt_groupwise(
     out: torch.Tensor
         The output tensor, shape ``(m, n)``.
     """
-    if scale_granularity_mnk[0] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[0] (m_gran) must be 1; got {scale_granularity_mnk[0]}"
-        )
-    if scale_granularity_mnk[1] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[1] (n_gran) must be 1 (kernel only exposes granK "
-            f"along K; 2D block B-scale must be broadcast to per-row before calling); "
-            f"got {scale_granularity_mnk[1]}"
-        )
-    if scale_granularity_mnk[2] not in (32, 128):
-        raise ValueError(
-            f"scale_granularity_mnk[2] (k_gran) must be 32 or 128; got {scale_granularity_mnk[2]}"
+    _check_scale_granularity_mnk(scale_granularity_mnk)
+    if backend != "cute":
+        raise NotImplementedError(
+            f'Only backend="cute" is currently implemented; got backend="{backend}"'
         )
 
     if out_dtype is None:
@@ -7475,6 +7474,7 @@ def group_gemm_mxfp8_nt_groupwise_masked(
     b_scale: torch.Tensor,
     masked_m: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
+    backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -7524,17 +7524,10 @@ def group_gemm_mxfp8_nt_groupwise_masked(
         Output tensor, shape ``(num_experts, max_m, n)``. Only the first
         ``masked_m[i]`` rows per expert are valid.
     """
-    if scale_granularity_mnk[0] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[0] (m_gran) must be 1; got {scale_granularity_mnk[0]}"
-        )
-    if scale_granularity_mnk[1] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[1] (n_gran) must be 1; got {scale_granularity_mnk[1]}"
-        )
-    if scale_granularity_mnk[2] not in (32, 128):
-        raise ValueError(
-            f"scale_granularity_mnk[2] (k_gran) must be 32 or 128; got {scale_granularity_mnk[2]}"
+    _check_scale_granularity_mnk(scale_granularity_mnk)
+    if backend != "cute":
+        raise NotImplementedError(
+            f'Only backend="cute" is currently implemented; got backend="{backend}"'
         )
 
     if out_dtype is None:
@@ -7570,6 +7563,7 @@ def gemm_mxfp8_nt_groupwise(
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
+    backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -7607,17 +7601,10 @@ def gemm_mxfp8_nt_groupwise(
     out: torch.Tensor
         Output tensor, shape ``(m, n)``.
     """
-    if scale_granularity_mnk[0] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[0] (m_gran) must be 1; got {scale_granularity_mnk[0]}"
-        )
-    if scale_granularity_mnk[1] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[1] (n_gran) must be 1; got {scale_granularity_mnk[1]}"
-        )
-    if scale_granularity_mnk[2] not in (32, 128):
-        raise ValueError(
-            f"scale_granularity_mnk[2] (k_gran) must be 32 or 128; got {scale_granularity_mnk[2]}"
+    _check_scale_granularity_mnk(scale_granularity_mnk)
+    if backend != "cute":
+        raise NotImplementedError(
+            f'Only backend="cute" is currently implemented; got backend="{backend}"'
         )
 
     if out_dtype is None:
@@ -7658,6 +7645,7 @@ def batch_gemm_mxfp8_nt_groupwise(
     stride_b: Optional[int] = None,
     ldd: Optional[int] = None,
     stride_d: Optional[int] = None,
+    backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
@@ -7703,17 +7691,10 @@ def batch_gemm_mxfp8_nt_groupwise(
     out: torch.Tensor
         Output tensor, shape ``(num_groups, m, n)``.
     """
-    if scale_granularity_mnk[0] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[0] (m_gran) must be 1; got {scale_granularity_mnk[0]}"
-        )
-    if scale_granularity_mnk[1] != 1:
-        raise ValueError(
-            f"scale_granularity_mnk[1] (n_gran) must be 1; got {scale_granularity_mnk[1]}"
-        )
-    if scale_granularity_mnk[2] not in (32, 128):
-        raise ValueError(
-            f"scale_granularity_mnk[2] (k_gran) must be 32 or 128; got {scale_granularity_mnk[2]}"
+    _check_scale_granularity_mnk(scale_granularity_mnk)
+    if backend != "cute":
+        raise NotImplementedError(
+            f'Only backend="cute" is currently implemented; got backend="{backend}"'
         )
 
     if out_dtype is None:
