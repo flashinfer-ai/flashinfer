@@ -236,7 +236,8 @@ struct TmaWarpSpecializedGroupedGemmInput {
 
 constexpr bool isGatedActivation(ActivationType activation_type) {
   return activation_type == ActivationType::Swiglu || activation_type == ActivationType::Geglu ||
-         activation_type == ActivationType::SwigluBias;
+         activation_type == ActivationType::SwigluBias ||
+         activation_type == ActivationType::SwigluStep;
 }
 
 template <typename T,                          /*The type used for activations/scales/compute*/

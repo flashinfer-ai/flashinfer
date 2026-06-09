@@ -47,7 +47,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -94,6 +94,150 @@ _DTYPE_MAP: Dict[torch.dtype, str] = {
 
 def _dtype_str(dtype: torch.dtype) -> str:
     return _DTYPE_MAP.get(dtype, str(dtype).replace("torch.", ""))
+
+
+def default_tolerances(dtype: Union[torch.dtype, str]) -> Tuple[float, float]:
+    """Return ``(rtol, atol)`` defaults for a trace correctness check.
+
+    These defaults are intentionally conservative for low-precision inference
+    data types. Template-specific ``check`` functions can override them by
+    passing explicit ``rtol`` and ``atol`` to :func:`default_check`.
+    """
+    dtype_name = str(dtype).replace("torch.", "")
+    if dtype_name in ("float64", "double"):
+        return 1e-7, 1e-7
+    if dtype_name in ("float32", "float"):
+        return 1e-5, 1e-5
+    if dtype_name in ("float16", "half"):
+        return 1e-3, 1e-3
+    if dtype_name == "bfloat16":
+        return 1e-2, 1e-2
+    if dtype_name.startswith("float8"):
+        return 1e-1, 1e-1
+    if dtype_name.startswith("float4") or "fp4" in dtype_name:
+        return 1.0, 1.0
+    return 0.0, 0.0
+
+
+def _as_output_list(outputs: Any) -> List[Any]:
+    if isinstance(outputs, list):
+        return outputs
+    if isinstance(outputs, tuple):
+        return list(outputs)
+    return [outputs]
+
+
+def _cosine_similarity(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    actual = actual.reshape(-1).to(torch.float32)
+    expected = expected.reshape(-1).to(torch.float32)
+    finite = torch.isfinite(actual) & torch.isfinite(expected)
+    if not finite.any():
+        return 1.0
+    actual = actual[finite]
+    expected = expected[finite]
+    actual_norm = torch.linalg.vector_norm(actual)
+    expected_norm = torch.linalg.vector_norm(expected)
+    if actual_norm.item() == 0 or expected_norm.item() == 0:
+        return 1.0 if torch.equal(actual, expected) else 0.0
+    return ((actual * expected).sum() / (actual_norm * expected_norm)).item()
+
+
+def default_check(
+    reference_outputs: Any,
+    actual_outputs: Any,
+    *,
+    rtol: Optional[float] = None,
+    atol: Optional[float] = None,
+    max_mismatch_pct: float = 0.0,
+    min_cos_sim: Optional[float] = 1.0 - 1e-3,
+) -> bool:
+    """Validate actual outputs against reference outputs.
+
+    ``reference_outputs`` and ``actual_outputs`` may be lists/tuples,
+    dictionaries with matching keys, or single output values. Tensor outputs
+    are checked for shape equality, closeness, mismatch percentage, and cosine
+    similarity. Non-floating tensors are checked exactly unless
+    ``max_mismatch_pct`` allows mismatches. Non-tensor outputs use Python
+    equality.
+    """
+    if isinstance(reference_outputs, dict) or isinstance(actual_outputs, dict):
+        if not isinstance(reference_outputs, dict) or not isinstance(
+            actual_outputs, dict
+        ):
+            return False
+        if reference_outputs.keys() != actual_outputs.keys():
+            return False
+        refs = [reference_outputs[key] for key in reference_outputs]
+        actuals = [actual_outputs[key] for key in reference_outputs]
+    else:
+        refs = _as_output_list(reference_outputs)
+        actuals = _as_output_list(actual_outputs)
+
+    if len(refs) != len(actuals):
+        return False
+
+    for ref, actual in zip(refs, actuals, strict=True):
+        if isinstance(ref, torch.Tensor) != isinstance(actual, torch.Tensor):
+            return False
+        if not isinstance(ref, torch.Tensor):
+            if ref != actual:
+                return False
+            continue
+
+        if ref.shape != actual.shape:
+            return False
+        if ref.numel() == 0:
+            continue
+
+        ref_is_float = torch.is_floating_point(ref)
+        actual_is_float = torch.is_floating_point(actual)
+        if ref_is_float or actual_is_float:
+            tolerance_dtype = actual.dtype if actual_is_float else ref.dtype
+            default_rtol, default_atol = default_tolerances(tolerance_dtype)
+            rtol_value = default_rtol if rtol is None else rtol
+            atol_value = default_atol if atol is None else atol
+            close = torch.isclose(
+                actual.to(torch.float32),
+                ref.to(torch.float32),
+                rtol=rtol_value,
+                atol=atol_value,
+            )
+            mismatch_pct = 100.0 * (1.0 - close.to(torch.float32).mean().item())
+            if mismatch_pct > max_mismatch_pct:
+                return False
+            if min_cos_sim is not None:
+                cos_sim = _cosine_similarity(actual, ref)
+                if cos_sim < min_cos_sim:
+                    return False
+        else:
+            matches = actual == ref
+            mismatch_pct = 100.0 * (1.0 - matches.to(torch.float32).mean().item())
+            if mismatch_pct > max_mismatch_pct:
+                return False
+
+    return True
+
+
+def standard_check(
+    reference_outputs: Any,
+    actual_outputs: Any,
+    *,
+    rtol: Optional[float] = None,
+    atol: Optional[float] = None,
+    max_mismatch_pct: float = 0.0,
+    min_cos_sim: Optional[float] = 1.0 - 1e-3,
+) -> bool:
+    """Default trace correctness check used when a template does not override it."""
+    from flashinfer.trace import default_check
+
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
 
 
 def _get_tensor(
@@ -342,6 +486,11 @@ class TraceTemplate:
         Ordered ``dict`` of ``json_name → Tensor | Scalar``.
     reference:
         Optional Python callable that implements the reference computation.
+    check:
+        Optional Python callable that validates reference output lists against
+        actual output lists and returns ``True`` when they pass. When omitted,
+        ``standard_check`` is used. The recommended signature is
+        ``check(reference_outputs, actual_outputs, **thresholds)``.
     init:
         Optional Python callable that returns a dict of valid inputs for the
         API, given the template's ``Var`` axes as keyword-only arguments.
@@ -384,6 +533,7 @@ class TraceTemplate:
         *,
         name_prefix: Optional[str] = None,
         reference: Optional[Callable] = None,
+        check: Optional[Callable] = None,
         init: Optional[Callable] = None,
         constraints: Optional[List[str]] = None,
         tags: Optional[List[str]] = None,
@@ -395,6 +545,7 @@ class TraceTemplate:
         self.inputs = inputs
         self.outputs = outputs
         self.reference = reference
+        self.check = standard_check if check is None else check
         self.init = init
         self.constraints = constraints or []
         self.tags = tags or []
@@ -464,6 +615,26 @@ class TraceTemplate:
             extractors[axis_name] = _make_scalar_extractor(axis_name)
 
         return extractors
+
+    def definition_name(self, axis_values: Dict[str, int]) -> str:
+        """Definition name for a concrete const-axis vector.
+
+        ``name_prefix`` (or ``op_type`` fallback) followed by each const axis's
+        ``abbrev`` + value (``abbrev=""`` omits the axis; ``abbrev=None`` uses the
+        axis name). This is the single source of truth for the naming convention,
+        shared by :meth:`build_fi_trace_fn` (trace time) and ``trace_apply``'s
+        name-routing (apply time), so the two always agree.
+        """
+        prefix = self.name_prefix if self.name_prefix is not None else self.op_type
+        parts = []
+        for n, marker in self.axes.items():
+            if not isinstance(marker, Const) or n not in axis_values:
+                continue
+            pfx = marker.abbrev if marker.abbrev is not None else n
+            if pfx == "":
+                continue
+            parts.append(f"{pfx}{axis_values[n]}")
+        return prefix + ("_" + "_".join(parts) if parts else "")
 
     # ------------------------------------------------------------------
     # fi_trace callable factory
@@ -564,30 +735,17 @@ class TraceTemplate:
                     entry = {"shape": descriptor.dim_names, "dtype": dtype}
                 if descriptor.optional:
                     entry["optional"] = True
+                # The API parameter this output is written into (out= buffer or,
+                # for in-place APIs, an input buffer); consumed by trace_apply.
+                if getattr(descriptor, "param", None) is not None:
+                    entry["param"] = descriptor.param
                 if descriptor.description:
                     entry["description"] = descriptor.description
                 outputs_json[json_key] = entry
 
             # ── 6. Resolve name (explicit override or auto-generate) ──────
             if name is None:
-                # Use name_prefix from the template when set (preferred: short,
-                # semantic names like "gqa_paged_decode", "gdn_mtp").
-                # Fall back to op_type otherwise.
-                prefix = (
-                    template.name_prefix
-                    if template.name_prefix is not None
-                    else template.op_type
-                )
-                const_parts = []
-                for n, marker in template.axes.items():
-                    if not isinstance(marker, Const) or n not in axis_values:
-                        continue
-                    # abbrev="" → omit from name; abbrev=None → use axis name
-                    pfx = marker.abbrev if marker.abbrev is not None else n
-                    if pfx == "":
-                        continue
-                    const_parts.append(f"{pfx}{axis_values[n]}")
-                name = prefix + ("_" + "_".join(const_parts) if const_parts else "")
+                name = template.definition_name(axis_values)
 
             # ── 7. Assemble definition ─────────────────────────────────────
             all_tags = [f"fi_api:{fi_api}"] + template.tags
@@ -605,6 +763,11 @@ class TraceTemplate:
             if template.reference is not None:
                 with contextlib.suppress(OSError, TypeError):
                     result["reference"] = _render_reference_source(template.reference)
+            if template.check is not None:
+                with contextlib.suppress(OSError, TypeError):
+                    import inspect  # noqa: PLC0415
+
+                    result["check"] = inspect.getsource(template.check)
             if template.init is not None:
                 with contextlib.suppress(OSError, TypeError):
                     result["init"] = _render_init_source(template.init)

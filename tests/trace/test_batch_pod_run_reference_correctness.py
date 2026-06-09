@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -83,6 +83,6 @@ def test_batch_pod_run_reference_correctness(shape_kwargs):
     )
     # Reference doesn't apply a causal mask for prefill; compare decode only.
     # Matches tests/utils/test_pod_kernels.py tolerance (fp16 decode).
-    _close(out_d, ref_d, atol=1e-3, rtol=1e-3)
+    _check(batch_pod_with_paged_kv_cache_run_trace, ref_d, out_d, atol=1e-3, rtol=1e-3)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

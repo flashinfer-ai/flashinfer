@@ -26,7 +26,7 @@ from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner, TunableRunner
 from ..trace.templates.attention import (
     mla_paged_decode_trace,
-    trtllm_batch_decode_mla_trace,
+    trtllm_batch_decode_mla_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
 from ..jit import gen_batch_mla_module, gen_trtllm_gen_fmha_module, setup_cubin_loader
@@ -729,21 +729,21 @@ class BatchMLAPagedAttentionWrapper:
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
             auxiliary data structures will be stored in provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
-        qo_indptr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
-            should be ``[batch_size + 1]``.
-            This argument is only effective when ``use_cuda_graph`` is ``True``.
-        kv_indptr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``kv_indptr`` array, the size of the buffer
-            should be ``[batch_size + 1]``.
-            This argument is only effective when ``use_cuda_graph`` is ``True``.
-        kv_indices_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``kv_indices`` array.
-            This argument is only effective when ``use_cuda_graph`` is ``True``.
-        kv_len_arr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``kv_len_arr`` array, the size of the buffer
-            should be ``[batch_size]``.
-            This argument is only effective when ``use_cuda_graph`` is ``True``.
+        qo_indptr : Optional[torch.Tensor]
+            User-reserved buffer to back the ``qo_indptr`` array, shape ``[batch_size + 1]``,
+            dtype ``int32``.  Only consulted when ``use_cuda_graph=True``.  The wrapper
+            copies into this buffer at :meth:`plan` time so capture-time pointers remain
+            stable.
+        kv_indptr : Optional[torch.Tensor]
+            User-reserved buffer to back the ``kv_indptr`` array, shape ``[batch_size + 1]``,
+            dtype ``int32``.  Only consulted when ``use_cuda_graph=True``.
+        kv_indices : Optional[torch.Tensor]
+            User-reserved buffer to back the ``kv_indices`` array, sized to the maximum
+            expected number of pages, dtype ``int32``.  Only consulted when
+            ``use_cuda_graph=True``.
+        kv_len_arr : Optional[torch.Tensor]
+            User-reserved buffer to back the ``kv_len_arr`` array, shape ``[batch_size]``,
+            dtype ``int32``.  Only consulted when ``use_cuda_graph=True``.
         backend : str
             The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
@@ -945,6 +945,12 @@ class BatchMLAPagedAttentionWrapper:
             The query length of each request, shape: ``[batch_size]``. Required when ``backend`` is ``cutlass``.
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
+        return_lse_base_on_e : bool, optional
+            Controls the base of the returned LSE values when ``return_lse=True``.
+            If ``False`` (default), the LSE is returned in base-2
+            (``log2(sum(exp2(...)))``) to match the kernel's internal log-base.
+            If ``True``, the LSE is converted to natural-log base (``log(sum(exp(...)))``)
+            for compatibility with cascade-merging APIs that expect base-e LSEs.
         o_scale : Optional[float]
             FP8 output dequantization scale (``real = quantized * o_scale``).
             When provided, ``out`` must be an FP8 tensor. Only supported with
@@ -1210,8 +1216,11 @@ def _cute_dsl_incompatibility_reason(
             "cute-dsl backend (MLA decode kernel) does not support separate KV "
             "page indices (uses_shared_paged_kv_idx=False)"
         )
-    if return_lse or lse is not None:
-        return "cute-dsl backend (MLA decode kernel) does not support return_lse/lse output"
+    # LSE is supported on the monolithic path; the modular path raises a
+    # clear NotImplementedError in wrappers/batch_mla.py if it gets picked
+    # for an LSE request (e.g. when ``sinks`` forces the modular dispatch).
+    # We don't pre-reject here so that the common case
+    # (cute_dsl_impl="auto" + LSE + no sinks → monolithic) goes through.
 
     _, q_len, num_heads, _ = query.shape
     try:
@@ -1496,6 +1505,8 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         enable_pdl: bool,
         is_var_seq: bool,
         uses_shared_paged_kv_idx: bool,
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
         sinks: Optional[torch.Tensor],
         cute_dsl_impl: str,
     ):
@@ -1518,6 +1529,8 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         self.enable_pdl = enable_pdl
         self.is_var_seq = is_var_seq
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
+        self.lse = lse
+        self.return_lse = return_lse
         self.sinks = sinks
         self.cute_dsl_impl = cute_dsl_impl
 
@@ -1598,12 +1611,14 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             out_dtype=self.out_dtype,
             is_var_seq=self.is_var_seq,
             enable_pdl=self.enable_pdl,
+            lse=self.lse,
+            return_lse=self.return_lse,
             sinks=self.sinks,
             cute_dsl_impl=self.cute_dsl_impl,
         )
 
 
-@flashinfer_api(trace=trtllm_batch_decode_mla_trace)
+@flashinfer_api(trace=trtllm_batch_decode_mla_trace_dispatch)
 def trtllm_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1662,6 +1677,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
+    enable_pdl : Optional[bool]
+        Programmatic Dependent Launch toggle.  When ``None`` (default), auto-detects
+        support from the query device.  Honoured by the ``trtllm-gen`` and ``xqa``
+        backends; ignored by ``cute-dsl``.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa``, ``trtllm-gen``, or ``cute-dsl``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
@@ -1680,14 +1699,20 @@ def trtllm_batch_decode_with_kv_cache_mla(
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
         False is only supported for trtllm-gen backend.
     lse : Optional[torch.Tensor] = None
-        Optional pre-allocated buffer for Log-Sum-Exp values. Only supported by
-        ``trtllm-gen`` backend. Must have shape
-        ``[batch_size * q_len_per_request, num_qo_heads]`` with dtype
-        ``torch.float32``. If ``return_lse`` is True and this is None, a buffer
-        will be allocated.
+        Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
+        ``trtllm-gen`` and ``cute-dsl`` backends. Must have dtype
+        ``torch.float32``. Accepted shapes:
+
+        * ``[batch_size * q_len_per_request, num_qo_heads]`` (trtllm-gen
+          native; accepted by both backends), or
+        * ``[batch_size, q_len_per_request, num_qo_heads]`` (cute-dsl native;
+          also accepted by cute-dsl).
+
+        If ``return_lse`` is True and this is None, a buffer will be
+        allocated by the backend.
     return_lse : bool = False
-        Whether to return LSE values. Only supported by ``trtllm-gen`` backend.
-        When True, the function returns ``(out, lse)``.
+        Whether to return LSE values. Supported by ``trtllm-gen`` and
+        ``cute-dsl`` backends. When True, the function returns ``(out, lse)``.
     cute_dsl_impl : str = "auto"
         Which cute-dsl implementation to use.  Honored only when
         ``backend="cute-dsl"``; ignored for other backends.
@@ -1810,8 +1835,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sm_count = get_device_sm_count(query.device)
 
     block_size = kv_cache.size(-2)
-    if block_size != 32 and block_size != 64:
-        raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
 
     if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
         raise ValueError("skip_softmax is not supported for sparse MLA")
@@ -1843,12 +1866,33 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "out",
         )
 
+    # Remember the caller-supplied lse so we can return it in its original
+    # shape: 2D ``(B*q_len, H)`` stays 2D, 3D ``(B, q_len, H)`` stays 3D, and
+    # an allocated default stays 2D.  Internally we normalize to 2D for the
+    # backend dispatch (matches trtllm-gen's native layout).
+    user_lse = lse
     if return_lse:
-        lse_shape = (query.size(0) * query.size(1), query.size(2))
+        flat_lse_shape = (query.size(0) * query.size(1), query.size(2))
+        nested_lse_shape = (query.size(0), query.size(1), query.size(2))
         if lse is None:
-            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+            lse = torch.empty(flat_lse_shape, dtype=torch.float32, device=query.device)
+            user_lse = lse
+        elif tuple(lse.shape) == flat_lse_shape:
+            check_shape_dtype_device(
+                lse, flat_lse_shape, torch.float32, query.device, "lse"
+            )
+        elif tuple(lse.shape) == nested_lse_shape:
+            check_shape_dtype_device(
+                lse, nested_lse_shape, torch.float32, query.device, "lse"
+            )
+            # Normalize to 2D for the backend; .view shares storage so the
+            # kernel writes propagate back to user_lse automatically.
+            lse = lse.view(flat_lse_shape)
         else:
-            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+            raise ValueError(
+                f"lse must have shape {flat_lse_shape} or {nested_lse_shape}; "
+                f"got {tuple(lse.shape)}"
+            )
 
     page_size = kv_cache.shape[-2]
     cute_dsl_reason = _cute_dsl_incompatibility_reason(
@@ -1923,6 +1967,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 enable_pdl=enable_pdl,
                 is_var_seq=is_var_seq,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                lse=lse,
+                return_lse=return_lse,
                 sinks=cute_dsl_sinks,
                 cute_dsl_impl=cute_dsl_impl,
             )
@@ -1949,7 +1995,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     )
     runner(inputs=inputs, tactic=tactic)
     if return_lse:
-        return out, lse
+        # Return the lse in the same shape the caller supplied (2D or 3D),
+        # or 2D ``(B*q_len, H)`` when we allocated the default.
+        return out, user_lse
     return out
 
 
@@ -1970,36 +2018,75 @@ def xqa_batch_decode_with_kv_cache_mla(
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool | None = None,
 ) -> torch.Tensor:
-    """
-    Parameters:
-    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
-    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe] or [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache. Both 3D and 4D formats are supported for backward compatibility.
-    workspace_buffer: torch.Tensor. Must be initialized to 0 for its first use.
-    qk_nope_head_dim: qk_nope_head_dim, must be 128
-    kv_lora_rank: kv_lora_rank, must be 512
-    qk_rope_head_dim: qk_rope_head_dim, must be 64
-    block_tables: page_table of kv cache, [batch_size, num_pages]
-    seq_lens: query_len
-    max_seq_len: max sequence length for kv_cache
-    out: output tensor, if not provided, will be allocated internally
-    bmm1_scale: fused scale for mla bmm1 input. Can be a float or a torch.Tensor.
-    bmm2_scale: fused scale for mla bmm2 input. Can be a float or a torch.Tensor.
-    sinks: additional value per head in the denominator of the softmax.
+    r"""XQA-backend batched MLA decode.
 
-    Note:
-    In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
-    bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
-    bmm2_scale = v_scale * o_scale
+    Single-query (MTP-aware) MLA decode kernel optimized for SM120a / SM121a tensor cores.
+    Accepts the concatenated ``(q_nope || q_rope)`` query and ``(ckv || kpe)`` paged KV
+    cache layout used by DeepSeek-V3 / R1 inference.
 
-    The two scale factors should be static constant for cuda graph capture.
-    Either (bmm1_scale, bmm2_scale) or (bmm1_scale_log2_tensor, bmm2_scale_tensor) should be provided.
+    Parameters
+    ----------
+    query : torch.Tensor
+        Query tensor with shape
+        ``[batch_size, q_len_per_request, num_heads, head_dim_qk]`` where
+        ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``.  Must be the concatenation
+        ``[q_nope, q_rope]``.  ``q_len_per_request`` is the MTP query length and is
+        currently required to be ``1``.
+    kv_cache : torch.Tensor
+        Paged KV cache, either 3-D
+        ``[num_pages, page_size, kv_lora_rank + qk_rope_head_dim]`` or 4-D
+        ``[num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim]``.  The last
+        dimension is the concatenation ``[ckv_cache, kpe_cache]``.  Both shapes are
+        accepted for backward compatibility.
+    workspace_buffer : torch.Tensor
+        Pre-allocated workspace buffer.  Must be zero-initialized on first use.
+    qk_nope_head_dim : int
+        Non-RoPE head dimension.  Must be ``128``.  Will be removed in 1.0; pass
+        ``kv_lora_rank`` instead going forward.
+    kv_lora_rank : int
+        Rank of the latent KV projection.  Must be ``512``.
+    qk_rope_head_dim : int
+        RoPE head dimension appended to the latent projection.  Must be ``64``.
+    block_tables : torch.Tensor
+        Per-request paged KV block table, shape ``[batch_size, num_pages]``.
+    seq_lens : torch.Tensor
+        Per-request KV sequence length, shape ``[batch_size]``.
+    max_seq_len : int
+        Maximum KV sequence length used for kernel scheduling.  Will be removed in
+        1.0; the kernel reads the per-request lengths from ``seq_lens``.
+    out : Optional[torch.Tensor]
+        Optional output tensor of shape ``[batch_size, num_heads, kv_lora_rank]``
+        and dtype ``torch.bfloat16``.  If ``None``, it is allocated internally.
+    bmm1_scale : Union[float, torch.Tensor]
+        Fused scale for MLA BMM1 (see Note).  ``float`` for static (CUDA-graph
+        safe) scales; ``torch.Tensor`` for on-device dynamic scales (FP8 only).
+    bmm2_scale : Union[float, torch.Tensor]
+        Fused scale for MLA BMM2 (see Note).  Same typing rules as ``bmm1_scale``.
+    sinks : Optional[List[torch.Tensor]]
+        Attention-sink tensors.  Currently unsupported and must be ``None``.
+    enable_pdl : Optional[bool]
+        Programmatic Dependent Launch toggle.  When ``None``, auto-detects support
+        from the device.
 
-    For static constant scale factors, the scale factors should be provided as float.
-        - (bmm1_scale, bmm2_scale)
-    For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.
-        - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
-        - Currently, only fp8 tensor core operation supports this mode.
-    When both are provided, the dynamic scale factor tensors will be used.
+    Returns
+    -------
+    torch.Tensor
+        Attention output, shape ``[batch_size, num_heads, kv_lora_rank]``, dtype
+        ``torch.bfloat16``.
+
+    Note
+    ----
+    In MLA, the BMM1 and BMM2 scales are fused as:
+
+    .. code-block:: text
+
+        bmm1_scale = q_scale * k_scale * sm_scale / sqrt(head_dim_qk)
+        bmm2_scale = v_scale * o_scale
+
+    The scale factors must be static constants for CUDA graph capture.  Either the
+    ``(bmm1_scale, bmm2_scale)`` (float) pair or the on-device
+    ``(bmm1_scale_log2_tensor, bmm2_scale_tensor)`` tensor pair may be passed.
+    When tensor inputs are supplied, the on-device path is taken (FP8 only).
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
     sm_count = get_device_sm_count(query.device)
