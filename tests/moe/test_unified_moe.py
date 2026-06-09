@@ -41,8 +41,8 @@ from flashinfer.fused_moe import (
     TrtllmFp4RoutedRunner,
 )
 from flashinfer.fused_moe.api import (
-    Activation,
     ActivationConfig,
+    ActivationType,
     BackendOptions,
     CuteDslConfig,
     CutlassConfig,
@@ -53,7 +53,7 @@ from flashinfer.fused_moe.api import (
     QuantConfig,
     QuantVariant,
     RoutingConfig,
-    RoutingMethod,
+    RoutingMethodType,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -77,11 +77,11 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
 
 
 class TestEnumRepr:
-    @pytest.mark.parametrize("member", list(RoutingMethod))
+    @pytest.mark.parametrize("member", list(RoutingMethodType))
     def test_routing_method_repr(self, member):
         assert eval(repr(member)) == member
 
-    @pytest.mark.parametrize("member", list(Activation))
+    @pytest.mark.parametrize("member", list(ActivationType))
     def test_activation_repr(self, member):
         assert eval(repr(member)) == member
 
@@ -91,18 +91,18 @@ class TestEnumRepr:
 
 
 # ---------------------------------------------------------------------------
-# Activation helpers
+# ActivationType helpers
 # ---------------------------------------------------------------------------
 
 
 class TestActivation:
     def test_is_gated(self):
-        assert Activation.Swiglu.is_gated
-        assert Activation.Geglu.is_gated
-        assert Activation.SwigluBias.is_gated
-        assert not Activation.Identity.is_gated
-        assert not Activation.Relu2.is_gated
-        assert not Activation.Gelu.is_gated
+        assert ActivationType.Swiglu.is_gated
+        assert ActivationType.Geglu.is_gated
+        assert ActivationType.SwigluBias.is_gated
+        assert not ActivationType.Identity.is_gated
+        assert not ActivationType.Relu2.is_gated
+        assert not ActivationType.Gelu.is_gated
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ class TestReprRoundTrip:
         cfg = RoutingConfig(
             num_experts=256,
             top_k=8,
-            method=RoutingMethod.DeepSeekV3,
+            method=RoutingMethodType.DeepSeekV3,
             n_group=8,
             topk_group=4,
             routed_scaling_factor=1.0,
@@ -167,7 +167,7 @@ class TestReprRoundTrip:
         assert _eval_repr(cfg) == cfg
 
     def test_activation_config(self):
-        for act in Activation:
+        for act in ActivationType:
             cfg = ActivationConfig(type=act)
             assert _eval_repr(cfg) == cfg
 
@@ -213,14 +213,14 @@ class TestReprRoundTrip:
             routing=RoutingConfig(
                 num_experts=256,
                 top_k=8,
-                method=RoutingMethod.DeepSeekV3,
+                method=RoutingMethodType.DeepSeekV3,
                 n_group=8,
                 topk_group=4,
                 routed_scaling_factor=1.0,
             ),
             quant=QuantConfig(variant=QuantVariant.MxFp8),
             experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-            activation=ActivationConfig(type=Activation.Geglu),
+            activation=ActivationConfig(type=ActivationType.Geglu),
             backend=BackendOptions(
                 candidates=(TrtllmFp8BlockConfig(), CutlassConfig())
             ),
@@ -402,10 +402,10 @@ class TestHashability:
 
 class TestActivationConfigSingletons:
     def test_singletons_exist(self):
-        assert ActivationConfig.swiglu == ActivationConfig(Activation.Swiglu)
-        assert ActivationConfig.geglu == ActivationConfig(Activation.Geglu)
-        assert ActivationConfig.relu2 == ActivationConfig(Activation.Relu2)
-        assert ActivationConfig.identity == ActivationConfig(Activation.Identity)
+        assert ActivationConfig.swiglu == ActivationConfig(ActivationType.Swiglu)
+        assert ActivationConfig.geglu == ActivationConfig(ActivationType.Geglu)
+        assert ActivationConfig.relu2 == ActivationConfig(ActivationType.Relu2)
+        assert ActivationConfig.identity == ActivationConfig(ActivationType.Identity)
 
     def test_singleton_is_gated(self):
         assert ActivationConfig.swiglu.is_gated
@@ -484,17 +484,17 @@ class TestExpressiveness:
             routing=RoutingConfig(
                 num_experts=256,
                 top_k=8,
-                method=RoutingMethod.DeepSeekV3,
+                method=RoutingMethodType.DeepSeekV3,
                 n_group=8,
                 topk_group=4,
                 routed_scaling_factor=1.0,
             ),
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
-            activation=ActivationConfig(type=Activation.Swiglu),
+            activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig())),
         )
-        assert cfg.routing.method == RoutingMethod.DeepSeekV3
+        assert cfg.routing.method == RoutingMethodType.DeepSeekV3
         assert cfg.quant.variant == QuantVariant.NVFP4
         assert cfg.activation.is_gated
 
@@ -504,11 +504,11 @@ class TestExpressiveness:
             routing=RoutingConfig(
                 num_experts=64,
                 top_k=8,
-                method=RoutingMethod.Renormalize,
+                method=RoutingMethodType.Renormalize,
             ),
             quant=QuantConfig(variant=QuantVariant.MxFp8),
             experts=ExpertConfig(intermediate_size=512),
-            activation=ActivationConfig(type=Activation.Swiglu),
+            activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions(
                 candidates=(TrtllmFp8BlockConfig(), CutlassConfig())
             ),
@@ -531,7 +531,7 @@ class TestExpressiveness:
             routing=RoutingConfig(
                 num_experts=8,
                 top_k=2,
-                method=RoutingMethod.Renormalize,
+                method=RoutingMethodType.Renormalize,
             ),
             quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=512),
@@ -555,7 +555,7 @@ class TestExpressiveness:
             routing=RoutingConfig(num_experts=64, top_k=8),
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             experts=ExpertConfig(intermediate_size=2048),
-            activation=ActivationConfig(type=Activation.Swiglu),
+            activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions((CutlassConfig(),)),
         )
         # CUTLASS uses modular dispatch — expressed via MoETensors, not config
@@ -567,7 +567,7 @@ class TestExpressiveness:
             routing=RoutingConfig(num_experts=64, top_k=8),
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
-            activation=ActivationConfig(type=Activation.Swiglu),
+            activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions(candidates=(CuteDslConfig(), CutlassConfig())),
         )
         assert any(isinstance(c, CuteDslConfig) for c in cfg.backend)
@@ -592,12 +592,12 @@ class TestExpressiveness:
             routing=RoutingConfig(
                 num_experts=16,
                 top_k=1,
-                method=RoutingMethod.Llama4,
+                method=RoutingMethodType.Llama4,
             ),
             quant=QuantConfig(variant=QuantVariant.BF16),
             experts=ExpertConfig(intermediate_size=4096),
         )
-        assert cfg.routing.method == RoutingMethod.Llama4
+        assert cfg.routing.method == RoutingMethodType.Llama4
         assert cfg.routing.top_k == 1
 
     def test_qwen3_renormalize_naive(self):
@@ -606,12 +606,12 @@ class TestExpressiveness:
             routing=RoutingConfig(
                 num_experts=64,
                 top_k=8,
-                method=RoutingMethod.RenormalizeNaive,
+                method=RoutingMethodType.RenormalizeNaive,
             ),
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             experts=ExpertConfig(intermediate_size=1024),
         )
-        assert cfg.routing.method == RoutingMethod.RenormalizeNaive
+        assert cfg.routing.method == RoutingMethodType.RenormalizeNaive
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +627,7 @@ class TestMoELayerMVPValidation:
             routing=RoutingConfig(num_experts=32, top_k=2),
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=512),
-            activation=ActivationConfig(type=Activation.Swiglu),
+            activation=ActivationConfig(type=ActivationType.Swiglu),
         )
         base.update(overrides)
         return MoEConfig(**base)
@@ -645,7 +645,7 @@ class TestMoELayerMVPValidation:
 
     @pytest.mark.parametrize(
         "act",
-        [a for a in Activation if a is not Activation.Swiglu],
+        [a for a in ActivationType if a is not ActivationType.Swiglu],
     )
     def test_non_swiglu_activation_rejected(self, act):
         from flashinfer.fused_moe import MoELayer

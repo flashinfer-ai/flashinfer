@@ -159,7 +159,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         self._num_local_experts = experts.local_num_experts or routing.num_experts
         self._local_expert_offset = experts.local_expert_offset
         self._intermediate_size = experts.intermediate_size
-        self._activation_type = int(config.activation.type.value)
+        self._activation_type = int(config.activation.type)
         self._tune_max_num_tokens = execution.tune_max_num_tokens
 
         # NVFP4: E2m1 activations + weights, no fp8 sub-quant.
@@ -306,7 +306,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             topk_group=routing.topk_group,
             local_expert_offset=self._local_expert_offset,
             routed_scaling_factor=routing.routed_scaling_factor,
-            routing_method_type=int(routing.method.value),
+            routing_method_type=int(routing.method),
             do_finalize=self.config.execution.do_finalize,
             enable_pdl=self._enable_pdl,
         )

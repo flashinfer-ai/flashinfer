@@ -32,45 +32,22 @@ from typing import ClassVar, Dict, Optional, Tuple, Union
 
 from torch import Tensor
 
+from ..tllm_enums import ActivationType, RoutingMethodType
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
-# These enums define the *unified API* vocabulary.  They intentionally mirror
-# the existing ``tllm_enums`` values so that adapters can cast directly.
-
-
-class RoutingMethod(Enum):
-    """Routing strategy applied to expert logits."""
-
-    Default = 0  # Softmax → TopK
-    Renormalize = 1  # TopK → Softmax
-    DeepSeekV3 = 2  # Sigmoid → Bias → TopK-group → TopK-expert
-    Llama4 = 3  # Top1 → Sigmoid
-    RenormalizeNaive = 4  # Softmax → TopK → Renormalize (Qwen3)
-    TopK = 5  # TopK only (no softmax)
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}.{self.name}"
-
-
-class Activation(Enum):
-    """Fused activation between GEMM1 and GEMM2."""
-
-    Gelu = 0
-    Relu = 1
-    Silu = 2
-    Swiglu = 3
-    Geglu = 4
-    SwigluBias = 5
-    Relu2 = 6
-    Identity = 7
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}.{self.name}"
-
-    @property
-    def is_gated(self) -> bool:
-        return self in (Activation.Swiglu, Activation.Geglu, Activation.SwigluBias)
+# Routing and activation reuse the shared kernel-level enums directly
+# (``RoutingMethodType`` / ``ActivationType`` from ``tllm_enums``): the API
+# speaks the kernels' vocabulary rather than mirroring it, so there is a single
+# source of truth (PR #3093 review G1).  Both are ``IntEnum`` — the value *is*
+# the kernel ABI int — and carry an eval-safe ``__repr__`` (defined in
+# ``tllm_enums``) plus ``ActivationType.is_gated`` for the repro round-trip and
+# config helpers.
+#
+# ``QuantVariant`` below is the one genuinely API-level enum: it has no single
+# kernel counterpart (the quant path is selected by dtype/scale wiring in the
+# runners, not one enum), so it is defined here as a plain ``Enum``.
 
 
 class QuantVariant(Enum):
@@ -103,7 +80,7 @@ class RoutingConfig:
         Total number of experts (global, before EP sharding).
     top_k : int
         Number of experts selected per token.
-    method : RoutingMethod
+    method : RoutingMethodType
         Routing strategy.
     n_group : int or None
         Expert group count for DeepSeekV3 routing.
@@ -115,14 +92,14 @@ class RoutingConfig:
 
     num_experts: int
     top_k: int
-    method: RoutingMethod = RoutingMethod.Default
+    method: RoutingMethodType = RoutingMethodType.Default
     n_group: Optional[int] = None
     topk_group: Optional[int] = None
     routed_scaling_factor: Optional[float] = None
 
     def __repr__(self) -> str:
         parts = [f"num_experts={self.num_experts!r}", f"top_k={self.top_k!r}"]
-        if self.method != RoutingMethod.Default:
+        if self.method != RoutingMethodType.Default:
             parts.append(f"method={self.method!r}")
         if self.n_group is not None:
             parts.append(f"n_group={self.n_group!r}")
@@ -143,10 +120,11 @@ class QuantConfig:
         Single knob for dtype + granularity + scale convention.
     swizzled_scale_factors : bool or None
         Whether block scale factors use the swizzled (vs linear) layout.
-        ``None`` → backend default.  Mirrors core's ``swizzled_input_sf``; finer
-        ``SfLayout`` (128x4 / 8x4 / linear) selection is deferred to the shared
-        enum-home consolidation (design doc C42 / review G1) so this config stays
-        ``eval(repr(cfg))``-round-trippable without importing an IntEnum.
+        ``None`` → backend default.  Mirrors core's ``swizzled_input_sf``.  Finer
+        ``SfLayout`` (128x4 / 8x4 / linear) selection is deferred (design doc
+        C42): unlike ``RoutingMethodType`` / ``ActivationType``, ``SfLayout`` has
+        no eval-safe ``__repr__``, so exposing it here would break the
+        ``eval(repr(cfg))`` round-trip — a bool keeps this config serializable.
     per_token_scale : bool or None
         Whether activations carry a per-token scale (vs per-tensor / block).
         ``None`` → backend default.
@@ -167,7 +145,7 @@ class ActivationConfig:
     relu2: ClassVar[ActivationConfig]
     identity: ClassVar[ActivationConfig]
 
-    type: Activation = Activation.Swiglu
+    type: ActivationType = ActivationType.Swiglu
 
     def __repr__(self) -> str:
         return f"ActivationConfig(type={self.type!r})"
@@ -177,10 +155,10 @@ class ActivationConfig:
         return self.type.is_gated
 
 
-ActivationConfig.swiglu = ActivationConfig(Activation.Swiglu)
-ActivationConfig.geglu = ActivationConfig(Activation.Geglu)
-ActivationConfig.relu2 = ActivationConfig(Activation.Relu2)
-ActivationConfig.identity = ActivationConfig(Activation.Identity)
+ActivationConfig.swiglu = ActivationConfig(ActivationType.Swiglu)
+ActivationConfig.geglu = ActivationConfig(ActivationType.Geglu)
+ActivationConfig.relu2 = ActivationConfig(ActivationType.Relu2)
+ActivationConfig.identity = ActivationConfig(ActivationType.Identity)
 
 
 @dataclass(frozen=True)
@@ -463,7 +441,7 @@ class MoEConfig:
     -------
     >>> config = MoEConfig(
     ...     routing=RoutingConfig(num_experts=64, top_k=8,
-    ...                           method=RoutingMethod.DeepSeekV3),
+    ...                           method=RoutingMethodType.DeepSeekV3),
     ...     quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
     ...     experts=ExpertConfig(intermediate_size=2048),
     ... )
@@ -474,7 +452,7 @@ class MoEConfig:
     quant: QuantConfig
     experts: ExpertConfig
     activation: ActivationConfig = field(
-        default_factory=lambda: ActivationConfig(Activation.Swiglu)
+        default_factory=lambda: ActivationConfig(ActivationType.Swiglu)
     )
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)

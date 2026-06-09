@@ -30,7 +30,7 @@ import torch
 from ..autotuner import AutoTuner
 from ..utils import get_compute_capability
 from .api import (
-    Activation,
+    ActivationType,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -113,7 +113,7 @@ class MoELayer:
                 "follow-ups."
             )
         act = config.activation.type
-        if act is not Activation.Swiglu:
+        if act is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"MoELayer MVP supports only the Swiglu activation; got {act!r}."
             )

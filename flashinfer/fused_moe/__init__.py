@@ -16,7 +16,6 @@ limitations under the License.
 
 # Unified MoE API
 from .api import (  # noqa: F401
-    Activation,
     ActivationConfig,
     BackendOptions,
     CuteDslConfig,
@@ -32,7 +31,6 @@ from .api import (  # noqa: F401
     QuantConfig,
     QuantVariant,
     RoutingConfig,
-    RoutingMethod,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -99,7 +97,6 @@ except ImportError:
 
 __all__ = [
     # Unified API
-    "Activation",
     "ActivationConfig",
     "BackendOptions",
     "CuteDslConfig",
@@ -118,7 +115,6 @@ __all__ = [
     "QuantConfig",
     "QuantVariant",
     "RoutingConfig",
-    "RoutingMethod",
     "TrtllmBf16Config",
     "TrtllmFp4Config",
     "TrtllmFp8BlockConfig",
