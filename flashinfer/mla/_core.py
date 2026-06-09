@@ -2423,6 +2423,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens,
             lse_stride_heads,
             False,  # enable_block_sparse_attention
+            0,  # bf16q_fp8kv_transform_mode
         )
         return out
 
