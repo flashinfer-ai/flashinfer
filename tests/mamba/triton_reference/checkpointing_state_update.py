@@ -1884,6 +1884,18 @@ def _persistent_main_impl(
     PHILOX_ROUNDS: tl.constexpr,
     QUANT_MAX: tl.constexpr,
     WRITE_CHECKPOINT: tl.constexpr,
+    # IS_DYNAMIC: when True (persistent_dynamic), is_write is resolved per-slot
+    # from PNAT at runtime.  When False (persistent_main), is_write is the
+    # WRITE_CHECKPOINT constexpr.  Ported from the standalone reference to fix
+    # the dropped runtime write-gating: dynamic + RECTANGLE=False previously
+    # passed WRITE_CHECKPOINT=False to every slot, so checkpoint state was never
+    # written (replay still ran, so output looked correct).
+    IS_DYNAMIC: tl.constexpr = False,
+    # WRITE_CHECKPOINT_IS_CONSTEXPR: force is_write to the WRITE_CHECKPOINT
+    # constexpr even in dynamic mode.  The rectangle write-arm sets this after
+    # the outer kernel has already narrowed the runtime branch to write slots,
+    # so the no-write codegen DCEs.
+    WRITE_CHECKPOINT_IS_CONSTEXPR: tl.constexpr = False,
 ):
     tl.static_assert(
         (QUANT_MAX > 0.0)
@@ -1904,10 +1916,24 @@ def _persistent_main_impl(
     t_mask = offs_t < T
     cache_window_mask = offs_window < MAX_REPLAY_BUFFER_LENGTH
 
-    if WRITE_CHECKPOINT:
+    # Resolve is_write (ported from the standalone reference):
+    #   - WRITE_CHECKPOINT_IS_CONSTEXPR: caller already narrowed to write slots
+    #     → use the WRITE_CHECKPOINT constexpr (no-write codegen DCEs).
+    #   - IS_DYNAMIC (persistent_dynamic, RECTANGLE=False caller): per-slot
+    #     runtime branch on PNAT.  Both write/no-write codegen live in one body.
+    #   - else (persistent_main): WRITE_CHECKPOINT constexpr from caller.
+    if WRITE_CHECKPOINT_IS_CONSTEXPR:
+        is_write: tl.constexpr = WRITE_CHECKPOINT
+    elif IS_DYNAMIC:
+        is_write = (prev_num_accepted_tokens + T) > MAX_REPLAY_BUFFER_LENGTH
+    else:
+        is_write = WRITE_CHECKPOINT
+    if is_write:
         write_offset = 0
+        write_buf = 1 - active_buf
     else:
         write_offset = prev_num_accepted_tokens
+        write_buf = active_buf
 
     # Load state
     state_ptr_local = (
@@ -2003,7 +2029,7 @@ def _persistent_main_impl(
     state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
 
     # Phase 3: Write post-replay state (checkpoint step only)
-    if WRITE_CHECKPOINT:
+    if is_write:
         if USE_RS_ROUNDING:
             rand_seed = tl.load(rand_seed_ptr + cache_batch_idx)
             base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
@@ -2088,15 +2114,14 @@ def _persistent_main_impl(
         mask=t_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
-    if WRITE_CHECKPOINT:
-        old_x_write_base = (
-            old_x_ptr
-            + cache_batch_idx * stride_old_x_cache
-            + (1 - active_buf) * stride_old_x_dbuf
-            + pid_h * stride_old_x_head
-        )
-    else:
-        old_x_write_base = old_x_base  # append to active buf
+    # write_buf = (1 - active_buf) on write (staging), active_buf on no-write
+    # (append) — resolved above alongside is_write.
+    old_x_write_base = (
+        old_x_ptr
+        + cache_batch_idx * stride_old_x_cache
+        + write_buf * stride_old_x_dbuf
+        + pid_h * stride_old_x_head
+    )
     tl.store(
         old_x_write_base
         + (write_offset + offs_t)[:, None] * stride_old_x_T
@@ -2702,7 +2727,9 @@ def _persistent_main_kernel(
                     USE_RS_ROUNDING,
                     PHILOX_ROUNDS,
                     QUANT_MAX,
-                    True,  # WRITE_CHECKPOINT=True for write arm
+                    True,  # WRITE_CHECKPOINT
+                    IS_DYNAMIC,
+                    True,  # WRITE_CHECKPOINT_IS_CONSTEXPR: write arm pre-narrowed
                 )
             else:
                 _persistent_rectangle_impl(
@@ -2863,6 +2890,8 @@ def _persistent_main_kernel(
                 PHILOX_ROUNDS,
                 QUANT_MAX,
                 WRITE_CHECKPOINT,
+                IS_DYNAMIC,
+                False,  # WRITE_CHECKPOINT_IS_CONSTEXPR: dynamic resolves at runtime
             )
 
 

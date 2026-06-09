@@ -1122,7 +1122,14 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
     int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
                               buf_write * params.old_cumAdt_stride_dbuf +
                               head * params.old_cumAdt_stride_head;
-    old_cumAdt_w[ca_w_base + write_offset + lane] = smem.cumAdt[lane];
+    // On no-write steps with prev_k > 0, offset the stored cumsum by the
+    // previous tail value so the buffer holds a monotonically increasing
+    // cumsum across consecutive no-write steps.  This is required for correct
+    // replay: total_old_cumAdt = old_cumAdt[prev_k-1] must reflect the total
+    // accumulated decay of all prev_k buffered tokens, not just the last step.
+    float const cumAdt_prefix =
+        (!must_checkpoint && prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
+    old_cumAdt_w[ca_w_base + write_offset + lane] = smem.cumAdt[lane] + cumAdt_prefix;
   }
 }
 

@@ -36,6 +36,25 @@ _CONFIGS = [
 ]
 
 
+def _old_x_to_5d(old_x_4d, cache_buf_idx):
+    """Build the 5-D double-buffered ``old_x`` the persistent Triton path
+    (``replay_selective_state_update``, ``mode=persistent_dynamic``) expects,
+    from the legacy 4-D single-buffer ``old_x`` the CUDA kernel uses.
+
+    The CUDA kernel keeps the 4-D layout ``(cache, window, nheads, dim)``; the
+    Triton 5-D path expects ``(cache, 2, window, nheads, dim)`` where the
+    buffered tokens live in the active buffer ``cache_buf_idx[slot]`` (the same
+    buffer ``old_B``/``old_dt``/``old_dA_cumsum`` are already double-buffered
+    into).  The inactive buffer is left zero — the kernel only reads the active
+    buffer's ``[0, prev_k)`` and overwrites the staging buffer on checkpoint.
+    """
+    cache_size, window, nheads, dim = old_x_4d.shape
+    old_x_5d = old_x_4d.new_zeros(cache_size, 2, window, nheads, dim)
+    rows = torch.arange(cache_size, device=old_x_4d.device)
+    old_x_5d[rows, cache_buf_idx.long()] = old_x_4d
+    return old_x_5d
+
+
 def _run_checkpointing_ssu_case(
     nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
 ):
@@ -127,7 +146,7 @@ def _run_checkpointing_ssu_case(
         ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         replay_selective_state_update(
             ref_state,
-            old_x.clone(),
+            _old_x_to_5d(old_x, cache_buf_idx),
             old_B.clone(),
             old_dt.clone(),
             old_cumAdt.clone(),
@@ -143,6 +162,7 @@ def _run_checkpointing_ssu_case(
             dt_bias=dt_bias,
             dt_softplus=True,
             state_batch_indices=state_batch_indices,
+            rectangle_for_nowrite=False,
         )
 
         # --- CUDA kernel ---
@@ -714,12 +734,6 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
                 msg=f"Triton old_dA mismatch at prev_k={prev_k} slot={slot}",
             )
 
-        # CUDA does not yet store continuous prefix for the no-write path.
-        if not must_checkpoint and prev_k > 0:
-            pytest.xfail(
-                "CUDA old_dA_cumsum does not yet store continuous prefix "
-                "(no-write + prev_k > 0) — will be fixed in a future CUDA update"
-            )
         torch.testing.assert_close(
             old_dA_test,
             old_dA_ref,
@@ -979,12 +993,6 @@ def test_checkpointing_ssu_philox_no_checkpoint(
                 msg=f"Triton old_dA mismatch at prev_k={prev_k} slot={slot}",
             )
 
-        # CUDA does not yet store continuous prefix for the no-write path.
-        if prev_k > 0:
-            pytest.xfail(
-                "CUDA old_dA_cumsum does not yet store continuous prefix "
-                "(no-write + prev_k > 0) — will be fixed in a future CUDA update"
-            )
         torch.testing.assert_close(
             old_dA_test,
             old_dA_ref,
@@ -2005,17 +2013,6 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
             msg=f"Triton old_dA mismatch at batch_idx={batch_idx} slot={slot} prev_k={prev_k}",
         )
 
-    # CUDA does not yet store continuous prefix for the no-write path.
-    # Some no-write slots have prev_k > 0 (e.g. prev_k=6), so this xfails.
-    has_nowrite_with_prefix = any(
-        not mc and pk > 0
-        for pk, mc in zip(prev_k_per_batch, must_checkpoint_per_batch, strict=True)
-    )
-    if has_nowrite_with_prefix:
-        pytest.xfail(
-            "CUDA old_dA_cumsum does not yet store continuous prefix "
-            "(no-write + prev_k > 0) — will be fixed in a future CUDA update"
-        )
     torch.testing.assert_close(
         old_dA_test, old_dA_ref, rtol=1e-4, atol=1e-4, msg="old_dA mismatch"
     )
@@ -4873,4 +4870,125 @@ def test_checkpointing_ssu_determinism_across_launches(
         assert len(scale_hashes) == 1, (
             f"[{tag}] state_scale non-deterministic across 5 launches "
             f"(got {len(scale_hashes)} unique hashes)"
+        )
+
+
+def test_checkpointing_ssu_continuous_dA_cumsum_multistep():
+    """5-step no-write test: verifies output correctness across consecutive no-write steps.
+
+    Uses `selective_state_update_triton` (running-state SSM) as the ground truth,
+    since `checkpointing_state_update` only supports prev_k <= T.  The CUDA
+    checkpointing kernel must produce the same output as the running SSM at each
+    step: it starts from the initial state in HBM (never updated on no-write) and
+    replays buffered tokens via old_dA_cumsum to reconstruct the decay factors.
+
+    Without the continuous dA_cumsum fix, the replay decays are wrong from step 3
+    (prev_k=6) onward because total_old_cumAdt = old_cumAdt[prev_k-1] excludes
+    step-1's contribution when step-2 stored zero-based (non-continuous) cumsums.
+    With the fix, the stored cumsums are monotonically increasing across steps so
+    total_old_cumAdt is the true total decay of all prev_k buffered tokens.
+    """
+    # T=3, max_window=16: 5 no-write steps with prev_k = 0, 3, 6, 9, 12.
+    # Bug manifests at step 3 (prev_k=6): wrong total_old_cumAdt causes
+    # catastrophically wrong decay of step-1 tokens (~40 output error vs atol=0.5).
+    T = 3
+    max_window = 16
+    nheads, head_dim, d_state, ngroups = _CONFIGS[0]
+    batch = 2
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.float16
+
+    cache_size = batch
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+    )
+
+    # CUDA cache (chained between steps)
+    old_x_test = torch.zeros(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_B_test = torch.zeros(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    old_dt_test = torch.zeros(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_dA_test = torch.zeros(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx_test = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    test_state = state0.clone()
+
+    # Reference: selective_state_update_triton maintains running SSM state.
+    # Each step updates ref_state in place, giving the same output as the
+    # checkpointing kernel's replay.
+    ref_state = state0.clone().to(torch.float32)
+
+    num_steps = 5
+    for step in range(num_steps):
+        prev_k = step * T
+        assert prev_k + T <= max_window, "all steps must be no-write"
+
+        torch.manual_seed(step + 100)
+        x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+        dt = repeat(dt_base, "b t h -> b t h p", p=head_dim)
+        B = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+        prev_test = torch.full((cache_size,), prev_k, device=device, dtype=torch.int32)
+        test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+
+        # Ground truth: running-state SSM (selective_state_update_triton updates
+        # ref_state in place, correctly accumulating each step's contribution).
+        selective_state_update(
+            ref_state,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            out=ref_out,
+        )
+
+        # CUDA checkpointing kernel (no-write path: state HBM not updated).
+        checkpointing_ssu(
+            test_state,
+            old_x_test,
+            old_B_test,
+            old_dt_test,
+            old_dA_test,
+            cache_buf_idx_test,
+            prev_test,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            out=test_out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+        )
+
+        torch.testing.assert_close(
+            test_out,
+            ref_out,
+            rtol=2e-2,
+            atol=5e-1,
+            msg=f"output mismatch at step {step + 1} (prev_k={prev_k})",
         )
