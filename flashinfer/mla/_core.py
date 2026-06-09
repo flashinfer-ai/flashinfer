@@ -1474,6 +1474,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse,
             lse_stride_tokens,
             lse_stride_heads,
+            0,  # bf16q_fp8kv_transform_mode
         )
         return out
 
