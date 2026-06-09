@@ -18,6 +18,14 @@ host has a supported NVIDIA GPU; the module guards its imports with
 
 .. currentmodule:: flashinfer.cute_dsl
 
+Availability
+------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    is_cute_dsl_available
+
 RMSNorm + FP4 Quantization
 --------------------------
 
