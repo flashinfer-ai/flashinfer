@@ -55,6 +55,45 @@ def _old_x_to_5d(old_x_4d, cache_buf_idx):
     return old_x_5d
 
 
+def _assert_old_x_5d_matches_4d(
+    old_x_cuda_4d,
+    old_x_triton_5d,
+    cache_buf_idx,
+    prev_tokens,
+    T,
+    max_window,
+    state_batch_indices,
+    cache_size,
+):
+    """Compare the CUDA (4-D single-buffer) old_x cache write against the Triton
+    (5-D double-buffer) cache write.
+
+    CUDA keeps the single-buffer layout, so its old_x[slot] retains stale
+    history outside the freshly-written region; Triton writes new tokens to a
+    separate buffer (staging on checkpoint, active on append) whose tail stays
+    zero.  Only the written ``[write_offset, write_offset+T)`` slice is
+    semantically required to match between the two layouts, so compare that.
+    """
+    slots = (
+        state_batch_indices.tolist()
+        if state_batch_indices is not None
+        else range(cache_size)
+    )
+    for slot in slots:
+        active = int(cache_buf_idx[slot])
+        pk = int(prev_tokens[slot])
+        write = (pk + T) > max_window
+        wb = (1 - active) if write else active
+        wo = 0 if write else pk
+        torch.testing.assert_close(
+            old_x_cuda_4d[slot, wo : wo + T],
+            old_x_triton_5d[slot, wb, wo : wo + T],
+            rtol=0,
+            atol=0,
+            msg=f"old_x cache mismatch slot={slot} (write={write}, prev_k={pk})",
+        )
+
+
 def _run_checkpointing_ssu_case(
     nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
 ):
@@ -615,7 +654,7 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
         ref_out = torch.zeros(
             batch, npredicted, nheads, head_dim, device=device, dtype=dtype
         )
-        old_x_ref = old_x.clone()
+        old_x_ref = _old_x_to_5d(old_x, cache_buf_idx)
         old_B_ref = old_B.clone()
         old_dt_ref = old_dt.clone()
         old_dA_ref = old_dA_cumsum.clone()
@@ -686,12 +725,15 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
             msg=f"state mismatch at prev_k={prev_k} (must_checkpoint={must_checkpoint})",
         )
         # Cache writes — both kernels should land at the same slot/offset.
-        torch.testing.assert_close(
+        _assert_old_x_5d_matches_4d(
             old_x_test,
             old_x_ref,
-            rtol=0,
-            atol=0,
-            msg=f"old_x mismatch at prev_k={prev_k}",
+            cache_buf_idx,
+            ref_prev,
+            npredicted,
+            max_window,
+            state_batch_indices,
+            cache_size,
         )
         torch.testing.assert_close(
             old_B_test,
@@ -864,7 +906,7 @@ def test_checkpointing_ssu_philox_no_checkpoint(
         ref_out = torch.zeros(
             batch, npredicted, nheads, head_dim, device=device, dtype=dtype
         )
-        old_x_ref = old_x.clone()
+        old_x_ref = _old_x_to_5d(old_x, cache_buf_idx)
         old_B_ref = old_B.clone()
         old_dt_ref = old_dt.clone()
         old_dA_ref = old_dA_cumsum.clone()
@@ -947,12 +989,15 @@ def test_checkpointing_ssu_philox_no_checkpoint(
         # Cache writes happen unconditionally; only target buffer/offset
         # depends on must_checkpoint.  Should match Triton ref bit-exactly
         # for old_x/old_B and to fp32 tolerance for old_dt/old_dA_cumsum.
-        torch.testing.assert_close(
+        _assert_old_x_5d_matches_4d(
             old_x_test,
             old_x_ref,
-            rtol=0,
-            atol=0,
-            msg=f"old_x mismatch at prev_k={prev_k}",
+            cache_buf_idx,
+            ref_prev,
+            npredicted,
+            max_window,
+            state_batch_indices,
+            cache_size,
         )
         torch.testing.assert_close(
             old_B_test,
@@ -1131,7 +1176,7 @@ def test_checkpointing_ssu_philox_with_checkpoint(
     ref_out = torch.zeros(
         batch, npredicted, nheads, head_dim, device=device, dtype=dtype
     )
-    old_x_ref = old_x.clone()
+    old_x_ref = _old_x_to_5d(old_x, cache_buf_idx)
     old_B_ref = old_B.clone()
     old_dt_ref = old_dt.clone()
     old_dA_ref = old_dA_cumsum.clone()
@@ -1215,8 +1260,15 @@ def test_checkpointing_ssu_philox_with_checkpoint(
 
     # Cache writes happen unconditionally; only target buffer/offset depends
     # on must_checkpoint.
-    torch.testing.assert_close(
-        old_x_test, old_x_ref, rtol=0, atol=0, msg=f"old_x mismatch (prev_k={prev_k})"
+    _assert_old_x_5d_matches_4d(
+        old_x_test,
+        old_x_ref,
+        cache_buf_idx,
+        ref_prev,
+        npredicted,
+        max_window,
+        state_batch_indices,
+        cache_size,
     )
     torch.testing.assert_close(
         old_B_test, old_B_ref, rtol=0, atol=0, msg=f"old_B mismatch (prev_k={prev_k})"
@@ -1881,7 +1933,7 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
     # its sliced state_batch_indices, so the two launches' writes don't
     # alias.  write_checkpoint is the constexpr that differs per sub-launch.
     ref_state = state0.clone()
-    old_x_ref = old_x.clone()
+    old_x_ref = _old_x_to_5d(old_x, cache_buf_idx)
     old_B_ref = old_B.clone()
     old_dt_ref = old_dt.clone()
     old_dA_ref = old_dA_cumsum.clone()
@@ -1980,8 +2032,15 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
 
     # Cache writes happen unconditionally; only target buffer/offset depends
     # on per-batch must_checkpoint.
-    torch.testing.assert_close(
-        old_x_test, old_x_ref, rtol=0, atol=0, msg="old_x mismatch"
+    _assert_old_x_5d_matches_4d(
+        old_x_test,
+        old_x_ref,
+        cache_buf_idx,
+        prev_per_slot,
+        npredicted,
+        max_window,
+        state_batch_indices_full,
+        cache_size,
     )
     torch.testing.assert_close(
         old_B_test, old_B_ref, rtol=0, atol=0, msg="old_B mismatch"
@@ -4272,13 +4331,13 @@ def _run_varlen_cuda_vs_triton(
     # --- Triton varlen ---
     state_tri = s["state0"].clone()
     state_scale_tri = s["state0_scale"].clone() if s["is_quantized"] else None
-    old_x_tri = s["old_x"].clone()
+    old_x_tri = _old_x_to_5d(s["old_x"], s["cache_buf_idx"])
     old_B_tri = s["old_B"].clone()
     old_dt_tri = s["old_dt"].clone()
     old_cumAdt_tri = s["old_cumAdt"].clone()
     out_tri = torch.zeros_like(x_packed)
 
-    checkpointing_state_update(
+    replay_selective_state_update(
         state_tri,
         old_x_tri,
         old_B_tri,
