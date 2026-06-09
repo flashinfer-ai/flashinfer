@@ -126,8 +126,14 @@ struct SharedStorageQKVO {
   // repacked+consumed (compute_qk) before V is repacked+consumed (compute_sfm_v).
   // Sized to max(HEAD_DIM_QK, HEAD_DIM_VO); 1 unless DTypeKV is an 8-bit (FP8)
   // type and not FP4 (FP4 keeps its in-loop dequant).
-  static constexpr bool USE_KV_REPACK =
-      (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO != 64);
+  // The repack staging buffer costs CTA_TILE_KV*max(HEAD_DIM_QK,HEAD_DIM_VO) BF16
+  // elements (~64KB at head_dim=512). At HEAD_DIM_VO > 256 that buffer is what
+  // pushes per-CTA smem past the 1-block-per-SM threshold (occupancy collapses to
+  // ~6%), so disable repack there and fall back to in-loop FP8 dequant — freeing
+  // the buffer lets the dispatcher fit 2 CTAs/SM, which dominates the per-tile
+  // dequant cost for this latency-bound regime.
+  static constexpr bool USE_KV_REPACK = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
+                                        (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256);
   static constexpr uint32_t REPACK_BUF_ELEMS =
       CTA_TILE_KV * (HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO);
   alignas(16) std::conditional_t<USE_KV_REPACK, DTypeQ[REPACK_BUF_ELEMS], DTypeQ[1]> kv_smem_repack;
@@ -186,8 +192,10 @@ struct KernelTraits {
   // When set, FP8 K/V are dequantized once per tile into BF16/FP16 staging smem
   // and read via the standard (shuffle-free) 16-bit ldmatrix path. Only for the
   // k128B-swizzle case (HEAD_DIM_VO != 64); FP4 keeps its in-loop dequant.
-  static constexpr bool USE_KV_REPACK =
-      (sizeof(DTypeKV_) == 1) && !is_fp4_type_v<DTypeKV_> && (HEAD_DIM_VO != 64);
+  // See SharedStorageQKVO::USE_KV_REPACK: disabled for HEAD_DIM_VO > 256 so the
+  // repack staging buffer doesn't cap occupancy at 1 CTA/SM (split-D regime).
+  static constexpr bool USE_KV_REPACK = (sizeof(DTypeKV_) == 1) && !is_fp4_type_v<DTypeKV_> &&
+                                        (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256);
   // b128 columns per KV row in the FP8 (packed) and BF16 (repacked) layouts.
   static constexpr uint32_t REPACK_STRIDE_QK = HEAD_DIM_QK / upcast_size<DTypeQ_>();
   static constexpr uint32_t REPACK_STRIDE_VO = HEAD_DIM_VO / upcast_size<DTypeQ_>();
@@ -1306,55 +1314,56 @@ __device__ __forceinline__ void compute_sfm_v(
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
 #pragma unroll
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-      uint32_t b_frag[4];
-      if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
-        uint32_t b_frag_quant[2];
-        if (mma_d % 2 == 0) {
-          v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_quant);
-        } else {
-          v_smem->ldmatrix_m8n8x4_trans_right_half(*v_smem_offset_r, b_frag_quant);
-        }
-
-        if constexpr (is_fp4_type_v<typename KTraits::DTypeKV>) {
-          b_frag_quant[0] = frag_layout_swizzle_16b_to_4b_trans(b_frag_quant[0]);
-          b_frag_quant[1] = frag_layout_swizzle_16b_to_4b_trans(b_frag_quant[1]);
-        } else {
-          b_frag_quant[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[0]);
-          b_frag_quant[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[1]);
-        }
-        vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeKV>::cast<8>(
-            (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeKV*)b_frag_quant);
-        swap(b_frag[1], b_frag[2]);
-        if constexpr (is_fp4_type_v<typename KTraits::DTypeKV>) {
-          // Apply scaling factors for V.
-          // SF smem is linear: sf[kv_row * SF_COLS + hd_group], SF_COLS = HEAD_DIM_VO/16.
-          // For transposed B (V), thread t's KV rows are 2*(t%4)+{0,1} and 2*(t%4)+{8,9}
-          // in the mma_kv tile. After swap, b_frag[0,2] cover rows {r0, r0+1} and
-          // b_frag[1,3] cover rows {r0+8, r0+9}. Each half2 needs two distinct SFs.
-          using DTypeQ_ = typename KTraits::DTypeQ;
-          using packed2_ = std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
-          constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;  // HEAD_DIM_VO / 16
-          uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + mma_d;
-          __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
-          sf0_fp8.__x = v_sf_smem[sf_base];
-          sf1_fp8.__x = v_sf_smem[sf_base + SF_COLS_V];
-          sf2_fp8.__x = v_sf_smem[sf_base + 8 * SF_COLS_V];
-          sf3_fp8.__x = v_sf_smem[sf_base + 9 * SF_COLS_V];
-          packed2_ scale_lo{static_cast<DTypeQ_>(sf0_fp8), static_cast<DTypeQ_>(sf1_fp8)};
-          packed2_ scale_hi{static_cast<DTypeQ_>(sf2_fp8), static_cast<DTypeQ_>(sf3_fp8)};
-          *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_lo);
-          *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_hi);
-          *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_lo);
-          *(packed2_*)&b_frag[3] = __hmul2(*(packed2_*)&b_frag[3], scale_hi);
-        }
-      } else {
-        v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
-      }
-      // Split-D: only accumulate the V columns belonging to the current VO tile
-      // into the (tile-sized) o_frag. The ldmatrix loads + offset advances above
-      // still run for every column so the swizzled V-smem offset bookkeeping is
-      // identical to the non-tiled path; only the MMA (accumulate) is gated.
+      // Split-D: load + dequantize + accumulate only the V columns of the current
+      // VO tile. Out-of-tile columns are skipped entirely here (saving the V
+      // ldmatrix + dequant) but still advance the V-smem offset below, keeping the
+      // swizzled bookkeeping identical to the non-tiled path.
       if (mma_d >= d_base && mma_d < d_base + KTraits::NUM_MMA_D_VO_TILE) {
+        uint32_t b_frag[4];
+        if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
+          uint32_t b_frag_quant[2];
+          if (mma_d % 2 == 0) {
+            v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_quant);
+          } else {
+            v_smem->ldmatrix_m8n8x4_trans_right_half(*v_smem_offset_r, b_frag_quant);
+          }
+
+          if constexpr (is_fp4_type_v<typename KTraits::DTypeKV>) {
+            b_frag_quant[0] = frag_layout_swizzle_16b_to_4b_trans(b_frag_quant[0]);
+            b_frag_quant[1] = frag_layout_swizzle_16b_to_4b_trans(b_frag_quant[1]);
+          } else {
+            b_frag_quant[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[0]);
+            b_frag_quant[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[1]);
+          }
+          vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeKV>::cast<8>(
+              (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeKV*)b_frag_quant);
+          swap(b_frag[1], b_frag[2]);
+          if constexpr (is_fp4_type_v<typename KTraits::DTypeKV>) {
+            // Apply scaling factors for V.
+            // SF smem is linear: sf[kv_row * SF_COLS + hd_group], SF_COLS = HEAD_DIM_VO/16.
+            // For transposed B (V), thread t's KV rows are 2*(t%4)+{0,1} and 2*(t%4)+{8,9}
+            // in the mma_kv tile. After swap, b_frag[0,2] cover rows {r0, r0+1} and
+            // b_frag[1,3] cover rows {r0+8, r0+9}. Each half2 needs two distinct SFs.
+            using DTypeQ_ = typename KTraits::DTypeQ;
+            using packed2_ =
+                std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
+            constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;  // HEAD_DIM_VO / 16
+            uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + mma_d;
+            __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
+            sf0_fp8.__x = v_sf_smem[sf_base];
+            sf1_fp8.__x = v_sf_smem[sf_base + SF_COLS_V];
+            sf2_fp8.__x = v_sf_smem[sf_base + 8 * SF_COLS_V];
+            sf3_fp8.__x = v_sf_smem[sf_base + 9 * SF_COLS_V];
+            packed2_ scale_lo{static_cast<DTypeQ_>(sf0_fp8), static_cast<DTypeQ_>(sf1_fp8)};
+            packed2_ scale_hi{static_cast<DTypeQ_>(sf2_fp8), static_cast<DTypeQ_>(sf3_fp8)};
+            *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_lo);
+            *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_hi);
+            *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_lo);
+            *(packed2_*)&b_frag[3] = __hmul2(*(packed2_*)&b_frag[3], scale_hi);
+          }
+        } else {
+          v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
+        }
         const uint32_t mma_d_local = mma_d - d_base;
 #pragma unroll
         for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {

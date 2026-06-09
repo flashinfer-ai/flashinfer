@@ -42,7 +42,7 @@ def warmup_jit():
         + gen_prefill_attention_modules(
             [torch.float16],  # q_dtypes
             [torch.float16],  # kv_dtypes
-            [64, 128, 256],  # head_dims
+            [64, 128, 256, 512],  # head_dims
             [0],  # pos_encoding_modes
             [False, True],  # use_sliding_windows
             [False],  # use_logits_soft_caps
@@ -199,7 +199,7 @@ def test_single_decode_prefill_sliding_window_match(
 @pytest.mark.parametrize("window_left", [43, 233])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4, 8])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 def test_single_prefill_sliding_window(
     seq_len, window_left, num_kv_heads, num_qo_heads, head_dim
 ):
@@ -230,7 +230,7 @@ def test_single_prefill_sliding_window(
 @pytest.mark.parametrize("window_left", [13, 33, 111])
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
 @pytest.mark.parametrize("num_qo_heads", [4, 8])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 @pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("backend", ["fa2", "auto"])
 def test_batch_paged_prefill_sliding_window(
@@ -338,7 +338,7 @@ def test_batch_paged_prefill_sliding_window(
 @pytest.mark.parametrize("window_left", [13, 33])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("num_qo_heads", [4, 8])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 @pytest.mark.parametrize("backend", ["fa2", "auto"])
 def test_batch_ragged_prefill_sliding_window(
     batch_size,

@@ -382,6 +382,15 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
 }
 
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+  // At head_dim >= 512 the Q smem tile (CTA_TILE_Q * head_dim * 2B) dominates the
+  // per-CTA shared memory: CTA_TILE_Q=64 needs 64KB for Q alone, capping occupancy
+  // at 1 CTA/SM and exceeding the ~100KB budget of consumer Blackwell (SM12x).
+  // CTA_TILE_Q=16 shrinks Q smem 4x, letting the kernel fit small-smem parts and
+  // run 2 CTAs/SM on large-smem parts. The split-D prefill kernel uses NUM_WARPS_KV=4
+  // at this tile, so KV work is still parallelized across warps.
+  if (head_dim >= 512) {
+    return 16;
+  }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;
   } else {
