@@ -1882,7 +1882,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   uint32_t pos = num_speculative_tokens;
   for (uint32_t i = 0; i < num_speculative_tokens; ++i) {
     IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
-    if (draft_id < 0) {
+    if (static_cast<int32_t>(draft_id) < 0) {
       pos = i;
       break;
     }
@@ -1900,8 +1900,8 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   uint32_t emitted_token_num = pos;
   uint32_t accepted_token_num = pos;
   for (uint32_t i = pos; i < num_speculative_tokens; ++i) {
-    int draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
-    if (draft_id < 0) {
+    IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    if (static_cast<int32_t>(draft_id) < 0) {
       break;
     }
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
