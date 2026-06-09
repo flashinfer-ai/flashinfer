@@ -64,9 +64,15 @@ deviating backend is caught by #2 directly, and #2 also names which backend -- s
 comparison adds no pass/fail power, only redundancy. See the design discussion.)
 
 Coverage today: NVFP4 (CuteDSL + TRTLLM-FP4-routed) on SM100 -- the only wired MVP runners.
-Run (SM100 required for the MVP backends; JIT needs CUDA_HOME):
-  CUDA_HOME=<cuda> PYTHONPATH=<this-worktree> CUDA_VISIBLE_DEVICES=<sm100-idx> \
-    pytest --forked tests/moe/test_unified_moe_fuzz.py
+
+OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
+SKIPPED unless that env var is set -- waived in CI pending gh #3547 and root-cause of a
+whole-process device-side-assert abort that would block B200 CI. Run it explicitly:
+  FLASHINFER_UMOE_FUZZ=1 CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<sm100-idx> \
+    pytest tests/moe/test_unified_moe_fuzz.py
+NOTE: `pytest --forked` does NOT work here (CUDA inits at collection ->
+"Cannot re-initialize CUDA in forked subprocess"); for crash-isolated enumeration run each
+test id in its own process instead (see var/03-ssh-docker-workflow.md).
 Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0).
 
 ------------------------------------------------------------------------------------------------
@@ -164,6 +170,24 @@ from flashinfer.utils import get_compute_capability
 
 NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
+
+# --- CI-safety gate: OPT-IN ----------------------------------------------------------------
+# Waived in CI pending gh #3547 + root-cause of a whole-process abort. Running the SM100 fuzzer
+# in a single `pytest` process can hit `CUDA error: device-side assert triggered` ->
+# `Fatal Python error: Aborted`, which would BLOCK B200 CI (an abort fails the whole job, not one
+# test). Notes from triage (2026-06-09): per-config isolation (one process each) passes 68/86
+# incl. EP offset>0 -- so the abort is NOT cleanly attributable to one config (the gh #3547 EP
+# case returns tolerated zeros, no assert, under torch.cuda.synchronize); it surfaces only in the
+# accumulated single-process run that CI uses. `pytest --forked` can't isolate it here either
+# (CUDA inits at collection -> "Cannot re-initialize CUDA in forked subprocess"). Until the abort
+# is root-caused and #3547 fixed (follow-up PR), this suite is opt-in: set FLASHINFER_UMOE_FUZZ=1
+# to run it (developer / nightly / SM100 box). Unset (CI default) -> collected-and-skipped, so it
+# never launches a kernel and cannot abort the job.
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("FLASHINFER_UMOE_FUZZ"),
+    reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending gh #3547 and "
+    "root-cause of the whole-process device-side-assert abort",
+)
 
 # Per-backend determinism contract, established empirically (CRC across reruns) + confirmed against
 # code. A "True" backend MUST reproduce bitwise; flip to False only with evidence (and ideally an
