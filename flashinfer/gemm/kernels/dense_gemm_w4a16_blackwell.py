@@ -28,29 +28,7 @@
 
 """W4A16 dense GEMM for Blackwell (SM100/103/120/121).
 
-Built on top of ``dense_gemm_bf16_blackwell.py`` (faithful port of
-CUTLASS's blackwell_geforce ``dense_gemm.py``) by replacing the B-operand
-path with packed FP4 weights + per-group FP8-E4M3 scales + a global
-alpha.  A and C remain bf16/fp16; the MMA atom and accumulator are
-unchanged.
-
-The B fragment is filled in-register by:
-
-  1. Loading two ``int32`` from ``sB_marlin`` per thread per K-block
-     (deterministic offsets driven by the cute partition; see
-     ``prepare_fp4_w4a16_weight`` in ``flashinfer/gemm/gemm_w4a16.py``
-     for the layout).
-  2. Decoding each ``int32`` via ``cvt.rn.f16x2.e2m1x2`` -> 4 ``fp16x2``
-     (= 8 fp16) using ``fp4_decode_4bytes``.
-  3. Multiplying each pair by its per-group E4M3 scale (loaded from
-     SMEM, converted to an f16x2 broadcast via
-     ``cvt_e4m3_to_f16x2_broadcast``).  The global scalar ``alpha`` is
-     *not* folded in here -- it is applied once to the fp32 accumulator
-     in the epilogue.
-  4. Casting back to the compute dtype and writing into ``tCrB``.
-
-Everything else (TMA pipeline for A, persistent tile scheduler,
-epilogue) is unchanged from the bf16 base.
+Built on top of ``dense_gemm_bf16_blackwell.py`` from cutlass examples.
 """
 
 from typing import Optional, Tuple, Type
@@ -65,8 +43,6 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Float32, Int32, Uint32
 
 from ...cute_dsl.fp4_common import (
-    cvt_e4m3_to_f16x2_broadcast,
-    cvt_e4m3_to_f32_via_f16,
     cvt_s0e5m3_to_f16x2_broadcast,
     f16x2_to_f32x2,
     fp4_decode_4bytes,
@@ -141,110 +117,47 @@ def f16x2_unpack(
     )
 
 
-# FP4 weight packing constants (must match prepare_fp4_w4a16_weight in
+# FP4 weight packing constants (must match _cute_dsl_pack_fp4_weight in
 # flashinfer/gemm/gemm_w4a16.py).
-_MARLIN_TILE_K: cutlass.Constexpr = 16
-_MARLIN_TILE_N: cutlass.Constexpr = 64
-_MARLIN_INTS_PER_TILE: cutlass.Constexpr = 128  # 128 int32 per (16K x 64N) block
+_PACK_TILE_K: cutlass.Constexpr = 16
+_PACK_TILE_N: cutlass.Constexpr = 64
+_PACK_INTS_PER_TILE: cutlass.Constexpr = 128  # 128 int32 per (16K x 64N) block
 
 
 class BlackwellDenseGemmW4A16Kernel:
     """Warp-MMA dense GEMM for Blackwell, FP4-weight A bf16/fp16 input.
 
     A: (M, K, L) bf16/fp16.
-    B: (K // 16, N * 2, L) int32 -- Marlin-packed FP4 (see prepare).
-    B_sf: (K // 16, N, L) uint8 -- FP8-E4M3 per-group scales.
+    B: (K // 16, N * 2, L) int32 -- packed FP4 (see prepare).
+    B_sf: (K // 16, N, L) uint8 -- per-group scales (S0E5M3).
     alpha: (1,) fp32 -- global scalar scale.
     C: (M, N, L) bf16/fp16; fp32 accumulator cast at write.
 
-    Uses ``MmaF16BF16Op`` (16x8x16) + ``LdMatrix8x8x16bOp.x4`` for A and
-    in-register FP4 decode for B.  Producer/consumer pipeline split with
-    a single DMA warp doing TMA loads of A and B_marlin.  Group size is
-    hardcoded to 16 (= MMA K-block size).
     """
 
     GROUP_SIZE: cutlass.Constexpr = 16
-
-    # Ablation bitflags -- compile-time toggles that omit one or more
-    # components from the inner loop while keeping the producer-consumer
-    # pipeline barriers intact (so the kernel doesn't deadlock).  Output
-    # is *incorrect* under any non-zero mode -- this is for perf
-    # decomposition only.
-    ABL_NONE: cutlass.Constexpr = 0
-    ABL_SKIP_DEQUANT: cutlass.Constexpr = 1  # tCrB left at uninitialized values
-    ABL_SKIP_MMA: cutlass.Constexpr = 2  # cute.gemm calls skipped
-    ABL_SKIP_LDMATRIX_A: cutlass.Constexpr = 4  # ldmatrix sA -> tCrA skipped
-    ABL_SKIP_EPILOGUE: cutlass.Constexpr = 8  # accumulator -> smem -> TMA store skipped
-    ABL_SKIP_PRODUCER_TAIL: cutlass.Constexpr = 16  # skip producer_tail drain
-    ABL_SKIP_FENCE: cutlass.Constexpr = 32  # skip fence_proxy in epilogue
-    ABL_SKIP_TMA_STORE: cutlass.Constexpr = 64  # skip TMA store call
-    ABL_SKIP_R2S: cutlass.Constexpr = 128  # skip the StMatrix R2S copy
-
-    # Dequant primitive selection (constexpr-friendly).
-    #   0 = CVT_F32 (baseline, retained for ablation):
-    #       cvt.rn.f16x2.e2m1x2 + per-element fp32 scale multiply, ~6 ops/pair.
-    #   1 = HMUL2_F16 (default, ~2% faster):
-    #       cvt.rn.f16x2.e2m1x2 + hmul2 in fp16 + cvt fp16x2->fp32x2->bf16
-    #       at write time.  Saves the 16 fp32 muls vs 8 hmul2s per K-block.
-    #
-    # Phase B experiment (see scratch_w4a16_dequant_sweep.py): we also tested
-    # vLLM Marlin's AND/OR/SHIFT bit-extract straight to bf16x2 + folded
-    # alpha*scale*2^126 hmul2 (csrc/quantization/marlin/dequant.h:434).  The
-    # algebra wins on op count (~66 vs ~72 ops/K-block) but the natural
-    # output pairing (same mma_i, varying nn) collides with the MMA register
-    # layout (varying mma_i, same nn).  The required bf16x2 unpack + non-
-    # adjacent tCrB writes regressed by 5 us, so we kept HMUL2_F16.
-    DEQUANT_MODE_CVT_F32: cutlass.Constexpr = 0
-    DEQUANT_MODE_HMUL2_F16: cutlass.Constexpr = 1
-
-    # Phase D: vectorize the 2 sB_marlin u32 reads as 1 ld.shared.v2.u32
-    # (u64 load).  Targets the long_scoreboard stalls (~18% per ncu).
-    VECTORIZED_SMEM_B_DEFAULT: cutlass.Constexpr = 1
-
-    # Phase C: K-block dequant pipeline depth (constexpr).
-    #   0 = no prefetch -- dequant(k) then gemm(k) in the same iteration.
-    #       Used as a baseline to measure whether prefetch is helping.
-    #   1 = current default -- dequant(k+1) while gemm(k) within the same
-    #       iteration; relies on the compiler to interleave the two streams.
-    PIPELINE_DEPTH_DEFAULT: cutlass.Constexpr = 1
 
     def __init__(
         self,
         acc_dtype,
         tile_shape_mnk,
         epi_stage: int = 4,
-        ablation_mode: int = 0,
-        dequant_mode: int = 1,
         pipeline_depth: int = 1,
-        vectorized_smem_b: int = 1,
         atom_layout: Tuple[int, int, int] = (2, 2, 1),
         epi_tile_override: Optional[Tuple[int, int]] = None,
         # 1 = fp16 MMA (default): MmaF16BF16Op uses Float16.  Dequant writes
         #     fp16 directly to tCrB (skipping the f16->f32->bf16 cvt chain
         #     the bf16 path needs after hmul2).  A is bf16 in SMEM ->
         #     ldmatrix into bf16 staging fragment -> in-register packed
-        #     bf16->fp16 cvt -> fp16 tCrA.  Same trick that gave the
-        #     mm_fp4 sibling a -1.95us / -7.7% win.  Slightly *more*
-        #     accurate than bf16 MMA for well-behaved inputs since fp16's
-        #     10-bit mantissa beats bf16's 7-bit at the multiply step;
-        #     accumulator stays fp32 in both modes.
+        #     bf16->fp16 cvt -> fp16 tCrA.  Slightly *more* accurate than
+        #     bf16 MMA for well-behaved inputs since fp16's 10-bit mantissa
+        #     beats bf16's 7-bit at the multiply step; accumulator stays
+        #     fp32 in both modes.
         # 0 = bf16 MMA: original path.  Safer for workloads with very
         #     large activation magnitudes (|A| > ~30000) since bf16's
         #     wider exponent range avoids saturation in the A cvt.
         use_fp16_mma: int = 1,
         enable_pdl: bool = True,
-        # When 1, the per-block scales are stored as S0E5M3 (host reformat of the
-        # E4M3 scale, rebiased exp 7->15) so the scale decode is a single
-        # mul.lo.u32 (``cvt_s0e5m3_to_f16x2_broadcast``) instead of the 3-op E4M3
-        # cvt+broadcast.  Memory-neutral (still 1 byte/scale); weight decode and
-        # MMA path are unchanged.  Requires the host to pass S0E5M3-formatted SF.
-        s0e5m3_scale: int = 0,
-        # Persistent-scheduler threadblock swizzle (in units of cluster=1 CTA).
-        # >1 groups the tile traversal into super-tiles for better L2 reuse of A
-        # and B -- the standard CUTLASS rasterization lever.  Targets the large-M
-        # prefill cliff (weight re-read thrashes L2 when M is large).  1 = the
-        # default col-major (M-major) raster.  raster_along_m only matters when
-        # tile_swizzle > 1.
         tile_swizzle: int = 1,
         raster_along_m: bool = True,
     ):
@@ -269,27 +182,12 @@ class BlackwellDenseGemmW4A16Kernel:
         self.epi_stage_target = int(epi_stage)
         if self.epi_stage_target < 1:
             raise ValueError(f"epi_stage must be >= 1 (got {epi_stage})")
-        # Constexpr-friendly ablation bitflags (see class docstring).
-        self.ablation_mode = int(ablation_mode)
-        self.dequant_mode = int(dequant_mode)
         self.pipeline_depth = int(pipeline_depth)
-        self.vectorized_smem_b = int(vectorized_smem_b)
         self.use_fp16_mma = int(use_fp16_mma)
-        self.s0e5m3_scale = int(s0e5m3_scale)
         self.tile_swizzle = int(tile_swizzle)
         self.raster_along_m = bool(raster_along_m)
-        # Programmatic Dependent Launch: when True, the kernel is launched with
-        # use_pdl=True and emits griddepcontrol wait/launch_dependents bookends
-        # so a producer kernel's tail can overlap this kernel's prologue (and
-        # vice-versa) in a back-to-back / CUDA-graph decode sequence.  The
-        # griddepcontrol instructions are no-ops unless use_pdl is set at launch.
         self.enable_pdl = bool(enable_pdl)
-        # Optional override for the epilogue tile shape.  Smaller epi_tile_m
-        # enables fine-grained skipping of OOB epilogue iterations when
-        # m_actual < tile_M.  Must be a multiple of the MMA-atom shape
-        # (e.g., for our m16n8k16 atom: epi_tile_m must be a multiple of 16,
-        # epi_tile_n must be a multiple of 16).  None = sm90 default
-        # heuristic (min(64, tile_M), 32).
+        # Optional override for the epilogue tile shape.
         self.epi_tile_override = (
             tuple(epi_tile_override) if epi_tile_override is not None else None
         )
@@ -300,23 +198,19 @@ class BlackwellDenseGemmW4A16Kernel:
         self.is_a_mcast = False
         self.is_b_mcast = False
 
-        if self.tile_shape_mnk[1] % _MARLIN_TILE_N != 0:
+        if self.tile_shape_mnk[1] % _PACK_TILE_N != 0:
             raise ValueError(
-                f"W4A16 requires tile_N % {_MARLIN_TILE_N} == 0 "
+                f"W4A16 requires tile_N % {_PACK_TILE_N} == 0 "
                 f"(got tile_N={self.tile_shape_mnk[1]})"
             )
-        if self.tile_shape_mnk[2] % _MARLIN_TILE_K != 0:
+        if self.tile_shape_mnk[2] % _PACK_TILE_K != 0:
             raise ValueError(
-                f"W4A16 requires tile_K % {_MARLIN_TILE_K} == 0 "
+                f"W4A16 requires tile_K % {_PACK_TILE_K} == 0 "
                 f"(got tile_K={self.tile_shape_mnk[2]})"
             )
 
         self.occupancy = 1
         # 2x2 atom layout: 4 MMA warps arranged as 2 M-warps x 2 N-warps.
-        # Matches the upstream Blackwell-Geforce reference; the partition
-        # diagnostic (see scratch_partition_mapping.py) shows mma_n=4
-        # (n_inner=2 via *2 trick x n_outer=2), giving 16 fp16 per thread
-        # per K-block = 2 int32 of FP4 to decode + scale.
         self.atom_layout = tuple(atom_layout)
         if self.atom_layout not in ((2, 2, 1), (1, 2, 1)):
             raise ValueError(
@@ -331,9 +225,7 @@ class BlackwellDenseGemmW4A16Kernel:
         self.threads_per_cta = (
             self.num_mma_warps + self.num_dma_warps
         ) * self.num_threads_per_warp
-        # SM100/103 expose >= SM120 SMEM/CTA; using sm_120 as the cap means
-        # one binary works across all four Blackwell targets without
-        # over-allocating on the smaller consumer chips.
+        # SM100/103 expose >= SM120 SMEM/CTA
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
 
         self.ab_stage = None
@@ -342,8 +234,6 @@ class BlackwellDenseGemmW4A16Kernel:
         self.a_smem_layout_staged = None
         self.b_smem_layout_staged = None
         self.epi_smem_layout_staged = None
-        # epi_tile and shared_storage are computed in __call__ before use;
-        # left unset here so mypy infers their type from that assignment.
         self.buffer_align_bytes = 1024
 
         self.epilog_sync_barrier = pipeline.NamedBarrier(
@@ -390,7 +280,7 @@ class BlackwellDenseGemmW4A16Kernel:
             epi_tile_override=self.epi_tile_override,
         )
 
-        # B-side smem is Marlin-packed int32 (4 bytes per logical FP4
+        # B-side smem is packed int32 (4 bytes per logical FP4
         # pair).  Stage budget uses int32 B + uint8 scales; bf16 phantom
         # layout is only used by partition_B/make_fragment_B.
         self.ab_stage, self.epi_stage = self._compute_stages(
@@ -412,7 +302,7 @@ class BlackwellDenseGemmW4A16Kernel:
 
         (
             self.a_smem_layout_staged,
-            self.b_marlin_smem_layout_staged,
+            self.b_packed_smem_layout_staged,
             self.b_sf_smem_layout_staged,
             self.b_bf16_logical_layout,
             self.epi_smem_layout_staged,
@@ -434,7 +324,7 @@ class BlackwellDenseGemmW4A16Kernel:
     def __call__(
         self,
         a: cute.Tensor,
-        b_marlin: cute.Tensor,
+        b_packed: cute.Tensor,
         b_sf: cute.Tensor,
         c: cute.Tensor,
         alpha: cute.Tensor,
@@ -446,8 +336,6 @@ class BlackwellDenseGemmW4A16Kernel:
         self.a_dtype = a.element_type
         # MMA operand dtype: bf16 by default matches A, or fp16 when
         # use_fp16_mma=1 (lets us skip the f16->f32->bf16 cvt chain on B).
-        # When fp16 MMA, A must be converted from bf16 to fp16 in-register
-        # after ldmatrix; see the mainloop's tCrA_bf16 staging path.
         if cutlass.const_expr(self.use_fp16_mma == 1):
             self.b_compute_dtype = Float16
         else:
@@ -455,8 +343,6 @@ class BlackwellDenseGemmW4A16Kernel:
         self.c_dtype = c.element_type
 
         self.a_layout = utils.LayoutEnum.from_tensor(a)
-        # B's compute (= post-dequant) view is N-major: matches the ldmatrix
-        # convention that the bf16 kernel uses for B.
         self.b_layout_compute = utils.LayoutEnum.ROW_MAJOR
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
@@ -476,15 +362,15 @@ class BlackwellDenseGemmW4A16Kernel:
             1,
         )
 
-        # B Marlin TMA: tile is (tile_K // 16, 2 * tile_N) int32.
-        b_marlin_tma_tile = (
-            self.tile_shape_mnk[2] // _MARLIN_TILE_K,
+        # Packed B TMA: tile is (tile_K // 16, 2 * tile_N) int32.
+        b_packed_tma_tile = (
+            self.tile_shape_mnk[2] // _PACK_TILE_K,
             2 * self.tile_shape_mnk[1],
         )
-        tma_atom_b_marlin, tma_tensor_b_marlin = self._make_tma_atoms_and_tensors(
-            b_marlin,
-            self.b_marlin_smem_layout_staged,
-            b_marlin_tma_tile,
+        tma_atom_b_packed, tma_tensor_b_packed = self._make_tma_atoms_and_tensors(
+            b_packed,
+            self.b_packed_smem_layout_staged,
+            b_packed_tma_tile,
             1,
         )
 
@@ -527,9 +413,9 @@ class BlackwellDenseGemmW4A16Kernel:
                 ],
                 self.buffer_align_bytes,
             ]
-            sB_marlin: cute.struct.Align[
+            sB_packed: cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Int32, cute.cosize(self.b_marlin_smem_layout_staged)
+                    cutlass.Int32, cute.cosize(self.b_packed_smem_layout_staged)
                 ],
                 self.buffer_align_bytes,
             ]
@@ -551,8 +437,8 @@ class BlackwellDenseGemmW4A16Kernel:
         self.kernel(
             tma_atom_a,
             tma_tensor_a,
-            tma_atom_b_marlin,
-            tma_tensor_b_marlin,
+            tma_atom_b_packed,
+            tma_tensor_b_packed,
             tma_atom_b_sf,
             tma_tensor_b_sf,
             tma_atom_c,
@@ -561,7 +447,7 @@ class BlackwellDenseGemmW4A16Kernel:
             self.tiled_mma,
             self.cta_layout_mnk,
             self.a_smem_layout_staged,
-            self.b_marlin_smem_layout_staged,
+            self.b_packed_smem_layout_staged,
             self.b_sf_smem_layout_staged,
             self.b_bf16_logical_layout,
             self.epi_smem_layout_staged,
@@ -580,8 +466,8 @@ class BlackwellDenseGemmW4A16Kernel:
         self,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
-        tma_atom_b_marlin: cute.CopyAtom,
-        mB_marlin_kn: cute.Tensor,
+        tma_atom_b_packed: cute.CopyAtom,
+        mB_packed_kn: cute.Tensor,
         tma_atom_b_sf: cute.CopyAtom,
         mB_sf_kn: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
@@ -590,7 +476,7 @@ class BlackwellDenseGemmW4A16Kernel:
         tiled_mma: cute.TiledMma,
         cta_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
-        b_marlin_smem_layout_staged: cute.Layout,
+        b_packed_smem_layout_staged: cute.Layout,
         b_sf_smem_layout_staged: cute.Layout,
         b_bf16_logical_layout: cute.ComposedLayout,
         epi_smem_layout_staged: cute.ComposedLayout,
@@ -603,7 +489,7 @@ class BlackwellDenseGemmW4A16Kernel:
         # Prefetch TMA descriptors from warp 0.
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b_marlin)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b_packed)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b_sf)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
 
@@ -622,11 +508,11 @@ class BlackwellDenseGemmW4A16Kernel:
         b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
 
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
-        b_marlin_smem_layout = cute.slice_(b_marlin_smem_layout_staged, (None, None, 0))
+        b_packed_smem_layout = cute.slice_(b_packed_smem_layout_staged, (None, None, 0))
         b_sf_smem_layout = cute.slice_(b_sf_smem_layout_staged, (None, None, 0))
         tma_copy_bytes = (
             cute.size_in_bytes(self.a_dtype, a_smem_layout)
-            + cute.size_in_bytes(cutlass.Int32, b_marlin_smem_layout)
+            + cute.size_in_bytes(cutlass.Int32, b_packed_smem_layout)
             + cute.size_in_bytes(cutlass.Uint8, b_sf_smem_layout)
         )
 
@@ -661,7 +547,7 @@ class BlackwellDenseGemmW4A16Kernel:
             a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
         )
         # Both B-side tensors are plain (non-swizzled) staged layouts.
-        sB_marlin = storage.sB_marlin.get_tensor(b_marlin_smem_layout_staged)
+        sB_packed = storage.sB_packed.get_tensor(b_packed_smem_layout_staged)
         sB_sf = storage.sB_sf.get_tensor(b_sf_smem_layout_staged)
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
@@ -672,14 +558,14 @@ class BlackwellDenseGemmW4A16Kernel:
             cute.slice_(self.tile_shape_mnk, (None, 0, None)),
             (None, None, None),
         )
-        # B Marlin: (K // 16, N * 2, L); tile = (tile_K // 16, 2 * tile_N).
-        b_marlin_tile_shape = (
-            self.tile_shape_mnk[2] // _MARLIN_TILE_K,
+        # Packed B: (K // 16, N * 2, L); tile = (tile_K // 16, 2 * tile_N).
+        b_packed_tile_shape = (
+            self.tile_shape_mnk[2] // _PACK_TILE_K,
             2 * self.tile_shape_mnk[1],
         )
-        gB_marlin_kn = cute.local_tile(
-            mB_marlin_kn,
-            b_marlin_tile_shape,
+        gB_packed_kn = cute.local_tile(
+            mB_packed_kn,
+            b_packed_tile_shape,
             (None, None, None),
         )
         # Scales: (K // 16, N, L); per-tile slice has shape
@@ -709,15 +595,15 @@ class BlackwellDenseGemmW4A16Kernel:
             cute.group_modes(gA_mkl, 0, 2),
         )
 
-        # TMA partition for B (Marlin int32).
+        # TMA partition for B (packed int32).
         b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
         b_cta_crd = cluster_coord_mnk[0]
-        tBmarlin_s, tBmarlin_g = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_b_marlin,
+        tBpacked_s, tBpacked_g = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b_packed,
             b_cta_crd,
             b_cta_layout,
-            cute.group_modes(sB_marlin, 0, 2),
-            cute.group_modes(gB_marlin_kn, 0, 2),
+            cute.group_modes(sB_packed, 0, 2),
+            cute.group_modes(gB_packed_kn, 0, 2),
         )
 
         # TMA partition for B_sf (uint8 scales).  Shares the b_cta_crd
@@ -730,13 +616,13 @@ class BlackwellDenseGemmW4A16Kernel:
             cute.group_modes(gB_sf_kn, 0, 2),
         )
 
-        # B partition uses a phantom bf16 layout on top of the sB_marlin
+        # B partition uses a phantom bf16 layout on top of the sB_packed
         # int32 storage (recast pointer + bf16 logical layout).  This
         # gives ``partition_B``/``make_fragment_B`` the right fragment
         # shape; the data is never read through this view -- we always
         # decode FP4 ourselves.
         sB_phantom = cute.make_tensor(
-            cute.recast_ptr(sB_marlin.iterator, dtype=self.b_compute_dtype),
+            cute.recast_ptr(sB_packed.iterator, dtype=self.b_compute_dtype),
             b_bf16_logical_layout,
         )
         tCsA = thr_mma.partition_A(sA)
@@ -754,8 +640,7 @@ class BlackwellDenseGemmW4A16Kernel:
             pipeline.sync(barrier_id=1)
 
         # PDL bookend (start): wait for the prior grid to finish so this
-        # kernel's TMA loads see the producer kernel's writes.  Always emitted;
-        # it is a no-op unless the kernel was launched with use_pdl=True.
+        # kernel's TMA loads see the producer kernel's writes.
         cute.arch.griddepcontrol_wait()
 
         k_tile_cnt = cute.size(gA_mkl, mode=[3])
@@ -778,7 +663,7 @@ class BlackwellDenseGemmW4A16Kernel:
 
             num_k_blocks = cute.size(tCrA, mode=[2])
 
-            # ldmatrix is only for A.  B is filled in-register from sB_marlin
+            # ldmatrix is only for A.  B is filled in-register from sB_packed
             # via FP4 decode + per-group scale.
             #
             # use_fp16_mma=1: tCrA is fp16-typed (matches the fp16 MMA), but
@@ -798,8 +683,6 @@ class BlackwellDenseGemmW4A16Kernel:
                 tCrA_bf16 = cute.make_fragment_like(tCrA, BFloat16)
                 tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA_bf16)
             else:
-                # Placeholder so the (dead) cvt branch at call sites can
-                # name-lookup tCrA_bf16 even when bf16-MMA is active.
                 tCrA_bf16 = tCrA
                 tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA)
 
@@ -827,18 +710,15 @@ class BlackwellDenseGemmW4A16Kernel:
                 # pipeline_depth >= 1.  With depth=0 the dequant for block k
                 # happens inside the same iteration as gemm(k) -- no prefetch.
                 if cutlass.const_expr(self.pipeline_depth >= 1):
-                    if cutlass.const_expr(
-                        (self.ablation_mode & self.ABL_SKIP_LDMATRIX_A) == 0
-                    ):
-                        cute.copy(
-                            smem_tiled_copy_A,
-                            tCsA_p[None, None, 0],
-                            tCrA_copy_view[None, None, 0],
-                        )
-                        if cutlass.const_expr(self.use_fp16_mma == 1):
-                            self._cvt_a_bf16_to_fp16_one_k_block(tCrA, tCrA_bf16, 0)
+                    cute.copy(
+                        smem_tiled_copy_A,
+                        tCsA_p[None, None, 0],
+                        tCrA_copy_view[None, None, 0],
+                    )
+                    if cutlass.const_expr(self.use_fp16_mma == 1):
+                        self._cvt_a_bf16_to_fp16_one_k_block(tCrA, tCrA_bf16, 0)
                     self._dequant_b_to_register(
-                        sB_marlin,
+                        sB_packed,
                         sB_sf,
                         tCrB,
                         tidx,
@@ -858,20 +738,17 @@ class BlackwellDenseGemmW4A16Kernel:
                             # all on the CURRENT K-tile's stage.  Release +
                             # advance + wait happens AFTER gemm of the last
                             # block so we don't drop SMEM under our own read.
-                            if cutlass.const_expr(
-                                (self.ablation_mode & self.ABL_SKIP_LDMATRIX_A) == 0
-                            ):
-                                cute.copy(
-                                    smem_tiled_copy_A,
-                                    tCsA_p[None, None, k_block_idx],
-                                    tCrA_copy_view[None, None, k_block_idx],
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, k_block_idx],
+                                tCrA_copy_view[None, None, k_block_idx],
+                            )
+                            if cutlass.const_expr(self.use_fp16_mma == 1):
+                                self._cvt_a_bf16_to_fp16_one_k_block(
+                                    tCrA, tCrA_bf16, k_block_idx
                                 )
-                                if cutlass.const_expr(self.use_fp16_mma == 1):
-                                    self._cvt_a_bf16_to_fp16_one_k_block(
-                                        tCrA, tCrA_bf16, k_block_idx
-                                    )
                             self._dequant_b_to_register(
-                                sB_marlin,
+                                sB_packed,
                                 sB_sf,
                                 tCrB,
                                 tidx,
@@ -879,16 +756,13 @@ class BlackwellDenseGemmW4A16Kernel:
                                 mainloop_consumer_state.count,
                                 k_block_idx,
                             )
-                            if cutlass.const_expr(
-                                (self.ablation_mode & self.ABL_SKIP_MMA) == 0
-                            ):
-                                cute.gemm(
-                                    tiled_mma,
-                                    accumulators,
-                                    tCrA[None, None, k_block_idx],
-                                    tCrB[None, None, k_block_idx],
-                                    accumulators,
-                                )
+                            cute.gemm(
+                                tiled_mma,
+                                accumulators,
+                                tCrA[None, None, k_block_idx],
+                                tCrB[None, None, k_block_idx],
+                                accumulators,
+                            )
                             if k_block_idx == num_k_blocks - 1:
                                 mainloop_pipeline.consumer_release(
                                     mainloop_consumer_state
@@ -928,20 +802,17 @@ class BlackwellDenseGemmW4A16Kernel:
                                     mainloop_consumer_state, peek_ab_full_status
                                 )
 
-                            if cutlass.const_expr(
-                                (self.ablation_mode & self.ABL_SKIP_LDMATRIX_A) == 0
-                            ):
-                                cute.copy(
-                                    smem_tiled_copy_A,
-                                    tCsA_p[None, None, k_block_next],
-                                    tCrA_copy_view[None, None, k_block_next],
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, k_block_next],
+                                tCrA_copy_view[None, None, k_block_next],
+                            )
+                            if cutlass.const_expr(self.use_fp16_mma == 1):
+                                self._cvt_a_bf16_to_fp16_one_k_block(
+                                    tCrA, tCrA_bf16, k_block_next
                                 )
-                                if cutlass.const_expr(self.use_fp16_mma == 1):
-                                    self._cvt_a_bf16_to_fp16_one_k_block(
-                                        tCrA, tCrA_bf16, k_block_next
-                                    )
                             self._dequant_b_to_register(
-                                sB_marlin,
+                                sB_packed,
                                 sB_sf,
                                 tCrB,
                                 tidx,
@@ -949,16 +820,13 @@ class BlackwellDenseGemmW4A16Kernel:
                                 mainloop_consumer_state.count,
                                 k_block_next,
                             )
-                            if cutlass.const_expr(
-                                (self.ablation_mode & self.ABL_SKIP_MMA) == 0
-                            ):
-                                cute.gemm(
-                                    tiled_mma,
-                                    accumulators,
-                                    tCrA[None, None, k_block_idx],
-                                    tCrB[None, None, k_block_idx],
-                                    accumulators,
-                                )
+                            cute.gemm(
+                                tiled_mma,
+                                accumulators,
+                                tCrA[None, None, k_block_idx],
+                                tCrB[None, None, k_block_idx],
+                                accumulators,
+                            )
                 # Hoist out last k_tile (no further loads after the last k_block)
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                     k_block_next = (
@@ -968,20 +836,17 @@ class BlackwellDenseGemmW4A16Kernel:
                     if cutlass.const_expr(self.pipeline_depth == 0):
                         # No-prefetch path for last K-tile.  Release happens
                         # AFTER gemm of the last block (kernel exits then).
-                        if cutlass.const_expr(
-                            (self.ablation_mode & self.ABL_SKIP_LDMATRIX_A) == 0
-                        ):
-                            cute.copy(
-                                smem_tiled_copy_A,
-                                tCsA_p[None, None, k_block_idx],
-                                tCrA_copy_view[None, None, k_block_idx],
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tCsA_p[None, None, k_block_idx],
+                            tCrA_copy_view[None, None, k_block_idx],
+                        )
+                        if cutlass.const_expr(self.use_fp16_mma == 1):
+                            self._cvt_a_bf16_to_fp16_one_k_block(
+                                tCrA, tCrA_bf16, k_block_idx
                             )
-                            if cutlass.const_expr(self.use_fp16_mma == 1):
-                                self._cvt_a_bf16_to_fp16_one_k_block(
-                                    tCrA, tCrA_bf16, k_block_idx
-                                )
                         self._dequant_b_to_register(
-                            sB_marlin,
+                            sB_packed,
                             sB_sf,
                             tCrB,
                             tidx,
@@ -989,16 +854,13 @@ class BlackwellDenseGemmW4A16Kernel:
                             mainloop_consumer_state.count,
                             k_block_idx,
                         )
-                        if cutlass.const_expr(
-                            (self.ablation_mode & self.ABL_SKIP_MMA) == 0
-                        ):
-                            cute.gemm(
-                                tiled_mma,
-                                accumulators,
-                                tCrA[None, None, k_block_idx],
-                                tCrB[None, None, k_block_idx],
-                                accumulators,
-                            )
+                        cute.gemm(
+                            tiled_mma,
+                            accumulators,
+                            tCrA[None, None, k_block_idx],
+                            tCrB[None, None, k_block_idx],
+                            accumulators,
+                        )
                         if k_block_idx == num_k_blocks - 1:
                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
                             mainloop_consumer_state.advance()
@@ -1009,20 +871,17 @@ class BlackwellDenseGemmW4A16Kernel:
                             mainloop_consumer_state.advance()
 
                         if k_block_next > 0:
-                            if cutlass.const_expr(
-                                (self.ablation_mode & self.ABL_SKIP_LDMATRIX_A) == 0
-                            ):
-                                cute.copy(
-                                    smem_tiled_copy_A,
-                                    tCsA_p[None, None, k_block_next],
-                                    tCrA_copy_view[None, None, k_block_next],
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, k_block_next],
+                                tCrA_copy_view[None, None, k_block_next],
+                            )
+                            if cutlass.const_expr(self.use_fp16_mma == 1):
+                                self._cvt_a_bf16_to_fp16_one_k_block(
+                                    tCrA, tCrA_bf16, k_block_next
                                 )
-                                if cutlass.const_expr(self.use_fp16_mma == 1):
-                                    self._cvt_a_bf16_to_fp16_one_k_block(
-                                        tCrA, tCrA_bf16, k_block_next
-                                    )
                             self._dequant_b_to_register(
-                                sB_marlin,
+                                sB_packed,
                                 sB_sf,
                                 tCrB,
                                 tidx,
@@ -1030,184 +889,154 @@ class BlackwellDenseGemmW4A16Kernel:
                                 mainloop_consumer_state.count,
                                 k_block_next,
                             )
-                        if cutlass.const_expr(
-                            (self.ablation_mode & self.ABL_SKIP_MMA) == 0
-                        ):
-                            cute.gemm(
-                                tiled_mma,
-                                accumulators,
-                                tCrA[None, None, k_block_idx],
-                                tCrB[None, None, k_block_idx],
-                                accumulators,
-                            )
+                        cute.gemm(
+                            tiled_mma,
+                            accumulators,
+                            tCrA[None, None, k_block_idx],
+                            tCrB[None, None, k_block_idx],
+                            accumulators,
+                        )
 
                 # Epilogue: accumulator -> smem -> gmem via R2S (StMatrix.x4)
-                # + TMA bulk store.  Skipped under ABL_SKIP_EPILOGUE.
-                if cutlass.const_expr(
-                    (self.ablation_mode & self.ABL_SKIP_EPILOGUE) == 0
-                ):
-                    copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-                        self.c_layout,
-                        elem_ty_d=self.c_dtype,
-                        elem_ty_acc=self.acc_dtype,
-                    )
+                # + TMA bulk store.
+                copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
+                    self.c_layout,
+                    elem_ty_d=self.c_dtype,
+                    elem_ty_acc=self.acc_dtype,
+                )
 
-                    copy_atom_C = cute.make_copy_atom(
-                        cute.nvgpu.warp.StMatrix8x8x16bOp(
-                            self.c_layout.is_m_major_c(),
-                            4,
-                        ),
-                        self.c_dtype,
-                    )
+                copy_atom_C = cute.make_copy_atom(
+                    cute.nvgpu.warp.StMatrix8x8x16bOp(
+                        self.c_layout.is_m_major_c(),
+                        4,
+                    ),
+                    self.c_dtype,
+                )
 
-                    tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(
-                        copy_atom_C, tiled_mma
-                    )
+                tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
 
-                    tiled_copy_r2s = cute.make_tiled_copy_S(
-                        copy_atom_r2s,
-                        tiled_copy_C_Atom,
-                    )
+                tiled_copy_r2s = cute.make_tiled_copy_S(
+                    copy_atom_r2s,
+                    tiled_copy_C_Atom,
+                )
 
-                    thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-                    tRS_sD = thr_copy_r2s.partition_D(sC)
-                    tRS_rAcc = tiled_copy_r2s.retile(accumulators)
+                thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
+                tRS_sD = thr_copy_r2s.partition_D(sC)
+                tRS_rAcc = tiled_copy_r2s.retile(accumulators)
 
-                    rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
-                    tRS_rD_layout = cute.make_layout(rD_shape[:3])
-                    tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
+                rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
+                tRS_rD_layout = cute.make_layout(rD_shape[:3])
+                tRS_rD = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
 
-                    sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
-                    tcgc_for_tma_partition = cute.zipped_divide(
-                        gC_mnl_slice, self.epi_tile
-                    )
+                sepi_for_tma_partition = cute.group_modes(sC, 0, 2)
+                tcgc_for_tma_partition = cute.zipped_divide(gC_mnl_slice, self.epi_tile)
 
-                    bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_c,
-                        0,
-                        cute.make_layout(1),
-                        sepi_for_tma_partition,
-                        tcgc_for_tma_partition,
-                    )
+                bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_c,
+                    0,
+                    cute.make_layout(1),
+                    sepi_for_tma_partition,
+                    tcgc_for_tma_partition,
+                )
 
-                    # b12x-style epilogue: iterate (epi_m, epi_n) explicitly
-                    # and use (mma_m, mma_n) mode indexing into tRS_rAcc so
-                    # the loop works for any epi_tile_m / epi_tile_n.  Also
-                    # supports OOB-iteration skipping when m_actual < tile_M.
-                    epi_rest_m = cute.size(tcgc_for_tma_partition, mode=[1, 0])
-                    epi_rest_n = cute.size(tcgc_for_tma_partition, mode=[1, 1])
-                    epi_tile_m = self.epi_tile[0]
-                    epi_tile_n = self.epi_tile[1]
-                    # mma_tile_{m,n} = per-mma-atom (M,N) size.  tRS_rAcc has
-                    # shape (atom_v, mma_m, mma_n); modes 1, 2 give the atom
-                    # counts in M, N.
-                    mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
-                    mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
-                    MmaMPerEpiM = epi_tile_m // mma_tile_m
-                    MmaNPerEpiN = epi_tile_n // mma_tile_n
+                # Epilogue: iterate (epi_m, epi_n) explicitly
+                # and use (mma_m, mma_n) mode indexing into tRS_rAcc so
+                # the loop works for any epi_tile_m / epi_tile_n.  Also
+                # supports OOB-iteration skipping when m_actual < tile_M.
+                epi_rest_m = cute.size(tcgc_for_tma_partition, mode=[1, 0])
+                epi_rest_n = cute.size(tcgc_for_tma_partition, mode=[1, 1])
+                epi_tile_m = self.epi_tile[0]
+                epi_tile_n = self.epi_tile[1]
+                # mma_tile_{m,n} = per-mma-atom (M,N) size.  tRS_rAcc has
+                # shape (atom_v, mma_m, mma_n); modes 1, 2 give the atom
+                # counts in M, N.
+                mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
+                mma_tile_n = self.tile_shape_mnk[1] // cute.size(tRS_rAcc, mode=[2])
+                MmaMPerEpiM = epi_tile_m // mma_tile_m
+                MmaNPerEpiN = epi_tile_n // mma_tile_n
 
-                    tma_store_producer_group = pipeline.CooperativeGroup(
-                        pipeline.Agent.Thread,
-                        self.num_mma_warps * self.num_threads_per_warp,
-                    )
-                    tma_store_pipeline = pipeline.PipelineTmaStore.create(
-                        num_stages=self.epi_stage,
-                        producer_group=tma_store_producer_group,
-                    )
+                tma_store_producer_group = pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.num_mma_warps * self.num_threads_per_warp,
+                )
+                tma_store_pipeline = pipeline.PipelineTmaStore.create(
+                    num_stages=self.epi_stage,
+                    producer_group=tma_store_producer_group,
+                )
 
-                    # Skip OOB epilogue iterations when actual M < tile_M.
-                    # TMA OOB clipping already protects correctness for
-                    # the non-skipped iterations; this avoids the work for
-                    # tiles that would be fully clipped anyway.
-                    m_actual = cute.size(mC_mnl, mode=[0])
-                    cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
+                # Skip OOB epilogue iterations when actual M < tile_M.
+                m_actual = cute.size(mC_mnl, mode=[0])
+                cta_m_offset = tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
 
-                    # kept_count cycles in lockstep with the TMA-store pipeline.
-                    # epi_buffer = kept_count % num_stages stays in sync with
-                    # producer_commit/acquire calls, regardless of how many
-                    # iterations are skipped.
-                    kept_count = 0
-                    for epi_n in cutlass.range_constexpr(epi_rest_n):
-                        for epi_m in cutlass.range_constexpr(epi_rest_m):
-                            epi_m_global_start = cta_m_offset + Int32(
-                                epi_m * epi_tile_m
-                            )
-                            if epi_m_global_start < m_actual:
-                                # Copy this epi-tile's slice of acc -> tRS_rD
-                                # using b12x-style (mma_m, mma_n) indexing.
-                                for mma_n_in_epi in cutlass.range_constexpr(
-                                    MmaNPerEpiN
+                # kept_count cycles in lockstep with the TMA-store pipeline.
+                # epi_buffer = kept_count % num_stages stays in sync with
+                # producer_commit/acquire calls, regardless of how many
+                # iterations are skipped.
+                kept_count = 0
+                for epi_n in cutlass.range_constexpr(epi_rest_n):
+                    for epi_m in cutlass.range_constexpr(epi_rest_m):
+                        epi_m_global_start = cta_m_offset + Int32(epi_m * epi_tile_m)
+                        if epi_m_global_start < m_actual:
+                            # Copy this epi-tile's slice of acc -> tRS_rD
+                            # using b12x-style (mma_m, mma_n) indexing.
+                            for mma_n_in_epi in cutlass.range_constexpr(MmaNPerEpiN):
+                                for mma_m_in_epi in cutlass.range_constexpr(
+                                    MmaMPerEpiM
                                 ):
-                                    for mma_m_in_epi in cutlass.range_constexpr(
-                                        MmaMPerEpiM
+                                    mma_n = epi_n * MmaNPerEpiN + mma_n_in_epi
+                                    mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
+                                    tRS_rD_slice = tRS_rD[
+                                        (None, mma_m_in_epi, mma_n_in_epi)
+                                    ]
+                                    tRS_rAcc_slice = tRS_rAcc[(None, mma_m, mma_n)]
+                                    for elem_idx in cutlass.range_constexpr(
+                                        cute.size(tRS_rD_slice)
                                     ):
-                                        mma_n = epi_n * MmaNPerEpiN + mma_n_in_epi
-                                        mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
-                                        tRS_rD_slice = tRS_rD[
-                                            (None, mma_m_in_epi, mma_n_in_epi)
+                                        tRS_rD_slice[elem_idx] = tRS_rAcc_slice[
+                                            elem_idx
                                         ]
-                                        tRS_rAcc_slice = tRS_rAcc[(None, mma_m, mma_n)]
-                                        for elem_idx in cutlass.range_constexpr(
-                                            cute.size(tRS_rD_slice)
-                                        ):
-                                            tRS_rD_slice[elem_idx] = tRS_rAcc_slice[
-                                                elem_idx
-                                            ]
 
-                                tRS_rD_out = cute.make_rmem_tensor(
-                                    tRS_rD_layout.shape, self.c_dtype
+                            tRS_rD_out = cute.make_rmem_tensor(
+                                tRS_rD_layout.shape, self.c_dtype
+                            )
+                            # Apply the global alpha here, once, on the
+                            # fp32 accumulator (hoisted out of the
+                            # per-K-block dequant): one rounding instead
+                            # of folding alpha into every B scale.
+                            acc_vec = tRS_rD.load()
+                            tRS_rD_out.store((alpha_val * acc_vec).to(self.c_dtype))
+
+                            epi_buffer = kept_count % cute.size(tRS_sD, mode=[3])
+                            cute.copy(
+                                tiled_copy_r2s,
+                                tRS_rD_out,
+                                tRS_sD[(None, None, None, epi_buffer)],
+                            )
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            self.epilog_sync_barrier.arrive_and_wait()
+
+                            if warp_idx == 0:
+                                cute.copy(
+                                    tma_atom_c,
+                                    bSG_sD[(None, epi_buffer)],
+                                    bSG_gD[(None, (epi_m, epi_n))],
                                 )
-                                # Apply the global alpha here, once, on the
-                                # fp32 accumulator (hoisted out of the
-                                # per-K-block dequant): one rounding instead
-                                # of folding alpha into every B scale.
-                                acc_vec = tRS_rD.load()
-                                tRS_rD_out.store((alpha_val * acc_vec).to(self.c_dtype))
+                                tma_store_pipeline.producer_commit()
+                                tma_store_pipeline.producer_acquire()
+                            kept_count = kept_count + 1
 
-                                epi_buffer = kept_count % cute.size(tRS_sD, mode=[3])
-                                if cutlass.const_expr(
-                                    (self.ablation_mode & self.ABL_SKIP_R2S) == 0
-                                ):
-                                    cute.copy(
-                                        tiled_copy_r2s,
-                                        tRS_rD_out,
-                                        tRS_sD[(None, None, None, epi_buffer)],
-                                    )
-                                if cutlass.const_expr(
-                                    (self.ablation_mode & self.ABL_SKIP_FENCE) == 0
-                                ):
-                                    cute.arch.fence_proxy("async.shared", space="cta")
-                                self.epilog_sync_barrier.arrive_and_wait()
-
-                                if warp_idx == 0:
-                                    if cutlass.const_expr(
-                                        (self.ablation_mode & self.ABL_SKIP_TMA_STORE)
-                                        == 0
-                                    ):
-                                        cute.copy(
-                                            tma_atom_c,
-                                            bSG_sD[(None, epi_buffer)],
-                                            bSG_gD[(None, (epi_m, epi_n))],
-                                        )
-                                        tma_store_pipeline.producer_commit()
-                                        tma_store_pipeline.producer_acquire()
-                                kept_count = kept_count + 1
-
-                    if cutlass.const_expr(
-                        (self.ablation_mode & self.ABL_SKIP_PRODUCER_TAIL) == 0
-                    ):
-                        tma_store_pipeline.producer_tail()
+                tma_store_pipeline.producer_tail()
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-        # Single DMA warp: issues all 3 TMA descriptors (A, B_marlin, B_sf)
+        # Single DMA warp: issues all 3 TMA descriptors (A, B_packed, B_sf)
         # back-to-back into the same stage barrier per K-tile.
         elif warp_idx == self.num_mma_warps:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
-                tBmarlin_g_kn = tBmarlin_g[
+                tBpacked_g_kn = tBpacked_g[
                     (None, None, tile_coord_mnl[1], tile_coord_mnl[2])
                 ]
                 tBsf_g_kn = tBsf_g[(None, None, tile_coord_mnl[1], tile_coord_mnl[2])]
@@ -1228,12 +1057,12 @@ class BlackwellDenseGemmW4A16Kernel:
                         mcast_mask=a_mcast_mask,
                     )
 
-                    tBmarlin_g_k = tBmarlin_g_kn[(None, mainloop_producer_state.count)]
-                    tBmarlin_s_pipe = tBmarlin_s[(None, mainloop_producer_state.index)]
+                    tBpacked_g_k = tBpacked_g_kn[(None, mainloop_producer_state.count)]
+                    tBpacked_s_pipe = tBpacked_s[(None, mainloop_producer_state.index)]
                     cute.copy(
-                        tma_atom_b_marlin,
-                        tBmarlin_g_k,
-                        tBmarlin_s_pipe,
+                        tma_atom_b_packed,
+                        tBpacked_g_k,
+                        tBpacked_s_pipe,
                         tma_bar_ptr=barrier_ptr,
                         mcast_mask=b_mcast_mask,
                     )
@@ -1253,9 +1082,6 @@ class BlackwellDenseGemmW4A16Kernel:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             mainloop_pipeline.producer_tail(mainloop_producer_state)
-        # PDL bookend (end): all warps have finished their loads/compute/store,
-        # so hint the dependent (next) kernel to begin launching -- its prologue
-        # overlaps this kernel's tail.  No-op unless launched with use_pdl=True.
         cute.arch.griddepcontrol_launch_dependents()
         return
 
@@ -1270,9 +1096,9 @@ class BlackwellDenseGemmW4A16Kernel:
         group_size: int = 16,
         epi_stage: int = 4,
     ) -> Tuple[int, int]:
-        """Stage budget accounting for A + B (Marlin int32) + B_sf (uint8).
+        """Stage budget accounting for A + B (packed int32) + B_sf (uint8).
 
-        Per (16K x 64N) Marlin block: 128 int32 = 512 bytes.
+        Per (16K x 64N) packed block: 128 int32 = 512 bytes.
         Per (group_size K x tile_N N) scale block: tile_N bytes.
         """
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
@@ -1281,17 +1107,17 @@ class BlackwellDenseGemmW4A16Kernel:
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
         a_bytes_per_stage = cute.size(a_shape) * a_dtype.width // 8
 
-        # B side: Marlin int32, 128 int32 per (16K x 64N) block.
-        marlin_blocks_per_tile = (tile_shape_mnk[2] // _MARLIN_TILE_K) * (
-            tile_shape_mnk[1] // _MARLIN_TILE_N
+        # B side: packed int32, 128 int32 per (16K x 64N) block.
+        packed_blocks_per_tile = (tile_shape_mnk[2] // _PACK_TILE_K) * (
+            tile_shape_mnk[1] // _PACK_TILE_N
         )
-        b_marlin_bytes_per_stage = marlin_blocks_per_tile * _MARLIN_INTS_PER_TILE * 4
+        b_packed_bytes_per_stage = packed_blocks_per_tile * _PACK_INTS_PER_TILE * 4
 
-        # Scale tile: 1 byte per (K-group, N).  Small compared to B_marlin.
+        # Scale tile: 1 byte per (K-group, N).  Small compared to B_packed.
         b_sf_bytes_per_stage = (tile_shape_mnk[2] // group_size) * tile_shape_mnk[1]
 
         ab_bytes_per_stage = (
-            a_bytes_per_stage + b_marlin_bytes_per_stage + b_sf_bytes_per_stage
+            a_bytes_per_stage + b_packed_bytes_per_stage + b_sf_bytes_per_stage
         )
         mbar_helpers_bytes = 1024
 
@@ -1316,9 +1142,9 @@ class BlackwellDenseGemmW4A16Kernel:
         epi_stage: int,
         group_size: int,
     ):
-        """Returns (sA, sB_marlin, sB_sf, b_bf16_phantom, sC) layouts.
+        """Returns (sA, sB_packed, sB_sf, b_bf16_phantom, sC) layouts.
 
-        ``sB_marlin_layout`` is a plain (non-swizzled) staged int32 layout
+        ``sB_packed_layout`` is a plain (non-swizzled) staged int32 layout
         ``(tile_K // 16, 2 * tile_N, ab_stage)``.
 
         ``sB_sf_layout`` is a plain staged uint8 layout
@@ -1337,10 +1163,10 @@ class BlackwellDenseGemmW4A16Kernel:
             ab_stage,
         )
 
-        # sB_marlin: (tile_K // 16) rows x (2 * tile_N) int32 cols x stage.
-        b_marlin_smem_layout_staged = cute.make_ordered_layout(
+        # sB_packed: (tile_K // 16) rows x (2 * tile_N) int32 cols x stage.
+        b_packed_smem_layout_staged = cute.make_ordered_layout(
             (
-                tile_shape_mnk[2] // _MARLIN_TILE_K,
+                tile_shape_mnk[2] // _PACK_TILE_K,
                 2 * tile_shape_mnk[1],
                 ab_stage,
             ),
@@ -1375,7 +1201,7 @@ class BlackwellDenseGemmW4A16Kernel:
         )
         return (
             a_smem_layout_staged,
-            b_marlin_smem_layout_staged,
+            b_packed_smem_layout_staged,
             b_sf_smem_layout_staged,
             b_bf16_logical_layout,
             epi_smem_layout_staged,
@@ -1469,7 +1295,7 @@ class BlackwellDenseGemmW4A16Kernel:
     @cute.jit
     def _dequant_b_to_register(
         self,
-        sB_marlin: cute.Tensor,
+        sB_packed: cute.Tensor,
         sB_sf: cute.Tensor,
         tCrB: cute.Tensor,
         tidx: Int32,
@@ -1479,8 +1305,7 @@ class BlackwellDenseGemmW4A16Kernel:
     ):
         """Decode 2 int32 per thread per K-block into 16 fp16 fragment slots.
 
-        Per the partition diagnostic for atom_layout (2,2,1) + *2 on N
-        (see ``scratch_partition_mapping.py``):
+        Per the MMA partition for atom_layout (2,2,1) + *2 on N:
 
           tc_row     = (lane % 4) * 2          in {0, 2, 4, 6}
           tc_col     = lane // 4               in [0, 8)
@@ -1491,11 +1316,11 @@ class BlackwellDenseGemmW4A16Kernel:
           K = {tc_row, tc_row+1, tc_row+8, tc_row+9}
           N = {base_n, base_n+16, base_n+32, base_n+48}
 
-        Two int32s per K-block per thread; sB_marlin offsets:
-          u32_0 @ sB_marlin[k_block_idx, n_warp_idx * 64 + lane * 2 + 0, stage]
-          u32_1 @ sB_marlin[k_block_idx, n_warp_idx * 64 + lane * 2 + 1, stage]
+        Two int32s per K-block per thread; sB_packed offsets:
+          u32_0 @ sB_packed[k_block_idx, n_warp_idx * 64 + lane * 2 + 0, stage]
+          u32_1 @ sB_packed[k_block_idx, n_warp_idx * 64 + lane * 2 + 1, stage]
 
-        Byte layout inside each int32 (see ``prepare_fp4_w4a16_weight`` in
+        Byte layout inside each int32 (see ``_cute_dsl_pack_fp4_weight`` in
         ``flashinfer/gemm/gemm_w4a16.py``):
           u32_0:
             byte 0: K=tc_row,    tc_row+1 at N=base_n        -> (mma_i=0,1, nn=0)
@@ -1503,14 +1328,7 @@ class BlackwellDenseGemmW4A16Kernel:
             byte 2: K=tc_row,    tc_row+1 at N=base_n+16     -> (mma_i=0,1, nn=1)
             byte 3: K=tc_row+8,  tc_row+9 at N=base_n+16     -> (mma_i=2,3, nn=1)
           u32_1 mirrors with N=base_n+32 and N=base_n+48 (nn=2, nn=3).
-
-        Ablation: when ``ABL_SKIP_DEQUANT`` is set in ``ablation_mode``,
-        this function is a no-op and tCrB stays at whatever the previous
-        iteration left in it (output is incorrect but timing is valid).
         """
-        if cutlass.const_expr((self.ablation_mode & self.ABL_SKIP_DEQUANT) != 0):
-            return
-
         lane = tidx % Int32(32)
         warp = tidx // Int32(32)
         # n_warp_idx maps warp -> N-stripe.  With (2,2,1) the 4 warps are
@@ -1522,19 +1340,19 @@ class BlackwellDenseGemmW4A16Kernel:
         tc_col = lane // Int32(4)
         base_n_in_tile = n_warp_idx * Int32(8) + tc_col
 
-        # tile_N is built from tile_N // 64 independent Marlin 64-N blocks.
+        # tile_N is built from tile_N // 64 independent packed 64-N blocks.
         # The hand-coded byte->fragment mapping below covers exactly one such
         # 64-N block (4 nn slots); for tile_N=128 we loop it over both blocks.
-        # Block n_blk lives at sB_marlin int32 columns [n_blk*128, +128), sB_sf
+        # Block n_blk lives at sB_packed int32 columns [n_blk*128, +128), sB_sf
         # N-rows [n_blk*64, +64), and writes tCrB nn in [n_blk*4, +4).  For
-        # tile_N=64 this loops once and is identical to the original path.
+        # tile_N=64 this loops once.
         num_n_blocks = cutlass.const_expr(self.tile_shape_mnk[1] // 64)
 
-        # _write helpers are loop-invariant (they capture tCrB / k_block_idx);
-        # the N-fragment slot ``nn`` and mma-row are passed per write.  Defined
-        # once here rather than inside the (now looped) mode branch.
+        # _write_hmul2 captures tCrB / k_block_idx; nn and mma-row passed per
+        # write.  fp16 MMA writes fp16 directly; bf16 MMA goes via fp32 (no
+        # packed f16x2 -> bf16x2 cvt on sm_100a).
         if cutlass.const_expr(self.use_fp16_mma == 1):
-            # fp16-MMA path: scaled_h2 (f16x2) -> 2 fp16 -> tCrB.
+
             def _write_hmul2(h2, scale_h2, mma_i_low, nn):
                 scaled_h2 = half2_mul(h2, scale_h2)
                 f_lo, f_hi = f16x2_unpack(scaled_h2)
@@ -1543,41 +1361,25 @@ class BlackwellDenseGemmW4A16Kernel:
         else:
 
             def _write_hmul2(h2, scale_h2, mma_i_low, nn):
-                # Multiply in fp16x2; convert to bf16 via fp32 (no packed PTX
-                # for f16x2 -> bf16x2 on sm_100a, so unpack to fp32 then write).
                 scaled_h2 = half2_mul(h2, scale_h2)
                 f_lo, f_hi = f16x2_to_f32x2(scaled_h2)
                 tCrB[mma_i_low, nn, k_block_idx] = f_lo.to(self.b_compute_dtype)
                 tCrB[mma_i_low + 1, nn, k_block_idx] = f_hi.to(self.b_compute_dtype)
-
-        def _write_pair(h2, scale, mma_i_low, nn):
-            f_lo, f_hi = f16x2_to_f32x2(h2)
-            tCrB[mma_i_low, nn, k_block_idx] = (f_lo * scale).to(self.b_compute_dtype)
-            tCrB[mma_i_low + 1, nn, k_block_idx] = (f_hi * scale).to(
-                self.b_compute_dtype
-            )
 
         for n_blk in cutlass.range_constexpr(num_n_blocks):
             n_col_off = Int32(n_blk * 128)  # int32 column offset of this 64-N block
             n_sf_off = Int32(n_blk * 64)  # SF N-row offset of this 64-N block
             nn0 = n_blk * 4  # base tCrB N-fragment slot for this block
 
+            # Single ld.shared.v2.u32 (8-byte load): u32_pos_base is always even
+            # (= n_blk*128 + n_warp*64 + lane*2), so the offset is 8-byte aligned.
             u32_pos_base = n_col_off + n_warp_idx * Int32(64) + lane * Int32(2)
-            if cutlass.const_expr(self.vectorized_smem_b == 1):
-                # Single ld.shared.v2.u32 (8-byte load) replaces 2 sequential
-                # ld.shared.u32.  u32_pos_base is always even (= n_blk*128 +
-                # n_warp*64 + lane*2), so the byte offset is 8-byte aligned.
-                smem_addr_b = get_smem_ptr_as_int32(
-                    sB_marlin, sB_marlin.layout((k_block_idx, u32_pos_base, stage_idx))
-                )
-                u32_0, u32_1 = ld_shared_v2_u32(smem_addr_b)
-            else:
-                u32_0 = Uint32(sB_marlin[k_block_idx, u32_pos_base, stage_idx])
-                u32_1 = Uint32(
-                    sB_marlin[k_block_idx, u32_pos_base + Int32(1), stage_idx]
-                )
+            smem_addr_b = get_smem_ptr_as_int32(
+                sB_packed, sB_packed.layout((k_block_idx, u32_pos_base, stage_idx))
+            )
+            u32_0, u32_1 = ld_shared_v2_u32(smem_addr_b)
 
-            # Per-group FP8-E4M3 scale loads.  4 distinct N positions per block.
+            # Per-group scale loads (S0E5M3).  4 distinct N positions per block.
             sf_n = base_n_in_tile + n_sf_off
             sf_byte_0 = Uint32(sB_sf[k_block_idx, sf_n + Int32(0), stage_idx])
             sf_byte_1 = Uint32(sB_sf[k_block_idx, sf_n + Int32(16), stage_idx])
@@ -1587,55 +1389,26 @@ class BlackwellDenseGemmW4A16Kernel:
             h0_a, h0_b, h0_c, h0_d = fp4_decode_4bytes(u32_0)
             h1_a, h1_b, h1_c, h1_d = fp4_decode_4bytes(u32_1)
 
-            # MODE 1 (default): cvt.rn.f16x2.e2m1x2 + hmul2 in fp16.
-            if cutlass.const_expr(self.dequant_mode == self.DEQUANT_MODE_HMUL2_F16):
-                # Per-group scale -> f16x2 broadcast.  E4M3: 3 PTX ops (cvt+prmt).
-                # S0E5M3 (host-reformatted): 1 op (mul.lo.u32).  alpha is applied
-                # once in the epilogue, so the scale never needs an f32 form.
-                if cutlass.const_expr(self.s0e5m3_scale != 0):
-                    sc_n0 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_0)
-                    sc_n1 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_1)
-                    sc_n2 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_2)
-                    sc_n3 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_3)
-                else:
-                    sc_n0 = cvt_e4m3_to_f16x2_broadcast(sf_byte_0)
-                    sc_n1 = cvt_e4m3_to_f16x2_broadcast(sf_byte_1)
-                    sc_n2 = cvt_e4m3_to_f16x2_broadcast(sf_byte_2)
-                    sc_n3 = cvt_e4m3_to_f16x2_broadcast(sf_byte_3)
-                _write_hmul2(h0_a, sc_n0, 0, nn0 + 0)
-                _write_hmul2(h0_b, sc_n0, 2, nn0 + 0)
-                _write_hmul2(h0_c, sc_n1, 0, nn0 + 1)
-                _write_hmul2(h0_d, sc_n1, 2, nn0 + 1)
-                _write_hmul2(h1_a, sc_n2, 0, nn0 + 2)
-                _write_hmul2(h1_b, sc_n2, 2, nn0 + 2)
-                _write_hmul2(h1_c, sc_n3, 0, nn0 + 3)
-                _write_hmul2(h1_d, sc_n3, 2, nn0 + 3)
-            else:
-                # MODE 0 (baseline): per-element fp32 multiply.
-                scale_n0 = cvt_e4m3_to_f32_via_f16(sf_byte_0)
-                scale_n1 = cvt_e4m3_to_f32_via_f16(sf_byte_1)
-                scale_n2 = cvt_e4m3_to_f32_via_f16(sf_byte_2)
-                scale_n3 = cvt_e4m3_to_f32_via_f16(sf_byte_3)
-                _write_pair(h0_a, scale_n0, 0, nn0 + 0)
-                _write_pair(h0_b, scale_n0, 2, nn0 + 0)
-                _write_pair(h0_c, scale_n1, 0, nn0 + 1)
-                _write_pair(h0_d, scale_n1, 2, nn0 + 1)
-                _write_pair(h1_a, scale_n2, 0, nn0 + 2)
-                _write_pair(h1_b, scale_n2, 2, nn0 + 2)
-                _write_pair(h1_c, scale_n3, 0, nn0 + 3)
-                _write_pair(h1_d, scale_n3, 2, nn0 + 3)
+            # S0E5M3 scale -> f16x2 broadcast in one mul.lo.u32.  alpha is
+            # applied once in the epilogue, so the scale never needs an f32 form.
+            sc_n0 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_0)
+            sc_n1 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_1)
+            sc_n2 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_2)
+            sc_n3 = cvt_s0e5m3_to_f16x2_broadcast(sf_byte_3)
+            _write_hmul2(h0_a, sc_n0, 0, nn0 + 0)
+            _write_hmul2(h0_b, sc_n0, 2, nn0 + 0)
+            _write_hmul2(h0_c, sc_n1, 0, nn0 + 1)
+            _write_hmul2(h0_d, sc_n1, 2, nn0 + 1)
+            _write_hmul2(h1_a, sc_n2, 0, nn0 + 2)
+            _write_hmul2(h1_b, sc_n2, 2, nn0 + 2)
+            _write_hmul2(h1_c, sc_n3, 0, nn0 + 3)
+            _write_hmul2(h1_d, sc_n3, 2, nn0 + 3)
 
-    # ------------------------------------------------------------------
-    # TVM-FFI entry: takes (m, k) A, (k//16, n*2) B (Marlin int32),
-    # (k//16, n) B_sf (E4M3), (m, n) C, (1,) alpha, with explicit batch L.
-    # Re-wraps each input with explicit (m, k, l) / (k_tiles, n2, l) /
-    # (k_sf, n, l) / (m, n, l) layouts the kernel mainloop expects.
-    # ------------------------------------------------------------------
     @cute.jit
     def wrapper(
         self,
         mA: cute.Tensor,
-        mB_marlin: cute.Tensor,
+        mB_packed: cute.Tensor,
         mB_sf: cute.Tensor,
         mC: cute.Tensor,
         mAlpha: cute.Tensor,
@@ -1647,7 +1420,7 @@ class BlackwellDenseGemmW4A16Kernel:
 
         Args:
             mA:        (m, k) input tensor A, bf16 or fp16.
-            mB_marlin: (k // 16, n * 2) int32 -- Marlin-packed FP4.
+            mB_packed: (k // 16, n * 2) int32 -- packed FP4.
             mB_sf:     (k // 16, n) uint8 -- FP8-E4M3 per-group scales.
             mC:        (m, n) output tensor C, bf16 or fp16.
             mAlpha:    (1,) fp32 global scale.
@@ -1658,7 +1431,7 @@ class BlackwellDenseGemmW4A16Kernel:
         m = cute.size(mA, mode=[0])
         k = cute.size(mA, mode=[1])
         n = cute.size(mC, mode=[1])
-        k_tiles = k // _MARLIN_TILE_K
+        k_tiles = k // _PACK_TILE_K
         n_packed = 2 * n
         k_sf_groups = k // self.GROUP_SIZE
 
@@ -1666,8 +1439,8 @@ class BlackwellDenseGemmW4A16Kernel:
             mA.iterator,
             layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
         )
-        b_marlin_tensor = cute.make_tensor(
-            mB_marlin.iterator,
+        b_packed_tensor = cute.make_tensor(
+            mB_packed.iterator,
             layout=cute.make_ordered_layout((k_tiles, n_packed, l), order=(1, 0, 2)),
         )
         b_sf_tensor = cute.make_tensor(
@@ -1681,7 +1454,7 @@ class BlackwellDenseGemmW4A16Kernel:
 
         self(
             a_tensor,
-            b_marlin_tensor,
+            b_packed_tensor,
             b_sf_tensor,
             c_tensor,
             mAlpha,

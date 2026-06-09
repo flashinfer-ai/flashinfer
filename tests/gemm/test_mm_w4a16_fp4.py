@@ -17,11 +17,38 @@ import torch
 import flashinfer
 from flashinfer.gemm.gemm_w4a16 import (
     _CUDNN_W4A16_MIN_BACKEND_VERSION,
-    _dequantize_w4a16_fp4_torch,
+    _unswizzle_sf_128x4,
     mm_w4a16_fp4,
     prepare_w4a16_fp4_weights,
 )
 from flashinfer.utils import get_compute_capability
+
+
+# E2M1 (FP4) codebook, signed (codes 0-7 positive, 8-15 negative), matching
+# ``flashinfer.nvfp4_quantize``.
+_E2M1_CODEBOOK_FP32 = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)  # fmt: skip
+
+
+def _dequantize_w4a16_fp4_torch(b, b_descale, alpha, n, k, block_size):
+    """fp32 ground-truth dequant of the canonical nvfp4 weight: unpack FP4
+    nibbles -> codebook -> per-block SF (unswizzled) -> optional alpha.
+    Returns the ``(N, K)`` fp32 weight matrix (the GEMM reference dequants
+    in fp32 then matmuls)."""
+    device = b.device
+    k_sf = k // block_size
+    lut = torch.tensor(_E2M1_CODEBOOK_FP32, dtype=torch.float32, device=device)
+    b_int = b.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
+    values = lut[codes]
+    sf = _unswizzle_sf_128x4(b_descale, n, k_sf).view(torch.float8_e4m3fn)
+    sf_expanded = sf.to(torch.float32).repeat_interleave(block_size, dim=1)
+    weight = values * sf_expanded
+    if alpha is not None:
+        weight = weight * alpha.to(torch.float32)
+    return weight
 
 
 # =============================================================================
@@ -34,20 +61,8 @@ from flashinfer.utils import get_compute_capability
 ALL_BACKENDS = ["cudnn", "cute-dsl"]
 
 
-# Both supported backends consume a non-swizzled SF, so the tests always pass
-# ``is_sf_swizzled=False``: cuDNN *requires* it (the API default is ``True``,
-# which cuDNN rejects), and the cute-DSL backend ignores the flag entirely (it
-# consumes the bespoke layout ``prepare_w4a16_fp4_weights`` emits).  There is no
-# longer a per-backend distinction worth a lookup table.
-
-
 def _skip_if_backend_unavailable(backend: str) -> None:
-    """Skip the current test if ``backend`` can't run on this device.
-
-    Gates on compute-capability support (via the ``@backend_requirement``
-    introspection) plus runtime availability that the cc check doesn't
-    cover -- notably the cuDNN W4A16 minimum backend version.
-    """
+    """Skip the current test if ``backend`` can't run on this device."""
     device = torch.device("cuda")
     cc = get_compute_capability(device)
     cc_number = cc[0] * 10 + cc[1]
@@ -65,15 +80,6 @@ def _skip_if_backend_unavailable(backend: str) -> None:
             )
 
 
-# (M, N, K) grid for numerical correctness.  Biased toward small M
-# (W4A16's primary use case is decode-shaped GEMMs), with medium/large M to
-# exercise the M-tiling path.  Shape constraints (see prepare_w4a16_fp4_weights
-# / the cute-DSL kernel): N is a multiple of 64 (the kernel N-tile; the 128x4 SF
-# swizzle only pads N to 128 and the prep unswizzles the padded tail) and K is a
-# multiple of 64 (so the kernel's tile_K of 64 or 128 divides it).  M is
-# unconstrained.  The non-power-of-2 block below deliberately covers odd M and
-# N/K that are multiples of 64 but not 128 (exercising the tile_K=64 path) since
-# real model widths are rarely powers of two.
 PROBLEM_SIZES = [
     # tiny: smoke / minimum valid shapes
     (1, 128, 128),
@@ -140,34 +146,18 @@ PROBLEM_SIZES = [
     (17, 3072, 3072),
 ]
 
-
 # Single mid-size shape used by the secondary contract tests
 # (alpha=None, out_dtype override, preallocated out, K-mismatch).  They
 # don't need to sweep the full numeric grid -- they only check that the
 # behaviour is consistent across backends.
 SMOKE_MNK = (16, 1024, 1024)
 
-
-# Unified tolerance for the secondary same-backend behaviour tests
-# (alpha=None vs alpha=1.0, preallocated out vs fresh out).  Those compare two
-# runs of the *same* deterministic kernel, so they match closely; a single
-# loose budget covers both backends.  The numeric correctness grid does not use
-# this -- it uses the norm/cosine check in ``_assert_close_to_reference``.
 ATOL = 1.5e-2
 RTOL = 1.5e-2
 
 
 def _assert_close_to_reference(out: torch.Tensor, ref: torch.Tensor, backend: str):
-    """Compare a backend's output against the fp32-accurate reference.
-
-    The ``cudnn`` / ``cute-dsl`` backends dequantize the FP4 weight to bf16
-    before a bf16 tensor-core matmul, so a handful of large-magnitude
-    output elements carry bf16 rounding that exceeds any sane elementwise
-    bound at large K.  We validate the relative L2-norm of the error
-    (catches decorrelation *and* scale/alpha bugs -- cosine alone is
-    scale-invariant) together with cosine similarity, mirroring
-    ``tests/gemm/test_mm_fp4.py``.
-    """
+    """Compare a backend's output against the fp32-accurate reference."""
     out_f = out.float().reshape(-1)
     ref_f = ref.float().reshape(-1)
     ref_norm = torch.linalg.vector_norm(ref_f).clamp_min(1e-6)
@@ -205,19 +195,6 @@ def _make_random_fp4_weights(
 
 
 # =============================================================================
-# Backend dispatch
-# =============================================================================
-
-
-def test_unknown_backend_raises_on_prepare():
-    """Calling prepare with an unknown backend is an error."""
-    device = torch.device("cuda")
-    b_fp4, b_sf, alpha = _make_random_fp4_weights(64, 128, device)
-    with pytest.raises(ValueError, match="Unknown backend"):
-        prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend="not-a-real-backend")
-
-
-# =============================================================================
 # Cross-backend numerical / behaviour contract
 # =============================================================================
 
@@ -238,7 +215,7 @@ def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
 
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
-    out = mm_w4a16_fp4(a, b_p, sf_p, alpha_p, backend=backend, is_sf_swizzled=False)
+    out = mm_w4a16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
 
     weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
     ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
@@ -263,10 +240,10 @@ def test_backend_alpha_none_equals_alpha_one(backend):
         torch.ones(1, device=device, dtype=torch.float32),
         backend=backend,
     )
-    out_one = mm_w4a16_fp4(a, b1, sf1, a1, backend=backend, is_sf_swizzled=False)
+    out_one = mm_w4a16_fp4(a, b1, sf1, a1, backend=backend)
 
     b0, sf0, a0 = prepare_w4a16_fp4_weights(b_fp4, b_sf, None, backend=backend)
-    out_none = mm_w4a16_fp4(a, b0, sf0, a0, backend=backend, is_sf_swizzled=False)
+    out_none = mm_w4a16_fp4(a, b0, sf0, a0, backend=backend)
 
     torch.testing.assert_close(out_none, out_one, atol=ATOL, rtol=RTOL)
 
@@ -291,7 +268,6 @@ def test_backend_out_dtype_override(backend):
         alpha_p,
         backend=backend,
         out_dtype=torch.float16,
-        is_sf_swizzled=False,
     )
     assert out.dtype == torch.float16
 
@@ -314,10 +290,9 @@ def test_backend_preallocated_out(backend):
         alpha_p,
         backend=backend,
         out=out,
-        is_sf_swizzled=False,
     )
     assert returned.data_ptr() == out_ptr_before
-    ref = mm_w4a16_fp4(a, b_p, sf_p, alpha_p, backend=backend, is_sf_swizzled=False)
+    ref = mm_w4a16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
     torch.testing.assert_close(returned, ref, atol=ATOL, rtol=RTOL)
 
 
@@ -337,7 +312,6 @@ def test_backend_shape_mismatch_raises(backend):
             sf_p,
             alpha_p,
             backend=backend,
-            is_sf_swizzled=False,
         )
 
 

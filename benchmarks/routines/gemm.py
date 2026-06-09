@@ -1333,6 +1333,35 @@ def testMmFp4(args):
     return res
 
 
+# E2M1 (FP4) codebook, signed (codes 0-7 positive, 8-15 negative), matching
+# ``flashinfer.nvfp4_quantize``.
+_E2M1_CODEBOOK_FP32 = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)  # fmt: skip
+
+
+def _dequantize_w4a16_fp4_ref(b, b_descale, alpha, n, k, block_size):
+    """fp32 ground-truth dequant of the canonical nvfp4 weight (refcheck gold):
+    unpack FP4 nibbles -> codebook -> per-block SF (unswizzled) -> optional
+    alpha.  Returns the ``(N, K)`` fp32 weight matrix."""
+    import torch
+    from flashinfer.gemm.gemm_w4a16 import _unswizzle_sf_128x4
+
+    device = b.device
+    k_sf = k // block_size
+    lut = torch.tensor(_E2M1_CODEBOOK_FP32, dtype=torch.float32, device=device)
+    b_int = b.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
+    values = lut[codes]
+    sf = _unswizzle_sf_128x4(b_descale, n, k_sf).view(torch.float8_e4m3fn)
+    sf_expanded = sf.to(torch.float32).repeat_interleave(block_size, dim=1)
+    weight = values * sf_expanded
+    if alpha is not None:
+        weight = weight * alpha.to(torch.float32)
+    return weight
+
+
 def testMmW4A16Fp4(args):
     """Benchmark mm_w4a16_fp4 (W4A16 FP4 GEMM).
 
@@ -1426,12 +1455,6 @@ def testMmW4A16Fp4(args):
     marlin_preps = {}  # marlin backend stashes its dequant reference for refcheck
 
     def make_runner(b_p, sf_p, alpha_p, backend):
-        # cuDNN consumes a non-swizzled (linear) SF; torch consumes the
-        # canonical 128x4-swizzled SF.  prepare_w4a16_fp4_weights already
-        # emits the right layout per backend, so the matching gate flag
-        # is simply: swizzled for everything except cudnn.
-        is_sf_swizzled = backend != "cudnn"
-
         def run(a):
             return flashinfer.mm_w4a16_fp4(
                 a,
@@ -1441,7 +1464,6 @@ def testMmW4A16Fp4(args):
                 backend=backend,
                 out_dtype=out_dtype,
                 block_size=16,
-                is_sf_swizzled=is_sf_swizzled,
                 enable_pdl=args.enable_pdl,
             )
 
@@ -1500,9 +1522,7 @@ def testMmW4A16Fp4(args):
     # to out_dtype (the same math the removed "torch" backend computed).
     ref = None
     if run_refcheck:
-        from flashinfer.gemm.gemm_w4a16 import _dequantize_w4a16_fp4_torch
-
-        weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+        weight_fp32 = _dequantize_w4a16_fp4_ref(b_fp4, b_sf, alpha, n, k, 16)
         ref = (a.float() @ weight_fp32.T).to(out_dtype)
 
     res = []
@@ -1513,14 +1533,11 @@ def testMmW4A16Fp4(args):
         + (k // 16) * n  # FP8-E4M3 per-block SF
         + m * n * torch.tensor([], dtype=out_dtype).element_size()
     )
-    # Per-backend refcheck tolerance vs the fp32-accurate gold.  The cute-dsl
-    # and cudnn kernels dequantize the FP4 weight to bf16 before the
-    # tensor-core matmul, so they carry ~1 bf16 ULP of weight rounding (up to
-    # ~1.5e-2 relative) that the fp32 reference does not.
-    _refcheck_tol = {
-        "cudnn": dict(rtol=1.5e-2, atol=1.5e-2),
-        "cute-dsl": dict(rtol=1.5e-2, atol=1.5e-2),
-    }
+    # Refcheck tolerance vs the fp32-accurate gold.  The cute-dsl and cudnn
+    # kernels dequantize the FP4 weight to bf16 before the tensor-core matmul,
+    # so they carry ~1 bf16 ULP of weight rounding (up to ~1.5e-2 relative)
+    # that the fp32 reference does not.
+    refcheck_tol = dict(rtol=1.5e-2, atol=1.5e-2)
     for backend in backends:
         runner = backend_runners[backend]
         if run_refcheck:
@@ -1554,9 +1571,8 @@ def testMmW4A16Fp4(args):
                         "vs self dequant ref)"
                     )
             else:
-                tol = _refcheck_tol.get(backend, dict(rtol=1.5e-2, atol=1.5e-2))
                 try:
-                    torch.testing.assert_close(out, ref, **tol)
+                    torch.testing.assert_close(out, ref, **refcheck_tol)
                 except AssertionError as e:
                     if args.allow_output_mismatch:
                         print(f"[WARNING] {backend} output mismatch vs fp32 ref: {e}")
