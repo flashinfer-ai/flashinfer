@@ -7172,6 +7172,11 @@ def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) ->
     """Validate the per-row UE8M0 ``scale_granularity_mnk`` contract shared by all
     MXFP8 cute SM120 GEMM entries. Accepts ``(1, 1, 32)`` or ``(1, 1, 128)``.
     """
+    if len(scale_granularity_mnk) != 3:
+        raise ValueError(
+            f"scale_granularity_mnk must be a 3-tuple (m_gran, n_gran, k_gran); "
+            f"got length {len(scale_granularity_mnk)}"
+        )
     if scale_granularity_mnk[0] != 1:
         raise ValueError(
             f"scale_granularity_mnk[0] (m_gran) must be 1; got {scale_granularity_mnk[0]}"
