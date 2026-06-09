@@ -39,6 +39,21 @@
     }                                                                                            \
   }
 
+// 2-value granK dispatch (mirrors flashinfer's DISPATCH_* macro style).
+// Validates input and instantiates the templated callsite for each supported
+// `granK` value. The throw branch defends against bypasses of the thop-layer
+// `TORCH_CHECK(granK == 32 || granK == 128, ...)` validators.
+#define DISPATCH_GRAN_K(granK, GRAN_K, ...)              \
+  if ((granK) == 32) {                                   \
+    constexpr int GRAN_K = 32;                           \
+    __VA_ARGS__;                                         \
+  } else if ((granK) == 128) {                           \
+    constexpr int GRAN_K = 128;                          \
+    __VA_ARGS__;                                         \
+  } else {                                               \
+    throw std::runtime_error("granK must be 32 or 128"); \
+  }
+
 namespace flashinfer::gemm::mxfp8_cute_sm120 {
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
@@ -64,16 +79,9 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
                                                                               float const* SFB,
                                                                               cudaStream_t stream,
                                                                               int granK) {
-  switch (granK) {
-    case 32:
-      gemm_mxfp8_nt_groupwise_impl<32>(D, A, B, shape_m, shape_n, shape_k, SFA, SFB, stream);
-      break;
-    case 128:
-      gemm_mxfp8_nt_groupwise_impl<128>(D, A, B, shape_m, shape_n, shape_k, SFA, SFB, stream);
-      break;
-    default:
-      throw std::runtime_error("granK must be 32 or 128");
-  }
+  DISPATCH_GRAN_K(granK, GRAN_K, {
+    gemm_mxfp8_nt_groupwise_impl<GRAN_K>(D, A, B, shape_m, shape_n, shape_k, SFA, SFB, stream);
+  })
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
@@ -143,20 +151,11 @@ void Mxfp8CuteGemmSm120Runner<
                                                           int num_groups, int shape_m, int shape_n,
                                                           int shape_k, cudaStream_t stream,
                                                           int granK) {
-  switch (granK) {
-    case 32:
-      batch_gemm_mxfp8_nt_groupwise_impl<32>(A, ld_a, stride_a, B, ld_b, stride_b, D, ld_d,
-                                             stride_d, SFA, SFB, num_groups, shape_m, shape_n,
-                                             shape_k, stream);
-      break;
-    case 128:
-      batch_gemm_mxfp8_nt_groupwise_impl<128>(A, ld_a, stride_a, B, ld_b, stride_b, D, ld_d,
-                                              stride_d, SFA, SFB, num_groups, shape_m, shape_n,
-                                              shape_k, stream);
-      break;
-    default:
-      throw std::runtime_error("granK must be 32 or 128");
-  }
+  DISPATCH_GRAN_K(granK, GRAN_K, {
+    batch_gemm_mxfp8_nt_groupwise_impl<GRAN_K>(A, ld_a, stride_a, B, ld_b, stride_b, D, ld_d,
+                                               stride_d, SFA, SFB, num_groups, shape_m, shape_n,
+                                               shape_k, stream);
+  })
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
@@ -227,18 +226,10 @@ void Mxfp8CuteGemmSm120Runner<
                                                                  int k, cudaStream_t stream,
                                                                  float const* SFA, float const* SFB,
                                                                  int granK) {
-  switch (granK) {
-    case 32:
-      group_gemm_mxfp8_nt_groupwise_masked_impl<32>(D, A, B, masked_m, num_groups, max_m, n, k,
-                                                    stream, SFA, SFB);
-      break;
-    case 128:
-      group_gemm_mxfp8_nt_groupwise_masked_impl<128>(D, A, B, masked_m, num_groups, max_m, n, k,
-                                                     stream, SFA, SFB);
-      break;
-    default:
-      throw std::runtime_error("granK must be 32 or 128");
-  }
+  DISPATCH_GRAN_K(granK, GRAN_K, {
+    group_gemm_mxfp8_nt_groupwise_masked_impl<GRAN_K>(D, A, B, masked_m, num_groups, max_m, n, k,
+                                                      stream, SFA, SFB);
+  })
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
@@ -278,18 +269,10 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
                                                int total_rows, int shape_n, int shape_k,
                                                cudaStream_t stream, float const* SFA,
                                                float const* SFB, int granK) {
-  switch (granK) {
-    case 32:
-      group_gemm_mxfp8_nt_groupwise_zero_padding_impl<32>(
-          D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k, stream, SFA, SFB);
-      break;
-    case 128:
-      group_gemm_mxfp8_nt_groupwise_zero_padding_impl<128>(
-          D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k, stream, SFA, SFB);
-      break;
-    default:
-      throw std::runtime_error("granK must be 32 or 128");
-  }
+  DISPATCH_GRAN_K(granK, GRAN_K, {
+    group_gemm_mxfp8_nt_groupwise_zero_padding_impl<GRAN_K>(
+        D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k, stream, SFA, SFB);
+  })
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
@@ -349,18 +332,10 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
                                              int shape_n, int shape_k, cudaStream_t stream,
                                              float const* SFA, float const* SFB, int granK,
                                              bool use_psum_layout) {
-  switch (granK) {
-    case 32:
-      group_gemm_mxfp8_nt_groupwise_contiguous_impl<32>(D, A, B, m_indices, num_groups, m, shape_n,
-                                                        shape_k, stream, SFA, SFB, use_psum_layout);
-      break;
-    case 128:
-      group_gemm_mxfp8_nt_groupwise_contiguous_impl<128>(
-          D, A, B, m_indices, num_groups, m, shape_n, shape_k, stream, SFA, SFB, use_psum_layout);
-      break;
-    default:
-      throw std::runtime_error("granK must be 32 or 128");
-  }
+  DISPATCH_GRAN_K(granK, GRAN_K, {
+    group_gemm_mxfp8_nt_groupwise_contiguous_impl<GRAN_K>(
+        D, A, B, m_indices, num_groups, m, shape_n, shape_k, stream, SFA, SFB, use_psum_layout);
+  })
 }
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
@@ -486,18 +461,10 @@ static void quantize_mxfp8_zero_padding_impl(void* fp8_output, void* scale_outpu
 void quantize_mxfp8_zero_padding(void* fp8_output, void* scale_output, void* input,
                                  void* token_offset, int64_t num_experts, int64_t max_token_num,
                                  int64_t size_k, cudaStream_t stream, int granK) {
-  switch (granK) {
-    case 32:
-      quantize_mxfp8_zero_padding_impl<32>(fp8_output, scale_output, input, token_offset,
-                                           num_experts, max_token_num, size_k, stream);
-      break;
-    case 128:
-      quantize_mxfp8_zero_padding_impl<128>(fp8_output, scale_output, input, token_offset,
-                                            num_experts, max_token_num, size_k, stream);
-      break;
-    default:
-      throw std::runtime_error("granK must be 32 or 128");
-  }
+  DISPATCH_GRAN_K(granK, GRAN_K, {
+    quantize_mxfp8_zero_padding_impl<GRAN_K>(fp8_output, scale_output, input, token_offset,
+                                             num_experts, max_token_num, size_k, stream);
+  })
 }
 
 }  // namespace flashinfer::gemm::mxfp8_cute_sm120
