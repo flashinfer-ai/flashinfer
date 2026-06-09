@@ -213,7 +213,7 @@ void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Masked(TensorView a, TensorVie
       reinterpret_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_k));
 }
 
-void Mxfp8QuantizeForZeroPaddingCuteSM120(TensorView input, TensorView token_offset,
+void QuantizeMxfp8ForZeroPaddingCuteSM120(TensorView input, TensorView token_offset,
                                           TensorView out_fp8, TensorView out_scale_raw,
                                           int64_t granK) {
   TVM_FFI_ICHECK(granK == 32 || granK == 128) << "granK must be 32 or 128; got " << granK;
@@ -246,7 +246,7 @@ void Mxfp8QuantizeForZeroPaddingCuteSM120(TensorView input, TensorView token_off
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   auto stream = get_stream(input.device());
 
-  flashinfer::gemm::mxfp8_cute_sm120::mxfp8_quantize_zero_padding(
+  flashinfer::gemm::mxfp8_cute_sm120::quantize_mxfp8_zero_padding(
       out_fp8.data_ptr(), out_scale_raw.data_ptr(), const_cast<void*>(input.data_ptr()),
       const_cast<void*>(static_cast<void const*>(token_offset.data_ptr())), num_experts, token_num,
       size_k, stream, static_cast<int>(granK));

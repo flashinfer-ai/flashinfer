@@ -9,7 +9,7 @@ TMA-aligned MN-major scale layout expected by:
 - `flashinfer.gemm.group_gemm_mxfp8_nt_groupwise` (MoE contiguous, psum_layout=True/False)
 - `flashinfer.gemm.group_gemm_mxfp8_nt_groupwise_masked` (MoE masked)
 - `flashinfer.gemm.group_gemm_mxfp8_nt_groupwise_zero_padding` (MoE zero-padding;
-  use the dedicated CUDA helper `mxfp8_quantize_for_zero_padding` instead — its
+  use the dedicated CUDA helper `quantize_mxfp8_for_zero_padding` instead — its
   input/output layout differs)
 
 Distinct from the existing `flashinfer.quantization.mxfp8_quantize` (TRT-LLM-style

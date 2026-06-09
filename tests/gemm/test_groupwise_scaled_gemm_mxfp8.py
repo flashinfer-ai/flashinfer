@@ -41,7 +41,7 @@ from flashinfer.gemm import (
     group_gemm_mxfp8_nt_groupwise,
     group_gemm_mxfp8_nt_groupwise_masked,
     group_gemm_mxfp8_nt_groupwise_zero_padding,
-    mxfp8_quantize_for_zero_padding,
+    quantize_mxfp8_for_zero_padding,
 )
 from flashinfer.quantization import (
     mxfp8_dequantize_per_row,
@@ -317,7 +317,7 @@ def test_mxfp8_group_gemm_groupwise_zero_padding(
 
     # A path uses the dedicated CUDA helper for kernel call (zero_padding-specific
     # padded sf layout with per-expert 3-row gaps for TMA alignment).
-    a_fp8, a_sf = mxfp8_quantize_for_zero_padding(a, m_indptr, granK=k_gran)
+    a_fp8, a_sf = quantize_mxfp8_for_zero_padding(a, m_indptr, granK=k_gran)
 
     # For the dequant reference: independently compute per-expert per-token quant
     # via mxfp8_quantize_per_row (no padded layout, just per-row sf). UE8M0 ceil

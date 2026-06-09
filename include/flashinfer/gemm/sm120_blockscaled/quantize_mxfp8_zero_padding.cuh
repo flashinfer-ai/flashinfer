@@ -42,7 +42,7 @@ __device__ __forceinline__ float reciprocal_approximate_ftz(float a) {
 //   GranK=32: 16 UE8M0 / warp packed into 4 int32 along K
 // SFA m-axis offsets are 4-row aligned via `math::compute_padded_offset`.
 template <int GranK, typename InputType, typename OutputType, int WarpsPerBlock = 4>
-__global__ void mxfp8_quantize_zero_padding_kernel_sm120(OutputType* __restrict__ fp8_output,
+__global__ void quantize_mxfp8_zero_padding_kernel_sm120(OutputType* __restrict__ fp8_output,
                                                          int32_t* __restrict__ scale_output,
                                                          InputType const* __restrict__ input,
                                                          int32_t const* __restrict__ token_offset,

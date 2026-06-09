@@ -7144,7 +7144,7 @@ def get_gemm_sm120_module_cute_mxfp8():
 
 
 @flashinfer_api
-def mxfp8_quantize_for_zero_padding(
+def quantize_mxfp8_for_zero_padding(
     input: torch.Tensor,
     m_indptr: torch.Tensor,
     granK: int = 128,
@@ -7206,7 +7206,7 @@ def mxfp8_quantize_for_zero_padding(
         (k_align, m_padded), dtype=torch.int32, device=input.device
     )
 
-    get_gemm_sm120_module_cute_mxfp8().mxfp8_quantize_for_zero_padding(
+    get_gemm_sm120_module_cute_mxfp8().quantize_mxfp8_for_zero_padding(
         input, m_indptr, out_fp8, out_scale_raw, granK
     )
 

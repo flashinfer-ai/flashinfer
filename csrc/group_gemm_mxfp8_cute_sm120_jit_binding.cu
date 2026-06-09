@@ -34,7 +34,7 @@ void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Masked(TensorView a, TensorVie
                                                          int64_t scale_granularity_n,
                                                          int64_t scale_granularity_k);
 
-void Mxfp8QuantizeForZeroPaddingCuteSM120(TensorView input, TensorView token_offset,
+void QuantizeMxfp8ForZeroPaddingCuteSM120(TensorView input, TensorView token_offset,
                                           TensorView out_fp8, TensorView out_scale_raw,
                                           int64_t granK);
 
@@ -47,5 +47,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_mxfp8_nt_groupwise,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_mxfp8_nt_groupwise_masked,
                               CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Masked);
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(mxfp8_quantize_for_zero_padding,
-                              Mxfp8QuantizeForZeroPaddingCuteSM120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(quantize_mxfp8_for_zero_padding,
+                              QuantizeMxfp8ForZeroPaddingCuteSM120);

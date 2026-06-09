@@ -51,7 +51,7 @@ Inputs are quantized via the helpers in
     group_gemm_mxfp8_nt_groupwise
     group_gemm_mxfp8_nt_groupwise_masked
     group_gemm_mxfp8_nt_groupwise_zero_padding
-    mxfp8_quantize_for_zero_padding
+    quantize_mxfp8_for_zero_padding
 
 FP8 GEMM
 --------

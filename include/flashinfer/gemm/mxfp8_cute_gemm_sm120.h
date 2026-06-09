@@ -128,7 +128,7 @@ class Mxfp8CuteGemmSm120Runner : public Mxfp8CuteGemmSm120RunnerInterface {
                                                      float const* SFB, bool use_psum_layout);
 };
 
-void mxfp8_quantize_zero_padding(
+void quantize_mxfp8_zero_padding(
     void* fp8_output,    // [total_tokens, k] FP8 output
     void* scale_output,  // [k/(granK*4), total_m_padded] int32 packed scale
     void* input,         // [total_tokens, k] bfloat16 input

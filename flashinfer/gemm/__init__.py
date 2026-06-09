@@ -28,7 +28,7 @@ from .gemm_base import (
     group_gemm_mxfp8_nt_groupwise_zero_padding as group_gemm_mxfp8_nt_groupwise_zero_padding,
 )
 from .gemm_base import (
-    mxfp8_quantize_for_zero_padding as mxfp8_quantize_for_zero_padding,
+    quantize_mxfp8_for_zero_padding as quantize_mxfp8_for_zero_padding,
 )
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
@@ -93,7 +93,7 @@ __all__ = [
     "group_gemm_mxfp8_nt_groupwise",
     "group_gemm_mxfp8_nt_groupwise_masked",
     "group_gemm_mxfp8_nt_groupwise_zero_padding",
-    "mxfp8_quantize_for_zero_padding",
+    "quantize_mxfp8_for_zero_padding",
     "fp8_blockscale_gemm_sm90",
     "mm_M1_16_K6144_N256",
     "mm_M1_16_K7168_N128",

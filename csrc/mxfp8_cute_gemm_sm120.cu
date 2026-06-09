@@ -25,7 +25,7 @@
 #include "flashinfer/gemm/sm120_blockscaled/builder.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/kernel_impl.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/launch.cuh"
-#include "flashinfer/gemm/sm120_blockscaled/mxfp8_quantize_zero_padding.cuh"
+#include "flashinfer/gemm/sm120_blockscaled/quantize_mxfp8_zero_padding.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/scheduler.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/utils.cuh"
 
@@ -450,7 +450,7 @@ template class Mxfp8CuteGemmSm120Runner<cute::float_e4m3_t, cute::bfloat16_t, fl
                                         cute::float_ue8m0_t>;
 
 template <int GranK>
-static void mxfp8_quantize_zero_padding_impl(void* fp8_output, void* scale_output, void* input,
+static void quantize_mxfp8_zero_padding_impl(void* fp8_output, void* scale_output, void* input,
                                              void* token_offset, int64_t num_experts,
                                              int64_t max_token_num, int64_t size_k,
                                              cudaStream_t stream) {
@@ -471,7 +471,7 @@ static void mxfp8_quantize_zero_padding_impl(void* fp8_output, void* scale_outpu
   int smem_size = (num_experts + 1) * sizeof(int32_t);
 
   auto scale_kernel =
-      sm120_blockscaled::mxfp8_quantize_zero_padding_kernel_sm120<GranK, __nv_bfloat16,
+      sm120_blockscaled::quantize_mxfp8_zero_padding_kernel_sm120<GranK, __nv_bfloat16,
                                                                   __nv_fp8_e4m3, kWarpsPerBlock>;
   cudaFuncSetAttribute(scale_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
   scale_kernel<<<grid, block, smem_size, stream>>>(
@@ -483,16 +483,16 @@ static void mxfp8_quantize_zero_padding_impl(void* fp8_output, void* scale_outpu
   cudaDeviceSynchronize();
 }
 
-void mxfp8_quantize_zero_padding(void* fp8_output, void* scale_output, void* input,
+void quantize_mxfp8_zero_padding(void* fp8_output, void* scale_output, void* input,
                                  void* token_offset, int64_t num_experts, int64_t max_token_num,
                                  int64_t size_k, cudaStream_t stream, int granK) {
   switch (granK) {
     case 32:
-      mxfp8_quantize_zero_padding_impl<32>(fp8_output, scale_output, input, token_offset,
+      quantize_mxfp8_zero_padding_impl<32>(fp8_output, scale_output, input, token_offset,
                                            num_experts, max_token_num, size_k, stream);
       break;
     case 128:
-      mxfp8_quantize_zero_padding_impl<128>(fp8_output, scale_output, input, token_offset,
+      quantize_mxfp8_zero_padding_impl<128>(fp8_output, scale_output, input, token_offset,
                                             num_experts, max_token_num, size_k, stream);
       break;
     default:
