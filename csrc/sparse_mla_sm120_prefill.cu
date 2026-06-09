@@ -399,13 +399,10 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  const uint8_t* KV_cache, const int32_t* indices,
                                  const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
-                                 int stride_kv_row, int extra_stride_kv_row, const float* attn_sink,
-                                 const int* topk_length, const int* extra_topk_length,
+                                 size_t stride_kv_block, size_t stride_kv_block_extra,
+                                 const float* attn_sink, const int* topk_length,
+                                 const int* extra_topk_length,
                                  cudaStream_t stream) {
-  const size_t stride_kv_block = (size_t)page_block_size * (size_t)stride_kv_row;
-  const size_t stride_kv_block_extra =
-      (extra_KV_cache != nullptr) ? (size_t)extra_page_block_size * (size_t)extra_stride_kv_row : 0;
-
   if (extra_KV_cache != nullptr) {
     if (mt != ModelType::DSV4) return false;
     return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,

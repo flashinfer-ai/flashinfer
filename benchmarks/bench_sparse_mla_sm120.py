@@ -43,6 +43,7 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import is_sm120a_supported
 
@@ -51,6 +52,7 @@ _BPT_DSV4 = 584
 _PAGE_BLOCK_SIZE_DSV4 = 64
 _D_QK_DSV4 = 512
 _D_V = 512
+_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
 # ── FP8 FOOTER pack (DSV4) ───────────────────────────────────────────────────
@@ -163,27 +165,25 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
         else None
     )
 
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        torch.empty(1, dtype=torch.int8, device=device),
-        backend="sparse-sm120",
-        d_v=d_v,
-    )
+    workspace = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
     output = torch.zeros(
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
     sm_scale = d_qk**-0.5
-    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
     def fn():
-        wrapper.run_sparse_mla(
-            q,
-            kv_packed,
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=q.unsqueeze(1),
+            swa_kv_cache=kv_packed,
+            workspace_buffer=workspace,
             sparse_indices=indices,
-            out=output,
-            sm_scale=sm_scale,
+            compressed_kv_cache=kv_packed,
+            sparse_topk_lens=indices.new_full((num_tokens,), topk),
+            seq_lens=indices.new_full((num_tokens,), 128),
+            out=output.unsqueeze(1),
+            bmm1_scale=sm_scale,
             sinks=attn_sink,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
+            backend="auto",
         )
 
     # Warm + measure.
@@ -224,24 +224,6 @@ def _actual_extra_topk(topk_extra, extra_topk_length):
     if extra_topk_length is None:
         return topk_extra
     return min(max(extra_topk_length, 0), topk_extra)
-
-
-def _make_decode_scratch(num_tokens, num_heads, topk, d_v, device, extra_topk=0):
-    if num_tokens > 64:
-        return None, None
-    num_splits = (topk + 63) // 64 + (extra_topk + 63) // 64
-    return (
-        torch.empty(
-            (num_tokens, num_heads, num_splits, d_v),
-            dtype=torch.bfloat16,
-            device=device,
-        ),
-        torch.empty(
-            (num_tokens, num_heads, num_splits),
-            dtype=torch.float32,
-            device=device,
-        ),
-    )
 
 
 def bench_sparse_mla_sm120_dsv4_dual(
@@ -288,38 +270,28 @@ def bench_sparse_mla_sm120_dsv4_dual(
         if with_sink
         else None
     )
-    extra_topk_length_tensor = None
-    if extra_topk_length is not None:
-        extra_topk_length_tensor = torch.full(
-            (num_tokens,), extra_topk_length, device=device, dtype=torch.int32
-        )
-
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        torch.empty(1, dtype=torch.int8, device=device),
-        backend="sparse-sm120",
-        d_v=d_v,
-    )
+    workspace = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
     output = torch.zeros(
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
     sm_scale = d_qk**-0.5
-    mid_out, mid_lse = _make_decode_scratch(
-        num_tokens, num_heads, topk_main, d_v, device, extra_topk=topk_extra
-    )
 
     def fn():
-        wrapper.run_sparse_mla(
-            q,
-            kv_main,
-            sparse_indices=indices,
-            out=output,
-            sm_scale=sm_scale,
+        sparse_topk_lens = indices.new_full(
+            (num_tokens,), topk_main + _actual_extra_topk(topk_extra, extra_topk_length)
+        )
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=q.unsqueeze(1),
+            swa_kv_cache=kv_main,
+            workspace_buffer=workspace,
+            sparse_indices=torch.cat((indices, indices_extra), dim=-1).contiguous(),
+            compressed_kv_cache=kv_extra,
+            sparse_topk_lens=sparse_topk_lens,
+            seq_lens=indices.new_full((num_tokens,), topk_main),
+            out=output.unsqueeze(1),
+            bmm1_scale=sm_scale,
             sinks=attn_sink,
-            extra_kv_cache=kv_extra,
-            extra_sparse_indices=indices_extra,
-            extra_sparse_lengths=extra_topk_length_tensor,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
+            backend="auto",
         )
 
     fn()
@@ -373,27 +345,25 @@ def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0
         else None
     )
 
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        torch.empty(1, dtype=torch.int8, device=device),
-        backend="sparse-sm120",
-        d_v=d_v,
-    )
     output = torch.zeros(
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
     sm_scale = d_qk**-0.5
-    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+    runner = _SparseMLAPagedAttentionRunner(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        kv_scale_format="arbitrary_fp32",
+        device=device,
+    )
 
     def fn():
-        wrapper.run_sparse_mla(
+        runner.run(
             q,
             kv_packed,
-            sparse_indices=indices,
-            out=output,
-            sm_scale=sm_scale,
-            sinks=attn_sink,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
+            indices,
+            output,
+            sm_scale,
+            attn_sink=attn_sink,
         )
 
     fn()

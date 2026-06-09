@@ -26,16 +26,18 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Sparse-MLA paged attention implementation for SM120.
+"""Internal Sparse-MLA paged attention implementation for SM120.
 
 Auto-dispatches between decode (num_tokens <= 64) and prefill (larger). Both
 DSv3.2 (d_qk=576) and DSv4 (d_qk=512) decode go through dedicated warp-spec
 standalone kernels; prefill is dispatched through the shared orchestrator.
 
-The canonical user-facing sparse MLA entry point is
-``flashinfer.mla.BatchMLAPagedAttentionWrapper(..., backend="sparse-sm120")``.
-This module keeps the SM120 implementation hooks and a thin implementation
-wrapper for callers that need direct access.
+The user-facing sparse MLA entry points are
+``flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4`` for DeepSeek V4 and
+``flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(..., sparse_mla_top_k=...)``
+for the DSv3.2 / GLM sparse top-k path. This module keeps only the SM120
+implementation hooks used by those dispatchers and focused kernel
+tests/benchmarks.
 """
 
 from __future__ import annotations
@@ -59,7 +61,6 @@ from .autotuner import (
 from .jit.sparse_mla_sm120 import gen_sparse_mla_sm120_module
 from .trace.templates.attention import (
     sparse_mla_sm120_decode_dsv4_trace,
-    sparse_mla_sm120_paged_trace,
 )
 from .utils import (
     register_custom_op,
@@ -131,6 +132,8 @@ _MODEL_TYPE_DSV3_2 = 0
 _MODEL_TYPE_DSV4 = 1
 _MODEL_TYPE_GLM_NSA = 2
 _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
+_BPT_DSV3_2 = 656
+_BPT_DSV4 = 584
 
 
 def _require_d_v_512(d_v: int) -> None:
@@ -177,6 +180,55 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
             )
         return _MODEL_TYPE_DSV4
     raise ValueError(f"SM120 sparse-MLA supports d_qk=576 or d_qk=512, got d_qk={d_qk}")
+
+
+def _bytes_per_token_for_model_type(model_type: int) -> int:
+    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+        return _BPT_DSV3_2
+    if model_type == _MODEL_TYPE_DSV4:
+        return _BPT_DSV4
+    raise ValueError(f"Unsupported SM120 sparse-MLA model_type={model_type}")
+
+
+def _packed_kv_page_block_size(
+    kv_cache: torch.Tensor,
+    *,
+    model_type: int,
+    name: str,
+) -> int:
+    bytes_per_token = _bytes_per_token_for_model_type(model_type)
+    if kv_cache.ndim == 2:
+        block_bytes = int(kv_cache.shape[1])
+        if block_bytes % bytes_per_token != 0:
+            raise ValueError(
+                f"{name} 2-D block width {block_bytes} is not divisible by "
+                f"{bytes_per_token} bytes/token"
+            )
+        return block_bytes // bytes_per_token
+    if kv_cache.ndim == 3:
+        if kv_cache.shape[-1] != bytes_per_token:
+            raise ValueError(
+                f"{name} last dim must be {bytes_per_token}, got "
+                f"{kv_cache.shape[-1]}"
+            )
+        return int(kv_cache.shape[1])
+    if kv_cache.ndim == 4:
+        if kv_cache.shape[-1] != bytes_per_token:
+            raise ValueError(
+                f"{name} last dim must be {bytes_per_token}, got "
+                f"{kv_cache.shape[-1]}"
+            )
+        if kv_cache.shape[1] == 1:
+            # HND: [num_pages, 1, page_block_size, bytes_per_token].
+            return int(kv_cache.shape[2])
+        if kv_cache.shape[2] == 1:
+            # NHD: [num_pages, page_block_size, 1, bytes_per_token].
+            return int(kv_cache.shape[1])
+        raise ValueError(
+            f"{name} must have a singleton KV-head axis in dim 1 (HND) or "
+            f"dim 2 (NHD), got shape {tuple(kv_cache.shape)}"
+        )
+    raise ValueError(f"{name} must have ndim 2, 3, or 4, got {kv_cache.ndim}")
 
 
 def _decode_dsv3_2_dispatchable(
@@ -279,8 +331,9 @@ def get_sparse_mla_sm120_module():
         _require_d_v_512(d_v)
         _check_last_dim_512(output, "output")
 
-        # kv_cache layout: [num_blocks, page_block_size, 1, bytes_per_token].
-        kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
+        kv_pbs = _packed_kv_page_block_size(
+            kv_cache, model_type=model_type, name="kv_cache"
+        )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         topk_length = _clamp_topk_length(topk_length, topk)
         extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
@@ -363,8 +416,7 @@ def get_sparse_mla_sm120_module():
 
 
 @supported_compute_capability([120, 121])
-@flashinfer_api(trace=sparse_mla_sm120_paged_trace)
-def sparse_mla_sm120_paged_attention(
+def _sparse_mla_sm120_paged_attention(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
@@ -382,7 +434,7 @@ def sparse_mla_sm120_paged_attention(
     mid_out: Optional[torch.Tensor] = None,
     mid_lse: Optional[torch.Tensor] = None,
 ) -> None:
-    r"""Sparse-MLA paged attention on SM120.
+    r"""Internal Sparse-MLA paged attention on SM120.
 
     Auto-dispatches decode (``num_tokens <= 64``) vs prefill (larger).
     Mutates ``output`` and ``out_lse`` in place.
@@ -394,8 +446,12 @@ def sparse_mla_sm120_paged_attention(
         ``d_qk=576`` uses the V32-family inline-scale cache and
         ``d_qk=512`` uses the DSv4 footer-scale cache.
     kv_cache : torch.Tensor
-        Paged main KV cache, shape ``[num_blocks, page_block_size, 1, bytes]``
-        with byte-packed FP8 inner dim.
+        Byte-packed paged main KV cache. Accepted forms are 3D
+        ``[num_blocks, page_block_size, bytes]``, HND
+        ``[num_blocks, 1, page_block_size, bytes]``, or NHD
+        ``[num_blocks, page_block_size, 1, bytes]``. The SM120 binding derives
+        page size and block stride from the tensor metadata without
+        materializing a layout conversion.
     indices : torch.Tensor
         Paged slot IDs per query token, shape ``[num_tokens, topk]`` or
         ``[num_tokens, 1, topk]``, dtype int32. ``-1`` marks invalid /
@@ -471,8 +527,8 @@ def sparse_mla_sm120_paged_attention(
     )
 
 
-class BatchSparseMLAPagedAttentionWrapper:
-    """Sparse-MLA paged attention implementation wrapper for SM120.
+class _SparseMLAPagedAttentionRunner:
+    """Sparse-MLA paged attention implementation runner for SM120.
 
     ``max_num_tokens`` and ``max_num_heads`` are optional upper bounds. When
     both are provided, the wrapper pre-allocates its LSE buffer. Otherwise, the
@@ -499,12 +555,11 @@ class BatchSparseMLAPagedAttentionWrapper:
 
     Example
     -------
-    >>> wrapper = BatchSparseMLAPagedAttentionWrapper()
-    >>> wrapper.run(q, kv_cache, indices, output, sm_scale=...)
+    >>> runner = _SparseMLAPagedAttentionRunner()
+    >>> runner.run(q, kv_cache, indices, output, sm_scale=...)
     """
 
     @supported_compute_capability([120, 121])
-    @flashinfer_api
     def __init__(
         self,
         max_num_tokens: Optional[int] = None,
@@ -608,9 +663,7 @@ class BatchSparseMLAPagedAttentionWrapper:
         )
         return mid_out, mid_lse
 
-    # Trace fires on the inner sparse_mla_sm120_paged_attention call;
-    # wrapper.run owns out_lse internally so no separate template is needed.
-    @flashinfer_api
+    # The runner owns out_lse internally so no separate template is needed.
     def run(
         self,
         q: torch.Tensor,
@@ -671,7 +724,7 @@ class BatchSparseMLAPagedAttentionWrapper:
         )
 
         out_lse_view = self._get_out_lse(num_tokens, num_heads, out_lse)
-        sparse_mla_sm120_paged_attention(
+        _sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
             indices,
@@ -997,7 +1050,7 @@ def _decode_dsv4_default_cache_path():
     """Default disk path for the decode-dsv4 AutoTuner cache.
 
     Override via ``FLASHINFER_AUTOTUNE_DIR`` env var or pass an explicit
-    path to :func:`sparse_mla_sm120_decode_dsv4_autotune`.
+    path to the generic :func:`flashinfer.autotune` context.
     """
     import pathlib
 
@@ -1060,63 +1113,6 @@ def _decode_dsv4_maybe_load_cache() -> None:
     except Exception:
         # Keep mtime unchanged so the next cold call retries.
         pass
-
-
-def sparse_mla_sm120_decode_dsv3_2_autotune(cache_path: Optional[str] = None):
-    """Context manager that opens an autotuning session for decode-dsv3_2.
-
-    The tuned tactic is ``chunks_per_block`` for the DSv3.2 / GLM-NSA decode
-    split-K kernel. If ``cache_path`` is ``None``, uses
-    ``$FLASHINFER_WORKSPACE_DIR/autotune/sparse_mla_sm120_decode_dsv3_2.json``.
-    """
-    import pathlib
-
-    from .autotuner import autotune
-
-    if cache_path is None:
-        path = _decode_dsv3_2_default_cache_path()
-    else:
-        path = pathlib.Path(cache_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return autotune(True, cache=str(path))
-
-
-def sparse_mla_sm120_decode_dsv4_autotune(cache_path: Optional[str] = None):
-    """Context manager that opens an autotuning session for decode-dsv4 with
-    persistent disk caching.
-
-    Usage::
-
-        with sparse_mla_sm120_decode_dsv4_autotune():
-            # First call on each (T_bucket, h, k) shape profiles all cpb
-            # tactics and caches the best. Subsequent calls (in this session
-            # OR a future fresh process) hit the cache.
-            for T in (1, 4, 16, 32):
-                sparse_mla_sm120_decode_dsv4(q[:T], ...)
-
-    On exit, the cache is saved to disk at
-    :func:`_decode_dsv4_default_cache_path` (or ``cache_path`` if supplied).
-
-    For one-off tuning without a session (e.g. when warming up at server
-    startup), simply call this once and let the context manager handle
-    load/save.
-
-    Parameters
-    ----------
-    cache_path : Optional[str]
-        Override the default disk cache location. If ``None``, uses
-        ``$FLASHINFER_WORKSPACE_DIR/autotune/sparse_mla_sm120_decode_dsv4.json``.
-    """
-    import pathlib
-
-    from .autotuner import autotune
-
-    if cache_path is None:
-        path = _decode_dsv4_default_cache_path()
-    else:
-        path = pathlib.Path(cache_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return autotune(True, cache=str(path))
 
 
 @supported_compute_capability([120, 121])

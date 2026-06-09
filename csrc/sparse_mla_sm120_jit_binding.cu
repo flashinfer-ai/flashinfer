@@ -40,6 +40,47 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
                                      const float* attn_sink, int chunks_per_block_override,
                                      float sm_scale, size_t stride_kv_block, cudaStream_t stream);
 
+namespace {
+
+struct PagedKVLayout {
+  int page_block_size;
+  size_t stride_kv_block;
+};
+
+inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const char* name) {
+  const size_t elem_bytes = static_cast<size_t>(kv.dtype().bits / 8);
+  if (kv.ndim() == 2) {
+    const size_t block_bytes = static_cast<size_t>(kv.size(1)) * elem_bytes;
+    TVM_FFI_ICHECK_EQ(block_bytes % static_cast<size_t>(bpt), 0)
+        << name << " 2D block width " << block_bytes
+        << " is not divisible by bytes_per_token=" << bpt;
+    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_bytes};
+  }
+  if (kv.ndim() == 3) {
+    TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
+        << name << " 3D form must be [num_pages, page_block_size, " << bpt << "]";
+    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+  }
+  TVM_FFI_ICHECK_EQ(kv.ndim(), 4)
+      << name << " must be 2D [num_pages, page_bytes], 3D "
+      << "[num_pages, page_block_size, bytes_per_token], HND "
+      << "[num_pages, 1, page_block_size, bytes_per_token], or NHD "
+      << "[num_pages, page_block_size, 1, bytes_per_token]";
+  TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
+      << name << " last dim must be bytes_per_token=" << bpt << ", got " << kv.size(-1);
+  if (kv.size(1) == 1) {
+    return {static_cast<int>(kv.size(2)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+  }
+  if (kv.size(2) == 1) {
+    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+  }
+  TVM_FFI_ICHECK(false) << name << " 4D form must have singleton KV-head axis at dim 1 "
+                        << "(HND) or dim 2 (NHD)";
+  return {0, 0};
+}
+
+}  // namespace
+
 // Thin TVM-FFI wrapper for the decode-dsv4 standalone path. The caller passes
 // already-sized scratch tensors mid_out + mid_lse plus the output and lse.
 // Currently only handles DSV4 h=128 topk=512 pbs=64.
@@ -52,8 +93,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                               Optional<TensorView> extra_topk_length,
                               int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
-  TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2) << "kv_cache must be 2D [num_blocks, page_bytes] or 4D "
-                                           "[num_blocks, page_block_size, 1, bpt]";
+  TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2);
   // indices may be 2D [T, topk] or 3D [T, s_q=1, topk] (some callers keep
   // the s_q singleton dim through the call stack). The kernel walks
   // `indices + t_idx * stride_per_t`, where stride is captured below from
@@ -74,24 +114,9 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   TVM_FFI_ICHECK_EQ(static_cast<int>(mt), static_cast<int>(ModelType::DSV4))
       << "decode-dsv4 currently DSV4-only";
 
-  // kv_cache may be:
-  //   2D: [num_blocks, page_bytes]              — flat layout
-  //   4D: [num_blocks, page_block_size, 1, bpt] — paged layout (may pad
-  //       the block stride for alignment)
-  // For 4D the block stride in bytes = product of dims[1..ndim-1] when
-  // strictly contiguous; with padding it may exceed the natural row size.
-  // Use stride(0) to capture the true block stride.
-  size_t stride_kv_block;
-  if (kv_cache.ndim() == 2) {
-    stride_kv_block = static_cast<size_t>(kv_cache.size(1));
-  } else {
-    // stride(0) reports elements; convert to bytes via the dtype size.
-    // For uint8 (1B element) this is identical numerically.
-    stride_kv_block = static_cast<size_t>(kv_cache.stride(0));
-  }
-  // decode-dsv4 only supports page_block_size=64 (DSv4 layout). The
-  // dispatcher rejects any other value.
-  constexpr int page_block_size = 64;
+  constexpr int BPT_DSV4 = 584;
+  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, BPT_DSV4, "kv_cache");
+  const int page_block_size = kv_layout.page_block_size;
 
   const int* topk_len_ptr =
       topk_length.has_value() ? static_cast<const int*>(topk_length.value().data_ptr()) : nullptr;
@@ -106,9 +131,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   const int* extra_topk_len_ptr =
       extra_topk_length.has_value() ? static_cast<const int*>(extra_topk_length.value().data_ptr())
                                     : nullptr;
-  // extra_topk and stride_extra_kv_block derived from the optional tensors.
-  // pbs_extra: 4D form gives it directly from dim -3; 2D form infers it
-  // from the total row width / BPT_DSV4 (= 584).
+  // extra_topk and stride_extra_kv_block are derived from the optional tensors.
   int extra_topk_arg = 0;
   int pbs_extra_arg = 0;
   size_t stride_extra_kv_block = 0;
@@ -116,16 +139,10 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
     TVM_FFI_ICHECK(extra_indices.has_value()) << "extra_kv_cache requires extra_indices";
     const auto& ekv = extra_kv_cache.value();
     extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
-    if (ekv.ndim() >= 3) {
-      pbs_extra_arg = static_cast<int>(ekv.size(-3));
-      // Use stride(0) to capture true block stride including any padding.
-      stride_extra_kv_block = static_cast<size_t>(ekv.stride(0));
-    } else {
-      // 2D fallback: assume DSV4 bpt = 584. Infer pbs from row width.
-      constexpr int BPT_DSV4 = 584;
-      stride_extra_kv_block = static_cast<size_t>(ekv.size(1));
-      pbs_extra_arg = static_cast<int>(stride_extra_kv_block / BPT_DSV4);
-    }
+    const PagedKVLayout extra_layout =
+        parse_paged_kv_layout(ekv, BPT_DSV4, "extra_kv_cache");
+    pbs_extra_arg = extra_layout.page_block_size;
+    stride_extra_kv_block = extra_layout.stride_kv_block;
   }
 
   cudaStream_t stream = get_stream(q.device());
@@ -136,8 +153,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),
       static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr, extra_kv_ptr,
       extra_indices_ptr, extra_topk_len_ptr, extra_topk_arg, pbs_extra_arg, stride_extra_kv_block,
-      static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale), stride_kv_block,
-      stream);
+      static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
+      kv_layout.stride_kv_block, stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv4 launch failed (unsupported shape or kernel error)";
 }
 
@@ -151,8 +168,7 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
                                 Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
                                 int64_t model_type, int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
-  TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2) << "kv_cache must be 2D [num_blocks, page_bytes] or 4D "
-                                           "[num_blocks, page_block_size, 1, bpt]";
+  TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2);
   TVM_FFI_ICHECK_GE(indices.ndim(), 2);
   if (indices.ndim() == 3) {
     TVM_FFI_ICHECK_EQ(indices.size(1), 1)
@@ -168,13 +184,9 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
   TVM_FFI_ICHECK(mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA)
       << "decode-dsv3_2 expects model_type DSV3_2 or GLM_NSA; got " << model_type;
 
-  // kv_cache: 2D [num_blocks, page_bytes] or 4D [num_blocks, pbs, 1, bpt].
-  size_t stride_kv_block;
-  if (kv_cache.ndim() == 2) {
-    stride_kv_block = static_cast<size_t>(kv_cache.size(1));
-  } else {
-    stride_kv_block = static_cast<size_t>(kv_cache.stride(0));
-  }
+  constexpr int BPT_DSV3_2 = 656;
+  const PagedKVLayout kv_layout =
+      parse_paged_kv_layout(kv_cache, BPT_DSV3_2, "kv_cache");
 
   const int* topk_len_ptr =
       topk_length.has_value() ? static_cast<const int*>(topk_length.value().data_ptr()) : nullptr;
@@ -188,8 +200,8 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
       static_cast<const int32_t*>(indices.data_ptr()), static_cast<bf16*>(mid_out.data_ptr()),
       static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),
       static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr,
-      static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale), stride_kv_block,
-      stream);
+      static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
+      kv_layout.stride_kv_block, stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv3_2 launch failed (unsupported shape or kernel error)";
 }
 

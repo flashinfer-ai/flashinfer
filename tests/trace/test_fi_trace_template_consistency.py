@@ -388,12 +388,8 @@ _E2E_SKIP = {
     "moe_fp4_block_scale_llama4_routing",
     "moe_fp4_block_scale_renormalize_naive_routing",
     "moe_fp4_block_scale_topk_routing",
-    # Sparse-MLA SM120 paged: extra_kv_cache / extra_indices are optional inputs
-    # and their axes (extra_topk, extra_page_block_size) can't be resolved when
-    # the auto-call exercises the single-cache path.
-    "sparse_mla_sm120_paged",
-    # Same optional dual-cache axes as sparse_mla_sm120_paged; covered by
-    # targeted single-cache and dual-cache tests below.
+    # Optional dual-cache axes are covered by targeted single-cache and
+    # dual-cache tests below.
     "sparse_mla_sm120_decode_dsv4",
 }
 
@@ -427,39 +423,6 @@ def test_fi_trace_complete_gqa_paged_decode():
     assert defn["axes"]["page_size"]["value"] == P
     # Optional plan-phase inputs (kv_indptr, kv_indices, sm_scale) may have "unknown" dtype
     # when not passed to run(); only check non-optional inputs.
-    non_optional_unknown = [
-        k
-        for k, v in defn["inputs"].items()
-        if isinstance(v, dict)
-        and v.get("dtype") == "unknown"
-        and not v.get("optional", False)
-    ]
-    assert not non_optional_unknown, (
-        f"Non-optional inputs with unknown dtype: {non_optional_unknown}"
-    )
-    assert "unknown" not in str(defn["outputs"])
-
-
-def test_fi_trace_complete_sparse_mla_sm120_paged_single_cache():
-    """Sparse-MLA SM120 paged: single-cache trace resolves required axes/dtypes."""
-    from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_paged_attention
-
-    T, H, DQK, DV, TOPK, P, NP, KVB = 4, 32, 512, 512, 512, 64, 8, 584
-    defn = sparse_mla_sm120_paged_attention.fi_trace(
-        q=torch.zeros(T, H, DQK, dtype=torch.bfloat16),
-        kv_cache=torch.zeros(NP, P, 1, KVB, dtype=torch.uint8),
-        indices=torch.zeros(T, TOPK, dtype=torch.int32),
-        output=torch.zeros(T, H, DV, dtype=torch.bfloat16),
-        out_lse=torch.zeros(T, H, dtype=torch.float32),
-        sm_scale=1.0,
-        d_v=DV,
-    )
-    assert defn["axes"]["num_heads"]["value"] == H
-    assert defn["axes"]["head_dim_qk"]["value"] == DQK
-    assert defn["axes"]["head_dim_v"]["value"] == DV
-    assert defn["axes"]["topk"]["value"] == TOPK
-    assert defn["axes"]["page_block_size"]["value"] == P
-    assert defn["axes"]["kv_bytes_per_token"]["value"] == KVB
     non_optional_unknown = [
         k
         for k, v in defn["inputs"].items()
