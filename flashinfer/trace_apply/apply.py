@@ -346,7 +346,7 @@ def _resolve_name(
             "Trace Apply: applying solution for definition %r on %s (dps=%s).",
             name,
             fi_api,
-            entry[2],
+            entry[1],
         )
     return entry
 
