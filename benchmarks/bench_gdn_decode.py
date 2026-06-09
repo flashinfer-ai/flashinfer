@@ -1848,6 +1848,7 @@ def gdn_decode_bf16_state_wrapper(
     softplus_threshold: float = 20.0,
     intermediate_states_buffer=None,
     accepted_steps=None,
+    ssm_state_indices=None,
     disable_state_update: bool = False,
     disable_output: bool = False,
     recovery_steps: int = 0,
@@ -1901,6 +1902,7 @@ def gdn_decode_bf16_state_wrapper(
             output_state_indices=output_state_indices,
             intermediate_states_buffer=intermediate_states_buffer,
             accepted_steps=accepted_steps,
+            ssm_state_indices=ssm_state_indices,
             disable_state_update=disable_state_update,
             disable_output=disable_output,
             recovery_steps=recovery_steps,
@@ -2263,6 +2265,7 @@ def bench_gdn_decode_bf16_state(
     pool_mode: str = "single",
     accepted_steps_mode: str = "none",
     accepted_steps_target_ar: float = -1.0,
+    ssm_state_indices_mode: str = "none",
 ):
     """Benchmark BF16 state kernel.
 
@@ -2280,6 +2283,18 @@ def bench_gdn_decode_bf16_state(
     assert pool_mode in ("single", "split"), (
         f"BF16 state path supports pool_mode in {{single, split}}, got {pool_mode}"
     )
+    assert ssm_state_indices_mode in ("none", "unique"), (
+        f"ssm_state_indices_mode must be 'none' or 'unique', got "
+        f"{ssm_state_indices_mode!r}"
+    )
+    # FLA-style per-token scatter requires T >= 2 (asserted by the wrapper)
+    # and is mutex with cache_intermediate_states.
+    fla_scatter = ssm_state_indices_mode != "none"
+    if fla_scatter:
+        assert seq_len >= 2, f"--ssm-state-indices requires seq_len>=2, got T={seq_len}"
+        assert not cache_intermediate_states, (
+            "--ssm-state-indices is mutex with --cache (no intermediate buffer)"
+        )
 
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
@@ -2297,8 +2312,11 @@ def bench_gdn_decode_bf16_state(
     b = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
 
     # Pool sized for the indexing mode: split needs 2B slots so write slots
-    # are distinct from read slots.
-    pool_size = 2 * batch_size if pool_mode == "split" else batch_size
+    # are distinct from read slots. FLA scatter needs an extra B*T slots for
+    # the per-token scatter destinations.
+    base_pool_size = 2 * batch_size if pool_mode == "split" else batch_size
+    fla_extra_slots = batch_size * T if fla_scatter else 0
+    pool_size = base_pool_size + fla_extra_slots
     state = torch.randn(
         pool_size,
         num_sab_heads,
@@ -2338,6 +2356,17 @@ def bench_gdn_decode_bf16_state(
         )
     else:
         output_state_indices = None
+
+    # FLA-style scatter destinations: B*T fresh slots at the tail of the pool.
+    # Layout: [h0_slots 0..B][split-pool out slots if any][FLA per-token slots]
+    ssm_state_indices_tensor = None
+    if fla_scatter:
+        ssm_state_indices_tensor = torch.arange(
+            base_pool_size,
+            base_pool_size + batch_size * T,
+            dtype=torch.int32,
+            device="cuda",
+        ).reshape(batch_size, T)
 
     # Build accepted_steps tensor based on mode. None means uniform-T (legacy
     # path, no per-request K support compiled in).
@@ -2426,6 +2455,7 @@ def bench_gdn_decode_bf16_state(
             use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
             accepted_steps=accepted_steps_tensor,
+            ssm_state_indices=ssm_state_indices_tensor,
             disable_state_update=disable_state_update,
             disable_output=disable_output,
             recovery_steps=recovery_steps,
@@ -2488,6 +2518,7 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
     pool_mode = getattr(args, "pool_mode", "single")
     accepted_steps_mode = getattr(args, "accepted_steps_mode", "none")
     accepted_steps_target_ar = getattr(args, "accepted_steps_target_ar", -1.0)
+    ssm_state_indices_mode = getattr(args, "ssm_state_indices", "none")
 
     print("\n" + "=" * 100)
     print(f"BF16 State GDN Benchmark (T={valid_seq_lens})")
@@ -2500,7 +2531,8 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
         f"output={'OFF' if disable_output else 'ON'}, "
         f"recovery_steps={recovery_steps}, "
         f"pool_mode={pool_mode}, "
-        f"accepted_steps={accepted_steps_mode}"
+        f"accepted_steps={accepted_steps_mode}, "
+        f"ssm_state_indices={ssm_state_indices_mode}"
     )
     print("=" * 100)
     print()
@@ -2529,6 +2561,7 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
                     pool_mode=pool_mode,
                     accepted_steps_mode=accepted_steps_mode,
                     accepted_steps_target_ar=accepted_steps_target_ar,
+                    ssm_state_indices_mode=ssm_state_indices_mode,
                 )
                 all_results.append(result)
 
@@ -2980,6 +3013,19 @@ Examples:
             "'split': allocate a pool of size 2*B; reads from slots [0..B), "
             "writes to slots [B..2B), exercising the split-pool dispatch "
             "(speculative-decoding / MTP-verify shape)."
+        ),
+    )
+    parser.add_argument(
+        "--ssm-state-indices",
+        choices=("none", "unique"),
+        default="none",
+        help=(
+            "FLA-style per-token pool scatter. 'none' (default): legacy "
+            "behavior (dense intermediate buffer or none). 'unique': "
+            "allocate B*T extra pool slots and pass ssm_state_indices=[B,T] "
+            "int32 to the kernel, so each h_{t+1} writes directly to "
+            "pool[ssm_state_indices[i, t]] (matches FLA's Triton API). "
+            "Requires T>=2 and is mutex with --cache."
         ),
     )
     parser.add_argument(
