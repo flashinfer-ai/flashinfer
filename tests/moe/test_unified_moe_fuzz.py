@@ -66,7 +66,7 @@ comparison adds no pass/fail power, only redundancy. See the design discussion.)
 Coverage today: NVFP4 (CuteDSL + TRTLLM-FP4-routed) on SM100 -- the only wired MVP runners.
 Run (SM100 required for the MVP backends; JIT needs CUDA_HOME):
   CUDA_HOME=<cuda> PYTHONPATH=<this-worktree> CUDA_VISIBLE_DEVICES=<sm100-idx> \
-    pytest --forked tests/moe/test_unified_moe_api_fuzz.py
+    pytest --forked tests/moe/test_unified_moe_fuzz.py
 Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0).
 
 ------------------------------------------------------------------------------------------------
@@ -474,7 +474,7 @@ def _is_unsupported(e):
 
 
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
-def test_unified_moe_api_fuzz(cfg):
+def test_unified_moe_fuzz(cfg):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
     # Full per-config determinism so any failure reproduces from the seed in the test id alone.

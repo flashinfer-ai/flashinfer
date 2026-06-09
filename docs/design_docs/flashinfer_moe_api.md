@@ -830,7 +830,7 @@ Repro: `benchmarks/flashinfer_benchmark.py --routine {trtllm_fp4_block_scale_moe
 
 ### Test Harness — Forward-Compatible Fuzzer (PR #6, merged 2026-06-09)
 
-`tests/moe/test_unified_moe_api_fuzz.py` (merged from `aleozlx/flashinfer#6`,
+`tests/moe/test_unified_moe_fuzz.py` (merged from `aleozlx/flashinfer#6`,
 branch `yanxu/unified-moe-api-fuzzer`) drives the **real user-facing surface** —
 one `MoEConfig` → `XxxConfig.prepare_weights(w1_bf16, w2_bf16, …)` →
 `MoELayer`'s per-backend runners — so the production dispatch + the `prepare.py`
