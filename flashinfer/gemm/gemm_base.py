@@ -7193,6 +7193,20 @@ def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) ->
         )
 
 
+def _check_scale_major_mode_mxfp8(scale_major_mode: str) -> None:
+    """Validate ``scale_major_mode`` for the MXFP8 cute SM120 GEMM entries.
+
+    The kernel only consumes per-row INT32-packed UE8M0 scales in MN-major
+    TMA-aligned layout. Future K-major support would require kernel changes;
+    until then any value other than ``"MN"`` is rejected.
+    """
+    if scale_major_mode != "MN":
+        raise ValueError(
+            f'scale_major_mode must be "MN" (kernel currently only supports the '
+            f'per-row MN-major TMA-aligned UE8M0 scale layout); got "{scale_major_mode}"'
+        )
+
+
 @supported_compute_capability([120, 121])
 @flashinfer_api
 def quantize_mxfp8_for_zero_padding(
@@ -7273,6 +7287,7 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
     b_scale: torch.Tensor,
     m_indptr: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
+    scale_major_mode: Literal["MN"] = "MN",
     backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -7344,6 +7359,7 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
       before invoking this function (one scale per N-row).
     """
     _check_scale_granularity_mnk(scale_granularity_mnk)
+    _check_scale_major_mode_mxfp8(scale_major_mode)
     _check_m_indptr(m_indptr, token_num=a.shape[0])
     if backend != "cute":
         raise NotImplementedError(
@@ -7368,7 +7384,7 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
         b_scale,
         m_indptr,
         out,
-        "MN",
+        scale_major_mode,
         scale_granularity_mnk[0],
         scale_granularity_mnk[1],
         scale_granularity_mnk[2],
@@ -7385,6 +7401,7 @@ def group_gemm_mxfp8_nt_groupwise(
     b_scale: torch.Tensor,
     m_indices: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
+    scale_major_mode: Literal["MN"] = "MN",
     use_psum_layout: bool = False,
     backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
@@ -7444,6 +7461,7 @@ def group_gemm_mxfp8_nt_groupwise(
         The output tensor, shape ``(m, n)``.
     """
     _check_scale_granularity_mnk(scale_granularity_mnk)
+    _check_scale_major_mode_mxfp8(scale_major_mode)
     if backend != "cute":
         raise NotImplementedError(
             f'Only backend="cute" is currently implemented; got backend="{backend}"'
@@ -7485,6 +7503,7 @@ def group_gemm_mxfp8_nt_groupwise_masked(
     b_scale: torch.Tensor,
     masked_m: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
+    scale_major_mode: Literal["MN"] = "MN",
     backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -7536,6 +7555,7 @@ def group_gemm_mxfp8_nt_groupwise_masked(
         ``masked_m[i]`` rows per expert are valid.
     """
     _check_scale_granularity_mnk(scale_granularity_mnk)
+    _check_scale_major_mode_mxfp8(scale_major_mode)
     if backend != "cute":
         raise NotImplementedError(
             f'Only backend="cute" is currently implemented; got backend="{backend}"'
@@ -7575,6 +7595,7 @@ def gemm_mxfp8_nt_groupwise(
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
+    scale_major_mode: Literal["MN"] = "MN",
     backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -7614,6 +7635,7 @@ def gemm_mxfp8_nt_groupwise(
         Output tensor, shape ``(m, n)``.
     """
     _check_scale_granularity_mnk(scale_granularity_mnk)
+    _check_scale_major_mode_mxfp8(scale_major_mode)
     if backend != "cute":
         raise NotImplementedError(
             f'Only backend="cute" is currently implemented; got backend="{backend}"'
@@ -7652,6 +7674,7 @@ def batch_gemm_mxfp8_nt_groupwise(
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
+    scale_major_mode: Literal["MN"] = "MN",
     lda: Optional[int] = None,
     stride_a: Optional[int] = None,
     ldb: Optional[int] = None,
@@ -7705,6 +7728,7 @@ def batch_gemm_mxfp8_nt_groupwise(
         Output tensor, shape ``(num_groups, m, n)``.
     """
     _check_scale_granularity_mnk(scale_granularity_mnk)
+    _check_scale_major_mode_mxfp8(scale_major_mode)
     if backend != "cute":
         raise NotImplementedError(
             f'Only backend="cute" is currently implemented; got backend="{backend}"'
