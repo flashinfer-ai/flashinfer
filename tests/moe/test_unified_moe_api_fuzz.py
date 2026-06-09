@@ -43,8 +43,21 @@ Verification model (single mode, uniform -- every config that runs gets the same
   5. **autotune-tactic sweep.** EVERY valid tactic (``get_valid_tactics``), not just the default,
      must match the reference -- the autotuner-picks-a-corrupting-tactic class (#3168/#3227) on the
      real ``MoELayer`` dispatch, since the autotuner enumerates these same tactics in production.
-  6. **device-state probe** after each config: a context-corrupting IMA surfaces as a failed
+  6. **autotune-ON, real production path** (gated to a config subset for cost): drive
+     ``with autotune(True): layer(...)`` so ``MoELayer._select_winner`` *profiles* every tactic of
+     every runner (the #3168 profiling-IMA / #2749 profiling-crash class -- distinct from #5, which
+     replays tactics outside the tuner) then selects + caches a winner; the autotuned output must
+     still match the authoritative reference. Skipped when a candidate has a known failure (the
+     tuner could legitimately pick the broken backend).
+  7. **device-state probe** after each config: a context-corrupting IMA surfaces as a failed
      alloc/launch or non-finite probe, turning silent corruption into a clean failure.
+
+A sibling SCENARIO test ``test_autotune_cache_coherence`` covers the one autotune surface this
+per-config fuzz structurally can't: the cross-call **winner cache**. It drives ONE persistent
+``MoELayer`` through a token-count *sequence* (incl bucket boundaries 4095/4096/4097) under
+``autotune(True)`` -- filling the per-bucket cache, crossing shapes, then re-running earlier counts
+to force cache hits -- asserting each output stays correct, so a stale / mis-keyed cached winner
+reused for a different shape is caught (the #2933-adjacent class).
 
 (Cross-backend agreement is intentionally NOT a check: with an authoritative tight reference, a
 deviating backend is caught by #2 directly, and #2 also names which backend -- so a cross-backend
@@ -67,6 +80,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import fp4_quantize
 from flashinfer.fused_moe import MoEActivationPack, MoELayer, MoEWeightPack
 from flashinfer.fused_moe.api import (
@@ -554,10 +568,127 @@ def test_unified_moe_api_fuzz(cfg):
     if n_ran == 0:
         pytest.skip(f"no runner ran {cfg.label} on SM{sm}")
 
-    # (6) device-state probe: a context-corrupting IMA in any backend above would surface here as a
+    # (6) autotune-ON: drive the REAL production path -- MoELayer._select_winner profiles every
+    # tactic of every runner (the #3168 profiling-IMA class) then selects + caches a winner; the
+    # autotuned output must match the authoritative reference. Gated to a subset (profiling is slow)
+    # and skipped if a candidate has a known failure (the tuner could pick the broken backend).
+    autotune_due = cfg.seed % 4 == 0 and not any(
+        _known_failure(_BACKEND_RUNNERS[B].backend_key, cfg) for B in wired_backends
+    )
+    if autotune_due:
+        with autotune(True):
+            a_out = layer(act_pack, weight_pack)
+        a_out = (a_out[0] if isinstance(a_out, (list, tuple)) else a_out).float()
+        torch.cuda.synchronize()
+        assert_correct(
+            a_out, f"{cfg.label} [autotune-ON winner={layer.winner_backend}]"
+        )
+
+    # (7) device-state probe: a context-corrupting IMA in any backend above would surface here as a
     # failed alloc/launch or a non-finite probe, turning a silent corruption into a clean failure.
     probe = torch.randn(2048, device="cuda") * 2.0
     torch.cuda.synchronize()
     assert torch.isfinite(probe).all(), (
         f"{cfg.label}: CUDA context corrupted after MoE run"
     )
+
+
+# ---------------------------------------------------------------------------
+# Sibling SCENARIO test (not per-config-stateless): the autotune CACHE is cross-call state, which
+# the fuzz test (fresh MoELayer per config) structurally can't reach. So drive ONE persistent layer
+# through a token-count SEQUENCE under autotune -- fill the per-bucket winner cache, cross shapes,
+# and re-run earlier counts to force cache hits. A stale / mis-keyed cached winner reused for a
+# different shape would produce a wrong answer here. (Shares the harness's snap/reference/prep.)
+# ---------------------------------------------------------------------------
+_CACHE_BASES = [
+    (32, 1024, 512),
+    (128, 512, 512),
+]  # (experts, hidden, intermediate), non-EP
+_CACHE_TOKEN_SEQ = [
+    16,
+    256,
+    4095,
+    4096,
+    4097,
+    256,
+    16,
+]  # buckets + boundaries + cache-hit re-runs
+
+
+@pytest.mark.parametrize(
+    "base", _CACHE_BASES, ids=[f"e{e}h{h}i{i}" for e, h, i in _CACHE_BASES]
+)
+def test_autotune_cache_coherence(base):
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+    sm = get_compute_capability(torch.device("cuda:0"))
+    sm = sm[0] * 10 + sm[1]
+    handler = _DTYPE[QuantVariant.NVFP4]
+    dev = torch.device("cuda")
+    wired = [
+        B
+        for B in handler.candidate_configs
+        if B in _BACKEND_RUNNERS and B.supported(sm)
+    ]
+    if not wired:
+        pytest.skip(f"no wired backend on SM{sm}")
+
+    E, H, I = base
+    top_k = 4
+    g = torch.Generator(device="cuda").manual_seed(12345)
+
+    def sparse(*shape):
+        dense = torch.randn(*shape, device="cuda", generator=g)
+        return handler.snap(
+            dense * (torch.rand(shape, device="cuda", generator=g) >= 0.75)
+        )
+
+    # Fixed weights + ONE layer instance; the cache lives across the whole sequence.
+    w1, w2 = sparse(E, 2 * I, H), sparse(E, H, I)
+    weight_pack = MoEWeightPack()
+    for B in wired:
+        weight_pack.prepare_for(
+            _BACKEND_RUNNERS[B].backend_key,
+            B.prepare_weights(
+                w1,
+                w2,
+                num_local_experts=E,
+                hidden_size=H,
+                intermediate_size=I,
+                device=dev,
+            ),
+        )
+    layer = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(num_experts=E, top_k=top_k),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
+            activation=ActivationConfig(),
+            backend=BackendOptions(candidates=tuple(B() for B in wired)),
+            execution=ExecutionConfig(tune_max_num_tokens=max(_CACHE_TOKEN_SEQ)),
+        )
+    )
+
+    with autotune(
+        True
+    ):  # fill the per-bucket cache on first sight; hit it on the re-runs
+        for num_tokens in _CACHE_TOKEN_SEQ:
+            x = sparse(num_tokens, H)
+            w = F.softmax(torch.randn(num_tokens, E, device="cuda", generator=g), dim=1)
+            w, sel = torch.topk(w, top_k, dim=-1)
+            final = (w / w.sum(dim=-1, keepdim=True)).float()
+            sel = sel.to(torch.int32)
+            act = handler.make_act_pack(x, sel, final)
+            ref = handler.reference(x, w1, w2, sel, final, I, 0)
+            out = layer(act, weight_pack)
+            out = (out[0] if isinstance(out, (list, tuple)) else out).float()
+            torch.cuda.synchronize()
+            tag = f"cache-seq T={num_tokens} (winner={layer.winner_backend}) {base}"
+            n_bad = int(((~torch.isfinite(out)) & torch.isfinite(ref)).sum().item())
+            assert n_bad == 0, f"{tag}: {n_bad} non-finite outputs"
+            atol = handler.atol_frac * ref.abs().max().item() + 1e-3
+            over = (out - ref).abs() > (atol + handler.rtol * ref.abs())
+            assert not over.any(), (
+                f"{tag}: {int(over.sum())} elems exceed tol "
+                f"(max|diff|={(out - ref).abs().max().item():.4g}) -- stale/mis-keyed cached winner?"
+            )
