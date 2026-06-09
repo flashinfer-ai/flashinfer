@@ -5909,7 +5909,6 @@ def _b12x_gemm_fp4_runner(
                     n,
                     real_k,
                     get_device_sm_count(a.device),
-                    is_mxfp8=False,
                     expected_m=m,
                 )
                 # swap_ab (narrow-N) is not yet supported by this wrapper; when the
