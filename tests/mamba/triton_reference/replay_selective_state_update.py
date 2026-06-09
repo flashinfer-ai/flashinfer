@@ -270,6 +270,12 @@ def _replay_precompute_impl(
     # it be runtime lets the dynamic dispatch kernel call us once with the
     # per-slot needs_write flag instead of inlining two specializations.
     write_checkpoint,
+    # Varlen: cu_seqlens[0..N] (int32) — only read when IS_VARLEN; Triton DCEs
+    # the load otherwise.  Varlen is purely a batch-side layout: x/dt/B/C are
+    # packed (1, total_tokens, ...) and the outer offset switches to
+    # bos * stride_*_T.  Cache (old_*) indexing is unchanged.
+    cu_seqlens_ptr,
+    IS_VARLEN: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_hg = tl.program_id(axis=1)  # head-group index
@@ -280,6 +286,24 @@ def _replay_precompute_impl(
         cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
     else:
         cache_batch_idx = pid_b.to(tl.int64)
+
+    # Varlen seq resolution (batch-side only).  bos = packed-token offset of
+    # this sequence; seq_len = its new-token count.  Non-varlen folds to the
+    # constexpr T and per-batch offsets.
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+        eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+        seq_len = (eos - bos).to(tl.int32)
+        if seq_len <= 0:
+            return
+        dt_seq_off = bos * stride_dt_T
+        B_seq_off = bos * stride_B_T
+        C_seq_off = bos * stride_C_T
+    else:
+        seq_len = T
+        dt_seq_off = pid_b * stride_dt_batch
+        B_seq_off = pid_b * stride_B_batch
+        C_seq_off = pid_b * stride_C_batch
 
     # --- Cache write semantics ---
     # cache_buf_idx names this step's "active" buffer — the one with the
@@ -305,7 +329,7 @@ def _replay_precompute_impl(
 
     offs_t = tl.arange(0, BLOCK_SIZE_T)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
-    t_mask = offs_t < T
+    t_mask = offs_t < seq_len
     n_mask = offs_n < dstate
 
     # Causal mask is shared across all heads (depends only on offs_t)
@@ -323,7 +347,7 @@ def _replay_precompute_impl(
     # Load dt (H, T)
     dt_addrs = (
         dt_ptr
-        + pid_b * stride_dt_batch
+        + dt_seq_off
         + heads_block[:, None] * stride_dt_head
         + offs_t[None, :] * stride_dt_T
     )
@@ -400,8 +424,8 @@ def _replay_precompute_impl(
 
     # --- Load C and B once for the group (shared across HEADS_PER_BLOCK heads) ---
     group_idx = first_head // nheads_ngroups_ratio
-    C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
-    B_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
+    C_base = C_ptr + C_seq_off + group_idx * stride_C_group
+    B_base = B_ptr + B_seq_off + group_idx * stride_B_group
 
     C_tile = tl.load(
         C_base + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
@@ -533,6 +557,9 @@ def _rectangle_precompute_impl(
     LAUNCH_WITH_PDL: tl.constexpr,
     HEADS_PER_BLOCK: tl.constexpr,
     USE_GATHER_FOR_NEW_TOKENS: tl.constexpr,
+    # Varlen: see _replay_precompute_impl — batch-side packing only.
+    cu_seqlens_ptr,
+    IS_VARLEN: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_hg = tl.program_id(axis=1)
@@ -542,6 +569,21 @@ def _rectangle_precompute_impl(
         cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
     else:
         cache_batch_idx = pid_b.to(tl.int64)
+
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+        eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+        seq_len = (eos - bos).to(tl.int32)
+        if seq_len <= 0:
+            return
+        dt_seq_off = bos * stride_dt_T
+        B_seq_off = bos * stride_B_T
+        C_seq_off = bos * stride_C_T
+    else:
+        seq_len = T
+        dt_seq_off = pid_b * stride_dt_batch
+        B_seq_off = pid_b * stride_B_batch
+        C_seq_off = pid_b * stride_C_batch
 
     # Nowrite-only: write_buf = active, write_offset = PNAT.  No flip after.
     buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
@@ -555,14 +597,14 @@ def _rectangle_precompute_impl(
     offs_t = tl.arange(0, BLOCK_SIZE_T)  # current-step output rows
     offs_window = tl.arange(0, BLOCK_SIZE_K)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
-    t_mask = offs_t < T
+    t_mask = offs_t < seq_len
     n_mask = offs_n < dstate
 
     # Window masks. Cache and matmul share this logical dimension.
     is_history_position = offs_window < prev_num_accepted_tokens
     safe_history_idx = tl.where(is_history_position, offs_window, 0)
     step_idx_from_window = offs_window - prev_num_accepted_tokens
-    is_step_position = (step_idx_from_window >= 0) & (step_idx_from_window < T)
+    is_step_position = (step_idx_from_window >= 0) & (step_idx_from_window < seq_len)
     safe_step_idx = tl.where(is_step_position, step_idx_from_window, 0)
 
     offs_h = tl.arange(0, HEADS_PER_BLOCK)
@@ -573,7 +615,7 @@ def _rectangle_precompute_impl(
     # global memory after storing would create a same-kernel write/read race.
     dt_addrs = (
         dt_ptr
-        + pid_b * stride_dt_batch
+        + dt_seq_off
         + heads_block[:, None] * stride_dt_head
         + offs_t[None, :] * stride_dt_T
     )
@@ -746,8 +788,8 @@ def _rectangle_precompute_impl(
         tl.extra.cuda.gdc_wait()
 
     # Conv1d outputs: B and C
-    C_base = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
-    step_B_base = B_ptr + pid_b * stride_B_batch + group_idx * stride_B_group
+    C_base = C_ptr + C_seq_off + group_idx * stride_C_group
+    step_B_base = B_ptr + B_seq_off + group_idx * stride_B_group
 
     C_tile = tl.load(
         C_base + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
@@ -794,7 +836,7 @@ def _rectangle_precompute_impl(
     step_idx_from_window_2d = window_idx_2d - prev_num_accepted_tokens
     is_step_causal_2d = (
         (step_idx_from_window_2d >= 0)
-        & (step_idx_from_window_2d < T)
+        & (step_idx_from_window_2d < seq_len)
         & (step_idx_from_window_2d <= t_idx_2d)
     )
     causal_combined = (is_history_position_2d | is_step_causal_2d) & t_mask[:, None]
@@ -842,6 +884,7 @@ def _rectangle_precompute_impl(
         )
     }
 )
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens_ptr"] is not None})
 @triton.jit()
 def _dynamic_precompute_kernel(
     # Input pointers
@@ -919,6 +962,9 @@ def _dynamic_precompute_kernel(
     # Compile-time pick: rectangle (with replay-write fallback) vs replay-only.
     RECTANGLE: tl.constexpr,
     RECTANGLE_USE_GATHER: tl.constexpr,
+    # Varlen: cu_seqlens[0..N]; IS_VARLEN derived by the heuristic above.
+    cu_seqlens_ptr,
+    IS_VARLEN: tl.constexpr,
 ):
     # Hoisted PDL signal: fire as the first thing every program does.
     if LAUNCH_DEPENDENT_KERNELS:
@@ -931,7 +977,14 @@ def _dynamic_precompute_kernel(
         cache_batch_idx = pid_b.to(tl.int64)
 
     pnat_local = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
-    needs_write_runtime = pnat_local + T > MAX_REPLAY_BUFFER_LENGTH
+    # Varlen: per-slot seq_len gates needs_write; non-varlen folds to T.
+    if IS_VARLEN:
+        _vbos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+        _veos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+        seq_len_local = (_veos - _vbos).to(tl.int32)
+    else:
+        seq_len_local = T
+    needs_write_runtime = pnat_local + seq_len_local > MAX_REPLAY_BUFFER_LENGTH
     # Replay precompute uses a per-slot write predicate; use rectangle only
     # for no-write slots when enabled.
     if needs_write_runtime or not RECTANGLE:
@@ -993,6 +1046,8 @@ def _dynamic_precompute_kernel(
             LAUNCH_WITH_PDL,
             HEADS_PER_BLOCK,
             needs_write_runtime,
+            cu_seqlens_ptr,
+            IS_VARLEN,
         )
     else:
         _rectangle_precompute_impl(
@@ -1055,6 +1110,8 @@ def _dynamic_precompute_kernel(
             LAUNCH_WITH_PDL,
             HEADS_PER_BLOCK,
             RECTANGLE_USE_GATHER,
+            cu_seqlens_ptr,
+            IS_VARLEN,
         )
 
 
@@ -1191,6 +1248,10 @@ def _persistent_main_impl(
     USE_TMA_LOAD_WRITE: tl.constexpr = False,
     USE_TMA_LOAD_NOWRITE: tl.constexpr = False,
     USE_TMA_STORE: tl.constexpr = False,
+    # Varlen: x/C/out/z are packed (1, total_tokens, ...); see precompute.  Only
+    # the batch-side outer offset changes; cache indexing is unaffected.
+    cu_seqlens_ptr=None,
+    IS_VARLEN: tl.constexpr = False,
 ):
     # IS_DYNAMIC: kernel-mode label, used by the outer _persistent_main_kernel
     # to decide slot-range derivation and outer is_w dispatch strategy
@@ -1211,6 +1272,24 @@ def _persistent_main_impl(
         "QUANT_MAX > 0.0 must coincide with int8 / int16 / float8e4nv state dtype.",
     )
 
+    # Varlen: batch-side packing only — bos is this sequence's packed-token
+    # offset, seq_len its new-token count.  Non-varlen folds to constexpr T and
+    # per-batch offsets.  Cache (state/old_*) indexing is unaffected.
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+        eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+        seq_len = (eos - bos).to(tl.int32)
+        x_seq_off = bos * stride_x_T
+        C_seq_off = bos * stride_C_T
+        out_seq_off = bos * stride_out_T
+        z_seq_off = bos * stride_z_T
+    else:
+        seq_len = T
+        x_seq_off = pid_b * stride_x_batch
+        C_seq_off = pid_b * stride_C_batch
+        out_seq_off = pid_b * stride_out_batch
+        z_seq_off = pid_b * stride_z_batch
+
     # Resolve is_write: see WRITE_CHECKPOINT_IS_CONSTEXPR / IS_DYNAMIC docs in the param
     # list above.  Three cases:
     #   - WRITE_CHECKPOINT_IS_CONSTEXPR=True (RECT=1 is_w=True arm callers): use WRITE_CHECKPOINT
@@ -1222,7 +1301,7 @@ def _persistent_main_impl(
     if WRITE_CHECKPOINT_IS_CONSTEXPR:
         is_write: tl.constexpr = WRITE_CHECKPOINT
     elif IS_DYNAMIC:
-        is_write = (prev_num_accepted_tokens + T) > MAX_REPLAY_BUFFER_LENGTH
+        is_write = (prev_num_accepted_tokens + seq_len) > MAX_REPLAY_BUFFER_LENGTH
     else:
         is_write = WRITE_CHECKPOINT
     if is_write:
@@ -1238,7 +1317,7 @@ def _persistent_main_impl(
     offs_window = tl.arange(0, BLOCK_SIZE_WINDOW)
     m_mask = offs_m < dim
     n_mask = offs_n < dstate
-    t_mask = offs_t < T
+    t_mask = offs_t < seq_len
 
     # Load state.  state_tma_descriptor is a host-built tensor_descriptor
     # over a flat (cache*nheads*dim, dstate) view of state when any TMA
@@ -1496,11 +1575,11 @@ def _persistent_main_impl(
                 tl.store(state_ptrs, _state_cast, mask=state_mask)
 
     # Phase 2: Output using precomputed CB_scaled and decay_vec
-    x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
-    C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
+    x_ptr += x_seq_off + pid_h * stride_x_head
+    C_ptr += C_seq_off + group_idx * stride_C_group
     if HAS_Z:
-        z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
-    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+        z_ptr += z_seq_off + pid_h * stride_z_head
+    out_ptr += out_seq_off + pid_h * stride_out_head
 
     if HAS_D:
         D = tl.load(
@@ -1665,6 +1744,9 @@ def _persistent_rectangle_impl(
     LAUNCH_WITH_PDL: tl.constexpr,
     QUANT_MAX: tl.constexpr,
     USE_TMA_LOAD: tl.constexpr = False,
+    # Varlen: x/C/out/z packed (1, total_tokens, ...); batch-side offsets only.
+    cu_seqlens_ptr=None,
+    IS_VARLEN: tl.constexpr = False,
 ):
     # Nowrite-only: step tokens append at [PNAT, PNAT+T).
 
@@ -1676,13 +1758,28 @@ def _persistent_rectangle_impl(
     offs_window = tl.arange(0, BLOCK_SIZE_K)
     m_mask = offs_m < dim
     n_mask = offs_n < dstate
-    t_mask = offs_t < T
+
+    if IS_VARLEN:
+        bos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+        eos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+        seq_len = (eos - bos).to(tl.int32)
+        x_seq_off = bos * stride_x_T
+        C_seq_off = bos * stride_C_T
+        out_seq_off = bos * stride_out_T
+        z_seq_off = bos * stride_z_T
+    else:
+        seq_len = T
+        x_seq_off = pid_b * stride_x_batch
+        C_seq_off = pid_b * stride_C_batch
+        out_seq_off = pid_b * stride_out_batch
+        z_seq_off = pid_b * stride_z_batch
+    t_mask = offs_t < seq_len
 
     # Window masks use the same PNAT-runtime offset as rectangle precompute.
     is_history_position = offs_window < prev_num_accepted_tokens
     safe_history_idx = tl.where(is_history_position, offs_window, 0)
     step_idx_from_window = offs_window - prev_num_accepted_tokens
-    is_step_position = (step_idx_from_window >= 0) & (step_idx_from_window < T)
+    is_step_position = (step_idx_from_window >= 0) & (step_idx_from_window < seq_len)
     safe_step_idx = tl.where(is_step_position, step_idx_from_window, 0)
 
     # Load state.  Quant scale hoist: defer `* decode_scale` post-matmul.
@@ -1721,11 +1818,11 @@ def _persistent_rectangle_impl(
 
     # Group / pointer offset setup
     group_idx = pid_h // nheads_ngroups_ratio
-    x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
-    C_ptr += pid_b * stride_C_batch + group_idx * stride_C_group
+    x_ptr += x_seq_off + pid_h * stride_x_head
+    C_ptr += C_seq_off + group_idx * stride_C_group
     if HAS_Z:
-        z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
-    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+        z_ptr += z_seq_off + pid_h * stride_z_head
+    out_ptr += out_seq_off + pid_h * stride_out_head
     # Rectangle path: nowrite-only.  write_buf == active_buf (no flip), so the
     # read and write paths target the same dbuf slot.  No race: write_offset=
     # PNAT puts new tokens at [PNAT, PNAT+T), disjoint from the read range
@@ -1874,6 +1971,7 @@ def _persistent_rectangle_impl(
 @triton.heuristics(
     {"NUM_PID_M_BLOCKS": lambda args: triton.cdiv(args["dim"], args["BLOCK_SIZE_M"])}
 )
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens_ptr"] is not None})
 @triton.jit()
 def _persistent_main_kernel(
     # Pointers
@@ -2022,6 +2120,11 @@ def _persistent_main_kernel(
     USE_TMA_LOAD_NOWRITE: tl.constexpr = False,
     USE_TMA_STORE: tl.constexpr = False,
     USE_REPLAY_CACHE_SLOT: tl.constexpr = True,
+    # Varlen: cu_seqlens[0..N]; IS_VARLEN derived by the heuristic above.  Has a
+    # default so it can trail the existing default-valued params (the standalone
+    # kernel signature ends with defaults — unlike the merged template).
+    cu_seqlens_ptr=None,
+    IS_VARLEN: tl.constexpr = False,
 ):
     # PDL signal: fire once at kernel entry (not per work unit).
     if LAUNCH_DEPENDENT_KERNELS:
@@ -2097,13 +2200,21 @@ def _persistent_main_kernel(
                 active_buf = tl.load(work_item_base + _REPLAY_WORK_CACHE_BUF_IDX).to(
                     tl.int32
                 )
+        # Varlen: per-work-item seq_len for the write decision (folds to T).
+        if IS_VARLEN:
+            _kbos = tl.load(cu_seqlens_ptr + pid_b).to(tl.int64)
+            _keos = tl.load(cu_seqlens_ptr + pid_b + 1).to(tl.int64)
+            seq_len_w = (_keos - _kbos).to(tl.int32)
+        else:
+            seq_len_w = T
+
         # Dispatch: when RECTANGLE is set, send nowrite slots to the rectangle
         # impl.  `replay_work_items` carries the cache slot, PNAT and active
         # buffer for persistent_main; persistent_dynamic resolves those once
         # here from the existing tensors.
         if RECTANGLE:
             if IS_DYNAMIC:
-                is_w = (pnat + T) > MAX_REPLAY_BUFFER_LENGTH
+                is_w = (pnat + seq_len_w) > MAX_REPLAY_BUFFER_LENGTH
             else:
                 is_w = WRITE_CHECKPOINT
             if is_w:
@@ -2213,6 +2324,8 @@ def _persistent_main_kernel(
                     USE_TMA_LOAD_WRITE,
                     USE_TMA_LOAD_NOWRITE,
                     USE_TMA_STORE,
+                    cu_seqlens_ptr,
+                    IS_VARLEN,
                 )
             else:
                 _persistent_rectangle_impl(
@@ -2285,6 +2398,8 @@ def _persistent_main_kernel(
                     LAUNCH_WITH_PDL,
                     QUANT_MAX,
                     USE_TMA_LOAD_NOWRITE,  # rect-load TMA toggle
+                    cu_seqlens_ptr,
+                    IS_VARLEN,
                 )
         else:
             _persistent_main_impl(
@@ -2381,6 +2496,8 @@ def _persistent_main_kernel(
                 USE_TMA_LOAD_WRITE,
                 USE_TMA_LOAD_NOWRITE,
                 USE_TMA_STORE,
+                cu_seqlens_ptr,
+                IS_VARLEN,
             )
 
 
@@ -3625,6 +3742,11 @@ def replay_selective_state_update(
     _cta_per_sm_nowrite: int | None = None,
     _num_loop_stages_write: int | None = None,
     _num_loop_stages_nowrite: int | None = None,
+    # Varlen: x/dt/B/C/out packed (1, total_tokens, ...); cu_seqlens[0..N]
+    # partitions them into N sequences.  batch = N, T = max_seqlen.  The cache
+    # stays per-slot (double-buffered) — varlen is a batch-side layout only.
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
 ):
     """
     Replay SSM state update with precomputed CB and tl.dot fast-forward.
@@ -3788,7 +3910,29 @@ def replay_selective_state_update(
         out = out.unsqueeze(1)
 
     cache_size, nheads, dim, dstate = state.shape
-    batch, T, _, _ = x.shape
+    # Varlen: x/dt/B/C/out are packed (1, total_tokens, ...); cu_seqlens[0..N]
+    # partitions them into N sequences.  batch = N, T = max_seqlen.  The cache
+    # stays per-slot (double-buffered) — varlen is a batch-side layout only.
+    is_varlen = cu_seqlens is not None
+    if is_varlen:
+        assert x.dim() == 4 and x.shape[0] == 1, (
+            f"varlen: x must be (1, total_tokens, nheads, dim), got {tuple(x.shape)}"
+        )
+        assert cu_seqlens.dim() == 1 and cu_seqlens.dtype == torch.int32, (
+            f"cu_seqlens must be 1D int32, got shape {tuple(cu_seqlens.shape)} "
+            f"dtype {cu_seqlens.dtype}"
+        )
+        assert cu_seqlens.is_cuda, "cu_seqlens must be a CUDA tensor"
+        assert max_seqlen is not None, (
+            "max_seqlen is required in varlen mode (cu_seqlens is not None)"
+        )
+        batch = cu_seqlens.shape[0] - 1
+        T = max_seqlen
+    else:
+        assert max_seqlen is None, (
+            "max_seqlen is only valid with cu_seqlens (varlen mode)"
+        )
+        batch, T, _, _ = x.shape
     ngroups = B.shape[2]
     assert nheads % ngroups == 0
 
@@ -3977,11 +4121,30 @@ def replay_selective_state_update(
     max_window = old_x.shape[2]
     assert max_window >= T, f"T={T} exceeds cache max_window={max_window}"
 
-    assert x.shape == (batch, T, nheads, dim)
-    assert dt.shape == x.shape
-    assert A.shape == (nheads, dim, dstate)
-    assert B.shape == (batch, T, ngroups, dstate)
-    assert C.shape == B.shape
+    if is_varlen:
+        # Packed (1, total_tokens, ...): validate trailing dims only; cu_seqlens
+        # partitions the token axis.  All of x/dt/B/C/out share total_tokens.
+        total_tokens = x.shape[1]
+        assert x.shape == (1, total_tokens, nheads, dim), (
+            f"varlen x shape {tuple(x.shape)} != (1, {total_tokens}, {nheads}, {dim})"
+        )
+        assert dt.shape == x.shape, (
+            f"varlen dt shape {tuple(dt.shape)} != x shape {tuple(x.shape)}"
+        )
+        assert A.shape == (nheads, dim, dstate)
+        assert B.shape == (1, total_tokens, ngroups, dstate), (
+            f"varlen B shape {tuple(B.shape)} != "
+            f"(1, {total_tokens}, {ngroups}, {dstate})"
+        )
+        assert C.shape == B.shape, (
+            f"varlen C shape {tuple(C.shape)} != B shape {tuple(B.shape)}"
+        )
+    else:
+        assert x.shape == (batch, T, nheads, dim)
+        assert dt.shape == x.shape
+        assert A.shape == (nheads, dim, dstate)
+        assert B.shape == (batch, T, ngroups, dstate)
+        assert C.shape == B.shape
     assert old_x.shape == (cache_size, 2, max_window, nheads, dim)
     assert old_B.shape == (cache_size, 2, max_window, ngroups, dstate)
     assert old_dt.shape == (cache_size, 2, nheads, max_window)
@@ -4306,6 +4469,7 @@ def replay_selective_state_update(
             HEADS_PER_BLOCK=heads_per_block,
             RECTANGLE=rectangle,
             RECTANGLE_USE_GATHER=rectangle_use_gather,
+            cu_seqlens_ptr=cu_seqlens,
             num_warps=precompute_num_warps,
             **(
                 {"num_stages": _precompute_num_stages} if _precompute_num_stages else {}
@@ -4474,6 +4638,7 @@ def replay_selective_state_update(
             ),
             USE_TMA_STORE=bool(_use_tma_replay_write_store and write_checkpoint),
             USE_REPLAY_CACHE_SLOT=bool(_use_replay_cache_slot),
+            cu_seqlens_ptr=cu_seqlens,
             num_warps=launch_num_warps,
             **({"num_stages": launch_num_stages} if launch_num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
@@ -4603,6 +4768,7 @@ def replay_selective_state_update(
             ),
             USE_TMA_STORE=bool(_use_tma_replay_write_store),
             USE_REPLAY_CACHE_SLOT=bool(_use_replay_cache_slot),
+            cu_seqlens_ptr=cu_seqlens,
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),

@@ -22,6 +22,18 @@ from .triton_reference.checkpointing_state_update import (
     _get_sm_version,
     replay_selective_state_update,
 )
+
+# Faithful TMA-optimized standalone persistent kernel (the merged copy above
+# dropped TMA + tuning).  Imported as `replay_persistent`; it requires explicit
+# n_writes / replay_work_items and a mode.  No varlen support (yet).
+from .triton_reference.replay_selective_state_update import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+    replay_selective_state_update as replay_persistent,
+)
 from .triton_reference.selective_state_update import (
     selective_state_update_triton as selective_state_update,
 )
@@ -53,6 +65,35 @@ def _old_x_to_5d(old_x_4d, cache_buf_idx):
     rows = torch.arange(cache_size, device=old_x_4d.device)
     old_x_5d[rows, cache_buf_idx.long()] = old_x_4d
     return old_x_5d
+
+
+def _make_replay_work_items(
+    prev_tokens, cache_buf_idx, T, max_window, batch, state_batch_indices
+):
+    """Build (n_writes, replay_work_items) for the standalone persistent kernel,
+    write-first sorted — mirrors mamba2_metadata._prepare_replay_work_items.
+
+    persistent_dynamic ignores the ordering at runtime; persistent_main relies
+    on the n_writes split (write slots first).
+    """
+    device = prev_tokens.device
+    position_in_decode_batch = torch.arange(batch, device=device, dtype=torch.int32)
+    if state_batch_indices is not None:
+        cache_slot = state_batch_indices[:batch].to(torch.int32)
+    else:
+        cache_slot = position_in_decode_batch
+    cache_slot_long = cache_slot.to(torch.long)
+    pnat = prev_tokens[cache_slot_long].to(torch.int32)
+    active_buf = cache_buf_idx[cache_slot_long].to(torch.int32)
+    write_mask = (pnat + T) > max_window
+    n_writes = write_mask.sum().to(torch.int32).reshape(1)
+    order = torch.argsort((~write_mask).to(torch.int32), stable=True).to(torch.long)
+    work = torch.empty(batch, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32)
+    work[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = position_in_decode_batch[order]
+    work[:, REPLAY_WORK_CACHE_SLOT] = cache_slot[order]
+    work[:, REPLAY_WORK_PNAT] = pnat[order]
+    work[:, REPLAY_WORK_CACHE_BUF_IDX] = active_buf[order]
+    return n_writes, work.contiguous()
 
 
 def _assert_old_x_5d_matches_4d(
@@ -183,7 +224,10 @@ def _run_checkpointing_ssu_case(
         ref_state = state0.clone()
         ref_prev = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        replay_selective_state_update(
+        n_writes, replay_work_items = _make_replay_work_items(
+            ref_prev, cache_buf_idx, T, old_x.shape[1], batch, state_batch_indices
+        )
+        replay_persistent(
             ref_state,
             _old_x_to_5d(old_x, cache_buf_idx),
             old_B.clone(),
@@ -197,11 +241,13 @@ def _run_checkpointing_ssu_case(
             B=B2,
             C=C2,
             out=ref_out,
+            n_writes=n_writes,
+            replay_work_items=replay_work_items,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
             state_batch_indices=state_batch_indices,
-            rectangle_for_nowrite=False,
+            mode="persistent_dynamic",
         )
 
         # --- CUDA kernel ---
@@ -4350,7 +4396,15 @@ def _run_varlen_cuda_vs_triton(
     old_cumAdt_tri = s["old_cumAdt"].clone()
     out_tri = torch.zeros_like(x_packed)
 
-    replay_selective_state_update(
+    n_writes, replay_work_items = _make_replay_work_items(
+        s["prev_tokens"],
+        s["cache_buf_idx"],
+        npredicted,
+        max_window,
+        len(seq_lens),
+        None,
+    )
+    replay_persistent(
         state_tri,
         old_x_tri,
         old_B_tri,
@@ -4364,13 +4418,15 @@ def _run_varlen_cuda_vs_triton(
         B=B_packed,
         C=C_packed,
         out=out_tri,
+        n_writes=n_writes,
+        replay_work_items=replay_work_items,
         D=s["D"],
         dt_bias=s["dt_bias"],
         dt_softplus=True,
         state_scales=state_scale_tri,
-        write_checkpoint=write_checkpoint,
         cu_seqlens=cu_seqlens,
         max_seqlen=npredicted,
+        mode="persistent_dynamic",
     )
 
     # --- Compare ---
