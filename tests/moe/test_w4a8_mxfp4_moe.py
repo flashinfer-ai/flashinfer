@@ -120,7 +120,11 @@ def test_w4a8_mxfp4_moe(top_k, clamp):
             gate_c = gate.clamp(max=limit)
             up_c = up.clamp(-limit, limit) + beta
             act = gate_c * torch.sigmoid(alpha * gate_c) * up_c
-        a2 = act.to(torch.float8_e4m3fn).float()  # mirror FP8 c1
+        # Mirror the kernel's intermediate path: SwiGLU -> BF16 -> per-token (per-row)
+        # FP8 requant with scale -> dequant (the scale is folded into the routing weight).
+        act_bf16 = act.to(torch.bfloat16).float()
+        sc = act_bf16.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 448.0
+        a2 = (act_bf16 / sc).clamp(-448, 448).to(torch.float8_e4m3fn).float() * sc
         down = a2 @ fc2_w[e].t()  # [T, H]
         for s in range(top_k):
             m = sel[:, s] == e

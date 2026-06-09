@@ -24,15 +24,21 @@ can swap to W4A8 with a near-identical call:
         quant_scales=[fc1_scale, fc2_scale], output=out)
 
 Internally:
-    permute (by expert) -> GEMM1 (gate/up) + fused SwiGLU -> FP8
-                        -> GEMM2 (down)    + finalize (scatter / moe_reduce) -> output
+    permute (by expert) -> GEMM1 (gate/up) + fused SwiGLU -> BF16
+                        -> per-token FP8 requant -> GEMM2 (down)
+                        -> finalize (scatter / moe_reduce) -> output
 
 Differences from the W4A16 cutlass path (W4A8 quantizes the activation to FP8):
 
-- **Activation**: ``input`` (bf16/fp16) is cast straight to FP8 e4m3 -- *no* per-token
-  activation scale. The fused SwiGLU epilogue computes ``silu`` on the raw GEMM1
-  accumulator and ``silu`` is nonlinear, so a per-token scale would change the result; a
-  direct cast is exact for in-range (post-norm, O(1)) activations.
+- **Input activation**: ``input`` (bf16/fp16) is cast straight to FP8 e4m3 -- *no* per-token
+  input scale. A direct cast is exact for in-range (post-norm, O(1)) inputs; outlier-heavy
+  models would want a SmoothQuant-style per-channel scale (a follow-up).
+- **Intermediate requant**: the GEMM1 SwiGLU output is produced in BF16, then requantized
+  to FP8 with a *per-token* scale before GEMM2 (matching the reference routed-MoE
+  ``fc2_input_scale``). The scale is constant along the GEMM2 contraction, so it folds into
+  the routing weight and GEMM2 applies it for free. (For clamped-SwiGLU models the
+  intermediate is already bounded, but the per-token scale still recovers the FP8 precision
+  an unscaled cast would lose.)
 - **GEMM1 weight (``fc1``)** ``[E, 2I, H/2]`` packed MXFP4 with **interleaved gate/up**
   rows (row ``2j`` = gate_j, ``2j+1`` = up_j) so each (gate,up) pair lands in one thread's
   adjacent WGMMA C registers for the fused SwiGLU. (cutlass W4A16 instead uses stacked
@@ -58,7 +64,7 @@ import torch
 from ...api_logging import flashinfer_api
 from ...trace.templates.moe import w4a8_mxfp4_moe_trace
 from .w4a8_mxfp4_grouped_gemm_sm90 import w4a8_mxfp4_grouped_gemm
-from .moe_reduce_triton import moe_reduce, build_reduce_index
+from .moe_reduce_triton import moe_reduce, build_reduce_index, per_token_quant_fp8
 
 try:
     import cutlass
@@ -194,7 +200,9 @@ def w4a8_mxfp4_moe(
 
     active = [e for e in range(E) if counts[e] > 0]
     a_list, w1_list, s1_list, ps1, c1_list = [], [], [], [], []
-    c1_buf = torch.empty(T * top_k, I, device=dev, dtype=torch.float8_e4m3fn)
+    # GEMM1 writes the SwiGLU intermediate in BF16 (not FP8) so it can be requantized
+    # per-token before GEMM2 (see the requant step below).
+    c1_buf = torch.empty(T * top_k, I, device=dev, dtype=torch.bfloat16)
     for e in active:
         off, cnt = offsets[e], counts[e]
         a_list.append(a_perm[off : off + cnt])
@@ -203,7 +211,7 @@ def w4a8_mxfp4_moe(
         c1_list.append(c1_buf[off : off + cnt])
         ps1.append((cnt, 2 * I, H, 1))
 
-    # 3. GEMM1 + fused SwiGLU -> FP8 [cnt, I] (gate/up interleaved in fc1).
+    # 3. GEMM1 + fused SwiGLU -> BF16 [cnt, I] (gate/up interleaved in fc1).
     w4a8_mxfp4_grouped_gemm(
         a_list,
         w1_list,
@@ -211,14 +219,26 @@ def w4a8_mxfp4_moe(
         c1_list,
         ps1,
         acc_dtype=_ACC,
-        c_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.BFloat16,
         swiglu=True,
         swiglu_alpha=alpha,
         swiglu_beta=beta,
         swiglu_limit=limit,
     )
 
-    # 4. GEMM2 (down) + finalize.
+    # 3b. Requant the BF16 intermediate to FP8 with a per-token (per-routed-row) scale
+    # for the FP8 GEMM2. The scale is constant along the GEMM2 contraction dim, so it
+    # pulls out to a per-output-row factor -- fold it straight into the routing weight
+    # (sorted_w, same routed order as c1_buf) and GEMM2's scatter / moe_reduce applies it
+    # for free, no GEMM2 change. (Matches the reference routed-MoE `fc2_input_scale`;
+    # for clamped-SwiGLU models the intermediate is already bounded, but the per-token
+    # scale recovers the FP8 precision an unscaled cast would lose.)
+    c1_fp8, a_scale = per_token_quant_fp8(c1_buf)  # [T*top_k, I] fp8, [T*top_k] f32
+    sorted_w = sorted_w * a_scale
+
+    # 4. GEMM2 (down) + finalize. GEMM2 input is the requantized FP8 intermediate; the
+    # per-token scale is already folded into sorted_w (-> wt_list below).
+    c1q_list = [c1_fp8[offsets[e] : offsets[e] + counts[e]] for e in active]
     w2_list = [fc2_expert_weights[e] for e in active]
     s2_list = [fc2_scale[e] for e in active]
     ps2 = [(counts[e], H, I, 1) for e in active]
@@ -236,7 +256,7 @@ def w4a8_mxfp4_moe(
         # Each token written once -> vectorized fused scatter (no atomicAdd).
         out_f32 = torch.empty(T, H, device=dev, dtype=torch.float32)
         w4a8_mxfp4_grouped_gemm(
-            c1_list,
+            c1q_list,
             w2_list,
             s2_list,
             None,
@@ -254,7 +274,7 @@ def w4a8_mxfp4_moe(
         c2_buf = torch.empty(T * top_k, H, device=dev, dtype=torch.float16)
         c2_list = [c2_buf[offsets[e] : offsets[e] + counts[e]] for e in active]
         w4a8_mxfp4_grouped_gemm(
-            c1_list,
+            c1q_list,
             w2_list,
             s2_list,
             c2_list,

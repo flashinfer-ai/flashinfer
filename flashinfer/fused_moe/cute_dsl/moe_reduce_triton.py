@@ -72,6 +72,36 @@ if _HAS_TRITON:
             acc += tl.where(valid, w, 0.0) * v
         tl.store(out_ptr + t * H + h, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
+    @triton.jit
+    def _per_token_quant_fp8_kernel(
+        x_ptr,  # [M, N] input (bf16/fp16/fp32)
+        out_ptr,  # [M, N] FP8 e4m3 output
+        scale_ptr,  # [M] f32 per-row scale (= row amax / FP8_MAX)
+        N,
+        FP8_MAX: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        # One program = one row: per-token dynamic FP8 quant. Pass 1 finds the row amax,
+        # pass 2 stores x/scale as FP8 (scale = amax / FP8_MAX, so values land in
+        # [-FP8_MAX, FP8_MAX]). Downstream dequant is value * scale.
+        m = tl.program_id(0)
+        row_x = x_ptr + m * N
+        amax = 0.0
+        for off in range(0, N, BLOCK_N):
+            n = off + tl.arange(0, BLOCK_N)
+            v = tl.load(row_x + n, mask=n < N, other=0.0).to(tl.float32)
+            amax = tl.maximum(amax, tl.max(tl.abs(v)))
+        scale = amax / FP8_MAX
+        scale = tl.where(scale > 0.0, scale, 1.0)  # all-zero row -> scale 1 (output 0)
+        tl.store(scale_ptr + m, scale)
+        inv = 1.0 / scale
+        row_o = out_ptr + m * N
+        for off in range(0, N, BLOCK_N):
+            n = off + tl.arange(0, BLOCK_N)
+            v = tl.load(row_x + n, mask=n < N, other=0.0).to(tl.float32) * inv
+            v = tl.minimum(tl.maximum(v, -FP8_MAX), FP8_MAX)
+            tl.store(row_o + n, v.to(out_ptr.dtype.element_ty), mask=n < N)
+
 
 def moe_reduce(
     permuted_out: torch.Tensor,
@@ -136,3 +166,25 @@ def build_reduce_index(
     )
     topk_scales = all_w[order].reshape(num_tokens, top_k).contiguous()
     return permuted_idx, topk_scales
+
+
+def per_token_quant_fp8(
+    x: torch.Tensor, block_n: int = 1024
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Per-token (per-row) dynamic FP8 e4m3 quantization. Returns ``(x_fp8 [M, N],
+    scale [M] f32)`` with ``x ≈ x_fp8.float() * scale[:, None]`` (``scale = row amax /
+    448``). Used to requantize the W4A8 MoE BF16 SwiGLU intermediate before GEMM2 -- the
+    per-row scale is folded into the routing weight, so GEMM2 needs no change (the scale
+    is constant along the GEMM2 contraction, so it pulls out to a per-output-row factor)."""
+    if not _HAS_TRITON:
+        raise RuntimeError("per_token_quant_fp8 requires triton")
+    assert x.dim() == 2, "per_token_quant_fp8 expects a 2D [M, N] tensor"
+    M, N = x.shape
+    x = x.contiguous()
+    x_fp8 = torch.empty(M, N, device=x.device, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(M, device=x.device, dtype=torch.float32)
+    if M > 0:
+        _per_token_quant_fp8_kernel[(M,)](
+            x, x_fp8, scale, N, FP8_MAX=448.0, BLOCK_N=block_n
+        )
+    return x_fp8, scale
