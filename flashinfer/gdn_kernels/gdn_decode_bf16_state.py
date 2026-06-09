@@ -123,6 +123,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     h0_indices: cute.Tensor,  # [B] - state pool slots to READ from
     h0_out_indices: cute.Tensor,  # [B] - state pool slots to WRITE final H to
     accepted_steps: cute.Tensor,  # [B] int32 - per-request K (last accepted step index in [0, T-1]); dummy when per_request_accepted_steps=False
+    ssm_state_indices: cute.Tensor,  # [B, T] int32 - per-token pool slots (FLA-style scatter); dummy when per_token_pool_scatter=False
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -139,6 +140,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     same_pool: cutlass.Constexpr[bool],
     disable_output: cutlass.Constexpr[bool],
     per_request_accepted_steps: cutlass.Constexpr[bool],
+    per_token_pool_scatter: cutlass.Constexpr[bool],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
@@ -667,14 +669,39 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     oc = oc + oc2
                     od = od + od2
 
-                if cutlass.const_expr(cache_intermediate_states):
+                # BF16 conversion of r_h is needed for either dense-buffer
+                # write OR per-token pool scatter (FLA-style).
+                if cutlass.const_expr(
+                    cache_intermediate_states or per_token_pool_scatter
+                ):
                     for i in cutlass.range_constexpr(vec_size):
                         r_hb4_0[i] = cutlass.BFloat16(r_h[0, i])
                         r_hb4_1[i] = cutlass.BFloat16(r_h[1, i])
                         r_hb4_2[i] = cutlass.BFloat16(r_h[2, i])
                         r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
 
-                if cutlass.const_expr(cache_intermediate_states):
+                if cutlass.const_expr(per_token_pool_scatter):
+                    # FLA-style per-token scatter: write h_{i_t+1} directly
+                    # to pool[ssm_state_indices[i_n, i_t]]. Slot is loaded
+                    # per-step via mul.wide.s32 (Int64) — same slot-slice
+                    # idiom used by the initial-state read at L353 and
+                    # introduced by commit bb2cb8ea. Caller pre-allocates
+                    # B*T fresh pool slots and passes them via
+                    # ssm_state_indices. Mutex with cache_intermediate_states
+                    # at the wrapper layer.
+                    pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                    h0_slot_t = h0_source[
+                        (cutlass.Int64(pool_slot_t), i_hv, None, None)
+                    ]
+                    ita = cute.local_tile(h0_slot_t, (1, vec_size), (va, lane_in_group))
+                    itb = cute.local_tile(h0_slot_t, (1, vec_size), (vb, lane_in_group))
+                    itc = cute.local_tile(h0_slot_t, (1, vec_size), (vc, lane_in_group))
+                    itd = cute.local_tile(h0_slot_t, (1, vec_size), (vd, lane_in_group))
+                    cute.autovec_copy(r_hb4_0, ita)
+                    cute.autovec_copy(r_hb4_1, itb)
+                    cute.autovec_copy(r_hb4_2, itc)
+                    cute.autovec_copy(r_hb4_3, itd)
+                elif cutlass.const_expr(cache_intermediate_states):
                     # The intermediate_states buffer is sized [B, T, HV, V, K]
                     # (batch-scoped, NOT pool-scoped), so this index uses i_n
                     # (the per-call batch index) and not cache_idx (the pool
@@ -740,16 +767,25 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         cute.autovec_copy(r_o4_bf16, ot4_slice)
 
             if cutlass.const_expr(not disable_state_update):
-                if cutlass.const_expr(not cache_intermediate_states):
-                    for i in cutlass.range_constexpr(vec_size):
-                        r_hb4_0[i] = cutlass.BFloat16(r_h[0, i])
-                        r_hb4_1[i] = cutlass.BFloat16(r_h[1, i])
-                        r_hb4_2[i] = cutlass.BFloat16(r_h[2, i])
-                        r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
-                cute.autovec_copy(r_hb4_0, hta_w)
-                cute.autovec_copy(r_hb4_1, htb_w)
-                cute.autovec_copy(r_hb4_2, htc_w)
-                cute.autovec_copy(r_hb4_3, htd_w)
+                # Skip final-state writeback in FLA-mode under same_pool: the
+                # per-token scatter at i_t=T-1 (or i_t=accepted_steps[i_n]
+                # under per-request K) already wrote h_K to its slot;
+                # write_cache_idx aliases h_0 under same_pool, so writing
+                # there would clobber the initial state. Under split-pool
+                # (same_pool=False), DO write — it lands in a separate slot.
+                if cutlass.const_expr(not (per_token_pool_scatter and same_pool)):
+                    if cutlass.const_expr(
+                        not cache_intermediate_states and not per_token_pool_scatter
+                    ):
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_hb4_0[i] = cutlass.BFloat16(r_h[0, i])
+                            r_hb4_1[i] = cutlass.BFloat16(r_h[1, i])
+                            r_hb4_2[i] = cutlass.BFloat16(r_h[2, i])
+                            r_hb4_3[i] = cutlass.BFloat16(r_h[3, i])
+                    cute.autovec_copy(r_hb4_0, hta_w)
+                    cute.autovec_copy(r_hb4_1, htb_w)
+                    cute.autovec_copy(r_hb4_2, htc_w)
+                    cute.autovec_copy(r_hb4_3, htd_w)
 
 
 # ==============================================================================
@@ -775,6 +811,7 @@ def gdn_wide_vec_kernel(
     h0_indices: cute.Tensor,
     h0_out_indices: cute.Tensor,
     accepted_steps: cute.Tensor,  # [B] int32 - per-request K; dummy when per_request_accepted_steps=False
+    ssm_state_indices: cute.Tensor,  # [B, T] int32 - per-token pool slots (FLA-style); dummy when per_token_pool_scatter=False
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -794,6 +831,7 @@ def gdn_wide_vec_kernel(
     disable_output: cutlass.Constexpr[bool],
     recovery_steps: cutlass.Constexpr[int],
     per_request_accepted_steps: cutlass.Constexpr[bool],
+    per_token_pool_scatter: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -835,7 +873,14 @@ def gdn_wide_vec_kernel(
         my_accepted_step = cutlass.Int32(T - 1)
 
     per_request_fused: cutlass.Constexpr[bool] = (
-        per_request_accepted_steps and not disable_output and not disable_state_update
+        per_request_accepted_steps
+        and not disable_output
+        and not disable_state_update
+        # FLA-style per-token pool scatter has its own semantics: every
+        # accepted-prefix iter writes h_{t+1} to ssm_state_indices[i, t].
+        # Don't fuse recovery into Phase A (which would skip pool writes
+        # for the accepted prefix and only scatter the rejected suffix).
+        and not per_token_pool_scatter
     )
 
     # 4D pool layout: h0_source is [pool_size, HV, V, K] with the caller-supplied
@@ -1214,6 +1259,20 @@ def gdn_wide_vec_kernel(
                 it3 = cute.local_tile(
                     intermediate_states, (1, 1, vec), (flat_idx, v3, lane_in_group)
                 )
+            elif cutlass.const_expr(per_token_pool_scatter):
+                # Pre-declare placeholder pool-slot views for FLA mode (slot 0).
+                # cute-dsl requires variables to be typed before any dynamic
+                # for-loop that re-assigns them. Phase B's per-token loop
+                # overwrites these with the real slot from
+                # ssm_state_indices[i_n, i_t] at each iteration. The shape
+                # differs from cache mode (2D vs 3D tile), but constexpr
+                # branches isolate the two specializations.
+                _ph_slot = cutlass.Int32(0)
+                _ph_slot_view = h0_source[(cutlass.Int64(_ph_slot), i_hv, None, None)]
+                it0 = cute.local_tile(_ph_slot_view, (1, vec), (v0, lane_in_group))
+                it1 = cute.local_tile(_ph_slot_view, (1, vec), (v1, lane_in_group))
+                it2 = cute.local_tile(_ph_slot_view, (1, vec), (v2, lane_in_group))
+                it3 = cute.local_tile(_ph_slot_view, (1, vec), (v3, lane_in_group))
 
             # === Phase A: recovery_steps iterations (no Q, no output) ===
             # Runtime loop (range, unroll=1) so the body is emitted once and
@@ -1650,12 +1709,37 @@ def gdn_wide_vec_kernel(
                         )
                         cute.autovec_copy(r_o4_bf16, o_slice)
 
-                if cutlass.const_expr(cache_intermediate_states):
+                # Per-token writes (Phase B): route to dense buffer or
+                # scattered pool slot based on mode. Mutex at wrapper layer.
+                if cutlass.const_expr(
+                    cache_intermediate_states or per_token_pool_scatter
+                ):
                     for i in cutlass.range_constexpr(vec):
                         r_hb0[i] = cutlass.BFloat16(r_h[0, i])
                         r_hb1[i] = cutlass.BFloat16(r_h[1, i])
                         r_hb2[i] = cutlass.BFloat16(r_h[2, i])
                         r_hb3[i] = cutlass.BFloat16(r_h[3, i])
+
+                if cutlass.const_expr(per_token_pool_scatter):
+                    # FLA-style per-token pool scatter: write h_{i_t+1}
+                    # directly to pool[ssm_state_indices[i_n, i_t]].
+                    # Slot loaded per-step via mul.wide.s32 (Int64) — same
+                    # slot-slice idiom used by initial-state reads (commit
+                    # bb2cb8ea). Caller pre-allocates B*T fresh slots and
+                    # passes them via ssm_state_indices.
+                    pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                    h0_slot_t = h0_source[
+                        (cutlass.Int64(pool_slot_t), i_hv, None, None)
+                    ]
+                    it0 = cute.local_tile(h0_slot_t, (1, vec), (v0, lane_in_group))
+                    it1 = cute.local_tile(h0_slot_t, (1, vec), (v1, lane_in_group))
+                    it2 = cute.local_tile(h0_slot_t, (1, vec), (v2, lane_in_group))
+                    it3 = cute.local_tile(h0_slot_t, (1, vec), (v3, lane_in_group))
+                    cute.autovec_copy(r_hb0, it0)
+                    cute.autovec_copy(r_hb1, it1)
+                    cute.autovec_copy(r_hb2, it2)
+                    cute.autovec_copy(r_hb3, it3)
+                elif cutlass.const_expr(cache_intermediate_states):
                     # Int64: intermediate_states is reshaped to [B*T*HV, V, K]
                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
@@ -1687,16 +1771,20 @@ def gdn_wide_vec_kernel(
                     cute.autovec_copy(r_hb3, it3)
 
             # Final state write-back to the split-pool WRITE slot. Skipped when
-            # caching is enabled (inter[T-1] already holds the final state)
-            # or when fused recovery+decode mode wrote h_K at the boundary
-            # already — both the scalar fused case (recovery_steps > 0) and
-            # the per-request fused case (per_request_fused=True) discard
-            # h_{K+T_decode} and rely on the boundary STG of h_K.
+            # caching is enabled (inter[T-1] already holds the final state),
+            # when fused recovery+decode wrote h_K at the boundary already
+            # (recovery_steps > 0 or per_request_fused), or when FLA-style
+            # per-token scatter aliases the read slot under same_pool (the
+            # per-token scatter at i_t=T-1 already wrote h_T to its slot;
+            # write_cache_idx aliases h_0 and overwriting it would clobber
+            # the initial state). Under split-pool with FLA mode, the
+            # writeback DOES execute and lands in a separate slot.
             if cutlass.const_expr(
                 not disable_state_update
                 and not cache_intermediate_states
                 and recovery_steps == 0
                 and not per_request_fused
+                and not (per_token_pool_scatter and same_pool)
             ):
                 for i in cutlass.range_constexpr(vec):
                     r_hb0[i] = cutlass.BFloat16(r_h[0, i])
@@ -2226,6 +2314,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     h0_indices: cute.Tensor,
     h0_out_indices: cute.Tensor,
     accepted_steps: cute.Tensor,
+    ssm_state_indices: cute.Tensor,  # [B, T] int32 — per-token pool slots (dummy when per_token_pool_scatter=False)
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -2243,6 +2332,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     same_pool: cutlass.Constexpr[bool],
     disable_output: cutlass.Constexpr[bool],
     per_request_accepted_steps: cutlass.Constexpr[bool],
+    per_token_pool_scatter: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -2280,6 +2370,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         h0_indices,
         h0_out_indices,
         accepted_steps,
+        ssm_state_indices,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -2296,6 +2387,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         same_pool,
         disable_output,
         per_request_accepted_steps,
+        per_token_pool_scatter,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -2324,6 +2416,7 @@ def _run_wide_vec(
     h0_indices: cute.Tensor,
     h0_out_indices: cute.Tensor,
     accepted_steps: cute.Tensor,
+    ssm_state_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -2342,6 +2435,7 @@ def _run_wide_vec(
     disable_output: cutlass.Constexpr[bool],
     recovery_steps: cutlass.Constexpr[int],
     per_request_accepted_steps: cutlass.Constexpr[bool],
+    per_token_pool_scatter: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
@@ -2366,6 +2460,7 @@ def _run_wide_vec(
         h0_indices,
         h0_out_indices,
         accepted_steps,
+        ssm_state_indices,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -2385,6 +2480,7 @@ def _run_wide_vec(
         disable_output,
         recovery_steps,
         per_request_accepted_steps,
+        per_token_pool_scatter,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -2721,6 +2817,7 @@ def gated_delta_rule_mtp_wide_vec(
     output_state_indices: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     accepted_steps: Optional[torch.Tensor] = None,
+    ssm_state_indices: Optional[torch.Tensor] = None,
     disable_state_update: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
     scale: Optional[float] = None,
@@ -2841,6 +2938,22 @@ def gated_delta_rule_mtp_wide_vec(
         )
         assert accepted_steps.device == q.device
 
+    # FLA-style per-token pool scatter (vLLM API compat). When the public
+    # gated_delta_rule_mtp wrapper threads ssm_state_indices through, the
+    # kernel writes each h_{t+1} directly to pool[ssm_state_indices[i, t]]
+    # instead of intermediate_states_buffer. Mutex with cache, recovery,
+    # and disable_state_update is enforced at the public-wrapper layer.
+    per_token_pool_scatter = ssm_state_indices is not None
+    if per_token_pool_scatter:
+        assert ssm_state_indices.shape == (B_val, T_val), (
+            f"ssm_state_indices must have shape [B={B_val}, T={T_val}], "
+            f"got {tuple(ssm_state_indices.shape)}"
+        )
+        assert ssm_state_indices.dtype == torch.int32, (
+            f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
+        )
+        assert ssm_state_indices.device == q.device
+
     cache_key = (
         "v3_mtp_bf16_tiled",
         B_val,
@@ -2862,6 +2975,7 @@ def gated_delta_rule_mtp_wide_vec(
         disable_output,
         recovery_steps,
         per_request_accepted_steps,
+        per_token_pool_scatter,
         # h0_source strides: padded pools (vLLM-style stride[0] > HV*V*K) must
         # compile as a separate specialization from tight pools. cute compiles
         # for a specific layout; reusing a tight-pool kernel on a padded pool
@@ -2877,6 +2991,11 @@ def gated_delta_rule_mtp_wide_vec(
         # when per_request_accepted_steps=False; never read by the kernel in
         # that case since the load is constexpr-gated).
         default_accepted_steps = torch.zeros(B_val, dtype=torch.int32, device=q.device)
+        # Dummy ssm_state_indices: B*T int32 tensor used as compile-time template
+        # and at runtime when per_token_pool_scatter=False (load constexpr-gated).
+        default_ssm_state_indices = torch.zeros(
+            B_val, T_val, dtype=torch.int32, device=q.device
+        )
 
         if initial_state_indices is None:
             initial_state_indices = default_indices
@@ -2905,6 +3024,9 @@ def gated_delta_rule_mtp_wide_vec(
         acc_steps_ = from_dlpack(
             default_accepted_steps, assumed_align=32, enable_tvm_ffi=True
         )
+        ssm_idx_ = from_dlpack(
+            default_ssm_state_indices, assumed_align=32, enable_tvm_ffi=True
+        )
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -2922,6 +3044,7 @@ def gated_delta_rule_mtp_wide_vec(
                 h0_idx_,
                 h0_out_idx_,
                 acc_steps_,
+                ssm_idx_,
                 softplus_beta,
                 softplus_threshold,
                 scale,
@@ -2940,11 +3063,13 @@ def gated_delta_rule_mtp_wide_vec(
                 disable_output,
                 recovery_steps,
                 per_request_accepted_steps,
+                per_token_pool_scatter,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
             "default_indices": default_indices,
             "default_accepted_steps": default_accepted_steps,
+            "default_ssm_state_indices": default_ssm_state_indices,
             "output": default_output,
         }
 
@@ -2964,6 +3089,11 @@ def gated_delta_rule_mtp_wide_vec(
         if accepted_steps is not None
         else cache["default_accepted_steps"]
     )
+    ssm_state_indices_arg = (
+        ssm_state_indices
+        if ssm_state_indices is not None
+        else cache["default_ssm_state_indices"]
+    )
 
     cache["compiled"](
         h0_source,
@@ -2979,6 +3109,7 @@ def gated_delta_rule_mtp_wide_vec(
         initial_state_indices,
         output_state_indices,
         accepted_steps_arg,
+        ssm_state_indices_arg,
         stream,
     )
     return output
@@ -3218,6 +3349,7 @@ def gated_delta_rule_mtp(
     output_state_indices: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     accepted_steps: Optional[torch.Tensor] = None,
+    ssm_state_indices: Optional[torch.Tensor] = None,
     disable_state_update: bool = False,
     use_qk_l2norm_in_kernel: bool = True,
     scale: Optional[float] = None,
@@ -3307,6 +3439,37 @@ def gated_delta_rule_mtp(
             :1, :1, :1
         ]  # Reuse existing allocation as dummy
 
+    # FLA-style per-token pool scatter (vLLM API compat).
+    # When `ssm_state_indices` is provided, the kernel writes h_{t+1} directly
+    # to initial_state_source[ssm_state_indices[i, t]] for each (i, t), instead
+    # of to a dense intermediate_states_buffer. The caller pre-allocates T+1
+    # pool slots per request from its free-list. See
+    # results/2026-06-03/FLA_SCATTER_MODE_PLAN.md.
+    per_token_pool_scatter = ssm_state_indices is not None
+    if per_token_pool_scatter:
+        assert intermediate_states_buffer is None, (
+            "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
+        )
+        assert not disable_state_update, (
+            "ssm_state_indices requires state writes; disable_state_update must be False"
+        )
+        assert recovery_steps == 0, (
+            "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
+        )
+        assert T >= 2, (
+            f"ssm_state_indices requires T >= 2 (got T={T}); for T=1 use output_state_indices"
+        )
+        assert ssm_state_indices.shape == (B, T), (
+            f"ssm_state_indices must have shape [B={B}, T={T}], "
+            f"got {tuple(ssm_state_indices.shape)}"
+        )
+        assert ssm_state_indices.dtype == torch.int32, (
+            f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
+        )
+        assert ssm_state_indices.device == q.device, (
+            f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
+        )
+
     # Dispatch to the wide_vec kernel when work_units (B*HV) amortizes its
     # lower per-CTA parallelism. ``_select_wide_vec_tile_v`` picks tile_v
     # ∈ {32, 64, 128} so wide_vec covers ``B*HV >= 128`` at T>=2; below
@@ -3352,6 +3515,7 @@ def gated_delta_rule_mtp(
             output_state_indices=output_state_indices,
             intermediate_states_buffer=intermediate_states_buffer,
             accepted_steps=accepted_steps,
+            ssm_state_indices=ssm_state_indices,
             disable_state_update=disable_state_update,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             scale=scale,
@@ -3407,6 +3571,7 @@ def gated_delta_rule_mtp(
         same_pool,
         disable_output,
         per_request_accepted_steps,
+        per_token_pool_scatter,
         # h0_source strides: see gated_delta_rule_mtp_wide_vec for rationale.
         tuple(int(s) for s in initial_state_source.stride()),
     )
@@ -3419,6 +3584,12 @@ def gated_delta_rule_mtp(
         default_indices = torch.arange(B, dtype=torch.int32, device=q.device)
         default_output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
         default_accepted_steps = torch.zeros(B, dtype=torch.int32, device=q.device)
+        # Per-token pool scatter (FLA-style) defaults: a B×T int32 tensor.
+        # When per_token_pool_scatter=False the kernel never reads it (constexpr
+        # gated); it exists so cute.compile sees a real tensor of the right shape.
+        default_ssm_state_indices = torch.zeros(
+            B, T, dtype=torch.int32, device=q.device
+        )
 
         h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
@@ -3437,6 +3608,9 @@ def gated_delta_rule_mtp(
         acc_steps_ = from_dlpack(
             default_accepted_steps, assumed_align=32, enable_tvm_ffi=True
         )
+        ssm_idx_ = from_dlpack(
+            default_ssm_state_indices, assumed_align=32, enable_tvm_ffi=True
+        )
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
@@ -3454,6 +3628,7 @@ def gated_delta_rule_mtp(
                 h0_idx_,
                 h0_out_idx_,
                 acc_steps_,
+                ssm_idx_,
                 softplus_beta,
                 softplus_threshold,
                 scale,
@@ -3471,11 +3646,13 @@ def gated_delta_rule_mtp(
                 same_pool,
                 disable_output,
                 per_request_accepted_steps,
+                per_token_pool_scatter,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
             "default_indices": default_indices,
             "default_accepted_steps": default_accepted_steps,
+            "default_ssm_state_indices": default_ssm_state_indices,
             "output": default_output,
         }
 
@@ -3489,6 +3666,11 @@ def gated_delta_rule_mtp(
         accepted_steps
         if accepted_steps is not None
         else cache["default_accepted_steps"]
+    )
+    ssm_state_indices_arg = (
+        ssm_state_indices
+        if ssm_state_indices is not None
+        else cache["default_ssm_state_indices"]
     )
 
     cache["compiled"](
@@ -3505,6 +3687,7 @@ def gated_delta_rule_mtp(
         initial_state_indices,
         output_state_indices,
         accepted_steps_arg,
+        ssm_state_indices_arg,
         stream,
     )
 

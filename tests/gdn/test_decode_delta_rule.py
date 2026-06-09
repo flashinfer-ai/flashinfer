@@ -3057,3 +3057,374 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
             atol=0,
             rtol=0,
         )
+
+
+# ==============================================================================
+# BF16 state FLA-style per-token pool scatter (ssm_state_indices)
+# ==============================================================================
+# vLLM-compatible API: when `ssm_state_indices` (shape [B, T] int32) is passed,
+# the kernel writes each h_{t+1} directly to pool[ssm_state_indices[i, t]],
+# replacing the dense intermediate_states_buffer. Caller is responsible for
+# pre-allocating B*T fresh pool slots and sizing the pool to >= B*(T+1) total
+# slots. See results/2026-06-03/FLA_SCATTER_MODE_PLAN.md for the design.
+
+
+@pytest.mark.parametrize("split_pool", [False, True])
+@pytest.mark.parametrize("max_T", [2, 4, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 256])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(16, 16, 64)],
+)
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_bf16_state_fla_scatter_vs_dense(
+    dtype: str,
+    head_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    batch_size: int,
+    max_T: int,
+    split_pool: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """FLA-style per-token scatter must produce bit-identical per-token
+    states to the dense-buffer reference. ``pool_fla[ssm_state_indices[i,t]]``
+    must equal ``intermediate_buffer[i, t]`` for every (i, t)."""
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    try:
+        from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+            gated_delta_rule_mtp,
+        )
+    except ImportError:
+        pytest.skip("gated_delta_rule_mtp not available")
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    B, T, HV, H, V, K = (
+        batch_size,
+        max_T,
+        num_v_heads,
+        num_q_heads,
+        head_size,
+        head_size,
+    )
+
+    # Pool sized for h0 (B slots) + per-token scatter destinations (B*T slots).
+    # Split-pool case adds B more output slots.
+    pool_size = B * (T + 1) + (B if split_pool else 0)
+    pool_init = torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16, device=device)
+
+    h0_idx = torch.arange(B, dtype=torch.int32, device=device)
+    ssm_idx = torch.arange(B, B + B * T, dtype=torch.int32, device=device).reshape(B, T)
+    out_idx = None
+    if split_pool:
+        out_idx = torch.arange(
+            B * (T + 1), B * (T + 2), dtype=torch.int32, device=device
+        )
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+
+    common = dict(
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state_indices=h0_idx,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+    )
+    if split_pool:
+        common["output_state_indices"] = out_idx
+
+    # FLA mode: per-token scatter to pool slots
+    pool_fla = pool_init.clone()
+    gated_delta_rule_mtp(
+        **common,
+        initial_state_source=pool_fla,
+        ssm_state_indices=ssm_idx,
+    )
+    torch.cuda.synchronize()
+
+    # Reference: dense buffer
+    pool_dense = pool_init.clone()
+    intermediate_buffer = torch.empty(
+        B, T, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    gated_delta_rule_mtp(
+        **common,
+        initial_state_source=pool_dense,
+        intermediate_states_buffer=intermediate_buffer,
+    )
+    torch.cuda.synchronize()
+
+    # Bit-equivalence at every (i, t).
+    max_diff = 0.0
+    worst_cell = None
+    for i in range(B):
+        for t in range(T):
+            slot = int(ssm_idx[i, t].item())
+            diff = (
+                (pool_fla[slot].float() - intermediate_buffer[i, t].float())
+                .abs()
+                .max()
+                .item()
+            )
+            if diff > max_diff:
+                max_diff = diff
+                worst_cell = (i, t, slot)
+    assert max_diff <= 0.06, (
+        f"FLA pool scatter deviates from dense buffer: "
+        f"max abs diff = {max_diff:.6f} at (i, t, slot)={worst_cell} "
+        f"(B={B}, T={T}, split_pool={split_pool})"
+    )
+
+    # h_0 slots: under same_pool (split_pool=False), the kernel skips the
+    # final-state writeback so the initial state is preserved bit-exactly.
+    if not split_pool:
+        torch.testing.assert_close(
+            pool_fla[h0_idx.long()],
+            pool_init[h0_idx.long()],
+            atol=0,
+            rtol=0,
+            msg="FLA mode under same_pool must preserve h_0 slots bit-exactly",
+        )
+
+    # Under split-pool, FLA mode writes h_T (the final-step state) to
+    # output_state_indices[i] as the final-state writeback. Reference: the
+    # dense path's last-step intermediate buffer entry. (We cannot compare
+    # to pool_dense[out_idx] directly because the wide_vec dense path skips
+    # the final writeback when caching is on — "buffer[:, T-1] IS h_T".)
+    if split_pool:
+        out_h_T_fla = pool_fla[out_idx.long()]  # [B, HV, V, K]
+        out_h_T_ref = intermediate_buffer[:, T - 1]  # [B, HV, V, K]
+        out_diff = (out_h_T_fla.float() - out_h_T_ref.float()).abs().max().item()
+        assert out_diff <= 0.06, (
+            f"split-pool final-state writeback (out_idx slot) "
+            f"deviates from dense buffer's h_T: max diff = {out_diff:.6f}"
+        )
+
+
+@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 64])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_bf16_state_fla_scatter_with_accepted_steps(
+    dtype: str,
+    head_size: int,
+    batch_size: int,
+    max_T: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """FLA scatter + per-request K (accepted_steps). Only the first
+    ``accepted_steps[i]+1`` slots per request should be written; slots
+    beyond must retain their pre-call values."""
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    B, T = batch_size, max_T
+    H, HV, K, V = 16, 64, head_size, head_size
+
+    pool_size = B * (T + 1)
+    pool_init = torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16, device=device)
+    h0_idx = torch.arange(B, dtype=torch.int32, device=device)
+    ssm_idx = torch.arange(B, B + B * T, dtype=torch.int32, device=device).reshape(B, T)
+    accepted_steps = torch.randint(0, T, (B,), dtype=torch.int32, device=device)
+
+    pool_fla = pool_init.clone()
+    gated_delta_rule_mtp(
+        q=torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device),
+        k=torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device),
+        v=torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device),
+        a=torch.randn(B, T, HV, dtype=torch.bfloat16, device=device),
+        b=torch.randn(B, T, HV, dtype=torch.bfloat16, device=device),
+        A_log=torch.randn(HV, dtype=torch.float32, device=device),
+        dt_bias=torch.randn(HV, dtype=torch.float32, device=device),
+        initial_state_source=pool_fla,
+        initial_state_indices=h0_idx,
+        ssm_state_indices=ssm_idx,
+        accepted_steps=accepted_steps,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+    torch.cuda.synchronize()
+
+    # Slots with t > accepted_steps[i] must be UNCHANGED from pool_init.
+    for i in range(B):
+        K_i = int(accepted_steps[i].item()) + 1
+        for t in range(K_i, T):
+            slot = int(ssm_idx[i, t].item())
+            torch.testing.assert_close(
+                pool_fla[slot],
+                pool_init[slot],
+                atol=0,
+                rtol=0,
+                msg=(
+                    f"slot beyond accepted_steps was clobbered: "
+                    f"req {i}, t={t}, K_i={K_i}, slot={slot}"
+                ),
+            )
+
+    # h_0 slots must also be unchanged (FLA + same_pool).
+    torch.testing.assert_close(
+        pool_fla[h0_idx.long()],
+        pool_init[h0_idx.long()],
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("batch_size", [4, 64])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_gdn_decode_bf16_state_fla_scatter_state_only(
+    dtype: str,
+    head_size: int,
+    batch_size: int,
+    max_T: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """FLA scatter + disable_output=True (state-only mode). Per-token states
+    must be scattered correctly even when no output is materialized."""
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    B, T = batch_size, max_T
+    H, HV, K, V = 16, 64, head_size, head_size
+
+    pool_size = B * (T + 1)
+    pool_init = torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16, device=device)
+    h0_idx = torch.arange(B, dtype=torch.int32, device=device)
+    ssm_idx = torch.arange(B, B + B * T, dtype=torch.int32, device=device).reshape(B, T)
+
+    common = dict(
+        q=torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device),
+        k=torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device),
+        v=torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device),
+        a=torch.randn(B, T, HV, dtype=torch.bfloat16, device=device),
+        b=torch.randn(B, T, HV, dtype=torch.bfloat16, device=device),
+        A_log=torch.randn(HV, dtype=torch.float32, device=device),
+        dt_bias=torch.randn(HV, dtype=torch.float32, device=device),
+        initial_state_indices=h0_idx,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+        disable_output=True,  # state-only
+    )
+
+    pool_fla = pool_init.clone()
+    gated_delta_rule_mtp(
+        **common,
+        initial_state_source=pool_fla,
+        ssm_state_indices=ssm_idx,
+    )
+    torch.cuda.synchronize()
+
+    # Reference: dense buffer in same state-only mode.
+    pool_dense = pool_init.clone()
+    intermediate_buffer = torch.empty(
+        B, T, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    gated_delta_rule_mtp(
+        **common,
+        initial_state_source=pool_dense,
+        intermediate_states_buffer=intermediate_buffer,
+    )
+    torch.cuda.synchronize()
+
+    # Per-token states equal.
+    for i in range(B):
+        for t in range(T):
+            slot = int(ssm_idx[i, t].item())
+            diff = (
+                (pool_fla[slot].float() - intermediate_buffer[i, t].float())
+                .abs()
+                .max()
+                .item()
+            )
+            assert diff <= 0.06, (
+                f"state-only FLA mode mismatch at (i={i}, t={t}): {diff:.6f}"
+            )
+
+
+def test_gdn_decode_bf16_state_fla_scatter_validation():
+    """Wrapper validation rejects illegal ssm_state_indices combinations."""
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    B, T = 2, 4
+    H, HV, K, V = 8, 8, 128, 128
+
+    def mk_args(B=B, T=T):
+        return dict(
+            A_log=torch.randn(HV, dtype=torch.float32, device=device),
+            a=torch.randn(B, T, HV, dtype=torch.bfloat16, device=device),
+            dt_bias=torch.randn(HV, dtype=torch.float32, device=device),
+            q=torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device),
+            k=torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device),
+            v=torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device),
+            b=torch.randn(B, T, HV, dtype=torch.bfloat16, device=device),
+            initial_state_source=torch.zeros(
+                B * (T + 1), HV, V, K, dtype=torch.bfloat16, device=device
+            ),
+            initial_state_indices=torch.arange(B, dtype=torch.int32, device=device),
+        )
+
+    ssm_idx = torch.arange(B, B + B * T, dtype=torch.int32, device=device).reshape(B, T)
+
+    # Mutex with intermediate_states_buffer
+    ibuf = torch.zeros(B, T, HV, V, K, dtype=torch.bfloat16, device=device)
+    with pytest.raises(AssertionError, match="mutually exclusive"):
+        gated_delta_rule_mtp(
+            **mk_args(), ssm_state_indices=ssm_idx, intermediate_states_buffer=ibuf
+        )
+
+    # Mutex with disable_state_update
+    with pytest.raises(AssertionError, match="state writes"):
+        gated_delta_rule_mtp(
+            **mk_args(), ssm_state_indices=ssm_idx, disable_state_update=True
+        )
+
+    # Mutex with recovery_steps > 0
+    with pytest.raises(AssertionError, match="not yet supported"):
+        gated_delta_rule_mtp(**mk_args(), ssm_state_indices=ssm_idx, recovery_steps=1)
+
+    # T = 1 not supported (MVP exclusion)
+    bad_ssm = torch.zeros(B, 1, dtype=torch.int32, device=device)
+    with pytest.raises(AssertionError, match="T >= 2"):
+        gated_delta_rule_mtp(**mk_args(T=1), ssm_state_indices=bad_ssm)
+
+    # Wrong dtype
+    with pytest.raises(AssertionError, match="int32"):
+        gated_delta_rule_mtp(**mk_args(), ssm_state_indices=ssm_idx.to(torch.int64))
+
+    # Wrong shape
+    bad_shape = torch.zeros(B, T + 1, dtype=torch.int32, device=device)
+    with pytest.raises(AssertionError, match="shape"):
+        gated_delta_rule_mtp(**mk_args(), ssm_state_indices=bad_shape)
