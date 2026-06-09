@@ -17,35 +17,36 @@
 
 #include "tvm_ffi_utils.h"
 
-void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120ZeroPadding(
+void CutlassGroupGemmMXFP8GroupwiseScaledSM120ZeroPadding(
     TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, TensorView m_indptr,
     TensorView out, std::string scale_major_mode, int64_t scale_granularity_m,
     int64_t scale_granularity_n, int64_t scale_granularity_k);
 
-void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Main(
-    TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, TensorView m_indices,
-    TensorView out, bool use_psum_layout, int64_t scale_granularity_m, int64_t scale_granularity_n,
-    int64_t scale_granularity_k);
+void CutlassGroupGemmMXFP8GroupwiseScaledSM120Main(TensorView a, TensorView b, TensorView a_scale,
+                                                   TensorView b_scale, TensorView m_indices,
+                                                   TensorView out, bool use_psum_layout,
+                                                   int64_t scale_granularity_m,
+                                                   int64_t scale_granularity_n,
+                                                   int64_t scale_granularity_k);
 
-void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Masked(TensorView a, TensorView b,
-                                                         TensorView a_scale, TensorView b_scale,
-                                                         TensorView masked_m, TensorView out,
-                                                         int64_t scale_granularity_m,
-                                                         int64_t scale_granularity_n,
-                                                         int64_t scale_granularity_k);
+void CutlassGroupGemmMXFP8GroupwiseScaledSM120Masked(TensorView a, TensorView b, TensorView a_scale,
+                                                     TensorView b_scale, TensorView masked_m,
+                                                     TensorView out, int64_t scale_granularity_m,
+                                                     int64_t scale_granularity_n,
+                                                     int64_t scale_granularity_k);
 
 void QuantizeMxfp8ForZeroPaddingCuteSM120(TensorView input, TensorView token_offset,
                                           TensorView out_fp8, TensorView out_scale_raw,
                                           int64_t granK);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_mxfp8_nt_groupwise_zero_padding,
-                              CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120ZeroPadding);
+                              CutlassGroupGemmMXFP8GroupwiseScaledSM120ZeroPadding);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_mxfp8_nt_groupwise,
-                              CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Main);
+                              CutlassGroupGemmMXFP8GroupwiseScaledSM120Main);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_mxfp8_nt_groupwise_masked,
-                              CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Masked);
+                              CutlassGroupGemmMXFP8GroupwiseScaledSM120Masked);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(quantize_mxfp8_for_zero_padding,
                               QuantizeMxfp8ForZeroPaddingCuteSM120);

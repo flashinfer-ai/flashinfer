@@ -15,10 +15,10 @@
  */
 #include <string>
 
-#include "flashinfer/gemm/mxfp8_cute_gemm_sm120.h"
+#include "flashinfer/gemm/mxfp8_gemm_cute_sm120.h"
 #include "tvm_ffi_utils.h"
 
-void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120ZeroPadding(
+void CutlassGroupGemmMXFP8GroupwiseScaledSM120ZeroPadding(
     TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, TensorView m_indptr,
     TensorView out, std::string scale_major_mode, int64_t scale_granularity_m,
     int64_t scale_granularity_n, int64_t scale_granularity_k) {
@@ -71,7 +71,7 @@ void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120ZeroPadding(
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());
 
-  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8CuteGemmSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
+  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8GemmCuteSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
                                                                float, cute::float_ue8m0_t>
       runner;
 
@@ -79,14 +79,16 @@ void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120ZeroPadding(
   runner.group_gemm_mxfp8_nt_groupwise_zero_padding(
       out.data_ptr(), static_cast<void const*>(a.data_ptr()),
       static_cast<void const*>(b.data_ptr()), static_cast<int32_t const*>(m_indptr.data_ptr()),
-      num_experts, total_rows, n, k, stream, reinterpret_cast<float const*>(a_scale.data_ptr()),
-      reinterpret_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_k));
+      num_experts, total_rows, n, k, stream, static_cast<int32_t const*>(a_scale.data_ptr()),
+      static_cast<int32_t const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_k));
 }
 
-void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Main(
-    TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, TensorView m_indices,
-    TensorView out, bool use_psum_layout, int64_t scale_granularity_m, int64_t scale_granularity_n,
-    int64_t scale_granularity_k) {
+void CutlassGroupGemmMXFP8GroupwiseScaledSM120Main(TensorView a, TensorView b, TensorView a_scale,
+                                                   TensorView b_scale, TensorView m_indices,
+                                                   TensorView out, bool use_psum_layout,
+                                                   int64_t scale_granularity_m,
+                                                   int64_t scale_granularity_n,
+                                                   int64_t scale_granularity_k) {
   TVM_FFI_ICHECK_EQ(scale_granularity_m, 1)
       << "scale_granularity_m must be 1; got " << scale_granularity_m;
   TVM_FFI_ICHECK_EQ(scale_granularity_n, 1)
@@ -140,24 +142,23 @@ void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Main(
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());
 
-  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8CuteGemmSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
+  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8GemmCuteSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
                                                                float, cute::float_ue8m0_t>
       runner;
 
   runner.group_gemm_mxfp8_nt_groupwise_contiguous(
       out.data_ptr(), static_cast<void const*>(a.data_ptr()),
       static_cast<void const*>(b.data_ptr()), static_cast<int32_t const*>(m_indices.data_ptr()),
-      num_groups, m, n, k, stream, reinterpret_cast<float const*>(a_scale.data_ptr()),
-      reinterpret_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_k),
+      num_groups, m, n, k, stream, static_cast<int32_t const*>(a_scale.data_ptr()),
+      static_cast<int32_t const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_k),
       use_psum_layout);
 }
 
-void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Masked(TensorView a, TensorView b,
-                                                         TensorView a_scale, TensorView b_scale,
-                                                         TensorView masked_m, TensorView out,
-                                                         int64_t scale_granularity_m,
-                                                         int64_t scale_granularity_n,
-                                                         int64_t scale_granularity_k) {
+void CutlassGroupGemmMXFP8GroupwiseScaledSM120Masked(TensorView a, TensorView b, TensorView a_scale,
+                                                     TensorView b_scale, TensorView masked_m,
+                                                     TensorView out, int64_t scale_granularity_m,
+                                                     int64_t scale_granularity_n,
+                                                     int64_t scale_granularity_k) {
   TVM_FFI_ICHECK_EQ(scale_granularity_m, 1)
       << "scale_granularity_m must be 1; got " << scale_granularity_m;
   TVM_FFI_ICHECK_EQ(scale_granularity_n, 1)
@@ -202,15 +203,15 @@ void CutlassGroupGemmMxfp8GroupwiseScaledCuteSM120Masked(TensorView a, TensorVie
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());
 
-  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8CuteGemmSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
+  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8GemmCuteSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
                                                                float, cute::float_ue8m0_t>
       runner;
 
   runner.group_gemm_mxfp8_nt_groupwise_masked(
       out.data_ptr(), static_cast<void const*>(a.data_ptr()),
       static_cast<void const*>(b.data_ptr()), static_cast<int const*>(masked_m.data_ptr()),
-      num_groups, max_m, n, k, stream, reinterpret_cast<float const*>(a_scale.data_ptr()),
-      reinterpret_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_k));
+      num_groups, max_m, n, k, stream, static_cast<int32_t const*>(a_scale.data_ptr()),
+      static_cast<int32_t const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_k));
 }
 
 void QuantizeMxfp8ForZeroPaddingCuteSM120(TensorView input, TensorView token_offset,

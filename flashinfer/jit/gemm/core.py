@@ -671,13 +671,13 @@ def gen_gemm_sm120_module_cute_mxfp8() -> JitSpec:
 
     Bundles 5 MoE/dense MXFP8 entries (Normal / Batched / MoE contiguous w/wo
     psum_layout / MoE masked / MoE zero_padding) with a shared cute-DSL runner
-    (`Mxfp8CuteGemmSm120Runner<e4m3_t, bf16_t, float, ue8m0_t>`). All source is
-    in-tree under `include/flashinfer/gemm/{mxfp8_cute_gemm_sm120.h,
-    sm120_blockscaled/}` and `csrc/mxfp8_cute_gemm_sm120.cu`; the kernel uses
+    (`Mxfp8GemmCuteSm120Runner<e4m3_t, bf16_t, float, ue8m0_t>`). All source is
+    in-tree under `include/flashinfer/gemm/{mxfp8_gemm_cute_sm120.h,
+    sm120_blockscaled/}` and `csrc/mxfp8_gemm_cute_sm120.cu`; the kernel uses
     flashinfer's own `3rdparty/cutlass`.
     """
     source_paths = [
-        jit_env.FLASHINFER_CSRC_DIR / "mxfp8_cute_gemm_sm120.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "mxfp8_gemm_cute_sm120.cu",
         jit_env.FLASHINFER_CSRC_DIR / "group_gemm_mxfp8_cute_sm120.cu",
         jit_env.FLASHINFER_CSRC_DIR / "group_gemm_mxfp8_cute_sm120_jit_binding.cu",
         jit_env.FLASHINFER_CSRC_DIR / "gemm_mxfp8_cute_sm120.cu",

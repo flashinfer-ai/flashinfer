@@ -15,14 +15,13 @@
  */
 #include <string>
 
-#include "flashinfer/gemm/mxfp8_cute_gemm_sm120.h"
+#include "flashinfer/gemm/mxfp8_gemm_cute_sm120.h"
 #include "tvm_ffi_utils.h"
 
-void CutlassGemmMxfp8GroupwiseScaledCuteSM120(TensorView a, TensorView b, TensorView a_scale,
-                                              TensorView b_scale, TensorView out,
-                                              int64_t scale_granularity_m,
-                                              int64_t scale_granularity_n,
-                                              int64_t scale_granularity_k) {
+void CutlassGemmMXFP8GroupwiseScaledSM120(TensorView a, TensorView b, TensorView a_scale,
+                                          TensorView b_scale, TensorView out,
+                                          int64_t scale_granularity_m, int64_t scale_granularity_n,
+                                          int64_t scale_granularity_k) {
   TVM_FFI_ICHECK_EQ(scale_granularity_m, 1)
       << "scale_granularity_m must be 1; got " << scale_granularity_m;
   TVM_FFI_ICHECK_EQ(scale_granularity_n, 1)
@@ -58,18 +57,18 @@ void CutlassGemmMxfp8GroupwiseScaledCuteSM120(TensorView a, TensorView b, Tensor
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());
 
-  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8CuteGemmSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
+  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8GemmCuteSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
                                                                float, cute::float_ue8m0_t>
       runner;
 
   runner.gemm_mxfp8_nt_groupwise(out.data_ptr(), static_cast<void const*>(a.data_ptr()),
                                  static_cast<void const*>(b.data_ptr()), m, n, k,
-                                 reinterpret_cast<float const*>(a_scale.data_ptr()),
-                                 reinterpret_cast<float const*>(b_scale.data_ptr()), stream,
+                                 static_cast<int32_t const*>(a_scale.data_ptr()),
+                                 static_cast<int32_t const*>(b_scale.data_ptr()), stream,
                                  static_cast<int>(scale_granularity_k));
 }
 
-void CutlassBatchGemmMxfp8GroupwiseScaledCuteSM120(
+void CutlassBatchGemmMXFP8GroupwiseScaledSM120(
     TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, TensorView out, int64_t lda,
     int64_t stride_a, int64_t ldb, int64_t stride_b, int64_t ldd, int64_t stride_d,
     int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k) {
@@ -138,7 +137,7 @@ void CutlassBatchGemmMxfp8GroupwiseScaledCuteSM120(
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());
 
-  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8CuteGemmSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
+  flashinfer::gemm::mxfp8_cute_sm120::Mxfp8GemmCuteSm120Runner<cute::float_e4m3_t, cute::bfloat16_t,
                                                                float, cute::float_ue8m0_t>
       runner;
 
@@ -146,7 +145,7 @@ void CutlassBatchGemmMxfp8GroupwiseScaledCuteSM120(
       const_cast<void*>(static_cast<void const*>(a.data_ptr())), static_cast<int>(lda),
       static_cast<int>(stride_a), const_cast<void*>(static_cast<void const*>(b.data_ptr())),
       static_cast<int>(ldb), static_cast<int>(stride_b), out.data_ptr(), static_cast<int>(ldd),
-      static_cast<int>(stride_d), reinterpret_cast<float*>(a_scale.data_ptr()),
-      reinterpret_cast<float*>(b_scale.data_ptr()), num_groups, m, n, k, stream,
+      static_cast<int>(stride_d), static_cast<int32_t*>(a_scale.data_ptr()),
+      static_cast<int32_t*>(b_scale.data_ptr()), num_groups, m, n, k, stream,
       static_cast<int>(scale_granularity_k));
 }

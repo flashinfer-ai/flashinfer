@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,62 +21,52 @@
 #include <cstring>
 
 #include "cutlass/gemm_coord.h"
-#include "flashinfer/gemm/mxfp8_cute_gemm_sm120.h"
+#include "flashinfer/gemm/mxfp8_gemm_cute_sm120.h"
 #include "flashinfer/gemm/sm120_blockscaled/builder.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/kernel_impl.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/launch.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/quantize_mxfp8_zero_padding.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/scheduler.cuh"
 #include "flashinfer/gemm/sm120_blockscaled/utils.cuh"
+#include "tvm_ffi_utils.h"
 
-#define CUTLASS_CHECK(status)                                                                    \
-  {                                                                                              \
-    cutlass::Status error = status;                                                              \
-    if (error != cutlass::Status::kSuccess) {                                                    \
-      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: " << __LINE__ \
-                << std::endl;                                                                    \
-      exit(EXIT_FAILURE);                                                                        \
-    }                                                                                            \
-  }
-
-// 2-value granK dispatch (mirrors flashinfer's DISPATCH_* macro style).
-// Validates input and instantiates the templated callsite for each supported
-// `granK` value. The throw branch defends against bypasses of the thop-layer
-// `TORCH_CHECK(granK == 32 || granK == 128, ...)` validators.
-#define DISPATCH_GRAN_K(granK, GRAN_K, ...)              \
-  if ((granK) == 32) {                                   \
-    constexpr int GRAN_K = 32;                           \
-    __VA_ARGS__;                                         \
-  } else if ((granK) == 128) {                           \
-    constexpr int GRAN_K = 128;                          \
-    __VA_ARGS__;                                         \
-  } else {                                               \
-    throw std::runtime_error("granK must be 32 or 128"); \
+// 2-value granK dispatch. Validates input and instantiates the templated
+// callsite for each supported `granK` value. The else branch defends against
+// bypasses of the caller-side validators.
+#define DISPATCH_GRAN_K(granK, GRAN_K, ...)             \
+  if ((granK) == 32) {                                  \
+    constexpr int GRAN_K = 32;                          \
+    __VA_ARGS__;                                        \
+  } else if ((granK) == 128) {                          \
+    constexpr int GRAN_K = 128;                         \
+    __VA_ARGS__;                                        \
+  } else {                                              \
+    TVM_FFI_ICHECK(false) << "granK must be 32 or 128"; \
   }
 
 namespace flashinfer::gemm::mxfp8_cute_sm120 {
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
-Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
-                         BlockScaleElementType>::Mxfp8CuteGemmSm120Runner() {}
+Mxfp8GemmCuteSm120Runner<ElementType, OutElementType, AccumElementType,
+                         BlockScaleElementType>::Mxfp8GemmCuteSm120Runner() {}
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
-Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
-                         BlockScaleElementType>::~Mxfp8CuteGemmSm120Runner() {}
+Mxfp8GemmCuteSm120Runner<ElementType, OutElementType, AccumElementType,
+                         BlockScaleElementType>::~Mxfp8GemmCuteSm120Runner() {}
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
-void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+void Mxfp8GemmCuteSm120Runner<ElementType, OutElementType, AccumElementType,
                               BlockScaleElementType>::gemm_mxfp8_nt_groupwise(void* D,
                                                                               void const* A,
                                                                               void const* B,
                                                                               int shape_m,
                                                                               int shape_n,
                                                                               int shape_k,
-                                                                              float const* SFA,
-                                                                              float const* SFB,
+                                                                              int32_t const* SFA,
+                                                                              int32_t const* SFB,
                                                                               cudaStream_t stream,
                                                                               int granK) {
   DISPATCH_GRAN_K(granK, GRAN_K, {
@@ -87,11 +77,11 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
 template <int GranK>
-void Mxfp8CuteGemmSm120Runner<
+void Mxfp8GemmCuteSm120Runner<
     ElementType, OutElementType, AccumElementType,
     BlockScaleElementType>::gemm_mxfp8_nt_groupwise_impl(void* D, void const* A, void const* B,
                                                          int shape_m, int shape_n, int shape_k,
-                                                         float const* SFA, float const* SFB,
+                                                         int32_t const* SFA, int32_t const* SFB,
                                                          cudaStream_t stream) {
   using KT_M128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK,
                                                              sm120_blockscaled::GemmType::Normal>;
@@ -106,9 +96,9 @@ void Mxfp8CuteGemmSm120Runner<
   auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
   auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
   auto ptr_SFA_in =
-      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
   auto ptr_SFB_in =
-      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
   auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
 
   int num_sms = sm120_blockscaled::get_num_sms();
@@ -143,11 +133,11 @@ void Mxfp8CuteGemmSm120Runner<
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
-void Mxfp8CuteGemmSm120Runner<
+void Mxfp8GemmCuteSm120Runner<
     ElementType, OutElementType, AccumElementType,
     BlockScaleElementType>::batch_gemm_mxfp8_nt_groupwise(void* A, int ld_a, int stride_a, void* B,
                                                           int ld_b, int stride_b, void* D, int ld_d,
-                                                          int stride_d, float* SFA, float* SFB,
+                                                          int stride_d, int32_t* SFA, int32_t* SFB,
                                                           int num_groups, int shape_m, int shape_n,
                                                           int shape_k, cudaStream_t stream,
                                                           int granK) {
@@ -161,12 +151,12 @@ void Mxfp8CuteGemmSm120Runner<
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
 template <int GranK>
-void Mxfp8CuteGemmSm120Runner<
+void Mxfp8GemmCuteSm120Runner<
     ElementType, OutElementType, AccumElementType,
     BlockScaleElementType>::batch_gemm_mxfp8_nt_groupwise_impl(void* A, int ld_a, int stride_a,
                                                                void* B, int ld_b, int stride_b,
                                                                void* D, int ld_d, int stride_d,
-                                                               float* SFA, float* SFB,
+                                                               int32_t* SFA, int32_t* SFB,
                                                                int num_groups, int shape_m,
                                                                int shape_n, int shape_k,
                                                                cudaStream_t stream) {
@@ -218,14 +208,14 @@ void Mxfp8CuteGemmSm120Runner<
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
-void Mxfp8CuteGemmSm120Runner<
+void Mxfp8GemmCuteSm120Runner<
     ElementType, OutElementType, AccumElementType,
     BlockScaleElementType>::group_gemm_mxfp8_nt_groupwise_masked(void* D, void const* A,
                                                                  void const* B, int const* masked_m,
                                                                  int num_groups, int max_m, int n,
                                                                  int k, cudaStream_t stream,
-                                                                 float const* SFA, float const* SFB,
-                                                                 int granK) {
+                                                                 int32_t const* SFA,
+                                                                 int32_t const* SFB, int granK) {
   DISPATCH_GRAN_K(granK, GRAN_K, {
     group_gemm_mxfp8_nt_groupwise_masked_impl<GRAN_K>(D, A, B, masked_m, num_groups, max_m, n, k,
                                                       stream, SFA, SFB);
@@ -235,12 +225,12 @@ void Mxfp8CuteGemmSm120Runner<
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
 template <int GranK>
-void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+void Mxfp8GemmCuteSm120Runner<ElementType, OutElementType, AccumElementType,
                               BlockScaleElementType>::
     group_gemm_mxfp8_nt_groupwise_masked_impl(void* D, void const* A, void const* B,
                                               int const* masked_m, int num_groups, int max_m, int n,
-                                              int k, cudaStream_t stream, float const* SFA,
-                                              float const* SFB) {
+                                              int k, cudaStream_t stream, int32_t const* SFA,
+                                              int32_t const* SFB) {
   using KT_MASKED =
       sm120_blockscaled::SM120BlockScaledBuilder<64, 128, 64, 4, GranK,
                                                  sm120_blockscaled::GemmType::MGroupedMasked>;
@@ -248,9 +238,9 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
   auto ptr_A_in = reinterpret_cast<typename KT_MASKED::ElementA*>(const_cast<void*>(A));
   auto ptr_B_in = reinterpret_cast<typename KT_MASKED::ElementB*>(const_cast<void*>(B));
   auto ptr_SFA_in =
-      reinterpret_cast<typename KT_MASKED::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+      reinterpret_cast<typename KT_MASKED::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
   auto ptr_SFB_in =
-      reinterpret_cast<typename KT_MASKED::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+      reinterpret_cast<typename KT_MASKED::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
   auto ptr_D_in = reinterpret_cast<typename KT_MASKED::ElementD*>(D);
 
   int num_sms = sm120_blockscaled::get_num_sms();
@@ -262,13 +252,13 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
-void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+void Mxfp8GemmCuteSm120Runner<ElementType, OutElementType, AccumElementType,
                               BlockScaleElementType>::
     group_gemm_mxfp8_nt_groupwise_zero_padding(void* D, void const* A, void const* B,
                                                int32_t const* token_offset, int num_experts,
                                                int total_rows, int shape_n, int shape_k,
-                                               cudaStream_t stream, float const* SFA,
-                                               float const* SFB, int granK) {
+                                               cudaStream_t stream, int32_t const* SFA,
+                                               int32_t const* SFB, int granK) {
   DISPATCH_GRAN_K(granK, GRAN_K, {
     group_gemm_mxfp8_nt_groupwise_zero_padding_impl<GRAN_K>(
         D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k, stream, SFA, SFB);
@@ -278,13 +268,13 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
 template <int GranK>
-void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+void Mxfp8GemmCuteSm120Runner<ElementType, OutElementType, AccumElementType,
                               BlockScaleElementType>::
     group_gemm_mxfp8_nt_groupwise_zero_padding_impl(void* D, void const* A, void const* B,
                                                     int32_t const* token_offset, int num_experts,
                                                     int total_rows, int shape_n, int shape_k,
-                                                    cudaStream_t stream, float const* SFA,
-                                                    float const* SFB) {
+                                                    cudaStream_t stream, int32_t const* SFA,
+                                                    int32_t const* SFB) {
   constexpr auto kGT = sm120_blockscaled::GemmType::MGroupedContiguousWithZeroPadding;
   constexpr int kTileK_M64 = (GranK == 32) ? 64 : 128;
   using KT_M32 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK, kGT>;
@@ -296,9 +286,9 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
   auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
   auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
   auto ptr_SFA_in =
-      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
   auto ptr_SFB_in =
-      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
   auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
 
   int num_sms = sm120_blockscaled::get_num_sms();
@@ -325,12 +315,12 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
 
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
-void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+void Mxfp8GemmCuteSm120Runner<ElementType, OutElementType, AccumElementType,
                               BlockScaleElementType>::
     group_gemm_mxfp8_nt_groupwise_contiguous(void* D, void const* A, void const* B,
                                              int32_t const* m_indices, int num_groups, int m,
                                              int shape_n, int shape_k, cudaStream_t stream,
-                                             float const* SFA, float const* SFB, int granK,
+                                             int32_t const* SFA, int32_t const* SFB, int granK,
                                              bool use_psum_layout) {
   DISPATCH_GRAN_K(granK, GRAN_K, {
     group_gemm_mxfp8_nt_groupwise_contiguous_impl<GRAN_K>(
@@ -341,12 +331,12 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
 template <typename ElementType, typename OutElementType, typename AccumElementType,
           typename BlockScaleElementType>
 template <int GranK>
-void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+void Mxfp8GemmCuteSm120Runner<ElementType, OutElementType, AccumElementType,
                               BlockScaleElementType>::
     group_gemm_mxfp8_nt_groupwise_contiguous_impl(void* D, void const* A, void const* B,
                                                   int32_t const* m_indices, int num_groups, int m,
                                                   int shape_n, int shape_k, cudaStream_t stream,
-                                                  float const* SFA, float const* SFB,
+                                                  int32_t const* SFA, int32_t const* SFB,
                                                   bool use_psum_layout) {
   constexpr int kTileK_M64 = (GranK == 32) ? 64 : 128;
   int num_sms = sm120_blockscaled::get_num_sms();
@@ -363,9 +353,9 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
     auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
     auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
     auto ptr_SFA_in =
-        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
     auto ptr_SFB_in =
-        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
     auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
 
     if (m_per_expert <= 12) {
@@ -396,9 +386,9 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
     auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
     auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
     auto ptr_SFA_in =
-        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
     auto ptr_SFB_in =
-        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
     auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
 
     if (m_per_expert <= 12) {
@@ -421,7 +411,7 @@ void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
   }
 }
 
-template class Mxfp8CuteGemmSm120Runner<cute::float_e4m3_t, cute::bfloat16_t, float,
+template class Mxfp8GemmCuteSm120Runner<cute::float_e4m3_t, cute::bfloat16_t, float,
                                         cute::float_ue8m0_t>;
 
 template <int GranK>

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #pragma once
 #include <cstdint>
 #include <cuda_runtime.h>
+#include "tvm_ffi_utils.h"
 
 namespace sm120_blockscaled
 {
