@@ -833,6 +833,76 @@ Repro: `benchmarks/flashinfer_benchmark.py --routine {trtllm_fp4_block_scale_moe
 | G6 | [x] | IwakuraRein · `api.py:546` | Naming collision: `MoeInputs` vs the config types. Consider renaming `MoeInputs` → `MoeRunnerInputs`. | **Done.** Renamed the core class `MoEInputs` → `MoeRunnerInputs` (it *is* the runner's flat input list) and updated all `core.py` + `runners.py` references. Kept a backward-compat alias `MoEInputs = MoeRunnerInputs` in `core.py` so out-of-tree importers and the existing tests (`test_unified_moe.py`, `test_trtllm_gen_moe_autotune_tactics.py`) keep working. The unrelated `CuteDslMoEInputsHelper` was left untouched. |
 | G7 | [x] | samuellees · `runners.py:77` | Forward `do_preparation` explicitly: `self._inner.forward(inputs, tactic=tactic, do_preparation=do_preparation, **kwargs)`. | **Done.** `CuteDslNvfp4Runner.forward` dropped `do_preparation` when delegating; `TrtllmFp4RoutedRunner.forward` already forwarded it, and `AutoTuner` calls `r(tensors, tactic=-1, do_preparation=True)` during profiling. Now both runners forward it (a no-op in the CuteDSL inner today, but correct + consistent and future-proof). |
 
+### Test Harness — Forward-Compatible Fuzzer (PR #6, merged 2026-06-09)
+
+`tests/moe/test_unified_moe_api_fuzz.py` (merged from `aleozlx/flashinfer#6`,
+branch `yanxu/unified-moe-api-fuzzer`) drives the **real user-facing surface** —
+one `MoEConfig` → `XxxConfig.prepare_weights(w1_bf16, w2_bf16, …)` →
+`MoELayer`'s per-backend runners — so the production dispatch + the `prepare.py`
+scale/layout plumbing are what's under test, where low-precision-MoE bugs
+cluster.
+
+**Forward-compatible by construction:**
+- Backends are **auto-discovered from the live runner registry** (`layer.runners`);
+  an unwired backend is skipped and gets covered the moment its runner lands —
+  zero new test code.
+- Weight prep is the uniform `cfg.prepare_weights(...)` (canonical bf16 in,
+  quantize+layout internal).
+- Per-dtype specifics live in one `_DTYPE` table (golden-input snap / activation
+  pack / canonical reference / poison / tolerances). New dtype = one
+  `DTypeHandler`; new backend = free.
+
+**Verification model** (uniform per config): (1) no crash / no NaN-Inf where the
+reference is finite; (2) numeric agreement vs a **single authoritative
+quant-aware reference** — inputs snapped to the exact nvfp4 grid + sparsified so
+a structural bug (dropped expert / wrong index / wrong scale role) is a gross
+error, tolerance at the fp4 requant floor (~0.08); (3) per-backend determinism
+(bitwise reproduce unless declared non-deterministic, e.g. CuteDSL atomic
+finalize); (4) output-buffer poison (garbage+NaN/Inf in the kernel's `new_empty`
+output → the torch→JAX buffer-hygiene guard); (5) autotune-tactic sweep (every
+valid tactic matches, not just the default); (6) autotune-ON real path
+(`autotune(True)` profiles+selects+caches a winner, output still matches); (7)
+device-state probe (turns a context-corrupting IMA into a clean failure). A
+sibling `test_autotune_cache_coherence` scenario covers the cross-call winner
+cache (token-count sequence across bucket boundaries 4095/4096/4097).
+Cross-backend agreement is **intentionally not** a check — an authoritative
+tight reference already catches (and names) a deviating backend.
+
+**Config space:** random non-pow2 (aligned) hidden/intermediate, odd/tile-boundary
+token counts, routing-load skew, and ~30% **expert-parallel shards** (global >
+local + `local_expert_offset` — the real deployment shape, in scope for the
+single-GPU harness; the EP *collective* is not), all under a weight-memory
+budget so one config never hogs the GPU.
+
+**Known-failure ledger** (`_KNOWN_FAILURES`): a filed-and-tracked bug is `xfail`ed
+by `(backend_key, predicate)` — the case is **still run**, so the suite stays
+green yet flags loudly (`xpass` → "remove this entry") the day the bug is fixed.
+A crash is never tolerated, only a wrong answer.
+
+**Bugs this fuzzer found + filed** (the EP/scale regimes the prior suite never
+exercised end-to-end):
+- **gh #3547** — `trtllm_fp4_routed` returns all-zeros for EP shards
+  (`local_expert_offset > 0`): the offset is applied twice (pre-subtracted in
+  `pack_inputs` *and* forwarded to the kernel). `cute_dsl_nvfp4` is correct
+  (passes global ids + offset, kernel localizes once). Encoded as the current
+  `_KNOWN_FAILURES` entry. Fix = stop pre-subtracting (pass global ids), then
+  delete the ledger entry so the case flips to passing.
+- **gh #3548** — activation **global-scale** gap: `prepare_*_weights` hardcodes
+  `gs=1.0`/`fc2_input_scale=1.0`/`alpha=ones` and `MoEActivationPack` has no
+  global-scale field, so calibrated-checkpoint scales are silently dropped
+  (~2400× output inflation). This is roadmap item #5 below (a standardized
+  intermediate-scale **QuantSpec** policy), not a quick fix; quick mitigation is
+  to make `prepare_*` fail **loud** on a non-default scale.
+
+**Roadmap (ranked, from the 2026-06-09 audit of 51 past MoE issues):** (1) a
+Blackwell/SM120 **PR-CI runner** — highest leverage, since PR-gating CI tops out
+at SM90 and the dominant fp4/MoE bug class is collected-then-skipped at PR time;
+(2) N-run stress + per-test timeout under `--forked`; (3) curated production
+shapes (DeepSeek-V3 / Llama-4 / Qwen3 / Mixtral + tile-window enumeration); (4) a
+build-manifest oracle (assert each advertised backend×quant×arch instantiates a
+kernel); (5) tighten the quantized-numeric net via the QuantSpec scale policy
+(also unblocks #3548 and an independent fp32 reference).
+
 ### Post-MVP Carryover
 
 | Status | Task | Review refs |
