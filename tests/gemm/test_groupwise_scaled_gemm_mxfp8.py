@@ -44,9 +44,9 @@ from flashinfer.gemm import (
     quantize_mxfp8_for_zero_padding,
 )
 from flashinfer.quantization import (
-    mxfp8_dequantize_per_row,
+    mxfp8_dequantize_per_token,
     mxfp8_quantize_per_block,
-    mxfp8_quantize_per_row,
+    mxfp8_quantize_per_token,
     mxfp8_transform_sf_layout,
 )
 from flashinfer.utils import get_compute_capability
@@ -60,10 +60,10 @@ def _skip_if_not_sm120():
         )
 
 
-def _quant_a_per_row(a, k_gran, masked_m=None):
+def _quant_a_per_token(a, k_gran, masked_m=None):
     """Return (a_fp8, a_sf_packed, a_dequant) where a_dequant reverses quantization."""
-    a_fp8, a_sf = mxfp8_quantize_per_row(a, masked_m=masked_m, k_gran=k_gran)
-    a_dequant = mxfp8_dequantize_per_row(a_fp8, a_sf, k_gran=k_gran, dtype=a.dtype)
+    a_fp8, a_sf = mxfp8_quantize_per_token(a, masked_m=masked_m, k_gran=k_gran)
+    a_dequant = mxfp8_dequantize_per_token(a_fp8, a_sf, k_gran=k_gran, dtype=a.dtype)
     return a_fp8, a_sf, a_dequant
 
 
@@ -80,7 +80,7 @@ def _quant_b_per_block(b, k_gran, num_groups=None):
         num_groups=num_groups,
         is_sfa=False,
     )
-    b_dequant = mxfp8_dequantize_per_row(b_fp8, b_sf, k_gran=k_gran, dtype=b.dtype)
+    b_dequant = mxfp8_dequantize_per_token(b_fp8, b_sf, k_gran=k_gran, dtype=b.dtype)
     return b_fp8, b_sf, b_dequant
 
 
@@ -98,7 +98,7 @@ def test_mxfp8_gemm_groupwise(m, n, k, k_gran):
     a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda") / math.sqrt(k)
 
-    a_fp8, a_sf, a_deq = _quant_a_per_row(a, k_gran=k_gran)
+    a_fp8, a_sf, a_deq = _quant_a_per_token(a, k_gran=k_gran)
     b_fp8, b_sf, b_deq = _quant_b_per_block(b, k_gran=k_gran)
     ref = einsum(a_deq, b_deq, "m k, n k -> m n").to(out_dtype)
 
@@ -133,7 +133,7 @@ def test_mxfp8_batch_gemm_groupwise(num_groups, m, n, k, k_gran):
         (num_groups, n, k), dtype=torch.bfloat16, device="cuda"
     ) / math.sqrt(k)
 
-    a_fp8, a_sf, a_deq = _quant_a_per_row(a, k_gran=k_gran)
+    a_fp8, a_sf, a_deq = _quant_a_per_token(a, k_gran=k_gran)
     b_fp8, b_sf, b_deq = _quant_b_per_block(b, k_gran=k_gran, num_groups=num_groups)
     ref = einsum(a_deq, b_deq, "g m k, g n k -> g m n").to(out_dtype)
 
@@ -174,7 +174,7 @@ def test_mxfp8_group_gemm_groupwise_psum_layout(num_groups, m_per_group, n, k, k
         device="cuda",
     )
 
-    a_fp8, a_sf, a_deq = _quant_a_per_row(a, k_gran=k_gran)
+    a_fp8, a_sf, a_deq = _quant_a_per_token(a, k_gran=k_gran)
     b_fp8, b_sf, b_deq = _quant_b_per_block(b, k_gran=k_gran, num_groups=num_groups)
 
     ref = torch.zeros(m, n, dtype=out_dtype, device="cuda")
@@ -223,7 +223,7 @@ def test_mxfp8_group_gemm_groupwise_mgroup_contiguous(
     for j in range(num_groups):
         m_indices[j * m_per_group : (j + 1) * m_per_group] = j
 
-    a_fp8, a_sf, a_deq = _quant_a_per_row(a, k_gran=k_gran)
+    a_fp8, a_sf, a_deq = _quant_a_per_token(a, k_gran=k_gran)
     b_fp8, b_sf, b_deq = _quant_b_per_block(b, k_gran=k_gran, num_groups=num_groups)
 
     ref = torch.zeros(m, n, dtype=out_dtype, device="cuda")
@@ -266,7 +266,7 @@ def test_mxfp8_group_gemm_groupwise_masked(num_groups, max_m, n, k, k_gran):
     ) / math.sqrt(k)
     masked_m = torch.full((num_groups,), max_m // 2, dtype=torch.int32, device="cuda")
 
-    a_fp8, a_sf, a_deq = _quant_a_per_row(a, masked_m=masked_m, k_gran=k_gran)
+    a_fp8, a_sf, a_deq = _quant_a_per_token(a, masked_m=masked_m, k_gran=k_gran)
     b_fp8, b_sf, b_deq = _quant_b_per_block(b, k_gran=k_gran, num_groups=num_groups)
 
     ref = einsum(a_deq, b_deq, "g m k, g n k -> g m n").to(out_dtype)
@@ -320,15 +320,15 @@ def test_mxfp8_group_gemm_groupwise_zero_padding(
     a_fp8, a_sf = quantize_mxfp8_for_zero_padding(a, m_indptr, gran_k=k_gran)
 
     # For the dequant reference: independently compute per-expert per-token quant
-    # via mxfp8_quantize_per_row (no padded layout, just per-row sf). UE8M0 ceil
+    # via mxfp8_quantize_per_token (no padded layout, just per-row sf). UE8M0 ceil
     # is deterministic so per-row fp8/sf values match the kernel's input; only sf
     # storage layout differs. Cos-sim is robust to this layout-only difference.
     a_deq = torch.zeros_like(a)
     for j in range(num_groups):
         start = int(m_indptr[j].item())
         end = int(m_indptr[j + 1].item())
-        a_j_fp8, a_j_sf = mxfp8_quantize_per_row(a[start:end], k_gran=k_gran)
-        a_deq[start:end] = mxfp8_dequantize_per_row(
+        a_j_fp8, a_j_sf = mxfp8_quantize_per_token(a[start:end], k_gran=k_gran)
+        a_deq[start:end] = mxfp8_dequantize_per_token(
             a_j_fp8,
             a_j_sf,
             k_gran=k_gran,

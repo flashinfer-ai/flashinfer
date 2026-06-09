@@ -20,12 +20,12 @@ from ..jit.quantization import gen_quantization_module
 # Re-export FP8 quantization
 from .fp8_quantization import mxfp8_quantize, mxfp8_dequantize_host
 
-# Re-export MXFP8 per-row layout helpers (cute sm120 backend, DG-aligned)
+# Re-export MXFP8 per-token / per-block layout helpers (cute sm120 backend, DG-aligned)
 from .mxfp8_layout import (
-    mxfp8_quantize_per_row,
+    mxfp8_quantize_per_token,
     mxfp8_quantize_per_block,
     mxfp8_transform_sf_layout,
-    mxfp8_dequantize_per_row,
+    mxfp8_dequantize_per_token,
 )
 
 # Re-export FP4 quantization (all public symbols)
@@ -77,11 +77,11 @@ __all__ = [
     # FP8
     "mxfp8_quantize",
     "mxfp8_dequantize_host",
-    # MXFP8 per-row layout (cute sm120 backend)
-    "mxfp8_quantize_per_row",
+    # MXFP8 per-token / per-block layout (cute sm120 backend)
+    "mxfp8_quantize_per_token",
     "mxfp8_quantize_per_block",
     "mxfp8_transform_sf_layout",
-    "mxfp8_dequantize_per_row",
+    "mxfp8_dequantize_per_token",
     # FP4
     "SfLayout",
     "block_scale_interleave",

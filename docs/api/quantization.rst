@@ -92,10 +92,10 @@ Supported ``k_gran ∈ {32, 128}``.
 .. autosummary::
     :toctree: ../generated
 
-    mxfp8_quantize_per_row
+    mxfp8_quantize_per_token
     mxfp8_quantize_per_block
     mxfp8_transform_sf_layout
-    mxfp8_dequantize_per_row
+    mxfp8_dequantize_per_token
 
 CuTe-DSL Quantization Kernels (experimental)
 --------------------------------------------

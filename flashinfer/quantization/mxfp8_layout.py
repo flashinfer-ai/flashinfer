@@ -38,12 +38,12 @@ def _ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
 
 
 @flashinfer_api
-def mxfp8_quantize_per_row(
+def mxfp8_quantize_per_token(
     input: torch.Tensor,
     masked_m: Optional[torch.Tensor] = None,
     k_gran: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Per-row (per-token) MXFP8 quantization with UE8M0 scaling.
+    r"""Per-token (1 x ``k_gran``) MXFP8 quantization with UE8M0 scaling.
 
     Quantizes ``input`` along the K dimension in blocks of ``k_gran`` elements,
     producing FP8 E4M3 values and INT32-packed UE8M0 scales in the kernel-required
@@ -253,7 +253,7 @@ def mxfp8_transform_sf_layout(
 
 
 @flashinfer_api
-def mxfp8_dequantize_per_row(
+def mxfp8_dequantize_per_token(
     fp8: torch.Tensor,
     sf_packed: torch.Tensor,
     k_gran: int = 128,
@@ -261,7 +261,7 @@ def mxfp8_dequantize_per_row(
 ) -> torch.Tensor:
     r"""Dequantize FP8 + INT32-packed UE8M0 scales back to BF16/FP16.
 
-    Reverse of ``mxfp8_quantize_per_row`` for upstream-test dequant-self
+    Reverse of ``mxfp8_quantize_per_token`` for upstream-test dequant-self
     correctness reference (testing fp8 arithmetic vs dequant pipeline
     consistency, calc_diff should be ~0).
 
@@ -272,10 +272,10 @@ def mxfp8_dequantize_per_row(
         ``torch.float8_e4m3fn``.
     sf_packed : torch.Tensor
         INT32-packed UE8M0 scale tensor produced by
-        ``mxfp8_quantize_per_row`` (per-row TMA-aligned MN-major layout).
+        ``mxfp8_quantize_per_token`` (per-row TMA-aligned MN-major layout).
     k_gran : int
         UE8M0 K-axis block granularity (must match the value used in
-        ``mxfp8_quantize_per_row``).
+        ``mxfp8_quantize_per_token``).
     dtype : torch.dtype
         Output dtype, default ``torch.bfloat16``.
 
