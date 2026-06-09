@@ -19,23 +19,20 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
-#include "tvm_ffi_utils.h"
+
 #include "math.cuh"
 
-namespace sm120_blockscaled
-{
+namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled {
 
-__device__ __forceinline__ float exp2f_rcp(uint8_t exp)
-{
-    constexpr uint32_t FP32_EXPONENT_BIAS = 127;
-    return (exp == 0) ? 1.0f : exp2f(FP32_EXPONENT_BIAS - static_cast<float>(exp));
+__device__ __forceinline__ float exp2f_rcp(uint8_t exp) {
+  constexpr uint32_t FP32_EXPONENT_BIAS = 127;
+  return (exp == 0) ? 1.0f : exp2f(FP32_EXPONENT_BIAS - static_cast<float>(exp));
 }
 
-__device__ __forceinline__ float reciprocal_approximate_ftz(float a)
-{
-    float b;
-    asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-    return b;
+__device__ __forceinline__ float reciprocal_approximate_ftz(float a) {
+  float b;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
+  return b;
 }
 
 // Per-token FP8 E4M3 quantization with UE8M0 scale, configurable K-axis granularity.
@@ -45,19 +42,16 @@ __device__ __forceinline__ float reciprocal_approximate_ftz(float a)
 //   GranK=32: 16 UE8M0 / warp packed into 4 int32 along K
 // SFA m-axis offsets are 4-row aligned via `math::compute_padded_offset`.
 template <int GranK, typename InputType, typename OutputType, int WarpsPerBlock = 4>
-__global__ void quantize_mxfp8_zero_padding_kernel_sm120(
-    OutputType* __restrict__ fp8_output,
-    int32_t* __restrict__ scale_output,
-    InputType const* __restrict__ input,
-    int32_t const* __restrict__ token_offset,
-    int64_t num_experts,
-    int64_t size_k,
-    int64_t scale_leading_dim)
-{
+__global__ void quantize_mxfp8_zero_padding_kernel_sm120(OutputType* __restrict__ fp8_output,
+                                                         int32_t* __restrict__ scale_output,
+                                                         InputType const* __restrict__ input,
+                                                         int32_t const* __restrict__ token_offset,
+                                                         int64_t num_experts, int64_t size_k,
+                                                         int64_t scale_leading_dim) {
   static_assert(GranK == 32 || GranK == 128, "GranK must be 32 or 128");
   constexpr int kLanesPerGroup = GranK / 16;
   constexpr int kGroupsPerWarp = 32 / kLanesPerGroup;
-  constexpr int kInt32PerWarp  = kGroupsPerWarp / 4;
+  constexpr int kInt32PerWarp = kGroupsPerWarp / 4;
 
   extern __shared__ char shared_memory[];
   int32_t* smem_token_offset = reinterpret_cast<int32_t*>(shared_memory);
@@ -76,9 +70,7 @@ __global__ void quantize_mxfp8_zero_padding_kernel_sm120(
   const int64_t grid_stride = static_cast<int64_t>(gridDim.y) * WarpsPerBlock;
 
   for (int64_t token_idx = static_cast<int64_t>(blockIdx.y) * WarpsPerBlock + warp_id;
-       token_idx < token_num;
-       token_idx += grid_stride)
-  {
+       token_idx < token_num; token_idx += grid_stride) {
     int64_t expert_idx = 0;
     {
       int left = 0;
@@ -98,8 +90,8 @@ __global__ void quantize_mxfp8_zero_padding_kernel_sm120(
 
     int const k_offset = (k_block_idx * 512 + lane_id * 16);
 
-    auto const cur_input_ptr = reinterpret_cast<double4 const*>(
-        input + token_idx * size_k + k_offset);
+    auto const cur_input_ptr =
+        reinterpret_cast<double4 const*>(input + token_idx * size_k + k_offset);
 
     constexpr int kLoadNumElems = sizeof(double4) / sizeof(InputType);
     union LoadTrick {
@@ -111,7 +103,7 @@ __global__ void quantize_mxfp8_zero_padding_kernel_sm120(
     load_trick.pack = k_offset < size_k ? cur_input_ptr[0] : double4{};
 
     InputType max_elem = InputType(0.0f);
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < kLoadNumElems; i++) {
       max_elem = __hmax(max_elem, __habs(load_trick.v[i]));
     }
@@ -139,13 +131,12 @@ __global__ void quantize_mxfp8_zero_padding_kernel_sm120(
     StoreTrick store_trick;
     store_trick.pack = float4{};
 
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < kStoreNumElems; i++) {
       store_trick.v[i] = OutputType(float(load_trick.v[i]) * quant_scale);
     }
 
-    auto cur_output_ptr = reinterpret_cast<float4*>(
-        fp8_output + token_idx * size_k + k_offset);
+    auto cur_output_ptr = reinterpret_cast<float4*>(fp8_output + token_idx * size_k + k_offset);
 
     if (k_offset < size_k) {
       cur_output_ptr[0] = store_trick.pack;
@@ -156,7 +147,7 @@ __global__ void quantize_mxfp8_zero_padding_kernel_sm120(
     const int64_t scale_padded_offset = math::compute_padded_offset(
         static_cast<int64_t>(smem_token_offset[expert_idx]), expert_idx);
 
-    #pragma unroll
+#pragma unroll
     for (int int32_idx = 0; int32_idx < kInt32PerWarp; int32_idx++) {
       int const base_lane = int32_idx * 8;
       uint32_t s0 = __shfl_sync(0xFFFFFFFF, my_scale, base_lane + 0 * kLanesPerGroup);
@@ -174,4 +165,4 @@ __global__ void quantize_mxfp8_zero_padding_kernel_sm120(
   }
 }
 
-} // namespace sm120_blockscaled
+}  // namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled

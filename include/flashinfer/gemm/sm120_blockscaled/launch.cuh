@@ -16,15 +16,13 @@
 
 #pragma once
 
-#include "utils.cuh"
-#include "scheduler.cuh"
 #include "kernel_impl.cuh"
+#include "scheduler.cuh"
+#include "utils.cuh"
 
-namespace sm120_blockscaled
-{
+namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled {
 
-inline int get_num_sms()
-{
+inline int get_num_sms() {
   int device;
   cudaGetDevice(&device);
   int num_sms;
@@ -36,30 +34,27 @@ inline int get_num_sms()
 // (M↔N)-inverted strides so the kernel sees user-N as kernel-M.
 template <typename KT, typename Kernel, typename L_T>
 __forceinline__ typename Kernel::Arguments make_launch_args(
-    typename KT::ElementA* ptr_A,
-    typename KT::ElementB* ptr_B,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFA,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFB,
-    typename KT::ElementD* ptr_D,
-    int M, int N, int K,
-    L_T grouped_layout)
-{
+    typename KT::ElementA* ptr_A, typename KT::ElementB* ptr_B,
+    typename KT::SFConfig::ElementSFLoad* ptr_SFA, typename KT::SFConfig::ElementSFLoad* ptr_SFB,
+    typename KT::ElementD* ptr_D, int M, int N, int K, L_T grouped_layout) {
   if constexpr (KT::kSwapAB) {
     return typename Kernel::Arguments{
-        ptr_B, typename KT::ABLoadConfig::StrideA{int64_t(K), Int<1>{}, int64_t(N) * K},
-        ptr_A, typename KT::ABLoadConfig::StrideB{int64_t(K), Int<1>{}, int64_t(M) * K},
-        ptr_SFB, ptr_SFA, ptr_D, grouped_layout};
+        ptr_B,   typename KT::ABLoadConfig::StrideA{int64_t(K), Int<1>{}, int64_t(N) * K},
+        ptr_A,   typename KT::ABLoadConfig::StrideB{int64_t(K), Int<1>{}, int64_t(M) * K},
+        ptr_SFB, ptr_SFA,
+        ptr_D,   grouped_layout};
   } else {
     return typename Kernel::Arguments{
-        ptr_A, typename KT::ABLoadConfig::StrideA{int64_t(K), Int<1>{}, int64_t(M) * K},
-        ptr_B, typename KT::ABLoadConfig::StrideB{int64_t(K), Int<1>{}, int64_t(N) * K},
-        ptr_SFA, ptr_SFB, ptr_D, grouped_layout};
+        ptr_A,   typename KT::ABLoadConfig::StrideA{int64_t(K), Int<1>{}, int64_t(M) * K},
+        ptr_B,   typename KT::ABLoadConfig::StrideB{int64_t(K), Int<1>{}, int64_t(N) * K},
+        ptr_SFA, ptr_SFB,
+        ptr_D,   grouped_layout};
   }
 }
 
 template <typename Kernel>
-__forceinline__ void launch_kernel(typename Kernel::Params const& params, int num_sms, cudaStream_t stream)
-{
+__forceinline__ void launch_kernel(typename Kernel::Params const& params, int num_sms,
+                                   cudaStream_t stream) {
   cudaLaunchConfig_t launch_config;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -73,8 +68,8 @@ __forceinline__ void launch_kernel(typename Kernel::Params const& params, int nu
   launch_config.numAttrs = 1;
 
   auto kernel_ptr = &cutlass::device_kernel<Kernel>;
-  CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel::kSmemSize));
+  CUTE_CHECK_ERROR(cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        Kernel::kSmemSize));
   CUTE_CHECK_ERROR(cudaLaunchKernelEx(&launch_config, kernel_ptr, params));
   CUTE_CHECK_ERROR(cudaGetLastError());
 }
@@ -83,58 +78,40 @@ __forceinline__ void launch_kernel(typename Kernel::Params const& params, int nu
 //   PsumLayout       : grouped_layout = [E]    cumsum aligned_m WITHOUT leading 0
 //   ZeroPadding      : grouped_layout = [E+1]  cumsum actual_m  WITH    leading 0
 template <typename KT>
-void launch_moe_gemm(
-    typename KT::ElementA* ptr_A,
-    typename KT::ElementB* ptr_B,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFA,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFB,
-    typename KT::ElementD* ptr_D,
-    int M_padded, int N, int K, int num_experts,
-    int32_t const* grouped_layout,
-    int num_sms,
-    cudaStream_t stream = 0)
-{
+void launch_moe_gemm(typename KT::ElementA* ptr_A, typename KT::ElementB* ptr_B,
+                     typename KT::SFConfig::ElementSFLoad* ptr_SFA,
+                     typename KT::SFConfig::ElementSFLoad* ptr_SFB, typename KT::ElementD* ptr_D,
+                     int M_padded, int N, int K, int num_experts, int32_t const* grouped_layout,
+                     int num_sms, cudaStream_t stream = 0) {
   using Kernel = SM120BlockScaledGemmKernel<KT>;
-  auto args = make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
-                                           M_padded, N, K, grouped_layout);
+  auto args = make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, M_padded, N, K,
+                                           grouped_layout);
   auto problem_shape = make_shape(M_padded, N, K, num_experts);
   launch_kernel<Kernel>(Kernel::to_underlying_arguments(problem_shape, args), num_sms, stream);
 }
 
 // Normal GEMM (kFlat, GemmType::Normal): single problem (M, N, K).
 template <typename KT>
-void launch_gemm(
-    typename KT::ElementA* ptr_A,
-    typename KT::ElementB* ptr_B,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFA,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFB,
-    typename KT::ElementD* ptr_D,
-    int M, int N, int K,
-    int num_sms,
-    cudaStream_t stream = 0)
-{
+void launch_gemm(typename KT::ElementA* ptr_A, typename KT::ElementB* ptr_B,
+                 typename KT::SFConfig::ElementSFLoad* ptr_SFA,
+                 typename KT::SFConfig::ElementSFLoad* ptr_SFB, typename KT::ElementD* ptr_D, int M,
+                 int N, int K, int num_sms, cudaStream_t stream = 0) {
   using Kernel = SM120BlockScaledGemmKernel<KT>;
-  auto args = make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
-                                           M, N, K, /*grouped_layout=*/nullptr);
+  auto args = make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, M, N, K,
+                                           /*grouped_layout=*/nullptr);
   auto problem_shape = make_shape(M, N, K, 1);
   launch_kernel<Kernel>(Kernel::to_underlying_arguments(problem_shape, args), num_sms, stream);
 }
 
 // Batched GEMM (kFlat, GemmType::Batched): L same-shape contiguous batches.
 template <typename KT>
-void launch_bmm(
-    typename KT::ElementA* ptr_A,
-    typename KT::ElementB* ptr_B,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFA,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFB,
-    typename KT::ElementD* ptr_D,
-    int M, int N, int K, int L,
-    int num_sms,
-    cudaStream_t stream = 0)
-{
+void launch_bmm(typename KT::ElementA* ptr_A, typename KT::ElementB* ptr_B,
+                typename KT::SFConfig::ElementSFLoad* ptr_SFA,
+                typename KT::SFConfig::ElementSFLoad* ptr_SFB, typename KT::ElementD* ptr_D, int M,
+                int N, int K, int L, int num_sms, cudaStream_t stream = 0) {
   using Kernel = SM120BlockScaledGemmKernel<KT>;
-  auto args = make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
-                                           M, N, K, /*grouped_layout=*/nullptr);
+  auto args = make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, M, N, K,
+                                           /*grouped_layout=*/nullptr);
   auto problem_shape = make_shape(M, N, K, L);
   launch_kernel<Kernel>(Kernel::to_underlying_arguments(problem_shape, args), num_sms, stream);
 }
@@ -142,22 +119,16 @@ void launch_bmm(
 // Masked GEMM (flat, GemmType::MGroupedMasked): per-batch padded (max_m, N, K)
 // with masked_m[b] = actual_m (NOT cumulative).
 template <typename KT>
-void launch_masked_gemm(
-    typename KT::ElementA* ptr_A,
-    typename KT::ElementB* ptr_B,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFA,
-    typename KT::SFConfig::ElementSFLoad* ptr_SFB,
-    typename KT::ElementD* ptr_D,
-    int max_m, int N, int K, int num_groups,
-    int32_t const* masked_m,
-    int num_sms,
-    cudaStream_t stream = 0)
-{
+void launch_masked_gemm(typename KT::ElementA* ptr_A, typename KT::ElementB* ptr_B,
+                        typename KT::SFConfig::ElementSFLoad* ptr_SFA,
+                        typename KT::SFConfig::ElementSFLoad* ptr_SFB, typename KT::ElementD* ptr_D,
+                        int max_m, int N, int K, int num_groups, int32_t const* masked_m,
+                        int num_sms, cudaStream_t stream = 0) {
   using Kernel = SM120BlockScaledGemmKernel<KT>;
-  auto args = make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
-                                           max_m, N, K, masked_m);
+  auto args =
+      make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, max_m, N, K, masked_m);
   auto problem_shape = make_shape(max_m, N, K, num_groups);
   launch_kernel<Kernel>(Kernel::to_underlying_arguments(problem_shape, args), num_sms, stream);
 }
 
-} // namespace sm120_blockscaled
+}  // namespace flashinfer::gemm::mxfp8_cute_sm120::sm120_blockscaled
