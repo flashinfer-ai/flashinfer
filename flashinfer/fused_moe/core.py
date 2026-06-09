@@ -1010,7 +1010,7 @@ def cutlass_fused_moe(
 
 
 @dataclass
-class MoEInputs:
+class MoeRunnerInputs:
     """MoERunner inputs.
 
     Field order defines the flat-list index used by the autotuner.
@@ -1051,15 +1051,22 @@ class MoEInputs:
     }
 
     def to_list(self) -> List[Optional[torch.Tensor]]:
-        return [getattr(self, name) for name in MoEInputs._FIELDS]
+        return [getattr(self, name) for name in MoeRunnerInputs._FIELDS]
 
     @classmethod
-    def from_list(cls, lst: List) -> "MoEInputs":
+    def from_list(cls, lst: List) -> "MoeRunnerInputs":
         return cls(**{name: lst[i] for i, name in enumerate(cls._FIELDS)})
 
     @classmethod
     def idx(cls, name: str) -> int:
         return cls._FIELDS.index(name)
+
+
+# Backward-compatible alias: this class was previously named ``MoEInputs``.
+# Renamed to ``MoeRunnerInputs`` to disambiguate from the API-level grouping
+# ``MoETensors`` (PR #3093 review G6).  Old name kept working for out-of-tree
+# importers and existing tests.
+MoEInputs = MoeRunnerInputs
 
 
 def _unpack_trtllm_moe_output(
@@ -1140,7 +1147,7 @@ def get_trtllm_moe_sm100_module():
 
         def _make_tuning_config(
             self,
-            moe_inputs: "MoEInputs",
+            moe_inputs: "MoeRunnerInputs",
             tune_max_num_tokens: int = 8192,
             **kwargs,
         ) -> TuningConfig:
@@ -1197,7 +1204,7 @@ def get_trtllm_moe_sm100_module():
                 ).to(dtype)
 
             sorted_inputs = sorted(
-                (MoEInputs.idx(name), name, init) for name, init in spec.items()
+                (MoeRunnerInputs.idx(name), name, init) for name, init in spec.items()
             )
             input_idx = tuple(i for i, _, _ in sorted_inputs)
 
@@ -1220,7 +1227,7 @@ def get_trtllm_moe_sm100_module():
                         f"expected layout (num_tokens={num_tokens}, ...)"
                     )
                     return 0
-                return MoEInputs._DYNAMIC_DIM[name]
+                return MoeRunnerInputs._DYNAMIC_DIM[name]
 
             dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
             initializers = [init for _, _, init in sorted_inputs]
@@ -1243,7 +1250,7 @@ def get_trtllm_moe_sm100_module():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            moe_inputs = MoEInputs.from_list(inputs)
+            moe_inputs = MoeRunnerInputs.from_list(inputs)
             num_tokens = moe_inputs.hidden_states.shape[0]
 
             has_gemm1_lora_delta = moe_inputs.gemm1_lora_delta is not None
@@ -1281,7 +1288,7 @@ def get_trtllm_moe_sm100_module():
             do_preparation: bool = False,
             **kwargs,
         ):
-            moe_inputs = MoEInputs.from_list(inputs)
+            moe_inputs = MoeRunnerInputs.from_list(inputs)
             output = moe_inputs.output
             routing_logits = moe_inputs.routing_logits
             topk_ids = moe_inputs.topk_ids
@@ -1607,7 +1614,7 @@ def get_trtllm_moe_sm100_module():
             num_experts=num_experts,
         )
 
-        moe_inputs = MoEInputs(
+        moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
             topk_ids=topk_ids,
@@ -1780,7 +1787,7 @@ def get_trtllm_moe_sm100_module():
             num_experts=num_experts,
         )
 
-        moe_inputs = MoEInputs(
+        moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
             topk_ids=topk_ids,
@@ -2010,7 +2017,7 @@ def get_trtllm_moe_sm100_module():
             num_experts=num_experts,
         )
 
-        moe_inputs = MoEInputs(
+        moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
             topk_ids=topk_ids,
@@ -2241,7 +2248,7 @@ def get_trtllm_moe_sm100_module():
             use_per_token_scaling=per_token_scale is not None,
             num_experts=num_experts,
         )
-        moe_inputs = MoEInputs(
+        moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
             topk_ids=topk_ids,
@@ -2467,7 +2474,7 @@ def get_trtllm_moe_sm100_module():
             num_experts=num_experts,
         )
 
-        moe_inputs = MoEInputs(
+        moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
             topk_ids=topk_ids,

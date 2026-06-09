@@ -135,9 +135,26 @@ class RoutingConfig:
 
 @dataclass(frozen=True)
 class QuantConfig:
-    """Quantization scheme."""
+    """Quantization scheme.
+
+    Parameters
+    ----------
+    variant : QuantVariant
+        Single knob for dtype + granularity + scale convention.
+    swizzled_scale_factors : bool or None
+        Whether block scale factors use the swizzled (vs linear) layout.
+        ``None`` → backend default.  Mirrors core's ``swizzled_input_sf``; finer
+        ``SfLayout`` (128x4 / 8x4 / linear) selection is deferred to the shared
+        enum-home consolidation (design doc C42 / review G1) so this config stays
+        ``eval(repr(cfg))``-round-trippable without importing an IntEnum.
+    per_token_scale : bool or None
+        Whether activations carry a per-token scale (vs per-tensor / block).
+        ``None`` → backend default.
+    """
 
     variant: QuantVariant = QuantVariant.BF16
+    swizzled_scale_factors: Optional[bool] = None
+    per_token_scale: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -505,9 +522,10 @@ class Gemm1Tensors:
     clamp_limit : Tensor or None
         Swiglu clamp limit.
     output_scale : Tensor or None
-        FP8 per-tensor output scale (gemm1 output).
+        Per-tensor (global) output-quantization scale for the gemm1 output
+        (FP4 in the NVFP4 path).
     output_scale_gate : Tensor or None
-        FP8 per-tensor output scale for gated path.
+        Per-tensor (global) output-quantization scale for the gemm1 gate branch.
     """
 
     weights: Tensor = None
@@ -533,7 +551,8 @@ class Gemm2Tensors:
     bias : Tensor or None
         Per-expert bias.
     output_scale : Tensor or None
-        FP8 per-tensor output scale.
+        Per-tensor (global) output-quantization scale for the gemm2 output
+        (FP4 in the NVFP4 path).
     """
 
     weights: Tensor = None
@@ -569,6 +588,9 @@ class MoETensors:
         Router bias ``[E]``.  DeepSeekV3.
     hidden_states_scale : Tensor or None
         Per-token or block scale for quantized hidden states.
+    per_token_scale : Tensor or None
+        Per-token activation scale (e.g. FP8 per-token quant).  Distinct from
+        ``hidden_states_scale`` (block scale); matches ``MoeRunnerInputs.per_token_scale``.
     token_selected_experts : Tensor or None
         Pre-routed expert indices ``[M, top_k]``.  Modular path.
     token_final_scales : Tensor or None
@@ -584,6 +606,7 @@ class MoETensors:
     routing_logits: Optional[Tensor] = None
     routing_bias: Optional[Tensor] = None
     hidden_states_scale: Optional[Tensor] = None
+    per_token_scale: Optional[Tensor] = None
     # Modular path
     token_selected_experts: Optional[Tensor] = None
     token_final_scales: Optional[Tensor] = None

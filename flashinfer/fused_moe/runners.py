@@ -74,7 +74,9 @@ class CuteDslNvfp4Runner(TunableRunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
-        return self._inner.forward(inputs, tactic=tactic, **kwargs)
+        return self._inner.forward(
+            inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+        )
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -126,7 +128,7 @@ class CuteDslNvfp4Runner(TunableRunner):
 class TrtllmFp4RoutedRunner(TunableRunner):
     """Pre-routed NVFP4 adapter over the canonical trtllm-gen ``MoERunner``.
 
-    Translates (MoEActivationPack, MoEWeightPack) into the ``MoEInputs`` list
+    Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
     plus the static weight/config kwargs that ``core.MoERunner.forward``
     consumes, then delegates tactic enumeration, tuning-config construction, and
     the tactic'd forward to that inner runner.  This mirrors
@@ -215,7 +217,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
     ) -> torch.Tensor:
         # MoELayer's autotuner call passes no kwargs, so the static weight/config
         # kwargs are injected here.  The inner runner writes the result in-place
-        # into inputs[0] (the output buffer of the MoEInputs list).
+        # into inputs[0] (the output buffer of the MoeRunnerInputs list).
         self._inner.forward(
             inputs,
             tactic=tactic,
@@ -227,7 +229,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        """Translate Packs → the ``MoEInputs`` list ``core.MoERunner`` expects.
+        """Translate Packs → the ``MoeRunnerInputs`` list ``core.MoERunner`` expects.
 
         Expected weight view keys: gemm1_weights, gemm1_weights_scale,
         gemm1_alpha, gemm2_weights, gemm2_weights_scale, and optionally
@@ -239,7 +241,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         ``[0, local_num_experts)``, so global expert ids are shifted down by the
         local offset before packing.
         """
-        from .core import MoEInputs, RoutingInputMode
+        from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
         routing = self.config.routing
@@ -269,7 +271,7 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         expert_weights = act.final_scales.new_empty(
             (num_tokens, routing.top_k), dtype=torch.bfloat16
         )
-        moe_inputs = MoEInputs(
+        moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=None,
             topk_ids=topk_ids,

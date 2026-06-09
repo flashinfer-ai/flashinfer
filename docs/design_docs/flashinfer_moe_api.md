@@ -812,6 +812,27 @@ Repro: `benchmarks/flashinfer_benchmark.py --routine {trtllm_fp4_block_scale_moe
 | [x] | Documented the as-built MVP in the new "MVP As-Built Reference" subsection: end-to-end example plus `MoEActivationPack` / `MoEWeightPack`, first-class `prepare_weights`, two-stage cross-backend autotune, per-bucket winner caching, and `winner_backend` / `reset_winner` introspection. | CR7-CR9 |
 | [x] | `unified_nvfp4_moe` runs end-to-end and emits `winner_backend` + per-candidate latency (one row per candidate; see the Decision Log evidence table) and now supports `--refcheck`: each candidate is verified against a shared bf16 reference (both views derive from the same bf16 weights). Validated on B200 — both backends 100% within tolerance. | CR10-CR11 |
 
+### PR #3093 Review Threads — Reviewer Pass 2 (2026-06-02/03)
+
+> **Status (2026-06-09): triaging the second human-reviewer pass.** After the
+> bot/merge-damage pass (Status 2026-06-01), three reviewers left new threads.
+> The bot threads (CodeRabbit ×6, Gemini ×3) and the earlier self-notes are all
+> **resolved**. What remains open are the human ergonomics/cleanup threads below,
+> tracked here so each is decided explicitly before resolving on GitHub. `G1-G6`
+> are IwakuraRein on `flashinfer/fused_moe/api.py`; `G7` is samuellees. The
+> qiching `_select_winner` thread is already tracked under Post-MVP Carryover
+> (it is a deferred design decision, not part of this pass).
+
+| ID | Status | Reviewer / loc | Ask | Decision |
+| --- | --- | --- | --- | --- |
+| G1 | [ ] | IwakuraRein · `api.py:73` | Routing/quant enums here duplicate `tllm_enums.py`; consider removing `tllm_enums.py` and moving its contents into `api.py`. Relates to C42 (keep enums on a shared home, don't fork a parallel surface). | _pending — to triage_ |
+| G2 | [x] | IwakuraRein · `api.py:140` | Add swizzle-layout and per-token-scale configuration to the config surface (likely `QuantConfig`). | **Done (partial).** Added `swizzled_scale_factors: Optional[bool]` and `per_token_scale: Optional[bool]` to `QuantConfig`, both defaulting to `None` (= backend default). Used `bool` (mirroring core's `swizzled_input_sf`) rather than the `SfLayout` IntEnum because `SfLayout` reprs as `<SfLayout.x: 0>` and would break the tested `eval(repr(cfg))` round-trip. Finer `SfLayout` (128x4/8x4/linear) selection is deferred to ride with the enum-home consolidation (G1/C42). Fields are not yet read by any runner — config surface only. |
+| G3 | [x] | IwakuraRein · `api.py:510` | Typo: `FP8 per-tensor`. | **Done.** The `output_scale` / `output_scale_gate` fields in `Gemm1Tensors`/`Gemm2Tensors` are per-tensor (global) scalars serving **FP4** output quantization (they map to the trtllm-gen `output{1,2}_scale[_gate]_scalar` fp32 scalars; set to `1.0` in the NVFP4 path because the per-block scales carry the quantization). "FP8 per-tensor" mislabeled the scheme — FP8 per-tensor was never wired. Reworded to scheme-neutral "per-tensor (global) output-quantization scale (FP4 in the NVFP4 path)" since `Gemm{1,2}Tensors` are generic groupings. |
+| G4 | [x] | IwakuraRein · `api.py:586` | Should `hidden_states` + `hidden_states_scale` be packed into a dataclass? `per_token_scales` is also missing here. | **Done (partial).** Added the missing `per_token_scale: Optional[Tensor]` field to `MoETensors` (singular, matching `MoeRunnerInputs.per_token_scale`). **Deferred** the "pack `hidden_states` + `hidden_states_scale` into a sub-dataclass" part — it overlaps the pack-rationale question (G5) and the shipped MVP path uses `MoEActivationPack`, so restructuring the aspirational `MoETensors` grouping is sequenced with that discussion. |
+| G5 | [ ] | IwakuraRein · `api.py:674` | Unclear why `MoEActivationPack` / `MoEWeightPack` exist separately — why not add these methods to `MoETensors`? (Needs a doc/justification; see CR7 "two packs, two lifetimes".) | _pending — to triage_ |
+| G6 | [x] | IwakuraRein · `api.py:546` | Naming collision: `MoeInputs` vs the config types. Consider renaming `MoeInputs` → `MoeRunnerInputs`. | **Done.** Renamed the core class `MoEInputs` → `MoeRunnerInputs` (it *is* the runner's flat input list) and updated all `core.py` + `runners.py` references. Kept a backward-compat alias `MoEInputs = MoeRunnerInputs` in `core.py` so out-of-tree importers and the existing tests (`test_unified_moe.py`, `test_trtllm_gen_moe_autotune_tactics.py`) keep working. The unrelated `CuteDslMoEInputsHelper` was left untouched. |
+| G7 | [x] | samuellees · `runners.py:77` | Forward `do_preparation` explicitly: `self._inner.forward(inputs, tactic=tactic, do_preparation=do_preparation, **kwargs)`. | **Done.** `CuteDslNvfp4Runner.forward` dropped `do_preparation` when delegating; `TrtllmFp4RoutedRunner.forward` already forwarded it, and `AutoTuner` calls `r(tensors, tactic=-1, do_preparation=True)` during profiling. Now both runners forward it (a no-op in the CuteDSL inner today, but correct + consistent and future-proof). |
+
 ### Post-MVP Carryover
 
 | Status | Task | Review refs |
