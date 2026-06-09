@@ -1063,9 +1063,9 @@ class MoeRunnerInputs:
 
 
 # Backward-compatible alias: this class was previously named ``MoEInputs``.
-# Renamed to ``MoeRunnerInputs`` to disambiguate from the API-level grouping
-# ``MoETensors`` (PR #3093 review G6).  Old name kept working for out-of-tree
-# importers and existing tests.
+# Renamed to ``MoeRunnerInputs`` to disambiguate from the unified-API input
+# grouping (the ``MoEActivationPack`` / ``MoEWeightPack`` lifetime split) — see
+# PR #3093 review G6.  Old name kept working for out-of-tree importers and tests.
 MoEInputs = MoeRunnerInputs
 
 

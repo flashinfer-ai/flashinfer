@@ -49,7 +49,6 @@ from flashinfer.fused_moe.api import (
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,
-    MoETensors,
     QuantConfig,
     QuantVariant,
     RoutingConfig,
@@ -413,60 +412,6 @@ class TestActivationConfigSingletons:
 
 
 # ---------------------------------------------------------------------------
-# MoETensors validation
-# ---------------------------------------------------------------------------
-
-
-class TestMoETensors:
-    def test_monolithic_path(self):
-        t = MoETensors(
-            hidden_states=torch.randn(4, 128),
-            routing_logits=torch.randn(4, 8),
-        )
-        assert t.is_monolithic
-        assert not t.is_modular
-        t.validate()
-
-    def test_modular_path(self):
-        t = MoETensors(
-            hidden_states=torch.randn(4, 128),
-            token_selected_experts=torch.randint(0, 8, (4, 2)),
-            token_final_scales=torch.randn(4, 2),
-        )
-        assert not t.is_monolithic
-        assert t.is_modular
-        t.validate()
-
-    def test_both_paths_raises(self):
-        t = MoETensors(
-            hidden_states=torch.randn(4, 128),
-            routing_logits=torch.randn(4, 8),
-            token_selected_experts=torch.randint(0, 8, (4, 2)),
-            token_final_scales=torch.randn(4, 2),
-        )
-        with pytest.raises(ValueError, match="Cannot provide both"):
-            t.validate()
-
-    def test_neither_path_raises(self):
-        t = MoETensors(hidden_states=torch.randn(4, 128))
-        with pytest.raises(ValueError, match="Must provide either"):
-            t.validate()
-
-    def test_modular_missing_scales_raises(self):
-        t = MoETensors(
-            hidden_states=torch.randn(4, 128),
-            token_selected_experts=torch.randint(0, 8, (4, 2)),
-        )
-        with pytest.raises(ValueError, match="token_final_scales is required"):
-            t.validate()
-
-    def test_missing_hidden_states_raises(self):
-        t = MoETensors(routing_logits=torch.randn(4, 8))
-        with pytest.raises(ValueError, match="hidden_states is required"):
-            t.validate()
-
-
-# ---------------------------------------------------------------------------
 # Expressiveness: can we represent the existing test configurations?
 # ---------------------------------------------------------------------------
 
@@ -558,7 +503,8 @@ class TestExpressiveness:
             activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions((CutlassConfig(),)),
         )
-        # CUTLASS uses modular dispatch — expressed via MoETensors, not config
+        # CUTLASS uses modular (pre-routed) dispatch — supplied at call time via
+        # MoEActivationPack (selected_experts/final_scales), not via config
         assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):

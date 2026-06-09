@@ -477,158 +477,24 @@ class MoEConfig:
 
 
 # ---------------------------------------------------------------------------
-# Tensor groupings
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Gemm1Tensors:
-    """Tensors for the first expert GEMM (FC1 / gate-up projection).
-
-    Parameters
-    ----------
-    weights : Tensor
-        Expert weights ``[E, N, K]`` or backend-specific layout.
-    weights_scale : Tensor or None
-        Scale factors for quantized weights.
-    bias : Tensor or None
-        Per-expert bias.
-    alpha : Tensor or None
-        Swiglu alpha scaling factor.
-    beta : Tensor or None
-        Swiglu beta scaling factor.
-    clamp_limit : Tensor or None
-        Swiglu clamp limit.
-    output_scale : Tensor or None
-        Per-tensor (global) output-quantization scale for the gemm1 output
-        (FP4 in the NVFP4 path).
-    output_scale_gate : Tensor or None
-        Per-tensor (global) output-quantization scale for the gemm1 gate branch.
-    """
-
-    weights: Tensor = None
-    weights_scale: Optional[Tensor] = None
-    bias: Optional[Tensor] = None
-    alpha: Optional[Tensor] = None
-    beta: Optional[Tensor] = None
-    clamp_limit: Optional[Tensor] = None
-    output_scale: Optional[Tensor] = None
-    output_scale_gate: Optional[Tensor] = None
-
-
-@dataclass
-class Gemm2Tensors:
-    """Tensors for the second expert GEMM (FC2 / down projection).
-
-    Parameters
-    ----------
-    weights : Tensor
-        Expert weights ``[E, K, N]`` or backend-specific layout.
-    weights_scale : Tensor or None
-        Scale factors for quantized weights.
-    bias : Tensor or None
-        Per-expert bias.
-    output_scale : Tensor or None
-        Per-tensor (global) output-quantization scale for the gemm2 output
-        (FP4 in the NVFP4 path).
-    """
-
-    weights: Tensor = None
-    weights_scale: Optional[Tensor] = None
-    bias: Optional[Tensor] = None
-    output_scale: Optional[Tensor] = None
-
-
-@dataclass
-class MoETensors:
-    """All tensors for a single MoE forward pass.
-
-    Supports two invocation modes:
-
-    **Monolithic** (routing fused into kernel): populate ``routing_logits``
-    and optionally ``routing_bias``.  The backend handles routing internally.
-
-    **Modular** (pre-routed): populate ``token_selected_experts`` and
-    ``token_final_scales``.  Routing was done externally (e.g. by the
-    serving framework).
-
-    Parameters
-    ----------
-    hidden_states : Tensor
-        Input activations ``[M, K]``.
-    gemm1 : Gemm1Tensors
-        First GEMM tensors.
-    gemm2 : Gemm2Tensors
-        Second GEMM tensors.
-    routing_logits : Tensor or None
-        Raw router logits ``[M, E]``.  Monolithic path.
-    routing_bias : Tensor or None
-        Router bias ``[E]``.  DeepSeekV3.
-    hidden_states_scale : Tensor or None
-        Per-token or block scale for quantized hidden states.
-    per_token_scale : Tensor or None
-        Per-token activation scale (e.g. FP8 per-token quant).  Distinct from
-        ``hidden_states_scale`` (block scale); matches ``MoeRunnerInputs.per_token_scale``.
-    token_selected_experts : Tensor or None
-        Pre-routed expert indices ``[M, top_k]``.  Modular path.
-    token_final_scales : Tensor or None
-        Pre-computed routing weights ``[M, top_k]``.  Modular path.
-    output : Tensor or None
-        Pre-allocated output buffer ``[M, K]``.  If None, allocated by kernel.
-    """
-
-    hidden_states: Tensor = None
-    gemm1: Gemm1Tensors = field(default_factory=Gemm1Tensors)
-    gemm2: Gemm2Tensors = field(default_factory=Gemm2Tensors)
-    # Monolithic path
-    routing_logits: Optional[Tensor] = None
-    routing_bias: Optional[Tensor] = None
-    hidden_states_scale: Optional[Tensor] = None
-    per_token_scale: Optional[Tensor] = None
-    # Modular path
-    token_selected_experts: Optional[Tensor] = None
-    token_final_scales: Optional[Tensor] = None
-    # Output
-    output: Optional[Tensor] = None
-
-    @property
-    def is_monolithic(self) -> bool:
-        """True if routing logits are provided (monolithic dispatch)."""
-        return self.routing_logits is not None
-
-    @property
-    def is_modular(self) -> bool:
-        """True if pre-routed expert assignments are provided."""
-        return self.token_selected_experts is not None
-
-    def validate(self) -> None:
-        """Raise ValueError if the tensor configuration is inconsistent."""
-        if self.hidden_states is None:
-            raise ValueError("hidden_states is required")
-        if self.is_monolithic and self.is_modular:
-            raise ValueError(
-                "Cannot provide both routing_logits (monolithic) and "
-                "token_selected_experts (modular).  Choose one dispatch mode."
-            )
-        if not self.is_monolithic and not self.is_modular:
-            raise ValueError(
-                "Must provide either routing_logits (monolithic) or "
-                "token_selected_experts (modular)."
-            )
-        if self.is_modular and self.token_final_scales is None:
-            raise ValueError(
-                "token_final_scales is required when using modular dispatch."
-            )
-
-
-# ---------------------------------------------------------------------------
 # Activation / weight packs for the autotuned pre-routed path
 # ---------------------------------------------------------------------------
 # These are the runner-level inputs used by MoELayer (plan §1).
-# Packs separate *per-call transient data* (activations) from *long-lived
-# model state* (weights).  Each pack knows how to present itself to a
-# specific backend via view_as / prepare_for — keeping backend-specific
-# layout logic out of the dispatch hot-path.
+#
+# Why two packs instead of one tensor bundle (PR #3093 review G5): the grouping
+# axis is *lifetime/role*, which is invariant across backends —
+#   * MoEActivationPack: per-call transient data (pre-routed activations),
+#     rebuilt every forward;
+#   * MoEWeightPack:     long-lived weights, materialized once at load and read
+#     every call, holding one native view *per backend* (the price of
+#     cross-backend autotune) keyed by backend_key.
+# A single per-call bundle cannot model a load-time, multi-backend weight cache
+# without conflating the two lifetimes.  We deliberately do *not* group tensors
+# by compute-graph stage (e.g. gemm1/gemm2): that mirrors the unfused two-GEMM
+# implementation and would overfit it — a fused/megakernel backend has no such
+# boundary, so a graph-shaped public API would leak one backend's internals.
+# Each pack presents itself to a backend via prepare_for / get_view, keeping
+# backend-specific layout logic out of the dispatch hot-path.
 
 
 @dataclass
