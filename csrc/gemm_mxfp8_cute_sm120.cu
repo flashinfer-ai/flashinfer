@@ -103,7 +103,7 @@ void CutlassBatchGemmMxfp8GroupwiseScaledCuteSM120(
 
   TVM_FFI_ICHECK_EQ(b.size(0), num_groups)
       << "b.size(0) (" << b.size(0) << ") must match a.size(0) (" << num_groups << ")";
-  TVM_FFI_ICHECK_EQ(b.size(2), k) << "b.size(2) (" << b.size(2) << ") must match a.size(2) (" << k
+  TVM_FFI_ICHECK_EQ(a.size(2), k) << "a.size(2) (" << a.size(2) << ") must match b.size(2) (" << k
                                   << ")";
   TVM_FFI_ICHECK_EQ(out.size(0), num_groups);
   TVM_FFI_ICHECK_EQ(out.size(1), m);
