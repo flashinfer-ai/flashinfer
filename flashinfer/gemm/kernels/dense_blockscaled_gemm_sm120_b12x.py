@@ -2470,16 +2470,12 @@ class DenseGemmKernel:
             b_ptr,
             layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)),
         )
-        if cutlass.const_expr(swap_ab):
-            c_tensor = cute.make_tensor(
-                mC.iterator,
-                layout=cute.make_ordered_layout((m, n, l), order=(0, 1, 2)),
-            )
-        else:
-            c_tensor = cute.make_tensor(
-                mC.iterator,
-                layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
-            )
+        # C is always row-major (m, n): b12x swap_ab is device-internal (the
+        # epilogue writes logical [m, n]), so this `swap_ab` arg is unused here.
+        c_tensor = cute.make_tensor(
+            mC.iterator,
+            layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
+        )
         sfa_tensor = cute.make_tensor(
             a_sf_ptr,
             layout=cute.make_ordered_layout(

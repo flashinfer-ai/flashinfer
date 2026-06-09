@@ -4333,29 +4333,6 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
-def _select_default_sm120_mma_tiler(m, n, sm_count):
-    """Select optimal SM120 tile shape based on problem size and SM count.
-
-    Uses narrower tiles (64x64, 64x128, 128x64) when the default 128x128
-    would leave SMs idle on small-M shapes.
-    """
-    coarse_tile = (128, 128)
-    coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
-        (n + coarse_tile[1] - 1) // coarse_tile[1]
-    )
-    if m <= 128 and coarse_tiles < max(1, sm_count // 2):
-        if n > 1536:
-            return (64, 128)
-        medium_tile = (128, 64)
-        medium_tiles = ((m + medium_tile[0] - 1) // medium_tile[0]) * (
-            (n + medium_tile[1] - 1) // medium_tile[1]
-        )
-        if medium_tiles < max(1, sm_count // 2):
-            return (64, 64)
-        return (128, 64)
-    return (128, 128)
-
-
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
     tile_m, tile_n = tile_mn
     cluster_m, cluster_n = cluster_shape_mn
@@ -5468,7 +5445,7 @@ def _cute_dsl_gemm_fp4_requirement(
 
 @supported_compute_capability([120, 121])
 def _b12x_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
+    a: torch.Tensor,
     b: torch.Tensor,  # unused
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
@@ -5493,6 +5470,17 @@ def _b12x_gemm_fp4_requirement(
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
+    # The b12x NVFP4 kernel requires K % 128 == 0 (tile_k = sf_vec_size * 8); the
+    # default launch path skips can_implement, so enforce it here. Under "auto"
+    # this drops b12x for unsupported K (falls back to cutlass/cudnn); under
+    # explicit backend="b12x" it raises instead of silently dropping the K-tail.
+    # a is the packed FP4 operand of shape (M, K // 2), 2 FP4 values per uint8.
+    real_k = a.shape[1] * 2
+    if real_k % 128 != 0:
+        raise ValueError(
+            "b12x FP4 GEMM requires the contraction dim K to be a multiple of 128 "
+            f"(tile_k = sf_vec_size * 8). Got K={real_k}."
+        )
     _check_cute_dsl_availability()
     return True
 
@@ -5911,19 +5899,12 @@ def _b12x_gemm_fp4_runner(
                     get_device_sm_count(a.device),
                     expected_m=m,
                 )
-                # swap_ab (narrow-N) is not yet supported by this wrapper; when the
-                # plan would request it, fall back to the M-independent default tile.
-                plan_tile = (
-                    _select_default_sm120_mma_tiler(
-                        m, n, get_device_sm_count(a.device)
-                    )
-                    if plan.swap_ab
-                    else plan.mma_tiler_mn
-                )
+                # Honor the plan's swap_ab (narrow-N decode tiles, e.g. 64x32).
+                # b12x swap_ab is device-internal; see the launch + wrapper notes.
                 tactic = (
-                    plan_tile,
+                    plan.mma_tiler_mn,
                     (1, 1),
-                    False,
+                    plan.swap_ab,
                     False,
                     "sm120",
                     None,
@@ -5938,12 +5919,11 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
             ) = tactic
 
-            kernel_m, kernel_n = m, n
             kernel_a, kernel_b = a, b.T
             kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
 
-            sf_m = (kernel_m + 127) // 128
-            sf_n = (kernel_n + 127) // 128
+            sf_m = (m + 127) // 128
+            sf_n = (n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
             cache_key = (
@@ -5969,6 +5949,11 @@ def _b12x_gemm_fp4_runner(
                 swap_ab=swap_ab,
             )
 
+            # b12x swap_ab is device-internal (applied via the kernel ctor); the
+            # public C stays row-major (m, n). The shared harness's `swap_ab` instead
+            # selects the SM100 operand-swap FFI convention (C declared (n, m)), which
+            # b12x must not use -- so pass swap_ab=False (keeps c_fake (m, n) + plain
+            # `out`). cache_key still carries the real swap_ab (separate caching).
             compiled_gemm, _ = _compile_block_scaled_gemm(
                 _B12X_MM_FP4_KERNEL_CACHE,
                 cache_key,
@@ -5978,7 +5963,7 @@ def _b12x_gemm_fp4_runner(
                 c_cutlass_dtype=c_cutlass_dtype,
                 ab_assumed_align=32,
                 cluster_shape_mn=cluster_shape_mn,
-                swap_ab=swap_ab,
+                swap_ab=False,
                 sf_m=sf_m,
                 sf_n=sf_n,
                 sf_k=sf_k,
@@ -5987,8 +5972,7 @@ def _b12x_gemm_fp4_runner(
 
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
-            # NOTE: swap_ab is always False here (narrow-N path disabled). When it is
-            # correctly supported, C must be passed as an (n, m) view of `out`.
+            # `out` is passed as-is (row-major (m, n)); see the swap_ab note above.
             compiled_gemm(
                 kernel_a,
                 kernel_b,
