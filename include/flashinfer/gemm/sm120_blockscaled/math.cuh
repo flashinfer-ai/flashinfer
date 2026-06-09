@@ -22,7 +22,7 @@ CUTE_HOST_DEVICE
 static auto align(const int& x, const int& alignment) { return ceil_div(x, alignment) * alignment; }
 
 template <typename T_offset, typename T_index>
-CUTE_HOST_DEVICE static T_offset compute_padded_offset(T_offset offset, T_index problem_idx) {
+CUTE_HOST_DEVICE T_offset compute_padded_offset(T_offset offset, T_index problem_idx) {
   constexpr T_offset alignment = 4;
   return (offset + problem_idx * (alignment - 1)) / alignment * alignment;
 }

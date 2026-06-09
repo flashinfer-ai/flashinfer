@@ -473,14 +473,14 @@ static void quantize_mxfp8_zero_padding_impl(void* fp8_output, void* scale_outpu
   auto scale_kernel =
       sm120_blockscaled::quantize_mxfp8_zero_padding_kernel_sm120<GranK, __nv_bfloat16,
                                                                   __nv_fp8_e4m3, kWarpsPerBlock>;
-  cudaFuncSetAttribute(scale_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+  CUTE_CHECK_ERROR(
+      cudaFuncSetAttribute(scale_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   scale_kernel<<<grid, block, smem_size, stream>>>(
       reinterpret_cast<__nv_fp8_e4m3*>(fp8_output), reinterpret_cast<int32_t*>(scale_output),
       reinterpret_cast<const __nv_bfloat16*>(input), reinterpret_cast<const int32_t*>(token_offset),
       num_experts, size_k, scale_leading_dim);
 
   CUTE_CHECK_ERROR(cudaGetLastError());
-  cudaDeviceSynchronize();
 }
 
 void quantize_mxfp8_zero_padding(void* fp8_output, void* scale_output, void* input,
