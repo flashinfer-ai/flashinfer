@@ -64,8 +64,71 @@ deviating backend is caught by #2 directly, and #2 also names which backend -- s
 comparison adds no pass/fail power, only redundancy. See the design discussion.)
 
 Coverage today: NVFP4 (CuteDSL + TRTLLM-FP4-routed) on SM100 -- the only wired MVP runners.
-Run: ``pytest --forked tests/moe/test_unified_moe_api_fuzz.py``.
-Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), _SEED (default 0).
+Run (SM100 required for the MVP backends; JIT needs CUDA_HOME):
+  CUDA_HOME=<cuda> PYTHONPATH=<this-worktree> CUDA_VISIBLE_DEVICES=<sm100-idx> \
+    pytest --forked tests/moe/test_unified_moe_api_fuzz.py
+Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0).
+
+------------------------------------------------------------------------------------------------
+EXTENDING (cheap, by design):
+  * New backend -> nothing to do: it is auto-discovered from ``_BACKEND_RUNNERS`` the moment its
+    runner registers and ``supported(sm)`` is true. If it ships with a tracked bug, add one
+    ``_KNOWN_FAILURES`` entry (the case still RUNS; an xpass then flags the fix).
+  * New dtype -> add ONE ``DTypeHandler`` to ``_DTYPE`` (snap / make_act_pack / reference / poison
+    / tolerances). Everything else (config gen, all 7 checks, the cache test) is dtype-generic.
+
+ROADMAP -- what's left, ranked by the 2026-06-09 audit of 51 past MoE GH issues (the full-build-out
+harness catches ~60% full / ~91% touched of the 35 in-scope; ~31% are structurally out-of-scope).
+Full synthesis lives in the cuDNN-project auto-memory ``flashinfer_quality_fuzzers.md``. Each item
+names the issue class it closes:
+  1. [HIGHEST LEVERAGE -- infra, not code] Blackwell/SM120 PR-CI runner. PR-gating CI tops out at
+     H100/SM90, so the dominant ~36% fp4/MoE bug class is collected-then-SKIPPED at PR time. This
+     harness only protects users on arches it actually RUNS on -- no oracle improvement beats
+     provisioning the runner. (This is the #1 documented escape reason for the whole MoE class.)
+  2. N-run (>=10) stress per config + a PER-TEST TIMEOUT, under ``--forked`` isolation. Turns the
+     intermittent PARTIALs into CAUGHT: #2569 (intermittent NaN), #2933 (concurrency-bucket hang).
+     A single pass samples a "hangs 1-in-100" failure poorly. NOTE a *deterministic* hang is
+     already catchable -- but TODAY it blocks the whole job; add ``@pytest.mark.timeout`` so it
+     fails ONE test cleanly. ``--forked`` needs lazy-CUDA-init handled (the cuDNN _replacement
+     Heisenbug lesson: forked children must init CUDA fresh).
+  3. Curated PRODUCTION shapes: seed the generator with real model dims (DeepSeek-V3, Llama-4,
+     Qwen3, Mixtral) + dense tile-window enumeration (every M in [tile-2, tile+2] around each
+     kernel's tile boundary). Closes the shape-luck escapes #3310 (Llama-4-Scout "no kernel") and
+     #2732 (Qwen3-Coder wrong output) that a synthetic 4096+-1 sweep misses.
+  4. BUILD-MANIFEST oracle: enumerate the advertised (backend x quant x arch) support matrix and
+     assert each combo actually INSTANTIATES a kernel. Closes #2501 (W4A8 autotune fail) -- an
+     un-compiled combo is invisible to a runtime fuzzer (the harness assumes backends are built).
+  5. [DEEPEST -- the one structurally-weak oracle] Tighten the QUANTIZED-NUMERIC net. Today check
+     #2 compares to ONE authoritative quant-aware reference at the fp4 requant-floor tolerance
+     (~10% of ||ref||inf). That floor HIDES sub-10% accuracy regressions (#2356 small-scale, #3103
+     minority-NaN), and the reference -- because it must itself encode the quant recipe -- can be
+     "wrong the same way" as a kernel (no independent fp32 ideal, unlike bf16). The real fix is the
+     unified API standardizing ONE intermediate-activation-scale POLICY (the design doc's
+     role-named QuantSpec; gh #3548): once every backend honors one DECLARED recipe, a single fp32
+     reference computing that recipe becomes an INDEPENDENT authority for all of them (and
+     calibrated checkpoints become expressible). Until then: add a small-scale / edge-magnitude
+     input axis and document the floor.
+
+OUT OF SCOPE for this single-GPU correctness harness (must live elsewhere, do NOT try to force in):
+  * multi-GPU / EP>1 / TP collective hangs & deadlocks (#3279 EP=8, #3530 TP8) -> a distributed
+    (2-8 GPU) test tier with collective-aware timeouts. (Single-GPU EP SHARDS -- global>local +
+    local_expert_offset -- ARE in scope and tested here; the COLLECTIVE is not.)
+  * perf/latency regressions (#2671) -> perf-CI with per-kernel latency baselines. A wrong-but-fast
+    tactic IS caught (check #5/#6); a correct-but-slow one is invisible by design.
+  * framework-glue triggers (vLLM/SGLang dispatch sequences #3427, #3390) -> integration tests.
+    The underlying KERNEL bug is in scope here IF invoked directly; the live-dispatch trigger isn't.
+  * build / cubin / packaging (#3466 missing SM103 cubin, #3344 _sm100f-only) -> an arch-coverage
+    manifest check in build CI (related to roadmap #4 but at the .so/cubin level).
+
+POINTERS for future agents (point me at this file and I know the rest):
+  * Full context (this fuzzer + the older adapter/GEMM fuzzers + the audit + findings): cuDNN-
+    project auto-memory ``flashinfer_quality_fuzzers.md``.
+  * Bugs THIS fuzzer found + filed: gh #3547 (trtllm EP offset>0 all-zero -- encoded in the
+    ``_KNOWN_FAILURES`` ledger below: xfailed but still RUN, so an xpass announces the fix) and
+    gh #3548 (activation global-scale gap == roadmap #5's scale-policy fix).
+  * Findings writeups: flashinfer_triage/EP_OFFSET_FINDING.md, flashinfer_triage/WEIGHT_SCALE_FINDING.md.
+  * The unified API under test: PR #3093 (branch ``moe_api``); this fuzzer is PR aleozlx/flashinfer#6
+    (branch ``yanxu/unified-moe-api-fuzzer``).
 """
 
 from __future__ import annotations
