@@ -7169,7 +7169,7 @@ def _check_m_indptr(m_indptr: torch.Tensor, token_num: int) -> None:
 
 
 def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) -> None:
-    """Validate the per-row UE8M0 ``scale_granularity_mnk`` contract shared by all
+    """Validate the per-token UE8M0 ``scale_granularity_mnk`` contract shared by all
     MXFP8 cute SM120 GEMM entries. Accepts ``(1, 1, 32)`` or ``(1, 1, 128)``.
     """
     if len(scale_granularity_mnk) != 3:
@@ -7184,7 +7184,7 @@ def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) ->
     if scale_granularity_mnk[1] != 1:
         raise ValueError(
             f"scale_granularity_mnk[1] (n_gran) must be 1 (kernel only exposes granK "
-            f"along K; 2D block B-scale must be broadcast to per-row caller-side); "
+            f"along K; 2D block B-scale must be broadcast to per-token caller-side); "
             f"got {scale_granularity_mnk[1]}"
         )
     if scale_granularity_mnk[2] not in (32, 128):
@@ -7196,14 +7196,14 @@ def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) ->
 def _check_scale_major_mode_mxfp8(scale_major_mode: str) -> None:
     """Validate ``scale_major_mode`` for the MXFP8 cute SM120 GEMM entries.
 
-    The kernel only consumes per-row INT32-packed UE8M0 scales in MN-major
+    The kernel only consumes per-token INT32-packed UE8M0 scales in MN-major
     TMA-aligned layout. Future K-major support would require kernel changes;
     until then any value other than ``"MN"`` is rejected.
     """
     if scale_major_mode != "MN":
         raise ValueError(
             f'scale_major_mode must be "MN" (kernel currently only supports the '
-            f'per-row MN-major TMA-aligned UE8M0 scale layout); got "{scale_major_mode}"'
+            f'per-token MN-major TMA-aligned UE8M0 scale layout); got "{scale_major_mode}"'
         )
 
 
@@ -7318,9 +7318,9 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
         ``torch.int32``.
 
     b_scale: torch.Tensor
-        Int32-packed UE8M0 scale tensor for ``b`` in per-row layout, shape
+        Int32-packed UE8M0 scale tensor for ``b`` in per-token layout, shape
         ``(num_experts, n, k_align)``. Data type is ``torch.int32``. See Notes for the
-        per-row layout requirement.
+        per-token layout requirement.
 
     m_indptr: torch.Tensor
         The indptr of the segment lengths, shape ``(num_experts + 1,)``, data type is
@@ -7330,7 +7330,7 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
         The granularity of the scale tensor, ``(m_granularity, n_granularity, k_granularity)``.
         Accepted values: ``(1, 1, 128)`` (DeepGEMM-style production, default) or
         ``(1, 1, 32)`` (OCP MXFP8). ``m_granularity`` and ``n_granularity`` must both be
-        ``1`` (per-row scaling along M and N); ``k_granularity`` must be ``32`` or ``128``.
+        ``1`` (per-token scaling along M and N); ``k_granularity`` must be ``32`` or ``128``.
         Anything else raises ``ValueError``.
 
     backend: Literal["cute"]
@@ -7351,11 +7351,11 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
     Notes
     -----
     - MXFP8 uses UE8M0 scales over K-axis blocks of size 32 (OCP spec) or 128
-      (DeepGEMM convention). Both ``a_scale`` and ``b_scale`` must be provided in per-row
+      (DeepGEMM convention). Both ``a_scale`` and ``b_scale`` must be provided in per-token
       layout: one UE8M0 scale per row along M (for ``a``) or N (for ``b``), packed 4 scales
       per int32 along the K-axis blocks.
     - If a caller starts from a 2D ``(k_granularity, k_granularity)`` block-quantized
-      ``b_scale``, it must be broadcast to per-row shape ``(num_experts, n, k_align)``
+      ``b_scale``, it must be broadcast to per-token shape ``(num_experts, n, k_align)``
       before invoking this function (one scale per N-row).
     """
     _check_scale_granularity_mnk(scale_granularity_mnk)
@@ -7422,17 +7422,17 @@ def group_gemm_mxfp8_nt_groupwise(
         ``torch.float8_e4m3fn``.
 
     a_scale: torch.Tensor
-        Int32-packed UE8M0 scale tensor for ``a`` in per-row layout, shape
+        Int32-packed UE8M0 scale tensor for ``a`` in per-token layout, shape
         ``(m, k_align)``. Data type is ``torch.int32``.
 
     b_scale: torch.Tensor
-        Int32-packed UE8M0 scale tensor for ``b`` in per-row layout, shape
+        Int32-packed UE8M0 scale tensor for ``b`` in per-token layout, shape
         ``(num_experts, n, k_align)``. Data type is ``torch.int32``.
 
     m_indices: torch.Tensor
         Group descriptor, data type is ``torch.int32``. Shape depends on ``use_psum_layout``:
 
-        - ``use_psum_layout=False`` (contiguous): shape ``(m,)`` per-row group assignment;
+        - ``use_psum_layout=False`` (contiguous): shape ``(m,)`` per-token group assignment;
           ``m_indices[i] = j`` means row ``i`` in ``a`` is multiplied with group ``j`` in
           ``b``. Follows the DeepGEMM convention.
         - ``use_psum_layout=True``: shape ``(num_experts,)`` cumulative sum of per-group
@@ -7441,7 +7441,7 @@ def group_gemm_mxfp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int]
         The granularity of the scale tensor, ``(m_granularity, n_granularity, k_granularity)``.
         Accepted values: ``(1, 1, 128)`` (default) or ``(1, 1, 32)``. ``m_granularity``
-        and ``n_granularity`` must both be ``1`` (per-row scaling); ``k_granularity`` must
+        and ``n_granularity`` must both be ``1`` (per-token scaling); ``k_granularity`` must
         be ``32`` or ``128``.
 
     use_psum_layout: bool
@@ -7527,11 +7527,11 @@ def group_gemm_mxfp8_nt_groupwise_masked(
 
     a_scale: torch.Tensor
         Int32-packed UE8M0 scale tensor for ``a``, shape
-        ``(num_experts, max_m, k_align)`` per-row layout. Data type ``torch.int32``.
+        ``(num_experts, max_m, k_align)`` per-token layout. Data type ``torch.int32``.
 
     b_scale: torch.Tensor
         Int32-packed UE8M0 scale tensor for ``b``, shape
-        ``(num_experts, n, k_align)`` per-row layout. Data type ``torch.int32``.
+        ``(num_experts, n, k_align)`` per-token layout. Data type ``torch.int32``.
 
     masked_m: torch.Tensor
         Per-group valid row count, shape ``(num_experts,)``, data type
@@ -7612,11 +7612,11 @@ def gemm_mxfp8_nt_groupwise(
         Column-major weight tensor shape ``(n, k)``, data type is ``torch.float8_e4m3fn``.
 
     a_scale: torch.Tensor
-        Int32-packed UE8M0 scale tensor for ``a``, shape ``(m, k_align)`` per-row layout.
+        Int32-packed UE8M0 scale tensor for ``a``, shape ``(m, k_align)`` per-token layout.
         Data type ``torch.int32``.
 
     b_scale: torch.Tensor
-        Int32-packed UE8M0 scale tensor for ``b``, shape ``(n, k_align)`` per-row layout.
+        Int32-packed UE8M0 scale tensor for ``b``, shape ``(n, k_align)`` per-token layout.
         Data type ``torch.int32``.
 
     scale_granularity_mnk: Tuple[int, int, int]

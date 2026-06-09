@@ -689,7 +689,7 @@ def gen_gemm_sm120_module_cute_mxfp8() -> JitSpec:
     )
 
     return gen_jit_spec(
-        "gemm_sm120_cute_mxfp8",
+        "mxfp8_gemm_cute_sm120",
         source_paths,
         extra_cuda_cflags=nvcc_flags
         + [

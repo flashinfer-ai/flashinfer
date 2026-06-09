@@ -182,18 +182,6 @@ def mxfp8_transform_sf_layout(
     r"""Transform a scale-factor tensor into the kernel-required layout
     (INT32-packed, per-row, TMA-aligned, MN-major). DeepGEMM-aligned API.
 
-    NOTE (alternative implementation, deferred to PM decision):
-    A DG-corresponding function exists at
-    ``flashinfer.deep_gemm.transform_sf_into_required_layout``, but it is
-    hardcoded to ``get_device_arch() in ("100a", "103a", "90a")`` and
-    ``granK=128`` — sm120 and granK=32 are not supported. We provide this
-    arch-/granK-agnostic helper as a parallel implementation rather than
-    modifying the DG one (which has live callers in ``deep_gemm.py:1450,
-    1451, 1563, 1566`` for the DG fp8_gemm_nt_* family). If the PM later
-    chooses to consolidate, the path forward is to extend the DG function
-    to accept arch-agnostic dispatch + granK ∈ {32, 128} + 2-tuple recipe,
-    and remove this helper (or have it delegate).
-
     Parameters
     ----------
     sf : torch.Tensor
