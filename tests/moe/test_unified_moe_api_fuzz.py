@@ -477,6 +477,13 @@ def _is_unsupported(e):
 def test_unified_moe_api_fuzz(cfg):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
+    # Full per-config determinism so any failure reproduces from the seed in the test id alone.
+    # Shapes (random.Random(seed)) and the input tensors (a per-config torch.Generator) are already
+    # seeded; this also pins the two GLOBAL-RNG draws -- the poison garbage and the device probe --
+    # so the entire run is bitwise-reproducible from `cfg.seed`. (Autotune winner selection is
+    # timing-based and may vary run-to-run, but every tactic is validated, so a correctness failure
+    # still reproduces via the tactic sweep regardless of which winner the tuner picks.)
+    torch.manual_seed(cfg.seed)
     sm = get_compute_capability(torch.device("cuda:0"))
     sm = sm[0] * 10 + sm[1]
 
