@@ -19,6 +19,7 @@
 #include <cooperative_groups/reduce.h>
 #include <cutlass/arch/arch.h>
 #include <flashinfer/exception.h>
+#include <flashinfer/logging.h>
 
 #include <cstdlib>
 #include <cub/cub.cuh>
@@ -57,6 +58,11 @@ struct ReservedSMsForOverlappingConfig {
   bool isSet;
 };
 
+struct CoopLaunchSMCounts {
+  int moeSms;
+  int reservedSms;
+};
+
 // Return the reserved-SM configuration for TRT-LLM fused MoE overlap.
 // The value is read from FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS once per
 // process. When the variable is not set, the default reserved-SM count is used
@@ -76,15 +82,27 @@ inline ReservedSMsForOverlappingConfig getReservedSMsForOverlappingConfig() {
   return config;
 }
 
-// Return the number of cooperative-launch blocks available after reserving SMs.
+// Return the cooperative-launch SM allocation after reserving SMs.
 // Validate the effective reserved-SM count against the runtime SM count before
-// subtraction so the result is always positive.
-inline int getCoopLaunchBlockCount(int smCount) {
+// subtraction so the number of SMs used by MoE is always positive.
+inline CoopLaunchSMCounts getCoopLaunchSMCounts(int smCount) {
   ReservedSMsForOverlappingConfig const config = getReservedSMsForOverlappingConfig();
   char const* source = config.isSet ? kReservedSMsForOverlappingEnv : "default reserved SM count";
   FLASHINFER_CHECK(config.reservedSms >= 0 && config.reservedSms < smCount, source,
                    " must satisfy 0 <= value < SM count (", smCount, "), got ", config.reservedSms);
-  return smCount - static_cast<int>(config.reservedSms);
+  int const reservedSms = static_cast<int>(config.reservedSms);
+  return CoopLaunchSMCounts{smCount - reservedSms, reservedSms};
+}
+
+inline void logCoopLaunchSMCounts(CoopLaunchSMCounts const& counts) {
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    FLASHINFER_LOG_INFO(
+        "TRT-LLM fused MoE cooperative launch SM allocation: {} SMs used for MoE, {} SMs "
+        "reserved for overlapping kernels (total SMs: {})",
+        counts.moeSms, counts.reservedSms, counts.moeSms + counts.reservedSms);
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
