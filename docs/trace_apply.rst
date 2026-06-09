@@ -19,6 +19,7 @@ callable or a first-class :class:`~flashinfer.trace.Solution`:
 
 .. code-block:: python
 
+   import torch
    import flashinfer
    import flashinfer.trace_apply as fi_trace_apply
 

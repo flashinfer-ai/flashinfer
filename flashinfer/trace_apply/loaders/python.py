@@ -38,10 +38,12 @@ def _cache_base() -> Path:
 
     No custom env knob: ``~/.cache/flashinfer/trace_apply/solutions`` normally,
     falling back to the system temp dir only when ``$HOME`` is unresolvable
-    (some serverless/container environments).
+    or the home directory is read-only/not writable.
     """
     try:
-        return Path.home() / ".cache" / "flashinfer" / "trace_apply" / "solutions"
+        path = Path.home() / ".cache" / "flashinfer" / "trace_apply" / "solutions"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     except (RuntimeError, OSError):
         return Path(tempfile.gettempdir()) / "flashinfer" / "trace_apply" / "solutions"
 
@@ -58,7 +60,7 @@ def _safe_relpath(out: Path, rel: str) -> Path:
     if p.is_absolute() or ".." in p.parts:
         raise ValueError(f"Unsafe solution source path: {rel!r}")
     target = (out / p).resolve()
-    if os.path.commonpath([target, out.resolve()]) != str(out.resolve()):
+    if not target.is_relative_to(out.resolve()):
         raise ValueError(f"Solution source path escapes cache dir: {rel!r}")
     return target
 

@@ -394,7 +394,10 @@ def _make_plan_wrapper(plan_original: Callable) -> Callable:
 def _is_inplace_api(original: Callable) -> bool:
     """True if the API mutates buffers and returns None (e.g. fused_add_rmsnorm)."""
     try:
-        return inspect.signature(original).return_annotation is None
+        ann = inspect.signature(original).return_annotation
+        # With ``from __future__ import annotations`` the annotation is the
+        # string ``"None"`` rather than the ``None`` object, so match both.
+        return ann is None or ann is type(None) or ann == "None"
     except (TypeError, ValueError):
         return False
 

@@ -45,7 +45,7 @@ def load(solution: Solution) -> Callable:
     sol_dir = materialize(solution)
 
     sources = [
-        sol_dir / src.path
+        str(sol_dir / src.path)
         for src in solution.sources
         if Path(src.path).suffix.lower() in _COMPILE_EXTS
     ]
@@ -56,11 +56,11 @@ def load(solution: Solution) -> Callable:
         )
 
     name = f"trace_apply_{solution.hash()[:16]}"
-    include_paths = sorted(
-        {(sol_dir / src.path).parent for src in solution.sources} | {sol_dir}
+    include_paths: list[str | Path] = sorted(
+        {str((sol_dir / src.path).parent) for src in solution.sources} | {str(sol_dir)}
     )
 
-    spec = gen_jit_spec(name, sources, extra_include_paths=list(include_paths))
+    spec = gen_jit_spec(name, sources, extra_include_paths=include_paths)
     module = spec.build_and_load()
 
     symbol = solution.entry_symbol()
