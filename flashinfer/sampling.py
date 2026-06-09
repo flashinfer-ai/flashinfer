@@ -1346,23 +1346,12 @@ def _top_k_first_fast_path(
     to the masked full-vocab path (validated TV ~0.01) but far cheaper at small batch.
     """
     # Local import avoids a module-level cycle between sampling and topk.
-    from .topk import TopKTieBreak, top_k as _radix_top_k
+    from .topk import top_k as _radix_top_k
 
-    # In deterministic mode, also fix top-k boundary tie-breaking for reproducibility.
-    tie_break = TopKTieBreak.SMALL if deterministic else TopKTieBreak.NONE
-    # top-k's default (vectorized radix) path is already CUDA-graph-capturable in
-    # deterministic mode, so we let it vectorize even during capture. Only the
-    # non-deterministic cluster path needs the graph-safe fallback (FilteredTopK with
-    # VEC_SIZE=1, ~3x slower), so request it only when actually capturing AND
-    # non-deterministic -- forcing it unconditionally regresses the common path.
-    dsa_graph_safe = not deterministic and torch.cuda.is_current_stream_capturing()
+    # deterministic=True makes top-k reproducible (its radix deterministic-collect path is
+    # stable even at ties). We do not enforce a tie break that requires 128KB smem/block.
     values, gathered_indices = _radix_top_k(
-        x,
-        top_k,
-        sorted=True,
-        deterministic=deterministic,
-        tie_break=tie_break,
-        dsa_graph_safe=dsa_graph_safe,
+        x, top_k, sorted=True, deterministic=deterministic
     )
     values = values.float()
     if from_logits:
