@@ -320,259 +320,259 @@ Each phase is independently valuable and independently shippable.
 
 These comments were transcribed from the DOCX review metadata. Anchors refer to the text range the comment was attached to in Word.
 
-### C0 — Minseok Lee US
+### C0 — Reviewer 1
 
 **Anchor:** `FlashInfer Unified MoE API`
 
 > Would it be helpful to describe first (1) what FlashInfer should be responsible for and (2) what frameworks should be responsible for, e.g., weight preprocessing (and what FlashInfer provides to support/supplement it)
 
-### C1 — Daniel Stokes NZ
+### C1 — Reviewer 2
 
 **Anchor:** `Design Principles`
 
 > I think one thing we are missing is backend introspection. Frameworks should be able to ask questions like "what are the supported backends for WideEP", "what data-types can I use for my model" etc. to help with their own heuristics. Maybe this doesn't fall under this scope, but it is something we likely need to expose longer-term
 
-### C2 — Alex Yang US
+### C2 — Reviewer 3
 
 **Anchor:** `Design Principles`
 
 > agree. i'll add it to the doc before resolving. thanks
 
-### C3 — Alex Yang US
+### C3 — Reviewer 3
 
 **Anchor:** `Design Principles`
 
 > please see "Find possible backends" in "Example Overview" if that workflow sound reasonable
 
-### C4 — Albert Cheng (Engrg-Hardware 1) US
+### C4 — Reviewer 4
 
 **Anchor:** `Config is pure data — frozen dataclasses, no behavior, serializable via repr()`
 
 > frozen dataclasses is good. i just have one concern on repr() serialization, its output is not a versioned format, if a constructor signature changes between releases, old repro logs cannot be parseable. Have you considered to_dict() and from_dict() with an explicit schema version field?
 
-### C5 — Alex Yang US
+### C5 — Reviewer 3
 
 **Anchor:** `Config is pure data — frozen dataclasses, no behavior, serializable via repr()`
 
 > what could go wrong if we don't worry about parsing old repro logs? e.g. limiting the usage to same version repro. as a "repro" the version should align anyway
 
-### C6 — Siyuan Fu US
+### C6 — Reviewer 5
 
 **Anchor:** `Frontend owns the schema — backends are consumers`
 
-> A tricky part is scale factor swizzling pattern and the interleaving required by trtllm-gen MoE. Many users aren't clear why these are needed and Flashinfer needs to emphasize these and provide useful tools. For example, MoEConfig can have a method called weight_preprocessing()2 total reactionsMinseok Lee US reacted with ➕ at 2026-05-12 20:00 PMCyrus Chang CN reacted with ➕ at 2026-05-13 01:13 AM
+> A tricky part is scale factor swizzling pattern and the interleaving required by trtllm-gen MoE. Many users aren't clear why these are needed and Flashinfer needs to emphasize these and provide useful tools. For example, MoEConfig can have a method called weight_preprocessing()2 total reactionsReviewer 1 reacted with ➕ at 2026-05-12 20:00 PMReviewer 6 reacted with ➕ at 2026-05-13 01:13 AM
 
-### C7 — Alex Yang US
+### C7 — Reviewer 3
 
 **Anchor:** `Frontend owns the schema — backends are consumers`
 
 > i missed this detail in the doc. but the plan is to have prepare functions like this https://github.com/flashinfer-ai/flashinfer/pull/3093/changes#diff-0995b259d16c6c37f02b6cc5d8825f9147ddf095a1c9b29846bbdee96ce2ab96R2278-R2280 weight_pack = MoEWeightPack()weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)weight_pack.prepare_for("trtllm_fp4_routed", trtllm_view)and it's organized into something like a static helper function in TrtllmFp4Config(). (wrapping current standalone functions)
 
-### C8 — Julien Debache CH
+### C8 — Reviewer 7
 
 **Anchor:** `Frontend owns the schema — backends are consumers`
 
 > Could you elaborate on this? I'm not sure I get it.
 
-### C9 — Julien Debache CH
+### C9 — Reviewer 7
 
 **Anchor:** `Immutable by default — use dataclasses.replace() for variants, never mutate`
 
 > Nit: even though I'm all for this, I think it mixes up design and implementation details
 
-### C10 — Julien Debache CH
+### C10 — Reviewer 7
 
 **Anchor:** `# --- Define config once ---`
 
-> Is it fair to summarize the idea of this design as:- User knows the dimensions of their MoE layer- User knows how it is quantized- User knows how routing should happen- User knows batch sizes that they are interested inThis information is mapped to a config type that FlashInfer defines, FlashInfer takes that in and returns something the user can call on their inputs.The `backends` are is just here for optionally overriding the selection? I would almost leave it out of the config type, and pass it as an additional argument.Could we have another function which returns the compatible backends for a config?3 total reactionsPavani Majety US reacted with ➕ at 2026-05-12 16:02 PMSiyuan Fu US reacted with ➕ at 2026-05-12 16:33 PMMinseok Lee US reacted with ➕ at 2026-05-12 20:01 PM
+> Is it fair to summarize the idea of this design as:- User knows the dimensions of their MoE layer- User knows how it is quantized- User knows how routing should happen- User knows batch sizes that they are interested inThis information is mapped to a config type that FlashInfer defines, FlashInfer takes that in and returns something the user can call on their inputs.The `backends` are is just here for optionally overriding the selection? I would almost leave it out of the config type, and pass it as an additional argument.Could we have another function which returns the compatible backends for a config?3 total reactionsReviewer 8 reacted with ➕ at 2026-05-12 16:02 PMReviewer 5 reacted with ➕ at 2026-05-12 16:33 PMReviewer 1 reacted with ➕ at 2026-05-12 20:01 PM
 
-### C11 — Alex Yang US
+### C11 — Reviewer 3
 
 **Anchor:** `# --- Define config once ---`
 
 > that makes a lot of sense to me! thx for the suggestion
 
-### C12 — Alex Yang US
+### C12 — Reviewer 3
 
 **Anchor:** `# --- Define config once ---`
 
 > >Could we have another function which returns the compatible backends for a config?that sounds super reasonable too
 
-### C13 — Alex Yang US
+### C13 — Reviewer 3
 
 **Anchor:** `# --- Define config once ---`
 
 > pls see updated "Example Overview"
 
-### C14 — Siyuan Fu US
+### C14 — Reviewer 5
 
 **Anchor:** `quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale)`
 
 > BTW we also have "MXFP4", so the block size (16 or 32) needs to be exposed
 
-### C15 — Pavani Majety US
+### C15 — Reviewer 8
 
 **Anchor:** `experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),`
 
 > hidden_size as well?
 
-### C16 — Pavani Majety US
+### C16 — Reviewer 8
 
 **Anchor:** `backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)]`
 
-> Very often community developers are not aware of which backends are supported for a given routing + quant config. Agree with Julien here that there should be an interface where users can query for a list of backends given quant config, hardware architecture. This can also extend to a benchmark option where we give the users an option to also see which backend performs best for a set of shapes of interest.
+> Very often community developers are not aware of which backends are supported for a given routing + quant config. Agree with Reviewer 7 here that there should be an interface where users can query for a list of backends given quant config, hardware architecture. This can also extend to a benchmark option where we give the users an option to also see which backend performs best for a set of shapes of interest.
 
-### C17 — Alex Yang US
+### C17 — Reviewer 3
 
 **Anchor:** `backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)]`
 
 > added a "Find possible backends" step in the example
 
-### C18 — Daniel Stokes NZ
+### C18 — Reviewer 2
 
 **Anchor:** `"unsupported reason..."`
 
 > I wonder if this format would be confusing. I would suggest a `find_backends()` that returns only the valid ones for the config. And then a separate `request_backend(backend_name, config, extra_backend_params)` that returns `Config | Error`
 
-### C19 — Daniel Stokes NZ
+### C19 — Reviewer 2
 
 **Anchor:** `"unsupported reason..."`
 
 > This way if frameworks dont care about customizing backends they can use `find_backends` and just directly use the result. But if the framework is aware of the different backends and wants to customize them it could instead explicitly call request_backend() with the customised parameters
 
-### C20 — Minseok Lee US
+### C20 — Reviewer 1
 
 **Anchor:** `output = layer(tensors)`
 
 > When is the backend decided in this workflow? During the first call of layer(tensors)?
 
-### C21 — Alex Yang US
+### C21 — Reviewer 3
 
 **Anchor:** `output = layer(tensors)`
 
 > added a line above as a possible solution to make it more explicit and clear
 
-### C22 — Minseok Lee US
+### C22 — Reviewer 1
 
 **Anchor:** `layer.benchmark(Gemm1Tensors) # isolate gemm1`
 
 > Should it be layer's responsibility to do benchmark? I thought it should be something like benchmark(layer, tensors).
 
-### C23 — Alex Yang US
+### C23 — Reviewer 3
 
 **Anchor:** `layer.benchmark(Gemm1Tensors) # isolate gemm1`
 
 > yeah your suggestion sounds better
 
-### C24 — Dimitrios Bariamis CH
+### C24 — Reviewer 9
 
 **Anchor:** `routing method`
 
 > Since the interface is being changed, it would be a good chance to rework how the routing method is passed to Flashinfer. I would find it a lot better to not expose the internal enumeration of possible routing methods, but instead receive the routing configuration (scoring function, topK, renorm, topK groups, etc.) and select the correct routing internally. A `supported()` classmethod can be added to allow queries.The drawback of the current enumeration is that it encodes multiple pieces of information. This leads to a large number of methods and to the inference frameworks implementing some version of the above `supported()` function to find out if a model can use Flashinfer MoE, which is error prone and not easily extendable.
 
-### C25 — Minseok Lee US
+### C25 — Reviewer 1
 
 **Anchor:** `routing method`
 
 > @siyuanf@nvidia.com @jiahanc@nvidia.com What do you think?
 
-### C26 — Siyuan Fu US
+### C26 — Reviewer 5
 
 **Anchor:** `routing method`
 
 > Having a decoupled routing configuration looks reasonable. However, in the CPP side, we probably need to preserve the enum list to align with Trtllm. Additionally, the user should be able to directly provide the topk_ids, in order to support custom score functions or DeepEP.
 
-### C27 — Cyrus Chang CN
+### C27 — Reviewer 6
 
 **Anchor:** `routing method`
 
 > @siyuanf@nvidia.com 's point is valid. I agree have a dataclass instead of just enumeration, but we should keep the enumeration in cpp to align with trtllm
 
-### C28 — Pavani Majety US
+### C28 — Reviewer 8
 
 **Anchor:** `dtype (fp4/fp8/bf16),`
 
 > nit: it should reflect both activation and weight dtypes
 
-### C29 — Trevor Morris US
+### C29 — Reviewer 10
 
 **Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
 > I'm not sure how realistic this is since usually each backend requires different weight processing at model load time or different checkpoints entirely.
 
-### C30 — Julien Debache CH
+### C30 — Reviewer 7
 
 **Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
-> Agree with Trevor: these backends are different operations with different inputs and potentially different outputs. I'm not sure there's a way of hiding that from the caller.
+> Agree with Reviewer 10: these backends are different operations with different inputs and potentially different outputs. I'm not sure there's a way of hiding that from the caller.
 
-### C31 — Pavani Majety US
+### C31 — Reviewer 8
 
 **Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
 > Agree, is the framework still defining and calling weight processing methods like swizzling, shuffling etc?
 
-### C32 — Pavani Majety US
+### C32 — Reviewer 8
 
 **Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
-> >I'm not sure there's a way of hiding that from the caller.It would be nice to have something like `moe_wrapper.process_weights_after_loading(layer.weight, ... , Backend=<>`1 total reactionTrevor Morris US reacted with ➕ at 2026-05-12 19:27 PM
+> >I'm not sure there's a way of hiding that from the caller.It would be nice to have something like `moe_wrapper.process_weights_after_loading(layer.weight, ... , Backend=<>`1 total reactionReviewer 10 reacted with ➕ at 2026-05-12 19:27 PM
 
-### C33 — Alex Yang US
+### C33 — Reviewer 3
 
 **Anchor:** `backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]`
 
 > sorry it was not meant to be hidden. the doc got a bit old but i sync'd back the idea from the WIP PR. please see "Example Overview"
 
-### C34 — Julien Debache CH
+### C34 — Reviewer 7
 
 **Anchor:** `layer = MoELayer(**config)`
 
 > Do we need to expose layers without implementations? Could we directly pass tensors to the constructor, or have a utility function that returns the "tuned" layer directly? This way no need to track "has this layer been tuned already".
 
-### C35 — Alex Yang US
+### C35 — Reviewer 3
 
 **Anchor:** `layer = MoELayer(**config)`
 
 > i see your point
 
-### C36 — Daniel Stokes NZ
+### C36 — Reviewer 2
 
 **Anchor:** `layer = MoELayer(**config)`
 
 > Yes I like the idea of an explicit "compile" api. Maybe we could do something similar to CuTe-DSL, though I don't have enough CuTe-DSL experience to know if that is a good design or not (or if it matches how FI/frameworks work)
 
-### C37 — Xin Li (Engrg-Hardware 1) CA
+### C37 — Reviewer 11
 
 **Anchor:** `Config`
 
 > when I instantiate a config, do I have guarantee that it is supported? or is that still "trial and error"?
 
-### C38 — Xin Li (Engrg-Hardware 1) CA
+### C38 — Reviewer 11
 
 **Anchor:** `Config`
 
 > nice I see `find_backend` in the later section
 
-### C39 — Albert Cheng (Engrg-Hardware 1) US
+### C39 — Reviewer 4
 
 **Anchor:** `Config is pure data — frozen dataclasses, no behavior, serializable via repr()`
 
 > My concern was mainly like bug reports where the fix lands on a newer version, but agreed that same version repro covers the majority case.
 
-### C40 — Daniel Stokes NZ
+### C40 — Reviewer 2
 
 **Anchor:** `routing method`
 
-> As Siyuan mentioned, an important thing I would consider is ease of supporting custom routing methods. e.g. when DeepSeek released it was a lot of work to bring up the new routing method because it was originally fused. If frameworks are dependent on flashinfer to supply their routing methods this limits their flexibility in enabling new/experimental/research models.I am not sure what the best approach is, since we still want to support all the various fusions, but maybe a "RoutingMethodType.Custom" that accepts a python function would allow users to inject custom scoring functions at the appropriate place, without having to reimplement the routing themselves.Im partial to the API from TRT-LLM where we have a BaseMoeRoutingMethod interface the user can override, but I understand that probably doesnt play well with trtllm backend with its fusions
+> As Reviewer 5 mentioned, an important thing I would consider is ease of supporting custom routing methods. e.g. when DeepSeek released it was a lot of work to bring up the new routing method because it was originally fused. If frameworks are dependent on flashinfer to supply their routing methods this limits their flexibility in enabling new/experimental/research models.I am not sure what the best approach is, since we still want to support all the various fusions, but maybe a "RoutingMethodType.Custom" that accepts a python function would allow users to inject custom scoring functions at the appropriate place, without having to reimplement the routing themselves.Im partial to the API from TRT-LLM where we have a BaseMoeRoutingMethod interface the user can override, but I understand that probably doesnt play well with trtllm backend with its fusions
 
-### C41 — Xin Li (Engrg-Hardware 1) CA
+### C41 — Reviewer 11
 
 **Anchor:** `RoutingConfig`
 
 > does the interface consider routed MoE as well?
 
-### C42 — Siyuan Fu US
+### C42 — Reviewer 5
 
 **Anchor:** `method: RoutingMethodType = RoutingMethodType.Default`
 
@@ -815,14 +815,14 @@ Repro: `benchmarks/flashinfer_benchmark.py --routine {trtllm_fp4_block_scale_moe
 ### PR #3093 Review Threads — Reviewer Pass 2 (2026-06-02/03)
 
 > **Status (2026-06-09): all resolved.** The second human-reviewer pass (G1–G7;
-> `G1–G6` IwakuraRein on `flashinfer/fused_moe/api.py`, `G7` samuellees) is fully
+> `G1–G6` Reviewer 12 on `flashinfer/fused_moe/api.py`, `G7` Reviewer 13) is fully
 > addressed and pushed — the bot threads (CodeRabbit ×6, Gemini ×3) and earlier
 > self-notes were resolved in the 2026-06-01 pass. The per-thread decisions and
 > rationale live in the commits (`fix(moe): … review comments` updates 1–3) and,
 > for the structural threads, in the code + sections above: G1 enum
 > consolidation (the enum block in `api.py` / `tllm_enums.py`), G4/G5 the
 > `MoETensors` cluster drop ("Two packs, two lifetimes" + the pack rationale in
-> `api.py`). The qiching `_select_winner` thread remains tracked under Post-MVP
+> `api.py`). The Reviewer 14 `_select_winner` thread remains tracked under Post-MVP
 > Carryover (a deferred design decision, not part of this pass). The *open* MoE
 > work is now the two fuzzer-filed bugs — gh #3547 / #3548 — described under
 > "Test Harness" above.
@@ -908,7 +908,7 @@ kernel); (5) tighten the quantized-numeric net via the QuantSpec scale policy
 | [ ] | Decide whether repro logs remain same-version-only or need a versioned schema for cross-version bug reports. | C4-C5, C39 |
 | [ ] | **Realistic wide-EP** lands in the separate `moe_ep` API (PR #3453): global top-k-of-N routing + cross-rank dispatch/combine + per-rank load imbalance. This MVP only ships a *local-only* per-rank proxy (route within local experts). Coordination seam: `moe_ep`'s `MoEEpLayer.forward` does `dispatch → inner_compute → combine`, and `inner_compute` (identity today) is where this unified `fused_moe` path becomes the per-rank expert compute — so our `ExpertConfig.local_expert_offset` wiring and local-only benchmark proxy already model that compute side. Building blocks for faithful EP: `compute_reference_moe_fp4`'s `num_local_experts`/`local_expert_offset` local-skip, `bench_moe_deepseek.py`'s `local_fraction` metric scaling. (Detailed coordination review in `var/log/`.) | #3453 |
 | [ ] | **Make the low-level trtllm-gen TVM-FFI ops take structured config objects instead of long positional argument lists** (§5). The mid-cut blocker (the unified runner rotting after a `main` merge silently inserted `routing_input_mode` / `topk_weights` / `per_token_scale` and moved the tactic arg) was a *positional-argument-drift* failure with no compile-time signal. Delegating to `core.MoERunner` reduced the fragile call to one site; a structured `…Node::FromObject(config)` boundary (C++ reads named struct members) would remove the failure mode entirely and let adapters pass dataclass configs through unchanged. Out of MVP scope — sequence it after the NVFP4 MVP lands. | §5 |
-| [ ] | **Gate `MoELayer._select_winner` behind the tuner's tuning mode.** Today a bucket-miss unconditionally runs the cross-backend `bench_gpu_time` shootout — even outside `autotune(True)` and even for ops `AutoTuner` would treat as `skip_ops` (where `choose_one` is a pure cache lookup / immediate fallback). The MVP is always exercised under `autotune(True)`, so this is correct for the shipped tests/benchmark, but a production layer built without an autotune context still silently benchmarks on first use per bucket. Follow-up: gate the shootout behind `self.tuner.is_tuning_mode`; when false and the bucket is uncached, select via a deterministic priority order (the §4 `DEFAULT_PRIORITY` heuristic) instead of benchmarking, and honor `skip_ops`. Needs a decision on the priority order, so deferred rather than rushed. | review (qiching) |
+| [ ] | **Gate `MoELayer._select_winner` behind the tuner's tuning mode.** Today a bucket-miss unconditionally runs the cross-backend `bench_gpu_time` shootout — even outside `autotune(True)` and even for ops `AutoTuner` would treat as `skip_ops` (where `choose_one` is a pure cache lookup / immediate fallback). The MVP is always exercised under `autotune(True)`, so this is correct for the shipped tests/benchmark, but a production layer built without an autotune context still silently benchmarks on first use per bucket. Follow-up: gate the shootout behind `self.tuner.is_tuning_mode`; when false and the bucket is uncached, select via a deterministic priority order (the §4 `DEFAULT_PRIORITY` heuristic) instead of benchmarking, and honor `skip_ops`. Needs a decision on the priority order, so deferred rather than rushed. | review (Reviewer 14) |
 
 ### Explicit Non-Goals For This MVP
 
