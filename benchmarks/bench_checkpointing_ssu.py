@@ -62,8 +62,16 @@ from einops import repeat
 # Add tests/mamba to path for triton_reference imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "mamba"))
 
-from triton_reference.checkpointing_state_update import (
-    checkpointing_state_update,
+from triton_reference.checkpointing_state_update import checkpointing_state_update
+
+# triton-replay uses the faithful, TMA-optimized standalone reference (the
+# merged checkpointing_state_update copy dropped TMA + tuning during migration).
+from triton_reference.replay_selective_state_update import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
     replay_selective_state_update,
 )
 from triton_reference.selective_state_update import (
@@ -318,7 +326,8 @@ def _build_tensors(
 KernelName = Literal[
     "cuda-incr",  # cuda_checkpointing_ssu
     "incremental",  # Triton checkpointing_state_update (old 4D path)
-    "triton-replay",  # Triton replay_selective_state_update (new 5D persistent path)
+    "triton-replay",  # Triton replay_selective_state_update — persistent_dynamic
+    "triton-replay-pm",  # Triton replay_selective_state_update — persistent_main
     "fi-dump",  # flashinfer_selective_state_update with dst_state_batch_indices
     "baseline-triton",  # Triton selective_state_update (disable_state_update)
     "baseline-flashinfer",  # flashinfer selective_state_update (disable_state_update)
@@ -437,6 +446,29 @@ def _old_x_to_5d(old_x_4d: torch.Tensor, cache_buf_idx: torch.Tensor) -> torch.T
     rows = torch.arange(cache_size, device=old_x_4d.device)
     old_x_5d[rows, cache_buf_idx.long()] = old_x_4d
     return old_x_5d
+
+
+def _make_replay_work_items(prev_tokens, cache_buf_idx, mtp_len, max_window, batch):
+    """Build (n_writes, replay_work_items) for the standalone persistent kernel,
+    write-first sorted — matches mamba2_metadata._prepare_replay_work_items.
+
+    The bench uses contiguous cache slots (state_batch_indices=None), so
+    cache_slot == position_in_decode_batch.  persistent_dynamic ignores the
+    ordering at runtime; persistent_main relies on the write-first split.
+    """
+    device = prev_tokens.device
+    pos = torch.arange(batch, device=device, dtype=torch.int32)
+    pnat = prev_tokens[:batch].to(torch.int32)
+    active_buf = cache_buf_idx[:batch].to(torch.int32)
+    write_mask = (pnat + mtp_len) > max_window
+    n_writes = write_mask.sum().to(torch.int32).reshape(1)
+    order = torch.argsort((~write_mask).to(torch.int32), stable=True).to(torch.long)
+    work = torch.empty(batch, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32)
+    work[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = pos[order]
+    work[:, REPLAY_WORK_CACHE_SLOT] = pos[order]
+    work[:, REPLAY_WORK_PNAT] = pnat[order]
+    work[:, REPLAY_WORK_CACHE_BUF_IDX] = active_buf[order]
+    return n_writes, work.contiguous()
 
 
 def build_kernel_inputs(
@@ -615,10 +647,28 @@ def _make_run_closure(
 
         return _run
 
-    if kernel == "triton-replay":
-        # New 5D persistent path (persistent_dynamic): a single launch decides
-        # write-vs-append per slot at runtime — no per-call write_checkpoint
-        # branching.  Reads the 5D double-buffered old_x; cache stays per-slot.
+    if kernel in ("triton-replay", "triton-replay-pm"):
+        # Faithful 5D persistent path (standalone, TMA-optimized).  Both modes:
+        #   triton-replay     → persistent_dynamic (single launch, per-slot
+        #                        runtime write decision).
+        #   triton-replay-pm  → persistent_main (two launches: write half +
+        #                        nowrite half, work items pre-sorted write-first).
+        # Build the work-item plumbing once (write-first sorted) — pd ignores the
+        # ordering at runtime, pm relies on the n_writes split.  mtp_len /
+        # max_window are fixed for this call; prev_tokens_i32 is set by
+        # time_kernel before this closure is built.  Tuning knobs default to
+        # None → the standalone's _resolve_tuning picks the tuned (TMA) config.
+        replay_mode = (
+            "persistent_dynamic" if kernel == "triton-replay" else "persistent_main"
+        )
+        n_writes, replay_work_items = _make_replay_work_items(
+            inputs.prev_tokens_i32,
+            inputs.cache_buf_idx_work,
+            mtp_len,
+            max_window,
+            inputs.batch,
+        )
+
         def _run():
             replay_selective_state_update(
                 inputs.state_work,
@@ -634,6 +684,8 @@ def _make_run_closure(
                 B=inputs.B,
                 C=inputs.C,
                 out=inputs.out_incr,
+                n_writes=n_writes,
+                replay_work_items=replay_work_items,
                 D=inputs.D,
                 dt_bias=inputs.dt_bias,
                 dt_softplus=True,
@@ -641,6 +693,7 @@ def _make_run_closure(
                 rand_seed=rand_seed,
                 philox_rounds=philox_rounds,
                 state_scales=inputs.state_scale_work,
+                mode=replay_mode,
             )
 
         return _run
@@ -1091,6 +1144,7 @@ def _bench_config(
         or args.flashinfer_dump
         or args.cuda_incr
         or args.triton_replay
+        or args.triton_replay_pm
     )
 
     pt_uniform_i32 = torch.zeros(batch, dtype=torch.int32, device="cuda")
@@ -1256,6 +1310,36 @@ def _bench_config(
                 p99_us,
             )
 
+    # --- Triton replay, persistent_main mode (write/nowrite two-launch split) ---
+    if args.triton_replay_pm:
+        for prev_k in prev_ks:
+            pt_uniform_i32.fill_(prev_k)
+            tag = (
+                f"triton_replay_pm_b{batch}_mtp{mtp_len}_k{prev_k}"
+                f"_s{state_dtype_name}_a{act_dtype_name}"
+            )
+            median_us, p95_us, p99_us = time_kernel(
+                kernel="triton-replay-pm",
+                inputs=inputs,
+                prev_tokens=pt_uniform_i32,
+                timing=timing,
+                tag=tag,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
+            )
+            _print_row(
+                show_kernel_col,
+                "triton-replay-pm",
+                batch,
+                mtp_len,
+                prev_k,
+                state_dtype_name,
+                act_dtype_name,
+                median_us,
+                p95_us,
+                p99_us,
+            )
+
     # --- FlashInfer dynamic-dump ---
     if args.flashinfer_dump:
         for prev_k in prev_ks:
@@ -1360,6 +1444,7 @@ def _run_benchmark(args) -> None:
         or args.flashinfer_dump
         or args.cuda_incr
         or args.triton_replay
+        or args.triton_replay_pm
     )
     if show_kernel_col:
         print(
@@ -1584,8 +1669,15 @@ def _parse_args() -> argparse.Namespace:
         "--triton-replay",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run Triton replay_selective_state_update (5D persistent path) "
-        "(default: on).",
+        help="Run Triton replay_selective_state_update, persistent_dynamic "
+        "(5D persistent path) (default: on).",
+    )
+    parser.add_argument(
+        "--triton-replay-pm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run Triton replay_selective_state_update, persistent_main "
+        "(write/nowrite two-launch split) (default: on).",
     )
     parser.add_argument(
         "--flashinfer-dump",
