@@ -15,11 +15,11 @@ from einops import repeat
 from flashinfer.mamba.checkpointing_ssu import checkpointing_ssu
 from flashinfer.utils import is_cvt_rs_supported
 
-# Import Triton reference.  `replay_selective_state_update` is a backwards-compat
-# alias for `checkpointing_state_update` kept inside the same module.
+# Import Triton reference.  All tests drive the 5D persistent path via
+# `replay_selective_state_update`; the old 4D `checkpointing_state_update` is no
+# longer used here.
 from .triton_reference.checkpointing_state_update import (
     _get_sm_version,
-    checkpointing_state_update,
     replay_selective_state_update,
 )
 from .triton_reference.selective_state_update import (
@@ -3328,14 +3328,20 @@ def test_checkpointing_state_update(
         test_state = state0.clone()
         test_scales = state0_scales.clone() if is_quantized else None
         prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
+        # The persistent-dynamic path decides write-vs-append per slot at
+        # runtime: is_w = (prev_k + T) > max_window.  prev_k = k is uniform here,
+        # so is_w is uniform.  The old forced `write_checkpoint` constexpr is
+        # moot on the dynamic path — expectations below follow is_w.
+        is_w = (k + T) > max_window
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        old_x_w = old_x.clone()
+        old_x_5d = _old_x_to_5d(old_x, cache_buf_idx)
+        old_x_w = old_x_5d.clone()
         old_B_w = old_B.clone()
         old_dt_w = old_dt.clone()
         old_dA_cumsum_w = old_dA_cumsum.clone()
         # cache_buf_idx stays at its random values — each slot reads from its own buffer
 
-        checkpointing_state_update(
+        replay_selective_state_update(
             test_state,
             old_x_w,
             old_B_w,
@@ -3383,7 +3389,7 @@ def test_checkpointing_state_update(
         #   False → kernel skips the HBM store; state must be UNCHANGED
         #           from the input (state0; for quant, scales also unchanged).
         if is_quantized:
-            if write_checkpoint:
+            if is_w:
                 expected_fp32 = (
                     ref_input_state[slots]
                     if k == 0
@@ -3414,7 +3420,7 @@ def test_checkpointing_state_update(
                 assert torch.equal(test_state[slots], state0[slots])
                 assert torch.equal(test_scales[slots], state0_scales[slots])
         else:
-            if write_checkpoint:
+            if is_w:
                 expected_state = (
                     state0[slots]
                     if k == 0
@@ -3426,40 +3432,47 @@ def test_checkpointing_state_update(
                 test_state[slots],
                 expected_state,
                 rtol=2e-2,
-                atol=1.0 if write_checkpoint else 0.0,
-                msg=f"State mismatch at k={k} (write_checkpoint={write_checkpoint})",
+                atol=1.0 if is_w else 0.0,
+                msg=f"State mismatch at k={k} (is_w={is_w})",
             )
 
         # --- Cache postconditions ---
         dt2_proc = F.softplus(dt2_base.float() + dt_bias_base.float()[None, None, :])
         dA_cumsum2 = torch.cumsum(A_base.float()[None, None, :] * dt2_proc, dim=1)
-        write_offset = 0 if write_checkpoint else k
+        write_offset = 0 if is_w else k
 
         for batch_idx, slot in enumerate(slot_indices):
             active = cache_buf_idx[slot].item()
-            wb = (1 - active) if write_checkpoint else active
+            wb = (1 - active) if is_w else active
 
-            # --- old_x (single-buffered): write at [write_offset : +T) of slot ---
+            # --- old_x (now 5-D double-buffered): write at write_buf, [write_offset:+T) ---
             torch.testing.assert_close(
-                old_x_w[slot, write_offset : write_offset + T],
+                old_x_w[slot, wb, write_offset : write_offset + T],
                 x2[batch_idx],
                 rtol=0,
                 atol=0,
             )
             if write_offset > 0:
                 torch.testing.assert_close(
-                    old_x_w[slot, :write_offset],
-                    old_x[slot, :write_offset],
+                    old_x_w[slot, wb, :write_offset],
+                    old_x_5d[slot, wb, :write_offset],
                     rtol=0,
                     atol=0,
                 )
             if write_offset + T < max_window:
                 torch.testing.assert_close(
-                    old_x_w[slot, write_offset + T :],
-                    old_x[slot, write_offset + T :],
+                    old_x_w[slot, wb, write_offset + T :],
+                    old_x_5d[slot, wb, write_offset + T :],
                     rtol=0,
                     atol=0,
                 )
+            # other buffer (1 - wb) untouched
+            torch.testing.assert_close(
+                old_x_w[slot, 1 - wb],
+                old_x_5d[slot, 1 - wb],
+                rtol=0,
+                atol=0,
+            )
 
             # --- old_B (double-buffered): write at write_buf, [write_offset:+T) ---
             torch.testing.assert_close(
@@ -3491,7 +3504,7 @@ def test_checkpointing_state_update(
 
             # --- old_dA_cumsum (double-buffered, fp32, layout (heads, T)): ---
             # Continuous cumsum: no-write + k > 0 adds the tail of the prior step.
-            if write_checkpoint or k == 0:
+            if is_w or k == 0:
                 expected_dAcs = dA_cumsum2[batch_idx].T
             else:
                 prefix = old_dA_cumsum[slot, wb, :, k - 1]  # (nheads,)
@@ -3607,9 +3620,9 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
     state_no_round = state0.clone()
     scales_no_round = state0_scales.clone() if is_quantized else None
     out_no_round = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    checkpointing_state_update(
+    replay_selective_state_update(
         state_no_round,
-        old_x.clone(),
+        _old_x_to_5d(old_x, cache_buf_idx),
         old_B.clone(),
         old_dt.clone(),
         old_dA_cumsum.clone(),
@@ -3624,9 +3637,9 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
     state_rounded = state0.clone()
     scales_rounded = state0_scales.clone() if is_quantized else None
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    checkpointing_state_update(
+    replay_selective_state_update(
         state_rounded,
-        old_x.clone(),
+        _old_x_to_5d(old_x, cache_buf_idx),
         old_B.clone(),
         old_dt.clone(),
         old_dA_cumsum.clone(),
@@ -3742,9 +3755,9 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
 
     state_fp32 = state0_fp32.clone()
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    checkpointing_state_update(
+    replay_selective_state_update(
         state_fp32,
-        old_x.clone(),
+        _old_x_to_5d(old_x, cache_buf_idx),
         old_B.clone(),
         old_dt.clone(),
         old_dA_cumsum.clone(),
@@ -3763,9 +3776,9 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
         state_rounded = state0_fp32.to(state_dtype)
         scales_rounded = None
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    checkpointing_state_update(
+    replay_selective_state_update(
         state_rounded,
-        old_x.clone(),
+        _old_x_to_5d(old_x, cache_buf_idx),
         old_B.clone(),
         old_dt.clone(),
         old_dA_cumsum.clone(),
