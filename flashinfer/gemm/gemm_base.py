@@ -7143,6 +7143,31 @@ def get_gemm_sm120_module_cute_mxfp8():
     return gen_gemm_sm120_module_cute_mxfp8().build_and_load()
 
 
+def _check_m_indptr(m_indptr: torch.Tensor, token_num: int) -> None:
+    """Validate ``m_indptr`` semantic consistency before launching the kernel.
+
+    Checks: 1-D int32, first element 0, monotonic non-decreasing, last element
+    equals ``token_num`` (the row count of the packed A tensor).
+    """
+    if m_indptr.dtype != torch.int32:
+        raise ValueError(f"m_indptr must be int32; got {m_indptr.dtype}")
+    if m_indptr.dim() != 1:
+        raise ValueError(f"m_indptr must be 1-D; got {m_indptr.dim()}D")
+    if m_indptr.numel() < 2:
+        raise ValueError(
+            f"m_indptr must have at least 2 elements (num_experts >= 1); "
+            f"got numel={m_indptr.numel()}"
+        )
+    first = int(m_indptr[0].item())
+    last = int(m_indptr[-1].item())
+    if first != 0:
+        raise ValueError(f"m_indptr[0] must be 0; got {first}")
+    if last != token_num:
+        raise ValueError(f"m_indptr[-1] must equal token_num={token_num}; got {last}")
+    if not bool((m_indptr[1:] >= m_indptr[:-1]).all().item()):
+        raise ValueError("m_indptr must be non-decreasing")
+
+
 def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) -> None:
     """Validate the per-row UE8M0 ``scale_granularity_mnk`` contract shared by all
     MXFP8 cute SM120 GEMM entries. Accepts ``(1, 1, 32)`` or ``(1, 1, 128)``.
@@ -7163,6 +7188,7 @@ def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) ->
         )
 
 
+@supported_compute_capability([120, 121])
 @flashinfer_api
 def quantize_mxfp8_for_zero_padding(
     input: torch.Tensor,
@@ -7207,11 +7233,10 @@ def quantize_mxfp8_for_zero_padding(
         raise ValueError(f"input must be bfloat16; got {input.dtype}")
     if input.dim() != 2:
         raise ValueError(f"input must be 2D; got {input.dim()}D")
-    if m_indptr.dtype != torch.int32:
-        raise ValueError(f"m_indptr must be int32; got {m_indptr.dtype}")
 
-    num_experts = m_indptr.shape[0] - 1
     token_num, k = input.shape
+    _check_m_indptr(m_indptr, token_num=token_num)
+    num_experts = m_indptr.shape[0] - 1
     if k % 16 != 0:
         raise ValueError(f"k must be multiple of 16; got k={k}")
 
@@ -7234,6 +7259,7 @@ def quantize_mxfp8_for_zero_padding(
     return out_fp8, out_scale
 
 
+@supported_compute_capability([120, 121])
 @flashinfer_api
 def group_gemm_mxfp8_nt_groupwise_zero_padding(
     a: torch.Tensor,
@@ -7242,12 +7268,6 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
     b_scale: torch.Tensor,
     m_indptr: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
-    scale_major_mode: Literal["MN"] = "MN",
-    tile_m: Optional[int] = None,
-    tile_n: Optional[int] = None,
-    tile_k: Optional[int] = None,
-    swap_ab: Optional[bool] = None,
-    mma_sm: int = 1,
     backend: Literal["cute"] = "cute",
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
@@ -7293,19 +7313,6 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
         ``1`` (per-row scaling along M and N); ``k_granularity`` must be ``32`` or ``128``.
         Anything else raises ``ValueError``.
 
-    scale_major_mode: Literal["MN"]
-        The layout mode of scale tensor. Currently only ``"MN"`` is supported.
-
-    tile_m, tile_n, tile_k: Optional[int]
-        Force a specific kernel tile size. ``None`` (default) auto-dispatches via the
-        kernel runner heuristic.
-
-    swap_ab: Optional[bool]
-        Force SwapAB layout. ``None`` (default) uses the kernel heuristic.
-
-    mma_sm: int
-        Reserved for multi-SM CGA dispatch. Ignored on SM120.
-
     backend: Literal["cute"]
         Backend selector. Currently only ``"cute"`` is implemented.
 
@@ -7331,11 +7338,8 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
       ``b_scale``, it must be broadcast to per-row shape ``(num_experts, n, k_align)``
       before invoking this function (one scale per N-row).
     """
-    if scale_major_mode != "MN":
-        raise ValueError(
-            f'Only scale_major_mode="MN" is supported; got "{scale_major_mode}"'
-        )
     _check_scale_granularity_mnk(scale_granularity_mnk)
+    _check_m_indptr(m_indptr, token_num=a.shape[0])
     if backend != "cute":
         raise NotImplementedError(
             f'Only backend="cute" is currently implemented; got backend="{backend}"'
@@ -7359,7 +7363,7 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
         b_scale,
         m_indptr,
         out,
-        scale_major_mode,
+        "MN",
         scale_granularity_mnk[0],
         scale_granularity_mnk[1],
         scale_granularity_mnk[2],
@@ -7367,6 +7371,7 @@ def group_gemm_mxfp8_nt_groupwise_zero_padding(
     return out
 
 
+@supported_compute_capability([120, 121])
 @flashinfer_api
 def group_gemm_mxfp8_nt_groupwise(
     a: torch.Tensor,
@@ -7466,6 +7471,7 @@ def group_gemm_mxfp8_nt_groupwise(
     return out
 
 
+@supported_compute_capability([120, 121])
 @flashinfer_api
 def group_gemm_mxfp8_nt_groupwise_masked(
     a: torch.Tensor,
@@ -7556,6 +7562,7 @@ def group_gemm_mxfp8_nt_groupwise_masked(
     return out
 
 
+@supported_compute_capability([120, 121])
 @flashinfer_api
 def gemm_mxfp8_nt_groupwise(
     a: torch.Tensor,
@@ -7632,6 +7639,7 @@ def gemm_mxfp8_nt_groupwise(
     return out
 
 
+@supported_compute_capability([120, 121])
 @flashinfer_api
 def batch_gemm_mxfp8_nt_groupwise(
     a: torch.Tensor,

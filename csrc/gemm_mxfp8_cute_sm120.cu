@@ -119,6 +119,22 @@ void CutlassBatchGemmMxfp8GroupwiseScaledCuteSM120(
   TVM_FFI_ICHECK_EQ(out.stride(2), 1)
       << "out.stride(2) must be 1 (n-major contiguous on last dim); got " << out.stride(2);
 
+  TVM_FFI_ICHECK_EQ(lda, a.stride(1))
+      << "lda must match a.stride(1); got lda=" << lda << ", a.stride(1)=" << a.stride(1);
+  TVM_FFI_ICHECK_EQ(stride_a, a.stride(0))
+      << "stride_a must match a.stride(0); got stride_a=" << stride_a
+      << ", a.stride(0)=" << a.stride(0);
+  TVM_FFI_ICHECK_EQ(ldb, b.stride(1))
+      << "ldb must match b.stride(1); got ldb=" << ldb << ", b.stride(1)=" << b.stride(1);
+  TVM_FFI_ICHECK_EQ(stride_b, b.stride(0))
+      << "stride_b must match b.stride(0); got stride_b=" << stride_b
+      << ", b.stride(0)=" << b.stride(0);
+  TVM_FFI_ICHECK_EQ(ldd, out.stride(1))
+      << "ldd must match out.stride(1); got ldd=" << ldd << ", out.stride(1)=" << out.stride(1);
+  TVM_FFI_ICHECK_EQ(stride_d, out.stride(0))
+      << "stride_d must match out.stride(0); got stride_d=" << stride_d
+      << ", out.stride(0)=" << out.stride(0);
+
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());
 

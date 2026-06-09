@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import os
 from itertools import product
 
@@ -664,6 +665,7 @@ def gen_gemm_sm120_module() -> JitSpec:
     )
 
 
+@functools.cache
 def gen_gemm_sm120_module_cute_mxfp8() -> JitSpec:
     """SM120 MXFP8 cute GEMM module.
 
