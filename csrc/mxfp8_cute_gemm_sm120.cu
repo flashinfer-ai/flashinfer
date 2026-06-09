@@ -1,0 +1,503 @@
+/*
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+
+#include "cutlass/gemm_coord.h"
+#include "flashinfer/gemm/mxfp8_cute_gemm_sm120.h"
+#include "flashinfer/gemm/sm120_blockscaled/builder.cuh"
+#include "flashinfer/gemm/sm120_blockscaled/kernel_impl.cuh"
+#include "flashinfer/gemm/sm120_blockscaled/launch.cuh"
+#include "flashinfer/gemm/sm120_blockscaled/mxfp8_quantize_zero_padding.cuh"
+#include "flashinfer/gemm/sm120_blockscaled/scheduler.cuh"
+#include "flashinfer/gemm/sm120_blockscaled/utils.cuh"
+
+#define CUTLASS_CHECK(status)                                                                    \
+  {                                                                                              \
+    cutlass::Status error = status;                                                              \
+    if (error != cutlass::Status::kSuccess) {                                                    \
+      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: " << __LINE__ \
+                << std::endl;                                                                    \
+      exit(EXIT_FAILURE);                                                                        \
+    }                                                                                            \
+  }
+
+namespace flashinfer::gemm::mxfp8_cute_sm120 {
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+                         BlockScaleElementType>::Mxfp8CuteGemmSm120Runner() {}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+                         BlockScaleElementType>::~Mxfp8CuteGemmSm120Runner() {}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::gemm_mxfp8_nt_groupwise(void* D,
+                                                                              void const* A,
+                                                                              void const* B,
+                                                                              int shape_m,
+                                                                              int shape_n,
+                                                                              int shape_k,
+                                                                              float const* SFA,
+                                                                              float const* SFB,
+                                                                              cudaStream_t stream,
+                                                                              int granK) {
+  switch (granK) {
+    case 32:
+      gemm_mxfp8_nt_groupwise_impl<32>(D, A, B, shape_m, shape_n, shape_k, SFA, SFB, stream);
+      break;
+    case 128:
+      gemm_mxfp8_nt_groupwise_impl<128>(D, A, B, shape_m, shape_n, shape_k, SFA, SFB, stream);
+      break;
+    default:
+      throw std::runtime_error("granK must be 32 or 128");
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+template <int GranK>
+void Mxfp8CuteGemmSm120Runner<
+    ElementType, OutElementType, AccumElementType,
+    BlockScaleElementType>::gemm_mxfp8_nt_groupwise_impl(void* D, void const* A, void const* B,
+                                                         int shape_m, int shape_n, int shape_k,
+                                                         float const* SFA, float const* SFB,
+                                                         cudaStream_t stream) {
+  using KT_M128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK,
+                                                             sm120_blockscaled::GemmType::Normal>;
+  using KT_M64 = sm120_blockscaled::SM120BlockScaledBuilder<64, 128, 64, 4, GranK,
+                                                            sm120_blockscaled::GemmType::Normal>;
+  using KT_M32 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK,
+                                                            sm120_blockscaled::GemmType::Normal>;
+  using KT_SWAPAB_N8 =
+      sm120_blockscaled::SM120BlockScaledBuilder<128, 8, 128, 4, GranK,
+                                                 sm120_blockscaled::GemmType::Normal, true>;
+
+  auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
+  auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
+  auto ptr_SFA_in =
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+  auto ptr_SFB_in =
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+  auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
+
+  int num_sms = sm120_blockscaled::get_num_sms();
+
+  if (shape_m <= 8) {
+    sm120_blockscaled::launch_gemm<KT_SWAPAB_N8>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                 ptr_D_in, shape_m, shape_n, shape_k, num_sms,
+                                                 stream);
+    return;
+  }
+
+  int min_tiles = num_sms / 2;
+
+  auto can_use = [&](int tile_m, int tile_n) {
+    int num_m = (shape_m + tile_m - 1) / tile_m;
+    int num_n = (shape_n + tile_n - 1) / tile_n;
+    int tiles = num_m * num_n;
+    return shape_m >= tile_m && num_m >= 2 && tiles >= min_tiles;
+  };
+
+  if (can_use(KT_M128::kTileM, KT_M128::kTileN)) {
+    sm120_blockscaled::launch_gemm<KT_M128>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
+                                            shape_m, shape_n, shape_k, num_sms, stream);
+  } else if (can_use(KT_M64::kTileM, KT_M64::kTileN)) {
+    sm120_blockscaled::launch_gemm<KT_M64>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
+                                           shape_m, shape_n, shape_k, num_sms, stream);
+  } else {
+    sm120_blockscaled::launch_gemm<KT_M32>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
+                                           shape_m, shape_n, shape_k, num_sms, stream);
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+void Mxfp8CuteGemmSm120Runner<
+    ElementType, OutElementType, AccumElementType,
+    BlockScaleElementType>::batch_gemm_mxfp8_nt_groupwise(void* A, int ld_a, int stride_a, void* B,
+                                                          int ld_b, int stride_b, void* D, int ld_d,
+                                                          int stride_d, float* SFA, float* SFB,
+                                                          int num_groups, int shape_m, int shape_n,
+                                                          int shape_k, cudaStream_t stream,
+                                                          int granK) {
+  switch (granK) {
+    case 32:
+      batch_gemm_mxfp8_nt_groupwise_impl<32>(A, ld_a, stride_a, B, ld_b, stride_b, D, ld_d,
+                                             stride_d, SFA, SFB, num_groups, shape_m, shape_n,
+                                             shape_k, stream);
+      break;
+    case 128:
+      batch_gemm_mxfp8_nt_groupwise_impl<128>(A, ld_a, stride_a, B, ld_b, stride_b, D, ld_d,
+                                              stride_d, SFA, SFB, num_groups, shape_m, shape_n,
+                                              shape_k, stream);
+      break;
+    default:
+      throw std::runtime_error("granK must be 32 or 128");
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+template <int GranK>
+void Mxfp8CuteGemmSm120Runner<
+    ElementType, OutElementType, AccumElementType,
+    BlockScaleElementType>::batch_gemm_mxfp8_nt_groupwise_impl(void* A, int ld_a, int stride_a,
+                                                               void* B, int ld_b, int stride_b,
+                                                               void* D, int ld_d, int stride_d,
+                                                               float* SFA, float* SFB,
+                                                               int num_groups, int shape_m,
+                                                               int shape_n, int shape_k,
+                                                               cudaStream_t stream) {
+  using KT_M128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK,
+                                                             sm120_blockscaled::GemmType::Batched>;
+  using KT_M64 = sm120_blockscaled::SM120BlockScaledBuilder<64, 128, 64, 4, GranK,
+                                                            sm120_blockscaled::GemmType::Batched>;
+  using KT_M32 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK,
+                                                            sm120_blockscaled::GemmType::Batched>;
+  using KT_SWAPAB_N8 =
+      sm120_blockscaled::SM120BlockScaledBuilder<128, 8, 128, 4, GranK,
+                                                 sm120_blockscaled::GemmType::Batched, true>;
+
+  auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(A);
+  auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(B);
+  auto ptr_SFA_in = reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(SFA);
+  auto ptr_SFB_in = reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(SFB);
+  auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
+
+  int num_sms = sm120_blockscaled::get_num_sms();
+
+  if (shape_m <= 8) {
+    sm120_blockscaled::launch_bmm<KT_SWAPAB_N8>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                ptr_D_in, shape_m, shape_n, shape_k, num_groups,
+                                                num_sms, stream);
+    return;
+  }
+
+  int min_tiles = num_sms / 2;
+
+  auto can_use = [&](int tile_m, int tile_n) {
+    int num_m = (shape_m + tile_m - 1) / tile_m;
+    int num_n = (shape_n + tile_n - 1) / tile_n;
+    int tiles = num_m * num_n;
+    return shape_m >= tile_m && num_m >= 2 && tiles >= min_tiles;
+  };
+
+  if (can_use(KT_M128::kTileM, KT_M128::kTileN)) {
+    sm120_blockscaled::launch_bmm<KT_M128>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
+                                           shape_m, shape_n, shape_k, num_groups, num_sms, stream);
+  } else if (can_use(KT_M64::kTileM, KT_M64::kTileN)) {
+    sm120_blockscaled::launch_bmm<KT_M64>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
+                                          shape_m, shape_n, shape_k, num_groups, num_sms, stream);
+  } else {
+    sm120_blockscaled::launch_bmm<KT_M32>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
+                                          shape_m, shape_n, shape_k, num_groups, num_sms, stream);
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+void Mxfp8CuteGemmSm120Runner<
+    ElementType, OutElementType, AccumElementType,
+    BlockScaleElementType>::group_gemm_mxfp8_nt_groupwise_masked(void* D, void const* A,
+                                                                 void const* B, int const* masked_m,
+                                                                 int num_groups, int max_m, int n,
+                                                                 int k, cudaStream_t stream,
+                                                                 float const* SFA, float const* SFB,
+                                                                 int granK) {
+  switch (granK) {
+    case 32:
+      group_gemm_mxfp8_nt_groupwise_masked_impl<32>(D, A, B, masked_m, num_groups, max_m, n, k,
+                                                    stream, SFA, SFB);
+      break;
+    case 128:
+      group_gemm_mxfp8_nt_groupwise_masked_impl<128>(D, A, B, masked_m, num_groups, max_m, n, k,
+                                                     stream, SFA, SFB);
+      break;
+    default:
+      throw std::runtime_error("granK must be 32 or 128");
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+template <int GranK>
+void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::
+    group_gemm_mxfp8_nt_groupwise_masked_impl(void* D, void const* A, void const* B,
+                                              int const* masked_m, int num_groups, int max_m, int n,
+                                              int k, cudaStream_t stream, float const* SFA,
+                                              float const* SFB) {
+  using KT_MASKED =
+      sm120_blockscaled::SM120BlockScaledBuilder<64, 128, 64, 4, GranK,
+                                                 sm120_blockscaled::GemmType::MGroupedMasked>;
+
+  auto ptr_A_in = reinterpret_cast<typename KT_MASKED::ElementA*>(const_cast<void*>(A));
+  auto ptr_B_in = reinterpret_cast<typename KT_MASKED::ElementB*>(const_cast<void*>(B));
+  auto ptr_SFA_in =
+      reinterpret_cast<typename KT_MASKED::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+  auto ptr_SFB_in =
+      reinterpret_cast<typename KT_MASKED::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+  auto ptr_D_in = reinterpret_cast<typename KT_MASKED::ElementD*>(D);
+
+  int num_sms = sm120_blockscaled::get_num_sms();
+
+  sm120_blockscaled::launch_masked_gemm<KT_MASKED>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                   ptr_D_in, max_m, n, k, num_groups, masked_m,
+                                                   num_sms, stream);
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::
+    group_gemm_mxfp8_nt_groupwise_zero_padding(void* D, void const* A, void const* B,
+                                               int32_t const* token_offset, int num_experts,
+                                               int total_rows, int shape_n, int shape_k,
+                                               cudaStream_t stream, float const* SFA,
+                                               float const* SFB, int granK) {
+  switch (granK) {
+    case 32:
+      group_gemm_mxfp8_nt_groupwise_zero_padding_impl<32>(
+          D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k, stream, SFA, SFB);
+      break;
+    case 128:
+      group_gemm_mxfp8_nt_groupwise_zero_padding_impl<128>(
+          D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k, stream, SFA, SFB);
+      break;
+    default:
+      throw std::runtime_error("granK must be 32 or 128");
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+template <int GranK>
+void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::
+    group_gemm_mxfp8_nt_groupwise_zero_padding_impl(void* D, void const* A, void const* B,
+                                                    int32_t const* token_offset, int num_experts,
+                                                    int total_rows, int shape_n, int shape_k,
+                                                    cudaStream_t stream, float const* SFA,
+                                                    float const* SFB) {
+  constexpr auto kGT = sm120_blockscaled::GemmType::MGroupedContiguousWithZeroPadding;
+  constexpr int kTileK_M64 = (GranK == 32) ? 64 : 128;
+  using KT_M32 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK, kGT>;
+  using KT_M64 = sm120_blockscaled::SM120BlockScaledBuilder<64, 128, kTileK_M64, 4, GranK, kGT>;
+  using KT_M128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK, kGT>;
+  using KT_SWAPAB_N8 =
+      sm120_blockscaled::SM120BlockScaledBuilder<128, 8, 128, 4, GranK, kGT, /*SwapAB=*/true>;
+
+  auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
+  auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
+  auto ptr_SFA_in =
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+  auto ptr_SFB_in =
+      reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+  auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
+
+  int num_sms = sm120_blockscaled::get_num_sms();
+  int m_per_expert = num_experts > 0 ? (total_rows / num_experts) : 0;
+
+  if (m_per_expert <= 12) {
+    sm120_blockscaled::launch_moe_gemm<KT_SWAPAB_N8>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                     ptr_D_in, total_rows, shape_n, shape_k,
+                                                     num_experts, token_offset, num_sms, stream);
+  } else if (m_per_expert <= 32) {
+    sm120_blockscaled::launch_moe_gemm<KT_M32>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
+                                               total_rows, shape_n, shape_k, num_experts,
+                                               token_offset, num_sms, stream);
+  } else if (m_per_expert < 96 || (m_per_expert < 192 && shape_k <= 2048)) {
+    sm120_blockscaled::launch_moe_gemm<KT_M64>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in, ptr_D_in,
+                                               total_rows, shape_n, shape_k, num_experts,
+                                               token_offset, num_sms, stream);
+  } else {
+    sm120_blockscaled::launch_moe_gemm<KT_M128>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                ptr_D_in, total_rows, shape_n, shape_k, num_experts,
+                                                token_offset, num_sms, stream);
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::
+    group_gemm_mxfp8_nt_groupwise_contiguous(void* D, void const* A, void const* B,
+                                             int32_t const* m_indices, int num_groups, int m,
+                                             int shape_n, int shape_k, cudaStream_t stream,
+                                             float const* SFA, float const* SFB, int granK,
+                                             bool use_psum_layout) {
+  switch (granK) {
+    case 32:
+      group_gemm_mxfp8_nt_groupwise_contiguous_impl<32>(D, A, B, m_indices, num_groups, m, shape_n,
+                                                        shape_k, stream, SFA, SFB, use_psum_layout);
+      break;
+    case 128:
+      group_gemm_mxfp8_nt_groupwise_contiguous_impl<128>(
+          D, A, B, m_indices, num_groups, m, shape_n, shape_k, stream, SFA, SFB, use_psum_layout);
+      break;
+    default:
+      throw std::runtime_error("granK must be 32 or 128");
+  }
+}
+
+template <typename ElementType, typename OutElementType, typename AccumElementType,
+          typename BlockScaleElementType>
+template <int GranK>
+void Mxfp8CuteGemmSm120Runner<ElementType, OutElementType, AccumElementType,
+                              BlockScaleElementType>::
+    group_gemm_mxfp8_nt_groupwise_contiguous_impl(void* D, void const* A, void const* B,
+                                                  int32_t const* m_indices, int num_groups, int m,
+                                                  int shape_n, int shape_k, cudaStream_t stream,
+                                                  float const* SFA, float const* SFB,
+                                                  bool use_psum_layout) {
+  constexpr int kTileK_M64 = (GranK == 32) ? 64 : 128;
+  int num_sms = sm120_blockscaled::get_num_sms();
+  int m_per_expert = num_groups > 0 ? (m / num_groups) : 0;
+
+  if (use_psum_layout) {
+    constexpr auto kGT = sm120_blockscaled::GemmType::MGroupedContiguousWithPsumLayout;
+    using KT_M32 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK, kGT>;
+    using KT_M64 = sm120_blockscaled::SM120BlockScaledBuilder<64, 128, kTileK_M64, 4, GranK, kGT>;
+    using KT_M128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK, kGT>;
+    using KT_SWAPAB_N8 =
+        sm120_blockscaled::SM120BlockScaledBuilder<128, 8, 128, 4, GranK, kGT, /*SwapAB=*/true>;
+
+    auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
+    auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
+    auto ptr_SFA_in =
+        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+    auto ptr_SFB_in =
+        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+    auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
+
+    if (m_per_expert <= 12) {
+      sm120_blockscaled::launch_moe_gemm<KT_SWAPAB_N8>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                       ptr_D_in, m, shape_n, shape_k, num_groups,
+                                                       m_indices, num_sms, stream);
+    } else if (m_per_expert <= 32) {
+      sm120_blockscaled::launch_moe_gemm<KT_M32>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                 ptr_D_in, m, shape_n, shape_k, num_groups,
+                                                 m_indices, num_sms, stream);
+    } else if (m_per_expert < 96 || (m_per_expert < 192 && shape_k <= 2048)) {
+      sm120_blockscaled::launch_moe_gemm<KT_M64>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                 ptr_D_in, m, shape_n, shape_k, num_groups,
+                                                 m_indices, num_sms, stream);
+    } else {
+      sm120_blockscaled::launch_moe_gemm<KT_M128>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                  ptr_D_in, m, shape_n, shape_k, num_groups,
+                                                  m_indices, num_sms, stream);
+    }
+  } else {
+    constexpr auto kGT = sm120_blockscaled::GemmType::MGroupedContiguous;
+    using KT_M32 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK, kGT>;
+    using KT_M64 = sm120_blockscaled::SM120BlockScaledBuilder<64, 128, kTileK_M64, 4, GranK, kGT>;
+    using KT_M128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK, kGT>;
+    using KT_SWAPAB_N8 =
+        sm120_blockscaled::SM120BlockScaledBuilder<128, 8, 128, 4, GranK, kGT, /*SwapAB=*/true>;
+
+    auto ptr_A_in = reinterpret_cast<typename KT_M128::ElementA*>(const_cast<void*>(A));
+    auto ptr_B_in = reinterpret_cast<typename KT_M128::ElementB*>(const_cast<void*>(B));
+    auto ptr_SFA_in =
+        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFA));
+    auto ptr_SFB_in =
+        reinterpret_cast<typename KT_M128::SFConfig::ElementSFLoad*>(const_cast<float*>(SFB));
+    auto ptr_D_in = reinterpret_cast<typename KT_M128::ElementD*>(D);
+
+    if (m_per_expert <= 12) {
+      sm120_blockscaled::launch_moe_gemm<KT_SWAPAB_N8>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                       ptr_D_in, m, shape_n, shape_k, num_groups,
+                                                       m_indices, num_sms, stream);
+    } else if (m_per_expert <= 32) {
+      sm120_blockscaled::launch_moe_gemm<KT_M32>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                 ptr_D_in, m, shape_n, shape_k, num_groups,
+                                                 m_indices, num_sms, stream);
+    } else if (m_per_expert < 96 || (m_per_expert < 192 && shape_k <= 2048)) {
+      sm120_blockscaled::launch_moe_gemm<KT_M64>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                 ptr_D_in, m, shape_n, shape_k, num_groups,
+                                                 m_indices, num_sms, stream);
+    } else {
+      sm120_blockscaled::launch_moe_gemm<KT_M128>(ptr_A_in, ptr_B_in, ptr_SFA_in, ptr_SFB_in,
+                                                  ptr_D_in, m, shape_n, shape_k, num_groups,
+                                                  m_indices, num_sms, stream);
+    }
+  }
+}
+
+template class Mxfp8CuteGemmSm120Runner<cute::float_e4m3_t, cute::bfloat16_t, float,
+                                        cute::float_ue8m0_t>;
+
+template <int GranK>
+static void mxfp8_quantize_zero_padding_impl(void* fp8_output, void* scale_output, void* input,
+                                             void* token_offset, int64_t num_experts,
+                                             int64_t max_token_num, int64_t size_k,
+                                             cudaStream_t stream) {
+  constexpr int kWarpsPerBlock = 4;
+  constexpr int kElementsPerWarp = 512;
+  int num_k_blocks = (size_k + kElementsPerWarp - 1) / kElementsPerWarp;
+  int64_t num_token_blocks = (max_token_num + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  int64_t scale_leading_dim =
+      sm120_blockscaled::math::compute_padded_offset(max_token_num, num_experts);
+
+  constexpr int kBlocksPerSM = 8;
+  int num_sms = sm120_blockscaled::get_num_sms();
+  int64_t max_blocks = static_cast<int64_t>(num_sms) * kBlocksPerSM;
+  int num_blocks_y = static_cast<int>(std::min(num_token_blocks, max_blocks));
+
+  dim3 grid(num_k_blocks, num_blocks_y);
+  dim3 block(kWarpsPerBlock * 32);
+  int smem_size = (num_experts + 1) * sizeof(int32_t);
+
+  auto scale_kernel =
+      sm120_blockscaled::mxfp8_quantize_zero_padding_kernel_sm120<GranK, __nv_bfloat16,
+                                                                  __nv_fp8_e4m3, kWarpsPerBlock>;
+  cudaFuncSetAttribute(scale_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+  scale_kernel<<<grid, block, smem_size, stream>>>(
+      reinterpret_cast<__nv_fp8_e4m3*>(fp8_output), reinterpret_cast<int32_t*>(scale_output),
+      reinterpret_cast<const __nv_bfloat16*>(input), reinterpret_cast<const int32_t*>(token_offset),
+      num_experts, size_k, scale_leading_dim);
+
+  CUTE_CHECK_ERROR(cudaGetLastError());
+  cudaDeviceSynchronize();
+}
+
+void mxfp8_quantize_zero_padding(void* fp8_output, void* scale_output, void* input,
+                                 void* token_offset, int64_t num_experts, int64_t max_token_num,
+                                 int64_t size_k, cudaStream_t stream, int granK) {
+  switch (granK) {
+    case 32:
+      mxfp8_quantize_zero_padding_impl<32>(fp8_output, scale_output, input, token_offset,
+                                           num_experts, max_token_num, size_k, stream);
+      break;
+    case 128:
+      mxfp8_quantize_zero_padding_impl<128>(fp8_output, scale_output, input, token_offset,
+                                            num_experts, max_token_num, size_k, stream);
+      break;
+    default:
+      throw std::runtime_error("granK must be 32 or 128");
+  }
+}
+
+}  // namespace flashinfer::gemm::mxfp8_cute_sm120

@@ -78,6 +78,25 @@ FP8 Quantization
     mxfp8_quantize
     mxfp8_dequantize_host
 
+.. _mxfp8-per-row-layout:
+
+MXFP8 Per-Row Layout (cute SM120)
+---------------------------------
+
+Helpers for the per-row UE8M0 INT-packed TMA-aligned MN-major scale layout
+expected by the MXFP8 cute SM120 GEMM family (see
+:ref:`MXFP8 Groupwise GEMM (cute SM120) <apigemm>`). Distinct from the
+TRT-LLM-style ``mxfp8_quantize`` (SM100+ swizzled layout, ``sfVecSize=32``).
+Supported ``k_gran ∈ {32, 128}``.
+
+.. autosummary::
+    :toctree: ../generated
+
+    mxfp8_quantize_per_row
+    mxfp8_quantize_per_block
+    mxfp8_transform_sf_layout
+    mxfp8_dequantize_per_row
+
 CuTe-DSL Quantization Kernels (experimental)
 --------------------------------------------
 

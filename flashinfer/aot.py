@@ -78,6 +78,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm120_module,
+    gen_gemm_sm120_module_cute_mxfp8,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_mm_bf16_cublaslt_module,
     gen_gemm_sm120_module_cutlass_mxfp8,
@@ -545,6 +546,7 @@ def gen_all_modules(
             # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module_cute_mxfp8())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())

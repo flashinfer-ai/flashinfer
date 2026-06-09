@@ -22,6 +22,7 @@ import torch
 
 from ...artifacts import ArtifactPath, CheckSumHash
 from .. import env as jit_env
+
 from ..core import (
     JitSpec,
     gen_jit_spec,
@@ -655,6 +656,38 @@ def gen_gemm_sm120_module() -> JitSpec:
 
     return gen_jit_spec(
         "gemm_sm120",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ],
+    )
+
+
+def gen_gemm_sm120_module_cute_mxfp8() -> JitSpec:
+    """SM120 MXFP8 cute GEMM module.
+
+    Bundles 5 MoE/dense MXFP8 entries (Normal / Batched / MoE contiguous w/wo
+    psum_layout / MoE masked / MoE zero_padding) with a shared cute-DSL runner
+    (`Mxfp8CuteGemmSm120Runner<e4m3_t, bf16_t, float, ue8m0_t>`). All source is
+    in-tree under `include/flashinfer/gemm/{mxfp8_cute_gemm_sm120.h,
+    sm120_blockscaled/}` and `csrc/mxfp8_cute_gemm_sm120.cu`; the kernel uses
+    flashinfer's own `3rdparty/cutlass`.
+    """
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "mxfp8_cute_gemm_sm120.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "group_gemm_mxfp8_cute_sm120.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "group_gemm_mxfp8_cute_sm120_jit_binding.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "gemm_mxfp8_cute_sm120.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "gemm_mxfp8_cute_sm120_jit_binding.cu",
+    ]
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12],
+    )
+
+    return gen_jit_spec(
+        "gemm_sm120_cute_mxfp8",
         source_paths,
         extra_cuda_cflags=nvcc_flags
         + [

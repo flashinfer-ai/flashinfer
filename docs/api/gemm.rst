@@ -33,6 +33,26 @@ MXFP8 GEMM
     mm_mxfp8
     bmm_mxfp8
 
+MXFP8 Groupwise GEMM (cute SM120)
+---------------------------------
+
+Cute-DSL MXFP8 groupwise-scaled GEMM family for the NVIDIA RTX PRO 6000
+Blackwell Server Edition (SM120). Uses per-row UE8M0 INT-packed
+TMA-aligned scale layout; ``scale_granularity_mnk ∈ {(1, 1, 32), (1, 1, 128)}``.
+Inputs are quantized via the helpers in
+:ref:`MXFP8 Per-Row Layout (cute SM120) <mxfp8-per-row-layout>` under
+:mod:`flashinfer.quantization`.
+
+.. autosummary::
+    :toctree: ../generated
+
+    gemm_mxfp8_nt_groupwise
+    batch_gemm_mxfp8_nt_groupwise
+    group_gemm_mxfp8_nt_groupwise
+    group_gemm_mxfp8_nt_groupwise_masked
+    group_gemm_mxfp8_nt_groupwise_zero_padding
+    mxfp8_quantize_for_zero_padding
+
 FP8 GEMM
 --------
 
