@@ -17,6 +17,8 @@ Kernels for LLM sampling.
     :toctree: ../generated
 
     sampling_from_probs
+    sampling_from_logits
+    softmax
     top_p_sampling_from_probs
     top_k_sampling_from_probs
     min_p_sampling_from_probs

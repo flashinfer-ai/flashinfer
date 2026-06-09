@@ -1426,23 +1426,32 @@ def run_mixed_comm(
     x_out: torch.Tensor | None = None,
     mode: MixedCommMode | None = None,
 ) -> torch.Tensor:
-    """Execute a mixed communication operation.
+    r"""Execute a mixed communication operation.
 
     This is the main entry point for running communication collectives
-    through the mixed communication handler. It supports fused GPU kernels
+    through the mixed communication handler.  It supports fused GPU kernels
     (using virtual memory intra-node and nvshmem inter-node), NCCL-based
     fallbacks, and autotuned mode selection.
 
-    Args:
-        op: The communication operation to perform.
-        handler: An initialized :class:`MixedCommHandler`.
-        x_in: The input tensor. Must be at least 2-D and match the handler's dtype/device.
-        x_out: Optional pre-allocated output tensor. Allocated automatically if ``None``.
-        mode: The execution mode. If ``None``, uses autotune (if enabled) or falls back
-            to an NCCL mode.
+    Parameters
+    ----------
+    op : MixedCommOp
+        The communication operation to perform.
+    handler : MixedCommHandler
+        An initialized :class:`MixedCommHandler`.
+    x_in : torch.Tensor
+        Input tensor.  Must be at least 2-D and match the handler's dtype /
+        device.
+    x_out : torch.Tensor, optional
+        Pre-allocated output tensor.  Allocated automatically when ``None``.
+    mode : MixedCommMode, optional
+        Execution mode.  When ``None``, uses autotune (if enabled) or falls
+        back to an NCCL mode.
 
-    Returns:
-        The output tensor containing the result of the collective operation.
+    Returns
+    -------
+    torch.Tensor
+        Output tensor containing the result of the collective operation.
     """
     if mode is None:
         if handler.use_autotune:

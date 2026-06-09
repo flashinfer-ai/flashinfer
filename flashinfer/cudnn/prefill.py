@@ -588,41 +588,93 @@ def cudnn_batch_prefill_with_kv_cache(
     backend: Optional[str] = None,
     o_data_type: Optional[torch.dtype] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Performs batched prefill attention with paged KV cache using cuDNN.
+    r"""Batched prefill attention with paged KV cache, backed by cuDNN SDPA.
 
-    Args:
-        q: Query tensor of shape (Total number of tokens, num_heads_qo, head_dim)
-        k_cache: Key cache tensor of shape   (total_num_pages, num_heads_kv, page_size, head_dim) if paged kv cache is enabled else (Total sequence length of kv, num_heads_kv, d_qk)
-        v_cache: Value cache tensor of shape (total_num_pages, num_heads_kv, page_size, head_dim) if paged kv cache is enabled else (Total sequence length of kv, num_heads_kv, d_vo)
-        scale: Scaling factor for attention scores, typically 1/sqrt(head_dim)
-        workspace_buffer: Workspace buffer for cuDNN operations. Scales with batch size. 128 MB should be sufficient for most cases
-        max_token_per_sequence: Maximum number of tokens per query sequence (s_qo_max)
-        max_sequence_kv: Maximum number of tokens per key/value sequence (s_kv_max)
-        actual_seq_lens_q:  Actual number of tokens per query sequence shape (batch_size,) on cpu or device (cpu if cuda_graph is False)
-        actual_seq_lens_kv: Actual sequence lengths for key/values per batch, shape (batch_size,) on CPU or device (cpu if cuda_graph is False)
-        block_tables: Page table mapping for KV cache, shape (batch_size, num_pages_per_seq) on GPU
-        causal: Whether to apply causal masking
-        return_lse: Whether to return log-sum-exp values (must be True)
-        out: Optional pre-allocated output tensor
-        lse: Optional pre-allocated tensor for log-sum-exp values if return_lse is True else returns None
-        is_cuda_graph_compatible: Whether the prefill operation is compatible with CUDA graph
-        q_scale: Optional scale tensor for query tensor of shape (1, 1, 1, 1) on GPU
-        k_scale: Optional scale tensor for key tensor of shape (1, 1, 1, 1) on GPU
-        v_scale: Optional scale tensor for value tensor of shape (1, 1, 1, 1) on GPU
-        batch_offsets_q: Optional batch offsets for query tensor of shape (batch_size,) on GPU
-        batch_offsets_o: Optional batch offsets for output tensor of shape (batch_size,) on GPU
-        batch_offsets_k: Optional batch offsets for key tensor of shape (batch_size,) on GPU
-        batch_offsets_v: Optional batch offsets for value tensor of shape (batch_size,) on GPU
-        o_data_type: Optional data type for output tensor
-    Returns:
-        Output tensor of shape (batch_size * seq_len_q, num_heads_qo, head_dim)
-        If return_lse is True, also returns log-sum-exp tensor of shape (batch_size, seq_len_q, num_heads_qo)
+    Parameters
+    ----------
+    q : torch.Tensor
+        Packed query tensor with shape ``(total_qo_tokens, num_heads_qo, head_dim_qk)``.
+    k_cache : torch.Tensor
+        Key cache.  If paged:
+        ``(total_num_pages, num_heads_kv, page_size, head_dim_qk)``; otherwise
+        ``(total_kv_tokens, num_heads_kv, head_dim_qk)``.
+    v_cache : torch.Tensor
+        Value cache.  If paged:
+        ``(total_num_pages, num_heads_kv, page_size, head_dim_vo)``; otherwise
+        ``(total_kv_tokens, num_heads_kv, head_dim_vo)``.
+    scale : float
+        Softmax scaling factor, typically ``1 / sqrt(head_dim_qk)``.
+    workspace_buffer : torch.Tensor
+        Workspace buffer for cuDNN.  Scales with batch size; 128 MB is sufficient
+        for typical prefill workloads.
+    max_token_per_sequence : int
+        Maximum number of tokens per query sequence (``s_qo_max``).
+    max_sequence_kv : int
+        Maximum number of tokens per KV sequence (``s_kv_max``).
+    actual_seq_lens_q : torch.Tensor
+        Per-request query lengths, shape ``(batch_size,)``.  When cuDNN is
+        available (the default backend) this tensor must reside on the same
+        CUDA device as ``q``.  Only the fallback non-cuDNN path accepts (and
+        internally copies) a CPU tensor; that fallback is also the only path
+        that requires a CPU tensor when ``is_cuda_graph_compatible`` is
+        ``False``.
+    actual_seq_lens_kv : torch.Tensor
+        Per-request KV lengths, shape ``(batch_size,)``.  Same device rules as
+        ``actual_seq_lens_q``.
+    block_tables : Optional[torch.Tensor]
+        Paged KV block table, shape ``(batch_size, num_pages_per_seq)`` on GPU.
+        Pass ``None`` for non-paged KV layouts.
+    causal : bool
+        Whether to apply a causal mask.
+    return_lse : bool
+        Whether to return the log-sum-exp tensor (currently must be ``True`` in the
+        cubin backend).
+    q_scale : Optional[torch.Tensor]
+        FP8 dequantization scale for the query, shape ``(1, 1, 1, 1)`` on GPU.
+    k_scale : Optional[torch.Tensor]
+        FP8 dequantization scale for the key, shape ``(1, 1, 1, 1)`` on GPU.
+    v_scale : Optional[torch.Tensor]
+        FP8 dequantization scale for the value, shape ``(1, 1, 1, 1)`` on GPU.
+    batch_offsets_q : Optional[torch.Tensor]
+        Per-request offsets into the query tensor, shape ``(batch_size,)`` on GPU.
+    batch_offsets_o : Optional[torch.Tensor]
+        Per-request offsets into the output tensor, shape ``(batch_size,)`` on GPU.
+    batch_offsets_k : Optional[torch.Tensor]
+        Per-request offsets into the key tensor, shape ``(batch_size,)`` on GPU.
+    batch_offsets_v : Optional[torch.Tensor]
+        Per-request offsets into the value tensor, shape ``(batch_size,)`` on GPU.
+    batch_offsets_stats : Optional[torch.Tensor]
+        Per-request offsets into the LSE / stats tensor, shape ``(batch_size,)``.
+    out : Optional[torch.Tensor]
+        Pre-allocated output tensor, shape
+        ``(total_qo_tokens, num_heads_qo, head_dim_vo)``.  Allocated internally
+        when ``None``.
+    lse : Optional[torch.Tensor]
+        Pre-allocated LSE tensor, shape
+        ``(batch_size, max_token_per_sequence, num_heads_qo)``.  Allocated
+        internally when ``None`` and ``return_lse`` is ``True``.
+    is_cuda_graph_compatible : bool
+        Whether to plan the operation in a CUDA-graph-capture-safe mode.
+    backend : Optional[str]
+        Optional cuDNN backend selector (e.g. ``"cubin"``).  When ``None``,
+        autodetects based on cuDNN availability.
+    o_data_type : Optional[torch.dtype]
+        Optional output dtype; defaults to ``q.dtype``.
 
-    Note:
-        Query and KV heads can have different sizes (num_heads_qo >= num_heads_kv)
-        When using cuda graph, actual_seq_lens_q and actual_seq_lens_kv must be on the same device as q
-        Head dimension of query and key must be 128 or 192
-        Head dimension of value and output must be 128
+    Returns
+    -------
+    Tuple[torch.Tensor, Optional[torch.Tensor]]
+        ``(output, lse)`` where ``output`` has shape
+        ``(total_qo_tokens, num_heads_qo, head_dim_vo)``; ``lse`` has shape
+        ``(batch_size, max_token_per_sequence, num_heads_qo)`` when
+        ``return_lse=True``, else ``None``.
+
+    Note
+    ----
+    Query and KV heads may differ (``num_heads_qo >= num_heads_kv``, MQA / GQA).
+    When using CUDA graph capture, ``actual_seq_lens_q`` and ``actual_seq_lens_kv``
+    must reside on the same device as ``q``.  ``head_dim_qk`` must be 128 or 192,
+    and ``head_dim_vo`` must be 128.
     """
 
     num_tokens = q.shape[0]
