@@ -260,6 +260,49 @@ def gen_attention(
             use_profiler=False,
         )
 
+    # FA2 decode-only at head_dim=512 (e.g. Gemma-4 global attention, fp8 KV cache).
+    # The decode kernel distributes head_dim across threads so it handles 512 today,
+    # but the FA2 prefill kernel does not yet (register-resident O accumulator; see
+    # issue #3297 / split-D work). Register decode modules in isolation so prebuilt
+    # wheels ship decode@512 without pulling in the unsupported prefill@512. Fold
+    # (512, 512) into fa2_head_dim_ above once prefill gains 512 support.
+    for (
+        dtype_qo,
+        dtype_kv,
+        use_sliding_window,
+        use_logits_soft_cap,
+    ) in product(
+        f16_dtype_,
+        f16_dtype_ + f8_dtype_,
+        use_sliding_window_,
+        use_logits_soft_cap_,
+    ):
+        if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
+            continue
+        if dtype_qo.itemsize == 1:
+            continue  # fp8 query not supported in fa2
+        yield gen_single_decode_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            head_dim_qk=512,
+            head_dim_vo=512,
+            pos_encoding_mode=0,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+        )
+        yield gen_batch_decode_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            dtype_idx=torch.int32,
+            head_dim_qk=512,
+            head_dim_vo=512,
+            pos_encoding_mode=0,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+        )
+
     # FA3 MHA / MQA / GQA
     if has_sm90:
         for (
