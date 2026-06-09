@@ -5810,6 +5810,15 @@ def _b12x_gemm_fp4_runner(
             f"Supported: torch.bfloat16, torch.float16."
         )
 
+    def _default_dense_plan(m, n, real_k, device):
+        # Single source of truth for the deterministic default tile / swap_ab pick.
+        # Used by BOTH forward()'s default path AND get_valid_tactics(), so the
+        # autotuner candidate set always contains the exact default-path tile --
+        # i.e. tuning is monotonic vs the static default (it can't pick worse).
+        return _select_default_dense_gemm_plan(
+            m, n, real_k, get_device_sm_count(device), expected_m=m
+        )
+
     class B12xFp4GemmRunner(TunableRunner):
         """TunableRunner for b12x block-scaled FP4 dense GEMM on SM120.
 
@@ -5835,18 +5844,9 @@ def _b12x_gemm_fp4_runner(
             batch_size = 1
 
             valid_tactics = []
-            # Autotuner candidate set (swap_ab-free). The M=1 decode tile (16x64) and
-            # other regime-optimal tiles are applied via the deterministic expected_m
-            # plan on the default path (see forward); adding extra tiles here only made
-            # the autotuner's per-shape pick noisier, so the set is kept minimal.
-            sm120_mma_tiler_candidates = [
-                (64, 64),
-                (64, 128),
-                (128, 64),
-                (128, 128),
-            ]
-            swap_ab = False
-            for mma_tiler_mn in sm120_mma_tiler_candidates:
+
+            def _add(mma_tiler_mn, swap_ab):
+                # upstream b12x can_implement is M-independent (no `m` arg)
                 if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
                     ab_dtype,
                     sf_dtype,
@@ -5854,7 +5854,6 @@ def _b12x_gemm_fp4_runner(
                     c_cutlass_dtype,
                     mma_tiler_mn,
                     (1, 1),
-                    # upstream b12x can_implement is M-independent (no `m` arg)
                     n,
                     real_k,
                     batch_size,
@@ -5863,11 +5862,26 @@ def _b12x_gemm_fp4_runner(
                     "n",
                     swap_ab=swap_ab,
                 ):
-                    continue
+                    return
                 for use_prefetch in (False, True):
-                    valid_tactics.append(
-                        (mma_tiler_mn, (1, 1), swap_ab, use_prefetch, "sm120", None)
-                    )
+                    tac = (mma_tiler_mn, (1, 1), swap_ab, use_prefetch, "sm120", None)
+                    if tac not in valid_tactics:
+                        valid_tactics.append(tac)
+
+            # Generic swap_ab-free candidate set the autotuner profiles. Kept minimal:
+            # a larger tile grid made the per-bucket pick noisier (overfits the bucket
+            # representative shape), so we only add a few balanced tiles here.
+            for mma_tiler_mn in [(64, 64), (64, 128), (128, 64), (128, 128)]:
+                _add(mma_tiler_mn, swap_ab=False)
+
+            # Also expose the deterministic plan's regime-optimal pick for this
+            # (bucketed) shape -- the same tile forward() uses on the default path,
+            # which may be a narrow-N swap_ab tile (e.g. (64,32) at m=1) absent from
+            # the generic set above. Including it keeps autotuning monotonic: the
+            # tuner can never select something worse than the static default, and it
+            # picks up swap_ab on SKUs where it actually wins.
+            plan = _default_dense_plan(m, n, real_k, a.device)
+            _add(plan.mma_tiler_mn, swap_ab=plan.swap_ab)
             return valid_tactics
 
         def forward(
@@ -5892,13 +5906,7 @@ def _b12x_gemm_fp4_runner(
                 # decode/prefill-optimal tile (via expected_m) and swap_ab for
                 # narrow-N, instead of the M-independent default tile. For a single
                 # call the actual m IS the representative regime, so expected_m=m.
-                plan = _select_default_dense_gemm_plan(
-                    m,
-                    n,
-                    real_k,
-                    get_device_sm_count(a.device),
-                    expected_m=m,
-                )
+                plan = _default_dense_plan(m, n, real_k, a.device)
                 # Honor the plan's swap_ab (narrow-N decode tiles, e.g. 64x32).
                 # b12x swap_ab is device-internal; see the launch + wrapper notes.
                 tactic = (
@@ -6027,6 +6035,14 @@ def _heuristic_func_mm_fp4(
     is_sm120 = major == 12 and minor == 0
 
     # SM120 + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
+    # TODO(sm121/DGX Spark): b12x is *supported* on SM121 (requirement is
+    # @supported_compute_capability([120, 121])) but `auto` only routes it at
+    # SM120 here, so on a Spark `backend="auto"` falls back to cutlass/cudnn and
+    # never picks b12x. To enable it, widen this to `major == 12` (covers 120+121).
+    # Gate the change on the Spark bench: only prefer b12x if it actually beats
+    # cutlass/cudnn on GB10. Also verify the kernel's hardcoded
+    # get_smem_capacity_in_bytes("sm_120") assumption holds on SM121 (run the
+    # e2e handoff's correctness section on the real Spark first).
     if is_sm120 and use_nvfp4 and cuda_major >= 13:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
