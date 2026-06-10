@@ -1194,8 +1194,53 @@ def get_trtllm_moe_sm100_module():
                 tune_max_num_tokens: Upper bound for the num_tokens tuning buckets.
                 **kwargs: Extra TuningConfig kwargs (e.g. use_cold_l2_cache).
             """
-            num_experts = self.num_experts
+            # Validate hidden_states_scale layout at call time (asserts must run
+            # every call), but resolve the dynamic dim to a hashable int so the
+            # actual TuningConfig can be cached. Without caching, every MoE
+            # forward allocates a fresh TuningConfig + DynamicTensorSpec +
+            # ~5 lambdas + bucket tuple, which leaks ~25 MB Own Memory across
+            # the trtllm autotuner family (see PR #2942 regression).
+            hidden_states_scale_dim: Optional[int] = None
+            if moe_inputs.hidden_states_scale is not None:
+                num_tokens = moe_inputs.hidden_states.shape[0]
+                t = moe_inputs.hidden_states_scale
+                if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+                    assert t.shape == (self.hidden_size // 128, num_tokens), (
+                        f"hidden_states_scale shape {tuple(t.shape)} does not match "
+                        f"expected DeepSeekFp8 layout "
+                        f"(hidden_size//128={self.hidden_size // 128}, num_tokens={num_tokens})"
+                    )
+                    hidden_states_scale_dim = 1
+                else:
+                    assert t.shape[0] == num_tokens, (
+                        f"hidden_states_scale shape {tuple(t.shape)} does not match "
+                        f"expected layout (num_tokens={num_tokens}, ...)"
+                    )
+                    hidden_states_scale_dim = 0
 
+            return self._build_tuning_config(
+                num_experts=self.num_experts,
+                num_local_experts=self.num_local_experts,
+                has_routing_logits=moe_inputs.routing_logits is not None,
+                has_topk_ids=moe_inputs.topk_ids is not None,
+                has_expert_weights=moe_inputs.expert_weights is not None,
+                hidden_states_scale_dim=hidden_states_scale_dim,
+                tune_max_num_tokens=tune_max_num_tokens,
+                extra_kwargs=tuple(sorted(kwargs.items())),
+            )
+
+        @staticmethod
+        @functools.lru_cache(maxsize=None)
+        def _build_tuning_config(
+            num_experts: int,
+            num_local_experts: int,
+            has_routing_logits: bool,
+            has_topk_ids: bool,
+            has_expert_weights: bool,
+            hidden_states_scale_dim: Optional[int],
+            tune_max_num_tokens: int,
+            extra_kwargs: Tuple[Tuple[str, Any], ...],
+        ) -> TuningConfig:
             def _init_packed_topk_ids(shapes, dtype, device):
                 expert_ids = make_random_topk_ids(
                     num_experts=num_experts,
@@ -1216,17 +1261,17 @@ def get_trtllm_moe_sm100_module():
                     shapes, device=device
                 ).to(dtype),
             }
-            if moe_inputs.routing_logits is not None:
+            if has_routing_logits:
                 spec["routing_logits"] = lambda shapes, dtype, device: torch.rand(
                     shapes, dtype=dtype, device=device
                 )
-            if moe_inputs.topk_ids is not None:
+            if has_topk_ids:
                 spec["topk_ids"] = _init_packed_topk_ids
-            if moe_inputs.expert_weights is not None:
+            if has_expert_weights:
                 spec["expert_weights"] = lambda shapes, dtype, device: torch.ones(
                     shapes, dtype=dtype, device=device
                 )
-            if moe_inputs.hidden_states_scale is not None:
+            if hidden_states_scale_dim is not None:
                 spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
                     shapes, device=device
                 ).to(dtype)
@@ -1244,28 +1289,12 @@ def get_trtllm_moe_sm100_module():
             )
             input_idx = tuple(i for i, _, _ in sorted_inputs)
 
-            num_tokens = moe_inputs.hidden_states.shape[0]
-
-            def _dynamic_dim(name: str) -> int:
+            def _dim_for(name: str) -> int:
                 if name == "hidden_states_scale":
-                    # DeepSeekFp8 uses [hidden_size//128, num_tokens];
-                    # all others (MxFp8, fp4, …) use [num_tokens, ...].
-                    t = moe_inputs.hidden_states_scale
-                    if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-                        assert t.shape == (self.hidden_size // 128, num_tokens), (
-                            f"hidden_states_scale shape {tuple(t.shape)} does not match "
-                            f"expected DeepSeekFp8 layout "
-                            f"(hidden_size//128={self.hidden_size // 128}, num_tokens={num_tokens})"
-                        )
-                        return 1
-                    assert t.shape[0] == num_tokens, (
-                        f"hidden_states_scale shape {tuple(t.shape)} does not match "
-                        f"expected layout (num_tokens={num_tokens}, ...)"
-                    )
-                    return 0
+                    return hidden_states_scale_dim
                 return MoEInputs._DYNAMIC_DIM[name]
 
-            dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
+            dim_idx = tuple(_dim_for(name) for _, name, _ in sorted_inputs)
             initializers = [init for _, _, init in sorted_inputs]
 
             return TuningConfig(
@@ -1278,7 +1307,7 @@ def get_trtllm_moe_sm100_module():
                         initializers,
                     ),
                 ),
-                **kwargs,
+                **dict(extra_kwargs),
             )
 
         def get_valid_tactics(
