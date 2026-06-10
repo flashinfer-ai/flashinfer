@@ -225,7 +225,10 @@ def gen_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
 
-    # FA2 MHA / MQA / GQA
+    # FA2 MHA / MQA / GQA. The FA2 prefill/decode modules (gen_fa2) support all
+    # head dims in fa2_head_dim_ (incl. head_dim=512, e.g. Gemma-4 / fp8 KV, #3297),
+    # but the holistic (persistent) batch-attention kernel (gen_batch_attention_module)
+    # only supports head_dim_vo <= 256, so it is skipped for larger head dims below.
     for (
         (head_dim_qk, head_dim_vo),
         dtype_qo,
@@ -247,43 +250,21 @@ def gen_attention(
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
         )
-        yield gen_batch_attention_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            dtype_idx=torch.int32,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            # use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-            use_profiler=False,
-        )
-
-    # FA2 at head_dim=512 (e.g. Gemma-4 global-attention layers, fp8 KV cache).
-    # Registered as a dedicated block rather than via fa2_head_dim_ so it pulls in
-    # only the FA2 prefill + decode modules (gen_fa2) and NOT gen_batch_attention_module,
-    # whose holistic kernel is not validated at 512. gen_fa2 emits single/batch
-    # prefill (split-D O accumulator, see issue #3297) and single/batch decode.
-    for (
-        dtype_qo,
-        dtype_kv,
-        use_sliding_window,
-        use_logits_soft_cap,
-    ) in product(
-        f16_dtype_,
-        f16_dtype_ + f8_dtype_,
-        use_sliding_window_,
-        use_logits_soft_cap_,
-    ):
-        yield from gen_fa2(
-            dtype_qo=dtype_qo,
-            dtype_kv=dtype_kv,
-            head_dim_qk=512,
-            head_dim_vo=512,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-        )
+        # The holistic (persistent) batch-attention kernel is not validated at
+        # head_dim=512, so register it only for head_dim_vo <= 256.
+        if head_dim_vo <= 256:
+            yield gen_batch_attention_module(
+                dtype_q=dtype_qo,
+                dtype_kv=dtype_kv,
+                dtype_o=dtype_qo,
+                dtype_idx=torch.int32,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                pos_encoding_mode=0,
+                # use_sliding_window=use_sliding_window,
+                use_logits_soft_cap=use_logits_soft_cap,
+                use_profiler=False,
+            )
 
     # FA3 MHA / MQA / GQA
     if has_sm90:
@@ -898,7 +879,9 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
+        # (512, 512): FA2 prefill/decode only (Gemma-4 global attn, fp8 KV; #3297);
+        # the holistic batch-attention kernel skips head_dim_vo > 256 (see gen_attention).
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256), (512, 512)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
         "f16_dtype": [torch.float16, torch.bfloat16],
         "f8_dtype": [torch.float8_e4m3fn],

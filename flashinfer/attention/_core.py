@@ -157,6 +157,21 @@ class BatchAttention:
             logits_soft_cap = 0.0
         self._logits_soft_cap = logits_soft_cap
 
+        # The holistic (persistent) kernel keeps a register-resident O accumulator
+        # sized by head_dim_vo (NUM_MMA_D_VO = head_dim_vo / 16); at head_dim > 256 it
+        # exceeds the 255-register limit and the per-CTA shared-memory budget. It has
+        # not been ported to the VO-split layout, so head_dim > 256 is unsupported here
+        # (the kernel also static_asserts this at compile time). Use the FA2 path for
+        # large head dims (e.g. head_dim=512, Gemma-4 / fp8 KV; issue #3297).
+        if head_dim_qk > 256 or head_dim_vo > 256:
+            raise ValueError(
+                "BatchAttention (holistic persistent kernel) does not support "
+                f"head_dim > 256 (got head_dim_qk={head_dim_qk}, "
+                f"head_dim_vo={head_dim_vo}). Use "
+                "BatchPrefillWithPagedKVCacheWrapper(backend='fa2') or "
+                "BatchDecodeWithPagedKVCacheWrapper(use_tensor_cores=True) instead."
+            )
+
         # get jit module
         get_module_args = (
             q_data_type,

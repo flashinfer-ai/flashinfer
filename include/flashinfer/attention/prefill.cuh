@@ -502,9 +502,11 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
   }
 }
 
-template <bool produce_v, typename KTraits>
-__device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStoragePaged* smem_storage,
-                                                uint32_t* smem_offset,
+// SmemStorage is deduced (SharedStorage or SharedStoragePaged): both expose k_smem/v_smem and are
+// layout-identical at HEAD_DIM_VO <= 256, so the FA2 prefill kernel (SharedStoragePaged) and the
+// holistic persistent kernel (SharedStorage) can share this loader. Offsets come from KTraits.
+template <bool produce_v, typename KTraits, typename SmemStorage>
+__device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint32_t* smem_offset,
                                                 typename KTraits::DTypeKV* kv_ptr,
                                                 const uint32_t kv_idx_base,
                                                 const size_t* thr_local_kv_offset,
@@ -603,14 +605,13 @@ __device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStorageP
  * \param warp_idx            Global warp index within the CTA.
  * \param lane_idx            Lane index within the warp.
  */
-template <bool produce_v, typename KTraits, typename IdType>
+template <bool produce_v, typename KTraits, typename SmemStorage, typename IdType>
 __device__ __forceinline__ void page_produce_kv_sf(
-    typename KTraits::SharedStoragePaged* smem_storage, uint8_t* sf_ptr,
-    const uint32_t packed_page_iter_base, const uint32_t packed_kv_bound,
-    const uint32_t kv_head_idx, const uint32_t kv_stride_page, const uint32_t kv_stride_h,
-    const uint32_t kv_stride_n, const uint_fastdiv& page_size, const IdType* indices,
-    const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t warp_idx,
-    const uint32_t lane_idx) {
+    SmemStorage* smem_storage, uint8_t* sf_ptr, const uint32_t packed_page_iter_base,
+    const uint32_t packed_kv_bound, const uint32_t kv_head_idx, const uint32_t kv_stride_page,
+    const uint32_t kv_stride_h, const uint32_t kv_stride_n, const uint_fastdiv& page_size,
+    const IdType* indices, const uint32_t kv_idx_base, const uint32_t kv_len,
+    const uint32_t warp_idx, const uint32_t lane_idx) {
   if constexpr (!is_fp4_type_v<typename KTraits::DTypeKV>) return;
 
   constexpr uint32_t HEAD_DIM = produce_v ? KTraits::HEAD_DIM_VO : KTraits::HEAD_DIM_QK;
