@@ -30,14 +30,18 @@ from flashinfer.gdn_decode import (
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.testing.utils import bench_gpu_time
 
-# Add tests/gdn to sys.path so the torch and Triton GDN references are
-# importable (same pattern as routines/mamba.py with tests/mamba).
+# Add tests/gdn to sys.path so the torch GDN reference is importable (same
+# pattern as routines/mamba.py with tests/mamba), and benchmarks/ for the
+# shared Triton GDN kernels.
 _repo_root = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 )
 _tests_gdn = os.path.join(_repo_root, "tests", "gdn")
 if _tests_gdn not in sys.path:
     sys.path.insert(0, _tests_gdn)
+_benchmarks_dir = os.path.join(_repo_root, "benchmarks")
+if _benchmarks_dir not in sys.path:
+    sys.path.insert(0, _benchmarks_dir)
 
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,

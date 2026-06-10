@@ -207,21 +207,11 @@ def gdn_decode_bytes(
 # ============================================================================
 # Triton Kernels for comparison benchmarks
 # ============================================================================
-# The Triton GDN kernels live in tests/gdn/gdn_triton_reference.py so they can
-# be shared with the flashinfer_benchmark.py GDN routines
-# (benchmarks/routines/gdn.py).
+# The Triton GDN kernels live in benchmarks/gdn_triton_reference.py (same
+# directory as this script) so they can be shared with the
+# flashinfer_benchmark.py GDN routines (benchmarks/routines/gdn.py).
 
-import os
-import sys
-
-_repo_root = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-)
-_tests_gdn = os.path.join(_repo_root, "tests", "gdn")
-if _tests_gdn not in sys.path:
-    sys.path.insert(0, _tests_gdn)
-
-from gdn_triton_reference import (  # noqa: E402
+from gdn_triton_reference import (
     TRITON_AVAILABLE,
     triton_gdn_decode,
     triton_gdn_decode_pretranspose,

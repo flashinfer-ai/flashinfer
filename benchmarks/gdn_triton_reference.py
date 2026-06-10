@@ -19,8 +19,8 @@ Triton reference implementations of the Gated Delta Rule (GDN) decode/MTP
 kernels, following SGLang's fused_sigmoid_gating_delta_rule implementation.
 
 Shared by:
-- benchmarks/bench_gdn_decode.py (standalone GDN decode benchmark)
-- benchmarks/routines/gdn.py (flashinfer_benchmark.py GDN routines)
+- bench_gdn_decode.py (standalone GDN decode benchmark)
+- routines/gdn.py (flashinfer_benchmark.py GDN routines)
 
 Exports:
 - TRITON_AVAILABLE: bool, whether triton could be imported
