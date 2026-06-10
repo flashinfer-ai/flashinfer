@@ -468,6 +468,7 @@ def autotune(
     tuning_buckets: Optional[Tuple[int, ...]] = None,
     round_up: Optional[bool] = None,
     skip_ops: Optional[Union[str, Set[str]]] = None,
+    distributed_process_group: Optional[Any] = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -535,6 +536,16 @@ def autotune(
             ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
             Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
             ``"fp8_gemm"``, ``"mxfp8_gemm"``.
+        distributed_process_group: Optional ``torch.distributed`` process group
+            used by the ``broadcast`` distributed tuning strategy (enabled via
+            ``FLASHINFER_AUTOTUNE_DISTRIBUTED=broadcast``) to scope the
+            cross-rank tactic broadcast.  Pass the group whose ranks shard the
+            work and must agree on the tactic -- e.g. the MoE expert-parallel
+            group.  ``None`` (default) uses the WORLD group, which is correct
+            when WORLD is a single EP group, but in multi-dimensional layouts
+            (e.g. EP8 + DP2 over 16 ranks) you should pass the EP group so the
+            broadcast does not cross independent EP-group boundaries.  No effect
+            unless the broadcast strategy is enabled.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
@@ -675,7 +686,12 @@ def autotune(
             # Align tactics across ranks (改动②) once the outermost tuning
             # context closes, so every rank leaves with the same per-key
             # decision.  No-op unless FLASHINFER_AUTOTUNE_DISTRIBUTED is set.
-            tuner._maybe_sync_distributed_cache()
+            # ``distributed_process_group`` scopes the broadcast to the ranks
+            # that actually shard the work (e.g. the MoE expert-parallel group);
+            # ``None`` falls back to the default WORLD group.
+            tuner._maybe_sync_distributed_cache(
+                process_group=distributed_process_group
+            )
 
         # Save configs on exit when tuning with a cache path,
         # but only if new profiling results were added this session
@@ -1502,21 +1518,30 @@ class AutoTuner:
 
         return sizes
 
-    def _maybe_sync_distributed_cache(self) -> None:
+    def _maybe_sync_distributed_cache(self, process_group: Any = None) -> None:
         """Align the profiling cache across EP/TP ranks (改动②).
 
         Mirrors TensorRT-LLM's ``DistributedTuningStrategy``:
 
-        - ``broadcast``: rank 0's chosen (runner_id, tactic) per cache key wins
-          on every rank.  This is the robust fix for the EP straggler problem --
-          even when several tactics are near-tied and per-rank profiling noise
-          would otherwise pick different ones, all ranks end up on the *same*
-          tactic, so the slowest rank no longer bottlenecks the all-to-all
-          (and the bad-tactic-frozen-in-CUDA-graph case disappears).
+        - ``broadcast``: the source rank's chosen (runner_id, tactic) per cache
+          key wins on every rank.  This is the robust fix for the EP straggler
+          problem -- even when several tactics are near-tied and per-rank
+          profiling noise would otherwise pick different ones, all ranks end up
+          on the *same* tactic, so the slowest rank no longer bottlenecks the
+          all-to-all (and the bad-tactic-frozen-in-CUDA-graph case disappears).
 
         Enabled via ``FLASHINFER_AUTOTUNE_DISTRIBUTED=broadcast``.  No-op when
         torch.distributed is unavailable / uninitialized / world_size==1, so it
         is safe to leave on for single-process use.
+
+        Args:
+            process_group: The process group whose ranks shard the work and must
+                agree on the tactic -- typically the MoE expert-parallel group.
+                ``None`` uses the default WORLD group.  Scoping matters in
+                multi-dimensional layouts (e.g. EP8 + DP2 over 16 ranks) where
+                WORLD spans several independent EP groups and a WORLD broadcast
+                would cross group boundaries.  The broadcast source is the
+                group-local rank 0 (mapped to its global rank).
 
         Only the (runner_id, tactic) decision is communicated -- never the
         ``OptimizationProfile`` object -- so there is nothing fragile to
@@ -1531,8 +1556,18 @@ class AutoTuner:
             return
         if not dist.is_available() or not dist.is_initialized():
             return
-        if dist.get_world_size() <= 1:
+        if dist.get_world_size(group=process_group) <= 1:
             return
+
+        # Broadcast source = rank 0 *within the group*, expressed as a global
+        # rank (torch's ``src`` is always a global rank).  For the default WORLD
+        # group that is simply global rank 0.
+        src = 0
+        if process_group is not None:
+            try:
+                src = dist.get_global_rank(process_group, 0)
+            except Exception:  # noqa: BLE001
+                src = 0
 
         with self._lock:
             snapshot = {
@@ -1540,7 +1575,7 @@ class AutoTuner:
             }
         payload = [snapshot]
         try:
-            dist.broadcast_object_list(payload, src=0)
+            dist.broadcast_object_list(payload, src=src, group=process_group)
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"[Autotuner]: distributed cache broadcast failed, keeping "
