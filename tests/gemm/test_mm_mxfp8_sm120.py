@@ -134,12 +134,12 @@ def test_probe_mxfp8_gemm_tactics_sm12x():
     _skip_if_not_sm120()
 
     from flashinfer.gemm.gemm_base import _probe_mxfp8_gemm_tactics
-    from flashinfer.jit.gemm.core import gen_gemm_sm120_module_cutlass_mxfp8
+    from flashinfer.jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
 
     raw_module = gen_gemm_sm120_module_cutlass_mxfp8().build_and_load()
-    valid = _probe_mxfp8_gemm_tactics(raw_module)
+    valid = _probe_mxfp8_gemm_tactics(raw_module, torch.cuda.current_device())
 
-    # At least the three small-tile configs (128x32, 128x64, 128x128) × 2 variants
+    # At least the three small-tile configs (128x32, 128x64, 128x128) x 2 variants
     # must be supported on any SM12x device.
     assert len(valid) >= 6, f"Expected at least 6 valid tactics, got {len(valid)}: {valid}"
 
@@ -151,10 +151,10 @@ def test_probe_mxfp8_gemm_tactics_sm12x():
     cc = get_compute_capability(torch.device("cuda"))
     if cc == (12, 1):
         # SM121: large tiles (tactics 6-9) should not be valid.
-        assert 6 not in valid, "Tactic 6 (256x128 bf16) should not work on SM121"
-        assert 7 not in valid, "Tactic 7 (256x128 half) should not work on SM121"
-        assert 8 not in valid, "Tactic 8 (128x256 bf16) should not work on SM121"
-        assert 9 not in valid, "Tactic 9 (128x256 half) should not work on SM121"
+        assert 6 not in valid, "Tactic 6 (256x128 non-swapped) should not work on SM121"
+        assert 7 not in valid, "Tactic 7 (256x128 swapped) should not work on SM121"
+        assert 8 not in valid, "Tactic 8 (128x256 non-swapped) should not work on SM121"
+        assert 9 not in valid, "Tactic 9 (128x256 swapped) should not work on SM121"
         assert valid == list(range(6)), f"SM121 expected tactics [0..5], got {valid}"
     elif cc == (12, 0):
         # SM120 data-centre: all 10 tactics should be valid.

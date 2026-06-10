@@ -18,7 +18,7 @@ import functools
 import logging
 from enum import Enum
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -4005,12 +4005,12 @@ def mm_fp8(
     return out
 
 
-def _probe_mxfp8_gemm_tactics(module) -> List[int]:
-    """Probe which CUTLASS MXFP8 GEMM tactics can initialize on the current device.
+def _probe_mxfp8_gemm_tactics(module, device_id: int) -> List[int]:
+    """Probe which CUTLASS MXFP8 GEMM tactics can initialize on a specific device.
 
     SM120 (B100/B200 data-centre, ~256 KB shared memory/SM) and SM121 (GB10 /
     DGX Spark GeForce Blackwell, ~99 KB shared memory/SM opt-in) share the same
-    compiled module.  Large CTA tiles — 256×128 and 128×256 — are compiled with
+    compiled module.  Large CTA tiles — 256x128 and 128x256 — are compiled with
     ``StageCount<2>``, which requires ~99 KB of shared memory.  On SM121 this is
     at or beyond the per-block opt-in limit (``cudaDevAttrMaxSharedMemoryPerBlockOptin
     ≈ 101376 bytes``), so the CUTLASS ``initialize()`` call returns
@@ -4019,13 +4019,20 @@ def _probe_mxfp8_gemm_tactics(module) -> List[int]:
     Rather than letting the autotuner discover this noisily (and log confusing
     "[MXFP8 SM120 gemm Runner] Failed to initialize …" messages), we pre-filter
     here with a device-capability probe so the autotuner only sees tactics that
-    will actually succeed on this GPU.
+    will actually succeed on the given GPU.
 
     The probe uses square M = N = K = 128 tensors; initialization failure is
     shape-independent (it depends only on CTA tile size and device smem capacity),
     so any valid shapes reach the same CUTLASS ``initialize()`` decision.
+
+    Parameters
+    ----------
+    module:
+        The raw TVM-FFI SM120 MXFP8 GEMM module.
+    device_id:
+        CUDA device index to probe (``torch.cuda.current_device()``).
     """
-    dev = "cuda"
+    dev = torch.device("cuda", device_id)
 
     def _pad_up(x: int, m: int) -> int:
         return ((x + m - 1) // m) * m
@@ -4048,14 +4055,15 @@ def _probe_mxfp8_gemm_tactics(module) -> List[int]:
             module.mxfp8_gemm(a, b, sfa, sfb, out, ws, t)
             valid.append(t)
         except RuntimeError:
-            device_name = torch.cuda.get_device_properties(0).name
+            device_name = torch.cuda.get_device_properties(device_id).name
             logger.debug(
-                "mxfp8_gemm tactic %d cannot initialize on %s; skipping. "
+                "mxfp8_gemm tactic %d cannot initialize on %s (device %d); skipping. "
                 "(Tip: SM121 GB10/DGX Spark has ~99 KB shared memory opt-in per SM; "
-                "256×128 and 128×256 CTA tiles require ~99 KB with StageCount<2> "
+                "256x128 and 128x256 CTA tiles require ~99 KB with StageCount<2> "
                 "and may fail on that device.)",
                 t,
                 device_name,
+                device_id,
             )
     return valid
 
@@ -4063,9 +4071,10 @@ def _probe_mxfp8_gemm_tactics(module) -> List[int]:
 def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
     """Helper function to create cutlass MXFP8 GEMM module."""
 
-    # One-time probe: cache valid tactics at closure scope so all runner
-    # instances for this module share the result without re-probing.
-    _valid_tactics_cache: List[int] = []
+    # Per-device cache keyed by device index.  Heterogeneous multi-GPU systems
+    # (e.g., mixing SM120 and SM121) require independent tactic sets per GPU,
+    # so a single shared list is insufficient.
+    _valid_tactics_cache: Dict[int, List[int]] = {}
 
     def cutlass_mxfp8_gemm_runner():
         class CutlassMxfp8GemmRunner(TunableRunner):
@@ -4074,9 +4083,12 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                if not _valid_tactics_cache:
-                    _valid_tactics_cache.extend(_probe_mxfp8_gemm_tactics(module))
-                return list(_valid_tactics_cache)
+                device_id = torch.cuda.current_device()
+                if device_id not in _valid_tactics_cache:
+                    _valid_tactics_cache[device_id] = _probe_mxfp8_gemm_tactics(
+                        module, device_id
+                    )
+                return list(_valid_tactics_cache[device_id])
 
             def forward(
                 self,
