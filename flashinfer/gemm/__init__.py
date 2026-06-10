@@ -17,19 +17,7 @@ from .gemm_base import (
 )
 from .gemm_base import gemm_fp8_nt_blockscaled as gemm_fp8_nt_blockscaled
 from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
-from .gemm_base import gemm_mxfp8_nt_groupwise as gemm_mxfp8_nt_groupwise
-from .gemm_base import batch_gemm_mxfp8_nt_groupwise as batch_gemm_mxfp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
-from .gemm_base import group_gemm_mxfp8_nt_groupwise as group_gemm_mxfp8_nt_groupwise
-from .gemm_base import (
-    group_gemm_mxfp8_nt_groupwise_masked as group_gemm_mxfp8_nt_groupwise_masked,
-)
-from .gemm_base import (
-    group_gemm_mxfp8_nt_groupwise_zero_padding as group_gemm_mxfp8_nt_groupwise_zero_padding,
-)
-from .gemm_base import (
-    quantize_mxfp8_for_zero_padding as quantize_mxfp8_for_zero_padding,
-)
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
 from .routergemm import (
@@ -87,13 +75,7 @@ __all__ = [
     "group_deepgemm_fp8_nt_groupwise",
     "gemm_fp8_nt_blockscaled",
     "gemm_fp8_nt_groupwise",
-    "gemm_mxfp8_nt_groupwise",
-    "batch_gemm_mxfp8_nt_groupwise",
     "group_gemm_fp8_nt_groupwise",
-    "group_gemm_mxfp8_nt_groupwise",
-    "group_gemm_mxfp8_nt_groupwise_masked",
-    "group_gemm_mxfp8_nt_groupwise_zero_padding",
-    "quantize_mxfp8_for_zero_padding",
     "fp8_blockscale_gemm_sm90",
     "mm_M1_16_K6144_N256",
     "mm_M1_16_K7168_N128",

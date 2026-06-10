@@ -14,11 +14,13 @@ Public APIs: ``grouped_mm_bf16``, ``grouped_mm_fp8``, ``grouped_mm_mxfp8``,
 ``grouped_mm_fp4``.
 """
 
-from typing import Optional
+import functools
+from typing import Literal, Optional, Tuple
 
 import torch
 
 from ..api_logging import flashinfer_api
+from ..jit.grouped_mm import gen_grouped_mm_sm120_module_cute_mxfp8
 from ..utils import backend_requirement, supported_compute_capability
 from .cudnn import (
     _CUDNN_MOE_BLOCK_SCALE_MIN_VERSION,
@@ -576,3 +578,263 @@ def grouped_mm_fp4(
         )
     else:
         raise ValueError("backend does not support grouped_mm_fp4")
+
+
+# =========================================================================
+# grouped_mm_mxfp8_nt_groupwise_zero_padding (SM120 cute backend)
+# =========================================================================
+
+
+@functools.cache
+def get_grouped_mm_sm120_module_cute_mxfp8():
+    """MXFP8 grouped MM module accessor for SM120 cute backend."""
+    return gen_grouped_mm_sm120_module_cute_mxfp8().build_and_load()
+
+
+def _check_m_indptr(m_indptr: torch.Tensor, token_num: int) -> None:
+    """Validate ``m_indptr`` semantic consistency before launching the kernel.
+
+    Checks: 1-D int32, first element 0, monotonic non-decreasing, last element
+    equals ``token_num`` (the row count of the packed A tensor).
+    """
+    if m_indptr.dtype != torch.int32:
+        raise ValueError(f"m_indptr must be int32; got {m_indptr.dtype}")
+    if m_indptr.dim() != 1:
+        raise ValueError(f"m_indptr must be 1-D; got {m_indptr.dim()}D")
+    if m_indptr.numel() < 2:
+        raise ValueError(
+            f"m_indptr must have at least 2 elements (num_experts >= 1); "
+            f"got numel={m_indptr.numel()}"
+        )
+    first = int(m_indptr[0].item())
+    last = int(m_indptr[-1].item())
+    if first != 0:
+        raise ValueError(f"m_indptr[0] must be 0; got {first}")
+    if last != token_num:
+        raise ValueError(f"m_indptr[-1] must equal token_num={token_num}; got {last}")
+    if not bool((m_indptr[1:] >= m_indptr[:-1]).all().item()):
+        raise ValueError("m_indptr must be non-decreasing")
+
+
+def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) -> None:
+    """Validate the per-token UE8M0 ``scale_granularity_mnk`` contract shared by all
+    MXFP8 cute SM120 GEMM entries. Accepts ``(1, 1, 32)`` or ``(1, 1, 128)``.
+    """
+    if len(scale_granularity_mnk) != 3:
+        raise ValueError(
+            f"scale_granularity_mnk must be a 3-tuple (m_gran, n_gran, k_gran); "
+            f"got length {len(scale_granularity_mnk)}"
+        )
+    if scale_granularity_mnk[0] != 1:
+        raise ValueError(
+            f"scale_granularity_mnk[0] (m_gran) must be 1; got {scale_granularity_mnk[0]}"
+        )
+    if scale_granularity_mnk[1] != 1:
+        raise ValueError(
+            f"scale_granularity_mnk[1] (n_gran) must be 1 (kernel only exposes granK "
+            f"along K; 2D block B-scale must be broadcast to per-token caller-side); "
+            f"got {scale_granularity_mnk[1]}"
+        )
+    if scale_granularity_mnk[2] not in (32, 128):
+        raise ValueError(
+            f"scale_granularity_mnk[2] (k_gran) must be 32 or 128; got {scale_granularity_mnk[2]}"
+        )
+
+
+def _check_scale_major_mode_mxfp8(scale_major_mode: str) -> None:
+    """Validate ``scale_major_mode`` for the MXFP8 cute SM120 GEMM entries.
+
+    The kernel only consumes per-token INT32-packed UE8M0 scales in MN-major
+    TMA-aligned layout. Future K-major support would require kernel changes;
+    until then any value other than ``"MN"`` is rejected.
+    """
+    if scale_major_mode != "MN":
+        raise ValueError(
+            f'scale_major_mode must be "MN" (kernel currently only supports the '
+            f'per-token MN-major TMA-aligned UE8M0 scale layout); got "{scale_major_mode}"'
+        )
+
+
+@supported_compute_capability([120, 121])
+@flashinfer_api
+def quantize_mxfp8_for_zero_padding(
+    input: torch.Tensor,
+    m_indptr: torch.Tensor,
+    gran_k: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Per-token MXFP8 quantization for ``grouped_mm_mxfp8_nt_groupwise_zero_padding``.
+
+    Produces a token-packed FP8 output and a 4-row per-expert padded int32-packed UE8M0
+    scale tensor matching the input layout expected by
+    ``grouped_mm_mxfp8_nt_groupwise_zero_padding``.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor shape ``(token_num, k)``, data type is ``torch.bfloat16``.
+
+    m_indptr: torch.Tensor
+        The indptr of the segment lengths, shape ``(num_experts + 1,)``, data type is
+        ``torch.int32``. ``m_indptr[0] = 0``, ``m_indptr[num_experts] = token_num``.
+
+    gran_k: int
+        UE8M0 K-axis block granularity. Must be ``32`` or ``128``.
+
+    Returns
+    -------
+    out_fp8: torch.Tensor
+        Token-packed FP8 output, shape ``(token_num, k)``, data type is
+        ``torch.float8_e4m3fn``.
+
+    out_scale: torch.Tensor
+        Int32-packed UE8M0 scale tensor (4 UE8M0 scales packed per int32), shape
+        ``(m_padded, k_align)`` where ``m_padded = (token_num + num_experts * 3) // 4 * 4``
+        and ``k_align = (k + 4 * gran_k - 1) // (4 * gran_k)``. Data type is ``torch.int32``.
+        Underlying storage is ``(k_align, m_padded)`` contiguous; the returned view is a
+        ``.transpose(0, 1)`` that aligns with the
+        ``grouped_mm_mxfp8_nt_groupwise_zero_padding`` caller convention.
+    """
+    if gran_k not in (32, 128):
+        raise ValueError(f"gran_k must be 32 or 128; got {gran_k}")
+    if input.dtype != torch.bfloat16:
+        raise ValueError(f"input must be bfloat16; got {input.dtype}")
+    if input.dim() != 2:
+        raise ValueError(f"input must be 2D; got {input.dim()}D")
+
+    token_num, k = input.shape
+    _check_m_indptr(m_indptr, token_num=token_num)
+    num_experts = m_indptr.shape[0] - 1
+    if k % 16 != 0:
+        raise ValueError(f"k must be multiple of 16; got k={k}")
+
+    pack_nk = gran_k * 4
+    m_padded = (token_num + num_experts * 3) // 4 * 4
+    k_align = (k + pack_nk - 1) // pack_nk
+
+    out_fp8 = torch.empty(
+        (token_num, k), dtype=torch.float8_e4m3fn, device=input.device
+    )
+    out_scale_raw = torch.zeros(
+        (k_align, m_padded), dtype=torch.int32, device=input.device
+    )
+
+    get_grouped_mm_sm120_module_cute_mxfp8().quantize_mxfp8_for_zero_padding(
+        input, m_indptr, out_fp8, out_scale_raw, gran_k
+    )
+
+    out_scale = out_scale_raw.transpose(0, 1)
+    return out_fp8, out_scale
+
+
+@supported_compute_capability([120, 121])
+@flashinfer_api
+def grouped_mm_mxfp8_nt_groupwise_zero_padding(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 1, 128),
+    scale_major_mode: Literal["MN"] = "MN",
+    backend: Literal["cute"] = "cute",
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    r"""Perform grouped GEMM with MXFP8 inputs in zero-padding mode using groupwise UE8M0
+    scaling. Currently only supported on NVIDIA RTX PRO 6000 Blackwell (SM120) architecture.
+
+    Zero-padding mode accepts token-packed input ``a`` (no per-expert pre-padding along M)
+    with 4-row per-expert padding on the scale tensor ``a_scale``. The group descriptor is
+    a CSR cumsum ``m_indptr``. This mode is optimized for decoding with small per-expert M
+    (down to ``m_per_expert = 1``) where DeepGEMM-style contiguous padding would waste
+    memory and compute.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Row-major input tensor shape ``(cum_m, k)``, data type is ``torch.float8_e4m3fn``.
+        Token-packed across experts; ``cum_m`` is the cumulative sum of segment lengths.
+
+    b: torch.Tensor
+        Column-major input tensor shape ``(num_experts, n, k)``, data type is
+        ``torch.float8_e4m3fn``.
+
+    a_scale: torch.Tensor
+        Int32-packed UE8M0 scale tensor for ``a`` (4 UE8M0 scales packed per int32), shape
+        ``(m_padded, k_align)`` where ``m_padded = (cum_m + num_experts * 3) // 4 * 4`` and
+        ``k_align = (k + 4 * k_granularity - 1) // (4 * k_granularity)``. Data type is
+        ``torch.int32``.
+
+    b_scale: torch.Tensor
+        Int32-packed UE8M0 scale tensor for ``b`` in per-token layout, shape
+        ``(num_experts, n, k_align)``. Data type is ``torch.int32``. See Notes for the
+        per-token layout requirement.
+
+    m_indptr: torch.Tensor
+        The indptr of the segment lengths, shape ``(num_experts + 1,)``, data type is
+        ``torch.int32``. ``m_indptr[0] = 0``, ``m_indptr[num_experts] = cum_m``.
+
+    scale_granularity_mnk: Tuple[int, int, int]
+        The granularity of the scale tensor, ``(m_granularity, n_granularity, k_granularity)``.
+        Accepted values: ``(1, 1, 128)`` (DeepGEMM-style production, default) or
+        ``(1, 1, 32)`` (OCP MXFP8). ``m_granularity`` and ``n_granularity`` must both be
+        ``1`` (per-token scaling along M and N); ``k_granularity`` must be ``32`` or ``128``.
+        Anything else raises ``ValueError``.
+
+    backend: Literal["cute"]
+        Backend selector. Currently only ``"cute"`` is implemented.
+
+    out: Optional[torch.Tensor]
+        The output tensor, shape ``(cum_m, n)``. If not specified, an output tensor will be
+        created.
+
+    out_dtype: Optional[torch.dtype]
+        The data type of the output tensor. Currently only ``torch.bfloat16`` is supported.
+
+    Returns
+    -------
+    out: torch.Tensor
+        The output tensor, shape ``(cum_m, n)``.
+
+    Notes
+    -----
+    - MXFP8 uses UE8M0 scales over K-axis blocks of size 32 (OCP spec) or 128
+      (DeepGEMM convention). Both ``a_scale`` and ``b_scale`` must be provided in per-token
+      layout: one UE8M0 scale per row along M (for ``a``) or N (for ``b``), packed 4 scales
+      per int32 along the K-axis blocks.
+    - If a caller starts from a 2D ``(k_granularity, k_granularity)`` block-quantized
+      ``b_scale``, it must be broadcast to per-token shape ``(num_experts, n, k_align)``
+      before invoking this function (one scale per N-row).
+    """
+    _check_scale_granularity_mnk(scale_granularity_mnk)
+    _check_scale_major_mode_mxfp8(scale_major_mode)
+    _check_m_indptr(m_indptr, token_num=a.shape[0])
+    if backend != "cute":
+        raise NotImplementedError(
+            f'Only backend="cute" is currently implemented; got backend="{backend}"'
+        )
+
+    if out_dtype is None:
+        out_dtype = out.dtype if out is not None else torch.bfloat16
+    if out_dtype != torch.bfloat16:
+        raise NotImplementedError(
+            f"Only out_dtype=torch.bfloat16 is supported; got {out_dtype}"
+        )
+
+    n = b.shape[1]
+    if out is None:
+        out = torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
+
+    get_grouped_mm_sm120_module_cute_mxfp8().group_gemm_mxfp8_nt_groupwise_zero_padding(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indptr,
+        out,
+        scale_major_mode,
+        scale_granularity_mnk[0],
+        scale_granularity_mnk[1],
+        scale_granularity_mnk[2],
+    )
+    return out

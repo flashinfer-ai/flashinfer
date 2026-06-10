@@ -32,12 +32,6 @@ MXFP8 GEMM
 
     mm_mxfp8
     bmm_mxfp8
-    gemm_mxfp8_nt_groupwise
-    batch_gemm_mxfp8_nt_groupwise
-    group_gemm_mxfp8_nt_groupwise
-    group_gemm_mxfp8_nt_groupwise_masked
-    group_gemm_mxfp8_nt_groupwise_zero_padding
-    quantize_mxfp8_for_zero_padding
 
 FP8 GEMM
 --------

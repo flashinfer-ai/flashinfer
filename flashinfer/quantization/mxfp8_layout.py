@@ -2,15 +2,14 @@
 MXFP8 (FP8 E4M3 + UE8M0 per-row) layout helpers for cute sm120 GEMM entries.
 
 These helpers produce input tensors compatible with the per-row INT32-packed
-TMA-aligned MN-major scale layout expected by:
-
-- `flashinfer.gemm.gemm_mxfp8_nt_groupwise` (dense Normal)
-- `flashinfer.gemm.batch_gemm_mxfp8_nt_groupwise` (dense Batched)
-- `flashinfer.gemm.group_gemm_mxfp8_nt_groupwise` (MoE contiguous, psum_layout=True/False)
-- `flashinfer.gemm.group_gemm_mxfp8_nt_groupwise_masked` (MoE masked)
-- `flashinfer.gemm.group_gemm_mxfp8_nt_groupwise_zero_padding` (MoE zero-padding;
-  use the dedicated CUDA helper `quantize_mxfp8_for_zero_padding` instead — its
-  input/output layout differs)
+TMA-aligned MN-major scale layout. The current SM120 cute backend only exposes
+`flashinfer.grouped_mm.grouped_mm_mxfp8_nt_groupwise_zero_padding` (MoE
+zero-padding), which provides its own dedicated CUDA quantization helper
+`quantize_mxfp8_for_zero_padding` — its input/output layout differs from the
+per-row helpers below. These per-row helpers (per-token/per-block quantize,
+transform, dequantize) are retained as building blocks for upstream tests and
+future SM120 GEMM entries (dense / batched / masked / contiguous) that share
+the per-row UE8M0 layout.
 
 Distinct from the existing `flashinfer.quantization.mxfp8_quantize` (TRT-LLM-style
 sfVecSize=32 swizzled layout, SM100+). These helpers target the cute sm120 backend

@@ -21,13 +21,13 @@
 #include <cstring>
 
 #include "cutlass/gemm_coord.h"
-#include "flashinfer/gemm/mxfp8_gemm_cute_sm120.h"
-#include "flashinfer/gemm/sm120_blockscaled/builder.cuh"
-#include "flashinfer/gemm/sm120_blockscaled/kernel_impl.cuh"
-#include "flashinfer/gemm/sm120_blockscaled/launch.cuh"
-#include "flashinfer/gemm/sm120_blockscaled/quantize_mxfp8_zero_padding.cuh"
-#include "flashinfer/gemm/sm120_blockscaled/scheduler.cuh"
-#include "flashinfer/gemm/sm120_blockscaled/utils.cuh"
+#include "flashinfer/grouped_mm/mxfp8_gemm_cute_sm120.h"
+#include "flashinfer/grouped_mm/sm120_blockscaled/builder.cuh"
+#include "flashinfer/grouped_mm/sm120_blockscaled/kernel_impl.cuh"
+#include "flashinfer/grouped_mm/sm120_blockscaled/launch.cuh"
+#include "flashinfer/grouped_mm/sm120_blockscaled/quantize_mxfp8_zero_padding.cuh"
+#include "flashinfer/grouped_mm/sm120_blockscaled/scheduler.cuh"
+#include "flashinfer/grouped_mm/sm120_blockscaled/utils.cuh"
 #include "tvm_ffi_utils.h"
 
 // 2-value granK dispatch. Validates input and instantiates the templated

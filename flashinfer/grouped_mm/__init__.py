@@ -13,10 +13,16 @@ from .core import grouped_mm_bf16 as grouped_mm_bf16
 from .core import grouped_mm_fp4 as grouped_mm_fp4
 from .core import grouped_mm_fp8 as grouped_mm_fp8
 from .core import grouped_mm_mxfp8 as grouped_mm_mxfp8
+from .core import (
+    grouped_mm_mxfp8_nt_groupwise_zero_padding as grouped_mm_mxfp8_nt_groupwise_zero_padding,
+)
+from .core import quantize_mxfp8_for_zero_padding as quantize_mxfp8_for_zero_padding
 
 __all__ = [
     "grouped_mm_bf16",
     "grouped_mm_fp4",
     "grouped_mm_fp8",
     "grouped_mm_mxfp8",
+    "grouped_mm_mxfp8_nt_groupwise_zero_padding",
+    "quantize_mxfp8_for_zero_padding",
 ]
