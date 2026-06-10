@@ -67,12 +67,22 @@ def _old_x_to_5d(old_x_4d, cache_buf_idx):
     return old_x_5d
 
 
+# Triton replay configs tested for non-varlen + varlen.  `non_tma` is the old
+# (merged, non-TMA) persistent kernel kept for cross-validation; `tma_pd`/`tma_pm`
+# are the faithful TMA standalone in its two modes.  When the old kernel is
+# removed, drop "non_tma" here (single point of change).
+_TRITON_IMPLS = ["non_tma", "tma_pd", "tma_pm"]
+
+
 def _make_replay_work_items(
-    prev_tokens, cache_buf_idx, T, max_window, batch, state_batch_indices
+    prev_tokens, cache_buf_idx, seq_len, max_window, batch, state_batch_indices
 ):
     """Build (n_writes, replay_work_items) for the standalone persistent kernel,
     write-first sorted — mirrors mamba2_metadata._prepare_replay_work_items.
 
+    ``seq_len`` is the per-step new-token count used in the write decision
+    ``(pnat + seq_len) > max_window``: a scalar for non-varlen, or a (batch,)
+    tensor of per-sequence lengths (indexed by decode-batch position) for varlen.
     persistent_dynamic ignores the ordering at runtime; persistent_main relies
     on the n_writes split (write slots first).
     """
@@ -85,7 +95,7 @@ def _make_replay_work_items(
     cache_slot_long = cache_slot.to(torch.long)
     pnat = prev_tokens[cache_slot_long].to(torch.int32)
     active_buf = cache_buf_idx[cache_slot_long].to(torch.int32)
-    write_mask = (pnat + T) > max_window
+    write_mask = (pnat + seq_len) > max_window
     n_writes = write_mask.sum().to(torch.int32).reshape(1)
     order = torch.argsort((~write_mask).to(torch.int32), stable=True).to(torch.long)
     work = torch.empty(batch, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32)
@@ -94,6 +104,103 @@ def _make_replay_work_items(
     work[:, REPLAY_WORK_PNAT] = pnat[order]
     work[:, REPLAY_WORK_CACHE_BUF_IDX] = active_buf[order]
     return n_writes, work.contiguous()
+
+
+def _call_replay(
+    impl,
+    *,
+    state,
+    old_x,
+    old_B,
+    old_dt,
+    old_dA,
+    cache_buf_idx,
+    prev_tokens,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    out,
+    max_window,
+    batch,
+    work_seq_len,
+    state_batch_indices=None,
+    D=None,
+    dt_bias=None,
+    dt_softplus=True,
+    state_scales=None,
+    rand_seed=None,
+    philox_rounds=0,
+    cu_seqlens=None,
+    max_seqlen=None,
+):
+    """Dispatch one replay call to a test config (see ``_TRITON_IMPLS``):
+      ``non_tma`` → merged ``replay_selective_state_update`` (non-TMA,
+        persistent_dynamic); ``tma_pd``/``tma_pm`` → the TMA standalone
+        ``replay_persistent`` in persistent_dynamic / persistent_main.
+
+    ``old_x`` is the 4-D single-buffer cache (converted to 5-D here).
+    ``work_seq_len`` is the new-token count for the persistent_main work-item
+    sort (scalar non-varlen, or a (batch,) per-sequence tensor for varlen).
+    For varlen pass ``cu_seqlens`` + ``max_seqlen``.
+    """
+    old_x_5d = _old_x_to_5d(old_x, cache_buf_idx)
+    common = dict(
+        x=x,
+        dt=dt,
+        A=A,
+        B=B,
+        C=C,
+        out=out,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        state_batch_indices=state_batch_indices,
+        state_scales=state_scales,
+        rand_seed=rand_seed,
+        philox_rounds=philox_rounds,
+    )
+    if cu_seqlens is not None:
+        common.update(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    if impl == "non_tma":
+        replay_selective_state_update(
+            state,
+            old_x_5d,
+            old_B,
+            old_dt,
+            old_dA,
+            cache_buf_idx,
+            prev_tokens,
+            rectangle_for_nowrite=False,
+            **common,
+        )
+    else:
+        mode = "persistent_dynamic" if impl == "tma_pd" else "persistent_main"
+        n_writes, replay_work_items = _make_replay_work_items(
+            prev_tokens,
+            cache_buf_idx,
+            work_seq_len,
+            max_window,
+            batch,
+            state_batch_indices,
+        )
+        replay_persistent(
+            state,
+            old_x_5d,
+            old_B,
+            old_dt,
+            old_dA,
+            cache_buf_idx,
+            prev_tokens,
+            n_writes=n_writes,
+            replay_work_items=replay_work_items,
+            mode=mode,
+            **common,
+        )
+    # Return the (kernel-mutated) 5D old_x so cache-postcondition checks can
+    # inspect it (the kernel wrote new tokens into the write buffer in place).
+    return old_x_5d
 
 
 def _assert_old_x_5d_matches_4d(
@@ -136,7 +243,7 @@ def _assert_old_x_5d_matches_4d(
 
 
 def _run_checkpointing_ssu_case(
-    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
+    impl, nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, d_split=None
 ):
     """
     For each k in 0..T, run both CUDA and Triton incremental kernels with
@@ -224,30 +331,28 @@ def _run_checkpointing_ssu_case(
         ref_state = state0.clone()
         ref_prev = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-        n_writes, replay_work_items = _make_replay_work_items(
-            ref_prev, cache_buf_idx, T, old_x.shape[1], batch, state_batch_indices
-        )
-        replay_persistent(
-            ref_state,
-            _old_x_to_5d(old_x, cache_buf_idx),
-            old_B.clone(),
-            old_dt.clone(),
-            old_cumAdt.clone(),
-            cache_buf_idx.clone(),
-            ref_prev,
+        _call_replay(
+            impl,
+            state=ref_state,
+            old_x=old_x,
+            old_B=old_B.clone(),
+            old_dt=old_dt.clone(),
+            old_dA=old_cumAdt.clone(),
+            cache_buf_idx=cache_buf_idx,
+            prev_tokens=ref_prev,
             x=x2,
             dt=dt2,
             A=A,
             B=B2,
             C=C2,
             out=ref_out,
-            n_writes=n_writes,
-            replay_work_items=replay_work_items,
+            max_window=old_x.shape[1],
+            batch=batch,
+            work_seq_len=T,
+            state_batch_indices=state_batch_indices,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=state_batch_indices,
-            mode="persistent_dynamic",
         )
 
         # --- CUDA kernel ---
@@ -319,7 +424,8 @@ def _run_checkpointing_ssu_case(
 # `D_SPLIT` template specialization, so this is a runtime-dispatch check.
 
 
-def test_checkpointing_ssu_d_split2():
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_d_split2(impl):
     """v12 §59 smoke — D_SPLIT=2 path dispatches and runs.  Both
     ``d_split={1,2}`` specializations are baked into the same JIT .so via
     the public dispatcher's switch; this test verifies the d_split=2 grid
@@ -327,6 +433,7 @@ def test_checkpointing_ssu_d_split2():
     coverage is provided by the d_split=1 tests sharing the same .so."""
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     _run_checkpointing_ssu_case(
+        impl,
         nheads,
         head_dim,
         d_state,
@@ -338,7 +445,8 @@ def test_checkpointing_ssu_d_split2():
     )
 
 
-def test_checkpointing_ssu_heads_per_group():
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_heads_per_group(impl):
     """Smoke test the multi-group code path (group_idx != 0 for some heads).
 
     The two ``_CONFIGS`` entries both have HEADS_PER_GROUP = nheads/ngroups
@@ -353,6 +461,7 @@ def test_checkpointing_ssu_heads_per_group():
     both `group_idx = 0` and `group_idx = 1` paths in the same launch."""
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 2  # HPG = 8
     _run_checkpointing_ssu_case(
+        impl,
         nheads,
         head_dim,
         d_state,
@@ -595,8 +704,9 @@ def test_checkpointing_ssu_pdl_fp8_philox5():
     [(4, 8), (10, 16)],
     ids=["np4w8", "np10w16"],
 )
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
 def test_checkpointing_ssu_max_window_gt_npredicted(
-    state_dtype, paged_cache, npredicted, max_window
+    impl, state_dtype, paged_cache, npredicted, max_window
 ):
     # Only one _CONFIGS entry — both share (head_dim, d_state, HPG=16) so
     # the JIT key is identical; the other config doesn't add coverage.
@@ -700,29 +810,31 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
         ref_out = torch.zeros(
             batch, npredicted, nheads, head_dim, device=device, dtype=dtype
         )
-        old_x_ref = _old_x_to_5d(old_x, cache_buf_idx)
         old_B_ref = old_B.clone()
         old_dt_ref = old_dt.clone()
         old_dA_ref = old_dA_cumsum.clone()
-        replay_selective_state_update(
-            ref_state,
-            old_x_ref,
-            old_B_ref,
-            old_dt_ref,
-            old_dA_ref,
-            cache_buf_idx.clone(),
-            ref_prev,
+        old_x_ref = _call_replay(
+            impl,
+            state=ref_state,
+            old_x=old_x,
+            old_B=old_B_ref,
+            old_dt=old_dt_ref,
+            old_dA=old_dA_ref,
+            cache_buf_idx=cache_buf_idx,
+            prev_tokens=ref_prev,
             x=x2,
             dt=dt2,
             A=A,
             B=B2,
             C=C2,
             out=ref_out,
+            max_window=max_window,
+            batch=batch,
+            work_seq_len=npredicted,
+            state_batch_indices=state_batch_indices,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=state_batch_indices,
-            write_checkpoint=must_checkpoint,
         )
 
         # ── CUDA kernel ──
@@ -847,8 +959,9 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
 )
 # (4, 8) gives must_checkpoint = (prev_k + 4 > 8) = False for prev_k ∈ [0, 4].
 @pytest.mark.parametrize("npredicted,max_window", [(4, 8)], ids=["np4w8"])
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
 def test_checkpointing_ssu_philox_no_checkpoint(
-    nheads, head_dim, d_state, ngroups, paged_cache, npredicted, max_window
+    impl, nheads, head_dim, d_state, ngroups, paged_cache, npredicted, max_window
 ):
     """Verify Philox SR path skips state HBM write when must_checkpoint=False.
 
@@ -952,29 +1065,33 @@ def test_checkpointing_ssu_philox_no_checkpoint(
         ref_out = torch.zeros(
             batch, npredicted, nheads, head_dim, device=device, dtype=dtype
         )
-        old_x_ref = _old_x_to_5d(old_x, cache_buf_idx)
         old_B_ref = old_B.clone()
         old_dt_ref = old_dt.clone()
         old_dA_ref = old_dA_cumsum.clone()
-        replay_selective_state_update(
-            ref_state,
-            old_x_ref,
-            old_B_ref,
-            old_dt_ref,
-            old_dA_ref,
-            cache_buf_idx.clone(),
-            ref_prev,
+        old_x_ref = _call_replay(
+            impl,
+            state=ref_state,
+            old_x=old_x,
+            old_B=old_B_ref,
+            old_dt=old_dt_ref,
+            old_dA=old_dA_ref,
+            cache_buf_idx=cache_buf_idx,
+            prev_tokens=ref_prev,
             x=x2,
             dt=dt2,
             A=A,
             B=B2,
             C=C2,
             out=ref_out,
+            max_window=max_window,
+            batch=batch,
+            work_seq_len=npredicted,
+            state_batch_indices=state_batch_indices,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=state_batch_indices,
-            write_checkpoint=False,
+            rand_seed=rand_seed,
+            philox_rounds=10,
         )
 
         # ── CUDA kernel with Philox enabled ──
@@ -1121,7 +1238,9 @@ def test_checkpointing_ssu_philox_no_checkpoint(
     ],
     ids=["np10w16_pk7", "np10w16_pk10", "np14w16_pk14", "np14w16_pk3"],
 )
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
 def test_checkpointing_ssu_philox_with_checkpoint(
+    impl,
     npredicted,
     max_window,
     prev_k,
@@ -1222,29 +1341,33 @@ def test_checkpointing_ssu_philox_with_checkpoint(
     ref_out = torch.zeros(
         batch, npredicted, nheads, head_dim, device=device, dtype=dtype
     )
-    old_x_ref = _old_x_to_5d(old_x, cache_buf_idx)
     old_B_ref = old_B.clone()
     old_dt_ref = old_dt.clone()
     old_dA_ref = old_dA_cumsum.clone()
-    replay_selective_state_update(
-        ref_state,
-        old_x_ref,
-        old_B_ref,
-        old_dt_ref,
-        old_dA_ref,
-        cache_buf_idx.clone(),
-        ref_prev,
+    old_x_ref = _call_replay(
+        impl,
+        state=ref_state,
+        old_x=old_x,
+        old_B=old_B_ref,
+        old_dt=old_dt_ref,
+        old_dA=old_dA_ref,
+        cache_buf_idx=cache_buf_idx,
+        prev_tokens=ref_prev,
         x=x2,
         dt=dt2,
         A=A,
         B=B2,
         C=C2,
         out=ref_out,
+        max_window=max_window,
+        batch=batch,
+        work_seq_len=npredicted,
+        state_batch_indices=state_batch_indices,
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=state_batch_indices,
-        write_checkpoint=True,
+        rand_seed=rand_seed,
+        philox_rounds=10,
     )
 
     # ── CUDA kernel with Philox enabled ──
@@ -1861,8 +1984,9 @@ def test_checkpointing_ssu_int8_smoke():
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("with_philox", [False, True], ids=["no_philox", "philox"])
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
 def test_checkpointing_ssu_mixed_checkpoint_batch(
-    nheads, head_dim, d_state, ngroups, paged_cache, with_philox
+    impl, nheads, head_dim, d_state, ngroups, paged_cache, with_philox
 ):
     """Verify CUDA kernel handles a batch with mixed must_checkpoint values.
 
@@ -1972,14 +2096,13 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
         dict(rand_seed=rand_seed, philox_rounds=10) if with_philox else dict()
     )
 
-    # ── Triton reference: two launches on disjoint sub-batches ──
+    # ── Triton reference: single full-batch launch ──
     #
-    # Each sub-launch passes the full state/cache tensors and the full
-    # prev_per_slot vector — Triton only touches the slots referenced by
-    # its sliced state_batch_indices, so the two launches' writes don't
-    # alias.  write_checkpoint is the constexpr that differs per sub-launch.
+    # The persistent path derives the per-slot write decision at runtime from
+    # (prev_per_slot + npredicted) > max_window, so a single launch handles
+    # the mixed [F, F, T, T] batch natively (no need for the old two-launch
+    # WRITE_CHECKPOINT-constexpr split).
     ref_state = state0.clone()
-    old_x_ref = _old_x_to_5d(old_x, cache_buf_idx)
     old_B_ref = old_B.clone()
     old_dt_ref = old_dt.clone()
     old_dA_ref = old_dA_cumsum.clone()
@@ -1987,28 +2110,30 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
         batch, npredicted, nheads, head_dim, device=device, dtype=dtype
     )
 
-    for sub_idx, sub_write in [(false_idx, False), (true_idx, True)]:
-        sub_slice = slice(sub_idx[0], sub_idx[-1] + 1)  # contiguous range
-        replay_selective_state_update(
-            ref_state,
-            old_x_ref,
-            old_B_ref,
-            old_dt_ref,
-            old_dA_ref,
-            cache_buf_idx.clone(),
-            prev_per_slot.clone(),
-            x=x2[sub_slice],
-            dt=dt2[sub_slice],
-            A=A,
-            B=B2[sub_slice],
-            C=C2[sub_slice],
-            out=ref_out[sub_slice],
-            D=D,
-            dt_bias=dt_bias,
-            dt_softplus=True,
-            state_batch_indices=state_batch_indices_full[sub_slice],
-            write_checkpoint=sub_write,
-        )
+    old_x_ref = _call_replay(
+        impl,
+        state=ref_state,
+        old_x=old_x,
+        old_B=old_B_ref,
+        old_dt=old_dt_ref,
+        old_dA=old_dA_ref,
+        cache_buf_idx=cache_buf_idx,
+        prev_tokens=prev_per_slot,
+        x=x2,
+        dt=dt2,
+        A=A,
+        B=B2,
+        C=C2,
+        out=ref_out,
+        max_window=max_window,
+        batch=batch,
+        work_seq_len=npredicted,
+        state_batch_indices=state_batch_indices_full,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        **philox_kwargs,
+    )
 
     # ── CUDA kernel: single launch with full per-batch prev_k ──
     test_state = state0.clone()
@@ -2123,9 +2248,11 @@ def test_checkpointing_ssu_mixed_checkpoint_batch(
     )
 
 
-def test_checkpointing_ssu_contiguous():
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_contiguous(impl):
     """Smoke test for the contiguous-cache path (TP=8, bf16 state, mtp=16)."""
     _run_checkpointing_ssu_case(
+        impl,
         nheads=16,
         head_dim=64,
         d_state=128,
@@ -3185,8 +3312,9 @@ _STATE_UPDATE_CASES = [
 @pytest.mark.parametrize(
     "state_dtype,paged_cache,T,write_checkpoint,_cfg_idx", _STATE_UPDATE_CASES
 )
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
 def test_checkpointing_state_update(
-    state_dtype, paged_cache, T, write_checkpoint, _cfg_idx
+    impl, state_dtype, paged_cache, T, write_checkpoint, _cfg_idx
 ):
     nheads, head_dim, d_state, ngroups = _CONFIGS[_cfg_idx]
     """
@@ -3380,33 +3508,38 @@ def test_checkpointing_state_update(
         # moot on the dynamic path — expectations below follow is_w.
         is_w = (k + T) > max_window
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        # Snapshot the pre-call 5-D cache for untouched-buffer comparisons.
         old_x_5d = _old_x_to_5d(old_x, cache_buf_idx)
-        old_x_w = old_x_5d.clone()
         old_B_w = old_B.clone()
         old_dt_w = old_dt.clone()
         old_dA_cumsum_w = old_dA_cumsum.clone()
         # cache_buf_idx stays at its random values — each slot reads from its own buffer
 
-        replay_selective_state_update(
-            test_state,
-            old_x_w,
-            old_B_w,
-            old_dt_w,
-            old_dA_cumsum_w,
-            cache_buf_idx.clone(),
-            prev_tokens,
+        # _call_replay returns the (kernel-mutated) 5-D old_x; the cache
+        # postconditions below inspect old_x_w against the snapshot old_x_5d.
+        old_x_w = _call_replay(
+            impl,
+            state=test_state,
+            old_x=old_x,
+            old_B=old_B_w,
+            old_dt=old_dt_w,
+            old_dA=old_dA_cumsum_w,
+            cache_buf_idx=cache_buf_idx,
+            prev_tokens=prev_tokens,
             x=x2,
             dt=dt2,
             A=A,
             B=B2,
             C=C2,
             out=test_out,
+            max_window=max_window,
+            batch=batch,
+            work_seq_len=T,
+            state_batch_indices=state_batch_indices,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
-            state_batch_indices=state_batch_indices,
             state_scales=test_scales,
-            write_checkpoint=write_checkpoint,
         )
 
         out_atol = (
@@ -3592,7 +3725,8 @@ _STATE_UPDATE_PHILOX_CASES = [
 @pytest.mark.parametrize(
     "state_dtype,paged_cache,T,_cfg_idx", _STATE_UPDATE_PHILOX_CASES
 )
-def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx):
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_state_update_philox(impl, state_dtype, paged_cache, T, _cfg_idx):
     nheads, head_dim, d_state, ngroups = _CONFIGS[_cfg_idx]
     """
     Verify that Philox stochastic rounding produces correct results across
@@ -3666,15 +3800,19 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
     state_no_round = state0.clone()
     scales_no_round = state0_scales.clone() if is_quantized else None
     out_no_round = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    replay_selective_state_update(
-        state_no_round,
-        _old_x_to_5d(old_x, cache_buf_idx),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
+    _call_replay(
+        impl,
+        state=state_no_round,
+        old_x=old_x,
+        old_B=old_B.clone(),
+        old_dt=old_dt.clone(),
+        old_dA=old_dA_cumsum.clone(),
+        cache_buf_idx=cache_buf_idx,
+        prev_tokens=prev_tokens,
         out=out_no_round,
+        max_window=T,
+        batch=batch,
+        work_seq_len=T,
         state_scales=scales_no_round,
         **common_kwargs,
     )
@@ -3683,15 +3821,19 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
     state_rounded = state0.clone()
     scales_rounded = state0_scales.clone() if is_quantized else None
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    replay_selective_state_update(
-        state_rounded,
-        _old_x_to_5d(old_x, cache_buf_idx),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
+    _call_replay(
+        impl,
+        state=state_rounded,
+        old_x=old_x,
+        old_B=old_B.clone(),
+        old_dt=old_dt.clone(),
+        old_dA=old_dA_cumsum.clone(),
+        cache_buf_idx=cache_buf_idx,
+        prev_tokens=prev_tokens,
         out=out_rounded,
+        max_window=T,
+        batch=batch,
+        work_seq_len=T,
         rand_seed=rand_seed,
         philox_rounds=10,
         state_scales=scales_rounded,
@@ -3746,7 +3888,8 @@ def test_checkpointing_state_update_philox(state_dtype, paged_cache, T, _cfg_idx
     [torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn],
     ids=["fp16", "int8", "int16", "fp8"],
 )
-def test_checkpointing_philox_rounding_unbiased(state_dtype):
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_philox_rounding_unbiased(impl, state_dtype):
     """Verify Philox SR is statistically unbiased (mean residual ≈ 0).
 
     Renamed from the upstream `test_philox_rounding_unbiased` to disambiguate
@@ -3801,15 +3944,19 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
 
     state_fp32 = state0_fp32.clone()
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    replay_selective_state_update(
-        state_fp32,
-        _old_x_to_5d(old_x, cache_buf_idx),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
+    _call_replay(
+        impl,
+        state=state_fp32,
+        old_x=old_x,
+        old_B=old_B.clone(),
+        old_dt=old_dt.clone(),
+        old_dA=old_dA_cumsum.clone(),
+        cache_buf_idx=cache_buf_idx,
+        prev_tokens=prev_tokens,
         out=out_fp32,
+        max_window=T,
+        batch=batch,
+        work_seq_len=T,
         **common_kwargs,
     )
 
@@ -3822,15 +3969,19 @@ def test_checkpointing_philox_rounding_unbiased(state_dtype):
         state_rounded = state0_fp32.to(state_dtype)
         scales_rounded = None
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    replay_selective_state_update(
-        state_rounded,
-        _old_x_to_5d(old_x, cache_buf_idx),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
+    _call_replay(
+        impl,
+        state=state_rounded,
+        old_x=old_x,
+        old_B=old_B.clone(),
+        old_dt=old_dt.clone(),
+        old_dA=old_dA_cumsum.clone(),
+        cache_buf_idx=cache_buf_idx,
+        prev_tokens=prev_tokens,
         out=out_rounded,
+        max_window=T,
+        batch=batch,
+        work_seq_len=T,
         rand_seed=rand_seed,
         philox_rounds=10,
         state_scales=scales_rounded,
@@ -4300,6 +4451,7 @@ def test_checkpointing_ssu_varlen_mixed_checkpoint(state_dtype):
 
 
 def _run_varlen_cuda_vs_triton(
+    impl,
     *,
     seq_lens,
     prev_ks,
@@ -4390,43 +4542,40 @@ def _run_varlen_cuda_vs_triton(
     # --- Triton varlen ---
     state_tri = s["state0"].clone()
     state_scale_tri = s["state0_scale"].clone() if s["is_quantized"] else None
-    old_x_tri = _old_x_to_5d(s["old_x"], s["cache_buf_idx"])
     old_B_tri = s["old_B"].clone()
     old_dt_tri = s["old_dt"].clone()
     old_cumAdt_tri = s["old_cumAdt"].clone()
     out_tri = torch.zeros_like(x_packed)
 
-    n_writes, replay_work_items = _make_replay_work_items(
-        s["prev_tokens"],
-        s["cache_buf_idx"],
-        npredicted,
-        max_window,
-        len(seq_lens),
-        None,
-    )
-    replay_persistent(
-        state_tri,
-        old_x_tri,
-        old_B_tri,
-        old_dt_tri,
-        old_cumAdt_tri,
-        s["cache_buf_idx"].clone(),
-        s["prev_tokens"].clone(),
+    # Per-slot real sequence lengths for the persistent_main work-item sort
+    # (so write items are ordered by the actual per-sequence length, not
+    # NPREDICTED).  (batch,) int32 derived from the packed cu_seqlens.
+    seq_lens_t = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+
+    _call_replay(
+        impl,
+        state=state_tri,
+        old_x=s["old_x"],
+        old_B=old_B_tri,
+        old_dt=old_dt_tri,
+        old_dA=old_cumAdt_tri,
+        cache_buf_idx=s["cache_buf_idx"],
+        prev_tokens=s["prev_tokens"].clone(),
         x=x_packed,
         dt=dt_packed,
         A=s["A"],
         B=B_packed,
         C=C_packed,
         out=out_tri,
-        n_writes=n_writes,
-        replay_work_items=replay_work_items,
+        max_window=max_window,
+        batch=len(seq_lens),
+        work_seq_len=seq_lens_t,
         D=s["D"],
         dt_bias=s["dt_bias"],
         dt_softplus=True,
         state_scales=state_scale_tri,
         cu_seqlens=cu_seqlens,
         max_seqlen=npredicted,
-        mode="persistent_dynamic",
     )
 
     # --- Compare ---
@@ -4467,7 +4616,8 @@ def _run_varlen_cuda_vs_triton(
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(state_dtype):
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(impl, state_dtype):
     """CUDA vs Triton (independent reference) — pure-Branch-B varlen.
 
     Constraint on test config: the Triton kernel caps prev_k <= NPREDICTED
@@ -4476,6 +4626,7 @@ def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(state_dtype):
     is acceptable to both kernels.
     """
     _run_varlen_cuda_vs_triton(
+        impl,
         seq_lens=[3, 1, 4, 2, 4],
         prev_ks=[0, 5, 10, 12, 8],  # all prev_k + max(seq_len)=4 <= 16
         npredicted=16,
@@ -4486,9 +4637,11 @@ def test_checkpointing_ssu_varlen_cuda_vs_triton_no_checkpoint(state_dtype):
 
 
 @pytest.mark.parametrize("state_dtype", _VARLEN_DTYPES)
-def test_checkpointing_ssu_varlen_cuda_vs_triton_checkpoint(state_dtype):
+@pytest.mark.parametrize("impl", _TRITON_IMPLS)
+def test_checkpointing_ssu_varlen_cuda_vs_triton_checkpoint(impl, state_dtype):
     """CUDA vs Triton (independent reference) — pure-Branch-A varlen."""
     _run_varlen_cuda_vs_triton(
+        impl,
         seq_lens=[3, 5, 8, 6, 7],
         prev_ks=[14, 15, 16, 14, 15],
         npredicted=16,
