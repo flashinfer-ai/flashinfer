@@ -18,7 +18,10 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cutlass/arch/arch.h>
+#include <flashinfer/exception.h>
+#include <flashinfer/logging.h>
 
+#include <cstdlib>
 #include <cub/cub.cuh>
 #include <cute/arch/cluster_sm90.hpp>
 #include <type_traits>
@@ -42,8 +45,65 @@ static constexpr int WarpSize = 32;
 static constexpr int NumBlocksPerCluster = 8;
 // Performance tuning knob.
 static constexpr int NumEltsPerOffsetTilePerThread = 8;
-// Number of SMs to reserve for overlapping kernels when using cooperative launch.
-static constexpr int kReservedSMsForOverlapping = 8;
+// Default number of SMs to leave available for overlapping kernels when using cooperative launch.
+static constexpr int kDefaultReservedSMsForOverlapping = 8;
+static constexpr char kReservedSMsForOverlappingEnv[] =
+    "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS";
+
+// Parsed reserved-SM value and whether it came from the environment.
+struct ReservedSMsForOverlappingConfig {
+  // Number of SMs to reserve for overlapping kernels.
+  long reservedSms;
+  // True when reservedSms was read from FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS.
+  bool isSet;
+};
+
+struct CoopLaunchSMCounts {
+  int moeSms;
+  int reservedSms;
+};
+
+// Return the reserved-SM configuration for TRT-LLM fused MoE overlap.
+// The value is read from FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS once per
+// process. When the variable is not set, the default reserved-SM count is used
+// and isSet is false so error messages can identify the source of the value.
+inline ReservedSMsForOverlappingConfig getReservedSMsForOverlappingConfig() {
+  static ReservedSMsForOverlappingConfig const config = [] {
+    char const* env = std::getenv(kReservedSMsForOverlappingEnv);
+    if (env == nullptr) {
+      return ReservedSMsForOverlappingConfig{kDefaultReservedSMsForOverlapping, false};
+    }
+    char* end = nullptr;
+    long const value = std::strtol(env, &end, 10);
+    FLASHINFER_CHECK(end != env && *end == '\0', kReservedSMsForOverlappingEnv,
+                     " must be an integer, got ", env);
+    return ReservedSMsForOverlappingConfig{value, true};
+  }();
+  return config;
+}
+
+// Return the cooperative-launch SM allocation after reserving SMs.
+// Validate the effective reserved-SM count against the runtime SM count before
+// subtraction so the number of SMs used by MoE is always positive.
+inline CoopLaunchSMCounts getCoopLaunchSMCounts(int smCount) {
+  ReservedSMsForOverlappingConfig const config = getReservedSMsForOverlappingConfig();
+  char const* source = config.isSet ? kReservedSMsForOverlappingEnv : "default reserved SM count";
+  FLASHINFER_CHECK(config.reservedSms >= 0 && config.reservedSms < smCount, source,
+                   " must satisfy 0 <= value < SM count (", smCount, "), got ", config.reservedSms);
+  int const reservedSms = static_cast<int>(config.reservedSms);
+  return CoopLaunchSMCounts{smCount - reservedSms, reservedSms};
+}
+
+inline void logCoopLaunchSMCounts(CoopLaunchSMCounts const& counts) {
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    FLASHINFER_LOG_INFO(
+        "TRT-LLM fused MoE cooperative launch SM allocation: {} SMs used for MoE, {} SMs "
+        "reserved for overlapping kernels (total SMs: {})",
+        counts.moeSms, counts.reservedSms, counts.moeSms + counts.reservedSms);
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

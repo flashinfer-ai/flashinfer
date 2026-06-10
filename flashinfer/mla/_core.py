@@ -1069,11 +1069,24 @@ _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 
 # Size of the trtllm-gen workspace counter region (multi-block semaphores)
 # per csrc/trtllm_fmha_kernel_launcher.cu:200: max_batch_size * max_num_qo_heads
-# * sizeof(uint32_t) = 8192 * 256 * 4 = 8 MB. The kernel requires this region
-# to be zero on its first use and self-resets at the end of each launch, but
-# we must restore zeros after any other kernel writes into the shared
-# workspace_buffer (e.g. cute-dsl's split-K scratch during autotune).
+# * sizeof(uint32_t) = 8192 * 256 * 4 = 8 MB. trtllm-gen places this counter
+# slab at the head of the workspace_buffer and self-resets it at the end of
+# every launch, so back-to-back trtllm-gen launches keep it valid without any
+# host-side zeroing.
 _TRTLLM_GEN_MLA_COUNTER_REGION_BYTES = 8192 * 256 * 4
+
+
+def _cute_dsl_workspace_view(workspace_buffer: torch.Tensor) -> torch.Tensor:
+    """Sub-view of the shared workspace that skips trtllm-gen's counter region.
+
+    cute-dsl carves its scratch from offset 0 of whatever buffer it is given;
+    offsetting past the 8 MB counter region keeps it from writing into the
+    bytes trtllm-gen needs zero on entry. Costs 8 MB of usable workspace
+    (callers should size the buffer accordingly; the recommended 128 MB has
+    ample headroom).
+    """
+    workspace_i8 = workspace_buffer.reshape(-1).view(torch.int8)
+    return workspace_i8[_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES:]
 
 
 def _round_to_seq_len_bucket(x: int) -> int:
@@ -1146,8 +1159,14 @@ def _compute_mla_decode_buckets(
     if "cute-dsl" in runner_names:
         from ..cute_dsl.utils import get_num_sm
 
+        # cute-dsl gives up the counter region only when trtllm-gen shares the
+        # buffer, so its usable size excludes that reservation only then.
+        reserved = (
+            _TRTLLM_GEN_MLA_COUNTER_REGION_BYTES if "trtllm-gen" in runner_names else 0
+        )
         cute_dsl_cap = _cute_dsl_max_supported_batch(
-            workspace_bytes=workspace_buffer.numel() * workspace_buffer.element_size(),
+            workspace_bytes=workspace_buffer.numel() * workspace_buffer.element_size()
+            - reserved,
             q_len=q_len,
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
@@ -1435,14 +1454,6 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
-        # Zero the counter region on every call. Other runners (cute-dsl)
-        # may share this workspace_buffer and write scratch into the first
-        # bytes, which would leave non-zero values in trtllm-gen's
-        # mandatory-zero semaphore region and cause kernel hangs. Done
-        # inside forward() rather than only at dispatcher final-call time so
-        # that autotune profile-loop invocations are also protected.
-        # The 8 MB memset is ~5us on B200, negligible vs kernel time.
-        self.workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
@@ -1509,12 +1520,20 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         return_lse: bool,
         sinks: Optional[torch.Tensor],
         cute_dsl_impl: str,
+        reserve_counter_region: bool = False,
     ):
         from ..cute_dsl.attention import cute_dsl_mla_decode
 
         self._run = cute_dsl_mla_decode
         self.kv_cache = kv_cache
-        self.workspace_buffer = workspace_buffer
+        # Only skip trtllm-gen's counter region when trtllm-gen shares this
+        # buffer (the "auto" path); a standalone cute-dsl runner owns the whole
+        # buffer and can use it from offset 0.
+        self.workspace_buffer = (
+            _cute_dsl_workspace_view(workspace_buffer)
+            if reserve_counter_region
+            else workspace_buffer
+        )
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -1971,6 +1990,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 return_lse=return_lse,
                 sinks=cute_dsl_sinks,
                 cute_dsl_impl=cute_dsl_impl,
+                # Reserve trtllm-gen's counter region only when it co-runs on
+                # the shared workspace (the "auto" path).
+                reserve_counter_region="trtllm-gen" in runner_names,
             )
         )
 
