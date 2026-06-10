@@ -139,6 +139,21 @@ struct CheckpointingSsuParams {
 
   // state_scale: (state_cache_size, nheads, dim)
   int64_t state_scale_stride_seq{};
+
+  // ── Two-kernel split scratch (both non-null ⇒ precompute+main path) ──
+  // Appended at the very end of the struct on purpose: keeps every field
+  // above at its original offset, so the monolithic kernel's struct layout
+  // (and cache-line access pattern) is byte-for-byte unchanged.
+  // Caller-provided (graph-safe, like `output` — no in-wrapper allocation).
+  // Precompute writes them per-head; main reads them.  Both null ⇒ monolithic.
+  //
+  // cb_scaled is bf16 (= input_t) in FRAGMENT-NATIVE layout
+  // [batch, nheads, lane(0..31), reg(0..7)] = matmul-4's fragA
+  // (mma.m16n8k16 A operand): the precompute STG.128s each lane's 8-bf16
+  // fragment, the main LDG.128s it straight into fragA — no smem / LDSM /
+  // swizzle on either side.  512 B/head.
+  void* __restrict__ cb_scaled{nullptr};  // bf16 (batch, nheads, 32, 8), fragA-native
+  void* __restrict__ decay_vec{nullptr};  // f32  (batch, nheads, NPREDICTED_PAD_MMA_M)
 };
 
 // Forward declaration — defined in kernel_checkpointing_ssu.cuh.

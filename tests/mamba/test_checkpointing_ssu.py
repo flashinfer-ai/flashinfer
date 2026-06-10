@@ -73,6 +73,12 @@ def _old_x_to_5d(old_x_4d, cache_buf_idx):
 # removed, drop "non_tma" here (single point of change).
 _TRITON_IMPLS = ["non_tma", "tma_pd", "tma_pm"]
 
+# fragA-native cb_scaled layout for the two-kernel CUDA path (.plans/ssu_split.md):
+# per (batch, head), one PackedAligned<bf16> per lane = WARP_SIZE lanes ×
+# MMA_FRAG_SIZE bf16 (the mma.m16n8k16 A fragment, 16 B/lane).
+WARP_SIZE = 32
+MMA_FRAG_SIZE = 8
+
 
 def _make_replay_work_items(
     prev_tokens, cache_buf_idx, seq_len, max_window, batch, state_batch_indices
@@ -490,7 +496,7 @@ def test_two_kernel_matches_monolithic():
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
     batch = 2
     cache_size = batch  # non-paged
-    max_window = T  # old_x is (cache, T, ...) → write for k>=1, nowrite for k=0
+    # old_x is (cache, T, ...) so max_window == T → write for k>=1, nowrite for k=0
 
     torch.manual_seed(42)
     A_base = -torch.rand(nheads, device=device) - 0.5
@@ -545,11 +551,15 @@ def test_two_kernel_matches_monolithic():
         )
         kw = {}
         if two_kernel:
+            # fragA-native contract (see .plans/ssu_split.md): cb_scaled is bf16
+            # [batch, nheads, lane(32), reg(8)] = matmul-4 fragA; decay_vec is
+            # f32 [batch, nheads, NPREDICTED_PAD_MMA_M] (=16 for T<=16).
+            T_pad = 16  # next_multiple_of<MMA::M=16>(T) for T <= 16
             kw["cb_scaled"] = torch.empty(
-                batch, nheads, T, max_window, device=device, dtype=torch.float32
+                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
             )
             kw["decay_vec"] = torch.empty(
-                batch, nheads, T, device=device, dtype=torch.float32
+                batch, nheads, T_pad, device=device, dtype=torch.float32
             )
         checkpointing_ssu(
             st,
