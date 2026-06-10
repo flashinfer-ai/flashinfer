@@ -154,53 +154,66 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // load_group_BC<input_t, NPREDICTED, DSTATE>(smem, params, lane, warp, group_idx, outer,
   // seq_len);
 
-  // ── Raw C·B MMA — ONCE per group → raw_cb[8] (registers) ──
-  // TODO(iterate): one warp does BOTH m16n8 N-tiles (n=[0,8) and [8,16)) so each
-  // thread holds the full 8-element fragA-order raw C·B; extract the MMA from
-  // compute_CB_scaled_2warp (common.cuh:869-913) WITHOUT its 2-warp N-split.
-  // float raw_cb[8]; compute_cb_raw<input_t, NPREDICTED, DSTATE>(smem, lane, raw_cb);
+  // ── Raw C·B MMA — ONCE per group, 2-warp N-split → swizzled smem.CB_scaled ──
+  // TODO(iterate): like compute_CB_scaled_2warp (common.cuh:869-938) but store
+  // the RAW (unscaled) accumulator to the swizzled smem.CB_scaled — the
+  // decay/dt scaling is per-head and deferred to the per-warp LDSM below.
+  // Warps 0/1 split the N axis; warps 2/3 idle here (the heavy B/C reads happen
+  // once, not per-warp).
+  // compute_cb_raw_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
 
-  // ── Per-head loop: C1/C2 + scale+store CB_scaled + decay_vec + cache ──
+  // ── Warp-per-head ──
+  // Each warp LDSMs the shared raw CB → fragA, scales by ITS head, STG.128s
+  // fragA-native to gmem.  NUM_ITER is uniform across warps, so the iter==0
+  // __syncthreads() is reached by every warp exactly once — deadlock-proof even
+  // when HEADS_PER_CTA < NUM_WARPS (tail warps just no-op the h-guarded work).
+  // The barrier is deferred past the cumAdt compute so the raw-CB smem store
+  // (warps 0/1) overlaps it.
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
-  auto* __restrict__ cb_gmem = reinterpret_cast<input_t*>(params.cb_scaled);
+  auto* __restrict__ cb_gmem = reinterpret_cast<PackedAligned<input_t>*>(params.cb_scaled);
   auto* __restrict__ decay_gmem = reinterpret_cast<float*>(params.decay_vec);
 
+  constexpr int NUM_ITER = (HEADS_PER_CTA + NUM_WARPS - 1) / NUM_WARPS;  // ceil, uniform
 #pragma unroll
-  for (int h = 0; h < HEADS_PER_CTA; ++h) {
+  for (int iter = 0; iter < NUM_ITER; ++iter) {
+    int const h = warp + iter * NUM_WARPS;
+    bool const has_head = (h < HEADS_PER_CTA);
     int const head = first_head + h;
-    if (head >= first_head + HEADS_PER_GROUP) break;  // tail tile guard (HPG=64)
-    float const A_val = toFloat(A_ptr[head]);
-    float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
 
-    // C1: dt_proc[t] = softplus(dt[t] + dt_bias)  — first NPREDICTED lanes.
-    // TODO(iterate): load dt[outer, t, head] → smem.dt_proc (the scalar LDG +
-    // softplus block from load_pre_pdl_wait_data).
-    // load_dt_proc<dt_t, NPREDICTED>(smem, params, lane, head, outer, dt_bias_val, seq_len);
-
-    // C2: cumAdt + decay (Hillis-Steele warp scan) → smem.cumAdt / smem.decay.
-    compute_cumAdt<NPREDICTED>(smem, lane, A_val);
-    __syncwarp();
-
-    // decay_vec[head, t] = exp(cumAdt[t]) = smem.decay[t].
-    if (warp == 0 && lane < seq_len) {
-      decay_gmem[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane] =
-          smem.decay[lane];
+    if (has_head) {
+      float const A_val = toFloat(A_ptr[head]);
+      float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
+      // C1: dt_proc[t] = softplus(dt[outer,t,head] + dt_bias) → per-warp smem.
+      // load_dt_proc<dt_t, NPREDICTED>(smem, params, warp, lane, head, outer,
+      //                                dt_bias_val, seq_len);
+      // C2: cumAdt + decay (warp scan) → per-warp smem.cumAdt[warp]/decay[warp].
+      // compute_cumAdt_pw<NPREDICTED>(smem, warp, lane, A_val);
+      (void)A_val;
+      (void)dt_bias_val;
     }
 
-    // C5: scale the (warp-shared) raw C·B by this head's decay → fragA-native
-    // gmem.  cb_scaled[batch, head] = warpSize × PackedAligned<input_t> (one
-    // 16 B pack per lane).
-    auto* cb_gmem_head = reinterpret_cast<PackedAligned<input_t>*>(cb_gmem) +
-                         (int64_t)(seq * params.nheads + head) * warpSize;
-    // scale_store_cb_gmem<input_t>(raw_cb, smem, lane, seq_len, cb_gmem_head);
-    (void)cb_gmem_head;
+    // Deferred barrier: overlaps the raw-CB smem store with the cumAdt compute.
+    if (iter == 0) __syncthreads();
 
-    // C7 + cache: store old_dt / old_cumAdt for this head at write_offset.
-    // TODO(iterate): reuse store_old_dt / store_old_cumAdt
-    // (common.cuh:1582+) — they already compute the cumsum-continuity prefix.
-    __syncwarp();
+    if (has_head) {
+      // decay_vec[batch, head, t] = exp(cumAdt[t]) (per-warp decay buffer).
+      // if (lane < seq_len)
+      //   decay_gmem[(seq*nheads + head)*NPREDICTED_PAD_MMA_M + lane] =
+      //       smem.decay_pw(warp, lane);
+      // LDSM the shared raw CB from smem.CB_scaled → raw_cb[8] (fragA order).
+      float raw_cb[8];
+      // ldsm_cb_raw<input_t>(smem, lane, raw_cb);
+      (void)raw_cb;
+      // C5: scale by this head's per-warp cumAdt/dt_proc + STG.128 fragA-native.
+      auto* cb_gmem_head = cb_gmem + (int64_t)(seq * params.nheads + head) * warpSize;
+      // scale_store_cb_gmem<input_t>(raw_cb, smem, warp, lane, seq_len, cb_gmem_head);
+      (void)cb_gmem_head;
+      // C7 + cache: store old_dt / old_cumAdt at write_offset (reuse
+      // store_old_dt / store_old_cumAdt, common.cuh:1582+).
+    }
   }
+  (void)decay_gmem;
   (void)buf_write;
   (void)write_offset;
 }
