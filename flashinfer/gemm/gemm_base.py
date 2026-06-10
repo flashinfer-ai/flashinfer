@@ -5809,8 +5809,6 @@ def _b12x_gemm_fp4_runner(
         )
 
     def _default_dense_plan(m, n, real_k, device):
-        # Shared by forward() and get_valid_tactics() so the tuner's candidate
-        # set always includes the default-path tile.
         return _select_default_dense_gemm_plan(
             m, n, real_k, get_device_sm_count(device), expected_m=m
         )
@@ -6019,15 +6017,9 @@ def _heuristic_func_mm_fp4(
     is_sm103 = major == 10 and minor == 3
     is_sm120 = major == 12 and minor == 0
 
-    # SM120 + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
-    # TODO(sm121/DGX Spark): b12x is *supported* on SM121 (requirement is
-    # @supported_compute_capability([120, 121])) but `auto` only routes it at
-    # SM120 here, so on a Spark `backend="auto"` falls back to cutlass/cudnn and
-    # never picks b12x. To enable it, widen this to `major == 12` (covers 120+121).
-    # Gate the change on the Spark bench: only prefer b12x if it actually beats
-    # cutlass/cudnn on GB10. Also verify the kernel's hardcoded
-    # get_smem_capacity_in_bytes("sm_120") assumption holds on SM121 (run the
-    # e2e handoff's correctness section on the real Spark first).
+    # SM120 + CUDA 13: prefer b12x. SM121 (GB10) is intentionally excluded -- b12x
+    # is supported there as an explicit backend, but cutlass/cudnn are faster in
+    # most cases, so `auto` keeps using them.
     if is_sm120 and use_nvfp4 and cuda_major >= 13:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
