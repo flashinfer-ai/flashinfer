@@ -865,3 +865,9 @@ if TRITON_AVAILABLE:
         )
 
         return output, initial_state
+else:
+    # Allow `from gdn_triton_reference import ...` to succeed without Triton;
+    # all call sites guard on TRITON_AVAILABLE before using these.
+    triton_gdn_decode = None
+    triton_gdn_decode_pretranspose = None
+    triton_gdn_mtp = None

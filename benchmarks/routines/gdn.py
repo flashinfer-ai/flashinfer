@@ -603,7 +603,10 @@ def _testGdnDecodeLike(args, seq_len):
                 return gated_delta_rule_decode(
                     q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
                 )[0]
-            if pool_split:
+            # BF16 state always goes through the pool path with pre-allocated
+            # indices: the non-pool API path synthesizes an arange index
+            # tensor per call, whose tiny kernel would pollute CUPTI timing.
+            if pool_split or use_bf16_state:
                 return gated_delta_rule_decode_pretranspose(
                     q,
                     k,
