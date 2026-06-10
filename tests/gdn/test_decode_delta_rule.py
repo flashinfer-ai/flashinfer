@@ -2099,6 +2099,7 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
     """Per-request variable K state recovery (FLA equivalent)."""
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     try:
         from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
@@ -2227,6 +2228,7 @@ def test_gdn_decode_bf16_state_fused_recovery_decode(
     """Fused recovery+decode (recovery_steps > 0) vs two-call reference."""
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     try:
         from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
@@ -2373,6 +2375,7 @@ def test_gdn_decode_bf16_state_fused_per_request_k(
     per-request two-call reference."""
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     try:
         from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
@@ -3094,6 +3097,7 @@ def test_gdn_decode_bf16_state_fla_scatter_vs_dense(
     must equal ``intermediate_buffer[i, t]`` for every (i, t)."""
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     try:
         from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
@@ -3235,6 +3239,7 @@ def test_gdn_decode_bf16_state_fla_scatter_with_accepted_steps(
     beyond must retain their pre-call values."""
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
 
@@ -3307,6 +3312,7 @@ def test_gdn_decode_bf16_state_fla_scatter_state_only(
     must be scattered correctly even when no output is materialized."""
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
 
@@ -3373,6 +3379,7 @@ def test_gdn_decode_bf16_state_fla_scatter_validation():
     """Wrapper validation rejects illegal ssm_state_indices combinations."""
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
 
@@ -3452,6 +3459,7 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
     """
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
 
@@ -3542,6 +3550,7 @@ def test_gdn_decode_bf16_state_fla_scatter_random_slots(
     """
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    _skip_if_not_sm90_or_later()
 
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
 
@@ -3630,6 +3639,7 @@ def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
     the widen (the smoke test that motivated the fix is now a regression
     test).
     """
+    _skip_if_not_sm90_or_later()
     from flashinfer.gdn_decode import gated_delta_rule_mtp as fp32_mtp
 
     torch.manual_seed(0)
