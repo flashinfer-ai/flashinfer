@@ -3428,3 +3428,259 @@ def test_gdn_decode_bf16_state_fla_scatter_validation():
     bad_shape = torch.zeros(B, T + 1, dtype=torch.int32, device=device)
     with pytest.raises(AssertionError, match="shape"):
         gated_delta_rule_mtp(**mk_args(), ssm_state_indices=bad_shape)
+
+
+# ============================================================================
+# Additional FLA-scatter coverage: padded pool (fallback), non-contiguous
+# slots (FLA index pattern), and FP32 FLA scatter (mirrors BF16 vs_dense).
+# ============================================================================
+
+
+@pytest.mark.parametrize("max_T", [2, 4, 8])
+@pytest.mark.parametrize("batch_size", [4, 16])
+def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
+    batch_size: int,
+    max_T: int,
+):
+    """FLA scatter on a vLLM-style padded pool (stride[0] > HV*V*K).
+
+    Exercises the `per_token_pool_scatter_flat=False` fallback branch
+    (4D slot-slice) — the contiguous-pool flat path is mutex with padded
+    layouts, so this is the only path that can run for vLLM's actual
+    production pool (conv state co-allocated into each slot's stride).
+    Without coverage here, the slot-slice fallback would have zero tests.
+    """
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, T = batch_size, max_T
+    H, HV, K, V = 16, 64, 128, 128
+
+    pool_size = B * (T + 1)
+    # vLLM-style padded layout: extra HV-aligned padding per slot.
+    inner = HV * V * K
+    pad_elts = 16384  # HV-row aligned
+    pad_hv_rows = pad_elts // (V * K)
+    big = torch.empty(
+        pool_size, HV + pad_hv_rows, V, K, dtype=torch.bfloat16, device=device
+    )
+    pool_padded = big[:, :HV, :, :]
+    pool_padded.copy_(torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16) * 0.1)
+    pool_padded._owner = big  # keep allocation alive
+    assert pool_padded.stride() == (inner + pad_elts, V * K, K, 1)
+    assert not pool_padded.is_contiguous()
+
+    # Mirror the same data into a contiguous reference pool for diff.
+    pool_contig_ref = pool_padded.contiguous()
+    assert pool_contig_ref.stride() == (HV * V * K, V * K, K, 1)
+
+    h0_idx = torch.arange(B, dtype=torch.int32, device=device)
+    ssm_idx = torch.arange(B, B + B * T, dtype=torch.int32, device=device).reshape(B, T)
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_indices=h0_idx,
+        ssm_state_indices=ssm_idx,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+
+    # Reference: contiguous pool → flat path
+    pool_ref = pool_contig_ref.clone()
+    gated_delta_rule_mtp(**common, initial_state_source=pool_ref)
+    torch.cuda.synchronize()
+
+    # Under test: padded pool → slot-slice fallback
+    pool_under_test = pool_padded.clone()
+    gated_delta_rule_mtp(**common, initial_state_source=pool_under_test)
+    torch.cuda.synchronize()
+
+    # Per-token scatter destinations must match between flat and fallback
+    # paths bit-exactly — they write the same h_{t+1} values.
+    for i in range(B):
+        for t in range(T):
+            slot = int(ssm_idx[i, t].item())
+            torch.testing.assert_close(
+                pool_under_test[slot].contiguous(),
+                pool_ref[slot],
+                atol=0,
+                rtol=0,
+                msg=f"padded-pool fallback diverged at (i={i}, t={t}, slot={slot})",
+            )
+
+
+@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("batch_size", [4, 16])
+def test_gdn_decode_bf16_state_fla_scatter_random_slots(
+    batch_size: int,
+    max_T: int,
+):
+    """FLA scatter with NON-CONTIGUOUS, scattered slot indices.
+
+    vLLM's free-list allocator can hand out scattered slots (not the
+    monotonic `arange(B, B+B*T)` pattern every other test uses). This
+    test feeds a random permutation of free slots to confirm the kernel
+    treats each `ssm_state_indices[i, t]` independently.
+    """
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    B, T = batch_size, max_T
+    H, HV, K, V = 16, 64, 128, 128
+
+    # Generous pool so we can scatter slots arbitrarily.
+    pool_size = max(64, B * (T + 1) * 2)
+    pool_init = (
+        torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16, device=device) * 0.1
+    )
+    h0_idx = torch.arange(B, dtype=torch.int32, device=device)
+
+    # Random permutation: pick B*T fresh slots (disjoint from h0_idx), shuffle.
+    free_slots = torch.randperm(pool_size - B, device=device)[: B * T] + B
+    ssm_idx = free_slots.to(torch.int32).reshape(B, T)
+    # Sanity: all distinct, all >= B, all < pool_size.
+    assert ssm_idx.unique().numel() == B * T
+    assert ssm_idx.min().item() >= B
+    assert ssm_idx.max().item() < pool_size
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    ibuf = torch.zeros(B, T, HV, V, K, dtype=torch.bfloat16, device=device)
+
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_indices=h0_idx,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+
+    # Dense reference (same input).
+    pool_dense = pool_init.clone()
+    gated_delta_rule_mtp(
+        **common, initial_state_source=pool_dense, intermediate_states_buffer=ibuf
+    )
+
+    # FLA with scattered slots.
+    pool_fla = pool_init.clone()
+    gated_delta_rule_mtp(
+        **common, initial_state_source=pool_fla, ssm_state_indices=ssm_idx
+    )
+    torch.cuda.synchronize()
+
+    # Each scattered slot must hold exactly h_{t+1} for its (i, t).
+    for i in range(B):
+        for t in range(T):
+            slot = int(ssm_idx[i, t].item())
+            diff = (pool_fla[slot].float() - ibuf[i, t].float()).abs().max().item()
+            assert diff == 0, (
+                f"scattered slot mismatch at (i={i}, t={t}, slot={slot}): {diff}"
+            )
+
+    # All unused slots (not h0_idx, not ssm_idx) must equal pool_init.
+    used = set(h0_idx.tolist()) | set(ssm_idx.flatten().tolist())
+    for s in range(pool_size):
+        if s in used:
+            continue
+        diff = (pool_fla[s] - pool_init[s]).abs().max().item()
+        assert diff == 0, f"unused slot {s} clobbered: {diff}"
+
+
+@pytest.mark.parametrize("max_T", [2, 4, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 128])
+def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
+    batch_size: int,
+    max_T: int,
+):
+    """FP32 FLA bit-equivalence with the dense `intermediate_states_buffer`
+    path. Exercises the Int64 widen on `fla_idx` — at B=128/T=8 the max
+    flat_idx is 73,727 which would overflow Int32 byte-addressing without
+    the widen (the smoke test that motivated the fix is now a regression
+    test).
+    """
+    from flashinfer.gdn_decode import gated_delta_rule_mtp as fp32_mtp
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, T = batch_size, max_T
+    H, HV, K, V = 16, 64, 128, 128
+
+    pool_size = B * (T + 1)
+    pool_init = (
+        torch.randn(pool_size, HV, V, K, dtype=torch.float32, device=device) * 0.1
+    )
+    h0_idx = torch.arange(B, dtype=torch.int32, device=device)
+    ssm_idx = torch.arange(B, B + B * T, dtype=torch.int32, device=device).reshape(B, T)
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+
+    common = dict(
+        q=q,
+        k=k,
+        v=v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state_indices=h0_idx,
+        scale=K**-0.5,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+    )
+
+    # Dense reference.
+    pool_dense = pool_init.clone()
+    ibuf = torch.zeros(B, T, HV, V, K, dtype=torch.float32, device=device)
+    fp32_mtp(**common, initial_state=pool_dense, intermediate_states_buffer=ibuf)
+
+    # FLA scatter.
+    pool_fla = pool_init.clone()
+    fp32_mtp(**common, initial_state=pool_fla, ssm_state_indices=ssm_idx)
+    torch.cuda.synchronize()
+
+    # Per-token states must match bit-exactly.
+    for i in range(B):
+        for t in range(T):
+            slot = int(ssm_idx[i, t].item())
+            diff = (pool_fla[slot].float() - ibuf[i, t].float()).abs().max().item()
+            assert diff == 0, (
+                f"FP32 FLA mismatch at (i={i}, t={t}, slot={slot}): {diff}"
+            )

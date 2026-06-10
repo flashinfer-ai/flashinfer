@@ -141,6 +141,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     disable_output: cutlass.Constexpr[bool],
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    per_token_pool_scatter_flat: cutlass.Constexpr[bool],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
@@ -682,21 +683,55 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
 
                 if cutlass.const_expr(per_token_pool_scatter):
                     # FLA-style per-token scatter: write h_{i_t+1} directly
-                    # to pool[ssm_state_indices[i_n, i_t]]. Slot is loaded
-                    # per-step via mul.wide.s32 (Int64) — same slot-slice
-                    # idiom used by the initial-state read at L353 and
-                    # introduced by commit bb2cb8ea. Caller pre-allocates
-                    # B*T fresh pool slots and passes them via
-                    # ssm_state_indices. Mutex with cache_intermediate_states
-                    # at the wrapper layer.
+                    # to pool[ssm_state_indices[i_n, i_t]]. Caller
+                    # pre-allocates B*T fresh pool slots and passes them
+                    # via ssm_state_indices. Mutex with
+                    # cache_intermediate_states at the wrapper layer.
                     pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                    h0_slot_t = h0_source[
-                        (cutlass.Int64(pool_slot_t), i_hv, None, None)
-                    ]
-                    ita = cute.local_tile(h0_slot_t, (1, vec_size), (va, lane_in_group))
-                    itb = cute.local_tile(h0_slot_t, (1, vec_size), (vb, lane_in_group))
-                    itc = cute.local_tile(h0_slot_t, (1, vec_size), (vc, lane_in_group))
-                    itd = cute.local_tile(h0_slot_t, (1, vec_size), (vd, lane_in_group))
+                    if cutlass.const_expr(per_token_pool_scatter_flat):
+                        # Fast path (contiguous h0_source): write through
+                        # the flat [pool*HV, V, K] `intermediate_states`
+                        # view set by the wrapper — same 3D structure as
+                        # cache mode. Int64 flat_idx for byte-offset
+                        # overflow safety (matches wide_vec FLA-flat).
+                        fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                        ita = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec_size),
+                            (fla_idx, va, lane_in_group),
+                        )
+                        itb = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec_size),
+                            (fla_idx, vb, lane_in_group),
+                        )
+                        itc = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec_size),
+                            (fla_idx, vc, lane_in_group),
+                        )
+                        itd = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec_size),
+                            (fla_idx, vd, lane_in_group),
+                        )
+                    else:
+                        # Slot-slice fallback (vLLM padded pool layout).
+                        h0_slot_t = h0_source[
+                            (cutlass.Int64(pool_slot_t), i_hv, None, None)
+                        ]
+                        ita = cute.local_tile(
+                            h0_slot_t, (1, vec_size), (va, lane_in_group)
+                        )
+                        itb = cute.local_tile(
+                            h0_slot_t, (1, vec_size), (vb, lane_in_group)
+                        )
+                        itc = cute.local_tile(
+                            h0_slot_t, (1, vec_size), (vc, lane_in_group)
+                        )
+                        itd = cute.local_tile(
+                            h0_slot_t, (1, vec_size), (vd, lane_in_group)
+                        )
                     cute.autovec_copy(r_hb4_0, ita)
                     cute.autovec_copy(r_hb4_1, itb)
                     cute.autovec_copy(r_hb4_2, itc)
@@ -832,6 +867,7 @@ def gdn_wide_vec_kernel(
     recovery_steps: cutlass.Constexpr[int],
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    per_token_pool_scatter_flat: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -1246,7 +1282,12 @@ def gdn_wide_vec_kernel(
             o2 = cutlass.Float32(0.0)
             o3 = cutlass.Float32(0.0)
             flat_idx = cutlass.Int32(0)
+            # FLA-flat predeclaration: Int64 so the Phase B loop's
+            # reassignment via Int64(pool_slot)*HV+i_hv keeps a consistent
+            # type. cute-DSL rejects type changes inside a dynamic for.
+            flat_idx_fla = cutlass.Int64(0)
             if cutlass.const_expr(cache_intermediate_states):
+                # Dense cache mode flat 3D writes.
                 it0 = cute.local_tile(
                     intermediate_states, (1, 1, vec), (flat_idx, v0, lane_in_group)
                 )
@@ -1259,14 +1300,30 @@ def gdn_wide_vec_kernel(
                 it3 = cute.local_tile(
                     intermediate_states, (1, 1, vec), (flat_idx, v3, lane_in_group)
                 )
+            elif cutlass.const_expr(
+                per_token_pool_scatter and per_token_pool_scatter_flat
+            ):
+                # FLA-flat: intermediate_states is a flat [pool*HV, V, K]
+                # view of h0_source (wrapper-reshaped). Same 3D write
+                # structure as cache mode, with Int64 flat_idx to handle
+                # pool_size*HV overflow at large B*T (see write site).
+                it0 = cute.local_tile(
+                    intermediate_states, (1, 1, vec), (flat_idx_fla, v0, lane_in_group)
+                )
+                it1 = cute.local_tile(
+                    intermediate_states, (1, 1, vec), (flat_idx_fla, v1, lane_in_group)
+                )
+                it2 = cute.local_tile(
+                    intermediate_states, (1, 1, vec), (flat_idx_fla, v2, lane_in_group)
+                )
+                it3 = cute.local_tile(
+                    intermediate_states, (1, 1, vec), (flat_idx_fla, v3, lane_in_group)
+                )
             elif cutlass.const_expr(per_token_pool_scatter):
-                # Pre-declare placeholder pool-slot views for FLA mode (slot 0).
-                # cute-dsl requires variables to be typed before any dynamic
-                # for-loop that re-assigns them. Phase B's per-token loop
-                # overwrites these with the real slot from
-                # ssm_state_indices[i_n, i_t] at each iteration. The shape
-                # differs from cache mode (2D vs 3D tile), but constexpr
-                # branches isolate the two specializations.
+                # Slot-slice fallback for vLLM padded pools (stride[0] >
+                # HV*V*K). 74 regs/thread. Pre-declare placeholder pool-slot
+                # views (slot 0) so cute-DSL has a type for it0..3 before
+                # Phase B's runtime loop reassigns them per token.
                 _ph_slot = cutlass.Int32(0)
                 _ph_slot_view = h0_source[(cutlass.Int64(_ph_slot), i_hv, None, None)]
                 it0 = cute.local_tile(_ph_slot_view, (1, vec), (v0, lane_in_group))
@@ -1723,18 +1780,59 @@ def gdn_wide_vec_kernel(
                 if cutlass.const_expr(per_token_pool_scatter):
                     # FLA-style per-token pool scatter: write h_{i_t+1}
                     # directly to pool[ssm_state_indices[i_n, i_t]].
-                    # Slot loaded per-step via mul.wide.s32 (Int64) — same
-                    # slot-slice idiom used by initial-state reads (commit
-                    # bb2cb8ea). Caller pre-allocates B*T fresh slots and
-                    # passes them via ssm_state_indices.
-                    pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                    h0_slot_t = h0_source[
-                        (cutlass.Int64(pool_slot_t), i_hv, None, None)
-                    ]
-                    it0 = cute.local_tile(h0_slot_t, (1, vec), (v0, lane_in_group))
-                    it1 = cute.local_tile(h0_slot_t, (1, vec), (v1, lane_in_group))
-                    it2 = cute.local_tile(h0_slot_t, (1, vec), (v2, lane_in_group))
-                    it3 = cute.local_tile(h0_slot_t, (1, vec), (v3, lane_in_group))
+                    # Caller pre-allocates B*T fresh slots and passes them
+                    # via ssm_state_indices.
+                    if cutlass.const_expr(per_token_pool_scatter_flat):
+                        # Fast path (contiguous h0_source): treat
+                        # intermediate_states (a flat [pool*HV, V, K] view
+                        # of h0_source set by the wrapper) the same way the
+                        # dense cache path does — single flat_idx, 3D
+                        # local_tile, identical SASS structure to dense.
+                        # 72 regs/thread, 7 CTAs/SM at small BS.
+                        #
+                        # Int64 widen on flat_idx: FLA flat_idx max =
+                        # (pool_size-1)*HV + (HV-1) = pool_size*HV - 1.
+                        # For pool_size = B*(T+1) at B=256/T=8 the max is
+                        # 147,455 — flat_idx * stride[0] (=V*K=16,384
+                        # BF16 elements) overflows Int32 at flat_idx ≥
+                        # 131,072. The Int64 widen ensures the multiply
+                        # uses mad.wide.u32 → u64. Same idiom as the
+                        # h0_slot_r read above (cache_idx → Int64).
+                        pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        flat_idx_fla = cutlass.Int64(pool_slot_t) * HV + i_hv
+                        it0 = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec),
+                            (flat_idx_fla, v0, lane_in_group),
+                        )
+                        it1 = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec),
+                            (flat_idx_fla, v1, lane_in_group),
+                        )
+                        it2 = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec),
+                            (flat_idx_fla, v2, lane_in_group),
+                        )
+                        it3 = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec),
+                            (flat_idx_fla, v3, lane_in_group),
+                        )
+                    else:
+                        # Slot-slice fallback (vLLM padded pool layout). The
+                        # 4D h0_source[slot, hv, V, K] index works even with
+                        # stride[0] > HV*V*K, at the cost of materializing
+                        # the per-iter Int64 slot byte pointer in 2 regs.
+                        pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                        h0_slot_t = h0_source[
+                            (cutlass.Int64(pool_slot_t), i_hv, None, None)
+                        ]
+                        it0 = cute.local_tile(h0_slot_t, (1, vec), (v0, lane_in_group))
+                        it1 = cute.local_tile(h0_slot_t, (1, vec), (v1, lane_in_group))
+                        it2 = cute.local_tile(h0_slot_t, (1, vec), (v2, lane_in_group))
+                        it3 = cute.local_tile(h0_slot_t, (1, vec), (v3, lane_in_group))
                     cute.autovec_copy(r_hb0, it0)
                     cute.autovec_copy(r_hb1, it1)
                     cute.autovec_copy(r_hb2, it2)
@@ -2333,6 +2431,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     disable_output: cutlass.Constexpr[bool],
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    per_token_pool_scatter_flat: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -2388,6 +2487,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         disable_output,
         per_request_accepted_steps,
         per_token_pool_scatter,
+        per_token_pool_scatter_flat,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -2436,6 +2536,7 @@ def _run_wide_vec(
     recovery_steps: cutlass.Constexpr[int],
     per_request_accepted_steps: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
+    per_token_pool_scatter_flat: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
@@ -2481,6 +2582,7 @@ def _run_wide_vec(
         recovery_steps,
         per_request_accepted_steps,
         per_token_pool_scatter,
+        per_token_pool_scatter_flat,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -2868,6 +2970,30 @@ def gated_delta_rule_mtp_wide_vec(
     # tests/gdn/test_decode_pretranspose_bf16_padded_pool.py and PR #3268.
     h0_source = initial_state_source
 
+    # FLA-flat fast path: when h0_source has the canonical contiguous
+    # [pool, HV, V, K] stride, reshape it to [pool*HV, V, K] and pass it
+    # as the kernel's `intermediate_states` arg. The kernel then writes
+    # FLA-mode per-token states via the SAME flat 3D pattern as the dense
+    # cache mode — single flat_idx fed to 3D `cute.local_tile`, with each
+    # store's address built fresh via mad.wide.u32 from the kernel-arg
+    # base in cmem. No per-iter Int64 byte pointer kept live across the
+    # 4 ILP V-row stores (that's what the 4D slot-slice path costs).
+    # Saves 2 regs/thread (74 → 72), recovering 7 CTAs/SM occupancy at
+    # small BS. The 4D slot-slice fallback below
+    # (per_token_pool_scatter_flat=False) handles padded pools (vLLM-style
+    # conv state co-allocated into each slot's stride).
+    canonical_pool_stride = (
+        HV_val * V_val * K_val,
+        V_val * K_val,
+        K_val,
+        1,
+    )
+    per_token_pool_scatter_flat = (
+        ssm_state_indices is not None
+        and intermediate_states_buffer is None
+        and tuple(int(s) for s in h0_source.stride()) == canonical_pool_stride
+    )
+
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
         # The cache buffer is BATCH-scoped: shape [B, T, HV, V, K]. The kernel
@@ -2889,6 +3015,11 @@ def gated_delta_rule_mtp_wide_vec(
             intermediate_states = intermediate_states.contiguous()
         # Skip the redundant final writeback when caching is on.
         effective_disable_final = True
+    elif per_token_pool_scatter_flat:
+        # Alias h0_source as a flat [pool*HV, V, K] BF16 view — same
+        # memory, FLA-mode writes land in the original pool slots.
+        intermediate_states = h0_source.reshape(-1, V_val, K_val)
+        effective_disable_final = disable_state_update
     else:
         intermediate_states = h0_source[:1, :1, :1]
         effective_disable_final = disable_state_update
@@ -2976,6 +3107,7 @@ def gated_delta_rule_mtp_wide_vec(
         recovery_steps,
         per_request_accepted_steps,
         per_token_pool_scatter,
+        per_token_pool_scatter_flat,
         # h0_source strides: padded pools (vLLM-style stride[0] > HV*V*K) must
         # compile as a separate specialization from tight pools. cute compiles
         # for a specific layout; reusing a tight-pool kernel on a padded pool
@@ -3064,6 +3196,7 @@ def gated_delta_rule_mtp_wide_vec(
                 recovery_steps,
                 per_request_accepted_steps,
                 per_token_pool_scatter,
+                per_token_pool_scatter_flat,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -3434,10 +3567,21 @@ def gated_delta_rule_mtp(
         )
         if not intermediate_states.is_contiguous():
             intermediate_states = intermediate_states.contiguous()
+        per_token_pool_scatter_flat = False
+    elif ssm_state_indices is not None and tuple(
+        int(s) for s in h0_source.stride()
+    ) == (HV * V * K, V * K, K, 1):
+        # FLA-flat fast path (mirrors wide_vec wrapper): when h0_source has
+        # canonical contiguous stride, alias it as a flat [pool*HV, V, K]
+        # view so the ILP4 kernel can write through the same 3D structure
+        # as cache mode (no Int64 byte ptr held cross-store).
+        intermediate_states = h0_source.reshape(-1, V, K)
+        per_token_pool_scatter_flat = True
     else:
         intermediate_states = h0_source[
             :1, :1, :1
         ]  # Reuse existing allocation as dummy
+        per_token_pool_scatter_flat = False
 
     # FLA-style per-token pool scatter (vLLM API compat).
     # When `ssm_state_indices` is provided, the kernel writes h_{t+1} directly
@@ -3572,6 +3716,7 @@ def gated_delta_rule_mtp(
         disable_output,
         per_request_accepted_steps,
         per_token_pool_scatter,
+        per_token_pool_scatter_flat,
         # h0_source strides: see gated_delta_rule_mtp_wide_vec for rationale.
         tuple(int(s) for s in initial_state_source.stride()),
     )
@@ -3647,6 +3792,7 @@ def gated_delta_rule_mtp(
                 disable_output,
                 per_request_accepted_steps,
                 per_token_pool_scatter,
+                per_token_pool_scatter_flat,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),

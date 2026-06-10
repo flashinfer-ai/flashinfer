@@ -1169,6 +1169,7 @@ def bench_gdn_mtp(
     disable_state_update: bool = True,
     warmup_iters: int = 10,
     bench_iters: int = 100,
+    ssm_state_indices_mode: str = "none",
 ):
     """Benchmark GDN MTP kernel using bench_gpu_time with CUPTI."""
     num_o_heads = max(num_q_heads, num_v_heads)
@@ -1194,8 +1195,23 @@ def bench_gdn_mtp(
         else torch.zeros(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
     )
 
+    # FLA-style per-token pool scatter (vLLM API compat).
+    assert ssm_state_indices_mode in ("none", "unique"), (
+        f"ssm_state_indices_mode must be 'none' or 'unique', got "
+        f"{ssm_state_indices_mode!r}"
+    )
+    fla_scatter = ssm_state_indices_mode != "none"
+    if fla_scatter:
+        assert T >= 2, f"--ssm-state-indices requires seq_len>=2, got T={T}"
+        assert not cache_intermediate_states, (
+            "--ssm-state-indices is mutex with --cache (no intermediate buffer)"
+        )
+
     # Initial state: [pool_size, HV, V, K] (K-last layout for MTP)
-    pool_size = batch_size
+    # FLA scatter needs an extra B*T slots for the per-token scatter destinations.
+    base_pool_size = batch_size
+    fla_extra_slots = batch_size * T if fla_scatter else 0
+    pool_size = base_pool_size + fla_extra_slots
     initial_state = torch.randn(
         pool_size,
         num_sab_heads,
@@ -1205,6 +1221,16 @@ def bench_gdn_mtp(
         device="cuda",
     )
     initial_state_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+
+    # FLA-style scatter destinations: B*T fresh slots at the tail of the pool.
+    ssm_state_indices_tensor = None
+    if fla_scatter:
+        ssm_state_indices_tensor = torch.arange(
+            base_pool_size,
+            base_pool_size + batch_size * T,
+            dtype=torch.int32,
+            device="cuda",
+        ).reshape(batch_size, T)
 
     # Intermediate states buffer (optional)
     if cache_intermediate_states:
@@ -1243,6 +1269,7 @@ def bench_gdn_mtp(
             scale,
             output,
             intermediate_states_buffer,
+            ssm_state_indices=ssm_state_indices_tensor,
             disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
         ),
@@ -2635,6 +2662,9 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
                         disable_state_update=not args.update_state,
                         warmup_iters=args.warmup,
                         bench_iters=args.iters,
+                        ssm_state_indices_mode=getattr(
+                            args, "ssm_state_indices", "none"
+                        ),
                     )
 
                     kernel_time_us = result["kernel_median_us"]
