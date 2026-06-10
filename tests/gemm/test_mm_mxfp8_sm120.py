@@ -1,4 +1,4 @@
-"""Tests for SM120 MXFP8 GEMM (issue #2728)."""
+"""Tests for SM120/SM121 MXFP8 GEMM."""
 
 import pytest
 import torch
@@ -121,3 +121,41 @@ def test_mm_mxfp8_sm120_rejects_linear_scales():
         mm_mxfp8(
             a_fp8, b_fp8.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="cutlass"
         )
+
+
+def test_probe_mxfp8_gemm_tactics_sm12x():
+    """_probe_mxfp8_gemm_tactics returns only device-compatible tactics.
+
+    SM120 (B100/B200, ~256 KB smem/SM) should support all 10 tactics.
+    SM121 (GB10/DGX Spark, ~99 KB smem/SM opt-in) should support only
+    tactics 0-5 (small CTA tiles); tactics 6-9 (256x128, 128x256) need
+    ~99 KB with StageCount<2> and fail on SM121.
+    """
+    _skip_if_not_sm120()
+
+    from flashinfer.gemm.gemm_base import _probe_mxfp8_gemm_tactics
+    from flashinfer.jit.gemm.core import gen_gemm_sm120_module_cutlass_mxfp8
+
+    raw_module = gen_gemm_sm120_module_cutlass_mxfp8().build_and_load()
+    valid = _probe_mxfp8_gemm_tactics(raw_module)
+
+    # At least the three small-tile configs (128x32, 128x64, 128x128) × 2 variants
+    # must be supported on any SM12x device.
+    assert len(valid) >= 6, f"Expected at least 6 valid tactics, got {len(valid)}: {valid}"
+
+    # All returned tactics must be within range.
+    total = raw_module.mxfp8_gemm_tactic_num()
+    assert all(0 <= t < total for t in valid), f"Out-of-range tactic in {valid}"
+
+    # Device-specific expectations.
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc == (12, 1):
+        # SM121: large tiles (tactics 6-9) should not be valid.
+        assert 6 not in valid, "Tactic 6 (256x128 bf16) should not work on SM121"
+        assert 7 not in valid, "Tactic 7 (256x128 half) should not work on SM121"
+        assert 8 not in valid, "Tactic 8 (128x256 bf16) should not work on SM121"
+        assert 9 not in valid, "Tactic 9 (128x256 half) should not work on SM121"
+        assert valid == list(range(6)), f"SM121 expected tactics [0..5], got {valid}"
+    elif cc == (12, 0):
+        # SM120 data-centre: all 10 tactics should be valid.
+        assert valid == list(range(10)), f"SM120 expected all 10 tactics, got {valid}"

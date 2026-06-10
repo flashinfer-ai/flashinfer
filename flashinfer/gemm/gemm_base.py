@@ -15,9 +15,12 @@ limitations under the License.
 """
 
 import functools
+import logging
 from enum import Enum
 from types import SimpleNamespace
 from typing import List, Literal, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -4002,8 +4005,67 @@ def mm_fp8(
     return out
 
 
+def _probe_mxfp8_gemm_tactics(module) -> List[int]:
+    """Probe which CUTLASS MXFP8 GEMM tactics can initialize on the current device.
+
+    SM120 (B100/B200 data-centre, ~256 KB shared memory/SM) and SM121 (GB10 /
+    DGX Spark GeForce Blackwell, ~99 KB shared memory/SM opt-in) share the same
+    compiled module.  Large CTA tiles — 256×128 and 128×256 — are compiled with
+    ``StageCount<2>``, which requires ~99 KB of shared memory.  On SM121 this is
+    at or beyond the per-block opt-in limit (``cudaDevAttrMaxSharedMemoryPerBlockOptin
+    ≈ 101376 bytes``), so the CUTLASS ``initialize()`` call returns
+    ``kErrorInternal`` for those tactics.
+
+    Rather than letting the autotuner discover this noisily (and log confusing
+    "[MXFP8 SM120 gemm Runner] Failed to initialize …" messages), we pre-filter
+    here with a device-capability probe so the autotuner only sees tactics that
+    will actually succeed on this GPU.
+
+    The probe uses square M = N = K = 128 tensors; initialization failure is
+    shape-independent (it depends only on CTA tile size and device smem capacity),
+    so any valid shapes reach the same CUTLASS ``initialize()`` decision.
+    """
+    dev = "cuda"
+
+    def _pad_up(x: int, m: int) -> int:
+        return ((x + m - 1) // m) * m
+
+    M = N = K = 128
+    sf_vec = 32
+    k_scales = (K + sf_vec - 1) // sf_vec
+
+    a = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=dev)
+    # b as [N, K] contiguous – the C++ binding expects mat2 with shape [N, K].
+    b = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=dev)
+    sfa = torch.zeros(_pad_up(M, 128) * _pad_up(k_scales, 4), dtype=torch.uint8, device=dev)
+    sfb = torch.zeros(_pad_up(N, 128) * _pad_up(k_scales, 4), dtype=torch.uint8, device=dev)
+    out = torch.zeros(M, N, dtype=torch.bfloat16, device=dev)
+    ws = torch.zeros(8 * 1024 * 1024, dtype=torch.uint8, device=dev)
+
+    valid: List[int] = []
+    for t in range(module.mxfp8_gemm_tactic_num()):
+        try:
+            module.mxfp8_gemm(a, b, sfa, sfb, out, ws, t)
+            valid.append(t)
+        except RuntimeError:
+            device_name = torch.cuda.get_device_properties(0).name
+            logger.debug(
+                "mxfp8_gemm tactic %d cannot initialize on %s; skipping. "
+                "(Tip: SM121 GB10/DGX Spark has ~99 KB shared memory opt-in per SM; "
+                "256×128 and 128×256 CTA tiles require ~99 KB with StageCount<2> "
+                "and may fail on that device.)",
+                t,
+                device_name,
+            )
+    return valid
+
+
 def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
     """Helper function to create cutlass MXFP8 GEMM module."""
+
+    # One-time probe: cache valid tactics at closure scope so all runner
+    # instances for this module share the result without re-probing.
+    _valid_tactics_cache: List[int] = []
 
     def cutlass_mxfp8_gemm_runner():
         class CutlassMxfp8GemmRunner(TunableRunner):
@@ -4012,7 +4074,9 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                return list(range(module.mxfp8_gemm_tactic_num()))
+                if not _valid_tactics_cache:
+                    _valid_tactics_cache.extend(_probe_mxfp8_gemm_tactics(module))
+                return list(_valid_tactics_cache)
 
             def forward(
                 self,
