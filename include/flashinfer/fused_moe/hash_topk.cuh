@@ -25,10 +25,14 @@
  * \file hash_topk.cuh
  * \brief DSv4 hash-based MoE expert routing.
  *
- * Ported from SGLang's `deepseek_v4/hash_topk.cuh`. DSv4-Pro hash-MoE layers
- * select experts from a precomputed token-to-expert table (`tid2eid`) rather
- * than running a dynamic top-k, so routing is an O(1) table lookup plus a
- * sqrt-softplus score normalization. One warp processes one token.
+ * Ported from SGLang (Apache-2.0):
+ *   sgl-project/sglang
+ *   python/sglang/jit_kernel/csrc/deepseek_v4/hash_topk.cuh
+ *
+ * DSv4-Pro hash-MoE layers select experts from a precomputed token-to-expert
+ * table (`tid2eid`) rather than running a dynamic top-k, so routing is an O(1)
+ * table lookup plus a sqrt-softplus score normalization. One warp processes one
+ * token.
  *
  * This header is framework-agnostic (raw pointers only). The launcher path from
  * PyTorch tensors lives in `csrc/fused_moe/hash_topk.cu`.
