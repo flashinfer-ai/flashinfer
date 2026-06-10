@@ -91,6 +91,7 @@ from .dsv3_optimizations import (
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
+from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (
     gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
 )
