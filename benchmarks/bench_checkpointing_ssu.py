@@ -46,11 +46,12 @@ Example usage:
 
 import argparse
 import bisect
+import contextlib
 import os
 import re
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -81,6 +82,14 @@ from flashinfer.mamba import selective_state_update as flashinfer_selective_stat
 from flashinfer.mamba.checkpointing_ssu import (
     checkpointing_ssu as cuda_checkpointing_ssu,
 )
+
+# Optional conv1d import for combined (conv1d + SSU) timing.
+# Standalone copy lives in tests/mamba/triton_reference/ (stripped of TRT-LLM deps).
+_causal_conv1d_update = None
+with contextlib.suppress(Exception):
+    from triton_reference.causal_conv1d_triton import (
+        causal_conv1d_update as _causal_conv1d_update,
+    )
 
 # ---------------------------------------------------------------------------
 # Model config defaults (Nemotron-3-Super-120B full model)
@@ -291,6 +300,26 @@ def _build_tensors(
         batch, mtp_len, nheads, head_dim, d_state, device=device, dtype=state_dtype
     )
 
+    # --- Conv1d tensors ---
+    d_inner = nheads * head_dim
+    conv_dim = d_inner + 2 * ngroups * d_state
+    d_conv = 4  # conv kernel width for Nemotron/Mamba2
+
+    # xbc_input: (batch, conv_dim, mtp_len) — match production layout from in_proj
+    # Production: in_proj output is (batch*mtp_len, conv_dim) contiguous, then
+    # .view(batch, mtp_len, conv_dim).transpose(1, 2) gives strides
+    # (mtp_len*conv_dim, 1, conv_dim) — NOT standard 3D allocation.
+    xbc_input_flat = torch.randn(
+        batch * mtp_len, conv_dim, device=device, dtype=act_dtype
+    )
+    xbc_input = xbc_input_flat.view(batch, mtp_len, conv_dim).transpose(1, 2)
+    # conv_state: (batch, conv_dim, d_conv) — "cold" cache
+    conv_state = torch.randn(batch, conv_dim, d_conv, device=device, dtype=act_dtype)
+    # conv_weight: (conv_dim, d_conv) — parameter
+    conv_weight = torch.randn(conv_dim, d_conv, device=device, dtype=act_dtype)
+    # conv_bias: (conv_dim,) — parameter
+    conv_bias = torch.randn(conv_dim, device=device, dtype=act_dtype)
+
     return (
         state0,
         state_scale,
@@ -311,6 +340,10 @@ def _build_tensors(
         out_incr,
         out_base,
         intermediate_states_buffer,
+        xbc_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
     )
 
 
@@ -423,6 +456,20 @@ class KernelInputs:
     mtp_len: int
     max_window: int
 
+    # Conv1d tensors (for --with-conv1d combined timing)
+    xbc_input0: torch.Tensor | None = None  # (batch, conv_dim, mtp_len) pristine
+    xbc_input_work: torch.Tensor | None = (
+        None  # (batch, conv_dim, mtp_len) working copy
+    )
+    conv_state0: torch.Tensor | None = None  # (batch, conv_dim, d_conv) pristine
+    conv_state_work: torch.Tensor | None = (
+        None  # (batch, conv_dim, d_conv) working copy
+    )
+    conv_weight: torch.Tensor | None = None  # (conv_dim, d_conv) — parameter
+    conv_bias: torch.Tensor | None = None  # (conv_dim,) — parameter
+    d_inner: int = 0  # nheads * head_dim
+    conv_dim: int = 0  # d_inner + 2 * ngroups * d_state
+
     def reset(self) -> None:
         """Restore ``*_work`` tensors to their pristine state."""
         self.state_work.copy_(self.state0)
@@ -435,6 +482,32 @@ class KernelInputs:
         self.old_dt_work.copy_(self.old_dt0)
         self.old_cumAdt_work.copy_(self.old_cumAdt0)
         self.cache_buf_idx_work.copy_(self.cache_buf_idx0)
+
+    def reset_with_conv1d(self) -> None:
+        """Realistic reset for conv1d + SSU combined timing.
+
+        Production pipeline: cold cache → L2 flush → hot in_proj output.
+        1. Restore cold state (cache tensors, SSM state)
+        2. L2 flush (evicts cold state from cache)
+        3. Write hot xbc_input (simulates in_proj output landing in L2)
+        """
+        # 1. Cold state reset
+        self.state_work.copy_(self.state0)
+        if self.state_scale_work is not None:
+            self.state_scale_work.copy_(self.state_scale0)
+        self.interm_work.copy_(self.intermediate_update_inputs)
+        self.old_x_work.copy_(self.old_x0)
+        self.old_x_work_5d.copy_(self.old_x0_5d)
+        self.old_B_work.copy_(self.old_B0)
+        self.old_dt_work.copy_(self.old_dt0)
+        self.old_cumAdt_work.copy_(self.old_cumAdt0)
+        self.cache_buf_idx_work.copy_(self.cache_buf_idx0)
+        self.conv_state_work.copy_(self.conv_state0)
+        # 2. L2 flush
+        if _l2_flush is not None:
+            _l2_flush.fill_(0.0)
+        # 3. Hot in_proj output
+        self.xbc_input_work.copy_(self.xbc_input0)
 
 
 def _old_x_to_5d(old_x_4d: torch.Tensor, cache_buf_idx: torch.Tensor) -> torch.Tensor:
@@ -504,6 +577,10 @@ def build_kernel_inputs(
         out_incr,
         out_base,
         intermediate_states_buffer,
+        xbc_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
     ) = _build_tensors(
         batch,
         mtp_len,
@@ -516,6 +593,8 @@ def build_kernel_inputs(
         ngroups,
     )
     old_x0_5d = _old_x_to_5d(old_x0, cache_buf_idx0)
+    d_inner = nheads * head_dim
+    _conv_dim = d_inner + 2 * ngroups * d_state
     return KernelInputs(
         state0=state0,
         state_scale0=state_scale0,
@@ -549,6 +628,14 @@ def build_kernel_inputs(
         batch=batch,
         mtp_len=mtp_len,
         max_window=max_window,
+        xbc_input0=xbc_input,
+        xbc_input_work=xbc_input.clone(),
+        conv_state0=conv_state,
+        conv_state_work=conv_state.clone(),
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        d_inner=d_inner,
+        conv_dim=_conv_dim,
     )
 
 
@@ -607,6 +694,71 @@ def time_kernel(
     return _time_kernel(timing, run_fn, inputs.reset, tag)
 
 
+def time_kernel_with_conv1d(
+    *,
+    kernel: KernelName,
+    inputs: KernelInputs,
+    prev_tokens: torch.Tensor,
+    timing: TimingOptions | None = None,
+    tag: str = "",
+    philox_rounds: int = 0,
+    rand_seed: torch.Tensor | None = None,
+    autotune: TritonAutotune | None = None,
+    external_pdl: bool = True,
+) -> tuple[float, float, float]:
+    """Time conv1d + kernel combined, measuring total span.
+
+    Same as time_kernel but prepends causal_conv1d_update and uses the
+    realistic reset (cold cache → L2 flush → hot xbc_input).
+    Captures PDL overlap between conv1d and SSU.
+    """
+    if _causal_conv1d_update is None:
+        raise RuntimeError(
+            "causal_conv1d_update not available — import from "
+            "tests/mamba/triton_reference/causal_conv1d_triton.py failed"
+        )
+    if timing is None:
+        timing = TimingOptions()
+    if autotune is None:
+        autotune = TritonAutotune()
+
+    assert inputs.xbc_input_work is not None, (
+        "conv1d tensors not allocated in KernelInputs"
+    )
+    assert prev_tokens.device.type == "cuda", (
+        f"prev_tokens must be on CUDA, got {prev_tokens.device}"
+    )
+    assert prev_tokens.shape == (inputs.batch,), (
+        f"prev_tokens shape mismatch: got {tuple(prev_tokens.shape)}, "
+        f"expected ({inputs.batch},)"
+    )
+    pt_max = int(prev_tokens.max().item()) if prev_tokens.numel() > 0 else 0
+    pt_min = int(prev_tokens.min().item()) if prev_tokens.numel() > 0 else 0
+    assert pt_min >= 0 and pt_max <= inputs.max_window, (
+        f"prev_tokens values must be in [0, max_window={inputs.max_window}]; "
+        f"got [{pt_min}, {pt_max}]"
+    )
+    assert prev_tokens.dtype == torch.int32, (
+        f"prev_tokens dtype must be int32, got {prev_tokens.dtype}"
+    )
+    inputs.prev_tokens_i32.copy_(prev_tokens)
+
+    run_fn = _make_run_closure(
+        kernel=kernel,
+        inputs=inputs,
+        philox_rounds=philox_rounds,
+        rand_seed=rand_seed,
+        autotune=autotune,
+        with_conv1d=True,
+        external_pdl=external_pdl,
+    )
+    # Disable the timing loop's own L2 flush — reset_with_conv1d already
+    # does a realistic flush (cold state → L2 evict → hot xbc_input write).
+    # Double-flushing would distort timings.
+    timing_no_flush = replace(timing, l2_flush=False)
+    return _time_kernel(timing_no_flush, run_fn, inputs.reset_with_conv1d, tag)
+
+
 def _make_run_closure(
     *,
     kernel: KernelName,
@@ -614,36 +766,108 @@ def _make_run_closure(
     philox_rounds: int,
     rand_seed: torch.Tensor | None,
     autotune: TritonAutotune,
+    with_conv1d: bool = False,
+    external_pdl: bool = True,
 ) -> Callable[[], None]:
-    """Build the per-iteration kernel invocation closure for ``time_kernel``."""
+    """Build the per-iteration kernel invocation closure for ``time_kernel``.
+
+    When *with_conv1d* is True the closure prepends a causal_conv1d_update
+    call and feeds the conv1d outputs (x, B, C views) directly to the SSU
+    kernel — matching the production pipeline where conv1d and SSU overlap
+    on the GPU via PDL.
+    """
     mtp_len = inputs.mtp_len
     max_window = inputs.max_window
 
-    if kernel == "cuda-incr":
+    # --- Conv1d split helper (used when with_conv1d=True) ---
+    if with_conv1d:
+        assert _causal_conv1d_update is not None, (
+            "causal_conv1d_update not available — import from "
+            "tests/mamba/triton_reference/causal_conv1d_triton.py failed"
+        )
+        assert inputs.xbc_input_work is not None, (
+            "conv1d tensors not allocated in KernelInputs"
+        )
+        batch = inputs.batch
+        d_inner = inputs.d_inner
+        conv_dim = inputs.conv_dim
+        nheads = inputs.x.shape[2]  # from x: (batch, mtp_len, nheads, head_dim)
+        head_dim = inputs.x.shape[3]
+        ngroups = inputs.B.shape[2]  # from B: (batch, mtp_len, ngroups, d_state)
+        d_state = inputs.B.shape[3]
 
-        def _run():
-            cuda_checkpointing_ssu(
-                inputs.state_work,
-                inputs.old_x_work,
-                inputs.old_B_work,
-                inputs.old_dt_work,
-                inputs.old_cumAdt_work,
-                inputs.cache_buf_idx_work,
-                inputs.prev_tokens_i32,
-                x=inputs.x,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
-                out=inputs.out_incr,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                state_batch_indices=None,
-                state_scale=inputs.state_scale_work,
-                rand_seed=rand_seed,
-                philox_rounds=philox_rounds,
+        def _conv1d_split():
+            """Run conv1d update and split output into (x, B, C) views."""
+            xbc_result = _causal_conv1d_update(
+                inputs.xbc_input_work,
+                inputs.conv_state_work,
+                inputs.conv_weight,
+                inputs.conv_bias,
+                activation="silu",
+                launch_dependent_kernels=external_pdl,
             )
+            xbc_flat = xbc_result.transpose(1, 2).reshape(batch * mtp_len, conv_dim)
+            x_flat, B_flat, C_flat = torch.split(
+                xbc_flat, [d_inner, ngroups * d_state, ngroups * d_state], dim=-1
+            )
+            x_conv = x_flat.view(batch, mtp_len, nheads, head_dim)
+            B_conv = B_flat.view(batch, mtp_len, ngroups, d_state)
+            C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
+            return x_conv, B_conv, C_conv
+
+    if kernel == "cuda-incr":
+        if with_conv1d:
+
+            def _run():
+                x_conv, B_conv, C_conv = _conv1d_split()
+                cuda_checkpointing_ssu(
+                    inputs.state_work,
+                    inputs.old_x_work,
+                    inputs.old_B_work,
+                    inputs.old_dt_work,
+                    inputs.old_cumAdt_work,
+                    inputs.cache_buf_idx_work,
+                    inputs.prev_tokens_i32,
+                    x=x_conv,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=B_conv,
+                    C=C_conv,
+                    out=inputs.out_incr,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=None,
+                    state_scale=inputs.state_scale_work,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                    enable_pdl=external_pdl,
+                )
+        else:
+
+            def _run():
+                cuda_checkpointing_ssu(
+                    inputs.state_work,
+                    inputs.old_x_work,
+                    inputs.old_B_work,
+                    inputs.old_dt_work,
+                    inputs.old_cumAdt_work,
+                    inputs.cache_buf_idx_work,
+                    inputs.prev_tokens_i32,
+                    x=inputs.x,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=inputs.B,
+                    C=inputs.C,
+                    out=inputs.out_incr,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=None,
+                    state_scale=inputs.state_scale_work,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                )
 
         return _run
 
@@ -669,32 +893,64 @@ def _make_run_closure(
             inputs.batch,
         )
 
-        def _run():
-            replay_selective_state_update(
-                inputs.state_work,
-                inputs.old_x_work_5d,
-                inputs.old_B_work,
-                inputs.old_dt_work,
-                inputs.old_cumAdt_work,
-                inputs.cache_buf_idx_work,
-                inputs.prev_tokens_i32,
-                x=inputs.x,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
-                out=inputs.out_incr,
-                n_writes=n_writes,
-                replay_work_items=replay_work_items,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                state_batch_indices=None,
-                rand_seed=rand_seed,
-                philox_rounds=philox_rounds,
-                state_scales=inputs.state_scale_work,
-                mode=replay_mode,
-            )
+        if with_conv1d:
+
+            def _run():
+                x_conv, B_conv, C_conv = _conv1d_split()
+                replay_selective_state_update(
+                    inputs.state_work,
+                    inputs.old_x_work_5d,
+                    inputs.old_B_work,
+                    inputs.old_dt_work,
+                    inputs.old_cumAdt_work,
+                    inputs.cache_buf_idx_work,
+                    inputs.prev_tokens_i32,
+                    x=x_conv,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=B_conv,
+                    C=C_conv,
+                    out=inputs.out_incr,
+                    n_writes=n_writes,
+                    replay_work_items=replay_work_items,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=None,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                    state_scales=inputs.state_scale_work,
+                    mode=replay_mode,
+                    launch_with_pdl=external_pdl,
+                )
+        else:
+
+            def _run():
+                replay_selective_state_update(
+                    inputs.state_work,
+                    inputs.old_x_work_5d,
+                    inputs.old_B_work,
+                    inputs.old_dt_work,
+                    inputs.old_cumAdt_work,
+                    inputs.cache_buf_idx_work,
+                    inputs.prev_tokens_i32,
+                    x=inputs.x,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=inputs.B,
+                    C=inputs.C,
+                    out=inputs.out_incr,
+                    n_writes=n_writes,
+                    replay_work_items=replay_work_items,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=None,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                    state_scales=inputs.state_scale_work,
+                    mode=replay_mode,
+                )
 
         return _run
 
@@ -722,7 +978,7 @@ def _make_run_closure(
         else:
             launches = [False, True]
 
-        def _one_launch(wc: bool):
+        def _one_launch(wc: bool, x_call, B_call, C_call, _launch_with_pdl=False):
             checkpointing_state_update(
                 inputs.state_work,
                 inputs.old_x_work,
@@ -731,11 +987,11 @@ def _make_run_closure(
                 inputs.old_cumAdt_work,
                 inputs.cache_buf_idx_work,
                 inputs.prev_tokens_i32,
-                x=inputs.x,
+                x=x_call,
                 dt=inputs.dt,
                 A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
+                B=B_call,
+                C=C_call,
                 out=inputs.out_incr,
                 D=inputs.D,
                 dt_bias=inputs.dt_bias,
@@ -746,6 +1002,7 @@ def _make_run_closure(
                 philox_rounds=philox_rounds,
                 state_scales=inputs.state_scale_work,
                 write_checkpoint=wc,
+                launch_with_pdl=_launch_with_pdl,
                 _block_size_m=autotune.block_size_m,
                 _num_warps=autotune.num_warps,
                 _num_stages=autotune.num_stages,
@@ -753,9 +1010,19 @@ def _make_run_closure(
                 _precompute_num_stages=autotune.precompute_num_stages,
             )
 
-        def _run(_launches=tuple(launches)):
-            for wc in _launches:
-                _one_launch(wc)
+        if with_conv1d:
+
+            def _run(_launches=tuple(launches)):
+                x_conv, B_conv, C_conv = _conv1d_split()
+                for wc in _launches:
+                    _one_launch(
+                        wc, x_conv, B_conv, C_conv, _launch_with_pdl=external_pdl
+                    )
+        else:
+
+            def _run(_launches=tuple(launches)):
+                for wc in _launches:
+                    _one_launch(wc, inputs.x, inputs.B, inputs.C)
 
         return _run
 
@@ -773,25 +1040,49 @@ def _make_run_closure(
         row_ix = torch.arange(inputs.batch, dtype=torch.int64, device="cuda")
         dst_indices[row_ix, last_pos.to(torch.int64)] = sbi
 
-        def _run():
-            flashinfer_selective_state_update(
-                state=inputs.state_work,
-                x=inputs.x,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                state_batch_indices=sbi,
-                dst_state_batch_indices=dst_indices,
-                pad_slot_id=-1,
-                state_scale=inputs.state_scale_work,
-                out=out_dump,
-                cache_steps=mtp_len,
-                algorithm="simple",
-            )
+        if with_conv1d:
+
+            def _run():
+                x_conv, B_conv, C_conv = _conv1d_split()
+                flashinfer_selective_state_update(
+                    state=inputs.state_work,
+                    x=x_conv,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=B_conv,
+                    C=C_conv,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=sbi,
+                    dst_state_batch_indices=dst_indices,
+                    pad_slot_id=-1,
+                    state_scale=inputs.state_scale_work,
+                    out=out_dump,
+                    cache_steps=mtp_len,
+                    algorithm="simple",
+                )
+        else:
+
+            def _run():
+                flashinfer_selective_state_update(
+                    state=inputs.state_work,
+                    x=inputs.x,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=inputs.B,
+                    C=inputs.C,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=sbi,
+                    dst_state_batch_indices=dst_indices,
+                    pad_slot_id=-1,
+                    state_scale=inputs.state_scale_work,
+                    out=out_dump,
+                    cache_steps=mtp_len,
+                    algorithm="simple",
+                )
 
         return _run
 
@@ -802,26 +1093,51 @@ def _make_run_closure(
         else:
             baseline_fn = selective_state_update
 
-        def _run():
-            extra = {"algorithm": "simple"} if is_fi else {}
-            if inputs.state_scale_work is not None:
-                extra["state_scale"] = inputs.state_scale_work
-            baseline_fn(
-                inputs.state_work,
-                x=inputs.x,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                out=inputs.out_base,
-                disable_state_update=True,
-                intermediate_states_buffer=inputs.intermediate_states_buffer,
-                cache_steps=mtp_len,
-                **extra,
-            )
+        if with_conv1d:
+
+            def _run():
+                x_conv, B_conv, C_conv = _conv1d_split()
+                extra = {"algorithm": "simple"} if is_fi else {}
+                if inputs.state_scale_work is not None:
+                    extra["state_scale"] = inputs.state_scale_work
+                baseline_fn(
+                    inputs.state_work,
+                    x=x_conv,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=B_conv,
+                    C=C_conv,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    out=inputs.out_base,
+                    disable_state_update=True,
+                    intermediate_states_buffer=inputs.intermediate_states_buffer,
+                    cache_steps=mtp_len,
+                    **extra,
+                )
+        else:
+
+            def _run():
+                extra = {"algorithm": "simple"} if is_fi else {}
+                if inputs.state_scale_work is not None:
+                    extra["state_scale"] = inputs.state_scale_work
+                baseline_fn(
+                    inputs.state_work,
+                    x=inputs.x,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=inputs.B,
+                    C=inputs.C,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    out=inputs.out_base,
+                    disable_state_update=True,
+                    intermediate_states_buffer=inputs.intermediate_states_buffer,
+                    cache_steps=mtp_len,
+                    **extra,
+                )
 
         return _run
 
@@ -958,7 +1274,12 @@ def _time_kernel_cupti(
                 cupti.ActivityKind.MEMCPY,
                 cupti.ActivityKind.MEMSET,
             ):
-                kernels.append((a.start, a.end, a.correlation_id))
+                # `name` is only present on CONCURRENT_KERNEL activities;
+                # MEMCPY/MEMSET have no kernel name (guard avoids attr error).
+                name = (
+                    a.name if a.kind == cupti.ActivityKind.CONCURRENT_KERNEL else None
+                )
+                kernels.append((a.start, a.end, a.correlation_id, name))
             elif a.kind in (cupti.ActivityKind.RUNTIME, cupti.ActivityKind.DRIVER):
                 launches.append((a.start, a.end, a.correlation_id))
 
@@ -1045,6 +1366,19 @@ def _time_kernel_cupti(
         min_start = min(k[0] for k in iter_kernels)
         max_end = max(k[1] for k in iter_kernels)
         latencies_us.append((max_end - min_start) / 1e3)  # ns → µs
+
+        if os.environ.get("SSU_CUPTI_DEBUG") and idx == 0:
+            print(
+                f"\n[CUPTI-DEBUG] tag={tag} iter={idx} n_kernels={len(iter_kernels)}",
+                file=sys.stderr,
+            )
+            for k in sorted(iter_kernels, key=lambda r: r[0]):
+                nm = k[3] if len(k) > 3 and k[3] is not None else "<memcpy/memset>"
+                print(
+                    f"  start={(k[0] - min_start) / 1e3:8.3f}  "
+                    f"end={(k[1] - min_start) / 1e3:8.3f} µs  {nm}",
+                    file=sys.stderr,
+                )
 
     return _compute_stats(latencies_us)
 

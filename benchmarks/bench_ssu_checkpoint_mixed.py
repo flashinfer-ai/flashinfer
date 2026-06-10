@@ -34,6 +34,10 @@ Usage
   python benchmarks/bench_ssu_checkpoint_mixed.py \\
       --al-csv benchmarks/histogram_T6.csv --batch-sizes 64
 
+  # With conv1d (measures total span: conv1d + SSU, captures PDL overlap)
+  python benchmarks/bench_ssu_checkpoint_mixed.py \\
+      --al-csv benchmarks/histogram_T6.csv --batch-sizes 64 --with-conv1d
+
   # Plot only from existing CSV
   python benchmarks/bench_ssu_checkpoint_mixed.py \\
       --plot-only benchmarks/img/ssu_checkpoint_mixed_b64.csv
@@ -293,6 +297,9 @@ def run_in_process_bench(
     d_state: int,
     ngroups: int,
     act_dtype: torch.dtype = torch.bfloat16,
+    with_conv1d: bool = False,
+    external_pdl: bool = True,
+    cuda_graph: bool = True,
 ) -> tuple[list[dict], dict]:
     """Collect rows for one full sweep.  Returns ``(rows, meta)``.
 
@@ -300,6 +307,11 @@ def run_in_process_bench(
     plain dtype name (e.g. ``"e4m3"``) for philox_rounds=0, or
     ``"<dtype>-philox-<N>"`` to enable Philox-<N> stochastic rounding on
     gmem state writeback (cuda-incr / Triton incremental only).
+
+    When *with_conv1d* is True, each kernel iteration prepends a
+    causal_conv1d_update call and measures the total span (conv1d + SSU),
+    capturing PDL overlap.  Uses a realistic reset: cold cache → L2 flush →
+    hot xbc_input.
 
     ``meta`` holds the analytical fields (e_al, write_frac, pi, weights)
     so callers can include them in plot titles / printed summaries.
@@ -358,12 +370,19 @@ def run_in_process_bench(
             "Check AL distribution for AL=0 mass or non-ergodic chain.",
             file=sys.stderr,
         )
+    if with_conv1d:
+        print(
+            f"conv1d: ENABLED (external_pdl={external_pdl}) — "
+            "measuring total span (conv1d + SSU)"
+        )
+    else:
+        print("conv1d: disabled — measuring SSU kernel only")
 
     # Pre-init L2 flush buffer (bench_checkpointing_ssu's CUDA-graph timing
     # path assumes this is set up when TimingOptions.l2_flush is True).
     bench_ssu._init_l2_flush()
     timing = bench_ssu.TimingOptions(
-        warmup=warmup, iters=iters, cupti=cupti, cuda_graph=True, l2_flush=True
+        warmup=warmup, iters=iters, cupti=cupti, cuda_graph=cuda_graph, l2_flush=True
     )
 
     rows: list[dict] = []
@@ -403,15 +422,27 @@ def run_in_process_bench(
                 # philox is only meaningful for cuda-incr / incremental.
                 kernel_philox = philox_rounds if kernel in _PHILOX_KERNELS else 0
                 kernel_rand_seed = rand_seed if kernel_philox > 0 else None
-                median_us, p95_us, p99_us = bench_ssu.time_kernel(
-                    kernel=kernel,
-                    inputs=inputs,
-                    prev_tokens=pt,
-                    timing=timing,
-                    tag=tag,
-                    philox_rounds=kernel_philox,
-                    rand_seed=kernel_rand_seed,
-                )
+                if with_conv1d:
+                    median_us, p95_us, p99_us = bench_ssu.time_kernel_with_conv1d(
+                        kernel=kernel,
+                        inputs=inputs,
+                        prev_tokens=pt,
+                        timing=timing,
+                        tag=tag,
+                        philox_rounds=kernel_philox,
+                        rand_seed=kernel_rand_seed,
+                        external_pdl=external_pdl,
+                    )
+                else:
+                    median_us, p95_us, p99_us = bench_ssu.time_kernel(
+                        kernel=kernel,
+                        inputs=inputs,
+                        prev_tokens=pt,
+                        timing=timing,
+                        tag=tag,
+                        philox_rounds=kernel_philox,
+                        rand_seed=kernel_rand_seed,
+                    )
                 per_sample_stats.append((median_us, p95_us, p99_us))
                 rows.append(
                     {
@@ -653,7 +684,20 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--iters", type=int, default=DEFAULT_ITERS)
-    parser.add_argument("--cupti", action="store_true", default=False)
+    parser.add_argument(
+        "--cupti",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use CUPTI hardware-level timing.  Pass --no-cupti when profiling "
+        "under ncu (CUPTI and ncu both grab the GPU profiling API and conflict).",
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Capture timed iterations in a CUDA graph.  Pass --no-cuda-graph "
+        "when profiling under ncu for clean per-launch kernel capture.",
+    )
     # Model dims (default = Nemotron @ TP=8).
     parser.add_argument(
         "--nheads", type=int, default=bench_ssu.NHEADS // bench_ssu.TP_SIZE
@@ -667,6 +711,28 @@ def main() -> None:
     parser.add_argument(
         "--plot-only", type=Path, default=None, help="Existing CSV to plot from."
     )
+    # Conv1d combined timing (measures total span: conv1d + SSU, captures PDL overlap)
+    parser.add_argument(
+        "--with-conv1d",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include conv1d kernel before SSU.  Measures total span (conv1d + SSU) "
+            "to capture PDL overlap — important for production latency estimation.  "
+            "Uses realistic reset: cold cache → L2 flush → hot in_proj output.  "
+            "Pass --no-with-conv1d to time SSU only (default)."
+        ),
+    )
+    parser.add_argument(
+        "--external-pdl",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable external PDL: conv1d launches dependent kernels so SSU can "
+            "start fetching state while conv1d is still finishing.  "
+            "Only relevant with --with-conv1d.  --no-external-pdl disables."
+        ),
+    )
     args = parser.parse_args()
 
     if args.window <= args.T:
@@ -678,6 +744,7 @@ def main() -> None:
     prefix = args.output_prefix or (
         f"ssu_checkpoint_mixed_b{'_'.join(str(b) for b in args.batch_sizes)}"
         f"_{args.state_dtype}_K{args.num_pnat_samples}"
+        f"{'_conv1d' if args.with_conv1d else ''}"
     )
     csv_path = CSV_DIR / f"{prefix}.csv"
     png_path = IMG_DIR / f"{prefix}.png"
@@ -689,6 +756,12 @@ def main() -> None:
         print(f"Loaded {len(rows)} rows from {csv_path}")
         plot_results(rows, png_path)
         return
+
+    if args.with_conv1d and bench_ssu._causal_conv1d_update is None:
+        parser.error(
+            "--with-conv1d requires causal_conv1d_update but the import from "
+            "tests/mamba/triton_reference/causal_conv1d_triton.py failed"
+        )
 
     rows, _meta = run_in_process_bench(
         al_csv=args.al_csv,
@@ -707,6 +780,9 @@ def main() -> None:
         head_dim=args.head_dim,
         d_state=args.d_state,
         ngroups=args.ngroups,
+        with_conv1d=args.with_conv1d,
+        external_pdl=args.external_pdl,
+        cuda_graph=args.cuda_graph,
     )
 
     if not rows:
