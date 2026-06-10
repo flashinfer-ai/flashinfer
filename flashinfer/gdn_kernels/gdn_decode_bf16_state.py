@@ -3072,10 +3072,24 @@ def gated_delta_rule_mtp_wide_vec(
     # FLA-style per-token pool scatter (vLLM API compat). When the public
     # gated_delta_rule_mtp wrapper threads ssm_state_indices through, the
     # kernel writes each h_{t+1} directly to pool[ssm_state_indices[i, t]]
-    # instead of intermediate_states_buffer. Mutex with cache, recovery,
-    # and disable_state_update is enforced at the public-wrapper layer.
+    # instead of intermediate_states_buffer. Mutex checks duplicated from
+    # the public-wrapper layer (gated_delta_rule_mtp) so direct callers of
+    # this entry point hit the same fail-fast errors.
     per_token_pool_scatter = ssm_state_indices is not None
     if per_token_pool_scatter:
+        assert intermediate_states_buffer is None, (
+            "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
+        )
+        assert not disable_state_update, (
+            "ssm_state_indices requires state writes; disable_state_update must be False"
+        )
+        assert recovery_steps == 0, (
+            "ssm_state_indices + recovery_steps>0 not yet supported (MVP exclusion)"
+        )
+        assert T_val >= 2, (
+            f"ssm_state_indices requires T >= 2 (got T={T_val}); "
+            f"for T=1 use output_state_indices"
+        )
         assert ssm_state_indices.shape == (B_val, T_val), (
             f"ssm_state_indices must have shape [B={B_val}, T={T_val}], "
             f"got {tuple(ssm_state_indices.shape)}"

@@ -1206,6 +1206,9 @@ def bench_gdn_mtp(
         assert not cache_intermediate_states, (
             "--ssm-state-indices is mutex with --cache (no intermediate buffer)"
         )
+        assert not disable_state_update, (
+            "--ssm-state-indices requires state writes; pass --update-state"
+        )
 
     # Initial state: [pool_size, HV, V, K] (K-last layout for MTP)
     # FLA scatter needs an extra B*T slots for the per-token scatter destinations.
@@ -2315,12 +2318,18 @@ def bench_gdn_decode_bf16_state(
         f"{ssm_state_indices_mode!r}"
     )
     # FLA-style per-token scatter requires T >= 2 (asserted by the wrapper)
-    # and is mutex with cache_intermediate_states.
+    # and is mutex with cache_intermediate_states and recovery_steps.
     fla_scatter = ssm_state_indices_mode != "none"
     if fla_scatter:
         assert seq_len >= 2, f"--ssm-state-indices requires seq_len>=2, got T={seq_len}"
         assert not cache_intermediate_states, (
             "--ssm-state-indices is mutex with --cache (no intermediate buffer)"
+        )
+        assert not disable_state_update, (
+            "--ssm-state-indices requires state writes; pass --update-state"
+        )
+        assert recovery_steps == 0, (
+            "--ssm-state-indices does not support --recovery-steps yet"
         )
 
     num_o_heads = max(num_q_heads, num_v_heads)
