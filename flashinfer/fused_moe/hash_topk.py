@@ -23,6 +23,7 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.jit import gen_hash_topk_module
+from flashinfer.trace.templates.moe import hash_topk_trace
 from flashinfer.utils import (
     backend_requirement,
     device_support_pdl,
@@ -141,7 +142,7 @@ def get_hash_topk_module():
 
 
 @backend_requirement({}, common_check=_check_hash_topk_supported)
-@flashinfer_api
+@flashinfer_api(trace=hash_topk_trace)
 def hash_topk(
     router_logits: torch.Tensor,
     input_ids: torch.Tensor,

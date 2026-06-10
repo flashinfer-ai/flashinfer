@@ -96,10 +96,8 @@ __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ pa
   if (warp_id >= params.num_tokens) return;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // `input_id` is the model's token ids, not produced by a primary kernel, so it
-  // is safe to read it before the grid-dependency wait. The dependent loads
-  // (`router_logits`) happen after the wait. The "memory" clobber prevents the
-  // compiler from hoisting those loads above the barrier.
+  // Wait before the dependent loads. The "memory" clobber prevents the compiler
+  // from hoisting loads/stores across the dependency barrier.
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
@@ -127,8 +125,10 @@ __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ pa
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // The "memory" clobber prevents the compiler from sinking the output stores
+  // above past the launch-dependents signal.
   if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 #endif
 }

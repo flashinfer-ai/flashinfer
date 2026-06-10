@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cmath>
 #include <cstdint>
 
 #include "flashinfer/fused_moe/hash_topk.cuh"
@@ -69,9 +70,14 @@ void HashTopK(TensorView router_logits, TensorView input_id, TensorView tid2eid,
       << "output rows must equal num_tokens";
   TVM_FFI_ICHECK(topk_weights.sizes()[1] == topk_fused)
       << "topk_weights cols must equal topk_fused";
-  TVM_FFI_ICHECK(num_shared_experts >= 0) << "topk_fused must be >= topk";
+  TVM_FFI_ICHECK(num_shared_experts == 0 || num_shared_experts == 1)
+      << "num_shared_experts (topk_fused - topk) must be 0 or 1";
   TVM_FFI_ICHECK(topk_fused <= flashinfer::fused_moe::kHashTopKWarpThreads)
       << "topk_fused must be <= warp size (32)";
+  if (num_shared_experts > 0) {
+    TVM_FFI_ICHECK(std::isfinite(routed_scaling_factor) && routed_scaling_factor > 0.0)
+        << "routed_scaling_factor must be positive and finite when a shared expert is fused";
+  }
 
   if (num_tokens == 0) {
     return;
