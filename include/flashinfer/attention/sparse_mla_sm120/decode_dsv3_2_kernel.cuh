@@ -152,7 +152,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   if (t_idx >= num_tokens) return;
 
   const int h_start = h_block_idx * HPB;
-  const int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
+  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
+  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
 
   // Chunk range this block owns.
   const int num_chunks_total = (topk_len + DSV3_2_CAND_WINDOW - 1) / DSV3_2_CAND_WINDOW;

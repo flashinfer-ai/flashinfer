@@ -157,11 +157,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   if (t_idx >= num_tokens) return;
 
   const int h_start = h_block_idx * HPB;
-  const int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
-  const int extra_topk_len =
+  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
+  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+  int extra_topk_len =
       (extra_KV_cache != nullptr)
           ? (extra_topk_length_ptr ? __ldg(extra_topk_length_ptr + t_idx) : extra_topk)
           : 0;
+  extra_topk_len =
+      extra_topk_len < 0 ? 0 : (extra_topk_len > extra_topk ? extra_topk : extra_topk_len);
 
   // Chunk range this block owns. Total chunks = main + extra (extra layout
   // is concatenated immediately after main; per-chunk dispatch in IO + math

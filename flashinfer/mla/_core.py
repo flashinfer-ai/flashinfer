@@ -561,8 +561,7 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
         raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
     if query.dtype != torch.bfloat16:
         raise ValueError(
-            "SM120 sparse MLA v32/GLM expects BF16 query, "
-            f"got {query.dtype}"
+            f"SM120 sparse MLA v32/GLM expects BF16 query, got {query.dtype}"
         )
     if kv_lora_rank != 512 or qk_rope_head_dim != 64 or query.size(-1) != 576:
         raise ValueError(
@@ -1013,36 +1012,8 @@ def _resolve_dsv4_sparse_mla_backend(device: torch.device, backend: str) -> str:
     if backend in ("trtllm-gen", "sparse"):
         return backend
     raise ValueError(
-        "backend must be one of 'auto', 'trtllm-gen', or 'sparse', "
-        f"got {backend!r}"
+        f"backend must be one of 'auto', 'trtllm-gen', or 'sparse', got {backend!r}"
     )
-
-
-def _dsv4_swa_topk_lens_for_sm120(
-    *,
-    seq_lens: torch.Tensor,
-    batch_size: int,
-    q_len_per_request: int,
-    cum_seq_lens_q: Optional[torch.Tensor],
-) -> torch.Tensor:
-    if cum_seq_lens_q is None:
-        q_lens = seq_lens.new_full((batch_size,), q_len_per_request)
-        req_ids = torch.arange(batch_size, device=seq_lens.device, dtype=torch.int64)
-        req_ids = req_ids.repeat_interleave(q_len_per_request)
-        q_offsets = torch.arange(
-            q_len_per_request, device=seq_lens.device, dtype=torch.int32
-        ).repeat(batch_size)
-    else:
-        q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-        req_ids = torch.arange(batch_size, device=seq_lens.device, dtype=torch.int64)
-        req_ids = req_ids.repeat_interleave(q_lens.to(torch.int64))
-        q_offsets = (
-            torch.arange(req_ids.numel(), device=seq_lens.device, dtype=torch.int32)
-            - cum_seq_lens_q[:-1].repeat_interleave(q_lens.to(torch.int64))
-        )
-    return (
-        seq_lens[req_ids] - q_lens[req_ids] + q_offsets + 1
-    ).clamp_(min=0, max=128)
 
 
 def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
@@ -1051,40 +1022,95 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     swa_kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
     sparse_indices: torch.Tensor,
-    compressed_kv_cache: torch.Tensor,
-    sparse_topk_lens: torch.Tensor,
-    seq_lens: torch.Tensor,
-    batch_size: int,
-    q_len_per_request: int,
+    compressed_kv_cache: Optional[torch.Tensor],
+    swa_topk_lens: torch.Tensor,
+    extra_sparse_indices: Optional[torch.Tensor],
+    extra_sparse_topk_lens: Optional[torch.Tensor],
     out: Optional[torch.Tensor],
     bmm1_scale: float,
     bmm2_scale: float,
     sinks: Optional[torch.Tensor],
-    cum_seq_lens_q: Optional[torch.Tensor],
+    kv_layout: Literal["HND", "NHD"],
 ) -> torch.Tensor:
     if bmm2_scale != 1.0:
         raise ValueError("SM120 DSv4 sparse MLA does not support bmm2_scale")
+    if query.ndim in (3, 4):
+        num_heads, head_dim = query.shape[-2:]
+    else:
+        raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
+    if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(
+            "SM120 DSv4 sparse MLA only supports BF16 or FP8 E4M3 query, "
+            f"got {query.dtype}"
+        )
+    if head_dim != 512:
+        raise ValueError(f"Expected DSv4 query head dim 512, got {head_dim}")
+    if num_heads not in (8, 16, 32, 64, 128):
+        raise ValueError(
+            "Expected 8, 16, 32, 64, or 128 query heads for SM120 DSv4 "
+            f"sparse MLA, got {num_heads}"
+        )
+    if swa_topk_lens is None:
+        raise ValueError("backend='sparse' requires swa_topk_lens")
 
+    swa_kv_cache = _check_sm120_dsv4_kv_cache_layout(
+        swa_kv_cache, kv_layout, "swa_kv_cache"
+    )
+    if swa_kv_cache.dtype == torch.uint8:
+        if swa_kv_cache.size(-1) != 584:
+            raise ValueError(
+                "Expected packed SM120 DSV4 swa_kv_cache head dim 584, got "
+                f"{swa_kv_cache.size(-1)}"
+            )
+    elif swa_kv_cache.dtype != query.dtype:
+        raise ValueError(
+            f"swa_kv_cache dtype must match query dtype, got {swa_kv_cache.dtype} "
+            f"and {query.dtype}"
+        )
+    elif swa_kv_cache.size(-1) != 512:
+        raise ValueError(
+            f"Expected swa_kv_cache head dim 512, got {swa_kv_cache.size(-1)}"
+        )
+
+    if (extra_sparse_indices is None) != (extra_sparse_topk_lens is None):
+        raise ValueError(
+            "extra_sparse_indices and extra_sparse_topk_lens must be provided "
+            "together for backend='sparse'"
+        )
     query_for_sm120 = query if query.ndim == 4 else query.unsqueeze(1)
     out_for_sm120 = out if out is None or out.ndim == 4 else out.unsqueeze(1)
-    swa_topk = 128
-    primary_indices = sparse_indices[:, :swa_topk].contiguous()
-    primary_lens = _dsv4_swa_topk_lens_for_sm120(
-        seq_lens=seq_lens,
-        batch_size=batch_size,
-        q_len_per_request=q_len_per_request,
-        cum_seq_lens_q=cum_seq_lens_q,
-    ).contiguous()
 
     sparse_mla_segments: List[_SparseMLASegment] = [
-        _SparseMLASegment(indices=primary_indices, lengths=primary_lens)
+        _SparseMLASegment(indices=sparse_indices, lengths=swa_topk_lens)
     ]
-    if sparse_indices.size(-1) > swa_topk:
-        extra_lens = (sparse_topk_lens - swa_topk).clamp_(min=0).contiguous()
+    if extra_sparse_indices is not None:
+        if compressed_kv_cache is None:
+            raise ValueError(
+                "compressed_kv_cache is required when extra_sparse_indices is provided"
+            )
+        compressed_kv_cache = _check_sm120_dsv4_kv_cache_layout(
+            compressed_kv_cache, kv_layout, "compressed_kv_cache"
+        )
+        if compressed_kv_cache.dtype == torch.uint8:
+            if compressed_kv_cache.size(-1) != 584:
+                raise ValueError(
+                    "Expected packed SM120 DSV4 compressed_kv_cache head dim 584, "
+                    f"got {compressed_kv_cache.size(-1)}"
+                )
+        elif compressed_kv_cache.dtype != query.dtype:
+            raise ValueError(
+                "compressed_kv_cache dtype must match query dtype, got "
+                f"{compressed_kv_cache.dtype} and {query.dtype}"
+            )
+        elif compressed_kv_cache.size(-1) != 512:
+            raise ValueError(
+                "Expected compressed_kv_cache head dim 512, got "
+                f"{compressed_kv_cache.size(-1)}"
+            )
         sparse_mla_segments.append(
             _SparseMLASegment(
-                indices=sparse_indices[:, swa_topk:].contiguous(),
-                lengths=extra_lens,
+                indices=extra_sparse_indices,
+                lengths=extra_sparse_topk_lens,
                 kv_cache=compressed_kv_cache,
             )
         )
@@ -1111,9 +1137,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     swa_kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
     sparse_indices: torch.Tensor,
-    compressed_kv_cache: torch.Tensor,
-    sparse_topk_lens: torch.Tensor,
-    seq_lens: torch.Tensor,
+    compressed_kv_cache: Optional[torch.Tensor] = None,
+    sparse_topk_lens: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Union[float, torch.Tensor] = 1.0,
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
@@ -1123,15 +1149,21 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     max_q_len: Optional[int] = None,
     enable_pdl: bool | None = None,
     backend: str = "auto",
+    swa_topk_lens: Optional[torch.Tensor] = None,
+    extra_sparse_indices: Optional[torch.Tensor] = None,
+    extra_sparse_topk_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA with separate SWA and compressed KV pools.
 
     This API is for DeepSeek V4 sparse MLA kernels where
     ``headDimQk == headDimV == 512``. It supports the SM100/SM103 TRTLLM-GEN
     path added in FlashInfer PR #3269 and the SM120 sparse MLA backend. The SWA
-    side is fixed to 128 indices per query. Callers provide a SWA KV pool, a
-    compressed KV pool, the concatenated sparse index matrix, and total sparse
-    MLA top-k lengths for every query token.
+    side is fixed to 128 indices per query. The SM100/SM103 ``trtllm-gen``
+    backend consumes TRTLLM-GEN's combined sparse index table and total top-k
+    lengths. The SM120 ``sparse`` backend consumes explicit sparse MLA segments:
+    ``sparse_indices``/``swa_topk_lens`` for the SWA segment, plus optional
+    ``extra_sparse_indices``/``extra_sparse_topk_lens`` into
+    ``compressed_kv_cache`` for the compressed segment.
 
     Parameters
     ----------
@@ -1151,28 +1183,26 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     workspace_buffer : torch.Tensor
         Backend workspace buffer. Must be zero-initialized for first use.
     sparse_indices : torch.Tensor
-        Flattened concatenated sparse MLA physical token indices in query-token
-        order with shape ``[sum_q, sparse_topk_capacity]``. The first 128
-        columns are SWA indices into ``swa_kv_cache``; the remaining columns are
-        compressed/top-k indices into ``compressed_kv_cache``. For SWA-only
-        calls, callers may provide padded invalid compressed columns, while
-        ``sparse_topk_lens`` controls the active length.
-    compressed_kv_cache : torch.Tensor
+        On ``trtllm-gen``, flattened concatenated sparse MLA physical token
+        indices in query-token order with shape ``[sum_q, sparse_topk_capacity]``.
+        The first 128 columns are SWA indices into ``swa_kv_cache``; the
+        remaining columns are compressed/top-k indices into
+        ``compressed_kv_cache``. On SM120 ``sparse``, this is the SWA segment
+        only and may be shaped ``[sum_q, 128]`` or ``[batch_size, q_len, 128]``.
+    compressed_kv_cache : Optional[torch.Tensor]
         Primary/compressed KV cache in the same backend layout as
-        ``swa_kv_cache``. For SWA-only calls, provide any valid primary pool.
-    sparse_topk_lens : torch.Tensor
+        ``swa_kv_cache``. Required by ``trtllm-gen`` and by SM120 ``sparse``
+        when ``extra_sparse_indices`` is provided.
+    sparse_topk_lens : Optional[torch.Tensor]
         Flattened total sparse MLA top-k lengths in query-token order, shape
         ``[sum_q]``. Values must already include the fixed 128 SWA entries,
         matching TRTLLM-GEN ``sparseMlaTopkLengths``, and must not exceed
-        ``sparse_indices.shape[-1]``.
-    seq_lens : torch.Tensor
+        ``sparse_indices.shape[-1]``. Required only by ``trtllm-gen``.
+    seq_lens : Optional[torch.Tensor]
         Original KV sequence lengths for the SWA side, shape ``[batch_size]``
-        INT32. This is required even though ``sparse_topk_lens`` already
-        includes the fixed SWA 128 entries. TRTLLM-GEN uses ``seq_lens`` and the
-        per-request query length to compute the valid length of tile 0, the
-        SWA-128 tile, as ``min(seq_lens[b] - q_lens[b] + q_idx + 1, 128)``.
-        ``sparse_topk_lens`` controls the total sparse MLA length; it does not
-        replace the SWA tile validity signal.
+        INT32. Required only by ``trtllm-gen``. TRTLLM-GEN uses ``seq_lens`` and
+        the per-request query length to compute the valid length of tile 0, the
+        SWA-128 tile.
     bmm1_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for QK and softmax. Tensor form must be FP32.
     bmm2_scale : Union[float, torch.Tensor]
@@ -1194,6 +1224,16 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     backend : str
         ``"auto"`` chooses ``"trtllm-gen"`` on SM100/SM103 and ``"sparse"``
         on SM120. Explicit values are intended for tests and benchmarking.
+    swa_topk_lens : Optional[torch.Tensor]
+        SM120 ``sparse`` backend only. Active SWA segment lengths in flattened
+        query-token order. These lengths are caller-owned metadata and are not
+        derived from ``seq_lens`` inside the wrapper.
+    extra_sparse_indices : Optional[torch.Tensor]
+        SM120 ``sparse`` backend only. Optional compressed segment indices into
+        ``compressed_kv_cache``.
+    extra_sparse_topk_lens : Optional[torch.Tensor]
+        SM120 ``sparse`` backend only. Active compressed segment lengths in
+        flattened query-token order.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     if enable_pdl is None:
@@ -1209,6 +1249,38 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             raise ValueError("SM120 DSv4 sparse MLA expects bmm2_scale to be a float")
         if bmm2_scale.dtype != torch.float32:
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
+
+    if backend == "sparse":
+        return _trtllm_batch_decode_sparse_mla_dsv4_sm120(
+            query=query,
+            swa_kv_cache=swa_kv_cache,
+            workspace_buffer=workspace_buffer,
+            sparse_indices=sparse_indices,
+            compressed_kv_cache=compressed_kv_cache,
+            swa_topk_lens=swa_topk_lens,
+            extra_sparse_indices=extra_sparse_indices,
+            extra_sparse_topk_lens=extra_sparse_topk_lens,
+            out=out,
+            bmm1_scale=float(bmm1_scale),
+            bmm2_scale=float(bmm2_scale),
+            sinks=sinks,
+            kv_layout=kv_layout,
+        )
+
+    if (
+        swa_topk_lens is not None
+        or extra_sparse_indices is not None
+        or extra_sparse_topk_lens is not None
+    ):
+        raise ValueError(
+            "swa_topk_lens, extra_sparse_indices, and extra_sparse_topk_lens "
+            "are only supported with backend='sparse'"
+        )
+    if sparse_topk_lens is None or compressed_kv_cache is None or seq_lens is None:
+        raise ValueError(
+            "backend='trtllm-gen' requires compressed_kv_cache, sparse_topk_lens, "
+            "and seq_lens"
+        )
 
     (
         swa_kv_cache,
@@ -1230,7 +1302,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         kv_layout,
         cum_seq_lens_q,
         max_q_len,
-        allow_sm120_packed_kv=backend == "sparse",
+        allow_sm120_packed_kv=False,
     )
 
     if out is None:
@@ -1252,24 +1324,6 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     primary_kv_cache = compressed_kv_cache
     sparse_indices = sparse_indices.reshape(query_flat.size(0), -1).contiguous()
     sparse_topk_lens = sparse_topk_lens.contiguous()
-
-    if backend == "sparse":
-        return _trtllm_batch_decode_sparse_mla_dsv4_sm120(
-            query=query,
-            swa_kv_cache=swa_kv_cache,
-            workspace_buffer=workspace_buffer,
-            sparse_indices=sparse_indices,
-            compressed_kv_cache=compressed_kv_cache,
-            sparse_topk_lens=sparse_topk_lens,
-            seq_lens=seq_lens.contiguous(),
-            batch_size=batch_size,
-            q_len_per_request=q_len_per_request,
-            out=out,
-            bmm1_scale=float(bmm1_scale),
-            bmm2_scale=float(bmm2_scale),
-            sinks=sinks,
-            cum_seq_lens_q=cum_seq_lens_q,
-        )
 
     op = get_trtllm_gen_fmha_module()
     run_func = getattr(op, "trtllm_paged_attention_decode_sparse_mla_dsv4", None)
@@ -2498,8 +2552,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cc = get_compute_capability(query.device)
         if cc[0] == 12 and sparse_mla_top_k > 0:
             backend = "sparse"
-        elif cc[0] == 12:
-            backend = "xqa"
         elif cc[0] != 10:
             backend = "xqa"
 

@@ -148,14 +148,6 @@ def _check_last_dim_512(tensor: torch.Tensor, name: str) -> None:
         )
 
 
-def _clamp_topk_length(
-    topk_length: Optional[torch.Tensor], max_topk: int
-) -> Optional[torch.Tensor]:
-    if topk_length is None:
-        return None
-    return torch.clamp(topk_length, min=0, max=int(max_topk))
-
-
 def _normalize_kv_scale_format(kv_scale_format: str) -> str:
     fmt = str(kv_scale_format).lower().replace("-", "_")
     if fmt not in _KV_SCALE_FORMATS:
@@ -335,8 +327,6 @@ def get_sparse_mla_sm120_module():
             kv_cache, model_type=model_type, name="kv_cache"
         )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
-        topk_length = _clamp_topk_length(topk_length, topk)
-        extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
         if (
             model_type == _MODEL_TYPE_DSV4
             and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
@@ -503,9 +493,6 @@ def _sparse_mla_sm120_paged_attention(
     _require_d_v_512(d_v)
     _check_last_dim_512(output, "output")
     model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
-    topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
-    extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-    extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
 
     impl = get_sparse_mla_sm120_module()
     impl.paged_attention(
@@ -939,15 +926,13 @@ def _decode_dsv4_init_indices(shapes, dtype, device):
 
 
 def _decode_dsv4_init_topk_length(shapes, dtype, device):
-    """Placeholder full-active topk_length; clamped to indices.shape[-1] by
-    the pre-hook before profiling so the kernel never indexes past indices.
-    """
+    """Placeholder full-active topk_length for autotune profiling."""
     return torch.full(shapes, 1 << 30, dtype=dtype, device=device)
 
 
 def _decode_dsv4_inputs_pre_hook(inputs):
     """Pair (indices, topk_length) and (extra_indices, extra_topk_length)
-    after per-tensor synthesis: clamp lengths to their paired indices' top-k.
+    after per-tensor synthesis: cap lengths to their paired indices' top-k.
     """
     inputs = list(inputs)
     indices = inputs[1] if len(inputs) > 1 else None
@@ -1139,7 +1124,6 @@ def sparse_mla_sm120_decode_dsv3_2(
     """
     _check_last_dim_512(output, "output")
     _check_last_dim_512(mid_out, "mid_out")
-    topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
 
     runner = _decode_dsv3_2_runner_singleton(int(model_type))
     inputs = [
@@ -1276,9 +1260,6 @@ def sparse_mla_sm120_decode_dsv4(
     """
     _check_last_dim_512(output, "output")
     _check_last_dim_512(mid_out, "mid_out")
-    topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
-    extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-    extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
 
     runner = _decode_dsv4_runner_singleton()
     inputs = [

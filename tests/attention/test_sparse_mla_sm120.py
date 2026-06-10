@@ -531,9 +531,7 @@ def test_sparse_mla_sm120_decode_dsv4_routes_through_dsv4_api() -> None:
         swa_kv_cache=kv_packed,
         workspace_buffer=torch.empty(1, dtype=torch.int8, device=device),
         sparse_indices=indices,
-        compressed_kv_cache=kv_packed,
-        sparse_topk_lens=torch.full((num_tokens,), topk, device=device, dtype=torch.int32),
-        seq_lens=torch.full((num_tokens,), topk, device=device, dtype=torch.int32),
+        swa_topk_lens=torch.full((num_tokens,), topk, device=device, dtype=torch.int32),
         bmm1_scale=sm_scale,
         kv_layout="NHD",
         backend="auto",
@@ -596,12 +594,13 @@ def test_sparse_mla_sm120_decode_dsv4_dual_more_than_32_splits() -> None:
         query=q.unsqueeze(1),
         swa_kv_cache=main_packed,
         workspace_buffer=torch.empty(1, dtype=torch.int8, device=device),
-        sparse_indices=torch.cat((main_idx, extra_idx), dim=-1).contiguous(),
+        sparse_indices=main_idx,
         compressed_kv_cache=extra_packed,
-        sparse_topk_lens=torch.full(
-            (num_tokens,), topk + extra_topk, dtype=torch.int32, device=device
+        swa_topk_lens=torch.full((num_tokens,), topk, dtype=torch.int32, device=device),
+        extra_sparse_indices=extra_idx,
+        extra_sparse_topk_lens=torch.full(
+            (num_tokens,), extra_topk, dtype=torch.int32, device=device
         ),
-        seq_lens=torch.full((num_tokens,), topk, dtype=torch.int32, device=device),
         bmm1_scale=sm_scale,
         kv_layout="NHD",
         backend="auto",
