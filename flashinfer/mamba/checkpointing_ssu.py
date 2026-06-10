@@ -224,6 +224,8 @@ def checkpointing_ssu(
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen: Optional[int] = None,
     enable_pdl: bool = False,
+    cb_scaled: Optional[torch.Tensor] = None,
+    decay_vec: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
@@ -284,6 +286,15 @@ def checkpointing_ssu(
         the upstream (e.g. conv1d) and signal the downstream kernel.
         Caller's responsibility: upstream/downstream kernels must also be
         PDL-paired for the wait/signal to have effect.  Defaults to False.
+    cb_scaled : Optional[torch.Tensor]
+        Pre-allocated fp32 scratch for the precomputed CB matrix, shape
+        (batch, nheads, T_pad, window_pad).  Providing it (together with
+        ``decay_vec``) selects the **two-kernel** (precompute + main) path;
+        leaving both ``None`` runs the monolithic kernel.  Caller-allocated so
+        the path is CUDA-graph-safe (no in-wrapper allocation, like ``out``).
+    decay_vec : Optional[torch.Tensor]
+        Pre-allocated fp32 scratch for the per-head decay vector, shape
+        (batch, nheads, T_pad).  Must be provided iff ``cb_scaled`` is.
 
     Returns
     -------
@@ -426,6 +437,25 @@ def checkpointing_ssu(
         if D is not None
         else (dt_bias.dtype if dt_bias is not None else dt.dtype)
     )
+
+    # ── Two-kernel split dispatch (presence of caller-provided scratch) ──
+    # The two-kernel (precompute + main) path runs iff the caller provides the
+    # scratch tensors cb_scaled/decay_vec — graph-safe, since the caller
+    # pre-allocates them like `out` (no wrapper allocation).  Both or neither.
+    # Kernels pending (precompute/main); stub raises so the xfail equivalence
+    # test is meaningful and existing monolithic callers are unaffected.
+    two_kernel = cb_scaled is not None
+    if two_kernel != (decay_vec is not None):
+        raise ValueError(
+            "cb_scaled and decay_vec must be provided together (both select the "
+            f"two-kernel path); got cb_scaled set={cb_scaled is not None}, "
+            f"decay_vec set={decay_vec is not None}"
+        )
+    if two_kernel:
+        raise NotImplementedError(
+            "checkpointing_ssu two-kernel path (cb_scaled/decay_vec provided) is "
+            "not implemented yet (precompute + main kernels pending)"
+        )
 
     _checkpointing_ssu(
         state,

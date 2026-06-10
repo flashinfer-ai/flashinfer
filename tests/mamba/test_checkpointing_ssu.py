@@ -472,6 +472,116 @@ def test_checkpointing_ssu_heads_per_group(impl):
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="two-kernel split (cb_scaled/decay_vec scratch) not implemented yet "
+    "(precompute + main kernels pending) — see .plans/ssu_split.md",
+)
+def test_two_kernel_matches_monolithic():
+    """The two-kernel path (caller passes cb_scaled/decay_vec scratch) must
+    match the monolithic kernel (no scratch) bit-for-bit on out, state, and the
+    mutated caches.  Covers a nowrite case (k=0) and a write case (k=T).
+
+    xfail-first: the two-kernel launch currently raises NotImplementedError, so
+    this fails until S3-S5 land; strict=True flips it to a failure once it
+    starts passing, prompting removal of the marker (S8)."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    batch = 2
+    cache_size = batch  # non-paged
+    max_window = T  # old_x is (cache, T, ...) → write for k>=1, nowrite for k=0
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(
+        torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim
+    )
+    D = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
+    )
+
+    # Step-1 inputs → buffered ("old") cache.
+    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    dt1_proc = dt1_base.float() + dt_bias[:, 0].float()[None, None, :]
+    dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc, torch.log1p(torch.exp(dt1_proc)))
+    cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
+
+    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    old_x[:] = x1
+    for slot in range(cache_size):
+        buf = cache_buf_idx[slot].item()
+        old_B[slot, buf] = B1[slot]
+        old_dt[slot, buf] = dt1_proc[slot].permute(1, 0)
+        old_cumAdt[slot, buf] = cumAdt1[slot].permute(1, 0)
+
+    def _run(k, *, two_kernel):
+        torch.manual_seed(k + 100)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt2 = repeat(
+            torch.randn(batch, T, nheads, device=device, dtype=dtype),
+            "b t h -> b t h p",
+            p=head_dim,
+        )
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        st = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        ox, ob, odt, oca = (
+            old_x.clone(),
+            old_B.clone(),
+            old_dt.clone(),
+            old_cumAdt.clone(),
+        )
+        kw = {}
+        if two_kernel:
+            kw["cb_scaled"] = torch.empty(
+                batch, nheads, T, max_window, device=device, dtype=torch.float32
+            )
+            kw["decay_vec"] = torch.empty(
+                batch, nheads, T, device=device, dtype=torch.float32
+            )
+        checkpointing_ssu(
+            st,
+            ox,
+            ob,
+            odt,
+            oca,
+            cache_buf_idx.clone(),
+            torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            **kw,
+        )
+        return out, st, ox, ob, odt, oca
+
+    for k in (0, T):  # k=0 nowrite, k=T write
+        ref = _run(k, two_kernel=False)
+        test = _run(k, two_kernel=True)
+        names = ("out", "state", "old_x", "old_B", "old_dt", "old_cumAdt")
+        for name, r, t in zip(names, ref, test, strict=True):
+            torch.testing.assert_close(
+                t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
+            )
+
+
 def test_checkpointing_ssu_pdl_bf16():
     """PDL smoke: bf16 state.  Runs the kernel twice on the same inputs —
     once with enable_pdl=False, once with True — and asserts the outputs and
