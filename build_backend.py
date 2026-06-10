@@ -628,16 +628,20 @@ def _install_cuda_tile_compile_deps() -> None:
     Mirrors ``_install_nvep_runtime_wheels`` for the uv-first / pip-fallback
     path.
 
-    Best-effort: when ``pip install -e .`` runs *without* ``--no-build-isolation``
-    (e.g. the AOT Build Import workflow), pip creates an isolated PEP 517 build
-    env that has only the declared build deps (setuptools / packaging / tvm-ffi)
-    and no ``pip`` module of its own. ``uv`` is also typically not on PATH in
-    such envs. In that case the install would have to fail, but the compile
-    chain we want is already present on flashinfer-ci images, so we *warn and
-    continue* instead of blocking the build. A clean PyPI install on a system
-    that lacks both ``uv`` and the compile chain will surface a clear
-    ``ImportError`` the first time the user calls a cuTile kernel — which is a
-    much better failure mode than aborting the install entirely.
+    Best-effort — PEP 517 build isolation limits what we can install here.
+    When ``pip install`` runs without ``--no-build-isolation`` (the default),
+    pip creates a **clean isolated build environment** that contains only the
+    declared build dependencies (such as ``setuptools`` and ``packaging``) and
+    does *not* include ``pip`` itself or ``uv``.  As a result, we cannot invoke
+    ``pip install`` from within that environment to resolve the
+    ``nvidia-cuda-runtime`` version conflict described above.
+
+    In such isolated builds (e.g. the AOT Build Import workflow) the compile
+    chain is already present on flashinfer-ci images, so we *warn and continue*
+    instead of blocking the build.  A clean PyPI install on a system that lacks
+    both ``uv`` and the compile chain will surface a clear ``ImportError`` the
+    first time the user calls a cuTile kernel — a better failure mode than
+    aborting the install entirely.
     """
     wheels = [
         "nvidia-cuda-nvcc<13.4,>=13.2",
