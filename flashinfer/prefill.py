@@ -4616,6 +4616,9 @@ def trtllm_fmha_v2_prefill(
     chunked_attention_size
         The chunked attention size. Defaults to ``0``, which means no chunked attention.
         Only effective when :attr:`mask_mode` is ``chunked``. Must be a power of 2.
+        Chunked-causal masking is implemented only by the warp-specialized SM90
+        (Hopper) kernels; it is **not supported on SM120 (Blackwell)**, where the
+        tiled kernels honor sliding-window causal (``window_left``) only.
     save_softmax_stats
         Whether to save the softmax statistics. Defaults to ``False``.
     skip_softmax_threshold_scale_factor
@@ -4715,18 +4718,24 @@ def trtllm_fmha_v2_prefill(
     uses_chunked = chunked_attention_size is not None and chunked_attention_size > 0
     is_non_causal = mask_mode is not None and mask_mode.lower() == "padding"
 
-    if (uses_sliding_window or uses_chunked) and is_sm12x_supported(query.device):
-        feature = "Sliding window" if uses_sliding_window else "Chunked"
-        raise ValueError(
-            f"{feature} attention is not yet supported for FMHAv2 on SM120 (Blackwell). "
-            "Only CAUSAL masks are available. "
-        )
-
     if (uses_sliding_window or uses_chunked) and is_non_causal:
         feature = "Sliding window" if uses_sliding_window else "Chunked"
         raise ValueError(
             f"{feature} attention requires causal masking. "
             f"The underlying kernel only supports SLIDING_OR_CHUNKED_CAUSAL mode. "
+        )
+
+    # Chunked-causal masking is only implemented by the warp-specialized (SM90)
+    # kernels. The non-warp-specialized "tiled" kernels used on SM120 honor
+    # ``sliding_window_size`` only and silently ignore ``chunked_attention_size``,
+    # so reject chunked attention here rather than returning wrong results.
+    # Sliding-window causal (``window_left``) IS supported on SM120.
+    if uses_chunked and is_sm12x_supported(query.device):
+        raise ValueError(
+            "Chunked-causal attention (chunked_attention_size > 0) is not "
+            "supported for FMHAv2 on SM120 (Blackwell). The SM120 tiled kernels "
+            "implement sliding-window causal only. Use window_left for "
+            "sliding-window masking, or run chunked attention on SM90 (Hopper)."
         )
 
     # Determine output dtype

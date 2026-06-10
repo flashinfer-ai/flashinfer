@@ -616,6 +616,26 @@ class TraceTemplate:
 
         return extractors
 
+    def definition_name(self, axis_values: Dict[str, int]) -> str:
+        """Definition name for a concrete const-axis vector.
+
+        ``name_prefix`` (or ``op_type`` fallback) followed by each const axis's
+        ``abbrev`` + value (``abbrev=""`` omits the axis; ``abbrev=None`` uses the
+        axis name). This is the single source of truth for the naming convention,
+        shared by :meth:`build_fi_trace_fn` (trace time) and ``trace_apply``'s
+        name-routing (apply time), so the two always agree.
+        """
+        prefix = self.name_prefix if self.name_prefix is not None else self.op_type
+        parts = []
+        for n, marker in self.axes.items():
+            if not isinstance(marker, Const) or n not in axis_values:
+                continue
+            pfx = marker.abbrev if marker.abbrev is not None else n
+            if pfx == "":
+                continue
+            parts.append(f"{pfx}{axis_values[n]}")
+        return prefix + ("_" + "_".join(parts) if parts else "")
+
     # ------------------------------------------------------------------
     # fi_trace callable factory
     # ------------------------------------------------------------------
@@ -715,30 +735,17 @@ class TraceTemplate:
                     entry = {"shape": descriptor.dim_names, "dtype": dtype}
                 if descriptor.optional:
                     entry["optional"] = True
+                # The API parameter this output is written into (out= buffer or,
+                # for in-place APIs, an input buffer); consumed by trace_apply.
+                if getattr(descriptor, "param", None) is not None:
+                    entry["param"] = descriptor.param
                 if descriptor.description:
                     entry["description"] = descriptor.description
                 outputs_json[json_key] = entry
 
             # ── 6. Resolve name (explicit override or auto-generate) ──────
             if name is None:
-                # Use name_prefix from the template when set (preferred: short,
-                # semantic names like "gqa_paged_decode", "gdn_mtp").
-                # Fall back to op_type otherwise.
-                prefix = (
-                    template.name_prefix
-                    if template.name_prefix is not None
-                    else template.op_type
-                )
-                const_parts = []
-                for n, marker in template.axes.items():
-                    if not isinstance(marker, Const) or n not in axis_values:
-                        continue
-                    # abbrev="" → omit from name; abbrev=None → use axis name
-                    pfx = marker.abbrev if marker.abbrev is not None else n
-                    if pfx == "":
-                        continue
-                    const_parts.append(f"{pfx}{axis_values[n]}")
-                name = prefix + ("_" + "_".join(const_parts) if const_parts else "")
+                name = template.definition_name(axis_values)
 
             # ── 7. Assemble definition ─────────────────────────────────────
             all_tags = [f"fi_api:{fi_api}"] + template.tags
