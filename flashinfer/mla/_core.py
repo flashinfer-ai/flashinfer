@@ -138,13 +138,7 @@ supported_mla_layer_dimensions = [
 
 @dataclass(frozen=True)
 class _SparseMLASegment:
-    """Internal Sparse MLA KV segment for SM120 paged decode.
-
-    ``indices`` holds physical KV slots for each query token. ``lengths`` is an
-    optional per-query active fanout. ``kv_cache=None`` means the segment uses a
-    caller-provided primary KV cache; additional segments provide their own KV
-    cache.
-    """
+    """Internal SM120 sparse MLA KV segment."""
 
     indices: torch.Tensor
     lengths: Optional[torch.Tensor] = None
@@ -493,12 +487,14 @@ def _check_sm120_sparse_v32_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
 
 
 def _normalize_sm120_sparse_v32_topk_length(
-    seq_lens: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
     *,
     batch_size: int,
     q_len_per_request: int,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
+    if seq_lens is None:
+        return None
     if seq_lens.dtype != torch.int32:
         raise ValueError(f"seq_lens must have dtype torch.int32, got {seq_lens.dtype}")
     if seq_lens.device != device:
@@ -529,7 +525,7 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
     sparse_mla_top_k: int,
     out: Optional[torch.Tensor],
     bmm1_scale: Union[float, torch.Tensor],
@@ -1153,17 +1149,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    r"""Decode DeepSeek V4 sparse MLA with separate SWA and compressed KV pools.
+    r"""Decode DeepSeek V4 sparse MLA.
 
-    This API is for DeepSeek V4 sparse MLA kernels where
-    ``headDimQk == headDimV == 512``. It supports the SM100/SM103 TRTLLM-GEN
-    path added in FlashInfer PR #3269 and the SM120 sparse MLA backend. The SWA
-    side is fixed to 128 indices per query. The SM100/SM103 ``trtllm-gen``
-    backend consumes TRTLLM-GEN's combined sparse index table and total top-k
-    lengths. The SM120 ``sparse`` backend consumes explicit sparse MLA segments:
-    ``sparse_indices``/``swa_topk_lens`` for the SWA segment, plus optional
-    ``extra_sparse_indices``/``extra_sparse_topk_lens`` into
-    ``compressed_kv_cache`` for the compressed segment.
+    Supports TRTLLM-GEN on SM100/SM103 and the SM120 sparse backend. For
+    ``backend="sparse"``, ``sparse_indices``/``swa_topk_lens`` describe the SWA
+    segment and ``extra_sparse_indices``/``extra_sparse_topk_lens`` describe the
+    optional compressed segment.
 
     Parameters
     ----------
@@ -1172,23 +1163,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         or varlen query input ``[sum_q, num_heads, 512]`` when
         ``cum_seq_lens_q`` is provided. BF16 or FP8 E4M3.
     swa_kv_cache : torch.Tensor
-        SWA KV cache. On the ``trtllm-gen`` backend, HND layout is
-        ``[num_pages, 1, page_size, 512]`` and NHD layout is
-        ``[num_pages, page_size, 1, 512]``; a 3D HND shorthand
-        ``[num_pages, page_size, 512]`` is also accepted. On the SM120
-        ``sparse`` backend, the packed uint8 DSv4 layout uses
-        ``[num_pages, 1, page_size, 584]`` for ``kv_layout="HND"`` and
-        ``[num_pages, page_size, 1, 584]`` for ``kv_layout="NHD"``; the 3D
-        shorthand ``[num_pages, page_size, 584]`` is also accepted.
+        SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
+        uint8 head dim 584. Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
         Backend workspace buffer. Must be zero-initialized for first use.
     sparse_indices : torch.Tensor
-        On ``trtllm-gen``, flattened concatenated sparse MLA physical token
-        indices in query-token order with shape ``[sum_q, sparse_topk_capacity]``.
-        The first 128 columns are SWA indices into ``swa_kv_cache``; the
-        remaining columns are compressed/top-k indices into
-        ``compressed_kv_cache``. On SM120 ``sparse``, this is the SWA segment
-        only and may be shaped ``[sum_q, 128]`` or ``[batch_size, q_len, 128]``.
+        TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
     compressed_kv_cache : Optional[torch.Tensor]
         Primary/compressed KV cache in the same backend layout as
         ``swa_kv_cache``. Required by ``trtllm-gen`` and by SM120 ``sparse``
@@ -1199,10 +1179,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         matching TRTLLM-GEN ``sparseMlaTopkLengths``, and must not exceed
         ``sparse_indices.shape[-1]``. Required only by ``trtllm-gen``.
     seq_lens : Optional[torch.Tensor]
-        Original KV sequence lengths for the SWA side, shape ``[batch_size]``
-        INT32. Required only by ``trtllm-gen``. TRTLLM-GEN uses ``seq_lens`` and
-        the per-request query length to compute the valid length of tile 0, the
-        SWA-128 tile.
+        Original KV sequence lengths, shape ``[batch_size]`` INT32. Required
+        only by ``trtllm-gen``.
     bmm1_scale : Union[float, torch.Tensor]
         Fused per-tensor scale for QK and softmax. Tensor form must be FP32.
     bmm2_scale : Union[float, torch.Tensor]
@@ -1216,24 +1194,20 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         INT32. When provided, dynamic top-k lengths are consumed in flattened
         query-token order.
     max_q_len : Optional[int]
-        Maximum query length in the varlen batch. Required when
-        ``cum_seq_lens_q`` is provided so the wrapper does not need a
-        device-to-host synchronization to infer it.
+        Maximum query length in the varlen batch. Required with
+        ``cum_seq_lens_q``.
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch.
     backend : str
         ``"auto"`` chooses ``"trtllm-gen"`` on SM100/SM103 and ``"sparse"``
-        on SM120. Explicit values are intended for tests and benchmarking.
+        on SM120.
     swa_topk_lens : Optional[torch.Tensor]
-        SM120 ``sparse`` backend only. Active SWA segment lengths in flattened
-        query-token order. These lengths are caller-owned metadata and are not
-        derived from ``seq_lens`` inside the wrapper.
+        Active SWA segment lengths for SM120 ``sparse``.
     extra_sparse_indices : Optional[torch.Tensor]
         SM120 ``sparse`` backend only. Optional compressed segment indices into
         ``compressed_kv_cache``.
     extra_sparse_topk_lens : Optional[torch.Tensor]
-        SM120 ``sparse`` backend only. Active compressed segment lengths in
-        flattened query-token order.
+        Active compressed segment lengths for SM120 ``sparse``.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     if enable_pdl is None:
@@ -2391,7 +2365,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    seq_lens: Optional[torch.Tensor],
     max_seq_len: int,
     sparse_mla_top_k: int = 0,
     out: Optional[torch.Tensor] = None,
@@ -2425,7 +2399,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
         where dim 1 distinguishes K (0) and V (1) page indices. For MLA both rows will
         typically be identical since K and V share the same compressed representation.
-    seq_lens: query_len
+    seq_lens: query_len. Optional for the SM120 sparse v32/GLM path; ``None``
+        means all sparse columns are active.
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
@@ -2556,6 +2531,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             backend = "xqa"
 
     if backend == "xqa":
+        if seq_lens is None:
+            raise ValueError("seq_lens is required for XQA MLA")
         if sparse_mla_top_k > 0:
             raise ValueError("XQA MLA does not support sparse_mla_top_k")
         if not is_sm12x_supported(query.device):
@@ -2628,6 +2605,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
             lse=lse,
             return_lse=return_lse,
             kv_scale_format=kv_scale_format,
+        )
+
+    if seq_lens is None:
+        raise ValueError(
+            "seq_lens is required for trtllm-gen and cute-dsl MLA backends"
         )
 
     # log2e fusion is a trtllm-gen-only transform (the kernel expects

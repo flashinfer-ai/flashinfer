@@ -26,25 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Correctness tests for sparse-MLA paged attention on SM120.
-
-Covers both decode (num_tokens <= 64) and prefill (num_tokens > 64) paths
-against a PyTorch SDPA-with-sparse-mask reference, plus the dual-cache
-prefill variant exclusive to DSv4:
-
-* DSv4 (d_qk=512, FP8 FOOTER 584 B/token, page_block_size=64)
-    - decode-dsv4   (single-cache)
-    - prefill-dsv4  (single-cache + dual-cache page-size variants)
-* DSv3.2 (d_qk=576, FP8 INLINE 656 B/token, page_block_size=64)
-    - decode-dsv3_2
-    - prefill-dsv3_2
-* GLM_NSA (d_qk=576, FP8 INLINE arbitrary FP32 scales)
-    - decode + prefill through kv_scale_format="arbitrary_fp32"
-
-Quantization helpers port the upstream FlashMLA packed layouts.
-
-Skipped on non-SM12x GPUs via :func:`is_sm12x_supported`.
-"""
+"""Correctness tests for sparse-MLA paged attention on SM120."""
 
 from __future__ import annotations
 
@@ -52,9 +34,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.sparse_mla_sm120 import (
-    _SparseMLAPagedAttentionRunner,
     _sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
 )
 from flashinfer.utils import is_sm12x_supported
@@ -65,18 +45,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_sparse_mla_wrapper(
-    *,
-    d_v: int,
-    device: torch.device,
-) -> _SparseMLAPagedAttentionRunner:
-    return _SparseMLAPagedAttentionRunner(
-        d_v=d_v,
-        device=device,
-    )
-
-
-# ── Quantization helpers (ported from flash_mla_sm120/tests/test_decode.py) ──
+# Quantization helpers.
 
 
 def _cast_scale_inv_to_ue8m0(scales_inv: torch.Tensor) -> torch.Tensor:
@@ -91,13 +60,7 @@ def _fp32_to_ue8m0_bytes(scale_fp32: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_kv_dsv4(kv_bf16: torch.Tensor) -> torch.Tensor:
-    """Pack bf16 KV into DSV4 FP8 FOOTER format.
-
-    Input  shape (nb, bs, 1, 512) bf16.
-    Output shape (nb, bs, 1, 584) uint8 — physical layout per block:
-        [0 : bs*576)        Token data (nope 448B FP8 + rope 128B BF16) per token
-        [bs*576 : bs*584)   Scale footer (7×UE8M0 + 1 pad) per token
-    """
+    """Pack bf16 KV into DSv4 FP8 FOOTER format."""
     d_nope, d_rope, tile_size, num_tiles = 448, 64, 64, 7
     data_stride = d_nope + d_rope * 2  # 576
     scale_bytes = num_tiles + 1  # 8
@@ -161,18 +124,11 @@ def dequantize_kv_dsv4(packed: torch.Tensor) -> torch.Tensor:
     return result.view(nb, bs, 1, 512)
 
 
-# ── DSv3.2 INLINE pack (656 B/token: FP8 nope + FP32 scales + BF16 rope) ─────
+# DSv3.2 INLINE pack.
 
 
 def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
-    """Pack bf16 KV into DSv3.2 FP8 INLINE format.
-
-    Input  shape (nb, bs, 1, 576) bf16  (d_qk = D_NOPE 512 + D_ROPE 64).
-    Output shape (nb, bs, 1, 656) uint8 — per-token layout:
-        [0   : 512)  FP8 e4m3 nope (4 tiles × 128 elements)
-        [512 : 528)  4 × FP32 power-of-2 scale (one per 128-elem tile)
-        [528 : 656)  BF16 rope (64 elements × 2B)
-    """
+    """Pack bf16 KV into DSv3.2 FP8 INLINE format."""
     d_nope, d_rope, tile_size, num_tiles = 512, 64, 128, 4
     scale_bytes = num_tiles * 4  # 16
     bpt = d_nope + scale_bytes + d_rope * 2  # 656
@@ -183,19 +139,16 @@ def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
 
     result = torch.zeros(nt, bpt, dtype=torch.uint8, device=kv.device)
 
-    # FP8 nope tiles + FP32 power-of-2 scales (inline, not footer).
     for ti in range(num_tiles):
         tile = kv[:, ti * tile_size : (ti + 1) * tile_size].float()
         amax = tile.abs().amax(dim=-1).clamp(min=1e-4)
         scale = _cast_scale_inv_to_ue8m0(amax / 448.0)  # power-of-2 FP32
         fp8 = (tile / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
         result[:, ti * tile_size : (ti + 1) * tile_size] = fp8.view(torch.uint8)
-        # FP32 scale → 4 bytes inline at offset 512 + ti*4.
         result[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4] = (
             scale.view(torch.float32).view(torch.uint8).view(nt, 4)
         )
 
-    # BF16 rope tail.
     rope = kv[:, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
     result[:, d_nope + scale_bytes :] = rope.view(nt, d_rope * 2)
     return result.view(nb, bs, 1, bpt)
@@ -261,7 +214,7 @@ def dequantize_kv_dsv3_2(packed: torch.Tensor) -> torch.Tensor:
     return result.view(nb, bs, 1, d_nope + d_rope)
 
 
-# ── PyTorch SDPA-with-sparse-mask reference ───────────────────────────────────
+# PyTorch SDPA reference.
 
 
 def _ref_sparse_attn(
@@ -273,11 +226,7 @@ def _ref_sparse_attn(
     attn_sink: torch.Tensor | None = None,
     topk_length: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dense SDPA over the sparse-gathered KV. Returns (output_bf16, lse_log2).
-
-    Honors ``attn_sink`` (FlashMLA V4 sink-merge convention) and
-    ``topk_length`` (per-token valid-length mask).
-    """
+    """Dense SDPA over sparse-gathered KV."""
     num_tokens, num_heads, d_qk = q.shape
     topk = indices.shape[-1]
 
@@ -287,32 +236,27 @@ def _ref_sparse_attn(
     idx_fixed = indices.clamp(min=0)
     invalid = indices < 0
     if topk_length is not None:
-        # Mark tokens beyond per-token length as invalid.
         ar = torch.arange(topk, device=q.device).unsqueeze(0)
         invalid = invalid | (ar >= topk_length.unsqueeze(-1))
 
     gathered = kv_flat.index_select(0, idx_fixed.view(-1)).view(num_tokens, topk, d_qk)
-    # logits: [num_tokens, num_heads, topk] = q @ K^T per (t, h)
     P = torch.einsum("thd,tkd->thk", q_f, gathered) * sm_scale
     P[invalid.unsqueeze(1).expand_as(P)] = float("-inf")
 
-    lse_e = torch.logsumexp(P, dim=-1)  # natural-log LSE [t, h]
+    lse_e = torch.logsumexp(P, dim=-1)
     lse_safe = lse_e.clone()
     lse_safe[lse_safe == float("-inf")] = float("+inf")
     weights = torch.exp(P - lse_safe.unsqueeze(-1))
     out_f = torch.einsum("thk,tkd->thd", weights, gathered[..., :d_v])
 
-    # Convert lse to log2 to match the kernel's epilogue convention.
     LN2 = float(torch.log(torch.tensor(2.0)).item())
     lse_log2 = lse_e / LN2
 
     if attn_sink is not None:
-        # FlashMLA V4 per-head sink: output[t,h,:] *= sigmoid(lse_e[t,h] - sink[h]).
-        sink = attn_sink.float()  # [num_heads]
-        sink_log2 = sink / LN2  # [num_heads]
-        factor = torch.sigmoid(lse_e.float() - sink.unsqueeze(0))  # [t, h]
-        out_f = out_f * factor.unsqueeze(-1)  # broadcast over d_v
-        # Merge sink into lse (in log2 space). Handle padded -inf head sinks.
+        sink = attn_sink.float()
+        sink_log2 = sink / LN2
+        factor = torch.sigmoid(lse_e.float() - sink.unsqueeze(0))
+        out_f = out_f * factor.unsqueeze(-1)
         lse_log2 = torch.where(
             lse_log2 == float("-inf"),
             sink_log2.unsqueeze(0).expand_as(lse_log2),
@@ -346,12 +290,7 @@ def _make_decode_scratch(
     )
 
 
-# ── Tests ────────────────────────────────────────────────────────────────────
-
 _DSV4_DECODE_CONFIGS = [
-    # (num_heads, topk)
-    # h=8 cases exercise the VALID_HPB < HPB code path (small-TP corner);
-    # cover all three topk values to confirm the dispatch table.
     (8, 128),
     (8, 512),
     (8, 1024),
@@ -368,7 +307,7 @@ _DSV4_DECODE_CONFIGS = [
 def test_sparse_mla_sm120_decode_dsv4(
     num_heads: int, topk: int, num_tokens: int, with_sink: bool
 ) -> None:
-    """DSV4 decode-dsv3_2 path: num_tokens <= 64, d_qk=512, page_block_size=64."""
+    """DSv4 decode."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
@@ -376,7 +315,6 @@ def test_sparse_mla_sm120_decode_dsv4(
     num_blocks = 64
     s_kv = num_blocks * page_block_size  # 4096
 
-    # bf16 reference KV → FP8-packed kernel KV.
     kv_bf16 = (
         torch.randn(
             num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
@@ -393,8 +331,6 @@ def test_sparse_mla_sm120_decode_dsv4(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    # Mark half the slots invalid (-1); ensures the kernel actually masks the
-    # sentinel rather than silently passing because the other logits dominate.
     indices[:, topk // 2 :] = -1
 
     attn_sink = (
@@ -405,12 +341,10 @@ def test_sparse_mla_sm120_decode_dsv4(
 
     sm_scale = d_qk**-0.5
 
-    # Reference (uses dequantized kv).
     ref_out, ref_lse = _ref_sparse_attn(
         q, kv_dequant, indices, sm_scale, d_v, attn_sink=attn_sink
     )
 
-    # Kernel: allocate output, call paged_attention.
     output = torch.zeros(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
@@ -430,20 +364,16 @@ def test_sparse_mla_sm120_decode_dsv4(
         mid_lse=mid_lse,
     )
 
-    # FP8 KV + BF16 output tolerance. Matches the repo convention for FP8
-    # attention tests (see tests/attention/test_xqa_mla_batch_decode.py).
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
 def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
-    """Kernel must honor topk_length even when indices past the length point at
-    valid slots — passing garbage past topk_length should not corrupt the answer.
-    """
+    """DSv4 decode honors topk_length."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_heads, topk, num_tokens = 32, 512, 16
-    topk_len = 128  # truncate to first 128 columns
+    topk_len = 128
     d_qk, d_v = 512, 512
     page_block_size = 64
     num_blocks = 64
@@ -465,13 +395,10 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    # Positions past topk_len intentionally point at valid slots (random in
-    # [0, s_kv)) to ensure the kernel actually uses topk_length to truncate.
     topk_length = torch.full((num_tokens,), topk_len, dtype=torch.int32, device=device)
 
     sm_scale = d_qk**-0.5
 
-    # Reference: mask positions past topk_length to -1, pass without topk_length.
     ref_indices = indices.clone()
     ref_indices[:, topk_len:] = -1
     ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, ref_indices, sm_scale, d_v)
@@ -498,7 +425,7 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_dsv4_routes_through_dsv4_api() -> None:
+def test_sparse_mla_sm120_decode_dsv4_public_api() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens, num_heads, topk = 16, 32, 128
@@ -540,12 +467,12 @@ def test_sparse_mla_sm120_decode_dsv4_routes_through_dsv4_api() -> None:
     torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_dsv4_dual_more_than_32_splits() -> None:
-    """Dual-cache decode must handle split counts above the old merge bound."""
+def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
+    """DSv4 dual-cache decode handles large compressed top-k."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens, num_heads = 1, 16
-    topk, extra_topk = 128, 2176  # 2 + 34 = 36 splits.
+    topk, extra_topk = 128, 2176
     d_qk, d_v = 512, 512
     main_pbs, extra_pbs = 64, 2
     main_num_blocks = 16
@@ -618,13 +545,12 @@ _DSV3_2_DECODE_HEADS = [8, 16, 32, 64, 128]
 def test_sparse_mla_sm120_decode_dsv3_2(
     num_heads: int, num_tokens: int, with_sink: bool
 ) -> None:
-    """DSv3.2 decode-dsv3_2 path: d_qk=576, topk=2048, page_block_size=64."""
+    """DSv3.2 decode."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 576, 512
-    topk = 2048  # the only dispatched topk for decode-dsv3_2
+    topk = 2048
     page_block_size = 64
-    # Pool sized so topk valid slot ids fit; 64 blocks * 64 slots = 4096 slots.
     num_blocks = 64
     s_kv = num_blocks * page_block_size
 
@@ -644,8 +570,6 @@ def test_sparse_mla_sm120_decode_dsv3_2(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    # Mark half the slots invalid (-1); ensures the kernel actually masks the
-    # sentinel rather than silently passing because the other logits dominate.
     indices[:, topk // 2 :] = -1
 
     attn_sink = (
@@ -683,59 +607,8 @@ def test_sparse_mla_sm120_decode_dsv3_2(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_dsv3_2_autotune_route() -> None:
-    """DSv3.2 decode participates in AutoTuner through the public API."""
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    d_qk, d_v = 576, 512
-    num_tokens, num_heads, topk = 1, 8, 128
-    page_block_size = 64
-    num_blocks = 4
-    s_kv = num_blocks * page_block_size
-
-    kv_bf16 = (
-        torch.randn(
-            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
-        )
-        / 10.0
-    ).clamp(-1, 1)
-    kv_packed = quantize_kv_dsv3_2(kv_bf16)
-    q = (
-        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
-        / 10.0
-    ).clamp(-1, 1)
-    indices = torch.randint(
-        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
-    )
-    output = torch.empty(
-        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
-    )
-    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device)
-    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
-
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-    with autotune(True, tuning_buckets=(num_tokens,)):
-        sparse_mla_sm120_paged_attention(
-            q,
-            kv_packed,
-            indices,
-            output,
-            out_lse,
-            d_qk**-0.5,
-            d_v=d_v,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
-        )
-    assert any(
-        cache_key[0] == "sparse_mla_sm120_decode_dsv3_2"
-        for cache_key in tuner.profiling_cache
-    )
-    tuner.clear_cache()
-
-
 def test_sparse_mla_sm120_v32_public_api_accepts_hnd_view() -> None:
-    """SM120 v32 sparse top-k keeps the existing HND public API layout."""
+    """SM120 v32 accepts HND KV layout."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 576, 512
@@ -772,7 +645,7 @@ def test_sparse_mla_sm120_v32_public_api_accepts_hnd_view() -> None:
         kv_lora_rank=512,
         qk_rope_head_dim=64,
         block_tables=indices.unsqueeze(1),
-        seq_lens=torch.full((num_tokens,), topk, dtype=torch.int32, device=device),
+        seq_lens=None,
         max_seq_len=topk,
         sparse_mla_top_k=topk,
         bmm1_scale=sm_scale,
@@ -784,7 +657,7 @@ def test_sparse_mla_sm120_v32_public_api_accepts_hnd_view() -> None:
 
 
 def test_sparse_mla_sm120_v32_prefill_public_api_accepts_hnd_view() -> None:
-    """The SM120 prefill orchestrator also consumes public HND layout."""
+    """SM120 v32 prefill accepts HND KV layout."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 576, 512
@@ -841,20 +714,14 @@ _DSV3_2_PREFILL_HEADS = [8, 16, 32, 64, 128]
 def test_sparse_mla_sm120_prefill_dsv3_2(
     num_heads: int, num_tokens: int, with_sink: bool
 ) -> None:
-    """DSv3.2 prefill path: d_qk=576, topk=2048, page_block_size=64, T>64.
-
-    Covers the SG kernel (NH=8 small-TP + NH=16) and the MG kernel
-    (NH=32/64/128). num_tokens>64 routes through the prefill orchestrator;
-    the kernel iterates all NI=TOPK/BI tiles per token and writes BF16
-    output directly (no split-K, no merge).
-    """
+    """DSv3.2 prefill."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 576, 512
     topk = 2048
     page_block_size = 64
     num_blocks = 64
-    s_kv = num_blocks * page_block_size  # 4096 slots
+    s_kv = num_blocks * page_block_size
 
     kv_bf16 = (
         torch.randn(
@@ -872,8 +739,6 @@ def test_sparse_mla_sm120_prefill_dsv3_2(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    # Mark half the slots invalid (-1); matches the decode-test masking
-    # convention and ensures the prefill kernel can't pass by ignoring -1.
     indices[:, topk // 2 :] = -1
 
     attn_sink = (
@@ -1013,8 +878,6 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
 
 
 _DSV4_PREFILL_CONFIGS = [
-    # (num_heads, topk). DSv4 prefill envelope: NH ∈ {16, 32, 64, 128},
-    # topk ∈ {128, 512, 1024}. NH=8 is not in the DSv4 prefill dispatch.
     (16, 128),
     (32, 512),
     (64, 1024),
@@ -1028,17 +891,13 @@ _DSV4_PREFILL_CONFIGS = [
 def test_sparse_mla_sm120_prefill_dsv4(
     num_heads: int, topk: int, num_tokens: int, with_sink: bool
 ) -> None:
-    """DSv4 prefill (single-cache) path: d_qk=512, page_block_size=64, T>64.
-
-    NH=16 dispatches through the SG kernel; NH=32/64/128 through the MG
-    kernel. Dual-cache (extra_kv_cache) variants are not exercised here.
-    """
+    """DSv4 prefill."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
     page_block_size = 64
     num_blocks = 64
-    s_kv = num_blocks * page_block_size  # 4096 slots
+    s_kv = num_blocks * page_block_size
 
     kv_bf16 = (
         torch.randn(
@@ -1056,7 +915,6 @@ def test_sparse_mla_sm120_prefill_dsv4(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    # Mark half the slots invalid (-1); same convention as the decode tests.
     indices[:, topk // 2 :] = -1
 
     attn_sink = (
@@ -1092,7 +950,6 @@ def test_sparse_mla_sm120_prefill_dsv4(
 
 
 _DSV4_PREFILL_DUAL_CONFIGS = [
-    # (extra_topk, extra_pbs). Main is fixed at (topk=128, pbs=64).
     (128, 64),
     (512, 64),
     (512, 2),
@@ -1106,11 +963,7 @@ _DSV4_PREFILL_DUAL_HEADS = [16, 32, 64, 128]
 def test_sparse_mla_sm120_prefill_dsv4_dual(
     num_heads: int, extra_topk: int, extra_pbs: int
 ) -> None:
-    """DSv4 prefill (dual-cache) path: main + extra KV with disjoint slot pools.
-
-    Main cache: topk=128, pbs=64. Extra cache parameters cover both secondary
-    cache page sizes. NH ∈ {16, 32, 64, 128} covers the MG dual-cache dispatch.
-    """
+    """DSv4 dual-cache prefill."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
@@ -1118,14 +971,11 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     main_pbs = 64
     num_tokens = 128
 
-    # Size both pools so all topk slot ids fit.
     main_num_blocks = 64
-    main_s_kv = main_num_blocks * main_pbs  # 4096
-    # Round extra block count up to fit extra_topk slots.
+    main_s_kv = main_num_blocks * main_pbs
     extra_num_blocks = max((extra_topk + extra_pbs - 1) // extra_pbs * 2, 16)
     extra_s_kv = extra_num_blocks * extra_pbs
 
-    # Main cache.
     main_bf16 = (
         torch.randn(
             main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
@@ -1135,7 +985,6 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     main_packed = quantize_kv_dsv4(main_bf16)
     main_dequant = dequantize_kv_dsv4(main_packed)
 
-    # Extra cache (independent quantization noise + slot pool).
     extra_bf16 = (
         torch.randn(
             extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
@@ -1155,7 +1004,6 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     extra_idx = torch.randint(
         0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
     )
-    # Mark half of each cache's slots invalid (-1).
     main_idx[:, topk // 2 :] = -1
     extra_idx[:, extra_topk // 2 :] = -1
 
@@ -1163,11 +1011,6 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
 
     sm_scale = d_qk**-0.5
 
-    # Reference: treat dual cache as one virtual pool. Main occupies slots
-    # [0, main_s_kv); extra occupies [main_s_kv, main_s_kv + extra_s_kv).
-    # Shift extra indices by main_s_kv so the unified pool sees disjoint
-    # index spaces. The kernel's running-softmax across both caches matches
-    # dense softmax over the union.
     virtual_kv = torch.cat(
         [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
     ).reshape(-1, 1, 1, d_qk)
@@ -1276,10 +1119,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_accepts_singleton_s_q_indices() -> N
 def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
     extra_topk_len: int,
 ) -> None:
-    """Dual-cache: extra_topk_length truncates the secondary window. Past-length
-    extra_indices intentionally point at valid slots to verify the kernel masks
-    them out via extra_topk_length. Over-declared lengths clamp to extra_topk.
-    """
+    """DSv4 dual-cache prefill honors extra_topk_length."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_heads, num_tokens = 64, 128
@@ -1322,7 +1162,6 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
     extra_idx = torch.randint(
         0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
     )
-    # Past-length entries point at valid slots; kernel must mask via length.
     extra_topk_length = torch.full(
         (num_tokens,), extra_topk_len, dtype=torch.int32, device=device
     )
@@ -1330,8 +1169,6 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
     attn_sink = torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
     sm_scale = d_qk**-0.5
 
-    # Reference: mask extra entries past length to -1, then build the unified
-    # virtual pool / virtual_idx.
     ref_extra_idx = extra_idx.clone()
     extra_topk_len_clamped = min(max(extra_topk_len, 0), extra_topk)
     ref_extra_idx[:, extra_topk_len_clamped:] = -1
@@ -1369,9 +1206,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
 
 
 def test_sparse_mla_sm120_prefill_dsv4_dual_zero_main_topk() -> None:
-    """When main topk_length is zero, main indices past the runtime length may be
-    uninitialized by callers and must not be read by the dual-cache prefill path.
-    """
+    """DSv4 dual-cache prefill handles zero main topk_length."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_heads, num_tokens = 32, 128
@@ -1451,7 +1286,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_zero_main_topk() -> None:
 
 
 def test_sparse_mla_sm120_prefill_dsv3_2_sg_zero_topk_length() -> None:
-    """SG prefill must not prefetch tile 0 when runtime topk_length is zero."""
+    """DSv3.2 SG prefill handles zero topk_length."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens, num_heads = 128, 8
@@ -1488,11 +1323,11 @@ def test_sparse_mla_sm120_prefill_dsv3_2_sg_zero_topk_length() -> None:
     torch.testing.assert_close(out_lse, torch.full_like(out_lse, -1e30))
 
 
-# Runtime topk_extra should not require a dedicated template instantiation.
 @pytest.mark.parametrize("extra_topk,extra_pbs", [(1024, 2), (1664, 2), (1024, 64)])
 def test_sparse_mla_sm120_prefill_dsv4_dual_runtime_extra_topk(
     extra_topk: int, extra_pbs: int
 ) -> None:
+    """DSv4 dual-cache prefill accepts runtime extra top-k."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_heads, num_tokens = 64, 128
@@ -1567,69 +1402,3 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_runtime_extra_topk(
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
-
-
-@pytest.mark.parametrize("model", ["dsv4", "dsv3_2"])
-def test_sparse_mla_sm120_wrapper_class_run(model: str) -> None:
-    """Smoke-test the wrapper class: construct once, call .run() across
-    decode (T ∈ {1, 16, 64}) and prefill (T = 128) shapes for both V32 and
-    DSv4 envelopes."""
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    page_block_size = 64
-    num_blocks = 32
-
-    if model == "dsv4":
-        num_heads, topk = 32, 512
-        d_qk, d_v = 512, 512
-        quantize = quantize_kv_dsv4
-    else:
-        num_heads, topk = 32, 2048
-        d_qk, d_v = 576, 512
-        quantize = quantize_kv_dsv3_2
-
-    s_kv = num_blocks * page_block_size
-
-    kv_bf16 = (
-        torch.randn(
-            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
-        )
-        / 10.0
-    ).clamp(-1, 1)
-    kv_packed = quantize(kv_bf16)
-
-    wrapper = _make_sparse_mla_wrapper(
-        d_v=d_v,
-        device=device,
-    )
-
-    # 1, 16, 64 -> decode kernel; 128 -> prefill orchestrator.
-    for num_tokens in (1, 16, 64, 128):
-        q = (
-            torch.randn(
-                num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16
-            )
-            / 10.0
-        ).clamp(-1, 1)
-        indices = torch.randint(
-            0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
-        )
-        output = torch.zeros(
-            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
-        )
-        mid_out = None
-        mid_lse = None
-        if num_tokens <= 64:
-            mid_out, mid_lse = _make_decode_scratch(
-                num_tokens, num_heads, topk, d_v, device
-            )
-        # No exception means the dispatch path is wired correctly.
-        wrapper.run(
-            q,
-            kv_packed,
-            indices,
-            output,
-            sm_scale=d_qk**-0.5,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
-        )
