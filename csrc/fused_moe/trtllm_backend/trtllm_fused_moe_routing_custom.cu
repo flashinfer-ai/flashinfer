@@ -1346,16 +1346,19 @@ void run(Data const& data, void* stream) {
     bool const canUseCoop =
         (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
     bool useCoop = false;
+    CoopLaunchSMCounts coopLaunchSMCounts{0, 0};
     int numBlocksCoop = 0;
 
     if (canUseCoop) {
       static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-      numBlocksCoop = smCount - kReservedSMsForOverlapping;
+      coopLaunchSMCounts = getCoopLaunchSMCounts(smCount);
+      numBlocksCoop = coopLaunchSMCounts.moeSms;
       int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
       useCoop = (data.mNumTokens <= maxTokensCoop);
     }
 
     if (useCoop) {
+      logCoopLaunchSMCounts(coopLaunchSMCounts);
       launchInitExpertCounts(mutableData, numThreadsHist, stream);
       launchCoopKernel(mutableData, numBlocksCoop, numThreadsHist, stream);
     } else {

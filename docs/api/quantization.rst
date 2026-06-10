@@ -94,6 +94,7 @@ importable.
     :toctree: ../generated
 
     nvfp4_quantize_cute_dsl
+    nvfp4_quantize_per_token_cute_dsl
 
 .. currentmodule:: flashinfer.quantization.kernels.mxfp4_quantize
 

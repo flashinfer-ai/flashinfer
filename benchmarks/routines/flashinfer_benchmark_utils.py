@@ -200,6 +200,7 @@ benchmark_apis = {
         "cutlass_fused_moe",
         "cute_dsl_fp4_block_scale_moe",
         "b12x_fused_moe",
+        "unified_nvfp4_moe",
         "bgmv_moe",
     ],
     "moe_comm": [
@@ -520,6 +521,12 @@ routine_cc_to_supported_backends = {
         "10.3": [],
         "12.0": ["b12x"],
         "12.1": ["b12x"],
+    },
+    # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
+    # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
+    "unified_nvfp4_moe": {
+        "10.0": ["unified"],
+        "10.3": ["unified"],
     },
     # NORM
     "rmsnorm": {
