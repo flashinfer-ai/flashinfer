@@ -41,7 +41,6 @@ import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import logging
-import os
 from cutlass import Int32, Int64
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp.mma import Field as WarpField
@@ -101,16 +100,6 @@ def scatter_add_bf16x2(addr: Int64, val0_f32, val1_f32, *, loc=None, ip=None):
 
 
 logger = logging.getLogger(__name__)
-_B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
-)
-_B12X_TIMING_THRESHOLD_MS = float(
-    os.getenv(
-        "B12X_TIMING_THRESHOLD_MS",
-        os.getenv("VLLM_B12X_TIMING_THRESHOLD_MS", "0"),
-    )
-)
-_B12X_DENSE_SPLITK_TURBO = os.getenv("B12X_DENSE_SPLITK_TURBO", "0") == "1"
 _DENSE_LOAD_PATHS = ("tma", "cpasync")
 
 

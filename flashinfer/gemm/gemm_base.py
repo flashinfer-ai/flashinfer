@@ -5470,13 +5470,11 @@ def _b12x_gemm_fp4_requirement(
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
-    # The b12x NVFP4 kernel requires K % 128 == 0 (tile_k = sf_vec_size * 8); the
-    # default launch path skips can_implement, so enforce it here. Under "auto"
-    # this drops b12x for unsupported K (falls back to cutlass/cudnn); under
-    # explicit backend="b12x" it raises instead of silently dropping the K-tail.
-    # a is the packed FP4 operand of shape (M, K // 2), 2 FP4 values per uint8.
+    # K must be a multiple of 128 (tile_k = sf_vec_size * 8); a is packed FP4 (M, K//2).
     real_k = a.shape[1] * 2
     if real_k % 128 != 0:
+        if backend != "b12x":
+            return False  # let "auto" fall back to cutlass/cudnn
         raise ValueError(
             "b12x FP4 GEMM requires the contraction dim K to be a multiple of 128 "
             f"(tile_k = sf_vec_size * 8). Got K={real_k}."
@@ -5811,10 +5809,8 @@ def _b12x_gemm_fp4_runner(
         )
 
     def _default_dense_plan(m, n, real_k, device):
-        # Single source of truth for the deterministic default tile / swap_ab pick.
-        # Used by BOTH forward()'s default path AND get_valid_tactics(), so the
-        # autotuner candidate set always contains the exact default-path tile --
-        # i.e. tuning is monotonic vs the static default (it can't pick worse).
+        # Shared by forward() and get_valid_tactics() so the tuner's candidate
+        # set always includes the default-path tile.
         return _select_default_dense_gemm_plan(
             m, n, real_k, get_device_sm_count(device), expected_m=m
         )
@@ -5846,7 +5842,7 @@ def _b12x_gemm_fp4_runner(
             valid_tactics = []
 
             def _add(mma_tiler_mn, swap_ab):
-                # upstream b12x can_implement is M-independent (no `m` arg)
+                # can_implement is M-independent (takes no `m`)
                 if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
                     ab_dtype,
                     sf_dtype,
@@ -5868,18 +5864,13 @@ def _b12x_gemm_fp4_runner(
                     if tac not in valid_tactics:
                         valid_tactics.append(tac)
 
-            # Generic swap_ab-free candidate set the autotuner profiles. Kept minimal:
-            # a larger tile grid made the per-bucket pick noisier (overfits the bucket
-            # representative shape), so we only add a few balanced tiles here.
+            # A few balanced swap_ab-free tiles for the tuner to profile (a larger
+            # grid overfit the bucket representative and made picks noisier).
             for mma_tiler_mn in [(64, 64), (64, 128), (128, 64), (128, 128)]:
                 _add(mma_tiler_mn, swap_ab=False)
 
-            # Also expose the deterministic plan's regime-optimal pick for this
-            # (bucketed) shape -- the same tile forward() uses on the default path,
-            # which may be a narrow-N swap_ab tile (e.g. (64,32) at m=1) absent from
-            # the generic set above. Including it keeps autotuning monotonic: the
-            # tuner can never select something worse than the static default, and it
-            # picks up swap_ab on SKUs where it actually wins.
+            # Also include the default-path tile (may be a narrow-N swap_ab tile
+            # absent from the set above) so the tuner can't pick worse than static.
             plan = _default_dense_plan(m, n, real_k, a.device)
             _add(plan.mma_tiler_mn, swap_ab=plan.swap_ab)
             return valid_tactics
@@ -5902,13 +5893,9 @@ def _b12x_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
-                # Deterministic, regime-aware plan from upstream b12x: picks the
-                # decode/prefill-optimal tile (via expected_m) and swap_ab for
-                # narrow-N, instead of the M-independent default tile. For a single
-                # call the actual m IS the representative regime, so expected_m=m.
+                # Default path: the m-aware plan picks the tile (and swap_ab for
+                # narrow-N) for this shape; expected_m=m since m is the actual size.
                 plan = _default_dense_plan(m, n, real_k, a.device)
-                # Honor the plan's swap_ab (narrow-N decode tiles, e.g. 64x32).
-                # b12x swap_ab is device-internal; see the launch + wrapper notes.
                 tactic = (
                     plan.mma_tiler_mn,
                     (1, 1),
@@ -5946,8 +5933,8 @@ def _b12x_gemm_fp4_runner(
                 out_dtype,
             )
 
-            # NOTE: upstream b12x ctor inserts mma_k/tile_k/single_work_tile_per_cta
-            # before use_prefetch, so pass these by keyword to avoid mis-binding.
+            # ctor takes mma_k/tile_k/single_work_tile_per_cta before use_prefetch,
+            # so pass the later args by keyword to avoid mis-binding.
             make_kernel = lambda: Sm120B12xBlockScaledDenseGemmKernel(
                 sf_vec_size,
                 mma_tiler_mn,
@@ -5957,11 +5944,9 @@ def _b12x_gemm_fp4_runner(
                 swap_ab=swap_ab,
             )
 
-            # b12x swap_ab is device-internal (applied via the kernel ctor); the
-            # public C stays row-major (m, n). The shared harness's `swap_ab` instead
-            # selects the SM100 operand-swap FFI convention (C declared (n, m)), which
-            # b12x must not use -- so pass swap_ab=False (keeps c_fake (m, n) + plain
-            # `out`). cache_key still carries the real swap_ab (separate caching).
+            # swap_ab is device-internal (applied in the kernel ctor); public C
+            # stays row-major (m, n). Pass swap_ab=False to the harness so it keeps
+            # the (m, n) output convention, not the SM100 operand-swap one.
             compiled_gemm, _ = _compile_block_scaled_gemm(
                 _B12X_MM_FP4_KERNEL_CACHE,
                 cache_key,
@@ -5980,7 +5965,7 @@ def _b12x_gemm_fp4_runner(
 
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
-            # `out` is passed as-is (row-major (m, n)); see the swap_ab note above.
+            # `out` passed as-is (row-major (m, n)).
             compiled_gemm(
                 kernel_a,
                 kernel_b,
