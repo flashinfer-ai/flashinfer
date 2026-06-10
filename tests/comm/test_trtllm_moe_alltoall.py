@@ -20,8 +20,9 @@ import torch
 import pynvml
 from flashinfer.comm.mapping import Mapping
 from flashinfer.fused_moe.utils import make_random_topk_ids
-from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 from flashinfer.tllm_enums import SfLayout
+from flashinfer.utils import get_compute_capability
+from tests.utils_fp8 import mxfp8_quantize_reference
 
 import flashinfer.comm.trtllm_moe_alltoall as trtllm_moe_alltoall
 
@@ -716,6 +717,13 @@ def test_moe_combine_multi_rank_single_gpu(
     sf_layout,
 ):
     torch.cuda.set_device(0)
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+    if quant_mode == CombineQuantMode.MXFP8 and compute_capability_number < 100:
+        pytest.skip(
+            f"MXFP8 quantized combine requires CUDA platform >= 100, got {compute_capability_number}."
+        )
+
     check_sufficient_sm_count(num_tokens, world_size)
     max_world_size = 16
     assert world_size <= max_world_size, (
@@ -853,13 +861,10 @@ def test_moe_combine_multi_rank_single_gpu(
             )
     elif quant_mode == CombineQuantMode.MXFP8:
         for rank in range(world_size):
-            ref_fp8, ref_sf = mxfp8_quantize(
+            ref_fp8, ref_sf = mxfp8_quantize_reference(
                 reference_result[rank],
                 sf_swizzle_layout=sf_layout,
             )
-            print(f"Rank {rank}")
-            print(f"  {ref_fp8=}")
-            print(f"  {combine_results[rank]=}")
             # Compare FP8 values via float32 cast (assert_close doesn't accept fp8 dtype).
             torch.testing.assert_close(
                 combine_results[rank].to(torch.float32),
