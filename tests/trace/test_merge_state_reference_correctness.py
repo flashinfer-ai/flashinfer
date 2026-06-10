@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -32,7 +32,6 @@ def test_merge_state_reference_correctness(shape_kwargs):
         inputs["v_a"], inputs["s_a"], inputs["v_b"], inputs["s_b"]
     )
     _assert_finite(v_api, s_api, v_ref, s_ref)
-    _close(v_api, v_ref, atol=1e-3, rtol=1e-3)
-    _close(s_api, s_ref, atol=1e-3, rtol=1e-3)
+    _check(merge_state_trace, (v_ref, s_ref), (v_api, s_api), atol=1e-3, rtol=1e-3)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

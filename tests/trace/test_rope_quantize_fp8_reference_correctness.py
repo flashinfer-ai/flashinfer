@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -65,9 +65,12 @@ def test_rope_quantize_fp8_reference_correctness(shape_kwargs):
     # Match tolerance used by tests/attention/test_rope.py's rope_quantize_fp8
     # coverage: generous rtol (2e-1) absorbs single-ULP FP8 rounding between
     # the CUDA kernel and torch's FP8 cast while still catching real bugs.
-    _close(q_r_api.float(), q_r_ref.float(), atol=1e-2, rtol=2e-1)
-    _close(k_r_api.float(), k_r_ref.float(), atol=1e-2, rtol=2e-1)
-    _close(q_n_api.float(), q_n_ref.float(), atol=1e-2, rtol=2e-1)
-    _close(k_n_api.float(), k_n_ref.float(), atol=1e-2, rtol=2e-1)
+    _check(
+        rope_quantize_fp8_trace,
+        (q_r_ref.float(), k_r_ref.float(), q_n_ref.float(), k_n_ref.float()),
+        (q_r_api.float(), k_r_api.float(), q_n_api.float(), k_n_api.float()),
+        atol=1e-2,
+        rtol=2e-1,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

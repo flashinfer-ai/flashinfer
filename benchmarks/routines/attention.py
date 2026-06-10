@@ -546,7 +546,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -642,6 +642,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 v_scale=v_scale,
                 q_len_per_req=s_qo,
                 kv_cache_sf=kv_cache_sf,
+                enable_pdl=args.enable_pdl,
             )
         elif backend == "cudnn":
             return flashinfer.decode.cudnn_batch_decode_with_kv_cache(
@@ -673,6 +674,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 q_len_per_req=s_qo,
                 mask=speculative_mask,
                 kv_cache_sf=kv_cache_sf,
+                enable_pdl=args.enable_pdl,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -1131,7 +1133,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {kv_cache.shape = }")
@@ -1144,7 +1146,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print(f"[VVERBOSE] {kv_last_page_len.shape = }")
         print(f"[VVERBOSE] {scale = }")
 
-    # Helper function to convert to FP8 (matches test_trtllm_gen_attention.py approach)
+    # Helper function to convert to FP8 (matches test_trtllm_gen_attention_decode.py approach)
     def to_float8(x, dtype=torch.float8_e4m3fn):
         finfo = torch.finfo(dtype)
         min_val, max_val = x.aminmax()
@@ -1285,6 +1287,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 kv_cache_sf=kv_cache_sf,
+                enable_pdl=args.enable_pdl,
             )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
@@ -1294,6 +1297,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 q_scale=q_scale_tensor,
                 k_scale=k_scale_tensor,
                 v_scale=v_scale_tensor,
+                enable_pdl=args.enable_pdl,
             )
         elif backend == "trtllm-native":
             # Compute combined bmm1_scale: q_scale * k_scale * sm_scale
@@ -1318,6 +1322,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 cum_seq_lens_kv=kv_indptr,
                 causal=causal,
                 kv_cache_sf=kv_cache_sf,
+                enable_pdl=args.enable_pdl,
             )
         elif backend == "cudnn-native":
             # Direct cudnn_batch_prefill_with_kv_cache call (similar to trtllm-native)
@@ -1847,7 +1852,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     )
 
     scale = float(1.0 / (head_dim_qk**0.5))
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {k.shape = }")
@@ -1962,7 +1967,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         kv_indptr,
     ):
         if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
-            return backend_wrappers[backend].run_return_lse(q, k, v)[0]
+            return backend_wrappers[backend].run_return_lse(
+                q, k, v, enable_pdl=args.enable_pdl
+            )[0]
         elif backend == "cute-dsl":
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
@@ -1982,7 +1989,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 window_left=-1,
                 cum_seq_lens_q=qo_indptr,
                 cum_seq_lens_kv=kv_indptr,
-                enable_pdl=False,
+                enable_pdl=args.enable_pdl,
                 is_causal=causal,
                 return_lse=True,
                 out=trtllm_out,
@@ -1990,7 +1997,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             )[0]
         elif backend == "cudnn":
             # cuDNN uses wrapper API
-            return backend_wrappers[backend].run(q, k, v)
+            return backend_wrappers[backend].run(q, k, v, enable_pdl=args.enable_pdl)
         elif backend == "cudnn-native":
             # Direct cudnn_batch_prefill_with_kv_cache call
             return flashinfer.prefill.cudnn_batch_prefill_with_kv_cache(
@@ -2033,7 +2040,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 window_left=-1,
                 cum_seq_lens_q=qo_indptr,
                 cum_seq_lens_kv=kv_indptr,
-                enable_pdl=False,
+                enable_pdl=args.enable_pdl,
                 is_causal=causal,
                 return_lse=True,
                 out=trtllm_out,
@@ -2413,7 +2420,7 @@ def testBatchMLAPagedAttentionWrapper(args):
         kv_indices[start_idx:end_idx] = block_tables[i, : end_idx - start_idx]
 
     sm_scale = 1.0 / ((128 + 64) ** 0.5)  # For DeepSeek-R1
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {ckv_cache.shape = }")
@@ -2477,6 +2484,9 @@ def testBatchMLAPagedAttentionWrapper(args):
         actual_seq_lens_kv,
     ):
         if backend in ["fa2", "fa3"]:
+            # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
+            # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
+            # cute-dsl branches below pass args.enable_pdl to the direct API.
             return backend_wrappers[backend].run(
                 q_nope,
                 q_pe,
@@ -2486,6 +2496,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 return_lse=False,
             )
         elif backend == "cutlass":
+            # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl.
             return backend_wrappers[backend].run(
                 q_nope,
                 q_pe,
@@ -2509,6 +2520,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 backend="trtllm-gen",
+                enable_pdl=args.enable_pdl,
             ).squeeze(1)
         elif backend == "auto":
             # Autotune dispatcher: picks between trtllm-gen and cute-dsl per
@@ -2527,6 +2539,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 backend="auto",
+                enable_pdl=args.enable_pdl,
             ).squeeze(1)
         elif backend == "cute-dsl":
             return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
@@ -2542,6 +2555,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 backend="cute-dsl",
+                enable_pdl=args.enable_pdl,
             ).squeeze(1)
         else:
             print(f"[ERROR] Unsupported backend: {backend}")

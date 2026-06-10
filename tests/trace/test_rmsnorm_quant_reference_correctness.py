@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -30,7 +30,6 @@ def test_rmsnorm_quant_reference_correctness(shape_kwargs):
         inputs["input"], inputs["weight"], inputs["scale"]
     )
     _assert_finite(out_api, out_ref)
-    s = inputs["scale"]
-    _close(out_api.float() * s, out_ref.float() * s, atol=1.0, rtol=1.0)
+    _check(rmsnorm_quant_trace, out_ref, out_api)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

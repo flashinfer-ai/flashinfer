@@ -253,7 +253,7 @@ class MLAStaticTileScheduler:
 
             blk_coord = (cluster_idx, s_idx, b_idx, split_kv_idx)
         else:
-            s_idx, b_idx = divmod(self.blk_coord[1], self.params.problem_shape_b_fdd)
+            b_idx, s_idx = divmod(self.blk_coord[1], self.params.problem_shape_s_fdd)
             blk_coord = (self.blk_coord[0], s_idx, b_idx, self.blk_coord[2])
 
         return WorkTileInfo(blk_coord, is_valid)

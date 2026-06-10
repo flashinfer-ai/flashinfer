@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -63,7 +63,12 @@ def test_append_paged_mla_kv_cache_reference_correctness(shape_kwargs):
         inputs["kv_indptr"],
         inputs["kv_last_page_len"],
     )
-    _close(ckv_api, ckv_ref, atol=0.0, rtol=0.0)
-    _close(kpe_api, kpe_ref, atol=0.0, rtol=0.0)
+    _check(
+        append_paged_mla_kv_cache_trace,
+        (ckv_ref, kpe_ref),
+        (ckv_api, kpe_api),
+        atol=0.0,
+        rtol=0.0,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

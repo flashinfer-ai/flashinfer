@@ -4,6 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
+    _check,
     _skip_if_not_sm100,
 )
 
@@ -29,10 +30,12 @@ def test_nvfp4_quantize_reference_correctness(shape_kwargs):
     # Since the round-trip needs a fp4 dequant LUT, we compare packed bytes
     # under a loose tolerance that accepts single-ULP mismatches from rounding.
     ref_packed, _ = nvfp4_quantize_trace.reference(inputs["a"], inputs["a_global_sf"])
-    # Check element-wise agreement rate; allow up to 5% bytes to differ by
-    # a single ULP (one nibble).
-    diff = (api_packed.to(torch.int32) - ref_packed.to(torch.int32)).abs()
-    frac_different = (diff > 0).float().mean().item()
-    assert frac_different < 0.05, f"{frac_different:.2%} packed bytes differ"
+    _check(
+        nvfp4_quantize_trace,
+        ref_packed,
+        api_packed,
+        max_mismatch_pct=5.0,
+        min_cos_sim=None,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

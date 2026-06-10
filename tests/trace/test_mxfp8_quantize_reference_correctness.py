@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
     _skip_if_not_sm100,
 )
 
@@ -26,9 +26,10 @@ def test_mxfp8_quantize_reference_correctness(shape_kwargs):
         pytest.skip(f"mxfp8_quantize kernel unavailable: {exc}")
     q_ref, _s_ref = mxfp8_quantize_trace.reference(inputs["input"])
     # Different swizzle layouts → compare absolute-value histograms only.
-    _close(
-        q_api.float().abs().mean(),
+    _check(
+        mxfp8_quantize_trace,
         q_ref.float().abs().mean(),
+        q_api.float().abs().mean(),
         atol=2.0,
         rtol=0.5,
     )

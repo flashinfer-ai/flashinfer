@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -37,6 +37,6 @@ def test_segment_gemm_run_reference_correctness(shape_kwargs):
         inputs["x"], inputs["weights"], seg_indptr=inputs["seg_indptr"]
     )
     # Matches tests/gemm/test_group_gemm.py.
-    _close(api_out, ref_out, atol=2e-3, rtol=1e-3)
+    _check(segment_gemm_run_trace, ref_out, api_out, atol=2e-3, rtol=1e-3)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

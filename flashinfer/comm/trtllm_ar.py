@@ -769,13 +769,20 @@ def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
 
 
 # allReduce fused quant utils
-def compute_fp4_swizzled_layout_sf_size(total_row, total_column):
-    """
-    Helper function to compute the padded size of the fp4 swizzled layout.
+def compute_fp4_swizzled_layout_sf_size(total_row: int, total_column: int) -> int:
+    r"""Compute the padded size (rows times columns) of the FP4 swizzled layout.
 
-    Parameters:
-    - total_row: the total number of rows.
-    - total_column: the total number of columns.
+    Parameters
+    ----------
+    total_row : int
+        Logical row count of the un-padded layout.
+    total_column : int
+        Logical column count of the un-padded layout.
+
+    Returns
+    -------
+    int
+        ``padded_row * padded_column`` for the swizzled layout.
     """
 
     def pad_up(x, y):
@@ -787,6 +794,17 @@ def compute_fp4_swizzled_layout_sf_size(total_row, total_column):
 
 
 def trtllm_lamport_initialize(buffer_ptr: int, size: int, dtype: torch.dtype) -> None:
+    r"""Initialize a single Lamport-style buffer to negative zero.
+
+    Parameters
+    ----------
+    buffer_ptr : int
+        Device pointer to the buffer.
+    size : int
+        Number of elements in the buffer.
+    dtype : torch.dtype
+        Element dtype of the buffer.
+    """
     get_trtllm_comm_module().trtllm_lamport_initialize(buffer_ptr, size, dtype)
 
 
@@ -797,15 +815,20 @@ def trtllm_lamport_initialize_all(
     size: int,
     dtype: torch.dtype,
 ) -> None:
-    """
-    Initialize 3 lamport buffers by negative zero.
+    r"""Initialize three Lamport buffers to negative zero.
 
-    Parameters:
-    - buffer_0_ptr: the pointer to the first buffer.
-    - buffer_1_ptr: the pointer to the second buffer.
-    - buffer_2_ptr: the pointer to the third buffer.
-    - size: the size of the buffer.
-    - dtype: the data type of the buffer.
+    Parameters
+    ----------
+    buffer_0_ptr : int
+        Device pointer to the first buffer.
+    buffer_1_ptr : int
+        Device pointer to the second buffer.
+    buffer_2_ptr : int
+        Device pointer to the third buffer.
+    size : int
+        Number of elements in each buffer.
+    dtype : torch.dtype
+        Element dtype of each buffer.
     """
 
     get_trtllm_comm_module().trtllm_lamport_initialize_all(
@@ -1010,6 +1033,14 @@ def trtllm_allreduce_fusion(
     - metadata: optional workspace metadata dict from create_ipc_workspace_for_all_reduce_fusion.
                 If provided, validates that token_num <= max_token_num, world_size == tp_size,
                 and hidden_dim == workspace hidden_dim. Raises ValueError if validation fails.
+    - block_quant_group_size: group size (in elements along hidden_dim) for per-token-group
+                              block-wise FP8 quantization patterns
+                              (e.g. ``kPerTokenGroupFP8Packed`` / DeepSeek-style FP8 with
+                              UE8M0 packed scales). Number of consecutive elements that
+                              share a single scale factor. Must be > 0 and divide
+                              ``hidden_dim`` when the pattern requires it; ignored
+                              (treated as 0 / unused) for patterns that do not perform
+                              block-quantization.
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
