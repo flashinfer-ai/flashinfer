@@ -25,9 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 def _make_qkv(qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout):
     """Create ``q``/``k``/``v`` tensors honoring the requested ``kv_layout``."""
-    q = torch.randn(
-        qo_len, num_qo_heads, head_dim, dtype=torch.float16, device=DEVICE
-    )
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.float16, device=DEVICE)
     if kv_layout == "NHD":
         kv_shape = (kv_len, num_kv_heads, head_dim)
     else:  # HND
@@ -45,9 +43,7 @@ def test_custom_mask_valid_shape_passes(kv_layout):
     qo_len, kv_len = 16, 32
     num_qo_heads = num_kv_heads = 4
     head_dim = 128
-    q, k, v = _make_qkv(
-        qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout
-    )
+    q, k, v = _make_qkv(qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout)
     mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=DEVICE)
 
     o = flashinfer.single_prefill_with_kv_cache(
@@ -74,9 +70,7 @@ def test_custom_mask_invalid_shape_raises(kv_layout, bad_shape_fn):
     qo_len, kv_len = 16, 32
     num_qo_heads = num_kv_heads = 4
     head_dim = 128
-    q, k, v = _make_qkv(
-        qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout
-    )
+    q, k, v = _make_qkv(qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout)
     bad_shape = bad_shape_fn(qo_len, kv_len)
     mask = torch.ones(*bad_shape, dtype=torch.bool, device=DEVICE)
 
@@ -93,9 +87,7 @@ def test_custom_mask_none_skips_validation():
     qo_len, kv_len = 16, 32
     num_qo_heads = num_kv_heads = 4
     head_dim = 128
-    q, k, v = _make_qkv(
-        qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, "NHD"
-    )
+    q, k, v = _make_qkv(qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, "NHD")
 
     o = flashinfer.single_prefill_with_kv_cache(q, k, v, custom_mask=None)
     assert o.shape == (qo_len, num_qo_heads, head_dim)
@@ -105,14 +97,10 @@ def test_packed_custom_mask_skips_validation():
     qo_len, kv_len = 16, 32
     num_qo_heads = num_kv_heads = 4
     head_dim = 128
-    q, k, v = _make_qkv(
-        qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, "NHD"
-    )
+    q, k, v = _make_qkv(qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, "NHD")
 
     full_mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=DEVICE)
-    packed = flashinfer.packbits(
-        full_mask.contiguous().view(-1), bitorder="little"
-    )
+    packed = flashinfer.packbits(full_mask.contiguous().view(-1), bitorder="little")
     # A deliberately wrong-shaped ``custom_mask`` must be ignored when a packed
     # mask is supplied, so no ValueError should be raised.
     wrong_mask = torch.ones(qo_len - 1, kv_len, dtype=torch.bool, device=DEVICE)
