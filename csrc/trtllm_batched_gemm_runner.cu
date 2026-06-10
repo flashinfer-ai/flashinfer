@@ -95,12 +95,21 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
   auto sm_version = getSMVersion();
   auto const hasKernelNameFilter = !mOptions.kernelNameFilterRegex.empty();
   std::regex kernelNameFilter;
+  static std::mutex kernelNameFilterMutex;
+  static std::unordered_map<std::string, std::regex> kernelNameFilterCache;
   if (hasKernelNameFilter) {
-    try {
-      kernelNameFilter = std::regex(mOptions.kernelNameFilterRegex);
-    } catch (std::regex_error const& e) {
-      FLASHINFER_CHECK(false, "Invalid TRTLLM-gen batched GEMM kernel name filter regex \"",
-                       mOptions.kernelNameFilterRegex, "\": ", e.what());
+    std::lock_guard<std::mutex> lock(kernelNameFilterMutex);
+    auto it = kernelNameFilterCache.find(mOptions.kernelNameFilterRegex);
+    if (it != kernelNameFilterCache.end()) {
+      kernelNameFilter = it->second;
+    } else {
+      try {
+        kernelNameFilter = std::regex(mOptions.kernelNameFilterRegex);
+        kernelNameFilterCache[mOptions.kernelNameFilterRegex] = kernelNameFilter;
+      } catch (std::regex_error const& e) {
+        FLASHINFER_CHECK(false, "Invalid TRTLLM-gen batched GEMM kernel name filter regex \"",
+                         mOptions.kernelNameFilterRegex, "\": ", e.what());
+      }
     }
   }
 
