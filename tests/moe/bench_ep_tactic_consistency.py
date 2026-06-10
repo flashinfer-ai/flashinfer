@@ -1,7 +1,7 @@
 """4-GPU EP autotuner consistency / determinism / speed micro-benchmark.
 
-This is the *accurate* test for "改动 1" (EP/DP-aware deterministic balanced
-dummy in the trtllm-gen MoE autotuner).  The bug it targets is fundamentally a
+This is the *accurate* test for the EP/DP-aware deterministic balanced
+dummy in the trtllm-gen MoE autotuner.  The bug it targets is fundamentally a
 **multi-process** phenomenon: every EP rank is its own process with its own
 autotuner and its own RNG, so the old unseeded ``make_random_topk_ids`` routing
 made each rank profile a *different* dummy problem and converge on a *different*
@@ -55,7 +55,7 @@ _FP4_OP = "flashinfer::trtllm_fp4_block_scale_moe"
 # NOTE: trtllm-gen MXFP4 cubins only expose kernel configs for hidden /
 # intermediate sizes that are 128-aligned (e.g. 3072, 4096, 7168).  gpt-oss's
 # raw 2880 has *no valid config* (getValidConfigIndices throws) -- TRT-LLM pads
-# it before calling the kernel.  Since "改动 1" only affects *tactic selection*
+# it before calling the kernel.  Since this change only affects *tactic selection*
 # (shape-independent), we default to a 128-aligned shape so the kernel runs and
 # we can observe per-rank tactic consistency / determinism.
 NUM_EXPERTS = int(os.environ.get("NUM_EXPERTS", "128"))

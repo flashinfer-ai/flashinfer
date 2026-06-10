@@ -683,7 +683,7 @@ def autotune(
 
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
-            # Align tactics across ranks (改动②) once the outermost tuning
+            # Align tactics across ranks once the outermost tuning
             # context closes, so every rank leaves with the same per-key
             # decision.  No-op unless FLASHINFER_AUTOTUNE_DISTRIBUTED is set.
             # ``distributed_process_group`` scopes the broadcast to the ranks
@@ -1519,7 +1519,7 @@ class AutoTuner:
         return sizes
 
     def _maybe_sync_distributed_cache(self, process_group: Any = None) -> None:
-        """Align the profiling cache across EP/TP ranks (改动②).
+        """Align the profiling cache across EP/TP ranks.
 
         Mirrors TensorRT-LLM's ``DistributedTuningStrategy``:
 

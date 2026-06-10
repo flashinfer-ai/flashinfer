@@ -1,4 +1,4 @@
-"""Correctness checks for the process-group-scoped broadcast (改动②).
+"""Correctness checks for the process-group-scoped broadcast.
 
 Three sub-checks, run together under a 4-GPU torchrun:
 

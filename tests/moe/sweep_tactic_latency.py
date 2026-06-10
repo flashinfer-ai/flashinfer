@@ -15,7 +15,7 @@ top-4, swiglu), this script:
   3. reports the latency spread and flags how many tactics are slower than the
      default -- i.e. the "trap" tactics a naive fastest-wins-with-noise tuner
      could freeze into the decode CUDA graph;
-  4. applies 改动① 's rule (only switch off the default if a tactic beats it by
+  4. applies our policy's rule (only switch off the default if a tactic beats it by
      ``FLASHINFER_AUTOTUNE_SWITCH_MARGIN``) and prints what *our* autotuner would
      select -- demonstrating it can never land on a slower-than-default tactic.
 
@@ -214,7 +214,7 @@ def main():
         n_slower_than_default = sum(1 for _, ms in rows_finite if ms > t_default)
         n_2x = sum(1 for _, ms in rows_finite if ms >= 1.8 * fastest_ms)
 
-        # What 改动① would select: the fastest tactic, but only if it beats the
+        # What our policy would select: the fastest tactic, but only if it beats the
         # default by the margin; otherwise keep the default (tactic=-1).
         if fastest_ms < t_default * (1.0 - MARGIN):
             chosen = f"tactic={fastest_tac} ({fastest_ms*1e3:.1f}us)"
@@ -230,7 +230,7 @@ def main():
             f"slowest/default={slowest_ms/t_default:.2f}x)\n"
             f"    #tactics slower than default = {n_slower_than_default}/{len(rows_finite)}"
             f"   |  #tactics >=1.8x fastest = {n_2x}\n"
-            f"    -> 改动① selects: {chosen}",
+            f"    -> policy selects: {chosen}",
             flush=True,
         )
         # Full sorted distribution for the record.

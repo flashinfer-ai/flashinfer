@@ -1210,7 +1210,7 @@ def get_trtllm_moe_sm100_module():
             # *different* routing distribution and can converge on a different /
             # slower tactic -- this is the root cause of Rong Song's cross-rank
             # divergence (issue #3537).  Leave unset for the EP/DP-aware balanced
-            # dummy (改动 1).  Used only by the EP A/B micro-benchmark.
+            # dummy.  Used only by the EP A/B micro-benchmark.
             _legacy_random_dummy = bool(
                 os.environ.get("FLASHINFER_AUTOTUNE_LEGACY_RANDOM_DUMMY", "")
             )
