@@ -94,7 +94,10 @@ def bench_fi(endpoints, h_qk, h_v, d, warmup, iters):
         torch.randn(T, h_qk, d, dtype=torch.float32, device=device), p=2, dim=-1
     ).to(dtype)
     v = torch.randn((T, h_v, d), dtype=dtype, device=device)
-    g = F.logsigmoid(torch.rand(T, h_v, dtype=torch.float32, device=device))
+    # FlashInfer's g is the linear-space forget gate alpha in (0, 1)
+    # ("defaults to all ones" = no decay). Log-space gates (e.g. logsigmoid)
+    # are out of domain and produce NaN outputs/state.
+    g = torch.rand(T, h_v, dtype=torch.float32, device=device)
     beta = torch.rand(T, h_v, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
     state_out = torch.zeros_like(h0)
@@ -162,8 +165,10 @@ def main():
     )
 
     if not _has_fla:
-        print("Error: FLA not installed. Run: pip install flash-linear-attention")
-        sys.exit(1)
+        print(
+            "Warning: FLA not installed (pip install flash-linear-attention). "
+            "Benchmarking FlashInfer only."
+        )
 
     print(f"\nGPU: {torch.cuda.get_device_name(0)} [{arch_label}]")
     print("Models: Qwen3.5 family (397B, 122B, 35B, 27B, 9B, 4B, 2B, 0.8B), d=128")
@@ -172,8 +177,9 @@ def main():
     header = (
         f"{'Heads':<15s}  {'Seqlens':<16s}  {'h_qk':>4s} {'h_v':>4s}"
         f"  {fi_col:>22s}  {'TFLOPS':>7s}"
-        f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
     )
+    if _has_fla:
+        header += f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
     print(header)
     print("-" * len(header))
 
@@ -181,15 +187,17 @@ def main():
         for endpoints, s_label in SEQ_CONFIGS:
             T = endpoints[-1]
             fi_ms = bench_fi(endpoints, h_qk, h_v, d, args.warmup, args.iters)
-            fla_ms = bench_fla(endpoints, h_qk, h_v, d, args.warmup, args.iters)
             tflops = _gdn_tflops(T, h_v, d, fi_ms)
-            speedup = fla_ms / fi_ms
-            marker = "+" if speedup > 1.0 else "-"
-            print(
+            row = (
                 f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
                 f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
-                f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
             )
+            if _has_fla:
+                fla_ms = bench_fla(endpoints, h_qk, h_v, d, args.warmup, args.iters)
+                speedup = fla_ms / fi_ms
+                marker = "+" if speedup > 1.0 else "-"
+                row += f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
+            print(row)
         print()
 
 
