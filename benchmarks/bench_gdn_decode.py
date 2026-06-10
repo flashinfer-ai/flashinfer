@@ -2422,13 +2422,10 @@ def bench_gdn_decode_bf16_state(
         else:
             p = (accepted_steps_target_ar - 1.0) / (T - 1)
             p = max(0.0, min(1.0, p))
-            n_tensor = torch.full((batch_size,), float(T - 1))
-            p_tensor = torch.full((batch_size,), p)
+            n_tensor = torch.full((batch_size,), float(T - 1), device="cuda")
+            p_tensor = torch.full((batch_size,), p, device="cuda")
             accepted_steps_tensor = (
-                torch.binomial(n_tensor, p_tensor)
-                .clamp(0, T - 1)
-                .to(torch.int32)
-                .cuda()
+                torch.binomial(n_tensor, p_tensor).clamp(0, T - 1).to(torch.int32)
             )
     elif accepted_steps_mode == "uniform":
         # All requests process all T tokens (K = T-1 each). Verifies early-break
