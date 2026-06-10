@@ -122,6 +122,11 @@
       __VA_ARGS__                                          \
       break;                                               \
     }                                                      \
+    case 32: {                                             \
+      constexpr uint32_t CTA_TILE_Q = 32;                  \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
     case 16: {                                             \
       constexpr uint32_t CTA_TILE_Q = 16;                  \
       __VA_ARGS__                                          \
@@ -381,15 +386,36 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
-inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
-  // At head_dim >= 512 the Q smem tile (CTA_TILE_Q * head_dim * 2B) dominates the
-  // per-CTA shared memory: CTA_TILE_Q=64 needs 64KB for Q alone, capping occupancy
-  // at 1 CTA/SM and exceeding the ~100KB budget of consumer Blackwell (SM12x).
-  // CTA_TILE_Q=16 shrinks Q smem 4x, letting the kernel fit small-smem parts and
-  // run 2 CTAs/SM on large-smem parts. The split-D prefill kernel uses NUM_WARPS_KV=4
-  // at this tile, so KV work is still parallelized across warps.
+inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
+                                     uint32_t sizeof_dtype_kv = 2) {
+  // At head_dim >= 512 (VO-split prefill) CTA_TILE_Q=32 doubles the queries/CTA vs
+  // 16, halving the K/V re-streaming through L1/shared memory (the hd512 bottleneck
+  // is L1TEX bandwidth, not DRAM). The choice is dtype-dependent because the warp
+  // layout that fits the 100KB SM12x budget differs by KV precision:
+  //  - 16-bit KV (bf16/fp16): the dispatcher uses a 2-Q x 2-KV-warp layout
+  //    (CTA_TILE_KV=32, o_frag=128 regs, no dequant temporaries), which fits 100KB
+  //    at CTA_TILE_Q=32 on every part -> always pick 32.
+  //  - FP8 KV: needs the 1-Q x 4-KV-warp layout (64-reg o_frag) to leave registers
+  //    for the in-loop dequant; that layout's min CTA_TILE_KV is 64, so CTA_TILE_Q=32
+  //    costs ~105KB and only fits big-smem parts (SM90/SM100 ~228KB, 2 CTAs/SM).
+  //    100KB parts (SM12x/GB10) fall back to the ~82KB CTA_TILE_Q=16 tile.
   if (head_dim >= 512) {
-    return 16;
+    // Short query length (decode / speculative-decode, packed_qo <= 32) is
+    // bandwidth-bound: CTA_TILE_Q=32's query amortization buys nothing, while the
+    // larger 104KB CTA caps occupancy at 2 CTAs/SM. Use the lean CTA_TILE_Q=16 tile
+    // (1Qx4KV VO-split, ~82KB -> more CTAs/SM, less wasted Q work). Long q (prefill)
+    // keeps CTA_TILE_Q=32 where the L1TEX-bandwidth amortization pays off.
+    if (avg_packed_qo_len <= 32) {
+      return 16;
+    }
+    if (sizeof_dtype_kv >= 2) {
+      return 32;  // 16-bit KV: 2x2 layout fits 100KB at CTA32 on all parts
+    }
+    int device_id = 0, max_smem_per_sm = 0;
+    cudaGetDevice(&device_id);
+    cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                           device_id);
+    return (max_smem_per_sm >= 128 * 1024) ? 32 : 16;  // FP8: CTA32 only on big-smem
   }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;

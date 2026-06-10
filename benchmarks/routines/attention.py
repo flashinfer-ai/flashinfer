@@ -383,11 +383,11 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "[INFO] FA2_TC backend does not support speculative decode. Skipping."
             )
             remove_fa2_tc = True
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] FA2_TC backend does not support FP8. Skipping.")
+        # fa2_tc (tensor-core decode = prefill kernel) supports FP8 *KV* with a
+        # 16-bit query; only an FP8 *query* is unsupported (the prefill kernel takes
+        # bf16/fp16 Q and dequantizes KV in-kernel).
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            print("[INFO] FA2_TC backend does not support FP8 query. Skipping.")
             remove_fa2_tc = True
         if remove_fa2_tc:
             backends.remove("fa2_tc")
