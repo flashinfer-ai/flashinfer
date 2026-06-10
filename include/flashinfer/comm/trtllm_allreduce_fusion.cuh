@@ -31,6 +31,12 @@ static constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
+static constexpr float kFP8E4M3Max = 448.0f;
+// E4M3FN's smallest positive subnormal is 2^-9. Clamp dynamic
+// scales to min_subnormal / max_finite so zero/tiny rows do not
+// produce a zero scale.
+static constexpr float kFP8E4M3MinSubnormal = 1.0f / 512.0f;
+static constexpr float kDynamicFP8MinScale = kFP8E4M3MinSubnormal / kFP8E4M3Max;
 
 }  // namespace details
 
@@ -414,7 +420,7 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
 
   __syncthreads();
 
-  bool is_mask = threadIdx.x < (blockDim.x / 32.f);
+  bool is_mask = threadIdx.x < (blockDim.x >> 5);
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane] : (T)(0.0f);
@@ -452,7 +458,7 @@ __inline__ __device__ T blockReduceMaxV2(T* val) {
 
   __syncthreads();
 
-  bool is_mask = threadIdx.x < (blockDim.x / 32.f);
+  bool is_mask = threadIdx.x < (blockDim.x >> 5);
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane]
@@ -1192,14 +1198,13 @@ class FusedOp {
         }
       }
     } else if constexpr (GetQuantType<Pattern> == QuantType::kDynamicFP8) {
-      constexpr float FP8_E4M3_MAX = 448.0f;
       float token_scale = dynamic_token_fp8_scale(val, token_id);
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
         float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) / token_scale;
-        q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+        q = fminf(fmaxf(q, -details::kFP8E4M3Max), details::kFP8E4M3Max);
         reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(q);
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
@@ -1252,8 +1257,6 @@ class FusedOp {
 
   __device__ __forceinline__ float dynamic_token_fp8_scale(vec_t<T, VEC_SIZE> const& val,
                                                            int token_id) {
-    static constexpr float kFP8E4M3Max = 448.0f;
-    static constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
     __shared__ float s_val;
     float acc = 0.f;
 #pragma unroll
@@ -1280,7 +1283,7 @@ class FusedOp {
     }
 #endif
     if (threadIdx.x == 0) {
-      s_val = fmaxf(acc / kFP8E4M3Max, kMinScale);
+      s_val = fmaxf(acc / details::kFP8E4M3Max, details::kDynamicFP8MinScale);
       reinterpret_cast<float*>(m_params.scale_out)[token_id] = s_val;
     }
     __syncthreads();

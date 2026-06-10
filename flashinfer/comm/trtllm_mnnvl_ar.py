@@ -686,6 +686,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             raise ValueError(
                 f"quant_out dtype for FP8 must be float8_e4m3fn, got {quant_out.dtype}."
             )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for FP8.")
         scale_out = None
     elif quant_type == MNNVLQuantType.NVFP4:
         if input.dtype == torch.float32:
@@ -710,6 +712,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             raise ValueError(
                 f"quant_out dtype for NVFP4 must be uint8 or float4_e2m1fn_x2, got {quant_out.dtype}."
             )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for NVFP4.")
 
         expected_scale_out_numel = (
             token_num * hidden_dim // 16
@@ -748,6 +752,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             raise ValueError(
                 f"quant_out dtype for dynamic FP8 must be float8_e4m3fn, got {quant_out.dtype}."
             )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for dynamic FP8.")
         expected_scale_shape = (token_num, 1)
         if scale_out is None:
             scale_out = torch.empty(

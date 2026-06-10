@@ -105,6 +105,13 @@ namespace utils {
 
 constexpr uint16_t kNEGZERO_FP16 = 0x8000U;
 constexpr uint32_t kNEGZERO_FP32 = 0x80000000U;
+constexpr int kMaxClusterSize = 8;
+constexpr float kFP8E4M3Max = 448.0f;
+// E4M3FN's smallest positive subnormal is 2^-9. Clamp dynamic
+// scales to min_subnormal / max_finite so zero/tiny rows do not
+// produce a zero scale.
+constexpr float kFP8E4M3MinSubnormal = 1.0f / 512.0f;
+constexpr float kDynamicFP8MinScale = kFP8E4M3MinSubnormal / kFP8E4M3Max;
 
 template <typename T>
 union Fp16BitCast {
@@ -784,7 +791,7 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
                                            bool useCluster) {
   // Step 1: start from the widest cluster we are willing to launch. MNNVL JIT only
   // targets SM90/SM100, but RMSNorm may request a no-CGA fallback for multi-load rows.
-  int clusterSize = useCluster ? 8 : 1;
+  int clusterSize = useCluster ? kMaxClusterSize : 1;
   int blockSize = 128;
   int threadsNeeded = ceil_div(dim, eltsPerThread);
   int loadsPerThread = 1;
@@ -826,7 +833,7 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
   // Step 6: for very wide rows, first increase cluster width on SM90+ and then increase
   // per-thread loads. The goal is to keep block_size within CUDA's 1024-thread limit.
   while (blockSize > 1024) {
-    if (useCluster && clusterSize < 8) {
+    if (useCluster && clusterSize < kMaxClusterSize) {
       clusterSize = clusterSize << 1;
     } else if (loadsPerThread < 8) {
       loadsPerThread += 1;
@@ -1042,15 +1049,13 @@ __global__ void __launch_bounds__(1024)
   }
 #endif
   else if constexpr (QType == QuantType::kDynamicFP8) {
-    static constexpr float kFP8E4M3Max = 448.0f;
-    static constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
     float threadMax = 0.F;
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
       threadMax = fmaxf(threadMax, fabsf(toFloat<T>(packedAccum.elements[i])));
     }
     float tokenMax = blockReduceMax<float, true>(threadMax);
-    __shared__ float sharedMax[8];
+    __shared__ float sharedMax[utils::kMaxClusterSize];
     int const numBlocks = cluster.num_blocks();
     int const blockRank = cluster.block_rank();
     if (numBlocks > 1) {
@@ -1064,7 +1069,7 @@ __global__ void __launch_bounds__(1024)
       }
       tokenMax = fullMax;
     }
-    float tokenScale = fmaxf(tokenMax / kFP8E4M3Max, kMinScale);
+    float tokenScale = fmaxf(tokenMax / utils::kFP8E4M3Max, utils::kDynamicFP8MinScale);
     if (threadIdx.x == 0 && blockRank == 0) {
       reinterpret_cast<float*>(params.scalingFactorOutPtr)[token] = tokenScale;
     }
@@ -1073,7 +1078,7 @@ __global__ void __launch_bounds__(1024)
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
       float q = toFloat<T>(packedAccum.elements[i]) / tokenScale;
-      q = fminf(fmaxf(q, -kFP8E4M3Max), kFP8E4M3Max);
+      q = fminf(fmaxf(q, -utils::kFP8E4M3Max), utils::kFP8E4M3Max);
       reinterpret_cast<__nv_fp8_e4m3*>(&quantPacked)[i] = static_cast<__nv_fp8_e4m3>(q);
     }
     reinterpret_cast<PackedQuantizedType*>(
@@ -1143,6 +1148,11 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       return cudaErrorInvalidValue;
     }
 #endif
+  }
+  if (clusterSize > utils::kMaxClusterSize) {
+    FLASHINFER_ERROR("[MNNVL AllReduceOneShot] cluster_size " + std::to_string(clusterSize) +
+                     " exceeds shared max buffer " + std::to_string(utils::kMaxClusterSize));
+    return cudaErrorInvalidValue;
   }
 
   cudaLaunchAttribute attrs[2];
@@ -1490,10 +1500,8 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   }
 
   if constexpr (QType == QuantType::kDynamicFP8) {
-    static constexpr float kFP8E4M3Max = 448.0f;
-    static constexpr float kMinScale = 1.0f / (448.0f * 512.0f);
     float tokenMax = blockReduceMax<float, true>(threadMax);
-    __shared__ float sharedMax[8];
+    __shared__ float sharedMax[utils::kMaxClusterSize];
     if constexpr (UseCGA) {
       namespace cg = cooperative_groups;
       cg::cluster_group cluster = cg::this_cluster();
@@ -1510,7 +1518,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
         tokenMax = fullMax;
       }
     }
-    float tokenScale = fmaxf(tokenMax / kFP8E4M3Max, kMinScale);
+    float tokenScale = fmaxf(tokenMax / utils::kFP8E4M3Max, utils::kDynamicFP8MinScale);
     if (threadIdx.x == 0 && clusterBlockRank == 0) {
       reinterpret_cast<float*>(params.scalingFactorOutPtr)[token] = tokenScale;
     }
@@ -1524,7 +1532,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
 #pragma unroll
         for (int j = 0; j < kELTS_PER_LOAD; j++) {
           float q = rNorm[i * kELTS_PER_LOAD + j] / tokenScale;
-          q = fminf(fmaxf(q, -kFP8E4M3Max), kFP8E4M3Max);
+          q = fminf(fmaxf(q, -utils::kFP8E4M3Max), utils::kFP8E4M3Max);
           reinterpret_cast<__nv_fp8_e4m3*>(&quantPacked)[j] = static_cast<__nv_fp8_e4m3>(q);
         }
         reinterpret_cast<PackedQuantizedType*>(&reinterpret_cast<__nv_fp8_e4m3*>(
@@ -1685,6 +1693,12 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   if (rnBlockSize > 1024 || rnLoadsPerThread > 8) {
     FLASHINFER_ERROR("[MNNVL AllReduceTwoShotRMSNorm] Unsupported hidden dimension " +
                      std::to_string(tokenDim));
+    return cudaErrorInvalidValue;
+  }
+  if (rnClusterSize > utils::kMaxClusterSize) {
+    FLASHINFER_ERROR("[MNNVL AllReduceTwoShotRMSNorm] cluster_size " +
+                     std::to_string(rnClusterSize) + " exceeds shared max buffer " +
+                     std::to_string(utils::kMaxClusterSize));
     return cudaErrorInvalidValue;
   }
 

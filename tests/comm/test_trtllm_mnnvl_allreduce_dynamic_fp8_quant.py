@@ -12,10 +12,13 @@ from tests.test_helpers.comm import init_torch_distributed_from_mpi
 
 
 FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
-MIN_FP8_SCALE = 1.0 / (FP8_MAX * 512.0)
+# E4M3FN's smallest positive subnormal is 2^-9.
+FP8_MIN_SUBNORMAL = 2.0**-9
+MIN_FP8_SCALE = FP8_MIN_SUBNORMAL / FP8_MAX
 
 
 def _prefer_mpi_launcher_env() -> None:
+    """Prefer MPI rank variables over Slurm rank variables for this test."""
     mpi_comm = MPI.COMM_WORLD
     if mpi_comm.Get_size() <= 1:
         return
@@ -46,6 +49,7 @@ def _reference(
     weight: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute torch references for MNNVL RMSNorm and dynamic FP8 quant."""
     reduced = allreduce_in.clone()
     dist.all_reduce(reduced)
     residual_out = reduced + residual
@@ -67,12 +71,29 @@ def _reference(
     return residual_out, norm_out, quant, scale
 
 
+def _assert_dynamic_fp8_dequant_close(
+    quant_out: torch.Tensor,
+    scale_out: torch.Tensor,
+    ref_quant: torch.Tensor,
+    ref_scale: torch.Tensor,
+) -> None:
+    """Compare dequantized dynamic FP8 outputs with scale-aware tolerances."""
+    scale_max = float(ref_scale.max().item())
+    torch.testing.assert_close(
+        quant_out.float() * scale_out,
+        ref_quant.float() * ref_scale,
+        atol=scale_max * 0.05,
+        rtol=0.05,
+    )
+
+
 @pytest.mark.parametrize("use_oneshot", [True, False])
 @pytest.mark.parametrize("with_norm_out", [False, True])
 def test_mnnvl_allreduce_dynamic_fp8_quant(
     use_oneshot: bool,
     with_norm_out: bool,
 ) -> None:
+    """Validate MNNVL dynamic FP8 fusion correctness."""
     if torch.cuda.device_count() == 0:
         pytest.skip("requires CUDA")
 
@@ -145,12 +166,7 @@ def test_mnnvl_allreduce_dynamic_fp8_quant(
             residual_out.float(), ref_residual.float(), atol=8e-1, rtol=1e-2
         )
         torch.testing.assert_close(scale_out, ref_scale, atol=1e-3, rtol=1e-3)
-        torch.testing.assert_close(
-            quant_out.float() * scale_out,
-            ref_quant.float() * ref_scale,
-            atol=5e-1,
-            rtol=5e-1,
-        )
+        _assert_dynamic_fp8_dequant_close(quant_out, scale_out, ref_quant, ref_scale)
         if norm_out is not None:
             torch.testing.assert_close(
                 norm_out.float(),
@@ -166,6 +182,7 @@ def test_mnnvl_allreduce_dynamic_fp8_quant(
 
 @pytest.mark.parametrize("use_oneshot", [True, False])
 def test_mnnvl_allreduce_dynamic_fp8_cuda_graph_replay(use_oneshot: bool) -> None:
+    """Validate MNNVL dynamic FP8 CUDA Graph replay."""
     if torch.cuda.device_count() == 0:
         pytest.skip("requires CUDA")
 
@@ -255,11 +272,8 @@ def test_mnnvl_allreduce_dynamic_fp8_cuda_graph_replay(use_oneshot: bool) -> Non
                 residual_out.float(), ref_residual.float(), atol=8e-1, rtol=1e-2
             )
             torch.testing.assert_close(scale_out, ref_scale, atol=1e-3, rtol=1e-3)
-            torch.testing.assert_close(
-                quant_out.float() * scale_out,
-                ref_quant.float() * ref_scale,
-                atol=5e-1,
-                rtol=5e-1,
+            _assert_dynamic_fp8_dequant_close(
+                quant_out, scale_out, ref_quant, ref_scale
             )
     finally:
         if workspace is not None:

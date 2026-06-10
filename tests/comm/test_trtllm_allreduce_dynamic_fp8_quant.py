@@ -10,10 +10,13 @@ from flashinfer.comm.mnnvl import TorchDistBackend
 
 
 FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
-MIN_FP8_SCALE = 1.0 / (FP8_MAX * 512.0)
+# E4M3FN's smallest positive subnormal is 2^-9.
+FP8_MIN_SUBNORMAL = 2.0**-9
+MIN_FP8_SCALE = FP8_MIN_SUBNORMAL / FP8_MAX
 
 
 def _get_open_port() -> int:
+    """Return a free localhost port for a spawned NCCL process group."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
@@ -26,6 +29,7 @@ def _reference(
     eps: float,
     group: dist.ProcessGroup,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute torch references for allreduce, RMSNorm, and dynamic FP8 quant."""
     reduced = allreduce_in.clone()
     dist.all_reduce(reduced, group=group)
     h = reduced if residual is None else reduced + residual
@@ -45,6 +49,22 @@ def _reference(
     return reduced, h, y, q, scale
 
 
+def _assert_dynamic_fp8_dequant_close(
+    quant_out: torch.Tensor,
+    scale_out: torch.Tensor,
+    ref_quant: torch.Tensor,
+    ref_scale: torch.Tensor,
+) -> None:
+    """Compare dequantized dynamic FP8 outputs with scale-aware tolerances."""
+    scale_max = float(ref_scale.max().item())
+    torch.testing.assert_close(
+        quant_out.float() * scale_out,
+        ref_quant.float() * ref_scale,
+        atol=scale_max * 0.05,
+        rtol=0.05,
+    )
+
+
 def _worker(
     rank: int,
     world_size: int,
@@ -55,6 +75,7 @@ def _worker(
     dtype: torch.dtype,
     use_oneshot: bool,
 ) -> None:
+    """Validate one TRT-LLM dynamic FP8 fusion configuration on one rank."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
@@ -134,9 +155,7 @@ def _worker(
         )
         torch.testing.assert_close(scale_out, scale_ref, atol=1e-3, rtol=1e-3)
 
-        dequant = quant_out.float() * scale_out
-        ref_dequant = q_ref.float() * scale_ref
-        torch.testing.assert_close(dequant, ref_dequant, atol=5e-1, rtol=5e-1)
+        _assert_dynamic_fp8_dequant_close(quant_out, scale_out, q_ref, scale_ref)
     finally:
         if workspace is not None:
             workspace.destroy()
@@ -153,6 +172,7 @@ def _worker_cuda_graph(
     dtype: torch.dtype,
     use_oneshot: bool,
 ) -> None:
+    """Validate CUDA Graph replay for TRT-LLM dynamic FP8 fusion on one rank."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
@@ -232,12 +252,7 @@ def _worker_cuda_graph(
                 residual_out.float(), h_ref.float(), atol=8e-1, rtol=1e-2
             )
             torch.testing.assert_close(scale_out, scale_ref, atol=1e-3, rtol=1e-3)
-            torch.testing.assert_close(
-                quant_out.float() * scale_out,
-                q_ref.float() * scale_ref,
-                atol=5e-1,
-                rtol=5e-1,
-            )
+            _assert_dynamic_fp8_dequant_close(quant_out, scale_out, q_ref, scale_ref)
     finally:
         if workspace is not None:
             workspace.destroy()
@@ -271,6 +286,7 @@ def test_trtllm_allreduce_dynamic_fp8_quant(
     dtype: torch.dtype,
     use_oneshot: bool,
 ) -> None:
+    """Spawn ranks and validate TRT-LLM dynamic FP8 fusion correctness."""
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"requires at least {world_size} GPUs")
     port = _get_open_port()
@@ -300,6 +316,7 @@ def test_trtllm_allreduce_dynamic_fp8_quant(
 
 @pytest.mark.parametrize("use_oneshot", [True, False])
 def test_trtllm_allreduce_dynamic_fp8_cuda_graph_replay(use_oneshot: bool) -> None:
+    """Spawn ranks and validate TRT-LLM dynamic FP8 CUDA Graph replay."""
     world_size = 2
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"requires at least {world_size} GPUs")
