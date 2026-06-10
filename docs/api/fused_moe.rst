@@ -26,6 +26,7 @@ Utility Functions
     reorder_rows_for_gated_act_gemm
     interleave_moe_weights_for_sm90_mixed_gemm
     interleave_moe_scales_for_sm90_mixed_gemm
+    fused_topk_deepseek
 
 CUTLASS Fused MoE
 -----------------
@@ -41,6 +42,38 @@ TensorRT-LLM Fused MoE
 .. autosummary::
     :toctree: ../generated
 
+    trtllm_bf16_moe
+    trtllm_bf16_routed_moe
     trtllm_fp4_block_scale_moe
+    trtllm_fp4_block_scale_routed_moe
     trtllm_fp8_block_scale_moe
+    trtllm_fp8_block_scale_routed_moe
     trtllm_fp8_per_tensor_scale_moe
+    trtllm_mxint4_block_scale_moe
+    trtllm_mxint4_block_scale_routed_moe
+
+CuteDSL Fused MoE
+-----------------
+
+The CuteDSL backends are conditionally available when the
+``nvidia-cutlass-dsl`` package is installed.
+
+.. autosummary::
+    :toctree: ../generated
+
+    cute_dsl_fused_moe_nvfp4
+    b12x_fused_moe
+
+.. autoclass:: CuteDslMoEWrapper
+    :members:
+    :inherited-members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+.. autoclass:: B12xMoEWrapper
+    :members:
+    :inherited-members:
+    :show-inheritance:
+
+    .. automethod:: __init__

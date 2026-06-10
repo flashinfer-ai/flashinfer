@@ -235,6 +235,26 @@ inline __device__ uint64_t fp32_vec_to_e4m3(float2 (&array)[4]) {
   return u.val;
 }
 
+// Convert 8 float2 values into 16 e4m3 values (represented as one uint4).
+inline __device__ uint4 fp32_vec_to_e4m3(float2 (&array)[8]) {
+  union {
+    uint4 val;
+    __nv_fp8x2_e4m3 elts[8];
+  } u;
+
+  static_assert(sizeof(u.val) == sizeof(u.elts), "Expected to alias uint4 and __nv_fp8x2_e4m3[8]");
+
+  u.elts[0] = __nv_fp8x2_e4m3(array[0]);
+  u.elts[1] = __nv_fp8x2_e4m3(array[1]);
+  u.elts[2] = __nv_fp8x2_e4m3(array[2]);
+  u.elts[3] = __nv_fp8x2_e4m3(array[3]);
+  u.elts[4] = __nv_fp8x2_e4m3(array[4]);
+  u.elts[5] = __nv_fp8x2_e4m3(array[5]);
+  u.elts[6] = __nv_fp8x2_e4m3(array[6]);
+  u.elts[7] = __nv_fp8x2_e4m3(array[7]);
+  return u.val;
+}
+
 // Fast reciprocal.
 inline __device__ float reciprocal_approximate_ftz(float a) {
   float b;
@@ -245,6 +265,112 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 __device__ __forceinline__ float exp2f_rcp(uint8_t exp) {
   constexpr uint32_t FP32_EXPONENT_BIAS = 127;
   return (exp == 0) ? 1 : exp2f(FP32_EXPONENT_BIAS - static_cast<float>(exp));
+}
+
+__device__ __forceinline__ float e2m1_code_to_float(uint8_t code) {
+  uint8_t const magnitude = code & 0x7;
+  float value = 0.0f;
+  switch (magnitude) {
+    case 1:
+      value = 0.5f;
+      break;
+    case 2:
+      value = 1.0f;
+      break;
+    case 3:
+      value = 1.5f;
+      break;
+    case 4:
+      value = 2.0f;
+      break;
+    case 5:
+      value = 3.0f;
+      break;
+    case 6:
+      value = 4.0f;
+      break;
+    case 7:
+      value = 6.0f;
+      break;
+    default:
+      value = 0.0f;
+      break;
+  }
+  if ((code & 0x8) != 0) {
+    value = -value;
+  }
+  return value;
+}
+
+__device__ __forceinline__ float2 e2m1x2_byte_to_float2(uint32_t byteVal) {
+  float2 result;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0, byte1, byte2, byte3;\n"
+      ".reg .b32 h2;\n"
+      ".reg .b16 lo, hi;\n"
+      ".reg .b32 code_lo, code_hi;\n"
+      ".reg .b32 bits_lo, bits_hi;\n"
+      ".reg .f32 f_lo, f_hi;\n"
+      ".reg .pred negzero_lo, negzero_hi;\n"
+      "mov.b32 {byte0, byte1, byte2, byte3}, %2;\n"
+      "cvt.rn.f16x2.e2m1x2 h2, byte0;\n"
+      "mov.b32 {lo, hi}, h2;\n"
+      "cvt.f32.f16 f_lo, lo;\n"
+      "cvt.f32.f16 f_hi, hi;\n"
+      "mov.b32 bits_lo, f_lo;\n"
+      "mov.b32 bits_hi, f_hi;\n"
+      "and.b32 code_lo, %2, 0xF;\n"
+      "shr.u32 code_hi, %2, 4;\n"
+      "and.b32 code_hi, code_hi, 0xF;\n"
+      "setp.eq.u32 negzero_lo, code_lo, 0x8;\n"
+      "setp.eq.u32 negzero_hi, code_hi, 0x8;\n"
+      "selp.u32 bits_lo, 0x80000000, bits_lo, negzero_lo;\n"
+      "selp.u32 bits_hi, 0x80000000, bits_hi, negzero_hi;\n"
+      "mov.b32 %0, bits_lo;\n"
+      "mov.b32 %1, bits_hi;\n"
+      "}"
+      : "=f"(result.x), "=f"(result.y)
+      : "r"(byteVal));
+#else
+  result.x = e2m1_code_to_float(static_cast<uint8_t>(byteVal & 0xF));
+  result.y = e2m1_code_to_float(static_cast<uint8_t>((byteVal >> 4) & 0xF));
+#endif
+  return result;
+}
+
+__device__ __forceinline__ float2 e2m1x2_byte_scaled_e4m3_to_float2(uint32_t byteVal,
+                                                                    uint8_t scaleVal) {
+  float2 result;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0, byte1, byte2, byte3;\n"
+      ".reg .b16 fp8_pair;\n"
+      ".reg .b16 scale_h, unused_h;\n"
+      ".reg .b16 lo, hi;\n"
+      ".reg .b32 q_h2;\n"
+      ".reg .b32 scale_h2;\n"
+      ".reg .b32 prod_h2;\n"
+      "mov.b32 {byte0, byte1, byte2, byte3}, %2;\n"
+      "cvt.rn.f16x2.e2m1x2 q_h2, byte0;\n"
+      "cvt.u16.u32 fp8_pair, %3;\n"
+      "cvt.rn.f16x2.e4m3x2 scale_h2, fp8_pair;\n"
+      "mov.b32 {scale_h, unused_h}, scale_h2;\n"
+      "mov.b32 scale_h2, {scale_h, scale_h};\n"
+      "mul.rn.f16x2 prod_h2, q_h2, scale_h2;\n"
+      "mov.b32 {lo, hi}, prod_h2;\n"
+      "cvt.f32.f16 %0, lo;\n"
+      "cvt.f32.f16 %1, hi;\n"
+      "}"
+      : "=f"(result.x), "=f"(result.y)
+      : "r"(byteVal), "r"(static_cast<uint32_t>(scaleVal)));
+#else
+  result.x = 0.0f;
+  result.y = 0.0f;
+#endif
+  return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -288,14 +414,33 @@ struct PackedVec<__nv_fp8_e4m3, NUM_ELTS> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Quantization helper functions
 
-// Quantizes the provided PackedVec into the uint32_t or uint64_t output
+template <typename NVFP4_4OVER6_CONFIG>
+__device__ __forceinline__ float compute_4over6_error_rn(float diff) {
+  if constexpr (NVFP4_4OVER6_CONFIG::errMode == NVFP44Over6ErrMode::MSE) {
+    return __fmul_rn(diff, diff);
+  } else if constexpr (NVFP4_4OVER6_CONFIG::errMode == NVFP44Over6ErrMode::MAE) {
+    return fabsf(diff);
+  } else {
+    static_assert(NVFP4_4OVER6_CONFIG::errMode == NVFP44Over6ErrMode::MAE,
+                  "Unsupported NVFP4 4over6 error mode.");
+  }
+}
+
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
-          bool TE_EXACT_NVFP4 = false>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
-    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout,
+    float rowAmax = 0.0f) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
+  static_assert(std::is_same_v<NVFP4_4OVER6_CONFIG, std::false_type> ||
+                    IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value,
+                "NVFP4_4OVER6_CONFIG must be std::false_type or NVFP44Over6Config.");
+  static_assert(!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value || !UE8M0_SF,
+                "NVFP4 4over6 requires E4M3 scale factors");
+  static_assert(!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value || SF_VEC_SIZE == 16,
+                "NVFP4 4over6 requires NVFP4 scale blocks");
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
 
@@ -331,7 +476,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
 
     fp8SFVal = tmp.__x;
     outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
-  } else if constexpr (TE_EXACT_NVFP4) {
+  } else if constexpr (!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value &&
+                       DISABLE_FP4_QUANT_FAST_MATH) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
     constexpr float fp4_max_inv = 1.0f / 6.0f;
@@ -341,9 +487,10 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
-    // Match TE's encode scale: 1 / (fp32(fp8(SFValue)) * (1 / SFScaleVal)).
-    outputScale = vecMax != 0 ? __fdiv_rn(1.0f, SFValue * __fdiv_rn(1.0f, SFScaleVal)) : 0.0f;
-  } else {
+    // Match TE's encode scale: min(1 / (fp32(fp8(SFValue)) * (1 / SFScaleVal)), fp32_max).
+    outputScale =
+        vecMax != 0 ? fminf(__fdiv_rn(1.0f, SFValue * __fdiv_rn(1.0f, SFScaleVal)), FLT_MAX) : 0.0f;
+  } else if constexpr (!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
     // TODO: use half as compute data type.
@@ -358,6 +505,156 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     outputScale = vecMax != 0
                       ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
                       : 0.0f;
+  }
+
+  if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
+    if (vecMax == 0.0f) {
+      if (SFout) {
+        *SFout = 0;
+      }
+      return ReturnType{0};
+    }
+
+    constexpr float E2M1_MAX_VALUE = 6.0f;
+    float sfHighPrecision6;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      sfHighPrecision6 = __fmul_rn(__fdiv_rn(vecMax, E2M1_MAX_VALUE), SFScaleVal);
+    } else {
+      sfHighPrecision6 = SFScaleVal * (vecMax * reciprocal_approximate_ftz(E2M1_MAX_VALUE));
+    }
+    float sfHighPrecision4;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      sfHighPrecision4 = __fmul_rn(sfHighPrecision6, 1.5f);
+    } else {
+      sfHighPrecision4 = sfHighPrecision6 * 1.5f;
+    }
+
+    __nv_fp8_e4m3 tmp4 = __nv_fp8_e4m3(sfHighPrecision4);
+    __nv_fp8_e4m3 tmp6 = __nv_fp8_e4m3(sfHighPrecision6);
+    uint8_t const fp8SFVal4 = tmp4.__x;
+    uint8_t const fp8SFVal6 = tmp6.__x;
+    float const sfValue4 = static_cast<float>(tmp4);
+    float const sfValue6 = static_cast<float>(tmp6);
+    float globalDecodeScale;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      globalDecodeScale = __fdiv_rn(1.0f, SFScaleVal);
+    } else {
+      globalDecodeScale = reciprocal_approximate_ftz(SFScaleVal);
+    }
+    constexpr float ERROR_DENOM = E2M1_MAX_VALUE * float(NVFP4_4OVER6_CONFIG::e4m3Max);
+    float outputScale4;
+    float outputScale6;
+    if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+      outputScale4 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue4, globalDecodeScale)), FLT_MAX);
+      outputScale6 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue6, globalDecodeScale)), FLT_MAX);
+    } else {
+      outputScale4 = reciprocal_approximate_ftz(sfValue4 * globalDecodeScale);
+      outputScale6 = reciprocal_approximate_ftz(sfValue6 * globalDecodeScale);
+    }
+
+    float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
+    float2 fp2Vals4[CVT_ELTS_PER_THREAD / 2];
+    float2 fp2Vals6[CVT_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+      if constexpr (std::is_same_v<Type, half>) {
+        fp2Vals[i] = __half22float2(vec.elts[i]);
+      } else {
+        fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
+      }
+      if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+        fp2Vals4[i].x = __fmul_rn(fp2Vals[i].x, outputScale4);
+        fp2Vals4[i].y = __fmul_rn(fp2Vals[i].y, outputScale4);
+        fp2Vals6[i].x = __fmul_rn(fp2Vals[i].x, outputScale6);
+        fp2Vals6[i].y = __fmul_rn(fp2Vals[i].y, outputScale6);
+      } else {
+        fp2Vals4[i].x = fp2Vals[i].x * outputScale4;
+        fp2Vals4[i].y = fp2Vals[i].y * outputScale4;
+        fp2Vals6[i].x = fp2Vals[i].x * outputScale6;
+        fp2Vals6[i].y = fp2Vals[i].y * outputScale6;
+      }
+    }
+
+    ReturnType const e2m1Vec4 = fp32_vec_to_e2m1(fp2Vals4);
+    ReturnType const e2m1Vec6 = fp32_vec_to_e2m1(fp2Vals6);
+    uint64_t const e2m1Bits4 = static_cast<uint64_t>(e2m1Vec4);
+    uint64_t const e2m1Bits6 = static_cast<uint64_t>(e2m1Vec6);
+    float error4 = 0.0f;
+    float error6 = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
+      uint32_t const byte4 = static_cast<uint32_t>((e2m1Bits4 >> (8 * i)) & 0xFF);
+      uint32_t const byte6 = static_cast<uint32_t>((e2m1Bits6 >> (8 * i)) & 0xFF);
+      if constexpr (NVFP4_4OVER6_CONFIG::errUseFastMath) {
+        float2 const candidate4 = e2m1x2_byte_scaled_e4m3_to_float2(byte4, fp8SFVal4);
+        float2 const candidate6 = e2m1x2_byte_scaled_e4m3_to_float2(byte6, fp8SFVal6);
+        float2 originalScaled;
+        float diff4;
+        float diff6;
+        originalScaled.x = __fmul_rn(fp2Vals[i].x, SFScaleVal);
+        originalScaled.y = __fmul_rn(fp2Vals[i].y, SFScaleVal);
+        diff4 = __fsub_rn(candidate4.x, originalScaled.x);
+        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+        diff6 = __fsub_rn(candidate6.x, originalScaled.x);
+        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+        diff4 = __fsub_rn(candidate4.y, originalScaled.y);
+        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+        diff6 = __fsub_rn(candidate6.y, originalScaled.y);
+        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+      } else {
+        float2 const e2m1Val4 = e2m1x2_byte_to_float2(byte4);
+        float2 const e2m1Val6 = e2m1x2_byte_to_float2(byte6);
+        float diff4;
+        float dequant4 =
+            rowAmax > 0.0f
+                ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), rowAmax), ERROR_DENOM)
+                : __fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), globalDecodeScale);
+        diff4 = __fsub_rn(dequant4, fp2Vals[i].x);
+        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+
+        float diff6;
+        float dequant6 =
+            rowAmax > 0.0f
+                ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), rowAmax), ERROR_DENOM)
+                : __fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), globalDecodeScale);
+        diff6 = __fsub_rn(dequant6, fp2Vals[i].x);
+        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+
+        dequant4 = rowAmax > 0.0f
+                       ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), rowAmax), ERROR_DENOM)
+                       : __fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), globalDecodeScale);
+        diff4 = __fsub_rn(dequant4, fp2Vals[i].y);
+        error4 = __fadd_rn(error4, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
+
+        dequant6 = rowAmax > 0.0f
+                       ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), rowAmax), ERROR_DENOM)
+                       : __fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), globalDecodeScale);
+        diff6 = __fsub_rn(dequant6, fp2Vals[i].y);
+        error6 = __fadd_rn(error6, compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
+      }
+    }
+
+    if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
+      error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 1));
+      error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 1));
+    }
+    if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
+      error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
+      error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
+    }
+
+    if (error4 < error6) {
+      if (SFout) {
+        *SFout = fp8SFVal4;
+      }
+      return e2m1Vec4;
+    }
+    if (SFout) {
+      *SFout = fp8SFVal6;
+    }
+    return e2m1Vec6;
   }
 
   if (SFout) {
@@ -551,12 +848,15 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 #endif
 }
 
-// Quantizes the provided PackedVec into the uint64_t output
+// Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
-__device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec,
-                                           uint8_t* SFout) {
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout) {
+  using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  // Get absolute maximum values among the local 8 values.
+  static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
+                "CVT_ELTS_PER_THREAD must be 8 or 16");
+  // Get absolute maximum values among the local elements.
   auto localMax = cuda_abs(vec.elts[0]);
 
 // Local maximum value.
@@ -610,29 +910,25 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>&
     fp2Vals[i].y *= outputScale;
   }
 
-  // Convert to e4m3 values.
-  uint64_t e4m3Vec = fp32_vec_to_e4m3(fp2Vals);
+  // Convert to e4m3 values. Overload selected by `fp2Vals` array length:
+  // ELTS_PER_THREAD=8 -> uint64_t (8 e4m3); ELTS_PER_THREAD=16 -> uint4 (16 e4m3).
+  ReturnType e4m3Vec = fp32_vec_to_e4m3(fp2Vals);
 
   // Write the e4m3 values to global memory.
   return e4m3Vec;
 #else
-  return 0;
+  return ReturnType{};
 #endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Scale factor offset calculation functions
 
-inline __device__ __host__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx,
-                                                           int kIdx, std::optional<int> numRows,
-                                                           int numColVecs) {
-  // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-  // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
-
+inline __device__ __host__ int64_t get_sf_out_offset_128x4(int batchIdx, int mIdx, int kIdx,
+                                                           int numRows, int numColVecs) {
   // batched tensor
   // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
   // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
-
   int32_t innerKIdx = (kIdx % 4);
   int64_t innerKStride = 1;
 
@@ -654,23 +950,18 @@ inline __device__ __host__ int64_t get_sf_out_offset_128x4(std::optional<int> ba
   int64_t mTileStride = numKTiles * kTileStride;
 
   // Each SF block has 128 rows so pad rows to the multiple of 128.
-  int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
+  int32_t numMTiles = (numRows + 128 - 1) / 128;
   int64_t bTileStride = numMTiles * mTileStride;
 
   // Compute the global offset.
-  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
-                     kTileIdx * kTileStride + outerMIdx * outerMStride + innerMIdx * innerMStride +
-                     innerKIdx * innerKStride;
+  int64_t SFOffset = batchIdx * bTileStride + mTileIdx * mTileStride + kTileIdx * kTileStride +
+                     outerMIdx * outerMStride + innerMIdx * innerMStride + innerKIdx * innerKStride;
 
   return SFOffset;
 }
 
-inline __device__ __host__ int64_t get_sf_out_offset_8x4(std::optional<int> batchIdx, int mIdx,
-                                                         int kIdx, std::optional<int> numRows,
-                                                         int numCols) {
-  // SF layout [numMTiles, numKTiles, 8 (mTile), 4(kTile)]
-  // --> index [mTileIdx, kTileIdx, innerMIdx, innerKIdx]
-
+inline __device__ __host__ int64_t get_sf_out_offset_8x4(int batchIdx, int mIdx, int kIdx,
+                                                         int numRows, int numCols) {
   // batched tensor
   // SF layout [numBTiles, numMTiles, numKTiles, 8 (mTile), 4(kTile)]
   // --> index [bTileIdx, mTileIdx, kTileIdx, innerMIdx, innerKIdx]
@@ -688,11 +979,65 @@ inline __device__ __host__ int64_t get_sf_out_offset_8x4(std::optional<int> batc
   int32_t mTileIdx = mIdx / mTile;
   int64_t mTileStride = numKTiles * kTileStride;
 
-  int32_t numMTiles = (numRows.value_or(0) + 8 - 1) / 8;
+  int32_t numMTiles = (numRows + 8 - 1) / 8;
   int64_t bTileStride = numMTiles * mTileStride;
 
-  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
-                     kTileIdx * kTileStride + innerMIdx * mStride + innerKIdx * innerKStride;
+  int64_t SFOffset = batchIdx * bTileStride + mTileIdx * mTileStride + kTileIdx * kTileStride +
+                     innerMIdx * mStride + innerKIdx * innerKStride;
+
+  return SFOffset;
+}
+
+inline __device__ __host__ int64_t get_sf_out_offset_128x4(int mIdx, int kIdx, int numColVecs) {
+  // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+  // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+  int32_t innerKIdx = (kIdx % 4);
+  int64_t innerKStride = 1;
+
+  int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+  int64_t innerMStride = 4 * innerKStride;  // 4
+
+  // M tile layout [32, 4] is column-major.
+  int32_t outerMIdx = (mIdx % 32);
+  int64_t outerMStride = 4 * innerMStride;  // 16
+
+  int32_t kTileIdx = (kIdx / 4);
+  int64_t kTileStride = 32 * outerMStride;  // 512
+
+  // SF vector size 16 or 32. We round the "numCols" up to a multiple of 64 or 128.
+  // It is the same as rounding the "numColVecs" up to a multiple of 4.
+  int32_t numKTiles = (numColVecs + 4 - 1) / 4;
+
+  int32_t mTileIdx = mIdx / (32 * 4);
+  int64_t mTileStride = numKTiles * kTileStride;
+
+  // Compute the global offset.
+  int64_t SFOffset = mTileIdx * mTileStride + kTileIdx * kTileStride + outerMIdx * outerMStride +
+                     innerMIdx * innerMStride + innerKIdx * innerKStride;
+
+  return SFOffset;
+}
+
+inline __device__ __host__ int64_t get_sf_out_offset_8x4(int mIdx, int kIdx, int numCols) {
+  // SF layout [numMTiles, numKTiles, 8 (mTile), 4(kTile)]
+  // --> index [mTileIdx, kTileIdx, innerMIdx, innerKIdx]
+  const int32_t mTile = 8;
+  int32_t innerKIdx = (kIdx % 4);
+  int64_t innerKStride = 1;
+
+  int32_t innerMIdx = (mIdx % mTile);
+  int64_t mStride = 4 * innerKStride;
+
+  int32_t kTileIdx = (kIdx / 4);
+  int64_t kTileStride = mTile * mStride;
+
+  int32_t numKTiles = (numCols + 4 - 1) / 4;
+  int32_t mTileIdx = mIdx / mTile;
+  int64_t mTileStride = numKTiles * kTileStride;
+
+  int64_t SFOffset = mTileIdx * mTileStride + kTileIdx * kTileStride + innerMIdx * mStride +
+                     innerKIdx * innerKStride;
 
   return SFOffset;
 }
@@ -714,23 +1059,31 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
         layout == QuantizationSFLayout::SWIZZLED_8x4) {
       // SF vector index (16 elements share one SF in the K dimension).
       // numRows and numCols are unpadded.
-      int32_t kIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
-      int32_t mIdx = rowIdx;
+      uint32_t kIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
+      uint32_t mIdx = rowIdx;
 
-      auto SFOffset = layout == QuantizationSFLayout::SWIZZLED_128x4
-                          ? get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numColVecs)
-                          : get_sf_out_offset_8x4(batchIdx, mIdx, kIdx, numRows, numColVecs);
+      uint32_t SFOffset;
+      if (batchIdx.has_value()) {
+        SFOffset =
+            layout == QuantizationSFLayout::SWIZZLED_128x4
+                ? get_sf_out_offset_128x4(batchIdx.value(), mIdx, kIdx, numRows.value(), numColVecs)
+                : get_sf_out_offset_8x4(batchIdx.value(), mIdx, kIdx, numRows.value(), numColVecs);
+      } else {
+        SFOffset = layout == QuantizationSFLayout::SWIZZLED_128x4
+                       ? get_sf_out_offset_128x4(mIdx, kIdx, numColVecs)
+                       : get_sf_out_offset_8x4(mIdx, kIdx, numColVecs);
+      }
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
     } else if (layout == QuantizationSFLayout::LINEAR) {
       // Linear row-major layout, no padding required.
-      int32_t KTileIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
+      uint32_t KTileIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
 
-      int32_t numKTiles = numColVecs;
-      int64_t mTileStride = numKTiles;
+      uint32_t numKTiles = numColVecs;
+      uint32_t mTileStride = numKTiles;
 
-      int64_t BTileStride = numRows.value_or(0) * mTileStride;
+      uint32_t BTileStride = numRows.value_or(0) * mTileStride;
 
-      int64_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
+      uint32_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
       return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
     } else {
       return nullptr;

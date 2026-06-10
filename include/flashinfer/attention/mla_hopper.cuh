@@ -18,6 +18,7 @@
 #include <cooperative_groups.h>
 
 #include <cstdint>
+#include <cuda/std/limits>
 #include <sstream>
 
 #include "hopper.cuh"
@@ -187,11 +188,14 @@ __device__ __forceinline__ void prefetch_offset(
       uint32_t packed_block_iter =
           packed_block_iter_base + lane_idx / 8 + (j + mma_kv * 2) * 16 + warp_idx_in_wg * 4;
       block_size.divmod(packed_block_iter, q, r);
+      // Widen page index to int64_t before multiplying to avoid overflow.
       ckv_offset[mma_kv][j] =
-          (packed_block_iter < packed_kv_bound ? indices[q] : 0) * ckv_stride_page +
+          static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
+              ckv_stride_page +
           r * ckv_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
       kpe_offset[mma_kv][j] =
-          (packed_block_iter < packed_kv_bound ? indices[q] : 0) * kpe_stride_page +
+          static_cast<int64_t>(packed_block_iter < packed_kv_bound ? indices[q] : 0) *
+              kpe_stride_page +
           r * kpe_stride_n + (lane_idx % 8) * upcast_size<DTypeKV>();
     }
   }
@@ -507,8 +511,9 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
       for (uint32_t j = 0; j < 2; ++j) {
         uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
         if (lane_idx % 4 == 0 && q_idx < q_len) {
-          partial_lse[(blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4] =
-              math::ptx_log2(d[j]) + float(m[j]);
+          float lse = (m[j] == -math::inf) ? -cuda::std::numeric_limits<float>::infinity()
+                                           : math::ptx_log2(d[j]) + float(m[j]);
+          partial_lse[(blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4] = lse;
         }
       }
     }
@@ -543,7 +548,9 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
           uint32_t q, r;
           num_heads.divmod(packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4, q, r);
           if (lane_idx % 4 == 0 && q < q_len) {
-            final_lse[q * num_heads + r] = math::ptx_log2(d[j]) + float(m[j]);
+            final_lse[q * num_heads + r] = (m[j] == -math::inf)
+                                               ? -cuda::std::numeric_limits<float>::infinity()
+                                               : math::ptx_log2(d[j]) + float(m[j]);
             if (return_lse_base_on_e) {
               final_lse[q * num_heads + r] *= math::loge2;
             }
@@ -711,10 +718,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
       const uint32_t block_iter_base = kv_indptr * block_size + kv_start;
 
-      prefetch_offset<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
-                               ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n,
-                               block_size, kv_indices, ckv_offset, kpe_offset);
       if (has_kv) {
+        prefetch_offset<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                                 ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n,
+                                 block_size, kv_indices, ckv_offset, kpe_offset);
         pipeline_kv.producer_acquire(smem_pipe_write_kv);
         PROFILER_EVENT_START(variant, ProfileEventType::kIssueLoadKV);
         load_kv<true, KTraits>(&smem_storage, ckv, kpe, packed_kv_bound,
@@ -724,9 +731,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
         kv_tile_idx -= 1;
         ++smem_pipe_write_kv;
-        prefetch_offset<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
-                                 ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n,
-                                 block_size, kv_indices, ckv_offset, kpe_offset);
+        if (kv_tile_idx >= 0) {
+          prefetch_offset<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                                   ckv_stride_page, ckv_stride_n, kpe_stride_page, kpe_stride_n,
+                                   block_size, kv_indices, ckv_offset, kpe_offset);
+        }
       }
 
       pipeline_q.producer_acquire(smem_pipe_write_q);

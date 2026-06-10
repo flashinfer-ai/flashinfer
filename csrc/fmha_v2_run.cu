@@ -438,6 +438,19 @@ void fmha_v2_run(
   if (chunked_attention_size > 0) {
     assert((chunked_attention_size & (chunked_attention_size - 1)) == 0 &&
            "chunked_attention_size has to be a power of 2");
+    // Chunked-causal masking is only implemented by the warp-specialized (SM90)
+    // kernels (see fmha/warpspec/{epilogue,dma,compute}.h, which branch on
+    // log2_chunked_attention_size). The non-warp-specialized "tiled" kernels used
+    // on SM120 honor sliding_window_size only and ignore log2_chunked_attention_size,
+    // so reject chunked attention here rather than silently returning wrong results.
+    // Sliding-window causal IS supported on SM120 (via window_left).
+    if (sm == 120) {
+      throw std::invalid_argument(
+          "Chunked-causal attention (chunked_attention_size > 0) is not supported for "
+          "FMHAv2 on SM120 (Blackwell). The SM120 tiled kernels implement sliding-window "
+          "causal only. Use window_left for sliding-window masking, or run chunked "
+          "attention on SM90 (Hopper).");
+    }
     attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
   }
   size_t sliding_window_size = size_t(INT_MAX);

@@ -41,6 +41,32 @@ import math
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
+from ._init_helpers import make_paged_kv_indices
+
+
+def _attention_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    # Matches tests/attention/test_single_prefill.py and related
+    # single-request attention unit tests for fp16 inputs.
+    rtol = 1e-3 if rtol is None else rtol
+    atol = 1e-3 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
 
 
 # ── GQA paged decode ─────────────────────────────────────────────────────────
@@ -82,6 +108,68 @@ def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_s
             output[b, h] = torch.matmul(attn, v_b[:, kv_h]).to(torch.bfloat16)
 
     return output, lse
+
+
+def _gqa_paged_decode_init(
+    *,
+    batch_size: int,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,  # derived: batch_size * num_pages_per_seq
+    num_pages_per_seq: int = 4,
+    len_indptr: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``BatchDecodeWithPagedKVCacheWrapper.run()``.
+
+    Returns a ``{"plan": ..., "run": ...}`` dict — the wrapper requires
+    ``plan(...)`` to be called first with the indptr/indices arrays and
+    ``run(...)`` to consume ``q`` and ``paged_kv_cache=(k_cache, v_cache)``.
+
+    Sourced from ``tests/attention/test_batch_decode_kernels.py`` and the
+    example call in ``tests/trace/example.py``.
+    """
+    del num_pages, len_indptr, num_kv_indices  # derived
+    torch.manual_seed(seed)
+    total_pages = batch_size * num_pages_per_seq
+    kv_indptr, kv_indices, kv_last = make_paged_kv_indices(
+        batch_size, num_pages_per_seq, page_size, device=device
+    )
+    q = torch.randn(
+        batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.randn(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    return {
+        # plan() signature: indptr, indices, last_page_len, num_qo_heads,
+        # num_kv_heads, head_dim, page_size, ...
+        "plan": {
+            "indptr": kv_indptr,
+            "indices": kv_indices,
+            "last_page_len": kv_last,
+            "num_qo_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "page_size": page_size,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
+        },
+        "run": {
+            "q": q,
+            "paged_kv_cache": (k_cache, v_cache),
+        },
+    }
 
 
 gqa_paged_decode_trace = TraceTemplate(
@@ -130,11 +218,15 @@ gqa_paged_decode_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(["batch_size", "num_qo_heads", "head_dim"], dtype_from="q"),
         "lse": Tensor(
             ["batch_size", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -145,6 +237,7 @@ gqa_paged_decode_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
     reference=_gqa_paged_decode_reference,
+    init=_gqa_paged_decode_init,
 )
 
 # ── GQA paged prefill ────────────────────────────────────────────────────────
@@ -201,6 +294,76 @@ def _gqa_paged_prefill_reference(
     return output, lse
 
 
+def _gqa_paged_prefill_init(
+    *,
+    total_q: int,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,
+    len_indptr: int = 0,
+    num_kv_indices: int = 0,
+    batch_size: int = 4,
+    num_pages_per_seq: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``BatchPrefillWithPagedKVCacheWrapper.run()``."""
+    del num_pages, len_indptr, num_kv_indices
+    torch.manual_seed(seed)
+    total_pages = batch_size * num_pages_per_seq
+    kv_indptr, kv_indices, kv_last = make_paged_kv_indices(
+        batch_size, num_pages_per_seq, page_size, device=device
+    )
+    # Distribute total_q so qo_indptr[-1] == total_q exactly even when
+    # total_q is not a multiple of batch_size (the test's constraint
+    # `total_q == qo_indptr[-1].item()` would otherwise fail for the
+    # earlier integer-division version).
+    base = total_q // max(1, batch_size)
+    rem = total_q % max(1, batch_size)
+    qo_lens = [base + (1 if i < rem else 0) for i in range(batch_size)]
+    qo_cum = [0]
+    for L in qo_lens:
+        qo_cum.append(qo_cum[-1] + L)
+    qo_indptr = torch.tensor(qo_cum, dtype=torch.int32, device=device)
+    q = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.randn(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    return {
+        # plan() signature: qo_indptr, paged_kv_indptr, paged_kv_indices,
+        # paged_kv_last_page_len, num_qo_heads, num_kv_heads, head_dim_qk,
+        # page_size, head_dim_vo, causal, ...
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "paged_kv_indptr": kv_indptr,
+            "paged_kv_indices": kv_indices,
+            "paged_kv_last_page_len": kv_last,
+            "num_qo_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim_qk": head_dim,
+            "head_dim_vo": head_dim,
+            "page_size": page_size,
+            "causal": True,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
+        },
+        "run": {
+            "q": q,
+            "paged_kv_cache": (k_cache, v_cache),
+        },
+    }
+
+
 gqa_paged_prefill_trace = TraceTemplate(
     op_type="gqa_paged",
     name_prefix="gqa_paged_prefill",
@@ -251,11 +414,15 @@ gqa_paged_prefill_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype_from="q"),
         "lse": Tensor(
             ["total_q", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -266,6 +433,7 @@ gqa_paged_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_gqa_paged_prefill_reference,
+    init=_gqa_paged_prefill_init,
 )
 
 # ── GQA ragged prefill ───────────────────────────────────────────────────────
@@ -319,6 +487,63 @@ def _gqa_ragged_prefill_reference(q, k, v, qo_indptr, kv_indptr, sm_scale):
     return output, lse
 
 
+def _gqa_ragged_init(
+    *,
+    total_q: int,
+    total_kv: int = 512,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    batch_size: int = 4,
+    len_indptr: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``BatchPrefillWithRaggedKVCacheWrapper.run()``.
+
+    Distributes ``total_q`` and ``total_kv`` across ``batch_size`` sequences
+    so the indptr tails equal the totals exactly (otherwise the trace's
+    ``total_q == qo_indptr[-1]`` constraint can fail for non-divisible
+    inputs).
+    """
+    del len_indptr
+    torch.manual_seed(seed)
+
+    def _split_into_indptr(total: int) -> torch.Tensor:
+        base = total // max(1, batch_size)
+        rem = total % max(1, batch_size)
+        cum = [0]
+        for i in range(batch_size):
+            cum.append(cum[-1] + base + (1 if i < rem else 0))
+        return torch.tensor(cum, dtype=torch.int32, device=device)
+
+    qo_indptr = _split_into_indptr(total_q)
+    kv_indptr = _split_into_indptr(total_kv)
+    q = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k = torch.randn(
+        total_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v = torch.randn_like(k)
+    return {
+        # plan() signature: qo_indptr, kv_indptr, num_qo_heads,
+        # num_kv_heads, head_dim_qk, head_dim_vo, causal, ...
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "num_qo_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim_qk": head_dim,
+            "head_dim_vo": head_dim,
+            "causal": True,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
+        },
+        "run": {"q": q, "k": k, "v": v},
+    }
+
+
 gqa_ragged_prefill_trace = TraceTemplate(
     op_type="gqa_ragged",
     name_prefix="gqa_ragged",
@@ -354,6 +579,9 @@ gqa_ragged_prefill_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(
@@ -363,6 +591,7 @@ gqa_ragged_prefill_trace = TraceTemplate(
         ),
         "lse": Tensor(
             ["total_q", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -373,6 +602,7 @@ gqa_ragged_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_gqa_ragged_prefill_reference,
+    init=_gqa_ragged_init,
 )
 
 # ── MLA paged decode (DeepSeek-V3 style) ─────────────────────────────────────
@@ -418,6 +648,78 @@ def _mla_paged_decode_reference(
         output[b] = (torch.softmax(logits, dim=-1) @ Kc).to(torch.bfloat16)
 
     return output, lse
+
+
+def _mla_paged_decode_init(
+    *,
+    batch_size: int,
+    num_qo_heads: int = 16,
+    head_dim_ckv: int = 512,
+    head_dim_kpe: int = 64,
+    page_size: int = 64,
+    num_pages: int = 0,
+    num_pages_per_seq: int = 4,
+    len_indptr: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``BatchMLAPagedAttentionWrapper.run()``.
+
+    Sourced from ``tests/trace/example.py`` MLA section. Default
+    ``num_qo_heads=16`` matches DeepSeek-V3 TP=8.
+    """
+    del num_pages, len_indptr, num_kv_indices
+    torch.manual_seed(seed)
+    total_pages = batch_size * num_pages_per_seq
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    kv_indptr, kv_indices, _ = make_paged_kv_indices(
+        batch_size, num_pages_per_seq, page_size, device=device
+    )
+    kv_len = torch.full(
+        (batch_size,),
+        num_pages_per_seq * page_size,
+        dtype=torch.int32,
+        device=device,
+    )
+    q_nope = torch.randn(
+        batch_size, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16, device=device
+    )
+    q_pe = torch.randn(
+        batch_size, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16, device=device
+    )
+    ckv_cache = torch.randn(
+        total_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
+    )
+    kpe_cache = torch.randn(
+        total_pages, page_size, head_dim_kpe, dtype=torch.bfloat16, device=device
+    )
+    return {
+        # plan() signature: qo_indptr, kv_indptr, kv_indices, kv_len_arr,
+        # num_heads, head_dim_ckv, head_dim_kpe, page_size, causal, ...
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_len_arr": kv_len,
+            "num_heads": int(num_qo_heads),
+            "head_dim_ckv": int(head_dim_ckv),
+            "head_dim_kpe": int(head_dim_kpe),
+            "page_size": int(page_size),
+            "causal": False,
+            # tests/attention/test_deepseek_mla.py scales by the pre-absorption
+            # QK dimension: qk_nope_head_dim(128) + head_dim_kpe.
+            "sm_scale": 1.0 / ((128 + head_dim_kpe) ** 0.5),
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
+        },
+        "run": {
+            "q_nope": q_nope,
+            "q_pe": q_pe,
+            "ckv_cache": ckv_cache,
+            "kpe_cache": kpe_cache,
+        },
+    }
 
 
 mla_paged_decode_trace = TraceTemplate(
@@ -479,13 +781,18 @@ mla_paged_decode_trace = TraceTemplate(
                 "based on head dimensions before matrix absorption. Set during plan(), not run()."
             ),
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(
-            ["batch_size", "num_qo_heads", "head_dim_ckv"], dtype_from="q_nope"
+            ["batch_size", "num_qo_heads", "head_dim_ckv"],
+            dtype_from="q_nope",
         ),
         "lse": Tensor(
             ["batch_size", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -496,6 +803,7 @@ mla_paged_decode_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
     reference=_mla_paged_decode_reference,
+    init=_mla_paged_decode_init,
 )
 
 # ── MLA paged prefill (DeepSeek-V3 style, causal) ────────────────────────────
@@ -557,6 +865,92 @@ def _mla_paged_prefill_reference(
             )
 
     return output, lse
+
+
+def _mla_paged_prefill_init(
+    *,
+    total_q: int,
+    batch_size: int = 4,
+    num_qo_heads: int = 16,
+    head_dim_ckv: int = 512,
+    head_dim_kpe: int = 64,
+    page_size: int = 64,
+    num_pages: int = 0,
+    num_pages_per_seq: int = 4,
+    len_indptr: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``BatchMLAPagedAttentionWrapper.run()`` (prefill).
+
+    Distinct from the decode init in two ways: ``total_q`` is the
+    *summed* query token count across the batch (not the batch_size),
+    and ``qo_indptr`` is built so its tail equals ``total_q``. KV-side
+    layout is the same uniform-pages-per-seq pattern as decode.
+    Sourced from ``tests/attention/test_deepseek_mla.py`` (prefill
+    fixture).
+    """
+    del num_pages, len_indptr, num_kv_indices
+    torch.manual_seed(seed)
+    total_pages = batch_size * num_pages_per_seq
+    # Distribute total_q across batch_size sequences (last seq absorbs the
+    # remainder so qo_indptr[-1] == total_q exactly).
+    base = total_q // max(1, batch_size)
+    rem = total_q % max(1, batch_size)
+    qo_lens = [base + (1 if i < rem else 0) for i in range(batch_size)]
+    qo_cum = [0]
+    for L in qo_lens:
+        qo_cum.append(qo_cum[-1] + L)
+    qo_indptr = torch.tensor(qo_cum, dtype=torch.int32, device=device)
+
+    kv_indptr, kv_indices, _ = make_paged_kv_indices(
+        batch_size, num_pages_per_seq, page_size, device=device
+    )
+    kv_len = torch.full(
+        (batch_size,),
+        num_pages_per_seq * page_size,
+        dtype=torch.int32,
+        device=device,
+    )
+    q_nope = torch.randn(
+        total_q, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16, device=device
+    )
+    q_pe = torch.randn(
+        total_q, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16, device=device
+    )
+    ckv_cache = torch.randn(
+        total_pages, page_size, head_dim_ckv, dtype=torch.bfloat16, device=device
+    )
+    kpe_cache = torch.randn(
+        total_pages, page_size, head_dim_kpe, dtype=torch.bfloat16, device=device
+    )
+    return {
+        # plan() signature: qo_indptr, kv_indptr, kv_indices, kv_len_arr,
+        # num_heads, head_dim_ckv, head_dim_kpe, page_size, causal, ...
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_len_arr": kv_len,
+            "num_heads": int(num_qo_heads),
+            "head_dim_ckv": int(head_dim_ckv),
+            "head_dim_kpe": int(head_dim_kpe),
+            "page_size": int(page_size),
+            "causal": True,
+            # tests/attention/test_deepseek_mla.py scales by the pre-absorption
+            # QK dimension: qk_nope_head_dim(128) + head_dim_kpe.
+            "sm_scale": 1.0 / ((128 + head_dim_kpe) ** 0.5),
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
+        },
+        "run": {
+            "q_nope": q_nope,
+            "q_pe": q_pe,
+            "ckv_cache": ckv_cache,
+            "kpe_cache": kpe_cache,
+        },
+    }
 
 
 mla_paged_prefill_trace = TraceTemplate(
@@ -635,6 +1029,7 @@ mla_paged_prefill_trace = TraceTemplate(
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_mla_paged_prefill_reference,
+    init=_mla_paged_prefill_init,
 )
 
 # ── DSA (Dense Sparse Attention) paged ────────────────────────────────────────
@@ -821,6 +1216,23 @@ def _single_prefill_reference(q, k, v, **kwargs):
     return output.to(q.dtype)
 
 
+def _single_decode_init(
+    *,
+    kv_len: int,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.single_decode_with_kv_cache``."""
+    torch.manual_seed(seed)
+    q = torch.randn(num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    return {"q": q, "k": k, "v": v}
+
+
 single_decode_with_kv_cache_trace = TraceTemplate(
     op_type="single_decode",
     name_prefix="single_decode",
@@ -851,7 +1263,28 @@ single_decode_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode"],
     reference=_single_decode_reference,
+    check=_attention_check,
+    init=_single_decode_init,
 )
+
+
+def _single_prefill_init(
+    *,
+    qo_len: int,
+    kv_len: int = 256,
+    num_qo_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.single_prefill_with_kv_cache``."""
+    torch.manual_seed(seed)
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    return {"q": q, "k": k, "v": v, "causal": True}
+
 
 single_prefill_with_kv_cache_trace = TraceTemplate(
     op_type="single_prefill",
@@ -878,6 +1311,8 @@ single_prefill_with_kv_cache_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill"],
     reference=_single_prefill_reference,
+    check=_attention_check,
+    init=_single_prefill_init,
 )
 
 # ── TRTLLM paged attention ────────────────────────────────────────────────────
@@ -1020,6 +1455,132 @@ def _trtllm_batch_context_reference(
     )
 
 
+def _trtllm_batch_decode_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,
+    kv_cache_dim: int = 2,
+    batch_size: int = 1,
+    max_pages_per_seq: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_batch_decode_with_kv_cache``."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if num_tokens % batch_size != 0:
+        raise ValueError("num_tokens must be divisible by batch_size")
+    torch.manual_seed(seed)
+    q_len_per_req = num_tokens // batch_size
+    max_pages_per_seq = max_pages_per_seq or max(
+        1, (num_pages + batch_size - 1) // batch_size
+    )
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    kv_len = page_size * max_pages_per_seq
+    query = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        num_pages,
+        kv_cache_dim,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    block_tables = torch.arange(
+        batch_size * max_pages_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, max_pages_per_seq)
+    seq_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": workspace_buffer,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": int(kv_len),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim),
+        "bmm2_scale": 1.0,
+        "kv_layout": "HND",
+        "q_len_per_req": int(q_len_per_req),
+    }
+
+
+def _trtllm_batch_context_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 0,
+    kv_cache_dim: int = 2,
+    batch_size: int = 1,
+    max_pages_per_seq: int = 0,
+    batch_size_plus_1_q: int = 0,
+    batch_size_plus_1_kv: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_batch_context_with_kv_cache``."""
+    del batch_size_plus_1_q, batch_size_plus_1_kv
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if num_tokens % batch_size != 0:
+        raise ValueError("num_tokens must be divisible by batch_size")
+    torch.manual_seed(seed)
+    q_len = num_tokens // batch_size
+    max_pages_per_seq = max_pages_per_seq or max(
+        1, (num_pages + batch_size - 1) // batch_size
+    )
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    kv_len = page_size * max_pages_per_seq
+    query = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        num_pages,
+        kv_cache_dim,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    block_tables = torch.arange(
+        batch_size * max_pages_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, max_pages_per_seq)
+    seq_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    cum_seq_lens_q = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * q_len
+    )
+    cum_seq_lens_kv = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * kv_len
+    )
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": workspace_buffer,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_q_len": int(q_len),
+        "max_kv_len": int(kv_len),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim),
+        "bmm2_scale": 1.0,
+        "batch_size": int(batch_size),
+        "cum_seq_lens_q": cum_seq_lens_q,
+        "cum_seq_lens_kv": cum_seq_lens_kv,
+        "kv_layout": "HND",
+    }
+
+
 trtllm_batch_decode_trace = TraceTemplate(
     op_type="trtllm_paged",
     name_prefix="trtllm_batch_decode",
@@ -1061,6 +1622,7 @@ trtllm_batch_decode_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode", "backend:trtllm"],
     reference=_trtllm_batch_decode_reference,
+    init=_trtllm_batch_decode_init,
 )
 
 # Add max_pages_per_seq axis used above
@@ -1124,6 +1686,7 @@ trtllm_batch_context_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill", "backend:trtllm"],
     reference=_trtllm_batch_context_reference,
+    init=_trtllm_batch_context_init,
 )
 trtllm_batch_context_trace.axes["batch_size_plus_1_q"] = Var(
     description="batch_size + 1."
@@ -1193,6 +1756,193 @@ def _trtllm_batch_decode_mla_reference(
     return output
 
 
+@torch.no_grad()
+def _trtllm_batch_decode_mla_sparse_reference(
+    query,
+    kv_cache,
+    workspace_buffer,
+    qk_nope_head_dim,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    sparse_mla_top_k,
+    **kwargs,
+):
+    """Reference for sparse top-k page MLA decode."""
+    del workspace_buffer, qk_nope_head_dim, seq_lens, max_seq_len, sparse_mla_top_k
+    batch_size, q_len, num_heads, head_dim_qk = query.shape
+    assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
+    bmm1_scale = kwargs.get("bmm1_scale", 1.0)
+    if isinstance(bmm1_scale, torch.Tensor):
+        bmm1_scale = float(bmm1_scale.item())
+    bmm2_scale = kwargs.get("bmm2_scale", 1.0)
+    if isinstance(bmm2_scale, torch.Tensor):
+        bmm2_scale = float(bmm2_scale.item())
+    if kv_cache.dim() == 4:
+        kv_cache = kv_cache.squeeze(1)
+    output = torch.zeros(
+        (batch_size, q_len, num_heads, kv_lora_rank),
+        dtype=query.dtype,
+        device=query.device,
+    )
+    for b in range(batch_size):
+        for t in range(q_len):
+            pages = block_tables[b, t].to(torch.long)
+            valid = (pages >= 0) & (pages < kv_cache.shape[0])
+            pages = pages[valid]
+            if pages.numel() == 0:
+                continue
+            flat = kv_cache[pages].reshape(-1, head_dim_qk).to(torch.float32)
+            kn = flat[:, :kv_lora_rank]
+            kp = flat[:, kv_lora_rank:]
+            q = query[b, t].to(torch.float32)
+            qn = q[:, :kv_lora_rank]
+            qp = q[:, kv_lora_rank:]
+            logits = (qn @ kn.T + qp @ kp.T) * bmm1_scale
+            attn = torch.softmax(logits, dim=-1)
+            output[b, t] = (attn @ kn * bmm2_scale).to(query.dtype)
+    return output
+
+
+def _trtllm_batch_decode_mla_init(
+    *,
+    batch_size: int,
+    q_len_per_request: int,
+    num_heads: int = 128,
+    head_dim_qk: int = 576,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    qk_nope_head_dim: int = 512,
+    num_pages: int = 0,
+    kv_pad_dim: int = 1,
+    page_size: int = 64,
+    max_pages_per_seq: int = 0,
+    workspace_size: int = 256 << 20,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``trtllm_batch_decode_with_kv_cache_mla``."""
+    torch.manual_seed(seed)
+    max_pages_per_seq = max_pages_per_seq or max(
+        1, (num_pages + batch_size - 1) // batch_size
+    )
+    num_pages = max(num_pages, batch_size * max_pages_per_seq)
+    seq_len = page_size * max_pages_per_seq
+    query = (
+        torch.randn(
+            batch_size,
+            q_len_per_request,
+            num_heads,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 4.0
+    ).to(torch.float8_e4m3fn)
+    kv_cache = (
+        torch.randn(
+            num_pages,
+            kv_pad_dim,
+            page_size,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 4.0
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.arange(
+        batch_size * max_pages_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, max_pages_per_seq)
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": workspace_buffer,
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": int(seq_len),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim_qk),
+        "bmm2_scale": 1.0,
+        "is_var_seq": False,
+    }
+
+
+def _trtllm_batch_decode_mla_sparse_init(
+    *,
+    batch_size: int,
+    q_len_per_request: int,
+    num_heads: int = 128,
+    head_dim_qk: int = 576,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    qk_nope_head_dim: int = 512,
+    num_pages: int,
+    kv_pad_dim: int = 1,
+    page_size: int = 64,
+    sparse_mla_top_k: int = 2048,
+    workspace_size: int = 256 << 20,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for sparse top-k ``trtllm_batch_decode_with_kv_cache_mla``."""
+    torch.manual_seed(seed)
+    num_pages = max(num_pages, 1)
+    query = (
+        torch.randn(
+            batch_size,
+            q_len_per_request,
+            num_heads,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 4.0
+    ).to(torch.float8_e4m3fn)
+    kv_cache = (
+        torch.randn(
+            num_pages,
+            kv_pad_dim,
+            page_size,
+            head_dim_qk,
+            dtype=torch.float32,
+            device=device,
+        )
+        / 4.0
+    ).to(torch.float8_e4m3fn)
+    page_ids = (
+        torch.arange(sparse_mla_top_k, dtype=torch.int32, device=device) % num_pages
+    )
+    block_tables = (
+        page_ids.view(1, 1, sparse_mla_top_k)
+        .expand(batch_size, q_len_per_request, sparse_mla_top_k)
+        .contiguous()
+    )
+    seq_len = page_size * min(num_pages, sparse_mla_top_k)
+    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.uint8, device=device)
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": workspace_buffer,
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": int(seq_len),
+        "sparse_mla_top_k": int(sparse_mla_top_k),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim_qk),
+        "bmm2_scale": 1.0,
+        "is_var_seq": False,
+    }
+
+
 trtllm_batch_decode_mla_trace = TraceTemplate(
     op_type="mla_paged",
     name_prefix="trtllm_batch_decode_mla",
@@ -1210,8 +1960,13 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
         "qk_rope_head_dim": Const(abbrev="kpe"),
         "qk_nope_head_dim": Const(abbrev="nope"),
         "num_pages": Var(),
+        "kv_pad_dim": Const(
+            abbrev="",
+            description="Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout.",
+        ),
         "page_size": Const(abbrev="ps"),
         "max_pages_per_seq": Var(),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
     },
     inputs={
         "query": Tensor(
@@ -1219,11 +1974,18 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
             description="Concatenated [Q_nope, Q_pe] query.",
         ),
         "kv_cache": Tensor(
-            ["num_pages", "page_size", "head_dim_qk"],
-            description="Paged KV cache [ckv ‖ kpe]; 4D layout with an extra num_kv_heads=1 dim is also accepted.",
+            ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
+            description=(
+                "Paged KV cache [ckv ‖ kpe]. The kernel accepts both the 3D "
+                "[num_pages, page_size, head_dim_qk] layout and the rank-4 "
+                "[num_pages, 1, page_size, head_dim_qk] layout for backwards "
+                "compatibility; this template models the rank-4 form."
+            ),
         ),
         "workspace_buffer": Tensor(
-            ["num_pages"], dtype="int8", description="Workspace scratch."
+            ["workspace_size"],
+            dtype="uint8",
+            description="Workspace scratch (flat byte buffer).",
         ),
         "qk_nope_head_dim": Scalar("int32"),
         "kv_lora_rank": Scalar("int32"),
@@ -1245,6 +2007,11 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
             optional=True,
             description="Scale applied after softmax @ V.",
         ),
+        "skip_softmax_threshold_scale_factor": Scalar(
+            "float32",
+            optional=True,
+            description="Threshold for skip-softmax sparsity (None disables).",
+        ),
     },
     outputs={
         "output": Tensor(
@@ -1254,7 +2021,113 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:decode", "backend:trtllm", "mla"],
     reference=_trtllm_batch_decode_mla_reference,
+    init=_trtllm_batch_decode_mla_init,
 )
+
+
+trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="trtllm_batch_decode_mla_sparse",
+    description=(
+        "SM100+ TRT-LLM MLA paged decode with NSA-style sparse top-k page "
+        "selection (DSV3.2 / GLM-5). Selected when sparse_mla_top_k > 0. "
+        "block_tables is a sparse top-k page index of shape [num_seqs, "
+        "q_len_per_request, sparse_mla_top_k] rather than the dense "
+        "[batch_size, max_pages_per_seq] layout."
+    ),
+    axes={
+        "batch_size": Var(),
+        "q_len_per_request": Var(description="Query length per request (MTP depth)."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "kv_lora_rank": Const(abbrev="ckv"),
+        "qk_rope_head_dim": Const(abbrev="kpe"),
+        "qk_nope_head_dim": Const(abbrev="nope"),
+        "num_pages": Var(),
+        "kv_pad_dim": Const(
+            abbrev="",
+            description="Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout.",
+        ),
+        "page_size": Const(abbrev="ps"),
+        "sparse_mla_top_k": Const(
+            abbrev="topk",
+            description="Number of top-k pages selected per query token.",
+        ),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
+    },
+    inputs={
+        "query": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
+            description="Concatenated [Q_nope, Q_pe] query.",
+        ),
+        "kv_cache": Tensor(
+            ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
+            description="Paged KV cache [ckv ‖ kpe], rank-4 layout.",
+        ),
+        "workspace_buffer": Tensor(
+            ["workspace_size"],
+            dtype="uint8",
+            description="Workspace scratch (flat byte buffer).",
+        ),
+        "qk_nope_head_dim": Scalar("int32"),
+        "kv_lora_rank": Scalar("int32"),
+        "qk_rope_head_dim": Scalar("int32"),
+        "block_tables": Tensor(
+            ["batch_size", "q_len_per_request", "sparse_mla_top_k"],
+            dtype="int32",
+            description=(
+                "Sparse top-k page index: for each (sequence, query token), "
+                "the IDs of the top_k pages selected by the NSA indexer."
+            ),
+        ),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_seq_len": Scalar("int32"),
+        "sparse_mla_top_k": Scalar(
+            "int32",
+            description="Number of top-k pages selected per query token; >0 selects this template.",
+        ),
+        "bmm1_scale": Scalar(
+            "float32",
+            optional=True,
+            description="Fused scale applied after Q @ K^T (includes 1/sqrt(head_dim_qk)).",
+        ),
+        "bmm2_scale": Scalar(
+            "float32",
+            optional=True,
+            description="Scale applied after softmax @ V.",
+        ),
+        "skip_softmax_threshold_scale_factor": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "Threshold for skip-softmax sparsity (kernel rejects this "
+                "kwarg when sparse_mla_top_k>0; documented for completeness)."
+            ),
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "q_len_per_request", "num_heads", "kv_lora_rank"],
+            dtype_from="query",
+        ),
+    },
+    tags=["status:verified", "stage:decode", "backend:trtllm", "mla", "sparse"],
+    reference=_trtllm_batch_decode_mla_sparse_reference,
+    init=_trtllm_batch_decode_mla_sparse_init,
+)
+
+
+def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
+    sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
+    if sparse_mla_top_k > 0:
+        return trtllm_batch_decode_mla_sparse_trace
+    return trtllm_batch_decode_mla_trace
+
+
+trtllm_batch_decode_mla_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    trtllm_batch_decode_mla_trace,
+    trtllm_batch_decode_mla_sparse_trace,
+]
 
 
 # ── XQA batch decode (non-MLA) ────────────────────────────────────────────────
@@ -1352,17 +2225,22 @@ xqa_batch_decode_mla_trace = TraceTemplate(
         "qk_rope_head_dim": Const(abbrev="kpe"),
         "qk_nope_head_dim": Const(abbrev="nope"),
         "num_pages": Var(),
+        "kv_pad_dim": Const(
+            abbrev="",
+            description="Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout.",
+        ),
         "page_size": Const(abbrev="ps"),
         "max_pages_per_seq": Var(),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
     },
     inputs={
         "query": Tensor(
             ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
         ),
         "kv_cache": Tensor(
-            ["num_pages", "page_size", "head_dim_qk"],
+            ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
         ),
-        "workspace_buffer": Tensor(["num_pages"], dtype="int8"),
+        "workspace_buffer": Tensor(["workspace_size"], dtype="uint8"),
         "qk_nope_head_dim": Scalar("int32"),
         "kv_lora_rank": Scalar("int32"),
         "qk_rope_head_dim": Scalar("int32"),
@@ -1403,6 +2281,31 @@ def _concat_mla_k_reference(k, k_nope, k_rope, **_unused):
     return k
 
 
+def _concat_mla_k_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 128,
+    nope_dim: int = 128,
+    rope_dim: int = 64,
+    total_dim: int = 0,  # derived
+    num_heads_broadcast: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.concat_mla_k``."""
+    del total_dim, num_heads_broadcast
+    torch.manual_seed(seed)
+    full_dim = nope_dim + rope_dim
+    k = torch.empty(
+        num_tokens, num_heads, full_dim, dtype=torch.bfloat16, device=device
+    )
+    k_nope = torch.randn(
+        num_tokens, num_heads, nope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_rope = torch.randn(num_tokens, 1, rope_dim, dtype=torch.bfloat16, device=device)
+    return {"k": k, "k_nope": k_nope, "k_rope": k_rope}
+
+
 concat_mla_k_trace = TraceTemplate(
     op_type="mla_paged",
     name_prefix="concat_mla_k",
@@ -1438,6 +2341,7 @@ concat_mla_k_trace = TraceTemplate(
     },
     tags=["status:verified", "mla"],
     reference=_concat_mla_k_reference,
+    init=_concat_mla_k_init,
 )
 concat_mla_k_trace.axes["num_heads_broadcast"] = Const(
     description="Always 1 (k_rope is shared across heads).", abbrev=""
@@ -1667,6 +2571,54 @@ cudnn_batch_prefill_trace = TraceTemplate(
 # These six wrappers live on top of existing kernels; their trace schemas
 # follow their Python-level run() signatures.
 
+
+def _batch_attention_run_init(
+    *,
+    num_qo_tokens: int = 1,
+    num_qo_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 64,
+    num_pages: int = 1,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``BatchDecodeWithPagedKVCacheWrapper.run``."""
+    torch.manual_seed(seed)
+    q = torch.randn(
+        num_qo_tokens, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.randn(
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    kv_last_page_len = torch.tensor([page_size], dtype=torch.int32, device=device)
+    return {
+        "plan": {
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_last_page_len": kv_last_page_len,
+            "num_qo_heads": int(num_qo_heads),
+            "num_kv_heads": int(num_kv_heads),
+            "head_dim": int(head_dim),
+            "page_size": int(page_size),
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
+        },
+        "run": {
+            "q": q,
+            "kv_cache": (k_cache, v_cache),
+        },
+    }
+
+
 batch_attention_run_trace = TraceTemplate(
     op_type="gqa_paged",
     name_prefix="batch_attention_run",
@@ -1699,6 +2651,7 @@ batch_attention_run_trace = TraceTemplate(
         ),
     },
     tags=["status:verified"],
+    init=_batch_attention_run_init,
 )
 
 
@@ -1711,6 +2664,72 @@ _POD_AXES: dict[str, Var | Const] = {
     "num_pages": Var(),
     "page_size": Const(abbrev="ps"),
 }
+
+
+def _pod_with_paged_kv_cache_run_init(
+    *,
+    prefill_len: int = 8,
+    decode_batch_size: int = 1,
+    num_pages: int = 1,
+    num_qo_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 64,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``PODWithPagedKVCacheWrapper.run``."""
+    torch.manual_seed(seed)
+    q_p = torch.randn(
+        prefill_len, num_qo_heads, head_dim, dtype=torch.float16, device=device
+    )
+    k_p = torch.randn(
+        prefill_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+    )
+    v_p = torch.randn_like(k_p)
+    q_d = torch.randn(
+        decode_batch_size, num_qo_heads, head_dim, dtype=torch.float16, device=device
+    )
+    k_cache = torch.randn(
+        decode_batch_size * num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    kv_indptr = (
+        torch.arange(decode_batch_size + 1, dtype=torch.int32, device=device)
+        * num_pages
+    )
+    kv_indices = torch.arange(
+        decode_batch_size * num_pages, dtype=torch.int32, device=device
+    )
+    kv_last_page_len = torch.full(
+        (decode_batch_size,), page_size, dtype=torch.int32, device=device
+    )
+    return {
+        "plan": {
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_last_page_len": kv_last_page_len,
+            "num_qo_heads": int(num_qo_heads),
+            "num_kv_heads": int(num_kv_heads),
+            "head_dim": int(head_dim),
+            "page_size": int(page_size),
+            "q_data_type": torch.float16,
+            "kv_data_type": torch.float16,
+        },
+        "run": {
+            "q_p": q_p,
+            "k_p": k_p,
+            "v_p": v_p,
+            "q_d": q_d,
+            "paged_kv_cache_d": (k_cache, v_cache),
+        },
+    }
+
 
 pod_with_paged_kv_cache_run_trace = TraceTemplate(
     op_type="pod",
@@ -1740,7 +2759,82 @@ pod_with_paged_kv_cache_run_trace = TraceTemplate(
         ),
     },
     tags=["status:verified", "stage:pod"],
+    init=_pod_with_paged_kv_cache_run_init,
 )
+
+
+def _batch_pod_with_paged_kv_cache_run_init(
+    *,
+    prefill_len: int = 16,
+    decode_batch_size: int = 1,
+    num_pages: int = 1,
+    num_qo_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 64,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``BatchPODWithPagedKVCacheWrapper.run``."""
+    torch.manual_seed(seed)
+    q_p = torch.randn(
+        prefill_len, num_qo_heads, head_dim, dtype=torch.float16, device=device
+    )
+    q_d = torch.randn(
+        decode_batch_size, num_qo_heads, head_dim, dtype=torch.float16, device=device
+    )
+    k_cache_p = torch.randn(
+        num_pages, page_size, num_kv_heads, head_dim, dtype=torch.float16, device=device
+    )
+    v_cache_p = torch.randn_like(k_cache_p)
+    k_cache_d = torch.randn(
+        decode_batch_size * num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+    v_cache_d = torch.randn_like(k_cache_d)
+    qo_indptr_p = torch.tensor([0, prefill_len], dtype=torch.int32, device=device)
+    kv_indptr_p = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    kv_indices_p = torch.arange(num_pages, dtype=torch.int32, device=device)
+    last_page_len_p = torch.tensor([page_size], dtype=torch.int32, device=device)
+    qo_indptr_d = torch.tensor([0, decode_batch_size], dtype=torch.int32, device=device)
+    kv_indptr_d = (
+        torch.arange(decode_batch_size + 1, dtype=torch.int32, device=device)
+        * num_pages
+    )
+    kv_indices_d = torch.arange(
+        decode_batch_size * num_pages, dtype=torch.int32, device=device
+    )
+    last_page_len_d = torch.full(
+        (decode_batch_size,), page_size, dtype=torch.int32, device=device
+    )
+    return {
+        "plan": {
+            "qo_indptr_p": qo_indptr_p,
+            "kv_indptr_p": kv_indptr_p,
+            "kv_indices_p": kv_indices_p,
+            "last_page_len_p": last_page_len_p,
+            "qo_indptr_d": qo_indptr_d,
+            "kv_indptr_d": kv_indptr_d,
+            "kv_indices_d": kv_indices_d,
+            "last_page_len_d": last_page_len_d,
+            "num_qo_heads": int(num_qo_heads),
+            "num_kv_heads": int(num_kv_heads),
+            "head_dim": int(head_dim),
+            "page_size": int(page_size),
+            "q_data_type": torch.float16,
+            "kv_data_type": torch.float16,
+        },
+        "run": {
+            "q_p": q_p,
+            "paged_kv_cache_p": (k_cache_p, v_cache_p),
+            "q_d": q_d,
+            "paged_kv_cache_d": (k_cache_d, v_cache_d),
+        },
+    }
 
 
 batch_pod_with_paged_kv_cache_run_trace = TraceTemplate(
@@ -1772,7 +2866,33 @@ batch_pod_with_paged_kv_cache_run_trace = TraceTemplate(
         ),
     },
     tags=["status:verified", "stage:pod"],
+    init=_batch_pod_with_paged_kv_cache_run_init,
 )
+
+
+def _block_sparse_attention_run_init(
+    *,
+    qo_len: int = 32,
+    kv_len: int = 32,
+    num_qo_heads: int = 4,
+    num_kv_heads: int = 2,
+    head_dim: int = 64,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build NHD q/k/v inputs for block-sparse wrapper ``run`` tests."""
+    torch.manual_seed(seed)
+    return {
+        "q": torch.randn(
+            qo_len, num_qo_heads, head_dim, dtype=torch.float16, device=device
+        ),
+        "k": torch.randn(
+            kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+        ),
+        "v": torch.randn(
+            kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
+        ),
+    }
 
 
 block_sparse_attention_run_trace = TraceTemplate(
@@ -1798,6 +2918,7 @@ block_sparse_attention_run_trace = TraceTemplate(
         "output": Tensor(["qo_len", "num_qo_heads", "head_dim"], dtype_from="q"),
     },
     tags=["status:verified", "sparse:block"],
+    init=_block_sparse_attention_run_init,
 )
 
 
@@ -1825,7 +2946,61 @@ variable_block_sparse_attention_run_trace = TraceTemplate(
         "output": Tensor(["qo_len", "num_qo_heads", "head_dim"], dtype_from="q"),
     },
     tags=["status:verified", "sparse:block"],
+    init=_block_sparse_attention_run_init,
 )
+
+
+def _multi_level_cascade_run_init(
+    *,
+    batch_size: int = 1,
+    num_pages: int = 1,
+    num_qo_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 64,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``MultiLevelCascadeAttentionWrapper.run``."""
+    torch.manual_seed(seed)
+    q = torch.randn(
+        batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.randn(
+        batch_size * num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    kv_cache = torch.stack([k_cache, v_cache], dim=1)
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    kv_indptr = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * num_pages
+    )
+    kv_indices = torch.arange(batch_size * num_pages, dtype=torch.int32, device=device)
+    kv_last_page_len = torch.full(
+        (batch_size,), page_size, dtype=torch.int32, device=device
+    )
+    return {
+        "plan": {
+            "qo_indptr": qo_indptr,
+            "kv_indptr": kv_indptr,
+            "kv_indices": kv_indices,
+            "kv_last_page_len": kv_last_page_len,
+            "num_qo_heads": int(num_qo_heads),
+            "num_kv_heads": int(num_kv_heads),
+            "head_dim": int(head_dim),
+            "page_size": int(page_size),
+            "q_data_type": torch.bfloat16,
+        },
+        "run": {
+            "q": q,
+            "paged_kv_cache": kv_cache,
+        },
+    }
 
 
 multi_level_cascade_run_trace = TraceTemplate(
@@ -1855,6 +3030,7 @@ multi_level_cascade_run_trace = TraceTemplate(
         "output": Tensor(["batch_size", "num_qo_heads", "head_dim"], dtype_from="q"),
     },
     tags=["status:verified", "cascade"],
+    init=_multi_level_cascade_run_init,
 )
 
 
@@ -1995,6 +3171,36 @@ segment_gemm_run_trace = TraceTemplate(
     tags=["status:verified"],
 )
 segment_gemm_run_trace.reference = _segment_gemm_run_reference
+
+
+def _segment_gemm_run_init(
+    *,
+    total_rows: int = 64,
+    batch_size: int = 2,
+    K: int = 32,
+    N: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``SegmentGEMMWrapper.run``."""
+    torch.manual_seed(seed)
+    x = torch.randn(total_rows, K, dtype=torch.float16, device=device)
+    weights = torch.randn(batch_size, K, N, dtype=torch.float16, device=device)
+    base = total_rows // max(1, batch_size)
+    rem = total_rows % max(1, batch_size)
+    seg_lens_cpu = [base + (1 if i < rem else 0) for i in range(batch_size)]
+    seg_lens = torch.tensor(seg_lens_cpu, dtype=torch.int64, device=device)
+    seg_indptr = torch.zeros(batch_size + 1, dtype=torch.int64, device=device)
+    seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+    return {
+        "x": x,
+        "weights": weights,
+        "seg_lens": seg_lens,
+        "seg_indptr": seg_indptr,
+    }
+
+
+segment_gemm_run_trace.init = _segment_gemm_run_init
 
 
 # ── CuteDSL MLA paged decode wrapper (.run) ──────────────────────────────────

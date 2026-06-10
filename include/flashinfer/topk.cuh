@@ -2769,6 +2769,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
           threshold_bytes[round] = static_cast<uint8_t>(threshold);
           topk_remain -= static_cast<uint32_t>(s_histogram[threshold + 1]);
 
+          __syncthreads();
           if (topk_remain == 0) {
             stop_round = round;
             break;

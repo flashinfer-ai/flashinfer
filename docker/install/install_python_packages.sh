@@ -19,6 +19,8 @@
 set -e
 set -u
 
+pip3 install --upgrade "setuptools>=77" "pip>=24"
+
 # Accept CUDA version as parameter (e.g., cu126, cu128, cu129)
 CUDA_VERSION=${1:-cu128}
 
@@ -32,7 +34,7 @@ pip3 install responses pytest scipy build cuda-python nvshmem4py-cu12
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
   pip3 install --upgrade cuda-python==13.0
   pip3 install --upgrade nvidia-cudnn-cu13
-  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]>=4.4.2"
+  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
 else
   pip3 install --upgrade cuda-python==12.*
   pip3 install --upgrade nvidia-cudnn-cu12

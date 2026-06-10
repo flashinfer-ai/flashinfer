@@ -32,6 +32,9 @@ from .fp4_quantization import (
     mxfp4_quantize,
     nvfp4_quantize,
     nvfp4_batched_quantize,
+    nvfp4_quantize_paged_kv_cache,
+    nvfp4_kv_quantize,
+    nvfp4_kv_dequantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
@@ -48,7 +51,10 @@ try:
     if is_cute_dsl_available():
         from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
         from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
-        from .kernels.nvfp4_quantize import nvfp4_quantize_cute_dsl
+        from .kernels.nvfp4_quantize import (
+            nvfp4_quantize_cute_dsl,
+            nvfp4_quantize_per_token_cute_dsl,
+        )
 
         _cute_dsl_available = True
 except ImportError:
@@ -74,6 +80,9 @@ __all__ = [
     "mxfp4_quantize",
     "nvfp4_quantize",
     "nvfp4_batched_quantize",
+    "nvfp4_quantize_paged_kv_cache",
+    "nvfp4_kv_quantize",
+    "nvfp4_kv_dequantize",
     "shuffle_matrix_a",
     "shuffle_matrix_sf_a",
     "scaled_fp4_grouped_quantize",
@@ -85,4 +94,5 @@ if _cute_dsl_available:
         "mxfp8_quantize_cute_dsl",
         "mxfp4_quantize_cute_dsl",
         "nvfp4_quantize_cute_dsl",
+        "nvfp4_quantize_per_token_cute_dsl",
     ]

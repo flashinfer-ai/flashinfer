@@ -17,7 +17,7 @@ MXFP8 Quantization using CuTe-DSL
 =================================
 
 High-performance MXFP8 quantization kernel using CuTe-DSL.
-Supports both linear and swizzled (128x4) scale factor layouts.
+Supports linear, swizzled 128x4, and swizzled 8x4 scale factor layouts.
 
 Key features:
 - Half2/BFloat2 SIMD for max-abs computation
@@ -63,6 +63,7 @@ from ..quantization_cute_dsl_utils import (
     reduce_max_2threads,
     reduce_max_4threads,
     compute_sf_index_swizzled_128x4_gpu,
+    compute_sf_index_swizzled_8x4_gpu,
     # High-level helpers
     half2_max_abs_4,
     half2_max_abs_8,
@@ -84,6 +85,11 @@ _MAX_THREADS_PER_BLOCK = 1024
 _MIN_WARPS = 4  # Minimum for reasonable occupancy (128 threads)
 _MAX_WARPS = 32  # Maximum to avoid register pressure (1024 threads)
 _DEFAULT_WARPS = 16  # Default when no optimization needed
+
+# Scale factor layout codes (match nvfp4/mxfp4 conventions)
+SF_LAYOUT_128x4 = 0
+SF_LAYOUT_8x4 = 1
+SF_LAYOUT_LINEAR = 2
 
 
 def _compute_optimal_warps(K: int, sf_blocks_per_warp: int = SF_BLOCKS_PER_WARP) -> int:
@@ -331,7 +337,7 @@ class MXFP8QuantizeLinearKernel:
 
 class MXFP8QuantizeSwizzledKernel:
     """
-    MXFP8 quantization kernel optimized for SWIZZLED layout.
+    MXFP8 quantization kernel optimized for SWIZZLED (128x4 or 8x4) layout.
 
     Key optimizations:
     - Multi-row processing: threads process multiple rows per block when K is small
@@ -356,10 +362,14 @@ class MXFP8QuantizeSwizzledKernel:
         K: int,
         enable_pdl: bool = False,
         use_2t_per_sf: bool = True,
+        sf_layout: int = SF_LAYOUT_128x4,
     ):
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.enable_pdl = enable_pdl
         self.use_2t_per_sf = use_2t_per_sf
+        self.sf_layout = sf_layout
+        self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
+        self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
 
         if use_2t_per_sf:
             self._elts_per_thread = ELTS_PER_THREAD
@@ -392,6 +402,16 @@ class MXFP8QuantizeSwizzledKernel:
         else:
             self.rows_per_block = 1
             self.needs_col_loop = True
+
+    @cute.jit
+    def _compute_sf_offset(
+        self, row_idx: Int32, col_idx: Int32, padded_cols: Int32
+    ) -> Int32:
+        """Compute scale factor offset based on layout (compile-time dispatch)."""
+        if cutlass.const_expr(self.sf_is_128x4):
+            return compute_sf_index_swizzled_128x4_gpu(row_idx, col_idx, padded_cols)
+        else:
+            return compute_sf_index_swizzled_8x4_gpu(row_idx, col_idx, padded_cols)
 
     @cute.jit
     def __call__(
@@ -462,7 +482,7 @@ class MXFP8QuantizeSwizzledKernel:
                     sf_col_idx = col_unit_idx
                     while sf_col_idx < padded_sf_cols:
                         if thread_in_unit == Int32(0):
-                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                            sf_offset = self._compute_sf_offset(
                                 row_idx, sf_col_idx, padded_sf_cols
                             )
                             mScales[sf_offset] = Uint8(0)
@@ -549,7 +569,7 @@ class MXFP8QuantizeSwizzledKernel:
                             )
 
                         if thread_in_unit == Int32(0):
-                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                            sf_offset = self._compute_sf_offset(
                                 row_idx, sf_col_idx, padded_sf_cols
                             )
                             mScales[sf_offset] = scale_ue8m0
@@ -560,7 +580,7 @@ class MXFP8QuantizeSwizzledKernel:
                     sf_col_idx = num_sf_blocks_per_row + col_unit_idx
                     while sf_col_idx < padded_sf_cols:
                         if thread_in_unit == Int32(0):
-                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                            sf_offset = self._compute_sf_offset(
                                 row_idx, sf_col_idx, padded_sf_cols
                             )
                             mScales[sf_offset] = Uint8(0)
@@ -593,7 +613,7 @@ class MXFP8QuantizeSwizzledKernel:
                         if thread_in_unit == Int32(0):
                             pad_col = sf_col_idx
                             while pad_col < padded_sf_cols:
-                                sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                sf_offset = self._compute_sf_offset(
                                     row_idx, pad_col, padded_sf_cols
                                 )
                                 mScales[sf_offset] = Uint8(0)
@@ -683,7 +703,7 @@ class MXFP8QuantizeSwizzledKernel:
                                 )
 
                             if thread_in_unit == Int32(0):
-                                sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                sf_offset = self._compute_sf_offset(
                                     row_idx, sf_col_idx, padded_sf_cols
                                 )
                                 mScales[sf_offset] = scale_ue8m0
@@ -696,7 +716,7 @@ class MXFP8QuantizeSwizzledKernel:
                             if thread_in_unit == Int32(0):
                                 pad_col = num_sf_blocks_per_row + sf_col_idx
                                 while pad_col < padded_sf_cols:
-                                    sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                    sf_offset = self._compute_sf_offset(
                                         row_idx, pad_col, padded_sf_cols
                                     )
                                     mScales[sf_offset] = Uint8(0)
@@ -772,12 +792,13 @@ def _get_compiled_kernel_mxfp8_swizzled(
     K: int,
     enable_pdl: bool = False,
     use_2t_per_sf: bool = True,
+    sf_layout: int = SF_LAYOUT_128x4,
 ) -> Tuple[Callable, int]:
     """
     Get or compile SWIZZLED layout kernel with TVM-FFI.
 
-    Cached by (K, dtype, pdl, use_2t) - M-agnostic, device-independent
-    compilation.
+    Cached by (K, dtype, pdl, use_2t, sf_layout) - M-agnostic,
+    device-independent compilation.
 
     Returns:
         Tuple of (compiled_kernel, rows_per_block) where rows_per_block
@@ -785,7 +806,7 @@ def _get_compiled_kernel_mxfp8_swizzled(
     """
     cutlass_dtype = cutlass.BFloat16 if is_bfloat16 else cutlass.Float16
     kernel_obj = MXFP8QuantizeSwizzledKernel(
-        cutlass_dtype, K, enable_pdl, use_2t_per_sf
+        cutlass_dtype, K, enable_pdl, use_2t_per_sf, sf_layout=sf_layout
     )
 
     # Use symbolic M for dynamic batch sizes
@@ -825,28 +846,44 @@ def mxfp8_quantize_cute_dsl(
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     enable_pdl: bool | None = None,
+    is_sf_8x4_layout: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to MXFP8 format using CuTe-DSL kernel.
+    r"""Quantize input tensor to MXFP8 format using the CuTe-DSL kernel.
 
-    This is a GPU implementation with dual-path optimization:
-    - LINEAR layout: SF-block based iteration (fast)
-    - SWIZZLED layout: Row-based iteration with padding fast path (optimized)
+    GPU implementation with dual-path optimization:
 
-    The kernel is compiled once per (K, dtype, pdl) combination and handles
-    varying M (batch size) at runtime without recompilation.
+    - **LINEAR layout**: SF-block based iteration (fast).
+    - **SWIZZLED layout**: row-based iteration with a padding fast path.
 
-    Args:
-        input: Input tensor of shape [M, K] with dtype fp16/bf16
-        is_sf_swizzled_layout: Whether to use 128x4 swizzled layout (True) or linear (False)
-        alignment: Alignment for K dimension (default 32, must be multiple of SF_VEC_SIZE)
-        enable_pdl: Whether to enable PDL (Programmatic Dependent Launch).
-            If None, automatically detects based on device capability (SM >= 9.0).
+    The kernel is compiled once per ``(K, dtype, pdl, sf_layout)`` tuple
+    and handles varying ``M`` (batch size) at runtime without
+    recompilation.
 
-    Returns:
-        Tuple of:
-            - fp8_tensor: Quantized tensor of shape [M, padded_K] with dtype float8_e4m3fn
-            - scale_tensor: Scale factors as uint8 tensor
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor of shape ``[M, K]`` with dtype fp16/bf16.
+    is_sf_swizzled_layout : bool
+        Whether to use a swizzled layout (``True``) or linear (``False``).
+        When ``True``, the layout is 128x4 by default; pass
+        ``is_sf_8x4_layout=True`` for 8x4.
+    alignment : int
+        Alignment for the K dimension (default 32; must be a multiple of
+        ``SF_VEC_SIZE``).
+    enable_pdl : bool, optional
+        Whether to enable Programmatic Dependent Launch.  Auto-detected
+        from device capability (SM >= 9.0) when ``None``.
+    is_sf_8x4_layout : bool
+        When ``is_sf_swizzled_layout`` is ``True``, selects 8x4 swizzling
+        instead of the default 128x4.  Ignored for the linear layout.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(fp8_tensor, scale_tensor)`` where ``fp8_tensor`` is the
+        quantized tensor of shape ``[M, padded_K]`` with dtype
+        ``float8_e4m3fn`` and ``scale_tensor`` is the UE8M0 scale-factor
+        tensor (``uint8``).
     """
     from ...utils import device_support_pdl
 
@@ -898,12 +935,14 @@ def mxfp8_quantize_cute_dsl(
 
     if is_sf_swizzled_layout:
         # Swizzled layout: compute padded_M and scale_output_size
-        padded_m = ((m + ROW_TILE_SIZE - 1) // ROW_TILE_SIZE) * ROW_TILE_SIZE
+        sf_layout = SF_LAYOUT_8x4 if is_sf_8x4_layout else SF_LAYOUT_128x4
+        row_tile_size = 8 if is_sf_8x4_layout else ROW_TILE_SIZE
+        padded_m = ((m + row_tile_size - 1) // row_tile_size) * row_tile_size
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
         scale_output_size = padded_m * padded_sf_cols
 
         kernel_fn, rows_per_block = _get_compiled_kernel_mxfp8_swizzled(
-            is_bfloat16, padded_k, enable_pdl, use_2t
+            is_bfloat16, padded_k, enable_pdl, use_2t, sf_layout
         )
 
         num_blocks = min((padded_m + rows_per_block - 1) // rows_per_block, target_grid)
@@ -940,6 +979,9 @@ def mxfp8_quantize_cute_dsl(
 
 
 __all__ = [
+    "SF_LAYOUT_128x4",
+    "SF_LAYOUT_8x4",
+    "SF_LAYOUT_LINEAR",
     "MXFP8QuantizeLinearKernel",
     "MXFP8QuantizeSwizzledKernel",
     "mxfp8_quantize_cute_dsl",

@@ -26,7 +26,7 @@ import flashinfer
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
@@ -112,6 +112,83 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     )
 
     torch.testing.assert_close(o_fp16, o_fp8, atol=1e-2, rtol=2e-1)
+
+
+@pytest.mark.parametrize("batch_size", [12, 17])
+@pytest.mark.parametrize("qo_len", [7, 53])
+@pytest.mark.parametrize("kv_len", [54, 97])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_batch_prefill_with_ragged_kv_cache_fp8(
+    batch_size,
+    qo_len,
+    kv_len,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    dtype,
+):
+    # Validates the ragged FP8 KV dequant kernel path (BF16 repack for hd128/256,
+    # in-loop dequant for the k64B hd64 case) against the equivalent 16-bit kernel
+    # run on the *same* dequantized values -- so no dependence on k/v scale
+    # plumbing (the fa2 ragged wrapper does not apply k_scale/v_scale).
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim, dtype=torch.float16
+    ).to(0)
+    qo_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
+
+    # Quantize K/V to FP8 (values already fit the FP8 range; no scaling needed).
+    k_fp8 = k.to(dtype)
+    v_fp8 = v.to(dtype)
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    # 16-bit reference on the dequantized FP8 values (same data, native path).
+    wrapper_ref = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper_ref.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=causal,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    o_ref = wrapper_ref.run(q, k_fp8.to(torch.float16), v_fp8.to(torch.float16))
+
+    # FP8 KV path.
+    wrapper_f8 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper_f8.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=causal,
+        q_data_type=torch.float16,
+        kv_data_type=dtype,
+    )
+    o_fp8 = wrapper_f8.run(q, k_fp8, v_fp8)
+
+    torch.testing.assert_close(o_fp8.to(torch.float16), o_ref, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])

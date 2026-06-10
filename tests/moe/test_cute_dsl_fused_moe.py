@@ -28,6 +28,9 @@ Tests include:
 - API consistency between functional and wrapper APIs
 """
 
+import gc
+import weakref
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -418,6 +421,138 @@ class TestTacticEnumeration:
 
 
 # =============================================================================
+# Test Class: CuteDslMoEInputsHelper.inputs_pre_hook layout contract
+# (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+class TestInputsHelperContract:
+    """Structural invariants for ``CuteDslMoEInputsHelper.inputs_pre_hook``.
+
+    Tests run without a GPU. They exercise the cross-file contract that
+    the hook's unpacking pattern (``x, x_sf, tse, *rest = inputs``) must
+    match the input list layout produced by ``CuteDslMoEWrapper.run`` so
+    that autotune profile inputs are not silently corrupted by a
+    refactor that reorders the wrapper's inputs list.
+    """
+
+    def _build_synthetic_inputs(self, num_tokens: int, num_local_experts: int):
+        """Mirror ``CuteDslMoEWrapper.run``'s inputs-list layout with
+        small-but-shape-faithful tensors so the test runs in <1s on CPU."""
+        n = num_tokens
+        # Small dimensions for fast CPU allocation; sizes only matter for
+        # shape checks, not numerical results.
+        hidden = 128
+        intermediate = 64
+        top_k = 8
+        sf_vec = 16
+        return [
+            torch.zeros(n, hidden // 2, dtype=torch.uint8),  # 0: x
+            torch.zeros(n, hidden // sf_vec, dtype=torch.uint8),  # 1: x_sf
+            torch.zeros(n, top_k, dtype=torch.int32),  # 2: token_selected_experts
+            torch.zeros(n, top_k, dtype=torch.float32),  # 3: token_final_scales
+            torch.zeros(
+                num_local_experts, 2 * intermediate, hidden // 2, dtype=torch.uint8
+            ),  # 4: w1_weight
+            torch.zeros(
+                num_local_experts, 2 * intermediate, hidden // sf_vec, dtype=torch.uint8
+            ),  # 5: w1_weight_sf
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 6: w1_alpha
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 7: fc2_input_scale
+            torch.zeros(
+                num_local_experts, hidden, intermediate // 2, dtype=torch.uint8
+            ),  # 8: w2_weight
+            torch.zeros(
+                num_local_experts, hidden, intermediate // sf_vec, dtype=torch.uint8
+            ),  # 9: w2_weight_sf
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 10: w2_alpha
+            torch.zeros(n, hidden, dtype=torch.bfloat16),  # 11: moe_output
+        ]
+
+    def test_hook_replaces_input_2_and_passes_through_rest(self):
+        """``inputs_pre_hook`` must replace ``inputs[2]``
+        (token_selected_experts) and pass through every other input
+        unchanged. Pins the contract with ``CuteDslMoEWrapper.run`` —
+        if someone reorders the inputs list (e.g. moves x_sf or a
+        weight tensor) without updating the helper's unpacking, the
+        autotune profile silently corrupts a different tensor."""
+        from flashinfer.fused_moe.cute_dsl._inputs_helper import (
+            CuteDslMoEInputsHelper,
+        )
+
+        num_local_experts = 16
+        helper = CuteDslMoEInputsHelper(
+            num_experts=256,
+            top_k=8,
+            num_local_experts=num_local_experts,
+            local_expert_offset=0,
+        )
+
+        inputs = self._build_synthetic_inputs(
+            num_tokens=64, num_local_experts=num_local_experts
+        )
+        original_tse = inputs[2]
+
+        output = helper.inputs_pre_hook(inputs)
+
+        assert len(output) == 12, f"Expected 12 outputs, got {len(output)}"
+        # Index 2 must be replaced (different object identity), with
+        # the same shape and dtype.
+        assert output[2] is not original_tse, (
+            "inputs[2] (token_selected_experts) must be REPLACED by the hook, "
+            "not passed through. Hook implementation in _inputs_helper.py "
+            "must build a fresh tensor for input #2."
+        )
+        assert output[2].shape == original_tse.shape, (
+            f"Replaced tse has shape {output[2].shape}, expected {original_tse.shape}"
+        )
+        assert output[2].dtype == original_tse.dtype, (
+            f"Replaced tse has dtype {output[2].dtype}, expected {original_tse.dtype}"
+        )
+        # Every other input MUST pass through with object identity preserved.
+        # If this breaks, the hook is mutating something it shouldn't, OR the
+        # wrapper's inputs-list ordering has drifted from the hook's unpacking.
+        for i in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+            assert output[i] is inputs[i], (
+                f"inputs[{i}] must pass through the hook unchanged (object identity). "
+                f"This typically indicates the inputs-list ordering in "
+                f"CuteDslMoEWrapper.run has drifted from the hook's unpacking pattern "
+                f"in CuteDslMoEInputsHelper.inputs_pre_hook."
+            )
+
+    def test_hook_is_deterministic_across_helper_instances(self):
+        """Two ``CuteDslMoEInputsHelper`` instances with the same seed
+        must produce tensor-equal replacement ``token_selected_experts``
+        for the same input. This is the core determinism property the
+        helper provides — cross-process autotune-pick variance is
+        eliminated only if seeded sampling is deterministic."""
+        from flashinfer.fused_moe.cute_dsl._inputs_helper import (
+            CuteDslMoEInputsHelper,
+        )
+
+        helper_a = CuteDslMoEInputsHelper(
+            num_experts=256, top_k=8, num_local_experts=16, local_expert_offset=0
+        )
+        helper_b = CuteDslMoEInputsHelper(
+            num_experts=256, top_k=8, num_local_experts=16, local_expert_offset=0
+        )
+
+        inputs_a = self._build_synthetic_inputs(num_tokens=64, num_local_experts=16)
+        inputs_b = self._build_synthetic_inputs(num_tokens=64, num_local_experts=16)
+
+        out_a = helper_a.inputs_pre_hook(inputs_a)
+        out_b = helper_b.inputs_pre_hook(inputs_b)
+
+        assert torch.equal(out_a[2], out_b[2]), (
+            "Two helpers with the same seed produced different "
+            "token_selected_experts tensors. The seeded "
+            "torch.random.fork_rng + manual_seed pattern in "
+            "generate_token_selected_experts is broken."
+        )
+
+
+# =============================================================================
 # Test Class: get_max_num_tiles / get_max_num_permuted_tokens (no GPU required)
 # =============================================================================
 
@@ -671,6 +806,182 @@ class TestGetMaxNumPermutedTokens:
         )
         tiles = get_max_num_tiles(num_tokens, top_k, num_local_experts, tile_size)
         assert permuted == tiles * tile_size
+
+
+# =============================================================================
+# Test Class: Autotuner bucket configuration (no GPU required)
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def bucket_spec():
+    """The first ``DynamicTensorSpec`` of a default-configured
+    ``CuteDslFusedMoENvfp4Runner`` — the spec that owns the
+    ``gen_tuning_buckets`` / ``map_to_tuning_buckets`` callables under
+    test. Module-scoped: the runner is stateless for these checks.
+    """
+    from flashinfer.fused_moe.cute_dsl.tuner import (
+        CuteDslFusedMoENvfp4Runner,
+    )
+
+    runner = CuteDslFusedMoENvfp4Runner(
+        forward_impl=lambda *a, **k: None,
+        num_experts=256,
+        top_k=8,
+        num_local_experts=256,
+    )
+    return runner.tuning_config.dynamic_tensor_specs[0]
+
+
+@cute_dsl_available
+class TestAutotunerBucketConfig:
+    """Structural tests for the ``gen_tuning_buckets`` /
+    ``map_to_tuning_buckets`` configuration on
+    ``CuteDslFusedMoENvfp4Runner.tuning_config``.
+
+    These tests run without a GPU. They guard against bucket-config
+    forms that bake a hardcoded cap into the autotuner's input-dim
+    bucket logic. A capped form silently clamps the autotune to a
+    fixed shape — at runtime any token count larger than the cap
+    maps to the smaller cached bucket and uses a tactic profiled at
+    the wrong workload size.
+
+    The correct form passes the bucket generators as bare callables;
+    the autotuner invokes them with the actual input dim at autotune
+    time so the bucket set adapts to the workload.
+    """
+
+    def test_gen_tuning_buckets_is_callable_not_static_tuple(self, bucket_spec):
+        """``gen_tuning_buckets`` must be a callable that adapts to the
+        actual input dim at autotune time — not a pre-computed
+        tuple/sequence that bakes in a hardcoded cap.
+        """
+        assert callable(bucket_spec.gen_tuning_buckets), (
+            f"gen_tuning_buckets must be a callable that adapts to the "
+            f"runtime input dim — got "
+            f"{type(bucket_spec.gen_tuning_buckets).__name__}. A "
+            f"pre-computed sequence (e.g., a tuple) likely indicates a "
+            f"bucket set with a hardcoded cap; pass the bare function "
+            f"reference instead."
+        )
+
+    def test_gen_tuning_buckets_responds_to_input_dim(self, bucket_spec):
+        """Calling ``gen_tuning_buckets`` with successively larger input
+        dims must produce bucket sets whose maximum grows with the
+        input. A capped form would produce identical (capped) bucket
+        sets regardless of input.
+        """
+        small = bucket_spec.gen_tuning_buckets(8192)
+        medium = bucket_spec.gen_tuning_buckets(16384)
+        large = bucket_spec.gen_tuning_buckets(32768)
+        assert max(small) >= 8192, (
+            f"gen_tuning_buckets(8192) max should reach 8192; got {max(small)}"
+        )
+        assert max(medium) >= 16384, (
+            f"gen_tuning_buckets(16384) max should reach 16384; "
+            f"got {max(medium)}. Likely a hardcoded cap below 16384."
+        )
+        assert max(large) >= 32768, (
+            f"gen_tuning_buckets(32768) max should reach 32768; "
+            f"got {max(large)}. Likely a hardcoded cap below 32768."
+        )
+        assert max(medium) > max(small), (
+            f"larger input dim should produce larger bucket max, but "
+            f"max(buckets@8192)={max(small)} >= "
+            f"max(buckets@16384)={max(medium)} — likely a hardcoded cap."
+        )
+
+    @pytest.mark.parametrize("x", [16384, 32768, 65536])
+    def test_map_to_tuning_buckets_responds_to_large_input(self, bucket_spec, x: int):
+        """``map_to_tuning_buckets(x)`` for large x must return a value
+        that scales with x, not collapse to a smaller constant. A
+        capped form would silently return the cap value for any input
+        above it.
+        """
+        result = bucket_spec.map_to_tuning_buckets(x)
+        assert result >= x, (
+            f"map_to_tuning_buckets({x}) = {result}; expected >= {x}. "
+            f"Likely a hardcoded cap below {x}."
+        )
+
+    @pytest.mark.parametrize("x", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    def test_map_to_tuning_buckets_matches_trtllm_at_small_powers_of_2(
+        self, bucket_spec, x: int
+    ):
+        """At power-of-2 inputs in the small-N regime (≤ 256), fi's
+        ``map_to_tuning_buckets(x)`` must equal ``x`` — matching
+        TRT-LLM's ``last_positive_power_of_2(x)`` behavior. Locks in
+        the fi/trt-llm parity that IS achievable in this regime.
+        """
+        from flashinfer.fused_moe.utils import last_positive_power_of_2
+
+        result = bucket_spec.map_to_tuning_buckets(x)
+        assert result == x == last_positive_power_of_2(x), (
+            f"At x={x} (power of 2 in small-N regime), fi's "
+            f"map_to_tuning_buckets should equal x and equal "
+            f"last_positive_power_of_2(x) (TRT-LLM's pattern). Got "
+            f"fi={result}, expected {x}."
+        )
+
+    def test_map_to_tuning_buckets_is_monotonic(self, bucket_spec):
+        """``map_to_tuning_buckets`` must be monotonically non-decreasing
+        in its input — a property TRT-LLM's mapper also satisfies.
+        Catches a regression that would introduce non-monotonic
+        bucket-mapping behavior.
+        """
+        test_xs = [
+            1,
+            2,
+            8,
+            100,
+            256,
+            257,
+            512,
+            768,
+            1024,
+            2048,
+            2049,
+            4096,
+            4097,
+            8192,
+            16384,
+            32768,
+            65536,
+        ]
+        results = [bucket_spec.map_to_tuning_buckets(x) for x in test_xs]
+        for prev_x, prev_y, curr_x, curr_y in zip(
+            test_xs, results, test_xs[1:], results[1:], strict=False
+        ):
+            assert prev_y <= curr_y, (
+                f"map_to_tuning_buckets must be monotonically "
+                f"non-decreasing; got map({prev_x})={prev_y} > "
+                f"map({curr_x})={curr_y}. Full mapping at probe "
+                f"points: {list(zip(test_xs, results, strict=False))}."
+            )
+
+    @pytest.mark.parametrize("max_n", [256, 4096, 16384])
+    def test_gen_tuning_buckets_covers_trtllm_power_of_2_points(
+        self, bucket_spec, max_n: int
+    ):
+        """fi's bucket set must be a superset of TRT-LLM's power-of-2
+        bucket set at every input dim tested, so the autotuner has at
+        least the same coarse-grained coverage as TRT-LLM at every
+        power-of-2 boundary up to the input dim.
+        """
+        from flashinfer.fused_moe.utils import last_positive_power_of_2
+
+        fi_buckets = set(bucket_spec.gen_tuning_buckets(max_n))
+        # Mirror TRT-LLM's get_last_power_of_2_num_tokens_buckets:
+        # powers of 2 from 1 up to last_positive_power_of_2(max_n).
+        trtllm_top = last_positive_power_of_2(max_n)
+        trtllm_buckets = {1 << i for i in range(trtllm_top.bit_length())}
+        missing = trtllm_buckets - fi_buckets
+        assert not missing, (
+            f"At max_n={max_n}, fi's bucket set is missing power-of-2 "
+            f"values that TRT-LLM's bucket set would include: "
+            f"{sorted(missing)}. fi: {sorted(fi_buckets)}; "
+            f"TRT-LLM: {sorted(trtllm_buckets)}."
+        )
 
 
 # =============================================================================
@@ -1034,6 +1345,167 @@ class TestCuteDslMoEWrapper:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    def test_cuda_graph_wrapper_lifetime_before_autotune(self):
+        """Dropped CUDA graph wrappers should not wait for cyclic GC."""
+        from flashinfer import autotune
+        from flashinfer import CuteDslMoEWrapper
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+        target_num_tokens = 256
+
+        def run_wrapper(moe, tensors):
+            return moe.run(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+
+        def warmup_and_drop_cuda_graph_wrapper():
+            tensors = create_moe_tensors(
+                num_tokens=64,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                top_k=top_k,
+            )
+            moe = CuteDslMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=True,
+                max_num_tokens=64,
+            )
+            ref = weakref.ref(moe)
+            finalized = []
+            weakref.finalize(moe, lambda: finalized.append(True))
+
+            for _ in range(3):
+                result = run_wrapper(moe, tensors)
+            torch.cuda.synchronize()
+            assert not torch.isnan(result).any()
+            return ref, finalized
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            wrapper_ref, finalized = warmup_and_drop_cuda_graph_wrapper()
+            assert wrapper_ref() is None
+            assert finalized == [True]
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+        tensors = create_moe_tensors(
+            num_tokens=target_num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=False,
+        )
+
+        with autotune(True):
+            result = run_wrapper(moe, tensors)
+        torch.cuda.synchronize()
+
+        assert result.shape == (target_num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+
+    def test_cuda_graph_wrapper_lifetime_after_autotune(self):
+        """Dropped CUDA graph wrappers should not wait for cyclic GC,
+        even after autotune profiling has populated the autotuner cache."""
+        from flashinfer import autotune
+        from flashinfer import CuteDslMoEWrapper
+        from flashinfer.autotuner import AutoTuner
+
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 2
+
+        def run_wrapper(moe, tensors):
+            return moe.run(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+
+        def autotune_and_drop_cuda_graph_wrapper():
+            tensors = create_moe_tensors(
+                num_tokens=64,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                top_k=top_k,
+            )
+            moe = CuteDslMoEWrapper(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=True,
+                max_num_tokens=64,
+            )
+            ref = weakref.ref(moe)
+            finalized = []
+            weakref.finalize(moe, lambda: finalized.append(True))
+
+            # Clear the autotuner cache so this test forces a profile pass.
+            # Otherwise a prior test in the same process may have populated
+            # a matching cache entry and `autotune(True)` would take the
+            # cache-hit path, skipping the runner-wrapper profiling
+            # interaction this test is meant to exercise.
+            autotuner = AutoTuner.get()
+            autotuner.clear_cache()
+
+            with autotune(True):
+                result = run_wrapper(moe, tensors)
+            torch.cuda.synchronize()
+            assert not torch.isnan(result).any()
+            # Confirm profiling actually ran for this custom op. Cache keys
+            # are (custom_op, runner_class, hash(runner), profile, extras)
+            # tuples; see AutoTuner._get_cache_key in flashinfer/autotuner.py.
+            assert any(
+                isinstance(k, tuple) and k[:1] == ("CuteDslMoEWrapper::run",)
+                for k in autotuner.profiling_cache
+            ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
+            return ref, finalized
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            wrapper_ref, finalized = autotune_and_drop_cuda_graph_wrapper()
+            assert wrapper_ref() is None
+            assert finalized == [True]
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
 
 # =============================================================================
 # Test Class: API Consistency
@@ -1284,8 +1756,8 @@ class TestExpertParallelism:
 class TestMoeSortBufferInitPoisoned:
     """Validate the invariant that the routing kernel writes every
     output entry that downstream code reads, by pre-poisoning the
-    wrapper's preallocated ``moe_sort`` output buffers with a sentinel
-    value before the first call.
+    ``moe_sort`` output buffers with a sentinel value before invoking
+    the MoE pipeline.
 
     The ``moe_sort`` wrapper in ``moe_utils.py`` allocates its output
     buffers via ``torch.empty(...)`` and relies on the routing kernel
@@ -1306,11 +1778,11 @@ class TestMoeSortBufferInitPoisoned:
     written as ``-1`` by the kernel. If the kernel ever stops writing
     masked slots, this test catches it.
 
-    These tests use ``use_cuda_graph=True`` so the wrapper preallocates
-    buffers (the path where stale state from prior calls / poisoning is
-    actually retained between calls). The default ``use_cuda_graph=False``
-    path allocates fresh buffers per call and doesn't exercise the
-    same scenario.
+    ``_moe_core_impl`` accepts an external ``moe_sort_buffers`` dict
+    for callers who want to manage their own routing-output buffers.
+    The test allocates the dict via ``allocate_moe_sort_buffers``,
+    fills it with the poison sentinel, and drives the full
+    routing+gemm pipeline through ``_moe_core_impl`` directly.
     """
 
     @pytest.mark.parametrize(
@@ -1334,7 +1806,7 @@ class TestMoeSortBufferInitPoisoned:
         self, ep_size: int, num_tokens: int
     ):
         """Pre-poison all six moe_sort output buffers with a sentinel
-        before the wrapper's first call; verify output is well-formed
+        before invoking the MoE pipeline; verify output is well-formed
         and (at low N) matches the eager reference within tolerance.
 
         The high-N case (``num_tokens > 1024``) skips the
@@ -1345,7 +1817,10 @@ class TestMoeSortBufferInitPoisoned:
         what the poisoning-detection logic actually relies on; the
         reference comparison is supplementary.
         """
-        from flashinfer import CuteDslMoEWrapper
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            allocate_moe_sort_buffers,
+        )
 
         hidden_size, intermediate_size = 256, 512
         num_experts, top_k = 256, 8
@@ -1361,33 +1836,29 @@ class TestMoeSortBufferInitPoisoned:
             top_k=top_k,
         )
 
-        # use_cuda_graph=True so the wrapper preallocates _moe_sort_buffers
-        # (the path that retains stale state between calls — exactly what
-        # we want to stress here).
-        moe = CuteDslMoEWrapper(
+        # Allocate the moe_sort outputs externally so we can poison them
+        # before invoking the kernel. ``_moe_core_impl`` accepts a
+        # ``moe_sort_buffers`` dict that flows through to ``moe_sort`` via
+        # **kwargs, taking the place of its internal ``torch.empty`` calls.
+        tile_size = 128  # default tactic for _moe_core_impl
+        moe_sort_buffers = allocate_moe_sort_buffers(
+            num_tokens=num_tokens,
             num_experts=num_experts,
             top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
             num_local_experts=num_local_experts,
-            local_expert_offset=local_expert_offset,
-            use_cuda_graph=True,
-            max_num_tokens=num_tokens,
+            tile_tokens_dim=tile_size,
+            device="cuda",
         )
 
-        # Defensive guard: if a future refactor renames or restructures
-        # ``_moe_sort_buffers``, the poisoning loop below would silently
-        # iterate over zero items and the test would pass without
-        # actually exercising the kernel-write invariant. Fail loudly
-        # in that case so the test must be updated rather than silently
-        # rotting.
-        assert (
-            getattr(moe, "_moe_sort_buffers", None) is not None
-            and len(moe._moe_sort_buffers) > 0
-        ), (
-            "Wrapper no longer exposes a non-empty ``_moe_sort_buffers`` "
-            "dict; the poisoning loop would be a no-op. Update this "
-            "test to target the new preallocation attribute."
+        # Defensive guard: if a future refactor renames or restructures the
+        # buffer dict returned by ``allocate_moe_sort_buffers``, the
+        # poisoning loop below would silently iterate over zero items and
+        # the test would pass without exercising the kernel-write
+        # invariant. Fail loudly in that case.
+        assert moe_sort_buffers and len(moe_sort_buffers) > 0, (
+            "``allocate_moe_sort_buffers`` no longer returns a non-empty "
+            "dict; the poisoning loop would be a no-op. Update this test "
+            "to target the new buffer-allocation API."
         )
 
         # Sentinel: a non-zero, non-(-1), out-of-valid-index-range int32.
@@ -1396,10 +1867,10 @@ class TestMoeSortBufferInitPoisoned:
         # atomic-add will scatter into wildly wrong output rows, producing
         # NaN/Inf or massive numerical divergence.
         POISON = 0x7FFFFFFE
-        for buf in moe._moe_sort_buffers.values():
+        for buf in moe_sort_buffers.values():
             buf.fill_(POISON)
 
-        result = moe.run(
+        result = _moe_core_impl(
             x=tensors["x"],
             x_sf=tensors["x_sf"],
             token_selected_experts=tensors["token_selected_experts"],
@@ -1411,6 +1882,13 @@ class TestMoeSortBufferInitPoisoned:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            tile_size=tile_size,
+            moe_sort_buffers=moe_sort_buffers,
+            output_dtype=torch.bfloat16,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1612,6 +2090,187 @@ class TestAllValidTactics:
             f"(tokens={num_tokens}, hidden={hidden_size}, "
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k})"
         )
+
+
+# ============================================================================
+# moe_output_memset_inplace (dense Path A) — unit tests
+# ============================================================================
+#
+# Tests for the dense cudaMemsetAsync wrapper that mirrors TRT-LLM's
+# `moe_output_memset_inplace` Path A. Used in `_moe_core_impl` before GEMM2
+# finalize to zero the active output slice for the atomic scatter-add.
+# See flashinfer/fused_moe/cute_dsl/moe_utils.py:moe_output_memset_inplace
+# for the function and the audit doc follow-up #11 for the scope decision.
+
+
+@cute_dsl_available
+@sm100_required
+class TestMoeOutputMemsetInplace:
+    """Correctness + stream-handling tests for the dense memset wrapper."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 7168),  # decode N=1, DSv3 hidden
+            (64, 1024),  # generic small
+        ],
+    )
+    def test_zeros_buffer(self, dtype, shape):
+        """Buffer is fully zeroed regardless of starting contents."""
+        x = torch.randn(*shape, device="cuda", dtype=dtype)
+        assert not (x == 0).all(), (
+            "test setup invariant: a random tensor must not be all-zeros"
+        )
+
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        moe_output_memset_inplace(x)
+        torch.cuda.synchronize()
+
+        assert (x == 0).all(), (
+            f"moe_output_memset_inplace did not zero the buffer "
+            f"(shape={shape}, dtype={dtype})"
+        )
+
+    def test_unsupported_dtype_raises(self):
+        """Reject dtypes we don't bind before native dispatch."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        x = torch.randn(16, 32, device="cuda", dtype=torch.float32)
+        with pytest.raises(ValueError, match="only supports"):
+            moe_output_memset_inplace(x)
+
+    def test_cuda_graph_capture(self):
+        """
+        Verify the wrapper captures cleanly into a CUDA graph and replays.
+
+        CUDA-graph capture requires every queued op to land on the capture
+        stream. If the wrapper's memset ended up on a *different* stream
+        (e.g. TVM FFI's env stream when the Python current stream is the
+        capture stream), capture would either error or produce an
+        inconsistent graph whose replay doesn't zero the buffer. A clean
+        capture + correct replay is strong evidence that the explicit
+        stream pointer is being honored by the C++ binding.
+        """
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            moe_output_memset_inplace,
+        )
+
+        x = torch.randn(128, 2048, device="cuda", dtype=torch.bfloat16)
+
+        # Warm up on the capture stream so JIT compile doesn't race capture.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            moe_output_memset_inplace(x)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        x.fill_(7.0)
+        with torch.cuda.graph(graph, stream=capture_stream):
+            moe_output_memset_inplace(x)
+
+        # Replay: refill with non-zero so a successful replay is observable.
+        x.fill_(7.0)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert (x == 0).all(), (
+            "CUDA graph replay did not zero the buffer — wrapper's memset "
+            "is not being captured onto the capture stream"
+        )
+
+
+class TestMoeOutputMemsetInplaceContract:
+    """
+    Python-level contract test for ``moe_output_memset_inplace``.
+
+    Intentionally NOT decorated with ``@cute_dsl_available`` /
+    ``@sm100_required`` — this test does not touch the GPU at all
+    (CPU tensor, monkeypatched FFI dispatch, monkeypatched stream
+    getter), so it runs everywhere and catches the highest-priority
+    Python-side regressions deterministically.
+    """
+
+    def test_passes_current_torch_stream_ptr_to_binding(self, monkeypatch):
+        """
+        Verify the wrapper passes the FFI binding:
+          - the right ``data_ptr`` (positional 1)
+          - ``num_tokens`` and ``hidden_size`` (positional 2/3)
+          - the result of ``_get_cuda_stream_ptr()`` (positional 4)
+
+        Catches Python-side regressions:
+          - dropping the ``_get_cuda_stream_ptr()`` argument
+          - passing 0 (which would fall back to TVM FFI's env stream)
+          - changing the order of FFI arguments
+          - calling the wrong dtype-suffixed entry point
+
+        Monkeypatches both ``_get_moe_utils_module`` (to capture the
+        FFI call) and ``_get_cuda_stream_ptr`` (to return a known
+        sentinel), so the test is fully deterministic and CPU-only.
+        """
+        from flashinfer.fused_moe.cute_dsl import moe_utils
+
+        captured = {}
+
+        def fake_memset(ptr, num_tokens, hidden_size, stream_ptr):
+            captured["ptr"] = ptr
+            captured["num_tokens"] = num_tokens
+            captured["hidden_size"] = hidden_size
+            captured["stream_ptr"] = stream_ptr
+
+        SENTINEL_STREAM_PTR = 0x123456789ABCDEF0
+        monkeypatch.setattr(
+            moe_utils,
+            "_get_moe_utils_module",
+            lambda: {"flashinfer_moe_output_memset_inplace_bf16": fake_memset},
+        )
+        monkeypatch.setattr(
+            moe_utils, "_get_cuda_stream_ptr", lambda: SENTINEL_STREAM_PTR
+        )
+
+        x = torch.empty((2, 3), device="cpu", dtype=torch.bfloat16)
+        moe_utils.moe_output_memset_inplace(x)
+
+        assert captured["ptr"] == x.data_ptr(), (
+            "wrapper passed wrong data_ptr to FFI binding"
+        )
+        assert captured["num_tokens"] == 2, "wrapper passed wrong num_tokens"
+        assert captured["hidden_size"] == 3, "wrapper passed wrong hidden_size"
+        assert captured["stream_ptr"] == SENTINEL_STREAM_PTR, (
+            "wrapper did not pass `_get_cuda_stream_ptr()`'s return value "
+            "as the 4th FFI argument — the active PyTorch stream would be "
+            "lost on the C++ side. Likely cause: `_get_cuda_stream_ptr()` "
+            "was dropped, replaced with 0, or the FFI argument order "
+            "changed."
+        )
+
+    @pytest.mark.parametrize(
+        ("tensor", "match"),
+        [
+            (torch.empty((2, 3), dtype=torch.float32), "only supports"),
+            (torch.empty((2, 3, 4), dtype=torch.bfloat16), "2D tensor"),
+            (torch.empty((2, 3), dtype=torch.bfloat16).t(), "contiguous"),
+        ],
+    )
+    def test_rejects_invalid_inputs_before_native_dispatch(
+        self, monkeypatch, tensor, match
+    ):
+        """Validate dangerous inputs before resolving the native binding."""
+        from flashinfer.fused_moe.cute_dsl import moe_utils
+
+        def fail_module_load():
+            raise AssertionError("native binding should not be loaded")
+
+        monkeypatch.setattr(moe_utils, "_get_moe_utils_module", fail_module_load)
+        with pytest.raises(ValueError, match=match):
+            moe_utils.moe_output_memset_inplace(tensor)
 
 
 if __name__ == "__main__":
