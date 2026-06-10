@@ -949,9 +949,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["flashinfer", "triton"],
         "12.1": ["flashinfer", "triton"],
     },
-    # GDN (Gated Delta Net). The FlashInfer CuTe-DSL kernels require SM90+;
-    # SM11x/SM12x are unverified for the flashinfer backend, so only the
-    # Triton reference is enabled there for decode/MTP.
+    # GDN (Gated Delta Net)
     "gated_delta_rule_decode": {
         "7.5": [],
         "8.0": [],

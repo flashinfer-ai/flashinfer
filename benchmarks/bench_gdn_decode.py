@@ -124,6 +124,7 @@ def gdn_decode_bytes(
     seq_len: int = 1,
     disable_state_update: bool = False,
     state_dtype_bytes: int = 4,  # 4 for FP32, 2 for BF16
+    cache_intermediate_states: bool = False,
 ) -> int:
     """
     Calculate memory bytes for GDN.
@@ -175,10 +176,10 @@ def gdn_decode_bytes(
     # b: [B, T, HV] - dtype
     b_bytes = batch_size * seq_len * num_sab_heads * elem_size
 
-    # Intermediate states: [B, T, HV, K, V] - only for MTP (seq_len > 1)
-    # Write all T steps of intermediate states
+    # Intermediate states: [B, T, HV, K, V] - only written when MTP
+    # intermediate-state caching is enabled
     intermediate_bytes = 0
-    if seq_len > 1:
+    if cache_intermediate_states and seq_len > 1:
         intermediate_bytes = (
             batch_size
             * seq_len
@@ -454,6 +455,7 @@ def bench_gdn_mtp(
         dtype,
         seq_len,
         disable_state_update=disable_state_update,
+        cache_intermediate_states=cache_intermediate_states,
     )
 
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
@@ -1577,6 +1579,7 @@ def bench_gdn_decode_bf16_state(
         seq_len,
         disable_state_update=disable_state_update,
         state_dtype_bytes=2,  # BF16 state for gdn_decode_bf16_state
+        cache_intermediate_states=cache_intermediate_states,
     )
 
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
