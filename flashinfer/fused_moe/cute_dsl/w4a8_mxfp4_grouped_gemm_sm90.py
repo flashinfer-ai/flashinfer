@@ -490,6 +490,16 @@ class HopperGroupedGemmPersistentKernel:
         swiglu_alpha: float = None,
         swiglu_beta: float = None,
         swiglu_limit: float = None,
+        # Dequant exponent re-centering. The FP4->FP8 dequant encodes
+        # value = FP4 x 2^(scale-127) by ADDING the scale exponent to the FP8 exponent
+        # bits -- exact in e4m3's NORMAL range, but real checkpoints carry small scales
+        # (DSv4: ~2^-8..2^-4) that push products below 2^-6 into the subnormal band,
+        # where exponent-add mis-encodes (1.5*2^-7 -> 0.5*2^-6) or underflows to 0.
+        # Fix: the caller biases the UE8M0 scale bytes by +dequant_exp_bias (lifting
+        # every product back into the normal range) and the epilogue multiplies the
+        # FP32 accumulator by 2^-dequant_exp_bias (exact) before any epilogue math
+        # (the SwiGLU clamp thresholds are in model units). 0 = off (bit-identical).
+        dequant_exp_bias: int = 0,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -595,6 +605,9 @@ class HopperGroupedGemmPersistentKernel:
         self.swiglu_alpha = 1.0 if swiglu_alpha is None else float(swiglu_alpha)
         self.swiglu_beta = 0.0 if swiglu_beta is None else float(swiglu_beta)
         self.swiglu_clamp = None if swiglu_limit is None else float(swiglu_limit)
+        # Dequant exponent re-centering (see constructor docstring): the epilogue
+        # multiplies the accumulator by 2^-bias; the caller pre-biased the scales.
+        self.dequant_exp_bias = int(dequant_exp_bias)
         # Delegate A/B tensor map init to MMA warp for better latency hiding (SMEM mode)
         self.delegate_tensormap_ab_init = (
             tensormap_update_mode == utils.TensorMapUpdateMode.SMEM
@@ -803,7 +816,7 @@ class HopperGroupedGemmPersistentKernel:
         problem_shape_mnkl: cute.Tensor,
         strides_abc: cute.Tensor,
         tensor_address_abc: cute.Tensor,
-        total_num_clusters: cutlass.Constexpr[int],
+        total_num_clusters: cutlass.Int32,
         tensormap_cute_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr[int],
         stream: cuda.CUstream,
@@ -817,7 +830,11 @@ class HopperGroupedGemmPersistentKernel:
         :param problem_shape_mnkl: Device tensor of shape (G, 4) Int32 with (M,N,K,L) per group.
         :param strides_abc: Device tensor of shape (G, 3, 2) Int32 with strides per group.
         :param tensor_address_abc: Device tensor of shape (G, 3) Int64 with base ptrs per group.
-        :param total_num_clusters: Total clusters across all groups (compile-time constant).
+        :param total_num_clusters: Total clusters across all groups (RUNTIME value: the
+            per-call routing changes it every MoE forward in serving, so baking it as a
+            Constexpr would force a recompile per routing; the persistent scheduler only
+            compares it against tile indices on device). The launch grid is static
+            (max_active_clusters); surplus CTAs find no valid tile and exit.
         :param tensormap_cute_tensor: Tensor map workspace, shape (num_sms, 3, 16) Int64.
         :param max_active_clusters: Max active clusters (compile-time constant).
         :param stream: CUDA stream.
@@ -2275,6 +2292,20 @@ class HopperGroupedGemmPersistentKernel:
                         )
                         trans2mma_consumer_release_state.advance()
 
+                # Dequant exponent re-centering: the caller biased the UE8M0 weight
+                # scales by +dequant_exp_bias so every FP4*scale product stays in FP8
+                # e4m3's NORMAL range (real DSv4 scales otherwise land subnormal, where
+                # the exponent-add dequant mis-encodes or underflows). Undo it here on
+                # the FP32 accumulator (exact), BEFORE any epilogue math -- the SwiGLU
+                # clamp thresholds and routing weights are in model units. One spot
+                # covers every epilogue branch (raw-store / SwiGLU / scatter / TMA
+                # staging all read these registers).
+                if cutlass.const_expr(self.dequant_exp_bias != 0):
+                    _descale = 2.0 ** (-self.dequant_exp_bias)
+                    for _dq_i in cutlass.range_constexpr(cute.size(accumulators)):
+                        _dq_c = cute.idx2crd(_dq_i, accumulators.shape)
+                        accumulators[_dq_c] = accumulators[_dq_c] * _descale
+
                 # Epilogue
                 if cutlass.const_expr(self.use_fused_scatter or self.use_swiglu):
                     # FS-0 raw-address store (validated; gated off by default).
@@ -2930,14 +2961,14 @@ class HopperGroupedGemmPersistentKernel:
 
     @staticmethod
     def _compute_grid(
-        total_num_clusters: int,
+        total_num_clusters: cutlass.Int32,
         cluster_shape_mn: tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
     ) -> tuple[utils.PersistentTileSchedulerParams, tuple]:
         """Compute tile scheduler params and grid shape for grouped GEMM.
 
-        :param total_num_clusters: Total clusters across all groups.
-        :type total_num_clusters: int
+        :param total_num_clusters: Total clusters across all groups (runtime value).
+        :type total_num_clusters: cutlass.Int32
         :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
         :type cluster_shape_mn: tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters.
@@ -2946,6 +2977,8 @@ class HopperGroupedGemmPersistentKernel:
         :return: (tile_sched_params, grid)
         :rtype: tuple
         """
+        # The scheduler params carry the (runtime) total: the persistent loop's
+        # validity check compares tile indices against it on device.
         problem_shape_ntile_mnl = (
             cluster_shape_mn[0],
             cluster_shape_mn[1],
@@ -2954,8 +2987,20 @@ class HopperGroupedGemmPersistentKernel:
         tile_sched_params = utils.PersistentTileSchedulerParams(
             problem_shape_ntile_mnl, (*cluster_shape_mn, 1)
         )
+        # The LAUNCH GRID must stay static (compile-time): build it from a params
+        # whose z-extent is the static max_active_clusters. A persistent kernel never
+        # usefully launches more than max_active clusters anyway; when the (runtime)
+        # total is smaller, the surplus CTAs see no valid tile and exit immediately.
+        grid_params = utils.PersistentTileSchedulerParams(
+            (
+                cluster_shape_mn[0],
+                cluster_shape_mn[1],
+                cutlass.Int32(max_active_clusters),
+            ),
+            (*cluster_shape_mn, 1),
+        )
         grid = StaticPersistentGroupTileScheduler.get_grid_shape(
-            tile_sched_params, max_active_clusters
+            grid_params, max_active_clusters
         )
         return tile_sched_params, grid
 
@@ -3238,7 +3283,10 @@ _W4A8_HW_CACHE: dict = {}
 # encodes only pointers, not operand content (which the kernel reads through them at
 # launch). Bounded to avoid unbounded growth when a caller churns fresh buffers.
 _W4A8_META_CACHE: dict = {}
-_W4A8_META_CACHE_CAP = 256
+# Sized for serving: a model holds (layers x capacity-buckets x 2 GEMMs) distinct
+# operand-metadata sets (e.g. DSv4: 44 MoE layers x buckets x 2 can exceed 256), each a
+# few KB of device tensors -- the cap guards runaway churn, not memory.
+_W4A8_META_CACHE_CAP = 4096
 
 
 def _w4a8_hw_info(cluster_shape_mn):
@@ -3474,6 +3522,7 @@ def w4a8_mxfp4_grouped_gemm(
     swiglu_alpha: float = None,
     swiglu_beta: float = None,
     swiglu_limit: float = None,
+    dequant_exp_bias: int = 0,
 ) -> None:
     """Callable W4A8 MXFP4 grouped GEMM: C[g] = A[g] @ dequant(B[g], scale[g])^T.
 
@@ -3637,16 +3686,27 @@ def w4a8_mxfp4_grouped_gemm(
         problem_sizes_mnkl, cluster_tile_shape_mn
     )
 
-    current_stream = cutlass_torch.default_stream()
+    # Launch on torch's CURRENT stream, not the default stream. Serving frameworks
+    # (sglang) run the model forward on a non-default stream; launching the GEMM on
+    # the default stream while the surrounding torch/triton ops (activation cast,
+    # permute, requant, finalize) run on the current stream gives ZERO ordering
+    # between the two -- e.g. the requant kernel can read the GEMM1 output buffer
+    # before the GEMM wrote it (uninitialized torch.empty garbage -> huge per-token
+    # scales -> ~1e37 layer outputs, observed in-situ on sglang with healthy inputs).
+    # On the current stream all ordering is plain stream program order.
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Reuse a cached compiled kernel when the compile-time config matches; only the
-    # runtime metadata tensors (built above) change between such calls. The key
-    # captures every input cute.compile specializes on: num_groups, operand dtypes (it
-    # specializes on pointer types), tile/cluster shape, tensormap mode,
-    # total_num_clusters + max_active_clusters/sm_count (Constexpr/GPU-fixed in the
-    # persistent scheduler), the scatter/gather operand-column layout (which also
-    # drives the kernel's behavior flags below), and a snapshot of the FI_W4A8_* debug
-    # env flags the kernel reads at trace time (SCALAR_XFORM/NO_PRMT/... change code).
+    # runtime metadata tensors (built above) and the runtime total_num_clusters change
+    # between such calls. The key captures every input cute.compile specializes on:
+    # num_groups, operand dtypes (it specializes on pointer types), tile/cluster shape,
+    # tensormap mode, max_active_clusters/sm_count (GPU-fixed in the persistent
+    # scheduler), the scatter/gather operand-column layout (which also drives the
+    # kernel's behavior flags below), and a snapshot of the FI_W4A8_* debug env flags
+    # the kernel reads at trace time (SCALAR_XFORM/NO_PRMT/... change code).
+    # total_num_clusters is deliberately NOT in the key: it is a runtime kernel arg
+    # (per-call routing changes it every MoE forward in serving; keying on it caused a
+    # cute.compile per MoE call -- a multi-second recompile storm).
     _env_snapshot = tuple(
         sorted((k, v) for k, v in os.environ.items() if k.startswith("FI_W4A8_"))
     )
@@ -3659,7 +3719,6 @@ def w4a8_mxfp4_grouped_gemm(
         tile_shape_mn,
         cluster_shape_mn,
         tensormap_update_mode,
-        total_num_clusters,
         max_active_clusters,
         sm_count,
         scatter,
@@ -3669,6 +3728,7 @@ def w4a8_mxfp4_grouped_gemm(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        dequant_exp_bias,
         _env_snapshot,
     )
     _cached = _W4A8_KERNEL_CACHE.get(cache_key)
@@ -3722,6 +3782,7 @@ def w4a8_mxfp4_grouped_gemm(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            dequant_exp_bias=dequant_exp_bias,
         )
         compiled_grouped_gemm = cute.compile(
             grouped_gemm,
@@ -3732,7 +3793,7 @@ def w4a8_mxfp4_grouped_gemm(
             tensor_of_dim_size_mnkl,
             tensor_of_strides_abc,
             tensor_of_ptrs_abc,
-            total_num_clusters,
+            cutlass.Int32(total_num_clusters),
             tensor_of_tensormap,
             max_active_clusters,
             current_stream,
@@ -3751,6 +3812,7 @@ def w4a8_mxfp4_grouped_gemm(
         tensor_of_dim_size_mnkl,
         tensor_of_strides_abc,
         tensor_of_ptrs_abc,
+        cutlass.Int32(total_num_clusters),
         tensor_of_tensormap,
         current_stream,
     )
@@ -3941,7 +4003,9 @@ def run(
         problem_sizes_mnkl, cluster_tile_shape_mn
     )
 
-    current_stream = cutlass_torch.default_stream()
+    # Current stream for the same reason as the public API (identical to the default
+    # stream in this single-script CLI, but keeps the two paths consistent).
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Compile kernel
     _compiler = cute.compile
@@ -3956,7 +4020,7 @@ def run(
         tensor_of_dim_size_mnkl,
         tensor_of_strides_abc,
         tensor_of_ptrs_abc,
-        total_num_clusters,
+        cutlass.Int32(total_num_clusters),
         tensor_of_tensormap,
         max_active_clusters,
         current_stream,
@@ -3970,6 +4034,7 @@ def run(
             tensor_of_dim_size_mnkl,
             tensor_of_strides_abc,
             tensor_of_ptrs_abc,
+            cutlass.Int32(total_num_clusters),
             tensor_of_tensormap,
             current_stream,
         )
@@ -4080,6 +4145,7 @@ def run(
             tensor_of_dim_size_mnkl,
             strides_ws,
             ptrs_ws,
+            cutlass.Int32(total_num_clusters),
             tensormap_ws,
             current_stream,
         )

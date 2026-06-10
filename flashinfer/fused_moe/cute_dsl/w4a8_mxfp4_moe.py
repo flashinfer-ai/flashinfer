@@ -143,6 +143,7 @@ def w4a8_mxfp4_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    dequant_exp_bias: int = 0,
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Full W4A8 MXFP4 MoE: ``out[t] = sum_k scales[t,k] * down_e(silu(gate_e(x))*up_e(x))``.
@@ -180,8 +181,12 @@ def w4a8_mxfp4_moe(
     top_k = token_selected_experts.shape[1]
     fc1_scale, fc2_scale = quant_scales
 
-    # 1. Activation -> FP8 (no per-token scale; see module docstring).
-    x_fp8 = input.to(torch.float8_e4m3fn)
+    # 1. Activation -> FP8 (no per-token scale; see module docstring). SATURATE at
+    # the e4m3 max: torch's cast maps |x| > 448 to NaN (e4m3fn has no inf), and real
+    # transformer hidden states carry outlier features that exceed 448 in deep layers
+    # -- an unclamped cast detonates the whole forward. Clamping loses the outlier's
+    # magnitude beyond 448 (a per-token/SmoothQuant input scale is the proper fix).
+    x_fp8 = input.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
     # 2. Routing -> permute order (group the (token, slot) pairs by expert).
     exp_e = token_selected_experts.reshape(-1).long()  # [T*top_k]
@@ -198,7 +203,12 @@ def w4a8_mxfp4_moe(
     # One coalesced permute of the activation into routed (group) order.
     a_perm = x_fp8[sorted_tok]  # [T*top_k, H] FP8
 
-    active = [e for e in range(E) if counts[e] > 0]
+    # ALL experts are always passed, including empty ones (M=0 contributes zero tiles;
+    # the scheduler never touches them). This keeps num_groups == E static, which --
+    # together with the runtime total_num_clusters -- makes the grouped GEMM's compile
+    # cache key routing-independent: ONE compile per config, no recompile when the
+    # per-expert token counts change between serving steps.
+    active = list(range(E))
     a_list, w1_list, s1_list, ps1, c1_list = [], [], [], [], []
     # GEMM1 writes the SwiGLU intermediate in BF16 (not FP8) so it can be requantized
     # per-token before GEMM2 (see the requant step below).
@@ -224,6 +234,7 @@ def w4a8_mxfp4_moe(
         swiglu_alpha=alpha,
         swiglu_beta=beta,
         swiglu_limit=limit,
+        dequant_exp_bias=dequant_exp_bias,
     )
 
     # 3b. Requant the BF16 intermediate to FP8 with a per-token (per-routed-row) scale
@@ -267,6 +278,7 @@ def w4a8_mxfp4_moe(
             weights=wt_list,
             output=out_f32,
             no_accumulate=True,
+            dequant_exp_bias=dequant_exp_bias,
         )
         output.copy_(out_f32)
     else:
@@ -281,6 +293,7 @@ def w4a8_mxfp4_moe(
             ps2,
             acc_dtype=_ACC,
             c_dtype=cutlass.Float16,
+            dequant_exp_bias=dequant_exp_bias,
         )
         permuted_idx, topk_scales = build_reduce_index(route_list, wt_list, T, top_k)
         moe_reduce(c2_buf, output, permuted_idx, topk_scales, top_k)

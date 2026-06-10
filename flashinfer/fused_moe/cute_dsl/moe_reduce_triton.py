@@ -74,18 +74,25 @@ if _HAS_TRITON:
 
     @triton.jit
     def _per_token_quant_fp8_kernel(
-        x_ptr,  # [M, N] input (bf16/fp16/fp32)
-        out_ptr,  # [M, N] FP8 e4m3 output
-        scale_ptr,  # [M] f32 per-row scale (= row amax / FP8_MAX)
+        x_ptr,  # [*, N] input (bf16/fp16/fp32)
+        out_ptr,  # [*, N] FP8 e4m3 output
+        scale_ptr,  # [*] f32 per-row scale (= row amax / FP8_MAX)
         N,
+        GROUP_ROWS,  # logical rows per group (= physical when no grouping)
+        GROUP_STRIDE,  # physical row stride between groups
         FP8_MAX: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        # One program = one row: per-token dynamic FP8 quant. Pass 1 finds the row amax,
-        # pass 2 stores x/scale as FP8 (scale = amax / FP8_MAX, so values land in
-        # [-FP8_MAX, FP8_MAX]). Downstream dequant is value * scale.
+        # One program = one LOGICAL row: per-token dynamic FP8 quant. Pass 1 finds the
+        # row amax, pass 2 stores x/scale as FP8 (scale = amax / FP8_MAX, so values land
+        # in [-FP8_MAX, FP8_MAX]). Downstream dequant is value * scale.
+        # Logical row m maps to physical row (m // GROUP_ROWS) * GROUP_STRIDE +
+        # (m % GROUP_ROWS): callers whose per-group rows sit at a fixed physical
+        # stride (e.g. capacity-padded buffers) quantize only the first GROUP_ROWS
+        # of each group. Identity when GROUP_ROWS == GROUP_STRIDE == total rows.
         m = tl.program_id(0)
-        row_x = x_ptr + m * N
+        pr = (m // GROUP_ROWS) * GROUP_STRIDE + (m % GROUP_ROWS)
+        row_x = x_ptr + pr * N
         amax = 0.0
         for off in range(0, N, BLOCK_N):
             n = off + tl.arange(0, BLOCK_N)
@@ -93,9 +100,9 @@ if _HAS_TRITON:
             amax = tl.maximum(amax, tl.max(tl.abs(v)))
         scale = amax / FP8_MAX
         scale = tl.where(scale > 0.0, scale, 1.0)  # all-zero row -> scale 1 (output 0)
-        tl.store(scale_ptr + m, scale)
+        tl.store(scale_ptr + pr, scale)
         inv = 1.0 / scale
-        row_o = out_ptr + m * N
+        row_o = out_ptr + pr * N
         for off in range(0, N, BLOCK_N):
             n = off + tl.arange(0, BLOCK_N)
             v = tl.load(row_x + n, mask=n < N, other=0.0).to(tl.float32) * inv
@@ -169,22 +176,55 @@ def build_reduce_index(
 
 
 def per_token_quant_fp8(
-    x: torch.Tensor, block_n: int = 1024
+    x: torch.Tensor,
+    block_n: int = 1024,
+    out: Optional[torch.Tensor] = None,
+    scale_out: Optional[torch.Tensor] = None,
+    group_rows: Optional[int] = None,
+    group_stride: Optional[int] = None,
+    num_groups: Optional[int] = None,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """Per-token (per-row) dynamic FP8 e4m3 quantization. Returns ``(x_fp8 [M, N],
     scale [M] f32)`` with ``x ≈ x_fp8.float() * scale[:, None]`` (``scale = row amax /
     448``). Used to requantize the W4A8 MoE BF16 SwiGLU intermediate before GEMM2 -- the
     per-row scale is folded into the routing weight, so GEMM2 needs no change (the scale
-    is constant along the GEMM2 contraction, so it pulls out to a per-output-row factor)."""
+    is constant along the GEMM2 contraction, so it pulls out to a per-output-row factor).
+
+    ``out`` / ``scale_out`` (preallocated ``[M, N]`` FP8 / ``[M]`` f32) let the caller
+    quantize into reused buffers instead of allocating fresh outputs each call (e.g. to
+    keep pointers stable / avoid per-call allocation in a steady-state serving loop).
+
+    Grouped mode (all three of ``group_rows`` / ``group_stride`` / ``num_groups`` set):
+    ``x`` is a ``[num_groups * group_stride, N]`` backing buffer in which each group
+    occupies ``group_stride`` physical rows but only the first ``group_rows`` are live;
+    exactly the live rows are quantized (in place into the same-layout ``out`` /
+    ``scale_out``). Used by the capacity-bucketed W4A8 serving runner, whose per-expert
+    buffers are laid out at a fixed capacity-cap stride."""
     if not _HAS_TRITON:
         raise RuntimeError("per_token_quant_fp8 requires triton")
     assert x.dim() == 2, "per_token_quant_fp8 expects a 2D [M, N] tensor"
     M, N = x.shape
+    grouped = group_rows is not None
+    if grouped:
+        assert group_stride is not None and num_groups is not None
+        assert group_rows <= group_stride and num_groups * group_stride <= M
+        total = num_groups * group_rows  # logical rows to quantize
+        g_rows, g_stride = group_rows, group_stride
+    else:
+        total, g_rows, g_stride = M, M, M  # identity mapping
     x = x.contiguous()
-    x_fp8 = torch.empty(M, N, device=x.device, dtype=torch.float8_e4m3fn)
-    scale = torch.empty(M, device=x.device, dtype=torch.float32)
-    if M > 0:
-        _per_token_quant_fp8_kernel[(M,)](
-            x, x_fp8, scale, N, FP8_MAX=448.0, BLOCK_N=block_n
+    x_fp8 = (
+        out
+        if out is not None
+        else torch.empty(M, N, device=x.device, dtype=torch.float8_e4m3fn)
+    )
+    scale = (
+        scale_out
+        if scale_out is not None
+        else torch.empty(M, device=x.device, dtype=torch.float32)
+    )
+    if total > 0:
+        _per_token_quant_fp8_kernel[(total,)](
+            x, x_fp8, scale, N, g_rows, g_stride, FP8_MAX=448.0, BLOCK_N=block_n
         )
     return x_fp8, scale
