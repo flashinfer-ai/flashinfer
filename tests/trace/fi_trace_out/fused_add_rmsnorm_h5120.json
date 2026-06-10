@@ -44,7 +44,8 @@
         "batch_size",
         "hidden_size"
       ],
-      "dtype": "bfloat16"
+      "dtype": "bfloat16",
+      "param": "input"
     },
     "residual": {
       "shape": [
@@ -52,6 +53,7 @@
         "hidden_size"
       ],
       "dtype": "bfloat16",
+      "param": "residual",
       "description": "Updated residual (in-place: residual += hidden_states)."
     }
   },

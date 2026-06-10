@@ -237,9 +237,12 @@ fused_add_rmsnorm_trace = TraceTemplate(
         "weight": Tensor(["hidden_size"]),
     },
     outputs={
-        "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
+        "output": Tensor(
+            ["batch_size", "hidden_size"], param="input", dtype_from="input"
+        ),
         "residual": Tensor(
             ["batch_size", "hidden_size"],
+            param="residual",
             dtype_from="input",
             description="Updated residual (in-place: residual += hidden_states).",
         ),
