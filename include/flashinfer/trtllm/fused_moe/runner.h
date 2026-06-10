@@ -212,7 +212,7 @@ class Runner {
                   int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
                   batchedGemm::gemm::MatrixLayout weight_layout,
                   batchedGemm::gemm::BiasType biasType, bool usePerTokenScaling,
-                  bool usePerChannelScaling);
+                  bool usePerChannelScaling, std::string const& kernelNameFilter = "");
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -258,7 +258,7 @@ class Runner {
                   batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8,
                   int tileTokensDim, bool useShuffledMatrix,
                   batchedGemm::gemm::MatrixLayout weight_layout, bool usePerTokenScaling,
-                  bool usePerChannelScaling);
+                  bool usePerChannelScaling, std::string const& kernelNameFilter = "");
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
                                  int32_t numExperts, int32_t numTokens, int32_t configIndex) const;
@@ -420,12 +420,14 @@ class Runner {
          bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weight_layout,
          batchedGemm::gemm::BiasType gemm1BiasType, bool usePerTokenScalingGemm1 = false,
          bool usePerTokenScalingGemm2 = false, bool usePerChannelScalingGemm1 = false,
-         bool usePerChannelScalingGemm2 = false);
+         bool usePerChannelScalingGemm2 = false, std::string const& kernelNameFilterFc1 = "",
+         std::string const& kernelNameFilterFc2 = "");
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
          bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
          bool usePerTokenScalingGemm1 = false, bool usePerTokenScalingGemm2 = false,
-         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
+         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false,
+         std::string const& kernelNameFilterFc1 = "", std::string const& kernelNameFilterFc2 = "");
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
            cudaStream_t stream, int64_t configIndex, bool enable_pdl);
