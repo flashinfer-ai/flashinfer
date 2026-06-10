@@ -22,23 +22,39 @@ namespace flashinfer::dsv4_hash_topk {
 
 using tvm::ffi::TensorView;
 
-// DSv4 hash-based MoE routing.
-//
-//   router_logits : [num_tokens, num_routed_experts] float32
-//   input_id      : [num_tokens]                     int64
-//   tid2eid       : [vocab, topk]                    int32   (token -> expert table)
-//   topk_weights  : [num_tokens, topk_fused]         float32 (output)
-//   topk_ids      : [num_tokens, topk_fused]         int32   (output)
-//
-// topk_fused = topk + num_shared_experts is inferred from the output shape.
+/*!
+ * \brief TVM-FFI entry point for DSv4 hash-based MoE routing.
+ *
+ *   router_logits : [num_tokens, num_routed_experts] float32
+ *   input_id      : [num_tokens]                     int64
+ *   tid2eid       : [vocab, topk]                    int32   (token -> expert table)
+ *   topk_weights  : [num_tokens, topk_fused]         float32 (output)
+ *   topk_ids      : [num_tokens, topk_fused]         int32   (output)
+ *
+ * topk_fused = topk + num_shared_experts is inferred from the output shape.
+ */
 void HashTopK(TensorView router_logits, TensorView input_id, TensorView tid2eid,
               TensorView topk_weights, TensorView topk_ids, double routed_scaling_factor,
               bool launch_with_pdl) {
-  TVM_FFI_ICHECK(router_logits.dim() == 2) << "router_logits must be a 2D Tensor";
-  TVM_FFI_ICHECK(input_id.dim() == 1) << "input_id must be a 1D Tensor";
-  TVM_FFI_ICHECK(tid2eid.dim() == 2) << "tid2eid must be a 2D Tensor";
-  TVM_FFI_ICHECK(topk_weights.dim() == 2) << "topk_weights must be a 2D Tensor";
-  TVM_FFI_ICHECK(topk_ids.dim() == 2) << "topk_ids must be a 2D Tensor";
+  // CUDA + contiguous + dtype.
+  CHECK_INPUT_AND_TYPE(router_logits, dl_float32);
+  CHECK_INPUT_AND_TYPE(input_id, dl_int64);
+  CHECK_INPUT_AND_TYPE(tid2eid, dl_int32);
+  CHECK_INPUT_AND_TYPE(topk_weights, dl_float32);
+  CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
+
+  // Same CUDA device for all tensors.
+  CHECK_DEVICE(input_id, router_logits);
+  CHECK_DEVICE(tid2eid, router_logits);
+  CHECK_DEVICE(topk_weights, router_logits);
+  CHECK_DEVICE(topk_ids, router_logits);
+
+  // Ranks.
+  CHECK_DIM(2, router_logits);
+  CHECK_DIM(1, input_id);
+  CHECK_DIM(2, tid2eid);
+  CHECK_DIM(2, topk_weights);
+  CHECK_DIM(2, topk_ids);
 
   const int64_t num_tokens = router_logits.sizes()[0];
   const int64_t num_routed_experts = router_logits.sizes()[1];
@@ -46,21 +62,9 @@ void HashTopK(TensorView router_logits, TensorView input_id, TensorView tid2eid,
   const int64_t topk_fused = topk_ids.sizes()[1];
   const int64_t num_shared_experts = topk_fused - topk;
 
-  TVM_FFI_ICHECK(
-      router_logits.device().device_type == kDLCUDA && input_id.device().device_type == kDLCUDA &&
-      tid2eid.device().device_type == kDLCUDA && topk_weights.device().device_type == kDLCUDA &&
-      topk_ids.device().device_type == kDLCUDA)
-      << "all tensors must be CUDA tensors";
-  TVM_FFI_ICHECK(encode_dlpack_dtype(router_logits.dtype()) == float32_code)
-      << "router_logits must be float32";
-  TVM_FFI_ICHECK(encode_dlpack_dtype(input_id.dtype()) == int64_code) << "input_id must be int64";
-  TVM_FFI_ICHECK(encode_dlpack_dtype(tid2eid.dtype()) == int32_code) << "tid2eid must be int32";
-  TVM_FFI_ICHECK(encode_dlpack_dtype(topk_weights.dtype()) == float32_code)
-      << "topk_weights must be float32";
-  TVM_FFI_ICHECK(encode_dlpack_dtype(topk_ids.dtype()) == int32_code) << "topk_ids must be int32";
-
+  TVM_FFI_ICHECK(num_routed_experts >= 1) << "num_routed_experts must be >= 1";
+  TVM_FFI_ICHECK(topk >= 1) << "topk must be >= 1";
   TVM_FFI_ICHECK(input_id.numel() == num_tokens) << "input_id length must equal num_tokens";
-  TVM_FFI_ICHECK(tid2eid.sizes()[0] >= 1 && topk >= 1) << "tid2eid must be [vocab, topk]";
   TVM_FFI_ICHECK(topk_weights.sizes()[0] == num_tokens && topk_ids.sizes()[0] == num_tokens)
       << "output rows must equal num_tokens";
   TVM_FFI_ICHECK(topk_weights.sizes()[1] == topk_fused)
@@ -68,6 +72,10 @@ void HashTopK(TensorView router_logits, TensorView input_id, TensorView tid2eid,
   TVM_FFI_ICHECK(num_shared_experts >= 0) << "topk_fused must be >= topk";
   TVM_FFI_ICHECK(topk_fused <= flashinfer::fused_moe::kHashTopKWarpThreads)
       << "topk_fused must be <= warp size (32)";
+
+  if (num_tokens == 0) {
+    return;
+  }
 
   auto stream = get_stream(router_logits.device());
 

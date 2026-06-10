@@ -102,3 +102,81 @@ def test_hash_topk(
 
     torch.testing.assert_close(weights, ref_weights, rtol=1e-3, atol=1e-3)
     assert torch.equal(ids, ref_ids)
+
+
+def _make_inputs(num_tokens, num_experts, topk, device, vocab=256):
+    router_logits = torch.randn(
+        num_tokens, num_experts, dtype=torch.float32, device=device
+    )
+    input_ids = torch.randint(
+        0, vocab, (max(num_tokens, 1),), dtype=torch.int64, device=device
+    )[:num_tokens]
+    tid2eid = torch.empty((vocab, topk), dtype=torch.int32, device=device)
+    for v in range(vocab):
+        tid2eid[v] = torch.randperm(num_experts, device=device)[:topk].to(torch.int32)
+    return router_logits, input_ids, tid2eid
+
+
+@pytest.mark.parametrize("topk", [1, 31])
+def test_hash_topk_topk_fused_boundary(topk):
+    """topk + shared == 32 (warp size) must be accepted."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    torch.manual_seed(2)
+    num_experts = 384
+    router_logits, input_ids, tid2eid = _make_inputs(64, num_experts, topk, device)
+    weights, ids = hash_topk(
+        router_logits, input_ids, tid2eid, num_fused_shared_experts=1
+    )
+    assert weights.shape == (64, topk + 1)
+    assert ids.shape == (64, topk + 1)
+
+
+def test_hash_topk_zero_tokens():
+    """num_tokens == 0 must return empty outputs without launching a 0-grid."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    router_logits, input_ids, tid2eid = _make_inputs(0, 256, 8, device)
+    weights, ids = hash_topk(
+        router_logits, input_ids, tid2eid, num_fused_shared_experts=1
+    )
+    assert weights.shape == (0, 9)
+    assert ids.shape == (0, 9)
+
+
+def test_hash_topk_invalid_args():
+    """Out-of-contract arguments must raise rather than silently misbehave."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    router_logits, input_ids, tid2eid = _make_inputs(16, 256, 8, device)
+
+    # topk_fused (= topk + shared) > 32
+    big_tid2eid = torch.zeros((256, 32), dtype=torch.int32, device=device)
+    with pytest.raises(ValueError):
+        hash_topk(router_logits, input_ids, big_tid2eid, num_fused_shared_experts=1)
+
+    # num_fused_shared_experts not in {0, 1}
+    with pytest.raises(ValueError):
+        hash_topk(router_logits, input_ids, tid2eid, num_fused_shared_experts=2)
+
+    # routed_scaling_factor <= 0 with a fused shared expert
+    with pytest.raises(ValueError):
+        hash_topk(
+            router_logits,
+            input_ids,
+            tid2eid,
+            num_fused_shared_experts=1,
+            routed_scaling_factor=0.0,
+        )
+
+    # non-contiguous router_logits
+    non_contig = torch.randn(16, 512, dtype=torch.float32, device=device)[:, ::2]
+    with pytest.raises(ValueError):
+        hash_topk(non_contig, input_ids, tid2eid)
+
+    # wrong dtype
+    with pytest.raises(ValueError):
+        hash_topk(router_logits.to(torch.bfloat16), input_ids, tid2eid)

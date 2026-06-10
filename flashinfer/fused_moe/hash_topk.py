@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 from types import SimpleNamespace
 from typing import Tuple
 
@@ -55,20 +56,32 @@ def _check_hash_topk_supported(
         )
 
     num_tokens = router_logits.shape[0]
+    num_routed_experts = router_logits.shape[1]
     topk = tid2eid.shape[1]
     topk_fused = topk + num_fused_shared_experts
 
+    if num_routed_experts < 1:
+        raise ValueError(f"num_routed_experts must be >= 1, got {num_routed_experts}")
+    if topk < 1:
+        raise ValueError(f"topk (tid2eid.shape[1]) must be >= 1, got {topk}")
     if input_ids.shape[0] != num_tokens:
         raise ValueError(
             f"input_ids length ({input_ids.shape[0]}) must equal num_tokens ({num_tokens})"
         )
-    if num_fused_shared_experts < 0:
+    if num_fused_shared_experts not in (0, 1):
         raise ValueError(
-            f"num_fused_shared_experts must be >= 0, got {num_fused_shared_experts}"
+            f"num_fused_shared_experts must be 0 or 1, got {num_fused_shared_experts}"
         )
     if topk_fused > 32:
         raise ValueError(
             f"topk + num_fused_shared_experts ({topk_fused}) must be <= warp size 32"
+        )
+    if num_fused_shared_experts > 0 and (
+        not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0.0
+    ):
+        raise ValueError(
+            f"routed_scaling_factor must be positive and finite when a shared expert "
+            f"is fused, got {routed_scaling_factor}"
         )
     if router_logits.dtype != torch.float32:
         raise ValueError(f"router_logits must be float32, got {router_logits.dtype}")
@@ -76,6 +89,24 @@ def _check_hash_topk_supported(
         raise ValueError(f"input_ids must be int64, got {input_ids.dtype}")
     if tid2eid.dtype != torch.int32:
         raise ValueError(f"tid2eid must be int32, got {tid2eid.dtype}")
+
+    dev = router_logits.device
+    for name, x in (
+        ("input_ids", input_ids),
+        ("tid2eid", tid2eid),
+    ):
+        if x.device != dev:
+            raise ValueError(
+                f"{name} must be on the same device as router_logits "
+                f"({x.device} vs {dev})"
+            )
+    for name, x in (
+        ("router_logits", router_logits),
+        ("input_ids", input_ids),
+        ("tid2eid", tid2eid),
+    ):
+        if not x.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
     return True
 
 
@@ -173,6 +204,9 @@ def hash_topk(
     topk_weights = torch.empty(
         (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
     )
+
+    if num_tokens == 0:
+        return topk_weights, topk_ids
 
     launch_with_pdl = launch_with_pdl and device_support_pdl(router_logits.device)
 
