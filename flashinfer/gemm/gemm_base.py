@@ -6822,7 +6822,9 @@ def gemm_fp8_nt_groupwise(
             -1,
         )
     elif backend == "cutile":
-        from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import gemm_fp8_nt_groupwise_cutile
+        from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import (
+            gemm_fp8_nt_groupwise_cutile,
+        )
 
         gemm_fp8_nt_groupwise_cutile(
             a,
@@ -7190,6 +7192,7 @@ def group_gemm_fp8_nt_groupwise(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["trtllm", "cutile"] = "trtllm",
 ) -> torch.Tensor:
     r"""Perform group GEMM with FP8 data types using groupwise scaling. Currently only supported on NVIDIA
     Blackwell architecture.
@@ -7282,7 +7285,6 @@ def group_gemm_fp8_nt_groupwise(
             scale_granularity_mnk=scale_granularity_mnk,
             scale_major_mode=scale_major_mode or "K",
         )
-
 
     if is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter

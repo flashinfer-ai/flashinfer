@@ -466,3 +466,61 @@ def gemm_fp8_nt_groupwise_cutile(
         out_dtype_int,
     )
     return out
+
+
+def group_gemm_fp8_nt_groupwise_cutile(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    out: torch.Tensor,
+    scale_granularity_mnk: tuple = (1, 128, 128),
+    scale_major_mode: str = "K",
+) -> torch.Tensor:
+    """Group GEMM with FP8 block-scaled inputs via cuTile.
+
+    Iterates over groups defined by ``m_indptr`` and dispatches each group
+    to :func:`gemm_fp8_nt_groupwise_cutile`.
+
+    Parameters
+    ----------
+    a : (cum_m, k) FP8 e4m3, row-major.
+    b : (batch_size, n, k) FP8 e4m3, row-major.
+    a_scale : (cum_m, k // block_k) float32, K-major scale for ``a``.
+    b_scale : (batch_size, n // block_n, k // block_k) float32, K-major scale for ``b``.
+    m_indptr : (batch_size + 1,) int32 row-segment boundaries.
+    out : (cum_m, n) output buffer; written in place per group.
+    scale_granularity_mnk : (m_g, n_g, k_g) — forwarded to each group call.
+    scale_major_mode : must be ``"K"`` (the only mode supported by the cuTile kernel).
+
+    Returns
+    -------
+    The same ``out`` tensor.
+    """
+    num_groups = m_indptr.shape[0] - 1
+    m_indptr_cpu = m_indptr.cpu()
+
+    for i in range(num_groups):
+        m_start = int(m_indptr_cpu[i])
+        m_end = int(m_indptr_cpu[i + 1])
+        if m_start == m_end:
+            continue
+
+        a_i = a[m_start:m_end].contiguous()
+        b_i = b[i].contiguous()
+        a_scale_i = a_scale[m_start:m_end].contiguous()
+        b_scale_i = b_scale[i].contiguous()
+        out_i = out[m_start:m_end]
+
+        gemm_fp8_nt_groupwise_cutile(
+            a=a_i,
+            b=b_i,
+            a_scale=a_scale_i,
+            b_scale=b_scale_i,
+            out=out_i,
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode,
+        )
+
+    return out

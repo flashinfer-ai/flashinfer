@@ -90,9 +90,7 @@ def test_bmm_bf16_cutile_repeat_uses_tune_cache():
 
     # Second call at the same shape: must hit cache without re-tuning.
     out2 = bmm_bf16_cutile(A, B, out.clone(), tune_cache=cache)
-    assert len(cache) == 1, (
-        f"second call must hit cache; got {len(cache)} entries"
-    )
+    assert len(cache) == 1, f"second call must hit cache; got {len(cache)} entries"
 
     torch.testing.assert_close(out1, out2)
 
