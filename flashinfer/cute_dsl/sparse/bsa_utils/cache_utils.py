@@ -4,10 +4,14 @@ import hashlib
 import logging
 import os
 import pickle
+import shutil
 import sys
 import tempfile
 import time
-from distutils.ccompiler import CCompiler, new_compiler
+try:
+    from setuptools._distutils.ccompiler import CCompiler, new_compiler
+except ImportError:
+    from distutils.ccompiler import CCompiler, new_compiler  # type: ignore[no-redef]
 from functools import lru_cache
 from getpass import getuser
 from pathlib import Path
@@ -274,7 +278,10 @@ class JITPersistentCache(JITCache):
         logger.debug("Clearing persistent cache at %s", self.cache_path)
         super().clear()
         for child in self.cache_path.iterdir():
-            child.unlink()
+            if child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                shutil.rmtree(child)
 
 
 def get_jit_cache(name: str | None = None) -> JITCache:

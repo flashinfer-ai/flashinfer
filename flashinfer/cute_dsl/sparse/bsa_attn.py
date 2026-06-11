@@ -8,6 +8,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from flashinfer.api_logging import flashinfer_api
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -57,6 +59,7 @@ torch2cute_dtype_map = {
 }
 
 
+@flashinfer_api
 def bsa_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,

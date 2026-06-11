@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import shutil
 from functools import lru_cache
 from pathlib import Path
 

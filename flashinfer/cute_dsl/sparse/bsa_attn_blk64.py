@@ -17,7 +17,10 @@ from typing import Optional, Tuple
 
 import torch
 
+from flashinfer.api_logging import flashinfer_api
 
+
+@flashinfer_api
 def bsa_attn_blk64_fwd(
     q: torch.Tensor,
     k: torch.Tensor,

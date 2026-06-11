@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+import os
 import statistics
 
 import numpy as np
@@ -483,6 +484,10 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac):
     )
 
 
+@pytest.mark.skipif(
+    not os.environ.get("FLASHINFER_TEST_PERF"),
+    reason="performance benchmark, set FLASHINFER_TEST_PERF=1 to run",
+)
 def test_vsa_performance_vs_dense():
     """Performance table: full fastvideo VSA (compress + select) vs dense FlashInfer prefill.
 
@@ -643,6 +648,10 @@ def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not os.environ.get("FLASHINFER_TEST_PERF"),
+    reason="performance benchmark, set FLASHINFER_TEST_PERF=1 to run",
+)
 def test_vsa_blk64_perf_sweep():
     """blk64 kernel throughput across seqlen in [1024, 2048, 4096] and density in [0.25, 0.5, 0.75]."""
     device = torch.device("cuda")
@@ -676,7 +685,7 @@ def test_vsa_blk64_perf_sweep():
             )
             wrapper.run(q, k, v)  # warm-up
 
-            times = bench_gpu_time(lambda: wrapper.run(q, k, v))
+            times = bench_gpu_time(lambda w=wrapper, _q=q, _k=k, _v=v: w.run(_q, _k, _v))
             ms = statistics.median(times)
 
             # FLOPs = 2 * (QK matmul + PV matmul) per active block pair

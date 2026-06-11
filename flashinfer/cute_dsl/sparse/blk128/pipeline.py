@@ -99,7 +99,7 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
     elif type is PipelineUserType.Consumer:
         return PipelineStateSimple(stages, Int32(0))
     else:
-        assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
+        raise ValueError(f"Invalid PipelineUserType: {type!r}")
 
 
 @dataclass(frozen=True)
