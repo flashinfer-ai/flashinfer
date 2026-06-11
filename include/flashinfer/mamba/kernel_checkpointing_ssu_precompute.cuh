@@ -64,23 +64,25 @@ namespace flashinfer::mamba::checkpointing {
 // the MMA / LDSM helpers index them unchanged.  cumAdt/dt/decay are
 // PER-WARP (each warp owns its head's C1/C2) — unlike the monolithic's single
 // copy (one head per CTA).
-template <typename input_t, int NPREDICTED, int DSTATE, int NUM_WARPS>
+template <typename input_t, int NPREDICTED, int MAX_WINDOW, int DSTATE, int NUM_WARPS>
 struct CheckpointingSsuPrecomputeStorage {
   static constexpr int NPREDICTED_PAD_MMA_M = next_multiple_of<MMA_prop::M>(NPREDICTED);
   static constexpr int NPREDICTED_PAD_MMA_N = next_multiple_of<MMA_prop::N>(NPREDICTED);
+  static constexpr int MAX_WINDOW_PAD_MMA_K = next_multiple_of<MMA_prop::K_SMALL>(MAX_WINDOW);
   static constexpr int NPREDICTED_SWIZZLE_R =
       next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
-  // Raw C·B kept in FP32 (scale in fp32 like the monolithic; cast to bf16 only
-  // at the final gmem STG.128 — storing raw as bf16 would lose the accumulator
-  // precision before scaling).  Swizzled via SmemSwizzle<float> (just like the
-  // monolithic's bf16 CB uses SmemSwizzle<input_t>) so the accumulator store and
-  // the per-warp (t,j) reads are bank-conflict-free; CB_STRIDE = the f32 swizzle
-  // atom cols (32).  Store + read both go through make_swizzled_layout_rc<float>.
+  // Raw C·B (C5, new tokens) and C·old_B (C6, old tokens — no-write path only)
+  // kept in FP32 (scale in fp32 like the monolithic; cast to bf16 only at the
+  // final gmem STG.128).  Swizzled via SmemSwizzle<float> (like the monolithic's
+  // bf16 CB uses SmemSwizzle<input_t>) so the accumulator store + per-warp (t,j)
+  // reads are bank-conflict-free; CB_STRIDE = the f32 swizzle atom cols (32).
   static constexpr int CB_STRIDE = SmemSwizzle<float>::ATOM_COLS;
-  float CB[NPREDICTED_PAD_MMA_M * CB_STRIDE];  // 16×32 f32 ≈ 2 KB
+  float CB[NPREDICTED_PAD_MMA_M * CB_STRIDE];      // C5 new-token raw C·B   (16×32 f32)
+  float CB_old[NPREDICTED_PAD_MMA_M * CB_STRIDE];  // C6 old-token raw C·old_B (no-write)
 
-  alignas(16) input_t B[NPREDICTED_PAD_MMA_N * DSTATE];  // matmul-1 N-operand (swizzled)
-  alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];  // matmul-1 A-operand (swizzled)
+  alignas(16) input_t B[NPREDICTED_PAD_MMA_N * DSTATE];      // matmul-1 N-operand (new B, swizzled)
+  alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];      // matmul-1 A-operand (C, swizzled)
+  alignas(16) input_t old_B[MAX_WINDOW_PAD_MMA_K * DSTATE];  // C6 N-operand (old B, no-write only)
 
   // Per-warp coefficients — warp w owns its head's C1/C2 results.
   float dt[NUM_WARPS][NPREDICTED];
@@ -91,10 +93,12 @@ struct CheckpointingSsuPrecomputeStorage {
 // -----------------------------------------------------------------------------
 // Load this group's C and B (conv1d outputs) into the swizzled smem.C / smem.B
 // via cp.async — gmem→smem direct, no register footprint for the ~4 KB tiles.
-// Only warps 0/1 run the CB MMA, so only they load B/C (redundant + idempotent
-// — each needs the full tile for its N-half).  Mirrors load_post_pdl_wait_data
-// (kernel_checkpointing_ssu_common.cuh:638) minus x.  Caller must have gdc_wait'd
-// first (B/C are conv1d outputs).
+// C is the A-operand of BOTH the new-token MMA (W0/1, compute_cb_2warp) and the
+// old-token MMA (W2/3, compute_cb_old_2warp on the no-write path), so it is
+// loaded by ALL warps (each warp's own cp.async — no cross-warp sync before the
+// MMA — idempotent same-payload writes, exactly like load_post_pdl_wait_data,
+// common.cuh:671).  B (new) is only read by W0/1, so only they load it.  Caller
+// must have gdc_wait'd first (B/C are conv1d outputs).
 template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
 __device__ __forceinline__ void load_group_BC(SmemT& smem, CheckpointingSsuParams const& params,
                                               int warp, int lane, int group_idx, int64_t outer,
@@ -105,12 +109,32 @@ __device__ __forceinline__ void load_group_BC(SmemT& smem, CheckpointingSsuParam
   int64_t const C_base = outer * params.C_stride_seq + (int64_t)group_idx * DSTATE;
   using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
   using BShape = cute::Shape<cute::Int<SmemT::NPREDICTED_PAD_MMA_N>, cute::Int<DSTATE>>;
+  load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane, seq_len);
   if (warp < 2) {
     load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_token, lane,
                                         seq_len);
-    load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane,
-                                        seq_len);
   }
+  __pipeline_commit();
+  __pipeline_wait_prior(0);
+  __syncwarp();
+}
+
+// Load this group's OLD B (cache, the buffered input-proj) into swizzled
+// smem.old_B via cp.async — the N-operand of the C6 MMA (compute_cb_old_2warp).
+// Called on the NO-WRITE path only, by W2/3 (the warps that run the old MMA);
+// each loads the full tile (idempotent).  Valid rows = prev_k (the buffered
+// tokens); the rest are masked by load_tile_async.  old_B is double-buffered:
+// (state_cache_size, 2, MAX_WINDOW, ngroups, dstate).
+template <typename input_t, int MAX_WINDOW, int DSTATE, typename SmemT>
+__device__ __forceinline__ void load_old_B(SmemT& smem, CheckpointingSsuParams const& params,
+                                           int lane, int64_t cache_slot, int buf_read,
+                                           int group_idx, int prev_k) {
+  auto const* __restrict__ oldB_ptr = reinterpret_cast<input_t const*>(params.old_B);
+  int64_t const base = cache_slot * params.old_B_stride_seq +
+                       (int64_t)buf_read * params.old_B_stride_dbuf + (int64_t)group_idx * DSTATE;
+  using OldBShape = cute::Shape<cute::Int<SmemT::MAX_WINDOW_PAD_MMA_K>, cute::Int<DSTATE>>;
+  load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, oldB_ptr + base, params.old_B_stride_token,
+                                         lane, prev_k);
   __pipeline_commit();
   __pipeline_wait_prior(0);
   __syncwarp();
@@ -236,6 +260,84 @@ __device__ __forceinline__ void compute_cb_2warp(SmemT& smem, int warp, int lane
 }
 
 // -----------------------------------------------------------------------------
+// Raw C·old_B MMA (C6, matmul-1 for the OLD tokens) for ONE group → fp32
+// swizzled smem.CB_old (UNMASKED, UNSCALED).  Identical to compute_cb_2warp
+// except the N-operand is smem.old_B (the buffered B, MAX_WINDOW_PAD_MMA_K rows)
+// and the output is smem.CB_old.  The C6 decay/coeff scaling + write are
+// deferred to scale_store_cb_old (the no-write counterpart of
+// scale_store_cb_gmem).  Run by warps 2/3 on the NO-WRITE path only; the
+// `warp_in_pair` arg is (threadIdx.y - 2) ∈ {0,1} so the N-split logic matches
+// compute_cb_2warp's (warp 0 → cols [0,8), warp 1 → cols [8,16)).
+//   MAX_WINDOW_PAD_MMA_K == 8: warp_in_pair 1 returns (only one N-tile).
+template <typename input_t, int NPREDICTED, int MAX_WINDOW, int DSTATE, typename SmemT>
+__device__ __forceinline__ void compute_cb_old_2warp(SmemT& smem, int warp_in_pair, int lane) {
+  using namespace cute;
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
+  constexpr int N_HALF = MMA_prop::N;  // 8 = one m16n8 N-tile per warp
+  static_assert(MAX_WINDOW_PAD_MMA_K % N_HALF == 0, "MAX_WINDOW_PAD_MMA_K must be a multiple of N");
+
+  if constexpr (MAX_WINDOW_PAD_MMA_K == N_HALF) {
+    if (warp_in_pair == 1) return;  // single N-tile; cols [8,16) never read.
+  }
+
+  // ── Swizzled smem views (C/old_B byte-identical to the monolithic layout) ──
+  auto layout_C =
+      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, NPREDICTED>();
+  auto layout_oldB = make_swizzled_layout_rc<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
+  Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.C)), layout_C);
+  Tensor smem_oldB =
+      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.old_B)), layout_oldB);
+
+  auto tiled_mma =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_1, _1>>{});
+  auto thr_mma = tiled_mma.get_slice(lane);
+
+  constexpr int K_TILE = MMA_prop::K_BIG;
+  Tensor smem_C_tiled = local_tile(smem_C, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<K_TILE>{}),
+                                   make_coord(_0{}, _));
+  Tensor smem_oldB_half =
+      local_tile(smem_oldB, make_tile(Int<N_HALF>{}, Int<K_TILE>{}), make_coord(warp_in_pair, _));
+
+  Tensor frag_A = thr_mma.partition_fragment_A(smem_C_tiled(_, _, _0{}));
+  Tensor frag_B = thr_mma.partition_fragment_B(smem_oldB_half(_, _, _0{}));
+  auto layout_cb_half = make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_HALF>{}));
+  Tensor frag_acc = thr_mma.partition_fragment_C(make_tensor((float*)nullptr, layout_cb_half));
+  clear(frag_acc);
+
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, input_t>{}, tiled_mma);
+  auto s2r_thr_A = s2r_A.get_slice(lane);
+  Tensor smem_C_s2r = s2r_thr_A.partition_S(smem_C_tiled);
+  Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, input_t>{}, tiled_mma);
+  auto s2r_thr_B = s2r_B.get_slice(lane);
+  Tensor smem_oldB_s2r = s2r_thr_B.partition_S(smem_oldB_half);
+  Tensor frag_B_view = s2r_thr_B.retile_D(frag_B);
+
+  constexpr int NUM_K_TILES = DSTATE / K_TILE;
+#pragma unroll
+  for (int k = 0; k < NUM_K_TILES; ++k) {
+    cute::copy(s2r_A, smem_C_s2r(_, _, _, k), frag_A_view);
+    cute::copy(s2r_B, smem_oldB_s2r(_, _, _, k), frag_B_view);
+    cute::gemm(tiled_mma, frag_acc, frag_A, frag_B, frag_acc);
+  }
+
+  // ── Store RAW fp32 accumulator → swizzled smem.CB_old, this warp's N-tile ──
+  constexpr int CB_STRIDE = SmemT::CB_STRIDE;
+  auto layout_cb =
+      make_swizzled_layout_rc<float, NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M, CB_STRIDE>();
+  Tensor smem_CB_old = make_tensor(make_smem_ptr(smem.CB_old), layout_cb);
+  Tensor smem_CB_old_half =
+      local_tile(smem_CB_old, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_HALF>{}),
+                 make_coord(_0{}, warp_in_pair));
+  Tensor smem_CB_old_part = thr_mma.partition_C(smem_CB_old_half);
+#pragma unroll
+  for (int i = 0; i < size(frag_acc); ++i) {
+    smem_CB_old_part(i) = frag_acc(i);  // raw fp32
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Scale one head's raw C·B (read fp32 from smem.CB) and store to gmem in
 // FRAGMENT-NATIVE layout, one STG.128 per thread.  Each thread emits the 8
 // values that == matmul-4's `fragA` for this lane (mma.m16n8k16 A operand), so
@@ -287,7 +389,8 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           typename stateIndex_t, int NPREDICTED, int MAX_WINDOW, int DIM, int DSTATE,
           int HEADS_PER_GROUP, int NUM_WARPS, bool DT_SOFTPLUS, bool VARLEN = false>
 __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams params) {
-  using SmemT = CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, DSTATE, NUM_WARPS>;
+  using SmemT =
+      CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE, NUM_WARPS>;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int N_HALF = NPREDICTED_PAD_MMA_M / 2;
   // First cut: one CTA per (batch, group) — every head of the group handled by
@@ -337,11 +440,24 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
 
   // ── Load this group's C, B (conv1d outputs) into swizzled smem (cp.async) ──
   load_group_BC<input_t, NPREDICTED, DSTATE>(smem, params, warp, lane, group_idx, outer, seq_len);
+  // NO-WRITE only: W2/3 also load this group's old B (cache) for the C6 MMA.
+  // must_checkpoint is uniform per CTA, so this branch is divergence-free.
+  if (!must_checkpoint && warp >= 2) {
+    load_old_B<input_t, MAX_WINDOW, DSTATE>(smem, params, lane, cache_slot, buf_read, group_idx,
+                                            prev_k);
+  }
 
-  // ── Raw C·B MMA — ONCE per group, 2-warp N-split → fp32 smem.CB ──
-  // Warps 0/1 compute the matmul (the heavy B/C reads happen once, not
-  // per-warp); warps 2/3 idle here, then pick up heads in the loop below.
-  if (warp < 2) compute_cb_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
+  // ── Raw matmul-1 — ONCE per group, all 4 warps (no-write) ──
+  // W0/1 → C·B (C5, new tokens) → smem.CB; W2/3 → C·old_B (C6, old tokens,
+  // no-write only) → smem.CB_old.  On the WRITE path W2/3 idle here (the main
+  // folds old tokens into state via the replay instead) and pick up heads in the
+  // loop below.  smem.CB / smem.CB_old become visible cross-warp at the loop's
+  // iter==0 __syncthreads, before any scale_store reads them.
+  if (warp < 2) {
+    compute_cb_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
+  } else if (!must_checkpoint) {
+    compute_cb_old_2warp<input_t, NPREDICTED, MAX_WINDOW, DSTATE>(smem, warp - 2, lane);
+  }
 
   // ── Warp-per-head ──
   // Each warp LDSMs the shared raw CB → fragA, scales by ITS head, STG.128s

@@ -154,6 +154,11 @@ struct CheckpointingSsuParams {
   // swizzle on either side.  512 B/head.
   void* __restrict__ cb_scaled{nullptr};  // bf16 (batch, nheads, 32, 8), fragA-native
   void* __restrict__ decay_vec{nullptr};  // f32  (batch, nheads, NPREDICTED_PAD_MMA_M)
+  // CB_old (C6): old-token CB for the NO-WRITE path only.  Same fragA-native
+  // layout as cb_scaled; the precompute writes it only when !must_checkpoint
+  // (the write path folds old tokens into state via the replay instead), and
+  // the main does OUT.3 = cb_old @ old_x.  Caller-provided when two-kernel.
+  void* __restrict__ cb_old{nullptr};  // bf16 (batch, nheads, 32, 8), fragA-native
 };
 
 // Forward declaration — defined in kernel_checkpointing_ssu.cuh.
