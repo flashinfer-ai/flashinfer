@@ -43,7 +43,15 @@ grouped ``group_*`` / ``*deepgemm*`` entries (m_indptr op-shape).
 
 Run (needs CUDA_HOME for JIT; SM100 for the fp4 adapters, SM89+ for fp8):
   CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<idx> pytest -q tests/gemm/test_unified_gemm_fuzz.py
-Env: FLASHINFER_GEMM_FUZZ_NUM_TESTS (default 250), FLASHINFER_GEMM_FUZZ_SEED (default 0).
+Env: FLASHINFER_GEMM_FUZZ_NUM_TESTS (default 250), FLASHINFER_GEMM_FUZZ_SEED (default 0),
+     FLASHINFER_GEMM_FUZZ_ONLY_SEED (comma-separated seeds -> run ONLY those configs; the
+     perfect-repro hook printed on every failure).
+
+Determinism / repro: every config is fully derived from its seed (shapes, modes, input data,
+buffer poison, and the global RNG via torch.manual_seed(seed)), so a failing test reproduces
+bit-for-bit from the REPRO command it prints. Each test prints its full config + repro command;
+on a numeric mismatch it dumps output-vs-oracle stats + the worst <=30 elements (so the CI log
+alone shows whether the output is all-zero / all-NaN / Inf, without rerunning).
 """
 
 from __future__ import annotations
@@ -76,6 +84,10 @@ from tests.utils_fp8 import to_float8
 
 NUM_TESTS = int(os.environ.get("FLASHINFER_GEMM_FUZZ_NUM_TESTS", "250"))
 BASE_SEED = int(os.environ.get("FLASHINFER_GEMM_FUZZ_SEED", "0"))
+# Perfect-repro hook: if set (comma-separated seeds), the suite runs ONLY those configs --
+# `_gen(seed)` is fully deterministic, so a single seed reproduces one config exactly. The
+# repro command printed on every failure uses this.
+_ONLY_SEEDS = os.environ.get("FLASHINFER_GEMM_FUZZ_ONLY_SEED", "")
 
 _SKIP = None
 _CC = (0, 0)
@@ -95,6 +107,7 @@ _SKIP_KW = (
     "unsupported",
     "no kernel",
     "no valid engine",
+    "no suitable",  # BackendSupportedError: "No suitable auto backends found for ..."
     "invalid",
     "must be",
     "requires",
@@ -172,7 +185,10 @@ def _run_fp8_bmm(a, b, out, backend, cfg):
     idt = cfg.fp8_idt or torch.float8_e4m3fn
     mdt = cfg.fp8_mdt or torch.float8_e4m3fn
     a_fp8, a_s = to_float8(a, dtype=idt)
-    bt = b.transpose(-2, -1).contiguous()  # [B, K, N]
+    # B must be the column-major [B,K,N] VIEW (stride [k*n,1,k]) -- the layout fp8 bmm requires.
+    # Do NOT .contiguous() it: that makes B row-major, which cudnn/cutlass reject and cublas
+    # SILENTLY computes garbage from (cosine~0). Matches the original test_bmm_fp8_fuzz.py.
+    bt = b.transpose(-2, -1)
     b_fp8, b_s = to_float8(bt, dtype=mdt)
     bmm_fp8(a_fp8, b_fp8, a_s, b_s, out.dtype, out, backend=backend)
 
@@ -197,7 +213,7 @@ def _run_nvfp4_mm(a, b, out, backend, cfg):
         out.dtype,
         out,
         block_size=16,
-        use_8x4_sf_layout=False,
+        use_8x4_sf_layout=cfg.use_8x4,
         backend=backend,
         use_nvfp4=True,
         skip_check=False,
@@ -217,7 +233,7 @@ def _run_mxfp4_mm(a, b, out, backend, cfg):
         out.dtype,
         out,
         block_size=32,
-        use_8x4_sf_layout=False,
+        use_8x4_sf_layout=cfg.use_8x4,
         backend=backend,
         use_nvfp4=False,
         skip_check=False,
@@ -347,6 +363,8 @@ class Cfg:
         None  # fp8 A-operand dtype (e4m3/e5m2); None -> e4m3
     )
     fp8_mdt: Optional[torch.dtype] = None  # fp8 B-operand dtype
+    noncontig: bool = False  # feed non-contiguous input views
+    use_8x4: bool = False  # mm_fp4 use_8x4_sf_layout (the #2861 padding-leak flag)
 
     @property
     def label(self):
@@ -357,9 +375,11 @@ class Cfg:
             if self.fp8_idt is not None
             else ""
         )
+        mode = ("nc" if self.noncontig else "") + ("8x4" if self.use_8x4 else "")
+        mode = f"_{mode}" if mode else ""
         return (
             f"{self.adapter.key}_{self.backend}_{sh}m{self.m}_n{self.n}_k{self.k}_"
-            f"{self.regime}_{dt}{fp8}_s{self.seed}"
+            f"{self.regime}_{dt}{fp8}{mode}_s{self.seed}"
         )
 
 
@@ -368,8 +388,23 @@ def _gen(seed) -> Cfg:
     wired = [a for a in _ADAPTERS if a.supported(_SM)]
     ad = rng.choice(wired)
     al = ad.align
-    n = max(al, (rng.choice(_SHAPES_N) // al) * al)
-    k = max(al, (rng.choice(_SHAPES_K) // al) * al)
+    # B2: ~10% of the time leave shapes UNALIGNED to verify a clean NOT_SUPPORTED rejection
+    # (not a crash); only meaningful where align>1 (fp4). The skip path handles the rejection.
+    if rng.random() < 0.10:
+        n, k = rng.choice(_SHAPES_N), rng.choice(_SHAPES_K)
+    else:
+        n = max(al, (rng.choice(_SHAPES_N) // al) * al)
+        k = max(al, (rng.choice(_SHAPES_K) // al) * al)
+    # B1 (DEFERRED): non-contiguous inputs. Needs the right oracle -- "non-contig result must MATCH
+    # the contiguous result, else clean-reject" -- not a direct ref compare (some APIs legitimately
+    # require contiguous and should raise). Re-enable with that consistency oracle. Kept False.
+    noncontig = False
+    # C1 (DEFERRED): mm_fp4 use_8x4_sf_layout=True is the #2861 padding-leak flag, BUT it is a
+    # trtllm-backend feature and requires the scale factors in the *matching* 8x4 SF layout (not the
+    # layout_128x4 / mxfp4 default this harness prepares). Toggling it on the cutlass/cudnn/auto
+    # backends just yields "No suitable backends" rejections. Re-enable once a trtllm mm_fp4 adapter
+    # + the matching SfLayout are wired (then the output-poison oracle catches #2861). Kept False.
+    use_8x4 = False
     fp8_idt = fp8_mdt = None
     backends = ad.backends
     if ad.quant_mode == "fp8":
@@ -396,20 +431,23 @@ def _gen(seed) -> Cfg:
         out_dtype=rng.choice([torch.bfloat16, torch.float16]),
         fp8_idt=fp8_idt,
         fp8_mdt=fp8_mdt,
+        noncontig=noncontig,
+        use_8x4=use_8x4,
     )
 
 
-_CONFIGS = (
-    [
+if _SKIP is not None or not any(a.supported(_SM) for a in _ADAPTERS):
+    _CONFIGS = []
+elif _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
+    _CONFIGS = [_gen(int(s)) for s in _ONLY_SEEDS.split(",") if s.strip()]
+else:
+    _CONFIGS = [
         _gen(
             random.Random(BASE_SEED).randint(0, 2**31 - 1)
             ^ (i * 2654435761 & 0x7FFFFFFF)
         )
         for i in range(NUM_TESTS)
     ]
-    if _SKIP is None and any(a.supported(_SM) for a in _ADAPTERS)
-    else []
-)
 
 
 def _canonical(cfg: Cfg, salt: int):
@@ -431,6 +469,75 @@ def _out_buffer(cfg: Cfg):
     )
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics: every test prints its full config + a perfect-repro command; on a numeric
+# mismatch we dump output-vs-oracle stats + the worst <=30 elements, so the CI log alone tells
+# you whether the output is all-zero / all-NaN / Inf without having to rerun.
+# ---------------------------------------------------------------------------
+def _describe(cfg: Cfg) -> str:
+    return (
+        f"CONFIG {cfg.label}\n"
+        f"  adapter={cfg.adapter.key} op={cfg.adapter.op_shape} quant={cfg.adapter.quant_mode} "
+        f"backend={cfg.backend} convention={cfg.adapter.convention}\n"
+        f"  shape: b={cfg.b} m={cfg.m} n={cfg.n} k={cfg.k}  regime={cfg.regime} "
+        f"out_dtype={cfg.out_dtype}\n"
+        f"  modes: noncontig={cfg.noncontig} use_8x4={cfg.use_8x4} "
+        f"fp8=({cfg.fp8_idt},{cfg.fp8_mdt})  seed={cfg.seed}"
+    )
+
+
+def _repro(cfg: Cfg) -> str:
+    cuda = os.environ.get("CUDA_HOME", "<cuda>")
+    dev = os.environ.get("CUDA_VISIBLE_DEVICES", "<sm100-idx>")
+    return (
+        f"REPRO: CUDA_HOME={cuda} CUDA_VISIBLE_DEVICES={dev} "
+        f"FLASHINFER_GEMM_FUZZ_ONLY_SEED={cfg.seed} "
+        f"pytest -s tests/gemm/test_unified_gemm_fuzz.py::test_unified_gemm_fuzz"
+    )
+
+
+def _stats(t: torch.Tensor) -> str:
+    tf = t.float()
+    n = tf.numel()
+    return (
+        f"shape={tuple(t.shape)} dtype={t.dtype} nan={int(torch.isnan(tf).sum())} "
+        f"inf={int(torch.isinf(tf).sum())} zero={int((tf == 0).sum())}/{n} "
+        f"max|.|={tf.abs().nan_to_num().max().item():.4g}"
+    )
+
+
+def _dump(out: torch.Tensor, ref: torch.Tensor, k: int = 30) -> str:
+    of, rf = out.float().reshape(-1), ref.float().reshape(-1)
+    diff = (of - rf).abs()
+    # rank by |diff|, treating non-finite diffs as worst so NaN/Inf elems surface first.
+    diffn = torch.where(torch.isfinite(diff), diff, torch.full_like(diff, float("inf")))
+    idx = torch.topk(diffn, min(k, diffn.numel())).indices.tolist()
+    lines = [
+        f"  output: {_stats(out)}",
+        f"  oracle: {_stats(ref)}",
+        f"  worst {len(idx)} elems  [flat_idx]  output  vs  oracle:",
+    ]
+    lines += [f"    [{i}] {of[i].item():.6g}  vs  {rf[i].item():.6g}" for i in idx]
+    return "\n".join(lines)
+
+
+def _fail(cfg: Cfg, why: str, out=None, ref=None):
+    parts = [why, _describe(cfg)]
+    if out is not None and ref is not None:
+        parts.append(_dump(out, ref))
+    parts.append(_repro(cfg))
+    pytest.fail("\n".join(parts))
+
+
+def _as_noncontig(t: torch.Tensor) -> torch.Tensor:
+    """Return a value-identical NON-contiguous view by stuffing values into a 2x-wide buffer at
+    stride 2 and slicing them back -- robust even when a leading dim is size 1 (last-dim padding
+    would still be contiguous there). Deterministic; no RNG. (B1 helper, currently unused.)"""
+    pad = torch.empty((*t.shape[:-1], t.shape[-1] * 2), device=t.device, dtype=t.dtype)
+    pad[..., ::2] = t
+    return pad[..., ::2]
+
+
 def _assert_invariants(cfg: Cfg, res: torch.Tensor, ref: torch.Tensor):
     resf = res.float()
     # (1) reference-aware no-spurious-NaN/Inf (only meaningful in-range; edge regimes legitimately
@@ -438,28 +545,46 @@ def _assert_invariants(cfg: Cfg, res: torch.Tensor, ref: torch.Tensor):
     if cfg.regime in _INRANGE:
         ref_od = ref.to(cfg.out_dtype).float()
         bad = int(((~torch.isfinite(resf)) & torch.isfinite(ref_od)).sum().item())
-        assert bad == 0, (
-            f"{cfg.label}: {bad}/{resf.numel()} spurious NaN/Inf where ref finite "
-            f"(#2440/#3103/#3334-class)"
-        )
+        if bad != 0:
+            _fail(
+                cfg,
+                f"{bad}/{resf.numel()} spurious NaN/Inf where oracle is finite "
+                f"(#2440/#3103/#3334-class)",
+                res,
+                ref,
+            )
     # (2) not (almost) all-zero vs a non-trivial reference (#3398/#3068 M-dependent / arch-divergent).
     if cfg.regime in _INRANGE and ref.abs().max().item() > 1e-3:
         nz = (resf.abs() > 0).float().mean().item()
-        assert nz > 0.01, (
-            f"{cfg.label}: ~all-zero output (nz={nz:.4f}) vs non-trivial reference "
-            f"(#3398/#3068-class)"
-        )
+        if nz <= 0.01:
+            _fail(
+                cfg,
+                f"~all-zero output (nz_frac={nz:.4f}) vs non-trivial oracle (#3398/#3068-class)",
+                res,
+                ref,
+            )
     # (4) loose numeric oracle only on the well-conditioned regime (FP4/FP8 quant error is large in
     #     edge regimes; structural invariants cover those). A tight snapped-input reference is the
     #     planned upgrade (see module docstring / MoE harness check #2).
     if cfg.regime == "normal" and ref.abs().max().item() > 1e-2:
         cos = F.cosine_similarity(ref.reshape(-1), resf.reshape(-1), dim=0).item()
-        assert cos > 0.90, f"{cfg.label}: cosine {cos:.4f} too low vs reference"
+        if cos <= 0.90:
+            _fail(cfg, f"cosine {cos:.4f} too low vs oracle", res, ref)
 
 
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
 def test_unified_gemm_fuzz(cfg: Cfg):
+    # Determinism: pin the global RNG too (device-state probe + any global draw), so the run is
+    # bit-reproducible from cfg.seed alone (inputs/buffer already use per-config seeded generators).
+    torch.manual_seed(cfg.seed)
+    # Every test prints its full config + the exact repro command (captured by pytest; shown on
+    # failure, or always with `-s`) so a CI log is self-explanatory.
+    print("\n" + _describe(cfg))
+    print(_repro(cfg))
+
     a, b, ref = _canonical(cfg, salt=1)
+    if cfg.noncontig:  # feed value-identical non-contiguous views (oracle unchanged)
+        a, b = _as_noncontig(a), _as_noncontig(b)
     res = _out_buffer(cfg)
 
     def _call(out):
@@ -488,17 +613,19 @@ def test_unified_gemm_fuzz(cfg: Cfg):
         res2 = _out_buffer(cfg)
         _call(res2)
         if not torch.equal(res, res2):
-            md = (res.float() - res2.float()).abs().max().item()
-            pytest.fail(
-                f"{cfg.label}: NONDETERMINISTIC output (max abs diff {md:.3e}, #2514-class)"
+            _fail(
+                cfg,
+                "NONDETERMINISTIC output across identical runs (#2514-class); "
+                "first run = output, second run = oracle below",
+                res,
+                res2,
             )
 
     # (5) device-state probe: a context-corrupting IMA above surfaces here as a non-finite probe.
     probe = torch.randn(2048, device="cuda") * 2.0
     torch.cuda.synchronize()
-    assert torch.isfinite(probe).all(), (
-        f"{cfg.label}: CUDA context corrupted after GEMM"
-    )
+    if not torch.isfinite(probe).all():
+        _fail(cfg, "CUDA context corrupted after GEMM (device-state probe non-finite)")
 
 
 # ---------------------------------------------------------------------------
