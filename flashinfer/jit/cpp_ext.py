@@ -348,6 +348,31 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
+def run_ninja_restat(workdir: Path, ninja_file: Path, verbose: bool) -> None:
+    """Re-sync the mtimes recorded in .ninja_log with current stat() values,
+    so that mtime skew on shared filesystems (GPFS, NFS) does not make ninja
+    rebuild up-to-date outputs. Non-fatal: worst case is a rebuild."""
+    if not (workdir / ".ninja_log").exists():
+        return
+    command = [
+        "ninja",
+        "-C",
+        str(workdir.resolve()),
+        "-f",
+        str(ninja_file.resolve()),
+        "-t",
+        "restat",
+    ]
+    subprocess.run(
+        command,
+        stdout=None if verbose else subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(workdir.resolve()),
+        check=False,
+        text=True,
+    )
+
+
 def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
