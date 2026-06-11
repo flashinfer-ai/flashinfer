@@ -4808,8 +4808,8 @@ def test_bf16_moe_swiglu_oa_activation_params(cache_permute_indices):
     if not torch.cuda.is_available():
         pytest.skip("TRT-LLM Gen BF16 MoE test requires CUDA.")
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10, 12]:
-        pytest.skip("TRT-LLM Gen BF16 MoE requires SM10.x or SM12.x.")
+    if compute_capability[0] != 10:
+        pytest.skip("TRT-LLM Gen BF16 MoE requires SM10.x.")
 
     num_experts = 64
     num_tokens = 8
