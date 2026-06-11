@@ -386,20 +386,16 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
-inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
-                                     uint32_t sizeof_dtype_kv = 2) {
+inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
   if (head_dim >= 512) {
     if (avg_packed_qo_len <= 32) {
-      return 16;
+      return 16;  // decode / short-q (incl. speculative decode): lean CTA16
     }
-    if (sizeof_dtype_kv >= 2) {
-      return 32;  // 16-bit KV: 2x2 layout fits 100KB at CTA32 on all parts
-    }
-    int device_id = 0, max_smem_per_sm = 0;
-    cudaGetDevice(&device_id);
-    cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
-                           device_id);
-    return (max_smem_per_sm >= 128 * 1024) ? 32 : 16;  // FP8: CTA32 only on big-smem
+    // Long-q prefill. Both 16-bit (bf16/fp16) and 8-bit FP8 KV time-share the K/V smem buffer at
+    // hd512 (USE_KV_SHARED_SMEM), so the CTA_TILE_Q=32 layout fits 100KB on SM120/SM121 for both.
+    // NVFP4 KV does not reach this path (rejected by the VO-split kernel), so CTA32 is
+    // unconditional.
+    return 32;
   }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;

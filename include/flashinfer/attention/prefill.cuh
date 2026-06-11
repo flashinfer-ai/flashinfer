@@ -101,8 +101,10 @@ template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint
 struct SharedStorageQKVO {
   static constexpr bool kVOSplit =
       kEnableVOSplitOpt && (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
+  // K/V smem time-sharing applies to both 16-bit (bf16/fp16) and 8-bit FP8 KV at hd512; only
+  // NVFP4 is excluded (its V-load path is separate and the VO-split kernel has no FP4 support).
   static constexpr bool kVShareActive =
-      kVOSplit && (sizeof(DTypeKV) == 2) && (HEAD_DIM_QK == HEAD_DIM_VO);
+      kVOSplit && !is_fp4_type_v<DTypeKV> && (HEAD_DIM_QK == HEAD_DIM_VO);
   union {
     struct {
       alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
@@ -166,8 +168,11 @@ struct KernelTraits {
   static constexpr bool USE_VO_SPLIT = (NUM_MMA_D_VO > 16) && (NUM_MMA_D_VO % NUM_WARPS_KV == 0);
   static constexpr uint32_t NUM_MMA_D_VO_PER_WARP =
       USE_VO_SPLIT ? (NUM_MMA_D_VO / NUM_WARPS_KV) : NUM_MMA_D_VO;
+  // Time-share the K/V smem buffer (load K -> QK -> reuse buffer for V -> PV) for both bf16/fp16
+  // and FP8 KV at hd512; halving the K+V footprint is what lets fp8 CTA_TILE_Q=32 fit 100KB on
+  // SM120/SM121. NVFP4 is excluded (no FP4 V-load in the VO-split PV path).
   static constexpr bool USE_KV_SHARED_SMEM =
-      USE_VO_SPLIT && (sizeof(DTypeKV_) == 2) && (HEAD_DIM_QK == HEAD_DIM_VO);
+      USE_VO_SPLIT && !is_fp4_type_v<DTypeKV_> && (HEAD_DIM_QK == HEAD_DIM_VO);
   static constexpr uint32_t UPCAST_STRIDE_Q = HEAD_DIM_QK / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_K = HEAD_DIM_QK / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeKV_>();
@@ -2002,7 +2007,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t packed_qo_len = qo_len * group_size;
-  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO, sizeof(DTypeKV));
+  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     // hd512 + 16-bit KV uses the 2-Q x 2-KV-warp VO-split layout (CTA_TILE_KV=32,
@@ -2623,6 +2628,11 @@ __device__ __forceinline__ void vosplit_compute_pv(
     const uint32_t warp_vo_base, const uint32_t warp_q_idx, const uint32_t lane_idx) {
   using DTypeQ = typename KTraits::DTypeQ;
   using DTypeKV = typename KTraits::DTypeKV;
+  // The VO-split PV path dequants V as bf16/fp16 or FP8; it has no NVFP4 V-load, so reject FP4
+  // here rather than silently running the bf16 path on packed FP4 bytes (head_dim>256 only).
+  static_assert(!is_fp4_type_v<DTypeKV>,
+                "NVFP4 KV is not supported with the VO-split prefill kernel (head_dim > 256); "
+                "use bf16/fp16 or FP8 KV.");
   constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
   const uint32_t q_row_base = (warp_q_idx * NUM_MMA_Q) * 16;
   constexpr uint32_t NUM_MMA_D_VO_PER_WARP = KTraits::NUM_MMA_D_VO_PER_WARP;
@@ -3507,7 +3517,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
   constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                               (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
-  constexpr bool kKVShared = (sizeof(DTypeKV) == 2) && (HEAD_DIM_VO / 16 > 16) &&
+  // Matches KernelTraits::USE_KV_SHARED_SMEM: K/V share one smem buffer for bf16/fp16 and FP8
+  // (not NVFP4), so the occupancy budget counts the K/V footprint once.
+  constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
                              ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
                              (HEAD_DIM_QK == HEAD_DIM_VO);
   constexpr bool kVOSplitDispatch =

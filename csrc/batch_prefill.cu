@@ -66,8 +66,8 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
       static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-      /*sizeof_dtype_o=*/2, /*sizeof_dtype_kv=*/sizeof(DTypeKV), window_left, fixed_split_size,
-      disable_split_kv, num_colocated_ctas, stream);
+      /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
+      stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan prefill with error: " << cudaGetErrorString(status);
