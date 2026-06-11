@@ -2899,11 +2899,15 @@ __device__ __forceinline__ void vosplit_write_o(
   }
 }
 
-template <typename KTraits, typename Params>
+// smem_storage is deduced (SharedStorage or SharedStoragePaged): the paged prefill kernel passes
+// the VO-split SharedStoragePaged, while the POD fused kernel reuses this device fn with its plain
+// SharedStorage. The two are layout-identical when USE_VO_SPLIT is false (HEAD_DIM_VO <= 256), and
+// every VO-split-only member is accessed solely under `if constexpr (KTraits::USE_VO_SPLIT)`.
+template <typename KTraits, typename Params, typename SmemStorage>
 __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
-    const Params params, typename KTraits::SharedStoragePaged& smem_storage,
-    const dim3 tid = threadIdx, const uint32_t bx = blockIdx.x,
-    const uint32_t kv_head_idx = blockIdx.z, const uint32_t num_kv_heads = gridDim.z) {
+    const Params params, SmemStorage& smem_storage, const dim3 tid = threadIdx,
+    const uint32_t bx = blockIdx.x, const uint32_t kv_head_idx = blockIdx.z,
+    const uint32_t num_kv_heads = gridDim.z) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {

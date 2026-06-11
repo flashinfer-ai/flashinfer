@@ -436,7 +436,6 @@ class PODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             0,  # num_colocated_ctas
-            torch.empty(0, dtype=kv_data_type).element_size(),  # sizeof_dtype_kv
         )
 
         self._indptr_type = indptr.dtype
@@ -1084,7 +1083,6 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             0,  # num_colocated_ctas
-            torch.empty(0, dtype=kv_data_type).element_size(),  # sizeof_dtype_kv
         )
 
         num_colocated_ctas = self._plan_info_d[0]
@@ -1111,7 +1109,6 @@ class BatchPODWithPagedKVCacheWrapper:
             -1,  # fixed_split_size
             False,  # disable_split_kv
             num_colocated_ctas,
-            torch.empty(0, dtype=kv_data_type).element_size(),  # sizeof_dtype_kv
         )
         self._indptr_type = kv_indptr_p.dtype
         self._pos_encoding_mode = pos_encoding_mode

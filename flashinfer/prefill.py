@@ -2151,9 +2151,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
-                # KV element size selects the head_dim=512 CTA tile / warp layout
-                # (16-bit KV -> CTA_TILE_Q=32 2x2; fp8 -> smem-adaptive 1x4).
-                args.append(torch.empty(0, dtype=kv_data_type).element_size())
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -3243,9 +3240,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
-                # KV element size selects the head_dim=512 CTA tile / warp layout
-                # (16-bit KV -> CTA_TILE_Q=32 2x2; fp8 -> smem-adaptive 1x4).
-                args.append(torch.empty(0, dtype=kv_data_type).element_size())
             self._plan_info = self._cached_module.plan(
                 *args,
             )
