@@ -380,6 +380,12 @@ __device__ __forceinline__ void scale_store_cb_gmem(
     }
     packed.val[e] = static_cast<input_t>(val);
   }
+  // WAR: the cross-lane smem.cumAdt/dt reads above are now done — the caller may
+  // overwrite its single-slot per-warp dt/cumAdt in the next head iteration.
+  // Placed right after the reads (before the STG) so the gmem store overlaps
+  // that next scan instead of blocking it.  (Any other consumer of smem.cumAdt/
+  // dt for this head, e.g. the C7 cache writes, must run BEFORE this point.)
+  __syncwarp();
   cb_gmem_head[lane] = packed;  // one STG.128
 }
 
@@ -503,18 +509,12 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
             smem.decay[warp][lane];
       // C5: scale the shared raw C·B (fp32 from smem.CB) by this head's per-warp
       // coeffs + STG.128 fragA-native to gmem.
+      // C7 + cache: store old_dt / old_cumAdt at write_offset (reuse
+      // store_old_dt / store_old_cumAdt, common.cuh:1582+).  TODO(cache) — must
+      // read smem.cumAdt/dt BEFORE scale_store_cb_gmem (it ends with the WAR
+      // __syncwarp that closes single-slot reuse against the next iter's scan).
       auto* cb_gmem_head = cb_gmem + (int64_t)(seq * params.nheads + head) * warpSize;
       scale_store_cb_gmem<input_t>(smem, warp, lane, seq_len, cb_gmem_head);
-      // C7 + cache: store old_dt / old_cumAdt at write_offset (reuse
-      // store_old_dt / store_old_cumAdt, common.cuh:1582+).  TODO(cache).
-
-      // WAR: the cross-lane reads of smem.dt/cumAdt[warp] above must complete
-      // before the NEXT iter overwrites them (single-slot reuse).  Lives inside
-      // has_head: only a warp that read this iter can clash with its own next
-      // write, and has_head is monotonic in iter (h only grows) so a warp that
-      // drops out never writes again.  A double-buffer [NUM_WARPS][2] would
-      // remove this and let the next scan overlap the store.
-      __syncwarp();
     }
   }
   (void)buf_write;
