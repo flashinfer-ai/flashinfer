@@ -436,6 +436,7 @@ def test_xqa_batch_decode(
     enable_sink,
     max_in_kv_len,
     kv_layout,
+    head_dim=128,
 ):
     """Test xqa_batch_decode_with_kv_cache function.
 
@@ -444,7 +445,6 @@ def test_xqa_batch_decode(
 
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 128
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
@@ -576,6 +576,46 @@ def test_xqa_batch_decode(
         output_ref.float() / o_scale,
         rtol=1e-1 if kv_dtype == "fp8" else 1e-2,
         atol=1e-1 if kv_dtype == "fp8" else 1e-2,
+    )
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+    ],
+)
+def test_xqa_batch_decode_head_dim_256_small_pages(
+    page_size, q_dtype, kv_dtype, o_dtype
+):
+    """Regression test for head_dim=256 with small page sizes.
+
+    head_dim=256 decode with page_size < 64 used to produce wrong outputs on
+    SM120 while page_size=64 and head_dim=128 passed (issue #2638). The main
+    test above only covers head_dim=128, so this exercises the
+    head_dim=256 x small-page corner explicitly.
+    """
+    test_xqa_batch_decode(
+        batch_size=4,
+        q_len_per_req=1,
+        page_size=page_size,
+        num_kv_heads=2,
+        head_grp_size=4,
+        window_left=-1,
+        q_dtype=q_dtype,
+        o_dtype=o_dtype,
+        kv_dtype=kv_dtype,
+        enable_pdl=False,
+        enable_sink=False,
+        max_in_kv_len=110,
+        kv_layout="NHD",
+        head_dim=256,
     )
 
 
