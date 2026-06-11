@@ -1229,8 +1229,24 @@ __device__ __forceinline__ void convert_frag(SrcFrag const& src, DstFrag& dst) {
   }
 }
 
+// Load a lane's REGS-element fragA chunk from gmem (fragA-native cb_scaled /
+// cb_old) straight into a matmul-4 A-operand fragment — one vectorized LDG, no
+// smem / LDSM / swizzle.  The two-kernel main's substitute for the monolithic's
+// LDSM of the smem-computed CB: the precompute STG'd each lane's fragA, so the
+// reverse LDG repopulates the identical fragment.  REGS = M·K/32 = K/2 (M=16):
+// m16n8k16 → 8 (LDG.128), m16n8k8 → 4 (LDG.64).  cb_head = &cb[batch_slot, head, 0].
+template <int REGS, typename input_t, typename FragCB>
+__device__ __forceinline__ void load_cb_fragA(FragCB& frag_CB, int lane,
+                                              input_t const* __restrict__ cb_head) {
+  using Pack = PackedAligned<input_t, REGS>;
+  Pack const packed = reinterpret_cast<Pack const*>(cb_head)[lane];  // one vectorized LDG
+#pragma unroll
+  for (int e = 0; e < REGS; ++e) frag_CB(e) = packed.val[e];
+}
+
 // 2b. frag_y += CB_scaled @ x  (matmul 4, single K-tile)
-//     CB_scaled A operand loaded from swizzled smem via LDSM (precomputed by warps 0,1).
+//     CB_scaled A operand: monolithic LDSMs swizzled smem; two-kernel main does
+//     one LDG.128 via load_cb_fragA — either way frag_CB is in registers here.
 //     x B operand loaded from smem via ldmatrix.trans.
 template <typename input_t, typename MmaT, int N_TILE, int NPREDICTED_PAD_MMA_M, typename FragY,
           typename FragCB, typename SmemXTrans, typename S2RBTrans, typename S2RThrBTrans,

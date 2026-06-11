@@ -413,22 +413,26 @@ __device__ __forceinline__ void scale_store_cb_gmem(
 // total_old_cumAdt = old_cumAdt[prev_k−1] (broadcast; 0 when prev_k==0 → no old
 // tokens → all-zero cb_old).  Validated against the monolithic compute_CB_old
 // (kernel_checkpointing_ssu_common.cuh:1054).
+// REGS = MAX_WINDOW_PAD_MMA_K/2: the matmul-4-OLD A-frag is m16n8k{K_old}
+// (K_old = MAX_WINDOW_PAD_MMA_K ∈ {8,16}), so K_old/2 elements/lane (4 @ K=8, 8 @
+// K=16) — NOT a fixed 8.  The K=8 layout is exactly the [0,8)-column prefix of
+// the m16n8k16 8-element (t,i) mapping, so the same on-the-fly formula works for
+// the first REGS elements.  Stores one PackedAligned<input_t, REGS> (STG.64 @
+// K=8 / STG.128 @ K=16) the main LDGs back via load_cb_fragA<REGS>.
 template <typename input_t, typename SmemT>
-__device__ __forceinline__ void scale_store_cb_old(
-    SmemT& smem, int warp, int lane, int seq_len, int prev_k,
-    PackedAligned<input_t>* __restrict__ cb_old_gmem_head) {
-  static_assert(PackedAligned<input_t>::count == 8,
-                "cb_old fragA store assumes 8 input_t per 16 B pack (bf16)");
+__device__ __forceinline__ void scale_store_cb_old(SmemT& smem, int warp, int lane, int seq_len,
+                                                   int prev_k, input_t* __restrict__ cb_old_head) {
   using namespace cute;
   constexpr int M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int REGS = SmemT::MAX_WINDOW_PAD_MMA_K / 2;
   auto const layout_cb = make_swizzled_layout_rc<float, M, M, SmemT::CB_STRIDE>();
   float const total_old = (prev_k > 0) ? smem.old_cumAdt[warp][prev_k - 1] : 0.f;
   int const r0 = lane / 4;
   int const c0 = (lane % 4) * 2;
-  PackedAligned<input_t> packed;
+  PackedAligned<input_t, REGS> packed;
 #pragma unroll
-  for (int e = 0; e < 8; ++e) {
-    // fragA(m16n8k16) element e → (row t = new token, col i = old token).
+  for (int e = 0; e < REGS; ++e) {
+    // fragA(m16n8k{K_old}) element e → (row t = new token, col i = old token).
     int const t = r0 + (((e >> 1) & 1) << 3);
     int const i = c0 + (((e >> 2) & 1) << 3) + (e & 1);
     float val = 0.f;
@@ -442,7 +446,7 @@ __device__ __forceinline__ void scale_store_cb_old(
   // WAR: cross-lane smem.cumAdt / old_cumAdt / old_dt reads done before the next
   // iter overwrites them (same single-slot reuse as scale_store_cb_gmem).
   __syncwarp();
-  cb_old_gmem_head[lane] = packed;  // one STG.128
+  reinterpret_cast<PackedAligned<input_t, REGS>*>(cb_old_head)[lane] = packed;  // one STG
 }
 
 // -----------------------------------------------------------------------------
@@ -543,8 +547,9 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
   auto* __restrict__ cb_gmem = reinterpret_cast<PackedAligned<input_t>*>(params.cb_scaled);
-  auto* __restrict__ cb_old_gmem = reinterpret_cast<PackedAligned<input_t>*>(params.cb_old);
+  auto* __restrict__ cb_old_gmem = reinterpret_cast<input_t*>(params.cb_old);  // K_old/2 regs/lane
   auto* __restrict__ cumAdt_gmem = reinterpret_cast<float*>(params.cumAdt_vec);
+  constexpr int CB_OLD_REGS = SmemT::MAX_WINDOW_PAD_MMA_K / 2;  // m16n8k{K_old} A-frag size
 
   constexpr int NUM_ITER = (HEADS_PER_CTA + NUM_WARPS - 1) / NUM_WARPS;  // ceil, uniform
 #pragma unroll
@@ -611,8 +616,9 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       // C6 (NO-WRITE): scale the raw C·old_B (smem.CB_old) per head + STG.128
       // fragA-native → cb_old.  Main does OUT.3 = cb_old @ old_x.
       if (!must_checkpoint) {
-        auto* cb_old_gmem_head = cb_old_gmem + (int64_t)(seq * params.nheads + head) * warpSize;
-        scale_store_cb_old<input_t>(smem, warp, lane, seq_len, prev_k, cb_old_gmem_head);
+        auto* cb_old_head =
+            cb_old_gmem + (int64_t)(seq * params.nheads + head) * warpSize * CB_OLD_REGS;
+        scale_store_cb_old<input_t>(smem, warp, lane, seq_len, prev_k, cb_old_head);
       }
     }
   }

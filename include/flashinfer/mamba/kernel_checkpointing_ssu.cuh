@@ -495,14 +495,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
 //     All operations on register-resident frag_y — no smem round-trip.
 //     Result converted f32 → input_t in registers and stored directly to gmem
 //     via partition_C of the global output tensor (like CUTLASS sgemm_sm80 epilogue).
+// READ_PRECOMPUTED_CB (default false ⇒ monolithic, byte-identical codegen): when
+// true (two-kernel main), the matmul-4 CB A-operand is loaded by one LDG.128/lane
+// from gmem `cb_gmem_head` (fragA-native) instead of LDSM'd from smem.CB_scaled.
 template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
-          int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
-__device__ __forceinline__ void compute_and_store_output(SmemT& smem,
-                                                         CheckpointingSsuParams const& params,
-                                                         int warp, int lane, int d_tile,
-                                                         int64_t out_seq_base, int head,
-                                                         int64_t cache_slot, float D_val,
-                                                         bool must_checkpoint, int seq_len) {
+          int NUM_WARPS, int PHILOX_ROUNDS, bool READ_PRECOMPUTED_CB = false, typename SmemT>
+__device__ __forceinline__ void compute_and_store_output(
+    SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int d_tile,
+    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, bool must_checkpoint,
+    int seq_len, input_t const* cb_gmem_head = nullptr) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_and_store_output requires 2-byte input type");
 
@@ -547,17 +548,23 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
       make_tiled_copy_B(Copy_Atom<SM75_U16x2_LDSM_T, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B_trans = s2r_B_trans.get_slice(tid);
 
-  // ── Load CB_scaled A operand from smem (precomputed by warps 0,1 between syncs) ──
-  // Row stride matches the buffer's padded width (one swizzle atom of `input_t`).
+  // ── Load CB_scaled A operand into frag_CB_A ──
+  // Monolithic: LDSM from swizzled smem.CB_scaled (computed by warps 0,1 between
+  // syncs).  Two-kernel main (READ_PRECOMPUTED_CB): one LDG.128/lane from gmem
+  // cb_scaled (fragA-native) — no smem / LDSM / swizzle.  Same frag_CB_A either way.
   constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
   auto layout_cb_swz =
       make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
   Tensor smem_CB = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_swz);
-  auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
   Tensor frag_CB_A = thr_mma.partition_fragment_A(smem_CB);
-  auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
-  cute::copy(s2r_A, smem_CB_s2r, frag_CB_A_view);
+  if constexpr (READ_PRECOMPUTED_CB) {
+    load_cb_fragA<NPREDICTED_PAD_MMA_M / 2, input_t>(frag_CB_A, lane, cb_gmem_head);
+  } else {
+    auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
+    auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
+    cute::copy(s2r_A, smem_CB_s2r, frag_CB_A_view);
+  }
 
   // Decay broadcast: cumAdt[t] → [NPREDICTED_PAD_MMA_M, N_TILE] with stride-0 on N.
   constexpr int N_TILE = cute::tile_size<1>(decltype(tiled_mma){});
@@ -684,11 +691,17 @@ __device__ __forceinline__ void compute_and_store_output(SmemT& smem,
 //   CB_old is populated by `compute_CB_old_2warp` on warps 2,3 before the
 //   `__syncthreads()` in the no-write dispatcher.  It lives in the CB_scaled
 //   buffer at cols [NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M + MAX_WINDOW_PAD_MMA_K).
+// READ_PRECOMPUTED_CB (default false ⇒ monolithic): when true (two-kernel main),
+// the new-token CB and old-token CB_old A-operands are loaded by one LDG.128/lane
+// from gmem (cb_gmem_head / cb_old_gmem_head, fragA-native) instead of LDSM'd
+// from smem.CB_scaled.
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
-          int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+          int D_PER_CTA, int DSTATE, int NUM_WARPS, bool READ_PRECOMPUTED_CB = false,
+          typename SmemT>
 __device__ __forceinline__ void compute_no_write_output(
     SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
-    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len) {
+    int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len,
+    input_t const* cb_gmem_head = nullptr, input_t const* cb_old_gmem_head = nullptr) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_no_write_output requires 2-byte input type");
 
@@ -747,31 +760,41 @@ __device__ __forceinline__ void compute_no_write_output(
       make_tiled_copy_B(Copy_Atom<LdsmBOld, MMA_prop::operand_t>{}, tiled_mma_old);
   auto s2r_thr_B_old_trans = s2r_B_old_trans.get_slice(tid);
 
-  // ── Load CB_scaled A operand (cols [0, NPREDICTED_PAD_MMA_M)) ──
+  // ── Load CB_scaled A operand (new tokens, cols [0, NPREDICTED_PAD_MMA_M)) ──
+  // Monolithic: LDSM from smem.  Two-kernel main (READ_PRECOMPUTED_CB): LDG from
+  // gmem cb_scaled (fragA-native), REGS = NPREDICTED_PAD_MMA_M/2 = 8 (K=16).
   auto layout_cb_swz =
       make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
   Tensor smem_CB = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_swz);
-  auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
   Tensor frag_CB_A = thr_mma.partition_fragment_A(smem_CB);
-  auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
-  cute::copy(s2r_A, smem_CB_s2r, frag_CB_A_view);
+  if constexpr (READ_PRECOMPUTED_CB) {
+    load_cb_fragA<NPREDICTED_PAD_MMA_M / 2, input_t>(frag_CB_A, lane, cb_gmem_head);
+  } else {
+    auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
+    auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
+    cute::copy(s2r_A, smem_CB_s2r, frag_CB_A_view);
+  }
 
-  // ── Load CB_old A operand (cols [NPREDICTED_PAD_MMA_M, +MAX_WINDOW_PAD_MMA_K)) ──
-  // Use the full physical (T_pad, CB_ROW_STRIDE) padded swizzle view — byte-
-  // compatible with both the CB_scaled (T_pad, T_pad, CB_ROW_STRIDE) write
-  // layout and compute_CB_old_2warp's wide write layout (inner offset
-  // r*CB_ROW_STRIDE + c is identical across the three views).
+  // ── Load CB_old A operand (old tokens, cols [NPREDICTED_PAD_MMA_M, +K_old)) ──
+  // Monolithic: LDSM from the CB_scaled old-region (full padded swizzle view,
+  // byte-compatible with compute_CB_old_2warp's write).  Two-kernel main: LDG
+  // from gmem cb_old (fragA-native), REGS = MAX_WINDOW_PAD_MMA_K/2 (4 @ K=8, 8 @
+  // K=16) — matches the m16n8k{K_old} A-frag from tiled_mma_old.
   auto layout_cb_full = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
   Tensor smem_CB_full = make_tensor(
       make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_full);
   Tensor smem_CB_old =
       local_tile(smem_CB_full, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
                  make_coord(_0{}, NPREDICTED_PAD_MMA_M / MAX_WINDOW_PAD_MMA_K));
-  auto smem_CB_old_s2r = s2r_thr_A_old.partition_S(smem_CB_old);
   Tensor frag_CB_old_A = thr_mma_old.partition_fragment_A(smem_CB_old);
-  auto frag_CB_old_A_view = s2r_thr_A_old.retile_D(frag_CB_old_A);
-  cute::copy(s2r_A_old, smem_CB_old_s2r, frag_CB_old_A_view);
+  if constexpr (READ_PRECOMPUTED_CB) {
+    load_cb_fragA<MAX_WINDOW_PAD_MMA_K / 2, input_t>(frag_CB_old_A, lane, cb_old_gmem_head);
+  } else {
+    auto smem_CB_old_s2r = s2r_thr_A_old.partition_S(smem_CB_old);
+    auto frag_CB_old_A_view = s2r_thr_A_old.retile_D(frag_CB_old_A);
+    cute::copy(s2r_A_old, smem_CB_old_s2r, frag_CB_old_A_view);
+  }
 
   // ── Decay broadcast: cumAdt[t] (per-T scalar) with stride-0 on N. ──
   constexpr int N_TILE = cute::tile_size<1>(decltype(tiled_mma){});
