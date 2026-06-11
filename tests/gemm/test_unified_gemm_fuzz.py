@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import os
 import random
+import zlib
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -445,14 +446,10 @@ if _SKIP is not None or not any(a.supported(_SM) for a in _ADAPTERS):
     _CONFIGS = []
 elif _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _CONFIGS = [_gen(int(s)) for s in _ONLY_SEEDS.split(",") if s.strip()]
-else:
-    _CONFIGS = [
-        _gen(
-            random.Random(BASE_SEED).randint(0, 2**31 - 1)
-            ^ (i * 2654435761 & 0x7FFFFFFF)
-        )
-        for i in range(NUM_TESTS)
-    ]
+else:  # draw the per-config seeds ONCE from a BASE_SEED-seeded RNG (deterministic + a real
+    # permutation; recreating Random(BASE_SEED) per iteration would draw the same value each time).
+    _rng = random.Random(BASE_SEED)
+    _CONFIGS = [_gen(_rng.randint(0, 2**31 - 1)) for _ in range(NUM_TESTS)]
 
 
 # ---------------------------------------------------------------------------
@@ -800,9 +797,10 @@ def test_gemm_quantize_fuzz(rows, cols, regime, qmode):
     """Quantizing finite inputs must never produce NaN/Inf scale factors (GH #2440)."""
     block = {"nvfp4": 16, "mxfp4": 32, "fp8": 1}[qmode]
     cols = max(block, (cols // block) * block)
-    x = _regime_tensor(
-        (rows, cols), regime, random.Random(hash((rows, cols, regime, qmode)) & 0xFFFF)
-    )
+    # Deterministic seed across processes: Python's hash() of str/tuple is randomized per-process
+    # (PYTHONHASHSEED), which would break repro; crc32 of a stable string is stable.
+    seed = zlib.crc32(f"{rows}_{cols}_{regime}_{qmode}".encode())
+    x = _regime_tensor((rows, cols), regime, random.Random(seed))
     assert torch.isfinite(x.float()).all(), "test input itself is non-finite"
     if qmode == "nvfp4":
         gsf = (448 * 6) / x.float().abs().nan_to_num().max().clamp_min(1e-30)
