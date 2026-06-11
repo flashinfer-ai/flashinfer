@@ -2511,6 +2511,8 @@ def _pack_trtllm_gen_spec_dec_mask(
     kv_dtype: torch.dtype,
     num_heads_q_per_kv: int,
     batch_size: int,
+    window_left: int = -1,
+    max_seq_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack a dense spec-dec tree mask into the TRTLLM-GEN custom-mask layout.
 
@@ -2525,6 +2527,14 @@ def _pack_trtllm_gen_spec_dec_mask(
     per-sequence starts in uint32 units, so all shapes are static for a given
     (batch_size, q_len_per_req) and the packing kernel is CUDA-graph
     capturable.
+
+    window_left >= 0 folds a sliding window into the packed mask: the cubins
+    treat KV below firstSparseMaskOffsetsKv as visible, so the window forces
+    the offset to 0 and explicit bits over the whole presented KV range,
+    sized by max_seq_len. Callers should present only roughly the in-window
+    KV (trimmed page table + clamped seq_lens) to keep the mask region small.
+    Proper SlidingWindow+Custom mask support in the trtllm-gen kernels is a
+    planned follow-up that would remove this folding.
     """
     if q_len_per_req is None or q_len_per_req <= 1:
         raise ValueError(
@@ -2544,10 +2554,16 @@ def _pack_trtllm_gen_spec_dec_mask(
     num_insts_kv = 1 if q_dtype != kv_dtype else 2
     tile_size_kv_per_cta = 128 * num_insts_kv
     num_tiles_q = ceil_div(q_len_per_req * num_heads_q_per_kv, 128)
-    # Worst case over prefix tile alignment: ceil((tile - 1 + q_len) / tile).
-    max_mask_tiles_kv = ceil_div(
-        tile_size_kv_per_cta - 1 + q_len_per_req, tile_size_kv_per_cta
-    )
+    if window_left >= 0:
+        # The mask region covers the whole presented KV range (offset 0).
+        if max_seq_len is None:
+            raise ValueError("window_left >= 0 requires max_seq_len for mask sizing")
+        max_mask_tiles_kv = ceil_div(max_seq_len, tile_size_kv_per_cta)
+    else:
+        # Worst case over prefix tile alignment: ceil((tile - 1 + q_len) / tile).
+        max_mask_tiles_kv = ceil_div(
+            tile_size_kv_per_cta - 1 + q_len_per_req, tile_size_kv_per_cta
+        )
     words_per_seq = num_tiles_q * max_mask_tiles_kv * num_insts_kv * (128 * 128 // 32)
     packed_custom_mask = torch.empty(
         (batch_size, words_per_seq), dtype=torch.uint32, device=mask.device
@@ -2569,6 +2585,7 @@ def _pack_trtllm_gen_spec_dec_mask(
         seq_lens.to(torch.int32),
         num_heads_q_per_kv,
         num_insts_kv,
+        window_left,
     )
     return packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv
 
@@ -2701,8 +2718,13 @@ def trtllm_batch_decode_with_kv_cache(
           ``[batch_size, q_len_per_req, q_len_per_req]`` (True = attend).
           Row ``i`` masks draft token ``i`` against the draft tail; the KV
           prefix before the draft tail is always attended. Requires uniform
-          query lengths (``q_len_per_req``), paged KV cache, head_dim 64 or
-          128, and no sliding window.
+          query lengths (``q_len_per_req``), paged KV cache, and head_dim 64
+          or 128. ``window_left >= 0`` is supported by folding the window
+          into the packed mask using the slot-index window rule (kv visible
+          iff ``kv_idx >= prefix + row - window_left``, as in the non-tree
+          window paths); the mask region then covers the whole presented KV
+          range, so callers should trim the page table and ``seq_lens`` to
+          roughly the window and pass the trimmed bound as ``max_seq_len``.
 
     max_q_len: Optional[int] = None
         The maximum query sequence length across all requests when using variable-length queries.
@@ -2978,8 +3000,15 @@ def trtllm_batch_decode_with_kv_cache(
                     k_cache.dtype,
                     query.size(1) // num_kv_heads,
                     batch_size,
+                    window_left,
+                    max_seq_len,
                 )
             )
+            # The custom-mask cubins have no SlidingWindow+Custom mask type,
+            # so the window is folded into the packed mask above and the
+            # kernel runs without one. Proper combined kernel support in
+            # trtllm-gen is a planned follow-up.
+            window_left = -1
 
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 

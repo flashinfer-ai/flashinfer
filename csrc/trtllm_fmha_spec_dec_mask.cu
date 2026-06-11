@@ -46,17 +46,30 @@ constexpr int kThreadsPerBlock = 256;
 // before the draft tail (the prefix) are emitted as visible, draft-tail
 // tokens take the tree mask bit, and out-of-range tokens are masked.
 //
+// window_left >= 0 folds a sliding window into the mask: the published
+// custom-mask cubins have no SlidingWindow+Custom mask type, and KV below
+// firstSparseMaskOffsetKv is implicitly visible, so the window forces
+// firstSparseMaskOffsetKv = 0 and explicit bits over the whole presented KV
+// range. The window uses slot indices (kv visible iff
+// kv_idx >= prefix + tokenQ - window_left), matching the kernel-side
+// window_left rule the non-tree spec-dec paths and FA2 references apply.
+// Callers should trim the presented KV (page table + seq_lens) to roughly
+// the window so the mask region stays small. Proper SlidingWindow+Custom
+// kernel support in trtllm-gen would remove the firstSparseMaskOffsetKv = 0
+// requirement and the packing cost; that is a planned follow-up.
+//
 // The mask region size depends on the runtime seqLensKv values, so this runs
 // as a device kernel (CUDA-graph capturable) over a static worst-case grid.
 __global__ void PackSpecDecMaskKernel(uint32_t* packed_mask, int32_t* first_sparse_mask_offsets_kv,
                                       bool const* tree_mask, int const* seq_lens_kv, int q_len,
                                       int num_heads_q_per_kv, int num_insts_kv,
-                                      int max_words_per_seq) {
+                                      int max_words_per_seq, int window_left) {
   int const batch_idx = blockIdx.y;
   int const seq_len_kv = seq_lens_kv[batch_idx];
   int const prefix_len = seq_len_kv - q_len;
   int const tile_size_kv_per_cta = kTileSizeKv * num_insts_kv;
-  int const first_sparse_tile_kv = prefix_len / tile_size_kv_per_cta;
+  bool const has_window = window_left >= 0;
+  int const first_sparse_tile_kv = has_window ? 0 : prefix_len / tile_size_kv_per_cta;
   int const adjusted_offset_kv = first_sparse_tile_kv * tile_size_kv_per_cta;
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     first_sparse_mask_offsets_kv[batch_idx] = adjusted_offset_kv;
@@ -88,14 +101,16 @@ __global__ void PackSpecDecMaskKernel(uint32_t* packed_mask, int32_t* first_spar
       int const token_idx_q = row_q / num_heads_q_per_kv;
       int const kv_base = adjusted_offset_kv + tile_idx_kv * tile_size_kv_per_cta +
                           inst_idx_kv * kTileSizeKv + kv_word * 32;
+      int const window_floor = has_window ? prefix_len + token_idx_q - window_left : INT_MIN;
 #pragma unroll
       for (int bit = 0; bit < 32; ++bit) {
         int const token_idx_kv = kv_base + bit;
         bool visible = false;
         if (token_idx_kv < prefix_len) {
-          visible = true;
+          visible = token_idx_kv >= window_floor;
         } else if (token_idx_kv < seq_len_kv) {
-          visible = local_tree_mask[token_idx_q * q_len + (token_idx_kv - prefix_len)];
+          visible = local_tree_mask[token_idx_q * q_len + (token_idx_kv - prefix_len)] &&
+                    token_idx_kv >= window_floor;
         }
         word |= (static_cast<uint32_t>(visible) << bit);
       }
@@ -108,7 +123,8 @@ __global__ void PackSpecDecMaskKernel(uint32_t* packed_mask, int32_t* first_spar
 
 void trtllm_fmha_pack_spec_dec_mask(TensorView packed_mask, TensorView first_sparse_mask_offsets_kv,
                                     TensorView tree_mask, TensorView seq_lens,
-                                    int64_t num_heads_q_per_kv, int64_t num_insts_kv) {
+                                    int64_t num_heads_q_per_kv, int64_t num_insts_kv,
+                                    int64_t window_left) {
   TVM_FFI_ICHECK_EQ(tree_mask.dtype(), dl_bool) << "tree_mask must be a bool tensor";
   TVM_FFI_ICHECK_EQ(tree_mask.ndim(), 3) << "tree_mask must have shape [batch, q_len, q_len]";
   TVM_FFI_ICHECK_EQ(tree_mask.size(1), tree_mask.size(2))
@@ -135,7 +151,7 @@ void trtllm_fmha_pack_spec_dec_mask(TensorView packed_mask, TensorView first_spa
       static_cast<int32_t*>(first_sparse_mask_offsets_kv.data_ptr()),
       static_cast<bool const*>(tree_mask.data_ptr()), static_cast<int const*>(seq_lens.data_ptr()),
       q_len, static_cast<int>(num_heads_q_per_kv), static_cast<int>(num_insts_kv),
-      max_words_per_seq);
+      max_words_per_seq, static_cast<int>(window_left));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fmha_pack_spec_dec_mask, trtllm_fmha_pack_spec_dec_mask);
