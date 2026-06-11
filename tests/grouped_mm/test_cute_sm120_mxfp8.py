@@ -133,9 +133,10 @@ def transform_sf_into_required_layout(
     )
 
 
-def compute_padded_offset(offset: int, problem_idx: int, alignment: int = 4) -> int:
-    """Worst-case padded cumulative offset — each of the `problem_idx` prior groups
-    assumed to need maximum `(alignment - 1)` padding rows.
+def compute_padded_offset(offset: int, problem_idx: int, alignment: int) -> int:
+    """Worst-case padded cumulative offset along M axis — each of the `problem_idx`
+    prior groups assumed to need maximum `(alignment - 1)` padding rows. For this
+    kernel `alignment = PACK_NSF` (sf is col-major + 4 UE8M0 pack into 1 int32 along M).
     """
     return (offset + problem_idx * (alignment - 1)) // alignment * alignment
 
@@ -159,7 +160,7 @@ def per_token_cast_to_mxfp8_for_moe_gemm(
     E = token_offset.numel() - 1
     PACK_NSF = 4
     PACK_NK = gran_k * PACK_NSF
-    m_padded = compute_padded_offset(token_num, E)
+    m_padded = compute_padded_offset(token_num, E, alignment=PACK_NSF)
     k_align = (k + PACK_NK - 1) // PACK_NK
 
     fp8_output = torch.empty((token_num, k), dtype=torch.float8_e4m3fn, device=x.device)
@@ -175,7 +176,7 @@ def per_token_cast_to_mxfp8_for_moe_gemm(
             x[start:end], use_ue8m0=True, gran_k=gran_k
         )
 
-        n_sf = k // gran_k
+        n_sf = ceil_div(k, gran_k)
         n_sf_padded = align(n_sf, PACK_NSF)
         if n_sf_padded != n_sf:
             pad = torch.zeros(
@@ -186,7 +187,7 @@ def per_token_cast_to_mxfp8_for_moe_gemm(
         packed_int = pack_ue8m0_to_int(expert_sf_ue8m0)
 
         fp8_output[start:end] = expert_fp8
-        padded_offset = compute_padded_offset(start, i)
+        padded_offset = compute_padded_offset(start, i, alignment=PACK_NSF)
         sf_int[:, padded_offset : padded_offset + actual_m] = packed_int.t()
 
     return fp8_output, sf_int.transpose(0, 1)
