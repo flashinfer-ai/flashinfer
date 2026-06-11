@@ -33,29 +33,22 @@ def get_gemm_sm120_module_cute_mxfp8():
     return gen_gemm_sm120_module_cute_mxfp8().build_and_load()
 
 
-def _check_m_indptr(m_indptr: torch.Tensor, token_num: int) -> None:
-    """Validate ``m_indptr`` semantic consistency before launching the kernel.
+def _check_m_indptr(m_indptr: torch.Tensor, num_experts: int) -> None:
+    """Validate ``m_indptr`` metadata (no GPU→CPU sync).
 
-    Checks: 1-D int32, first element 0, monotonic non-decreasing, last element
-    equals ``token_num`` (the row count of the packed A tensor).
+    Caller contract: ``m_indptr[0] == 0``, monotonic non-decreasing, last element
+    equals the packed A row count. Value invariants are not enforced here to avoid
+    GPU→CPU sync on a low-latency kernel path.
     """
     if m_indptr.dtype != torch.int32:
         raise ValueError(f"m_indptr must be int32; got {m_indptr.dtype}")
     if m_indptr.dim() != 1:
         raise ValueError(f"m_indptr must be 1-D; got {m_indptr.dim()}D")
-    if m_indptr.numel() < 2:
+    if m_indptr.numel() != num_experts + 1:
         raise ValueError(
-            f"m_indptr must have at least 2 elements (num_experts >= 1); "
-            f"got numel={m_indptr.numel()}"
+            f"m_indptr.numel() must equal num_experts + 1 = {num_experts + 1}; "
+            f"got {m_indptr.numel()}"
         )
-    first = int(m_indptr[0].item())
-    last = int(m_indptr[-1].item())
-    if first != 0:
-        raise ValueError(f"m_indptr[0] must be 0; got {first}")
-    if last != token_num:
-        raise ValueError(f"m_indptr[-1] must equal token_num={token_num}; got {last}")
-    if not bool((m_indptr[1:] >= m_indptr[:-1]).all().item()):
-        raise ValueError("m_indptr must be non-decreasing")
 
 
 def _check_scale_granularity_mnk(scale_granularity_mnk: Tuple[int, int, int]) -> None:
@@ -180,7 +173,7 @@ def moe_gemm_mxfp8_nt_groupwise(
     """
     _check_scale_granularity_mnk(scale_granularity_mnk)
     _check_scale_major_mode_mxfp8(scale_major_mode)
-    _check_m_indptr(m_indptr, token_num=a.shape[0])
+    _check_m_indptr(m_indptr, num_experts=b.shape[0])
     if backend != "cute":
         raise NotImplementedError(
             f'Only backend="cute" is currently implemented; got backend="{backend}"'

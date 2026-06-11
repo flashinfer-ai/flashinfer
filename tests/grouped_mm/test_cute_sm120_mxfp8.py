@@ -247,7 +247,7 @@ def per_block_resmooth_to_ue8m0(
 
 
 @pytest.mark.parametrize("num_groups", [2, 4])
-@pytest.mark.parametrize("rows_per_group", [64, 128])
+@pytest.mark.parametrize("rows_per_group", [1, 8, 64, 128])
 @pytest.mark.parametrize("n,k", [(4096, 7168), (7168, 4096)])
 @pytest.mark.parametrize("k_gran", [32, 128])
 @pytest.mark.parametrize("is_weight_scale_float", [True, False])
