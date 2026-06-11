@@ -88,6 +88,88 @@ struct CheckpointingSsuPrecomputeStorage {
 };
 
 // -----------------------------------------------------------------------------
+// Raw C·B MMA (matmul-1) for ONE group, 2-warp N-split → fp32 row-major smem.CB
+// (UNMASKED, UNSCALED).  This is the MMA half of compute_CB_scaled_2warp
+// (kernel_checkpointing_ssu_common.cuh:806) with the scale/mask epilogue
+// dropped — the per-head decay/dt scaling + causal mask are deferred to
+// scale_store_cb_gmem.  Reads the same swizzled smem.C / smem.B; stores RAW
+// fp32 via a ROW-MAJOR layout so scale_store reads by logical (t,j) = t*S+j.
+// Run by warps 0/1:
+//   NPREDICTED_PAD_MMA_N == 16: warp 0 → cols [0,8), warp 1 → cols [8,16).
+//   NPREDICTED_PAD_MMA_N == 8 : warp 0 covers all valid j (<NPREDICTED); warp 1
+//     returns (its cols [8,16) are j>=8>=seq_len, never read by scale_store).
+template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
+__device__ __forceinline__ void compute_cb_2warp(SmemT& smem, int warp, int lane) {
+  using namespace cute;
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int NPREDICTED_PAD_MMA_N = SmemT::NPREDICTED_PAD_MMA_N;
+  constexpr int N_HALF = NPREDICTED_PAD_MMA_M / 2;
+  static_assert(N_HALF % MMA_prop::N == 0, "N_HALF must be a multiple of MMA::N");
+
+  if constexpr (NPREDICTED_PAD_MMA_N == 8) {
+    if (warp == 1) return;  // no valid B rows; cols [8,16) never read.
+  }
+
+  // ── Swizzled smem views (C/B byte-identical to the monolithic layout) ──
+  auto layout_C =
+      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, NPREDICTED>();
+  auto layout_B = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_N, DSTATE>();
+  Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.C)), layout_C);
+  Tensor smem_B = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.B)), layout_B);
+
+  // ── TiledMMA: _1x_1 = 32 threads, one [16, 8] atom ──
+  auto tiled_mma =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_1, _1>>{});
+  auto thr_mma = tiled_mma.get_slice(lane);
+
+  constexpr int K_TILE = MMA_prop::K_BIG;
+  Tensor smem_C_tiled = local_tile(smem_C, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<K_TILE>{}),
+                                   make_coord(_0{}, _));
+  Tensor smem_B_half =
+      local_tile(smem_B, make_tile(Int<N_HALF>{}, Int<K_TILE>{}), make_coord(warp, _));
+
+  Tensor frag_A = thr_mma.partition_fragment_A(smem_C_tiled(_, _, _0{}));
+  Tensor frag_B = thr_mma.partition_fragment_B(smem_B_half(_, _, _0{}));
+  auto layout_cb_half = make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_HALF>{}));
+  Tensor frag_acc = thr_mma.partition_fragment_C(make_tensor((float*)nullptr, layout_cb_half));
+  clear(frag_acc);
+
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, input_t>{}, tiled_mma);
+  auto s2r_thr_A = s2r_A.get_slice(lane);
+  Tensor smem_C_s2r = s2r_thr_A.partition_S(smem_C_tiled);
+  Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, input_t>{}, tiled_mma);
+  auto s2r_thr_B = s2r_B.get_slice(lane);
+  Tensor smem_B_s2r = s2r_thr_B.partition_S(smem_B_half);
+  Tensor frag_B_view = s2r_thr_B.retile_D(frag_B);
+
+  // ── Gemm: DSTATE/K_TILE K-tiles, 1 HMMA each ──
+  constexpr int NUM_K_TILES = DSTATE / K_TILE;
+#pragma unroll
+  for (int k = 0; k < NUM_K_TILES; ++k) {
+    cute::copy(s2r_A, smem_C_s2r(_, _, _, k), frag_A_view);
+    cute::copy(s2r_B, smem_B_s2r(_, _, _, k), frag_B_view);
+    cute::gemm(tiled_mma, frag_acc, frag_A, frag_B, frag_acc);
+  }
+
+  // ── Store RAW fp32 accumulator → row-major smem.CB, this warp's N-half ──
+  // No scaling, no mask (deferred to scale_store_cb_gmem).  partition_C of a
+  // ROW-MAJOR layout maps element i → (t, warp*N_HALF+n) → CB[t*CB_STRIDE + j],
+  // so scale_store's t*S+j read addresses the identical (t,j).
+  constexpr int CB_STRIDE = SmemT::CB_STRIDE;
+  auto layout_cb = make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<CB_STRIDE>{}),
+                               make_stride(Int<CB_STRIDE>{}, _1{}));
+  Tensor smem_CB = make_tensor(make_smem_ptr(smem.CB), layout_cb);
+  Tensor smem_CB_half = local_tile(smem_CB, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_HALF>{}),
+                                   make_coord(_0{}, warp));
+  Tensor smem_CB_part = thr_mma.partition_C(smem_CB_half);
+#pragma unroll
+  for (int i = 0; i < size(frag_acc); ++i) {
+    smem_CB_part(i) = frag_acc(i);  // raw fp32
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Scale one head's raw C·B (read fp32 from smem.CB) and store to gmem in
 // FRAGMENT-NATIVE layout, one STG.128 per thread.  Each thread emits the 8
 // values that == matmul-4's `fragA` for this lane (mma.m16n8k16 A operand), so
@@ -121,10 +203,8 @@ __device__ __forceinline__ void scale_store_cb_gmem(
     if (j <= t && t < seq_len && j < seq_len) {
       // C5: CB_scaled[t,j] = (C·B) * exp(cumAdt[t]-cumAdt[j]) * dt_proc[j].
       // Raw C·B read fp32 from smem; per-warp coeffs (this warp owns this head).
-      // TODO(layout): `t * S + j` is a PLACEHOLDER row-major index.  The real
-      // offset must come from the SAME CuTe layout compute_cb_2warp uses to
-      // store the MMA accumulator (likely a swizzle, not row-major) — resolve
-      // both sides together when that helper lands.
+      // Row-major: compute_cb_2warp stores the accumulator via a row-major CuTe
+      // layout, so CB[t*S+j] addresses the identical logical (t,j).
       val = smem.CB[t * S + j] * __expf(smem.cumAdt[warp][t] - smem.cumAdt[warp][j]) *
             smem.dt_proc[warp][j];
     }
@@ -195,12 +275,9 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // seq_len);
 
   // ── Raw C·B MMA — ONCE per group, 2-warp N-split → fp32 smem.CB ──
-  // TODO(iterate): like compute_CB_scaled_2warp (common.cuh:869-938) but store
-  // the RAW, UNMASKED accumulator (fp32, no scaling) to row-major smem.CB —
-  // the causal mask + decay/dt scaling are per-head and deferred to
-  // scale_store_cb_gmem below.  Warps 0/1 split the N axis; warps 2/3 idle here
-  // (the heavy B/C reads happen once, not per-warp).
-  // compute_cb_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
+  // Warps 0/1 compute the matmul (the heavy B/C reads happen once, not
+  // per-warp); warps 2/3 idle here, then pick up heads in the loop below.
+  if (warp < 2) compute_cb_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
 
   // ── Warp-per-head ──
   // Each warp LDSMs the shared raw CB → fragA, scales by ITS head, STG.128s
