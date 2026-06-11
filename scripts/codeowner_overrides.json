@@ -1,6 +1,4 @@
 {
-  "*": ["@yzh119", "@sricketts", "@aleozlx", "@yongwww", "@cyx-6", "@saltyminty", "@bkryu", "@yyihuang", "@kahyunnam", "@jimmyzho", "@nv-yunzheq", "@samuellees", "@dhiraj113", "@qsang-nv"],
-
   "scripts/codeowner_overrides.json": ["@ci-users"],
 
   "flashinfer/attention.py": ["@flashinfer-ai/attention-owners"],
