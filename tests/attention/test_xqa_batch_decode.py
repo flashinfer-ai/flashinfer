@@ -4,7 +4,13 @@ from tests.test_helpers.sink_attention_reference import sink_attention_unified
 
 import flashinfer
 from flashinfer import SfLayout
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
+)
 from flashinfer.fp4_quantization import (
     nvfp4_quantize,
     e2m1_and_ufp8sf_scale_to_float,
@@ -436,12 +442,46 @@ def test_xqa_batch_decode(
     enable_sink,
     max_in_kv_len,
     kv_layout,
-    head_dim=128,
 ):
     """Test xqa_batch_decode_with_kv_cache function.
 
     This test supports both NHD and HND layouts.
     """
+    _run_xqa_batch_decode(
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+        page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_grp_size=head_grp_size,
+        window_left=window_left,
+        q_dtype=q_dtype,
+        o_dtype=o_dtype,
+        kv_dtype=kv_dtype,
+        enable_pdl=enable_pdl,
+        enable_sink=enable_sink,
+        max_in_kv_len=max_in_kv_len,
+        kv_layout=kv_layout,
+        head_dim=128,
+    )
+
+
+def _run_xqa_batch_decode(
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    kv_layout,
+    head_dim,
+):
+    """Shared body for the XQA batch-decode tests above/below."""
 
     # Set up test parameters
     torch.manual_seed(0)
@@ -580,7 +620,12 @@ def test_xqa_batch_decode(
 
 
 @pytest.mark.skipif(
-    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm100a_supported(torch.device("cuda"))
+        or is_sm120a_supported(torch.device("cuda"))
+        or is_sm121a_supported(torch.device("cuda"))
+    ),
     reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize("page_size", [16, 32, 64])
@@ -601,7 +646,7 @@ def test_xqa_batch_decode_head_dim_256_small_pages(
     test above only covers head_dim=128, so this exercises the
     head_dim=256 x small-page corner explicitly.
     """
-    test_xqa_batch_decode(
+    _run_xqa_batch_decode(
         batch_size=4,
         q_len_per_req=1,
         page_size=page_size,
