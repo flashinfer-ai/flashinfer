@@ -35,11 +35,12 @@
 //   (frag_acc, registers) is reused across the tile's heads; only the per-head
 //   decay scaling differs.  That is the whole point of the per-group grid.
 //
-// CB_scaled store: one STG.128 per thread of a PackedAligned<input_t> (16 B) in
-// fragA-native layout — the precompute never puts CB in (swizzled) smem and the
-// main never LDSMs it; each side does a single 16 B vectorized transfer of the
-// thread's 8-bf16 fragment.  (The two m16n8 N-tiles a thread accumulates ==
-// fragA's 8 elements in the same order — see scale_store_cb_gmem.)
+// CB handling: the 2-warp MMA writes raw C·B as FP32 to row-major smem.CB
+// (scale in fp32, like the monolithic).  Each warp then scales its head and
+// writes the result to gmem with one STG.128/thread in fragA-native layout —
+// the MAIN never LDSMs CB; it reads its 8-bf16 fragment with one LDG.128
+// straight into matmul-4's fragA.  bf16 conversion happens only at the gmem
+// store, so numerics match the monolithic.
 // =============================================================================
 #ifndef FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_PRECOMPUTE_CUH_
 #define FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_PRECOMPUTE_CUH_
@@ -53,40 +54,79 @@
 namespace flashinfer::mamba::checkpointing {
 
 // -----------------------------------------------------------------------------
-// Store one head's scaled CB to gmem in FRAGMENT-NATIVE layout, one STG.128 per
-// thread.  The two m16n8 N-tile accumulators that produce CB (n=[0,8) ++
-// n=[8,16), 4+4 f32/thread) have the SAME per-thread element order as `fragA`
-// for matmul-4's `CB @ x` (8 bf16/thread, mma.m16n8k16 A operand).  So laying
-// each thread's 8 scaled values out contiguously as [batch, head, lane, 8]
-// lets the MAIN kernel read them with a single LDG.128 straight into fragA —
-// no LDSM, no swizzle, no de-swizzle, neither side touches smem for CB.
+// Lean precompute smem: only the C·B-path buffers (B, C, CB_scaled) + per-warp
+// coefficients (warp-per-head).  Drops the monolithic CheckpointingSsuStorage's
+// state / old_x / old_B / x / z — none touched here — so the precompute uses
+// far less smem → more CTAs/SM → better occupancy (the lever we're chasing).
 //
-// `raw_cb` = this lane's 8 raw C·B values in fragA element order:
-//   e0=(r0,c0)   e1=(r0,c0+1) e2=(r1,c0)   e3=(r1,c0+1)   [N-tile 0]
-//   e4=(r0,c0+8) e5=(r0,c0+9) e6=(r1,c0+8) e7=(r1,c0+9)   [N-tile 1]
+// B / C / CB_scaled keep byte-identical swizzled layouts to
+// CheckpointingSsuStorage, so the same `make_swizzled_layout_rc` accessors in
+// the MMA / LDSM helpers index them unchanged.  cumAdt/dt_proc/decay are
+// PER-WARP (each warp owns its head's C1/C2) — unlike the monolithic's single
+// copy (one head per CTA).
+template <typename input_t, int NPREDICTED, int DSTATE, int NUM_WARPS>
+struct CheckpointingSsuPrecomputeStorage {
+  static constexpr int NPREDICTED_PAD_MMA_M = next_multiple_of<MMA_prop::M>(NPREDICTED);
+  static constexpr int NPREDICTED_PAD_MMA_N = next_multiple_of<MMA_prop::N>(NPREDICTED);
+  static constexpr int NPREDICTED_SWIZZLE_R =
+      next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
+  // Raw C·B kept in FP32 (scale in fp32 like the monolithic; cast to bf16 only
+  // at the final gmem STG.128 — storing raw as bf16 would lose the accumulator
+  // precision before scaling and diverge from the monolithic).  Simple
+  // row-major: the per-warp scale reads it by (t,j), NOT via LDSM, so there is
+  // no swizzle and no pad.
+  static constexpr int CB_STRIDE = NPREDICTED_PAD_MMA_M;
+  float CB[NPREDICTED_PAD_MMA_M * CB_STRIDE];  // 16×16 f32 ≈ 1 KB
+
+  alignas(16) input_t B[NPREDICTED_PAD_MMA_N * DSTATE];  // matmul-1 N-operand (swizzled)
+  alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];  // matmul-1 A-operand (swizzled)
+
+  // Per-warp coefficients — warp w owns its head's C1/C2 results.
+  float dt_proc[NUM_WARPS][NPREDICTED];
+  float cumAdt[NUM_WARPS][NPREDICTED];
+  float decay[NUM_WARPS][NPREDICTED];
+};
+
+// -----------------------------------------------------------------------------
+// Scale one head's raw C·B (read fp32 from smem.CB) and store to gmem in
+// FRAGMENT-NATIVE layout, one STG.128 per thread.  Each thread emits the 8
+// values that == matmul-4's `fragA` for this lane (mma.m16n8k16 A operand), so
+// the MAIN kernel reads them with a single LDG.128 straight into fragA — no
+// LDSM, no swizzle, neither side puts CB in smem as bf16.
+//
+// The 8 fragA elements for this lane map to CB coords (t,j) computed on the fly
+// from the register index e:
+//   e0=(r0,c0)   e1=(r0,c0+1) e2=(r1,c0)   e3=(r1,c0+1)   [cols 0..7]
+//   e4=(r0,c0+8) e5=(r0,c0+9) e6=(r1,c0+8) e7=(r1,c0+9)   [cols 8..15]
 // with r0=lane/4, r1=r0+8, c0=(lane%4)*2.
+// Scaling is done in fp32 (raw read fp32 from smem.CB), cast to bf16 only at
+// the pack — matches the monolithic's precision.
 // cb_gmem_head = &cb_scaled[batch_slot, head, 0]  (32 × PackedAligned<input_t>).
 template <typename input_t, typename SmemT>
 __device__ __forceinline__ void scale_store_cb_gmem(
-    float const (&raw_cb)[8], SmemT& smem, int lane, int seq_len,
+    SmemT& smem, int warp, int lane, int seq_len,
     PackedAligned<input_t>* __restrict__ cb_gmem_head) {
   static_assert(PackedAligned<input_t>::count == 8,
                 "cb_scaled fragA store assumes 8 input_t per 16 B pack (bf16)");
+  constexpr int S = SmemT::CB_STRIDE;
   int const r0 = lane / 4;
   int const c0 = (lane % 4) * 2;
   PackedAligned<input_t> packed;
 #pragma unroll
   for (int e = 0; e < 8; ++e) {
-    // fragA(m16n8k16) element e → (row t, col j), on the fly (folds at unroll):
-    //   row half = (e >> 1) & 1  → t = r0 + 8*half
-    //   N-tile   = (e >> 2) & 1  → j += 8*Ntile  (N-tile 1 covers cols [8,16))
-    //   col pair =  e & 1        → j += pair
+    // fragA(m16n8k16) element e → (row t, col j), on the fly (folds at unroll).
     int const t = r0 + (((e >> 1) & 1) << 3);
     int const j = c0 + (((e >> 2) & 1) << 3) + (e & 1);
     float val = 0.f;
     if (j <= t && t < seq_len && j < seq_len) {
       // C5: CB_scaled[t,j] = (C·B) * exp(cumAdt[t]-cumAdt[j]) * dt_proc[j].
-      val = raw_cb[e] * __expf(smem.cumAdt[t] - smem.cumAdt[j]) * smem.dt_proc[j];
+      // Raw C·B read fp32 from smem; per-warp coeffs (this warp owns this head).
+      // TODO(layout): `t * S + j` is a PLACEHOLDER row-major index.  The real
+      // offset must come from the SAME CuTe layout compute_cb_2warp uses to
+      // store the MMA accumulator (likely a swizzle, not row-major) — resolve
+      // both sides together when that helper lands.
+      val = smem.CB[t * S + j] * __expf(smem.cumAdt[warp][t] - smem.cumAdt[warp][j]) *
+            smem.dt_proc[warp][j];
     }
     packed.val[e] = static_cast<input_t>(val);
   }
@@ -99,7 +139,7 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           typename stateIndex_t, int NPREDICTED, int MAX_WINDOW, int DIM, int DSTATE,
           int HEADS_PER_GROUP, int NUM_WARPS, bool VARLEN = false>
 __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams params) {
-  using SmemT = CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE>;
+  using SmemT = CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, DSTATE, NUM_WARPS>;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int N_HALF = NPREDICTED_PAD_MMA_M / 2;
   // First cut: one CTA per (batch, group) — every head of the group handled by
@@ -154,13 +194,13 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // load_group_BC<input_t, NPREDICTED, DSTATE>(smem, params, lane, warp, group_idx, outer,
   // seq_len);
 
-  // ── Raw C·B MMA — ONCE per group, 2-warp N-split → swizzled smem.CB_scaled ──
+  // ── Raw C·B MMA — ONCE per group, 2-warp N-split → fp32 smem.CB ──
   // TODO(iterate): like compute_CB_scaled_2warp (common.cuh:869-938) but store
-  // the RAW (unscaled) accumulator to the swizzled smem.CB_scaled — the
-  // decay/dt scaling is per-head and deferred to the per-warp LDSM below.
-  // Warps 0/1 split the N axis; warps 2/3 idle here (the heavy B/C reads happen
-  // once, not per-warp).
-  // compute_cb_raw_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
+  // the RAW, UNMASKED accumulator (fp32, no scaling) to row-major smem.CB —
+  // the causal mask + decay/dt scaling are per-head and deferred to
+  // scale_store_cb_gmem below.  Warps 0/1 split the N axis; warps 2/3 idle here
+  // (the heavy B/C reads happen once, not per-warp).
+  // compute_cb_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
 
   // ── Warp-per-head ──
   // Each warp LDSMs the shared raw CB → fragA, scales by ITS head, STG.128s
@@ -200,14 +240,11 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       // decay_vec[batch, head, t] = exp(cumAdt[t]) (per-warp decay buffer).
       // if (lane < seq_len)
       //   decay_gmem[(seq*nheads + head)*NPREDICTED_PAD_MMA_M + lane] =
-      //       smem.decay_pw(warp, lane);
-      // LDSM the shared raw CB from smem.CB_scaled → raw_cb[8] (fragA order).
-      float raw_cb[8];
-      // ldsm_cb_raw<input_t>(smem, lane, raw_cb);
-      (void)raw_cb;
-      // C5: scale by this head's per-warp cumAdt/dt_proc + STG.128 fragA-native.
+      //       smem.decay[warp][lane];
+      // C5: scale the shared raw C·B (fp32, read from smem.CB) by this
+      // head's per-warp coeffs + STG.128 fragA-native to gmem.
       auto* cb_gmem_head = cb_gmem + (int64_t)(seq * params.nheads + head) * warpSize;
-      // scale_store_cb_gmem<input_t>(raw_cb, smem, warp, lane, seq_len, cb_gmem_head);
+      // scale_store_cb_gmem<input_t>(smem, warp, lane, seq_len, cb_gmem_head);
       (void)cb_gmem_head;
       // C7 + cache: store old_dt / old_cumAdt at write_offset (reuse
       // store_old_dt / store_old_cumAdt, common.cuh:1582+).
