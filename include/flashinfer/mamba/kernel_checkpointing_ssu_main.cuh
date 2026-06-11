@@ -34,9 +34,12 @@
 // Cache ownership (see precompute header): the main writes old_x (it loads x)
 // and state (the replay's C8); the precompute owns old_B / old_dt / old_cumAdt.
 //
-// PDL (first cut): gdc_wait before the load — a no-op without a programmatic
-// predecessor (e.g. T0).  Hiding the replay under the precompute (moving the
-// wait between matmul-3 and matmul-4) is the S9 overlap refinement.
+// PDL overlap: the load + state replay run BEFORE gdc_wait, so under the PDL
+// chain they overlap the precompute (the replay is the heaviest work — folding
+// old tokens into state + the C8 HBM write); only the cb_scaled / cumAdt_vec
+// consumption (β + matmul-4) waits.  gdc_wait is a no-op without a programmatic
+// predecessor (T0 / non-PDL).  (matmul-3 C@state is still post-wait; moving it
+// pre-wait would split compute_and_store_output — a further refinement.)
 // =============================================================================
 #ifndef FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_MAIN_CUH_
 #define FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_MAIN_CUH_
@@ -59,7 +62,7 @@ namespace flashinfer::mamba::checkpointing {
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_main_data(SmemT& smem, CheckpointingSsuParams const& params,
-                                               int lane, int warp, int d_tile, int seq, int head,
+                                               int lane, int warp, int d_tile, int head,
                                                int group_idx, int64_t cache_slot, int buf_read,
                                                int64_t outer, int seq_len) {
   using namespace cute;
@@ -118,18 +121,10 @@ __device__ __forceinline__ void load_main_data(SmemT& smem, CheckpointingSsuPara
   }
 
   // ── Scalar: old_dt / old_cumAdt (shared helper) ──
+  // cumAdt itself (← cumAdt_vec) is a precompute OUTPUT, loaded post-gdc_wait in
+  // the kernel — not here (this load is the pre-wait, precompute-independent set).
   load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, MAX_WINDOW, smem.old_dt,
                      smem.old_cumAdt);
-
-  // ── cumAdt ← precompute's raw cumAdt_vec (replaces the monolithic's C1/C2) ──
-  // The output epilogue exp's smem.cumAdt for β (OUT.1); the [seq_len, NPREDICTED)
-  // tail stays uninitialized but is gated by seq_len downstream (same as the
-  // monolithic's scan tail).
-  auto const* __restrict__ cumAdt_ptr = reinterpret_cast<float const*>(params.cumAdt_vec);
-  if (lane < seq_len) {
-    smem.cumAdt[lane] =
-        cumAdt_ptr[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane];
-  }
 
   __pipeline_commit();
   __pipeline_wait_prior(0);
@@ -197,23 +192,52 @@ __global__ void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
   auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
   float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
 
-  // ── PDL: wait for the precompute (cb_scaled / cb_old / cumAdt_vec) ──
-  // No-op without a programmatic predecessor (T0).  First cut waits before the
-  // load; the replay-overlap refinement is S9.
+  // ════════════════════════════════════════════════════════════════════════
+  // PRE-gdc_wait: load + state replay — all precompute-INDEPENDENT, so it
+  // overlaps the precompute under the PDL chain (the whole point of the split).
+  // ════════════════════════════════════════════════════════════════════════
+  // Load the cache + conv1d data (state, old_*, x, z, C) — NOT the precompute's
+  // cumAdt_vec/cb_scaled, which are loaded post-wait below.
+  load_main_data<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
+      smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, outer, seq_len);
+
+  if (must_checkpoint) {
+    __syncthreads();  // state (per-warp split) visible cross-warp before the replay
+    // Replay: fold old tokens into state + C8 stochastic-round → HBM.  Reads only
+    // cache (old_x/old_B/old_dt/old_cumAdt) + state — precompute-independent.
+    int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
+    int64_t const state_ptr_offset =
+        cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
+    state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) + state_ptr_offset +
+                                  (int64_t)d_tile * D_PER_CTA * DSTATE;
+    replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
+        smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
+        /*must_checkpoint=*/true);
+  }
+
+  // ── gdc_wait: the load + replay above overlap the precompute; only the
+  // cb_scaled / cumAdt_vec consumption below waits.  No-op without a
+  // programmatic predecessor (T0 / non-PDL). ──
   if constexpr (ENABLE_PDL) {
     cudaGridDependencySynchronize();
   }
 
-  load_main_data<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, lane, warp, d_tile, seq, head, group_idx, cache_slot, buf_read, outer, seq_len);
-
-  // Cross-warp visibility: state (per-warp split), x (W2), z (W3), C, old_*.
+  // ════════════════════════════════════════════════════════════════════════
+  // POST-gdc_wait: consume the precompute's outputs.
+  // ════════════════════════════════════════════════════════════════════════
+  // cumAdt_vec → smem.cumAdt (the existing exp(smem.cumAdt) epilogue gives β).
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  auto const* __restrict__ cumAdt_ptr = reinterpret_cast<float const*>(params.cumAdt_vec);
+  if (lane < seq_len) {
+    smem.cumAdt[lane] =
+        cumAdt_ptr[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane];
+  }
+  // Publish: the replay's folded state (write path), the load's x/z/C/old_*, and
+  // cumAdt_vec — all cross-warp before the output reads them.
   __syncthreads();
 
-  // ── Precompute CB pointers (fragA-native, per (batch_slot, head)) ──
-  // REGS = K/2: new = NPREDICTED_PAD_MMA_M/2 (=8, m16n8k16); old =
-  // MAX_WINDOW_PAD_MMA_K/2 (matmul-4-old's m16n8k{K_old}).
-  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  // Precompute CB pointers (fragA-native, per (batch_slot, head)).  REGS = K/2:
+  // new = NPREDICTED_PAD_MMA_M/2 (=8, m16n8k16); old = MAX_WINDOW_PAD_MMA_K/2.
   constexpr int CB_NEW_REGS = NPREDICTED_PAD_MMA_M / 2;
   constexpr int CB_OLD_REGS = SmemT::MAX_WINDOW_PAD_MMA_K / 2;
   auto const* __restrict__ cb_gmem_head =
@@ -221,21 +245,21 @@ __global__ void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
       (int64_t)(seq * params.nheads + head) * warpSize * CB_NEW_REGS;
 
   if (must_checkpoint) {
-    // Replay (folds old → state, writes state HBM) + output; matmul-4 reads
-    // cb_scaled.  Old-token contribution comes via the folded state (no cb_old).
-    ssu_checkpoint<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS, PHILOX_ROUNDS,
-                   /*READ_PRECOMPUTED_CB=*/true>(smem, params, warp, lane, prev_k, d_tile,
-                                                 out_seq_base, head, cache_slot, D_val, seq_len,
-                                                 cb_gmem_head);
+    // Output: matmul-3 (C@folded-state) + β + matmul-4 (cb_scaled@x).  The old
+    // tokens' contribution is already in the folded state (no cb_old).
+    compute_and_store_output<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                             PHILOX_ROUNDS, /*READ_PRECOMPUTED_CB=*/true>(
+        smem, params, warp, lane, d_tile, out_seq_base, head, cache_slot, D_val,
+        /*must_checkpoint=*/true, seq_len, cb_gmem_head);
   } else {
-    // No replay (state stays s_0); output = C@s_0 + cb_scaled@x + cb_old@old_x.
+    // No replay (state = s_0); output = β·C@s_0 + cb_scaled@x + cb_old@old_x.
     auto const* __restrict__ cb_old_head =
         reinterpret_cast<input_t const*>(params.cb_old) +
         (int64_t)(seq * params.nheads + head) * warpSize * CB_OLD_REGS;
-    ssu_nocheckpoint<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                     /*READ_PRECOMPUTED_CB=*/true>(smem, params, warp, lane, prev_k, d_tile,
-                                                   out_seq_base, head, cache_slot, D_val, seq_len,
-                                                   cb_gmem_head, cb_old_head);
+    compute_no_write_output<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                            NUM_WARPS, /*READ_PRECOMPUTED_CB=*/true>(
+        smem, params, warp, lane, prev_k, d_tile, out_seq_base, head, cache_slot, D_val, seq_len,
+        cb_gmem_head, cb_old_head);
   }
 
   // ── PDL: signal `output` written; the cache write below is next-step-only ──
