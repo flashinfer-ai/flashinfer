@@ -121,7 +121,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   FusedMoeRunner(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                  bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                 bool use_mxfp8_act_scaling, bool use_packed_weights) {
+                 bool use_mxfp8_act_scaling, bool use_packed_weights, bool use_fused_finalize) {
     mActivationDtype = activation_dtype;
     mWeightDtype = weight_dtype;
     mUsePackedWeights = use_packed_weights;
@@ -129,6 +129,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
     mUseW4GroupScaling = use_w4_group_scaling;
     mUseMxfp8ActScaling = use_mxfp8_act_scaling;
+    mUseFusedFinalize = use_fused_finalize;
     mInnerDimMultiplier = 1;
 
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
@@ -226,6 +227,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << ", Weight: " << DLDataTypeToString(mWeightDtype)
           << ", Output: " << DLDataTypeToString(mOutputDtype);
     }
+
+    // Must be set before enumerating tactics below: it gates whether GEMM2 finalize-fusion
+    // tactics are produced (mayHaveFinalizeFused) and the corresponding workspace sizing.
+    mKernelRunner->use_fused_finalize_ = mUseFusedFinalize;
 
     mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
     // Get tactics for both GEMM1 and GEMM2, combine them
@@ -806,6 +811,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool mUseW4GroupScaling = false;
   bool mUseMxfp8ActScaling = false;
   bool mUsePackedWeights = false;
+  bool mUseFusedFinalize = true;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
@@ -1289,10 +1295,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
 tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                       bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                      bool use_mxfp8_act_scaling, bool use_packed_weights) {
+                      bool use_mxfp8_act_scaling, bool use_packed_weights,
+                      bool use_fused_finalize) {
   auto ptr = tvm::ffi::make_object<FusedMoeRunner>(
       activation_dtype, weight_dtype, output_dtype, use_deepseek_fp8_block_scale,
-      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights);
+      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights, use_fused_finalize);
   return tvm::ffi::Module(ptr);
 }
 
