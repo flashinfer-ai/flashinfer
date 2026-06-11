@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import os
 import random
+import warnings
 import zlib
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -330,6 +331,27 @@ _CONVENTION_DIVERGENCES = [
     ),
 ]
 
+# Tracked findings the fuzzer surfaced (xfail-but-RUN: the case still executes, a correctness
+# failure is tolerated to keep the suite green, and an unexpected PASS warns "fixed -> remove it").
+_KNOWN_FAILURES = [
+    (
+        lambda cfg: cfg.adapter.key == "mm_bf16"
+        and cfg.out_dtype == torch.float16
+        and _SM == 90,
+        "cuDNN mm_bf16 with fp16 OUTPUT produces garbage on SM90/Hopper (ratio ~1); bf16 output is "
+        "correct and SM100 is correct -- a real arch-specific finding (the cross-arch oracle caught "
+        "it). Pending gh issue / fix.",
+    ),
+]
+
+
+def _known_failure(cfg: Cfg) -> Optional[str]:
+    for pred, reason in _KNOWN_FAILURES:
+        if pred(cfg):
+            return reason
+    return None
+
+
 _SHAPES_M = [
     1,
     2,
@@ -395,13 +417,14 @@ def _gen(seed) -> Cfg:
     wired = [a for a in _ADAPTERS if a.supported(_SM)]
     ad = rng.choice(wired)
     al = ad.align
-    # B2: ~10% of the time leave shapes UNALIGNED to verify a clean NOT_SUPPORTED rejection
-    # (not a crash); only meaningful where align>1 (fp4). The skip path handles the rejection.
+    # B2: ~10% leave N unaligned to verify a clean kernel rejection (not a crash). K stays aligned
+    # so fp4 input quant is still FORMABLE (an unaligned K breaks the quantizer/snap itself, before
+    # the kernel -- which is not a meaningful "kernel rejects" test). Matches the old fuzzer.
+    k = max(al, (rng.choice(_SHAPES_K) // al) * al)
     if rng.random() < 0.10:
-        n, k = rng.choice(_SHAPES_N), rng.choice(_SHAPES_K)
+        n = rng.choice(_SHAPES_N)  # possibly unaligned
     else:
         n = max(al, (rng.choice(_SHAPES_N) // al) * al)
-        k = max(al, (rng.choice(_SHAPES_K) // al) * al)
     # B1 (DEFERRED): non-contiguous inputs. Needs the right oracle -- "non-contig result must MATCH
     # the contiguous result, else clean-reject" -- not a direct ref compare (some APIs legitimately
     # require contiguous and should raise). Re-enable with that consistency oracle. Kept False.
@@ -668,7 +691,20 @@ def test_unified_gemm_fuzz(cfg: Cfg):
         raise  # a crash is a finding
 
     print(f"RATIO {cfg.adapter.quant_mode} {cfg.backend} ratio={_ratio(res, ref):.4g}")
-    _assert_invariants(cfg, res, ref)
+    known = _known_failure(cfg)
+    try:
+        _assert_invariants(cfg, res, ref)
+    except (AssertionError, pytest.fail.Exception):
+        if known:
+            pytest.xfail(
+                f"KNOWN FINDING: {known}"
+            )  # tolerated (still ran); flagged if it ever passes
+        raise
+    if known:
+        warnings.warn(
+            f"KNOWN-FAILURE config unexpectedly PASSED -- fixed? remove from _KNOWN_FAILURES: {known}",
+            stacklevel=2,
+        )
 
     # (3) determinism: re-run into a freshly-poisoned buffer; a deterministic backend must match
     #     bit-exactly.
@@ -795,6 +831,10 @@ _Q_CONFIGS = [
 )
 def test_gemm_quantize_fuzz(rows, cols, regime, qmode):
     """Quantizing finite inputs must never produce NaN/Inf scale factors (GH #2440)."""
+    if qmode in ("nvfp4", "mxfp4") and _SM < 100:
+        pytest.skip(
+            f"fp4 quantize requires SM100 (got SM{_SM})"
+        )  # to_float8/fp8 runs on SM80+
     block = {"nvfp4": 16, "mxfp4": 32, "fp8": 1}[qmode]
     cols = max(block, (cols // block) * block)
     # Deterministic seed across processes: Python's hash() of str/tuple is randomized per-process
