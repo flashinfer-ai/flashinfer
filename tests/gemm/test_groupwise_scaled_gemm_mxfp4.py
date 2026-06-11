@@ -131,6 +131,24 @@ def dequantize_e2m1(x):
     return x_dequant
 
 
+def assert_close_chunked(actual, expected, *, atol, rtol, chunk_rows=2048):
+    """Row-chunked ``torch.testing.assert_close``.
+
+    The comparison allocates several temporaries proportional to the operand
+    size; for the large cases here that pushes a 32GB GPU over the edge after
+    the kernel outputs are resident (gh #3527). Chunking caps the comparison
+    overhead while checking exactly the same elements.
+    """
+    assert actual.shape == expected.shape
+    for i in range(0, actual.shape[0], chunk_rows):
+        torch.testing.assert_close(
+            actual[i : i + chunk_rows],
+            expected[i : i + chunk_rows],
+            atol=atol,
+            rtol=rtol,
+        )
+
+
 def gemm_mxfp8_mxfp4_nt_groupwise_ref(
     A, B, As, Bs, tile_size, n, k, output_dtype=torch.bfloat16
 ):
@@ -158,7 +176,15 @@ def gemm_mxfp8_mxfp4_nt_groupwise_ref(
 
 def quantize_tensor(x, tile_size, n_padded, k_padded, quant_mode):
     r"""
-    Quantizes a tensor to MXFP4 or MXFP8.
+    Quantizes a tensor to MXFP4 or MXFP8, chunked over the leading dim.
+
+    The underlying reference quantization materializes ~10 fp32 temporaries
+    the size of its input (log2/exp2/round/sign/... in ``quantize_e2m1`` and
+    the tiled-scale math below), so quantizing a large operand in one shot
+    peaks at ~10x its fp32 size — the dominant allocation behind the 32GB-GPU
+    OOMs in gh #3527.  Chunking over the leading dimension bounds the
+    temporaries while producing identical bytes (every step is elementwise or
+    tiled along the last dim only).
 
     Args:
         x (torch.Tensor): The input tensor.
@@ -171,6 +197,21 @@ def quantize_tensor(x, tile_size, n_padded, k_padded, quant_mode):
         tuple: A tuple containing the quantized tensor and the
                calculated scales.
     """
+    # ~32M fp32 elements (~128MB) per chunk keeps the ~10x temporary
+    # footprint near 1GB regardless of the test case size.
+    elems_per_lead = x[0].numel()
+    lead_per_chunk = max(1, (1 << 25) // max(1, elems_per_lead))
+    if x.shape[0] <= lead_per_chunk:
+        return _quantize_tensor_impl(x, tile_size, n_padded, k_padded, quant_mode)
+    quants, scales = [], []
+    for x_chunk in x.split(lead_per_chunk, dim=0):
+        q, s = _quantize_tensor_impl(x_chunk, tile_size, n_padded, k_padded, quant_mode)
+        quants.append(q)
+        scales.append(s)
+    return torch.cat(quants), torch.cat(scales)
+
+
+def _quantize_tensor_impl(x, tile_size, n_padded, k_padded, quant_mode):
     # 1. Initial Setup
     ue8m0_bias = 127
     if quant_mode == QuantMode.MXFP8_E4M3:
@@ -281,6 +322,9 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
     b_fp4, b_scale = quantize_tensor(
         b_val, tile_size, n_padded, k_padded, QuantMode.MXFP4
     )
+    # The fp32 sources are only needed for quantization; freeing them matters
+    # on 32GB GPUs where the large cases otherwise OOM (gh #3527).
+    del a_val, b_val
 
     a_scale_swizzled = swizzle_blockscale(
         a_scale.unflatten(0, (group_size, m)), group_size, m, k_padded, tile_size
@@ -314,6 +358,7 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
         for i, x in enumerate(a_scale_chunked)
     ]
     a_scale_swizzled = torch.cat(a_scale_chunked)
+    del a_scale_chunked
 
     out_ref = torch.empty((group_size * m, n), dtype=out_dtype, device="cuda")
     for i in range(group_size):
@@ -357,7 +402,8 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
             swap_ab=swap_ab,
             out_dtype=out_dtype,
         )[:, :n]
-        torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+        assert_close_chunked(out, out_ref, atol=1e-2, rtol=1e-2)
+        del out
 
 
 if __name__ == "__main__":
