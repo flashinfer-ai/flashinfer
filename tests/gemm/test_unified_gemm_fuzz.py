@@ -3,10 +3,15 @@
 ONE harness for the whole {op-shape} x {quant-mode} x {backend} cross-product instead of N
 per-API files, built on the same best-practice oracle kit as the unified MoE fuzzer
 (``tests/moe/test_unified_moe_fuzz.py``):
-  * adversarial input regimes (tiny / large / mixed-rows / with-zeros / skewed) + nasty shapes
-    (non-pow2, the "in-between" M that broke tile selection #3398, degenerate 1/2/3),
-  * reference-aware no-spurious-NaN/Inf (only flag non-finite where the fp32 ref is finite),
-  * not-(almost)-all-zero vs a non-trivial reference (#3398/#3068 M-dependent / arch-divergent),
+  * SPARSE (~75% zero) + EXACTLY-REPRESENTABLE inputs (snapped to each quant mode's grid), so input
+    quantization is lossless and the gemm reductions are short -- a structural bug (wrong tile /
+    dropped block / wrong scale) is a GROSS error, not one averaged away. This is the MoE harness's
+    model (it dropped the old magnitude-regime axis for this), enabling a TIGHT numeric oracle
+    instead of a loose cosine. Nasty shapes too (non-pow2, the "in-between" M that broke tile
+    selection #3398, degenerate 1/2/3, occasional unaligned -> clean reject).
+  * numeric vs an AUTHORITATIVE reference at a tight per-quant-mode tolerance atol=C*||ref||_inf
+    (input quant is lossless, so C is the accumulation/requant floor, NOT the dense-random fp4/fp8
+    quant error); + reference-aware no-spurious-NaN/Inf; + not-(almost)-all-zero (#3398/#3068),
   * output-buffer POISON (NaN-fill so a kernel that doesn't fully write its output is caught),
   * run-to-run determinism (#2514),
   * device-state probe after each config (a context-corrupting IMA -> clean failure),
@@ -37,13 +42,14 @@ becomes the proof the convention was unified.
 STATUS: framework + 4 grounded adapters (bf16 mm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm) +
 a standalone quantize-root fuzzer. This file REPLACES the earlier per-op ``test_mm_fp4_fuzz.py`` /
 ``test_bmm_fp8_fuzz.py`` (their logic + the #2440 quantize test are folded in here). Validated on
-SM100 (B200). EXTEND by folding in more adapters one ``GemmAdapter`` at a time: mm_fp8 (low-latency,
+A100/SM80, L40S/SM89, H100/SM90, B200/SM100. EXTEND by folding in more adapters one ``GemmAdapter``
+at a time: mm_fp8 (low-latency,
 needs ``prepare_low_latency_gemm_weights`` -- a distinct convention), mm_mxfp8, bmm_mxfp8, and the
 grouped ``group_*`` / ``*deepgemm*`` entries (m_indptr op-shape).
 
 Run (needs CUDA_HOME for JIT; SM100 for the fp4 adapters, SM89+ for fp8):
   CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<idx> pytest -q tests/gemm/test_unified_gemm_fuzz.py
-Env: FLASHINFER_GEMM_FUZZ_NUM_TESTS (default 250), FLASHINFER_GEMM_FUZZ_SEED (default 0),
+Env: FLASHINFER_GEMM_FUZZ_NUM_TESTS (default 1000, ~10 min), FLASHINFER_GEMM_FUZZ_SEED (default 0),
      FLASHINFER_GEMM_FUZZ_ONLY_SEED (comma-separated seeds -> run ONLY those configs; the
      perfect-repro hook printed on every failure).
 
@@ -74,6 +80,7 @@ from flashinfer import (
     mxfp4_quantize,
     nvfp4_quantize,
 )
+from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float, mxfp4_dequantize
 from flashinfer.utils import LibraryError, get_compute_capability
 
 try:
@@ -82,7 +89,9 @@ except Exception:  # pragma: no cover - constant may move between versions
     CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "\0never-matches\0"
 from tests.utils_fp8 import to_float8
 
-NUM_TESTS = int(os.environ.get("FLASHINFER_GEMM_FUZZ_NUM_TESTS", "250"))
+# Default sized so a full sweep is a substantial fuzz (~10 min on a warm cache on one GPU). Tune
+# down via the env var for a quick smoke; the per-config seed makes any failure reproducible.
+NUM_TESTS = int(os.environ.get("FLASHINFER_GEMM_FUZZ_NUM_TESTS", "1000"))
 BASE_SEED = int(os.environ.get("FLASHINFER_GEMM_FUZZ_SEED", "0"))
 # Perfect-repro hook: if set (comma-separated seeds), the suite runs ONLY those configs --
 # `_gen(seed)` is fully deterministic, so a single seed reproduces one config exactly. The
@@ -118,11 +127,9 @@ _SKIP_KW = (
 )
 _CRASH_KW = ("cuda error", "illegal memory", "misaligned", "device-side assert")
 
+# Magnitude regimes are used ONLY by the standalone quantize-root fuzzer (test_gemm_quantize_fuzz),
+# where extreme magnitudes are the point (#2440). The main fuzz uses sparse + exact-grid (below).
 _REGIMES = ["normal", "tiny", "large", "mixed_rows", "with_zeros", "skewed"]
-_INRANGE = (
-    "normal",
-    "with_zeros",
-)  # where a spurious-NaN / all-zero assertion is meaningful
 
 
 def _is_unsupported(e: Exception) -> bool:
@@ -357,7 +364,6 @@ class Cfg:
     m: int
     n: int
     k: int
-    regime: str
     out_dtype: torch.dtype
     fp8_idt: Optional[torch.dtype] = (
         None  # fp8 A-operand dtype (e4m3/e5m2); None -> e4m3
@@ -379,7 +385,7 @@ class Cfg:
         mode = f"_{mode}" if mode else ""
         return (
             f"{self.adapter.key}_{self.backend}_{sh}m{self.m}_n{self.n}_k{self.k}_"
-            f"{self.regime}_{dt}{fp8}{mode}_s{self.seed}"
+            f"{dt}{fp8}{mode}_s{self.seed}"
         )
 
 
@@ -427,7 +433,6 @@ def _gen(seed) -> Cfg:
         m=rng.choice(_SHAPES_M),
         n=n,
         k=k,
-        regime=rng.choice(_REGIMES),
         out_dtype=rng.choice([torch.bfloat16, torch.float16]),
         fp8_idt=fp8_idt,
         fp8_mdt=fp8_mdt,
@@ -450,12 +455,67 @@ else:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Per-quant-mode SNAP (round-trip a bf16 tensor onto that mode's exact grid -> input quant lossless)
+# + tight tolerance. Same model as the MoE harness: with exact-grid inputs the oracle measures the
+# accumulation/requant floor, not the (large) dense-random quant error, so C can be tight.
+# ---------------------------------------------------------------------------
+def _snap_bf16(t, dtype=None):
+    return t  # bf16 is exactly representable; the gemm accumulates in fp32
+
+
+def _snap_fp8(t, dtype):
+    dt = dtype or torch.float8_e4m3fn
+    q, s = to_float8(t, dtype=dt)
+    return (q.float() * s).to(torch.bfloat16)
+
+
+def _snap_nvfp4(t, dtype=None):
+    flat = t.reshape(-1, t.shape[-1])
+    gsf = (448 * 6) / flat.float().abs().nan_to_num().max().clamp_min(1e-30)
+    q, sf = nvfp4_quantize(flat, gsf, sfLayout=SfLayout.layout_128x4, do_shuffle=False)
+    deq = e2m1_and_ufp8sf_scale_to_float(
+        q.cpu(), sf.cpu().view(torch.uint8).reshape(-1), (1.0 / gsf).cpu(), 16, 1, False
+    )
+    return deq.reshape(t.shape).to(t.device, torch.bfloat16)
+
+
+def _snap_mxfp4(t, dtype=None):
+    flat = t.reshape(-1, t.shape[-1])
+    q, sf = mxfp4_quantize(flat)
+    deq = mxfp4_dequantize(q, sf)
+    return deq.reshape(t.shape).to(t.device, torch.bfloat16)
+
+
+# (snap, atol_frac, rtol). atol = atol_frac*||ref||_inf. Tight because inputs are exact-grid; final
+# values calibrated on SM100 (observed max-ratio per mode, ~2x margin) -- see the RATIO diagnostic.
+_QMODE = {
+    # Calibrated on SM100 (60-config sweep, observed max-ratio): bf16 .0027, fp8 .0092 (incl e5m2),
+    # mxfp4 .0039, nvfp4 .053. atol_frac set ~3-5x that (extra margin on bf16/fp8 for cross-arch).
+    "bf16": (_snap_bf16, 1.5e-2, 1.0e-2),
+    "fp8": (_snap_fp8, 4.0e-2, 5.0e-2),
+    "nvfp4": (_snap_nvfp4, 1.2e-1, 1.0e-1),
+    "mxfp4": (_snap_mxfp4, 2.0e-2, 5.0e-2),
+}
+
+
+def _sparse(shape, rng):
+    """~75% zeros, bf16, deterministically seeded -> short gemm reductions so structural bugs are
+    gross, not averaged away (the MoE/cuDNN sparse trick)."""
+    g = torch.Generator(device="cuda").manual_seed(rng.randint(0, 2**31 - 1))
+    dense = torch.randn(shape, device="cuda", generator=g)
+    keep = torch.rand(shape, device="cuda", generator=g) >= 0.75
+    return (dense * keep).to(torch.bfloat16)
+
+
 def _canonical(cfg: Cfg, salt: int):
-    """NT-convention canonical bf16 inputs: a=[(B,)M,K], b=[(B,)N,K]; reference = a @ b^T (fp32)."""
+    """Sparse + exact-grid NT inputs: a=[(B,)M,K], b=[(B,)N,K] snapped to the quant mode's grid;
+    reference = snapped_a @ snapped_b^T (fp32) -- the authoritative oracle."""
+    snap = _QMODE[cfg.adapter.quant_mode][0]
     pre = (cfg.b,) if cfg.adapter.op_shape == "bmm" else ()
-    a = _regime_tensor((*pre, cfg.m, cfg.k), cfg.regime, random.Random(cfg.seed + salt))
-    b = _regime_tensor(
-        (*pre, cfg.n, cfg.k), cfg.regime, random.Random(cfg.seed + salt + 1)
+    a = snap(_sparse((*pre, cfg.m, cfg.k), random.Random(cfg.seed + salt)), cfg.fp8_idt)
+    b = snap(
+        _sparse((*pre, cfg.n, cfg.k), random.Random(cfg.seed + salt + 1)), cfg.fp8_mdt
     )
     ref = torch.matmul(a.float(), b.float().transpose(-2, -1))
     return a, b, ref
@@ -479,8 +539,7 @@ def _describe(cfg: Cfg) -> str:
         f"CONFIG {cfg.label}\n"
         f"  adapter={cfg.adapter.key} op={cfg.adapter.op_shape} quant={cfg.adapter.quant_mode} "
         f"backend={cfg.backend} convention={cfg.adapter.convention}\n"
-        f"  shape: b={cfg.b} m={cfg.m} n={cfg.n} k={cfg.k}  regime={cfg.regime} "
-        f"out_dtype={cfg.out_dtype}\n"
+        f"  shape: b={cfg.b} m={cfg.m} n={cfg.n} k={cfg.k}  out_dtype={cfg.out_dtype}\n"
         f"  modes: noncontig={cfg.noncontig} use_8x4={cfg.use_8x4} "
         f"fp8=({cfg.fp8_idt},{cfg.fp8_mdt})  seed={cfg.seed}"
     )
@@ -538,38 +597,44 @@ def _as_noncontig(t: torch.Tensor) -> torch.Tensor:
     return pad[..., ::2]
 
 
+def _ratio(res: torch.Tensor, ref: torch.Tensor) -> float:
+    """max|out-ref| / ||ref||_inf -- the per-config error ratio (used to calibrate atol_frac)."""
+    denom = ref.abs().max().item()
+    return (res.float() - ref).abs().max().item() / denom if denom > 0 else 0.0
+
+
 def _assert_invariants(cfg: Cfg, res: torch.Tensor, ref: torch.Tensor):
     resf = res.float()
-    # (1) reference-aware no-spurious-NaN/Inf (only meaningful in-range; edge regimes legitimately
-    #     overflow the dtype and the reference overflows too).
-    if cfg.regime in _INRANGE:
-        ref_od = ref.to(cfg.out_dtype).float()
-        bad = int(((~torch.isfinite(resf)) & torch.isfinite(ref_od)).sum().item())
-        if bad != 0:
-            _fail(
-                cfg,
-                f"{bad}/{resf.numel()} spurious NaN/Inf where oracle is finite "
-                f"(#2440/#3103/#3334-class)",
-                res,
-                ref,
-            )
-    # (2) not (almost) all-zero vs a non-trivial reference (#3398/#3068 M-dependent / arch-divergent).
-    if cfg.regime in _INRANGE and ref.abs().max().item() > 1e-3:
-        nz = (resf.abs() > 0).float().mean().item()
-        if nz <= 0.01:
-            _fail(
-                cfg,
-                f"~all-zero output (nz_frac={nz:.4f}) vs non-trivial oracle (#3398/#3068-class)",
-                res,
-                ref,
-            )
-    # (4) loose numeric oracle only on the well-conditioned regime (FP4/FP8 quant error is large in
-    #     edge regimes; structural invariants cover those). A tight snapped-input reference is the
-    #     planned upgrade (see module docstring / MoE harness check #2).
-    if cfg.regime == "normal" and ref.abs().max().item() > 1e-2:
-        cos = F.cosine_similarity(ref.reshape(-1), resf.reshape(-1), dim=0).item()
-        if cos <= 0.90:
-            _fail(cfg, f"cosine {cos:.4f} too low vs oracle", res, ref)
+    # (1) reference-aware no-spurious-NaN/Inf. Inputs are exact-grid + well-conditioned (sparse
+    #     randn), so the reference is finite and any non-finite output is a real defect.
+    bad = int(((~torch.isfinite(resf)) & torch.isfinite(ref)).sum().item())
+    if bad != 0:
+        _fail(
+            cfg,
+            f"{bad}/{resf.numel()} spurious NaN/Inf where oracle is finite (#2440/#3103/#3334-class)",
+            res,
+            ref,
+        )
+    # (2) TIGHT numeric vs the authoritative exact-grid reference (replaces the loose cosine). With
+    #     lossless input quant, atol_frac is the accumulation/requant floor -> catches structural
+    #     bugs grossly AND sub-floor accuracy regressions a cosine oracle misses.
+    _, atol_frac, rtol = _QMODE[cfg.adapter.quant_mode]
+    atol = atol_frac * ref.abs().max().item() + 1e-3
+    over = (resf - ref).abs() > (atol + rtol * ref.abs())
+    if over.any():
+        _fail(
+            cfg,
+            f"{int(over.sum())}/{resf.numel()} elems exceed tol "
+            f"(atol_frac={atol_frac} rtol={rtol} atol={atol:.3g}, ratio={_ratio(res, ref):.4g})",
+            res,
+            ref,
+        )
+    # (3) not (almost) all-zero vs a non-trivial reference -- redundant with (2) but a crisp #3398
+    #     signal in the log.
+    if ref.abs().max().item() > 1e-3 and (resf.abs() > 0).float().mean().item() <= 0.01:
+        _fail(
+            cfg, "~all-zero output vs non-trivial oracle (#3398/#3068-class)", res, ref
+        )
 
 
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
@@ -605,6 +670,7 @@ def test_unified_gemm_fuzz(cfg: Cfg):
             pytest.skip(f"unsupported {cfg.label}: {e}")
         raise  # a crash is a finding
 
+    print(f"RATIO {cfg.adapter.quant_mode} {cfg.backend} ratio={_ratio(res, ref):.4g}")
     _assert_invariants(cfg, res, ref)
 
     # (3) determinism: re-run into a freshly-poisoned buffer; a deterministic backend must match
@@ -672,7 +738,6 @@ def test_convention_conformance(capsys):
             m=128,
             n=256,
             k=256,
-            regime="normal",
             out_dtype=torch.bfloat16,
         )
         a, b, _ref = _canonical(cfg, salt=7)
