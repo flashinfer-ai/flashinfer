@@ -249,7 +249,7 @@ def gen_attention(
         )
         # The holistic (persistent) batch-attention kernel
         # does not support head_dim=512.
-        if head_dim_vo <= 256:
+        if head_dim_qk <= 256 and head_dim_vo <= 256:
             yield gen_batch_attention_module(
                 dtype_q=dtype_qo,
                 dtype_kv=dtype_kv,
