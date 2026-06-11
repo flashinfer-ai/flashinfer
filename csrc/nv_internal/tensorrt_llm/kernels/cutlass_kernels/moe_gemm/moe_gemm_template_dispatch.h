@@ -68,6 +68,9 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels_oss {
+#if defined(ENABLE_FP4)
+using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
+#endif
 
 // ============================= Variable batched Gemm things ===========================
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
@@ -97,7 +100,7 @@ struct genericMoeGemmKernelLauncher {
     static_assert(cutlass::platform::is_same<T, WeightType>::value ||
                   cutlass::platform::is_same<WeightType, uint8_t>::value ||
 #if defined(ENABLE_FP4)
-                  cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value ||
+                  cutlass::platform::is_same<WeightType, Fp4Type>::value ||
 #endif
                   cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value);
 
@@ -253,7 +256,7 @@ static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputT
   constexpr bool isFp8 = false;
 #endif
 #if defined(ENABLE_FP4)
-  constexpr bool isFp4 = std::is_same_v<T, __nv_fp4_e2m1>;
+  constexpr bool isFp4 = std::is_same_v<T, Fp4Type>;
 #else
   constexpr bool isFp4 = false;
 #endif
@@ -758,7 +761,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
 
   if (sm_ >= 75 && sm_ < 80) {
 #if defined(ENABLE_FP4)
-    constexpr bool is_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
+    constexpr bool is_fp4 = std::is_same_v<WeightType, Fp4Type>;
 #else
     constexpr bool is_fp4 = false;
 #endif
@@ -771,7 +774,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
     }
   } else if (sm_ >= 80 && sm_ < 90) {
 #if defined(ENABLE_FP4)
-    constexpr bool is_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
+    constexpr bool is_fp4 = std::is_same_v<WeightType, Fp4Type>;
 #else
     constexpr bool is_fp4 = false;
 #endif

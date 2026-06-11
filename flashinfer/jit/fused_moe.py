@@ -117,7 +117,7 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_BF16",
         "-DENABLE_FP8",
         "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
-        "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
+        "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
     ]
