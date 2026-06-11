@@ -1121,6 +1121,126 @@ class TestB12xFunctional:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    @pytest.mark.parametrize("rows_per_expert", [128, 256, 512])
+    @pytest.mark.parametrize("activation", ["silu", "relu2"])
+    def test_skewed_routing_fills_second_m_quadrant(
+        self, rows_per_expert: int, activation: str
+    ):
+        """Regression for num_m_tiles dropping the 2nd 64-row M warp quadrant.
+
+        The static MoE kernels derive their M-tile loop bound from the warp atom
+        layout. A prior hardcoded divisor assumed the dense kernel's 4-M-warp
+        layout, so the GEMM mainloop only filled M-tiles {0,1} (rows 0..63) and
+        left rows 64..127 of every >64-row expert tile at fill(0.0) -- exact-zero
+        output. Random routing over many experts never puts >64 rows on a single
+        expert, so this only surfaces under skewed routing.
+
+        Here every token is forced (top_k=1) onto expert 0, so that one expert's
+        GEMM has `rows_per_expert` (>= 128) rows and must populate the second
+        64-row quadrant. Row counts stay within the static-backend range so the
+        affected kernels are exercised directly. With the bug, ~half the rows are
+        zero and accuracy collapses; with the fix it sits at the FP4 floor.
+        """
+        from flashinfer import b12x_fused_moe
+
+        num_tokens = rows_per_expert
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 1
+
+        if activation == "relu2":
+            tensors = create_relu2_moe_tensors(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                top_k=top_k,
+                seed=2024,
+            )
+        else:
+            tensors = create_moe_tensors(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_experts,
+                top_k=top_k,
+                seed=2024,
+            )
+
+        # Force ALL tokens onto a single expert -> one expert gets num_tokens
+        # (>= 128) rows, spanning both 64-row M warp quadrants.
+        target_expert = 0
+        tensors["token_selected_experts"] = torch.full(
+            (num_tokens, top_k), target_expert, dtype=torch.int32, device="cuda"
+        )
+        tensors["token_final_scales"] = torch.ones(
+            (num_tokens, top_k), dtype=torch.float32, device="cuda"
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        # The bug zeroed rows 64..127 of each 128-row tile; assert no all-zero
+        # rows beyond the first quadrant (decisive, independent of tolerance).
+        upper = result[64:]
+        assert not (upper == 0).all(dim=-1).any(), (
+            f"rows>=64 contain all-zero output ({activation}, "
+            f"rows_per_expert={rows_per_expert}) -- 2nd M quadrant dropped"
+        )
+
+        if activation == "relu2":
+            ref_output = compute_reference_moe_relu2(
+                hidden_states=tensors["x_bf16"].float().cuda(),
+                fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                fc2_input_scale=tensors["fc2_input_scale"],
+            )
+        else:
+            ref_output = compute_reference_moe_fp4(
+                hidden_states=tensors["x_bf16"].float().cuda(),
+                gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                fc2_input_scale=tensors["fc2_input_scale"],
+            )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Skewed routing {activation} rows_per_expert={rows_per_expert}: "
+            f"only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
     def test_activation_precision_api_validation(self):
         """W4A4 requires fc2_input_scale; W4A16 tolerates it."""
         from flashinfer import b12x_fused_moe
