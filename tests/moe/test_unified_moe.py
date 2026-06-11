@@ -656,8 +656,8 @@ def _make_packs_and_config(
     act_pack = MoEActivationPack(
         hidden_states_q=tensors["x"],
         hidden_states_scale=tensors["x_sf"].squeeze(-1),
-        selected_experts=tensors["token_selected_experts"],
-        final_scales=tensors["token_final_scales"],
+        topk_ids=tensors["token_selected_experts"],
+        topk_weights=tensors["token_final_scales"],
     )
 
     weight_pack = MoEWeightPack()
@@ -710,8 +710,8 @@ def _compute_ref(act_pack, tensors, shape):
         hidden_states=tensors["x_bf16"].float().cuda(),
         gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
         gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-        token_selected_experts=act_pack.selected_experts,
-        token_final_scales=act_pack.final_scales,
+        token_selected_experts=act_pack.topk_ids,
+        token_final_scales=act_pack.topk_weights,
         num_tokens=act_pack.num_tokens,
         num_experts=shape["num_experts"],
         top_k=shape["top_k"],
@@ -913,8 +913,8 @@ def _make_bf16_packs_and_config(
     act_pack = MoEActivationPack(
         hidden_states_q=x,  # raw bf16 on this path
         hidden_states_scale=None,  # unused by trtllm_bf16_routed
-        selected_experts=selected_experts,
-        final_scales=final_scales,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
     )
 
     w1_view, w2_view = _bf16_kernel_weight_views(w1, w2)
@@ -993,8 +993,8 @@ def _bf16_ref(act_pack, tensors, expert_offset=0):
         tensors["x"],
         tensors["w1"],
         tensors["w2"],
-        act_pack.selected_experts,
-        act_pack.final_scales,
+        act_pack.topk_ids,
+        act_pack.topk_weights,
         tensors["w2"].shape[-1],  # intermediate_size, derived not hardcoded
         expert_offset=expert_offset,
     )
@@ -1223,8 +1223,8 @@ class TestTrtllmRoutedPackingContract:
         act_pack = MoEActivationPack(
             hidden_states_q=hidden_q,
             hidden_states_scale=hidden_scale,
-            selected_experts=selected_experts,
-            final_scales=final_scales,
+            topk_ids=selected_experts,
+            topk_weights=final_scales,
         )
 
         # pack_inputs only threads weights into static kwargs; dummies suffice
@@ -1315,8 +1315,8 @@ class TestTrtllmEPOffset:
             act_pack = MoEActivationPack(
                 hidden_states_q=tensors["x"],
                 hidden_states_scale=tensors["x_sf"].squeeze(-1),
-                selected_experts=tensors["token_selected_experts"] + offset,
-                final_scales=tensors["token_final_scales"],
+                topk_ids=tensors["token_selected_experts"] + offset,
+                topk_weights=tensors["token_final_scales"],
             )
             runner = TrtllmFp4RoutedRunner(config, device=device)
             inputs = runner.pack_inputs(act_pack, weight_pack)

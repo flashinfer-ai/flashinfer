@@ -2558,11 +2558,11 @@ def testUnifiedNvfp4Moe(args):
     act_pack = MoEActivationPack(
         hidden_states_q=cute_dsl_data["x"],
         hidden_states_scale=x_sf,
-        selected_experts=cute_dsl_data["token_selected_experts"],
-        final_scales=cute_dsl_data["token_final_scales"],
+        topk_ids=cute_dsl_data["token_selected_experts"],
+        topk_weights=cute_dsl_data["token_final_scales"],
     )
 
-    num_active_experts = int(act_pack.selected_experts.unique().numel())
+    num_active_experts = int(act_pack.topk_ids.unique().numel())
 
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)
@@ -2610,8 +2610,8 @@ def testUnifiedNvfp4Moe(args):
             hidden_states=cute_dsl_data["x_bf16"].float().to(device),
             gemm1_weights=w1_bf16.float().to(device),
             gemm2_weights=w2_bf16.float().to(device),
-            token_selected_experts=act_pack.selected_experts,
-            token_final_scales=act_pack.final_scales,
+            token_selected_experts=act_pack.topk_ids,
+            token_final_scales=act_pack.topk_weights,
             num_tokens=num_tokens,
             num_experts=num_experts,
             top_k=top_k,

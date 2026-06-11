@@ -39,6 +39,7 @@ from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner  # noqa: F401
 
 # Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
+    RoutingInputMode,
     convert_to_block_layout,
     cutlass_fused_moe,
     interleave_moe_scales_for_sm90_mixed_gemm,
@@ -117,6 +118,7 @@ __all__ = [
     "ExpertConfig",
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
+    "RoutingInputMode",
     "MoEConfig",
     "MoELayer",
     "MoEWeightPack",
