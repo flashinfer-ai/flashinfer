@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .bsa_attn import bsa_attn_fwd
-from .bsa_attn_blk64 import bsa_attn_blk64_fwd
+from .loader import load_blk64_ext
 
-__all__ = [
-    "bsa_attn_fwd",
-    "bsa_attn_blk64_fwd",
-]
+__all__ = ["load_blk64_ext"]

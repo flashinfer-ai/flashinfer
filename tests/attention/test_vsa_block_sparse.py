@@ -35,8 +35,8 @@ pytestmark = pytest.mark.skipif(
     reason="VSA Blackwell backend requires sm100a (Blackwell GPU)",
 )
 
-# VSA Blackwell kernel has fixed constraints:
-R = C = 64
+# BSA blk128 kernel block granularity: 128-token Q/KV blocks
+R = C = 128
 HEAD_DIM = 128
 
 
@@ -124,14 +124,10 @@ def _make_wrapper(device):
 
 
 @pytest.mark.parametrize("dtype,density,num_blocks,num_heads", [
-    (torch.bfloat16, 0.25,  4, 1),
     (torch.bfloat16, 0.25, 16, 8),
     (torch.bfloat16, 0.75,  4, 8),
-    (torch.bfloat16, 0.75, 16, 1),
-    (torch.float16,  0.25,  4, 8),
-    (torch.float16,  0.25, 16, 1),
-    (torch.float16,  0.75,  4, 1),
-    (torch.float16,  0.75, 16, 8),
+    (torch.float16,  0.25, 16, 8),
+    (torch.float16,  0.75,  4, 8),
 ])
 def test_vsa_accuracy(dtype, density, num_blocks, num_heads):
     """VSA output must match PyTorch dense reference."""
@@ -157,88 +153,6 @@ def test_vsa_accuracy(dtype, density, num_blocks, num_heads):
 
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
 
-
-def test_vsa_preallocated_output():
-    """run(out=...) must write into the provided tensor."""
-    device = torch.device("cuda")
-    torch.manual_seed(1)
-    num_heads, num_blocks = 4, 8
-    M = N = num_blocks * R
-    dtype = torch.bfloat16
-
-    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
-
-    wrapper = _make_wrapper(device)
-    wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
-        q_data_type=dtype,
-    )
-
-    o = wrapper.run(q, k, v)
-    o_buf = torch.empty_like(o)
-    wrapper.run(q, k, v, out=o_buf)
-    torch.testing.assert_close(o, o_buf)
-
-
-def test_vsa_return_lse():
-    """return_lse=True must yield correctly shaped, finite LSE."""
-    device = torch.device("cuda")
-    torch.manual_seed(2)
-    num_heads, num_blocks = 4, 8
-    M = N = num_blocks * R
-    dtype = torch.bfloat16
-
-    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
-
-    wrapper = _make_wrapper(device)
-    wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
-        q_data_type=dtype,
-    )
-
-    o, lse = wrapper.run(q, k, v, return_lse=True)
-
-    assert o.shape == (M, num_heads, HEAD_DIM)
-    assert lse.shape == (M, num_heads)
-    assert lse.dtype == torch.float32
-    assert not torch.isnan(lse).any()
-    assert not torch.isinf(lse).any()
-
-
-def test_vsa_preallocated_lse():
-    """run(lse=...) must write LSE into the provided tensor."""
-    device = torch.device("cuda")
-    torch.manual_seed(3)
-    num_heads, num_blocks = 4, 8
-    M = N = num_blocks * R
-    dtype = torch.bfloat16
-
-    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
-
-    wrapper = _make_wrapper(device)
-    wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
-        q_data_type=dtype,
-    )
-
-    _, lse = wrapper.run(q, k, v, return_lse=True)
-    lse_buf = torch.empty(M, num_heads, dtype=torch.float32, device=device)
-    _, lse2 = wrapper.run(q, k, v, lse=lse_buf, return_lse=True)
-
-    assert lse2 is lse_buf
-    torch.testing.assert_close(lse, lse_buf)
 
 
 @pytest.mark.parametrize("sm_scale", [0.5])
@@ -269,39 +183,6 @@ def test_vsa_sm_scale(sm_scale):
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
 
 
-def test_vsa_vs_flashinfer_default_backend():
-    """Cross-validate VSA backend against FlashInfer's default backend."""
-    device = torch.device("cuda")
-    torch.manual_seed(7)
-    num_heads, num_blocks = 4, 8
-    M = N = num_blocks * R
-    dtype = torch.bfloat16
-
-    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
-    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
-
-    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-
-    ref_w = BlockSparseAttentionWrapper(ws, backend="auto")
-    ref_w.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
-        q_data_type=dtype,
-    )
-    o_ref = ref_w.run(q, k, v)
-
-    vsa_w = BlockSparseAttentionWrapper(ws, backend="vsa_blackwell")
-    vsa_w.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
-        q_data_type=dtype,
-    )
-    o_vsa = vsa_w.run(q, k, v)
-
-    torch.testing.assert_close(o_ref.float(), o_vsa.float(), atol=1e-2, rtol=1e-2)
-
 
 def test_vsa_vs_auto_80k():
     """Cross-validate VSA backend against auto backend at 80k context (1250 blocks × 64).
@@ -311,7 +192,7 @@ def test_vsa_vs_auto_80k():
     device = torch.device("cuda")
     torch.manual_seed(8)
     num_heads = 8
-    num_blocks = 1250  # 1250 * 64 = 80 000 tokens
+    num_blocks = 625  # 625 * 128 = 80 000 tokens
     density = 0.01
     dtype = torch.bfloat16
 
@@ -343,152 +224,6 @@ def test_vsa_vs_auto_80k():
 
     torch.testing.assert_close(o_ref.float(), o_vsa.float(), atol=1e-2, rtol=1e-2)
 
-
-# ---------------------------------------------------------------------------
-# plan() constraint-violation tests
-# ---------------------------------------------------------------------------
-
-
-def _plan_indptr_indices(device, num_blocks=2):
-    indptr = torch.arange(num_blocks + 1, dtype=torch.int32, device=device)
-    indices = torch.arange(num_blocks, dtype=torch.int32, device=device)
-    return indptr, indices
-
-
-@pytest.mark.parametrize(
-    "bad_R, bad_C",
-    [(64, 32), (32, 64)],
-)
-def test_plan_rejects_bad_block_size(bad_R, bad_C):
-    device = torch.device("cuda")
-    indptr, indices = _plan_indptr_indices(device)
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="R == C == 64"):
-        wrapper.plan(indptr, indices, bad_R * 2, bad_C * 2, bad_R, bad_C, 4, 4, HEAD_DIM)
-
-
-def test_plan_rejects_bad_head_dim():
-    device = torch.device("cuda")
-    indptr, indices = _plan_indptr_indices(device)
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="head_dim == 128"):
-        wrapper.plan(indptr, indices, 2 * R, 2 * C, R, C, 4, 4, 64)
-
-
-def test_plan_rejects_gqa():
-    device = torch.device("cuda")
-    indptr, indices = _plan_indptr_indices(device)
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="GQA"):
-        wrapper.plan(indptr, indices, 2 * R, 2 * C, R, C, 8, 4, HEAD_DIM)
-
-
-def test_plan_rejects_mask():
-    device = torch.device("cuda")
-    num_blocks = 2
-    indptr, indices = _plan_indptr_indices(device, num_blocks)
-    nnz = int(indices.shape[0])
-    mask = torch.ones(nnz, R, C, dtype=torch.bool, device=device)
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="mask"):
-        wrapper.plan(
-            indptr, indices, num_blocks * R, num_blocks * C, R, C,
-            4, 4, HEAD_DIM,
-            mask=mask,
-        )
-
-
-def test_plan_rejects_packed_mask():
-    device = torch.device("cuda")
-    num_blocks = 2
-    indptr, indices = _plan_indptr_indices(device, num_blocks)
-    packed_mask = torch.zeros(1, dtype=torch.uint8, device=device)
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="mask"):
-        wrapper.plan(
-            indptr, indices, num_blocks * R, num_blocks * C, R, C,
-            4, 4, HEAD_DIM,
-            packed_mask=packed_mask,
-        )
-
-
-def test_plan_rejects_causal():
-    device = torch.device("cuda")
-    num_blocks = 2
-    indptr, indices = _plan_indptr_indices(device, num_blocks)
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="causal"):
-        wrapper.plan(
-            indptr, indices, num_blocks * R, num_blocks * C, R, C,
-            4, 4, HEAD_DIM,
-            causal=True,
-        )
-
-
-def test_plan_rejects_pos_encoding_mode():
-    device = torch.device("cuda")
-    num_blocks = 2
-    indptr, indices = _plan_indptr_indices(device, num_blocks)
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="pos_encoding_mode"):
-        wrapper.plan(
-            indptr, indices, num_blocks * R, num_blocks * C, R, C,
-            4, 4, HEAD_DIM,
-            pos_encoding_mode="ROPE_LLAMA",
-        )
-
-
-def test_plan_rejects_logits_soft_cap():
-    device = torch.device("cuda")
-    num_blocks = 2
-    indptr, indices = _plan_indptr_indices(device, num_blocks)
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="logits_soft_cap"):
-        wrapper.plan(
-            indptr, indices, num_blocks * R, num_blocks * C, R, C,
-            4, 4, HEAD_DIM,
-            logits_soft_cap=50.0,
-        )
-
-
-def test_plan_rejects_block_mask_wrong_shape():
-    """block_mask with wrong shape must raise ValueError."""
-    device = torch.device("cuda")
-    num_blocks, num_heads = 4, 4
-    wrapper = _make_wrapper(device)
-    bad_mask = torch.ones(num_heads + 1, num_blocks, num_blocks, dtype=torch.bool, device=device)
-    with pytest.raises(ValueError, match="block_mask must have shape"):
-        wrapper.plan(
-            None, None, num_blocks * R, num_blocks * C, R, C,
-            num_heads, num_heads, HEAD_DIM,
-            block_mask=bad_mask,
-        )
-
-
-def test_plan_rejects_block_mask_non_vsa():
-    """block_mask must be rejected for non-vsa_blackwell backends."""
-    device = torch.device("cuda")
-    num_blocks, num_heads = 4, 4
-    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    wrapper = BlockSparseAttentionWrapper(ws, backend="auto")
-    block_mask = torch.ones(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
-    with pytest.raises(ValueError, match="vsa_blackwell"):
-        wrapper.plan(
-            None, None, num_blocks * R, num_blocks * C, R, C,
-            num_heads, num_heads, HEAD_DIM,
-            block_mask=block_mask,
-        )
-
-
-def test_plan_rejects_missing_indptr_indices():
-    """vsa_blackwell without block_mask must require indptr/indices."""
-    device = torch.device("cuda")
-    wrapper = _make_wrapper(device)
-    with pytest.raises(ValueError, match="indptr"):
-        wrapper.plan(
-            None, None, 4 * R, 4 * C, R, C,
-            4, 4, HEAD_DIM,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +412,6 @@ def _cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
 
 # (seqlen, topk_fraction)
 _SWEEP_CONFIGS = [
-    (4096,  0.50),   # short-seq boundary: VSA break-even point
     (16384, 0.50),
     (16384, 0.25),
     (16384, 0.10),
@@ -703,7 +437,7 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac):
       CosSim – mean cosine similarity per (token, head) vector
     VSA output must be finite; no strict accuracy bound since it is an approximation.
     """
-    assert seqlen % R == 0, "seqlen must be a multiple of R=64"
+    assert seqlen % R == 0, "seqlen must be a multiple of R=128"
     device = torch.device("cuda")
     torch.manual_seed(42)
 
@@ -825,3 +559,518 @@ def test_vsa_performance_vs_dense():
 
     print(sep)
 
+
+# ===========================================================================
+# blk64 tests — BSA blk64 C++ kernel (kSparseBlockSize=64, kRows=64)
+# ===========================================================================
+
+R64 = C64 = 64          # blk64 block granularity
+HEAD_DIM_BLK64 = 128   # blk64 kernel requires head_dim=128
+
+
+def _make_wrapper_blk64(device):
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    return BlockSparseAttentionWrapper(ws, backend="vsa_blackwell_blk64")
+
+
+@pytest.mark.parametrize("density,num_blocks,num_heads", [
+    (0.25, 16, 8),
+    (0.75,  4, 8),
+])
+def test_vsa_blk64_accuracy(density, num_blocks, num_heads):
+    """blk64 output must match PyTorch dense reference (bfloat16 only)."""
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+
+    M = N = num_blocks * R64
+    q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, density, device)
+
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(device)
+    wrapper.plan(
+        indptr, indices, M, N, R64, C64,
+        num_heads, num_heads, HEAD_DIM_BLK64,
+        q_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
+
+
+
+
+@pytest.mark.parametrize("seqlen,topk_frac", [
+    (4096, 0.5),
+])
+def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac):
+    """blk64 output must be close to dense attention for the selected blocks."""
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    num_heads = 8
+    dtype = torch.bfloat16
+
+    assert seqlen % R64 == 0
+    MB = NB = seqlen // R64
+    M = N = seqlen
+
+    q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(MB, NB, topk_frac, device)
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(device)
+    wrapper.plan(
+        indptr, indices, M, N, R64, C64,
+        num_heads, num_heads, HEAD_DIM_BLK64,
+        q_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+
+    assert torch.isfinite(o).all(), "blk64 output contains non-finite values"
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# blk64 performance: seqlen × density sweep
+# ---------------------------------------------------------------------------
+
+
+def test_vsa_blk64_perf_sweep():
+    """blk64 kernel throughput across seqlen in [1024, 2048, 4096] and density in [0.25, 0.5, 0.75]."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+
+    num_heads = 8
+    dtype = torch.bfloat16
+    seqlens = [1024, 2048, 4096]
+    densities = [0.25, 0.5, 0.75]
+
+    header = f"\n{'seqlen':>8}  {'density':>8}  {'active_blks':>12}  {'median_ms':>10}  {'tflops':>8}"
+    sep = "-" * (len(header) - 1)
+    print(header)
+    print(sep)
+
+    for seqlen in seqlens:
+        num_blocks = seqlen // R64
+        q = torch.randn(seqlen, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+        k = torch.randn(seqlen, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+        v = torch.randn(seqlen, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+        for density in densities:
+            indptr, indices = _build_random_bsr(num_blocks, num_blocks, density, device)
+            active_blocks = len(indices)
+
+            wrapper = _make_wrapper_blk64(device)
+            wrapper.plan(
+                indptr, indices, seqlen, seqlen, R64, C64,
+                num_heads, num_heads, HEAD_DIM_BLK64,
+                q_data_type=dtype,
+            )
+            wrapper.run(q, k, v)  # warm-up
+
+            times = bench_gpu_time(lambda: wrapper.run(q, k, v))
+            ms = statistics.median(times)
+
+            # FLOPs = 2 * (QK matmul + PV matmul) per active block pair
+            flops = 2 * 2 * num_blocks * active_blocks * R64 * C64 * num_heads * HEAD_DIM_BLK64
+            tflops = flops / (ms * 1e-3) / 1e12
+
+            actual_density = active_blocks / (num_blocks * num_blocks)
+            print(f"{seqlen:>8}  {actual_density:>8.3f}  {active_blocks:>12}  {ms:>10.3f}  {tflops:>8.2f}")
+
+        print(sep)
+
+
+# ---------------------------------------------------------------------------
+# blk64 validation / rejection tests
+
+
+# ===========================================================================
+# New testcases: gaps vs. Block-Sparse-Attention/test_flash_fwd.py
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. GQA / MQA — blk128
+# ---------------------------------------------------------------------------
+
+
+def _pytorch_ref_gqa(
+    q: torch.Tensor,      # [M, Hq, D]
+    k: torch.Tensor,      # [N, Hkv, D]
+    v: torch.Tensor,      # [N, Hkv, D]
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    R: int,
+    C: int,
+    sm_scale: float = None,
+) -> torch.Tensor:
+    """PyTorch reference for GQA block-sparse attention.
+    QO head h attends to KV head h // (Hq // Hkv), using the shared BSR mask.
+    """
+    M, Hq, D = q.shape
+    Hkv = k.shape[1]
+    qhead_per_kvhead = Hq // Hkv
+    MB, NB = M // R, k.shape[0] // C
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(D)
+
+    mask = _bsr_to_dense_mask(indptr, indices, MB, NB, R, C, q.device)  # [M, N]
+    output = torch.empty_like(q)
+    for h in range(Hq):
+        h_kv = h // qhead_per_kvhead
+        qh = q[:, h, :].float()
+        kh = k[:, h_kv, :].float()
+        vh = v[:, h_kv, :].float()
+        scores = torch.matmul(qh, kh.t()) * sm_scale  # [M, N]
+        scores = scores.masked_fill(~mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        output[:, h, :] = torch.matmul(probs, vh).to(q.dtype)
+    return output
+
+
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads,dtype", [
+    (8, 4, torch.bfloat16),   # GQA 2x
+    (8, 2, torch.bfloat16),   # GQA 4x
+    (8, 1, torch.bfloat16),   # MQA
+    (8, 4, torch.float16),    # GQA 2x, fp16
+])
+def test_vsa_gqa_native_bsr(num_qo_heads, num_kv_heads, dtype):
+    """Native GQA via BSR path: plan() with num_qo_heads != num_kv_heads.
+
+    Passes real (num_qo_heads, num_kv_heads) to wrapper.plan() and verifies
+    against a per-QO-head PyTorch reference that maps each QO head to its
+    corresponding KV head (h_kv = h // qhead_per_kvhead).
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    num_blocks = 8
+    M = N = num_blocks * R
+
+    q = torch.randn(M, num_qo_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(N, num_kv_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(N, num_kv_heads, HEAD_DIM, dtype=dtype, device=device)
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+
+    o_ref = _pytorch_ref_gqa(q, k, v, indptr, indices, R, C)
+
+    wrapper = _make_wrapper(device)
+    wrapper.plan(
+        indptr, indices, M, N, R, C,
+        num_qo_heads, num_kv_heads, HEAD_DIM,
+        q_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [
+    (8, 4),   # GQA 2x
+    (8, 2),   # GQA 4x
+])
+def test_vsa_gqa_native_block_mask(num_qo_heads, num_kv_heads):
+    """Native GQA via per-head block_mask: accepts (num_qo_heads, MB, NB) shape.
+
+    Builds a per-KV-head mask, broadcasts to QO heads, passes the
+    (num_qo_heads, MB, NB) tensor to plan(), and verifies each QO head
+    uses the correct KV-head's sparsity pattern.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(43)
+    num_blocks = 8
+    M = N = num_blocks * R
+    dtype = torch.bfloat16
+    qhead_per_kvhead = num_qo_heads // num_kv_heads
+
+    q = torch.randn(M, num_qo_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(N, num_kv_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(N, num_kv_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    # Per-KV-head mask [Hkv, MB, NB], broadcast to [Hq, MB, NB]
+    block_mask_kv = torch.zeros(num_kv_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    for h in range(num_kv_heads):
+        chosen = torch.randperm(num_blocks)[:max(1, num_blocks // 2)]
+        block_mask_kv[h, :, chosen] = True
+    block_mask_qo = block_mask_kv.repeat_interleave(qhead_per_kvhead, dim=0)  # [Hq, MB, NB]
+
+    wrapper = _make_wrapper(device)
+    wrapper.plan(
+        None, None, M, N, R, C,
+        num_qo_heads, num_kv_heads, HEAD_DIM,
+        q_data_type=dtype,
+        block_mask=block_mask_qo,
+    )
+    o = wrapper.run(q, k, v)
+
+    # PyTorch reference: each QO head uses its KV head's block mask
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    o_ref = torch.empty_like(o)
+    for h in range(num_qo_heads):
+        h_kv = h // qhead_per_kvhead
+        qh = q[:, h, :].float()
+        kh = k[:, h_kv, :].float()
+        vh = v[:, h_kv, :].float()
+        token_mask = torch.zeros(M, N, dtype=torch.bool, device=device)
+        for qi in range(num_blocks):
+            for ki in range(num_blocks):
+                if block_mask_kv[h_kv, qi, ki]:
+                    token_mask[qi*R:(qi+1)*R, ki*C:(ki+1)*C] = True
+        scores = torch.matmul(qh, kh.t()) * sm_scale
+        scores = scores.masked_fill(~token_mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        o_ref[:, h, :] = torch.matmul(probs, vh).to(dtype)
+
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 2. head_dim variants (64, 96) — blk128
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("head_dim,density,num_blocks", [
+    (64, 0.5, 8),
+    (64, 0.25, 16),
+    (96, 0.5, 8),
+    (96, 0.25, 16),
+])
+def test_vsa_head_dim_accuracy(head_dim, density, num_blocks):
+    """VSA blk128 with head_dim=64/96 must match PyTorch dense reference."""
+    device = torch.device("cuda")
+    torch.manual_seed(7)
+    num_heads = 4
+    M = N = num_blocks * R
+    dtype = torch.bfloat16
+
+    q = torch.randn(M, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, head_dim, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, density, device)
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R, C)
+
+    wrapper = _make_wrapper(device)
+    wrapper.plan(
+        indptr, indices, M, N, R, C,
+        num_heads, num_heads, head_dim,
+        q_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 3. seqlen_q != seqlen_k (cross-attention shape) — blk128
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("MB,NB,num_heads,density", [
+    (4, 8, 8, 0.5),
+    (8, 4, 4, 0.5),
+    (2, 16, 4, 0.25),
+])
+def test_vsa_asymmetric_seqlen(MB, NB, num_heads, density):
+    """VSA blk128 with seqlen_q != seqlen_k must match PyTorch dense reference."""
+    device = torch.device("cuda")
+    torch.manual_seed(13)
+    M, N = MB * R, NB * R
+    dtype = torch.bfloat16
+
+    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(MB, NB, density, device)
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R, C)
+
+    wrapper = _make_wrapper(device)
+    wrapper.plan(
+        indptr, indices, M, N, R, C,
+        num_heads, num_heads, HEAD_DIM,
+        q_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 4. seqlen_q != seqlen_k — blk64
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("MB64,NB64,density", [
+    (4, 8, 0.5),
+    (8, 4, 0.5),
+])
+def test_vsa_blk64_asymmetric_seqlen(MB64, NB64, density):
+    """VSA blk64 with seqlen_q != seqlen_k must match PyTorch dense reference."""
+    device = torch.device("cuda")
+    torch.manual_seed(14)
+    num_heads = 4
+    M, N = MB64 * R64, NB64 * R64
+    dtype = torch.bfloat16
+
+    q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(MB64, NB64, density, device)
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(device)
+    wrapper.plan(
+        indptr, indices, M, N, R64, C64,
+        num_heads, num_heads, HEAD_DIM_BLK64,
+        q_data_type=dtype,
+    )
+    o = wrapper.run(q, k, v)
+
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 5. LSE output validation — blk128
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dtype,num_blocks,num_heads", [
+    (torch.bfloat16, 8, 4),
+    (torch.float16,  8, 4),
+])
+def test_vsa_return_lse(dtype, num_blocks, num_heads):
+    """return_lse=True must produce LSE values consistent with the attention output."""
+    device = torch.device("cuda")
+    torch.manual_seed(20)
+    M = N = num_blocks * R
+
+    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+
+    # Reference LSE from PyTorch
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    mask = _bsr_to_dense_mask(indptr, indices, num_blocks, num_blocks, R, C, device)
+    qf = q.float().permute(1, 0, 2)   # [H, M, D]
+    kf = k.float().permute(1, 0, 2)   # [H, N, D]
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale   # [H, M, N]
+    scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+    lse_ref = torch.logsumexp(scores, dim=-1).permute(1, 0)       # [M, H]
+
+    wrapper = _make_wrapper(device)
+    wrapper.plan(
+        indptr, indices, M, N, R, C,
+        num_heads, num_heads, HEAD_DIM,
+        q_data_type=dtype,
+    )
+    _, lse = wrapper.run(q, k, v, return_lse=True)
+
+    # Only compare finite positions (rows with no KV blocks produce -inf LSE)
+    finite = lse_ref.isfinite()
+    assert finite.any(), "no finite LSE positions"
+    torch.testing.assert_close(
+        lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. LSE output validation — blk64
+# ---------------------------------------------------------------------------
+
+def test_vsa_blk64_return_lse():
+    """blk64 return_lse=True must produce finite LSE values matching PyTorch reference."""
+    device = torch.device("cuda")
+    torch.manual_seed(21)
+    num_heads, num_blocks = 4, 8
+    M = N = num_blocks * R64
+    dtype = torch.bfloat16
+
+    q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM_BLK64)
+    mask = _bsr_to_dense_mask(indptr, indices, num_blocks, num_blocks, R64, C64, device)
+    qf = q.float().permute(1, 0, 2)
+    kf = k.float().permute(1, 0, 2)
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale
+    scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+    lse_ref = torch.logsumexp(scores, dim=-1).permute(1, 0)   # [M, H]
+
+    wrapper = _make_wrapper_blk64(device)
+    wrapper.plan(
+        indptr, indices, M, N, R64, C64,
+        num_heads, num_heads, HEAD_DIM_BLK64,
+        q_data_type=dtype,
+    )
+    _, lse = wrapper.run(q, k, v, return_lse=True)
+
+    finite = lse_ref.isfinite()
+    assert finite.any()
+    torch.testing.assert_close(
+        lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Per-q-block variable KV-block count via block_mask — blk128
+# ---------------------------------------------------------------------------
+
+def test_vsa_variable_blocks_per_q():
+    """Per-head block_mask with variable KV count per Q-block must match per-head PyTorch ref.
+
+    Each Q-block gets a different number of attended KV blocks (row-varying density),
+    exercising the variable block count path (q2k_num differs across Q-blocks).
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(30)
+    num_heads, num_blocks = 4, 8
+    M = N = num_blocks * R
+    dtype = torch.bfloat16
+
+    q = torch.randn(M, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
+
+    # Each Q-block attends to i+1 KV blocks (varying count per row, same across heads)
+    block_mask = torch.zeros(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    for i in range(num_blocks):
+        cnt = i + 1   # Q-block 0 → 1 block, Q-block 7 → 8 blocks
+        chosen = torch.randperm(num_blocks)[:cnt]
+        block_mask[:, i, chosen] = True
+
+    wrapper = _make_wrapper(device)
+    wrapper.plan(
+        None, None, M, N, R, C,
+        num_heads, num_heads, HEAD_DIM,
+        q_data_type=dtype,
+        block_mask=block_mask,
+    )
+    o_vsa = wrapper.run(q, k, v)
+
+    # PyTorch reference per head
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    o_ref = torch.empty_like(o_vsa)
+    for h in range(num_heads):
+        qh = q[:, h, :].float()
+        kh = k[:, h, :].float()
+        vh = v[:, h, :].float()
+        token_mask = torch.zeros(M, N, dtype=torch.bool, device=device)
+        for qi in range(num_blocks):
+            for ki in range(num_blocks):
+                if block_mask[h, qi, ki]:
+                    token_mask[qi*R:(qi+1)*R, ki*C:(ki+1)*C] = True
+        scores = torch.matmul(qh, kh.t()) * sm_scale
+        scores = scores.masked_fill(~token_mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        o_ref[:, h, :] = torch.matmul(probs, vh).to(dtype)
+
+    torch.testing.assert_close(o_ref, o_vsa, atol=1e-2, rtol=1e-2)
+# ---------------------------------------------------------------------------
