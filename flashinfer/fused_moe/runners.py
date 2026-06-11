@@ -137,7 +137,8 @@ class TrtllmFp4RoutedRunner(TunableRunner):
     ``core.MoERunner.forward``.
 
     Routing is pre-computed (``RoutingInputMode.PackedPrecomputed``): the packed
-    int32 top-k ids carry ``((expert_id - local_offset) << 16) | bf16(weight)``.
+    int32 top-k ids carry ``(global_expert_id << 16) | bf16(weight)``; the
+    kernel maps global ids onto the local shard via ``local_expert_offset``.
     The inner ``MoERunner`` needs the hidden size for its tactic keys and tuning
     buckets, so it is built lazily on the first ``pack_inputs`` call.
     """
@@ -236,10 +237,11 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar.
 
         The local-shard offset comes from ``ExpertConfig.local_expert_offset``
-        on the config this runner was built with.  For expert-parallel
-        pre-routed inputs the kernel indexes local experts as
-        ``[0, local_num_experts)``, so global expert ids are shifted down by the
-        local offset before packing.
+        on the config this runner was built with.  ``selected_experts`` carries
+        GLOBAL expert ids and is packed as-is; the kernel performs the
+        global→local mapping itself by subtracting ``local_expert_offset``
+        (passed via the static kwargs) and dropping ids outside
+        ``[offset, offset + local_num_experts)``.
         """
         from .core import MoeRunnerInputs, RoutingInputMode
 
@@ -255,8 +257,13 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         if hidden_states_scale.dtype == torch.uint8:
             hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
 
-        # Packed pre-routed top-k ids: ((expert_id - offset) << 16) | bf16(weight)
-        ids = act.selected_experts - self._local_expert_offset
+        # Packed pre-routed top-k ids: (global_expert_id << 16) | bf16(weight).
+        # The kernel owns the EP-shard mapping: it subtracts
+        # local_expert_offset itself (``mLocalExpertsStartIdx`` in
+        # RoutingKernel.h) and ignores ids outside the local shard, so the ids
+        # must stay GLOBAL here.  Pre-subtracting would apply the offset twice
+        # and silently zero the output for any nonzero offset (gh #3547).
+        ids = act.selected_experts
         weight_bf16_bits = (
             act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
         )

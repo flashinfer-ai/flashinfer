@@ -19,9 +19,9 @@ weight-memory budget so one config never hogs the GPU (parallel-CI-friendly), pl
 larger-end shapes. Large expert counts are reached with small H/I and/or **expert-parallel shards**
 (global>local + ``local_expert_offset``, the real deployment shape), not by filling the GPU.
 
-A small ``_KNOWN_FAILURES`` ledger xfails already-filed bugs (e.g. trtllm EP offset>0 -> all-zero,
-EP_OFFSET_FINDING.md): the case is still *run* so the suite stays green on a tracked bug yet flags
-loudly the day it starts passing (fixed). A crash is never tolerated -- only a wrong answer.
+A small ``_KNOWN_FAILURES`` ledger xfails already-filed bugs (e.g. the since-fixed trtllm EP
+offset>0 all-zero bug, gh #3547): the case is still *run* so the suite stays green on a tracked bug
+yet flags loudly the day it starts passing (fixed). A crash is never tolerated -- only a wrong answer.
 
 Verification model (single mode, uniform -- every config that runs gets the same checks):
   1. **no crash / no NaN-Inf** where the reference is finite.
@@ -66,7 +66,7 @@ comparison adds no pass/fail power, only redundancy. See the design discussion.)
 Coverage today: NVFP4 (CuteDSL + TRTLLM-FP4-routed) on SM100 -- the only wired MVP runners.
 
 OPT-IN: this suite is gated behind FLASHINFER_UMOE_FUZZ (see the pytestmark below) and is
-SKIPPED unless that env var is set -- waived in CI pending gh #3547 and root-cause of a
+SKIPPED unless that env var is set -- waived in CI pending root-cause of a
 whole-process device-side-assert abort that would block B200 CI. Run it explicitly:
   FLASHINFER_UMOE_FUZZ=1 CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<sm100-idx> \
     pytest tests/moe/test_unified_moe_fuzz.py
@@ -202,11 +202,8 @@ _DETERMINISTIC = {
 # bug while still EXERCISING it, so the day the bug is fixed the case starts passing and we get a loud
 # "unexpectedly passed -> remove this entry" signal. A crash is never tolerated (only wrong answers).
 _KNOWN_FAILURES = [
-    (
-        "trtllm_fp4_routed",
-        lambda c: c.expert_offset > 0,
-        "trtllm EP local_expert_offset>0 -> all-zero output (offset applied twice); gh #3547",
-    ),
+    # Entries: (backend_key, predicate(cfg), "reason; gh #NNNN").
+    # Empty since the gh #3547 EP-offset double-subtraction fix.
 ]
 
 
