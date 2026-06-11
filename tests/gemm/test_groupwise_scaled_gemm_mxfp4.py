@@ -140,6 +140,9 @@ def assert_close_chunked(actual, expected, *, atol, rtol, chunk_rows=2048):
     overhead while checking exactly the same elements.
     """
     assert actual.shape == expected.shape
+    if actual.ndim == 0 or actual.shape[0] == 0:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        return
     for i in range(0, actual.shape[0], chunk_rows):
         torch.testing.assert_close(
             actual[i : i + chunk_rows],
@@ -197,9 +200,14 @@ def quantize_tensor(x, tile_size, n_padded, k_padded, quant_mode):
         tuple: A tuple containing the quantized tensor and the
                calculated scales.
     """
+    # Chunking splits dim 0, which is only safe when it is not the dim that
+    # n_padded pads (dim -2): for 2-D inputs they coincide, so fall through
+    # to the unchunked path there (this test only pads the 3-D B operand).
+    if x.ndim < 3 and n_padded is not None:
+        return _quantize_tensor_impl(x, tile_size, n_padded, k_padded, quant_mode)
     # ~32M fp32 elements (~128MB) per chunk keeps the ~10x temporary
     # footprint near 1GB regardless of the test case size.
-    elems_per_lead = x[0].numel()
+    elems_per_lead = x.numel() // max(1, x.shape[0])
     lead_per_chunk = max(1, (1 << 25) // max(1, elems_per_lead))
     if x.shape[0] <= lead_per_chunk:
         return _quantize_tensor_impl(x, tile_size, n_padded, k_padded, quant_mode)
@@ -372,6 +380,8 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
             k,
             out_dtype,
         )
+    # The unswizzled scales are only consumed by the reference above.
+    del a_scale, b_scale
 
     if compute_capability[0] == 12:
         mma_sm_list = [1]
