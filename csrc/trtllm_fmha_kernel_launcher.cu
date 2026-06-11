@@ -112,7 +112,7 @@ void trtllm_paged_attention_launcher(
     int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens, int64_t lse_stride_heads,
     int64_t bf16q_fp8kv_transform_mode, const uint32_t* packed_custom_mask,
     const int64_t* custom_mask_offsets, const int32_t* first_sparse_mask_offsets_kv,
-    cudaStream_t stream) {
+    bool force_spec_dec_tree_keeps, bool custom_mask_uses_sliding_window, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -159,6 +159,7 @@ void trtllm_paged_attention_launcher(
   runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
   runner_params.mBatchSize = batch_size;
   runner_params.mMaxSeqLenKv = max_kv_len;
+  runner_params.mForceSpecDecTreeKeeps = force_spec_dec_tree_keeps;
   runner_params.mMaxNumPagesPerSeqKv = max_num_blocks_per_seq;
   runner_params.mNumTokensPerPage = page_size;
   runner_params.mQkvLayout = QkvLayout::PagedKv;
@@ -240,7 +241,9 @@ void trtllm_paged_attention_launcher(
       TVM_FFI_ICHECK(custom_mask_offsets != nullptr && first_sparse_mask_offsets_kv != nullptr)
           << "custom_mask_offsets and first_sparse_mask_offsets_kv must be provided with "
              "packed_custom_mask";
-      runner_params.mMaskType = TrtllmGenAttentionMaskType::Custom;
+      runner_params.mMaskType = custom_mask_uses_sliding_window
+                                     ? TrtllmGenAttentionMaskType::SlidingWindowCustom
+                                     : TrtllmGenAttentionMaskType::Custom;
       runner_params.customMaskPtr = packed_custom_mask;
       runner_params.customMaskOffsetsPtr = custom_mask_offsets;
       runner_params.firstSparseMaskOffsetsKvPtr = first_sparse_mask_offsets_kv;
@@ -342,7 +345,8 @@ void trtllm_paged_attention_decode(
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
     int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode,
     Optional<TensorView> packed_custom_mask, Optional<TensorView> custom_mask_offsets,
-    Optional<TensorView> first_sparse_mask_offsets_kv) {
+    Optional<TensorView> first_sparse_mask_offsets_kv,
+    bool force_spec_dec_tree_keeps, bool custom_mask_uses_sliding_window) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -490,7 +494,109 @@ void trtllm_paged_attention_decode(
       sm_count, enable_pdl, workspace_size, k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads,
       v_sf_stride_batch, /*is_causal=*/true, lse_stride_tokens, lse_stride_heads,
       bf16q_fp8kv_transform_mode, packed_custom_mask_ptr, custom_mask_offsets_ptr,
-      first_sparse_mask_offsets_kv_ptr, stream);
+      first_sparse_mask_offsets_kv_ptr,
+      force_spec_dec_tree_keeps, custom_mask_uses_sliding_window, stream);
+}
+
+bool trtllm_fmha_has_spec_dec_tree_kernel(TensorView query, TensorView key_cache,
+                                          TensorView value_cache, TensorView out,
+                                          int64_t batch_size, int64_t max_q_len,
+                                          int64_t max_kv_len,
+                                          Optional<bool> uses_shared_paged_kv_idx,
+                                          bool custom_mask_uses_sliding_window) {
+  auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
+  auto k_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
+  auto v_data_type = dl_dtype_to_tllm_data_type(value_cache.dtype());
+  auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
+  int const head_dim_k = is_4bit(k_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
+  int const head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
+  int const head_dim_v = is_4bit(v_data_type) ? value_cache.size(-1) * 2 : value_cache.size(-1);
+  int const head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
+  TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
+      << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
+      << std::to_string(head_dim_q);
+  TVM_FFI_ICHECK_EQ(head_dim_v, head_dim_o)
+      << "head_dim_v and head_dim_o must be the same, got " << std::to_string(head_dim_v) << " and "
+      << std::to_string(head_dim_o);
+
+  auto fmha_runner =
+      TllmGenFmhaRunnerCache::get(q_data_type, k_data_type, v_data_type, o_data_type);
+  TllmGenFmhaRunnerParams runner_params;
+  runner_params.qPtr = query.data_ptr();
+  runner_params.kPtr = key_cache.data_ptr();
+  runner_params.vPtr = value_cache.data_ptr();
+  runner_params.oPtr = out.data_ptr();
+  runner_params.customMaskPtr = nullptr;
+  runner_params.customMaskOffsetsPtr = nullptr;
+  runner_params.firstSparseMaskOffsetsKvPtr = nullptr;
+  runner_params.slidingWindowKvPoolPtr = nullptr;
+  runner_params.kvPageIdxPtr = nullptr;
+  runner_params.kSfBasePtr = nullptr;
+  runner_params.vSfBasePtr = nullptr;
+  runner_params.seqLensKvPtr = nullptr;
+  runner_params.cumSeqLensQPtr = nullptr;
+  runner_params.cumSeqLensKvPtr = nullptr;
+  runner_params.multiCtasKvCounterPtr = nullptr;
+  runner_params.multiCtasKvScratchPtr = nullptr;
+  runner_params.softmaxStatsPtr = nullptr;
+  runner_params.lsePtr = nullptr;
+  runner_params.ptrAttentionSinks = nullptr;
+  runner_params.sparseMlaTopKLensPtr = nullptr;
+  runner_params.outputScalePtr = nullptr;
+  runner_params.scaleSoftmaxLog2Ptr = nullptr;
+  runner_params.kvSfScalePtr = nullptr;
+  runner_params.oSfPtr = nullptr;
+  runner_params.mMaskType = custom_mask_uses_sliding_window
+                                ? TrtllmGenAttentionMaskType::SlidingWindowCustom
+                                : TrtllmGenAttentionMaskType::Custom;
+  runner_params.mKernelType = FmhaKernelType::Generation;
+  runner_params.mTileScheduler = TileScheduler::Static;
+  runner_params.mMultiCtasKvMode = true;
+  runner_params.mHeadDimQk = head_dim_q;
+  runner_params.mHeadDimV = head_dim_v;
+  runner_params.mNumHeadsQ = query.size(1);
+  runner_params.mNumHeadsKv = key_cache.size(-3);
+  runner_params.mNumHeadsQPerKv = runner_params.mNumHeadsQ / runner_params.mNumHeadsKv;
+  runner_params.mBatchSize = batch_size;
+  runner_params.mMaxSeqLenQ = max_q_len;
+  runner_params.mSumOfSeqLensQ = query.size(0);
+  runner_params.mMaxSeqLenKv = max_kv_len;
+  runner_params.mMaxNumPagesPerSeqKv = 0;
+  runner_params.mNumTokensPerPage = key_cache.size(-2);
+  runner_params.mQkvLayout = QkvLayout::PagedKv;
+  runner_params.mMultiProcessorCount = getMultiProcessorCount();
+  runner_params.mChunkedAttentionSize = INT_MAX;
+  runner_params.mAttentionWindowSize = custom_mask_uses_sliding_window ? max_kv_len : INT_MAX;
+  runner_params.mSparseMlaType = TrtllmGenSparseMlaType::None;
+  runner_params.mSparseMlaTopK = 0;
+  runner_params.mHasSlidingWindowKvPool = false;
+  runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx.value_or(true);
+  runner_params.mSkipsSoftmaxWhenPossible = false;
+  runner_params.mSkipSoftmaxThresholdScaleFactor = 0.0f;
+  runner_params.mScaleSfKv = 1.0f;
+  runner_params.mScaleSfO = -1.0f;
+  runner_params.mSfStartTokenIdx = 0;
+  runner_params.outputScale = 1.0f;
+  runner_params.scaleSoftmaxLog2 = 1.0f;
+  runner_params.qStrideTokens = query.stride(0);
+  runner_params.qStrideHeads = query.stride(1);
+  int const stride_idx_factor = is_4bit(k_data_type) ? 2 : 1;
+  runner_params.kStrideKeysValues = key_cache.stride(-2) * stride_idx_factor;
+  runner_params.kStrideHeads = key_cache.stride(-3) * stride_idx_factor;
+  runner_params.kStrideBatch = key_cache.stride(0) * stride_idx_factor;
+  runner_params.vStrideKeysValues = value_cache.stride(-2) * stride_idx_factor;
+  runner_params.vStrideHeads = value_cache.stride(-3) * stride_idx_factor;
+  runner_params.vStrideBatch = value_cache.stride(0) * stride_idx_factor;
+  runner_params.kSfStrideHeads = 0;
+  runner_params.kSfStrideBatch = 0;
+  runner_params.vSfStrideHeads = 0;
+  runner_params.vSfStrideBatch = 0;
+  runner_params.lseStrideTokens = 0;
+  runner_params.lseStrideHeads = 0;
+  runner_params.enable_pdl = false;
+  runner_params.stream = nullptr;
+
+  return fmha_runner->isSupported(runner_params);
 }
 
 void trtllm_paged_attention_context(
@@ -629,7 +735,9 @@ void trtllm_paged_attention_context(
       sm_count, enable_pdl, workspace_size, k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads,
       v_sf_stride_batch, is_causal, lse_stride_tokens, lse_stride_heads,
       /*bf16q_fp8kv_transform_mode=*/0, /*packed_custom_mask=*/nullptr,
-      /*custom_mask_offsets=*/nullptr, /*first_sparse_mask_offsets_kv=*/nullptr, stream);
+      /*custom_mask_offsets=*/nullptr, /*first_sparse_mask_offsets_kv=*/nullptr,
+      /*force_spec_dec_tree_keeps=*/false,
+      /*custom_mask_uses_sliding_window=*/false, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -983,7 +1091,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
       /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0,
       /*packed_custom_mask=*/nullptr, /*custom_mask_offsets=*/nullptr,
-      /*first_sparse_mask_offsets_kv=*/nullptr, stream);
+      /*first_sparse_mask_offsets_kv=*/nullptr, /*force_spec_dec_tree_keeps=*/false,
+      /*custom_mask_uses_sliding_window=*/false, stream);
 }
 
 namespace trtllm_cubin_loader {
@@ -991,6 +1100,8 @@ namespace trtllm_cubin_loader {
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fmha_has_spec_dec_tree_kernel,
+                              trtllm_fmha_has_spec_dec_tree_kernel);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode_sparse_mla_dsv4,
                               trtllm_paged_attention_decode_sparse_mla_dsv4);

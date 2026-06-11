@@ -982,14 +982,12 @@ class TllmGenFmhaKernel {
   }
 
   // Selects the generation kernel for custom-mask (spec-dec tree) attention.
-  // Mirrors trtllm-gen FmhaAutoTuner::selectSpecDecTreeKernel, constrained to
-  // the cubins shipped in the current artifact: Q128 KeepsMmaAbForGeneration
-  // (groupsTokensHeadsQ) with tileSizeKv = 128. Small numTokensHeadsQ shapes
-  // would prefer the SwapsMmaAb Q8/16/32 custom-mask kernels, which are not
-  // exported yet; revisit the heuristic when they are published.
-  // CgaSmemReduction is only wired up for SwapsMmaAb kernels, so the
-  // multiCtasKv path stays on GmemReduction, matching trtllm-gen's choice
-  // for spec-dec tree (Q128 can exceed the 16-CTA cluster limit).
+  // Mirrors trtllm-gen FmhaAutoTuner::selectSpecDecTreeKernel. SwapsMmaAb
+  // uses one draft token per CTA and packs the custom mask in the Swaps LDTM
+  // bit layout; KeepsMmaAb uses the Q128 row-major custom-mask layout. The
+  // Python mask packer mirrors this same threshold table.
+  // CgaSmemReduction is feasible for some Swaps cases, but trtllm-gen selects
+  // GmemReduction for spec-dec tree, so keep the reduction mode aligned.
   void selectSpecDecTreeGenerationKernel(RunnerParams const& params,
                                          SelectKernelParams& selectKernelParams) const {
     FLASHINFER_CHECK(params.mHeadDimQk == 64 || params.mHeadDimQk == 128,
@@ -997,18 +995,38 @@ class TllmGenFmhaKernel {
                      params.mHeadDimQk);
     FLASHINFER_CHECK(isPagedKv(params.mQkvLayout),
                      "Custom-mask spec-dec generation requires a paged KV cache.");
-    // The published custom-mask cubins have no SlidingWindow+Custom mask
-    // type; callers fold sliding windows into the packed mask and disable
-    // the kernel-side window (see _pack_trtllm_gen_spec_dec_mask). Proper
-    // combined kernel support in trtllm-gen is a planned follow-up.
-    FLASHINFER_CHECK(
-        params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
-            params.mChunkedAttentionSize == INT_MAX,
-        "Custom-mask spec-dec generation does not support sliding-window or chunked attention; "
-        "fold the window into the packed custom mask instead.");
-    selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-    selectKernelParams.mTileSizeQ = 128;
+    if (!isSlidingWindowCustomMask(selectKernelParams.mMaskType)) {
+      FLASHINFER_CHECK(
+          params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
+              params.mChunkedAttentionSize == INT_MAX,
+          "Custom-mask spec-dec generation requires SlidingWindowCustom metadata for "
+          "kernel-side sliding-window masking; fold the window into the packed custom mask "
+          "instead.");
+    } else {
+      FLASHINFER_CHECK(params.mAttentionWindowSize != INT_MAX &&
+                           params.mChunkedAttentionSize == INT_MAX,
+                       "SlidingWindowCustom spec-dec generation requires sliding-window attention "
+                       "and does not support chunked attention.");
+    }
+    int const numTokensHeadsQ = params.mNumHeadsQPerKv * params.mMaxSeqLenQ;
+    if (params.mForceSpecDecTreeKeeps) {
+      selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      selectKernelParams.mTileSizeQ = 128;
+    } else if (numTokensHeadsQ <= 8) {
+      selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mTileSizeQ = 8;
+    } else if (numTokensHeadsQ <= 16) {
+      selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mTileSizeQ = 16;
+    } else if (numTokensHeadsQ <= 64) {
+      selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mTileSizeQ = 32;
+    } else {
+      selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      selectKernelParams.mTileSizeQ = 128;
+    }
     selectKernelParams.mTileSizeKv = 128;
+    selectKernelParams.mForceGmemReduction = true;
   }
 
   // Select a kernel based on the heuristic.

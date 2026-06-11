@@ -18,7 +18,7 @@ import functools
 import math
 import warnings
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, List, Literal, NamedTuple, Optional, Tuple, Union, overload
 
 import torch
 
@@ -2365,6 +2365,8 @@ class TrtllmGenDecodeModule:
             None,  # packed_custom_mask
             None,  # custom_mask_offsets
             None,  # first_sparse_mask_offsets_kv
+            False,  # force_spec_dec_tree_keeps
+            False,  # custom_mask_uses_sliding_window
         )
         return out
 
@@ -2533,6 +2535,99 @@ def _check_xqa_nvfp4_page_size(page_size: int) -> None:
         )
 
 
+class _SpecDecTreeKernelLayout(NamedTuple):
+    kernel_layout: Literal["keeps", "swaps"]
+    tile_size_q: int
+    num_insts_kv: int
+    num_heads_q_per_kv: int
+
+    @property
+    def layout_id(self) -> int:
+        return 1 if self.kernel_layout == "swaps" else 0
+
+    def words_per_sequence(
+        self, q_len: int, max_seq_len: Optional[int], window_left: int
+    ) -> int:
+        tile_size_kv_per_cta = 128 * self.num_insts_kv
+        if window_left >= 0:
+            if max_seq_len is None:
+                raise ValueError("window_left >= 0 requires max_seq_len for mask sizing")
+            max_mask_tiles_kv = ceil_div(max_seq_len, tile_size_kv_per_cta)
+        else:
+            max_mask_tiles_kv = ceil_div(
+                tile_size_kv_per_cta - 1 + q_len, tile_size_kv_per_cta
+        )
+        if self.kernel_layout == "swaps":
+            tile_size_q = ceil_div(self.tile_size_q, 32) * 32
+            num_tiles_q = q_len * ceil_div(self.num_heads_q_per_kv, tile_size_q)
+            words_per_tile_block = self.num_insts_kv * 128 * ceil_div(self.tile_size_q, 32)
+        else:
+            num_tiles_q = ceil_div(q_len * self.num_heads_q_per_kv, 128)
+            words_per_tile_block = self.num_insts_kv * (128 * 128 // 32)
+        return num_tiles_q * max_mask_tiles_kv * words_per_tile_block
+
+
+def _select_trtllm_gen_spec_dec_tree_kernel(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_heads_q_per_kv: int,
+    q_len: int,
+    force_keeps: bool = False,
+) -> _SpecDecTreeKernelLayout:
+    num_tokens_heads_q = num_heads_q_per_kv * q_len
+    num_insts_kv = 1 if q_dtype != kv_dtype else 2
+    if force_keeps:
+        return _SpecDecTreeKernelLayout("keeps", 128, num_insts_kv, num_heads_q_per_kv)
+    if num_tokens_heads_q <= 8:
+        return _SpecDecTreeKernelLayout("swaps", 8, num_insts_kv, num_heads_q_per_kv)
+    if num_tokens_heads_q <= 16:
+        return _SpecDecTreeKernelLayout("swaps", 16, num_insts_kv, num_heads_q_per_kv)
+    if num_tokens_heads_q <= 64:
+        return _SpecDecTreeKernelLayout("swaps", 32, num_insts_kv, num_heads_q_per_kv)
+    return _SpecDecTreeKernelLayout("keeps", 128, num_insts_kv, num_heads_q_per_kv)
+
+
+def _should_force_trtllm_gen_spec_dec_tree_keeps(
+    layout: _SpecDecTreeKernelLayout,
+    seq_lens: torch.Tensor,
+    q_len: int,
+    window_left: int,
+) -> bool:
+    if layout.kernel_layout != "swaps":
+        return False
+    if window_left >= 0:
+        return True
+    tile_size_kv_per_cta = 128 * layout.num_insts_kv
+    prefix_lens = seq_lens - q_len
+    straddles_kv_cta = (prefix_lens % tile_size_kv_per_cta) + q_len > tile_size_kv_per_cta
+    return bool(torch.any(straddles_kv_cta).item())
+
+
+def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out: torch.Tensor,
+    batch_size: int,
+    max_q_len: int,
+    max_seq_len: int,
+    uses_shared_paged_kv_idx: bool,
+) -> bool:
+    return bool(
+        get_trtllm_gen_fmha_module().trtllm_fmha_has_spec_dec_tree_kernel(
+            query,
+            k_cache,
+            v_cache,
+            out,
+            batch_size,
+            max_q_len,
+            max_seq_len,
+            uses_shared_paged_kv_idx,
+            True,
+        )
+    )
+
+
 def _pack_trtllm_gen_spec_dec_mask(
     mask: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2543,6 +2638,7 @@ def _pack_trtllm_gen_spec_dec_mask(
     batch_size: int,
     window_left: int = -1,
     max_seq_len: Optional[int] = None,
+    force_keeps: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack a dense spec-dec tree mask into the TRTLLM-GEN custom-mask layout.
 
@@ -2558,13 +2654,12 @@ def _pack_trtllm_gen_spec_dec_mask(
     (batch_size, q_len_per_req) and the packing kernel is CUDA-graph
     capturable.
 
-    window_left >= 0 folds a sliding window into the packed mask: the cubins
-    treat KV below firstSparseMaskOffsetsKv as visible, so the window forces
-    the offset to 0 and explicit bits over the whole presented KV range,
-    sized by max_seq_len. Callers should present only roughly the in-window
-    KV (trimmed page table + clamped seq_lens) to keep the mask region small.
-    Proper SlidingWindow+Custom mask support in the trtllm-gen kernels is a
-    planned follow-up that would remove this folding.
+    ``window_left >= 0`` selects the compatibility fallback layout: the
+    sliding window is folded into the packed mask, the kernel-side window is
+    disabled, and the mask region covers the whole presented KV range sized
+    by ``max_seq_len``. Native ``SlidingWindowCustom`` kernels pass
+    ``window_left=-1`` here so the packed mask is tail-only and the kernel
+    applies the window analytically.
     """
     if q_len_per_req is None or q_len_per_req <= 1:
         raise ValueError(
@@ -2579,13 +2674,7 @@ def _pack_trtllm_gen_spec_dec_mask(
             "mask must be a bool tensor of shape [batch_size, q_len_per_req, "
             f"q_len_per_req], got {mask.dtype} {tuple(mask.shape)}"
         )
-    # Mixed-dtype Q/KV kernels reserve a warpgroup for the KV transform and
-    # use a single KV tile instance (stepKv 128 instead of 256).
-    num_insts_kv = 1 if q_dtype != kv_dtype else 2
-    tile_size_kv_per_cta = 128 * num_insts_kv
-    num_tiles_q = ceil_div(q_len_per_req * num_heads_q_per_kv, 128)
     if window_left >= 0:
-        # The mask region covers the whole presented KV range (offset 0).
         if max_seq_len is None:
             raise ValueError("window_left >= 0 requires max_seq_len for mask sizing")
         if seq_lens.numel() != batch_size:
@@ -2600,13 +2689,12 @@ def _pack_trtllm_gen_spec_dec_mask(
                 "seq_lens contains values larger than max_seq_len; trim the "
                 "presented KV/page table and pass the trimmed bound."
             )
-        max_mask_tiles_kv = ceil_div(max_seq_len, tile_size_kv_per_cta)
-    else:
-        # Worst case over prefix tile alignment: ceil((tile - 1 + q_len) / tile).
-        max_mask_tiles_kv = ceil_div(
-            tile_size_kv_per_cta - 1 + q_len_per_req, tile_size_kv_per_cta
-        )
-    words_per_seq = num_tiles_q * max_mask_tiles_kv * num_insts_kv * (128 * 128 // 32)
+    kernel_layout = _select_trtllm_gen_spec_dec_tree_kernel(
+        q_dtype, kv_dtype, num_heads_q_per_kv, q_len_per_req, force_keeps
+    )
+    words_per_seq = kernel_layout.words_per_sequence(
+        q_len_per_req, max_seq_len, window_left
+    )
     packed_custom_mask = torch.empty(
         (batch_size, words_per_seq), dtype=torch.uint32, device=mask.device
     )
@@ -2626,7 +2714,9 @@ def _pack_trtllm_gen_spec_dec_mask(
         mask.contiguous(),
         seq_lens.to(device=mask.device, dtype=torch.int32),
         num_heads_q_per_kv,
-        num_insts_kv,
+        kernel_layout.num_insts_kv,
+        kernel_layout.tile_size_q,
+        kernel_layout.layout_id,
         window_left,
     )
     return packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv
@@ -2763,12 +2853,14 @@ def trtllm_batch_decode_with_kv_cache(
           Row ``i`` masks draft token ``i`` against the draft tail; the KV
           prefix before the draft tail is always attended. Requires uniform
           query lengths (``q_len_per_req``), paged KV cache, and head_dim 64
-          or 128. ``window_left >= 0`` is supported by folding the window
-          into the packed mask using the slot-index window rule (kv visible
-          iff ``kv_idx >= prefix + row - window_left``, as in the non-tree
-          window paths); the mask region then covers the whole presented KV
-          range, so callers should trim the page table and ``seq_lens`` to
-          roughly the window and pass the trimmed bound as ``max_seq_len``.
+          or 128. When the loaded TRTLLM-GEN artifact contains native
+          ``SlidingWindowCustom`` kernels, ``window_left >= 0`` keeps the full
+          presented KV range and applies the window in-kernel using the same
+          slot-index rule as non-tree window paths (kv visible iff
+          ``kv_idx >= prefix + row - window_left``). Older artifacts fall back
+          to folding the window into the packed mask; in that mode callers
+          should trim the page table and ``seq_lens`` to roughly the window
+          and pass the trimmed bound as ``max_seq_len``.
 
     max_q_len: Optional[int] = None
         The maximum query sequence length across all requests when using variable-length queries.
@@ -3061,8 +3153,40 @@ def trtllm_batch_decode_with_kv_cache(
         packed_custom_mask = None
         custom_mask_offsets = None
         first_sparse_mask_offsets_kv = None
+        force_spec_dec_tree_keeps = False
+        custom_mask_uses_sliding_window = False
         if mask is not None:
+            if q_len_per_req is None or q_len_per_req <= 1:
+                raise ValueError(
+                    "TRTLLM-GEN spec-dec tree mask requires q_len_per_req > 1"
+                )
             num_kv_heads = k_cache.shape[-3]
+            spec_dec_tree_layout = _select_trtllm_gen_spec_dec_tree_kernel(
+                query.dtype,
+                k_cache.dtype,
+                query.size(1) // num_kv_heads,
+                q_len_per_req,
+            )
+            custom_mask_uses_sliding_window = (
+                window_left >= 0
+                and _has_trtllm_gen_native_spec_dec_tree_window_kernel(
+                    query,
+                    k_cache,
+                    v_cache,
+                    out,
+                    batch_size,
+                    max_q_len,
+                    max_seq_len,
+                    uses_shared_paged_kv_idx,
+                )
+            )
+            mask_pack_window_left = -1 if custom_mask_uses_sliding_window else window_left
+            force_spec_dec_tree_keeps = _should_force_trtllm_gen_spec_dec_tree_keeps(
+                spec_dec_tree_layout,
+                seq_lens,
+                q_len_per_req,
+                mask_pack_window_left,
+            )
             packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv = (
                 _pack_trtllm_gen_spec_dec_mask(
                     mask,
@@ -3072,15 +3196,16 @@ def trtllm_batch_decode_with_kv_cache(
                     k_cache.dtype,
                     query.size(1) // num_kv_heads,
                     batch_size,
-                    window_left,
+                    mask_pack_window_left,
                     max_seq_len,
+                    force_spec_dec_tree_keeps,
                 )
             )
-            # The custom-mask cubins have no SlidingWindow+Custom mask type,
-            # so the window is folded into the packed mask above and the
-            # kernel runs without one. Proper combined kernel support in
-            # trtllm-gen is a planned follow-up.
-            window_left = -1
+            if not custom_mask_uses_sliding_window:
+                # Older artifacts have no SlidingWindowCustom mask type, so
+                # the window is folded into the packed mask above and the
+                # kernel runs without a kernel-side window.
+                window_left = -1
 
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
@@ -3133,6 +3258,8 @@ def trtllm_batch_decode_with_kv_cache(
             packed_custom_mask,
             custom_mask_offsets,
             first_sparse_mask_offsets_kv,
+            force_spec_dec_tree_keeps,
+            custom_mask_uses_sliding_window,
         )
 
         result_out = (

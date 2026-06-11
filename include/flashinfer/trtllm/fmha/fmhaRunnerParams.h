@@ -35,7 +35,9 @@ enum class TrtllmGenAttentionMaskType {
   // Sliding window or chunked causal mask.
   SlidingOrChunkedCausal,
   // Custom mask.
-  Custom
+  Custom,
+  // Custom mask combined with sliding-window masking.
+  SlidingWindowCustom
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -50,9 +52,14 @@ enum class TrtllmGenAttentionMaskType {
 ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
-ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
+
+inline bool isCustomMask(TrtllmGenAttentionMaskType maskType) {
+  return maskType == TrtllmGenAttentionMaskType::Custom ||
+         maskType == TrtllmGenAttentionMaskType::SlidingWindowCustom;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -314,6 +321,9 @@ struct TllmGenFmhaRunnerParams {
   int mAttentionWindowSize;
   // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
   int mChunkedAttentionSize;
+  // Force the spec-dec tree custom-mask path onto KeepsMmaAb when a runtime
+  // sequence shape cannot be represented safely by the Swaps packed layout.
+  bool mForceSpecDecTreeKeeps;
   // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
   int mSumOfSeqLensQ;
   int mSumOfSeqLensKv;
@@ -374,6 +384,9 @@ struct TllmGenFmhaRunnerParams {
         break;
       case 3:  // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
         mMaskType = TrtllmGenAttentionMaskType::Custom;
+        break;
+      case 4:  // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_WINDOW_CUSTOM
+        mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCustom;
         break;
       default:
         FLASHINFER_ERROR("Invalid attention mask type");
