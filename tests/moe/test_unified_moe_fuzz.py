@@ -129,8 +129,8 @@ OUT OF SCOPE for this single-GPU correctness harness (must live elsewhere, do NO
 POINTERS for future agents (point me at this file and I know the rest):
   * Full context (this fuzzer + the older adapter/GEMM fuzzers + the audit + findings): cuDNN-
     project auto-memory ``flashinfer_quality_fuzzers.md``.
-  * Bugs THIS fuzzer found + filed: gh #3547 (trtllm EP offset>0 all-zero -- encoded in the
-    ``_KNOWN_FAILURES`` ledger below: xfailed but still RUN, so an xpass announces the fix) and
+  * Bugs THIS fuzzer found + filed: gh #3547 (trtllm EP offset>0 all-zero -- tracked in the
+    ``_KNOWN_FAILURES`` ledger below until fixed) and
     gh #3548 (activation global-scale gap == roadmap #5's scale-policy fix).
   * Findings writeups: flashinfer_triage/EP_OFFSET_FINDING.md, flashinfer_triage/WEIGHT_SCALE_FINDING.md.
   * The unified API under test: PR #3093 (branch ``moe_api``); this fuzzer is PR aleozlx/flashinfer#6
@@ -172,20 +172,20 @@ NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
 
 # --- CI-safety gate: OPT-IN ----------------------------------------------------------------
-# Waived in CI pending gh #3547 + root-cause of a whole-process abort. Running the SM100 fuzzer
+# Waived in CI pending root-cause of a whole-process abort. Running the SM100 fuzzer
 # in a single `pytest` process can hit `CUDA error: device-side assert triggered` ->
 # `Fatal Python error: Aborted`, which would BLOCK B200 CI (an abort fails the whole job, not one
 # test). Notes from triage (2026-06-09): per-config isolation (one process each) passes 68/86
-# incl. EP offset>0 -- so the abort is NOT cleanly attributable to one config (the gh #3547 EP
-# case returns tolerated zeros, no assert, under torch.cuda.synchronize); it surfaces only in the
-# accumulated single-process run that CI uses. `pytest --forked` can't isolate it here either
-# (CUDA inits at collection -> "Cannot re-initialize CUDA in forked subprocess"). Until the abort
-# is root-caused and #3547 fixed (follow-up PR), this suite is opt-in: set FLASHINFER_UMOE_FUZZ=1
+# incl. EP offset>0 -- so the abort is NOT cleanly attributable to one config (the since-fixed
+# gh #3547 EP case returned tolerated zeros, no assert, under torch.cuda.synchronize); it surfaces
+# only in the accumulated single-process run that CI uses. `pytest --forked` can't isolate it
+# either (CUDA inits at collection -> "Cannot re-initialize CUDA in forked subprocess"). Until the
+# abort is root-caused, this suite is opt-in: set FLASHINFER_UMOE_FUZZ=1
 # to run it (developer / nightly / SM100 box). Unset (CI default) -> collected-and-skipped, so it
 # never launches a kernel and cannot abort the job.
 pytestmark = pytest.mark.skipif(
     not os.environ.get("FLASHINFER_UMOE_FUZZ"),
-    reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending gh #3547 and "
+    reason="opt-in fuzzer (set FLASHINFER_UMOE_FUZZ=1); waived in CI pending "
     "root-cause of the whole-process device-side-assert abort",
 )
 
