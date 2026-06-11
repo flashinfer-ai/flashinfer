@@ -22,6 +22,7 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     is_cute_dsl_available,
 )
+from flashinfer.utils import is_sm100a_supported, is_sm100f_supported
 
 
 @pytest.mark.skipif(
@@ -274,11 +275,11 @@ def test_grouped_gemm_nt_masked_output_layout_contract():
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    major, _ = torch.cuda.get_device_capability("cuda:0")
-    if major < 10:
-        pytest.skip("NVFP4 grouped GEMM requires SM100+")
-
     dev = torch.device("cuda:0")
+    # cute-dsl grouped GEMM is SM100-only (SM110 is explicitly unsupported).
+    if not (is_sm100a_supported(dev) or is_sm100f_supported(dev)):
+        pytest.skip("NVFP4 grouped GEMM requires SM100")
+
     sf_vec = 16
     m, n, k, E = 128, 128, 256, 2
     k_packed, rm, k_sf = k // 2, m // 128, k // sf_vec
