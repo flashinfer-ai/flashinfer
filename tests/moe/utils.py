@@ -482,12 +482,17 @@ def create_moe_tensors(
     use_per_token_activation: bool = False,
     interleave_gated_weights: bool = True,
     use_nontrivial_alphas: bool = True,
+    calibrated_activation_scale: bool = False,
 ):
     """Create properly quantized MoE tensors for testing.
 
     CuTe SM100 kernels consume interleaved gated weights and the tests exercise
     nontrivial per-expert alpha scales. B12x kernels use the opposite settings;
     callers should use :func:`create_b12x_moe_tensors` for that configuration.
+
+    ``calibrated_activation_scale`` quantizes the activations with the real
+    calibrated NVFP4 global scale ``(448 * 6) / amax`` instead of 1.0; the
+    scale used is returned under the ``a1_gs`` key (gh #3548).
     """
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.quantization import (
@@ -510,6 +515,12 @@ def create_moe_tensors(
     )
     x_per_token_scale = None
     if use_per_token_activation:
+        if calibrated_activation_scale:
+            raise ValueError(
+                "calibrated_activation_scale applies to the global-scale "
+                "quantization path (use_per_token_activation=False)."
+            )
+        a1_gs = None
         x_global_scale = make_nvfp4_global_scale(
             x_bf16,
             per_token_activation=True,
@@ -533,7 +544,10 @@ def create_moe_tensors(
         ).to(device)
         x_ref = x_ref.float() * x_per_token_scale.unsqueeze(1)
     else:
-        a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+        if calibrated_activation_scale:
+            a1_gs = ((448 * 6) / x_bf16.float().abs().nan_to_num().max()).reshape(1)
+        else:
+            a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
         x_quantized, x_sf = fp4_quantize(
             x_bf16,
             global_scale=a1_gs,
@@ -543,7 +557,7 @@ def create_moe_tensors(
         x_ref = e2m1_and_ufp8sf_scale_to_float(
             x_quantized.cpu(),
             x_sf.view(torch.uint8).cpu().reshape(-1),
-            torch.ones(1, dtype=torch.float32),
+            (1.0 / a1_gs).cpu(),
             sf_vec_size=sf_vec_size,
             ufp8_type=1,
             is_sf_swizzled_layout=False,
@@ -637,6 +651,7 @@ def create_moe_tensors(
         "x_sf": x_sf,
         "x_bf16": x_bf16,
         "x_ref": x_ref,
+        "a1_gs": a1_gs,
         "x_per_token_scale": x_per_token_scale,
         "token_selected_experts": selected_experts,
         "token_final_scales": routing_weights,

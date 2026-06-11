@@ -952,6 +952,110 @@ def _compute_ref(act_pack, tensors, shape):
     )
 
 
+
+
+@sm100_required
+class TestCalibratedGlobalScales:
+    """The unified API must reproduce the reference when the activations were
+    quantized with a real calibrated NVFP4 global scale, not just the trivial
+    1.0 the other tests use (gh #3548)."""
+
+    @pytest.mark.parametrize("backend_key", ["cute_dsl_nvfp4", "trtllm_fp4_routed"])
+    def test_backend_matches_reference_with_calibrated_scales(self, backend_key):
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_tokens = 256
+        hidden_size = SMALL["hidden_size"]
+        intermediate_size = SMALL["intermediate_size"]
+        num_experts = SMALL["num_experts"]
+        top_k = SMALL["top_k"]
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            calibrated_activation_scale=True,
+        )
+        # The case is only meaningful if the calibrated scale is non-trivial.
+        assert float(tensors["a1_gs"]) > 100.0
+
+        # Calibrated intermediate (c_global_sf / a2) scale from the bf16
+        # swiglu outputs over all (token, expert) pairs.
+        gemm1_out = torch.einsum(
+            "th,eoh->teo",
+            tensors["x_bf16"].float(),
+            tensors["w1_weight_bf16"].float(),
+        )
+        swiglu_out = (
+            torch.nn.functional.silu(gemm1_out[..., intermediate_size:])
+            * gemm1_out[..., :intermediate_size]
+        )
+        a2_gs = ((448 * 6) / swiglu_out.abs().nan_to_num().max()).reshape(1)
+
+        act_pack = MoEActivationPack(
+            hidden_states_q=tensors["x"],
+            hidden_states_scale=tensors["x_sf"].squeeze(-1),
+            topk_ids=tensors["token_selected_experts"],
+            topk_weights=tensors["token_final_scales"],
+            hidden_states_scale_global=tensors["a1_gs"],
+        )
+        weight_pack = MoEWeightPack()
+        prepare_kwargs = dict(
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            intermediate_scale_global=a2_gs,
+        )
+        weight_pack.prepare_for(
+            "cute_dsl_nvfp4",
+            CuteDslConfig.prepare_weights(
+                tensors["w1_weight_bf16"], tensors["w2_weight_bf16"], **prepare_kwargs
+            ),
+        )
+        weight_pack.prepare_for(
+            "trtllm_fp4_routed",
+            TrtllmFp4Config.prepare_weights(
+                tensors["w1_weight_bf16"], tensors["w2_weight_bf16"], **prepare_kwargs
+            ),
+        )
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(intermediate_size=intermediate_size),
+            activation=ActivationConfig(),
+            backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+        )
+        layer = MoELayer(config)
+        runner = next(r for r in layer.runners if r.backend_key == backend_key)
+
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        out = runner.forward(inputs, tactic=-1)
+
+        ref = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float(),
+            gemm1_weights=tensors["w1_weight_bf16"].float(),
+            gemm2_weights=tensors["w2_weight_bf16"].float(),
+            token_selected_experts=act_pack.topk_ids,
+            token_final_scales=act_pack.topk_weights,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=a2_gs,
+        )
+        passed, pct, atol = check_accuracy(out, ref)
+        assert passed, (
+            f"{backend_key} with calibrated scales (a1_gs="
+            f"{float(tensors['a1_gs']):.1f}, a2_gs={float(a2_gs):.1f}): "
+            f"{pct * 100:.2f}% within tolerance (atol={atol:.4f}) vs bf16 "
+            f"reference — gh #3548 regression"
+        )
+
 # ---------------------------------------------------------------------------
 # 2. Dispatch plumbing
 # ---------------------------------------------------------------------------
