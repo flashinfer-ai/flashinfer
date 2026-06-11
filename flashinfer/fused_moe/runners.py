@@ -106,7 +106,11 @@ class CuteDslNvfp4Runner(TunableRunner):
         v = weights.get_view(self.backend_key)
         w1_alpha = v["w1_alpha"]
         if act.hidden_states_scale_global is not None:
-            w1_alpha = w1_alpha / act.hidden_states_scale_global
+            # Match w1_alpha's device: a CPU-resident Pack scale would
+            # otherwise raise (or sync) on the GPU division.
+            w1_alpha = w1_alpha / act.hidden_states_scale_global.to(
+                device=w1_alpha.device, dtype=torch.float32
+            )
         num_tokens = act.hidden_states_q.shape[0]
         hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
         moe_output = act.hidden_states_q.new_empty(
@@ -273,9 +277,11 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         output1_scale_gate_scalar = v.get("output1_scale_gate_scalar")
         a1_gs = act.hidden_states_scale_global
         if a1_gs is not None:
-            inv_a1 = 1.0 / a1_gs.to(torch.float32)
+            # Pin to the runner's device: a CPU-resident Pack scale would
+            # otherwise produce CPU scalars feeding a GPU kernel.
+            inv_a1 = 1.0 / a1_gs.to(device=self.device, dtype=torch.float32)
             ones = torch.ones(
-                self._num_local_experts, device=a1_gs.device, dtype=torch.float32
+                self._num_local_experts, device=self.device, dtype=torch.float32
             )
             # Views without precomputed scalars imply weight-side factors of
             # 1.0 (weights quantized at global scale 1.0).
