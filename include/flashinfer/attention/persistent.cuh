@@ -641,13 +641,6 @@ template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, ui
 cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
                                           const uint32_t num_blks_x, const uint32_t num_blks_y,
                                           const cudaStream_t stream) {
-  // The holistic kernel keeps a register-resident O accumulator
-  // o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8] with NUM_MMA_D_VO = HEAD_DIM_VO/16, so
-  // HEAD_DIM_VO > 256 (NUM_MMA_D_VO > 16) blows past the 255-register/thread limit
-  // (and the per-CTA smem budget). It has not been ported to the VO-split layout
-  // used by the FA2 prefill path, so reject it loudly at compile time rather than
-  // silently emitting a spilling / non-launchable kernel. Large head dims (e.g. 512,
-  // issue #3297) must use the FA2 prefill/decode path instead.
   static_assert(HEAD_DIM_VO <= 256 && HEAD_DIM_QK <= 256,
                 "BatchAttention (holistic persistent) kernel does not support "
                 "head_dim > 256; use the FA2 prefill/decode path for large head dims.");

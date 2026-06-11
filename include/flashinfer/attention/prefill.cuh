@@ -70,15 +70,8 @@ constexpr uint32_t WARP_SIZE = 32;
 constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
 
 constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
-  // CTA_TILE_Q == 32 is produced ONLY by the HEAD_DIM_VO>=512 long-q VO-split path
-  // (FA2DetermineCtaTileQ). This default is the 1-Q-warp x 4-KV-warp layout (4 KV
-  // warps partition VO into NUM_MMA_D_VO/4=8 tiles each -> 64-reg o_frag, leaving
-  // register headroom for the FP8 in-loop dequant), used by the FP8 path. NOTE: the
-  // bf16/fp16 path OVERRIDES this to 2-Q x 2-KV in the *Dispatched fns (kBf16VOSplit),
-  // since 16-bit KV has no dequant temporaries and the 128-reg o_frag fits.
-  // (No HEAD_DIM<512 path emits 32.)
   if (cta_tile_q == 32) {
-    return 1;
+    return 1;  // HEAD_DIM_VO >= 512
   }
   if (cta_tile_q > 16) {
     return 4;
@@ -92,9 +85,8 @@ constexpr uint32_t get_num_warps_kv(const uint32_t cta_tile_kv) {
 }
 
 constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
-  // CTA_TILE_Q == 32 (HEAD_DIM_VO>=512 VO-split): 1 Q-warp owns 2 Q MMA tiles.
   if (cta_tile_q == 32) {
-    return 2;
+    return 2;  // HEAD_DIM_VO >= 512
   }
   if (cta_tile_q > 64) {
     return 2;
@@ -103,28 +95,12 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
   }
 }
 
-// kEnableVOSplitOpt gates the VO-split shared-memory optimizations (cta_sync_o /
-// v_smem shrinks + the P / m-d staging buffers). It is TRUE only for the storage
-// type used by the paged VO-split kernel; the default (FALSE) keeps the layout
-// byte-identical to the split-D baseline so the single/ragged kernels (which use
-// split-D and a real v_smem / cta_sync_o) are unaffected.
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
           bool kEnableVOSplitOpt = false>
 struct SharedStorageQKVO {
-  // Mirrors KernelTraits::USE_VO_SPLIT (HEAD_DIM_VO>256, NUM_MMA_D_VO divisible by
-  // NUM_WARPS_KV). On this path warps own disjoint VO slices and write O directly
-  // to gmem, so the cross-warp O reduction buffer cta_sync_o_smem is UNUSED — sizing
-  // it to the full NUM_WARPS_KV*CTA_TILE_Q*256 (128KB at CTA_TILE_Q=32) would
-  // needlessly inflate the union and cap occupancy at 1 CTA/SM, so it is shrunk to 1.
   static constexpr bool kVOSplit =
       kEnableVOSplitOpt && (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
-  // Mirrors KernelTraits::USE_KV_SHARED_SMEM: 16-bit KV on the VO-split path
-  // time-shares k_smem for V (load K -> QK -> load V into k_smem -> PV), so v_smem
-  // is shrunk to 1 and all V accesses target k_smem (HEAD_DIM_QK == HEAD_DIM_VO
-  // makes the buffer the right size). Halves the K+V footprint (128KB -> 64KB at
-  // hd512) so bf16/fp16 hd512 fits the 100KB SM12x budget. kVShareActive is the flag
-  // the K/V-load redirect (page_produce_kv / vosplit_compute_pv) keys off.
   static constexpr bool kVShareActive =
       kVOSplit && (sizeof(DTypeKV) == 2) && (HEAD_DIM_QK == HEAD_DIM_VO);
   union {
@@ -135,10 +111,6 @@ struct SharedStorageQKVO {
           std::conditional_t<kVShareActive, DTypeKV[1], DTypeKV[CTA_TILE_KV * HEAD_DIM_VO]> v_smem;
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
-      // Split-D: the cross-warp O reduction operates on one VO tile at a time
-      // (<= 256 wide) and is reused across the NUM_D_VO_TILES passes, so this
-      // buffer is sized to a single tile rather than the full HEAD_DIM_VO. For
-      // HEAD_DIM_VO <= 256 this is unchanged. VO-split doesn't use it (-> [1]).
       alignas(
           16) std::conditional_t<NUM_WARPS_KV == 1 || kVOSplit, float[1],
                                  float[NUM_WARPS_KV * CTA_TILE_Q *
@@ -156,47 +128,14 @@ struct SharedStorageQKVO {
   alignas(16) std::conditional_t<is_fp4_type_v<DTypeKV>,
                                  uint8_t[CTA_TILE_KV * HEAD_DIM_VO / NVFP4_SF_VEC_SIZE],
                                  uint8_t[1]> v_sf_smem;
-  // BF16/FP16 staging buffer for the FP8 "repack" path: K (then V) is dequantized
-  // once per tile into this, then read with the standard (shuffle-free) 16-bit
-  // ldmatrix path. A single buffer is time-shared between K and V because K is
-  // repacked+consumed (compute_qk) before V is repacked+consumed (compute_sfm_v).
-  // Sized to max(HEAD_DIM_QK, HEAD_DIM_VO); 1 unless DTypeKV is an 8-bit (FP8)
-  // type and not FP4 (FP4 keeps its in-loop dequant).
-  // The repack staging buffer costs CTA_TILE_KV*max(HEAD_DIM_QK,HEAD_DIM_VO) BF16
-  // elements (~64KB at head_dim=512). At HEAD_DIM_VO > 256 that buffer is what
-  // pushes per-CTA smem past the 1-block-per-SM threshold (occupancy collapses to
-  // ~6%), so disable repack there and fall back to in-loop FP8 dequant — freeing
-  // the buffer lets the dispatcher fit 2 CTAs/SM, which dominates the per-tile
-  // dequant cost for this latency-bound regime.
-  // Enabled for HEAD_DIM_VO <= 256. Also gated to CTA_TILE_Q > 16: repack pays off
-  // only when the per-tile dequant is amortized over enough query rows (prefill,
-  // CTA_TILE_Q 64/128). CTA_TILE_Q==16 is the short-query / decode regime (the
-  // dispatcher picks it for avg_packed_qo_len<=16), where decode streams a huge KV
-  // per query so the staging buffer's ~3x smem traffic + its ~32KB footprint
-  // (occupancy, critical on 100KB SM12x) make it a net loss vs in-loop dequant.
   static constexpr bool USE_KV_REPACK = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                                         (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
                                         (CTA_TILE_Q > 16);
   static constexpr uint32_t REPACK_BUF_ELEMS =
       CTA_TILE_KV * (HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO);
   alignas(16) std::conditional_t<USE_KV_REPACK, DTypeQ[REPACK_BUF_ELEMS], DTypeQ[1]> kv_smem_repack;
-
-  // VO-split path: staging buffer for the softmax probabilities P[CTA_TILE_Q x
-  // CTA_TILE_KV] so every warp can ldmatrix the full score row for its VO-slice
-  // PV. P is stored in DTypeQ (the PV A-operand type). Sized to 1 (negligible)
-  // unless the VO-split path is active (HEAD_DIM_VO > 256). The per-tile cross-warp
-  // m/d reduction reuses cta_sync_md_smem above.
-  // Only the VO-split (paged) storage carries the P / m-d staging buffers; gate on
-  // kVOSplit (which includes kEnableVOSplitOpt) so the split-D storage is unchanged.
   static constexpr bool VO_SPLIT_SMEM = kVOSplit;
   alignas(16) std::conditional_t<VO_SPLIT_SMEM, DTypeQ[CTA_TILE_Q * CTA_TILE_KV], DTypeQ[1]> p_smem;
-
-  // VO-split cross-warp m/d reduction buffer. MUST live outside the union above:
-  // the VO-split PV reads v_smem *after* the softmax writes m/d, but the union's
-  // cta_sync_md_smem aliases v_smem for FP8 KV (smaller 8-bit buffers shift v_smem
-  // up into the cta_sync region), which would clobber the V tile mid-iteration.
-  // (For BF16 KV cta_sync_md_smem happens to alias the already-consumed k_smem, so
-  // the split-D path can keep using the in-union buffer.) Sized to 1 off-path.
   alignas(16) std::conditional_t<VO_SPLIT_SMEM, float2[NUM_WARPS_KV * CTA_TILE_Q],
                                  float2[1]> vosplit_md_smem;
 };
@@ -219,38 +158,14 @@ struct KernelTraits {
   static constexpr uint32_t NUM_WARPS = NUM_WARPS_Q * NUM_WARPS_KV;
   static constexpr uint32_t HEAD_DIM_QK = NUM_MMA_D_QK * 16;
   static constexpr uint32_t HEAD_DIM_VO = NUM_MMA_D_VO * 16;
-  // Split-D over the output (VO) dimension: the O accumulator o_frag is
-  // register-resident across the whole KV loop, costing 8*NUM_MMA_D_VO regs per
-  // thread. For HEAD_DIM_VO > 256 (NUM_MMA_D_VO > 16) that exceeds the 255-reg
-  // budget, so we tile the VO dimension into NUM_D_VO_TILES passes of
-  // NUM_MMA_D_VO_TILE (<=16) each, re-running the KV loop per tile. The softmax
-  // state (m/d) depends only on Q.K^T (not VO), so each pass recomputes identical
-  // m/d; only the O accumulation differs per tile. For HEAD_DIM_VO <= 256 this is
-  // a single tile (NUM_D_VO_TILES == 1), i.e. behaviorally unchanged.
   static constexpr uint32_t NUM_MMA_D_VO_TILE = NUM_MMA_D_VO > 16 ? 16 : NUM_MMA_D_VO;
   static constexpr uint32_t NUM_D_VO_TILES = NUM_MMA_D_VO / NUM_MMA_D_VO_TILE;
   static_assert(NUM_MMA_D_VO % NUM_MMA_D_VO_TILE == 0,
                 "NUM_MMA_D_VO must be divisible by NUM_MMA_D_VO_TILE");
   static constexpr uint32_t HEAD_DIM_VO_TILE = NUM_MMA_D_VO_TILE * 16;
-  // VO-split path (HEAD_DIM_VO >= 512): instead of split-D recompute, the
-  // NUM_WARPS_KV warps partition the OUTPUT (VO) dimension — each warp owns
-  // NUM_MMA_D_VO_PER_WARP MMA tiles of VO, so its O accumulator is only
-  // NUM_MMA_Q*NUM_MMA_D_VO_PER_WARP*8 registers (no 256-reg wall). The warps
-  // cooperatively compute Q.K^T into a shared smem score buffer (one KV-tile at
-  // a time), so QK is computed once (no recompute) and every warp reads the full
-  // score row -> consistent online-softmax m/d without a cross-warp reduction.
   static constexpr bool USE_VO_SPLIT = (NUM_MMA_D_VO > 16) && (NUM_MMA_D_VO % NUM_WARPS_KV == 0);
   static constexpr uint32_t NUM_MMA_D_VO_PER_WARP =
       USE_VO_SPLIT ? (NUM_MMA_D_VO / NUM_WARPS_KV) : NUM_MMA_D_VO;
-  // K/V shared-smem path: for 16-bit (bf16/fp16) KV on the VO-split path, K and V
-  // each cost CTA_TILE_KV*HEAD_DIM*2B (= 64KB at hd512, NUM_WARPS_KV=4), and the
-  // kernel would otherwise keep both resident — 128KB for K+V, which doesn't fit
-  // the 100KB shared-memory budget of consumer Blackwell (SM12x / GB10). But within
-  // a KV tile K is fully consumed by Q.K^T before V is needed by P.V, so they can
-  // time-share ONE buffer (load K -> QK -> load V into the same smem -> PV), halving
-  // the K/V footprint to 64KB. (FP8 KV already fits at 64KB total and uses in-loop
-  // dequant, so it is excluded.) Requires symmetric head dims (the buffer is sized
-  // to HEAD_DIM_QK and reused for V).
   static constexpr bool USE_KV_SHARED_SMEM =
       USE_VO_SPLIT && (sizeof(DTypeKV_) == 2) && (HEAD_DIM_QK == HEAD_DIM_VO);
   static constexpr uint32_t UPCAST_STRIDE_Q = HEAD_DIM_QK / upcast_size<DTypeQ_>();
@@ -272,13 +187,6 @@ struct KernelTraits {
   using DTypeQKAccum = DTypeQKAccum_;
   using IdType = IdType_;
   using AttentionVariant = AttentionVariant_;
-  // When set, FP8 K/V are dequantized once per tile into BF16/FP16 staging smem
-  // and read via the standard (shuffle-free) 16-bit ldmatrix path. Only for the
-  // k128B-swizzle case (HEAD_DIM_VO != 64); FP4 keeps its in-loop dequant.
-  // See SharedStorageQKVO::USE_KV_REPACK: disabled for HEAD_DIM_VO > 256 so the
-  // repack staging buffer doesn't cap occupancy at 1 CTA/SM. The VO-split FP8 path
-  // (HEAD_DIM_VO > 256) dequantizes K/V in-loop instead (compute_qk + the FP8
-  // branch of vosplit_compute_pv), so it needs no staging buffer.
   static constexpr bool USE_KV_REPACK = (sizeof(DTypeKV_) == 1) && !is_fp4_type_v<DTypeKV_> &&
                                         (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
                                         (CTA_TILE_Q > 16);  // CTA16 = decode/short-q -> in-loop
@@ -287,10 +195,6 @@ struct KernelTraits {
   static constexpr uint32_t REPACK_STRIDE_VO = HEAD_DIM_VO / upcast_size<DTypeQ_>();
 
   static constexpr bool IsInvalid() {
-    // The register-pressure bound uses NUM_MMA_D_VO_TILE (not NUM_MMA_D_VO): the
-    // o_frag accumulator is split-D tiled, so only one VO tile (<=16 MMAs) is
-    // register-resident at a time. This admits HEAD_DIM_VO=512 with NUM_MMA_Q==1
-    // (128 regs for o_frag) while still rejecting NUM_MMA_Q==2 at 512 (256 regs).
     return ((NUM_MMA_D_VO < 4) || (NUM_MMA_D_VO == 4 && NUM_MMA_KV % 2 == 1) ||
             (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && NUM_MMA_D_VO > 4 &&
              NUM_MMA_D_VO % (2 * NUM_WARPS_Q) != 0) ||
@@ -303,9 +207,6 @@ struct KernelTraits {
 
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
                                           HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>;
-  // Storage variant for the paged VO-split kernel: enables the cta_sync_o / v_smem
-  // shrinks and the P / m-d staging buffers. Layout-identical to SharedStorage when
-  // VO-split doesn't apply (HEAD_DIM_VO <= 256), so paged split-D is unchanged.
   using SharedStoragePaged =
       SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ,
                         DTypeKV, DTypeO, /*kEnableVOSplitOpt=*/true>;
@@ -502,9 +403,6 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
   }
 }
 
-// SmemStorage is deduced (SharedStorage or SharedStoragePaged): both expose k_smem/v_smem and are
-// layout-identical at HEAD_DIM_VO <= 256, so the FA2 prefill kernel (SharedStoragePaged) and the
-// holistic persistent kernel (SharedStorage) can share this loader. Offsets come from KTraits.
 template <bool produce_v, typename KTraits, typename SmemStorage>
 __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint32_t* smem_offset,
                                                 typename KTraits::DTypeKV* kv_ptr,
@@ -1411,10 +1309,6 @@ __device__ __forceinline__ void compute_sfm_v(
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
 #pragma unroll
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-      // Split-D: load + dequantize + accumulate only the V columns of the current
-      // VO tile. Out-of-tile columns are skipped entirely here (saving the V
-      // ldmatrix + dequant) but still advance the V-smem offset below, keeping the
-      // swizzled bookkeeping identical to the non-tiled path.
       if (mma_d >= d_base && mma_d < d_base + KTraits::NUM_MMA_D_VO_TILE) {
         uint32_t b_frag[4];
         if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
@@ -1545,8 +1439,6 @@ __device__ __forceinline__ void transform_output(
 /*!
  * \brief Synchronize the states of the MDO kernel across the threadblock along threadIdx.z.
  */
-// SmemStorage is deduced so this works for both the split-D storage (single/ragged)
-// and the paged VO-split storage variant (paged split-D path at HEAD_DIM_VO<=256).
 template <typename KTraits, typename SmemStorage>
 __device__ __forceinline__ void threadblock_sync_mdo_states(
     float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], SmemStorage* smem_storage,
@@ -1684,8 +1576,6 @@ __device__ __forceinline__ void write_o_reg_gmem(
     typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
     const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
     const uint_fastdiv group_size, const dim3 tid = threadIdx) {
-  // o_ptr_base is pre-offset by the caller to the current VO tile's column base
-  // (d_base*16 elements); o_frag holds only this tile's NUM_MMA_D_VO_TILE columns.
   using DTypeO = typename KTraits::DTypeO;
   constexpr uint32_t UPCAST_STRIDE_O = KTraits::UPCAST_STRIDE_O;
   const uint32_t warp_idx_x = get_warp_idx_q<KTraits>(tid.y);
@@ -1890,9 +1780,6 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                              ? o + chunk_idx * o_stride_n + (kv_head_idx * group_size) * o_stride_h
                              : o + (kv_head_idx * group_size) * o_stride_h;
 
-    // Split-D over the VO dimension (see BatchPrefillWithPagedKVCacheDevice for the
-    // rationale): re-run the KV pipeline once per VO tile. Single tile (no-op) for
-    // HEAD_DIM_VO <= 256.
 #pragma unroll 1
     for (uint32_t d_tile = 0; d_tile < KTraits::NUM_D_VO_TILES; ++d_tile) {
       const uint32_t d_base = d_tile * KTraits::NUM_MMA_D_VO_TILE;
@@ -2076,9 +1963,6 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           }
         }
       }
-
-      // Sync so this VO tile's write_o (staging O through q_smem) finishes reading
-      // q_smem before the next pass reloads Q into it.
       block.sync();
     }  // d_tile (split-D over VO) loop
 #if (__CUDA_ARCH__ < 800)
@@ -2372,9 +2256,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     asm volatile("griddepcontrol.wait;");
 #endif
 
-    // Split-D over the VO dimension (see BatchPrefillWithPagedKVCacheDevice for the
-    // rationale): re-run the KV pipeline once per VO tile so o_frag holds only
-    // NUM_MMA_D_VO_TILE columns. Single tile (no-op) for HEAD_DIM_VO <= 256.
 #pragma unroll 1
     for (uint32_t d_tile = 0; d_tile < KTraits::NUM_D_VO_TILES; ++d_tile) {
       const uint32_t d_base = d_tile * KTraits::NUM_MMA_D_VO_TILE;
@@ -2623,9 +2504,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
           }
         }
       }
-
-      // Sync so this VO tile's write_o (staging O through q_smem) finishes reading
-      // q_smem before the next pass reloads Q into it.
       block.sync();
     }  // d_tile (split-D over VO) loop
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -2636,16 +2514,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 #endif
 }
 
-// ===========================================================================
-// VO-split helpers (HEAD_DIM_VO >= 512): the NUM_WARPS_KV warps own disjoint KV
-// chunks for QK (as usual) but disjoint VO slices for PV. Per KV tile we (1)
-// reconcile the online-softmax m/d across warps so every warp has a CONSISTENT
-// global m/d, (2) stage the probabilities P[CTA_TILE_Q x CTA_TILE_KV] into
-// p_smem (row-major), and (3) each warp reads the full P row and accumulates
-// P @ V[:, its-VO-slice]. QK is computed once (no split-D recompute) and the O
-// accumulator is only NUM_MMA_Q*NUM_MMA_D_VO_PER_WARP*8 registers (no 256-reg
-// wall). s_frag thread->(row,col): row = mma_q*16 + lane/4 + 8*((reg%4)/2),
-// col = mma_kv*16 + 2*(lane%4) + 8*(reg/4) + reg%2.
+// VO-split helpers (HEAD_DIM_VO >= 512)
 template <typename KTraits>
 __device__ __forceinline__ void vosplit_softmax_store_p(
     typename KTraits::AttentionVariant variant,
@@ -2658,16 +2527,11 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
   constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
   constexpr uint32_t NUM_WARPS_KV = KTraits::NUM_WARPS_KV;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  // smem_md is reduced over KV warps only; the Q warps own disjoint query rows, so
-  // warp_q_idx is part of the row identity (not a reduction axis). p_smem rows are
-  // likewise offset by the Q warp.
   const uint32_t q_row_base = (warp_q_idx * NUM_MMA_Q) * 16;
   auto md_idx = [&](uint32_t w_kv, uint32_t mma_q, uint32_t j) {
     return (((w_kv * NUM_WARPS_Q + warp_q_idx) * NUM_MMA_Q + mma_q) * 2 + j) * 8 + lane_idx / 4;
   };
   const float sm_scale = variant.sm_scale_log2;
-  // Dedicated (non-union) m/d buffer — see SharedStorageQKVO::vosplit_md_smem for
-  // why the in-union cta_sync_md_smem cannot be used on the VO-split path.
   float2* smem_md = smem_storage->vosplit_md_smem;  // [warp][mma_q][j][8]
   typename KTraits::DTypeQ* p_smem = smem_storage->p_smem;
 
@@ -2752,17 +2616,6 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
   }
 }
 
-// VO-split PV: this warp owns VO MMA tiles [warp_vo_base, warp_vo_base+PER_WARP).
-// It reads the FULL probability row P[CTA_TILE_Q x CTA_TILE_KV] from p_smem (direct
-// indexed loads into the m16k16 A-fragment) and V[all CTA_TILE_KV rows, its VO
-// cols] from v_smem, accumulating into the 64-register o_frag. o_frag is first
-// rescaled by o_scale (online softmax). V is read directly from the native KV smem:
-// BF16 via ldmatrix_trans, FP8 via the in-loop dequant path (left/right-half
-// ldmatrix + frag swizzle + cast), exactly as compute_sfm_v does — so no BF16
-// repack staging buffer is needed (frees ~64KB, fits SM121's 100KB and 2 CTAs/SM).
-// Loops over NUM_MMA_Q, so it is correct for all VO-split layouts: the bf16 2x2
-// CTA_TILE_Q=32 layout (NUM_WARPS_Q=2, NUM_MMA_Q=1), the FP8 1x4 CTA_TILE_Q=32
-// layout (NUM_WARPS_Q=1, NUM_MMA_Q=2), and the decode CTA_TILE_Q=16 (NUM_MMA_Q=1).
 template <typename KTraits>
 __device__ __forceinline__ void vosplit_compute_pv(
     typename KTraits::SharedStoragePaged* smem_storage,
@@ -2771,21 +2624,17 @@ __device__ __forceinline__ void vosplit_compute_pv(
   using DTypeQ = typename KTraits::DTypeQ;
   using DTypeKV = typename KTraits::DTypeKV;
   constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
-  // This warp's Q rows in p_smem start here (Q warps own disjoint query rows).
   const uint32_t q_row_base = (warp_q_idx * NUM_MMA_Q) * 16;
   constexpr uint32_t NUM_MMA_D_VO_PER_WARP = KTraits::NUM_MMA_D_VO_PER_WARP;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t NUM_MMA_KV_FULL = CTA_TILE_KV / 16;
   constexpr uint32_t UPCAST_STRIDE_V = KTraits::UPCAST_STRIDE_V;
-  // BF16: a b128 column holds 8 elems -> a 16-wide VO MMA tile spans 2 b128 cols.
   constexpr uint32_t VO_COLS_PER_TILE = 16 / upcast_size<DTypeKV>();
   constexpr bool IS_FP8 = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV>;
   DTypeQ* p_smem = smem_storage->p_smem;
-  // K/V-shared path (bf16/fp16 hd512): V was dequant-free loaded into k_smem.
   smem_t<KTraits::SWIZZLE_MODE_KV> v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage->k_smem
                                                                       : smem_storage->v_smem);
 
-  // online rescale of the running O accumulator
 #pragma unroll
   for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
@@ -2847,10 +2696,6 @@ __device__ __forceinline__ void vosplit_compute_pv(
   }
 }
 
-// VO-split epilogue: each warp writes its disjoint VO slice (PER_WARP MMA tiles
-// = PER_WARP*16 columns, based at warp_vo_base*16) directly to gmem. No cross-warp
-// O reduction is needed because the warps own disjoint VO columns. Applies the
-// final 1/d normalization. fp32 / 16-bit DTypeO both handled.
 template <typename KTraits>
 __device__ __forceinline__ void vosplit_write_o(
     float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*d)[2],
@@ -2899,10 +2744,6 @@ __device__ __forceinline__ void vosplit_write_o(
   }
 }
 
-// smem_storage is deduced (SharedStorage or SharedStoragePaged): the paged prefill kernel passes
-// the VO-split SharedStoragePaged, while the POD fused kernel reuses this device fn with its plain
-// SharedStorage. The two are layout-identical when USE_VO_SPLIT is false (HEAD_DIM_VO <= 256), and
-// every VO-split-only member is accessed solely under `if constexpr (KTraits::USE_VO_SPLIT)`.
 template <typename KTraits, typename Params, typename SmemStorage>
 __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const Params params, SmemStorage& smem_storage, const dim3 tid = threadIdx,
@@ -3040,12 +2881,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     asm volatile("griddepcontrol.wait;");
 #endif
 
-    // Split-D over the VO dimension: re-run the KV pipeline once per VO tile so the
-    // register-resident o_frag holds only NUM_MMA_D_VO_TILE columns. Q is reloaded
-    // each pass because write_o_reg_gmem stages O through q_smem; the softmax state
-    // (m/d) depends only on Q.K^T, so each pass recomputes identical m/d. For
-    // HEAD_DIM_VO <= 256 there is a single tile (loop runs once, d_base == 0).
-    // VO-split path (HEAD_DIM_VO >= 512): single pass, warps own disjoint VO slices.
+    // Split-D over the VO dimension
 #pragma unroll 1
     for (uint32_t d_tile = 0; d_tile < (KTraits::USE_VO_SPLIT ? 1u : KTraits::NUM_D_VO_TILES);
          ++d_tile) {
@@ -3116,11 +2952,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                    warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                    lane_idx % KV_THR_LAYOUT_COL);
 
-      // FP8 repack path: BF16 staging buffers + their (16-bit-strided) read offsets.
-      // Same (row, col) lane mapping as the FP8 read offsets above, native stride.
-      // Guard the offset computation by USE_KV_REPACK: for the k64B swizzle
-      // (HEAD_DIM_VO == 64, where repack is disabled) get_permuted_offset requires
-      // stride == 4, so the stride-8 repack offset must not be instantiated there.
+      // FP8 repack path
       smem_t<SWIZZLE_MODE_KV> k_smem_bf16(smem_storage.kv_smem_repack),
           v_smem_bf16(smem_storage.kv_smem_repack);
       uint32_t k_smem_offset_r_bf16 = 0, v_smem_offset_r_bf16 = 0;
@@ -3340,8 +3172,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
         block.sync();
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
-          // Shared K/V: K(iter) is now consumed by Q.K^T -> load V(iter) into the
-          // same buffer (k_smem) using this tile's stashed offsets, then wait for it.
           page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
                                          iter * CTA_TILE_KV, shared_v_kv_offset, chunk_size,
                                          warp_idx, lane_idx);
@@ -3363,10 +3193,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
         // compute sfm*v
         if constexpr (KTraits::USE_VO_SPLIT) {
-          // VO-split: read the full P row from p_smem and accumulate P @ V[:, this
-          // warp's VO slice] into the 64-reg o_frag (rescaled by o_scale inside).
-          // V is read directly from native KV smem (BF16 or in-loop FP8 dequant) —
-          // no BF16 repack staging buffer needed on this path.
           const uint32_t warp_vo_base =
               get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP;
           vosplit_compute_pv<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
@@ -3391,8 +3217,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
         block.sync();
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
-          // Shared K/V: V(iter) is now consumed by P.V -> prefetch K(iter+1) into the
-          // same buffer (k_smem), and stash tile-(iter+1) offsets for that tile's V.
           page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
                                           warp_idx, lane_idx);
@@ -3422,8 +3246,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
 
       if constexpr (KTraits::USE_VO_SPLIT) {
-        // VO-split: warps own disjoint VO slices (no cross-warp O reduction). Each
-        // warp 1/d-normalizes and writes its slice straight to gmem.
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
                                  get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
@@ -3473,9 +3295,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           }
         }
       }
-
-      // Sync so this VO tile's write_o (which stages O through q_smem) finishes
-      // reading q_smem before the next pass reloads Q into it.
       block.sync();
     }  // d_tile (split-D over VO) loop
 
@@ -3688,15 +3507,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
   constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                               (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
-  // Paged VO-split with 16-bit KV time-shares one smem buffer between K and V
-  // (KernelTraits::USE_KV_SHARED_SMEM), so K+V costs ONE buffer here, not two.
   constexpr bool kKVShared = (sizeof(DTypeKV) == 2) && (HEAD_DIM_VO / 16 > 16) &&
                              ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
                              (HEAD_DIM_QK == HEAD_DIM_VO);
-  // VO-split also stages P[CTA_TILE_Q x CTA_TILE_KV] in p_smem, which scales with
-  // CTA_TILE_KV (= NUM_MMA_KV * NUM_WARPS_KV * 16). Folding its per-NUM_MMA_KV cost
-  // into the budget keeps the dispatcher from over-picking NUM_MMA_KV (e.g. on SM12x
-  // it then selects NUM_MMA_KV=1 -> CTA_TILE_KV=32 so CTA_TILE_Q=32 fits 100KB).
   constexpr bool kVOSplitDispatch =
       (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
   constexpr uint32_t kKVSmemPerMmaKV =
@@ -3724,11 +3537,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
        !USE_FP16_QK_REDUCTION)
           ? 2
           : (8 / NUM_MMA_Q);
-  // Fixed (NUM_MMA_KV-independent) VO-split overhead: the cross-warp m/d buffer
-  // vosplit_md_smem plus a margin for the alignas(16) padding of the small VO-split
-  // buffers. Subtracting it stops the dispatcher over-picking NUM_MMA_KV on tight-smem
-  // parts, so SM12x lands on NUM_MMA_KV=1 / CTA_TILE_KV=32 for the bf16 2x2 layout
-  // (a 64-tile would not fit 100KB) while big-smem parts still get NUM_MMA_KV=2.
   constexpr uint32_t kVOSplitFixedSmem =
       kVOSplitDispatch ? (NUM_WARPS_KV * CTA_TILE_Q * 8u + 2048u) : 0u;
   const uint32_t max_num_mma_kv_smem =

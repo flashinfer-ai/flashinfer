@@ -388,23 +388,7 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
 
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
                                      uint32_t sizeof_dtype_kv = 2) {
-  // At head_dim >= 512 (VO-split prefill) CTA_TILE_Q=32 doubles the queries/CTA vs
-  // 16, halving the K/V re-streaming through L1/shared memory (the hd512 bottleneck
-  // is L1TEX bandwidth, not DRAM). The choice is dtype-dependent because the warp
-  // layout that fits the 100KB SM12x budget differs by KV precision:
-  //  - 16-bit KV (bf16/fp16): the dispatcher uses a 2-Q x 2-KV-warp layout
-  //    (CTA_TILE_KV=32, o_frag=128 regs, no dequant temporaries), which fits 100KB
-  //    at CTA_TILE_Q=32 on every part -> always pick 32.
-  //  - FP8 KV: needs the 1-Q x 4-KV-warp layout (64-reg o_frag) to leave registers
-  //    for the in-loop dequant; that layout's min CTA_TILE_KV is 64, so CTA_TILE_Q=32
-  //    costs ~105KB and only fits big-smem parts (SM90/SM100 ~228KB, 2 CTAs/SM).
-  //    100KB parts (SM12x/GB10) fall back to the ~82KB CTA_TILE_Q=16 tile.
   if (head_dim >= 512) {
-    // Short query length (decode / speculative-decode, packed_qo <= 32) is
-    // bandwidth-bound: CTA_TILE_Q=32's query amortization buys nothing, while the
-    // larger 104KB CTA caps occupancy at 2 CTAs/SM. Use the lean CTA_TILE_Q=16 tile
-    // (1Qx4KV VO-split, ~82KB -> more CTAs/SM, less wasted Q work). Long q (prefill)
-    // keeps CTA_TILE_Q=32 where the L1TEX-bandwidth amortization pays off.
     if (avg_packed_qo_len <= 32) {
       return 16;
     }

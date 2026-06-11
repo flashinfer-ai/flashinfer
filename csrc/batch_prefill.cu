@@ -66,9 +66,6 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
       static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-      // DTypeKV is a file-scope alias from batch_prefill_config.inc (this TU is compiled per
-      // KV-dtype), so the head_dim=512 tile/warp-layout selection reads the size at compile time
-      // instead of taking it as a runtime arg from Python.
       /*sizeof_dtype_o=*/2, /*sizeof_dtype_kv=*/sizeof(DTypeKV), window_left, fixed_split_size,
       disable_split_kv, num_colocated_ctas, stream);
 
