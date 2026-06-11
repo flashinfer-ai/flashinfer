@@ -108,8 +108,11 @@ def test_w4a8_mxfp4_moe(top_k, clamp):
         x, sel, rw, fc1, fc2, torch.bfloat16, [fc1_scale, fc2_scale], **swiglu_kw
     ).float()
 
-    # Reference (mirrors kernel intermediate precisions: x->FP8, swiglu out->FP8).
-    xf = x.to(torch.float8_e4m3fn).float()
+    # Reference (mirrors kernel intermediate precisions: x -> per-token-scaled FP8
+    # (wrapper quantizes x/s_t and GEMM1's epilogue multiplies s_t back), swiglu
+    # out -> FP8).
+    sc_in = x.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 448.0
+    xf = (x.float() / sc_in).to(torch.float8_e4m3fn).float() * sc_in
     ref = torch.zeros(T, H, dtype=torch.float32, device=dev)
     for e in range(E):
         gate = xf @ fc1_w[e][0::2].t()  # [T, I]

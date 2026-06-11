@@ -73,6 +73,77 @@ if _HAS_TRITON:
         tl.store(out_ptr + t * H + h, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
+    def _w4a8_fill_meta_kernel(
+        counts_ptr,  # [E] int32: tokens routed to each expert
+        sizes1_ptr,  # [E, 4] int32 GEMM1 (M,N,K,L); cols 1..3 prefilled by the host
+        ptrs1_ptr,  # [E, 4] int64 GEMM1 (A, B, C, scale) base addresses
+        sizes2_ptr,  # [E, 4] int32 GEMM2 sizes; cols 1..3 prefilled
+        ptrs2_ptr,  # [E, N_OPS2] int64 GEMM2 addresses (+ route/weight if scatter)
+        clusters1_ptr,  # [1] int32: GEMM1 total cluster tiles
+        clusters2_ptr,  # [1] int32: GEMM2 total cluster tiles
+        a1_base,
+        b1_base,
+        c1_base,
+        s1_base,  # GEMM1 operand base addresses (bytes)
+        sr1_base,  # GEMM1 per-row A-scale base (f32 [total routed rows]; 0 if unused)
+        a2_base,
+        b2_base,
+        c2_base,
+        s2_base,  # GEMM2 operand base addresses
+        r2_base,
+        w2_base,  # GEMM2 scatter route-map / routing-weight bases (0 if unused)
+        a1_row,
+        c1_row,  # GEMM1 per-routed-row byte strides of A / C
+        b1_exp,
+        s1_exp,  # GEMM1 per-EXPERT byte strides of B / scale
+        a2_row,
+        c2_row,  # GEMM2 row strides (c2_row == 0 in scatter mode: shared C base)
+        b2_exp,
+        s2_exp,
+        tile_m1,
+        nn1,  # GEMM1 cluster-tile M extent / N tile count
+        tile_m2,
+        nn2,
+        E,
+        N_OPS1: tl.constexpr,
+        N_OPS2: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # ONE program builds, from the per-expert token counts, everything the two
+        # grouped GEMM launches need: per-group M sizes, per-group operand pointers
+        # (base + exclusive-cumsum(counts) * row stride for the routed
+        # activation/output operands; base + expert index * expert stride for the
+        # weight/scale operands), and the two cluster-tile totals the persistent
+        # scheduler reads from device memory. Replaces the per-expert Python loops
+        # (~6 x E tensor slices + 2 x E small casts) and the host->device metadata
+        # copies of the list-based path with a single launch, and keeps the host
+        # entirely blind to the routing -- no device->host sync anywhere.
+        e = tl.arange(0, BLOCK)
+        mask = e < E
+        cnt = tl.load(counts_ptr + e, mask=mask, other=0)
+        offs = (tl.cumsum(cnt, 0) - cnt).to(tl.int64)  # exclusive prefix sum (rows)
+        e64 = e.to(tl.int64)
+        tl.store(sizes1_ptr + e * 4, cnt, mask=mask)
+        tl.store(sizes2_ptr + e * 4, cnt, mask=mask)
+        tl.store(ptrs1_ptr + e * N_OPS1 + 0, a1_base + offs * a1_row, mask=mask)
+        tl.store(ptrs1_ptr + e * N_OPS1 + 1, b1_base + e64 * b1_exp, mask=mask)
+        tl.store(ptrs1_ptr + e * N_OPS1 + 2, c1_base + offs * c1_row, mask=mask)
+        tl.store(ptrs1_ptr + e * N_OPS1 + 3, s1_base + e64 * s1_exp, mask=mask)
+        if N_OPS1 == 5:  # per-row A scale (f32 [M] per group, swiglu epilogue)
+            tl.store(ptrs1_ptr + e * N_OPS1 + 4, sr1_base + offs * 4, mask=mask)
+        tl.store(ptrs2_ptr + e * N_OPS2 + 0, a2_base + offs * a2_row, mask=mask)
+        tl.store(ptrs2_ptr + e * N_OPS2 + 1, b2_base + e64 * b2_exp, mask=mask)
+        tl.store(ptrs2_ptr + e * N_OPS2 + 2, c2_base + offs * c2_row, mask=mask)
+        tl.store(ptrs2_ptr + e * N_OPS2 + 3, s2_base + e64 * s2_exp, mask=mask)
+        if N_OPS2 == 6:  # token-scatter mode: route map / weights are [M] i32/f32
+            tl.store(ptrs2_ptr + e * N_OPS2 + 4, r2_base + offs * 4, mask=mask)
+            tl.store(ptrs2_ptr + e * N_OPS2 + 5, w2_base + offs * 4, mask=mask)
+        nm1 = (cnt + tile_m1 - 1) // tile_m1
+        nm2 = (cnt + tile_m2 - 1) // tile_m2
+        tl.store(clusters1_ptr, tl.sum(nm1 * nn1).to(tl.int32))
+        tl.store(clusters2_ptr, tl.sum(nm2 * nn2).to(tl.int32))
+
+    @triton.jit
     def _per_token_quant_fp8_kernel(
         x_ptr,  # [*, N] input (bf16/fp16/fp32)
         out_ptr,  # [*, N] FP8 e4m3 output
@@ -228,3 +299,83 @@ def per_token_quant_fp8(
             x, x_fp8, scale, N, g_rows, g_stride, FP8_MAX=448.0, BLOCK_N=block_n
         )
     return x_fp8, scale
+
+
+def fill_w4a8_moe_meta(
+    counts: torch.Tensor,
+    sizes1: torch.Tensor,
+    ptrs1: torch.Tensor,
+    clusters1: torch.Tensor,
+    sizes2: torch.Tensor,
+    ptrs2: torch.Tensor,
+    clusters2: torch.Tensor,
+    g1_bases: "tuple[int, int, int, int, int]",
+    g1_rows: "tuple[int, int]",
+    g1_experts: "tuple[int, int]",
+    g2_bases: "tuple[int, int, int, int, int, int]",
+    g2_rows: "tuple[int, int]",
+    g2_experts: "tuple[int, int]",
+    tile_m1: int,
+    nn1: int,
+    tile_m2: int,
+    nn2: int,
+) -> None:
+    """Fill BOTH grouped-GEMM metadata sets of one W4A8 MoE call from the per-expert
+    token counts, in a single kernel launch (see ``_w4a8_fill_meta_kernel``).
+
+    :param counts: ``[E]`` int32 tokens per expert (device).
+    :param sizes1/ptrs1/clusters1: GEMM1 metadata device tensors -- ``[E, 4]`` int32
+        (cols 1..3 prefilled with N/K/L), ``[E, 4|5]`` int64 (5 with the per-row
+        A-scale column), ``[1]`` int32.
+    :param sizes2/ptrs2/clusters2: GEMM2 metadata; ``ptrs2`` is ``[E, 4]`` or
+        ``[E, 6]`` (token-scatter mode appends route-map/weight pointers).
+    :param g*_bases: operand base addresses in bytes -- GEMM1 ``(A, B, C, scale,
+        a_row_scale)`` (last 0 when unused), GEMM2 ``(A, B, C, scale, route_map,
+        weights)`` (last two 0 when unused).
+    :param g*_rows: per-routed-row byte strides ``(A_row, C_row)``; GEMM2's C_row
+        is 0 in scatter mode (every group scatters into the shared output base).
+    :param g*_experts: per-expert byte strides ``(B_expert, scale_expert)``.
+    :param tile_m*/nn*: cluster-tile M extent and N-direction tile count per GEMM,
+        for the device-side cluster totals the persistent scheduler consumes.
+    """
+    if not _HAS_TRITON:
+        raise RuntimeError("fill_w4a8_moe_meta requires triton")
+    E = counts.numel()
+    n_ops1 = ptrs1.shape[1]
+    n_ops2 = ptrs2.shape[1]
+    _w4a8_fill_meta_kernel[(1,)](
+        counts,
+        sizes1,
+        ptrs1,
+        sizes2,
+        ptrs2,
+        clusters1,
+        clusters2,
+        g1_bases[0],
+        g1_bases[1],
+        g1_bases[2],
+        g1_bases[3],
+        g1_bases[4],
+        g2_bases[0],
+        g2_bases[1],
+        g2_bases[2],
+        g2_bases[3],
+        g2_bases[4],
+        g2_bases[5],
+        g1_rows[0],
+        g1_rows[1],
+        g1_experts[0],
+        g1_experts[1],
+        g2_rows[0],
+        g2_rows[1],
+        g2_experts[0],
+        g2_experts[1],
+        tile_m1,
+        nn1,
+        tile_m2,
+        nn2,
+        E,
+        N_OPS1=n_ops1,
+        N_OPS2=n_ops2,
+        BLOCK=triton.next_power_of_2(E),
+    )

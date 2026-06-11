@@ -490,6 +490,16 @@ class HopperGroupedGemmPersistentKernel:
         swiglu_alpha: float = None,
         swiglu_beta: float = None,
         swiglu_limit: float = None,
+        # Per-row A (activation) scale, applied to the accumulator BEFORE the SwiGLU
+        # math: with a per-token FP8 input quantization (x_fp8 = x / s_row), the GEMM
+        # computes acc = x_fp8 @ W^T and the true pre-activation is acc * s_row. The
+        # scale cannot fold into the routing weight (SwiGLU is nonlinear), so the
+        # epilogue reads a per-group f32 [M] scale vector (metadata operand column 4)
+        # and multiplies gate/up by it. Requires use_swiglu (column 4 is the scatter
+        # route map otherwise). Per-token input scale removes both failure modes of a
+        # direct FP8 cast: outlier clipping at the e4m3 max and subnormal
+        # under-resolution of small hidden states.
+        use_a_row_scale: bool = None,
         # Dequant exponent re-centering. The FP4->FP8 dequant encodes
         # value = FP4 x 2^(scale-127) by ADDING the scale exponent to the FP8 exponent
         # bits -- exact in e4m3's NORMAL range, but real checkpoints carry small scales
@@ -600,6 +610,7 @@ class HopperGroupedGemmPersistentKernel:
         self._opt_real_gather = use_real_gather
         self._opt_scatter_no_accumulate = scatter_no_accumulate
         self._opt_swiglu = use_swiglu
+        self._opt_a_row_scale = use_a_row_scale
         # Clamped-SwiGLU constants (uniform per call). None limit => plain silu(gate)*up;
         # a float limit selects the cutlass SwiGLUBias formula in the fused epilogue.
         self.swiglu_alpha = 1.0 if swiglu_alpha is None else float(swiglu_alpha)
@@ -816,7 +827,7 @@ class HopperGroupedGemmPersistentKernel:
         problem_shape_mnkl: cute.Tensor,
         strides_abc: cute.Tensor,
         tensor_address_abc: cute.Tensor,
-        total_num_clusters: cutlass.Int32,
+        total_clusters: cute.Tensor,
         tensormap_cute_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr[int],
         stream: cuda.CUstream,
@@ -830,11 +841,14 @@ class HopperGroupedGemmPersistentKernel:
         :param problem_shape_mnkl: Device tensor of shape (G, 4) Int32 with (M,N,K,L) per group.
         :param strides_abc: Device tensor of shape (G, 3, 2) Int32 with strides per group.
         :param tensor_address_abc: Device tensor of shape (G, 3) Int64 with base ptrs per group.
-        :param total_num_clusters: Total clusters across all groups (RUNTIME value: the
-            per-call routing changes it every MoE forward in serving, so baking it as a
-            Constexpr would force a recompile per routing; the persistent scheduler only
-            compares it against tile indices on device). The launch grid is static
-            (max_active_clusters); surplus CTAs find no valid tile and exit.
+        :param total_clusters: DEVICE tensor of shape (1,) Int32 holding the total
+            cluster-tile count across all groups. The per-call routing changes the total
+            every MoE forward in serving, so it cannot be a Constexpr (recompile storm);
+            keeping it in device memory (read by the kernel itself) -- rather than a host
+            Int32 argument -- additionally frees the host from ever knowing the
+            routing-dependent value, which removes the last device->host sync from the
+            serving path and makes the launch CUDA-graph-capturable. The launch grid is
+            static (max_active_clusters); surplus CTAs find no valid tile and exit.
         :param tensormap_cute_tensor: Tensor map workspace, shape (num_sms, 3, 16) Int64.
         :param max_active_clusters: Max active clusters (compile-time constant).
         :param stream: CUDA stream.
@@ -889,6 +903,14 @@ class HopperGroupedGemmPersistentKernel:
             _env_flag("FI_W4A8_SWIGLU", False)
             if self._opt_swiglu is None
             else self._opt_swiglu
+        )
+        # Per-row A scale in the SwiGLU epilogue (see constructor): metadata column 4
+        # is a per-group f32 [M] vector multiplied into gate/up before the SwiGLU
+        # math. Gated on use_swiglu -- column 4 is the scatter route map otherwise.
+        self.use_a_row_scale = self.use_swiglu and (
+            _env_flag("FI_W4A8_A_ROW_SCALE", False)
+            if self._opt_a_row_scale is None
+            else self._opt_a_row_scale
         )
         # A/B knob: force the old per-element scalar atomicAdd in the accumulating
         # token-scatter epilogue instead of the vectorized v2.f32 atomic (default).
@@ -975,11 +997,7 @@ class HopperGroupedGemmPersistentKernel:
             self.epi_tile,
         )
 
-        tile_sched_params, grid = self._compute_grid(
-            total_num_clusters,
-            self.cluster_shape_mn,
-            max_active_clusters,
-        )
+        grid = self._compute_grid(self.cluster_shape_mn, max_active_clusters)
 
         # Number of Int64 words needed for the SMEM tensor map buffer (0 in GMEM mode)
         self.size_tensormap_in_i64 = (
@@ -1056,7 +1074,7 @@ class HopperGroupedGemmPersistentKernel:
             self.b_fp8_smem_layout_staged,
             self.b_fp8_smem_layout_single,
             self.epi_smem_layout_staged,
-            tile_sched_params,
+            total_clusters,
             group_count,
             problem_shape_mnkl,
             strides_abc,
@@ -1442,7 +1460,7 @@ class HopperGroupedGemmPersistentKernel:
         b_fp8_smem_layout_staged: cute.ComposedLayout,
         b_fp8_smem_layout_single: cute.ComposedLayout,
         epi_smem_layout_staged: cute.ComposedLayout,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        total_clusters: cute.Tensor,
         group_count: cutlass.Constexpr[int],
         problem_sizes_mnkl: cute.Tensor,
         strides_abc: cute.Tensor,
@@ -1474,8 +1492,9 @@ class HopperGroupedGemmPersistentKernel:
         :type b_smem_layout_staged: cute.ComposedLayout
         :param epi_smem_layout_staged: Shared memory layout for epilogue
         :type epi_smem_layout_staged: cute.ComposedLayout
-        :param tile_sched_params: Parameters for the persistent tile scheduler
-        :type tile_sched_params: utils.PersistentTileSchedulerParams
+        :param total_clusters: (1,) Int32 device tensor with the total cluster-tile
+            count; the scheduler params are rebuilt from it on device (see below)
+        :type total_clusters: cute.Tensor
         """
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -1713,7 +1732,22 @@ class HopperGroupedGemmPersistentKernel:
             tensormap_b_smem_ptr = None
             tensormap_c_smem_ptr = None
 
-        tile_sched_params_for_sched = tile_sched_params
+        # The routing-dependent cluster total lives in DEVICE memory: rebuild the
+        # scheduler params here from total_clusters[0] (exactly what the host-side
+        # _compute_grid used to do with a host Int32). PersistentTileSchedulerParams
+        # is a @dsl_user_op tracing pure cute ops, so constructing it in the kernel
+        # body is legal; the fast-divmod magic it derives from the (dynamic) total
+        # already had to be computed from a runtime value on the old host path. This
+        # keeps the host blind to the per-routing total -- no device->host sync, and
+        # the launch becomes CUDA-graph-capturable.
+        tile_sched_params_for_sched = utils.PersistentTileSchedulerParams(
+            (
+                self.cluster_shape_mn[0],
+                self.cluster_shape_mn[1],
+                cutlass.Int32(total_clusters[0]),
+            ),
+            (*self.cluster_shape_mn, 1),
+        )
 
         is_dma_warp_group = warp_group_idx < self.num_dma_warp_groups
         # Dedicated transform warpgroup (placed after DMA + MMA). It consumes the
@@ -2371,6 +2405,26 @@ class HopperGroupedGemmPersistentKernel:
                             cute.AddressSpace.gmem,
                             assumed_align=16,
                         )
+                        if cutlass.const_expr(self.use_a_row_scale):
+                            # Per-row activation scale (metadata col 4, f32 [M]): the
+                            # input was quantized per token (x_fp8 = x / s_row), so the
+                            # true gate/up pre-activations are acc * s_row -- applied
+                            # HERE because SwiGLU is nonlinear (silu(g*s)*(u*s) cannot
+                            # be recovered after the fact, unlike GEMM2's per-token
+                            # scale which folds into the routing weight). Read like the
+                            # scatter route map; an rmem scratch carries the value out
+                            # of the bounds-guarded read (rows past m_bound are never
+                            # stored, the guard only keeps the gmem read in-bounds).
+                            a_row_scale = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.Float32,
+                                    ptrs_abc[(cur_group_idx, 4)],
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=4,
+                                ),
+                                cute.make_layout((m_bound,), stride=(1,)),
+                            )
+                            _srow = cute.make_rmem_tensor((1,), self.acc_dtype)
                         # Pass 1: silu(gate)*up for each (gate,up) register pair into an
                         # FP32 fragment. Pass 2: ONE vectorized FP32->FP8 convert (a
                         # scalar f32->fp8 cvt is illegal -- it needs a 1-d vector). Pass
@@ -2385,6 +2439,18 @@ class HopperGroupedGemmPersistentKernel:
                             _up = accumulators[
                                 cute.idx2crd(2 * _p + 1, accumulators.shape)
                             ]
+                            if cutlass.const_expr(self.use_a_row_scale):
+                                _sgm = (
+                                    m_base
+                                    + tTR_cC[cute.idx2crd(2 * _p, accumulators.shape)][
+                                        0
+                                    ]
+                                )
+                                _srow[0] = 0.0
+                                if _sgm < m_bound:
+                                    _srow[0] = a_row_scale[_sgm]
+                                _gate = _gate * _srow[0]
+                                _up = _up * _srow[0]
                             if cutlass.const_expr(self.swiglu_clamp is not None):
                                 # Clamped SwiGLU (cutlass SwiGLUBias): clamp gate to
                                 # (-inf, L], clamp up to [-L, L] then + beta, and scale the
@@ -2961,36 +3027,25 @@ class HopperGroupedGemmPersistentKernel:
 
     @staticmethod
     def _compute_grid(
-        total_num_clusters: cutlass.Int32,
         cluster_shape_mn: tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> tuple[utils.PersistentTileSchedulerParams, tuple]:
-        """Compute tile scheduler params and grid shape for grouped GEMM.
+    ) -> tuple:
+        """Compute the (static) launch grid for the persistent grouped GEMM.
 
-        :param total_num_clusters: Total clusters across all groups (runtime value).
-        :type total_num_clusters: cutlass.Int32
         :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
         :type cluster_shape_mn: tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters.
         :type max_active_clusters: cutlass.Constexpr
 
-        :return: (tile_sched_params, grid)
+        :return: grid
         :rtype: tuple
         """
-        # The scheduler params carry the (runtime) total: the persistent loop's
-        # validity check compares tile indices against it on device.
-        problem_shape_ntile_mnl = (
-            cluster_shape_mn[0],
-            cluster_shape_mn[1],
-            cutlass.Int32(total_num_clusters),
-        )
-        tile_sched_params = utils.PersistentTileSchedulerParams(
-            problem_shape_ntile_mnl, (*cluster_shape_mn, 1)
-        )
         # The LAUNCH GRID must stay static (compile-time): build it from a params
         # whose z-extent is the static max_active_clusters. A persistent kernel never
         # usefully launches more than max_active clusters anyway; when the (runtime)
         # total is smaller, the surplus CTAs see no valid tile and exit immediately.
+        # The scheduler params that carry the RUNTIME total are rebuilt inside the
+        # kernel from the total_clusters device tensor (see kernel()).
         grid_params = utils.PersistentTileSchedulerParams(
             (
                 cluster_shape_mn[0],
@@ -3002,7 +3057,7 @@ class HopperGroupedGemmPersistentKernel:
         grid = StaticPersistentGroupTileScheduler.get_grid_shape(
             grid_params, max_active_clusters
         )
-        return tile_sched_params, grid
+        return grid
 
     @staticmethod
     def _make_tma_store_atoms_and_tensors(
@@ -3500,191 +3555,83 @@ def _compute_total_num_clusters(
     return total
 
 
-@flashinfer_api
-def w4a8_mxfp4_grouped_gemm(
-    a_fp8_list: "List[torch.Tensor]",
-    b_packed_list: "List[torch.Tensor]",
-    scale_list: "List[torch.Tensor]",
-    c_list: "List[torch.Tensor]",
-    problem_sizes_mnkl: List[Tuple[int, int, int, int]],
+def w4a8_select_tile_mn(n_values) -> Tuple[int, int]:
+    """CTA tile auto-selection, shared by the list front end and the MoE wrapper (the
+    wrapper must pick the SAME tile it sizes the cluster-total math with). The
+    (128,256) cooperative (2-MMA-warpgroup) tile is ~1.2x faster than (128,128) on
+    large-N MoE GEMMs -- more warps/CTA hide the dequant->smem->wgmma latency (the
+    GEMM is latency-bound at low occupancy, not compute/BW-bound), and the bigger
+    tile amortizes the dequant overhead. It needs N % 256 == 0, so the auto default
+    upgrades to it only when every group's N qualifies, else falls back to
+    (128,128). FI_W4A8_TILE_MN="M,N" forces a tile. See spike_w4a8_tile_sweep.py."""
+    _tile_override = os.environ.get("FI_W4A8_TILE_MN")
+    if _tile_override:
+        _tm, _tn = _tile_override.split(",")
+        return (int(_tm), int(_tn))
+    if all(n % 256 == 0 for n in n_values):
+        return (128, 256)
+    return (128, 128)
+
+
+def w4a8_grouped_gemm_premeta(
+    num_groups: int,
+    tensor_of_dim_size_mnkl,
+    tensor_of_strides_abc,
+    tensor_of_ptrs_abc,
+    tensor_of_total_clusters,
+    *,
+    c_dtype: Type[cutlass.Numeric],
     acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-    c_dtype: Type[cutlass.Numeric] = cutlass.Float16,
-    tile_shape_mn: Tuple[int, int] = None,
+    tile_shape_mn: Tuple[int, int] = (128, 128),
     cluster_shape_mn: Tuple[int, int] = (1, 1),
     tensormap_update_mode: utils.TensorMapUpdateMode = utils.TensorMapUpdateMode.SMEM,
-    route_maps: "List[torch.Tensor]" = None,
-    weights: "List[torch.Tensor]" = None,
-    output: "torch.Tensor" = None,
-    activations: "torch.Tensor" = None,
-    gather_route_maps: "List[torch.Tensor]" = None,
+    scatter: bool = False,
+    gather: bool = False,
     no_accumulate: bool = False,
     swiglu: bool = False,
     swiglu_alpha: float = None,
     swiglu_beta: float = None,
     swiglu_limit: float = None,
+    a_row_scale: bool = False,
     dequant_exp_bias: int = 0,
 ) -> None:
-    """Callable W4A8 MXFP4 grouped GEMM: C[g] = A[g] @ dequant(B[g], scale[g])^T.
+    """Launch the W4A8 grouped GEMM from caller-owned, pre-built METADATA tensors.
 
-    This is the Python entry point an MoE wrapper drives (gather/route happens in
-    the caller for now; the GEMM stays a plain grouped GEMM). Per group g with
-    shape (M_g, N, K, 1), the caller must pass, all on CUDA and kept alive until
-    after the launch synchronizes:
+    The serving fast path: the four metadata operands are persistent cute tensors
+    (created once via ``cutlass_torch.cute_tensor_like``) whose DEVICE contents the
+    caller updates in place each call (e.g. the MoE wrapper's single meta-fill kernel
+    writes per-group M, the routing-dependent pointers, and the cluster total straight
+    from the expert counts). This function then only looks up the cached compiled
+    kernel and launches -- no per-group Python loops, no host->device copies, and no
+    host knowledge of the routing (the cluster total stays in device memory), so a
+    steady-state call issues a handful of host ops regardless of the group count.
 
-    - ``a_fp8_list[g]``    : FP8 e4m3 activation ``[M_g, K]``, row-major (K contiguous).
-    - ``b_packed_list[g]`` : MXFP4 weight packed as Uint8 ``[N, K // 2]`` (2 nibbles
-                             per byte, low nibble = even K index), row-major.
-    - ``scale_list[g]``    : UE8M0 block scale ``[N, K // 32]`` as Uint8, row-major.
-    - ``c_list[g]``        : preallocated output ``[M_g, N]`` in ``c_dtype``, row-major.
+    - ``tensor_of_dim_size_mnkl``: (G, 4) Int32 -- (M, N, K, L) per group.
+    - ``tensor_of_strides_abc``: (G, n_ops, 2) Int32 -- per-operand (row, col) strides.
+    - ``tensor_of_ptrs_abc``: (G, n_ops) Int64 -- per-operand base addresses.
+      n_ops = 4 (A, B, C, scale), 5 (+ per-row A scale: ``a_row_scale=True``, swiglu
+      only), or 6 (+ scatter route map, routing weights).
+    - ``tensor_of_total_clusters``: (1,) Int32 -- total cluster tiles across groups,
+      consistent with ``tile_shape_mn * cluster_shape_mn`` and the per-group M/N.
 
-    Output is written in place into ``c_list``. K must be a multiple of 32 and the
-    contiguous dims 16-byte aligned (K % 16 == 0 for FP8 A, N % … for C).
-
-    ``swiglu=True`` fuses the GEMM1 SwiGLU activation into the epilogue: the weight columns
-    must be interleaved gate/up (row 2j = gate_j, 2j+1 = up_j), ``c_dtype`` must be
-    ``Float8E4M3FN``, and each ``c_list[g]`` is ``[M_g, N//2]``. ``swiglu_limit`` (a uniform
-    scalar) additionally selects the clamped SwiGLUBias variant (gate clamped to
-    ``(-inf, limit]``, up to ``[-limit, limit]`` then ``+ swiglu_beta``, sigmoid argument
-    scaled by ``swiglu_alpha``); ``None`` => plain ``silu(gate)*up``.
+    All correctness obligations (operand alignment, K % 32 == 0, interleaved gate/up
+    for ``swiglu``) are the caller's, exactly as documented on
+    ``w4a8_mxfp4_grouped_gemm``, which is the list-based convenience front end of this
+    entry point.
     """
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU is required for w4a8_mxfp4_grouped_gemm")
-    # CTA tile selection. The (128,256) cooperative (2-MMA-warpgroup) tile is ~1.2x
-    # faster than (128,128) on large-N MoE GEMMs -- more warps/CTA hide the
-    # dequant->smem->wgmma latency (the GEMM is latency-bound at low occupancy, not
-    # compute/BW-bound), and the bigger tile amortizes the dequant overhead. It needs
-    # N % 256 == 0, so the auto default upgrades to it only when every group's N
-    # qualifies, else falls back to (128,128). FI_W4A8_TILE_MN="M,N" forces a tile;
-    # an explicit tile_shape_mn arg is respected as-is. See spike_w4a8_tile_sweep.py.
-    _tile_override = os.environ.get("FI_W4A8_TILE_MN")
-    if _tile_override:
-        _tm, _tn = _tile_override.split(",")
-        tile_shape_mn = (int(_tm), int(_tn))
-    elif tile_shape_mn is None:
-        if all(n % 256 == 0 for (_, n, _, _) in problem_sizes_mnkl):
-            tile_shape_mn = (128, 256)
-        else:
-            tile_shape_mn = (128, 128)
-    num_groups = len(problem_sizes_mnkl)
-    # c_list is unused in token-scatter mode; a_fp8_list is unused in fused-gather
-    # mode (A is the shared `activations` tensor).
-    _c_len_ok = output is not None or len(c_list) == num_groups
-    _a_len_ok = activations is not None or len(a_fp8_list) == num_groups
-    if not (
-        len(b_packed_list) == len(scale_list) == num_groups and _c_len_ok and _a_len_ok
-    ):
-        raise ValueError("operand lists and problem_sizes_mnkl must have equal length")
-
+    if a_row_scale and (not swiglu or scatter or gather):
+        raise ValueError(
+            "a_row_scale requires the fused-SwiGLU epilogue (metadata column 4 is "
+            "the scatter route map otherwise)"
+        )
     a_dtype = cutlass.Float8E4M3FN
     b_dtype = cutlass.Float4E2M1FN
     a_major, b_major, c_major = "k", "k", "n"
-
-    # Token-scatter (FS-1) mode: when an `output` tensor is given, each group's
-    # output rows are scattered into it via a per-group route map (local row ->
-    # output/token row), scaled by a per-row routing weight. The per-group C
-    # pointer becomes the shared `output` base, and route map + weights are
-    # appended as the 5th/6th per-group operands. Default (output is None) keeps
-    # the direct per-group-C path.
-    scatter = output is not None
-    if scatter and not (route_maps is not None and weights is not None):
-        raise ValueError("token-scatter mode requires route_maps and weights")
-
-    # Fused-gather (FS-1 input side) mode: when an `activations` tensor is given,
-    # operand 0 (A) is its shared base and a per-group `gather_route_maps[g]` maps
-    # each local row -> source row in `activations` (operand 6). a_fp8_list is then
-    # unused. Default (activations is None) keeps the per-group A path.
-    gather = activations is not None
-    if gather and gather_route_maps is None:
-        raise ValueError("fused-gather mode requires gather_route_maps")
-
-    # The kernel reads the per-(N, K/32) UE8M0 scale as a 4th per-group operand. This
-    # callable always supplies a real scale, and token-scatter / fused-gather follow
-    # from the presence of `output` / `activations`; these are passed straight to the
-    # kernel constructor as explicit booleans (no os.environ signaling).
-
-    # Per-group pointer/stride metadata: scale is the 4th operand -> (G, 4); in
-    # token-scatter mode route map + weights append -> (G, 6).
-    ptrs_abc: List[List[int]] = []
-    strides_abc: List[List[Tuple[int, int]]] = []
-    for g, (_m, n, k, _l) in enumerate(problem_sizes_mnkl):
-        b_g, s_g = b_packed_list[g], scale_list[g]
-        a_ptr = activations.data_ptr() if gather else a_fp8_list[g].data_ptr()
-        c_ptr = output.data_ptr() if scatter else c_list[g].data_ptr()
-        row = [a_ptr, b_g.data_ptr(), c_ptr, s_g.data_ptr()]
-        # A [M,K] k-major -> (K,1); B packed Uint8 [N,K/2] -> (K/2,1);
-        # C [M,N] n-major -> (N,1); scale [N,K/32] -> (K/32,1).
-        stride_row = [(k, 1), (k // 2, 1), (n, 1), (k // 32, 1)]
-        # operands 4,5 = scatter route map + weights (padded when not scattering but
-        # gathering, so the gather route map keeps a fixed column index 6).
-        if scatter:
-            row += [route_maps[g].data_ptr(), weights[g].data_ptr()]
-            stride_row += [(1, 0), (1, 0)]
-        elif gather:
-            row += [0, 0]
-            stride_row += [(1, 0), (1, 0)]
-        # operand 6 = gather route map [M] int32 (local row -> source row in A).
-        if gather:
-            row += [gather_route_maps[g].data_ptr()]
-            stride_row += [(1, 0)]
-        ptrs_abc.append(row)
-        strides_abc.append(stride_row)
-
     alignment = 16
     min_ab_size = alignment * 8 // a_dtype.width
     min_c_size = alignment * 8 // c_dtype.width
 
     sm_count, max_active_clusters = _w4a8_hw_info(cluster_shape_mn)
-
-    # Per-call metadata tensors: the actual operand pointers/strides/sizes, passed to
-    # the (cached) compiled kernel at launch time -- the kernel reads all operands
-    # through them, not through the type-spec dummies. cute_tensor_like does a
-    # host->device copy_, so memoize on the exact metadata content (see _W4A8_META_CACHE
-    # above): when operand buffers are reused across calls the rebuild + copy_ is skipped
-    # (cuts host overhead; makes the launch CUDA-graph-capturable since a hit issues no
-    # copy_). Tuple-ify the nested lists for a hashable key.
-    _meta_key = (
-        tuple(map(tuple, ptrs_abc)),
-        tuple(tuple(map(tuple, sr)) for sr in strides_abc),
-        tuple(problem_sizes_mnkl),
-        c_dtype,
-    )
-    _meta = _W4A8_META_CACHE.get(_meta_key)
-    if _meta is None:
-        tensor_of_dim_size_mnkl, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(problem_sizes_mnkl, dtype=torch.int32),
-            cutlass.Int32,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-        tensor_of_strides_abc, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(strides_abc, dtype=torch.int32),
-            cutlass.Int32,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-        tensor_of_ptrs_abc, _ = cutlass_torch.cute_tensor_like(
-            torch.tensor(ptrs_abc, dtype=torch.int64),
-            cutlass.Int64,
-            is_dynamic_layout=False,
-            assumed_align=16,
-        )
-        if len(_W4A8_META_CACHE) >= _W4A8_META_CACHE_CAP:
-            _W4A8_META_CACHE.clear()  # churny caller: drop and rebuild rather than grow
-        _W4A8_META_CACHE[_meta_key] = (
-            tensor_of_dim_size_mnkl,
-            tensor_of_strides_abc,
-            tensor_of_ptrs_abc,
-        )
-    else:
-        tensor_of_dim_size_mnkl, tensor_of_strides_abc, tensor_of_ptrs_abc = _meta
-
-    cluster_tile_shape_mn = (
-        tile_shape_mn[0] * cluster_shape_mn[0],
-        tile_shape_mn[1] * cluster_shape_mn[1],
-    )
-    total_num_clusters = _compute_total_num_clusters(
-        problem_sizes_mnkl, cluster_tile_shape_mn
-    )
 
     # Launch on torch's CURRENT stream, not the default stream. Serving frameworks
     # (sglang) run the model forward on a non-default stream; launching the GEMM on
@@ -3697,16 +3644,15 @@ def w4a8_mxfp4_grouped_gemm(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Reuse a cached compiled kernel when the compile-time config matches; only the
-    # runtime metadata tensors (built above) and the runtime total_num_clusters change
-    # between such calls. The key captures every input cute.compile specializes on:
-    # num_groups, operand dtypes (it specializes on pointer types), tile/cluster shape,
-    # tensormap mode, max_active_clusters/sm_count (GPU-fixed in the persistent
-    # scheduler), the scatter/gather operand-column layout (which also drives the
-    # kernel's behavior flags below), and a snapshot of the FI_W4A8_* debug env flags
-    # the kernel reads at trace time (SCALAR_XFORM/NO_PRMT/... change code).
-    # total_num_clusters is deliberately NOT in the key: it is a runtime kernel arg
-    # (per-call routing changes it every MoE forward in serving; keying on it caused a
-    # cute.compile per MoE call -- a multi-second recompile storm).
+    # runtime metadata tensors change between such calls. The key captures every input
+    # cute.compile specializes on: num_groups, operand dtypes (it specializes on
+    # pointer types), tile/cluster shape, tensormap mode, max_active_clusters/sm_count
+    # (GPU-fixed in the persistent scheduler), the scatter/gather operand-column
+    # layout (which also drives the kernel's behavior flags below), and a snapshot of
+    # the FI_W4A8_* debug env flags the kernel reads at trace time
+    # (SCALAR_XFORM/NO_PRMT/... change code). The cluster total is a device-resident
+    # runtime operand, never part of the key (keying on it caused a cute.compile per
+    # MoE call -- a multi-second recompile storm).
     _env_snapshot = tuple(
         sorted((k, v) for k, v in os.environ.items() if k.startswith("FI_W4A8_"))
     )
@@ -3728,6 +3674,7 @@ def w4a8_mxfp4_grouped_gemm(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
+        a_row_scale,
         dequant_exp_bias,
         _env_snapshot,
     )
@@ -3764,7 +3711,7 @@ def w4a8_mxfp4_grouped_gemm(
         )
         # Behavior is passed explicitly (no os.environ signaling): this API always
         # supplies a real UE8M0 scale, and token-scatter / fused-gather follow from
-        # the presence of `output` / `activations`.
+        # the scatter/gather arguments.
         grouped_gemm = HopperGroupedGemmPersistentKernel(
             acc_dtype,
             tile_shape_mn,
@@ -3782,6 +3729,7 @@ def w4a8_mxfp4_grouped_gemm(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            use_a_row_scale=a_row_scale,
             dequant_exp_bias=dequant_exp_bias,
         )
         compiled_grouped_gemm = cute.compile(
@@ -3793,7 +3741,7 @@ def w4a8_mxfp4_grouped_gemm(
             tensor_of_dim_size_mnkl,
             tensor_of_strides_abc,
             tensor_of_ptrs_abc,
-            cutlass.Int32(total_num_clusters),
+            tensor_of_total_clusters,
             tensor_of_tensormap,
             max_active_clusters,
             current_stream,
@@ -3812,9 +3760,221 @@ def w4a8_mxfp4_grouped_gemm(
         tensor_of_dim_size_mnkl,
         tensor_of_strides_abc,
         tensor_of_ptrs_abc,
-        cutlass.Int32(total_num_clusters),
+        tensor_of_total_clusters,
         tensor_of_tensormap,
         current_stream,
+    )
+
+
+@flashinfer_api
+def w4a8_mxfp4_grouped_gemm(
+    a_fp8_list: "List[torch.Tensor]",
+    b_packed_list: "List[torch.Tensor]",
+    scale_list: "List[torch.Tensor]",
+    c_list: "List[torch.Tensor]",
+    problem_sizes_mnkl: List[Tuple[int, int, int, int]],
+    acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+    c_dtype: Type[cutlass.Numeric] = cutlass.Float16,
+    tile_shape_mn: Tuple[int, int] = None,
+    cluster_shape_mn: Tuple[int, int] = (1, 1),
+    tensormap_update_mode: utils.TensorMapUpdateMode = utils.TensorMapUpdateMode.SMEM,
+    route_maps: "List[torch.Tensor]" = None,
+    weights: "List[torch.Tensor]" = None,
+    output: "torch.Tensor" = None,
+    activations: "torch.Tensor" = None,
+    gather_route_maps: "List[torch.Tensor]" = None,
+    no_accumulate: bool = False,
+    swiglu: bool = False,
+    swiglu_alpha: float = None,
+    swiglu_beta: float = None,
+    swiglu_limit: float = None,
+    a_row_scales: "List[torch.Tensor]" = None,
+    dequant_exp_bias: int = 0,
+) -> None:
+    """Callable W4A8 MXFP4 grouped GEMM: C[g] = A[g] @ dequant(B[g], scale[g])^T.
+
+    This is the Python entry point an MoE wrapper drives (gather/route happens in
+    the caller for now; the GEMM stays a plain grouped GEMM). Per group g with
+    shape (M_g, N, K, 1), the caller must pass, all on CUDA and kept alive until
+    after the launch synchronizes:
+
+    - ``a_fp8_list[g]``    : FP8 e4m3 activation ``[M_g, K]``, row-major (K contiguous).
+    - ``b_packed_list[g]`` : MXFP4 weight packed as Uint8 ``[N, K // 2]`` (2 nibbles
+                             per byte, low nibble = even K index), row-major.
+    - ``scale_list[g]``    : UE8M0 block scale ``[N, K // 32]`` as Uint8, row-major.
+    - ``c_list[g]``        : preallocated output ``[M_g, N]`` in ``c_dtype``, row-major.
+
+    Output is written in place into ``c_list``. K must be a multiple of 32 and the
+    contiguous dims 16-byte aligned (K % 16 == 0 for FP8 A, N % … for C).
+
+    ``swiglu=True`` fuses the GEMM1 SwiGLU activation into the epilogue: the weight columns
+    must be interleaved gate/up (row 2j = gate_j, 2j+1 = up_j), ``c_dtype`` must be
+    ``Float8E4M3FN``, and each ``c_list[g]`` is ``[M_g, N//2]``. ``swiglu_limit`` (a uniform
+    scalar) additionally selects the clamped SwiGLUBias variant (gate clamped to
+    ``(-inf, limit]``, up to ``[-limit, limit]`` then ``+ swiglu_beta``, sigmoid argument
+    scaled by ``swiglu_alpha``); ``None`` => plain ``silu(gate)*up``.
+
+    ``a_row_scales`` (swiglu only): per-group f32 ``[M_g]`` per-row activation scales,
+    multiplied into gate/up before the SwiGLU math -- pass when A was quantized with a
+    per-token scale (``a = a_true / scale``); the epilogue restores model units.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("GPU is required for w4a8_mxfp4_grouped_gemm")
+    # CTA tile selection (see w4a8_select_tile_mn): FI_W4A8_TILE_MN overrides; an
+    # explicit tile_shape_mn arg is respected as-is; else auto by N.
+    if os.environ.get("FI_W4A8_TILE_MN") or tile_shape_mn is None:
+        tile_shape_mn = w4a8_select_tile_mn([n for (_, n, _, _) in problem_sizes_mnkl])
+    num_groups = len(problem_sizes_mnkl)
+    # c_list is unused in token-scatter mode; a_fp8_list is unused in fused-gather
+    # mode (A is the shared `activations` tensor).
+    _c_len_ok = output is not None or len(c_list) == num_groups
+    _a_len_ok = activations is not None or len(a_fp8_list) == num_groups
+    if not (
+        len(b_packed_list) == len(scale_list) == num_groups and _c_len_ok and _a_len_ok
+    ):
+        raise ValueError("operand lists and problem_sizes_mnkl must have equal length")
+
+    # Token-scatter (FS-1) mode: when an `output` tensor is given, each group's
+    # output rows are scattered into it via a per-group route map (local row ->
+    # output/token row), scaled by a per-row routing weight. The per-group C
+    # pointer becomes the shared `output` base, and route map + weights are
+    # appended as the 5th/6th per-group operands. Default (output is None) keeps
+    # the direct per-group-C path.
+    scatter = output is not None
+    if scatter and not (route_maps is not None and weights is not None):
+        raise ValueError("token-scatter mode requires route_maps and weights")
+
+    # Fused-gather (FS-1 input side) mode: when an `activations` tensor is given,
+    # operand 0 (A) is its shared base and a per-group `gather_route_maps[g]` maps
+    # each local row -> source row in `activations` (operand 6). a_fp8_list is then
+    # unused. Default (activations is None) keeps the per-group A path.
+    gather = activations is not None
+    if gather and gather_route_maps is None:
+        raise ValueError("fused-gather mode requires gather_route_maps")
+
+    # The kernel reads the per-(N, K/32) UE8M0 scale as a 4th per-group operand. This
+    # callable always supplies a real scale, and token-scatter / fused-gather follow
+    # from the presence of `output` / `activations`; these are passed straight to the
+    # kernel constructor as explicit booleans (no os.environ signaling).
+
+    # Per-group pointer/stride metadata: scale is the 4th operand -> (G, 4); in
+    # token-scatter mode route map + weights append -> (G, 6).
+    ptrs_abc: List[List[int]] = []
+    strides_abc: List[List[Tuple[int, int]]] = []
+    for g, (_m, n, k, _l) in enumerate(problem_sizes_mnkl):
+        b_g, s_g = b_packed_list[g], scale_list[g]
+        a_ptr = activations.data_ptr() if gather else a_fp8_list[g].data_ptr()
+        c_ptr = output.data_ptr() if scatter else c_list[g].data_ptr()
+        row = [a_ptr, b_g.data_ptr(), c_ptr, s_g.data_ptr()]
+        # A [M,K] k-major -> (K,1); B packed Uint8 [N,K/2] -> (K/2,1);
+        # C [M,N] n-major -> (N,1); scale [N,K/32] -> (K/32,1).
+        stride_row = [(k, 1), (k // 2, 1), (n, 1), (k // 32, 1)]
+        # operand 4 = per-row A scale (swiglu only; mutually exclusive with the
+        # scatter/gather columns -- premeta validates).
+        if a_row_scales is not None:
+            row += [a_row_scales[g].data_ptr()]
+            stride_row += [(1, 0)]
+        # operands 4,5 = scatter route map + weights (padded when not scattering but
+        # gathering, so the gather route map keeps a fixed column index 6).
+        if scatter:
+            row += [route_maps[g].data_ptr(), weights[g].data_ptr()]
+            stride_row += [(1, 0), (1, 0)]
+        elif gather:
+            row += [0, 0]
+            stride_row += [(1, 0), (1, 0)]
+        # operand 6 = gather route map [M] int32 (local row -> source row in A).
+        if gather:
+            row += [gather_route_maps[g].data_ptr()]
+            stride_row += [(1, 0)]
+        ptrs_abc.append(row)
+        strides_abc.append(stride_row)
+
+    # Per-call metadata tensors: the actual operand pointers/strides/sizes plus the
+    # cluster-tile total, passed to the (cached) compiled kernel at launch time -- the
+    # kernel reads all operands through them, not through the type-spec dummies.
+    # cute_tensor_like does a host->device copy_, so memoize on the exact metadata
+    # content (see _W4A8_META_CACHE above): when operand buffers are reused across
+    # calls the rebuild + copy_ is skipped (cuts host overhead; a hit issues no
+    # copy_). Tuple-ify the nested lists for a hashable key. tile/cluster shape are in
+    # the key because the cached cluster TOTAL depends on them. (The zero-rebuild
+    # serving path is w4a8_grouped_gemm_premeta, which this front end delegates to.)
+    _meta_key = (
+        tuple(map(tuple, ptrs_abc)),
+        tuple(tuple(map(tuple, sr)) for sr in strides_abc),
+        tuple(problem_sizes_mnkl),
+        c_dtype,
+        tile_shape_mn,
+        cluster_shape_mn,
+    )
+    _meta = _W4A8_META_CACHE.get(_meta_key)
+    if _meta is None:
+        cluster_tile_shape_mn = (
+            tile_shape_mn[0] * cluster_shape_mn[0],
+            tile_shape_mn[1] * cluster_shape_mn[1],
+        )
+        total_num_clusters = _compute_total_num_clusters(
+            problem_sizes_mnkl, cluster_tile_shape_mn
+        )
+        tensor_of_dim_size_mnkl, _ = cutlass_torch.cute_tensor_like(
+            torch.tensor(problem_sizes_mnkl, dtype=torch.int32),
+            cutlass.Int32,
+            is_dynamic_layout=False,
+            assumed_align=16,
+        )
+        tensor_of_strides_abc, _ = cutlass_torch.cute_tensor_like(
+            torch.tensor(strides_abc, dtype=torch.int32),
+            cutlass.Int32,
+            is_dynamic_layout=False,
+            assumed_align=16,
+        )
+        tensor_of_ptrs_abc, _ = cutlass_torch.cute_tensor_like(
+            torch.tensor(ptrs_abc, dtype=torch.int64),
+            cutlass.Int64,
+            is_dynamic_layout=False,
+            assumed_align=16,
+        )
+        tensor_of_total_clusters, _ = cutlass_torch.cute_tensor_like(
+            torch.tensor([total_num_clusters], dtype=torch.int32),
+            cutlass.Int32,
+            is_dynamic_layout=False,
+            assumed_align=16,
+        )
+        if len(_W4A8_META_CACHE) >= _W4A8_META_CACHE_CAP:
+            _W4A8_META_CACHE.clear()  # churny caller: drop and rebuild rather than grow
+        _W4A8_META_CACHE[_meta_key] = (
+            tensor_of_dim_size_mnkl,
+            tensor_of_strides_abc,
+            tensor_of_ptrs_abc,
+            tensor_of_total_clusters,
+        )
+    else:
+        (
+            tensor_of_dim_size_mnkl,
+            tensor_of_strides_abc,
+            tensor_of_ptrs_abc,
+            tensor_of_total_clusters,
+        ) = _meta
+
+    w4a8_grouped_gemm_premeta(
+        num_groups,
+        tensor_of_dim_size_mnkl,
+        tensor_of_strides_abc,
+        tensor_of_ptrs_abc,
+        tensor_of_total_clusters,
+        c_dtype=c_dtype,
+        acc_dtype=acc_dtype,
+        tile_shape_mn=tile_shape_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        tensormap_update_mode=tensormap_update_mode,
+        scatter=scatter,
+        gather=gather,
+        no_accumulate=no_accumulate,
+        swiglu=swiglu,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        a_row_scale=a_row_scales is not None,
+        dequant_exp_bias=dequant_exp_bias,
     )
 
 
@@ -4002,6 +4162,14 @@ def run(
     total_num_clusters = compute_total_num_clusters(
         problem_sizes_mnkl, cluster_tile_shape_mn
     )
+    # The kernel reads the cluster total from device memory (see __call__): upload
+    # the host-computed value into a (1,) Int32 tensor once.
+    tensor_of_total_clusters, _ = cutlass_torch.cute_tensor_like(
+        torch.tensor([total_num_clusters], dtype=torch.int32),
+        cutlass.Int32,
+        is_dynamic_layout=False,
+        assumed_align=16,
+    )
 
     # Current stream for the same reason as the public API (identical to the default
     # stream in this single-script CLI, but keeps the two paths consistent).
@@ -4020,7 +4188,7 @@ def run(
         tensor_of_dim_size_mnkl,
         tensor_of_strides_abc,
         tensor_of_ptrs_abc,
-        cutlass.Int32(total_num_clusters),
+        tensor_of_total_clusters,
         tensor_of_tensormap,
         max_active_clusters,
         current_stream,
@@ -4034,7 +4202,7 @@ def run(
             tensor_of_dim_size_mnkl,
             tensor_of_strides_abc,
             tensor_of_ptrs_abc,
-            cutlass.Int32(total_num_clusters),
+            tensor_of_total_clusters,
             tensor_of_tensormap,
             current_stream,
         )
@@ -4145,7 +4313,7 @@ def run(
             tensor_of_dim_size_mnkl,
             strides_ws,
             ptrs_ws,
-            cutlass.Int32(total_num_clusters),
+            tensor_of_total_clusters,
             tensormap_ws,
             current_stream,
         )

@@ -30,9 +30,12 @@ Internally:
 
 Differences from the W4A16 cutlass path (W4A8 quantizes the activation to FP8):
 
-- **Input activation**: ``input`` (bf16/fp16) is cast straight to FP8 e4m3 -- *no* per-token
-  input scale. A direct cast is exact for in-range (post-norm, O(1)) inputs; outlier-heavy
-  models would want a SmoothQuant-style per-channel scale (a follow-up).
+- **Input activation**: ``input`` (bf16/fp16) is quantized to FP8 e4m3 with a *per-token*
+  scale (``x_fp8 = x / s_t``, ``s_t = row amax / 448``), and GEMM1's fused epilogue
+  multiplies ``s_t`` back per row before the SwiGLU math (the scale cannot fold into the
+  routing weight across a nonlinearity). This keeps outlier features exact (a direct cast
+  hard-clips |x| > 448) and keeps small hidden values out of e4m3's subnormal band. A
+  SmoothQuant-style per-channel scale remains a possible refinement for channel outliers.
 - **Intermediate requant**: the GEMM1 SwiGLU output is produced in BF16, then requantized
   to FP8 with a *per-token* scale before GEMM2 (matching the reference routed-MoE
   ``fc2_input_scale``). The scale is constant along the GEMM2 contraction, so it folds into
@@ -49,25 +52,37 @@ Differences from the W4A16 cutlass path (W4A8 quantizes the activation to FP8):
 
 Clamped SwiGLU (GPT-OSS / DeepSeek-V4) is supported via ``swiglu_alpha/beta/limit`` (a
 uniform per-expert scalar each, matching cutlass "SwiGLUBias"); ``swiglu_limit=None`` keeps
-plain ``silu(gate)*up``. Not yet supported (raise rather than silently mis-compute): expert
+plain ``silu(gate)*up``. Serving layers should pass these as plain Python floats
+(extracted once at weight-load time) -- the tensor form costs two device->host syncs per
+parameter per call. Not yet supported (raise rather than silently mis-compute): expert
 biases; non-uniform per-expert SwiGLU params; TP/EP sharding (caller shards).
 
-Perf caveat: per-expert token counts vary with the routing, so the per-call problem sizes
-are dynamic and the underlying grouped GEMM recompiles when they change. For static-shape
-serving, pad each expert to a fixed capacity (a follow-up); correctness is unaffected.
+Host path: the forward is SYNC-FREE and its per-call host cost is independent of E. All
+routing-dependent state -- per-group sizes, operand pointers, and the persistent
+scheduler's cluster totals -- is written by one device kernel (``fill_w4a8_moe_meta``)
+into a persistent metadata workspace whose cute wrappers are created once, and the
+grouped GEMM reads the cluster total from device memory. The host never calls
+``.item()``/``.tolist()`` and never loops over experts, so the GEMM launches stream
+back-to-back (and the whole forward is CUDA-graph-capturable in principle). The
+underlying grouped GEMM compiles once per config (num_groups == E is static; empty
+experts are legal M=0 groups).
 """
 
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 
 from ...api_logging import flashinfer_api
 from ...trace.templates.moe import w4a8_mxfp4_moe_trace
-from .w4a8_mxfp4_grouped_gemm_sm90 import w4a8_mxfp4_grouped_gemm
-from .moe_reduce_triton import moe_reduce, build_reduce_index, per_token_quant_fp8
+from .w4a8_mxfp4_grouped_gemm_sm90 import (
+    w4a8_grouped_gemm_premeta,
+    w4a8_select_tile_mn,
+)
+from .moe_reduce_triton import fill_w4a8_moe_meta, moe_reduce, per_token_quant_fp8
 
 try:
     import cutlass
+    import cutlass.torch as cutlass_torch
 
     _ACC = cutlass.Float32
     _CUTLASS_DTYPE = {
@@ -77,6 +92,7 @@ try:
     }
 except ImportError:  # pragma: no cover
     cutlass = None
+    cutlass_torch = None
     _ACC = None
     _CUTLASS_DTYPE = {}
 
@@ -107,26 +123,97 @@ def _check_unsupported(fc1_expert_biases, fc2_expert_biases):
 
 
 def _uniform_scalar(t, name):
-    """Extract a single scalar from a per-expert SwiGLU param tensor. In practice these
-    are uniform across experts (GPT-OSS / DeepSeek-V4 broadcast one value to all experts),
+    """Extract a single scalar from a per-expert SwiGLU param. In practice these are
+    uniform across experts (GPT-OSS / DeepSeek-V4 broadcast one value to all experts),
     and the fused epilogue bakes each as one compile-time const, so require uniformity
     rather than silently using expert 0's value.
 
-    Deliberately *not* memoized: the uniformity check + ``.item()`` force a small
-    device->host sync, but it only runs on the clamped-SwiGLU path and is dwarfed by the
-    routing-side syncs (``bincount(...).tolist()``, ``argsort``). Caching the extracted
-    *value* keyed on the buffer address would go stale if the buffer's contents change or
-    the allocator reuses the storage -- a silent wrong result, a worse failure mode than
-    the tiny sync. (Unlike ``_W4A8_META_CACHE``, which caches pointer wrappers whose data
-    is re-read at launch, this would cache a content-derived value.)"""
-    if t is None:
-        return None
+    A plain Python float/int passes straight through: serving layers should extract
+    the scalars ONCE at weight-load time and pass floats, because the tensor path's
+    uniformity check + ``.item()`` are device->host syncs -- per MoE call and per
+    parameter (3 params x 2 syncs), they were the dominant host stall of the
+    otherwise sync-free forward. The tensor path stays for convenience/back-compat
+    and is deliberately *not* memoized: caching a content-derived value keyed on the
+    buffer address would go stale if the buffer is reused -- a silent wrong result,
+    a worse failure mode than the sync."""
+    if t is None or isinstance(t, (int, float)):
+        return None if t is None else float(t)
     flat = t.reshape(-1)
     if not bool(torch.all(flat == flat[0])):
         raise NotImplementedError(
             f"w4a8_mxfp4_moe requires a uniform per-expert {name} (got non-uniform values)"
         )
     return float(flat[0].item())
+
+
+# Persistent grouped-GEMM metadata workspaces, keyed on the MoE config (device, E,
+# per-GEMM N/K, scatter-or-not). Each holds the sizes/strides/ptrs/cluster-total
+# device tensors AND their cute wrappers, both created once; every call rewrites only
+# the routing-dependent device CONTENTS (one fill_w4a8_moe_meta launch) and reuses the
+# wrappers, so the per-call host cost is independent of E and the launch path issues
+# no host->device copies and no syncs. Reusing one workspace across layers is safe on
+# a single stream: the fill of call N+1 is stream-ordered after the GEMMs of call N
+# (same constraint as the kernel-cache tensormap workspace; concurrent multi-stream
+# callers would need per-stream workspaces).
+_W4A8_MOE_WS: dict = {}
+
+
+def _gemm_meta_set(E: int, n: int, k: int, n_ops: int) -> dict:
+    """Build one grouped-GEMM metadata set: persistent device tensors + cute wrappers.
+
+    Everything routing-independent is prefilled here once -- the N/K/L size columns
+    and the full stride matrix (all groups share (n, k), only M varies). The per-call
+    meta-fill kernel rewrites just the M column and the pointer matrix."""
+    sizes_cpu = torch.zeros((E, 4), dtype=torch.int32)
+    sizes_cpu[:, 1] = n
+    sizes_cpu[:, 2] = k
+    sizes_cpu[:, 3] = 1
+    # Per-operand (row, col) element strides: A [M,K] k-major, B packed Uint8
+    # [N,K/2], C [M,N] n-major, scale [N,K/32] (+ per-row [M] vector operands:
+    # GEMM1's A-row scale at col 4, or GEMM2's scatter route map / weights).
+    stride_row = [(k, 1), (k // 2, 1), (n, 1), (k // 32, 1)]
+    stride_row += [(1, 0)] * (n_ops - 4)
+    strides_cpu = torch.tensor(stride_row, dtype=torch.int32).repeat(E, 1, 1)
+    sizes_cute, sizes_dev = cutlass_torch.cute_tensor_like(
+        sizes_cpu, cutlass.Int32, is_dynamic_layout=False, assumed_align=16
+    )
+    strides_cute, _ = cutlass_torch.cute_tensor_like(
+        strides_cpu, cutlass.Int32, is_dynamic_layout=False, assumed_align=16
+    )
+    ptrs_cute, ptrs_dev = cutlass_torch.cute_tensor_like(
+        torch.zeros((E, n_ops), dtype=torch.int64),
+        cutlass.Int64,
+        is_dynamic_layout=False,
+        assumed_align=16,
+    )
+    clusters_cute, clusters_dev = cutlass_torch.cute_tensor_like(
+        torch.zeros(1, dtype=torch.int32),
+        cutlass.Int32,
+        is_dynamic_layout=False,
+        assumed_align=16,
+    )
+    return {
+        "sizes_cute": sizes_cute,
+        "sizes_dev": sizes_dev,
+        "strides_cute": strides_cute,
+        "ptrs_cute": ptrs_cute,
+        "ptrs_dev": ptrs_dev,
+        "clusters_cute": clusters_cute,
+        "clusters_dev": clusters_dev,
+    }
+
+
+def _moe_meta_ws(
+    device: torch.device, E: int, n1: int, k1: int, n2: int, k2: int, n_ops2: int
+) -> "tuple[dict, dict]":
+    key = (device.index, E, n1, k1, n2, k2, n_ops2)
+    ws = _W4A8_MOE_WS.get(key)
+    if ws is None:
+        with torch.cuda.device(device):
+            # GEMM1 carries the per-row A-scale column (n_ops=5, swiglu epilogue).
+            ws = (_gemm_meta_set(E, n1, k1, 5), _gemm_meta_set(E, n2, k2, n_ops2))
+        _W4A8_MOE_WS[key] = ws
+    return ws
 
 
 @flashinfer_api(trace=w4a8_mxfp4_moe_trace)
@@ -140,9 +227,9 @@ def w4a8_mxfp4_moe(
     quant_scales: List[torch.Tensor],
     fc1_expert_biases: Optional[torch.Tensor] = None,
     fc2_expert_biases: Optional[torch.Tensor] = None,
-    swiglu_alpha: Optional[torch.Tensor] = None,
-    swiglu_beta: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[Union[torch.Tensor, float]] = None,
+    swiglu_beta: Optional[Union[torch.Tensor, float]] = None,
+    swiglu_limit: Optional[Union[torch.Tensor, float]] = None,
     dequant_exp_bias: int = 0,
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -181,121 +268,168 @@ def w4a8_mxfp4_moe(
     top_k = token_selected_experts.shape[1]
     fc1_scale, fc2_scale = quant_scales
 
-    # 1. Activation -> FP8 (no per-token scale; see module docstring). SATURATE at
-    # the e4m3 max: torch's cast maps |x| > 448 to NaN (e4m3fn has no inf), and real
-    # transformer hidden states carry outlier features that exceed 448 in deep layers
-    # -- an unclamped cast detonates the whole forward. Clamping loses the outlier's
-    # magnitude beyond 448 (a per-token/SmoothQuant input scale is the proper fix).
-    x_fp8 = input.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    TK = T * top_k
 
-    # 2. Routing -> permute order (group the (token, slot) pairs by expert).
-    exp_e = token_selected_experts.reshape(-1).long()  # [T*top_k]
-    exp_tok = torch.arange(T, device=dev).repeat_interleave(top_k)  # [T*top_k]
-    exp_w = token_final_scales.reshape(-1).float()  # [T*top_k]
-    order = torch.argsort(exp_e, stable=True)  # group by expert
-    sorted_tok = exp_tok[order]
-    sorted_w = exp_w[order]
-    counts = torch.bincount(exp_e, minlength=E).tolist()  # tokens per expert
-    offsets = [0]
-    for c in counts:
-        offsets.append(offsets[-1] + c)
+    # 1. Activation -> FP8 with a PER-TOKEN scale (x_fp8 = x / s_t, s_t = row amax /
+    # 448). Replaces the earlier direct saturating cast, which had two real error
+    # sources on DSv4: outlier features beyond the e4m3 max were hard-clipped
+    # (directional error on exactly the channels that matter), and small hidden
+    # values fell into e4m3's subnormal band where mantissa bits drop off (the same
+    # failure mode dequant_exp_bias fixes on the weight side). The scale cannot fold
+    # into the routing weight (GEMM1 feeds the nonlinear SwiGLU), so GEMM1's epilogue
+    # multiplies it back per row BEFORE the SwiGLU math (a_row_scale operand below).
+    x_fp8 = torch.empty(T, H, device=dev, dtype=torch.float8_e4m3fn)
+    x_scale = torch.empty(T, device=dev, dtype=torch.float32)
+    per_token_quant_fp8(input, out=x_fp8, scale_out=x_scale)
 
-    # One coalesced permute of the activation into routed (group) order.
-    a_perm = x_fp8[sorted_tok]  # [T*top_k, H] FP8
+    # 2. Routing -> permute order (group the (token, slot) pairs by expert), entirely
+    # on device. NOTE: counts deliberately avoids torch.bincount, whose CUDA kernel
+    # sizes its output via input.max().item() -- a hidden device->host sync. From here
+    # to the final output the host never learns anything routing-dependent: the
+    # grouped GEMM metadata AND the persistent scheduler's cluster totals are written
+    # by a device kernel (fill_w4a8_moe_meta) and read by the GEMM from device memory,
+    # so the whole forward is sync-free (and thus CUDA-graph-capturable).
+    exp_e = token_selected_experts.reshape(-1).long()  # [TK]
+    order = torch.argsort(exp_e, stable=True)  # group (token, slot) pairs by expert
+    sorted_tok = order // top_k  # routed row -> source token (flat index // top_k)
+    sorted_w = token_final_scales.reshape(-1).float()[order]
+    counts = torch.zeros(E, dtype=torch.int32, device=dev)
+    counts.index_add_(0, exp_e, torch.ones(TK, dtype=torch.int32, device=dev))
 
-    # ALL experts are always passed, including empty ones (M=0 contributes zero tiles;
-    # the scheduler never touches them). This keeps num_groups == E static, which --
-    # together with the runtime total_num_clusters -- makes the grouped GEMM's compile
-    # cache key routing-independent: ONE compile per config, no recompile when the
-    # per-expert token counts change between serving steps.
-    active = list(range(E))
-    a_list, w1_list, s1_list, ps1, c1_list = [], [], [], [], []
-    # GEMM1 writes the SwiGLU intermediate in BF16 (not FP8) so it can be requantized
-    # per-token before GEMM2 (see the requant step below).
-    c1_buf = torch.empty(T * top_k, I, device=dev, dtype=torch.bfloat16)
-    for e in active:
-        off, cnt = offsets[e], counts[e]
-        a_list.append(a_perm[off : off + cnt])
-        w1_list.append(fc1_expert_weights[e])
-        s1_list.append(fc1_scale[e])
-        c1_list.append(c1_buf[off : off + cnt])
-        ps1.append((cnt, 2 * I, H, 1))
+    # One coalesced permute of the activation (and its per-token scale) into routed
+    # (group) order; a_scale_perm is GEMM1's per-row scale operand.
+    a_perm = x_fp8[sorted_tok]  # [TK, H] FP8
+    a_scale_perm = x_scale[sorted_tok]  # [TK] f32
 
-    # 3. GEMM1 + fused SwiGLU -> BF16 [cnt, I] (gate/up interleaved in fc1).
-    w4a8_mxfp4_grouped_gemm(
-        a_list,
-        w1_list,
-        s1_list,
-        c1_list,
-        ps1,
-        acc_dtype=_ACC,
+    # 3. All per-call buffers up front -- their base addresses feed the meta-fill
+    # kernel below. GEMM1 writes the SwiGLU intermediate in BF16 (not FP8) so it can
+    # be requantized per-token before GEMM2 (see the requant step below); c1_fp8 /
+    # a_scale / wt_buf are preallocated so the requant + weight-fold write into
+    # buffers whose pointers are already in the metadata.
+    c1_buf = torch.empty(TK, I, device=dev, dtype=torch.bfloat16)
+    c1_fp8 = torch.empty(TK, I, device=dev, dtype=torch.float8_e4m3fn)
+    a_scale = torch.empty(TK, device=dev, dtype=torch.float32)
+    wt_buf = torch.empty(TK, device=dev, dtype=torch.float32)
+    if output is None:
+        output = torch.empty(T, H, device=dev, dtype=output_dtype)
+    scatter = top_k == 1
+    if scatter:
+        # Each token written once -> vectorized fused scatter (no atomicAdd) into a
+        # plain f32 buffer, cast to output_dtype at the end.
+        out_f32 = torch.empty(T, H, device=dev, dtype=torch.float32)
+        c2_buf = out_f32
+        c2_row_bytes = 0  # shared C base: every group scatters into out_f32
+        route_i32 = sorted_tok.to(torch.int32)
+        r2_base, w2_base = route_i32.data_ptr(), wt_buf.data_ptr()
+    else:
+        # top_k >= 2: GEMM2 -> per-expert C rows (routed order) + non-atomic reduce.
+        c2_buf = torch.empty(TK, H, device=dev, dtype=torch.float16)
+        c2_row_bytes = c2_buf.stride(0) * c2_buf.element_size()
+        r2_base = w2_base = 0
+
+    # 4. Metadata: ALL experts are always passed, including empty ones (M=0
+    # contributes zero tiles; the scheduler never touches them), keeping
+    # num_groups == E static -- ONE compile per config regardless of routing. A
+    # single device kernel rewrites the M column, the operand pointers, and the
+    # cluster totals of BOTH GEMMs inside the persistent metadata workspace.
+    g1, g2 = _moe_meta_ws(dev, E, 2 * I, H, H, I, 6 if scatter else 4)
+    tile1 = w4a8_select_tile_mn([2 * I])
+    tile2 = w4a8_select_tile_mn([H])
+    fill_w4a8_moe_meta(
+        counts,
+        g1["sizes_dev"],
+        g1["ptrs_dev"],
+        g1["clusters_dev"],
+        g2["sizes_dev"],
+        g2["ptrs_dev"],
+        g2["clusters_dev"],
+        g1_bases=(
+            a_perm.data_ptr(),
+            fc1_expert_weights.data_ptr(),
+            c1_buf.data_ptr(),
+            fc1_scale.data_ptr(),
+            a_scale_perm.data_ptr(),
+        ),
+        g1_rows=(
+            a_perm.stride(0) * a_perm.element_size(),
+            c1_buf.stride(0) * c1_buf.element_size(),
+        ),
+        g1_experts=(
+            fc1_expert_weights.stride(0) * fc1_expert_weights.element_size(),
+            fc1_scale.stride(0) * fc1_scale.element_size(),
+        ),
+        g2_bases=(
+            c1_fp8.data_ptr(),
+            fc2_expert_weights.data_ptr(),
+            c2_buf.data_ptr(),
+            fc2_scale.data_ptr(),
+            r2_base,
+            w2_base,
+        ),
+        g2_rows=(c1_fp8.stride(0) * c1_fp8.element_size(), c2_row_bytes),
+        g2_experts=(
+            fc2_expert_weights.stride(0) * fc2_expert_weights.element_size(),
+            fc2_scale.stride(0) * fc2_scale.element_size(),
+        ),
+        tile_m1=tile1[0],
+        nn1=(2 * I + tile1[1] - 1) // tile1[1],
+        tile_m2=tile2[0],
+        nn2=(H + tile2[1] - 1) // tile2[1],
+    )
+
+    # 5. GEMM1 + fused SwiGLU -> BF16 [cnt, I] (gate/up interleaved in fc1).
+    w4a8_grouped_gemm_premeta(
+        E,
+        g1["sizes_cute"],
+        g1["strides_cute"],
+        g1["ptrs_cute"],
+        g1["clusters_cute"],
         c_dtype=cutlass.BFloat16,
+        acc_dtype=_ACC,
+        tile_shape_mn=tile1,
         swiglu=True,
         swiglu_alpha=alpha,
         swiglu_beta=beta,
         swiglu_limit=limit,
+        a_row_scale=True,
         dequant_exp_bias=dequant_exp_bias,
     )
 
-    # 3b. Requant the BF16 intermediate to FP8 with a per-token (per-routed-row) scale
+    # 5b. Requant the BF16 intermediate to FP8 with a per-token (per-routed-row) scale
     # for the FP8 GEMM2. The scale is constant along the GEMM2 contraction dim, so it
     # pulls out to a per-output-row factor -- fold it straight into the routing weight
-    # (sorted_w, same routed order as c1_buf) and GEMM2's scatter / moe_reduce applies it
-    # for free, no GEMM2 change. (Matches the reference routed-MoE `fc2_input_scale`;
-    # for clamped-SwiGLU models the intermediate is already bounded, but the per-token
-    # scale recovers the FP8 precision an unscaled cast would lose.)
-    c1_fp8, a_scale = per_token_quant_fp8(c1_buf)  # [T*top_k, I] fp8, [T*top_k] f32
-    sorted_w = sorted_w * a_scale
+    # (sorted_w, same routed order as c1_buf) and GEMM2's scatter / moe_reduce applies
+    # it for free, no GEMM2 change. (Matches the reference routed-MoE
+    # `fc2_input_scale`; for clamped-SwiGLU models the intermediate is already
+    # bounded, but the per-token scale recovers the FP8 precision an unscaled cast
+    # would lose.)
+    per_token_quant_fp8(c1_buf, out=c1_fp8, scale_out=a_scale)
+    torch.mul(sorted_w, a_scale, out=wt_buf)
 
-    # 4. GEMM2 (down) + finalize. GEMM2 input is the requantized FP8 intermediate; the
-    # per-token scale is already folded into sorted_w (-> wt_list below).
-    c1q_list = [c1_fp8[offsets[e] : offsets[e] + counts[e]] for e in active]
-    w2_list = [fc2_expert_weights[e] for e in active]
-    s2_list = [fc2_scale[e] for e in active]
-    ps2 = [(counts[e], H, I, 1) for e in active]
-    route_list = [
-        sorted_tok[offsets[e] : offsets[e] + counts[e]].to(torch.int32) for e in active
-    ]
-    wt_list = [
-        sorted_w[offsets[e] : offsets[e] + counts[e]].contiguous() for e in active
-    ]
-
-    if output is None:
-        output = torch.empty(T, H, device=dev, dtype=output_dtype)
-
-    if top_k == 1:
-        # Each token written once -> vectorized fused scatter (no atomicAdd).
-        out_f32 = torch.empty(T, H, device=dev, dtype=torch.float32)
-        w4a8_mxfp4_grouped_gemm(
-            c1q_list,
-            w2_list,
-            s2_list,
-            None,
-            ps2,
-            acc_dtype=_ACC,
-            c_dtype=c_cutlass,
-            route_maps=route_list,
-            weights=wt_list,
-            output=out_f32,
-            no_accumulate=True,
-            dequant_exp_bias=dequant_exp_bias,
-        )
+    # 6. GEMM2 (down) + finalize. GEMM2 input is the requantized FP8 intermediate;
+    # the per-token scale is already folded into wt_buf.
+    w4a8_grouped_gemm_premeta(
+        E,
+        g2["sizes_cute"],
+        g2["strides_cute"],
+        g2["ptrs_cute"],
+        g2["clusters_cute"],
+        c_dtype=c_cutlass if scatter else cutlass.Float16,
+        acc_dtype=_ACC,
+        tile_shape_mn=tile2,
+        scatter=scatter,
+        no_accumulate=scatter,
+        dequant_exp_bias=dequant_exp_bias,
+    )
+    if scatter:
         output.copy_(out_f32)
     else:
-        # top_k >= 2: GEMM2 -> per-expert C (routed order) + non-atomic moe_reduce.
-        c2_buf = torch.empty(T * top_k, H, device=dev, dtype=torch.float16)
-        c2_list = [c2_buf[offsets[e] : offsets[e] + counts[e]] for e in active]
-        w4a8_mxfp4_grouped_gemm(
-            c1q_list,
-            w2_list,
-            s2_list,
-            c2_list,
-            ps2,
-            acc_dtype=_ACC,
-            c_dtype=cutlass.Float16,
-            dequant_exp_bias=dequant_exp_bias,
-        )
-        permuted_idx, topk_scales = build_reduce_index(route_list, wt_list, T, top_k)
+        # Group each token's top_k routed rows: argsort(sorted_tok) IS the permuted
+        # row index list of build_reduce_index (the concatenated per-group route maps
+        # are exactly sorted_tok), computed without materializing per-group lists.
+        order2 = torch.argsort(sorted_tok, stable=True)
+        permuted_idx = order2.reshape(T, top_k).to(torch.int32)
+        topk_scales = wt_buf[order2].reshape(T, top_k)
         moe_reduce(c2_buf, output, permuted_idx, topk_scales, top_k)
 
     return output
