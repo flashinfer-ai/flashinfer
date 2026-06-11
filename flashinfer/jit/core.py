@@ -12,7 +12,12 @@ from filelock import FileLock
 
 from ..compilation_context import CompilationContext
 from . import env as jit_env
-from .cpp_ext import generate_ninja_build_for_op, get_nvcc_parallelism_flags, run_ninja
+from .cpp_ext import (
+    generate_ninja_build_for_op,
+    get_nvcc_parallelism_flags,
+    run_ninja,
+    run_ninja_restat,
+)
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
@@ -299,6 +304,7 @@ class JitSpec:
         )
         with lock:
             self.write_ninja()
+            run_ninja_restat(self.build_dir, self.ninja_path, verbose)
             run_ninja(self.build_dir, self.ninja_path, verbose)
 
     def load(self, so_path: Path):
@@ -308,12 +314,17 @@ class JitSpec:
         if self.is_aot:
             return self.load(self.aot_path)
 
+        so_path = self.jit_library_path
+        if so_path.exists():
+            return self.load(so_path)
+
         # Guard both build and load with the same lock to avoid race condition
         # where another process is building the library and removes the .so file.
         with FileLock(self.lock_path, thread_local=False):
             so_path = self.jit_library_path
-            verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
-            self.build(verbose, need_lock=False)
+            if not so_path.exists():
+                verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+                self.build(verbose, need_lock=False)
             result = self.load(so_path)
 
         return result
