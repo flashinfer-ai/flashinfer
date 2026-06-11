@@ -648,8 +648,8 @@ def _make_packs_and_config(
     act_pack = MoEActivationPack(
         hidden_states_q=tensors["x"],
         hidden_states_scale=tensors["x_sf"].squeeze(-1),
-        selected_experts=tensors["token_selected_experts"],
-        final_scales=tensors["token_final_scales"],
+        topk_ids=tensors["token_selected_experts"],
+        topk_weights=tensors["token_final_scales"],
     )
 
     weight_pack = MoEWeightPack()
@@ -890,8 +890,8 @@ class TestTrtllmEPOffset:
             hidden_states_scale=torch.zeros(
                 num_tokens, hidden_size // sf_vec_size, dtype=torch.uint8, device=device
             ).view(torch.float8_e4m3fn),
-            selected_experts=selected_experts,
-            final_scales=final_scales,
+            topk_ids=selected_experts,
+            topk_weights=final_scales,
         )
 
         # pack_inputs only passes weight tensors through; dummies suffice since

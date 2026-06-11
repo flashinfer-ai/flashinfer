@@ -172,7 +172,12 @@ import torch.nn.functional as F
 
 from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import fp4_quantize
-from flashinfer.fused_moe import MoEActivationPack, MoELayer, MoEWeightPack
+from flashinfer.fused_moe import (
+    MoEActivationPack,
+    MoELayer,
+    MoEWeightPack,
+    RoutingInputMode,
+)
 from flashinfer.fused_moe.api import (
     ActivationConfig,
     BackendOptions,
@@ -308,8 +313,9 @@ def _nvfp4_act_pack(x, selected_experts, final_scales):
     return MoEActivationPack(
         hidden_states_q=packed,
         hidden_states_scale=scale.squeeze(-1) if scale.dim() > 2 else scale,
-        selected_experts=selected_experts,
-        final_scales=final_scales,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales,
     )
 
 
@@ -324,6 +330,7 @@ def _nvfp4_act_pack_logits(x, routing_logits, routing_bias):
     return MoEActivationPack(
         hidden_states_q=packed,
         hidden_states_scale=scale.squeeze(-1) if scale.dim() > 2 else scale,
+        routing_input_mode=RoutingInputMode.FromLogits,
         routing_logits=routing_logits,
         routing_bias=routing_bias,
     )

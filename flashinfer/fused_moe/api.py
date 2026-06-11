@@ -33,6 +33,7 @@ from typing import ClassVar, Dict, Optional, Tuple, Union
 from torch import Tensor
 
 from ..tllm_enums import ActivationType, RoutingMethodType
+from .core import RoutingInputMode  # ABI enum; core does not import api (no cycle)
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -499,27 +500,27 @@ class MoEConfig:
 
 @dataclass
 class MoEActivationPack:
-    """Per-call transient data — pre-quantized NVFP4 activations plus routing.
+    """Per-call transient data — pre-quantized NVFP4 activations plus routing inputs.
 
-    Routing is supplied one of two mutually-exclusive ways (the runner picks the
-    kernel's ``RoutingInputMode`` from which fields are populated):
+    ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
-    * **pre-routed** (``RoutingInputMode.PackedPrecomputed``): the caller computes
-      expert selection on the host and passes ``selected_experts`` + ``final_scales``.
-      This is the original MVP path.
-    * **in-kernel** (``RoutingInputMode.FromLogits``): the caller passes raw
-      ``routing_logits`` (and, for bias-aware methods like DeepSeekV3/MiniMax2,
-      ``routing_bias``); the kernel computes the top-k selection itself per
-      ``RoutingConfig.method``.  ``selected_experts`` / ``final_scales`` are then
-      OUTPUT buffers the kernel fills, so the caller leaves them ``None``.
+    * ``PackedPrecomputed`` (default) / ``UnpackedPrecomputed`` — **pre-routed**: the caller
+      computes expert selection on the host and passes ``topk_ids`` + ``topk_weights``.
+    * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
+      methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
+      itself per ``RoutingConfig.method``, and ``topk_ids`` / ``topk_weights`` are OUTPUT buffers
+      (left ``None`` by the caller).
+
+    ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425).
     """
 
     hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4)
     hidden_states_scale: Tensor  # [M, H//16] float8_e4m3fn
-    # Pre-routed (PackedPrecomputed):
-    selected_experts: Optional[Tensor] = None  # [M, top_k] int32
-    final_scales: Optional[Tensor] = None  # [M, top_k] float32
-    # In-kernel routing (FromLogits):
+    routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed
+    # Pre-routed top-k selection (Packed/Unpacked modes); kernel-filled OUTPUT buffers under FromLogits.
+    topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
+    topk_weights: Optional[Tensor] = None  # [M, top_k] float32 (routing weights)
+    # In-kernel routing inputs (FromLogits):
     routing_logits: Optional[Tensor] = None  # [M, num_experts] float32 or bfloat16
     routing_bias: Optional[Tensor] = None  # [num_experts] (same dtype as logits)
 
