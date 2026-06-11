@@ -1328,6 +1328,95 @@ def min_p_sampling_from_probs(
     )
 
 
+# Gating thresholds for the "top_k_first" fast path (parallel top-k, then top-p over only
+# the k survivors). For a modest scalar top_k this is far cheaper than masking/renorming the
+# full vocab and running rejection sampling across it: the old path's expensive steps (a
+# full-vocab softmax for the logits entry point, and a single-CTA full-vocab top-p rejection
+# for both) shrink to k-element work, while top-k selection costs about the same.
+#
+# The win only holds when (a) the vocab is large enough that the avoided full-vocab work
+# outweighs the top-k selection cost, AND (b) k is small enough that the survivors stay
+# cheap. Outside these thresholds we fall back to the original kernels.
+# Thresholds were empirically determined.
+_TOP_K_FIRST_FAST_PATH_MAX_K = 256
+_TOP_K_FIRST_FAST_PATH_MIN_VOCAB = 65536
+
+
+def _top_k_first_fast_path_applicable(
+    x: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    indices: Optional[torch.Tensor],
+) -> bool:
+    return (
+        indices is None
+        and isinstance(top_k, int)
+        and 0 < top_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
+        and x.size(-1) >= _TOP_K_FIRST_FAST_PATH_MIN_VOCAB
+        and top_k < x.size(-1)
+    )
+
+
+def _top_k_first_fast_path(
+    x: torch.Tensor,
+    top_k: int,
+    top_p: Union[torch.Tensor, float],
+    *,
+    from_logits: bool,
+    deterministic: bool,
+    generator: Optional[torch.Generator],
+    check_nan: bool,
+    seed: Optional[Union[int, torch.Tensor]],
+    offset: Optional[Union[int, torch.Tensor]],
+    return_valid: bool = False,
+):
+    """Shared "top_k_first" fast path for both the logits and probs entry points.
+
+    Selects the top-k entries with the parallel radix/cluster top-k kernel, then runs
+    top-p sampling over only those k entries. ``sorted=True`` gives an identical,
+    deterministic ordering for both logits and probs inputs, so the two entry points
+    reduce to the same ``probs_k`` and stay sample-aligned. This is distribution-equivalent
+    to the masked full-vocab path (validated TV ~0.01) but far cheaper at small batch.
+    """
+    # Local import avoids a module-level cycle between sampling and topk.
+    from .topk import top_k as _radix_top_k
+
+    # deterministic=True makes top-k reproducible (its radix deterministic-collect path is
+    # stable even at ties). We do not enforce a tie break that requires 128KB smem/block.
+    values, gathered_indices = _radix_top_k(
+        x, top_k, sorted=True, deterministic=deterministic
+    )
+    values = values.float()
+    if from_logits:
+        # softmax over the k retained logits == top-k-masked softmax over the full vocab.
+        probs_k = torch.softmax(values, dim=-1)
+    else:
+        # renormalizing the k retained probabilities == top_k_renorm over the full vocab.
+        probs_k = values / values.sum(dim=-1, keepdim=True)
+    result = top_p_sampling_from_probs(
+        probs_k,
+        top_p,
+        None,
+        deterministic,
+        check_nan=check_nan,
+        generator=generator,
+        seed=seed,
+        offset=offset,
+        return_valid=return_valid,
+    )
+
+    def _map(local):
+        return (
+            gathered_indices.gather(1, local.view(-1, 1).long())
+            .squeeze(1)
+            .to(torch.int32)
+        )
+
+    if return_valid:
+        local, valid = result
+        return _map(local), valid
+    return _map(result)
+
+
 @flashinfer_api(trace=top_k_top_p_sampling_from_logits_trace)
 def top_k_top_p_sampling_from_logits(
     logits: torch.Tensor,
@@ -1443,6 +1532,18 @@ def top_k_top_p_sampling_from_logits(
     top_p_sampling_from_probs
     """
     if filter_apply_order == "top_k_first":
+        if _top_k_first_fast_path_applicable(logits, top_k, indices):
+            return _top_k_first_fast_path(
+                logits,
+                top_k,
+                top_p,
+                from_logits=True,
+                deterministic=deterministic,
+                generator=generator,
+                check_nan=check_nan,
+                seed=seed,
+                offset=offset,
+            )
         masked_logits = top_k_mask_logits(logits, top_k)
         probs = torch.softmax(masked_logits, dim=-1)
         return top_p_sampling_from_probs(
@@ -1593,6 +1694,19 @@ def top_k_top_p_sampling_from_probs(
     top_k_mask_logits
     """
     if filter_apply_order == "top_k_first":
+        if _top_k_first_fast_path_applicable(probs, top_k, indices):
+            return _top_k_first_fast_path(
+                probs,
+                top_k,
+                top_p,
+                from_logits=False,
+                deterministic=deterministic,
+                generator=generator,
+                check_nan=check_nan,
+                seed=seed,
+                offset=offset,
+                return_valid=return_valid,
+            )
         renorm_probs = top_k_renorm_probs(probs, top_k)
         return top_p_sampling_from_probs(
             renorm_probs,
