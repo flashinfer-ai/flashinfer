@@ -35,7 +35,7 @@
 //   (frag_acc, registers) is reused across the tile's heads; only the per-head
 //   decay scaling differs.  That is the whole point of the per-group grid.
 //
-// CB handling: the 2-warp MMA writes raw C·B as FP32 to row-major smem.CB
+// CB handling: the 2-warp MMA writes raw C·B as FP32 to swizzled smem.CB
 // (scale in fp32, like the monolithic).  Each warp then scales its head and
 // writes the result to gmem with one STG.128/thread in fragA-native layout —
 // the MAIN never LDSMs CB; it reads its 8-bf16 fragment with one LDG.128
@@ -54,7 +54,7 @@
 namespace flashinfer::mamba::checkpointing {
 
 // -----------------------------------------------------------------------------
-// Lean precompute smem: only the C·B-path buffers (B, C, CB_scaled) + per-warp
+// Lean precompute smem: only the C·B-path buffers (B, C, CB) + per-warp
 // coefficients (warp-per-head).  Drops the monolithic CheckpointingSsuStorage's
 // state / old_x / old_B / x / z — none touched here — so the precompute uses
 // far less smem → more CTAs/SM → better occupancy (the lever we're chasing).
@@ -72,11 +72,12 @@ struct CheckpointingSsuPrecomputeStorage {
       next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
   // Raw C·B kept in FP32 (scale in fp32 like the monolithic; cast to bf16 only
   // at the final gmem STG.128 — storing raw as bf16 would lose the accumulator
-  // precision before scaling and diverge from the monolithic).  Simple
-  // row-major: the per-warp scale reads it by (t,j), NOT via LDSM, so there is
-  // no swizzle and no pad.
-  static constexpr int CB_STRIDE = NPREDICTED_PAD_MMA_M;
-  float CB[NPREDICTED_PAD_MMA_M * CB_STRIDE];  // 16×16 f32 ≈ 1 KB
+  // precision before scaling).  Swizzled via SmemSwizzle<float> (just like the
+  // monolithic's bf16 CB uses SmemSwizzle<input_t>) so the accumulator store and
+  // the per-warp (t,j) reads are bank-conflict-free; CB_STRIDE = the f32 swizzle
+  // atom cols (32).  Store + read both go through make_swizzled_layout_rc<float>.
+  static constexpr int CB_STRIDE = SmemSwizzle<float>::ATOM_COLS;
+  float CB[NPREDICTED_PAD_MMA_M * CB_STRIDE];  // 16×32 f32 ≈ 2 KB
 
   alignas(16) input_t B[NPREDICTED_PAD_MMA_N * DSTATE];  // matmul-1 N-operand (swizzled)
   alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];  // matmul-1 A-operand (swizzled)
@@ -88,7 +89,7 @@ struct CheckpointingSsuPrecomputeStorage {
 };
 
 // -----------------------------------------------------------------------------
-// Raw C·B MMA (matmul-1) for ONE group, 2-warp N-split → fp32 row-major smem.CB
+// Raw C·B MMA (matmul-1) for ONE group, 2-warp N-split → fp32 swizzled smem.CB
 // (UNMASKED, UNSCALED).  This is the MMA half of compute_CB_scaled_2warp
 // (kernel_checkpointing_ssu_common.cuh:806) with the scale/mask epilogue
 // dropped — the per-head decay/dt scaling + causal mask are deferred to
@@ -152,13 +153,13 @@ __device__ __forceinline__ void compute_cb_2warp(SmemT& smem, int warp, int lane
     cute::gemm(tiled_mma, frag_acc, frag_A, frag_B, frag_acc);
   }
 
-  // ── Store RAW fp32 accumulator → row-major smem.CB, this warp's N-half ──
-  // No scaling, no mask (deferred to scale_store_cb_gmem).  partition_C of a
-  // ROW-MAJOR layout maps element i → (t, warp*N_HALF+n) → CB[t*CB_STRIDE + j],
-  // so scale_store's t*S+j read addresses the identical (t,j).
+  // ── Store RAW fp32 accumulator → swizzled smem.CB, this warp's N-half ──
+  // No scaling, no mask (deferred to scale_store_cb_gmem).  Swizzled
+  // (SmemSwizzle<float>) for bank-conflict-free store/read; scale_store reads
+  // the identical (t,j) through the same make_swizzled_layout_rc<float>.
   constexpr int CB_STRIDE = SmemT::CB_STRIDE;
-  auto layout_cb = make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<CB_STRIDE>{}),
-                               make_stride(Int<CB_STRIDE>{}, _1{}));
+  auto layout_cb =
+      make_swizzled_layout_rc<float, NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M, CB_STRIDE>();
   Tensor smem_CB = make_tensor(make_smem_ptr(smem.CB), layout_cb);
   Tensor smem_CB_half = local_tile(smem_CB, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_HALF>{}),
                                    make_coord(_0{}, warp));
@@ -190,7 +191,10 @@ __device__ __forceinline__ void scale_store_cb_gmem(
     PackedAligned<input_t>* __restrict__ cb_gmem_head) {
   static_assert(PackedAligned<input_t>::count == 8,
                 "cb_scaled fragA store assumes 8 input_t per 16 B pack (bf16)");
-  constexpr int S = SmemT::CB_STRIDE;
+  using namespace cute;
+  // Same swizzled f32 layout compute_cb_2warp stored CB through.
+  constexpr int M = SmemT::NPREDICTED_PAD_MMA_M;
+  auto const layout_cb = make_swizzled_layout_rc<float, M, M, SmemT::CB_STRIDE>();
   int const r0 = lane / 4;
   int const c0 = (lane % 4) * 2;
   PackedAligned<input_t> packed;
@@ -202,10 +206,9 @@ __device__ __forceinline__ void scale_store_cb_gmem(
     float val = 0.f;
     if (j <= t && t < seq_len && j < seq_len) {
       // C5: CB_scaled[t,j] = (C·B) * exp(cumAdt[t]-cumAdt[j]) * dt_proc[j].
-      // Raw C·B read fp32 from smem; per-warp coeffs (this warp owns this head).
-      // Row-major: compute_cb_2warp stores the accumulator via a row-major CuTe
-      // layout, so CB[t*S+j] addresses the identical logical (t,j).
-      val = smem.CB[t * S + j] * __expf(smem.cumAdt[warp][t] - smem.cumAdt[warp][j]) *
+      // Raw C·B read fp32 from swizzled smem (same layout compute_cb_2warp
+      // stored); scaled in fp32, per-warp coeffs (this warp owns this head).
+      val = smem.CB[layout_cb(t, j)] * __expf(smem.cumAdt[warp][t] - smem.cumAdt[warp][j]) *
             smem.dt_proc[warp][j];
     }
     packed.val[e] = static_cast<input_t>(val);
