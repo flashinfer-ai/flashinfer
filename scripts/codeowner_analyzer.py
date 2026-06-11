@@ -589,6 +589,12 @@ class CodeOwnersAnalyzer:
                 f.write("# Manual overrides applied from overrides file\n")
             f.write("\n")
 
+            # Global catch-all ownership must appear before more specific entries;
+            # CODEOWNERS uses last-match-wins semantics.
+            if self.owner_overrides and "*" in self.owner_overrides:
+                usernames = self._normalize_usernames(self.owner_overrides["*"])
+                f.write(f"* {' '.join(usernames)}\n\n")
+
             # Write directory entries (computed + merged overrides)
             for module, data in results.items():
                 # Extract GitHub usernames from computed owners

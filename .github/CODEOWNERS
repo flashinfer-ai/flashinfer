@@ -4,7 +4,6 @@
 #   - Last matching pattern wins (GitHub semantics).
 #   - Catch-all ensures every PR gets at least one core-maintainer review.
 #   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
-#   - Keep entries sorted alphabetically within each section.
 
 # ── Catch-all: core maintainers review everything not covered below ──
 * @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv
