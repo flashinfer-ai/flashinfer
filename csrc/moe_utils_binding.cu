@@ -21,7 +21,7 @@
 #include <cuda_fp8.h>
 #endif
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
@@ -101,9 +101,9 @@ void moe_permute_fp4(int64_t input_ptr, int64_t permuted_output_ptr, int64_t inp
                      int64_t permuted_idx_to_expanded_idx_ptr, int64_t num_non_exiting_tiles_ptr,
                      int32_t max_num_permuted_tokens, int32_t hidden_size, int32_t top_k,
                      int32_t tile_size, bool enable_pdl) {
-  moePermute<__nv_fp4_e2m1, uint8_t>(
-      reinterpret_cast<__nv_fp4_e2m1 const*>(input_ptr),
-      reinterpret_cast<__nv_fp4_e2m1*>(permuted_output_ptr),
+  moePermute<tensorrt_llm::kernels::cutlass_kernels::Fp4Type, uint8_t>(
+      reinterpret_cast<tensorrt_llm::kernels::cutlass_kernels::Fp4Type const*>(input_ptr),
+      reinterpret_cast<tensorrt_llm::kernels::cutlass_kernels::Fp4Type*>(permuted_output_ptr),
       reinterpret_cast<uint8_t const*>(input_sf_ptr), reinterpret_cast<uint8_t*>(permuted_sf_ptr),
       reinterpret_cast<int32_t const*>(tile_idx_to_mn_limit_ptr),
       reinterpret_cast<int32_t const*>(permuted_idx_to_expanded_idx_ptr),

@@ -1448,10 +1448,10 @@ __global__ void expandInputRowsKernel(
 
 #ifdef ENABLE_FP4
   constexpr bool is_nvfp4 =
-      std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> &&
+      std::is_same_v<ExpandedActivationsType, Fp4Type> &&
       BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4 &&
       !PRE_QUANT_AWQ;
-  constexpr bool is_nvfp4_input = is_nvfp4 && std::is_same_v<InputActivationsType, __nv_fp4_e2m1>;
+  constexpr bool is_nvfp4_input = is_nvfp4 && std::is_same_v<InputActivationsType, Fp4Type>;
   constexpr bool need_nvfp4_quant = is_nvfp4 && !is_nvfp4_input;
 #else
   constexpr bool is_nvfp4 = false;
@@ -1615,7 +1615,7 @@ void expandInputRowsKernelLauncher(
     void const* prequant_scales, bool enable_pdl, cudaStream_t stream) {
 #ifdef ENABLE_FP4
   TLLM_CHECK_WITH_INFO(
-      (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1> && fc1_act_sf_flat) ||
+      (std::is_same_v<ExpandedActivationsType, Fp4Type> && fc1_act_sf_flat) ||
           !use_per_expert_act_scale,
       "Per-expert act scale for FC1 is only supported for NVFP4 activations");
 #endif
@@ -1658,7 +1658,7 @@ void expandInputRowsKernelLauncher(
     } else
 #endif
 #ifdef ENABLE_FP4
-        if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp4_e2m1>) {
+        if constexpr (std::is_same_v<ExpandedActivationsType, Fp4Type>) {
       TLLM_CHECK_WITH_INFO(quant_params.fp4.fc1.weight_block_scale,
                            "NVFP4 block scaling is expected for FP4xFP4");
       TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
@@ -2148,7 +2148,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     ActivationParams activation_params) {
 #ifdef ENABLE_FP4
   constexpr bool IsNVFP4 =
-      std::is_same_v<T, __nv_fp4_e2m1> &&
+      std::is_same_v<T, Fp4Type> &&
       BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
   constexpr bool IsMXFP8 =
       std::is_same_v<T, __nv_fp8_e4m3> &&
@@ -2390,7 +2390,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE>{};
 #ifdef ENABLE_FP4
-    if constexpr (std::is_same_v<T, __nv_fp4_e2m1>) {
+    if constexpr (std::is_same_v<T, Fp4Type>) {
       TLLM_CHECK_WITH_INFO(quant_params.fp4.fc2.weight_block_scale,
                            "NVFP4 block scaling is expected for FP4xFP4");
       return dispatchNVFP44Over6Config(

@@ -25,7 +25,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 #include <cuda_runtime_api.h>
 
@@ -562,11 +562,11 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
 #if defined(ENABLE_FP4)
 #if defined(ENABLE_BF16)
-  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> &&
+  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, Fp4Type> &&
                                       (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
 #else
   static constexpr bool use_wfp4a16 =
-      std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+      std::is_same_v<WeightType, Fp4Type> && std::is_same_v<T, half>;
 #endif
 #else
   static constexpr bool use_wfp4a16 = false;
@@ -588,13 +588,13 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 #endif
   static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 #if defined(ENABLE_FP4)
-  static constexpr bool act_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
-  static constexpr bool weight_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
+  static constexpr bool act_fp4 = std::is_same_v<T, Fp4Type>;
+  static constexpr bool weight_fp4 = std::is_same_v<WeightType, Fp4Type>;
   static constexpr bool use_wfp4afp8 = std::is_same_v<T, __nv_fp8_e4m3> && weight_fp4;
   static constexpr bool use_fp4 = act_fp4 && weight_fp4;
-  static_assert(!std::is_same_v<BackBoneType, __nv_fp4_e2m1>,
+  static_assert(!std::is_same_v<BackBoneType, Fp4Type>,
                 "Current logic requires backbone type to be >=16-bits");
-  static_assert(!std::is_same_v<OutputType, __nv_fp4_e2m1>,
+  static_assert(!std::is_same_v<OutputType, Fp4Type>,
                 "Current logic requires output type to be >=16-bits");
 #else
   static constexpr bool act_fp4 = false;

@@ -59,6 +59,9 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 
+#if defined(ENABLE_FP4)
+using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
+#endif
 using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 namespace tk = tensorrt_llm::common;
@@ -162,10 +165,10 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
   // perform the best for mixed type gemms.
 
 #if defined(ENABLE_FP4)
-  constexpr int Ntile = (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 64 : 128;
+  constexpr int Ntile = (std::is_same_v<WeightType, Fp4Type>) ? 64 : 128;
   constexpr int Ktile =
-      (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 128 : 128 * PackedScalesNum / sizeof(T);
-  TLLM_CHECK(sizeof(T) == (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 2 : 1);
+      (std::is_same_v<WeightType, Fp4Type>) ? 128 : 128 * PackedScalesNum / sizeof(T);
+  TLLM_CHECK(sizeof(T) == (std::is_same_v<WeightType, Fp4Type>) ? 2 : 1);
 #else
   constexpr int Ntile = 128;
   constexpr int Ktile = 128 * PackedScalesNum / sizeof(T);
@@ -253,7 +256,7 @@ template <typename T, typename WeightType, typename OutputType>
 size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_count_) {
   size_t count = 0;
 #if defined(ENABLE_FP4)
-  constexpr int Ktile = (std::is_same_v<WeightType, __nv_fp4_e2m1>) ? 256 : 512;
+  constexpr int Ktile = (std::is_same_v<WeightType, Fp4Type>) ? 256 : 512;
 #else
   constexpr int Ktile = 512;
 #endif

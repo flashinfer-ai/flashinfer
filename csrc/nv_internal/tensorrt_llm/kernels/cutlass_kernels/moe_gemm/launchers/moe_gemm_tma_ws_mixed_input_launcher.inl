@@ -60,6 +60,11 @@ namespace tensorrt_llm {
 namespace kernels {
 namespace cutlass_kernels_oss {
 using namespace tensorrt_llm::kernels::cutlass_kernels;
+#ifdef ENABLE_FP4
+using SafeFP4 = Fp4Type;
+#else
+struct SafeFP4 {};
+#endif
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 

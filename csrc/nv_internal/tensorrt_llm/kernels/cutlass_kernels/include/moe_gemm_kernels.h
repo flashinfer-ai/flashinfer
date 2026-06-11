@@ -32,7 +32,7 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm_configs.h"
 
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
@@ -252,11 +252,11 @@ class MoeGemmRunner {
 
 #if defined(ENABLE_FP4)
 #if defined(ENABLE_BF16)
-  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> &&
+  static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, Fp4Type> &&
                                       (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
 #else
   static constexpr bool use_wfp4a16 =
-      std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
+      std::is_same_v<WeightType, Fp4Type> && std::is_same_v<T, half>;
 #endif
 #else
   static constexpr bool use_wfp4a16 = false;
@@ -266,7 +266,7 @@ class MoeGemmRunner {
       (std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>) &&
       !std::is_same_v<WeightType, cutlass::uint4b_t>
 #if defined(ENABLE_FP4)
-      && !std::is_same_v<WeightType, __nv_fp4_e2m1>
+      && !std::is_same_v<WeightType, Fp4Type>
 #endif
       ;
   static constexpr bool use_w4afp8 =
@@ -280,9 +280,9 @@ class MoeGemmRunner {
   static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
 #if defined(ENABLE_FP4)
-  static constexpr bool use_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
+  static constexpr bool use_fp4 = std::is_same_v<T, Fp4Type>;
   static constexpr bool use_wfp4afp8 =
-      std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+      std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, Fp4Type>;
 #else
   static constexpr bool use_fp4 = false;
   static constexpr bool use_wfp4afp8 = false;

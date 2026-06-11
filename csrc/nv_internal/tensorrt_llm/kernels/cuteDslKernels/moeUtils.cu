@@ -21,7 +21,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cuh"
 
 #ifdef ENABLE_FP4
-#include <cuda_fp4.h>
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
 #include <cute/numeric/numeric_types.hpp>
 
@@ -35,7 +35,7 @@ using SFCopyType = uint32_t;
 template <typename T>
 auto constexpr bitsPerElem() {
 #ifdef ENABLE_FP4
-  return std::is_same_v<T, __nv_fp4_e2m1> ? 4 : cute::sizeof_bits_v<T>;
+  return std::is_same_v<T, cutlass_kernels::Fp4Type> ? 4 : cute::sizeof_bits_v<T>;
 #else
   return cute::sizeof_bits_v<T>;
 #endif
@@ -152,7 +152,7 @@ INSTANTIATE_MOE_PERMUTE(__nv_bfloat16, uint8_t);
 INSTANTIATE_MOE_PERMUTE(__nv_fp8_e4m3, uint8_t);
 #endif
 #ifdef ENABLE_FP4
-INSTANTIATE_MOE_PERMUTE(__nv_fp4_e2m1, uint8_t);
+INSTANTIATE_MOE_PERMUTE(cutlass_kernels::Fp4Type, uint8_t);
 #endif
 #undef INSTANTIATE_MOE_PERMUTE
 

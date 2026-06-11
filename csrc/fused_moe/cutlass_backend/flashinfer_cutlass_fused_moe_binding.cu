@@ -157,7 +157,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #ifdef ENABLE_FP4
     if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant()) {
       mInnerDimMultiplier = 16;  // 16 FP4 -> 1 LONG
-      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp4_e2m1>(mOutputDtype);
+      mKernelRunner = switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type>(mOutputDtype);
     }
 
     if (isNvfp4Quant()) {
@@ -167,22 +167,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #ifdef ENABLE_BF16
         case bfloat16_code:
 #endif
-          mKernelRunner = switch_output_type<__nv_fp4_e2m1, __nv_fp4_e2m1, true>(mOutputDtype);
+          mKernelRunner = switch_output_type<kernels::Fp4Type, kernels::Fp4Type, true>(mOutputDtype);
           break;
         default:
-          mKernelRunner = switch_output_type<__nv_fp4_e2m1, __nv_fp4_e2m1, false>(mOutputDtype);
+          mKernelRunner = switch_output_type<kernels::Fp4Type, kernels::Fp4Type, false>(mOutputDtype);
       }
     }
 
     if (isWFP4A16Quant()) {
       mInnerDimMultiplier = 2;
       if (mActivationDtype == dl_float16) {
-        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, __nv_fp4_e2m1>>();
+        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, kernels::Fp4Type>>();
       }
 #ifdef ENABLE_BF16
       else if (mActivationDtype == dl_bfloat16) {
         mKernelRunner =
-            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>>();
+            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, kernels::Fp4Type>>();
       }
 #endif
     }
