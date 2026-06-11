@@ -413,6 +413,9 @@ def _resolve_expert_global_scales(
     """
     if scales is None:
         amax = weights_bf16.float().abs().nan_to_num().amax(dim=(1, 2))
+        # Guard all-zero (e.g. pruned/dummy) experts: amax = 0 would make the
+        # global scale inf and poison the block scales with non-finite values.
+        amax = amax.clamp_(min=torch.finfo(torch.float32).tiny)
         return (448.0 * 6.0) / amax
     scales = scales.to(device=device, dtype=torch.float32).reshape(-1)
     if scales.numel() == 1:
