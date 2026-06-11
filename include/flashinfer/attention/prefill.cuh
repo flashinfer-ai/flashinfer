@@ -99,9 +99,15 @@ template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
           bool kEnableVOSplitOpt = false>
 struct SharedStorageQKVO {
-  static constexpr bool kVOSplit =
-      kEnableVOSplitOpt && (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
-  static constexpr bool kVShareActive = kVOSplit && !is_fp4_type_v<DTypeKV> &&
+  static constexpr bool kKVShareShape =
+      (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
+  static constexpr bool kVOSplit = kEnableVOSplitOpt && kKVShareShape;
+  // K/V time-sharing (V loaded into k_smem after Q.K^T) applies to ALL kernels
+  // at large head dims — paged (with VO-split) and single/ragged (without) —
+  // so it must match KernelTraits::USE_KV_SHARED_SMEM, independent of
+  // kEnableVOSplitOpt. Otherwise the single/ragged kernels cannot fit
+  // head_dim=512 K+V tiles on SKUs with 99KB-smem (SM86/89/120/121).
+  static constexpr bool kVShareActive = kKVShareShape && !is_fp4_type_v<DTypeKV> &&
                                         (HEAD_DIM_QK == HEAD_DIM_VO) &&
                                         (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   union {
@@ -1800,7 +1806,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         block.sync();
       }
 
-      smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
+      // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
+      smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
+          v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage.k_smem : smem_storage.v_smem);
 
       const uint32_t num_iterations = ceil_div(
           MASK_MODE == MaskMode::kCausal
@@ -1855,15 +1863,24 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
                                     k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
       cp_async::commit_group();
-      produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
-                                                              v_stride_n, 0, chunk_size, tid);
-      produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
-                                   v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
-      cp_async::commit_group();
+      if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
+        // Shared K/V: don't preload V(0) (it would clobber K(0)); V(0) is loaded
+        // inside iter 0 after Q.K^T.
+        produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
+                                                                v_stride_n, 0, chunk_size, tid);
+        produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
+                                     v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
+        cp_async::commit_group();
+      }
 
 #pragma unroll 1
       for (uint32_t iter = 0; iter < num_iterations; ++iter) {
-        cp_async::wait_group<1>();
+        // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
+        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+          cp_async::wait_group<0>();
+        } else {
+          cp_async::wait_group<1>();
+        }
         block.sync();
 
         if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -1893,14 +1910,22 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
         block.sync();
-        produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
-                                                               k_stride_n, (iter + 1) * CTA_TILE_KV,
-                                                               chunk_size, tid);
-        produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
-                                      k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
-                                      warp_idx, lane_idx);
-        cp_async::commit_group();
-        cp_async::wait_group<1>();
+        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+          // Load V(iter) into k_smem (time-shared) now that Q.K^T is done.
+          produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+              v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, iter * CTA_TILE_KV, chunk_size, tid);
+          cp_async::commit_group();
+          cp_async::wait_group<0>();
+        } else {
+          produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
+              k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+              tid);
+          produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+                                        k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV,
+                                        chunk_size, warp_idx, lane_idx);
+          cp_async::commit_group();
+          cp_async::wait_group<1>();
+        }
         block.sync();
 
         // compute sfm*v
@@ -1911,13 +1936,21 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                lane_idx, s_frag, o_frag, d, d_base);
 
         block.sync();
-        produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
-            v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
-            tid);
-        produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
-                                     v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
-                                     warp_idx, lane_idx);
-        cp_async::commit_group();
+        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+          // K(iter+1) goes into the shared buffer only after sfm*v consumed V(iter).
+          produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
+              k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+              tid);
+          cp_async::commit_group();
+        } else {
+          produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+              v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+              tid);
+          produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
+                                       v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                       warp_idx, lane_idx);
+          cp_async::commit_group();
+        }
       }
       cp_async::wait_group<0>();
       block.sync();
@@ -2007,10 +2040,12 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
-    // hd512 + 16-bit KV uses the 2-Q x 2-KV-warp VO-split layout (CTA_TILE_KV=32,
-    // 128-reg o_frag) so CTA_TILE_Q=32 fits 100KB; FP8 keeps the default 1x4 layout.
-    constexpr bool kBf16VOSplit =
-        (sizeof(DTypeKV) == 2) && (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
+    // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. Unlike the paged
+    // (VO-split) kernel, this kernel merges warp outputs through
+    // cta_sync_o_smem (NUM_WARPS_KV * CTA_TILE_Q * 256 floats), which only fits
+    // 99KB-smem GPUs with NUM_WARPS_KV=2 — so FP8 takes this layout too.
+    constexpr bool kBf16VOSplit = (sizeof(DTypeKV) <= 2) && !is_fp4_type_v<DTypeKV> &&
+                                  (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
     constexpr uint32_t NUM_WARPS_Q = kBf16VOSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
     constexpr uint32_t NUM_WARPS_KV = kBf16VOSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
     constexpr uint32_t NUM_MMA_Q = kBf16VOSplit ? 1 : get_num_mma_q(CTA_TILE_Q);
@@ -2024,6 +2059,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     int max_smem_per_sm = 0;
     FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
         &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+    int max_smem_per_block_optin = 0;
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block_optin,
+                                                cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
     // we expect each sm execute two threadblocks
     // Per-NUM_MMA_KV K/V shared-memory cost, including the single BF16 repack
     // staging buffer (sized max(HEAD_DIM_QK, HEAD_DIM_VO)) when the FP8 repack
@@ -2032,8 +2070,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     // staging buffer still lives in SharedStorageQKVO, so it must be accounted.
     constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                                 (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
+    constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
+                               ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
+                               (HEAD_DIM_QK == HEAD_DIM_VO) &&
+                               (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
     constexpr uint32_t kKVSmemPerMmaKV =
-        (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV) +
+        (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+                   : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
         (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                        sizeof(DTypeQ))
                     : 0u);
@@ -2047,7 +2090,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                                         kMinValidMmaKV * kKVSmemPerMmaKV)
                                     ? 2
                                     : 1;
-    const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
+    const int max_smem_per_threadblock =
+        min(max_smem_per_sm / num_ctas_per_sm, max_smem_per_block_optin);
 
     const uint32_t max_num_mma_kv_reg =
         (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
@@ -2056,6 +2100,15 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
             : (8 / NUM_MMA_Q);
     const uint32_t max_num_mma_kv_smem =
         (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) / kKVSmemPerMmaKV;
+    if (max_num_mma_kv_smem < 1) {
+      std::ostringstream err_msg;
+      err_msg << "Even the smallest KV tile for head_dim_qk=" << HEAD_DIM_QK
+              << ", head_dim_vo=" << HEAD_DIM_VO << ", cta_tile_q=" << CTA_TILE_Q
+              << " exceeds this GPU's " << max_smem_per_block_optin
+              << " bytes of shared memory per block; this configuration is not supported on "
+                 "this architecture.";
+      FLASHINFER_ERROR(err_msg.str());
+    }
 
     // control NUM_MMA_KV for maximum warp occupancy
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
@@ -2077,6 +2130,15 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
         constexpr uint32_t num_threads = (NUM_WARPS_Q * NUM_WARPS_KV) * WARP_SIZE;
         auto kernel = SinglePrefillWithKVCacheKernel<KTraits, Params>;
         size_t smem_size = sizeof(typename KTraits::SharedStorage);
+        if (smem_size > (size_t)max_smem_per_block_optin) {
+          std::ostringstream err_msg;
+          err_msg << "Required shared memory (" << smem_size
+                  << " bytes) for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO
+                  << ", cta_tile_q=" << CTA_TILE_Q << " exceeds this GPU's per-block limit ("
+                  << max_smem_per_block_optin
+                  << " bytes); this configuration is not supported on this architecture.";
+          FLASHINFER_ERROR(err_msg.str());
+        }
         FLASHINFER_CUDA_CALL(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         int num_blocks_per_sm = 0;
@@ -2312,7 +2374,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                : chunk_size) /
           CTA_TILE_KV;
 
-      smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
+      // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
+      smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
+          v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage.k_smem : smem_storage.v_smem);
 
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -2361,15 +2425,24 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
                                     k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
       cp_async::commit_group();
-      produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
-                                                              v_stride_n, 0, chunk_size, tid);
-      produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
-                                   v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
-      cp_async::commit_group();
+      if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
+        // Shared K/V: don't preload V(0) (it would clobber K(0)); V(0) is loaded
+        // inside iter 0 after Q.K^T.
+        produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
+                                                                v_stride_n, 0, chunk_size, tid);
+        produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
+                                     v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
+        cp_async::commit_group();
+      }
 
 #pragma unroll 1
       for (uint32_t iter = 0; iter < num_iterations; ++iter) {
-        cp_async::wait_group<1>();
+        // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
+        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+          cp_async::wait_group<0>();
+        } else {
+          cp_async::wait_group<1>();
+        }
         block.sync();
 
         if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -2419,14 +2492,22 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
         block.sync();
-        produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
-                                                               k_stride_n, (iter + 1) * CTA_TILE_KV,
-                                                               chunk_size, tid);
-        produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
-                                      k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
-                                      warp_idx, lane_idx);
-        cp_async::commit_group();
-        cp_async::wait_group<1>();
+        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+          // Load V(iter) into k_smem (time-shared) now that Q.K^T is done.
+          produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+              v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, iter * CTA_TILE_KV, chunk_size, tid);
+          cp_async::commit_group();
+          cp_async::wait_group<0>();
+        } else {
+          produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
+              k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+              tid);
+          produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
+                                        k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV,
+                                        chunk_size, warp_idx, lane_idx);
+          cp_async::commit_group();
+          cp_async::wait_group<1>();
+        }
         block.sync();
 
         // compute sfm*v
@@ -2449,13 +2530,21 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         }
 
         block.sync();
-        produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
-            v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
-            tid);
-        produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
-                                     v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
-                                     warp_idx, lane_idx);
-        cp_async::commit_group();
+        if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+          // K(iter+1) goes into the shared buffer only after sfm*v consumed V(iter).
+          produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
+              k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+              tid);
+          cp_async::commit_group();
+        } else {
+          produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
+              v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
+              tid);
+          produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
+                                       v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                       warp_idx, lane_idx);
+          cp_async::commit_group();
+        }
       }
       cp_async::wait_group<0>();
       block.sync();
@@ -3334,10 +3423,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
-  // hd512 + 16-bit KV uses the 2-Q x 2-KV-warp VO-split layout (CTA_TILE_KV=32,
-  // 128-reg o_frag) so CTA_TILE_Q=32 fits 100KB; FP8 keeps the default 1x4 layout.
-  constexpr bool kBf16VOSplit =
-      (sizeof(DTypeKV) == 2) && (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
+  // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. Unlike the paged
+  // (VO-split) kernel, this kernel merges warp outputs through
+  // cta_sync_o_smem (NUM_WARPS_KV * CTA_TILE_Q * 256 floats), which only fits
+  // 99KB-smem GPUs with NUM_WARPS_KV=2 — so FP8 takes this layout too.
+  constexpr bool kBf16VOSplit = (sizeof(DTypeKV) <= 2) && !is_fp4_type_v<DTypeKV> &&
+                                (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
   constexpr uint32_t NUM_MMA_Q = kBf16VOSplit ? 1 : get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = kBf16VOSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_KV = kBf16VOSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
@@ -3361,6 +3452,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  int max_smem_per_block_optin = 0;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block_optin,
+                                              cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
   // we expect each sm execute two threadblocks
   // Per-NUM_MMA_KV K/V shared-memory cost, including the single BF16 repack
   // staging buffer (sized max(HEAD_DIM_QK, HEAD_DIM_VO)) when the FP8 repack path
@@ -3368,8 +3462,16 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
   constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                               (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
+  // Matches KernelTraits::USE_KV_SHARED_SMEM: at large head dims K and V
+  // time-share one smem buffer, so the occupancy budget counts the K/V
+  // footprint once exactly when the kernel actually shares it.
+  constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
+                             ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
+                             (HEAD_DIM_QK == HEAD_DIM_VO) &&
+                             (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   constexpr uint32_t kKVSmemPerMmaKV =
-      (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV) +
+      (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+                 : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u);
@@ -3384,7 +3486,14 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                                                       kMinValidMmaKV * kKVSmemPerMmaKV)
                                   ? 2
                                   : 1;
-  const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
+  // The occupancy budget (max_smem_per_sm / num_ctas_per_sm) can exceed the
+  // hard per-block opt-in limit when only one CTA fits per SM (the two
+  // attributes differ by 1KB on most arches), which would make
+  // cudaFuncSetAttribute fail with cudaErrorInvalidValue. Clamp to the legal
+  // per-block maximum so a config in that gap selects a smaller NUM_MMA_KV
+  // instead of failing the launch.
+  const int max_smem_per_threadblock =
+      min(max_smem_per_sm / num_ctas_per_sm, max_smem_per_block_optin);
 
   const uint32_t max_num_mma_kv_reg =
       (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
@@ -3393,6 +3502,15 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
           : (8 / NUM_MMA_Q);
   const uint32_t max_num_mma_kv_smem =
       (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) / kKVSmemPerMmaKV;
+  if (max_num_mma_kv_smem < 1) {
+    std::ostringstream err_msg;
+    err_msg << "Even the smallest KV tile for head_dim_qk=" << HEAD_DIM_QK
+            << ", head_dim_vo=" << HEAD_DIM_VO << ", cta_tile_q=" << CTA_TILE_Q
+            << " exceeds this GPU's " << max_smem_per_block_optin
+            << " bytes of shared memory per block; this configuration is not supported on "
+               "this architecture.";
+    FLASHINFER_ERROR(err_msg.str());
+  }
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
@@ -3412,6 +3530,18 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
     } else {
       size_t smem_size = sizeof(typename KTraits::SharedStorage);
       auto kernel = BatchPrefillWithRaggedKVCacheKernel<KTraits, Params>;
+      // Exact final check: the analytic NUM_MMA_KV budget can slightly
+      // under-count the real struct (cross-warp merge buffers, padding);
+      // fail with a clear error instead of a launch-time cudaErrorInvalidValue.
+      if (smem_size > (size_t)max_smem_per_block_optin) {
+        std::ostringstream err_msg;
+        err_msg << "Required shared memory (" << smem_size
+                << " bytes) for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO
+                << ", cta_tile_q=" << CTA_TILE_Q << " exceeds this GPU's per-block limit ("
+                << max_smem_per_block_optin
+                << " bytes); this configuration is not supported on this architecture.";
+        FLASHINFER_ERROR(err_msg.str());
+      }
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       // PDL launch config
@@ -3507,6 +3637,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  int max_smem_per_block_optin = 0;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block_optin,
+                                              cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
   // we expect each sm execute two threadblocks
   // Per-NUM_MMA_KV K/V shared-memory cost, including the single BF16 repack
   // staging buffer (sized max(HEAD_DIM_QK, HEAD_DIM_VO)) when the FP8 repack path
@@ -3541,7 +3674,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                       kMinValidMmaKV * kKVSmemPerMmaKV)
                                   ? 2
                                   : 1;
-  const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
+  const int max_smem_per_threadblock =
+      min(max_smem_per_sm / num_ctas_per_sm, max_smem_per_block_optin);
 
   const uint32_t max_num_mma_kv_reg =
       (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
@@ -3553,6 +3687,15 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   const uint32_t max_num_mma_kv_smem =
       (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) - kVOSplitFixedSmem) /
       kKVSmemPerMmaKV;
+  if (max_num_mma_kv_smem < 1) {
+    std::ostringstream err_msg;
+    err_msg << "Even the smallest KV tile for head_dim_qk=" << HEAD_DIM_QK
+            << ", head_dim_vo=" << HEAD_DIM_VO << ", cta_tile_q=" << CTA_TILE_Q
+            << " exceeds this GPU's " << max_smem_per_block_optin
+            << " bytes of shared memory per block; this configuration is not supported on "
+               "this architecture.";
+    FLASHINFER_ERROR(err_msg.str());
+  }
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
@@ -3572,6 +3715,18 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     } else {
       size_t smem_size = sizeof(typename KTraits::SharedStoragePaged);
       auto kernel = BatchPrefillWithPagedKVCacheKernel<KTraits, Params>;
+      // Exact final check: the analytic NUM_MMA_KV budget can slightly
+      // under-count the real struct (cross-warp merge buffers, padding);
+      // fail with a clear error instead of a launch-time cudaErrorInvalidValue.
+      if (smem_size > (size_t)max_smem_per_block_optin) {
+        std::ostringstream err_msg;
+        err_msg << "Required shared memory (" << smem_size
+                << " bytes) for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO
+                << ", cta_tile_q=" << CTA_TILE_Q << " exceeds this GPU's per-block limit ("
+                << max_smem_per_block_optin
+                << " bytes); this configuration is not supported on this architecture.";
+        FLASHINFER_ERROR(err_msg.str());
+      }
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       // PDL launch config
