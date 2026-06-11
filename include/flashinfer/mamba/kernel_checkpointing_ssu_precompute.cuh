@@ -88,6 +88,12 @@ struct CheckpointingSsuPrecomputeStorage {
   float dt[NUM_WARPS][NPREDICTED];
   float cumAdt[NUM_WARPS][NPREDICTED];
   float decay[NUM_WARPS][NPREDICTED];
+
+  // Per-warp OLD coefficients (NO-WRITE path): the buffered head's dt / cumAdt
+  // (f32, from the cache).  Feed C6's coeff[i] = exp(total_old_cumAdt -
+  // old_cumAdt[i]) * old_dt[i] for the CB_old scaling, and the C7 continuity.
+  float old_dt[NUM_WARPS][MAX_WINDOW];
+  float old_cumAdt[NUM_WARPS][MAX_WINDOW];
 };
 
 // -----------------------------------------------------------------------------
@@ -390,6 +396,49 @@ __device__ __forceinline__ void scale_store_cb_gmem(
 }
 
 // -----------------------------------------------------------------------------
+// Scale one head's raw C·old_B (C6, read fp32 from smem.CB_old) and store to
+// gmem (cb_old) FRAGMENT-NATIVE, one STG.128/lane — the NO-WRITE counterpart of
+// scale_store_cb_gmem.  The 8 fragA elements map to (row t = new token, col
+// i = old token) exactly as there (j → i).  Scaling (C6):
+//   CB_old[t,i] = (C·old_B) * exp(cumAdt[t]) * coeff[i],
+//   coeff[i]    = exp(total_old_cumAdt − old_cumAdt[i]) * old_dt[i].
+// Mask is i < prev_k — NO causal t≥i (old tokens all precede the new ones).
+// total_old_cumAdt = old_cumAdt[prev_k−1] (broadcast; 0 when prev_k==0 → no old
+// tokens → all-zero cb_old).  Validated against the monolithic compute_CB_old
+// (kernel_checkpointing_ssu_common.cuh:1054).
+template <typename input_t, typename SmemT>
+__device__ __forceinline__ void scale_store_cb_old(
+    SmemT& smem, int warp, int lane, int seq_len, int prev_k,
+    PackedAligned<input_t>* __restrict__ cb_old_gmem_head) {
+  static_assert(PackedAligned<input_t>::count == 8,
+                "cb_old fragA store assumes 8 input_t per 16 B pack (bf16)");
+  using namespace cute;
+  constexpr int M = SmemT::NPREDICTED_PAD_MMA_M;
+  auto const layout_cb = make_swizzled_layout_rc<float, M, M, SmemT::CB_STRIDE>();
+  float const total_old = (prev_k > 0) ? smem.old_cumAdt[warp][prev_k - 1] : 0.f;
+  int const r0 = lane / 4;
+  int const c0 = (lane % 4) * 2;
+  PackedAligned<input_t> packed;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    // fragA(m16n8k16) element e → (row t = new token, col i = old token).
+    int const t = r0 + (((e >> 1) & 1) << 3);
+    int const i = c0 + (((e >> 2) & 1) << 3) + (e & 1);
+    float val = 0.f;
+    if (i < prev_k && t < seq_len) {
+      // C6: (C·old_B) * exp(cumAdt[t]) * exp(total_old - old_cumAdt[i]) * old_dt[i].
+      float const coeff = __expf(total_old - smem.old_cumAdt[warp][i]) * smem.old_dt[warp][i];
+      val = smem.CB_old[layout_cb(t, i)] * __expf(smem.cumAdt[warp][t]) * coeff;
+    }
+    packed.val[e] = static_cast<input_t>(val);
+  }
+  // WAR: cross-lane smem.cumAdt / old_cumAdt / old_dt reads done before the next
+  // iter overwrites them (same single-slot reuse as scale_store_cb_gmem).
+  __syncwarp();
+  cb_old_gmem_head[lane] = packed;  // one STG.128
+}
+
+// -----------------------------------------------------------------------------
 // PRECOMPUTE kernel.  Template params mirror checkpointing_ssu_kernel.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, int NPREDICTED, int MAX_WINDOW, int DIM, int DSTATE,
@@ -475,6 +524,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
   auto* __restrict__ cb_gmem = reinterpret_cast<PackedAligned<input_t>*>(params.cb_scaled);
+  auto* __restrict__ cb_old_gmem = reinterpret_cast<PackedAligned<input_t>*>(params.cb_old);
   auto* __restrict__ decay_gmem = reinterpret_cast<float*>(params.decay_vec);
 
   constexpr int NUM_ITER = (HEADS_PER_CTA + NUM_WARPS - 1) / NUM_WARPS;  // ceil, uniform
@@ -490,6 +540,11 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       load_dt<dt_t, NPREDICTED, DT_SOFTPLUS>(smem, params, warp, lane, head, outer, dt_bias_val,
                                              seq_len);         // C1
       compute_cumAdt_pw<NPREDICTED>(smem, warp, lane, A_val);  // C2
+      // C6/C7 inputs (NO-WRITE only): this head's buffered old_dt / old_cumAdt.
+      // Own-lane writes; sync (A) below publishes them before scale_store_cb_old.
+      if (!must_checkpoint)
+        load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, prev_k, &smem.old_dt[warp][0],
+                           &smem.old_cumAdt[warp][0]);
     }
 
     // Sync before the reads below.  iter 0 uses __syncthreads — it also makes
@@ -507,14 +562,37 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       if (lane < seq_len)
         decay_gmem[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane] =
             smem.decay[warp][lane];
+      // C7: persist this head's new dt / cumAdt into the cache tape at
+      // write_offset (so the new tokens become "old" for the next step).
+      // cumAdt continuity: no-write steps offset by the previous buffer's tail
+      // (smem.old_cumAdt[warp][prev_k-1]) so old_cumAdt stays a monotone cumsum
+      // across consecutive no-write steps (monolithic kernel_*_ssu.cuh:1112).
+      // Runs BEFORE the stores below so their WAR __syncwarp also closes this
+      // cross-lane old_cumAdt read against the next iter's load_old_dt_cumAdt.
+      if (lane < seq_len) {
+        auto* __restrict__ old_dt_w = reinterpret_cast<float*>(params.old_dt);
+        auto* __restrict__ old_ca_w = reinterpret_cast<float*>(params.old_cumAdt);
+        int64_t const dt_w_base = cache_slot * params.old_dt_stride_seq +
+                                  (int64_t)buf_write * params.old_dt_stride_dbuf +
+                                  (int64_t)head * params.old_dt_stride_head;
+        int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
+                                  (int64_t)buf_write * params.old_cumAdt_stride_dbuf +
+                                  (int64_t)head * params.old_cumAdt_stride_head;
+        float const cumAdt_prefix =
+            (!must_checkpoint && prev_k > 0) ? smem.old_cumAdt[warp][prev_k - 1] : 0.f;
+        old_dt_w[dt_w_base + write_offset + lane] = smem.dt[warp][lane];
+        old_ca_w[ca_w_base + write_offset + lane] = smem.cumAdt[warp][lane] + cumAdt_prefix;
+      }
       // C5: scale the shared raw C·B (fp32 from smem.CB) by this head's per-warp
       // coeffs + STG.128 fragA-native to gmem.
-      // C7 + cache: store old_dt / old_cumAdt at write_offset (reuse
-      // store_old_dt / store_old_cumAdt, common.cuh:1582+).  TODO(cache) — must
-      // read smem.cumAdt/dt BEFORE scale_store_cb_gmem (it ends with the WAR
-      // __syncwarp that closes single-slot reuse against the next iter's scan).
       auto* cb_gmem_head = cb_gmem + (int64_t)(seq * params.nheads + head) * warpSize;
       scale_store_cb_gmem<input_t>(smem, warp, lane, seq_len, cb_gmem_head);
+      // C6 (NO-WRITE): scale the raw C·old_B (smem.CB_old) per head + STG.128
+      // fragA-native → cb_old.  Main does OUT.3 = cb_old @ old_x.
+      if (!must_checkpoint) {
+        auto* cb_old_gmem_head = cb_old_gmem + (int64_t)(seq * params.nheads + head) * warpSize;
+        scale_store_cb_old<input_t>(smem, warp, lane, seq_len, prev_k, cb_old_gmem_head);
+      }
     }
   }
   (void)buf_write;

@@ -463,6 +463,30 @@ __device__ __forceinline__ void compute_cumAdt(SmemT& smem, int lane, float A_va
   }
 }
 
+// Load this head's buffered old_dt / old_cumAdt (f32) from the double-buffered
+// cache (state_cache_size, 2, nheads, MAX_WINDOW) into the caller's smem slices.
+// Synchronous scalar per-lane LDG of the first `count` entries (lanes >= count
+// untouched).  Shared by the monolithic load_pre/post halves (count =
+// MAX_WINDOW, single per-CTA smem.old_dt/old_cumAdt) and the two-kernel
+// precompute (count = prev_k, per-warp slice &smem.old_dt[warp][0]).
+__device__ __forceinline__ void load_old_dt_cumAdt(CheckpointingSsuParams const& params, int lane,
+                                                   int64_t cache_slot, int buf_read, int head,
+                                                   int count, float* __restrict__ dt_dst,
+                                                   float* __restrict__ ca_dst) {
+  if (lane < count) {
+    auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
+    auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
+    int64_t const dt_base = cache_slot * params.old_dt_stride_seq +
+                            (int64_t)buf_read * params.old_dt_stride_dbuf +
+                            (int64_t)head * params.old_dt_stride_head;
+    int64_t const ca_base = cache_slot * params.old_cumAdt_stride_seq +
+                            (int64_t)buf_read * params.old_cumAdt_stride_dbuf +
+                            (int64_t)head * params.old_cumAdt_stride_head;
+    dt_dst[lane] = old_dt_ptr[dt_base + lane];
+    ca_dst[lane] = old_cumAdt_ptr[ca_base + lane];
+  }
+}
+
 // Load phase.  Split into two halves around the PDL barrier (`gdc_wait`):
 //
 //   load_pre_pdl_wait_data:  data NOT produced by the immediate upstream
@@ -515,8 +539,6 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
   auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
-  auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
-  auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
   int64_t const ox_base = cache_slot * params.old_x_stride_seq + head * DIM + d_tile_off;
@@ -586,18 +608,8 @@ __device__ __forceinline__ void load_pre_pdl_wait_data(
   // dt_proc: load up to NPREDICTED lanes (new-token scalars from in_proj).
   // Synchronous LDG + plain smem stores — no cp.async.  Writes from 4
   // warps to the same slots are idempotent (same payloads). ──
-  static_assert(MAX_WINDOW <= warpSize, "MAX_WINDOW must fit in a single warp");
-  if (lane < MAX_WINDOW) {
-    int64_t const dt_rd_base = cache_slot * params.old_dt_stride_seq +
-                               buf_read * params.old_dt_stride_dbuf +
-                               head * params.old_dt_stride_head;
-    smem.old_dt[lane] = old_dt_ptr[dt_rd_base + lane];
-
-    int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_seq +
-                               buf_read * params.old_cumAdt_stride_dbuf +
-                               head * params.old_cumAdt_stride_head;
-    smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
-  }
+  load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, MAX_WINDOW, smem.old_dt,
+                     smem.old_cumAdt);
   // dt → softplus → smem.dt_proc.  Under varlen the active lane range is
   // `[0, seq_len)`; lanes `[seq_len, NPREDICTED)` are left uninitialized —
   // `compute_cumAdt` will scan over them and produce garbage in the
@@ -718,8 +730,6 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   auto const* __restrict__ z_ptr = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
   auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
-  auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
-  auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
   auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
 
   int64_t const B_base = outer * params.B_stride_seq + (int64_t)group_idx * DSTATE;
@@ -775,18 +785,8 @@ __device__ __forceinline__ void load_data(SmemT& smem, CheckpointingSsuParams co
   }
 
   // ── Scalar loads (overlap with cp.async) + cumAdt cumsum ──
-  static_assert(MAX_WINDOW <= warpSize, "MAX_WINDOW must fit in a single warp");
-  if (lane < MAX_WINDOW) {
-    int64_t const dt_rd_base = cache_slot * params.old_dt_stride_seq +
-                               buf_read * params.old_dt_stride_dbuf +
-                               head * params.old_dt_stride_head;
-    smem.old_dt[lane] = old_dt_ptr[dt_rd_base + lane];
-
-    int64_t const ca_rd_base = cache_slot * params.old_cumAdt_stride_seq +
-                               buf_read * params.old_cumAdt_stride_dbuf +
-                               head * params.old_cumAdt_stride_head;
-    smem.old_cumAdt[lane] = old_cumAdt_ptr[ca_rd_base + lane];
-  }
+  load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, MAX_WINDOW, smem.old_dt,
+                     smem.old_cumAdt);
   int64_t const dt_seq_base_local = outer * params.dt_stride_seq + head;
   if (lane < seq_len) {
     float dt_val = toFloat(dt_ptr[dt_seq_base_local + (int64_t)lane * params.dt_stride_token]);
