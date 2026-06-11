@@ -678,9 +678,10 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
-    ):
+    ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
 
