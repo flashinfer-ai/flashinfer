@@ -348,8 +348,8 @@ def _check_dsv4_sparse_mla_inputs(
         )
     if head_dim != 512:
         raise ValueError(f"Expected query head dim 512, got {head_dim}")
-    if num_heads not in (64, 128):
-        raise ValueError(f"Expected 64 or 128 query heads, got {num_heads}")
+    if num_heads not in (8, 16, 32, 64, 128):
+        raise ValueError(f"Expected 8, 16, 32, 64, or 128 query heads, got {num_heads}")
 
     if (
         sparse_indices is None
