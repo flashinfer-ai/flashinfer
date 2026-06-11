@@ -28,6 +28,19 @@ Utility Functions
     interleave_moe_scales_for_sm90_mixed_gemm
     fused_topk_deepseek
 
+Multi-LoRA MoE (BGMV)
+---------------------
+
+Batched Gather-Matrix-Vector kernels for serving multiple LoRA adapters on
+top of a Mixture-of-Experts layer (shrink + expand).
+
+.. autosummary::
+    :toctree: ../generated
+
+    bgmv_moe
+    bgmv_moe_shrink
+    bgmv_moe_expand
+
 CUTLASS Fused MoE
 -----------------
 
