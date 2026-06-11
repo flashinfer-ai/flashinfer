@@ -1212,6 +1212,25 @@ def build_tree_custom_mask_flat(
     return torch.cat(parts)
 
 
+def build_tree_window_custom_mask_flat(
+    tree_mask: torch.Tensor, seq_lens: torch.Tensor, q_len: int, window_left: int
+) -> torch.Tensor:
+    """Reference mask for spec-dec tree verify on sliding-window layers:
+    slot-index window rule (kv visible iff kv_idx >= prefix + row -
+    window_left, the same rule the non-tree window_left paths apply) ANDed
+    with the tree mask over the draft tail."""
+    parts = []
+    for b in range(tree_mask.shape[0]):
+        kv_len = int(seq_lens[b])
+        prefix_len = kv_len - q_len
+        kv_idx = torch.arange(kv_len, device=tree_mask.device)
+        q_idx = prefix_len + torch.arange(q_len, device=tree_mask.device)
+        m = kv_idx.unsqueeze(0) >= (q_idx.unsqueeze(1) - window_left)
+        m[:, prefix_len:] &= tree_mask[b]
+        parts.append(m.flatten())
+    return torch.cat(parts)
+
+
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
@@ -1328,6 +1347,138 @@ def test_trtllm_batch_decode_spec_dec_tree(
     if q_dtype == "fp8" and o_dtype == "fp8":
         rtol, atol = 5e-2, 7e-2
     elif q_dtype == "fp8":
+        rtol, atol = 4e-2, 7e-2
+    else:
+        rtol, atol = 1e-2, 1e-2
+    # Same relaxation as the causal speculative-decoding tests.
+    rtol, atol = rtol * 2, atol * 2
+
+    total_elements = output.numel()
+    max_mismatched_elements = int(5e-5 * total_elements)
+    assert_close_with_mismatch_tolerance(
+        output.float(),
+        output_ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=max_mismatched_elements,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 4, 32, 2, 5),
+        (4, 8, 64, 4, 1),
+        (16, 32, 64, 2, 8),
+    ],
+)
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("bf16", "fp8", "bf16"),
+        ("fp8", "fp8", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("window_left", [48, 333])
+@pytest.mark.parametrize("max_in_kv_len", [110, 2048])
+@pytest.mark.parametrize("head_dim", [128])
+def test_trtllm_batch_decode_spec_dec_tree_window(
+    batch_size: int,
+    q_len_per_req: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    q_dtype: str,
+    kv_dtype: str,
+    o_dtype: str,
+    window_left: int,
+    max_in_kv_len: int,
+    head_dim: int,
+):
+    """Spec-dec tree decode on sliding-window layers: the window is folded
+    into the packed custom mask (the cubins have no SlidingWindow+Custom mask
+    type), so the kernel runs with window_left disabled and per-row window
+    bits over the whole presented KV range."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen backend requires SM100 and SM103 GPUs.")
+
+    torch.manual_seed(0)
+    num_qo_heads = num_kv_heads * head_grp_size
+    q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
+        batch_size, q_len_per_req, max_in_kv_len, None
+    )
+
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    q_indptr = generate_cumsum_lens(q_lens)
+
+    kv_cache, k_scale, v_scale, ref_kv_cache, _ = create_kv_cache(
+        batch_size,
+        seq_lens,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_dtype,
+        "bf16" if q_dtype == "fp8" else q_dtype,
+        "HND",
+    )
+    page_table, all_page_ids, page_per_seq = create_page_table(
+        batch_size, seq_lens, page_size
+    )
+    kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_last_page_len = get_last_page_len(seq_lens, page_size)
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+
+    tree_mask = generate_random_tree_mask(batch_size, q_len_per_req, GPU_DEVICE)
+
+    sm_scale = float(1.0 / (head_dim**0.5))
+
+    # FA2 prefill reference with the window folded into the dense mask
+    # (slot-index window rule, matching FA2's own window_left semantics).
+    wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer_ref, "HND"
+    )
+    wrapper_ref.plan(
+        qo_indptr=q_indptr,
+        paged_kv_indptr=kv_indptr,
+        paged_kv_indices=all_page_ids,
+        paged_kv_last_page_len=kv_last_page_len.to(GPU_DEVICE),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        custom_mask=build_tree_window_custom_mask_flat(
+            tree_mask, seq_lens, q_len_per_req, window_left
+        ),
+        pos_encoding_mode="NONE",
+        kv_data_type=ref_kv_cache.dtype,
+        q_data_type=ref_q.dtype,
+    )
+    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+
+    out_dtype = DTYPE_MAP[o_dtype]
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm2_scale = v_scale
+
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        q.contiguous(),
+        kv_cache,
+        workspace_buffer,
+        page_table,
+        seq_lens.to(GPU_DEVICE),
+        torch.max(seq_lens).item(),
+        bmm1_scale,
+        bmm2_scale,
+        window_left,
+        out_dtype=out_dtype,
+        kv_layout="HND",
+        backend="trtllm-gen",
+        q_len_per_req=q_len_per_req,
+        mask=tree_mask,
+    )
+
+    if q_dtype == "fp8":
         rtol, atol = 4e-2, 7e-2
     else:
         rtol, atol = 1e-2, 1e-2

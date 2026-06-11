@@ -997,10 +997,15 @@ class TllmGenFmhaKernel {
                      params.mHeadDimQk);
     FLASHINFER_CHECK(isPagedKv(params.mQkvLayout),
                      "Custom-mask spec-dec generation requires a paged KV cache.");
+    // The published custom-mask cubins have no SlidingWindow+Custom mask
+    // type; callers fold sliding windows into the packed mask and disable
+    // the kernel-side window (see _pack_trtllm_gen_spec_dec_mask). Proper
+    // combined kernel support in trtllm-gen is a planned follow-up.
     FLASHINFER_CHECK(
         params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
             params.mChunkedAttentionSize == INT_MAX,
-        "Custom-mask spec-dec generation does not support sliding-window or chunked attention.");
+        "Custom-mask spec-dec generation does not support sliding-window or chunked attention; "
+        "fold the window into the packed custom mask instead.");
     selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
     selectKernelParams.mTileSizeQ = 128;
     selectKernelParams.mTileSizeKv = 128;
