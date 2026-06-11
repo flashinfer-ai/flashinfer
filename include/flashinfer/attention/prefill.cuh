@@ -101,11 +101,6 @@ template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint
 struct SharedStorageQKVO {
   static constexpr bool kVOSplit =
       kEnableVOSplitOpt && (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
-  // K/V smem time-sharing: bf16/fp16 share at every tile (hd512 K+V cannot fit 100KB otherwise),
-  // while FP8 shares only for the CTA_TILE_Q=32 prefill tile (where sharing is what lets it fit
-  // 100KB). FP8 at CTA_TILE_Q=16 (decode / short-q) keeps the unshared layout: it already fits,
-  // and not sharing avoids serializing the K/V loads in the decode regime. NVFP4 is excluded (no
-  // FP4 V-load in the VO-split PV path).
   static constexpr bool kVShareActive = kVOSplit && !is_fp4_type_v<DTypeKV> &&
                                         (HEAD_DIM_QK == HEAD_DIM_VO) &&
                                         (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
@@ -172,10 +167,6 @@ struct KernelTraits {
   static constexpr bool USE_VO_SPLIT = (NUM_MMA_D_VO > 16) && (NUM_MMA_D_VO % NUM_WARPS_KV == 0);
   static constexpr uint32_t NUM_MMA_D_VO_PER_WARP =
       USE_VO_SPLIT ? (NUM_MMA_D_VO / NUM_WARPS_KV) : NUM_MMA_D_VO;
-  // Time-share the K/V smem buffer (load K -> QK -> reuse buffer for V -> PV). bf16/fp16 share at
-  // every tile; FP8 shares only for the CTA_TILE_Q=32 prefill tile -- halving K+V is what lets fp8
-  // CTA32 fit 100KB on SM120/SM121, whereas fp8 CTA_TILE_Q=16 (decode/short-q) already fits
-  // unshared and skips the load serialization. NVFP4 excluded (no FP4 V-load in VO-split PV).
   static constexpr bool USE_KV_SHARED_SMEM = USE_VO_SPLIT && !is_fp4_type_v<DTypeKV_> &&
                                              (HEAD_DIM_QK == HEAD_DIM_VO) &&
                                              (sizeof(DTypeKV_) == 2 || CTA_TILE_Q_ > 16);
