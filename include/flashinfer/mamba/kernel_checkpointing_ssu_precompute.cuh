@@ -29,8 +29,9 @@
 //   cb_old    : bf16, same fragA-native layout — equation C6 (NO-WRITE path
 //               only; the write path folds old tokens into state via the
 //               replay).  Main does OUT.3 = cb_old @ old_x.
-//   decay_vec : f32, (batch, nheads, NPREDICTED_PAD_MMA_M) — exp(cumAdt[t]),
-//               the per-head β factor for the main's OUT.1 (β·C@state).
+//   cumAdt_vec: f32, (batch, nheads, NPREDICTED_PAD_MMA_M) — raw cumAdt[t].  The
+//               main loads it into smem.cumAdt; the existing exp(smem.cumAdt)
+//               epilogue computes β on the fly (OUT.1) — no decay branch.
 //
 // Launch granularity (see .plans/ssu_split.md "Granularity"):
 //   grid = (batch, ngroups, ceil(HEADS_PER_GROUP / HEADS_PER_CTA))
@@ -89,10 +90,11 @@ struct CheckpointingSsuPrecomputeStorage {
   alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];      // matmul-1 A-operand (C, swizzled)
   alignas(16) input_t old_B[MAX_WINDOW_PAD_MMA_K * DSTATE];  // C6 N-operand (old B, no-write only)
 
-  // Per-warp coefficients — warp w owns its head's C1/C2 results.
+  // Per-warp coefficients — warp w owns its head's C1/C2 results.  No `decay`
+  // slot: exp(cumAdt) is computed on the fly by the scale_store epilogues and
+  // the main's OUT.1; cumAdt itself is what cumAdt_vec stores.
   float dt[NUM_WARPS][NPREDICTED];
   float cumAdt[NUM_WARPS][NPREDICTED];
-  float decay[NUM_WARPS][NPREDICTED];
 
   // Per-warp OLD coefficients (NO-WRITE path): the buffered head's dt / cumAdt
   // (f32, from the cache).  Feed C6's coeff[i] = exp(total_old_cumAdt -
@@ -172,9 +174,10 @@ __device__ __forceinline__ void load_dt(SmemT& smem, CheckpointingSsuParams cons
 }
 
 // -----------------------------------------------------------------------------
-// C2: cumAdt = cumsum(A * dt) (inclusive Hillis-Steele warp scan) + decay =
-// exp(cumAdt) → per-warp smem.cumAdt[warp] / smem.decay[warp].  Per-warp variant
-// of compute_cumAdt (common.cuh:451).
+// C2: cumAdt = cumsum(A * dt) (inclusive Hillis-Steele warp scan) → per-warp
+// smem.cumAdt[warp].  Per-warp variant of compute_cumAdt (common.cuh:451).
+// decay = exp(cumAdt) is NOT materialized — the scale_store epilogues and the
+// main's OUT.1 exp it on the fly.
 template <int NPREDICTED, typename SmemT>
 __device__ __forceinline__ void compute_cumAdt_pw(SmemT& smem, int warp, int lane, float A_val) {
   float val = (lane < NPREDICTED) ? A_val * smem.dt[warp][lane] : 0.f;
@@ -184,7 +187,6 @@ __device__ __forceinline__ void compute_cumAdt_pw(SmemT& smem, int warp, int lan
   }
   if (lane < NPREDICTED) {
     smem.cumAdt[warp][lane] = val;
-    smem.decay[warp][lane] = __expf(val);
   }
 }
 
@@ -542,7 +544,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
   auto* __restrict__ cb_gmem = reinterpret_cast<PackedAligned<input_t>*>(params.cb_scaled);
   auto* __restrict__ cb_old_gmem = reinterpret_cast<PackedAligned<input_t>*>(params.cb_old);
-  auto* __restrict__ decay_gmem = reinterpret_cast<float*>(params.decay_vec);
+  auto* __restrict__ cumAdt_gmem = reinterpret_cast<float*>(params.cumAdt_vec);
 
   constexpr int NUM_ITER = (HEADS_PER_CTA + NUM_WARPS - 1) / NUM_WARPS;  // ceil, uniform
 #pragma unroll
@@ -575,10 +577,12 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       __syncwarp();
 
     if (has_head) {
-      // decay_vec[batch, head, t] = exp(cumAdt[t]).
+      // cumAdt_vec[batch, head, t] = raw cumAdt[t].  The main loads this into
+      // smem.cumAdt and the existing exp(smem.cumAdt) epilogue computes β on the
+      // fly (OUT.1) — so the output path needs no decay branch.
       if (lane < seq_len)
-        decay_gmem[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane] =
-            smem.decay[warp][lane];
+        cumAdt_gmem[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane] =
+            smem.cumAdt[warp][lane];
       // C7: persist this head's new dt / cumAdt into the cache tape at
       // write_offset (so the new tokens become "old" for the next step).
       // cumAdt continuity: no-write steps offset by the previous buffer's tail

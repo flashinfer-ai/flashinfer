@@ -480,11 +480,11 @@ def test_checkpointing_ssu_heads_per_group(impl):
 
 @pytest.mark.xfail(
     strict=True,
-    reason="two-kernel split (cb_scaled/decay_vec scratch) not implemented yet "
+    reason="two-kernel split (cb_scaled/cumAdt_vec scratch) not implemented yet "
     "(precompute + main kernels pending) — see .plans/ssu_split.md",
 )
 def test_two_kernel_matches_monolithic():
-    """The two-kernel path (caller passes cb_scaled/decay_vec scratch) must
+    """The two-kernel path (caller passes cb_scaled/cumAdt_vec scratch) must
     match the monolithic kernel (no scratch) bit-for-bit on out, state, and the
     mutated caches.  Covers a nowrite case (k=0) and a write case (k=T).
 
@@ -552,13 +552,13 @@ def test_two_kernel_matches_monolithic():
         kw = {}
         if two_kernel:
             # fragA-native contract (see .plans/ssu_split.md): cb_scaled is bf16
-            # [batch, nheads, lane(32), reg(8)] = matmul-4 fragA; decay_vec is
+            # [batch, nheads, lane(32), reg(8)] = matmul-4 fragA; cumAdt_vec is
             # f32 [batch, nheads, NPREDICTED_PAD_MMA_M] (=16 for T<=16).
             T_pad = 16  # next_multiple_of<MMA::M=16>(T) for T <= 16
             kw["cb_scaled"] = torch.empty(
                 batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
             )
-            kw["decay_vec"] = torch.empty(
+            kw["cumAdt_vec"] = torch.empty(
                 batch, nheads, T_pad, device=device, dtype=torch.float32
             )
         checkpointing_ssu(
