@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 // =============================================================================
-// Two-kernel split: MAIN kernel (.plans/ssu_split.md, S4).
-//
-// PROTOTYPE / DESIGN DRAFT — structure for review, expect compile iteration.
+// Two-kernel split: MAIN kernel (.plans/ssu_split.md, S4).  Validated bit-exact
+// vs the monolithic via test_two_kernel_matches_monolithic (T0).
 //
 // The CONSUMER of the precompute's scratch.  Grid (D_SPLIT, batch, nheads) —
 // per (batch, head, d-tile), like the monolithic (per-head state recurrence).

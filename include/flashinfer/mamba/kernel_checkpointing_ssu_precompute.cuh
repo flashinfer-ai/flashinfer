@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 // =============================================================================
-// Two-kernel split: PRECOMPUTE kernel (.plans/ssu_split.md, S3).
-//
-// PROTOTYPE / DESIGN DRAFT — structure for review, expect compile iteration.
+// Two-kernel split: PRECOMPUTE kernel (.plans/ssu_split.md, S3).  Validated
+// bit-exact vs the monolithic via test_two_kernel_matches_monolithic (T0).
 //
 // Computes the conv1d-coefficient block (equations C1/C2/C5/C6) and owns the
 // cache writes for the data only IT holds — old_dt/old_cumAdt (C7, from its
