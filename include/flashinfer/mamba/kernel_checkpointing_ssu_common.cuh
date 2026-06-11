@@ -1238,7 +1238,11 @@ __device__ __forceinline__ void convert_frag(SrcFrag const& src, DstFrag& dst) {
 template <int REGS, typename input_t, typename FragCB>
 __device__ __forceinline__ void load_cb_fragA(FragCB& frag_CB, int lane,
                                               input_t const* __restrict__ cb_head) {
-  using Pack = PackedAligned<input_t, REGS>;
+  // The fragment element is the MMA operand type (bit-compatible with input_t
+  // but a distinct C++ type — e.g. cutlass bf16 vs nv_bfloat16).  Read the gmem
+  // bytes AS that type so the per-element assignment is well-typed (no cast).
+  using frag_t = cute::remove_cvref_t<decltype(frag_CB(0))>;
+  using Pack = PackedAligned<frag_t, REGS>;
   Pack const packed = reinterpret_cast<Pack const*>(cb_head)[lane];  // one vectorized LDG
 #pragma unroll
   for (int e = 0; e < REGS; ++e) frag_CB(e) = packed.val[e];

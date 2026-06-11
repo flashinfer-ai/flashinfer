@@ -478,19 +478,10 @@ def test_checkpointing_ssu_heads_per_group(impl):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="two-kernel split (cb_scaled/cumAdt_vec scratch) not implemented yet "
-    "(precompute + main kernels pending) — see .plans/ssu_split.md",
-)
 def test_two_kernel_matches_monolithic():
-    """The two-kernel path (caller passes cb_scaled/cumAdt_vec scratch) must
-    match the monolithic kernel (no scratch) bit-for-bit on out, state, and the
-    mutated caches.  Covers a nowrite case (k=0) and a write case (k=T).
-
-    xfail-first: the two-kernel launch currently raises NotImplementedError, so
-    this fails until S3-S5 land; strict=True flips it to a failure once it
-    starts passing, prompting removal of the marker (S8)."""
+    """The two-kernel path (caller passes cb_scaled/cumAdt_vec/cb_old scratch)
+    must match the monolithic kernel (no scratch) bit-for-bit on out, state, and
+    the mutated caches.  Covers a nowrite case (k=0) and a write case (k=T)."""
     device = "cuda"
     dtype = torch.bfloat16
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
@@ -560,6 +551,13 @@ def test_two_kernel_matches_monolithic():
             )
             kw["cumAdt_vec"] = torch.empty(
                 batch, nheads, T_pad, device=device, dtype=torch.float32
+            )
+            # cb_old (C6, no-write): m16n8k{K_old} fragA, K_old =
+            # next_multiple_of<MMA::K_SMALL=8>(max_window); REGS = K_old/2.
+            # max_window == T here.
+            k_old = ((T + 7) // 8) * 8
+            kw["cb_old"] = torch.empty(
+                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             )
         checkpointing_ssu(
             st,
