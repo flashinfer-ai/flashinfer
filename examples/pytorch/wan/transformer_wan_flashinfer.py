@@ -869,9 +869,10 @@ class FlashInferWanTransformer3DModel(nn.Module):
     def __init__(self, config: Union[WanTransformer3DConfig, Any]):
         super().__init__()
 
-        # Normalize HuggingFace/diffusers configs to the local dataclass and
-        # apply environment overrides once at construction time.
-        config = _config_to_flashinfer_config(config)
+        # Normalize external configs once. Pre-normalized local configs should
+        # keep their explicit values.
+        if not isinstance(config, WanTransformer3DConfig):
+            config = _config_to_flashinfer_config(config)
         self.config = config
 
         patch_size = getattr(config, "patch_size", (1, 2, 2))

@@ -1525,6 +1525,7 @@ class FlashInferFeedForward(nn.Module):
         self.proj_down = create_linear_layer(inner_dim, dim, **linear_kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        approximate = "tanh" if self.activation_fn == "gelu-approximate" else "none"
         if self.use_gating:
             # Gated FFN using FlashInfer fused gelu_and_mul
             hidden = self.proj_up(x)
@@ -1546,11 +1547,11 @@ class FlashInferFeedForward(nn.Module):
             else:
                 # Fallback for non-aligned
                 gate, up = hidden.chunk(2, dim=-1)
-                hidden = F.gelu(gate, approximate="tanh") * up
+                hidden = F.gelu(gate, approximate=approximate) * up
         else:
             # Simple FFN: up -> activation -> down
             hidden = self.proj_up(x)
-            hidden = F.gelu(hidden, approximate="tanh")
+            hidden = F.gelu(hidden, approximate=approximate)
 
         return self.proj_down(hidden)
 
