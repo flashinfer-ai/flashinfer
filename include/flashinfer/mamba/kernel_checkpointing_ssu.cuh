@@ -880,11 +880,12 @@ __device__ __forceinline__ void compute_no_write_output(
 // ssu_checkpoint: replay → sync → output (today's body).
 // ssu_nocheckpoint: sync → no-write output (skips replay).
 template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE,
-          int NUM_WARPS, int PHILOX_ROUNDS, typename SmemT>
+          int NUM_WARPS, int PHILOX_ROUNDS, bool READ_PRECOMPUTED_CB = false, typename SmemT>
 __device__ __forceinline__ void ssu_checkpoint(SmemT& smem, CheckpointingSsuParams const& params,
                                                int warp, int lane, int prev_k, int d_tile,
                                                int64_t out_seq_base, int head, int64_t cache_slot,
-                                               float D_val, int seq_len) {
+                                               float D_val, int seq_len,
+                                               input_t const* cb_gmem_head = nullptr) {
   // ── DO NOT HOIST `rand_seed` ── see kernel preamble for the perf rationale.
   int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   // `state_ptr_offset` is int64 — matches Triton's `base_rand =
@@ -903,23 +904,28 @@ __device__ __forceinline__ void ssu_checkpoint(SmemT& smem, CheckpointingSsuPara
   __syncthreads();
 
   compute_and_store_output<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                           PHILOX_ROUNDS>(smem, params, warp, lane, d_tile, out_seq_base, head,
-                                          cache_slot, D_val, /*must_checkpoint=*/true, seq_len);
+                           PHILOX_ROUNDS, READ_PRECOMPUTED_CB>(
+      smem, params, warp, lane, d_tile, out_seq_base, head, cache_slot, D_val,
+      /*must_checkpoint=*/true, seq_len, cb_gmem_head);
 }
 
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
-          int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+          int D_PER_CTA, int DSTATE, int NUM_WARPS, bool READ_PRECOMPUTED_CB = false,
+          typename SmemT>
 __device__ __forceinline__ void ssu_nocheckpoint(SmemT& smem, CheckpointingSsuParams const& params,
                                                  int warp, int lane, int prev_k, int d_tile,
                                                  int64_t out_seq_base, int head, int64_t cache_slot,
-                                                 float D_val, int seq_len) {
+                                                 float D_val, int seq_len,
+                                                 input_t const* cb_gmem_head = nullptr,
+                                                 input_t const* cb_old_gmem_head = nullptr) {
   // Caller's responsibility to __syncthreads() before this call — see the
   // dispatch site in checkpointing_ssu_kernel.  The sync covers (a) load_data
   // cross-warp loads (state, B/C/x/z), (b) compute_CB_scaled_2warp writes
   // from warps 0,1, and (c) compute_CB_old_2warp writes from warps 2,3.
   compute_no_write_output<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                          NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base, head,
-                                     cache_slot, D_val, seq_len);
+                          NUM_WARPS, READ_PRECOMPUTED_CB>(smem, params, warp, lane, prev_k, d_tile,
+                                                          out_seq_base, head, cache_slot, D_val,
+                                                          seq_len, cb_gmem_head, cb_old_gmem_head);
 }
 
 // =============================================================================
