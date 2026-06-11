@@ -126,7 +126,7 @@ class CuteDslNvfp4Runner(TunableRunner):
 
 
 class TrtllmFp4RoutedRunner(TunableRunner):
-    """Pre-routed NVFP4 adapter over the canonical trtllm-gen ``MoERunner``.
+    """NVFP4 adapter over the canonical trtllm-gen ``MoERunner``.
 
     Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
     plus the static weight/config kwargs that ``core.MoERunner.forward``
@@ -136,8 +136,16 @@ class TrtllmFp4RoutedRunner(TunableRunner):
     the fragile raw-op positional launch in exactly one place —
     ``core.MoERunner.forward``.
 
-    Routing is pre-computed (``RoutingInputMode.PackedPrecomputed``): the packed
-    int32 top-k ids carry ``((expert_id - local_offset) << 16) | bf16(weight)``.
+    Routing mode is chosen per-call from the activation pack (``pack_inputs``):
+
+    * **pre-routed** (``RoutingInputMode.PackedPrecomputed``) when the pack carries
+      ``selected_experts`` / ``final_scales``: the packed int32 top-k ids carry
+      ``((expert_id - local_offset) << 16) | bf16(weight)``.
+    * **in-kernel** (``RoutingInputMode.FromLogits``) when the pack carries
+      ``routing_logits``: the kernel computes the top-k selection from raw logits
+      per ``RoutingConfig.method`` (+ optional ``routing_bias``), writing
+      ``topk_ids`` / ``expert_weights`` into the OUTPUT buffers we allocate.
+
     The inner ``MoERunner`` needs the hidden size for its tactic keys and tuning
     buckets, so it is built lazily on the first ``pack_inputs`` call.
     """
@@ -235,6 +243,11 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         gemm1_alpha, gemm2_weights, gemm2_weights_scale, and optionally
         output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar.
 
+        Routing mode is chosen from the activation pack: if ``act.routing_logits``
+        is set we drive ``RoutingInputMode.FromLogits`` (the kernel routes); else we
+        pack the pre-routed ``selected_experts`` / ``final_scales`` for
+        ``RoutingInputMode.PackedPrecomputed``.
+
         The local-shard offset comes from ``ExpertConfig.local_expert_offset``
         on the config this runner was built with.  For expert-parallel
         pre-routed inputs the kernel indexes local experts as
@@ -255,25 +268,55 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         if hidden_states_scale.dtype == torch.uint8:
             hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
 
-        # Packed pre-routed top-k ids: ((expert_id - offset) << 16) | bf16(weight)
-        ids = act.selected_experts - self._local_expert_offset
-        weight_bf16_bits = (
-            act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-        )
-        topk_ids = (ids << 16) | (weight_bf16_bits & 0xFFFF)
-
         output = act.hidden_states_q.new_empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16
         )
-        # PackedPrecomputed still requires a (kernel-side) topk_weights buffer:
-        # the raw op declares it non-Optional.  The high-level wrapper allocates
-        # an empty bf16 placeholder here; we mirror that since we bypass it.
-        expert_weights = act.final_scales.new_empty(
-            (num_tokens, routing.top_k), dtype=torch.bfloat16
-        )
+
+        if act.routing_logits is not None:
+            # FromLogits: topk_ids/expert_weights are OUTPUT buffers the kernel fills.
+            # We allocate them here (mirroring trtllm_fp4_block_scale_moe_op, core.py
+            # ~2268) because MoERunner.forward calls the raw op directly, bypassing the
+            # buffer-allocating wrapper. Weight dtype mirrors logits dtype (core.py:2253).
+            assert act.selected_experts is None and act.final_scales is None, (
+                "MoEActivationPack carries routing_logits but also selected_experts/"
+                "final_scales; supply exactly one (in-kernel vs pre-routed)."
+            )
+            routing_input_mode = RoutingInputMode.FromLogits
+            routing_logits = act.routing_logits
+            routing_bias = act.routing_bias
+            topk_ids = act.hidden_states_q.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.int32
+            )
+            # routing_logits.new_empty inherits its device + dtype (core.py:2253).
+            expert_weights = routing_logits.new_empty((num_tokens, routing.top_k))
+        else:
+            # Pre-routed packed path: ((expert_id - offset) << 16) | bf16(weight).
+            assert act.selected_experts is not None and act.final_scales is not None, (
+                "MoEActivationPack must carry either routing_logits (in-kernel) or "
+                "selected_experts + final_scales (pre-routed)."
+            )
+            assert act.routing_bias is None, (
+                "MoEActivationPack carries routing_bias but no routing_logits; "
+                "routing_bias is only consumed by in-kernel (FromLogits) routing."
+            )
+            routing_input_mode = RoutingInputMode.PackedPrecomputed
+            routing_logits = None
+            routing_bias = None
+            ids = act.selected_experts - self._local_expert_offset
+            weight_bf16_bits = (
+                act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+            )
+            topk_ids = (ids << 16) | (weight_bf16_bits & 0xFFFF)
+            # PackedPrecomputed still requires a (kernel-side) topk_weights buffer:
+            # the raw op declares it non-Optional.  The high-level wrapper allocates
+            # an empty bf16 placeholder here; we mirror that since we bypass it.
+            expert_weights = act.final_scales.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+
         moe_inputs = MoeRunnerInputs(
             output=output,
-            routing_logits=None,
+            routing_logits=routing_logits,
             topk_ids=topk_ids,
             expert_weights=expert_weights,
             hidden_states=act.hidden_states_q,
@@ -286,8 +329,8 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         # MoERunner.forward.  None-valued entries are the optional gemm bias /
         # swiglu beta-clamp / per-token-scale paths not used by the MVP.
         self._static_kwargs = dict(
-            routing_input_mode=RoutingInputMode.PackedPrecomputed,
-            routing_bias=None,
+            routing_input_mode=routing_input_mode,
+            routing_bias=routing_bias,
             gemm1_weights=v["gemm1_weights"],
             gemm1_weights_scale=v["gemm1_weights_scale"],
             gemm1_bias=None,
