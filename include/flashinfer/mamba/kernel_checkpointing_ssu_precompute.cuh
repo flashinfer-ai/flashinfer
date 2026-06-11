@@ -61,7 +61,7 @@ namespace flashinfer::mamba::checkpointing {
 //
 // B / C / CB_scaled keep byte-identical swizzled layouts to
 // CheckpointingSsuStorage, so the same `make_swizzled_layout_rc` accessors in
-// the MMA / LDSM helpers index them unchanged.  cumAdt/dt_proc/decay are
+// the MMA / LDSM helpers index them unchanged.  cumAdt/dt/decay are
 // PER-WARP (each warp owns its head's C1/C2) — unlike the monolithic's single
 // copy (one head per CTA).
 template <typename input_t, int NPREDICTED, int DSTATE, int NUM_WARPS>
@@ -83,10 +83,73 @@ struct CheckpointingSsuPrecomputeStorage {
   alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];  // matmul-1 A-operand (swizzled)
 
   // Per-warp coefficients — warp w owns its head's C1/C2 results.
-  float dt_proc[NUM_WARPS][NPREDICTED];
+  float dt[NUM_WARPS][NPREDICTED];
   float cumAdt[NUM_WARPS][NPREDICTED];
   float decay[NUM_WARPS][NPREDICTED];
 };
+
+// -----------------------------------------------------------------------------
+// Load this group's C and B (conv1d outputs) into the swizzled smem.C / smem.B
+// via cp.async — gmem→smem direct, no register footprint for the ~4 KB tiles.
+// Only warps 0/1 run the CB MMA, so only they load B/C (redundant + idempotent
+// — each needs the full tile for its N-half).  Mirrors load_post_pdl_wait_data
+// (kernel_checkpointing_ssu_common.cuh:638) minus x.  Caller must have gdc_wait'd
+// first (B/C are conv1d outputs).
+template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
+__device__ __forceinline__ void load_group_BC(SmemT& smem, CheckpointingSsuParams const& params,
+                                              int warp, int lane, int group_idx, int64_t outer,
+                                              int seq_len) {
+  auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
+  auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
+  int64_t const B_base = outer * params.B_stride_seq + (int64_t)group_idx * DSTATE;
+  int64_t const C_base = outer * params.C_stride_seq + (int64_t)group_idx * DSTATE;
+  using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
+  using BShape = cute::Shape<cute::Int<SmemT::NPREDICTED_PAD_MMA_N>, cute::Int<DSTATE>>;
+  if (warp < 2) {
+    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_token, lane,
+                                        seq_len);
+    load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane,
+                                        seq_len);
+  }
+  __pipeline_commit();
+  __pipeline_wait_prior(0);
+  __syncwarp();
+}
+
+// -----------------------------------------------------------------------------
+// C1: scalar per-lane LDG of dt[outer, t, head] + bias + softplus → per-warp
+// smem.dt[warp].  dt is tiny (NPREDICTED floats/head, T-axis stride
+// dt_stride_token = nheads), so an on-the-fly strided LDG is fine — no cp.async.
+// Same compute as load_pre_pdl_wait_data's dt→dt_proc block (common.cuh:613).
+template <typename dt_t, int NPREDICTED, typename SmemT>
+__device__ __forceinline__ void load_dt_pw(SmemT& smem, CheckpointingSsuParams const& params,
+                                           int warp, int lane, int head, int64_t outer,
+                                           float dt_bias_val, int seq_len) {
+  if (lane < seq_len) {
+    auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
+    int64_t const base = outer * params.dt_stride_seq + head;
+    float dt_val = toFloat(dt_ptr[base + (int64_t)lane * params.dt_stride_token]) + dt_bias_val;
+    if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
+    smem.dt[warp][lane] = dt_val;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// C2: cumAdt = cumsum(A * dt) (inclusive Hillis-Steele warp scan) + decay =
+// exp(cumAdt) → per-warp smem.cumAdt[warp] / smem.decay[warp].  Per-warp variant
+// of compute_cumAdt (common.cuh:451).
+template <int NPREDICTED, typename SmemT>
+__device__ __forceinline__ void compute_cumAdt_pw(SmemT& smem, int warp, int lane, float A_val) {
+  float val = (lane < NPREDICTED) ? A_val * smem.dt[warp][lane] : 0.f;
+  for (int offset = 1; offset < NPREDICTED; offset *= 2) {
+    float other = __shfl_up_sync(constants::MASK_ALL_LANES, val, offset);
+    if (lane >= offset) val += other;
+  }
+  if (lane < NPREDICTED) {
+    smem.cumAdt[warp][lane] = val;
+    smem.decay[warp][lane] = __expf(val);
+  }
+}
 
 // -----------------------------------------------------------------------------
 // Raw C·B MMA (matmul-1) for ONE group, 2-warp N-split → fp32 swizzled smem.CB
@@ -205,11 +268,11 @@ __device__ __forceinline__ void scale_store_cb_gmem(
     int const j = c0 + (((e >> 2) & 1) << 3) + (e & 1);
     float val = 0.f;
     if (j <= t && t < seq_len && j < seq_len) {
-      // C5: CB_scaled[t,j] = (C·B) * exp(cumAdt[t]-cumAdt[j]) * dt_proc[j].
+      // C5: CB_scaled[t,j] = (C·B) * exp(cumAdt[t]-cumAdt[j]) * dt[j].
       // Raw C·B read fp32 from swizzled smem (same layout compute_cb_2warp
       // stored); scaled in fp32, per-warp coeffs (this warp owns this head).
       val = smem.CB[layout_cb(t, j)] * __expf(smem.cumAdt[warp][t] - smem.cumAdt[warp][j]) *
-            smem.dt_proc[warp][j];
+            smem.dt[warp][j];
     }
     packed.val[e] = static_cast<input_t>(val);
   }
@@ -270,12 +333,8 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
     cudaGridDependencySynchronize();  // conv1d produces B/C — wait before the load.
   }
 
-  // ── Load C, B for this GROUP into smem (shared across the head loop) ──
-  // TODO(iterate): factor the C/B cp.async out of load_*_data — the precompute
-  // needs only C and B (not state/old_x/x/z).  Reuse the same swizzled smem.C /
-  // smem.B layouts so compute_cb_raw below indexes them identically.
-  // load_group_BC<input_t, NPREDICTED, DSTATE>(smem, params, lane, warp, group_idx, outer,
-  // seq_len);
+  // ── Load this group's C, B (conv1d outputs) into swizzled smem (cp.async) ──
+  load_group_BC<input_t, NPREDICTED, DSTATE>(smem, params, warp, lane, group_idx, outer, seq_len);
 
   // ── Raw C·B MMA — ONCE per group, 2-warp N-split → fp32 smem.CB ──
   // Warps 0/1 compute the matmul (the heavy B/C reads happen once, not
@@ -304,33 +363,39 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
     if (has_head) {
       float const A_val = toFloat(A_ptr[head]);
       float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
-      // C1: dt_proc[t] = softplus(dt[outer,t,head] + dt_bias) → per-warp smem.
-      // load_dt_proc<dt_t, NPREDICTED>(smem, params, warp, lane, head, outer,
-      //                                dt_bias_val, seq_len);
-      // C2: cumAdt + decay (warp scan) → per-warp smem.cumAdt[warp]/decay[warp].
-      // compute_cumAdt_pw<NPREDICTED>(smem, warp, lane, A_val);
-      (void)A_val;
-      (void)dt_bias_val;
+      load_dt_pw<dt_t, NPREDICTED>(smem, params, warp, lane, head, outer, dt_bias_val,
+                                   seq_len);                   // C1
+      compute_cumAdt_pw<NPREDICTED>(smem, warp, lane, A_val);  // C2
     }
 
-    // Deferred barrier: overlaps the raw-CB smem store with the cumAdt compute.
-    if (iter == 0) __syncthreads();
+    // Sync before the reads below.  iter 0 uses __syncthreads — it also makes
+    // the warps-0/1 raw-CB store visible cross-warp before scale_store; later
+    // iters only need __syncwarp (CB unchanged since iter 0; this publishes this
+    // warp's freshly-written dt/cumAdt for the cross-lane reads).  NUM_ITER is
+    // uniform so the __syncthreads is reached by every warp exactly once.
+    if (iter == 0)
+      __syncthreads();
+    else
+      __syncwarp();
 
     if (has_head) {
-      // decay_vec[batch, head, t] = exp(cumAdt[t]) (per-warp decay buffer).
-      // if (lane < seq_len)
-      //   decay_gmem[(seq*nheads + head)*NPREDICTED_PAD_MMA_M + lane] =
-      //       smem.decay[warp][lane];
-      // C5: scale the shared raw C·B (fp32, read from smem.CB) by this
-      // head's per-warp coeffs + STG.128 fragA-native to gmem.
+      // decay_vec[batch, head, t] = exp(cumAdt[t]).
+      if (lane < seq_len)
+        decay_gmem[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane] =
+            smem.decay[warp][lane];
+      // C5: scale the shared raw C·B (fp32 from smem.CB) by this head's per-warp
+      // coeffs + STG.128 fragA-native to gmem.
       auto* cb_gmem_head = cb_gmem + (int64_t)(seq * params.nheads + head) * warpSize;
-      // scale_store_cb_gmem<input_t>(smem, warp, lane, seq_len, cb_gmem_head);
-      (void)cb_gmem_head;
+      scale_store_cb_gmem<input_t>(smem, warp, lane, seq_len, cb_gmem_head);
       // C7 + cache: store old_dt / old_cumAdt at write_offset (reuse
-      // store_old_dt / store_old_cumAdt, common.cuh:1582+).
+      // store_old_dt / store_old_cumAdt, common.cuh:1582+).  TODO(cache).
     }
+
+    // WAR: this iter's cross-lane reads of smem.dt/cumAdt[warp] must complete
+    // before the next iter overwrites them (single-slot reuse).  A double-buffer
+    // [NUM_WARPS][2] would remove this and let the next scan overlap the store.
+    __syncwarp();
   }
-  (void)decay_gmem;
   (void)buf_write;
   (void)write_offset;
 }
