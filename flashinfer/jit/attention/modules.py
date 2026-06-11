@@ -1826,6 +1826,7 @@ def gen_trtllm_gen_fmha_module():
         "fmha_gen",
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_spec_dec_mask.cu",
             jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
         ],
         # link "include" sub-directory in cache
