@@ -94,8 +94,19 @@ class CuteDslNvfp4Runner(TunableRunner):
         tuning_config declares index 11 as a dynamic tensor, so it must be
         present for the autotuner profiling path to assign it a per-bucket
         initializer.
+
+        When the Pack carries ``hidden_states_scale_global`` (gh #3548) it is
+        folded into the gemm1 dequant: the kernel computes
+        ``w1_alpha * (A @ B)`` and the dequantized NVFP4 product carries
+        ``act_gs * weight_gs``, so the combined alpha is the view's
+        weight-side ``w1_alpha`` (``1 / weight_gs``) divided by ``act_gs``.
+        ``fc2_input_scale`` / ``w2_alpha`` do not involve ``act_gs``.  ``None``
+        keeps the view tensors untouched (bit-identical to act_gs = 1.0).
         """
         v = weights.get_view(self.backend_key)
+        w1_alpha = v["w1_alpha"]
+        if act.hidden_states_scale_global is not None:
+            w1_alpha = w1_alpha / act.hidden_states_scale_global
         num_tokens = act.hidden_states_q.shape[0]
         hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
         moe_output = act.hidden_states_q.new_empty(
@@ -108,7 +119,7 @@ class CuteDslNvfp4Runner(TunableRunner):
             act.final_scales,
             v["w1_weight"],
             v["w1_weight_sf"],
-            v["w1_alpha"],
+            w1_alpha,
             v["fc2_input_scale"],
             v["w2_weight"],
             v["w2_weight_sf"],
@@ -242,11 +253,38 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         global→local mapping itself by subtracting ``local_expert_offset``
         (passed via the static kwargs) and dropping ids outside
         ``[offset, offset + local_num_experts)``.
+
+        When the Pack carries ``hidden_states_scale_global`` (gh #3548), its
+        reciprocal is folded into ``output1_scale_scalar`` /
+        ``output1_scale_gate_scalar``, mirroring the canonical gated-act
+        formulas in tests/moe/test_trtllm_gen_fused_moe.py (``scale_c_fc1 =
+        c_global_sf / (gemm1_gs * act_gs)``, ``scale_gate_fc1 =
+        1 / (gemm1_gs * act_gs)``; ``scale_c_fc2`` has no ``act_gs`` term).
+        The view's scalars are the weight-side factors (``act_gs = 1``), so
+        folding is a division; ``None`` keeps them untouched (bit-identical
+        to act_gs = 1.0).
         """
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
         routing = self.config.routing
+
+        output1_scale_scalar = v.get("output1_scale_scalar")
+        output1_scale_gate_scalar = v.get("output1_scale_gate_scalar")
+        a1_gs = act.hidden_states_scale_global
+        if a1_gs is not None:
+            inv_a1 = 1.0 / a1_gs.to(torch.float32)
+            ones = torch.ones(
+                self._num_local_experts, device=a1_gs.device, dtype=torch.float32
+            )
+            # Views without precomputed scalars imply weight-side factors of
+            # 1.0 (weights quantized at global scale 1.0).
+            if output1_scale_scalar is None:
+                output1_scale_scalar = ones
+            if output1_scale_gate_scalar is None:
+                output1_scale_gate_scalar = ones
+            output1_scale_scalar = output1_scale_scalar * inv_a1
+            output1_scale_gate_scalar = output1_scale_gate_scalar * inv_a1
 
         num_tokens = act.hidden_states_q.shape[0]
         hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
@@ -304,8 +342,8 @@ class TrtllmFp4RoutedRunner(TunableRunner):
             gemm2_weights=v["gemm2_weights"],
             gemm2_weights_scale=v["gemm2_weights_scale"],
             gemm2_bias=None,
-            output1_scale_scalar=v.get("output1_scale_scalar"),
-            output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
+            output1_scale_scalar=output1_scale_scalar,
+            output1_scale_gate_scalar=output1_scale_gate_scalar,
             output2_scale_scalar=v.get("output2_scale_scalar"),
             per_token_scale=None,
             num_experts=routing.num_experts,

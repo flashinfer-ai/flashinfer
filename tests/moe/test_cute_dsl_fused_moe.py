@@ -204,8 +204,14 @@ def create_moe_tensors(
     device: str = "cuda",
     seed: int = 42,
     gated: bool = True,
+    calibrated_activation_scale: bool = False,
 ):
-    """Create properly quantized MoE tensors for testing."""
+    """Create properly quantized MoE tensors for testing.
+
+    ``calibrated_activation_scale`` quantizes the activations with the real
+    calibrated NVFP4 global scale ``(448 * 6) / amax`` instead of 1.0; the
+    scale used is returned under the ``a1_gs`` key (gh #3548).
+    """
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
@@ -216,7 +222,10 @@ def create_moe_tensors(
     x_bf16 = (
         torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
     )
-    a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    if calibrated_activation_scale:
+        a1_gs = ((448 * 6) / x_bf16.float().abs().nan_to_num().max()).reshape(1)
+    else:
+        a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
     x_quantized, x_sf = fp4_quantize(
         x_bf16, global_scale=a1_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=False
@@ -296,6 +305,7 @@ def create_moe_tensors(
         "x": x_quantized,
         "x_sf": x_sf,
         "x_bf16": x_bf16,
+        "a1_gs": a1_gs,
         "token_selected_experts": selected_experts,
         "token_final_scales": routing_weights,
         "w1_weight": w1_q,
