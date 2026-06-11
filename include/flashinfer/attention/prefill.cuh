@@ -103,10 +103,9 @@ struct SharedStorageQKVO {
       (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
   static constexpr bool kVOSplit = kEnableVOSplitOpt && kKVShareShape;
   // K/V time-sharing (V loaded into k_smem after Q.K^T) applies to ALL kernels
-  // at large head dims — paged (with VO-split) and single/ragged (without) —
-  // so it must match KernelTraits::USE_KV_SHARED_SMEM, independent of
-  // kEnableVOSplitOpt. Otherwise the single/ragged kernels cannot fit
-  // head_dim=512 K+V tiles on SKUs with 99KB-smem (SM86/89/120/121).
+  // at large head dims. Must match KernelTraits::USE_KV_SHARED_SMEM.
+  // Otherwise the single/ragged kernels cannot fit head_dim=512 K+V
+  // tiles on SKUs with 99KB-smem (SM86/89/120/121).
   static constexpr bool kVShareActive = kKVShareShape && !is_fp4_type_v<DTypeKV> &&
                                         (HEAD_DIM_QK == HEAD_DIM_VO) &&
                                         (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
