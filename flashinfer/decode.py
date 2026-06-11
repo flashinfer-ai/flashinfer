@@ -2362,6 +2362,9 @@ class TrtllmGenDecodeModule:
             lse_stride_tokens,
             lse_stride_heads,
             bf16q_fp8kv_transform_mode,
+            None,  # packed_custom_mask
+            None,  # custom_mask_offsets
+            None,  # first_sparse_mask_offsets_kv
         )
         return out
 
@@ -2531,6 +2534,76 @@ def _check_xqa_nvfp4_page_size(page_size: int) -> None:
 
 
 @flashinfer_api(trace=trtllm_batch_decode_trace)
+def _pack_trtllm_gen_spec_dec_mask(
+    mask: torch.Tensor,
+    seq_lens: torch.Tensor,
+    q_len_per_req: Optional[int],
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_heads_q_per_kv: int,
+    batch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack a dense spec-dec tree mask into the TRTLLM-GEN custom-mask layout.
+
+    The packed bit layout matches the Q128 KeepsMmaAbForGeneration custom-mask
+    cubins and mirrors TRT-LLM's prepareCustomMask.cu: rows are
+    tokenQ * numHeadsQPerKv + head (head-broadcast), grouped into
+    [numTilesQ, numMaskTilesKv, numInstsKv, 128, 128] bit tiles. numInstsKv =
+    stepKv / tileSizeKv of the selected cubin: 2 for same-dtype Q/KV (stepKv
+    256) and 1 for mixed-dtype (stepKv 128); the packing must agree with the
+    instancing the selected cubin was built with. Each sequence occupies a
+    fixed stride in the packed buffer and the offsets tensor carries
+    per-sequence starts in uint32 units, so all shapes are static for a given
+    (batch_size, q_len_per_req) and the packing kernel is CUDA-graph
+    capturable.
+    """
+    if q_len_per_req is None or q_len_per_req <= 1:
+        raise ValueError(
+            "mask requires uniform q_len_per_req > 1 for the trtllm-gen backend"
+        )
+    if mask.dtype != torch.bool or mask.shape != (
+        batch_size,
+        q_len_per_req,
+        q_len_per_req,
+    ):
+        raise ValueError(
+            "mask must be a bool tensor of shape [batch_size, q_len_per_req, "
+            f"q_len_per_req], got {mask.dtype} {tuple(mask.shape)}"
+        )
+    # Mixed-dtype Q/KV kernels reserve a warpgroup for the KV transform and
+    # use a single KV tile instance (stepKv 128 instead of 256).
+    num_insts_kv = 1 if q_dtype != kv_dtype else 2
+    tile_size_kv_per_cta = 128 * num_insts_kv
+    num_tiles_q = ceil_div(q_len_per_req * num_heads_q_per_kv, 128)
+    # Worst case over prefix tile alignment: ceil((tile - 1 + q_len) / tile).
+    max_mask_tiles_kv = ceil_div(
+        tile_size_kv_per_cta - 1 + q_len_per_req, tile_size_kv_per_cta
+    )
+    words_per_seq = num_tiles_q * max_mask_tiles_kv * num_insts_kv * (128 * 128 // 32)
+    packed_custom_mask = torch.empty(
+        (batch_size, words_per_seq), dtype=torch.uint32, device=mask.device
+    )
+    custom_mask_offsets = torch.arange(
+        0,
+        batch_size * words_per_seq,
+        words_per_seq,
+        dtype=torch.int64,
+        device=mask.device,
+    )
+    first_sparse_mask_offsets_kv = torch.empty(
+        (batch_size,), dtype=torch.int32, device=mask.device
+    )
+    get_trtllm_gen_fmha_module().trtllm_fmha_pack_spec_dec_mask(
+        packed_custom_mask,
+        first_sparse_mask_offsets_kv,
+        mask.contiguous(),
+        seq_lens.to(torch.int32),
+        num_heads_q_per_kv,
+        num_insts_kv,
+    )
+    return packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv
+
+
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -2651,7 +2724,17 @@ def trtllm_batch_decode_with_kv_cache(
         output scale factor for xqa fp8 output.
 
     mask : Optional[torch.Tensor] = None
-        causal attention mask for xqa speculative decoding.
+        Attention mask for speculative decoding (``q_len_per_req > 1``).
+        The format is backend specific:
+
+        - ``xqa``: packed causal mask with shape
+          ``[batch_size, q_len_per_req, ceil(q_len_per_req / 32) * 2]``.
+        - ``trtllm-gen``: dense bool spec-dec tree mask with shape
+          ``[batch_size, q_len_per_req, q_len_per_req]`` (True = attend).
+          Row ``i`` masks draft token ``i`` against the draft tail; the KV
+          prefix before the draft tail is always attended. Requires uniform
+          query lengths (``q_len_per_req``), paged KV cache, head_dim 64 or
+          128, and no sliding window.
 
     max_q_len: Optional[int] = None
         The maximum query sequence length across all requests when using variable-length queries.
@@ -2941,6 +3024,23 @@ def trtllm_batch_decode_with_kv_cache(
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
 
+        packed_custom_mask = None
+        custom_mask_offsets = None
+        first_sparse_mask_offsets_kv = None
+        if mask is not None:
+            num_kv_heads = k_cache.shape[-3]
+            packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv = (
+                _pack_trtllm_gen_spec_dec_mask(
+                    mask,
+                    seq_lens,
+                    q_len_per_req,
+                    query.dtype,
+                    k_cache.dtype,
+                    query.size(1) // num_kv_heads,
+                    batch_size,
+                )
+            )
+
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
         num_qo_heads = query.size(1)
@@ -2989,6 +3089,9 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_tokens,
             lse_stride_heads,
             bf16q_fp8kv_transform_mode_value,
+            packed_custom_mask,
+            custom_mask_offsets,
+            first_sparse_mask_offsets_kv,
         )
 
         result_out = (
