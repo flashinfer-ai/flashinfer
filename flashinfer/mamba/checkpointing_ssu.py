@@ -69,6 +69,10 @@ def _get_module(
         "old_dt",
         "old_cumAdt",
         "state_scale",
+        # Two-kernel scratch — the precompute writes them.
+        "cb_scaled",
+        "cumAdt_vec",
+        "cb_old",
     ),
 )
 def _checkpointing_ssu(
@@ -95,6 +99,9 @@ def _checkpointing_ssu(
     rand_seed: Optional[torch.Tensor],
     d_split: int,
     cu_seqlens: Optional[torch.Tensor],
+    cb_scaled: Optional[torch.Tensor],
+    cumAdt_vec: Optional[torch.Tensor],
+    cb_old: Optional[torch.Tensor],
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -150,6 +157,9 @@ def _checkpointing_ssu(
         rand_seed,
         d_split,
         cu_seqlens,
+        cb_scaled,
+        cumAdt_vec,
+        cb_old,
     )
 
 
@@ -178,6 +188,9 @@ def _checkpointing_ssu_fake(
     rand_seed: Optional[torch.Tensor],
     d_split: int,
     cu_seqlens: Optional[torch.Tensor],
+    cb_scaled: Optional[torch.Tensor],
+    cumAdt_vec: Optional[torch.Tensor],
+    cb_old: Optional[torch.Tensor],
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -226,6 +239,7 @@ def checkpointing_ssu(
     enable_pdl: bool = False,
     cb_scaled: Optional[torch.Tensor] = None,
     cumAdt_vec: Optional[torch.Tensor] = None,
+    cb_old: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
@@ -441,21 +455,18 @@ def checkpointing_ssu(
 
     # ── Two-kernel split dispatch (presence of caller-provided scratch) ──
     # The two-kernel (precompute + main) path runs iff the caller provides the
-    # scratch tensors cb_scaled/cumAdt_vec — graph-safe, since the caller
-    # pre-allocates them like `out` (no wrapper allocation).  Both or neither.
-    # Kernels pending (precompute/main); stub raises so the xfail equivalence
-    # test is meaningful and existing monolithic callers are unaffected.
+    # scratch tensors cb_scaled / cumAdt_vec / cb_old — graph-safe, since the
+    # caller pre-allocates them like `out` (no wrapper allocation).  All three
+    # or none: cb_scaled (C5) + cumAdt_vec (β) are produced on both paths;
+    # cb_old (C6) is consumed on the no-write path, which the wrapper can't
+    # predict per-slot, so it must be present whenever the path is selected.
+    # The launcher routes on params.cb_scaled != nullptr.
     two_kernel = cb_scaled is not None
-    if two_kernel != (cumAdt_vec is not None):
+    if two_kernel != (cumAdt_vec is not None) or two_kernel != (cb_old is not None):
         raise ValueError(
-            "cb_scaled and cumAdt_vec must be provided together (both select the "
-            f"two-kernel path); got cb_scaled set={cb_scaled is not None}, "
-            f"cumAdt_vec set={cumAdt_vec is not None}"
-        )
-    if two_kernel:
-        raise NotImplementedError(
-            "checkpointing_ssu two-kernel path (cb_scaled/cumAdt_vec provided) is "
-            "not implemented yet (precompute + main kernels pending)"
+            "cb_scaled, cumAdt_vec, and cb_old must be provided together (all select "
+            f"the two-kernel path); got cb_scaled set={cb_scaled is not None}, "
+            f"cumAdt_vec set={cumAdt_vec is not None}, cb_old set={cb_old is not None}"
         )
 
     _checkpointing_ssu(
@@ -482,6 +493,9 @@ def checkpointing_ssu(
         rand_seed,
         d_split,
         cu_seqlens,
+        cb_scaled,
+        cumAdt_vec,
+        cb_old,
         enable_pdl,
         philox_rounds=philox_rounds,
         state_dtype=state.dtype,

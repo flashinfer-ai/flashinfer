@@ -45,7 +45,10 @@ void checkpointing_ssu(
     Optional<TensorView> state_scale,  // (cache, nheads, dim) f32
     Optional<TensorView> rand_seed,    // single int64
     int64_t d_split,                   // v12 §59: per-head DIM split factor (1, 2, or 4)
-    Optional<TensorView> cu_seqlens);  // (batch+1,) int32 — varlen mode
+    Optional<TensorView> cu_seqlens,   // (batch+1,) int32 — varlen mode
+    Optional<TensorView> cb_scaled,    // two-kernel scratch: bf16 (batch, nheads, 32, 8)
+    Optional<TensorView> cumAdt_vec,   // two-kernel scratch: f32 (batch, nheads, T_pad)
+    Optional<TensorView> cb_old);      // two-kernel scratch: bf16 (batch, nheads, 32, K_old/2)
 
 }  // namespace flashinfer::mamba::checkpointing
 

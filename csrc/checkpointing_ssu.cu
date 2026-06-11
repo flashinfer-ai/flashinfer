@@ -49,10 +49,13 @@ void checkpointing_ssu(
     bool dt_softplus,
     Optional<TensorView> state_batch_indices,  // (batch,) int32
     int64_t pad_slot_id,
-    Optional<TensorView> state_scale,   // (state_cache_size, nheads, dim) f32
-    Optional<TensorView> rand_seed,     // single int64
-    int64_t d_split,                    // v12 §59: per-head DIM split factor (1, 2, or 4)
-    Optional<TensorView> cu_seqlens) {  // (batch+1,) int32, varlen mode
+    Optional<TensorView> state_scale,  // (state_cache_size, nheads, dim) f32
+    Optional<TensorView> rand_seed,    // single int64
+    int64_t d_split,                   // v12 §59: per-head DIM split factor (1, 2, or 4)
+    Optional<TensorView> cu_seqlens,   // (batch+1,) int32, varlen mode
+    Optional<TensorView> cb_scaled,    // two-kernel: bf16 (batch, nheads, 32, 8) fragA-native
+    Optional<TensorView> cumAdt_vec,   // two-kernel: f32 (batch, nheads, T_pad) raw cumAdt
+    Optional<TensorView> cb_old) {     // two-kernel: bf16 (batch, nheads, 32, K_old/2) fragA-native
 
   bool const is_varlen = cu_seqlens.has_value();
 
@@ -503,6 +506,13 @@ void checkpointing_ssu(
     FLASHINFER_CHECK(rs.dtype().code == kDLInt && rs.dtype().bits == 64, "rand_seed must be int64");
     p.rand_seed = static_cast<const int64_t*>(rs.data_ptr());
   }
+
+  // Two-kernel split scratch (presence of cb_scaled selects precompute+main).
+  // Caller-allocated (graph-safe); both/neither of cb_scaled+cumAdt_vec, plus
+  // cb_old for the no-write path — validated in the Python wrapper.
+  if (cb_scaled.has_value()) p.cb_scaled = const_cast<void*>(cb_scaled.value().data_ptr());
+  if (cumAdt_vec.has_value()) p.cumAdt_vec = const_cast<void*>(cumAdt_vec.value().data_ptr());
+  if (cb_old.has_value()) p.cb_old = const_cast<void*>(cb_old.value().data_ptr());
 
   // Strides
   p.state_stride_seq = state.stride(0);

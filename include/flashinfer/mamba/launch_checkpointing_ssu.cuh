@@ -21,6 +21,8 @@
 
 #include "kernel_checkpointing_ssu.cuh"
 #include "kernel_checkpointing_ssu_8bit.cuh"
+#include "kernel_checkpointing_ssu_main.cuh"
+#include "kernel_checkpointing_ssu_precompute.cuh"
 
 namespace flashinfer::mamba::checkpointing {
 
@@ -74,6 +76,74 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = ENABLE_PDL ? 1 : 0;
+
+  // ── Two-kernel split: precompute → main, when the caller provides scratch ──
+  // (cb_scaled/cb_old/cumAdt_vec).  bf16/fp16 only (precompute + main require
+  // 2-byte input + state).  Both launched on `stream` with the same
+  // programmatic-serialization attr: the conv1d→precompute→main PDL chain
+  // overlaps when ENABLE_PDL is stamped; otherwise stream order serializes them
+  // (still correct — the main reads cb_scaled the precompute wrote).  The
+  // precompute does NOT yet trigger early-completion, so the main's gdc_wait
+  // resolves at precompute completion — correct, no overlap; the early-trigger
+  // overlap is the S9 refinement.
+  if (params.cb_scaled != nullptr) {
+    if constexpr (sizeof(state_t) == 2 && sizeof(input_t) == 2) {
+      // Precompute: grid (batch, ngroups, 1) — one CTA/group (HEADS_PER_CTA ==
+      // HEADS_PER_GROUP, first cut).  DT_SOFTPLUS is JIT-folded; dispatch on the
+      // runtime flag.
+      auto launch_precompute = [&]<bool DT_SOFTPLUS>() {
+        auto pfunc =
+            checkpointing_ssu_precompute_kernel<input_t, dt_t, weight_t, matrixA_t, state_t,
+                                                stateIndex_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                                HEADS_PER_GROUP, NUM_WARPS, DT_SOFTPLUS, VARLEN>;
+        constexpr size_t psmem = sizeof(
+            CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE, NUM_WARPS>);
+        if constexpr (psmem > 0) {
+          FLASHINFER_CUDA_CHECK(
+              cudaFuncSetAttribute(pfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, psmem));
+        }
+        cudaLaunchConfig_t pcfg;
+        pcfg.gridDim = dim3(params.batch, params.ngroups, 1);
+        pcfg.blockDim = dim3(warpSize, NUM_WARPS);
+        pcfg.dynamicSmemBytes = psmem;
+        pcfg.stream = stream;
+        pcfg.attrs = attrs;
+        pcfg.numAttrs = 1;
+        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
+      };
+      if (params.dt_softplus) {
+        launch_precompute.template operator()<true>();
+      } else {
+        launch_precompute.template operator()<false>();
+      }
+
+      // Main: grid (D_SPLIT, batch, nheads), same smem as the monolithic.
+      auto mfunc =
+          checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                        state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                        HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN>;
+      constexpr size_t msmem = sizeof(
+          CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+      if constexpr (msmem > 0) {
+        FLASHINFER_CUDA_CHECK(
+            cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
+      }
+      cudaLaunchConfig_t mcfg;
+      mcfg.gridDim = dim3(D_SPLIT, params.batch, params.nheads);
+      mcfg.blockDim = dim3(warpSize, NUM_WARPS);
+      mcfg.dynamicSmemBytes = msmem;
+      mcfg.stream = stream;
+      mcfg.attrs = attrs;
+      mcfg.numAttrs = 1;
+      FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
+      return;
+    } else {
+      FLASHINFER_CHECK(false,
+                       "two-kernel SSU split (cb_scaled provided) requires 2-byte input + state "
+                       "(bf16/fp16); got sizeof(input_t)=",
+                       sizeof(input_t), ", sizeof(state_t)=", sizeof(state_t));
+    }
+  }
 
   auto launch_kernel = [&]() {
     if constexpr (sizeof(state_t) == 1) {
