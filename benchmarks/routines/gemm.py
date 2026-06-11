@@ -156,9 +156,8 @@ def parse_gemm_args(line, parser):
             "b12x",
             "auto",
             "tinygemm",
-            "marlin",
         ],
-        help="Kernel backends to test. Default: cudnn ('marlin' = vLLM Marlin nvfp4 W4A16, for mm_w4a16_fp4 only)",
+        help="Kernel backends to test. Default: cudnn",
     )
     parser.add_argument(
         "--use_128x4_sf_layout",
@@ -1417,20 +1416,6 @@ def testMmW4A16Fp4(args):
         raise ValueError("mm_w4a16_fp4 benchmark requires n % 64 == 0")
     if k % 16 != 0:
         raise ValueError("mm_w4a16_fp4 benchmark requires k % 16 == 0 (FP4 block size)")
-    if "marlin" in backends:
-        # vLLM Marlin nvfp4 W4A16 (apples-to-apples comparison backend).
-        # Output follows the bf16 activation dtype, and the Marlin kernel's
-        # min thread-K is 128, so we tighten the shape/dtype constraints.
-        if out_dtype != torch.bfloat16:
-            raise ValueError(
-                "marlin backend only supports out_dtype=bfloat16 (output follows "
-                f"the bf16 activation dtype); got {args.out_dtype}. Use "
-                "--out_dtype bfloat16 for the comparison."
-            )
-        if k % 128 != 0:
-            raise ValueError(
-                f"marlin backend requires k % 128 == 0 (Marlin min thread-K); got k={k}."
-            )
 
     torch.manual_seed(args.random_seed)
     a = torch.randn((m, k), device=device, dtype=input_dtype) * 0.5
@@ -1452,7 +1437,6 @@ def testMmW4A16Fp4(args):
 
     # Per-backend prep + runner closures.  Prep is one-shot and not timed.
     backend_runners = {}
-    marlin_preps = {}  # marlin backend stashes its dequant reference for refcheck
 
     def make_runner(b_p, sf_p, alpha_p, backend):
         def run(a):
@@ -1470,27 +1454,6 @@ def testMmW4A16Fp4(args):
         return run
 
     for backend in backends:
-        if backend == "marlin":
-            # vLLM Marlin nvfp4 W4A16 GEMM: same work (FP4->bf16 dequant + bf16
-            # tensor-core matmul) as FlashInfer's cute-dsl/cudnn, for an
-            # apples-to-apples perf comparison.  vLLM imported lazily here.
-            from .vllm_marlin_w4a16 import (
-                is_vllm_marlin_available,
-                make_marlin_runner,
-                prepare_marlin_weights,
-            )
-
-            ok, detail = is_vllm_marlin_available()
-            if not ok:
-                raise RuntimeError(
-                    "marlin backend requested but vLLM's Marlin nvfp4 GEMM is "
-                    f"unavailable: {detail}. Install vLLM (with its compiled _C "
-                    "ops) into this environment."
-                )
-            prep = prepare_marlin_weights(w, device)
-            marlin_preps[backend] = prep
-            backend_runners[backend] = make_marlin_runner(prep, n, k)
-            continue
         b_p, sf_p, alpha_p = flashinfer.prepare_w4a16_fp4_weights(
             b_fp4, b_sf, alpha, backend=backend
         )
@@ -1542,42 +1505,13 @@ def testMmW4A16Fp4(args):
         runner = backend_runners[backend]
         if run_refcheck:
             out = runner(a)
-            if backend == "marlin":
-                # Marlin uses independently-generated FP4 weights (perf parity,
-                # not bit-identical to FlashInfer's quantization of w), so it
-                # cannot match the FlashInfer fp32 gold.  Validate it against
-                # its own fp32 dequant reference with a mean-relative-error
-                # metric (as vLLM's own Marlin test does) -- robust to the few
-                # bf16 accumulation-order outliers near cancellation that a
-                # strict elementwise check trips on at large K.
-                w_ref = marlin_preps[backend]["w_ref"]  # (K, N), bf16 dequant
-                target = a.float() @ w_ref.float()
-                rel_err = (
-                    (out.float() - target).abs().mean() / (target.abs().mean() + 1e-12)
-                ).item()
-                marlin_tol = 5e-2
-                if rel_err > marlin_tol:
-                    msg = (
-                        f"marlin mean-rel-err {rel_err:.3e} exceeds {marlin_tol:.1e} "
-                        "vs self dequant ref"
-                    )
-                    if args.allow_output_mismatch:
-                        print(f"[WARNING] {msg}")
-                    else:
-                        raise AssertionError(msg)
-                elif args.verbose >= 1:
-                    print(
-                        f"[INFO] marlin refcheck OK (mean-rel-err {rel_err:.3e} "
-                        "vs self dequant ref)"
-                    )
-            else:
-                try:
-                    torch.testing.assert_close(out, ref, **refcheck_tol)
-                except AssertionError as e:
-                    if args.allow_output_mismatch:
-                        print(f"[WARNING] {backend} output mismatch vs fp32 ref: {e}")
-                    else:
-                        raise
+            try:
+                torch.testing.assert_close(out, ref, **refcheck_tol)
+            except AssertionError as e:
+                if args.allow_output_mismatch:
+                    print(f"[WARNING] {backend} output mismatch vs fp32 ref: {e}")
+                else:
+                    raise
 
         timing = bench_gpu_time(
             runner,
