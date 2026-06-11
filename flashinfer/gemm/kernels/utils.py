@@ -17,6 +17,9 @@ limitations under the License.
 from ...fused_moe.utils import last_positive_power_of_2
 
 _SM100_MMA_TILER_MN_CANDIDATES = [
+    (128, 8),
+    (128, 16),
+    (128, 32),
     (128, 64),
     (256, 64),
     (128, 128),
@@ -91,6 +94,8 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
     best_score = -1.0
 
     for tile_m, tile_n in _SM100_MMA_TILER_MN_CANDIDATES:
+        if tile_n < 64 and prob_n > tile_n:
+            continue
         n_tiles = (prob_n + tile_n - 1) // tile_n
         n_eff = prob_n / (n_tiles * tile_n)
         tile_area_factor = ((tile_m * tile_n) / max_tile_area) ** 0.5

@@ -28,6 +28,7 @@ from .flashinfer_benchmark_utils import (
     is_close_stats,
     print_perf_metrics,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
 
 
@@ -245,7 +246,9 @@ def testSoftmax(args):
 
     def run_backend(backend, logits):
         if backend == "cuda":
-            return flashinfer.sampling.softmax(logits, temperature=temperature)
+            return flashinfer.sampling.softmax(
+                logits, temperature=temperature, enable_pdl=args.enable_pdl
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -328,6 +331,7 @@ def testSamplingFromProbs(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testSamplingFromProbs")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -427,6 +431,7 @@ def testSamplingFromLogits(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testSamplingFromLogits")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -527,6 +532,7 @@ def testTopKSamplingFromProbs(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopKSamplingFromProbs")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -629,6 +635,7 @@ def testTopPSamplingFromProbs(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopPSamplingFromProbs")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -731,6 +738,7 @@ def testTopKTopPSamplingFromProbs(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopKTopPSamplingFromProbs")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -844,6 +852,7 @@ def testTopKTopPSamplingFromLogits(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopKTopPSamplingFromLogits")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -958,6 +967,7 @@ def testMinPSamplingFromProbs(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testMinPSamplingFromProbs")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1060,6 +1070,7 @@ def testTopKRenormProbs(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopKRenormProbs")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1193,6 +1204,7 @@ def testTopPRenormProbs(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopPRenormProbs")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1330,6 +1342,7 @@ def testTopKMaskLogits(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopKMaskLogits")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1477,6 +1490,7 @@ def testChainSpeculativeSampling(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testChainSpeculativeSampling")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1599,6 +1613,7 @@ def testTopK(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopK")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1744,6 +1759,7 @@ def testTopKPageTableTransform(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopKPageTableTransform")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1894,6 +1910,7 @@ def testTopKRaggedTransform(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testTopKRaggedTransform")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")

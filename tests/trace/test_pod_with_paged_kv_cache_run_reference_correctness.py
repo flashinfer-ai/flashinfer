@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
 )
 
 
@@ -77,7 +77,12 @@ def test_pod_with_paged_kv_cache_run_reference_correctness(shape_kwargs):
         run["paged_kv_cache_d"],
     )
     # Matches tests/utils/test_pod_kernels.py.
-    _close(out_p, ref_p, atol=1e-3, rtol=1e-3)
-    _close(out_d, ref_d, atol=1e-3, rtol=1e-3)
+    _check(
+        pod_with_paged_kv_cache_run_trace,
+        (ref_p, ref_d),
+        (out_p, out_d),
+        atol=1e-3,
+        rtol=1e-3,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

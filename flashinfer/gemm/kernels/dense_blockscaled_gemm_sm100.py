@@ -1339,7 +1339,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 )
             )
 
-            tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
+            tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC
             )
@@ -1630,7 +1630,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(
+        tTR_rAcc = cute.make_rmem_tensor(
             tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
         )
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
@@ -1959,7 +1959,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Skip invalid mma tile shape
         if mma_tiler_mn[0] not in [128, 256]:
             is_valid = False
-        if mma_tiler_mn[1] not in [64, 128, 192, 256]:
+        if mma_tiler_mn[1] not in [8, 16, 32, 64, 128, 192, 256]:
             is_valid = False
         # Skip illegal cluster shape
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
@@ -2081,6 +2081,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if not cls.is_valid_tensor_alignment(
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
+            can_implement = False
+
+        if mma_tiler_mn[1] < 64 and (n > mma_tiler_mn[1] or cluster_shape_mn[1] > 1):
             can_implement = False
         return can_implement
 

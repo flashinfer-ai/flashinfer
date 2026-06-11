@@ -5,7 +5,7 @@ import pytest
 
 from tests.trace.reference_utils import (
     _assert_finite,
-    _close,
+    _check,
 )
 
 
@@ -24,6 +24,6 @@ def test_softmax_reference_correctness(shape_kwargs):
         inputs["logits"], temperature=inputs["temperature"]
     )
     _assert_finite(api_out, ref_out)
-    _close(api_out, ref_out, atol=1e-3, rtol=1e-3)
+    _check(softmax_trace, ref_out, api_out, atol=1e-3, rtol=1e-3)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

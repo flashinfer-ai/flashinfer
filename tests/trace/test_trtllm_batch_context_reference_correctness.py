@@ -5,7 +5,7 @@ import torch
 import pytest
 
 from tests.trace.reference_utils import (
-    _close,
+    _check,
     _skip_if_not_sm100_or_103,
 )
 
@@ -94,6 +94,6 @@ def test_trtllm_batch_context_reference_correctness(shape_kwargs):
         kv_layout="HND",
     )
     # Matches tests/attention/test_cudnn_prefill.py bf16 tolerance.
-    _close(api_out, ref_out, atol=1e-2, rtol=1e-2)
+    _check(trtllm_batch_context_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
