@@ -544,27 +544,31 @@ void run(Data& data, void* stream) {
       data.mPtrExpertCounts = nullptr;
     }
 
-    static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    int const numBlocksCoop = smCount - 8;
-    int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
-
     if (useSingleCluster) {
       launchClusterKernel(data, numThreadsHist, stream);
-    } else if (data.mNumTokens <= maxTokensCoop) {
-      launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
     } else {
-      const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
-      const int32_t histogramEltsPerBlock = 8 * numThreadsHist;
-      const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
-      const int32_t maxNumBlocks = 1024;
+      static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+      CoopLaunchSMCounts const coopLaunchSMCounts = getCoopLaunchSMCounts(smCount);
+      int const numBlocksCoop = coopLaunchSMCounts.moeSms;
+      int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
 
-      int const numBlocksHistogram = std::min(
-          (expandedIdxSize + histogramEltsPerBlock - 1) / histogramEltsPerBlock, maxNumBlocks);
-      int const numBlocksOffsets =
-          std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
+      if (data.mNumTokens <= maxTokensCoop) {
+        logCoopLaunchSMCounts(coopLaunchSMCounts);
+        launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
+      } else {
+        const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
+        const int32_t histogramEltsPerBlock = 8 * numThreadsHist;
+        const int32_t offsetEltsPerBlock = NumEltsPerOffsetTilePerThread * numThreadsHist;
+        const int32_t maxNumBlocks = 1024;
 
-      launchHistogramKernel(data, numBlocksHistogram, numThreadsHist, stream);
-      launchOffsetsKernel(data, numBlocksOffsets, numThreadsHist, stream);
+        int const numBlocksHistogram = std::min(
+            (expandedIdxSize + histogramEltsPerBlock - 1) / histogramEltsPerBlock, maxNumBlocks);
+        int const numBlocksOffsets =
+            std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
+
+        launchHistogramKernel(data, numBlocksHistogram, numThreadsHist, stream);
+        launchOffsetsKernel(data, numBlocksOffsets, numThreadsHist, stream);
+      }
     }
   }
 }
