@@ -18,12 +18,17 @@
 //
 // PROTOTYPE / DESIGN DRAFT — structure for review, expect compile iteration.
 //
-// Computes the conv1d-coefficient block (equations C1/C2/C5 + the
-// old_dt/old_cumAdt cache writes) and stores two scratch tensors the `main`
-// kernel consumes:
+// Computes the conv1d-coefficient block (equations C1/C2/C5/C6) and owns the
+// cache writes for the data only IT holds — old_dt/old_cumAdt (C7, from its
+// dt/cumAdt) and old_B (from smem.B; the main reads cb_scaled and never loads
+// B).  The main owns old_x (it loads x) and state.  Stores three scratch
+// tensors the `main` kernel consumes:
 //   cb_scaled : bf16, FRAGMENT-NATIVE [batch, nheads, lane(0..31), reg(0..7)] —
 //               equation C5 laid out as matmul-4's fragA, so the main reads it
 //               with one LDG.128 per thread straight into fragA.
+//   cb_old    : bf16, same fragA-native layout — equation C6 (NO-WRITE path
+//               only; the write path folds old tokens into state via the
+//               replay).  Main does OUT.3 = cb_old @ old_x.
 //   decay_vec : f32, (batch, nheads, NPREDICTED_PAD_MMA_M) — exp(cumAdt[t]),
 //               the per-head β factor for the main's OUT.1 (β·C@state).
 //
@@ -502,6 +507,18 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
                                             prev_k);
   }
 
+  // ── old_B cache writeback (per-group, D-independent) ──
+  // The new B tokens become the buffered "old" for the next step's replay /
+  // CB_old.  Only the precompute holds smem.B (the main reads cb_scaled and
+  // never loads B), so it owns this writeback.  W0/1 hold smem.B; fires before
+  // the CB MMA so the STG overlaps it (hoisted exactly like the monolithic).
+  // store_old_B self-gates on head % HEADS_PER_GROUP — first_head qualifies.
+  if (warp < 2) {
+    store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, first_head,
+                                                              group_idx, cache_slot, buf_write,
+                                                              write_offset, seq_len);
+  }
+
   // ── Raw matmul-1 — ONCE per group, all 4 warps (no-write) ──
   // W0/1 → C·B (C5, new tokens) → smem.CB; W2/3 → C·old_B (C6, old tokens,
   // no-write only) → smem.CB_old.  On the WRITE path W2/3 idle here (the main
@@ -595,8 +612,6 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       }
     }
   }
-  (void)buf_write;
-  (void)write_offset;
 }
 
 }  // namespace flashinfer::mamba::checkpointing
