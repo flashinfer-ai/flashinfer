@@ -85,7 +85,16 @@ whole-process device-side-assert abort that would block B200 CI. Run it explicit
 NOTE: `pytest --forked` does NOT work here (CUDA inits at collection ->
 "Cannot re-initialize CUDA in forked subprocess"); for crash-isolated enumeration run each
 test id in its own process instead (see var/03-ssh-docker-workflow.md).
-Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0).
+Env: FLASHINFER_UMOE_FUZZ_NUM_TESTS (default 80), FLASHINFER_UMOE_FUZZ_SEED (default 0),
+     FLASHINFER_UMOE_FUZZ_ONLY_SEED (comma-separated seeds -> run ONLY those configs; the
+     perfect-repro hook printed on every test).
+
+Determinism / repro / diagnostics: every config is fully derived from its seed -- shapes
+(random.Random(seed)), input tensors + output-buffer init (per-config torch.Generator), and the
+global RNG (torch.manual_seed(seed)) -- so a failing test reproduces bit-for-bit from the REPRO
+command it prints. Each test prints its full config + repro command (visible with `-s`, or on
+failure); on a numeric mismatch it dumps output-vs-oracle stats + the worst <=30 elements, so the
+CI log alone tells you whether the output is all-zero / all-NaN / Inf without having to rerun.
 
 ------------------------------------------------------------------------------------------------
 EXTENDING (cheap, by design):
@@ -183,6 +192,10 @@ from flashinfer.utils import get_compute_capability
 
 NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "80"))
 BASE_SEED = int(os.environ.get("FLASHINFER_UMOE_FUZZ_SEED", "0"))
+# Perfect-repro hook: if set (comma-separated seeds), the suite runs ONLY those configs. A curated
+# seed maps to its hand-written Cfg; any other seed is regenerated via the deterministic _gen(seed),
+# so a single seed reproduces exactly one config. The repro command printed on every test uses this.
+_ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 
 # --- CI-safety gate: OPT-IN ----------------------------------------------------------------
 # Waived in CI pending gh #3547 + root-cause of a whole-process abort. Running the SM100 fuzzer
@@ -274,13 +287,13 @@ class DTypeHandler:
     rtol: float
 
 
-def _nvfp4_poison(buf):
-    """Fill a bf16 output buffer with large garbage + scattered NaN/±Inf. If a kernel reads or
-    scatter-adds into an uninitialized output instead of fully writing it, the poison leaks and
-    is caught by no-NaN / numeric. This is the torch->JAX buffer-hygiene guard: torch's caching
-    allocator usually hands back clean memory (masking the bug), JAX/XLA donates dirty buffers
-    (the GH-6158764 class)."""
-    g = torch.randn_like(buf) * 1e4
+def _nvfp4_poison(buf, gen):
+    """Fill a bf16 output buffer with large garbage + scattered NaN/±Inf, DETERMINISTICALLY (from a
+    per-config seeded generator, so a failure repros bit-for-bit). If a kernel reads or scatter-adds
+    into an uninitialized output instead of fully writing it, the poison leaks and is caught by
+    no-NaN / numeric. This is the torch->JAX buffer-hygiene guard: torch's caching allocator usually
+    hands back clean memory (masking the bug), JAX/XLA donates dirty buffers (the GH-6158764 class)."""
+    g = torch.randn(buf.shape, generator=gen, device=buf.device, dtype=buf.dtype) * 1e4
     flat = g.view(-1)
     flat[0::4], flat[1::4], flat[2::4] = float("nan"), float("inf"), float("-inf")
     buf.copy_(g)
@@ -618,7 +631,14 @@ _CURATED = [
         routed_scaling=1.0,
     ),  # DeepSeekV3 mid-size (top_k 8 < 2*128/4=64), non-pow2 intermediate
 ]
-_CONFIGS = _CURATED + [_gen(BASE_SEED + i) for i in range(NUM_TESTS)]
+if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
+    _curated_by_seed = {c.seed: c for c in _CURATED}
+    _CONFIGS = [
+        _curated_by_seed.get(s) or _gen(s)
+        for s in (int(t) for t in _ONLY_SEEDS.split(",") if t.strip())
+    ]
+else:
+    _CONFIGS = _CURATED + [_gen(BASE_SEED + i) for i in range(NUM_TESTS)]
 
 
 def _route(
@@ -761,17 +781,86 @@ def _is_unsupported(e):
     return isinstance(e, NotImplementedError) or any(s in msg for s in _SKIP_SUBSTR)
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics: every test prints its full config + a perfect-repro command; on a mismatch we dump
+# output-vs-oracle stats + the worst <=30 elements, so the CI log alone tells you whether the output
+# is all-zero / all-NaN / Inf without having to rerun. (Mirrors tests/gemm/test_unified_gemm_fuzz.py.)
+# ---------------------------------------------------------------------------
+def _describe(cfg: Cfg) -> str:
+    return (
+        f"CONFIG {cfg.label}\n"
+        f"  variant={cfg.variant} routing={cfg.routing_input_mode} "
+        f"method={cfg.routing_method.name} logits_dtype={cfg.logits_dtype} route={cfg.route}\n"
+        f"  shape: tokens={cfg.num_tokens} hidden={cfg.hidden} intermediate={cfg.intermediate}  "
+        f"experts={cfg.num_experts} top_k={cfg.top_k}\n"
+        f"  EP: n_local={cfg.n_local} expert_offset={cfg.expert_offset} (is_ep={cfg.is_ep})  "
+        f"group: n_group={cfg.n_group} topk_group={cfg.topk_group} "
+        f"routed_scaling={cfg.routed_scaling}  seed={cfg.seed}"
+    )
+
+
+def _repro(cfg: Cfg) -> str:
+    cuda = os.environ.get("CUDA_HOME", "<cuda>")
+    dev = os.environ.get("CUDA_VISIBLE_DEVICES", "<sm100-idx>")
+    return (
+        f"REPRO: CUDA_HOME={cuda} CUDA_VISIBLE_DEVICES={dev} FLASHINFER_UMOE_FUZZ=1 "
+        f"FLASHINFER_UMOE_FUZZ_ONLY_SEED={cfg.seed} "
+        f"pytest -s tests/moe/test_unified_moe_fuzz.py::test_unified_moe_fuzz"
+    )
+
+
+def _stats(t: torch.Tensor) -> str:
+    tf = t.float()
+    n = tf.numel()
+    return (
+        f"shape={tuple(t.shape)} dtype={t.dtype} nan={int(torch.isnan(tf).sum())} "
+        f"inf={int(torch.isinf(tf).sum())} zero={int((tf == 0).sum())}/{n} "
+        f"max|.|={tf.abs().nan_to_num().max().item():.4g}"
+    )
+
+
+def _dump(out: torch.Tensor, ref: torch.Tensor, k: int = 30) -> str:
+    of, rf = out.float().reshape(-1), ref.float().reshape(-1)
+    diff = (of - rf).abs()
+    # rank by |diff|, treating non-finite diffs as worst so NaN/Inf elems surface first.
+    diffn = torch.where(torch.isfinite(diff), diff, torch.full_like(diff, float("inf")))
+    idx = torch.topk(diffn, min(k, diffn.numel())).indices.tolist()
+    lines = [
+        f"  output: {_stats(out)}",
+        f"  oracle: {_stats(ref)}",
+        f"  worst {len(idx)} elems  [flat_idx]  output  vs  oracle:",
+    ]
+    lines += [f"    [{i}] {of[i].item():.6g}  vs  {rf[i].item():.6g}" for i in idx]
+    return "\n".join(lines)
+
+
+def _fail(cfg: Cfg, tag: str, why: str, out=None, ref=None):
+    parts = [f"{tag}: {why}", _describe(cfg)]
+    if out is not None and ref is not None:
+        parts.append(_dump(out, ref))
+    parts.append(_repro(cfg))
+    pytest.fail("\n".join(parts))
+
+
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
 def test_unified_moe_fuzz(cfg):
     if not torch.cuda.is_available():
         pytest.skip("no CUDA")
-    # Full per-config determinism so any failure reproduces from the seed in the test id alone.
-    # Shapes (random.Random(seed)) and the input tensors (a per-config torch.Generator) are already
-    # seeded; this also pins the two GLOBAL-RNG draws -- the poison garbage and the device probe --
-    # so the entire run is bitwise-reproducible from `cfg.seed`. (Autotune winner selection is
-    # timing-based and may vary run-to-run, but every tactic is validated, so a correctness failure
-    # still reproduces via the tactic sweep regardless of which winner the tuner picks.)
+    # Full per-config determinism so any failure reproduces from the seed alone. Shapes
+    # (random.Random(seed)) and input tensors (a per-config torch.Generator) are already seeded;
+    # this pins the global RNG (the device probe), and the output buffer is initialized from the
+    # dedicated `poison_gen` below -- so the entire run is bitwise-reproducible from `cfg.seed`.
+    # (Autotune winner selection is timing-based and may vary run-to-run, but every tactic is
+    # validated, so a correctness failure still reproduces via the tactic sweep regardless of which
+    # winner the tuner picks.)
     torch.manual_seed(cfg.seed)
+    # Dedicated generator for output-buffer init, decoupled from the input generator's stream so the
+    # poison/zero fill is deterministic regardless of how many runners/calls a config drives.
+    poison_gen = torch.Generator(device="cuda").manual_seed(cfg.seed + 1_000_003)
+    # Every test prints its full config + the exact repro command (captured by pytest; shown on
+    # failure, or always with `-s`) so a CI log is self-explanatory without a rerun.
+    print("\n" + _describe(cfg))
+    print(_repro(cfg))
     sm = get_compute_capability(torch.device("cuda:0"))
     sm = sm[0] * 10 + sm[1]
 
@@ -855,36 +944,49 @@ def test_unified_moe_fuzz(cfg):
 
     def run(runner, poison=False):
         inputs = runner.pack_inputs(act_pack, weight_pack)
-        if poison:
-            # The output buffer is a kernel-owned `new_empty` tensor inside the inputs list
-            # (cute_dsl idx 11, trtllm the `output=`); locate it by dtype+shape and poison it.
-            bufs = [
-                t
-                for t in inputs
-                if torch.is_tensor(t)
-                and t.dtype == handler.out_dtype
-                and tuple(t.shape) == out_shape
-            ]
-            assert bufs, "could not locate the output buffer in pack_inputs to poison"
-            for b in bufs:
-                handler.poison(b)
+        # Deterministically initialize the kernel-owned output buffer (a `new_empty` in the runner's
+        # pack_inputs; cute_dsl idx 11, trtllm the `output=`), located by dtype+shape: clean=zeros,
+        # poison=seeded garbage+NaN/Inf. Both are bit-reproducible from cfg.seed, so any failure --
+        # including a partial-write that depends on the buffer -- reproduces exactly.
+        bufs = [
+            t
+            for t in inputs
+            if torch.is_tensor(t)
+            and t.dtype == handler.out_dtype
+            and tuple(t.shape) == out_shape
+        ]
+        assert bufs, "could not locate the output buffer in pack_inputs"
+        for b in bufs:
+            handler.poison(b, poison_gen) if poison else b.zero_()
         out = runner.forward(inputs, tactic=-1)
         out = (out[0] if isinstance(out, (list, tuple)) else out).float()
         torch.cuda.synchronize()
         return out
 
     def assert_correct(out, tag):
-        # no NaN/Inf where the reference is finite.
+        # (1) no NaN/Inf where the reference is finite.
         n_bad = int(((~torch.isfinite(out)) & torch.isfinite(ref)).sum().item())
-        assert n_bad == 0, f"{tag}: {n_bad} non-finite outputs vs finite reference"
-        # numeric vs the canonical quant-aware reference (the authority), magnitude-scaled.
+        if n_bad != 0:
+            _fail(
+                cfg,
+                tag,
+                f"{n_bad}/{out.numel()} non-finite outputs where oracle is finite "
+                f"(#2569/#3103-class)",
+                out,
+                ref,
+            )
+        # (2) numeric vs the canonical quant-aware reference (the authority), magnitude-scaled.
         abs_diff = (out - ref).abs()
         over_tol = abs_diff > (atol + rtol * ref.abs())
         if over_tol.any():
-            pytest.fail(
-                f"{tag}: {int(over_tol.sum())}/{out.numel()} elems exceed "
-                f"(rtol={rtol} atol={atol:.3g}); max|diff|={abs_diff.max().item():.4g}, "
-                f"‖ref‖∞={ref.abs().max().item():.4g}"
+            _fail(
+                cfg,
+                tag,
+                f"{int(over_tol.sum())}/{out.numel()} elems exceed tol "
+                f"(rtol={rtol} atol={atol:.3g}; max|diff|={abs_diff.max().item():.4g}, "
+                f"‖ref‖∞={ref.abs().max().item():.4g})",
+                out,
+                ref,
             )
 
     def check_backend(runner, out, tag):
@@ -893,11 +995,15 @@ def test_unified_moe_fuzz(cfg):
         # (3) determinism per the backend's contract: deterministic backends must reproduce
         # bitwise; non-deterministic ones (atomic-scatter finalize) are exempt.
         if _DETERMINISTIC.get(runner.backend_key, False):
-            if not torch.equal(out, run(runner)):
-                drift = (out - run(runner)).abs().max().item()
-                pytest.fail(
-                    f"{tag}: declared DETERMINISTIC but not bitwise-reproducible "
-                    f"(max abs diff {drift:.3e})"
+            out2 = run(runner)
+            if not torch.equal(out, out2):
+                _fail(
+                    cfg,
+                    tag,
+                    "declared DETERMINISTIC but not bitwise-reproducible across identical runs "
+                    "(#2514-class); 'output' = first run, 'oracle' = second run",
+                    out,
+                    out2,
                 )
         # (4) output-buffer poison: the kernel owns its (uninitialized `new_empty`) output, so the
         # result must NOT depend on it being clean. torch's allocator usually hands back zeros and
@@ -1011,6 +1117,16 @@ def test_autotune_cache_coherence(base):
 
     E, H, I = base
     top_k = 4
+    _cuda = os.environ.get("CUDA_HOME", "<cuda>")
+    _dev = os.environ.get("CUDA_VISIBLE_DEVICES", "<sm100-idx>")
+    _repro_cmd = (
+        f"REPRO: CUDA_HOME={_cuda} CUDA_VISIBLE_DEVICES={_dev} FLASHINFER_UMOE_FUZZ=1 "
+        f"pytest -s tests/moe/test_unified_moe_fuzz.py::test_autotune_cache_coherence -k e{E}h{H}i{I}"
+    )
+    print(
+        f"\nCACHE-COHERENCE base=e{E}h{H}i{I} top_k={top_k} token_seq={_CACHE_TOKEN_SEQ}"
+    )
+    print(_repro_cmd)
     g = torch.Generator(device="cuda").manual_seed(12345)
 
     def sparse(*shape):
@@ -1061,10 +1177,13 @@ def test_autotune_cache_coherence(base):
             torch.cuda.synchronize()
             tag = f"cache-seq T={num_tokens} (winner={layer.winner_backend}) {base}"
             n_bad = int(((~torch.isfinite(out)) & torch.isfinite(ref)).sum().item())
-            assert n_bad == 0, f"{tag}: {n_bad} non-finite outputs"
             atol = handler.atol_frac * ref.abs().max().item() + 1e-3
             over = (out - ref).abs() > (atol + handler.rtol * ref.abs())
-            assert not over.any(), (
-                f"{tag}: {int(over.sum())} elems exceed tol "
-                f"(max|diff|={(out - ref).abs().max().item():.4g}) -- stale/mis-keyed cached winner?"
-            )
+            if n_bad != 0 or over.any():
+                why = (
+                    f"{n_bad} non-finite outputs"
+                    if n_bad
+                    else f"{int(over.sum())} elems exceed tol "
+                    f"(max|diff|={(out - ref).abs().max().item():.4g}) -- stale/mis-keyed cached winner?"
+                )
+                pytest.fail(f"{tag}: {why}\n{_dump(out, ref)}\n{_repro_cmd}")
