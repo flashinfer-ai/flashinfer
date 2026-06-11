@@ -71,7 +71,7 @@ class PackGQA:
         m_block_size: cutlass.Constexpr[int],
         head_dim_padded: cutlass.Constexpr[int],
         check_hdim_oob: cutlass.Constexpr[bool],
-        qhead_per_kvhead: cutlass.Constexpr[bool],
+        qhead_per_kvhead: cutlass.Constexpr[int],
     ):
         self.m_block_size = m_block_size
         self.head_dim_padded = head_dim_padded
