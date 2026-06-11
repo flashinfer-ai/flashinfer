@@ -507,12 +507,15 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       scale_store_cb_gmem<input_t>(smem, warp, lane, seq_len, cb_gmem_head);
       // C7 + cache: store old_dt / old_cumAdt at write_offset (reuse
       // store_old_dt / store_old_cumAdt, common.cuh:1582+).  TODO(cache).
-    }
 
-    // WAR: this iter's cross-lane reads of smem.dt/cumAdt[warp] must complete
-    // before the next iter overwrites them (single-slot reuse).  A double-buffer
-    // [NUM_WARPS][2] would remove this and let the next scan overlap the store.
-    __syncwarp();
+      // WAR: the cross-lane reads of smem.dt/cumAdt[warp] above must complete
+      // before the NEXT iter overwrites them (single-slot reuse).  Lives inside
+      // has_head: only a warp that read this iter can clash with its own next
+      // write, and has_head is monotonic in iter (h only grows) so a warp that
+      // drops out never writes again.  A double-buffer [NUM_WARPS][2] would
+      // remove this and let the next scan overlap the store.
+      __syncwarp();
+    }
   }
   (void)buf_write;
   (void)write_offset;
