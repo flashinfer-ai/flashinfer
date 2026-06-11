@@ -1710,7 +1710,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         If no value is provided, then standard attention is used.
         Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
         The actual threshold value equals the provided threshold_scale_factor divided by the context length.
-        Not supported together with ``cum_seq_lens_q``.
     enable_pdl : Optional[bool]
         Programmatic Dependent Launch toggle.  When ``None`` (default), auto-detects
         support from the query device.  Honoured by the ``trtllm-gen`` and ``xqa``
@@ -1901,11 +1900,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 "sparse MLA (sparse_mla_top_k > 0) is not supported with "
                 "variable-length queries (cum_seq_lens_q) for trtllm-gen"
-            )
-        if skip_softmax_threshold_scale_factor is not None:
-            raise ValueError(
-                "skip_softmax is not supported with variable-length queries "
-                "(cum_seq_lens_q) for trtllm-gen MLA"
             )
         if return_lse or lse is not None:
             raise NotImplementedError(
