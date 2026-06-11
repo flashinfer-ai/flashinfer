@@ -470,6 +470,12 @@ class KernelInputs:
     d_inner: int = 0  # nheads * head_dim
     conv_dim: int = 0  # d_inner + 2 * ngroups * d_state
 
+    # Two-kernel split scratch (None ⇒ monolithic).  The precompute overwrites
+    # them each iteration — graph-safe, no reset needed (like out_incr).
+    cb_scaled: torch.Tensor | None = None  # (batch, nheads, 32, 8) act_dtype
+    cumAdt_vec: torch.Tensor | None = None  # (batch, nheads, T_pad) f32
+    cb_old: torch.Tensor | None = None  # (batch, nheads, 32, K_old//2) act_dtype
+
     def reset(self) -> None:
         """Restore ``*_work`` tensors to their pristine state."""
         self.state_work.copy_(self.state0)
@@ -555,6 +561,7 @@ def build_kernel_inputs(
     head_dim: int,
     d_state: int,
     ngroups: int,
+    two_kernel: bool = True,
 ) -> KernelInputs:
     """Build a fresh tensor bundle for one benchmark configuration."""
     (
@@ -595,6 +602,23 @@ def build_kernel_inputs(
     old_x0_5d = _old_x_to_5d(old_x0, cache_buf_idx0)
     d_inner = nheads * head_dim
     _conv_dim = d_inner + 2 * ngroups * d_state
+
+    # Two-kernel split scratch (graph-safe; overwritten by the precompute each
+    # iter).  fragA-native: cb_scaled m16n8k16 (8 regs/lane); cb_old m16n8k{K_old}
+    # (K_old/2 regs/lane), K_old = next_multiple_of<8>(max_window); cumAdt_vec f32
+    # over T_pad = next_multiple_of<16>(mtp_len).  See .plans/ssu_split.md.
+    cb_scaled = cumAdt_vec = cb_old = None
+    if two_kernel:
+        t_pad = ((mtp_len + 15) // 16) * 16
+        k_old = ((max_window + 7) // 8) * 8
+        cb_scaled = torch.empty(batch, nheads, 32, 8, device=x.device, dtype=act_dtype)
+        cumAdt_vec = torch.empty(
+            batch, nheads, t_pad, device=x.device, dtype=torch.float32
+        )
+        cb_old = torch.empty(
+            batch, nheads, 32, k_old // 2, device=x.device, dtype=act_dtype
+        )
+
     return KernelInputs(
         state0=state0,
         state_scale0=state_scale0,
@@ -636,6 +660,9 @@ def build_kernel_inputs(
         conv_bias=conv_bias,
         d_inner=d_inner,
         conv_dim=_conv_dim,
+        cb_scaled=cb_scaled,
+        cumAdt_vec=cumAdt_vec,
+        cb_old=cb_old,
     )
 
 
@@ -842,6 +869,9 @@ def _make_run_closure(
                     rand_seed=rand_seed,
                     philox_rounds=philox_rounds,
                     enable_pdl=external_pdl,
+                    cb_scaled=inputs.cb_scaled,
+                    cumAdt_vec=inputs.cumAdt_vec,
+                    cb_old=inputs.cb_old,
                 )
         else:
 
@@ -867,6 +897,9 @@ def _make_run_closure(
                     state_scale=inputs.state_scale_work,
                     rand_seed=rand_seed,
                     philox_rounds=philox_rounds,
+                    cb_scaled=inputs.cb_scaled,
+                    cumAdt_vec=inputs.cumAdt_vec,
+                    cb_old=inputs.cb_old,
                 )
 
         return _run
@@ -1467,6 +1500,7 @@ def _bench_config(
         head_dim=args.head_dim,
         d_state=args.d_state,
         ngroups=args.tp_ngroups,
+        two_kernel=args.two_kernel,
     )
 
     # Reuse args directly as the TimingOptions duck — it carries .warmup,
@@ -1915,6 +1949,14 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="L2 eviction between iterations",
+    )
+    parser.add_argument(
+        "--two-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the cuda-incr path as the two-kernel split (precompute + "
+        "main, caller-provided cb_scaled/cumAdt_vec/cb_old scratch). On by "
+        "default; --no-two-kernel runs the monolithic kernel instead.",
     )
     parser.add_argument(
         "--cuda-graph",
