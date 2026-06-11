@@ -101,10 +101,14 @@ template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint
 struct SharedStorageQKVO {
   static constexpr bool kVOSplit =
       kEnableVOSplitOpt && (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
-  // K/V smem time-sharing applies to both 16-bit (bf16/fp16) and 8-bit FP8 KV at hd512; only
-  // NVFP4 is excluded (its V-load path is separate and the VO-split kernel has no FP4 support).
-  static constexpr bool kVShareActive =
-      kVOSplit && !is_fp4_type_v<DTypeKV> && (HEAD_DIM_QK == HEAD_DIM_VO);
+  // K/V smem time-sharing: bf16/fp16 share at every tile (hd512 K+V cannot fit 100KB otherwise),
+  // while FP8 shares only for the CTA_TILE_Q=32 prefill tile (where sharing is what lets it fit
+  // 100KB). FP8 at CTA_TILE_Q=16 (decode / short-q) keeps the unshared layout: it already fits,
+  // and not sharing avoids serializing the K/V loads in the decode regime. NVFP4 is excluded (no
+  // FP4 V-load in the VO-split PV path).
+  static constexpr bool kVShareActive = kVOSplit && !is_fp4_type_v<DTypeKV> &&
+                                        (HEAD_DIM_QK == HEAD_DIM_VO) &&
+                                        (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   union {
     struct {
       alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
@@ -168,11 +172,13 @@ struct KernelTraits {
   static constexpr bool USE_VO_SPLIT = (NUM_MMA_D_VO > 16) && (NUM_MMA_D_VO % NUM_WARPS_KV == 0);
   static constexpr uint32_t NUM_MMA_D_VO_PER_WARP =
       USE_VO_SPLIT ? (NUM_MMA_D_VO / NUM_WARPS_KV) : NUM_MMA_D_VO;
-  // Time-share the K/V smem buffer (load K -> QK -> reuse buffer for V -> PV) for both bf16/fp16
-  // and FP8 KV at hd512; halving the K+V footprint is what lets fp8 CTA_TILE_Q=32 fit 100KB on
-  // SM120/SM121. NVFP4 is excluded (no FP4 V-load in the VO-split PV path).
-  static constexpr bool USE_KV_SHARED_SMEM =
-      USE_VO_SPLIT && !is_fp4_type_v<DTypeKV_> && (HEAD_DIM_QK == HEAD_DIM_VO);
+  // Time-share the K/V smem buffer (load K -> QK -> reuse buffer for V -> PV). bf16/fp16 share at
+  // every tile; FP8 shares only for the CTA_TILE_Q=32 prefill tile -- halving K+V is what lets fp8
+  // CTA32 fit 100KB on SM120/SM121, whereas fp8 CTA_TILE_Q=16 (decode/short-q) already fits
+  // unshared and skips the load serialization. NVFP4 excluded (no FP4 V-load in VO-split PV).
+  static constexpr bool USE_KV_SHARED_SMEM = USE_VO_SPLIT && !is_fp4_type_v<DTypeKV_> &&
+                                             (HEAD_DIM_QK == HEAD_DIM_VO) &&
+                                             (sizeof(DTypeKV_) == 2 || CTA_TILE_Q_ > 16);
   static constexpr uint32_t UPCAST_STRIDE_Q = HEAD_DIM_QK / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_K = HEAD_DIM_QK / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeKV_>();
@@ -3517,11 +3523,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
   constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                               (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
-  // Matches KernelTraits::USE_KV_SHARED_SMEM: K/V share one smem buffer for bf16/fp16 and FP8
-  // (not NVFP4), so the occupancy budget counts the K/V footprint once.
+  // Matches KernelTraits::USE_KV_SHARED_SMEM: K/V share one smem buffer for bf16/fp16 at every
+  // tile and for FP8 only at CTA_TILE_Q=32 (not NVFP4), so the occupancy budget counts the K/V
+  // footprint once exactly when the kernel actually shares it.
   constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
                              ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
-                             (HEAD_DIM_QK == HEAD_DIM_VO);
+                             (HEAD_DIM_QK == HEAD_DIM_VO) &&
+                             (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   constexpr bool kVOSplitDispatch =
       (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
   constexpr uint32_t kKVSmemPerMmaKV =
