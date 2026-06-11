@@ -121,15 +121,17 @@ __device__ __forceinline__ void load_group_BC(SmemT& smem, CheckpointingSsuParam
 // smem.dt[warp].  dt is tiny (NPREDICTED floats/head, T-axis stride
 // dt_stride_token = nheads), so an on-the-fly strided LDG is fine — no cp.async.
 // Same compute as load_pre_pdl_wait_data's dt→dt_proc block (common.cuh:613).
-template <typename dt_t, int NPREDICTED, typename SmemT>
-__device__ __forceinline__ void load_dt_pw(SmemT& smem, CheckpointingSsuParams const& params,
-                                           int warp, int lane, int head, int64_t outer,
-                                           float dt_bias_val, int seq_len) {
+// DT_SOFTPLUS is JIT-stamped (the launcher reads params.dt_softplus once and
+// dispatches), so the softplus branch folds away at compile time.
+template <typename dt_t, int NPREDICTED, bool DT_SOFTPLUS, typename SmemT>
+__device__ __forceinline__ void load_dt(SmemT& smem, CheckpointingSsuParams const& params, int warp,
+                                        int lane, int head, int64_t outer, float dt_bias_val,
+                                        int seq_len) {
   if (lane < seq_len) {
     auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
     int64_t const base = outer * params.dt_stride_seq + head;
     float dt_val = toFloat(dt_ptr[base + (int64_t)lane * params.dt_stride_token]) + dt_bias_val;
-    if (params.dt_softplus) dt_val = thresholded_softplus(dt_val);
+    if constexpr (DT_SOFTPLUS) dt_val = thresholded_softplus(dt_val);
     smem.dt[warp][lane] = dt_val;
   }
 }
@@ -283,7 +285,7 @@ __device__ __forceinline__ void scale_store_cb_gmem(
 // PRECOMPUTE kernel.  Template params mirror checkpointing_ssu_kernel.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, int NPREDICTED, int MAX_WINDOW, int DIM, int DSTATE,
-          int HEADS_PER_GROUP, int NUM_WARPS, bool VARLEN = false>
+          int HEADS_PER_GROUP, int NUM_WARPS, bool DT_SOFTPLUS, bool VARLEN = false>
 __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams params) {
   using SmemT = CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, DSTATE, NUM_WARPS>;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
@@ -363,8 +365,8 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
     if (has_head) {
       float const A_val = toFloat(A_ptr[head]);
       float const dt_bias_val = dt_bias_ptr ? toFloat(dt_bias_ptr[head]) : 0.f;
-      load_dt_pw<dt_t, NPREDICTED>(smem, params, warp, lane, head, outer, dt_bias_val,
-                                   seq_len);                   // C1
+      load_dt<dt_t, NPREDICTED, DT_SOFTPLUS>(smem, params, warp, lane, head, outer, dt_bias_val,
+                                             seq_len);         // C1
       compute_cumAdt_pw<NPREDICTED>(smem, warp, lane, A_val);  // C2
     }
 
