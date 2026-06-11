@@ -34,11 +34,12 @@ convention-compat fix) makes two previously-divergent APIs share a convention, m
 same conformance group and the test will *enforce* they now agree -- and the ledger entry's removal
 becomes the proof the convention was unified.
 
-STATUS: framework + 4 grounded adapters (bf16 mm / fp8 bmm / nvfp4 mm / mxfp4 mm), whose quantize +
-call code is carried over verbatim from the GPU-validated ``test_mm_fp4_fuzz.py`` /
-``test_bmm_fp8_fuzz.py``. NOT re-validated on GPU in the authoring session -- run on an SM100 box to
-confirm, then fold in more adapters (mm_fp8 low-latency, mm_mxfp8, bmm_mxfp8, the group_* /
-deepgemm grouped entries) one ``GemmAdapter`` at a time.
+STATUS: framework + 4 grounded adapters (bf16 mm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm) +
+a standalone quantize-root fuzzer. This file REPLACES the earlier per-op ``test_mm_fp4_fuzz.py`` /
+``test_bmm_fp8_fuzz.py`` (their logic + the #2440 quantize test are folded in here). Validated on
+SM100 (B200). EXTEND by folding in more adapters one ``GemmAdapter`` at a time: mm_fp8 (low-latency,
+needs ``prepare_low_latency_gemm_weights`` -- a distinct convention), mm_mxfp8, bmm_mxfp8, and the
+grouped ``group_*`` / ``*deepgemm*`` entries (m_indptr op-shape).
 
 Run (needs CUDA_HOME for JIT; SM100 for the fp4 adapters, SM89+ for fp8):
   CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<idx> pytest -q tests/gemm/test_unified_gemm_fuzz.py
@@ -50,7 +51,7 @@ from __future__ import annotations
 import os
 import random
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import pytest
 import torch
@@ -153,13 +154,13 @@ class GemmAdapter:
     backends: tuple  # selectable `backend=` values
     convention: dict  # DECLARED scale convention (the audit substrate)
     supported: Callable[[int], bool]  # (sm) -> bool
-    run: Callable  # (a_bf16, b_bf16, out, backend) -> None  (writes into `out`)
+    run: Callable  # (a_bf16, b_bf16, out, backend, cfg) -> None  (writes into `out`)
     deterministic: bool = True
     align: int = 1  # required N/K alignment (snap shapes to this)
 
 
 # --- bf16 mm: no quant convention -> the cross-backend EQUALITY oracle is valid here ----------
-def _run_bf16_mm(a, b, out, backend):
+def _run_bf16_mm(a, b, out, backend, cfg):
     # mm_bf16 wants b as [K, N] column-major == our [N, K]^T.
     o = mm_bf16(a, b.transpose(0, 1), out=out, out_dtype=out.dtype, backend=backend)
     if out.data_ptr() != o.data_ptr():
@@ -167,15 +168,17 @@ def _run_bf16_mm(a, b, out, backend):
 
 
 # --- fp8 bmm: per-tensor A/B scales passed as separate args, no output scale -------------------
-def _run_fp8_bmm(a, b, out, backend):
-    a_fp8, a_s = to_float8(a, dtype=torch.float8_e4m3fn)
+def _run_fp8_bmm(a, b, out, backend, cfg):
+    idt = cfg.fp8_idt or torch.float8_e4m3fn
+    mdt = cfg.fp8_mdt or torch.float8_e4m3fn
+    a_fp8, a_s = to_float8(a, dtype=idt)
     bt = b.transpose(-2, -1).contiguous()  # [B, K, N]
-    b_fp8, b_s = to_float8(bt, dtype=torch.float8_e4m3fn)
+    b_fp8, b_s = to_float8(bt, dtype=mdt)
     bmm_fp8(a_fp8, b_fp8, a_s, b_s, out.dtype, out, backend=backend)
 
 
 # --- nvfp4 mm: block(16) scales + a GLOBAL dequant scalar alpha = 1/(gsf_a*gsf_b) --------------
-def _run_nvfp4_mm(a, b, out, backend):
+def _run_nvfp4_mm(a, b, out, backend, cfg):
     gsf_a = (448 * 6) / a.float().abs().nan_to_num().max().clamp_min(1e-30)
     gsf_b = (448 * 6) / b.float().abs().nan_to_num().max().clamp_min(1e-30)
     a_q, a_sf = nvfp4_quantize(
@@ -202,7 +205,7 @@ def _run_nvfp4_mm(a, b, out, backend):
 
 
 # --- mxfp4 mm: block(32) scales only, NO global alpha (the convention that diverges from nvfp4) -
-def _run_mxfp4_mm(a, b, out, backend):
+def _run_mxfp4_mm(a, b, out, backend, cfg):
     a_q, a_sf = mxfp4_quantize(a)
     b_q, b_sf = mxfp4_quantize(b)
     mm_fp4(
@@ -340,14 +343,23 @@ class Cfg:
     k: int
     regime: str
     out_dtype: torch.dtype
+    fp8_idt: Optional[torch.dtype] = (
+        None  # fp8 A-operand dtype (e4m3/e5m2); None -> e4m3
+    )
+    fp8_mdt: Optional[torch.dtype] = None  # fp8 B-operand dtype
 
     @property
     def label(self):
         sh = f"b{self.b}_" if self.adapter.op_shape == "bmm" else ""
         dt = str(self.out_dtype).split(".")[-1]
+        fp8 = (
+            f"_{str(self.fp8_idt).split('_')[-1]}x{str(self.fp8_mdt).split('_')[-1]}"
+            if self.fp8_idt is not None
+            else ""
+        )
         return (
             f"{self.adapter.key}_{self.backend}_{sh}m{self.m}_n{self.n}_k{self.k}_"
-            f"{self.regime}_{dt}_s{self.seed}"
+            f"{self.regime}_{dt}{fp8}_s{self.seed}"
         )
 
 
@@ -358,16 +370,32 @@ def _gen(seed) -> Cfg:
     al = ad.align
     n = max(al, (rng.choice(_SHAPES_N) // al) * al)
     k = max(al, (rng.choice(_SHAPES_K) // al) * al)
+    fp8_idt = fp8_mdt = None
+    backends = ad.backends
+    if ad.quant_mode == "fp8":
+        fp8_idt = rng.choice([torch.float8_e4m3fn, torch.float8_e5m2])
+        # documented invalid combo: e5m2 x e5m2 -> force the other operand to e4m3.
+        fp8_mdt = (
+            torch.float8_e4m3fn
+            if fp8_idt == torch.float8_e5m2
+            else rng.choice([torch.float8_e4m3fn, torch.float8_e5m2])
+        )
+        # cutlass bmm_fp8 does NOT support e5m2 (test_bmm_fp8.py contract) -> don't offer it then
+        # (else it silently NaNs instead of NOT_SUPPORTED -- a minor robustness gap, out of scope).
+        if torch.float8_e5m2 in (fp8_idt, fp8_mdt):
+            backends = tuple(b for b in backends if b != "cutlass")
     return Cfg(
         seed=seed,
         adapter=ad,
-        backend=rng.choice(ad.backends),
+        backend=rng.choice(backends),
         b=rng.choice(_BATCH) if ad.op_shape == "bmm" else 1,
         m=rng.choice(_SHAPES_M),
         n=n,
         k=k,
         regime=rng.choice(_REGIMES),
         out_dtype=rng.choice([torch.bfloat16, torch.float16]),
+        fp8_idt=fp8_idt,
+        fp8_mdt=fp8_mdt,
     )
 
 
@@ -436,7 +464,7 @@ def test_unified_gemm_fuzz(cfg: Cfg):
 
     def _call(out):
         with autotune(False):  # determinism: pin the tactic
-            cfg.adapter.run(a, b, out, cfg.backend)
+            cfg.adapter.run(a, b, out, cfg.backend, cfg)
         torch.cuda.synchronize()
 
     try:
@@ -526,7 +554,7 @@ def test_convention_conformance(capsys):
                 out = _out_buffer(cfg)
                 try:
                     with autotune(False):
-                        ad.run(a, b, out, be)
+                        ad.run(a, b, out, be, cfg)
                     torch.cuda.synchronize()
                 except Exception as e:
                     if _is_unsupported(e):
@@ -554,3 +582,47 @@ def test_convention_conformance(capsys):
     matrix_lines.append(f"cross-backend conformance pairs checked: {checked_pairs}")
     with capsys.disabled():
         print("\n".join(matrix_lines))
+
+
+# ---------------------------------------------------------------------------
+# Standalone quantize-root fuzzer (the #2440 class): quantizing FINITE inputs must never emit
+# non-finite scale factors -- the root cause behind several low-precision GEMM NaN reports, and a
+# class a GEMM-call-only fuzzer reaches only indirectly. Ported from test_mm_fp4_fuzz.py's
+# test_fp4_quantize_fuzz and extended to fp8 to_float8.
+# ---------------------------------------------------------------------------
+_Q_CONFIGS = [
+    (rows, cols, regime, qmode)
+    for rows in (1, 7, 64, 2048)
+    for cols in (16, 64, 256, 1024)
+    for regime in ("tiny", "large", "with_zeros", "skewed", "normal")
+    for qmode in ("nvfp4", "mxfp4", "fp8")
+]
+
+
+@pytest.mark.parametrize(
+    "rows,cols,regime,qmode",
+    _Q_CONFIGS,
+    ids=[f"{q}_{r}x{c}_{g}" for r, c, g, q in _Q_CONFIGS],
+)
+def test_gemm_quantize_fuzz(rows, cols, regime, qmode):
+    """Quantizing finite inputs must never produce NaN/Inf scale factors (GH #2440)."""
+    block = {"nvfp4": 16, "mxfp4": 32, "fp8": 1}[qmode]
+    cols = max(block, (cols // block) * block)
+    x = _regime_tensor(
+        (rows, cols), regime, random.Random(hash((rows, cols, regime, qmode)) & 0xFFFF)
+    )
+    assert torch.isfinite(x.float()).all(), "test input itself is non-finite"
+    if qmode == "nvfp4":
+        gsf = (448 * 6) / x.float().abs().nan_to_num().max().clamp_min(1e-30)
+        _q, sf = nvfp4_quantize(
+            x, gsf, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+        )
+    elif qmode == "mxfp4":
+        _q, sf = mxfp4_quantize(x)
+    else:  # fp8 per-tensor
+        _q, sf = to_float8(x, dtype=torch.float8_e4m3fn)
+    n_bad = int((~torch.isfinite(sf.float())).sum().item())
+    assert n_bad == 0, (
+        f"{qmode} quantize({rows}x{cols},{regime}) produced {n_bad} non-finite "
+        f"scale-factor elements from finite input (GH #2440-class)"
+    )
