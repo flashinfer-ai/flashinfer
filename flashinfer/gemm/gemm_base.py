@@ -7119,6 +7119,7 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["trtllm", "cutile"] = "trtllm",
 ):
     if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(f"a must be a float8 tensor, but got {a.dtype}")
