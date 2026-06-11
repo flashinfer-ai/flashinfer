@@ -357,7 +357,8 @@ def _build_tensors(
 
 
 KernelName = Literal[
-    "cuda-incr",  # cuda_checkpointing_ssu
+    "cuda-incr",  # cuda_checkpointing_ssu (monolithic)
+    "cuda-incr-2k",  # cuda_checkpointing_ssu, two-kernel split (precompute + main)
     "incremental",  # Triton checkpointing_state_update (old 4D path)
     "triton-replay",  # Triton replay_selective_state_update — persistent_dynamic
     "triton-replay-pm",  # Triton replay_selective_state_update — persistent_main
@@ -842,7 +843,14 @@ def _make_run_closure(
             C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
             return x_conv, B_conv, C_conv
 
-    if kernel == "cuda-incr":
+    if kernel in ("cuda-incr", "cuda-incr-2k"):
+        # "cuda-incr-2k" passes the precompute scratch → the launcher routes to
+        # the two-kernel split; "cuda-incr" passes None → monolithic.  Both run
+        # in one bench for a direct comparison.
+        _two = kernel == "cuda-incr-2k"
+        _cb = inputs.cb_scaled if _two else None
+        _ca = inputs.cumAdt_vec if _two else None
+        _cbo = inputs.cb_old if _two else None
         if with_conv1d:
 
             def _run():
@@ -869,9 +877,9 @@ def _make_run_closure(
                     rand_seed=rand_seed,
                     philox_rounds=philox_rounds,
                     enable_pdl=external_pdl,
-                    cb_scaled=inputs.cb_scaled,
-                    cumAdt_vec=inputs.cumAdt_vec,
-                    cb_old=inputs.cb_old,
+                    cb_scaled=_cb,
+                    cumAdt_vec=_ca,
+                    cb_old=_cbo,
                 )
         else:
 
@@ -897,9 +905,9 @@ def _make_run_closure(
                     state_scale=inputs.state_scale_work,
                     rand_seed=rand_seed,
                     philox_rounds=philox_rounds,
-                    cb_scaled=inputs.cb_scaled,
-                    cumAdt_vec=inputs.cumAdt_vec,
-                    cb_old=inputs.cb_old,
+                    cb_scaled=_cb,
+                    cumAdt_vec=_ca,
+                    cb_old=_cbo,
                 )
 
         return _run
@@ -1620,33 +1628,39 @@ def _bench_config(
 
     # --- CUDA checkpointing_ssu kernel ---
     if args.cuda_incr:
-        for prev_k in prev_ks:
-            pt_uniform_i32.fill_(prev_k)
-            tag = (
-                f"cuda_incr_b{batch}_mtp{mtp_len}_k{prev_k}"
-                f"_s{state_dtype_name}_a{act_dtype_name}"
-            )
-            median_us, p95_us, p99_us = time_kernel(
-                kernel="cuda-incr",
-                inputs=inputs,
-                prev_tokens=pt_uniform_i32,
-                timing=timing,
-                tag=tag,
-                philox_rounds=philox_rounds,
-                rand_seed=rand_seed,
-            )
-            _print_row(
-                show_kernel_col,
-                "cuda-incr",
-                batch,
-                mtp_len,
-                prev_k,
-                state_dtype_name,
-                act_dtype_name,
-                median_us,
-                p95_us,
-                p99_us,
-            )
+        # Monolithic ("cuda-incr") + the two-kernel split ("cuda-incr-2k", when
+        # --two-kernel) as separate rows in one run, for a direct comparison.
+        cuda_variants = ["cuda-incr"]
+        if args.two_kernel:
+            cuda_variants.append("cuda-incr-2k")
+        for kname in cuda_variants:
+            for prev_k in prev_ks:
+                pt_uniform_i32.fill_(prev_k)
+                tag = (
+                    f"{kname.replace('-', '_')}_b{batch}_mtp{mtp_len}_k{prev_k}"
+                    f"_s{state_dtype_name}_a{act_dtype_name}"
+                )
+                median_us, p95_us, p99_us = time_kernel(
+                    kernel=kname,
+                    inputs=inputs,
+                    prev_tokens=pt_uniform_i32,
+                    timing=timing,
+                    tag=tag,
+                    philox_rounds=philox_rounds,
+                    rand_seed=rand_seed,
+                )
+                _print_row(
+                    show_kernel_col,
+                    kname,
+                    batch,
+                    mtp_len,
+                    prev_k,
+                    state_dtype_name,
+                    act_dtype_name,
+                    median_us,
+                    p95_us,
+                    p99_us,
+                )
 
     # --- Triton replay (new 5D persistent path) ---
     if args.triton_replay:
