@@ -4,7 +4,13 @@ from tests.test_helpers.sink_attention_reference import sink_attention_unified
 
 import flashinfer
 from flashinfer import SfLayout
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
+)
 from flashinfer.fp4_quantization import (
     nvfp4_quantize,
     e2m1_and_ufp8sf_scale_to_float,
@@ -441,10 +447,44 @@ def test_xqa_batch_decode(
 
     This test supports both NHD and HND layouts.
     """
+    _run_xqa_batch_decode(
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+        page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_grp_size=head_grp_size,
+        window_left=window_left,
+        q_dtype=q_dtype,
+        o_dtype=o_dtype,
+        kv_dtype=kv_dtype,
+        enable_pdl=enable_pdl,
+        enable_sink=enable_sink,
+        max_in_kv_len=max_in_kv_len,
+        kv_layout=kv_layout,
+        head_dim=128,
+    )
+
+
+def _run_xqa_batch_decode(
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    kv_layout,
+    head_dim,
+):
+    """Shared body for the XQA batch-decode tests above/below."""
 
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 128
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
@@ -576,6 +616,51 @@ def test_xqa_batch_decode(
         output_ref.float() / o_scale,
         rtol=1e-1 if kv_dtype == "fp8" else 1e-2,
         atol=1e-1 if kv_dtype == "fp8" else 1e-2,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm100a_supported(torch.device("cuda"))
+        or is_sm120a_supported(torch.device("cuda"))
+        or is_sm121a_supported(torch.device("cuda"))
+    ),
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+    ],
+)
+def test_xqa_batch_decode_head_dim_256_small_pages(
+    page_size, q_dtype, kv_dtype, o_dtype
+):
+    """Regression test for head_dim=256 with small page sizes.
+
+    head_dim=256 decode with page_size < 64 used to produce wrong outputs on
+    SM120 while page_size=64 and head_dim=128 passed (issue #2638). The main
+    test above only covers head_dim=128, so this exercises the
+    head_dim=256 x small-page corner explicitly.
+    """
+    _run_xqa_batch_decode(
+        batch_size=4,
+        q_len_per_req=1,
+        page_size=page_size,
+        num_kv_heads=2,
+        head_grp_size=4,
+        window_left=-1,
+        q_dtype=q_dtype,
+        o_dtype=o_dtype,
+        kv_dtype=kv_dtype,
+        enable_pdl=False,
+        enable_sink=False,
+        max_in_kv_len=110,
+        kv_layout="NHD",
+        head_dim=256,
     )
 
 
