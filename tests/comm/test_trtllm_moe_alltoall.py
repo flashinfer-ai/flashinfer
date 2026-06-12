@@ -423,8 +423,7 @@ def fake_moe(
     Apply a deterministic fake MoE transformation for validation.
 
     Each expert applies a predictable scale: (expert_id + 1.0) / num_experts + 0.5
-    When lora_ids is provided, the scale also depends on the LoRA adapter ID:
-        scale += (lora_id + 1.0) / 256
+    When lora_ids is provided, the LoRA adapter ID adds an integer step: scale += lora_id + 1.0
 
     Args:
         hidden_states: Input tensor [num_tokens, hidden_size] or [world_size, num_tokens, hidden_size]
@@ -463,9 +462,8 @@ def fake_moe(
                 continue
 
             scale = (expert_id + 1.0) / num_experts + 0.5
-            # TODO: replace with a better unique scale when LoRA is used
             if lora_ids is not None:
-                scale += (lora_ids[token_idx].item() + 1.0) / 256
+                scale += lora_ids[token_idx].item() + 1.0
             results.append(hidden_states[token_idx] * scale)
 
         # Summing the results after is closer to the actual implementation as we do a tree reduction.
