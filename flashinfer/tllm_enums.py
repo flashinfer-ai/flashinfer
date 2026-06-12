@@ -27,6 +27,12 @@ class RoutingMethodType(IntEnum):
     # Unspecified
     Unspecified = (9,)
 
+    # Eval-safe repr (``RoutingMethodType.Default`` rather than IntEnum's default
+    # ``<RoutingMethodType.Default: 0>``) so configs that embed this member
+    # round-trip through ``eval(repr(cfg))`` — relied on by the unified MoE API.
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}.{self.name}"
+
 
 # Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
 class ActivationType(IntEnum):
@@ -38,8 +44,22 @@ class ActivationType(IntEnum):
     SwigluBias = 5
     Relu2 = 6
     SwigluStep = 7
-    Identity = 8
-    InvalidType = 9
+    GegluTanh = 8
+    Identity = 9
+    InvalidType = 10
+
+    # Eval-safe repr — see ``RoutingMethodType.__repr__``.
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}.{self.name}"
+
+    @property
+    def is_gated(self) -> bool:
+        """True for activations that consume a gate branch (SwiGLU family)."""
+        return self in (
+            ActivationType.Swiglu,
+            ActivationType.Geglu,
+            ActivationType.SwigluBias,
+        )
 
 
 class DtypeTrtllmGen(IntEnum):

@@ -14,86 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
 import math
-from types import SimpleNamespace
 from typing import Optional, Union, Tuple
 import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
-from .jit.gdn import gen_gdn_prefill_sm90_module
 from .utils import (
-    register_custom_op,
-    register_fake_op,
-    get_device_sm_count,
     get_compute_capability,
-    _get_cache_buf,
 )
-from .gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
-
-
-@functools.cache
-def get_gdn_prefill_module():
-    module = gen_gdn_prefill_sm90_module().build_and_load()
-
-    @register_custom_op(
-        "flashinfer::gdn_prefill",
-        mutates_args=("output", "output_state", "state_checkpoints"),
-    )
-    def gdn_prefill(
-        output: torch.Tensor,
-        output_state: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        initial_state: Optional[torch.Tensor],
-        g: Optional[torch.Tensor],
-        beta: Optional[torch.Tensor],
-        scale: float,
-        workspace_buffer: torch.Tensor,
-        state_checkpoints: Optional[torch.Tensor],
-        checkpoint_cu_starts: Optional[torch.Tensor],
-        checkpoint_every_n_tokens: int,
-    ) -> None:
-        module.gdn_prefill(
-            output,
-            output_state,
-            q,
-            k,
-            v,
-            cu_seqlens,
-            initial_state,
-            g,
-            beta,
-            scale,
-            workspace_buffer,
-            state_checkpoints,
-            checkpoint_cu_starts,
-            checkpoint_every_n_tokens,
-        )
-
-    @register_fake_op("flashinfer::gdn_prefill")
-    def _fake_gdn_prefill(
-        output: torch.Tensor,
-        output_state: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        initial_state: Optional[torch.Tensor],
-        g: Optional[torch.Tensor],
-        beta: Optional[torch.Tensor],
-        scale: float,
-        workspace_buffer: torch.Tensor,
-        state_checkpoints: Optional[torch.Tensor],
-        checkpoint_cu_starts: Optional[torch.Tensor],
-        checkpoint_every_n_tokens: int,
-    ) -> None:
-        pass
-
-    return SimpleNamespace(gdn_prefill=gdn_prefill)
+from .gdn_kernels import (
+    chunk_gated_delta_rule_sm90,
+    chunk_gated_delta_rule_sm100,
+)
 
 
 @flashinfer_api(trace=gdn_prefill_trace)
@@ -283,13 +216,13 @@ def chunk_gated_delta_rule(
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    _is_sm100a = get_compute_capability(device)[0] == 10
-    if _is_sm100a:
+    _arch_major = get_compute_capability(device)[0]
+    if _arch_major == 10:
         if _cuda_major < 13:
             raise NotImplementedError(
                 "Blackwell GDN prefill is only supported on CUDA 13+"
             )
-        if not _has_blackwell_prefill:
+        if chunk_gated_delta_rule_sm100 is None:
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
 
         # Blackwell SM100 and SM103 path (CuTe DSL kernel)
@@ -342,8 +275,10 @@ def chunk_gated_delta_rule(
             cu_checkpoints=_cu_checkpoints,
             output_checkpoints=state_checkpoints,
         )
-    else:
-        # SM90 Hopper path (C++ JIT kernel)
+    elif _arch_major == 9:
+        if chunk_gated_delta_rule_sm90 is None:
+            raise NotImplementedError("SM90 GDN prefill DSL kernel is unavailable")
+
         if output_state is None:
             output_state = torch.empty(
                 (num_seqs, num_sab_heads, head_size, head_size),
@@ -351,29 +286,25 @@ def chunk_gated_delta_rule(
                 device=device,
             )
 
-        workspace_size = get_device_sm_count(device) * 128
-        workspace_buffer = _get_cache_buf(
-            "gdn_prefill_workspace", workspace_size, device
-        )
-
-        get_gdn_prefill_module().gdn_prefill(
+        chunk_gated_delta_rule_sm90(
             output,
             output_state,
             q,
             k,
             v,
-            cu_seqlens.to(torch.int64),
             initial_state,
             g,
             beta,
+            cu_seqlens.to(torch.int64),
             _scale,
-            workspace_buffer,
             state_checkpoints,
             checkpoint_cu_starts.to(torch.int64)
             if checkpoint_cu_starts is not None
             else None,
             checkpoint_every_n_tokens,
         )
+    else:
+        raise NotImplementedError("GDN prefill DSL kernel is unavailable")
 
     if output_final_state:
         return output, output_state
