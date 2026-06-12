@@ -476,43 +476,15 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // unconditionally (launch_checkpointing_ssu.cuh), so this always pairs.
   cudaTriggerProgrammaticLaunchCompletion();  // main may co-launch now
 
-  // ── EXTERNAL PDL (conv1d → precompute): gated by ENABLE_PDL — conv1d produces
-  // B/C, so wait before the load.  No-op without a programmatic conv1d.
-  if constexpr (ENABLE_PDL) {
-    cudaGridDependencySynchronize();
-  }
-
-  // ── Load this group's C, B (conv1d outputs) into swizzled smem (cp.async) ──
-  load_group_BC<input_t, NPREDICTED, DSTATE>(smem, params, warp, lane, group_idx, outer, seq_len);
-  // NO-WRITE only: W2/3 also load this group's old B (cache) for the C6 MMA.
-  // must_checkpoint is uniform per CTA, so this branch is divergence-free.
-  if (!must_checkpoint && warp >= 2) {
-    load_old_B<input_t, MAX_WINDOW, DSTATE>(smem, params, lane, cache_slot, buf_read, group_idx,
-                                            prev_k);
-  }
-
-  // ── old_B cache writeback (per-group, D-independent) ──
-  // The new B tokens become the buffered "old" for the next step's replay /
-  // CB_old.  Only the precompute holds smem.B (the main reads cb_scaled and
-  // never loads B), so it owns this writeback.  W0/1 hold smem.B; fires before
-  // the CB MMA so the STG overlaps it (hoisted exactly like the monolithic).
-  // store_old_B self-gates on head % HEADS_PER_GROUP — first_head qualifies.
-  if (warp < 2) {
-    store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, first_head,
-                                                              group_idx, cache_slot, buf_write,
-                                                              write_offset, seq_len);
-  }
-
-  // ── PHASE 1: load ALL heads' scalar coefficients up front, ALL 128 threads ──
-  // dt (new) + dt_bias + A always; old_dt / old_cumAdt on the no-write path.  Each
-  // goes to per-head smem.  Issuing every head's LDGs together (vs one head per
-  // warp per loop iteration) lets the global-load latency OVERLAP instead of
-  // serialize — PHASE 2's head loop then does ZERO gmem loads, so it can't stall
-  // on tiny per-head fetches.  bias + softplus are deferred to PHASE 2 (smem).
-  // After load_group_BC so its LDGs overlap the B/C cp.async (NOT hoisted
-  // pre-gdc_wait — that exposes the latency standalone, ~1 us regression at large
-  // mtp; a cliff-only hoist can be added, and measured, when conv1d PDL is wired).
-  {
+  // ── PHASE 1: load ALL heads' scalar coefficients into per-head smem, ALL 128
+  // threads (dt + dt_bias + A always; old_dt / old_cumAdt on the no-write path).
+  // Batching every head's LDGs lets the global-load latency OVERLAP; PHASE 2 then
+  // does ZERO gmem loads.  bias + softplus deferred to PHASE 2 (smem).  These are
+  // conv1d-INDEPENDENT (only B/C are conv1d outputs), so WHERE this runs is a free
+  // choice — gated below: ENABLE_PDL (cliff) runs it BEFORE gdc_wait to fill the
+  // conv1d wait; standalone runs it AFTER load_group_BC to overlap the B/C cp.async
+  // (hoisting it pre-wait standalone exposes the latency — ~1 us regress at big mtp).
+  auto load_phase1_coeffs = [&]() {
     auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
     auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
     int const flat_tid = warp * warpSize + lane;
@@ -564,6 +536,41 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
         smem.old_cumAdt[h][t] = cv;
       }
     }
+  };
+
+  // ── EXTERNAL PDL (conv1d → precompute): gated by ENABLE_PDL — conv1d produces B/C,
+  // so wait before load_group_BC.  PHASE 1 (conv1d-independent) runs HERE, before the
+  // wait, so its LDGs fill the conv1d wait window.  No-op without a programmatic conv1d.
+  if constexpr (ENABLE_PDL) {
+    load_phase1_coeffs();
+    cudaGridDependencySynchronize();
+  }
+
+  // ── Load this group's C, B (conv1d outputs) into swizzled smem (cp.async) ──
+  load_group_BC<input_t, NPREDICTED, DSTATE>(smem, params, warp, lane, group_idx, outer, seq_len);
+  // NO-WRITE only: W2/3 also load this group's old B (cache) for the C6 MMA.
+  // must_checkpoint is uniform per CTA, so this branch is divergence-free.
+  if (!must_checkpoint && warp >= 2) {
+    load_old_B<input_t, MAX_WINDOW, DSTATE>(smem, params, lane, cache_slot, buf_read, group_idx,
+                                            prev_k);
+  }
+
+  // ── old_B cache writeback (per-group, D-independent) ──
+  // The new B tokens become the buffered "old" for the next step's replay /
+  // CB_old.  Only the precompute holds smem.B (the main reads cb_scaled and
+  // never loads B), so it owns this writeback.  W0/1 hold smem.B; fires before
+  // the CB MMA so the STG overlaps it (hoisted exactly like the monolithic).
+  // store_old_B self-gates on head % HEADS_PER_GROUP — first_head qualifies.
+  if (warp < 2) {
+    store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, first_head,
+                                                              group_idx, cache_slot, buf_write,
+                                                              write_offset, seq_len);
+  }
+
+  // Standalone (!ENABLE_PDL): no conv1d wait to hide behind, so run PHASE 1 HERE to
+  // overlap the B/C cp.async issued above instead of exposing its latency pre-wait.
+  if constexpr (!ENABLE_PDL) {
+    load_phase1_coeffs();
   }
 
   // ── Raw matmul-1 — ONCE per group, all 4 warps (no-write).  W0/1 → C·B (C5) →

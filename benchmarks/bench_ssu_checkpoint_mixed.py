@@ -71,7 +71,7 @@ DEFAULT_SEED = 42
 DEFAULT_WARMUP = 5
 DEFAULT_ITERS = 20
 DEFAULT_NUM_PNAT_SAMPLES = 8
-DEFAULT_KERNELS = "cuda-incr,incremental,triton-replay,triton-replay-pm"
+DEFAULT_KERNELS = "cuda-incr,cuda-incr-2k,incremental,triton-replay,triton-replay-pm"
 # Kernels that honor Philox stochastic rounding on the gmem state writeback
 # (the FlashInfer / baseline rows silently ignore rand_seed).  Includes the new
 # 5D persistent paths (triton-replay = persistent_dynamic, -pm = persistent_main).
@@ -324,6 +324,19 @@ def run_in_process_bench(
     state_dtype, philox_rounds, state_label = bench_ssu.parse_state_spec(
         state_dtype_spec
     )
+    # The two-kernel split ("cuda-incr-2k") routes to precompute+main only for
+    # 2-byte (fp16/bf16) state + input; the launcher won't take it for fp8 /
+    # quantized state.  Drop it there (matches bench_checkpointing_ssu.py:1644).
+    if "cuda-incr-2k" in kernels and state_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        print(
+            f"NOTE: dropping cuda-incr-2k — two-kernel split needs 2-byte state, "
+            f"got {state_label}.",
+            file=sys.stderr,
+        )
+        kernels = [k for k in kernels if k != "cuda-incr-2k"]
     rand_seed = (
         torch.tensor([0xDECAFBAD], device="cuda", dtype=torch.int64)
         if philox_rounds > 0
