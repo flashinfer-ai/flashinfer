@@ -61,8 +61,10 @@ struct FP8SparseCollectiveMainloop {
 
   using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
   using SmemLayoutK = typename Ktraits::SmemLayoutK;
-  using SmemLayoutV = typename Ktraits::SmemLayoutV;
-  using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
+  // Sparse path: use SmemLayoutVSparse which has shape (CTA_KV, HEAD_DIM, STAGES) for cp.async
+  // loading
+  using SmemLayoutV = typename Ktraits::SmemLayoutVSparse;
+  using SmemLayoutVt = typename Ktraits::SmemLayoutVtSparse;
 
   using ShapeT = cute::Shape<int32_t, int32_t, int32_t>;
   using StrideT = cute::Shape<int64_t, _1, int64_t>;  // (N, D, H)
@@ -189,14 +191,15 @@ struct FP8SparseCollectiveMainloop {
     Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
 
     // *** Prepare In-kernel V Transpose ***
-    using SmemLayoutVTransposeSrc = typename Ktraits::SmemLayoutVTransposeSrc;
-    using SmemLayoutVtTransposeTgt = typename Ktraits::SmemLayoutVtTransposeTgt;
+    // Sparse path: use SmemLayoutVSparseTransposeSrc/Tgt for original (N, D) -> (D, N) transpose
+    using SmemLayoutVSparseTransposeSrc = typename Ktraits::SmemLayoutVSparseTransposeSrc;
+    using SmemLayoutVtSparseTransposeTgt = typename Ktraits::SmemLayoutVtSparseTransposeTgt;
 
     Tensor sV_src = as_position_independent_swizzle_tensor(
-        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVTransposeSrc{}));
-    Tensor sVt_tgt = as_position_independent_swizzle_tensor(
-        make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVtTransposeTgt{}));
-    auto v_tranposer = SmemTransposeFP8_64x64<Ktraits>();
+        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVSparseTransposeSrc{}));
+    Tensor sVt_tgt = as_position_independent_swizzle_tensor(make_tensor(
+        make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVtSparseTransposeTgt{}));
+    auto v_tranposer = SmemTransposeFP8_64x64_Sparse<Ktraits>();
     /* ----- V Transpose ---- */
 
     auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =

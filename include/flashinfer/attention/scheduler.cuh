@@ -796,7 +796,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   return cudaSuccess;
 }
 
-inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
+inline float cost_function(int qo_len, int kv_len) { return 0.05 * float(qo_len) + kv_len; }
 
 template <typename T>
 std::vector<T> flatten(const std::vector<std::vector<T>>& vec, int size_after_flatten) {
@@ -902,8 +902,13 @@ inline cudaError_t PrefillSM90Plan(
   std::sort(idx_qo_kv_len_vec.begin(), idx_qo_kv_len_vec.end(),
             [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
   int cta_tile_q = 128;
+  int cta_tile_kv = 128;
   if (head_dim_vo == 64) {
     cta_tile_q = 192;
+  } else if (head_dim_qk == 128 && head_dim_vo == 128 && !causal) {
+    cta_tile_kv = 192;
+  } else if (head_dim_qk > 128) {
+    cta_tile_kv = 64;
   }
 
   int device = 0;
@@ -924,25 +929,69 @@ inline cudaError_t PrefillSM90Plan(
   int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
 
-  for (int qo_head_idx = 0;
-       qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads); ++qo_head_idx) {
+  // L2-aware scheduling: compute swizzle size based on L2 cache capacity
+  // Group adjacent heads together so K/V can be reused in L2 cache
+  // Use conservative L2 size estimate (8MB like FA3, not full 50MB)
+  constexpr int64_t size_l2 = 8 * 1024 * 1024;  // 8 MB (conservative, FA3 uses this)
+
+  // Compute max KV blocks across all batches
+  int64_t max_kv_blocks = 1;
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    int64_t kv_blocks = ceil_div(int64_t(kv_len_arr_h[i]), int64_t(cta_tile_kv));
+    max_kv_blocks = std::max(max_kv_blocks, kv_blocks);
+  }
+
+  // Size of one KV block: cta_tile_kv * (head_dim_qk + head_dim_vo) * sizeof(half)
+  int64_t size_one_kv_block = cta_tile_kv * (head_dim_qk + head_dim_vo) * 2;  // 2 bytes for FP16
+  int64_t max_kv_blocks_in_l2 = size_l2 / size_one_kv_block;
+
+  // FA3-style: use stepped values (16, 8, 4, 2, 1) based on how many KV heads fit
+  int nheads_in_l2 = max_kv_blocks * 16 <= max_kv_blocks_in_l2  ? 16
+                     : max_kv_blocks * 8 <= max_kv_blocks_in_l2 ? 8
+                     : max_kv_blocks * 4 <= max_kv_blocks_in_l2 ? 4
+                     : max_kv_blocks * 2 <= max_kv_blocks_in_l2 ? 2
+                                                                : 1;
+
+  // Scale by GQA group size (num_qo_heads / num_kv_heads)
+  int group_size = num_qo_heads / num_kv_heads;
+  int swizzle = nheads_in_l2 * group_size;
+  // Clamp swizzle to valid range
+  swizzle = std::max(1, std::min(swizzle, int(num_qo_heads)));
+
+  // Schedule tiles in L2-aware order: process heads in groups of 'swizzle'
+  // Within each section, iterate over q_tiles first (LPT order), then heads
+  // This matches FA3's traversal order for better L2 cache utilization
+  int num_sections = ceil_div(int(num_qo_heads), swizzle);
+
+  for (int section = 0; section < (plan_info.same_schedule_for_all_heads ? 1 : num_sections);
+       ++section) {
+    int head_start = section * swizzle;
+    int head_end = plan_info.same_schedule_for_all_heads
+                       ? 1
+                       : std::min(head_start + swizzle, int(num_qo_heads));
+    int nheads_in_section = head_end - head_start;
+
+    // Within each section, iterate over q_tiles first (LPT: from last to first), then heads
+    // This allows adjacent heads to reuse K/V in L2 cache
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
       int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
       for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-        auto [cta_idx, accum_cost] = cta_cost_heap.pop();
-        // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
-        // so the group_size in cost_function is always 1
-        int effective_kv_len =
-            causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cta_tile_q, num_qo_tiles, 1)
-                   : kv_len;
-        cta_cost_heap.insert({cta_idx, accum_cost + cost_function(cta_tile_q, effective_kv_len)});
-        cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
-        cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
-        cta_qo_len[cta_idx].push_back(qo_len);
-        cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
-        cta_kv_len[cta_idx].push_back(kv_len);
-        cta_head_indices[cta_idx].push_back(qo_head_idx);
-        cta_batch_indices[cta_idx].push_back(i);
+        for (int qo_head_idx = head_start; qo_head_idx < head_end; ++qo_head_idx) {
+          auto [cta_idx, accum_cost] = cta_cost_heap.pop();
+          // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
+          // so the group_size in cost_function is always 1
+          int effective_kv_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
+                                                               cta_tile_q, num_qo_tiles, 1)
+                                        : kv_len;
+          cta_cost_heap.insert({cta_idx, accum_cost + cost_function(cta_tile_q, effective_kv_len)});
+          cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
+          cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
+          cta_qo_len[cta_idx].push_back(qo_len);
+          cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
+          cta_kv_len[cta_idx].push_back(kv_len);
+          cta_head_indices[cta_idx].push_back(qo_head_idx);
+          cta_batch_indices[cta_idx].push_back(i);
+        }
       }
     }
   }
