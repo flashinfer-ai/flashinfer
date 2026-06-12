@@ -692,7 +692,15 @@ def gen_all_modules(
                     )
                 )
             jit_specs.append(gen_trtllm_utils_module())
-        if has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121:
+        if (
+            has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm110
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
