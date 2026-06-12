@@ -101,6 +101,25 @@ __device__ __forceinline__ void st_release(int* ptr, int val) {
 #endif
 }
 
+// Atomically add val to *ptr with release semantics, returning the old value
+__device__ __forceinline__ int atom_add_release(int* ptr, int val) {
+  int old_val = 0;
+#if (__CUDA_ARCH__ >= 700)
+  // SM70 and newer use memory consistency qualifiers
+  // Release pattern using acq_rel fence + relaxed modifier
+  // (The fence also releases data that was weakly-written by other threads prior to the last
+  // syncthreads)
+  asm volatile("fence.acq_rel.gpu;\n");
+  asm volatile("atom.relaxed.gpu.global.add.s32 %0, [%1], %2;\n"
+               : "=r"(old_val)
+               : "l"(ptr), "r"(val));
+#else
+  __threadfence();
+  old_val = atomicAdd(ptr, val);
+#endif
+  return old_val;
+}
+
 // Wait until the value at ptr reaches target_val using acquire semantics
 // Only thread 0 spins, then all threads synchronize
 __device__ __forceinline__ void wait_ge(int* ptr, int target_val, int thread_idx) {
@@ -138,6 +157,69 @@ inline RadixDeterministicCollectScratch* MaybeGetRadixDeterministicCollectScratc
              : reinterpret_cast<RadixDeterministicCollectScratch*>(row_states_buffer + num_groups);
 }
 
+/*!
+ * \brief Verify that one radix group can be fully co-resident and clamp the number of
+ *        concurrently processed groups to the kernel's measured occupancy.
+ *
+ * The multi-CTA radix kernels synchronize the CTAs of each group with a software barrier
+ * (AdvanceRadixGroupBarrier), which only completes when every CTA of the group is resident
+ * on the device at the same time. The grid must therefore never exceed the number of CTAs
+ * the device can actually co-schedule for this kernel, instead of assuming one CTA per SM.
+ *
+ * \param kernel Kernel entry point (query after cudaFuncSetAttribute for dynamic smem)
+ * \param block_threads Number of threads per CTA
+ * \param dyn_smem_bytes Dynamic shared memory per CTA
+ * \param num_sms Number of SMs on the device
+ * \param ctas_per_group Number of CTAs cooperating on one radix group
+ * \param num_groups In/out: number of groups processed concurrently, clamped on return
+ */
+inline cudaError_t RadixTopKClampGroupsToCoResidency(const void* kernel, uint32_t block_threads,
+                                                     size_t dyn_smem_bytes, int num_sms,
+                                                     uint32_t ctas_per_group,
+                                                     uint32_t* num_groups) {
+  int max_blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &max_blocks_per_sm, kernel, block_threads, dyn_smem_bytes));
+  const uint32_t max_coresident_ctas =
+      static_cast<uint32_t>(max_blocks_per_sm) * static_cast<uint32_t>(num_sms);
+  if (ctas_per_group > max_coresident_ctas) {
+    // Not even a single group can be fully co-resident: the software barrier would spin
+    // forever. Fail loudly instead of deadlocking the stream.
+    return cudaErrorCooperativeLaunchTooLarge;
+  }
+  *num_groups = std::min(*num_groups, max_coresident_ctas / ctas_per_group);
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Launch a multi-CTA radix top-k kernel with gang scheduling when available.
+ *
+ * A regular launch provides no co-residency guarantee: when concurrent kernels (other
+ * streams or processes) hold enough SMs, a radix group can become only partially resident
+ * and its resident CTAs spin forever in the software barrier. This manifested as permanent
+ * sampler stream hangs on SM120/SM121 (issue #3610), where two concurrently running
+ * multi-CTA kernels can starve each other indefinitely. cudaLaunchCooperativeKernel makes
+ * the hardware gang-schedule the grid: no CTA starts executing until all of them can be
+ * resident, so partial residency (and thus the deadlock) is impossible by construction.
+ * During stream capture cooperative launches are not universally supported, so the regular
+ * launch is kept there to preserve existing CUDA-graph behavior.
+ */
+inline cudaError_t LaunchRadixTopKMultiCTAKernel(const void* kernel, dim3 nblks, dim3 nthrs,
+                                                 void** args, size_t smem_size,
+                                                 cudaStream_t stream) {
+  int device = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int supports_coop_launch = 0;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, device));
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  FLASHINFER_CUDA_CALL(cudaStreamIsCapturing(stream, &capture_status));
+  if (supports_coop_launch && capture_status == cudaStreamCaptureStatusNone) {
+    return cudaLaunchCooperativeKernel(kernel, nblks, nthrs, args, smem_size, stream);
+  }
+  return cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream);
+}
+
 // ==================== Common Device Functions for Radix Top-K ====================
 /*!
  * \brief Software barrier across all CTAs in the same radix group.
@@ -159,6 +241,57 @@ __device__ __forceinline__ void AdvanceRadixGroupBarrier(RadixRowState* state, i
   wait_ge(&state->arrival_counter, target, tx);
   barrier_phase++;
   __syncthreads();
+}
+
+/*!
+ * \brief Reset the per-group state for the next launch, performed by the LAST CTA to finish.
+ *
+ * Each CTA marks its exit on the group arrival counter; the CTA that observes the final exit
+ * knows every peer CTA has already passed its last wait_ge spin, so clearing the state cannot
+ * strand a peer. Resetting from the leading CTA instead is racy: the leading CTA can pass the
+ * final barrier, finish its tail work and zero the arrival counter while a peer CTA that has
+ * already arrived is still spinning in wait_ge waiting to observe the barrier target. That
+ * peer then spins on the zeroed counter forever, permanently wedging the stream (issue #3610,
+ * observed as sampler hangs on SM120/SM121).
+ *
+ * \param state Per-group radix row state to reset
+ * \param det_scratch Optional per-group deterministic-collect scratch to clear (nullptr if
+ *                    unused)
+ * \param barrier_phase Number of barrier phases completed by every CTA of the group
+ * \param ctas_per_group Number of CTAs participating in the group
+ * \param tx Thread index within the block
+ */
+template <uint32_t BLOCK_THREADS>
+__device__ __forceinline__ void RadixGroupResetStateLastCTA(
+    RadixRowState* state, RadixDeterministicCollectScratch* det_scratch, int barrier_phase,
+    uint32_t ctas_per_group, uint32_t tx) {
+  constexpr uint32_t RADIX = 256;
+  __shared__ int s_is_last_cta;
+  if (tx == 0) {
+    const int exit_target = (barrier_phase + 1) * static_cast<int>(ctas_per_group);
+    s_is_last_cta = (atom_add_release(&state->arrival_counter, 1) + 1 == exit_target);
+  }
+  __syncthreads();
+  if (s_is_last_cta) {
+    for (uint32_t buf = 0; buf < 3; ++buf) {
+      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+        state->histogram[buf][i] = 0;
+      }
+    }
+    if (det_scratch != nullptr) {
+      static_assert(sizeof(RadixDeterministicCollectScratch) % sizeof(uint32_t) == 0);
+      uint32_t* det_words = reinterpret_cast<uint32_t*>(det_scratch);
+      constexpr uint32_t DET_WORDS = sizeof(RadixDeterministicCollectScratch) / sizeof(uint32_t);
+      for (uint32_t i = tx; i < DET_WORDS; i += BLOCK_THREADS) {
+        det_words[i] = 0;
+      }
+    }
+    // Ensure all threads' clears complete before tx0 publishes the counter reset.
+    __syncthreads();
+    if (tx == 0) {
+      st_release(&state->arrival_counter, 0);
+    }
+  }
 }
 
 /*!
@@ -1295,26 +1428,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     }
   }
 
-  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
+  // Reset group state for the next launch, from the last CTA to exit (only for multi-CTA).
+  // The leading CTA must not do this: it could zero the arrival counter while a peer CTA is
+  // still spinning in its final wait_ge, wedging the stream forever (issue #3610).
   if constexpr (!SINGLE_CTA) {
-    if (cta_in_group == 0) {
-      for (uint32_t buf = 0; buf < 3; ++buf) {
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          state->histogram[buf][i] = 0;
-        }
-      }
-      if constexpr (DETERMINISTIC) {
-        static_assert(sizeof(RadixDeterministicCollectScratch) % sizeof(uint32_t) == 0);
-        uint32_t* det_words = reinterpret_cast<uint32_t*>(det_scratch);
-        constexpr uint32_t DET_WORDS = sizeof(RadixDeterministicCollectScratch) / sizeof(uint32_t);
-        for (uint32_t i = tx; i < DET_WORDS; i += BLOCK_THREADS) {
-          det_words[i] = 0;
-        }
-      }
-      if (tx == 0) {
-        st_release(&state->arrival_counter, 0);
-      }
-    }
+    RadixGroupResetStateLastCTA<BLOCK_THREADS>(state, DETERMINISTIC ? det_scratch : nullptr,
+                                               barrier_phase, ctas_per_group, tx);
   }
 
 #undef shared_output_counter
@@ -1445,20 +1564,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
     }
   }
 
-  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
+  // Reset group state for the next launch, from the last CTA to exit (only for multi-CTA).
+  // The leading CTA must not do this: it could zero the arrival counter while a peer CTA is
+  // still spinning in its final wait_ge, wedging the stream forever (issue #3610).
   if constexpr (!SINGLE_CTA) {
-    // Only leading CTA clears the buffers using release semantics
-    if (cta_in_group == 0) {
-      for (uint32_t buf = 0; buf < 3; ++buf) {
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          state->histogram[buf][i] = 0;
-        }
-      }
-
-      if (tx == 0) {
-        st_release(&state->arrival_counter, 0);
-      }
-    }
+    RadixGroupResetStateLastCTA<BLOCK_THREADS>(state, nullptr, barrier_phase, ctas_per_group, tx);
   }
 }
 
@@ -1525,12 +1635,16 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
           RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(
+          (const void*)kernel, BLOCK_THREADS, smem_size, num_sms, ctas_per_group, &num_groups));
+      total_ctas = num_groups * ctas_per_group;
 
       dim3 nblks(total_ctas);
       dim3 nthrs(BLOCK_THREADS);
       void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
                       &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args,
+                                                         smem_size, stream));
     }
   });
 
@@ -1774,20 +1888,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     }
   }
 
-  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
+  // Reset group state for the next launch, from the last CTA to exit (only for multi-CTA).
+  // The leading CTA must not do this: it could zero the arrival counter while a peer CTA is
+  // still spinning in its final wait_ge, wedging the stream forever (issue #3610).
   if constexpr (!SINGLE_CTA) {
-    // Only leading CTA clears the buffers using release semantics
-    if (cta_in_group == 0) {
-      for (uint32_t buf = 0; buf < 3; ++buf) {
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          state->histogram[buf][i] = 0;
-        }
-      }
-
-      if (tx == 0) {
-        st_release(&state->arrival_counter, 0);
-      }
-    }
+    RadixGroupResetStateLastCTA<BLOCK_THREADS>(state, nullptr, barrier_phase, ctas_per_group, tx);
   }
 }
 
@@ -1854,12 +1959,16 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
           RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(
+          (const void*)kernel, BLOCK_THREADS, smem_size, num_sms, ctas_per_group, &num_groups));
+      total_ctas = num_groups * ctas_per_group;
 
       dim3 nblks(total_ctas);
       dim3 nthrs(BLOCK_THREADS);
       void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
                       &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args,
+                                                         smem_size, stream));
     }
   });
 
@@ -1951,7 +2060,19 @@ cudaError_t RadixTopKPageTableTransformMultiCTA(DType* input, IdType* output_pag
                                           RadixTopKMode::PageTableTransform, DType, IdType>;      \
     FLASHINFER_CUDA_CALL(                                                                         \
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));    \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream)); \
+    if (!(SINGLE_CTA_FLAG)) {                                                                     \
+      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(                                     \
+          (const void*)kernel, THREADS, smem_size, num_sms, ctas_per_group, &num_groups));        \
+      total_ctas = num_groups * ctas_per_group;                                                   \
+      nblks.x = total_ctas;                                                                       \
+      det_scratch_buffer = MaybeGetRadixDeterministicCollectScratchBuffer(                        \
+          row_states_buffer, num_groups, single_cta, deterministic);                              \
+      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args, \
+                                                         smem_size, stream));                     \
+    } else {                                                                                      \
+      FLASHINFER_CUDA_CALL(                                                                       \
+          cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));                \
+    }                                                                                             \
   } while (0)
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
@@ -2058,7 +2179,19 @@ cudaError_t RadixTopKRaggedTransformMultiCTA(DType* input, IdType* output_indice
                                           RadixTopKMode::RaggedTransform, DType, IdType>;         \
     FLASHINFER_CUDA_CALL(                                                                         \
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));    \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream)); \
+    if (!(SINGLE_CTA_FLAG)) {                                                                     \
+      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(                                     \
+          (const void*)kernel, THREADS, smem_size, num_sms, ctas_per_group, &num_groups));        \
+      total_ctas = num_groups * ctas_per_group;                                                   \
+      nblks.x = total_ctas;                                                                       \
+      det_scratch_buffer = MaybeGetRadixDeterministicCollectScratchBuffer(                        \
+          row_states_buffer, num_groups, single_cta, deterministic);                              \
+      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args, \
+                                                         smem_size, stream));                     \
+    } else {                                                                                      \
+      FLASHINFER_CUDA_CALL(                                                                       \
+          cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));                \
+    }                                                                                             \
   } while (0)
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
@@ -2167,7 +2300,19 @@ cudaError_t RadixTopKMultiCTA(DType* input, IdType* output_indices, DType* outpu
                                           RadixTopKMode::Basic, DType, IdType>;                   \
     FLASHINFER_CUDA_CALL(                                                                         \
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));    \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream)); \
+    if (!(SINGLE_CTA_FLAG)) {                                                                     \
+      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(                                     \
+          (const void*)kernel, THREADS, smem_size, num_sms, ctas_per_group, &num_groups));        \
+      total_ctas = num_groups * ctas_per_group;                                                   \
+      nblks.x = total_ctas;                                                                       \
+      det_scratch_buffer = MaybeGetRadixDeterministicCollectScratchBuffer(                        \
+          row_states_buffer, num_groups, single_cta, deterministic);                              \
+      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args, \
+                                                         smem_size, stream));                     \
+    } else {                                                                                      \
+      FLASHINFER_CUDA_CALL(                                                                       \
+          cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));                \
+    }                                                                                             \
   } while (0)
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
