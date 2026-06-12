@@ -1,0 +1,75 @@
+{# Copyright (c) 2026 by the IFKernel team.
+
+   Licensed under the Apache License, Version 2.0 (the "License"); you may
+   not use this file except in compliance with the License. You may obtain
+   a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+   Originally contributed to the FlashInfer-Bench MLSys'26 kernel-generation
+   contest (https://github.com/flashinfer-ai/mlsys26-contest). #}
+// FuseMoE Blackwell shape configuration.
+//
+// Rendered per-shape by flashinfer/jit/fusemoe_blackwell.py and dropped into
+// the gen directory alongside fusemoe_blackwell.cu. The .cu file picks the
+// values up via #include "fusemoe_blackwell_config.h".
+//
+// kBlock is fixed at 128 because that's the FP8 block-scale group size.
+// The remaining seven constants are JIT inputs.
+#pragma once
+
+#include <cstddef>
+
+namespace flashinfer_fusemoe_blackwell_config {
+
+constexpr int kHidden            = {{ hidden_size }};
+constexpr int kIntermediate      = {{ intermediate_size }};
+constexpr int kNumExpertsGlobal  = {{ num_experts_global }};
+constexpr int kNumLocalExperts   = {{ num_local_experts }};
+constexpr int kBlock             = 128;
+constexpr int kTopK              = {{ top_k }};
+constexpr int kNumGroups         = {{ n_group }};
+constexpr int kTopKGroup         = {{ topk_group }};
+
+// Compile-time divisibility checks. These are the constraints the kernel
+// implicitly assumes via `__shared__` array sizes, vectorised loads, and
+// unroll counts. If any of these fail, the kernel will not produce correct
+// results (or will not compile in the first place).
+static_assert(kBlock == 128,
+              "kBlock is fixed at 128 (FP8 block-scale group size).");
+static_assert(kHidden % 128 == 0,
+              "hidden_size must be divisible by 128.");
+static_assert(kIntermediate % 128 == 0,
+              "intermediate_size must be divisible by 128.");
+static_assert(kHidden % 16 == 0,
+              "hidden_size must be divisible by 16 (vec16 loads).");
+static_assert(kIntermediate >= 512 && kIntermediate % 256 == 0,
+              "intermediate_size must be >= 512 and divisible by 256 "
+              "(thread tiling assumes 256 threads with even pairs).");
+static_assert(kNumExpertsGlobal % kNumGroups == 0,
+              "num_experts_global must be divisible by n_group.");
+static_assert(kNumExpertsGlobal / kNumGroups <= 32,
+              "experts-per-group must fit in one warp for the routing kernel.");
+static_assert(kTopKGroup <= kNumGroups,
+              "topk_group cannot exceed n_group.");
+static_assert(kTopK <= 32,
+              "top_k must fit in one warp.");
+static_assert(kTopK <= kNumExpertsGlobal,
+              "top_k cannot exceed num_experts_global.");
+static_assert(kNumLocalExperts <= kNumExpertsGlobal,
+              "num_local_experts cannot exceed num_experts_global.");
+
+}  // namespace flashinfer_fusemoe_blackwell_config
+
+// Bring the constants into the global namespace so the existing kernel body,
+// which references `kHidden` etc. directly, keeps compiling unchanged.
+using flashinfer_fusemoe_blackwell_config::kHidden;
+using flashinfer_fusemoe_blackwell_config::kIntermediate;
+using flashinfer_fusemoe_blackwell_config::kNumExpertsGlobal;
+using flashinfer_fusemoe_blackwell_config::kNumLocalExperts;
+using flashinfer_fusemoe_blackwell_config::kBlock;
+using flashinfer_fusemoe_blackwell_config::kTopK;
+using flashinfer_fusemoe_blackwell_config::kNumGroups;
+using flashinfer_fusemoe_blackwell_config::kTopKGroup;
