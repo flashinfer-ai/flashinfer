@@ -339,12 +339,13 @@ _KNOWN_FAILURES = [
         lambda cfg: cfg.adapter.key == "mm_bf16"
         and cfg.out_dtype == torch.float16
         and _SM == 90
-        and _CUDNN_VER < 93000,
+        and _CUDNN_VER < 92301,
         "cuDNN runtime-fusion implicit-GEMM (fortNativeRuntimeFusionEngine) miscomputes mm_bf16 with "
         "fp16 OUTPUT for non-power-of-2 M on SM90/Hopper (garbage, ratio ~1); bf16 output and SM100 "
-        "are unaffected. A cuDNN 9.23-era regression -- VERIFIED FIXED in cuDNN 9.30 (ran the repro "
-        "against the local 9.30 build). xfail gated to cuDNN<9.30; on >=9.30 the test PASSES and this "
-        "entry can be removed once CI's cuDNN is >=the fix.",
+        "are unaffected. Root cause: the split-k partial-reduce kernel assumed row-major output, but "
+        "Hopper swaps A<->B so the output is column-major -> wrong reduce dims. Fixed by cuDNN commit "
+        "'fix hopper swap ab again' (a745f55cf). VERIFIED FIXED in cuDNN 9.23.1 (92301) and 9.30; "
+        "BROKEN in 9.23.0.x (92300). xfail gated to cuDNN<9.23.1; on >= it the test PASSES.",
     ),
 ]
 
