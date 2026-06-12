@@ -82,15 +82,16 @@ def verify_topk_correctness(logits, values, indices, k):
 def _get_cached_topk_row_states_buffer(device: torch.device):
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    key = (f"radix_topk_row_states_{device}", device)
-    return flashinfer_utils._cache_buf.get(key)
+    key = ("radix_topk_row_states", device)
+    ring = flashinfer_utils._ring_cache_buf.get(key)
+    return None if ring is None else ring.buf
 
 
 def _clear_cached_topk_row_states_buffer(device: torch.device):
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    key = (f"radix_topk_row_states_{device}", device)
-    flashinfer_utils._cache_buf.pop(key, None)
+    key = ("radix_topk_row_states", device)
+    flashinfer_utils._ring_cache_buf.pop(key, None)
 
 
 def _build_strictly_descending_logits(

@@ -29,7 +29,7 @@ from .trace.templates.sampling import (
     top_k_ragged_transform_trace,
 )
 from .utils import (
-    _get_cache_buf,
+    _get_cache_buf_ring,
     get_compute_capability,
     register_custom_op,
     register_fake_op,
@@ -617,12 +617,13 @@ def top_k(
 
     # Allocate row_states buffer for multi-CTA path
     # 1MB is enough for any reasonable GPU (covers up to ~200 groups for deterministic
-    # mode and ~300 groups for non-deterministic mode)
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{input.device}",
+    # mode and ~300 groups for non-deterministic mode).
+    # Ring-buffered so that concurrent launches from different streams do not
+    # share the kernel's synchronization state (see issue #3618).
+    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf_ring(
+        "radix_topk_row_states",
         1024 * 1024,  # 1MB
         input.device,
-        zero_init=True,
     )
 
     # Allocate output_values for kernel to write directly
@@ -762,12 +763,13 @@ def top_k_page_table_transform(
     ):
         return topk_clusters_page_table_transform(input, lengths, src_page_table, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
+    # Allocate row_states buffer for multi-CTA path.
+    # Ring-buffered so that concurrent launches from different streams do not
+    # share the kernel's synchronization state (see issue #3618).
+    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf_ring(
+        "radix_topk_row_states",
         1024 * 1024,  # 1MB
         device,
-        zero_init=True,
     )
 
     # Allocate output
@@ -884,12 +886,13 @@ def top_k_ragged_transform(
     ):
         return topk_clusters_ragged_transform(input, lengths, offsets, k)
 
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
+    # Allocate row_states buffer for multi-CTA path.
+    # Ring-buffered so that concurrent launches from different streams do not
+    # share the kernel's synchronization state (see issue #3618).
+    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf_ring(
+        "radix_topk_row_states",
         1024 * 1024,  # 1MB
         device,
-        zero_init=True,
     )
 
     # Allocate output
