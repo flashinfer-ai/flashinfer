@@ -1771,21 +1771,7 @@ def test_moe_w4a8(
         fc2_weights.contiguous().view(torch.uint8), "int4"
     )
 
-    def interleave_weights(w: torch.Tensor, dim: int) -> torch.Tensor:
-        # Factors are chosen based on TRTLLM's quantization.py
-        interleave_factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
-        s = w.shape
-        w_interleaved = (
-            w.reshape(s[0], s[1], s[2] // interleave_factor, interleave_factor)
-            .permute(0, 2, 1, 3)
-            .reshape(s[0], s[2] // interleave_factor, s[1] * interleave_factor)
-            .contiguous()
-        )
-        return w_interleaved
-
     w3_w1_scales = torch.cat([w3_scale, w1_scale], dim=1)
-    w3_w1_scales_int = interleave_weights(w3_w1_scales, k)
-    w2_scales_int = interleave_weights(w2_scale, n)
 
     # act scales
     w3_w1_pre_quant_max = torch.max(w1_pre_quant_scale, w3_pre_quant_scale)
@@ -1799,21 +1785,16 @@ def test_moe_w4a8(
     zero_1 = torch.empty(0, dtype=dtype, device="cuda")
     zero_2 = torch.empty(0, dtype=dtype, device="cuda")
 
-    # SM90 requires bfloat16 bit patterns
-    sm = (
-        torch.cuda.get_device_capability()[0] * 10
-        + torch.cuda.get_device_capability()[1]
+    # SM90 mixed-input kernels read INT4 weight scales as bf16 bit patterns in
+    # folded 64x128 scale blocks.
+    w3_w1_scales_out = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
+        w3_w1_scales.to(torch.bfloat16).view(dtype), group_size
     )
-    if sm >= 90:
-        w3_w1_scales_out = w3_w1_scales_int.to(torch.bfloat16).view(dtype)
-        w2_scales_out = w2_scales_int.to(torch.bfloat16).view(dtype)
-        fc31_act_out = fc31_act_scale.to(torch.bfloat16).view(dtype)
-        fc2_act_out = fc2_act_scale.to(torch.bfloat16).view(dtype)
-    else:
-        w3_w1_scales_out = w3_w1_scales_int.to(dtype)
-        w2_scales_out = w2_scales_int.to(dtype)
-        fc31_act_out = fc31_act_scale
-        fc2_act_out = fc2_act_scale
+    w2_scales_out = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
+        w2_scale.to(torch.bfloat16).view(dtype), group_size
+    )
+    fc31_act_out = fc31_act_scale.to(torch.bfloat16).view(dtype)
+    fc2_act_out = fc2_act_scale.to(torch.bfloat16).view(dtype)
 
     quant_scales = (
         w3_w1_scales_out,
@@ -2494,18 +2475,6 @@ def test_moe_mxfp8_mxfp4_ndim_padding_safety(
     )
 
 
-# ============================================================================
-# SM90 mixed-input MoE tests — PR #3084
-#
-# Exercise the W4A16 (MXFP4 x BF16) and W4A8 (INT4 x FP8) paths with the
-# preprocessing helpers exposed by this PR: weights go through
-# ``interleave_moe_weights_for_sm90_mixed_gemm``, MXFP4 block scales go
-# through ``interleave_moe_scales_for_sm90_mixed_gemm``, and W4A8 weight
-# scales use a local group-wise reshape+permute (factor = 4 / 2 / 1 based on
-# whether K is divisible by 512 / 256) to match the W4A8 kernel layout.
-# ============================================================================
-
-
 _MXFP4_LUT = (
     0.0,
     0.5,
@@ -2810,21 +2779,14 @@ def _run_w4a8_moe_hopper(
         fc2_weights.contiguous().view(torch.uint8), "int4"
     )
 
-    def _interleave_scales(w, dim):
-        factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
-        s = w.shape
-        return (
-            w.reshape(s[0], s[1], s[2] // factor, factor)
-            .permute(0, 2, 1, 3)
-            .reshape(s[0], s[2] // factor, s[1] * factor)
-            .contiguous()
-        )
-
-    w3_w1_scales_int = _interleave_scales(torch.cat([w3_scale, w1_scale], dim=1), k)
-    w2_scales_int = _interleave_scales(w2_scale, n)
     # Weight scales: bf16 bit-pattern trick; act scales stay in native dtype.
-    w3_w1_scales_out = w3_w1_scales_int.to(torch.bfloat16).view(dtype)
-    w2_scales_out = w2_scales_int.to(torch.bfloat16).view(dtype)
+    w3_w1_scales = torch.cat([w3_scale, w1_scale], dim=1)
+    w3_w1_scales_out = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
+        w3_w1_scales.to(torch.bfloat16).view(dtype), group_size
+    )
+    w2_scales_out = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
+        w2_scale.to(torch.bfloat16).view(dtype), group_size
+    )
 
     w3_w1_input_scale_max = input_scale.max()
     fc31_act_scale = (

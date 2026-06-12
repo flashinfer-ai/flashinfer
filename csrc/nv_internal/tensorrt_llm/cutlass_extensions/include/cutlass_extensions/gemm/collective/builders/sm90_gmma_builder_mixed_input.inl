@@ -78,30 +78,9 @@ constexpr int compute_stage_count_or_override_folded_weight_scale(
   constexpr int carveout_bytes = cutlass::round_up(carveout_bytes_, alignment);
   constexpr int capacity_bytes = capacity_bytes_ / alignment * alignment;
 
-  return (capacity_bytes - carveout_bytes) / stage_bytes;
+  constexpr int computed_stage_count = (capacity_bytes - carveout_bytes) / stage_bytes;
+  return computed_stage_count < 2 ? 2 : computed_stage_count;
 }
-
-template <bool UseFoldedWeightScaleStorage>
-struct MixedInputStageCountSelector {
-  template <int CapacityBytes, class ElementA, class ElementB, class ElementScale,
-            class ElementZero, class TileShapeMNK, int Alignment, class StageCountType>
-  static constexpr int get(StageCountType stage_count) {
-    return compute_stage_count_or_override_single_affine_transformed_input<
-        CapacityBytes, ElementA, ElementB, ElementScale, ElementZero, TileShapeMNK, Alignment>(
-        stage_count);
-  }
-};
-
-template <>
-struct MixedInputStageCountSelector<true> {
-  template <int CapacityBytes, class ElementA, class ElementB, class ElementScale,
-            class ElementZero, class TileShapeMNK, int Alignment, class StageCountType>
-  static constexpr int get(StageCountType stage_count) {
-    return compute_stage_count_or_override_folded_weight_scale<
-        CapacityBytes, ElementA, ElementB, ElementScale, ElementZero, TileShapeMNK, Alignment>(
-        stage_count);
-  }
-};
 
 }  // namespace detail
 
@@ -122,7 +101,7 @@ struct CollectiveBuilderMixedInput<
          cute::is_same_v<KernelScheduleType, KernelPtrArrayTmaWarpSpecializedCooperative> ||
          cute::is_same_v<KernelScheduleType, KernelPtrArrayTmaWarpSpecializedPingpong>) &&
         (detail::is_use_rmem_A<ElementA_, GmemLayoutATag_, ElementB_, GmemLayoutBTag_>() ||
-         // ConvertAndScale and ConvertAndScaleWithZero
+         // ConvertAndScale
          cute::is_tuple<ElementA_>::value || cute::is_tuple<ElementB_>::value ||
          // DirectConvert
          sizeof_bits<ElementA_>::value != sizeof_bits<ElementB_>::value)>> {
@@ -179,12 +158,6 @@ struct CollectiveBuilderMixedInput<
   static constexpr bool IsATransformed = cute::is_tuple<ElementPairA>::value;
   using ElementScale = cute::conditional_t<IsATransformed, ScaleA, ScaleB>;
   using ElementZero = cute::conditional_t<IsATransformed, ZeroA, ZeroB>;
-  static constexpr bool UseFoldedWeightScaleStorage =
-      IsMixedInput && IsATransformed && cute::is_void_v<ElementZero> &&
-      cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
-      cute::is_same_v<ElementB, cutlass::bfloat16_t> &&
-      cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>;
-
   static_assert(is_static<TileShape_MNK>::value);
   static_assert(is_static<ClusterShape_MNK>::value);
   static_assert(
@@ -255,8 +228,8 @@ struct CollectiveBuilderMixedInput<
       cutlass::detail::alignment_for_swizzle(SmemLayoutAtomB{});
   static constexpr int SmemAlignment = static_cast<int>(cute::max(SmemAlignmentA, SmemAlignmentB));
 
-  // Handle mixed dtype array GEMM's size of tensor map storage.
-  static constexpr size_t TensorMapStorage = sizeof(cute::TmaDescriptor) * size_t(IsMixedInput) * 4;
+  // Array mixed-input GEMM keeps only A/B TMA descriptors; folded scales are loaded by bulk copy.
+  static constexpr size_t TensorMapStorage = sizeof(cute::TmaDescriptor) * size_t(IsMixedInput) * 2;
   static constexpr int KernelSmemCarveout = static_cast<int>(TensorMapStorage);
   static constexpr int Sm90ReducedSmemCapacityBytes =
       detail::sm90_smem_capacity_bytes - KernelSmemCarveout;
@@ -264,10 +237,10 @@ struct CollectiveBuilderMixedInput<
   static constexpr int PipelineStages =
       IsMixedInput
           ? (IsArrayOfPointersGemm
-                 ? detail::MixedInputStageCountSelector<UseFoldedWeightScaleStorage>::template get<
+                 ? detail::compute_stage_count_or_override_folded_weight_scale<
                        Sm90ReducedSmemCapacityBytes, RealElementA, RealElementB, ElementScale,
                        ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{})
-                 : detail::MixedInputStageCountSelector<UseFoldedWeightScaleStorage>::template get<
+                 : detail::compute_stage_count_or_override_folded_weight_scale<
                        detail::sm90_smem_capacity_bytes, RealElementA, RealElementB, ElementScale,
                        ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{}))
           : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes, ElementAMma,

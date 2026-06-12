@@ -704,48 +704,75 @@ def interleave_moe_scales_for_sm90_mixed_gemm(
     scales: torch.Tensor,
     group_size: int = 32,
 ) -> torch.Tensor:
-    """Interleave MXFP4 block scales for the SM90 mixed-input MoE GEMM.
+    """Fold weight scales for the SM90 mixed-input MoE GEMM.
 
     Parameters
     ----------
     scales : torch.Tensor
-        ``[num_experts, rows, K // group_size]`` uint8 tensor of E8M0 block
-        scales.
+        ``[num_experts, rows, K // group_size]`` tensor of scalar weight scales.
+        MXFP4 uses uint8 E8M0 scales with ``group_size=32``; W4A8 uses bf16
+        bit-pattern scales with ``group_size=128``.
     group_size : int
-        MXFP4 quantization group size (default 32).
+        Weight quantization group size.
 
     Returns
     -------
     torch.Tensor
-        Contiguous uint8 tensor with shape
-        ``[num_experts, rows // 64, (K // group_size) // factor, 16, 16]``
-        where ``factor = 128 // group_size``.
+        Contiguous tensor with shape
+        ``[num_experts, rows // 64, K // 128, folded_m, physical_cols]``.
+        ``physical_cols`` is the number of scale elements in 16B and
+        ``folded_m`` is derived so each 64x128 logical scale block is stored as
+        a 16B-contiguous folded block.
     """
     if scales.dim() != 3:
         raise ValueError(
             f"scales must be 3D (num_experts, rows, K/group_size); got {tuple(scales.shape)}"
         )
-    if scales.dtype != torch.uint8:
-        raise ValueError(f"scales must be uint8 (E8M0); got {scales.dtype}")
 
-    factor = 128 // group_size
-    if factor < 1 or 128 % group_size != 0:
+    scale_groups_per_k128 = 128 // group_size
+    if scale_groups_per_k128 < 1 or 128 % group_size != 0:
         raise ValueError(
-            f"group_size={group_size} must divide 128 (interleave factor = 128 // group_size)"
+            f"group_size={group_size} must divide 128 (scale groups per K128 block)"
         )
+    element_bits = scales.element_size() * 8
+    physical_cols = 128 // element_bits
+    if physical_cols < 1 or 128 % element_bits != 0:
+        raise ValueError(
+            f"scale dtype {scales.dtype} has unsupported element size {element_bits} bits"
+        )
+    if physical_cols % scale_groups_per_k128 != 0:
+        raise ValueError(
+            f"scale dtype {scales.dtype} and group_size={group_size} do not form "
+            "an integer folded M slice"
+        )
+    m_slices_per_m64 = physical_cols // scale_groups_per_k128
+    if 64 % m_slices_per_m64 != 0:
+        raise ValueError(
+            f"folded M slices {m_slices_per_m64} must divide the logical M64 block"
+        )
+    folded_m = 64 // m_slices_per_m64
+
     e, rows, kgs = scales.shape
     if rows % 64 != 0:
         raise ValueError(f"scale rows={rows} must be divisible by 64")
-    if kgs % factor != 0:
+    if kgs % scale_groups_per_k128 != 0:
         raise ValueError(
-            f"K/group_size={kgs} must be divisible by interleave factor {factor}"
+            f"K/group_size={kgs} must be divisible by scale groups per K128 block "
+            f"{scale_groups_per_k128}"
         )
-    k128_blocks = kgs // factor
+    k128_blocks = kgs // scale_groups_per_k128
     return (
-        scales.reshape(e, rows // 64, 4, 16, k128_blocks, factor)
+        scales.reshape(
+            e,
+            rows // 64,
+            m_slices_per_m64,
+            folded_m,
+            k128_blocks,
+            scale_groups_per_k128,
+        )
         .permute(0, 1, 4, 3, 2, 5)
         .contiguous()
-        .reshape(e, rows // 64, k128_blocks, 16, 16)
+        .reshape(e, rows // 64, k128_blocks, folded_m, physical_cols)
     )
 
 
