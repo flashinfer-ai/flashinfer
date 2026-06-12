@@ -1817,6 +1817,9 @@ def _moe_bf16_run_experts(
     topk_idx,
     local_expert_offset,
     E_global,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """Un-quantized (bf16) MoE expert computation with SwiGLU."""
     T, H = hidden_states.shape
@@ -1839,12 +1842,34 @@ def _moe_bf16_run_experts(
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
         X1, X2 = G1[:, :I], G1[:, I:]
-        silu_X2 = X2 / (1.0 + torch.exp(-X2))
-        O = (silu_X2 * X1).matmul(W2[le].t())
+        if gemm1_clamp_limit is not None:
+            limit = gemm1_clamp_limit[le].to(device=X1.device, dtype=torch.float32)
+            X1 = torch.clamp(X1, min=-limit, max=limit)
+            X2 = torch.clamp(X2, max=limit)
+        if (
+            gemm1_alpha is not None
+            or gemm1_beta is not None
+            or gemm1_clamp_limit is not None
+        ):
+            alpha = (
+                1.0
+                if gemm1_alpha is None
+                else gemm1_alpha[le].to(device=X2.device, dtype=torch.float32)
+            )
+            beta = (
+                0.0
+                if gemm1_beta is None
+                else gemm1_beta[le].to(device=X1.device, dtype=torch.float32)
+            )
+            activation = X2 * torch.sigmoid(alpha * X2) * (X1 + beta)
+        else:
+            silu_X2 = X2 / (1.0 + torch.exp(-X2))
+            activation = silu_X2 * X1
+        expert_out = activation.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
         w_e = (w_tok * match).sum(dim=1)
-        output.index_add_(0, token_idx, O * w_e.unsqueeze(1))
+        output.index_add_(0, token_idx, expert_out * w_e.unsqueeze(1))
     return output.to(torch.bfloat16)
 
 
@@ -1891,6 +1916,9 @@ def _trtllm_bf16_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for TRT-LLM BF16 MoE (Default routing)."""
@@ -1905,6 +1933,9 @@ def _trtllm_bf16_moe_reference(
         topk_idx,
         local_expert_offset,
         int(num_experts),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -1918,6 +1949,9 @@ def _trtllm_bf16_routed_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for TRT-LLM BF16 MoE with precomputed topk_ids."""
@@ -1938,6 +1972,9 @@ def _trtllm_bf16_routed_moe_reference(
         topk_ids.to(torch.int64),
         local_expert_offset,
         int(num_experts),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -2225,13 +2262,34 @@ _TRTLLM_MOE_COMMON_OUTPUTS: dict[str, Tensor | Scalar] = {
     ),
 }
 
+_TRTLLM_BF16_SWIGLU_OA_INPUTS: dict[str, Tensor] = {
+    "gemm1_alpha": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        optional=True,
+        description="Optional per-expert SwiGLU OA alpha.",
+    ),
+    "gemm1_beta": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        optional=True,
+        description="Optional per-expert SwiGLU OA beta.",
+    ),
+    "gemm1_clamp_limit": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        optional=True,
+        description="Optional per-expert SwiGLU OA clamp limit.",
+    ),
+}
+
 # BF16 MoE (no quantization)
 trtllm_bf16_moe_trace = TraceTemplate(
     op_type="moe",
     name_prefix="trtllm_bf16_moe",
     description="TRT-LLM BF16 MoE (no quantization).",
     axes=dict(_TRTLLM_MOE_COMMON_AXES),
-    inputs=dict(_TRTLLM_MOE_COMMON_INPUTS),
+    inputs={**_TRTLLM_MOE_COMMON_INPUTS, **_TRTLLM_BF16_SWIGLU_OA_INPUTS},
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm"],
     reference=_trtllm_bf16_moe_reference,
@@ -2265,6 +2323,7 @@ trtllm_bf16_routed_moe_trace = TraceTemplate(
         "top_k": _TRTLLM_MOE_COMMON_INPUTS["top_k"],
         "local_expert_offset": _TRTLLM_MOE_COMMON_INPUTS["local_expert_offset"],
         "routed_scaling_factor": _TRTLLM_MOE_COMMON_INPUTS["routed_scaling_factor"],
+        **_TRTLLM_BF16_SWIGLU_OA_INPUTS,
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm"],

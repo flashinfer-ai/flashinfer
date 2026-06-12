@@ -1209,7 +1209,6 @@ class GatedDeltaNetChunkedKernel:
                 work = scheduler.get_current_work()
             a_inv_ready_producer.tail()
             qk_ready_producer.tail()
-            o_store_producer.tail()
             group_order_producer.tail()
 
         # ==============================================================
