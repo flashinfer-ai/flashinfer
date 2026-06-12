@@ -94,7 +94,9 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
     weight_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      if (weight != nullptr) {
+        weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      }
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
@@ -121,7 +123,7 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
   const uint32_t smem_size = num_warps * sizeof(float);
-  float weight_bias = 0.f;
+  float weight_bias = (weight == nullptr) ? 1.f : 0.f;
   void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
 
   cudaLaunchConfig_t config;
@@ -322,7 +324,9 @@ __global__ void QKRMSNormKernel(T* __restrict__ input, T* __restrict__ weight,
       if ((i * num_threads + thread_id) * VEC_SIZE < d) {
         input_vec.load(input + batch_idx * stride_input_n + head_idx * stride_input_h +
                        i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-        weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+        if (weight != nullptr) {
+          weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+        }
       }
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; j++) {
@@ -348,7 +352,7 @@ cudaError_t QKRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint3
   const uint32_t num_warps = 4;
   const uint32_t smem_size = 0;
 
-  float weight_bias = 0.f;
+  float weight_bias = (weight == nullptr) ? 1.f : 0.f;
 
   cudaLaunchConfig_t config;
   config.dynamicSmemBytes = smem_size;
@@ -459,7 +463,9 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     weight_vec.fill(0.f);
     x_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      if (weight != nullptr) {
+        weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      }
       x_vec.load(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
 #pragma unroll
@@ -487,7 +493,7 @@ cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_siz
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
   const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
-  float weight_bias = 0.f;
+  float weight_bias = (weight == nullptr) ? 1.f : 0.f;
   void* args[] = {&input,        &residual,        &weight,      &d,
                   &stride_input, &stride_residual, &weight_bias, &eps};
 
