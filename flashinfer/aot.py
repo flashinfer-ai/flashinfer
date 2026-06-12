@@ -90,7 +90,7 @@ from .jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from .jit.mhc import gen_mhc_module
-from .jit.mla import gen_mla_module
+from .jit.mla import gen_mla_module, gen_sparse_mla_sm120_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -105,7 +105,6 @@ from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
-from .jit.sparse_mla_sm120 import gen_sparse_mla_sm120_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.tllm_utils import gen_trtllm_utils_module

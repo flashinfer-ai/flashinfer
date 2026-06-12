@@ -34,7 +34,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.sparse_mla_sm120 import (
+from flashinfer.mla._sparse_mla_sm120 import (
     _sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
 )
 from flashinfer.utils import is_sm12x_supported
@@ -461,7 +461,6 @@ def test_sparse_mla_sm120_decode_dsv4_public_api() -> None:
         swa_topk_lens=torch.full((num_tokens,), topk, device=device, dtype=torch.int32),
         bmm1_scale=sm_scale,
         kv_layout="NHD",
-        backend="auto",
     )
 
     torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
@@ -530,7 +529,6 @@ def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
         ),
         bmm1_scale=sm_scale,
         kv_layout="NHD",
-        backend="auto",
     )
 
     torch.testing.assert_close(output.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)

@@ -391,7 +391,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     primary_segment = segments[0]
     extra_segment = segments[1] if len(segments) > 1 else None
 
-    from ..sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
+    from ._sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
 
     query_flat = query.reshape(batch_size * q_len_per_request, num_heads, head_dim)
     expected_out_shape = (batch_size, q_len_per_request, num_heads, 512)
@@ -994,21 +994,15 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
-def _resolve_dsv4_sparse_mla_backend(device: torch.device, backend: str) -> str:
-    if backend == "auto":
-        cc = get_compute_capability(device)
-        if cc[0] == 12:
-            return "sparse"
-        if cc[0] == 10:
-            return "trtllm-gen"
-        raise ValueError(
-            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
-            f"TRTLLM-GEN or SM120 via sparse backend, got SM{cc[0]}{cc[1]}"
-        )
-    if backend in ("trtllm-gen", "sparse"):
-        return backend
+def _resolve_dsv4_sparse_mla_backend(device: torch.device) -> str:
+    cc = get_compute_capability(device)
+    if cc[0] == 12:
+        return "sparse"
+    if cc[0] == 10:
+        return "trtllm-gen"
     raise ValueError(
-        f"backend must be one of 'auto', 'trtllm-gen', or 'sparse', got {backend!r}"
+        "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
+        f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
     )
 
 
@@ -1144,17 +1138,29 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     enable_pdl: bool | None = None,
-    backend: str = "auto",
     swa_topk_lens: Optional[torch.Tensor] = None,
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
 
-    Supports TRTLLM-GEN on SM100/SM103 and the SM120 sparse backend. For
-    ``backend="sparse"``, ``sparse_indices``/``swa_topk_lens`` describe the SWA
-    segment and ``extra_sparse_indices``/``extra_sparse_topk_lens`` describe the
-    optional compressed segment.
+    The implementation is selected from the query device architecture.
+
+    On SM100/SM103, this calls the TRTLLM-GEN DeepSeek V4 sparse MLA kernels.
+    The query and both KV pools use head dim 512. The query may be BF16 or
+    per-tensor FP8 E4M3 and the output is BF16. The first 128 columns of
+    ``sparse_indices`` are SWA entries into ``swa_kv_cache``; remaining columns
+    are compressed entries into ``compressed_kv_cache``. ``sparse_topk_lens``
+    gives the total active sparse length for each query token and must include
+    the fixed 128 SWA entries. ``seq_lens`` provides the original KV sequence
+    length for the SWA validity window.
+
+    On SM120/SM121, this calls the packed sparse backend. ``swa_kv_cache`` is
+    the required packed uint8 SWA pool with 584 bytes per token. ``sparse_indices``
+    and ``swa_topk_lens`` describe the active SWA segment. To add a compressed
+    segment, pass ``compressed_kv_cache`` as another packed uint8 pool and pass
+    ``extra_sparse_indices`` with ``extra_sparse_topk_lens``. The SM120/SM121
+    path accepts BF16 or FP8 E4M3 query tensors and produces BF16 output.
 
     Parameters
     ----------
@@ -1197,30 +1203,33 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Maximum query length in the varlen batch. Required with
         ``cum_seq_lens_q``.
     enable_pdl : Optional[bool]
-        Whether to enable Programmatic Dependent Launch.
-    backend : str
-        ``"auto"`` chooses ``"trtllm-gen"`` on SM100/SM103 and ``"sparse"``
-        on SM120.
+        Whether to enable Programmatic Dependent Launch. Used by the
+        TRTLLM-GEN path.
     swa_topk_lens : Optional[torch.Tensor]
-        Active SWA segment lengths for SM120 ``sparse``.
+        Active SWA segment lengths for SM120/SM121, shape ``[sum_q]`` INT32.
     extra_sparse_indices : Optional[torch.Tensor]
-        SM120 ``sparse`` backend only. Optional compressed segment indices into
+        Optional SM120/SM121 compressed segment indices into
         ``compressed_kv_cache``.
     extra_sparse_topk_lens : Optional[torch.Tensor]
-        Active compressed segment lengths for SM120 ``sparse``.
+        Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
+        INT32.
     """
-    backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
+    backend = _resolve_dsv4_sparse_mla_backend(query.device)
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
         if backend == "sparse":
-            raise ValueError("SM120 DSv4 sparse MLA expects bmm1_scale to be a float")
+            raise ValueError(
+                "SM120/SM121 DSv4 sparse MLA expects bmm1_scale to be a float"
+            )
         if bmm1_scale.dtype != torch.float32:
             raise TypeError("bmm1_scale tensor must have dtype torch.float32")
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         if backend == "sparse":
-            raise ValueError("SM120 DSv4 sparse MLA expects bmm2_scale to be a float")
+            raise ValueError(
+                "SM120/SM121 DSv4 sparse MLA expects bmm2_scale to be a float"
+            )
         if bmm2_scale.dtype != torch.float32:
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
 
@@ -1248,7 +1257,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     ):
         raise ValueError(
             "swa_topk_lens, extra_sparse_indices, and extra_sparse_topk_lens "
-            "are only supported with backend='sparse'"
+            "are only supported on SM120/SM121"
         )
     if sparse_topk_lens is None or compressed_kv_cache is None or seq_lens is None:
         raise ValueError(
@@ -1463,13 +1472,6 @@ class BatchMLAPagedAttentionWrapper:
             kernels will be generated by CUTLASS and only float_workspace_buffer is required and
             other arguments are ignored.
         """
-        if backend == "sparse-sm120":
-            raise ValueError(
-                "backend='sparse-sm120' is no longer supported on "
-                "BatchMLAPagedAttentionWrapper; use "
-                "trtllm_batch_decode_sparse_mla_dsv4 for DeepSeek V4 sparse MLA"
-            )
-
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
 
@@ -2382,34 +2384,67 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cute_dsl_impl: str = "auto",
     kv_scale_format: str = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """
+    r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
+
+    With ``backend="auto"``, SM100/SM103 devices use TRTLLM-GEN for sparse MLA
+    when ``sparse_mla_top_k > 0``. SM120/SM121 devices use the packed sparse
+    backend for ``sparse_mla_top_k > 0`` and XQA for dense decode.
+
     Parameters
     ----------
-    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
-    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe] or [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache. Both 3D and 4D formats are supported for backward compatibility.
-    workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
-    qk_nope_head_dim: qk_nope_head_dim, must be 128 or 64
-    kv_lora_rank: kv_lora_rank, must be 512 or 256
-    qk_rope_head_dim: qk_rope_head_dim, must be 64
-    sparse_mla_top_k: sparse MLA top k for sparse page-table decode paths.
-        On SM100/SM103 this selects the TRTLLM-GEN sparse MLA path. On SM120,
-        ``backend="auto"`` selects the SM120 packed v32/GLM sparse backend.
-    block_tables: page table of kv cache.
-        When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
-        When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
-        where dim 1 distinguishes K (0) and V (1) page indices. For MLA both rows will
-        typically be identical since K and V share the same compressed representation.
-    seq_lens: query_len. Optional for the SM120 sparse v32/GLM path; ``None``
-        means all sparse columns are active.
-    max_seq_len: max sequence length for kv_cache
-    out: output tensor, if not provided, will be allocated internally
-    bmm1_scale: fused scale for mla bmm1 input.
-        When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
-        When using ``cute-dsl`` backend, only ``float`` values are supported.
-    bmm2_scale: fused scale for mla bmm2 input.
-        When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
-        When using ``cute-dsl`` backend, only ``float`` values are supported.
-    sinks: additional value per head in the denominator of the softmax.
+    query : torch.Tensor
+        Query tensor with shape
+        ``[batch_size, q_len_per_request, num_heads, head_dim_qk]`` where
+        ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``. For the SM120/SM121
+        v32/GLM sparse backend, this must be BF16 with ``head_dim_qk == 576``.
+    kv_cache : torch.Tensor
+        For TRTLLM-GEN, CuteDSL, and XQA, the paged KV cache is
+        ``[num_pages, page_size, kv_lora_rank + qk_rope_head_dim]`` or
+        ``[num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim]`` and uses
+        the query-compatible dense dtype. For the SM120/SM121 v32/GLM sparse
+        backend, this is a packed uint8 cache with 656 bytes per token, shaped
+        ``[num_pages, page_size, 656]`` or ``[num_pages, 1, page_size, 656]``.
+    workspace_buffer : torch.Tensor
+        Pre-allocated workspace buffer. Must be zero-initialized on first use
+        by kernels that use semaphore state.
+    qk_nope_head_dim : int
+        Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
+        ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
+        ignores this value and validates ``query.shape[-1] == 576`` instead.
+    kv_lora_rank : int
+        Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
+    qk_rope_head_dim : int
+        RoPE head dimension. Sparse MLA paths use ``64``.
+    block_tables : torch.Tensor
+        Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
+        SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.
+        For SM120/SM121 sparse v32/GLM, it is the sparse index matrix and must
+        have shape ``[batch_size, q_len_per_request, sparse_mla_top_k]`` with
+        int32 physical token indices.
+    seq_lens : Optional[torch.Tensor]
+        Per-request KV sequence lengths for dense and TRTLLM-GEN paths. For
+        SM120/SM121 sparse v32/GLM, pass ``[batch_size, q_len_per_request]`` or
+        flattened ``[batch_size * q_len_per_request]`` active top-k lengths; if
+        ``None``, every column in ``block_tables`` is active.
+    max_seq_len : int
+        Maximum KV sequence length used for dense/TRTLLM-GEN scheduling.
+        Ignored by the SM120/SM121 sparse v32/GLM backend.
+    sparse_mla_top_k : int
+        Enables sparse MLA when greater than zero. On SM100/SM103 this selects
+        the TRTLLM-GEN sparse page-table path. On SM120/SM121 with
+        ``backend="auto"`` or ``backend="sparse"``, this is the width of the
+        packed v32/GLM sparse index matrix.
+    out : Optional[torch.Tensor]
+        Output tensor. If not provided, it is allocated internally.
+    bmm1_scale : Union[float, torch.Tensor]
+        Fused scale for MLA BMM1. TRTLLM-GEN accepts a FP32 tensor or float.
+        CuteDSL, XQA, and SM120/SM121 sparse v32/GLM require a float.
+    bmm2_scale : Union[float, torch.Tensor]
+        Fused scale for MLA BMM2. TRTLLM-GEN accepts a FP32 tensor or float.
+        CuteDSL and XQA require a float. SM120/SM121 sparse v32/GLM requires
+        ``1.0``.
+    sinks : Optional[List[torch.Tensor]]
+        Additional value per head in the denominator of the softmax.
         Supported by ``trtllm-gen``, ``cute-dsl``, and ``sparse``.
         On ``cute-dsl`` this requires the modular implementation;
         ``cute_dsl_impl="auto"`` (the default) promotes to modular
@@ -2425,13 +2460,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         support from the query device.  Honoured by the ``trtllm-gen`` and ``xqa``
         backends; ignored by ``cute-dsl``.
     backend : str = "auto"
-        The implementation backend, could be ``auto``/``xqa``,
-        ``trtllm-gen``, ``cute-dsl``, or ``sparse``. Defaults to
-        ``auto``.
-        When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
-        For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
-        For sm_120 (blackwell architecture), ``auto`` will choose ``sparse``
-        when ``sparse_mla_top_k > 0`` and ``xqa`` otherwise.
+        Implementation backend. Valid values are ``"auto"``, ``"xqa"``,
+        ``"trtllm-gen"``, ``"cute-dsl"``, and ``"sparse"``. ``"auto"``
+        chooses ``"trtllm-gen"`` for SM100/SM103 sparse MLA and chooses
+        ``"sparse"`` for SM120/SM121 when ``sparse_mla_top_k > 0``; otherwise
+        SM120/SM121 dense decode uses ``"xqa"``.
         The ``cute-dsl`` backend has two interchangeable implementations
         (``monolithic`` and ``modular``) on the same shape/dtype envelope;
         which one runs is controlled by the ``cute_dsl_impl`` kwarg below.
@@ -2440,17 +2473,17 @@ def trtllm_batch_decode_with_kv_cache_mla(
         If True, the sequence length is variable.
         Otherwise,the sequence length is fixed for all the requests in the batch.
     uses_shared_paged_kv_idx : bool = True
-        Whether the K and V page indices are shared as a unified index.
+        Whether K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
-        False is only supported for trtllm-gen backend.
+        False is only supported by TRTLLM-GEN.
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
         ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must have
         dtype ``torch.float32``. Accepted shapes:
 
-        * ``[batch_size * q_len_per_request, num_qo_heads]`` (trtllm-gen
-          native; accepted by both backends), or
+        * ``[batch_size * q_len_per_request, num_qo_heads]`` (TRTLLM-GEN
+          native; accepted by sparse), or
         * ``[batch_size, q_len_per_request, num_qo_heads]`` (cute-dsl native;
           also accepted by cute-dsl).
 
@@ -2472,9 +2505,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
           raise :class:`ValueError` if the call uses any modular-only
           feature (e.g. ``sinks``).
     kv_scale_format : str = "auto"
-        Scale semantics for the SM120 packed v32/GLM sparse backend. ``"auto"``
-        and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline scales;
-        ``"arbitrary_fp32"`` selects GLM-style arbitrary FP32 inline scales.
+        Scale semantics for the SM120/SM121 packed v32/GLM sparse backend.
+        ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline
+        scales; ``"arbitrary_fp32"`` selects GLM-style arbitrary FP32 inline scales.
         Ignored by the ``trtllm-gen``, ``xqa``, and ``cute-dsl`` backends.
 
     Note
@@ -2498,12 +2531,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
     Autotune
     --------
-    When called under ``flashinfer.autotune(True)`` with ``backend="auto"``, this
-    function profiles both ``trtllm-gen`` and ``cute-dsl`` across a bucketed batch
-    sweep up to each runner's kernel/workspace cap and caches the winning runner
-    per shape signature. Subsequent calls under ``autotune(False)`` dispatch to
-    the cached choice; any batch outside the tuned range falls back to a default
-    runner with a one-time warning.
+    On SM100/SM103 dense MLA, calling under ``flashinfer.autotune(True)`` with
+    ``backend="auto"`` profiles both ``trtllm-gen`` and ``cute-dsl`` across a
+    bucketed batch sweep up to each runner's kernel/workspace cap and caches the
+    winning runner per shape signature. Subsequent calls under
+    ``autotune(False)`` dispatch to the cached choice; any batch outside the
+    tuned range falls back to a default runner with a one-time warning.
 
     The autotune bucket range and cache key do **not** depend on
     ``kv_cache.shape[0]`` (the number of pages in the pool), so reallocating the
@@ -2580,8 +2613,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             enable_pdl,
         )
 
-    if backend == "sparse-sm120":
-        backend = "sparse"
     if backend not in ("auto", "trtllm-gen", "cute-dsl", "sparse"):
         raise ValueError(f"Backend {backend} not supported")
 

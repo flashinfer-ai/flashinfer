@@ -438,7 +438,7 @@ def test_fi_trace_complete_gqa_paged_decode():
 
 def test_fi_trace_complete_sparse_mla_sm120_decode_dsv4_single_cache():
     """Sparse-MLA SM120 decode-dsv4: single-cache trace resolves required axes/dtypes."""
-    from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
 
     T, H, DQK, DV, TOPK, P, NP, KVB = 4, 32, 512, 512, 512, 64, 8, 584
     SPLITS = (TOPK + 63) // 64
@@ -463,7 +463,7 @@ def test_fi_trace_complete_sparse_mla_sm120_decode_dsv4_single_cache():
 
 def test_fi_trace_complete_sparse_mla_sm120_decode_dsv4_dual_cache():
     """Sparse-MLA SM120 decode-dsv4: dual-cache optional axes resolve when present."""
-    from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
 
     T, H, DQK, DV, TOPK, XTOPK, P, XP, NP, XNP, KVB = (
         4,

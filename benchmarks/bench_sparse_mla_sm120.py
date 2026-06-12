@@ -43,7 +43,7 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
+from flashinfer.mla._sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import is_sm120a_supported
 
@@ -177,13 +177,10 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
             swa_kv_cache=kv_packed,
             workspace_buffer=workspace,
             sparse_indices=indices,
-            compressed_kv_cache=kv_packed,
-            sparse_topk_lens=indices.new_full((num_tokens,), topk),
-            seq_lens=indices.new_full((num_tokens,), 128),
+            swa_topk_lens=indices.new_full((num_tokens,), topk),
             out=output.unsqueeze(1),
             bmm1_scale=sm_scale,
             sinks=attn_sink,
-            backend="auto",
         )
 
     # Warm + measure.
@@ -277,21 +274,21 @@ def bench_sparse_mla_sm120_dsv4_dual(
     sm_scale = d_qk**-0.5
 
     def fn():
-        sparse_topk_lens = indices.new_full(
-            (num_tokens,), topk_main + _actual_extra_topk(topk_extra, extra_topk_length)
+        extra_lens = indices.new_full(
+            (num_tokens,), _actual_extra_topk(topk_extra, extra_topk_length)
         )
         flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
             query=q.unsqueeze(1),
             swa_kv_cache=kv_main,
             workspace_buffer=workspace,
-            sparse_indices=torch.cat((indices, indices_extra), dim=-1).contiguous(),
+            sparse_indices=indices,
             compressed_kv_cache=kv_extra,
-            sparse_topk_lens=sparse_topk_lens,
-            seq_lens=indices.new_full((num_tokens,), topk_main),
+            swa_topk_lens=indices.new_full((num_tokens,), topk_main),
+            extra_sparse_indices=indices_extra,
+            extra_sparse_topk_lens=extra_lens,
             out=output.unsqueeze(1),
             bmm1_scale=sm_scale,
             sinks=attn_sink,
-            backend="auto",
         )
 
     fn()

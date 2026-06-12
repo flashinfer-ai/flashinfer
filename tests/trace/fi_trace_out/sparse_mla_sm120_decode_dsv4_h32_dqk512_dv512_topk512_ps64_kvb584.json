@@ -3,7 +3,7 @@
   "description": "Sparse-MLA paged decode (DSv4 standalone kernel) on SM120 with optional dual-cache support and AutoTuner-driven chunks_per_block tactic selection.",
   "op_type": "sparse_mla_decode_dsv4_sm120",
   "tags": [
-    "fi_api:flashinfer.sparse_mla_sm120.sparse_mla_sm120_decode_dsv4",
+    "fi_api:flashinfer.mla._sparse_mla_sm120.sparse_mla_sm120_decode_dsv4",
     "status:wip",
     "sparse:topk",
     "backend:sm120",

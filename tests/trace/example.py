@@ -97,7 +97,7 @@ from flashinfer.prefill import (
     BatchPrefillWithRaggedKVCacheWrapper,
 )
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
-from flashinfer.sparse_mla_sm120 import (
+from flashinfer.mla._sparse_mla_sm120 import (
     sparse_mla_sm120_decode_dsv4,
 )
 

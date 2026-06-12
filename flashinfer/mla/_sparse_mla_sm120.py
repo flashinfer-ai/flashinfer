@@ -49,8 +49,8 @@ from typing import List, Optional
 
 import torch
 
-from .api_logging import flashinfer_api
-from .autotuner import (
+from ..api_logging import flashinfer_api
+from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
     DynamicTensorSpec,
@@ -58,11 +58,11 @@ from .autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from .jit.sparse_mla_sm120 import gen_sparse_mla_sm120_module
-from .trace.templates.attention import (
+from ..jit.mla import gen_sparse_mla_sm120_module
+from ..trace.templates.attention import (
     sparse_mla_sm120_decode_dsv4_trace,
 )
-from .utils import (
+from ..utils import (
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
@@ -200,15 +200,13 @@ def _packed_kv_page_block_size(
     if kv_cache.ndim == 3:
         if kv_cache.shape[-1] != bytes_per_token:
             raise ValueError(
-                f"{name} last dim must be {bytes_per_token}, got "
-                f"{kv_cache.shape[-1]}"
+                f"{name} last dim must be {bytes_per_token}, got {kv_cache.shape[-1]}"
             )
         return int(kv_cache.shape[1])
     if kv_cache.ndim == 4:
         if kv_cache.shape[-1] != bytes_per_token:
             raise ValueError(
-                f"{name} last dim must be {bytes_per_token}, got "
-                f"{kv_cache.shape[-1]}"
+                f"{name} last dim must be {bytes_per_token}, got {kv_cache.shape[-1]}"
             )
         if kv_cache.shape[1] == 1:
             # HND: [num_pages, 1, page_block_size, bytes_per_token].
@@ -1025,7 +1023,7 @@ def _decode_dsv3_2_default_cache_path():
     if override:
         base = pathlib.Path(override)
     else:
-        from .jit.env import FLASHINFER_WORKSPACE_DIR
+        from ..jit.env import FLASHINFER_WORKSPACE_DIR
 
         base = FLASHINFER_WORKSPACE_DIR / "autotune"
     return base / "sparse_mla_sm120_decode_dsv3_2.json"
@@ -1043,7 +1041,7 @@ def _decode_dsv4_default_cache_path():
     if override:
         base = pathlib.Path(override)
     else:
-        from .jit.env import FLASHINFER_WORKSPACE_DIR
+        from ..jit.env import FLASHINFER_WORKSPACE_DIR
 
         base = FLASHINFER_WORKSPACE_DIR / "autotune"
     return base / "sparse_mla_sm120_decode_dsv4.json"
