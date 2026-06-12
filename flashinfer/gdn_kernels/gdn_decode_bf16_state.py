@@ -2040,12 +2040,8 @@ def gated_delta_rule_mtp(
         same_pool,
     )
     if cache_key not in _compiled_kernels_mtp:
-        # First call for this config: do dlpack conversions once for
-        # compilation (default_indices is only a compile-time template for
-        # the index tensors; this entry point requires
-        # initial_state_indices at runtime). Steady-state calls pass torch
-        # tensors straight to the compiled callable (tvm-ffi accepts
-        # either). Batch-dependent dimensions are marked dynamic so the
+        # First call for this config: compile the kernel.
+        # Batch-dependent dimensions are marked dynamic so the
         # compiled kernel is reused across batch sizes.
         default_indices = torch.arange(B, dtype=torch.int32, device=q.device)
         default_output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
@@ -2112,10 +2108,6 @@ def gated_delta_rule_mtp(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            # The default output is batch-sized, so it lives in a per-(B,
-            # device) map now that B is no longer part of the cache key.
-            # (No default indices needed at runtime: this entry point
-            # requires initial_state_indices.)
             "aux": {(B, q.device): default_output},
         }
 
