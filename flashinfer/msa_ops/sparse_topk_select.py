@@ -1,0 +1,124 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import functools
+from typing import Optional
+
+import torch
+
+from ..utils import is_sm12x_supported
+from .jit import gen_sparse_topk_select_module
+
+
+@functools.cache
+def _get_sparse_topk_select_module():
+    return gen_sparse_topk_select_module().build_and_load()
+
+
+def sparse_topk_select(
+    max_score: torch.Tensor,
+    topk: int,
+    num_valid_pages: Optional[int] = None,
+    output: Optional[torch.Tensor] = None,
+    force_begin_blocks: int = 0,
+    force_end_blocks: int = 0,
+) -> torch.Tensor:
+    """Select the top-K KV blocks per query token based on attention scores.
+
+    Implements the block-scoring pass of Minimax Sparse Attention: given the
+    per-block maximum attention scores from a cheap proxy prefill, selects the
+    ``topk`` most important KV blocks for each (query token, head) pair and
+    returns their sorted indices.
+
+    Parameters
+    ----------
+    max_score : torch.Tensor
+        Shape ``(num_qo_heads, max_k_tiles, total_qo_len)``, dtype float32.
+        Per-KV-block maximum attention scores produced by the proxy prefill
+        pass.  Entries for invalid tiles (beyond the actual KV length) must be
+        set to ``-inf`` by the caller.
+    topk : int
+        Number of KV blocks to select per (query token, head).  Must be 16.
+    num_valid_pages : int, optional
+        Actual number of valid KV pages (``<= max_k_tiles``).  Indices
+        ``>= num_valid_pages`` are replaced with -1 and sorted to the tail.
+        Defaults to ``max_k_tiles`` (disables clamping).
+    output : torch.Tensor, optional
+        Pre-allocated output tensor of shape
+        ``(total_qo_len, num_qo_heads, topk)``, dtype int32.  Allocated
+        internally if not provided.
+    force_begin_blocks : int
+        Number of KV blocks at the beginning (sink tokens) to always include.
+    force_end_blocks : int
+        Number of KV blocks at the end (local window) to always include.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(total_qo_len, num_qo_heads, topk)``, dtype int32.
+        Ascending KV-block indices; ``-1`` entries are tail-padded invalid
+        slots.
+    """
+    if not is_sm12x_supported(max_score.device):
+        raise RuntimeError(
+            "sparse_topk_select requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+        )
+
+    if max_score.dtype != torch.float32:
+        raise ValueError(f"max_score must be float32, got {max_score.dtype}")
+    if not max_score.is_contiguous():
+        raise ValueError("max_score must be contiguous")
+    if max_score.ndim != 3:
+        raise ValueError(
+            f"max_score must be 3D (num_qo_heads, max_k_tiles, total_qo_len), got {max_score.ndim}D"
+        )
+    if topk != 16:
+        raise ValueError(f"topk must be 16, got {topk}")
+
+    num_qo_heads, max_k_tiles, total_qo_len = max_score.shape
+
+    if num_valid_pages is None:
+        num_valid_pages = max_k_tiles
+
+    if output is None:
+        output = torch.empty(
+            (total_qo_len, num_qo_heads, topk),
+            dtype=torch.int32,
+            device=max_score.device,
+        )
+    else:
+        if output.shape != (total_qo_len, num_qo_heads, topk):
+            raise ValueError(
+                f"output shape must be ({total_qo_len}, {num_qo_heads}, {topk}), "
+                f"got {tuple(output.shape)}"
+            )
+        if output.dtype != torch.int32:
+            raise ValueError(f"output must be int32, got {output.dtype}")
+
+    workspace_size = num_qo_heads * max_k_tiles * total_qo_len
+    workspace = torch.empty(workspace_size, dtype=torch.int32, device=max_score.device)
+
+    _get_sparse_topk_select_module().sparse_topk_select(
+        max_score,
+        output,
+        workspace,
+        topk,
+        num_valid_pages,
+        force_begin_blocks,
+        force_end_blocks,
+    )
+
+    return output
