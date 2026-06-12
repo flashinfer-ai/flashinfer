@@ -396,7 +396,6 @@ class TritonAutotune:
     num_stages: int | None = None
     precompute_num_warps: int | None = None
     precompute_num_stages: int | None = None
-    internal_pdl: bool = True
 
 
 @dataclass
@@ -876,6 +875,9 @@ def _make_run_closure(
                     state_scale=inputs.state_scale_work,
                     rand_seed=rand_seed,
                     philox_rounds=philox_rounds,
+                    # enable_pdl is the EXTERNAL (conv1d→kernel) chain only.  The
+                    # split's internal precompute→main PDL is unconditional in the
+                    # launcher, so it is NOT controlled here.
                     enable_pdl=external_pdl,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
@@ -905,6 +907,10 @@ def _make_run_closure(
                     state_scale=inputs.state_scale_work,
                     rand_seed=rand_seed,
                     philox_rounds=philox_rounds,
+                    # No conv1d here → no external PDL.  The split's internal
+                    # precompute→main PDL is unconditional in the launcher, so it
+                    # is active regardless of this flag.
+                    enable_pdl=False,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
@@ -1038,7 +1044,10 @@ def _make_run_closure(
                 dt_bias=inputs.dt_bias,
                 dt_softplus=True,
                 state_batch_indices=None,
-                use_internal_pdl=autotune.internal_pdl,
+                # Internal precompute→main PDL is intrinsic to the split (the
+                # main's replay overlaps the precompute) — always on, never a
+                # user knob.  Only external (conv1d) PDL is exposed.
+                use_internal_pdl=True,
                 rand_seed=rand_seed,
                 philox_rounds=philox_rounds,
                 state_scales=inputs.state_scale_work,
@@ -1585,7 +1594,6 @@ def _bench_config(
                                 num_stages=ns,
                                 precompute_num_warps=pnw,
                                 precompute_num_stages=pns,
-                                internal_pdl=args.internal_pdl,
                             )
                             parts = []
                             if bsm is not None:
@@ -2026,12 +2034,6 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Override num_warps: single value or comma-separated sweep (e.g. '1,2,4').",
-    )
-    parser.add_argument(
-        "--internal-pdl",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Internal PDL between precompute and main kernels (default: on).",
     )
     parser.add_argument(
         "--num-stages",

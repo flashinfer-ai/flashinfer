@@ -485,9 +485,12 @@ def test_two_kernel_matches_monolithic():
     device = "cuda"
     dtype = torch.bfloat16
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    max_window = 8  # > T so a prev_k>0 NO-WRITE case exists (k=2 below)
     batch = 2
     cache_size = batch  # non-paged
-    # old_x is (cache, T, ...) so max_window == T → write for k>=1, nowrite for k=0
+    # old_* caches are (cache, max_window, ...).  must_checkpoint = prev_k + T >
+    # max_window, so the k-loop below hits: k=0 nowrite(prev_k=0), k=2
+    # nowrite(prev_k>0 — exercises the gated old_cumAdt tail load), k=T=6 write.
 
     torch.manual_seed(42)
     A_base = -torch.rand(nheads, device=device) - 0.5
@@ -508,21 +511,27 @@ def test_two_kernel_matches_monolithic():
     dt1_proc = torch.where(dt1_proc > 20.0, dt1_proc, torch.log1p(torch.exp(dt1_proc)))
     cumAdt1 = torch.cumsum(A_base.float()[None, None, :] * dt1_proc, dim=1)
 
-    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_x = torch.zeros(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
     old_cumAdt = torch.randn(
-        cache_size, 2, nheads, T, device=device, dtype=torch.float32
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
     )
     cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
-    old_x[:] = x1
+    old_x[:, :T] = x1  # buffer the T step-1 tokens into the first T of max_window
     for slot in range(cache_size):
         buf = cache_buf_idx[slot].item()
-        old_B[slot, buf] = B1[slot]
-        old_dt[slot, buf] = dt1_proc[slot].permute(1, 0)
-        old_cumAdt[slot, buf] = cumAdt1[slot].permute(1, 0)
+        old_B[slot, buf, :T] = B1[slot]
+        old_dt[slot, buf, :, :T] = dt1_proc[slot].permute(1, 0)
+        old_cumAdt[slot, buf, :, :T] = cumAdt1[slot].permute(1, 0)
 
-    def _run(k, *, two_kernel):
+    def _run(k, *, two_kernel, enable_pdl=False):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
         dt2 = repeat(
@@ -554,8 +563,7 @@ def test_two_kernel_matches_monolithic():
             )
             # cb_old (C6, no-write): m16n8k{K_old} fragA, K_old =
             # next_multiple_of<MMA::K_SMALL=8>(max_window); REGS = K_old/2.
-            # max_window == T here.
-            k_old = ((T + 7) // 8) * 8
+            k_old = ((max_window + 7) // 8) * 8
             kw["cb_old"] = torch.empty(
                 batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
             )
@@ -576,17 +584,28 @@ def test_two_kernel_matches_monolithic():
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
+            enable_pdl=enable_pdl,
             **kw,
         )
         return out, st, ox, ob, odt, oca
 
-    for k in (0, T):  # k=0 nowrite, k=T write
+    names = ("out", "state", "old_x", "old_B", "old_dt", "old_cumAdt")
+    for k in (0, 2, T):  # k=0 nowrite(prev_k=0), k=2 nowrite(prev_k>0), k=T write
         ref = _run(k, two_kernel=False)
         test = _run(k, two_kernel=True)
-        names = ("out", "state", "old_x", "old_B", "old_dt", "old_cumAdt")
         for name, r, t in zip(names, ref, test, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
+            )
+        # Same split, but with the real precompute→main PDL chain active
+        # (precompute fires cudaTriggerProgrammaticLaunchCompletion, main
+        # gdc_waits).  Exercises the trigger's memory-ordering contract — the
+        # main must still see every cb_scaled/cumAdt_vec/cb_old the precompute
+        # wrote.  Must match the monolithic ref bit-for-bit.
+        test_pdl = _run(k, two_kernel=True, enable_pdl=True)
+        for name, r, t in zip(names, ref, test_pdl, strict=True):
+            torch.testing.assert_close(
+                t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k} (PDL)"
             )
 
 

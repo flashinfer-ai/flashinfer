@@ -26,6 +26,21 @@
 
 namespace flashinfer::mamba::checkpointing {
 
+// Map a runtime heads-per-CTA `hc` (a value on the HEADS_PER_GROUP>>k chain the
+// tiling heuristic produces) to a compile-time template arg.  Recurses
+// HC = HC_MAX, HC_MAX/2, ... 1 and calls fn<HC>() for the largest HC <= hc, so
+// the per-head smem footprint and grid.z are both compile-time constants.
+template <int HC_MAX, typename Fn>
+void dispatch_heads_per_cta(int hc, Fn&& fn) {
+  if constexpr (HC_MAX <= 1) {
+    fn.template operator()<1>();
+  } else if (hc >= HC_MAX) {
+    fn.template operator()<HC_MAX>();
+  } else {
+    dispatch_heads_per_cta<HC_MAX / 2>(hc, fn);
+  }
+}
+
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 // `D_SPLIT` splits each head's DIM axis across `D_SPLIT` CTAs.
 // `VARLEN` selects the packed-token gmem layout (cu_seqlens-driven).
@@ -67,43 +82,54 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
   FLASHINFER_CHECK(params.nheads / params.ngroups == HEADS_PER_GROUP,
                    "nheads/ngroups (=", params.nheads / params.ngroups,
                    ") must match JIT HEADS_PER_GROUP=", HEADS_PER_GROUP);
-  // PDL launch attribute.  ENABLE_PDL is JIT-stamped (see
-  // checkpointing_ssu_customize_config.jinja); the kernel's body has its
-  // PDL PTX gated on the same constexpr via `if constexpr (ENABLE_PDL)`, so
-  // the .so contains exactly one load path.  When ENABLE_PDL is false the
-  // attribute is set to 0 (effectively no PDL) — cudaLaunchKernelEx is
-  // used either way per FlashInfer convention (see norm.cuh:135).
+  // PDL launch attribute (EXTERNAL chain: a programmatic upstream kernel — e.g.
+  // conv1d — overlapping THIS kernel).  ENABLE_PDL is JIT-stamped (see
+  // checkpointing_ssu_customize_config.jinja); the kernel body gates its
+  // conv1d-facing PDL PTX on the same constexpr via `if constexpr (ENABLE_PDL)`.
+  // This is the ONLY PDL knob a caller controls — "does my upstream conv1d
+  // overlap the SSU?".  The two-kernel split's INTERNAL precompute→main PDL is
+  // NOT gated by this (see below): it is intrinsic to the split, always on.
+  // When ENABLE_PDL is false the attribute is 0 — cudaLaunchKernelEx is used
+  // either way per FlashInfer convention (see norm.cuh:135).
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = ENABLE_PDL ? 1 : 0;
 
   // ── Two-kernel split: precompute → main, when the caller provides scratch ──
   // (cb_scaled/cb_old/cumAdt_vec).  bf16/fp16 only (precompute + main require
-  // 2-byte input + state).  Both launched on `stream` with the same
-  // programmatic-serialization attr: the conv1d→precompute→main PDL chain
-  // overlaps when ENABLE_PDL is stamped; otherwise stream order serializes them
-  // (still correct — the main reads cb_scaled the precompute wrote).  The
-  // precompute does NOT yet trigger early-completion, so the main's gdc_wait
-  // resolves at precompute completion — correct, no overlap; the early-trigger
-  // overlap is the S9 refinement.
+  // 2-byte input + state).
+  //
+  // INTERNAL PDL (precompute → main) is ALWAYS on — it is the split's mechanism,
+  // not a user knob: the main co-launches with the precompute (its attr below is
+  // hard-wired to 1) and runs its precompute-independent state replay while the
+  // precompute computes CB / waits on conv1d; the main's own gdc_wait then blocks
+  // for the precompute to finish before it reads cb_scaled.  This is what lets
+  // the replay overlap conv1d on the cliff, so it must not be disable-able.
+  //
+  // EXTERNAL PDL (conv1d → precompute) rides on ENABLE_PDL (`attrs`): the
+  // precompute co-launches with a programmatic conv1d and gdc_waits for B/C.
+  // The precompute fires cudaTriggerProgrammaticLaunchCompletion() at its TOP
+  // (unconditional) so the main becomes eligible to launch immediately.
   if (params.cb_scaled != nullptr) {
     if constexpr (sizeof(state_t) == 2 && sizeof(input_t) == 2) {
-      // Precompute: grid (batch, ngroups, 1) — one CTA/group (HEADS_PER_CTA ==
-      // HEADS_PER_GROUP, first cut).  DT_SOFTPLUS is JIT-folded; dispatch on the
-      // runtime flag.
-      auto launch_precompute = [&]<bool DT_SOFTPLUS>() {
-        auto pfunc =
-            checkpointing_ssu_precompute_kernel<input_t, dt_t, weight_t, matrixA_t, state_t,
-                                                stateIndex_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                                HEADS_PER_GROUP, NUM_WARPS, DT_SOFTPLUS, VARLEN>;
-        constexpr size_t psmem = sizeof(
-            CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE, NUM_WARPS>);
+      // Precompute: grid (batch, ngroups, ceil(HEADS_PER_GROUP/HEADS_PER_CTA)).
+      // Heads are tiled across grid.z to fill the GPU at small batch (heuristic
+      // below).  HEADS_PER_CTA is picked at runtime, dispatched to a template arg;
+      // DT_SOFTPLUS is JIT-folded on the runtime flag.
+      auto launch_precompute = [&]<int HEADS_PER_CTA, bool DT_SOFTPLUS>() {
+        auto pfunc = checkpointing_ssu_precompute_kernel<
+            input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, NPREDICTED, MAX_WINDOW, DIM,
+            DSTATE, HEADS_PER_GROUP, HEADS_PER_CTA, NUM_WARPS, DT_SOFTPLUS, VARLEN>;
+        constexpr size_t psmem =
+            sizeof(CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE,
+                                                     NUM_WARPS, HEADS_PER_CTA>);
         if constexpr (psmem > 0) {
           FLASHINFER_CUDA_CHECK(
               cudaFuncSetAttribute(pfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, psmem));
         }
+        constexpr int head_tiles = (HEADS_PER_GROUP + HEADS_PER_CTA - 1) / HEADS_PER_CTA;
         cudaLaunchConfig_t pcfg;
-        pcfg.gridDim = dim3(params.batch, params.ngroups, 1);
+        pcfg.gridDim = dim3(params.batch, params.ngroups, head_tiles);
         pcfg.blockDim = dim3(warpSize, NUM_WARPS);
         pcfg.dynamicSmemBytes = psmem;
         pcfg.stream = stream;
@@ -111,11 +137,46 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
         pcfg.numAttrs = 1;
         FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
       };
-      if (params.dt_softplus) {
-        launch_precompute.template operator()<true>();
-      } else {
-        launch_precompute.template operator()<false>();
-      }
+      // ── Head-tiling heuristic (fill the GPU at small batch) ──────────────────
+      // One CTA/group (HEADS_PER_CTA == HEADS_PER_GROUP) launches only
+      // batch·ngroups CTAs — at small batch that starves the GPU.  Tile heads
+      // across grid.z so #CTAs = batch·ngroups·ceil(HPG/hc) reaches one resident
+      // wave (S·O).  Largest hc on the HPG>>k chain with #CTAs >= S·O:
+      //   hc = HPG;  while (hc > 1 && hc > batch·nheads/(S·O)) hc >>= 1;
+      // (batch·G·h = batch·nheads.)  O is register-bound, hence ~constant in hc
+      // (shrinking per-head smem at small hc only relaxes the non-binding smem
+      // limit), so query it once for the untiled kernel.  S, O are device/kernel
+      // constants → cache statically.
+      static int const sm_count = [] {
+        int dev = 0, s = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&s, cudaDevAttrMultiProcessorCount, dev);
+        return s > 0 ? s : 1;
+      }();
+      static int const occ = [] {
+        int o = 0;
+        constexpr size_t qsmem =
+            sizeof(CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE,
+                                                     NUM_WARPS, HEADS_PER_GROUP>);
+        auto qfunc = checkpointing_ssu_precompute_kernel<
+            input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, NPREDICTED, MAX_WINDOW, DIM,
+            DSTATE, HEADS_PER_GROUP, HEADS_PER_GROUP, NUM_WARPS, true, VARLEN>;
+        if constexpr (qsmem > 48 * 1024) {
+          cudaFuncSetAttribute(qfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, qsmem);
+        }
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, qfunc, NUM_WARPS * (int)warpSize, qsmem);
+        return o > 0 ? o : 1;
+      }();
+      int const hc_ideal = (params.batch * params.nheads) / (sm_count * occ);
+      int hc = HEADS_PER_GROUP;
+      while (hc > 1 && hc > hc_ideal) hc >>= 1;
+      dispatch_heads_per_cta<HEADS_PER_GROUP>(hc, [&]<int HEADS_PER_CTA>() {
+        if (params.dt_softplus) {
+          launch_precompute.template operator()<HEADS_PER_CTA, true>();
+        } else {
+          launch_precompute.template operator()<HEADS_PER_CTA, false>();
+        }
+      });
 
       // Main: grid (D_SPLIT, batch, nheads), same smem as the monolithic.
       auto mfunc =
@@ -128,12 +189,19 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
         FLASHINFER_CUDA_CHECK(
             cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
       }
+      // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr
+      // hard-wired to 1, independent of ENABLE_PDL) — the split's mechanism, not
+      // a user knob.  Its gdc_wait (unconditional in the kernel body) blocks for
+      // the precompute before reading cb_scaled, so this is always correct.
+      cudaLaunchAttribute main_attrs[1];
+      main_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      main_attrs[0].val.programmaticStreamSerializationAllowed = 1;
       cudaLaunchConfig_t mcfg;
       mcfg.gridDim = dim3(D_SPLIT, params.batch, params.nheads);
       mcfg.blockDim = dim3(warpSize, NUM_WARPS);
       mcfg.dynamicSmemBytes = msmem;
       mcfg.stream = stream;
-      mcfg.attrs = attrs;
+      mcfg.attrs = main_attrs;
       mcfg.numAttrs = 1;
       FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
       return;
