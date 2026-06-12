@@ -4642,7 +4642,7 @@ void GemmProfilerBackend::prepareRouting(int num_tokens, char* workspace_ptr_cha
 }
 
 void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr_char,
-                                             cudaStream_t) {
+                                             cudaStream_t stream) {
   auto workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
 #define GET_WS_PTR(type, name)                                                                 \
   auto* name = (workspaces.at(#name).first                                                     \
@@ -4681,6 +4681,14 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
     // storage dtypes are identical and only mScalingType distinguishes them
     // (issue #3558).
     TLLM_CHECK(quant_2 && quant_3 && quant_5 && quant_6);
+    // Initialize the weight block-SF buffers to E8M0 1.0 (biased exponent
+    // 0x7F): the profiler never fills them with real data, and uninitialized
+    // exponents make the timed kernels read nondeterministic scale patterns,
+    // which can skew tactic rankings vs real traffic.
+    TLLM_CUDA_CHECK(
+        cudaMemsetAsync(const_cast<void*>(quant_2), 0x7F, workspaces.at("quant_2").first, stream));
+    TLLM_CUDA_CHECK(
+        cudaMemsetAsync(const_cast<void*>(quant_5), 0x7F, workspaces.at("quant_5").first, stream));
     mQuantParams = QuantParams::MXFP8MXFP8(
         static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_2),
         static_cast<float const*>(quant_3),
@@ -4774,6 +4782,16 @@ void GemmProfilerBackend::prepareTmaWsInputs(
   GET_WS_PTR(int*, active_expert_global_ids);
 
 #undef GET_WS_PTR
+
+  // For MXFP8, fill the activation block-SF buffer with E8M0 1.0 (biased
+  // exponent 0x7F). The profiler never quantizes real activations into it,
+  // and uninitialized exponents give the timed kernels a nondeterministic
+  // scale pattern, skewing tactic rankings relative to real traffic.
+  if (fp4_act_scale_flat != nullptr &&
+      mScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX) {
+    TLLM_CUDA_CHECK(cudaMemsetAsync(fp4_act_scale_flat, 0x7F,
+                                    workspaces.at("fp4_act_scale_flat").first, stream));
+  }
 
   size_t tma_ws_size =
       TmaWarpSpecializedGroupedGemmInput::workspaceSize(mNumExpertsPerNode, mScalingType);
