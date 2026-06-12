@@ -436,6 +436,8 @@ class MnnvlMoe:
     moe_workspace_tensor: torch.Tensor = None
     moe_prepare_workspace_tensor: torch.Tensor = None
     moe_mapping: Mapping = None
+    _graph_visible_addresses: Optional[dict] = None
+    _prepare_graph_visible_addresses: Optional[dict] = None
 
     @staticmethod
     def get_moe_workspaces(mapping: Mapping, config: Optional[MnnvlConfig] = None):
@@ -450,6 +452,9 @@ class MnnvlMoe:
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(
             torch.uint64
+        )
+        MnnvlMoe._graph_visible_addresses = (
+            MnnvlMoe.moe_workspace.get_graph_visible_addresses()
         )
         return MnnvlMoe.moe_workspace_tensor
 
@@ -469,7 +474,72 @@ class MnnvlMoe:
         MnnvlMoe.moe_prepare_workspace_tensor = (
             MnnvlMoe.moe_prepare_workspace.as_torch_strided_tensor(torch.uint64)
         )
+        MnnvlMoe._prepare_graph_visible_addresses = (
+            MnnvlMoe.moe_prepare_workspace.get_graph_visible_addresses()
+        )
         return MnnvlMoe.moe_prepare_workspace_tensor
+
+    @staticmethod
+    def get_graph_visible_addresses():
+        """Return CUDA graph-visible MNNVL workspace VA/layout metadata."""
+        return {
+            "workspace": MnnvlMoe._graph_visible_addresses,
+            "prepare_workspace": MnnvlMoe._prepare_graph_visible_addresses,
+        }
+
+    @staticmethod
+    def validate_graph_visible_addresses():
+        """Validate that cached workspace tensors still use their original VAs."""
+        if MnnvlMoe.moe_workspace is not None:
+            MnnvlMoe.moe_workspace.validate_graph_visible_addresses(
+                MnnvlMoe._graph_visible_addresses,
+                MnnvlMoe.moe_workspace_tensor,
+            )
+        if MnnvlMoe.moe_prepare_workspace is not None:
+            MnnvlMoe.moe_prepare_workspace.validate_graph_visible_addresses(
+                MnnvlMoe._prepare_graph_visible_addresses,
+                MnnvlMoe.moe_prepare_workspace_tensor,
+            )
+
+    @staticmethod
+    def detach_physical_keep_va(
+        *, synchronize: bool = True, barrier: bool = True
+    ) -> None:
+        """Release two-sided MoE MNNVL mappings while preserving workspace VAs."""
+        MnnvlMoe.validate_graph_visible_addresses()
+        if MnnvlMoe.moe_workspace is not None:
+            MnnvlMoe.moe_workspace.detach_physical_keep_va(
+                synchronize=synchronize, barrier=barrier
+            )
+        if MnnvlMoe.moe_prepare_workspace is not None:
+            MnnvlMoe.moe_prepare_workspace.detach_physical_keep_va(
+                synchronize=synchronize, barrier=barrier
+            )
+
+    @staticmethod
+    def remap_physical_same_va(
+        *,
+        config: Optional[MnnvlConfig] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        zero_local: bool = True,
+    ) -> None:
+        """Remap two-sided MoE MNNVL workspaces at their original VAs."""
+        if MnnvlMoe.moe_workspace is not None:
+            MnnvlMoe.moe_workspace.remap_physical_same_va(
+                config=config,
+                synchronize=synchronize,
+                barrier=barrier,
+                zero_local=zero_local,
+            )
+        if MnnvlMoe.moe_prepare_workspace is not None:
+            MnnvlMoe.moe_prepare_workspace.remap_physical_same_va(
+                config=config,
+                synchronize=synchronize,
+                barrier=barrier,
+                zero_local=zero_local,
+            )
+        MnnvlMoe.validate_graph_visible_addresses()
 
     @staticmethod
     def compute_target_rank_id(

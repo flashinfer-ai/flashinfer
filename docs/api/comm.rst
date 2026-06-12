@@ -120,6 +120,33 @@ Core Classes
     MnnvlMemory
     McastGPUBuffer
 
+CUDA graph-stable checkpoint pause/resume
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+MNNVL workspaces used by MoE all-to-all kernels are CUDA VMM allocations.
+For process checkpoint/restore, callers may release the non-checkpointable
+physical/imported MNNVL handles while keeping the CUDA virtual address
+reservations and Python workspace tensors alive.  Use
+``detach_physical_keep_va`` only after all kernels using the workspace have
+quiesced.  After restore, use ``remap_physical_same_va`` to recreate/export/
+import handles and map them at the original virtual addresses before replaying
+captured CUDA graphs.  The remap path refreshes communicator/transport state
+from the current ``MnnvlConfig`` when provided; it does not reuse stale
+cross-process handles from the checkpoint.
+
+CUDA graphs remain valid only if every graph-visible workspace tensor pointer,
+rank stride, rank count, rank id, and tensor layout validates unchanged.  The
+MNNVL APIs fail closed when this metadata changes.  Non-workspace tensors
+captured by a graph remain the caller's responsibility.
+
+.. autosummary::
+    :toctree: ../generated
+
+    MnnvlMemory.detach_physical_keep_va
+    MnnvlMemory.remap_physical_same_va
+    MnnvlMemory.get_graph_visible_addresses
+    MnnvlMemory.validate_graph_visible_addresses
+
 TensorRT-LLM MNNVL AllReduce
 ----------------------------
 
