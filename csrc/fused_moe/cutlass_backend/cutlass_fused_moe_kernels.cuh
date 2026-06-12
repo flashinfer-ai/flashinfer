@@ -4686,6 +4686,11 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
         static_cast<float const*>(quant_3),
         static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
         static_cast<float const*>(quant_6));
+    // Backfill the shared FP8 dequant aliases: prepareTmaWsInputs() and the
+    // common GEMM/TMA setup read mQuantParams.fp8.dequant_fc1/fc2 directly,
+    // mirroring the WMXFP8AMXFP8 remap that runMoe() performs.
+    mQuantParams.fp8.dequant_fc1 = static_cast<float const*>(quant_3);
+    mQuantParams.fp8.dequant_fc2 = static_cast<float const*>(quant_6);
 #else
     TLLM_CHECK_WITH_INFO(false, "MXFP8 x MXFP8 profiling requires OSS Cutlass MoE GEMM");
 #endif
