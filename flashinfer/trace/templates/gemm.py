@@ -583,10 +583,17 @@ def _mm_w4a16_fp4_cudnn_init(
     """
     del K_div_2, K_div_block_size
     from flashinfer import (  # noqa: PLC0415
+        mm_w4a16_fp4,
         nvfp4_quantize,
         prepare_w4a16_fp4_weights,
     )
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("mm_w4a16_fp4 init requires a CUDA device")
+    major, minor = torch.cuda.get_device_capability(torch.device(device))
+    if not mm_w4a16_fp4.is_compute_capability_supported(major * 10 + minor):
+        raise NotImplementedError(f"mm_w4a16_fp4 is not supported on SM{major}{minor}")
 
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
@@ -630,10 +637,17 @@ def _mm_w4a16_fp4_cute_dsl_init(
     """
     del K_div_16, K_div_block_size, N_mul_2
     from flashinfer import (  # noqa: PLC0415
+        mm_w4a16_fp4,
         nvfp4_quantize,
         prepare_w4a16_fp4_weights,
     )
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("mm_w4a16_fp4 init requires a CUDA device")
+    major, minor = torch.cuda.get_device_capability(torch.device(device))
+    if not mm_w4a16_fp4.is_compute_capability_supported(major * 10 + minor):
+        raise NotImplementedError(f"mm_w4a16_fp4 is not supported on SM{major}{minor}")
 
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)

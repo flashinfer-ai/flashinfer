@@ -80,6 +80,14 @@ def _skip_if_backend_unavailable(backend: str) -> None:
             )
 
 
+def _skip_if_compute_capability_unsupported() -> None:
+    """Skip the current test if no W4A16 backend supports this device."""
+    cc = get_compute_capability(torch.device("cuda"))
+    cc_number = cc[0] * 10 + cc[1]
+    if not mm_w4a16_fp4.is_compute_capability_supported(cc_number):
+        pytest.skip(f"mm_w4a16_fp4 not supported on compute capability {cc_number}")
+
+
 PROBLEM_SIZES = [
     # tiny: smoke / minimum valid shapes
     (1, 128, 128),
@@ -326,6 +334,7 @@ def test_backend_shape_mismatch_raises(backend):
 @pytest.mark.parametrize("bad_dtype", [torch.float32, torch.float16])
 def test_a_dtype_must_be_bfloat16(bad_dtype):
     """Only bfloat16 activations are supported (fp16 deferred)."""
+    _skip_if_compute_capability_unsupported()
     device = torch.device("cuda")
     b_fp4, b_sf, alpha = _make_random_fp4_weights(64, 128, device)
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(
@@ -338,6 +347,7 @@ def test_a_dtype_must_be_bfloat16(bad_dtype):
 
 def test_b_dtype_must_be_uint8_in_prepare():
     """Prepare rejects non-uint8 B."""
+    _skip_if_compute_capability_unsupported()
     device = torch.device("cuda")
     b_bad = torch.zeros((64, 64), device=device, dtype=torch.int32)
     b_descale = torch.zeros((4096,), device=device, dtype=torch.uint8)
@@ -347,6 +357,7 @@ def test_b_dtype_must_be_uint8_in_prepare():
 
 def test_alpha_dtype_must_be_float32():
     """Prepare rejects non-fp32 alpha."""
+    _skip_if_compute_capability_unsupported()
     device = torch.device("cuda")
     b_fp4, b_sf, _ = _make_random_fp4_weights(64, 128, device)
     alpha_bad = torch.ones(1, device=device, dtype=torch.bfloat16)
