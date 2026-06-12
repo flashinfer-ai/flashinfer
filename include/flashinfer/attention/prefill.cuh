@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2023 by FlashInfer team.
+ * Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -2007,8 +2008,35 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
          !USE_FP16_QK_REDUCTION)
             ? 2
             : (8 / NUM_MMA_Q);
-    const uint32_t max_num_mma_kv_smem =
-        (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) / kKVSmemPerMmaKV;
+    // Size the largest KV tile from the exact shared-memory footprint rather than
+    // the analytic per-tile estimate, which omits the k/v scale-factor buffers and
+    // alignment padding carried in SharedStorageQKVO and is not clamped to the
+    // per-block opt-in limit. On GPUs with a 64 KB per-block limit there is no
+    // headroom, so the real sizeof(SharedStorage) overshoots and the launch fails
+    // with cudaErrorInvalidArgument (larger-smem GPUs hide the gap). The layout is
+    // affine in NUM_MMA_KV once the q/k/v arrays dominate the storage union, so two
+    // large sample points recover the exact bytes-per-tile and fixed base, and the
+    // budget is clamped to the real per-block opt-in limit.
+    constexpr uint32_t smem_sample_lo_mma = 128;
+    constexpr uint32_t smem_sample_hi_mma = 256;
+    constexpr size_t smem_sample_lo = sizeof(
+        SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, smem_sample_lo_mma * NUM_WARPS_KV * 16,
+                          HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>);
+    constexpr size_t smem_sample_hi = sizeof(
+        SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, smem_sample_hi_mma * NUM_WARPS_KV * 16,
+                          HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>);
+    constexpr size_t smem_per_mma_kv =
+        (smem_sample_hi - smem_sample_lo) / (smem_sample_hi_mma - smem_sample_lo_mma);
+    constexpr size_t smem_mma_kv_base = smem_sample_lo - smem_sample_lo_mma * smem_per_mma_kv;
+    int max_smem_per_block_optin = 0;
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
+        &max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+    const int smem_budget = max_smem_per_threadblock < max_smem_per_block_optin
+                                ? max_smem_per_threadblock
+                                : max_smem_per_block_optin;
+    const uint32_t max_num_mma_kv_smem = static_cast<uint32_t>(
+        (smem_budget - static_cast<int>(smem_mma_kv_base)) /
+        static_cast<int>(smem_per_mma_kv));
 
     // control NUM_MMA_KV for maximum warp occupancy
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
@@ -3004,8 +3032,35 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
        !USE_FP16_QK_REDUCTION)
           ? 2
           : (8 / NUM_MMA_Q);
-  const uint32_t max_num_mma_kv_smem =
-      (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) / kKVSmemPerMmaKV;
+  // Size the largest KV tile from the exact shared-memory footprint rather than
+  // the analytic per-tile estimate, which omits the k/v scale-factor buffers and
+  // alignment padding carried in SharedStorageQKVO and is not clamped to the
+  // per-block opt-in limit. On GPUs with a 64 KB per-block limit there is no
+  // headroom, so the real sizeof(SharedStorage) overshoots and the launch fails
+  // with cudaErrorInvalidArgument (larger-smem GPUs hide the gap). The layout is
+  // affine in NUM_MMA_KV once the q/k/v arrays dominate the storage union, so two
+  // large sample points recover the exact bytes-per-tile and fixed base, and the
+  // budget is clamped to the real per-block opt-in limit.
+  constexpr uint32_t smem_sample_lo_mma = 128;
+  constexpr uint32_t smem_sample_hi_mma = 256;
+  constexpr size_t smem_sample_lo = sizeof(
+      SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, smem_sample_lo_mma * NUM_WARPS_KV * 16,
+                        HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>);
+  constexpr size_t smem_sample_hi = sizeof(
+      SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, smem_sample_hi_mma * NUM_WARPS_KV * 16,
+                        HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>);
+  constexpr size_t smem_per_mma_kv =
+      (smem_sample_hi - smem_sample_lo) / (smem_sample_hi_mma - smem_sample_lo_mma);
+  constexpr size_t smem_mma_kv_base = smem_sample_lo - smem_sample_lo_mma * smem_per_mma_kv;
+  int max_smem_per_block_optin = 0;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
+      &max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+  const int smem_budget = max_smem_per_threadblock < max_smem_per_block_optin
+                              ? max_smem_per_threadblock
+                              : max_smem_per_block_optin;
+  const uint32_t max_num_mma_kv_smem = static_cast<uint32_t>(
+      (smem_budget - static_cast<int>(smem_mma_kv_base)) /
+      static_cast<int>(smem_per_mma_kv));
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
@@ -3146,8 +3201,35 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
        !USE_FP16_QK_REDUCTION)
           ? 2
           : (8 / NUM_MMA_Q);
-  const uint32_t max_num_mma_kv_smem =
-      (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) / kKVSmemPerMmaKV;
+  // Size the largest KV tile from the exact shared-memory footprint rather than
+  // the analytic per-tile estimate, which omits the k/v scale-factor buffers and
+  // alignment padding carried in SharedStorageQKVO and is not clamped to the
+  // per-block opt-in limit. On GPUs with a 64 KB per-block limit there is no
+  // headroom, so the real sizeof(SharedStorage) overshoots and the launch fails
+  // with cudaErrorInvalidArgument (larger-smem GPUs hide the gap). The layout is
+  // affine in NUM_MMA_KV once the q/k/v arrays dominate the storage union, so two
+  // large sample points recover the exact bytes-per-tile and fixed base, and the
+  // budget is clamped to the real per-block opt-in limit.
+  constexpr uint32_t smem_sample_lo_mma = 128;
+  constexpr uint32_t smem_sample_hi_mma = 256;
+  constexpr size_t smem_sample_lo = sizeof(
+      SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, smem_sample_lo_mma * NUM_WARPS_KV * 16,
+                        HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>);
+  constexpr size_t smem_sample_hi = sizeof(
+      SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, smem_sample_hi_mma * NUM_WARPS_KV * 16,
+                        HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>);
+  constexpr size_t smem_per_mma_kv =
+      (smem_sample_hi - smem_sample_lo) / (smem_sample_hi_mma - smem_sample_lo_mma);
+  constexpr size_t smem_mma_kv_base = smem_sample_lo - smem_sample_lo_mma * smem_per_mma_kv;
+  int max_smem_per_block_optin = 0;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
+      &max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+  const int smem_budget = max_smem_per_threadblock < max_smem_per_block_optin
+                              ? max_smem_per_threadblock
+                              : max_smem_per_block_optin;
+  const uint32_t max_num_mma_kv_smem = static_cast<uint32_t>(
+      (smem_budget - static_cast<int>(smem_mma_kv_base)) /
+      static_cast<int>(smem_per_mma_kv));
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
