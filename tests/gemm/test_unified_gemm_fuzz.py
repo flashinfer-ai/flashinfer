@@ -39,13 +39,14 @@ convention-compat fix) makes two previously-divergent APIs share a convention, m
 same conformance group and the test will *enforce* they now agree -- and the ledger entry's removal
 becomes the proof the convention was unified.
 
-STATUS: framework + 4 grounded adapters (bf16 mm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm) +
-a standalone quantize-root fuzzer. This file REPLACES the earlier per-op ``test_mm_fp4_fuzz.py`` /
-``test_bmm_fp8_fuzz.py`` (their logic + the #2440 quantize test are folded in here). Validated on
-A100/SM80, L40S/SM89, H100/SM90, B200/SM100. EXTEND by folding in more adapters one ``GemmAdapter``
-at a time: mm_fp8 (low-latency,
-needs ``prepare_low_latency_gemm_weights`` -- a distinct convention), mm_mxfp8, bmm_mxfp8, and the
-grouped ``group_*`` / ``*deepgemm*`` entries (m_indptr op-shape).
+STATUS: framework + 7 grounded adapters (bf16 mm+bmm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm /
+mxfp8 mm+bmm) + a standalone quantize-root fuzzer. This file REPLACES the earlier per-op
+``test_mm_fp4_fuzz.py`` / ``test_bmm_fp8_fuzz.py`` (their logic + the #2440 quantize test are folded
+in here). Validated on A100/SM80, L40S/SM89, H100/SM90, B200/SM100. The mxfp8 adapters surfaced two
+real cuDNN findings (a ``_KNOWN_FAILURES`` ledger entry + the ``min_dim`` note record them). EXTEND
+by folding in more adapters one ``GemmAdapter`` at a time: mm_fp8 (low-latency decode-shape regime,
+needs ``prepare_low_latency_gemm_weights``) and the grouped ``group_*`` / ``*deepgemm*`` entries
+(m_indptr op-shape).
 
 Run (needs CUDA_HOME for JIT; SM100 for the fp4 adapters, SM89+ for fp8):
   CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<idx> pytest -q tests/gemm/test_unified_gemm_fuzz.py
@@ -77,10 +78,15 @@ import torch.nn.functional as F
 from flashinfer import (
     SfLayout,
     autotune,
+    bmm_bf16,
     bmm_fp8,
+    bmm_mxfp8,
     mm_bf16,
     mm_fp4,
+    mm_mxfp8,
     mxfp4_quantize,
+    mxfp8_dequantize_host,
+    mxfp8_quantize,
     nvfp4_quantize,
 )
 from flashinfer.autotuner import AutoTuner
@@ -175,13 +181,16 @@ def _regime_tensor(shape, regime, rng) -> torch.Tensor:
 class GemmAdapter:
     key: str
     op_shape: str  # "mm" | "bmm"
-    quant_mode: str  # "bf16" | "fp8" | "nvfp4" | "mxfp4"
+    quant_mode: str  # "bf16" | "fp8" | "mxfp8" | "nvfp4" | "mxfp4"
     backends: tuple  # selectable `backend=` values
     convention: dict  # DECLARED scale convention (the audit substrate)
     supported: Callable[[int], bool]  # (sm) -> bool
     run: Callable  # (a_bf16, b_bf16, out, backend, cfg) -> None  (writes into `out`)
     deterministic: bool = True
     align: int = 1  # required N/K alignment (snap shapes to this)
+    min_dim: int = (
+        1  # minimum N/K (some kernels require a min tile, e.g. mxfp8 needs n,k >= 128)
+    )
 
 
 # --- bf16 mm: no quant convention -> the cross-backend EQUALITY oracle is valid here ----------
@@ -252,6 +261,36 @@ def _run_mxfp4_mm(a, b, out, backend, cfg):
     )
 
 
+def _run_bf16_bmm(a, b, out, backend, cfg):
+    # bmm_bf16: like bmm_fp8, mat2 must be column-major [B,K,N] -> pass the transposed VIEW of our
+    # [B,N,K] (NO .contiguous(); a contiguous copy is row-major and the kernel reads it transposed).
+    bmm_bf16(a, b.transpose(-2, -1), out=out, out_dtype=out.dtype, backend=backend)
+
+
+def _run_mm_mxfp8(a, b, out, backend, cfg):
+    # mm_mxfp8: per-block(32) mxfp8 with 128x4-swizzled e8m0 scales; a=[M,K], b=[N,K], pass mat2 as
+    # b_q.T. reference = a @ b^T. (swizzle changes only scale STORAGE, not values -> matches snap.)
+    a_q, a_s = mxfp8_quantize(a, sf_swizzle_layout=SfLayout.layout_128x4)
+    b_q, b_s = mxfp8_quantize(b, sf_swizzle_layout=SfLayout.layout_128x4)
+    res = mm_mxfp8(a_q, b_q.T, a_s, b_s, out=out, out_dtype=out.dtype, backend=backend)
+    if res.data_ptr() != out.data_ptr():
+        out.copy_(res)
+
+
+def _run_mxfp8_bmm(a, b, out, backend, cfg):
+    # bmm_mxfp8: per-block(32) mxfp8. A=[B,M,K] row-major; the weight is quantized as the contiguous
+    # [B,N,K] (blocked along K, like every other adapter) and passed as B = weight_q.transpose(-2,-1)
+    # -> a COLUMN-major [B,K,N] VIEW (the kernel rejects a row-major/contiguous B). reference = a@b^T.
+    # cudnn here drives the override-shape (dynamic-M) path -- the #3455 regression surface.
+    a_q, a_s = mxfp8_quantize(
+        a, True
+    )  # is_sf_swizzled_layout=True (values identical to linear)
+    b_q, b_s = mxfp8_quantize(
+        b, True
+    )  # b is the [B,N,K] weight; do NOT .contiguous() the transpose
+    bmm_mxfp8(a_q, b_q.transpose(-2, -1), a_s, b_s, out.dtype, out, backend=backend)
+
+
 _ADAPTERS = [
     GemmAdapter(
         key="mm_bf16",
@@ -312,9 +351,61 @@ _ADAPTERS = [
         deterministic=True,
         align=32,
     ),
-    # EXTEND: mm_fp8 (trtllm_low_latency, needs prepare_low_latency_gemm_weights -> a distinct
-    # convention), mm_mxfp8, bmm_mxfp8, group_gemm_*_nt_groupwise / *deepgemm* (grouped op-shape
-    # with m_indptr offsets). Add one GemmAdapter each; unsupported (op_shape, arch) just skips.
+    GemmAdapter(
+        key="bmm_bf16",
+        op_shape="bmm",
+        quant_mode="bf16",
+        backends=("cutlass", "cudnn", "auto"),
+        convention={"a_scale": "none", "b_scale": "none", "global": "none"},
+        supported=lambda sm: sm >= 80,
+        run=_run_bf16_bmm,
+        deterministic=True,
+        align=8,
+    ),
+    GemmAdapter(
+        key="mm_mxfp8",
+        op_shape="mm",
+        quant_mode="mxfp8",
+        backends=("cudnn", "cutlass", "auto"),
+        convention={
+            "a_scale": "block-32",
+            "b_scale": "block-32",
+            "global": "none",
+            "layout": "128x4 (swizzled e8m0)",
+        },
+        supported=lambda sm: sm >= 100,
+        run=_run_mm_mxfp8,
+        deterministic=True,
+        align=32,
+        min_dim=128,  # mxfp8 GEMM requires n,k >= 128 (cutlass rejects below; see _gen B2 note)
+    ),
+    GemmAdapter(
+        key="bmm_mxfp8",
+        op_shape="bmm",
+        quant_mode="mxfp8",
+        # cudnn -> SM10x (override-shape / dynamic-M path), cutlass -> SM12x; chosen from live GPU.
+        backends=("cudnn",) if _CC[0] == 10 else (("cutlass",) if _CC[0] == 12 else ()),
+        convention={
+            "a_scale": "block-32",
+            "b_scale": "block-32",
+            "global": "none",
+            "layout": "mx",
+            # NB: B must be a COLUMN-major [b,k,n] VIEW (weight_q.transpose, no .contiguous());
+            # the cudnn override-shape path (PR #3455) rejects a row-major/contiguous B.
+            "b_memory": "column-major (transpose view)",
+        },
+        supported=lambda sm: (sm // 10) in (10, 12),
+        run=_run_mxfp8_bmm,
+        deterministic=True,
+        align=32,
+        min_dim=128,  # mxfp8 needs n,k >= 128; bmm_mxfp8 does NOT enforce it (silent garbage) -- see
+        # _gen B2 note: the fuzzer stays in the supported regime, the missing guard is reported.
+    ),
+    # EXTEND:
+    # * mm_fp8 (trtllm_low_latency): decode-only shape regime (M<=16, K>=8192, N in {2560,5120} +
+    #   prepare_low_latency_gemm_weights) -> needs its OWN shape distribution, not the uniform _gen.
+    # * group_gemm_*_nt_groupwise / *deepgemm*: grouped op-shape with m_indptr offsets.
+    # Add one GemmAdapter each; unsupported (op_shape, arch) just skips.
 ]
 
 # Known cross-mode convention incompatibilities (documented, not silently passing). The moment a
@@ -338,18 +429,29 @@ _CONVENTION_DIVERGENCES = [
 # failure is tolerated to keep the suite green, and an unexpected PASS warns "fixed -> remove it").
 _KNOWN_FAILURES = [
     (
-        lambda cfg: cfg.adapter.key == "mm_bf16"
-        and cfg.out_dtype == torch.float16
-        and _SM == 90
-        and _CUDNN_VER < 92301
-        and (cfg.m & (cfg.m - 1))
-        != 0,  # only NON-power-of-2 M triggers it (pow2 M is correct)
-        "cuDNN runtime-fusion implicit-GEMM (fortNativeRuntimeFusionEngine) miscomputes mm_bf16 with "
-        "fp16 OUTPUT for non-power-of-2 M on SM90/Hopper (garbage, ratio ~1); bf16 output and SM100 "
+        lambda cfg: (
+            cfg.adapter.key in ("mm_bf16", "bmm_bf16")
+            and cfg.out_dtype == torch.float16
+            and _SM == 90
+            and _CUDNN_VER < 92301
+            and (cfg.m & (cfg.m - 1)) != 0
+        ),  # only NON-power-of-2 M triggers it (pow2 M is correct); bmm_bf16 shares the kernel
+        "cuDNN runtime-fusion implicit-GEMM (fortNativeRuntimeFusionEngine) miscomputes bf16 mm/bmm "
+        "with fp16 OUTPUT for non-power-of-2 M on SM90/Hopper (garbage, ratio ~1); bf16 output + SM100 "
         "are unaffected. Root cause: the split-k partial-reduce kernel assumed row-major output, but "
         "Hopper swaps A<->B so the output is column-major -> wrong reduce dims. Fixed by cuDNN commit "
         "'fix hopper swap ab again' (a745f55cf). VERIFIED FIXED in cuDNN 9.23.1 (92301) and 9.30; "
         "BROKEN in 9.23.0.x (92300). xfail gated to cuDNN<9.23.1; on >= it the test PASSES.",
+    ),
+    (
+        lambda cfg: cfg.adapter.key == "bmm_mxfp8" and cfg.b > 1 and (cfg.m % 128) != 0,
+        "cuDNN bmm_mxfp8 (override-shape / dynamic-M path) returns GARBAGE/inf for batch indices > 0 "
+        "when b>1 AND M is not a multiple of 128 (batch 0 is always correct; b==1 is correct for any "
+        "M; b>1 with M%128==0 is correct). Root cause: the override recomputes the per-batch "
+        "block-scale stride from an aligned/cache M while the buffer is laid out for the unpadded M, "
+        "so batch>0 indexes the wrong scale offset -- the known #3455 'b>1 SF-padding' follow-up. "
+        "Found by this fuzzer on cuDNN 9.23.0 (92300). Re-verify against newer cuDNN and drop the "
+        "entry once batch>0 is correct (it will then xpass -> a visible 'fixed' signal).",
     ),
 ]
 
@@ -426,14 +528,18 @@ def _gen(seed) -> Cfg:
     wired = [a for a in _ADAPTERS if a.supported(_SM)]
     ad = rng.choice(wired)
     al = ad.align
-    # B2: ~10% leave N unaligned to verify a clean kernel rejection (not a crash). K stays aligned
-    # so fp4 input quant is still FORMABLE (an unaligned K breaks the quantizer/snap itself, before
-    # the kernel -- which is not a meaningful "kernel rejects" test). Matches the old fuzzer.
-    k = max(al, (rng.choice(_SHAPES_K) // al) * al)
-    if rng.random() < 0.10:
+    # K stays aligned (>= the per-mode floor) so fp4/mxfp8 input quant is FORMABLE -- an unaligned K
+    # breaks the quantizer/snap itself, before the kernel, which is not a meaningful "rejects" test.
+    lo = max(al, ad.min_dim)  # floor for N/K (mxfp8 kernels need n,k >= 128)
+    k = max(lo, (rng.choice(_SHAPES_K) // al) * al)
+    # B2: ~10% leave N unaligned to verify a clean kernel rejection (not a crash) -- only for modes
+    # that DO reject (min_dim==1). mxfp8 (min_dim=128) is excluded: bmm_mxfp8 lacks the n>=128 guard
+    # mm_mxfp8 has and silently returns garbage for 32<=n<128 (a real robustness gap, reported
+    # separately), so an unaligned-N "clean reject" assertion would spuriously fail there.
+    if ad.min_dim <= 1 and rng.random() < 0.10:
         n = rng.choice(_SHAPES_N)  # possibly unaligned
     else:
-        n = max(al, (rng.choice(_SHAPES_N) // al) * al)
+        n = max(lo, (rng.choice(_SHAPES_N) // al) * al)
     # B1 (DEFERRED): non-contiguous inputs. Needs the right oracle -- "non-contig result must MATCH
     # the contiguous result, else clean-reject" -- not a direct ref compare (some APIs legitimately
     # require contiguous and should raise). Re-enable with that consistency oracle. Kept False.
@@ -499,6 +605,24 @@ def _snap_fp8(t, dtype):
     return (q.float() * s).to(torch.bfloat16)
 
 
+def _snap_mxfp8(t, dtype=None):
+    # mxfp8 = e4m3 + per-32-element pow2 (e8m0) block scale along the LAST (K) dim -- for both the
+    # [.,M,K] activation and the [.,N,K] weight (the kernel quantizes the contiguous [b,n,k] weight,
+    # then passes its transpose), so a plain last-dim round-trip matches the kernel's own grid.
+    # swizzled vs linear changes only scale STORAGE, not the quantized values -> linear (which is
+    # host-dequantizable) here equals the kernel's swizzled quant.
+    flat = t.reshape(-1, t.shape[-1])
+    q, s = mxfp8_quantize(flat, False)  # linear (non-swizzled) scale layout
+    # mxfp8_dequantize_host is a HOST function (like e2m1_..._to_float in _snap_nvfp4) -> move to CPU
+    # first, else it dereferences device pointers on the host and segfaults. Its value-tensor must be
+    # uint8-wrapped e4m3 (CHECK_INPUT_TYPE dl_uint8 -- not a kernel bug, q is e4m3) and 2D, and the
+    # scale layout must MATCH the quantize layout (decoding linear scales as swizzled reads OOB).
+    deq = mxfp8_dequantize_host(
+        q.view(torch.uint8).cpu(), s.cpu(), is_sf_swizzled_layout=False
+    )
+    return deq.reshape(t.shape).to(t.device, torch.bfloat16)
+
+
 def _snap_nvfp4(t, dtype=None):
     flat = t.reshape(-1, t.shape[-1])
     gsf = (448 * 6) / flat.float().abs().nan_to_num().max().clamp_min(1e-30)
@@ -523,6 +647,7 @@ _QMODE = {
     # mxfp4 .0039, nvfp4 .053. atol_frac set ~3-5x that (extra margin on bf16/fp8 for cross-arch).
     "bf16": (_snap_bf16, 1.5e-2, 1.0e-2),
     "fp8": (_snap_fp8, 4.0e-2, 5.0e-2),
+    "mxfp8": (_snap_mxfp8, 4.0e-2, 5.0e-2),
     "nvfp4": (_snap_nvfp4, 1.2e-1, 1.0e-1),
     "mxfp4": (_snap_mxfp4, 2.0e-2, 5.0e-2),
 }
