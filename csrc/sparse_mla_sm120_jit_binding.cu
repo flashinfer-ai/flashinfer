@@ -61,11 +61,10 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
         << name << " 3D form must be [num_pages, page_block_size, " << bpt << "]";
     return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
   }
-  TVM_FFI_ICHECK_EQ(kv.ndim(), 4)
-      << name << " must be 2D [num_pages, page_bytes], 3D "
-      << "[num_pages, page_block_size, bytes_per_token], HND "
-      << "[num_pages, 1, page_block_size, bytes_per_token], or NHD "
-      << "[num_pages, page_block_size, 1, bytes_per_token]";
+  TVM_FFI_ICHECK_EQ(kv.ndim(), 4) << name << " must be 2D [num_pages, page_bytes], 3D "
+                                  << "[num_pages, page_block_size, bytes_per_token], HND "
+                                  << "[num_pages, 1, page_block_size, bytes_per_token], or NHD "
+                                  << "[num_pages, page_block_size, 1, bytes_per_token]";
   TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
       << name << " last dim must be bytes_per_token=" << bpt << ", got " << kv.size(-1);
   if (kv.size(1) == 1) {
@@ -139,8 +138,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
     TVM_FFI_ICHECK(extra_indices.has_value()) << "extra_kv_cache requires extra_indices";
     const auto& ekv = extra_kv_cache.value();
     extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
-    const PagedKVLayout extra_layout =
-        parse_paged_kv_layout(ekv, BPT_DSV4, "extra_kv_cache");
+    const PagedKVLayout extra_layout = parse_paged_kv_layout(ekv, BPT_DSV4, "extra_kv_cache");
     pbs_extra_arg = extra_layout.page_block_size;
     stride_extra_kv_block = extra_layout.stride_kv_block;
   }
@@ -185,8 +183,7 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
       << "decode-dsv3_2 expects model_type DSV3_2 or GLM_NSA; got " << model_type;
 
   constexpr int BPT_DSV3_2 = 656;
-  const PagedKVLayout kv_layout =
-      parse_paged_kv_layout(kv_cache, BPT_DSV3_2, "kv_cache");
+  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, BPT_DSV3_2, "kv_cache");
 
   const int* topk_len_ptr =
       topk_length.has_value() ? static_cast<const int*>(topk_length.value().data_ptr()) : nullptr;

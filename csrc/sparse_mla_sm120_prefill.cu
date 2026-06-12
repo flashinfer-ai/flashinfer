@@ -401,8 +401,7 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t stride_kv_block_extra,
                                  const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length,
-                                 cudaStream_t stream) {
+                                 const int* extra_topk_length, cudaStream_t stream) {
   if (extra_KV_cache != nullptr) {
     if (mt != ModelType::DSV4) return false;
     return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,

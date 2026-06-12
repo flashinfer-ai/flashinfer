@@ -52,8 +52,7 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t extra_stride_kv_block,
                                  const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length,
-                                 cudaStream_t stream);
+                                 const int* extra_topk_length, cudaStream_t stream);
 
 namespace {
 
@@ -109,11 +108,10 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
         << name << " 3D form must be [num_pages, page_block_size, " << bpt << "]";
     return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
   }
-  TVM_FFI_ICHECK_EQ(kv.ndim(), 4)
-      << name << " must be 2D [num_pages, page_bytes], 3D "
-      << "[num_pages, page_block_size, bytes_per_token], HND "
-      << "[num_pages, 1, page_block_size, bytes_per_token], or NHD "
-      << "[num_pages, page_block_size, 1, bytes_per_token]";
+  TVM_FFI_ICHECK_EQ(kv.ndim(), 4) << name << " must be 2D [num_pages, page_bytes], 3D "
+                                  << "[num_pages, page_block_size, bytes_per_token], HND "
+                                  << "[num_pages, 1, page_block_size, bytes_per_token], or NHD "
+                                  << "[num_pages, page_block_size, 1, bytes_per_token]";
   TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
       << name << " last dim must be bytes_per_token=" << bpt << ", got " << kv.size(-1);
   if (kv.size(1) == 1) {
@@ -174,8 +172,7 @@ void SparseMlaSm120PagedAttention(
   const int d_qk = static_cast<int>(q.size(2));
   const int topk = check_dense_indices_2d_or_s_q_3d(indices, "indices", num_tokens);
   const ModelType mt = resolve_model_type(d_qk, model_type);
-  const PagedKVLayout kv_layout =
-      parse_paged_kv_layout(kv_cache, bytes_per_token(mt), "kv_cache");
+  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bytes_per_token(mt), "kv_cache");
   const int page_block_size = kv_layout.page_block_size;
 
   TVM_FFI_ICHECK_GT(num_heads, 0);

@@ -19,7 +19,7 @@ import functools
 import math
 import os
 import warnings
-from typing import List, Literal, Optional, Sequence, Tuple, Union, overload
+from typing import List, Literal, Optional, Sequence, Tuple, Union, cast, overload
 
 import torch
 
@@ -1099,17 +1099,20 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             )
         )
 
-    result = _trtllm_batch_decode_sparse_mla_sm120(
-        query=query_for_sm120,
-        kv_cache=swa_kv_cache,
-        workspace_buffer=workspace_buffer,
-        sparse_mla_segments=sparse_mla_segments,
-        out=out_for_sm120,
-        sm_scale=bmm1_scale,
-        sinks=sinks,
-        lse=None,
-        return_lse=False,
-        kv_scale_format="auto",
+    result = cast(
+        torch.Tensor,
+        _trtllm_batch_decode_sparse_mla_sm120(
+            query=query_for_sm120,
+            kv_cache=swa_kv_cache,
+            workspace_buffer=workspace_buffer,
+            sparse_mla_segments=sparse_mla_segments,
+            out=out_for_sm120,
+            sm_scale=bmm1_scale,
+            sinks=sinks,
+            lse=None,
+            return_lse=False,
+            kv_scale_format="auto",
+        ),
     )
     if query.ndim == 3:
         return result.squeeze(1)
