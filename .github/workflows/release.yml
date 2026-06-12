@@ -42,7 +42,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # On PRs the head branch may live on a fork, so we must explicitly
+          # set `repository:` to the head's repo and pin to head.sha (stable
+          # across re-pushes during the run). On `workflow_dispatch` the
+          # default repository is correct and we check out the input tag.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Verify tag matches version.txt
@@ -90,7 +95,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # On PRs the head branch may live on a fork, so we must explicitly
+          # set `repository:` to the head's repo and pin to head.sha (stable
+          # across re-pushes during the run). On `workflow_dispatch` the
+          # default repository is correct and we check out the input tag.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Set up Python
@@ -124,7 +134,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # On PRs the head branch may live on a fork, so we must explicitly
+          # set `repository:` to the head's repo and pin to head.sha (stable
+          # across re-pushes during the run). On `workflow_dispatch` the
+          # default repository is correct and we check out the input tag.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Set up Python
@@ -162,6 +177,15 @@ jobs:
       matrix:
         cuda: ["12.8", "12.9", "13.0"]
         arch: ['x86_64', 'aarch64']
+        sm_family: ['sm9x', 'sm10x', 'sm110', 'sm12x']
+        exclude:
+          # Thor (sm110) JIT-cache wheels are produced only for aarch64 CUDA 13.0.
+          - arch: x86_64
+            sm_family: sm110
+          - cuda: "12.8"
+            sm_family: sm110
+          - cuda: "12.9"
+            sm_family: sm110
 
     runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
 
@@ -172,11 +196,17 @@ jobs:
           echo "RAM: $(free -h | awk '/^Mem:/ {print $7 " available out of " $2}')"
           echo "Disk: $(df -h / | awk 'NR==2 {print $4 " available out of " $2}')"
           echo "Architecture: $(uname -m)"
+          echo "SM family: ${{ matrix.sm_family }}"
 
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          # On PRs the head branch may live on a fork, so we must explicitly
+          # set `repository:` to the head's repo and pin to head.sha (stable
+          # across re-pushes during the run). On `workflow_dispatch` the
+          # default repository is correct and we check out the input tag.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
       - name: Build wheel in container
@@ -203,6 +233,7 @@ jobs:
             -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+            -e FLASHINFER_JIT_CACHE_SM_FAMILY="${{ matrix.sm_family }}" \
             -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-}" \
             -e SCCACHE_BUCKET="${{ vars.SCCACHE_BUCKET }}" \
             -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
@@ -220,7 +251,7 @@ jobs:
         id: artifact-name
         run: |
           CUDA_NO_DOT=$(echo "${{ matrix.cuda }}" | tr -d '.')
-          echo "name=jit-cache-cu${CUDA_NO_DOT}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+          echo "name=jit-cache-cu${CUDA_NO_DOT}-${{ matrix.arch }}-${{ matrix.sm_family }}" >> $GITHUB_OUTPUT
 
       - name: Upload flashinfer-jit-cache artifact
         uses: actions/upload-artifact@v4
@@ -319,29 +350,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Upload jit-cache wheels one at a time to avoid OOM
-          # Each wheel can be several GB, so we download, upload, delete, repeat
+          # Upload jit-cache wheels one at a time to avoid OOM.
+          # Each wheel can be ~1 GB, so we download, upload, delete, repeat.
+          # Wheels are split per (CUDA, CPU-arch, SM family) to stay under
+          # GitHub Releases' 2 GiB per-asset limit.
           mkdir -p dist-jit-cache
 
           for cuda in 128 129 130; do
             for arch in x86_64 aarch64; do
-              ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}"
-              echo "Processing ${ARTIFACT_NAME}..."
-
-              # Download this specific artifact
-              gh run download ${{ github.run_id }} -n "${ARTIFACT_NAME}" -D dist-jit-cache/ || {
-                echo "Warning: Failed to download ${ARTIFACT_NAME}, skipping..."
-                continue
-              }
-
-              # Upload to release
-              if [ -n "$(ls -A dist-jit-cache/)" ]; then
-                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
-                echo "✅ Uploaded ${ARTIFACT_NAME}"
+              sm_families="sm9x sm10x sm12x"
+              if [ "$cuda" = "130" ] && [ "$arch" = "aarch64" ]; then
+                sm_families="sm9x sm10x sm110 sm12x"
               fi
+              for sm_family in $sm_families; do
+                ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}-${sm_family}"
+                echo "Processing ${ARTIFACT_NAME}..."
 
-              # Clean up to save disk space before next iteration
-              rm -rf dist-jit-cache/*
+                # Download this specific artifact
+                gh run download ${{ github.run_id }} -n "${ARTIFACT_NAME}" -D dist-jit-cache/ || {
+                  echo "Warning: Failed to download ${ARTIFACT_NAME}, skipping..."
+                  continue
+                }
+
+                # Upload to release
+                if [ -n "$(ls -A dist-jit-cache/)" ]; then
+                  gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
+                  echo "✅ Uploaded ${ARTIFACT_NAME}"
+                fi
+
+                # Clean up to save disk space before next iteration
+                rm -rf dist-jit-cache/*
+              done
             done
           done
 
