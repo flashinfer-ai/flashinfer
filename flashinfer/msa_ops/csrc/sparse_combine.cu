@@ -17,6 +17,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
@@ -30,14 +31,17 @@ namespace {
 
 constexpr int kMaxTopK = 256;  // slot id is packed into 8 bits upstream
 
-template <typename T>
-__global__ void sparse_combine_kernel(T const* __restrict__ o_partial,  // [topk, total_q, Hq, d]
-                                      float const* __restrict__ lse2,   // [topk, total_q, Hq]
-                                      int const* __restrict__ split_counts,  // [total_q, Hkv]
-                                      T* __restrict__ out,                   // [total_q, Hq, d]
-                                      float* __restrict__ lse_out,  // [total_q, Hq] or nullptr
-                                      float out_scale,  // e.g. NVFP4 V global dequant scale
-                                      int total_q, int Hq, int group_size, int topk, int head_dim) {
+template <typename P, typename T>
+__global__ void sparse_combine_kernel(
+    P const* __restrict__ o_partial,       // [topk, total_q, Hq, d]
+    float const* __restrict__ lse2,        // [topk, total_q, Hq]
+    int const* __restrict__ split_counts,  // [total_q, Hkv]
+    T* __restrict__ out,                   // [total_q, Hq, d]
+    float* __restrict__ lse_out,           // [total_q, Hq] or nullptr
+    float const* __restrict__ lse_t2,      // temperature LSE partials or nullptr
+    float* __restrict__ lse_t_out,         // [total_q, Hq] or nullptr
+    float out_scale,                       // e.g. NVFP4 V global dequant scale
+    int total_q, int Hq, int group_size, int topk, int head_dim) {
   int q = blockIdx.x;
   int h = blockIdx.y;
   int tid = threadIdx.x;
@@ -54,6 +58,7 @@ __global__ void sparse_combine_kernel(T const* __restrict__ o_partial,  // [topk
   if (count <= 0) {
     for (int c = tid; c < head_dim; c += blockDim.x) out[qh * head_dim + c] = T(0.0f);
     if (lse_out != nullptr && tid == 0) lse_out[qh] = -CUDART_INF_F;
+    if (lse_t_out != nullptr && tid == 0) lse_t_out[qh] = -CUDART_INF_F;
     return;
   }
 
@@ -74,6 +79,17 @@ __global__ void sparse_combine_kernel(T const* __restrict__ o_partial,  // [topk
     }
     s_max = m;
     s_denom = denom;
+    if (lse_t_out != nullptr) {
+      // independent log2-domain logsumexp over the same split partition
+      float mt = -CUDART_INF_F;
+      for (int s = 0; s < count; ++s) mt = fmaxf(mt, lse_t2[s * slot_stride + qh]);
+      float dt = 0.0f;
+      if (isfinite(mt)) {
+        for (int s = 0; s < count; ++s) dt += exp2f(lse_t2[s * slot_stride + qh] - mt);
+      }
+      lse_t_out[qh] =
+          (dt > 0.0f && isfinite(mt)) ? (mt + log2f(dt)) * 0.6931471805599453f : -CUDART_INF_F;
+    }
     if (lse_out != nullptr) {
       // natural-log LSE: (max + log2(denom)) * ln(2)
       lse_out[qh] =
@@ -98,8 +114,9 @@ __global__ void sparse_combine_kernel(T const* __restrict__ o_partial,  // [topk
 }  // anonymous namespace
 
 void sparse_combine(TensorView o_partial, TensorView lse_partial, TensorView split_counts,
-                    TensorView out, Optional<TensorView> lse_out, int64_t group_size,
-                    double out_scale) {
+                    TensorView out, Optional<TensorView> lse_out,
+                    Optional<TensorView> lse_t_partial, Optional<TensorView> lse_t_out,
+                    int64_t group_size, double out_scale) {
   CHECK_INPUT(o_partial);
   CHECK_INPUT(lse_partial);
   CHECK_INPUT(split_counts);
@@ -134,29 +151,41 @@ void sparse_combine(TensorView o_partial, TensorView lse_partial, TensorView spl
     lse_out_ptr = static_cast<float*>(lse_out.value().data_ptr());
   }
 
+  float* lse_t2_ptr = nullptr;
+  float* lse_t_out_ptr = nullptr;
+  if (lse_t_out.has_value()) {
+    TVM_FFI_ICHECK(lse_t_partial.has_value()) << "lse_t_out requires lse_t_partial";
+    lse_t2_ptr = static_cast<float*>(lse_t_partial.value().data_ptr());
+    lse_t_out_ptr = static_cast<float*>(lse_t_out.value().data_ptr());
+  }
+
   cudaStream_t stream = get_current_stream();
   dim3 grid(total_q, Hq);
   int threads = std::min(128, d);
 
-  auto dtype_code = encode_dlpack_dtype(o_partial.dtype());
-  TVM_FFI_ICHECK(encode_dlpack_dtype(out.dtype()) == dtype_code)
-      << "out dtype must match o_partial";
-  if (dtype_code == bfloat16_code) {
-    sparse_combine_kernel<__nv_bfloat16>
-        <<<grid, threads, 0, stream>>>(static_cast<const __nv_bfloat16*>(o_partial.data_ptr()),
-                                       static_cast<const float*>(lse_partial.data_ptr()),
-                                       static_cast<const int*>(split_counts.data_ptr()),
-                                       static_cast<__nv_bfloat16*>(out.data_ptr()), lse_out_ptr,
-                                       (float)out_scale, total_q, Hq, (int)group_size, topk, d);
-  } else if (dtype_code == float16_code) {
-    sparse_combine_kernel<__half><<<grid, threads, 0, stream>>>(
-        static_cast<const __half*>(o_partial.data_ptr()),
-        static_cast<const float*>(lse_partial.data_ptr()),
-        static_cast<const int*>(split_counts.data_ptr()), static_cast<__half*>(out.data_ptr()),
-        lse_out_ptr, (float)out_scale, total_q, Hq, (int)group_size, topk, d);
-  } else {
-    TVM_FFI_ICHECK(false) << "o_partial must be bf16 or fp16";
+  auto p_code = encode_dlpack_dtype(o_partial.dtype());
+  auto t_code = encode_dlpack_dtype(out.dtype());
+  bool launched = false;
+#define DISPATCH_COMBINE(PCODE, P, TCODE, T)                                                    \
+  if (p_code == (PCODE) && t_code == (TCODE)) {                                                 \
+    sparse_combine_kernel<P, T><<<grid, threads, 0, stream>>>(                                  \
+        static_cast<const P*>(o_partial.data_ptr()),                                            \
+        static_cast<const float*>(lse_partial.data_ptr()),                                      \
+        static_cast<const int*>(split_counts.data_ptr()), static_cast<T*>(out.data_ptr()),      \
+        lse_out_ptr, lse_t2_ptr, lse_t_out_ptr, (float)out_scale, total_q, Hq, (int)group_size, \
+        topk, d);                                                                               \
+    launched = true;                                                                            \
   }
+  DISPATCH_COMBINE(bfloat16_code, __nv_bfloat16, bfloat16_code, __nv_bfloat16)
+  DISPATCH_COMBINE(float16_code, __half, float16_code, __half)
+  DISPATCH_COMBINE(float32_code, float, bfloat16_code, __nv_bfloat16)
+  DISPATCH_COMBINE(float32_code, float, float16_code, __half)
+  DISPATCH_COMBINE(float16_code, __half, bfloat16_code, __nv_bfloat16)
+  DISPATCH_COMBINE(bfloat16_code, __nv_bfloat16, float16_code, __half)
+  DISPATCH_COMBINE(float8_e4m3fn_code, __nv_fp8_e4m3, bfloat16_code, __nv_bfloat16)
+  DISPATCH_COMBINE(float8_e4m3fn_code, __nv_fp8_e4m3, float16_code, __half)
+#undef DISPATCH_COMBINE
+  TVM_FFI_ICHECK(launched) << "unsupported (partial, out) dtype combination";
   cudaError_t status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_combine launch failed: " << cudaGetErrorString(status);

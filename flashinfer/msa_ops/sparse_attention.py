@@ -18,6 +18,7 @@ from typing import Optional
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..utils import is_sm12x_supported
 
 _BLK_KV = 128
@@ -26,22 +27,57 @@ _MAX_KV_BLOCKS = 4096  # SMEM selection-map capacity: max_seqlen_k <= 4096 * 128
 _compile_cache: dict = {}
 
 
-def _to_cute(t: torch.Tensor, leading_dim: int):
-    from cutlass.cute.runtime import from_dlpack
+def _q_offset_tensor(
+    q_offset,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    device,
+) -> torch.Tensor:
+    """Per-batch causal offset (MSA q_offset semantics: query global position
+    = q_offset[b] + batch-local index). Defaults to right-aligned
+    (seqlen_k - seqlen_q)."""
+    if q_offset is None:
+        return (
+            (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
+            - (cu_seqlens_q[1:] - cu_seqlens_q[:-1])
+        ).to(torch.int32)
+    if isinstance(q_offset, int):
+        n = cu_seqlens_q.numel() - 1
+        return torch.full((n,), q_offset, dtype=torch.int32, device=device)
+    if q_offset.dtype != torch.int32:
+        raise ValueError("q_offset must be int32")
+    return q_offset.to(device)
 
-    dtype_width = t.element_size() * 8
-    return (
-        from_dlpack(t, assumed_align=16)
-        .mark_layout_dynamic(leading_dim=leading_dim)
-        .mark_compact_shape_dynamic(
-            mode=leading_dim,
-            stride_order=t.dim_order(),
-            divisibility=128 // dtype_width,
-        )
+
+def _cutlass_dtype(torch_dtype: torch.dtype):
+    import cutlass
+
+    return {
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float16: cutlass.Float16,
+        torch.float32: cutlass.Float32,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.uint8: cutlass.Uint8,
+        torch.int32: cutlass.Int32,
+    }[torch_dtype]
+
+
+def _fake(dtype, shape, align=16):
+    """Fake compact row-major tensor for TVM-FFI compilation (FlashInfer's
+    established cute-dsl pattern: compile once against symbolic shapes, then
+    pass torch tensors directly at runtime)."""
+    import cutlass.cute as cute
+
+    return cute.runtime.make_fake_compact_tensor(
+        dtype,
+        shape,
+        stride_order=tuple(reversed(range(len(shape)))),
+        assumed_align=align,
     )
 
 
-def sparse_attention(
+@flashinfer_api
+def msa_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -52,17 +88,17 @@ def sparse_attention(
     causal: bool = False,
     softmax_scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
+    q_offset=None,
 ) -> torch.Tensor:
     """Minimax Sparse Attention forward pass for SM120/SM121.
 
     Computes attention where each query token attends only to its top-K
     selected KV blocks (of ``blk_kv = 128`` tokens each), as chosen by
-    :func:`sparse_topk_select`.
+    :func:`msa_topk_select`.
 
-    This is the Phase-3a q-major kernel: each CTA processes a tile of query
+    This is the q-major kernel: each CTA processes a tile of query
     tokens for one query head and gathers the union of the tile's selected
-    KV blocks. (The KV-major CSR kernel consuming :func:`build_k2q_csr`
-    output is Phase 3b.)
+    KV blocks.
 
     Parameters
     ----------
@@ -94,14 +130,13 @@ def sparse_attention(
         Shape ``(total_q, num_qo_heads, head_dim)``, dtype of ``q``. Query
         tokens with no valid selected blocks produce zeros.
     """
-    import cuda.bindings.driver as cuda_driver
     import cutlass
 
     from .cute_dsl import SparseAttentionForwardSm12x
 
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
-            "sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
         )
 
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -160,24 +195,18 @@ def sparse_attention(
 
     cu_q_dev = cu_seqlens_q.to(q.device, non_blocking=True)
     cu_k_dev = cu_seqlens_k.to(q.device, non_blocking=True)
+    qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k_dev, q.device)
 
     import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
-    q_c = _to_cute(q, 2)
-    k_c = _to_cute(k, 2)
-    v_c = _to_cute(v, 2)
-    o_c = _to_cute(output, 2)
-    idx_c = from_dlpack(q2k_indices, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    cuq_c = from_dlpack(cu_q_dev, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-    cuk_c = from_dlpack(cu_k_dev, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-
-    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
     dtype_key = str(q.dtype)
     key = (dtype_key, topk, causal)
     compiled = _compile_cache.get(key)
     if compiled is None:
+        cdt = _cutlass_dtype(q.dtype)
+        i32 = _cutlass_dtype(torch.int32)
+        s_tq, s_hq, s_tk, s_hkv, s_b1, s_b0 = (cute.sym_int() for _ in range(6))
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel_obj = SparseAttentionForwardSm12x(
             head_dim=head_dim,
             m_block_size=64,
@@ -189,34 +218,36 @@ def sparse_attention(
         )
         compiled = cute.compile(
             kernel_obj,
-            q_c,
-            k_c,
-            v_c,
-            o_c,
-            idx_c,
-            cuq_c,
-            cuk_c,
-            cutlass.Float32(softmax_scale),
-            cutlass.Int32(max_seqlen_q),
-            cutlass.Int32(batch_size),
-            cutlass.Int32(num_qo_heads),
-            stream,
+            _fake(cdt, (s_tq, s_hq, head_dim)),
+            _fake(cdt, (s_tk, s_hkv, head_dim)),
+            _fake(cdt, (s_tk, s_hkv, head_dim)),
+            _fake(cdt, (s_tq, s_hq, head_dim)),
+            _fake(i32, (s_hkv, s_tq, topk), align=4),
+            _fake(i32, (s_b1,), align=4),
+            _fake(i32, (s_b1,), align=4),
+            _fake(i32, (s_b0,), align=4),
+            cutlass.Float32(1.0),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            stream_fake,
+            options="--enable-tvm-ffi",
         )
         _compile_cache[key] = compiled
 
     compiled(
-        q_c,
-        k_c,
-        v_c,
-        o_c,
-        idx_c,
-        cuq_c,
-        cuk_c,
-        cutlass.Float32(softmax_scale),
-        cutlass.Int32(max_seqlen_q),
-        cutlass.Int32(batch_size),
-        cutlass.Int32(num_qo_heads),
-        stream,
+        q,
+        k,
+        v,
+        output,
+        q2k_indices,
+        cu_q_dev,
+        cu_k_dev,
+        qoff_dev,
+        float(softmax_scale),
+        int(max_seqlen_q),
+        int(batch_size),
+        int(num_qo_heads),
     )
     return output
 
@@ -237,6 +268,8 @@ def _combine_partials(
     out_dtype: torch.dtype,
     lse_out: Optional[torch.Tensor] = None,
     out_scale: float = 1.0,
+    lse_t_partial: Optional[torch.Tensor] = None,
+    lse_t_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused CUDA LSE-weighted reduction over each query's split slots."""
     topk, total_q, num_qo_heads, head_dim = o_partial.shape
@@ -244,7 +277,15 @@ def _combine_partials(
         (total_q, num_qo_heads, head_dim), dtype=out_dtype, device=o_partial.device
     )
     _get_sparse_combine_module().sparse_combine(
-        o_partial, lse_partial, split_counts, out, lse_out, group_size, out_scale
+        o_partial,
+        lse_partial,
+        split_counts,
+        out,
+        lse_out,
+        lse_t_partial,
+        lse_t_out,
+        group_size,
+        out_scale,
     )
     return out
 
@@ -276,7 +317,8 @@ def _combine_partials_torch(
     return out.to(out_dtype)
 
 
-def sparse_attention_kvmajor(
+@flashinfer_api
+def msa_sparse_attention_kvmajor(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -296,19 +338,25 @@ def sparse_attention_kvmajor(
     v_scale: Optional[torch.Tensor] = None,
     k_global_scale: Optional[float] = None,
     v_global_scale: Optional[float] = None,
+    q_offset=None,
+    partial_dtype: Optional[torch.dtype] = None,
+    return_temperature_lse: bool = False,
+    lse_temperature_scale: float = 1.0,
+    qk_dtype: Optional[torch.dtype] = None,
+    pv_dtype: Optional[torch.dtype] = None,
 ):
-    """Minimax Sparse Attention forward (KV-major, Phase 3b) for SM120/SM121.
+    """Minimax Sparse Attention forward for SM120/SM121.
 
-    Same semantics as :func:`sparse_attention`, but follows MSA's KV-major
+    Same semantics as :func:`msa_sparse_attention`, but follows MSA's KV-major
     design: work is distributed over (kv-head, KV block) CSR rows built by
-    :func:`build_k2q_csr_schedule`, each KV block is loaded once and shared
+    :func:`msa_build_k2q_csr_schedule`, each KV block is loaded once and shared
     by all queries that selected it, and per-block partial outputs are
     combined with a fused LSE-weighted reduction.
 
-    Parameters are as in :func:`sparse_attention`, with these additions:
+    Parameters are as in :func:`msa_sparse_attention`, with these additions:
 
-    schedule : SparseAttentionSchedule, optional
-        Pre-computed schedule (from :func:`build_k2q_csr_schedule`) to
+    schedule : MsaAttentionSchedule, optional
+        Pre-computed schedule (from :func:`msa_build_k2q_csr_schedule`) to
         amortize index preprocessing across layers.
     page_table : torch.Tensor, optional
         Enables the paged-KV path: ``k``/``v`` are then
@@ -328,20 +376,28 @@ def sparse_attention_kvmajor(
         Output ``(total_q, num_qo_heads, head_dim)``; plus LSE if
         ``return_softmax_lse``.
     """
-    import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
 
     from .cute_dsl import SparseAttentionForwardKvMajorSm12x
-    from .sparse_index_utils import build_k2q_csr_schedule
+    from .sparse_index_utils import msa_build_k2q_csr_schedule
 
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
-            "sparse_attention_kvmajor requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_sparse_attention_kvmajor requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
         )
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"q must be bf16 or fp16, got {q.dtype}")
+    q_fp8 = q.dtype == torch.float8_e4m3fn
+    compute_dtype = torch.bfloat16 if q_fp8 else q.dtype
+    qk_fp8_mma = qk_dtype == torch.float8_e4m3fn
+    if qk_fp8_mma and not q_fp8:
+        raise ValueError("qk_dtype=float8_e4m3fn requires fp8 Q")
+    if qk_fp8_mma and k.dtype != torch.float8_e4m3fn:
+        raise ValueError("qk_dtype=float8_e4m3fn requires fp8 K/V")
+    pv_fp8_mma = pv_dtype == torch.float8_e4m3fn
+    if pv_fp8_mma and v.dtype != torch.float8_e4m3fn:
+        raise ValueError("pv_dtype=float8_e4m3fn requires fp8 V")
+    if not q_fp8 and q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"q must be bf16/fp16/fp8_e4m3, got {q.dtype}")
     total_q, num_qo_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     if head_dim != 128:
@@ -371,7 +427,9 @@ def sparse_attention_kvmajor(
             raise ValueError("k_scale/v_scale must be uint8 (E4M3 bytes)")
         if k_global_scale is not None:
             softmax_scale = softmax_scale * float(k_global_scale)
-    elif k.dtype != q.dtype or v.dtype != q.dtype:
+    elif (k.dtype != compute_dtype or v.dtype != compute_dtype) and not (
+        q_fp8 and k.dtype == torch.float8_e4m3fn
+    ):
         raise ValueError("k/v dtype must match q (or be fp8/packed NVFP4)")
 
     paged = page_table is not None
@@ -400,7 +458,7 @@ def sparse_attention_kvmajor(
             raise ValueError("flat k/v must be (total_k, num_kv_heads, head_dim)")
 
     if schedule is None:
-        schedule = build_k2q_csr_schedule(
+        schedule = msa_build_k2q_csr_schedule(
             q2k_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -409,15 +467,31 @@ def sparse_attention_kvmajor(
         )
 
     dev = q.device
+    if partial_dtype is None:
+        partial_dtype = compute_dtype
+    if partial_dtype not in (
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+    ):
+        raise ValueError(f"unsupported partial_dtype {partial_dtype}")
     o_partial = torch.empty(
-        (topk, total_q, num_qo_heads, head_dim), dtype=q.dtype, device=dev
+        (topk, total_q, num_qo_heads, head_dim), dtype=partial_dtype, device=dev
     )
     lse_partial = torch.empty(
         (topk, total_q, num_qo_heads), dtype=torch.float32, device=dev
     )
+    if return_temperature_lse:
+        lse_t_partial = torch.empty(
+            (topk, total_q, num_qo_heads), dtype=torch.float32, device=dev
+        )
+    else:
+        lse_t_partial = torch.zeros((1, 1, 1), dtype=torch.float32, device=dev)
 
     cu_q_dev = cu_seqlens_q.to(dev, non_blocking=True)
     cu_k_dev = cu_seqlens_k.to(dev, non_blocking=True)
+    qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k_dev, dev)
 
     if paged:
         pt_dev = page_table.contiguous()
@@ -436,34 +510,12 @@ def sparse_attention_kvmajor(
         ksf_dev = torch.zeros(1, dtype=torch.uint8, device=dev)
         vsf_dev = ksf_dev
 
-    q_c = _to_cute(q, 2)
-    k_c = _to_cute(k_pass, 3 if paged else 2)
-    v_c = _to_cute(v_pass, 3 if paged else 2)
-    pt_c = from_dlpack(pt_dev, assumed_align=4).mark_layout_dynamic(leading_dim=1)
-    ksf_c = from_dlpack(ksf_dev, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-    vsf_c = from_dlpack(vsf_dev, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-    op_c = _to_cute(o_partial, 3)
-    lse_c = from_dlpack(lse_partial, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    rp_c = from_dlpack(schedule.row_ptr, assumed_align=4).mark_layout_dynamic(
-        leading_dim=1
-    )
-    qs_c = from_dlpack(schedule.qsplit_indices, assumed_align=4).mark_layout_dynamic(
-        leading_dim=1
-    )
-    sched_c = from_dlpack(
-        schedule.scheduler_metadata, assumed_align=4
-    ).mark_layout_dynamic(leading_dim=1)
-    wc_c = from_dlpack(schedule.work_count, assumed_align=4).mark_layout_dynamic(
-        leading_dim=0
-    )
-    cuq_c = from_dlpack(cu_q_dev, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-    cuk_c = from_dlpack(cu_k_dev, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-
-    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-
     key = (
         "kvmajor",
         str(q.dtype),
+        q_fp8,
+        qk_fp8_mma,
+        pv_fp8_mma,
         group_size,
         causal,
         paged,
@@ -471,9 +523,21 @@ def sparse_attention_kvmajor(
         kv_nvfp4,
         m_block_size,
         num_threads,
+        str(partial_dtype),
+        return_temperature_lse,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
+        q_in_cdt = _cutlass_dtype(q.dtype)
+        kv_cdt = _cutlass_dtype(k_pass.dtype)
+        i32 = _cutlass_dtype(torch.int32)
+        u8 = _cutlass_dtype(torch.uint8)
+        kv_last = k_pass.shape[-1]  # 128 (or 16 int32 words for nvfp4)
+        s_tq, s_hq, s_tk, s_hkv, s_topk, s_b1, s_b0 = (cute.sym_int() for _ in range(7))
+        s_lt0, s_lt1, s_lt2 = (cute.sym_int() for _ in range(3))
+        s_pb, s_pm, s_ksf, s_vsf, s_tr, s_qs, s_cap = (cute.sym_int() for _ in range(7))
+        kv_shape = (s_tk, s_hkv, _BLK_KV, kv_last) if paged else (s_tk, s_hkv, kv_last)
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel_obj = SparseAttentionForwardKvMajorSm12x(
             head_dim=head_dim,
             m_block_size=m_block_size,
@@ -484,61 +548,80 @@ def sparse_attention_kvmajor(
             paged=paged,
             kv_fp8=kv_fp8,
             kv_nvfp4=kv_nvfp4,
+            return_temperature_lse=return_temperature_lse,
+            q_fp8=q_fp8,
+            qk_fp8_mma=qk_fp8_mma,
+            pv_fp8_mma=pv_fp8_mma,
         )
         compiled = cute.compile(
             kernel_obj,
-            q_c,
-            k_c,
-            v_c,
-            pt_c,
-            ksf_c,
-            vsf_c,
-            op_c,
-            lse_c,
-            rp_c,
-            qs_c,
-            sched_c,
-            wc_c,
-            cuq_c,
-            cuk_c,
-            cutlass.Float32(softmax_scale),
-            cutlass.Int32(schedule.work_capacity),
-            stream,
+            _fake(q_in_cdt, (s_tq, s_hq, head_dim)),
+            _fake(kv_cdt, kv_shape),
+            _fake(kv_cdt, kv_shape),
+            _fake(i32, (s_pb, s_pm), align=4),
+            _fake(u8, (s_ksf,), align=4),
+            _fake(u8, (s_vsf,), align=4),
+            _fake(_cutlass_dtype(partial_dtype), (s_topk, s_tq, s_hq, head_dim)),
+            _fake(_cutlass_dtype(torch.float32), (s_topk, s_tq, s_hq), align=4),
+            _fake(_cutlass_dtype(torch.float32), (s_lt0, s_lt1, s_lt2), align=4),
+            _fake(i32, (s_hkv, s_tr), align=4),
+            _fake(i32, (s_hkv, s_qs), align=4),
+            _fake(i32, (s_cap, 6), align=4),
+            _fake(i32, (1,), align=4),
+            _fake(i32, (s_b1,), align=4),
+            _fake(i32, (s_b1,), align=4),
+            _fake(i32, (s_b0,), align=4),
+            cutlass.Float32(1.0),
+            cutlass.Float32(1.0),
+            cutlass.Int32(1),
+            stream_fake,
+            options="--enable-tvm-ffi",
         )
         _compile_cache[key] = compiled
 
     compiled(
-        q_c,
-        k_c,
-        v_c,
-        pt_c,
-        ksf_c,
-        vsf_c,
-        op_c,
-        lse_c,
-        rp_c,
-        qs_c,
-        sched_c,
-        wc_c,
-        cuq_c,
-        cuk_c,
-        cutlass.Float32(softmax_scale),
-        cutlass.Int32(schedule.work_capacity),
-        stream,
+        q,
+        k_pass,
+        v_pass,
+        pt_dev,
+        ksf_dev,
+        vsf_dev,
+        o_partial,
+        lse_partial,
+        lse_t_partial,
+        schedule.row_ptr,
+        schedule.qsplit_indices,
+        schedule.scheduler_metadata,
+        schedule.work_count,
+        cu_q_dev,
+        cu_k_dev,
+        qoff_dev,
+        float(softmax_scale),
+        float(lse_temperature_scale),
+        int(schedule.work_capacity),
     )
 
     lse_out = None
-    if return_softmax_lse:
+    if return_softmax_lse or return_temperature_lse:
         lse_out = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
+    lse_t_out = None
+    if return_temperature_lse:
+        lse_t_out = torch.empty(
+            (total_q, num_qo_heads), dtype=torch.float32, device=dev
+        )
     out = _combine_partials(
         o_partial,
         lse_partial,
         schedule.split_counts,
         group_size,
-        q.dtype,
+        compute_dtype,
         lse_out=lse_out,
         out_scale=float(v_global_scale) if v_global_scale is not None else 1.0,
+        lse_t_partial=lse_t_partial if return_temperature_lse else None,
+        lse_t_out=lse_t_out,
     )
+    if return_temperature_lse:
+        return out, lse_out, lse_t_out
     if return_softmax_lse:
         return out, lse_out
     return out

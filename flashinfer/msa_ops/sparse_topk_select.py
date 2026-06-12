@@ -19,6 +19,7 @@ from typing import Optional
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..utils import is_sm12x_supported
 from .jit import gen_sparse_topk_select_module
 
@@ -28,7 +29,8 @@ def _get_sparse_topk_select_module():
     return gen_sparse_topk_select_module().build_and_load()
 
 
-def sparse_topk_select(
+@flashinfer_api
+def msa_topk_select(
     max_score: torch.Tensor,
     topk: int,
     num_valid_pages: Optional[int] = None,
@@ -74,7 +76,7 @@ def sparse_topk_select(
     """
     if not is_sm12x_supported(max_score.device):
         raise RuntimeError(
-            "sparse_topk_select requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_topk_select requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
         )
 
     if max_score.dtype != torch.float32:

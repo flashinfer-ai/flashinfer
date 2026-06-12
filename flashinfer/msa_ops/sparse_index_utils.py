@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..utils import is_sm12x_supported
 from .jit import gen_build_k2q_csr_module
 
@@ -30,7 +31,7 @@ def _get_build_k2q_csr_module():
 
 
 @dataclass
-class SparseAttentionSchedule:
+class MsaAttentionSchedule:
     """CSR + flat work schedule for the KV-major sparse forward kernel."""
 
     row_ptr: torch.Tensor  # [Hkv, total_rows + 1] int32
@@ -45,7 +46,8 @@ class SparseAttentionSchedule:
     topk: int
 
 
-def build_k2q_csr(
+@flashinfer_api
+def msa_build_k2q_csr(
     q2k_indices: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
@@ -56,7 +58,7 @@ def build_k2q_csr(
     """Invert per-query top-K KV block indices into a KV-major CSR structure.
 
     Given ``q2k_indices`` mapping each (head, query token) to its selected KV
-    blocks (the output of :func:`sparse_topk_select`, transposed to head-major),
+    blocks (the output of :func:`msa_topk_select`, transposed to head-major),
     builds the inverse mapping: for each (head, KV block row), the sorted list
     of query tokens that selected it. This KV-major layout is what the sparse
     attention kernel consumes.
@@ -98,7 +100,7 @@ def build_k2q_csr(
     """
     if not is_sm12x_supported(q2k_indices.device):
         raise RuntimeError(
-            "build_k2q_csr requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_build_k2q_csr requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
         )
 
     if q2k_indices.dtype != torch.int32:
@@ -176,18 +178,19 @@ def build_k2q_csr(
     return row_ptr, q_indices
 
 
-def build_k2q_csr_schedule(
+@flashinfer_api
+def msa_build_k2q_csr_schedule(
     q2k_indices: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     blk_kv: int = 128,
     target_q_per_cta: int = 128,
     max_seqlen_q: int = 0,
-) -> SparseAttentionSchedule:
+) -> MsaAttentionSchedule:
     """Build the KV-major CSR plus the flat work schedule for the sparse
     forward kernel.
 
-    In addition to :func:`build_k2q_csr`'s outputs, this produces:
+    In addition to :func:`msa_build_k2q_csr`'s outputs, this produces:
 
     - ``qsplit_indices``: like ``q_indices`` but each entry packs the
       batch-local query index (low 24 bits) with the query's *split slot*
@@ -203,7 +206,7 @@ def build_k2q_csr_schedule(
     """
     if not is_sm12x_supported(q2k_indices.device):
         raise RuntimeError(
-            "build_k2q_csr_schedule requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_build_k2q_csr_schedule requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
         )
     if q2k_indices.dtype != torch.int32 or q2k_indices.ndim != 3:
         raise ValueError("q2k_indices must be int32 of shape (Hkv, total_q, topk)")
@@ -263,7 +266,7 @@ def build_k2q_csr_schedule(
         max_seqlen_q,
     )
 
-    return SparseAttentionSchedule(
+    return MsaAttentionSchedule(
         row_ptr=row_ptr,
         q_indices=q_indices,
         qsplit_indices=qsplit_indices,

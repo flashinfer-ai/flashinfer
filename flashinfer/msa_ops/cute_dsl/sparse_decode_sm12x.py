@@ -15,7 +15,7 @@ limitations under the License.
 
 ---
 
-Slim sparse decode kernel for SM120/SM121 (Phase 4 perf kernel).
+Slim sparse decode kernel for SM120/SM121
 
 Decode shape: one query token (x its GQA query heads) attending one selected
 128-token KV block per CTA. Compared to running decode through the prefill
@@ -35,8 +35,6 @@ KV-major kernel, this kernel:
 Partial outputs and log2-domain LSE go to the same split-slot buffers as the
 prefill kernel and are reduced by the same fused combine kernel.
 """
-
-from typing import Type
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -58,6 +56,7 @@ class SparseDecodeForwardSm12x:
         paged: bool = False,
         kv_fp8: bool = False,
         kv_nvfp4: bool = False,
+        q_fp8: bool = False,
     ):
         if head_dim != 128 or blk_kv != 128 or sub_block != 64:
             raise ValueError("only head_dim=blk_kv=128, sub_block=64 supported")
@@ -76,6 +75,7 @@ class SparseDecodeForwardSm12x:
         self._kv_fp8 = kv_fp8
         # NVFP4: packed e2m1 K/V (int32 word views) + e4m3 128x4 block scales
         self._kv_nvfp4 = kv_nvfp4
+        self._q_fp8 = q_fp8
         if kv_fp8 and kv_nvfp4:
             raise ValueError("kv_fp8 and kv_nvfp4 are mutually exclusive")
         self._pad_stride = head_dim + 8  # 16B-aligned padded rows
@@ -98,20 +98,26 @@ class SparseDecodeForwardSm12x:
         mLse: cute.Tensor,  # (topk, total_q, Hq) f32, log2 domain
         mSplitCounts: cute.Tensor,  # (total_q, Hkv) int32
         mCuK: cute.Tensor,  # (B + 1,) int32
+        mQOffset: cute.Tensor,  # (B,) int32 causal offset (MSA q_offset)
         softmax_scale: cutlass.Float32,
         seqlen_q: cutlass.Int32,
         total_q: cutlass.Int32,
         num_kv_heads: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        if cutlass.const_expr(
-            not (
-                mQ.element_type == cutlass.Float16
-                or mQ.element_type == cutlass.BFloat16
-            )
-        ):
-            raise TypeError("Only Float16 or BFloat16 q is supported")
-        self._dtype: Type[cutlass.Numeric] = mQ.element_type
+        if cutlass.const_expr(self._q_fp8):
+            if cutlass.const_expr(mQ.element_type != cutlass.Float8E4M3FN):
+                raise TypeError("q_fp8 requires Q to be Float8E4M3FN")
+            self._dtype = cutlass.BFloat16
+        else:
+            if cutlass.const_expr(
+                not (
+                    mQ.element_type == cutlass.Float16
+                    or mQ.element_type == cutlass.BFloat16
+                )
+            ):
+                raise TypeError("Only Float16 or BFloat16 q is supported")
+            self._dtype = mQ.element_type
 
         LOG2_E = 1.4426950408889634074
         softmax_scale_log2 = softmax_scale * LOG2_E
@@ -127,6 +133,7 @@ class SparseDecodeForwardSm12x:
             mLse,
             mSplitCounts,
             mCuK,
+            mQOffset,
             softmax_scale_log2,
             seqlen_q,
         ).launch(
@@ -149,6 +156,7 @@ class SparseDecodeForwardSm12x:
         mLse: cute.Tensor,
         mSplitCounts: cute.Tensor,
         mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         seqlen_q: cutlass.Int32,
     ):
@@ -233,7 +241,16 @@ class SparseDecodeForwardSm12x:
                     if q_m < G:
                         g_row = mQ[qi, kv_head * G + q_m, None]
                         g_chunk = cute.local_tile(g_row, (8,), (q_c8,))
-                        cute.autovec_copy(g_chunk, s_chunk)
+                        if cutlass.const_expr(self._q_fp8):
+                            qfrag.store(
+                                g_chunk.load()
+                                .to(cutlass.Float16)
+                                .to(cutlass.Float32)
+                                .to(self._dtype)
+                            )
+                            cute.autovec_copy(qfrag, s_chunk)
+                        else:
+                            cute.autovec_copy(g_chunk, s_chunk)
                     else:
                         qfrag.fill(0)
                         cute.autovec_copy(qfrag, s_chunk)
@@ -308,9 +325,8 @@ class SparseDecodeForwardSm12x:
                 )
 
             if cutlass.const_expr(self._is_causal):
-                q_pos_limit = (
-                    tok_in_req + seqlen_k - seqlen_q + 1
-                )  # exclusive col limit
+                # causal: query global position = q_offset[b] + tok_in_req
+                q_pos_limit = tok_in_req + mQOffset[batch_idx] + 1
                 col_limit = cutlass.min(q_pos_limit, seqlen_k)
             else:
                 col_limit = seqlen_k

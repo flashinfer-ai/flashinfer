@@ -17,7 +17,7 @@ limitations under the License.
 
 Minimax Sparse Attention forward kernel for SM120/SM121 (consumer Blackwell).
 
-Q-major design (Phase 3a functional baseline): each CTA owns one tile of
+Q-major design: each CTA owns one tile of
 ``m_block_size`` query tokens for a single query head and iterates over the
 KV blocks selected by any query in the tile (union of the tile's per-query
 top-K lists).  Per-row membership masking inside the online softmax restores
@@ -114,6 +114,7 @@ class SparseAttentionForwardSm12x:
         mIdx: cute.Tensor,  # (Hkv, total_q, topk) int32, ascending, -1 padded
         mCuQ: cute.Tensor,  # (B + 1,) int32
         mCuK: cute.Tensor,  # (B + 1,) int32
+        mQOffset: cute.Tensor,  # (B,) int32 causal offset (MSA q_offset)
         softmax_scale: cutlass.Float32,
         max_seqlen_q: cutlass.Int32,
         batch_size: cutlass.Int32,
@@ -220,6 +221,7 @@ class SparseAttentionForwardSm12x:
             mIdx,
             mCuQ,
             mCuK,
+            mQOffset,
             softmax_scale_log2,
             sQ_layout,
             sKV_layout,
@@ -246,6 +248,7 @@ class SparseAttentionForwardSm12x:
         mIdx: cute.Tensor,
         mCuQ: cute.Tensor,
         mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
         sKV_layout: cute.ComposedLayout,
@@ -510,6 +513,7 @@ class SparseAttentionForwardSm12x:
                         m_block,
                         seqlen_q,
                         seqlen_k,
+                        mQOffset[batch_idx],
                         mma_params,
                         gmem_copy_params,
                         smem_copy_params,
@@ -583,6 +587,7 @@ class SparseAttentionForwardSm12x:
         m_block: cutlass.Int32,
         seqlen_q: cutlass.Int32,
         seqlen_k: cutlass.Int32,
+        q_offset: cutlass.Int32,
         mma_params: SimpleNamespace,
         gmem_copy_params: SimpleNamespace,
         smem_copy_params: SimpleNamespace,
@@ -663,9 +668,8 @@ class SparseAttentionForwardSm12x:
                 if sIdx[row_local * self._topk + t] == kv_block:
                     selected = cutlass.Boolean(True)
             if cutlass.const_expr(self._is_causal):
-                # right-aligned causal: q_pos attends k positions
-                # <= q_pos + (seqlen_k - seqlen_q)
-                col_limit = q_pos + seqlen_k - seqlen_q + 1
+                # causal: query global position = q_offset[b] + q_pos
+                col_limit = q_pos + q_offset + 1
                 col_limit = cutlass.min(col_limit, seqlen_k)
             else:
                 col_limit = seqlen_k

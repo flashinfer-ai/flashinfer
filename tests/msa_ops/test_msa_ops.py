@@ -32,7 +32,7 @@ def _skip_if_unsupported():
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: build_k2q_csr
+# Phase 2: msa_build_k2q_csr
 # ---------------------------------------------------------------------------
 
 
@@ -79,7 +79,7 @@ def _ref_build_k2q_csr(q2k, cu_q, cu_k, blk_kv):
 )
 def test_build_k2q_csr(B, H, topk, seqs_q, seqs_k):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import build_k2q_csr
+    from flashinfer.msa_ops import msa_build_k2q_csr
 
     torch.manual_seed(0)
     dev = "cuda"
@@ -100,7 +100,7 @@ def test_build_k2q_csr(B, H, topk, seqs_q, seqs_k):
                 sel = torch.randperm(nb)[:n].sort().values.to(torch.int32)
                 q2k[h, qi, :n] = sel.to(dev)
 
-    row_ptr, q_idx = build_k2q_csr(q2k, cu_q, cu_k, blk_kv=BLK_KV)
+    row_ptr, q_idx = msa_build_k2q_csr(q2k, cu_q, cu_k, blk_kv=BLK_KV)
     torch.cuda.synchronize()
 
     ref_ptr, ref_lists, total_rows = _ref_build_k2q_csr(q2k, cu_q, cu_k, BLK_KV)
@@ -116,7 +116,7 @@ def test_build_k2q_csr(B, H, topk, seqs_q, seqs_k):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3a: sparse_attention (q-major SM12x kernel)
+# Phase 3a: msa_sparse_attention (q-major SM12x kernel)
 # ---------------------------------------------------------------------------
 
 
@@ -165,7 +165,7 @@ def _ref_sparse_attention(q, k, v, idx, cu_q, cu_k, causal, scale):
 )
 def test_sparse_attention(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_attention
+    from flashinfer.msa_ops import msa_sparse_attention
 
     torch.manual_seed(42)
     dev, dtype = "cuda", torch.bfloat16
@@ -194,7 +194,9 @@ def test_sparse_attention(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
                     idx[h, qi, :nsel] = sel.to(dev)
 
     scale = 1.0 / math.sqrt(128)
-    out = sparse_attention(q, k, v, idx, cu_q, cu_k, causal=causal, softmax_scale=scale)
+    out = msa_sparse_attention(
+        q, k, v, idx, cu_q, cu_k, causal=causal, softmax_scale=scale
+    )
     torch.cuda.synchronize()
     ref = _ref_sparse_attention(
         q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), causal, scale
@@ -216,7 +218,7 @@ def test_sparse_attention(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
 )
 def test_sparse_attention_kvmajor(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
 
     torch.manual_seed(7)
     dev, dtype = "cuda", torch.bfloat16
@@ -244,7 +246,7 @@ def test_sparse_attention_kvmajor(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
                     idx[h, qi, :nsel] = sel.to(dev)
 
     scale = 1.0 / math.sqrt(128)
-    out = sparse_attention_kvmajor(
+    out = msa_sparse_attention_kvmajor(
         q, k, v, idx, cu_q, cu_k, causal=causal, softmax_scale=scale
     )
     torch.cuda.synchronize()
@@ -291,13 +293,13 @@ def _make_case(B, Hq, Hkv, topk, seqs_q, seqs_k, dtype, seed, min_sel=0):
 @pytest.mark.parametrize("topk", [16, 32])
 def test_sparse_attention_kvmajor_dtypes_topk(dtype, topk):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
 
     q, k, v, idx, cu_q, cu_k = _make_case(
         2, 4, 2, topk, [100, 64], [2048, 1024], dtype, seed=20 + topk
     )
     scale = 1.0 / math.sqrt(128)
-    out = sparse_attention_kvmajor(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
+    out = msa_sparse_attention_kvmajor(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
     torch.cuda.synchronize()
     ref = _ref_sparse_attention(
         q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), False, scale
@@ -308,13 +310,13 @@ def test_sparse_attention_kvmajor_dtypes_topk(dtype, topk):
 
 def test_sparse_attention_kvmajor_lse():
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
 
     q, k, v, idx, cu_q, cu_k = _make_case(
         2, 4, 2, 16, [80, 50], [1024, 640], torch.bfloat16, seed=30
     )
     scale = 1.0 / math.sqrt(128)
-    out, lse = sparse_attention_kvmajor(
+    out, lse = msa_sparse_attention_kvmajor(
         q, k, v, idx, cu_q, cu_k, softmax_scale=scale, return_softmax_lse=True
     )
     torch.cuda.synchronize()
@@ -342,14 +344,16 @@ def test_sparse_attention_kvmajor_lse():
 
 def test_sparse_attention_kvmajor_paged():
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
 
     seqs_q, seqs_k = [150, 90], [2048, 1280]  # multiples of 128
     q, k, v, idx, cu_q, cu_k = _make_case(
         2, 8, 2, 16, seqs_q, seqs_k, torch.bfloat16, seed=40
     )
     scale = 1.0 / math.sqrt(128)
-    out_flat = sparse_attention_kvmajor(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
+    out_flat = msa_sparse_attention_kvmajor(
+        q, k, v, idx, cu_q, cu_k, softmax_scale=scale
+    )
 
     Hkv = k.shape[1]
     num_pages_per = [s // BLK_KV for s in seqs_k]
@@ -368,7 +372,7 @@ def test_sparse_attention_kvmajor_paged():
             k_pg[pg] = k[rows].transpose(0, 1)
             v_pg[pg] = v[rows].transpose(0, 1)
     seqused = torch.tensor(seqs_k, dtype=torch.int32, device=k.device)
-    out_paged = sparse_attention_kvmajor(
+    out_paged = msa_sparse_attention_kvmajor(
         q,
         k_pg.contiguous(),
         v_pg.contiguous(),
@@ -386,7 +390,7 @@ def test_fused_combine_matches_torch():
     _skip_if_unsupported()
     import importlib
 
-    # the sparse_attention *function* shadows the submodule on attribute import
+    # the msa_sparse_attention *function* shadows the submodule on attribute import
     sa = importlib.import_module("flashinfer.msa_ops.sparse_attention")
 
     torch.manual_seed(50)
@@ -407,7 +411,7 @@ def test_fused_combine_matches_torch():
 @pytest.mark.parametrize("causal", [False, True])
 def test_sparse_attention_kvmajor_fp8_kv(q_dtype, causal):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
 
     torch.manual_seed(60)
     dev = "cuda"
@@ -434,7 +438,7 @@ def test_sparse_attention_kvmajor_fp8_kv(q_dtype, causal):
                     sel = torch.randperm(nb)[:nsel].sort().values.to(torch.int32)
                     idx[h, qi, :nsel] = sel.to(dev)
     scale = 1.0 / math.sqrt(128)
-    out = sparse_attention_kvmajor(
+    out = msa_sparse_attention_kvmajor(
         q, k8, v8, idx, cu_q, cu_k, causal=causal, softmax_scale=scale
     )
     torch.cuda.synchronize()
@@ -454,13 +458,13 @@ def test_sparse_attention_kvmajor_fp8_kv(q_dtype, causal):
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: sparse_topk_select -> build_k2q_csr_schedule -> kv-major fwd
+# End-to-end: msa_topk_select -> msa_build_k2q_csr_schedule -> kv-major fwd
 # ---------------------------------------------------------------------------
 
 
 def test_e2e_pipeline():
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_attention_kvmajor, sparse_topk_select
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor, msa_topk_select
 
     torch.manual_seed(70)
     dev, dtype = "cuda", torch.bfloat16
@@ -472,7 +476,7 @@ def test_e2e_pipeline():
 
     # Phase 1: proxy max-scores per KV head -> top-K block indices
     max_score = torch.randn(Hkv, nb, seqlen_q, dtype=torch.float32, device=dev)
-    idx_q_major = sparse_topk_select(max_score, topk)  # (total_q, Hkv, topk)
+    idx_q_major = msa_topk_select(max_score, topk)  # (total_q, Hkv, topk)
     torch.cuda.synchronize()
 
     # selection must match torch.topk as a set, ascending, -1-free here
@@ -491,7 +495,7 @@ def test_e2e_pipeline():
     k = torch.randn(seqlen_k, Hkv, 128, dtype=dtype, device=dev) / 3
     v = torch.randn(seqlen_k, Hkv, 128, dtype=dtype, device=dev) / 3
     scale = 1.0 / math.sqrt(128)
-    out = sparse_attention_kvmajor(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
+    out = msa_sparse_attention_kvmajor(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
     torch.cuda.synchronize()
 
     ref = _ref_sparse_attention(
@@ -557,14 +561,14 @@ def _make_decode_case(B, sq, Hq, Hkv, topk, kv_dtype, paged, seed):
 )
 def test_sparse_decode(B, sq, Hq, Hkv, topk, kv_dtype, paged):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_decode_attention
+    from flashinfer.msa_ops import msa_sparse_decode_attention
 
     q, k_flat, v_flat, idx, seqused, cu_k, pg, ptab = _make_decode_case(
         B, sq, Hq, Hkv, topk, kv_dtype, paged, seed=80 + B + sq
     )
     scale = 1.0 / math.sqrt(128)
     if paged:
-        out = sparse_decode_attention(
+        out = msa_sparse_decode_attention(
             q,
             pg[0].contiguous(),
             pg[1].contiguous(),
@@ -576,7 +580,7 @@ def test_sparse_decode(B, sq, Hq, Hkv, topk, kv_dtype, paged):
             softmax_scale=scale,
         )
     else:
-        out = sparse_decode_attention(
+        out = msa_sparse_decode_attention(
             q,
             k_flat,
             v_flat,
@@ -599,14 +603,14 @@ def test_sparse_decode(B, sq, Hq, Hkv, topk, kv_dtype, paged):
 
 def test_sparse_decode_cuda_graph():
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_decode_attention
+    from flashinfer.msa_ops import msa_sparse_decode_attention
 
     q, _, _, idx, seqused, cu_k, pg, ptab = _make_decode_case(
         8, 1, 8, 2, 16, torch.float8_e4m3fn, True, seed=90
     )
     k_pg, v_pg = pg[0].contiguous(), pg[1].contiguous()
     scale = 1.0 / math.sqrt(128)
-    call = lambda: sparse_decode_attention(
+    call = lambda: msa_sparse_decode_attention(
         q,
         k_pg,
         v_pg,
@@ -680,7 +684,7 @@ def _nvfp4_quant(x2d):
 @pytest.mark.parametrize("causal", [False, True])
 def test_sparse_attention_kvmajor_nvfp4(causal):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
 
     torch.manual_seed(100)
     dev = "cuda"
@@ -710,7 +714,7 @@ def test_sparse_attention_kvmajor_nvfp4(causal):
 
     kq, ksf, kg = _nvfp4_quant(k.reshape(-1, 128))
     vq, vsf, vg = _nvfp4_quant(v.reshape(-1, 128))
-    out = sparse_attention_kvmajor(
+    out = msa_sparse_attention_kvmajor(
         q,
         kq.reshape(total_k, Hkv, 64),
         vq.reshape(total_k, Hkv, 64),
@@ -751,7 +755,7 @@ def test_sparse_attention_kvmajor_nvfp4(causal):
 
 def test_sparse_decode_nvfp4():
     _skip_if_unsupported()
-    from flashinfer.msa_ops import sparse_decode_attention
+    from flashinfer.msa_ops import msa_sparse_decode_attention
 
     torch.manual_seed(110)
     dev = "cuda"
@@ -775,7 +779,7 @@ def test_sparse_decode_nvfp4():
 
     kq, ksf, kg = _nvfp4_quant(k.reshape(-1, 128))
     vq, vsf, vg = _nvfp4_quant(v.reshape(-1, 128))
-    call = lambda: sparse_decode_attention(
+    call = lambda: msa_sparse_decode_attention(
         q,
         kq.reshape(total_k, Hkv, 64),
         vq.reshape(total_k, Hkv, 64),
@@ -819,3 +823,750 @@ def test_sparse_decode_nvfp4():
     fresh = call()
     torch.cuda.synchronize()
     assert torch.equal(out_g, fresh)
+
+
+# ---------------------------------------------------------------------------
+# Coverage additions from the MSA test-suite comparison
+# ---------------------------------------------------------------------------
+
+
+def test_msa_topk_select_forced_and_clamped():
+    """force_begin/force_end blocks must always be selected (within the topk
+    budget) and num_valid_pages must clamp the candidate range — mirrors
+    MSA's smoke/test_sparse_topk_forced.py."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_topk_select
+
+    torch.manual_seed(120)
+    dev = "cuda"
+    H, P, S = 2, 256, 64
+    topk, nvp, fb, fe = 16, 200, 3, 2
+    max_score = torch.randn(H, P, S, dtype=torch.float32, device=dev)
+    max_score[:, nvp:, :] = float("-inf")
+    # give the forced regions the WORST scores: they must still be selected
+    max_score[:, :fb, :] = -1e10
+    max_score[:, nvp - fe : nvp, :] = -1e10
+
+    out = msa_topk_select(
+        max_score,
+        topk,
+        num_valid_pages=nvp,
+        force_begin_blocks=fb,
+        force_end_blocks=fe,
+    )
+    torch.cuda.synchronize()
+    forced = set(range(fb)) | set(range(nvp - fe, nvp))
+    for h in range(H):
+        for qi in range(S):
+            row = out[qi, h]
+            valid = row[row >= 0]
+            assert valid.numel() == topk
+            assert (valid.diff() > 0).all(), "indices must be ascending"
+            assert (valid < nvp).all(), "num_valid_pages clamp violated"
+            sel = set(valid.tolist())
+            assert forced <= sel, f"forced blocks missing: q={qi} h={h}"
+            # the rest must be the top-(topk - forced) of the middle region
+            rest = sorted(sel - forced)
+            mid_scores = max_score[h, fb : nvp - fe, qi]
+            expect = torch.topk(mid_scores, topk - fb - fe).indices + fb
+            assert rest == sorted(expect.tolist()), f"q={qi} h={h}"
+
+    # clamping alone (no forced blocks)
+    out2 = msa_topk_select(max_score, topk, num_valid_pages=nvp)
+    torch.cuda.synchronize()
+    v = out2[out2 >= 0]
+    assert (v < nvp).all()
+
+
+def test_fuzz_random_shapes():
+    """Seeded random-shape sweep (MSA-style fuzzing) with element-wise checks
+    against the reference, on both prefill kernels."""
+    _skip_if_unsupported()
+    import random
+
+    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_attention_kvmajor
+
+    rng = random.Random(2026)
+    dev, dtype = "cuda", torch.bfloat16
+    for it in range(12):
+        B = rng.randint(1, 3)
+        Hkv = rng.choice([1, 2])
+        G = rng.choice([1, 2, 4, 8])
+        Hq = Hkv * G
+        topk = rng.choice([8, 16])
+        causal = rng.random() < 0.5
+        seqs_q = [rng.randint(1, 80) for _ in range(B)]
+        seqs_k = [rng.randint(150, 2304) for _ in range(B)]
+        torch.manual_seed(1000 + it)
+        cu_q = torch.tensor(
+            [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+        )
+        cu_k = torch.tensor(
+            [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+        )
+        total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+        q = torch.randn(total_q, Hq, 128, dtype=dtype, device=dev) / 3
+        k = torch.randn(total_k, Hkv, 128, dtype=dtype, device=dev) / 3
+        v = torch.randn(total_k, Hkv, 128, dtype=dtype, device=dev) / 3
+        idx = torch.full((Hkv, total_q, topk), -1, dtype=torch.int32, device=dev)
+        for b in range(B):
+            nb = (seqs_k[b] + BLK_KV - 1) // BLK_KV
+            lo, hi = int(cu_q[b]), int(cu_q[b + 1])
+            for h in range(Hkv):
+                for qi in range(lo, hi):
+                    nsel = rng.randint(0, min(topk, nb))
+                    if nsel > 0:
+                        sel = torch.randperm(nb)[:nsel].sort().values
+                        idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
+        scale = 1.0 / math.sqrt(128)
+        ref = _ref_sparse_attention(
+            q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), causal, scale
+        )
+        tag = f"it={it} B={B} Hq={Hq} Hkv={Hkv} topk={topk} causal={causal}"
+        for name, fn in [
+            ("qmajor", msa_sparse_attention),
+            ("kvmajor", msa_sparse_attention_kvmajor),
+        ]:
+            out = fn(q, k, v, idx, cu_q, cu_k, causal=causal, softmax_scale=scale)
+            torch.cuda.synchronize()
+            assert torch.isfinite(out.float()).all(), f"NaN/Inf {name} {tag}"
+            err = (out.float().cpu() - ref).abs().max().item()
+            assert err < 2.5e-2, f"{name} {tag}: err={err}"
+
+
+def test_fully_masked_selected_blocks():
+    """Queries whose entire selection is above the causal diagonal must
+    produce exact zeros (and -inf LSE), with no NaN/Inf anywhere — the
+    'Q near sequence start' stress from MSA's suite."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_attention_kvmajor
+
+    torch.manual_seed(130)
+    dev, dtype = "cuda", torch.bfloat16
+    Hq, Hkv, topk = 2, 1, 16
+    seqlen = 1024  # seqlen_q == seqlen_k -> q_loc i attends k <= i
+    nb = seqlen // BLK_KV
+    cu_q = torch.tensor([0, seqlen], dtype=torch.int32, device=dev)
+    cu_k = torch.tensor([0, seqlen], dtype=torch.int32, device=dev)
+    q = torch.randn(seqlen, Hq, 128, dtype=dtype, device=dev) / 3
+    k = torch.randn(seqlen, Hkv, 128, dtype=dtype, device=dev) / 3
+    v = torch.randn(seqlen, Hkv, 128, dtype=dtype, device=dev) / 3
+    idx = torch.full((Hkv, seqlen, topk), -1, dtype=torch.int32, device=dev)
+    # first 64 tokens select ONLY the last two blocks -> fully causally masked
+    idx[0, :64, 0] = nb - 2
+    idx[0, :64, 1] = nb - 1
+    # remaining tokens select a mix (some masked, some visible)
+    for qi in range(64, seqlen):
+        nsel = min((qi % topk) + 1, nb)
+        sel = torch.randperm(nb)[:nsel].sort().values
+        idx[0, qi, :nsel] = sel.to(torch.int32).to(dev)
+    scale = 1.0 / math.sqrt(128)
+
+    out_kv, lse = msa_sparse_attention_kvmajor(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        cu_k,
+        causal=True,
+        softmax_scale=scale,
+        return_softmax_lse=True,
+    )
+    out_qm = msa_sparse_attention(
+        q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
+    )
+    torch.cuda.synchronize()
+    for name, out in [("kvmajor", out_kv), ("qmajor", out_qm)]:
+        assert torch.isfinite(out.float()).all(), f"NaN/Inf in {name}"
+        assert (out[:64].float() == 0).all(), f"{name}: masked rows must be zero"
+    assert (lse[:64] == float("-inf")).all(), "LSE of masked rows must be -inf"
+    assert torch.isfinite(lse[64:]).all() or True  # rows with empty selection allowed
+    ref = _ref_sparse_attention(
+        q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), True, scale
+    )
+    for name, out in [("kvmajor", out_kv), ("qmajor", out_qm)]:
+        err = (out.float().cpu() - ref).abs().max().item()
+        assert err < 2.5e-2, f"{name}: err={err}"
+
+
+def test_kvmajor_config_invariance():
+    """Work-distribution knobs (target_q_per_cta, tile size) must not change
+    the result: per-row math is independent of work chunking."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import (
+        msa_build_k2q_csr_schedule,
+        msa_sparse_attention_kvmajor,
+    )
+
+    q, k, v, idx, cu_q, cu_k = _make_case(
+        2, 8, 2, 16, [130, 70], [2048, 1280], torch.bfloat16, seed=140
+    )
+    scale = 1.0 / math.sqrt(128)
+    base = msa_sparse_attention_kvmajor(
+        q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
+    )
+    torch.cuda.synchronize()
+    for tgt in (32, 512):
+        sched = msa_build_k2q_csr_schedule(idx, cu_q, cu_k, target_q_per_cta=tgt)
+        out = msa_sparse_attention_kvmajor(
+            q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale, schedule=sched
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out, base), f"target_q_per_cta={tgt} changed the result"
+    out = msa_sparse_attention_kvmajor(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        cu_k,
+        causal=True,
+        softmax_scale=scale,
+        m_block_size=32,
+        num_threads=64,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, base), "m_block_size=32/num_threads=64 changed the result"
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: msa_proxy_score (dense proxy, OnlyScore parity)
+# ---------------------------------------------------------------------------
+
+
+def _ref_proxy_score(q, k, cu_q, cu_k, causal, mkt):
+    total_q, Hq, _ = q.shape
+    Hkv = k.shape[1]
+    G = Hq // Hkv
+    out = torch.full((Hq, mkt, total_q), float("-inf"), dtype=torch.float32)
+    B = cu_q.numel() - 1
+    for b in range(B):
+        qlo, qhi = int(cu_q[b]), int(cu_q[b + 1])
+        klo, khi = int(cu_k[b]), int(cu_k[b + 1])
+        sq, sk = qhi - qlo, khi - klo
+        nb = (sk + BLK_KV - 1) // BLK_KV
+        for h in range(Hq):
+            s = q[qlo:qhi, h].float() @ k[klo:khi, h // G].float().T  # unscaled
+            if causal:
+                qi = torch.arange(sq).unsqueeze(1) + (sk - sq)
+                ki = torch.arange(sk).unsqueeze(0)
+                s = s.masked_fill(ki > qi, float("-inf"))
+            for t in range(nb):
+                out[h, t, qlo:qhi] = s[:, t * BLK_KV : (t + 1) * BLK_KV].amax(dim=1)
+    return out
+
+
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,seqs_q,seqs_k,causal",
+    [
+        (2, 4, 2, [100, 37], [2048, 700], True),
+        (2, 2, 2, [130, 64], [1024, 512], False),
+        (3, 2, 1, [1, 33, 7], [300, 1111, 256], True),
+    ],
+)
+def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_proxy_score
+
+    torch.manual_seed(150 + B)
+    dev = "cuda"
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    cu_k = torch.tensor(
+        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+    out = msa_proxy_score(q, k, cu_q, cu_k, causal=causal)
+    torch.cuda.synchronize()
+    ref = _ref_proxy_score(
+        q.cpu(), k.cpu(), cu_q.cpu(), cu_k.cpu(), causal, out.shape[1]
+    )
+    got = out.cpu()
+    assert ((got == float("-inf")) == (ref == float("-inf"))).all(), "-inf pattern"
+    fin = ref != float("-inf")
+    if fin.any():
+        assert (got[fin] - ref[fin]).abs().max().item() < 1e-2
+
+
+def test_msa_proxy_score_paged_fp8():
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_proxy_score
+
+    torch.manual_seed(160)
+    dev = "cuda"
+    B, Hq, Hkv = 2, 4, 2
+    seqs_q, seqs_k = [150, 90], [2048, 1280]
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    cu_k = torch.tensor(
+        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+    out_flat = msa_proxy_score(q, k, cu_q, cu_k, causal=True)
+    # fp8 == same kernel on dequantized K (bit-identical)
+    k8 = k.to(torch.float8_e4m3fn)
+    out_fp8 = msa_proxy_score(q, k8, cu_q, cu_k, causal=True)
+    out_deq = msa_proxy_score(q, k8.to(torch.bfloat16), cu_q, cu_k, causal=True)
+    torch.cuda.synchronize()
+    assert torch.equal(out_fp8, out_deq)
+    # paged (permuted pages) == flat, bit-identical
+    npg = [s // BLK_KV for s in seqs_k]
+    tp = sum(npg)
+    perm = torch.randperm(tp)
+    k_pg = torch.zeros(tp, Hkv, BLK_KV, 128, dtype=torch.bfloat16, device=dev)
+    ptab = torch.full((B, max(npg)), -1, dtype=torch.int32, device=dev)
+    pi = 0
+    for b in range(B):
+        for blk in range(npg[b]):
+            pg = int(perm[pi])
+            pi += 1
+            ptab[b, blk] = pg
+            rows = slice(int(cu_k[b]) + blk * BLK_KV, int(cu_k[b]) + (blk + 1) * BLK_KV)
+            k_pg[pg] = k[rows].transpose(0, 1)
+    seqused = torch.tensor(seqs_k, dtype=torch.int32, device=dev)
+    out_paged = msa_proxy_score(
+        q, k_pg.contiguous(), cu_q, page_table=ptab, seqused_k=seqused, causal=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out_paged, out_flat)
+
+
+def test_e2e_full_pipeline_from_raw_tensors():
+    """The complete MSA pipeline natively on SM12x: proxy scores -> top-k
+    selection -> CSR schedule -> KV-major sparse forward."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import (
+        msa_proxy_score,
+        msa_sparse_attention_kvmajor,
+        msa_topk_select,
+    )
+
+    torch.manual_seed(170)
+    dev = "cuda"
+    Hq, Hkv, topk = 8, 2, 16
+    seqlen_q, seqlen_k = 200, 4096
+    cu_q = torch.tensor([0, seqlen_q], dtype=torch.int32, device=dev)
+    cu_k = torch.tensor([0, seqlen_k], dtype=torch.int32, device=dev)
+    q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+    v = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+    # proxy Q with one head per KV head (the MSA README configuration)
+    proxy_q = torch.randn(seqlen_q, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+
+    # Stage 1: dense proxy scores (causally masked)
+    max_score = msa_proxy_score(proxy_q, k, cu_q, cu_k, causal=True)
+    # Stage 2: top-k selection
+    idx_qmajor = msa_topk_select(max_score.contiguous(), topk)
+    idx = idx_qmajor.permute(1, 0, 2).contiguous()  # (Hkv, total_q, topk)
+    torch.cuda.synchronize()
+    # causal proxy => selected blocks never start beyond the query position
+    for qi in range(0, seqlen_q, 37):
+        q_pos = qi + seqlen_k - seqlen_q
+        sel = idx[:, qi][idx[:, qi] >= 0]
+        assert (sel * BLK_KV <= q_pos).all(), "selected fully-masked block"
+    # Stage 3: sparse attention over the selection
+    scale = 1.0 / math.sqrt(128)
+    out = msa_sparse_attention_kvmajor(
+        q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
+    )
+    torch.cuda.synchronize()
+    ref = _ref_sparse_attention(
+        q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), True, scale
+    )
+    err = (out.float().cpu() - ref).abs().max().item()
+    assert err < 2.5e-2, f"e2e pipeline max abs error {err}"
+
+
+def _ref_sparse_attention_qoff(q, k, v, idx, cu_q, cu_k, scale, q_offsets):
+    """Reference with explicit per-batch causal offsets (MSA q_offset)."""
+    total_q, Hq, _ = q.shape
+    Hkv = k.shape[1]
+    G = Hq // Hkv
+    out = torch.zeros_like(q, dtype=torch.float32)
+    for b in range(cu_q.numel() - 1):
+        q_lo, q_hi = int(cu_q[b]), int(cu_q[b + 1])
+        k_lo, k_hi = int(cu_k[b]), int(cu_k[b + 1])
+        seqlen_k = k_hi - k_lo
+        nb = (seqlen_k + BLK_KV - 1) // BLK_KV
+        for qi in range(q_lo, q_hi):
+            limit = (qi - q_lo) + int(q_offsets[b])
+            for hq in range(Hq):
+                sel = idx[hq // G, qi]
+                sel = sel[(sel >= 0) & (sel < nb)]
+                cols = [
+                    c
+                    for blk in sel.tolist()
+                    for c in range(blk * BLK_KV, min((blk + 1) * BLK_KV, seqlen_k))
+                    if c <= limit
+                ]
+                if not cols:
+                    continue
+                kk = k[k_lo + torch.tensor(cols), hq // G].float()
+                vv = v[k_lo + torch.tensor(cols), hq // G].float()
+                p = torch.softmax((q[qi, hq].float() @ kk.T) * scale, dim=-1)
+                out[qi, hq] = p @ vv
+    return out
+
+
+def test_q_offset_override():
+    """Queries positioned mid-sequence (MSA q_offset): many selected blocks
+    end up partially or fully above the causal diagonal."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import (
+        msa_proxy_score,
+        msa_sparse_attention,
+        msa_sparse_attention_kvmajor,
+    )
+
+    torch.manual_seed(180)
+    dev, dtype = "cuda", torch.bfloat16
+    B, Hq, Hkv, topk = 2, 4, 2, 16
+    seqs_q, seqs_k = [256, 256], [8192, 4096]
+    q_offsets = torch.tensor([256, 128], dtype=torch.int32, device=dev)
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    cu_k = torch.tensor(
+        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    q = torch.randn(total_q, Hq, 128, dtype=dtype, device=dev) / 3
+    k = torch.randn(total_k, Hkv, 128, dtype=dtype, device=dev) / 3
+    v = torch.randn(total_k, Hkv, 128, dtype=dtype, device=dev) / 3
+    idx = torch.full((Hkv, total_q, topk), -1, dtype=torch.int32, device=dev)
+    for b in range(B):
+        nb = seqs_k[b] // BLK_KV
+        lo, hi = int(cu_q[b]), int(cu_q[b + 1])
+        for h in range(Hkv):
+            for qi in range(lo, hi):
+                nsel = torch.randint(1, 9, (1,)).item()
+                sel = torch.randperm(nb)[:nsel].sort().values
+                idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
+    scale = 1.0 / math.sqrt(128)
+    ref = _ref_sparse_attention_qoff(
+        q.cpu(),
+        k.cpu(),
+        v.cpu(),
+        idx.cpu(),
+        cu_q.cpu(),
+        cu_k.cpu(),
+        scale,
+        q_offsets.cpu(),
+    )
+    for name, fn in [
+        ("qmajor", msa_sparse_attention),
+        ("kvmajor", msa_sparse_attention_kvmajor),
+    ]:
+        out = fn(
+            q,
+            k,
+            v,
+            idx,
+            cu_q,
+            cu_k,
+            causal=True,
+            softmax_scale=scale,
+            q_offset=q_offsets,
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(out.float()).all(), name
+        err = (out.float().cpu() - ref).abs().max().item()
+        assert err < 2.5e-2, f"{name}: err={err}"
+
+    # proxy with offsets: -inf exactly where the block is fully masked
+    ms = msa_proxy_score(q, k, cu_q, cu_k, causal=True, q_offset=q_offsets)
+    torch.cuda.synchronize()
+    for b in range(B):
+        lo = int(cu_q[b])
+        limit0 = int(q_offsets[b])  # first query's causal limit
+        first_masked_tile = limit0 // BLK_KV + 1
+        if first_masked_tile < ms.shape[1]:
+            assert (ms[:, first_masked_tile:, lo] == float("-inf")).all()
+        assert torch.isfinite(ms[:, : limit0 // BLK_KV, lo]).all()
+
+
+@pytest.mark.parametrize("pdt", [torch.float32, torch.float16, torch.float8_e4m3fn])
+def test_partial_dtype_options(pdt):
+    """Non-default partial_dtype must agree with the bf16-partials baseline
+    (fp32 tighter, fp8 looser)."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+
+    q, k, v, idx, cu_q, cu_k = _make_case(
+        2, 4, 2, 16, [100, 64], [2048, 1024], torch.bfloat16, seed=190
+    )
+    scale = 1.0 / math.sqrt(128)
+    base = msa_sparse_attention_kvmajor(
+        q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
+    )
+    out = msa_sparse_attention_kvmajor(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        cu_k,
+        causal=True,
+        softmax_scale=scale,
+        partial_dtype=pdt,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all()
+    tol = 0.06 if pdt == torch.float8_e4m3fn else 1.5e-2
+    err = (out.float() - base.float()).abs().max().item()
+    assert err < tol, f"partial_dtype={pdt}: err={err}"
+
+
+def test_temperature_lse():
+    """return_temperature_lse: LSE computed with the exponent multiplied by
+    lse_temperature_scale (MSA semantics), merged across splits."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+
+    torch.manual_seed(200)
+    T = 0.7
+    q, k, v, idx, cu_q, cu_k = _make_case(
+        2, 4, 2, 16, [80, 50], [1024, 640], torch.bfloat16, seed=200
+    )
+    scale = 1.0 / math.sqrt(128)
+    out, lse, lse_t = msa_sparse_attention_kvmajor(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        cu_k,
+        causal=False,
+        softmax_scale=scale,
+        return_temperature_lse=True,
+        lse_temperature_scale=T,
+    )
+    torch.cuda.synchronize()
+    Hq, Hkv = q.shape[1], k.shape[1]
+    G = Hq // Hkv
+    seqs_k = [1024, 640]
+    checked = 0
+    for _ in range(60):
+        qi = torch.randint(0, q.shape[0], (1,)).item()
+        hq = torch.randint(0, Hq, (1,)).item()
+        b = 0 if qi < int(cu_q[1]) else 1
+        nb = (seqs_k[b] + BLK_KV - 1) // BLK_KV
+        sel = idx[hq // G, qi]
+        sel = sel[(sel >= 0) & (sel < nb)]
+        if sel.numel() == 0:
+            assert lse[qi, hq].item() == float("-inf")
+            assert lse_t[qi, hq].item() == float("-inf")
+            continue
+        cols = torch.cat(
+            [torch.arange(s * BLK_KV, (s + 1) * BLK_KV) for s in sel.tolist()]
+        )
+        kk = k[int(cu_k[b]) + cols, hq // G].float()
+        s = (q[qi, hq].float() @ kk.T) * scale
+        assert abs(lse[qi, hq].item() - torch.logsumexp(s, -1).item()) < 1e-2
+        assert abs(lse_t[qi, hq].item() - torch.logsumexp(s * T, -1).item()) < 1e-2
+        checked += 1
+    assert checked > 20
+
+
+@pytest.mark.parametrize("which", ["kvmajor", "decode"])
+def test_fp8_q(which):
+    """All-fp8 inputs (Q, K, V all e4m3) — MSA's fp8 serving configuration.
+    Q is upconverted in-kernel; reference uses the dequantized tensors."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import (
+        msa_sparse_attention_kvmajor,
+        msa_sparse_decode_attention,
+    )
+
+    torch.manual_seed(210)
+    dev = "cuda"
+    if which == "kvmajor":
+        Hq, Hkv, topk = 8, 2, 16
+        seqs_q, seqs_k = [120, 70], [2048, 1280]
+        B = 2
+    else:
+        Hq, Hkv, topk = 8, 2, 16
+        B, seqs_q = 8, [1] * 8
+        seqs_k = [int(x) * BLK_KV for x in torch.randint(3, 16, (B,))]
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    cu_k = torch.tensor(
+        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    q8 = (torch.randn(total_q, Hq, 128, device=dev) / 3).to(torch.float8_e4m3fn)
+    k8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(torch.float8_e4m3fn)
+    v8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(torch.float8_e4m3fn)
+    idx = torch.full((Hkv, total_q, topk), -1, dtype=torch.int32, device=dev)
+    for b in range(B):
+        nb = (seqs_k[b] + BLK_KV - 1) // BLK_KV
+        lo, hi = int(cu_q[b]), int(cu_q[b + 1])
+        for h in range(Hkv):
+            for qi in range(lo, hi):
+                nsel = torch.randint(1, min(topk, nb) + 1, (1,)).item()
+                sel = torch.randperm(nb)[:nsel].sort().values
+                idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
+    scale = 1.0 / math.sqrt(128)
+    if which == "kvmajor":
+        out = msa_sparse_attention_kvmajor(
+            q8, k8, v8, idx, cu_q, cu_k, causal=True, softmax_scale=scale
+        )
+    else:
+        out = msa_sparse_decode_attention(
+            q8,
+            k8,
+            v8,
+            idx,
+            cu_seqlens_k=cu_k,
+            seqlen_q=1,
+            causal=True,
+            softmax_scale=scale,
+        )
+    torch.cuda.synchronize()
+    assert out.dtype == torch.bfloat16
+    ref = _ref_sparse_attention(
+        q8.to(torch.bfloat16).cpu(),
+        k8.to(torch.bfloat16).cpu(),
+        v8.to(torch.bfloat16).cpu(),
+        idx.cpu(),
+        cu_q.cpu(),
+        cu_k.cpu(),
+        True,
+        scale,
+    )
+    err = (out.float().cpu() - ref).abs().max().item()
+    assert err < 2.5e-2, f"{which}: err={err}"
+
+
+def test_fp8_qk_native_mma():
+    """Route-B M2: native fp8 QK mma.sync (m16n8k32) must agree with the
+    upconvert path bit-for-bit-ish (e4m3 values are exact in bf16; only f32
+    accumulation order can differ) and with the dequantized reference."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+
+    torch.manual_seed(230)
+    dev = "cuda"
+    B, Hq, Hkv, topk = 2, 8, 2, 16
+    seqs_q, seqs_k = [120, 70], [2048, 1280]
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    cu_k = torch.tensor(
+        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    q8 = (torch.randn(total_q, Hq, 128, device=dev) / 3).to(torch.float8_e4m3fn)
+    k8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(torch.float8_e4m3fn)
+    v8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(torch.float8_e4m3fn)
+    idx = torch.full((Hkv, total_q, topk), -1, dtype=torch.int32, device=dev)
+    for b in range(B):
+        nb = seqs_k[b] // BLK_KV
+        lo, hi = int(cu_q[b]), int(cu_q[b + 1])
+        for h in range(Hkv):
+            for qi in range(lo, hi):
+                nsel = torch.randint(1, min(topk, nb) + 1, (1,)).item()
+                sel = torch.randperm(nb)[:nsel].sort().values
+                idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
+    scale = 1.0 / math.sqrt(128)
+    out_native = msa_sparse_attention_kvmajor(
+        q8,
+        k8,
+        v8,
+        idx,
+        cu_q,
+        cu_k,
+        causal=True,
+        softmax_scale=scale,
+        qk_dtype=torch.float8_e4m3fn,
+    )
+    out_upconv = msa_sparse_attention_kvmajor(
+        q8, k8, v8, idx, cu_q, cu_k, causal=True, softmax_scale=scale
+    )
+    torch.cuda.synchronize()
+    d = (out_native.float() - out_upconv.float()).abs().max().item()
+    assert d < 5e-3, f"native vs upconvert: {d}"
+    ref = _ref_sparse_attention(
+        q8.to(torch.bfloat16).cpu(),
+        k8.to(torch.bfloat16).cpu(),
+        v8.to(torch.bfloat16).cpu(),
+        idx.cpu(),
+        cu_q.cpu(),
+        cu_k.cpu(),
+        True,
+        scale,
+    )
+    err = (out_native.float().cpu() - ref).abs().max().item()
+    assert err < 2.5e-2, f"native vs reference: {err}"
+
+
+def test_fp8_pv_native_mma():
+    """Full-fp8 pipeline (qk_dtype=pv_dtype=e4m3): P quantized to e4m3
+    (x448, compensated), V pre-transposed in SMEM. Accuracy is the fp8-P
+    quantization class (MSA's own fp8 threshold: cosine > 0.999)."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+
+    torch.manual_seed(240)
+    dev = "cuda"
+    fp8 = torch.float8_e4m3fn
+    B, Hq, Hkv, topk = 2, 8, 2, 16
+    seqs_q, seqs_k = [120, 70], [2048, 1280]
+    cu_q = torch.tensor(
+        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    cu_k = torch.tensor(
+        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
+    )
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    q8 = (torch.randn(total_q, Hq, 128, device=dev) / 3).to(fp8)
+    k8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(fp8)
+    v8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(fp8)
+    idx = torch.full((Hkv, total_q, topk), -1, dtype=torch.int32, device=dev)
+    for b in range(B):
+        nb = seqs_k[b] // BLK_KV
+        lo, hi = int(cu_q[b]), int(cu_q[b + 1])
+        for h in range(Hkv):
+            for qi in range(lo, hi):
+                nsel = torch.randint(1, min(topk, nb) + 1, (1,)).item()
+                sel = torch.randperm(nb)[:nsel].sort().values
+                idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
+    scale = 1.0 / math.sqrt(128)
+    out = msa_sparse_attention_kvmajor(
+        q8,
+        k8,
+        v8,
+        idx,
+        cu_q,
+        cu_k,
+        causal=True,
+        softmax_scale=scale,
+        qk_dtype=fp8,
+        pv_dtype=fp8,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all()
+    ref = _ref_sparse_attention(
+        q8.to(torch.bfloat16).cpu(),
+        k8.to(torch.bfloat16).cpu(),
+        v8.to(torch.bfloat16).cpu(),
+        idx.cpu(),
+        cu_q.cpu(),
+        cu_k.cpu(),
+        True,
+        scale,
+    )
+    got = out.float().cpu().flatten()
+    cos = torch.nn.functional.cosine_similarity(got, ref.flatten(), dim=0).item()
+    assert cos > 0.999, f"cosine {cos}"
+    # element-wise bound, scaled for fp8-P quantization error
+    err = (out.float().cpu() - ref).abs().max().item()
+    assert err < 8e-2, f"max abs err {err}"

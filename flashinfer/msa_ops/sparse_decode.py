@@ -15,13 +15,13 @@ limitations under the License.
 
 ---
 
-Minimax Sparse Attention decode path for SM120/SM121 (Phase 4).
+Minimax Sparse Attention decode path for SM120/SM121.
 
 A decode step is a varlen batch with a short, uniform ``seqlen_q`` per
 request. Each valid (kv-head, token, t) entry of ``q2k_indices`` becomes one
 work item of the KV-major forward kernel: one token (x its GQA query heads)
 attending one selected KV block, written to split slot ``t``. Because
-:func:`sparse_topk_select` tail-pads invalid entries with -1, the slot is
+:func:`msa_topk_select` tail-pads invalid entries with -1, the slot is
 simply the list position and the split count is the valid prefix length —
 so the whole schedule is built with a handful of torch ops, with no CUDA
 scheduler kernels.
@@ -31,19 +31,21 @@ from typing import Optional
 
 import torch
 
-from .sparse_index_utils import SparseAttentionSchedule
+from ..api_logging import flashinfer_api
+from .sparse_index_utils import MsaAttentionSchedule
 
 
-def build_decode_schedule(
+@flashinfer_api
+def msa_build_decode_schedule(
     q2k_indices: torch.Tensor,  # (Hkv, total_q, topk) int32, -1 tail-padded
     cu_seqlens_q: torch.Tensor,  # (B + 1,) int32, device
     cu_seqlens_k: torch.Tensor,  # (B + 1,) int32, device
-) -> SparseAttentionSchedule:
+) -> MsaAttentionSchedule:
     """Build a KV-major schedule for decode: one work item per valid
     (kv-head, token, selected-block) entry.
 
     ``q2k_indices`` must be ascending with ``-1`` entries tail-padded (as
-    produced by :func:`sparse_topk_select`); the split slot of an entry is
+    produced by :func:`msa_topk_select`); the split slot of an entry is
     its position ``t`` in the list.
     """
     num_kv_heads, total_q, topk = q2k_indices.shape
@@ -104,7 +106,7 @@ def build_decode_schedule(
     ).contiguous()
     work_count = torch.full((1,), n_items, dtype=torch.int32, device=dev)
 
-    return SparseAttentionSchedule(
+    return MsaAttentionSchedule(
         row_ptr=row_ptr,
         q_indices=qsplit_indices,  # unused by the kernel; kept for shape parity
         qsplit_indices=qsplit_indices,
@@ -118,7 +120,8 @@ def build_decode_schedule(
     )
 
 
-def sparse_decode_attention(
+@flashinfer_api
+def msa_sparse_decode_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -135,8 +138,10 @@ def sparse_decode_attention(
     v_scale: Optional[torch.Tensor] = None,
     k_global_scale: Optional[float] = None,
     v_global_scale: Optional[float] = None,
+    q_offset=None,
+    partial_dtype: Optional[torch.dtype] = None,
 ):
-    """Sparse decode attention for SM120/SM121 (Phase 4).
+    """Sparse decode attention for SM120/SM121.
 
     Computes attention for a decode step: each request contributes
     ``seqlen_q`` query tokens (uniform across the batch) attending only the
@@ -154,7 +159,7 @@ def sparse_decode_attention(
     q2k_indices : torch.Tensor
         ``(num_kv_heads, batch_size * seqlen_q, topk)`` int32, ascending,
         ``-1`` tail-padded (the format produced by
-        :func:`sparse_topk_select`).
+        :func:`msa_topk_select`).
     seqlen_q : int
         Uniform query length per request (e.g. 1, or >1 for speculative
         decoding).
@@ -167,26 +172,32 @@ def sparse_decode_attention(
         ``(batch_size * seqlen_q, num_qo_heads, 128)`` in q's dtype; plus
         the natural-log LSE if ``return_softmax_lse``.
     """
-    import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
 
     from ..utils import is_sm12x_supported
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
-    from .sparse_attention import _combine_partials, _compile_cache, _to_cute
+    from .sparse_attention import (
+        _combine_partials,
+        _compile_cache,
+        _cutlass_dtype,
+        _fake,
+        _q_offset_tensor,
+    )
 
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
-            "sparse_decode_attention requires SM120 or SM121 and CUDA >= 12.8"
+            "msa_sparse_decode_attention requires SM120 or SM121 and CUDA >= 12.8"
         )
     total_q, num_qo_heads, head_dim = q.shape
     if total_q % seqlen_q != 0:
         raise ValueError(
             f"q rows ({total_q}) must be batch_size * seqlen_q ({seqlen_q})"
         )
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"q must be bf16 or fp16, got {q.dtype}")
+    q_fp8 = q.dtype == torch.float8_e4m3fn
+    compute_dtype = torch.bfloat16 if q_fp8 else q.dtype
+    if not q_fp8 and q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"q must be bf16/fp16/fp8_e4m3, got {q.dtype}")
     if head_dim != 128:
         raise ValueError(f"head_dim must be 128, got {head_dim}")
     batch_size = total_q // seqlen_q
@@ -209,7 +220,7 @@ def sparse_decode_attention(
             raise ValueError("k and v must both be packed uint8 for NVFP4")
         if k_scale is None or v_scale is None:
             raise ValueError("NVFP4 KV requires k_scale and v_scale")
-    elif not kv_fp8 and k.dtype != q.dtype:
+    elif not kv_fp8 and k.dtype != compute_dtype:
         raise ValueError("k/v dtype must match q (or be fp8/packed NVFP4)")
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
@@ -239,8 +250,13 @@ def sparse_decode_attention(
         cu_k = cu_seqlens_k.to(dev)
         pt_dev = torch.zeros((1, 1), dtype=torch.int32, device=dev)
 
+    cu_q_loc = torch.arange(0, total_q + 1, seqlen_q, dtype=torch.int32, device=dev)
+    qoff_dev = _q_offset_tensor(q_offset, cu_q_loc, cu_k, dev)
+
+    if partial_dtype is None:
+        partial_dtype = compute_dtype
     o_partial = torch.empty(
-        (topk, total_q, num_qo_heads, head_dim), dtype=q.dtype, device=dev
+        (topk, total_q, num_qo_heads, head_dim), dtype=partial_dtype, device=dev
     )
     lse_partial = torch.empty(
         (topk, total_q, num_qo_heads), dtype=torch.float32, device=dev
@@ -257,23 +273,29 @@ def sparse_decode_attention(
         ksf_dev = torch.zeros(1, dtype=torch.uint8, device=dev)
         vsf_dev = ksf_dev
 
-    q_c = _to_cute(q, 2)
-    k_c = _to_cute(k_pass, 3 if paged else 2)
-    v_c = _to_cute(v_pass, 3 if paged else 2)
-    pt_c = from_dlpack(pt_dev, assumed_align=4).mark_layout_dynamic(leading_dim=1)
-    ksf_c = from_dlpack(ksf_dev, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-    vsf_c = from_dlpack(vsf_dev, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-    idx_c = from_dlpack(q2k_indices, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    op_c = _to_cute(o_partial, 3)
-    lse_c = from_dlpack(lse_partial, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-    sc_c = from_dlpack(split_counts, assumed_align=4).mark_layout_dynamic(leading_dim=1)
-    cuk_c = from_dlpack(cu_k, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-
-    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    key = ("decode", str(q.dtype), group_size, topk, causal, paged, kv_fp8, kv_nvfp4)
+    key = (
+        "decode",
+        str(q.dtype),
+        q_fp8,
+        group_size,
+        topk,
+        causal,
+        paged,
+        kv_fp8,
+        kv_nvfp4,
+        str(partial_dtype),
+    )
     compiled = _compile_cache.get(key)
     if compiled is None:
+        q_in_cdt = _cutlass_dtype(q.dtype)
+        kv_cdt = _cutlass_dtype(k_pass.dtype)
+        i32 = _cutlass_dtype(torch.int32)
+        u8 = _cutlass_dtype(torch.uint8)
+        kv_word = k_pass.shape[-1]  # 128 (or 16 int32 words for nvfp4)
+        s_tq, s_hq, s_tk, s_hkv, s_b1, s_b0 = (cute.sym_int() for _ in range(6))
+        s_pb, s_pm, s_ksf, s_vsf = (cute.sym_int() for _ in range(4))
+        kv_shape = (s_tk, s_hkv, 128, kv_word) if paged else (s_tk, s_hkv, kv_word)
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel_obj = SparseDecodeForwardSm12x(
             head_dim=head_dim,
             group_size=group_size,
@@ -283,45 +305,48 @@ def sparse_decode_attention(
             paged=paged,
             kv_fp8=kv_fp8,
             kv_nvfp4=kv_nvfp4,
+            q_fp8=q_fp8,
         )
         compiled = cute.compile(
             kernel_obj,
-            q_c,
-            k_c,
-            v_c,
-            pt_c,
-            ksf_c,
-            vsf_c,
-            idx_c,
-            op_c,
-            lse_c,
-            sc_c,
-            cuk_c,
-            cutlass.Float32(softmax_scale),
-            cutlass.Int32(seqlen_q),
-            cutlass.Int32(total_q),
-            cutlass.Int32(num_kv_heads),
-            stream,
+            _fake(q_in_cdt, (s_tq, s_hq, head_dim)),
+            _fake(kv_cdt, kv_shape),
+            _fake(kv_cdt, kv_shape),
+            _fake(i32, (s_pb, s_pm), align=4),
+            _fake(u8, (s_ksf,), align=4),
+            _fake(u8, (s_vsf,), align=4),
+            _fake(i32, (s_hkv, s_tq, topk), align=4),
+            _fake(_cutlass_dtype(partial_dtype), (topk, s_tq, s_hq, head_dim)),
+            _fake(_cutlass_dtype(torch.float32), (topk, s_tq, s_hq), align=4),
+            _fake(i32, (s_tq, s_hkv), align=4),
+            _fake(i32, (s_b1,), align=4),
+            _fake(i32, (s_b0,), align=4),
+            cutlass.Float32(1.0),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            stream_fake,
+            options="--enable-tvm-ffi",
         )
         _compile_cache[key] = compiled
 
     compiled(
-        q_c,
-        k_c,
-        v_c,
-        pt_c,
-        ksf_c,
-        vsf_c,
-        idx_c,
-        op_c,
-        lse_c,
-        sc_c,
-        cuk_c,
-        cutlass.Float32(softmax_scale),
-        cutlass.Int32(seqlen_q),
-        cutlass.Int32(total_q),
-        cutlass.Int32(num_kv_heads),
-        stream,
+        q,
+        k_pass,
+        v_pass,
+        pt_dev,
+        ksf_dev,
+        vsf_dev,
+        q2k_indices,
+        o_partial,
+        lse_partial,
+        split_counts,
+        cu_k,
+        qoff_dev,
+        float(softmax_scale),
+        int(seqlen_q),
+        int(total_q),
+        int(num_kv_heads),
     )
 
     lse_out = None
@@ -332,7 +357,7 @@ def sparse_decode_attention(
         lse_partial,
         split_counts,
         group_size,
-        q.dtype,
+        compute_dtype,
         lse_out=lse_out,
         out_scale=float(v_global_scale) if v_global_scale is not None else 1.0,
     )
