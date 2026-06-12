@@ -1441,3 +1441,207 @@ def test_trtllm_fmha_v2_chunked_prefill_chunked_attention(
 
     rtol, atol = 1e-2, 1e-2
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
+
+
+####################################################################################################
+# Tests for GPU prepare + plan + run_with_plan path
+####################################################################################################
+
+
+def test_fmha_v2_prepare_kernel():
+    """Test that the GPU prepare kernel produces the same kv_lens, block_tables,
+    and metadata as the CPU-side Python computation."""
+    from flashinfer.prefill import trtllm_fmha_v2_prepare
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")) and not is_sm120a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("FMHA v2 requires SM90+ (Hopper) or SM12x GPUs.")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    batch_size = 4
+    page_size = 16
+
+    # Create variable-length KV sequences
+    kv_seq_lens = torch.tensor([48, 32, 64, 16], dtype=torch.int32, device=device)
+    q_seq_lens = torch.tensor([8, 4, 16, 2], dtype=torch.int32, device=device)
+
+    # Build paged KV indptr and indices
+    num_pages_per_seq = (kv_seq_lens + page_size - 1) // page_size  # [3, 2, 4, 1]
+    total_pages = num_pages_per_seq.sum().item()
+    paged_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    paged_kv_indptr[1:] = torch.cumsum(num_pages_per_seq, dim=0)
+    paged_kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)
+    paged_kv_last_page_len = ((kv_seq_lens - 1) % page_size) + 1
+
+    # Build qo_indptr
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    qo_indptr[1:] = torch.cumsum(q_seq_lens, dim=0)
+
+    max_blocks_per_seq = num_pages_per_seq.max().item()
+
+    # Outputs
+    kv_lens_out = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    block_tables_out = torch.zeros(
+        batch_size, max_blocks_per_seq, dtype=torch.int32, device=device
+    )
+    metadata_out = torch.zeros(4, dtype=torch.int32, device=device)
+
+    trtllm_fmha_v2_prepare(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_last_page_len,
+        paged_kv_indices,
+        kv_lens_out,
+        block_tables_out,
+        metadata_out,
+        page_size,
+        batch_size,
+        max_blocks_per_seq,
+    )
+
+    # Verify kv_lens
+    expected_kv_lens = kv_seq_lens.cpu()
+    torch.testing.assert_close(kv_lens_out.cpu(), expected_kv_lens)
+
+    # Verify metadata
+    meta = metadata_out.cpu()
+    assert meta[0].item() == q_seq_lens.max().item(), "max_q_len mismatch"
+    assert meta[1].item() == kv_seq_lens.max().item(), "max_kv_len mismatch"
+    assert meta[2].item() == qo_indptr[-1].item(), "total_num_rows mismatch"
+    assert meta[3].item() == max_blocks_per_seq, "max_blocks_per_seq mismatch"
+
+    # Verify block_tables
+    indptr_cpu = paged_kv_indptr.cpu()
+    indices_cpu = paged_kv_indices.cpu()
+    bt_cpu = block_tables_out.cpu()
+    for i in range(batch_size):
+        n_pages = num_pages_per_seq[i].item()
+        start = indptr_cpu[i].item()
+        expected_row = indices_cpu[start : start + n_pages]
+        torch.testing.assert_close(bt_cpu[i, :n_pages], expected_row)
+
+
+@pytest.mark.parametrize("input_layout", ["Q_PAGED_KV_HND", "Q_PAGED_KV_NHD"])
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fmha_v2_prefill_with_plan(
+    input_layout: str,
+    batch_size: int,
+    dtype: torch.dtype,
+) -> None:
+    """Test that prepare + plan + run_with_plan produces the same result as
+    the original one-shot run path."""
+    from flashinfer.prefill import (
+        trtllm_fmha_v2_prefill,
+        trtllm_fmha_v2_plan,
+    )
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")) and not is_sm120a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("FMHA v2 requires SM90+ (Hopper) or SM12x GPUs.")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    num_qo_heads = 8
+    num_kv_heads = 4
+    head_dim = 128
+    page_size = 16
+    max_seq_len = 256
+
+    is_nhd = input_layout == "Q_PAGED_KV_NHD"
+
+    # Create sequences
+    seq_lens = torch.randint(
+        max_seq_len // 2, max_seq_len + 1, (batch_size,),
+        dtype=torch.int32, device=device,
+    )
+    max_kv_len = seq_lens.max().item()
+    max_q_len = max_kv_len  # prefill: q_len == kv_len
+    cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+    total_tokens = cum_seq_lens[-1].item()
+
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    # Create paged KV cache
+    max_num_blocks = (max_kv_len + page_size - 1) // page_size
+    num_pages = batch_size * max_num_blocks
+    paged_shape = (
+        (num_pages, 2, page_size, num_kv_heads, head_dim)
+        if is_nhd
+        else (num_pages, 2, num_kv_heads, page_size, head_dim)
+    )
+    paged_kv_cache = torch.randn(*paged_shape, dtype=dtype, device=device)
+    q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+
+    # Build block tables
+    block_tables = torch.zeros(batch_size, max_num_blocks, dtype=torch.int32, device=device)
+    for i in range(batch_size):
+        num_blocks_needed = (seq_lens[i].item() + page_size - 1) // page_size
+        block_tables[i, :num_blocks_needed] = torch.arange(
+            i * max_num_blocks, i * max_num_blocks + num_blocks_needed, device=device,
+        )
+
+    qkv_arg = (q, paged_kv_cache)
+    workspace_buffer = _get_workspace_buffer()
+
+    # --- Original one-shot path ---
+    o_ref = torch.zeros(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+    trtllm_fmha_v2_prefill(
+        qkv_arg,
+        input_layout,
+        workspace_buffer=workspace_buffer,
+        seq_lens=seq_lens,
+        max_q_len=max_q_len,
+        max_kv_len=max_kv_len,
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        batch_size=batch_size,
+        cum_seq_lens_q=cum_seq_lens,
+        cum_seq_lens_kv=cum_seq_lens,
+        block_tables=block_tables,
+        out=o_ref,
+        out_dtype=dtype,
+        mask_mode="causal",
+    )
+
+    # --- Plan + run_with_plan path ---
+    k_cache, v_cache = paged_kv_cache.unbind(dim=1)
+    plan_info = trtllm_fmha_v2_plan(
+        q,
+        k_cache,
+        v_cache,
+        input_layout,
+        mask_mode="causal",
+        max_kv_len=max_kv_len,
+        batch_size=batch_size,
+    )
+
+    workspace_buffer2 = _get_workspace_buffer()
+    o_plan = torch.zeros(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+    trtllm_fmha_v2_prefill(
+        qkv_arg,
+        input_layout,
+        workspace_buffer=workspace_buffer2,
+        seq_lens=seq_lens,
+        max_q_len=max_q_len,
+        max_kv_len=max_kv_len,
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        batch_size=batch_size,
+        cum_seq_lens_q=cum_seq_lens,
+        cum_seq_lens_kv=cum_seq_lens,
+        block_tables=block_tables,
+        out=o_plan,
+        out_dtype=dtype,
+        mask_mode="causal",
+        plan_info=plan_info,
+    )
+
+    # The two outputs should be bitwise identical since they run the same kernel
+    torch.testing.assert_close(o_plan.float(), o_ref.float(), rtol=0, atol=0)
