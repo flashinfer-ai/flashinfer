@@ -326,37 +326,31 @@ def flatten_paged_kv(
     """Build flat K/V and token-level indptr from paged KV cache and page table."""
     device = ref_kv_cache.device
     batch_size = int(page_table.shape[0])
+    num_pages_per_seq = int(page_table.shape[1])
 
-    # Move loop-control tensors to CPU to avoid GPU sync in loops
-    page_table_cpu = page_table.cpu()
-    seq_lens_cpu = seq_lens.cpu()
-    kv_last_page_len_cpu = kv_last_page_len.cpu()
-    page_per_seq = (seq_lens_cpu + page_size - 1) // page_size
-    k_list = []
-    v_list = []
-    for i in range(batch_size):
-        pages_i = int(page_per_seq[i].item())
-        last_len_i = int(kv_last_page_len_cpu[i].item())
-        for j in range(pages_i):
-            page_id = int(page_table_cpu[i, j].item())
-            k_page = ref_kv_cache[page_id, 0]
-            v_page = ref_kv_cache[page_id, 1]
-            if kv_layout == "HND":
-                # HND layout: [num_kv_heads, page_size, head_dim]
-                if j == pages_i - 1:
-                    k_page = k_page[:, :last_len_i, :]
-                    v_page = v_page[:, :last_len_i, :]
-                k_list.append(einops.rearrange(k_page, "h p d -> p h d"))
-                v_list.append(einops.rearrange(v_page, "h p d -> p h d"))
-            else:  # NHD layout
-                # NHD layout: [page_size, num_kv_heads, head_dim]
-                if j == pages_i - 1:
-                    k_page = k_page[:last_len_i, :, :]
-                    v_page = v_page[:last_len_i, :, :]
-                k_list.append(einops.rearrange(k_page, "p h d -> p h d"))
-                v_list.append(einops.rearrange(v_page, "p h d -> p h d"))
-    k_flat = torch.cat(k_list, dim=0)
-    v_flat = torch.cat(v_list, dim=0)
+    # Vectorized page gather for flattening.
+    seq_lens_dev = seq_lens.to(device)
+    pages = ref_kv_cache[page_table.reshape(-1).long()]  # [B*P, 2, ...]
+    if kv_layout == "HND":
+        # page layout: [num_kv_heads, page_size, head_dim]
+        k_tokens = einops.rearrange(
+            pages[:, 0], "(b p) h s d -> b (p s) h d", b=batch_size
+        )
+        v_tokens = einops.rearrange(
+            pages[:, 1], "(b p) h s d -> b (p s) h d", b=batch_size
+        )
+    else:  # NHD layout
+        # page layout: [page_size, num_kv_heads, head_dim]
+        k_tokens = einops.rearrange(
+            pages[:, 0], "(b p) s h d -> b (p s) h d", b=batch_size
+        )
+        v_tokens = einops.rearrange(
+            pages[:, 1], "(b p) s h d -> b (p s) h d", b=batch_size
+        )
+    token_idx = torch.arange(num_pages_per_seq * page_size, device=device)
+    valid = token_idx.unsqueeze(0) < seq_lens_dev.unsqueeze(1)  # [B, P*page_size]
+    k_flat = k_tokens[valid]
+    v_flat = v_tokens[valid]
     kv_indptr_tokens = torch.cat(
         [
             torch.tensor([0], dtype=torch.int32, device=device),
@@ -946,7 +940,7 @@ def _test_trtllm_batch_decode(
             num_qo_heads, batch_size, max_q_len_val
         )
         guard_end = min(softmax_end + TRTLLM_GEN_WORKSPACE_CHECK_BYTES, workspace_size)
-        assert (workspace_buffer[softmax_end:guard_end].cpu().numpy() == 0).all(), (
+        assert (workspace_buffer[softmax_end:guard_end] == 0).all().item(), (
             "trtllm-gen decode kernel wrote past the softmax slab"
         )
     else:
@@ -955,7 +949,7 @@ def _test_trtllm_batch_decode(
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+        assert (workspace_buffer[: 8192 * 256 * 4] == 0).all().item()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -1074,7 +1068,7 @@ def _test_trtllm_batch_decode(
                 )
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+        assert (workspace_buffer[: 8192 * 256 * 4] == 0).all().item()
 
 
 @pytest.mark.parametrize("backend", ["trtllm-gen"])
