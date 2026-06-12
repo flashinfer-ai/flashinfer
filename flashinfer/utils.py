@@ -16,8 +16,9 @@ limitations under the License.
 
 import functools
 import math
+import threading
 from enum import Enum
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
@@ -221,6 +222,86 @@ def _get_cache_buf(
             buf = torch.empty(bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
+
+
+class _RingBuf:
+    """A ring of ``num_slots`` equally-sized zero-initialized device buffers.
+
+    Used for kernel-internal synchronization state (e.g. the multi-CTA top-k
+    ``RadixRowState`` arrays) that must not be shared by kernels that may
+    execute concurrently on different CUDA streams of the same device.
+
+    Slot assignment is pinned per CUDA stream: launches enqueued on the same
+    stream are serialized by the stream and may safely reuse one slot (each
+    kernel resets its state words to zero on exit), while launches from
+    different streams get disjoint slots. Slots are recycled round-robin once
+    more than ``num_slots`` distinct streams have been seen; a collision then
+    requires more than ``num_slots`` streams to have such kernels in flight
+    simultaneously on one device.
+    """
+
+    __slots__ = ["buf", "slot_bytes", "num_slots", "stream_slots", "next_slot"]
+
+    def __init__(self, slot_bytes: int, num_slots: int, device: torch.device):
+        self.slot_bytes = slot_bytes
+        self.num_slots = num_slots
+        self.buf = torch.zeros(slot_bytes * num_slots, dtype=torch.uint8, device=device)
+        self.stream_slots: Dict[int, int] = {}  # cudaStream_t handle -> slot
+        self.next_slot = 0
+
+    def get_slot(self, stream: int) -> torch.Tensor:
+        slot = self.stream_slots.get(stream)
+        if slot is None:
+            slot = self.next_slot % self.num_slots
+            self.next_slot += 1
+            self.stream_slots[stream] = slot
+        offset = slot * self.slot_bytes
+        return self.buf[offset : offset + self.slot_bytes]
+
+
+_ring_cache_buf: Dict[Tuple[str, torch.device], _RingBuf] = {}
+_ring_cache_lock = threading.Lock()
+# Buffers handed out during CUDA graph capture. Their addresses are baked into
+# the captured graphs, so they must be kept alive for the lifetime of the
+# process (graphs may be replayed at any later time).
+_graph_capture_bufs: List[torch.Tensor] = []
+
+
+def _get_cache_buf_ring(
+    name: str, nbytes: int, device: torch.device, num_slots: int = 8
+) -> torch.Tensor:
+    """Return a zero-initialized scratch buffer that is private to the calling
+    CUDA stream (up to ``num_slots`` concurrently launching streams).
+
+    Unlike :func:`_get_cache_buf`, which returns one buffer per ``(name,
+    device)`` and is therefore unsafe for kernel-internal synchronization
+    state when the same API is launched concurrently from multiple streams
+    (see issue #3618), this returns one of ``num_slots`` disjoint slots,
+    selected by the current stream.
+
+    CUDA graphs: if the current stream is capturing, a dedicated buffer is
+    allocated for this launch (from the capture's memory pool) and kept alive
+    for the process lifetime, so replays of different graphs - possibly on
+    different streams - never share synchronization state with each other or
+    with eagerly launched kernels.
+
+    The contract for the returned buffer matches ``zero_init=True`` of
+    :func:`_get_cache_buf`: it is zeroed on first use, and the consuming
+    kernel must reset it to zero before finishing so the slot can be reused
+    by the next (stream-ordered) launch.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        buf = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+        _graph_capture_bufs.append(buf)
+        return buf
+    key = (name, device)
+    stream = torch.cuda.current_stream(device).cuda_stream
+    with _ring_cache_lock:
+        ring = _ring_cache_buf.get(key)
+        if ring is None or ring.slot_bytes < nbytes or ring.num_slots < num_slots:
+            ring = _RingBuf(nbytes, num_slots, device)
+            _ring_cache_buf[key] = ring
+        return ring.get_slot(stream)
 
 
 # find the least power of 2 that is greater than or equal to x

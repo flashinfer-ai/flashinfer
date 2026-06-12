@@ -37,6 +37,7 @@ from .trace.templates.sampling import (
 )
 from .utils import (
     _get_cache_buf,
+    _get_cache_buf_ring,
     device_support_pdl,
     get_default_generators,
     register_custom_op,
@@ -1887,13 +1888,14 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
+    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU).
+    # Ring-buffered so that concurrent launches from different streams do not
+    # share the kernel's synchronization state (see issue #3618).
     buffer_bytes = 1024 * 1024  # 1MB
-    row_states_buffer = _get_cache_buf(
-        f"top_k_renorm_probs_row_states_{probs.device}",
+    row_states_buffer = _get_cache_buf_ring(
+        "top_k_renorm_probs_row_states",
         buffer_bytes,
         probs.device,
-        zero_init=True,
     )
 
     return get_sampling_module().top_k_renorm_probs(
@@ -1959,17 +1961,19 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
+    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU).
+    # Ring-buffered so that concurrent launches from different streams do not
+    # share the kernel's synchronization state (see issue #3618).
     buffer_bytes = 1024 * 1024  # 1MB
-    row_states_buffer = _get_cache_buf(
-        f"top_k_mask_logits_row_states_{logits.device}",
+    row_states_buffer = _get_cache_buf_ring(
+        "top_k_mask_logits_row_states",
         buffer_bytes,
         logits.device,
-        zero_init=True,
     )
 
-    # Note: row_states_buffer is zero-initialized on first allocation by _get_cache_buf
-    # Kernel will reset arrival_counter to 0 at the end of each launch
+    # Note: row_states_buffer is zero-initialized on first allocation by
+    # _get_cache_buf_ring. Kernel will reset arrival_counter to 0 at the end
+    # of each launch.
 
     return get_sampling_module().top_k_mask_logits(
         logits, *_to_tensor_scalar_tuple(top_k), row_states_buffer
