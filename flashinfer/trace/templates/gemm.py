@@ -468,6 +468,298 @@ mm_fp4_trace = TraceTemplate(
 )
 
 
+# ── W4A16 FP4 GEMM (mm_w4a16_fp4) ────────────────────────────────────────────
+#
+# ``mm_w4a16_fp4`` consumes *prepared* weights whose layout is backend-
+# specific (see ``flashinfer.prepare_w4a16_fp4_weights``), so each backend
+# gets its own template and ``trace=`` is a dispatch callable keyed on the
+# ``backend`` kwarg (same pattern as the trtllm MoE routing templates).
+
+# E2M1 nibble codebook (low 3 bits magnitude, bit 3 sign).
+_E2M1_CODEBOOK = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)  # fmt: skip
+
+
+def _w4a16_matmul(a, weight_kn, alpha):
+    """Final fp32 matmul shared by both W4A16 references.
+
+    ``weight_kn`` is the dequantized fp32 weight in (K, N) layout.
+    """
+    if alpha is not None:
+        weight_kn = weight_kn * alpha.to(torch.float32)
+    return (a.to(torch.float32) @ weight_kn).to(a.dtype)
+
+
+def _mm_w4a16_fp4_cudnn_reference(a, b, b_descale, alpha=None, block_size=16):
+    """Reference for the cuDNN-prepared layout.
+
+    b: [N, K//2] uint8, two FP4 codes per byte (low nibble = even K).
+    b_descale: [N, K//block_size] float8_e4m3fn per-block scales (linear).
+    """
+    n, k_half = b.shape
+    k = k_half * 2
+    lut = torch.tensor(_E2M1_CODEBOOK, dtype=torch.float32, device=b.device)
+    b_int = b.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
+    sf = b_descale.to(torch.float32).repeat_interleave(block_size, dim=1)
+    return _w4a16_matmul(a, (lut[codes] * sf).T, alpha)
+
+
+def _mm_w4a16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16):
+    """Reference for the cute-DSL-prepared layout.
+
+    b: [K//16, N*2] int32 -- FP4 bytes permuted into (16K x 64N) MMA tiles
+    of 128 int32 each (inverts
+    ``flashinfer.gemm.gemm_w4a16._cute_dsl_pack_fp4_weight``).
+    b_descale: [K//block_size, N] uint8 -- S0E5M3 per-block scales
+    (fp16 value = byte << 7 reinterpreted as fp16 bits).
+    """
+    device = b.device
+    k_sf, n = b_descale.shape
+    k = k_sf * block_size
+    k_tiles, n_tiles = k // 16, n // 64
+
+    # Rebuild the within-tile byte permutation of _cute_dsl_pack_fp4_weight.
+    u32_pos = torch.arange(128, device=device, dtype=torch.long)
+    lane = (u32_pos // 2) % 32
+    base_n = (u32_pos // 64) * 8 + lane // 4
+    k_half_in_tile = (lane % 4)[:, None] + torch.tensor(
+        [0, 4, 0, 4], device=device, dtype=torch.long
+    )
+    n_in_tile = (
+        base_n[:, None]
+        + torch.tensor(
+            [[0, 0, 16, 16], [32, 32, 48, 48]], device=device, dtype=torch.long
+        )[u32_pos % 2]
+    )
+    within_idx = (k_half_in_tile * 64 + n_in_tile).reshape(-1)  # (512,) permutation
+
+    # Invert: scatter each tile's 512 gathered bytes back to row-major (8, 64).
+    gathered = (
+        b.reshape(k_tiles, n_tiles, 128, 1)
+        .view(torch.uint8)
+        .reshape(k_tiles, n_tiles, 512)
+    )
+    tile_bytes = torch.empty_like(gathered)
+    tile_bytes[:, :, within_idx] = gathered
+    b_kn = (
+        tile_bytes.reshape(k_tiles, n_tiles, 8, 64)
+        .permute(0, 2, 1, 3)
+        .reshape(k // 2, n)
+    )
+
+    lut = torch.tensor(_E2M1_CODEBOOK, dtype=torch.float32, device=device)
+    b_int = b_kn.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=1).reshape(k, n)
+    # S0E5M3 -> fp16: the byte is the top 8 bits of the fp16 bit pattern.
+    sf = (
+        (b_descale.to(torch.int16) << 7)
+        .view(torch.float16)
+        .to(torch.float32)
+        .repeat_interleave(block_size, dim=0)
+    )
+    return _w4a16_matmul(a, lut[codes] * sf, alpha)
+
+
+def _mm_w4a16_fp4_cudnn_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_div_2: int = 0,  # derived
+    K_div_block_size: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_w4a16_fp4`` (cuDNN backend).
+
+    Sourced from ``tests/gemm/test_mm_w4a16_fp4.py``: quantize a randn
+    bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
+    repack with ``prepare_w4a16_fp4_weights``.  Requires SM100+ at
+    runtime; CPU smoke tests skip.
+    """
+    del K_div_2, K_div_block_size
+    from flashinfer import (  # noqa: PLC0415
+        nvfp4_quantize,
+        prepare_w4a16_fp4_weights,
+    )
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = (448.0 * 6.0) / w.float().abs().nan_to_num().max()
+    b_fp4, b_sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    alpha = torch.tensor([1.0 / g_w.item()], dtype=torch.float32, device=device)
+    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cudnn", block_size=block_size
+    )
+    return {
+        "a": a,
+        "b": b_p,
+        "b_descale": sf_p,
+        "alpha": alpha_p,
+        "backend": "cudnn",
+        "block_size": int(block_size),
+    }
+
+
+def _mm_w4a16_fp4_cute_dsl_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_div_16: int = 0,  # derived
+    K_div_block_size: int = 0,  # derived
+    N_mul_2: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_w4a16_fp4`` (cute-DSL backend).
+
+    Sourced from ``tests/gemm/test_mm_w4a16_fp4.py``: quantize a randn
+    bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
+    repack with ``prepare_w4a16_fp4_weights``.  Requires SM100+ at
+    runtime; CPU smoke tests skip.
+    """
+    del K_div_16, K_div_block_size, N_mul_2
+    from flashinfer import (  # noqa: PLC0415
+        nvfp4_quantize,
+        prepare_w4a16_fp4_weights,
+    )
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = (448.0 * 6.0) / w.float().abs().nan_to_num().max()
+    b_fp4, b_sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    alpha = torch.tensor([1.0 / g_w.item()], dtype=torch.float32, device=device)
+    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl", block_size=block_size
+    )
+    return {
+        "a": a,
+        "b": b_p,
+        "b_descale": sf_p,
+        "alpha": alpha_p,
+        "backend": "cute-dsl",
+        "block_size": int(block_size),
+    }
+
+
+mm_w4a16_fp4_cudnn_trace = TraceTemplate(
+    op_type="gemm_w4a16_fp4",
+    name_prefix="mm_w4a16_fp4_cudnn",
+    description=(
+        "W4A16 GEMM C = (A @ dequant(B).T) * alpha, cuDNN-prepared weights. "
+        "A is bf16; B is fp4 (e2m1fn_x2 packed as uint8) with fp8-e4m3 "
+        "per-block scales in linear [N, K//block_size] layout."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "block_size": Const(description="FP4 quantization block size (16 for nvfp4)."),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a", description="Activation, bfloat16."),
+        "B": Tensor(
+            ["N", "K_div_2"],
+            param="b",
+            description="Weight, fp4 e2m1fn_x2 packed as uint8, [N, K//2].",
+        ),
+        "b_descale": Tensor(
+            ["N", "K_div_block_size"],
+            description="Per-block scales, float8_e4m3fn, [N, K//block_size].",
+        ),
+        "alpha": Tensor(
+            ["1"],
+            optional=True,
+            description="Optional global scale, float32, shape (1,).",
+        ),
+        "block_size": Scalar("int32", description="FP4 block size (always 16)."),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified", "quantization:fp4"],
+    reference=_mm_w4a16_fp4_cudnn_reference,
+    check=_fp4_gemm_check,
+    init=_mm_w4a16_fp4_cudnn_init,
+)
+
+mm_w4a16_fp4_cute_dsl_trace = TraceTemplate(
+    op_type="gemm_w4a16_fp4",
+    name_prefix="mm_w4a16_fp4_cute_dsl",
+    description=(
+        "W4A16 GEMM C = (A @ dequant(B).T) * alpha, cute-DSL-prepared weights. "
+        "A is bf16; B is fp4 repacked into (16K x 64N) MMA tiles as int32 "
+        "[K//16, N*2] with S0E5M3 per-block scales [K//block_size, N]."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "block_size": Const(description="FP4 quantization block size (16 for nvfp4)."),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a", description="Activation, bfloat16."),
+        "B": Tensor(
+            ["K_div_16", "N_mul_2"],
+            param="b",
+            description="Weight, fp4 tile-packed as int32, [K//16, N*2].",
+        ),
+        "b_descale": Tensor(
+            ["K_div_block_size", "N"],
+            description="Per-block scales, S0E5M3 as uint8, [K//block_size, N].",
+        ),
+        "alpha": Tensor(
+            ["1"],
+            optional=True,
+            description="Optional global scale, float32, shape (1,).",
+        ),
+        "block_size": Scalar("int32", description="FP4 block size (always 16)."),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified", "quantization:fp4"],
+    reference=_mm_w4a16_fp4_cute_dsl_reference,
+    check=_fp4_gemm_check,
+    init=_mm_w4a16_fp4_cute_dsl_init,
+)
+
+_MM_W4A16_FP4_TRACE_BY_BACKEND = {
+    "cudnn": mm_w4a16_fp4_cudnn_trace,
+    "cute-dsl": mm_w4a16_fp4_cute_dsl_trace,
+}
+
+
+def mm_w4a16_fp4_trace_dispatch(**kwargs):
+    """Return the TraceTemplate matching the call's ``backend`` kwarg.
+
+    Pass as ``trace=mm_w4a16_fp4_trace_dispatch`` to ``@flashinfer_api``;
+    returns ``None`` (no trace) for unknown backends.
+    """
+    return _MM_W4A16_FP4_TRACE_BY_BACKEND.get(kwargs.get("backend"))
+
+
+# Expose the templates so _attach_fi_trace auto-registers them for the
+# consistency tests (same pattern as the MoE routing dispatchers).
+mm_w4a16_fp4_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _MM_W4A16_FP4_TRACE_BY_BACKEND.values()
+)
+
+
 # ── Batched matmuls (BMM) ────────────────────────────────────────────────────
 
 

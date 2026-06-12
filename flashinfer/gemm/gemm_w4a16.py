@@ -6,6 +6,7 @@ from typing import List, Literal, Optional, Tuple, cast
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.gemm import mm_w4a16_fp4_trace_dispatch
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -69,6 +70,10 @@ def _check_mm_w4a16_fp4_problem_size(
         raise ValueError(f"out_dtype must be bfloat16 or float16; got {out_dtype}")
     if block_size != 16:
         raise ValueError(f"block_size must be 16 for FP4; got {block_size}")
+    if alpha is not None and alpha.device != a.device:
+        raise ValueError(
+            f"alpha must be on the same device as a ({a.device}); got {alpha.device}"
+        )
     return True
 
 
@@ -172,6 +177,15 @@ def prepare_w4a16_fp4_weights(
     k = int(b.shape[1]) * 2
     if k % block_size != 0:
         raise ValueError(f"K={k} must be a multiple of block_size={block_size}")
+    n = int(b.shape[0])
+    k_sf = k // block_size
+    expected_sf_bytes = ((n + 127) // 128) * ((k_sf + 3) // 4) * 512
+    sf_bytes = b_descale.numel() * b_descale.element_size()
+    if sf_bytes < expected_sf_bytes:
+        raise ValueError(
+            f"b_descale has {sf_bytes} bytes but the 128x4-swizzled layout for "
+            f"N={n}, K_sf={k_sf} requires at least {expected_sf_bytes}"
+        )
     if alpha is not None:
         if alpha.dim() != 1 or alpha.shape[0] != 1:
             raise ValueError(f"alpha must be shape (1,); got {tuple(alpha.shape)}")
@@ -191,7 +205,7 @@ def prepare_w4a16_fp4_weights(
     },
     common_check=_check_mm_w4a16_fp4_problem_size,
 )
-@flashinfer_api
+@flashinfer_api(trace=mm_w4a16_fp4_trace_dispatch)
 def mm_w4a16_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -845,8 +859,8 @@ def _prepare_w4a16_alpha(
             _W4A16_ALPHA_ONE_CACHE[device] = cached
         return cached
     if alpha.dim() == 0:
-        return alpha.to(torch.float32).unsqueeze(0)
-    return alpha.to(torch.float32).reshape(1)
+        return alpha.to(device=device, dtype=torch.float32).unsqueeze(0)
+    return alpha.to(device=device, dtype=torch.float32).reshape(1)
 
 
 def _select_w4a16_tile_shape(
@@ -1063,16 +1077,9 @@ def _cute_dsl_pack_fp4_weight(b: torch.Tensor) -> torch.Tensor:
         k_tiles, n_tiles, _CUTE_DSL_PACK_INTS_PER_TILE, 4
     )
 
-    # Pack 4 bytes (little-endian: byte_idx 0 in bits 0-7) into one int32.
-    out64 = torch.zeros(
-        (k_tiles, n_tiles, _CUTE_DSL_PACK_INTS_PER_TILE),
-        dtype=torch.int64,
-        device=device,
-    )
-    for byte_idx in range(4):
-        out64 |= gathered[..., byte_idx].to(torch.int64) << (byte_idx * 8)
-
-    return out64.to(torch.int32).reshape(
+    # Each 4 consecutive bytes are one little-endian int32 (byte 0 = bits 0-7),
+    # exactly what the kernel's 32-bit loads read -- reinterpret in place.
+    return gathered.view(torch.int32).reshape(
         k_tiles, n_tiles * _CUTE_DSL_PACK_INTS_PER_TILE
     )
 
@@ -1275,7 +1282,8 @@ def _compute_cute_dsl(
     """cute-DSL-backend compute: dispatch to the compiled Blackwell kernel.
 
     ``b`` is the packed ``(K // 16, N * 2)`` int32 weight and
-    ``b_descale`` the ``(K // 16, N)`` FP8-E4M3 SF returned by
+    ``b_descale`` the ``(K // block_size, N)`` uint8 SF in S0E5M3 format
+    (reformatted from FP8-E4M3 by :func:`_e4m3_to_s0e5m3`) returned by
     :func:`_prepare_cute_dsl`.
     """
     if b.dtype != torch.int32:

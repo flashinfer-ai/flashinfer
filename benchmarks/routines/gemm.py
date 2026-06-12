@@ -1399,6 +1399,7 @@ def testMmW4A16Fp4(args):
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     backends = args.backends
     run_refcheck = args.refcheck
+    is_cuda_graph_compatible = not args.no_cuda_graph
 
     if input_dtype != torch.bfloat16:
         raise ValueError(
@@ -1453,11 +1454,27 @@ def testMmW4A16Fp4(args):
 
         return run
 
+    backends_to_remove = []
     for backend in backends:
-        b_p, sf_p, alpha_p = flashinfer.prepare_w4a16_fp4_weights(
-            b_fp4, b_sf, alpha, backend=backend
-        )
-        backend_runners[backend] = make_runner(b_p, sf_p, alpha_p, backend)
+        try:
+            b_p, sf_p, alpha_p = flashinfer.prepare_w4a16_fp4_weights(
+                b_fp4, b_sf, alpha, backend=backend
+            )
+            runner = make_runner(b_p, sf_p, alpha_p, backend)
+            runner(a)
+            backend_runners[backend] = runner
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+
+    for backend in backends_to_remove:
+        backends.remove(backend)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return
 
     # cuDNN sweeps its execution plans + M buckets; cute-dsl sweeps its tile
     # shape + perf-knob config space (both via mm_w4a16_fp4's TunableRunners).
@@ -1491,10 +1508,10 @@ def testMmW4A16Fp4(args):
     res = []
     flops = 2 * m * n * k
     bytes_accessed = (
-        m * k * torch.tensor([], dtype=input_dtype).element_size()
+        m * k * input_dtype.itemsize
         + (k // 2) * n  # FP4 weight (uint8, 2 codes / byte)
         + (k // 16) * n  # FP8-E4M3 per-block SF
-        + m * n * torch.tensor([], dtype=out_dtype).element_size()
+        + m * n * out_dtype.itemsize
     )
     # Refcheck tolerance vs the fp32-accurate gold.  The cute-dsl and cudnn
     # kernels dequantize the FP4 weight to bf16 before the tensor-core matmul,
@@ -1514,9 +1531,14 @@ def testMmW4A16Fp4(args):
                     raise
 
         timing = bench_gpu_time(
-            runner,
-            input_args=(a,),
+            fn=runner,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=(a,),
         )
         median_time = float(np.median(timing))
         std_time = float(np.std(timing))
