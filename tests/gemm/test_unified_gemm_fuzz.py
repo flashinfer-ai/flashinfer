@@ -49,7 +49,8 @@ grouped ``group_*`` / ``*deepgemm*`` entries (m_indptr op-shape).
 
 Run (needs CUDA_HOME for JIT; SM100 for the fp4 adapters, SM89+ for fp8):
   CUDA_HOME=<cuda> CUDA_VISIBLE_DEVICES=<idx> pytest -q tests/gemm/test_unified_gemm_fuzz.py
-Env: FLASHINFER_GEMM_FUZZ_NUM_TESTS (default 1000, ~10 min), FLASHINFER_GEMM_FUZZ_SEED (default 0),
+Env: FLASHINFER_GEMM_FUZZ_NUM_TESTS (default 2000; autotune-OFF breadth ~0.4s/cfg + ~5% autotune-ON
+     at ~5-8s/cfg), FLASHINFER_GEMM_FUZZ_SEED (default 0),
      FLASHINFER_GEMM_FUZZ_ONLY_SEED (comma-separated seeds -> run ONLY those configs; the
      perfect-repro hook printed on every failure).
 
@@ -62,6 +63,7 @@ alone shows whether the output is all-zero / all-NaN / Inf, without rerunning).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import random
 import zlib
@@ -81,6 +83,7 @@ from flashinfer import (
     mxfp4_quantize,
     nvfp4_quantize,
 )
+from flashinfer.autotuner import AutoTuner
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float, mxfp4_dequantize
 from flashinfer.utils import LibraryError, get_compute_capability
 
@@ -92,7 +95,7 @@ from tests.utils_fp8 import to_float8
 
 # Default sized so a full sweep is a substantial fuzz (~10 min on a warm cache on one GPU). Tune
 # down via the env var for a quick smoke; the per-config seed makes any failure reproducible.
-NUM_TESTS = int(os.environ.get("FLASHINFER_GEMM_FUZZ_NUM_TESTS", "1000"))
+NUM_TESTS = int(os.environ.get("FLASHINFER_GEMM_FUZZ_NUM_TESTS", "2000"))
 BASE_SEED = int(os.environ.get("FLASHINFER_GEMM_FUZZ_SEED", "0"))
 # Perfect-repro hook: if set (comma-separated seeds), the suite runs ONLY those configs --
 # `_gen(seed)` is fully deterministic, so a single seed reproduces one config exactly. The
@@ -663,6 +666,29 @@ def _assert_invariants(cfg: Cfg, res: torch.Tensor, ref: torch.Tensor):
         )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_autotune_cache():
+    # autotune(True) populates the AutoTuner's process-global profiling_cache, and autotune(False)
+    # will REUSE a cached winner if one exists -- so without clearing, a config's result could
+    # depend on which earlier configs tuned the same shape (breaks per-seed repro + order-independence).
+    # Clear the *profiling* cache before each test (cheap). We deliberately do NOT clear the cuDNN
+    # graph/plan cache (keeping it avoids per-config plan rebuilds; it doesn't affect winner choice).
+    with contextlib.suppress(Exception):
+        AutoTuner.get().clear_cache()
+    yield
+
+
+def _validate(cfg: Cfg, out: torch.Tensor, ref: torch.Tensor):
+    """Assert correctness vs the authoritative reference; a tracked finding is tolerated (xfail)."""
+    try:
+        _assert_invariants(cfg, out, ref)
+    except (AssertionError, pytest.fail.Exception):
+        known = _known_failure(cfg)
+        if known:
+            pytest.xfail(f"KNOWN FINDING: {known}")
+        raise
+
+
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
 def test_unified_gemm_fuzz(cfg: Cfg):
     # Determinism: pin the global RNG too (device-state probe + any global draw), so the run is
@@ -697,17 +723,8 @@ def test_unified_gemm_fuzz(cfg: Cfg):
         raise  # a crash is a finding
 
     print(f"RATIO {cfg.adapter.quant_mode} {cfg.backend} ratio={_ratio(res, ref):.4g}")
-    # Known findings are TOLERATED if they fail (xfail) but NOT flagged when they pass: the cuDNN
-    # finding only manifests when cuDNN actually engages split-k (an internal heuristic we can't
-    # predict from the config), so many predicate-matched configs legitimately pass. Fix-detection
-    # is the version gate in _KNOWN_FAILURES (the predicate goes False on cuDNN >= the fix).
-    try:
-        _assert_invariants(cfg, res, ref)
-    except (AssertionError, pytest.fail.Exception):
-        known = _known_failure(cfg)
-        if known:
-            pytest.xfail(f"KNOWN FINDING: {known}")
-        raise
+    # autotune-OFF (default tactic) correctness vs the authoritative reference; tracked findings xfail.
+    _validate(cfg, res, ref)
 
     # (3) determinism: re-run into a freshly-poisoned buffer; a deterministic backend must match
     #     bit-exactly.
@@ -728,6 +745,26 @@ def test_unified_gemm_fuzz(cfg: Cfg):
     torch.cuda.synchronize()
     if not torch.isfinite(probe).all():
         _fail(cfg, "CUDA context corrupted after GEMM (device-state probe non-finite)")
+
+    # (a') autotune-ON winner validation (gated ~20%) -- run LAST: it populates the profiling cache
+    # (autotune(False) would then reuse that winner), so doing it after the determinism check above
+    # keeps that check on the clean default tactic. Runs the REAL autotuner-selected winner and
+    # validates it vs the SAME reference -> catches "autotuner picks a fast-but-wrong tactic"
+    # (#3227/#3398/#2504-class) on exactly what users get. Backend-agnostic; a backend that rejects
+    # under tuning just falls back to the OFF result already validated above. Gated to ~5% because
+    # autotune profiling is ~5-8s/config (it times every tactic); the cheap autotune-OFF path above
+    # carries the breadth, this adds bounded autotuner-correctness depth.
+    if cfg.seed % 20 == 0:
+        a_out = _out_buffer(cfg)
+        try:
+            with autotune(True):
+                cfg.adapter.run(a, b, a_out, cfg.backend, cfg)
+            torch.cuda.synchronize()
+        except Exception as e:
+            if not _is_unsupported(e):
+                raise
+        else:
+            _validate(cfg, a_out, ref)
 
 
 # ---------------------------------------------------------------------------
@@ -859,3 +896,70 @@ def test_gemm_quantize_fuzz(rows, cols, regime, qmode):
         f"{qmode} quantize({rows}x{cols},{regime}) produced {n_bad} non-finite "
         f"scale-factor elements from finite input (GH #2440-class)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Autotune-cache + dynamic-shape coherence (backend-agnostic). Under autotune(True), drive ONE
+# backend over a SEQUENCE of M (the dynamic dim): the first M's build/profile the per-bucket winner
+# + plan; later M's (incl odd / in-between / repeats) REUSE the cached winner and OVERRIDE the shape
+# to the new M -- the cuDNN override-shape path (>=9.21) and the analogous cross-call cache reuse in
+# cutlass/cublas/trtllm. A stale/mis-keyed cached winner or a bad shape-override -> wrong output,
+# caught against the per-M reference. No backend special-casing: the cuDNN override-shape regression
+# surface is exercised by the same generic sequence that exercises every other backend.
+# ---------------------------------------------------------------------------
+_DYNSHAPE_M_SEQ = [
+    256,
+    4096,
+    17,
+    4097,
+    3,
+    256,
+    4096,
+    129,
+    256,
+]  # buckets + boundaries + odd + repeats
+
+
+@pytest.mark.parametrize(
+    "akey", [a.key for a in _ADAPTERS], ids=[a.key for a in _ADAPTERS]
+)
+def test_autotune_cache_dynshape(akey):
+    if _SKIP is not None:
+        pytest.skip(_SKIP)
+    ad = next(a for a in _ADAPTERS if a.key == akey)
+    if not ad.supported(_SM):
+        pytest.skip(f"{akey} unsupported on SM{_SM}")
+    torch.manual_seed(0)
+    al = ad.align
+    N, K = max(al, (512 // al) * al), max(al, (512 // al) * al)
+    fp8 = ad.quant_mode == "fp8"
+    n_ran = 0
+    with autotune(
+        True
+    ):  # fill the per-bucket cache on first sight; reuse + override on later M
+        for i, m in enumerate(_DYNSHAPE_M_SEQ):
+            cfg = Cfg(
+                seed=70000 + i,
+                adapter=ad,
+                backend="auto",
+                b=2 if ad.op_shape == "bmm" else 1,
+                m=m,
+                n=N,
+                k=K,
+                out_dtype=torch.bfloat16,
+                fp8_idt=torch.float8_e4m3fn if fp8 else None,
+                fp8_mdt=torch.float8_e4m3fn if fp8 else None,
+            )
+            a, b, ref = _canonical(cfg, salt=1)
+            out = _out_buffer(cfg)
+            try:
+                ad.run(a, b, out, "auto", cfg)
+                torch.cuda.synchronize()
+            except Exception as e:
+                if _is_unsupported(e):
+                    continue  # this M unsupported (e.g. unaligned fp4) -> skip it, keep the sequence
+                raise
+            n_ran += 1
+            _validate(cfg, out, ref)
+    if n_ran == 0:
+        pytest.skip(f"no M in the dyn-shape sequence ran for {akey} on SM{_SM}")
