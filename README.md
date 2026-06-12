@@ -102,11 +102,11 @@ pip install flashinfer-python
 
 ```bash
 pip install flashinfer-python flashinfer-cubin
-# JIT cache (replace cu129 with your CUDA version)
-pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
+# JIT cache (replace cu132 with your CUDA version: cu126, cu130, or cu132)
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu132
 ```
 
-**For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
+**For Blackwell (SM 10.0+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
 
 ```bash
 pip install flashinfer-python[cu13]
@@ -140,6 +140,13 @@ See [documentation](https://docs.flashinfer.ai/) for comprehensive API reference
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer
 python -m pip install -v .
+```
+
+For CUDA 13 source or development environments, install dependencies with the CUDA 13 requirements overlay before installing the local package:
+
+```bash
+python -m pip install -r requirements-cu13.txt
+python -m pip install --no-deps -v .
 ```
 
 **For development**, install in editable mode:
@@ -176,10 +183,11 @@ For more details, see the [Install from Source documentation](https://docs.flash
 
 ```bash
 pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps
-pip install flashinfer-python  # Install dependencies from PyPI
+# Install dependencies from PyPI (use flashinfer-python[cu13] for CUDA 13)
+pip install flashinfer-python
 pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
-# JIT cache (replace cu129 with your CUDA version)
-pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
+# JIT cache (replace cu132 with your CUDA version: cu126, cu130, or cu132)
+pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu132
 ```
 
 ### CLI Tools
@@ -224,9 +232,9 @@ Users can customize their own attention variants with additional parameters. For
 
 ## CUDA Support
 
-**Supported CUDA Versions:** 12.6, 12.8, 13.0, 13.1
+**Supported CUDA Versions:** 12.6, 13.0, 13.2
 
-> **Note:** FlashInfer strives to follow PyTorch's supported CUDA versions plus the latest CUDA release.
+> **Note:** FlashInfer strives to follow PyTorch's supported CUDA versions.
 
 ## Adoption
 
