@@ -147,7 +147,7 @@ void sm90_dispatch_moe_mixed_dtype_gemm_config(
 }
 
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
-          int PackedScalesNum>
+          int UnusedScalePackFactor>
 void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
@@ -160,7 +160,7 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
 #else
   TLLM_CHECK(sizeof(T) == 1);
 #endif
-  static_cast<void>(PackedScalesNum);
+  static_cast<void>(UnusedScalePackFactor);
 
 #define DISPATCH_MIXED_DTYPE_MOE_TILE(ENUM_NAME, TILE_M, TILE_N, TILE_K)                    \
   case tkc::CutlassTileConfigSM90::ENUM_NAME:                                                \

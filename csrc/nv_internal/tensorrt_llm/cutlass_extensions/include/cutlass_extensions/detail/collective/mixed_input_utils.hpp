@@ -168,6 +168,26 @@ struct MixedInputFoldedWeightScaleStorage<
   static constexpr bool value = true;
 };
 
+template <class Collective, bool HasFoldedWeightScaleStorage>
+struct MixedInputScaleTmaLayout {
+  using type = typename Collective::SmemLayoutScale;
+};
+
+template <class Collective>
+struct MixedInputScaleTmaLayout<Collective, true> {
+  using type = void;
+};
+
+template <class Collective, bool HasFoldedWeightScaleStorage>
+struct MixedInputScaleCopyAtom {
+  using type = typename Collective::SmemCopyAtomScale;
+};
+
+template <class Collective>
+struct MixedInputScaleCopyAtom<Collective, true> {
+  using type = void;
+};
+
 template <class Collective>
 struct MixedGroupedGemmInputUtils {
  private:
@@ -175,14 +195,12 @@ struct MixedGroupedGemmInputUtils {
   using ConversionMode = typename Collective::ConversionMode;
   using SmemLayoutA = typename Collective::SmemLayoutA;
   using SmemLayoutB = typename Collective::SmemLayoutB;
-  using SmemLayoutScale = typename Collective::SmemLayoutScale;
   using SwappedElementA = typename Collective::SwappedElementA;
   using SwappedElementB = typename Collective::SwappedElementB;
   using RealSwappedElementA = typename Collective::RealSwappedElementA;
   using RealSwappedElementB = typename Collective::RealSwappedElementB;
   using ElementScale = typename Collective::ElementScale;
   using ElementZero = typename Collective::ElementZero;
-  using SmemCopyAtomScale = typename Collective::SmemCopyAtomScale;
   static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
@@ -190,10 +208,16 @@ struct MixedGroupedGemmInputUtils {
   static constexpr auto UseInt4ToFP8LookupTable = Collective::UseInt4ToFP8LookupTable;
   static constexpr bool HasFoldedWeightScaleStorage =
       MixedInputFoldedWeightScaleStorage<Collective>::value;
+  using SmemLayoutScale =
+      typename MixedInputScaleTmaLayout<Collective, HasFoldedWeightScaleStorage>::type;
+  using SmemCopyAtomScale =
+      typename MixedInputScaleCopyAtom<Collective, HasFoldedWeightScaleStorage>::type;
 
  public:
   static constexpr auto elements_per_smem_scale() {
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
+      return 0;
+    } else if constexpr (HasFoldedWeightScaleStorage) {
       return 0;
     } else if constexpr (ModeHasScales) {
       return cute::cosize_v<SmemLayoutScale>;
@@ -205,7 +229,8 @@ struct MixedGroupedGemmInputUtils {
 
   static constexpr auto elements_per_smem_zero() {
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert ||
-                  KernelConversionMode == ConversionMode::ConvertAndScale) {
+                  KernelConversionMode == ConversionMode::ConvertAndScale ||
+                  HasFoldedWeightScaleStorage) {
       return 0;
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
       return cute::cosize_v<SmemLayoutScale>;
@@ -232,21 +257,24 @@ struct MixedGroupedGemmInputUtils {
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return 0;
     } else if constexpr (ModeHasScales) {
-      constexpr uint32_t scale_tx_bytes =
-          cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
-                                 static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
         if constexpr (HasFoldedWeightScaleStorage) {
           static_assert(Collective::WeightScaleBulkCopyBytes % bulk_copy_alignment_bytes == 0,
                         "Each folded weight-scale bulk copy must be 16B aligned.");
           return Collective::WeightScaleTransactionBytes;
         } else {
+          constexpr uint32_t scale_tx_bytes =
+              cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
+                                     static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
           static_assert(scale_tx_bytes % 128 == 0,
                         "Each scale stage must be 128B aligned.");  // required by TMA
           return scale_tx_bytes;
         }
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         // Scale and zero share smem layout
+        constexpr uint32_t scale_tx_bytes =
+            cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
+                                   static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
         static_assert(scale_tx_bytes % 128 == 0,
                       "Each scale stage must be 128B aligned.");  // required by TMA
         constexpr uint32_t zero_tx_bytes =
