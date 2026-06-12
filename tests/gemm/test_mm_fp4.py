@@ -12,6 +12,12 @@ from flashinfer.utils import get_compute_capability, LibraryError
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
 
 
+_TEST_MS = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256, 512]
+_AUTO_TEST_MS = [1, 48, 256, 512]
+# Share one tuning bucket (the largest parametrized m, with round-up mapping to save time.
+_TUNING_BUCKETS = (max(_TEST_MS + _AUTO_TEST_MS),)
+
+
 def _test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
 ):
@@ -82,7 +88,7 @@ def _test_mm_fp4(
     res = torch.empty([m, n], device="cuda", dtype=res_dtype)
 
     try:
-        with autotune(auto_tuning):
+        with autotune(auto_tuning, tuning_buckets=_TUNING_BUCKETS, round_up=True):
             mm_fp4(
                 input_fp4,
                 mat2_fp4.T,
@@ -109,7 +115,7 @@ def _test_mm_fp4(
 
 
 # TODO: Consdier splitting this function up for the various backends
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 48, 64, 128, 256, 512])
+@pytest.mark.parametrize("m", _TEST_MS)
 @pytest.mark.parametrize("n", [128, 256, 512])
 @pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
@@ -127,7 +133,7 @@ def test_mm_fp4(
 
 
 # Split tests for checking auto functionality
-@pytest.mark.parametrize("m", [1, 48, 256, 512])
+@pytest.mark.parametrize("m", _AUTO_TEST_MS)
 @pytest.mark.parametrize("n", [256, 512])
 @pytest.mark.parametrize("k", [256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
