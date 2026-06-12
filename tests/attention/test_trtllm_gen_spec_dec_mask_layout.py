@@ -1,11 +1,25 @@
 import torch
 import pytest
 
+import flashinfer.decode
 from flashinfer.decode import (
     _pack_trtllm_gen_spec_dec_mask,
     _select_trtllm_gen_spec_dec_tree_kernel,
     _should_force_trtllm_gen_spec_dec_tree_keeps,
 )
+
+
+def test_untrimmed_swa_spec_dec_tree_capability_flag():
+    # Cross-repo contract: sglang's trtllm_mha backend reads this attribute
+    # via getattr to gate its untrimmed SWA tree-verify path.
+    assert (
+        getattr(
+            flashinfer.decode,
+            "trtllm_gen_supports_untrimmed_swa_spec_dec_tree",
+            False,
+        )
+        is True
+    )
 
 
 def test_spec_dec_tree_kernel_selection_matches_trtllm_gen_thresholds():
@@ -42,8 +56,14 @@ def test_spec_dec_tree_mask_words_per_sequence_for_keeps_and_swaps():
         q_len=5,
     )
 
-    assert swaps.words_per_sequence(q_len=8, max_seq_len=257, window_left=128) == 8 * 2 * 2 * 128
-    assert keeps.words_per_sequence(q_len=5, max_seq_len=257, window_left=128) == 1 * 2 * 2 * 512
+    assert (
+        swaps.words_per_sequence(q_len=8, max_seq_len=257, window_left=128)
+        == 8 * 2 * 2 * 128
+    )
+    assert (
+        keeps.words_per_sequence(q_len=5, max_seq_len=257, window_left=128)
+        == 1 * 2 * 2 * 512
+    )
 
 
 def test_spec_dec_tree_native_window_uses_tail_only_mask_stride():
@@ -54,7 +74,9 @@ def test_spec_dec_tree_native_window_uses_tail_only_mask_stride():
         q_len=8,
     )
 
-    fallback_words = layout.words_per_sequence(q_len=8, max_seq_len=4096, window_left=128)
+    fallback_words = layout.words_per_sequence(
+        q_len=8, max_seq_len=4096, window_left=128
+    )
     native_words = layout.words_per_sequence(q_len=8, max_seq_len=4096, window_left=-1)
 
     assert fallback_words == 8 * 16 * 2 * 128
@@ -111,7 +133,9 @@ def test_pack_spec_dec_tree_mask_swaps_layout_bits():
     assert offsets.cpu().tolist() == [0]
     assert first_sparse_offsets.cpu().tolist() == [0]
 
-    def swaps_word_bit(token_idx_q: int, token_idx_kv: int, head_idx_q: int) -> tuple[int, int]:
+    def swaps_word_bit(
+        token_idx_q: int, token_idx_kv: int, head_idx_q: int
+    ) -> tuple[int, int]:
         tile_size_q = 32
         tile_size_kv = 128
         num_insts_kv = 2

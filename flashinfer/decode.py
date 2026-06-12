@@ -2551,16 +2551,20 @@ class _SpecDecTreeKernelLayout(NamedTuple):
         tile_size_kv_per_cta = 128 * self.num_insts_kv
         if window_left >= 0:
             if max_seq_len is None:
-                raise ValueError("window_left >= 0 requires max_seq_len for mask sizing")
+                raise ValueError(
+                    "window_left >= 0 requires max_seq_len for mask sizing"
+                )
             max_mask_tiles_kv = ceil_div(max_seq_len, tile_size_kv_per_cta)
         else:
             max_mask_tiles_kv = ceil_div(
                 tile_size_kv_per_cta - 1 + q_len, tile_size_kv_per_cta
-        )
+            )
         if self.kernel_layout == "swaps":
             tile_size_q = ceil_div(self.tile_size_q, 32) * 32
             num_tiles_q = q_len * ceil_div(self.num_heads_q_per_kv, tile_size_q)
-            words_per_tile_block = self.num_insts_kv * 128 * ceil_div(self.tile_size_q, 32)
+            words_per_tile_block = (
+                self.num_insts_kv * 128 * ceil_div(self.tile_size_q, 32)
+            )
         else:
             num_tiles_q = ceil_div(q_len * self.num_heads_q_per_kv, 128)
             words_per_tile_block = self.num_insts_kv * (128 * 128 // 32)
@@ -2599,8 +2603,18 @@ def _should_force_trtllm_gen_spec_dec_tree_keeps(
         return True
     tile_size_kv_per_cta = 128 * layout.num_insts_kv
     prefix_lens = seq_lens - q_len
-    straddles_kv_cta = (prefix_lens % tile_size_kv_per_cta) + q_len > tile_size_kv_per_cta
+    straddles_kv_cta = (
+        prefix_lens % tile_size_kv_per_cta
+    ) + q_len > tile_size_kv_per_cta
     return bool(torch.any(straddles_kv_cta).item())
+
+
+# Cross-repo capability flag read by callers (e.g. sglang's trtllm_mha
+# backend) to gate untrimmed SWA page tables for spec-dec tree verify: native
+# SlidingWindowCustom cubins skip out-of-window KV tiles in-kernel, and when a
+# shape has no native cubin the window is folded into the packed custom mask,
+# which stays correct over the full presented KV range.
+trtllm_gen_supports_untrimmed_swa_spec_dec_tree = True
 
 
 def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
