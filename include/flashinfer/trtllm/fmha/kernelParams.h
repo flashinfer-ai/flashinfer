@@ -901,8 +901,7 @@ struct KernelParams {
     FLASHINFER_CHECK(!options.isSparseMla() || (options.mSparseMlaTopK % 4) == 0,
                      "SparseMlaTopK must be a multiple of 4");
     params.mSparseAttnTopK = options.mSparseMlaTopK;
-    // TODO: Integrate trtllm block-sparse attention kernels when needed.
-    params.mUseBlockSparseAttention = false;
+    params.mUseBlockSparseAttention = options.mSparseMla;
     // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
     params.mUsesSharedPagedKvIdx = options.mUsesSharedPagedKvIdx;
     return params;
