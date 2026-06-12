@@ -4462,11 +4462,11 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     quant_1_size = 0;
     quant_2_size =
         getOffsetWeightSF(num_experts_per_node, fc1_out_size, hidden_size, mScalingType) *
-        sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+        sizeof(TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF);
     quant_3_size = num_experts_per_node * sizeof(float);
     quant_4_size = 0;
     quant_5_size = getOffsetWeightSF(num_experts_per_node, hidden_size, inter_size, mScalingType) *
-                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF);
+                   sizeof(TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF);
     quant_6_size = num_experts_per_node * sizeof(float);
   }
 
