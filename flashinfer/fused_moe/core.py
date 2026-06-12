@@ -706,13 +706,6 @@ def interleave_moe_scales_for_sm90_mixed_gemm(
 ) -> torch.Tensor:
     """Interleave MXFP4 block scales for the SM90 mixed-input MoE GEMM.
 
-    The kernel expects scales in layout
-    ``(num_experts, K // (group_size * 4), rows * 4)`` rather than the natural
-    ``(num_experts, rows, K // group_size)`` produced by the MXFP4 quantizer.
-    This helper performs the reshape + permute equivalent to TensorRT-LLM's
-    ``WFP4A16FusedMoEMethod.load_quant_scales`` (PR #12451), with the fixed
-    interleave factor of ``128 // group_size`` used for MXFP4.
-
     Parameters
     ----------
     scales : torch.Tensor
@@ -725,7 +718,7 @@ def interleave_moe_scales_for_sm90_mixed_gemm(
     -------
     torch.Tensor
         Contiguous uint8 tensor with shape
-        ``[num_experts, K // (group_size * factor), rows * factor]``
+        ``[num_experts, rows // 64, (K // group_size) // factor, 16, 16]``
         where ``factor = 128 // group_size``.
     """
     if scales.dim() != 3:
@@ -741,14 +734,19 @@ def interleave_moe_scales_for_sm90_mixed_gemm(
             f"group_size={group_size} must divide 128 (interleave factor = 128 // group_size)"
         )
     e, rows, kgs = scales.shape
+    if rows % 64 != 0:
+        raise ValueError(f"scale rows={rows} must be divisible by 64")
     if kgs % factor != 0:
         raise ValueError(
             f"K/group_size={kgs} must be divisible by interleave factor {factor}"
         )
-    tmp = (
-        scales.reshape(e, rows, kgs // factor, factor).permute(0, 2, 1, 3).contiguous()
+    k128_blocks = kgs // factor
+    return (
+        scales.reshape(e, rows // 64, 4, 16, k128_blocks, factor)
+        .permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .reshape(e, rows // 64, k128_blocks, 16, 16)
     )
-    return tmp.reshape(e, kgs // factor, rows * factor)
 
 
 @flashinfer_api
