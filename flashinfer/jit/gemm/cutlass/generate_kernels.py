@@ -658,7 +658,6 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     ]
 
     supported_dtypes_fp4 = [
-        (DataType.f16, e2m1, DataType.ue8m0, DataType.f16, DataType.f16),
         (
             DataType.bf16,
             e2m1,
@@ -672,16 +671,21 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
 
-    M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
-    N_TILES = [16, 32, 64, 128]
-    K_TILES = [128, 256, 512]
-    cta_shapes_mnk_int4 = list(product(M_TILES, N_TILES, K_TILES))
-
-    M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
-    N_TILES = [16, 32, 64]
-    K_TILES = [128, 256]
-    cta_shapes_mnk_fp4 = list(product(M_TILES, N_TILES, K_TILES))
-    cta_shapes_mnk_fp4.append((128, 128, 128))
+    cta_shapes_mnk_cmx_profiler = list(
+        product([64], [16, 32, 64, 128], [128, 256, 512])
+    )
+    cta_shapes_mnk_cmx_profiler.extend(
+        product([128], [16, 32, 64, 128], [128, 256, 512])
+    )
+    cta_shapes_mnk_cmx_profiler.extend(
+        [(128, 256, k_tile) for k_tile in [128, 256]]
+    )
+    cta_shapes_mnk_cmx_profiler.extend(
+        [(256, 128, k_tile) for k_tile in [128, 256]]
+    )
+    cta_shapes_mnk_cmx_profiler.append((256, 256, 128))
+    cta_shapes_mnk_int4 = list(cta_shapes_mnk_cmx_profiler)
+    cta_shapes_mnk_fp4 = list(cta_shapes_mnk_cmx_profiler)
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
@@ -709,13 +713,6 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
         )
         epi_schedule = EpilogueScheduleType.TmaWarpSpecializedCooperative
         for mainloop_schedule in mainloop_schedules:
-            if (
-                cta_shape_mnk[0] == 128
-                and cta_shape_mnk[1] == 128
-                and mainloop_schedule
-                == KernelScheduleType.TmaWarpSpecializedCooperative
-            ):
-                continue
             moe_gemm_operation = TrtLlm_GemmLauncher(
                 GemmKind.Grouped,
                 arch,

@@ -34,6 +34,79 @@ namespace cutlass::gemm::collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace detail {
+
+template <int capacity_bytes, class ElementA, class ElementB, class ElementScale,
+          class ElementZero, class TileShapeMNK, int alignment = 128, int stages>
+constexpr int compute_stage_count_or_override_folded_weight_scale(cute::Int<stages> stage_count) {
+  return stages;
+}
+
+template <int capacity_bytes, class ElementA, class ElementB, class ElementScale,
+          class ElementZero, class TileShapeMNK, int alignment = 128, int stages>
+constexpr int compute_stage_count_or_override_folded_weight_scale(StageCount<stages> stage_count) {
+  return stages;
+}
+
+template <int capacity_bytes_, class ElementA, class ElementB, class ElementScale,
+          class ElementZero, class TileShapeMNK, int alignment = 128, int carveout_bytes_>
+constexpr int compute_stage_count_or_override_folded_weight_scale(
+    StageCountAutoCarveout<carveout_bytes_> stage_count) {
+  constexpr auto mainloop_pipeline_bytes = sizeof(typename cutlass::PipelineTmaAsync<1>::SharedStorage);
+  constexpr auto a_bits = cute::sizeof_bits_v<ElementA>;
+  constexpr auto b_bits = cute::sizeof_bits_v<ElementB>;
+  constexpr auto s_bits = cute::sizeof_bits_v<ElementScale>;
+  constexpr auto z_bits = get_bits_for_possibly_void_element<ElementZero>();
+  constexpr int scale_group_size = DefaultWeightScaleGroupSize<ElementA>::value;
+
+  static_assert((size<2>(TileShapeMNK{}) % scale_group_size) == 0,
+                "Folded weight-scale storage requires TileK to cover complete scale groups.");
+
+  constexpr auto scale_bytes =
+      cutlass::bits_to_bytes(s_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{}) / scale_group_size);
+  constexpr auto zero_bytes = cutlass::bits_to_bytes(z_bits * size<0>(TileShapeMNK{}));
+  static_assert(scale_bytes % 16 == 0, "Folded weight-scale bulk copy must be at least 16B aligned.");
+  static_assert(zero_bytes % 128 == 0, "Zero bytes must be a multiple of 128");
+
+  constexpr int stage_bytes_ =
+      cutlass::bits_to_bytes(a_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
+      cutlass::bits_to_bytes(b_bits * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{})) +
+      scale_bytes + zero_bytes;
+
+  constexpr int stage_bytes =
+      cutlass::round_up(stage_bytes_, alignment) + static_cast<int>(mainloop_pipeline_bytes);
+  constexpr int carveout_bytes = cutlass::round_up(carveout_bytes_, alignment);
+  constexpr int capacity_bytes = capacity_bytes_ / alignment * alignment;
+
+  return (capacity_bytes - carveout_bytes) / stage_bytes;
+}
+
+template <bool UseFoldedWeightScaleStorage>
+struct MixedInputStageCountSelector {
+  template <int CapacityBytes, class ElementA, class ElementB, class ElementScale,
+            class ElementZero, class TileShapeMNK, int Alignment, class StageCountType>
+  static constexpr int get(StageCountType stage_count) {
+    return compute_stage_count_or_override_single_affine_transformed_input<
+        CapacityBytes, ElementA, ElementB, ElementScale, ElementZero, TileShapeMNK, Alignment>(
+        stage_count);
+  }
+};
+
+template <>
+struct MixedInputStageCountSelector<true> {
+  template <int CapacityBytes, class ElementA, class ElementB, class ElementScale,
+            class ElementZero, class TileShapeMNK, int Alignment, class StageCountType>
+  static constexpr int get(StageCountType stage_count) {
+    return compute_stage_count_or_override_folded_weight_scale<
+        CapacityBytes, ElementA, ElementB, ElementScale, ElementZero, TileShapeMNK, Alignment>(
+        stage_count);
+  }
+};
+
+}  // namespace detail
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 // GMMA_TMA_WS_RS
 template <class ElementA_, class GmemLayoutATag_, int AlignmentA, class ElementB_,
           class GmemLayoutBTag_, int AlignmentB, class ElementAccumulator, class TileShape_MNK,
@@ -106,6 +179,11 @@ struct CollectiveBuilderMixedInput<
   static constexpr bool IsATransformed = cute::is_tuple<ElementPairA>::value;
   using ElementScale = cute::conditional_t<IsATransformed, ScaleA, ScaleB>;
   using ElementZero = cute::conditional_t<IsATransformed, ZeroA, ZeroB>;
+  static constexpr bool UseFoldedWeightScaleStorage =
+      IsMixedInput && IsATransformed && cute::is_void_v<ElementZero> &&
+      cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+      cute::is_same_v<ElementB, cutlass::bfloat16_t> &&
+      cute::is_same_v<ElementScale, cutlass::float_ue8m0_t>;
 
   static_assert(is_static<TileShape_MNK>::value);
   static_assert(is_static<ClusterShape_MNK>::value);
@@ -186,10 +264,10 @@ struct CollectiveBuilderMixedInput<
   static constexpr int PipelineStages =
       IsMixedInput
           ? (IsArrayOfPointersGemm
-                 ? detail::compute_stage_count_or_override_single_affine_transformed_input<
+                 ? detail::MixedInputStageCountSelector<UseFoldedWeightScaleStorage>::template get<
                        Sm90ReducedSmemCapacityBytes, RealElementA, RealElementB, ElementScale,
                        ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{})
-                 : detail::compute_stage_count_or_override_single_affine_transformed_input<
+                 : detail::MixedInputStageCountSelector<UseFoldedWeightScaleStorage>::template get<
                        detail::sm90_smem_capacity_bytes, RealElementA, RealElementB, ElementScale,
                        ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{}))
           : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes, ElementAMma,

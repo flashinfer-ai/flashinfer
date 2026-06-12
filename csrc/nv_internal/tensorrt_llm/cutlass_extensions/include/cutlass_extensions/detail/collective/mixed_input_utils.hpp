@@ -36,6 +36,19 @@ typedef cutlass::uint128_t __nv_bf16x8_storage_t;
 constexpr int int4_group_size = 128;
 constexpr int mxfp4_group_size = 32;
 
+template <class ElementWeight>
+struct DefaultWeightScaleGroupSize;
+
+template <>
+struct DefaultWeightScaleGroupSize<cutlass::float_e2m1_t> {
+  static constexpr int value = mxfp4_group_size;
+};
+
+template <>
+struct DefaultWeightScaleGroupSize<cutlass::int4b_t> {
+  static constexpr int value = int4_group_size;
+};
+
 inline __device__ unsigned prmt(unsigned hi, unsigned lo, unsigned select_code) {
   unsigned res = 0;
 
@@ -139,6 +152,22 @@ __device__ __inline__ __nv_fp8x8_storage_t psx_cvt_lut_prmt_int4x8_to_fp8x8(
   return fp8x8_raw;
 }
 
+template <class...>
+using MixedInputVoid = void;
+
+template <class Collective, class = void>
+struct MixedInputFoldedWeightScaleStorage {
+  static constexpr bool value = false;
+};
+
+template <class Collective>
+struct MixedInputFoldedWeightScaleStorage<
+    Collective,
+    MixedInputVoid<decltype(Collective::WeightScaleBulkCopyBytes),
+                   decltype(Collective::WeightScaleTransactionBytes)>> {
+  static constexpr bool value = true;
+};
+
 template <class Collective>
 struct MixedGroupedGemmInputUtils {
  private:
@@ -159,6 +188,8 @@ struct MixedGroupedGemmInputUtils {
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
   static constexpr auto UseFP4ToBF16LookupTable = Collective::UseFP4ToBF16LookupTable;
   static constexpr auto UseInt4ToFP8LookupTable = Collective::UseInt4ToFP8LookupTable;
+  static constexpr bool HasFoldedWeightScaleStorage =
+      MixedInputFoldedWeightScaleStorage<Collective>::value;
 
  public:
   static constexpr auto elements_per_smem_scale() {
@@ -197,18 +228,27 @@ struct MixedGroupedGemmInputUtils {
   }
 
   static constexpr uint32_t compute_tma_transaction_bytes_extra() {
+    constexpr uint32_t bulk_copy_alignment_bytes = 16;
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return 0;
     } else if constexpr (ModeHasScales) {
       constexpr uint32_t scale_tx_bytes =
           cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
                                  static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
-      static_assert(scale_tx_bytes % 128 == 0,
-                    "Each scale stage must be 128B aligned.");  // required by TMA
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return scale_tx_bytes;
+        if constexpr (HasFoldedWeightScaleStorage) {
+          static_assert(Collective::WeightScaleBulkCopyBytes % bulk_copy_alignment_bytes == 0,
+                        "Each folded weight-scale bulk copy must be 16B aligned.");
+          return Collective::WeightScaleTransactionBytes;
+        } else {
+          static_assert(scale_tx_bytes % 128 == 0,
+                        "Each scale stage must be 128B aligned.");  // required by TMA
+          return scale_tx_bytes;
+        }
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         // Scale and zero share smem layout
+        static_assert(scale_tx_bytes % 128 == 0,
+                      "Each scale stage must be 128B aligned.");  // required by TMA
         constexpr uint32_t zero_tx_bytes =
             cutlass::bits_to_bytes(size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
                                    static_cast<uint32_t>(cute::sizeof_bits_v<ElementZero>));
@@ -553,24 +593,36 @@ struct MixedGroupedGemmInputUtils {
     }
   }
 
-  template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut, class... Ts>
+  template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut>
   CUTLASS_DEVICE static void convert_A_kblock(Tensor<EngineIn, LayoutIn> const& tCrA_load,
                                               Tensor<EngineOut, LayoutOut>& tCrA_mma,
                                               int const k_block) {
+    Tensor src = tCrA_load(_, _, k_block);
+    Tensor dst = tCrA_mma(_, _, k_block);
+    convert_A_slot(src, dst);
+  }
+
+  template <int KBlock, class EngineIn, class EngineOut, class LayoutIn, class LayoutOut>
+  CUTLASS_DEVICE static void convert_A_kblock(Tensor<EngineIn, LayoutIn> const& tCrA_load,
+                                              Tensor<EngineOut, LayoutOut>& tCrA_mma,
+                                              cute::Int<KBlock> k_block) {
+    Tensor src = tCrA_load(_, _, k_block);
+    Tensor dst = tCrA_mma(_, _, k_block);
+    convert_A_slot(src, dst);
+  }
+
+  template <class EngineIn, class EngineOut, class LayoutIn, class LayoutOut>
+  CUTLASS_DEVICE static void convert_A_slot(Tensor<EngineIn, LayoutIn> const& src,
+                                            Tensor<EngineOut, LayoutOut>& dst) {
     static_assert(is_rmem<EngineIn>::value,
                   "Input tensor for A conversion must come from registers");
     static_assert(is_rmem<EngineOut>::value,
                   "Output tensor for A conversion must come from registers");
-    static_assert(cosize_v<LayoutIn> == cosize_v<LayoutOut>);
-    static_assert(size_v<LayoutIn> == cosize_v<LayoutIn>);
-    static_assert(size_v<LayoutOut> == cosize_v<LayoutOut>);
     using SrcType = typename EngineIn::value_type;
-
-    Tensor src = tCrA_load(_, _, k_block);
-    Tensor dst = tCrA_mma(_, _, k_block);
 
     CUTE_STATIC_ASSERT_V(size(src(_, 0)) == cosize(src(_, 0).layout()),
                          "The first mode of tensor src must be contiguous in memory");
+    CUTE_STATIC_ASSERT_V(size(src) == size(dst));
     // try to make the size of the first mode equal to 32bit
     int constexpr NumValPerSrcReg =
         cute::min(decltype(size(src(_, 0)))::value, ceil_div(32, sizeof_bits_v<SrcType>));

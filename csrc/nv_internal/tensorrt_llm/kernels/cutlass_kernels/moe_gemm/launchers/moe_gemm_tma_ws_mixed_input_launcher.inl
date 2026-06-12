@@ -115,6 +115,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
       std::conditional_t<use_wfp4a16, cutlass::float_ue8m0_t,
                          TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA>;
   using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
+  using MainloopElementScale =
+      std::conditional_t<use_wfp4a16, ElementScale, ElementScalePacked>;
   using LayoutScale = cutlass::layout::RowMajor;
 
   // C/D matrix configuration
@@ -158,7 +160,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   // information must get paired with the operand that will be scaled. In this example, B is scaled
   // so we make a tuple of B's information and the scale information.
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<
-      ArchTag, OperatorClass, cute::tuple<ElementB, ElementScalePacked>, LayoutB_Transpose*,
+      ArchTag, OperatorClass, cute::tuple<ElementB, MainloopElementScale>, LayoutB_Transpose*,
       AlignmentB, ElementA, LayoutA_Transpose*, AlignmentA, ElementAccumulator, TileShape,
       ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
@@ -200,7 +202,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
        reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
        reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
        reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
-       reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+       reinterpret_cast<MainloopElementScale const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
        reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
       {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
        reinterpret_cast<StrideC*>(hopper_inputs.stride_c),

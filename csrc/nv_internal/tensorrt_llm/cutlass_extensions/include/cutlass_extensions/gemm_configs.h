@@ -106,20 +106,38 @@ enum class CutlassTileConfigSM90 : int {
 
   // CTA configs for M=64
   CtaShape64x16x128B = shape_tuple_to_enum(64, 16, 128),
+  CtaShape64x16x256B = shape_tuple_to_enum(64, 16, 256),
+  CtaShape64x16x512B = shape_tuple_to_enum(64, 16, 512),
   CtaShape64x32x128B = shape_tuple_to_enum(64, 32, 128),
+  CtaShape64x32x256B = shape_tuple_to_enum(64, 32, 256),
+  CtaShape64x32x512B = shape_tuple_to_enum(64, 32, 512),
   CtaShape64x64x128B = shape_tuple_to_enum(64, 64, 128),
+  CtaShape64x64x256B = shape_tuple_to_enum(64, 64, 256),
+  CtaShape64x64x512B = shape_tuple_to_enum(64, 64, 512),
   CtaShape64x128x128B = shape_tuple_to_enum(64, 128, 128),
+  CtaShape64x128x256B = shape_tuple_to_enum(64, 128, 256),
+  CtaShape64x128x512B = shape_tuple_to_enum(64, 128, 512),
   CtaShape64x256x128B = shape_tuple_to_enum(64, 256, 128),
 
   // CTA configs for M=128
   CtaShape128x16x128B = shape_tuple_to_enum(128, 16, 128),
+  CtaShape128x16x256B = shape_tuple_to_enum(128, 16, 256),
+  CtaShape128x16x512B = shape_tuple_to_enum(128, 16, 512),
   CtaShape128x32x128B = shape_tuple_to_enum(128, 32, 128),
+  CtaShape128x32x256B = shape_tuple_to_enum(128, 32, 256),
+  CtaShape128x32x512B = shape_tuple_to_enum(128, 32, 512),
   CtaShape128x64x128B = shape_tuple_to_enum(128, 64, 128),
+  CtaShape128x64x256B = shape_tuple_to_enum(128, 64, 256),
+  CtaShape128x64x512B = shape_tuple_to_enum(128, 64, 512),
   CtaShape128x128x128B = shape_tuple_to_enum(128, 128, 128),
+  CtaShape128x128x256B = shape_tuple_to_enum(128, 128, 256),
+  CtaShape128x128x512B = shape_tuple_to_enum(128, 128, 512),
   CtaShape128x256x128B = shape_tuple_to_enum(128, 256, 128),
+  CtaShape128x256x256B = shape_tuple_to_enum(128, 256, 256),
 
   // CTA configs for M=256
   CtaShape256x128x128B = shape_tuple_to_enum(256, 128, 128),
+  CtaShape256x128x256B = shape_tuple_to_enum(256, 128, 256),
   CtaShape256x256x128B = shape_tuple_to_enum(256, 256, 128),
 };
 

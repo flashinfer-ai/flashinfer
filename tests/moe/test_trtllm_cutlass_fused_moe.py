@@ -1848,23 +1848,8 @@ def test_moe_bf16_mxfp4(
         output=flash_output,
     )
 
-    dq_mfxp4_w1 = (
-        dequant_mxfp4_batches_host(
-            w1.cpu(),
-            w1_scale.cpu(),
-        )
-        .cuda()
-        .to(torch.bfloat16)
-    )
-
-    dq_mfxp4_w2 = (
-        dequant_mxfp4_batches_host(
-            w2.cpu(),
-            w2_scale.cpu(),
-        )
-        .cuda()
-        .to(torch.bfloat16)
-    )
+    dq_mfxp4_w1 = _dequant_mxfp4_on_device(w1, w1_scale)
+    dq_mfxp4_w2 = _dequant_mxfp4_on_device(w2, w2_scale)
 
     # Use original weights for reference computation
     ref_output = compute_with_experts(
