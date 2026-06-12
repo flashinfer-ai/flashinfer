@@ -80,8 +80,16 @@ Each file describes one operation instance.  Here is an annotated example for
         "hidden_size": { "type": "const", "value": 7168 }
       },
       "inputs": {
-        "hidden_states": { "shape": ["batch_size", "hidden_size"], "dtype": "bfloat16" },
-        "weight":        { "shape": ["hidden_size"],               "dtype": "bfloat16" }
+        "hidden_states": {
+          "shape": ["batch_size", "hidden_size"],
+          "dtype": "bfloat16",
+          "Cacheable": false
+        },
+        "weight": {
+          "shape": ["hidden_size"],
+          "dtype": "bfloat16",
+          "Cacheable": true
+        }
       },
       "outputs": {
         "output": { "shape": ["batch_size", "hidden_size"], "dtype": "bfloat16" }
@@ -111,7 +119,9 @@ Key fields:
        dimension, hidden size) and carry a ``"value"``.
    * - ``inputs`` / ``outputs``
      - Each entry has ``"shape"`` (list of axis names) and a resolved
-       ``"dtype"``.  Optional inputs carry ``"optional": true``.
+       ``"dtype"``. Input entries also carry ``"Cacheable"`` to indicate
+       whether the kernel may cache the input across launches. Optional
+       inputs carry ``"optional": true``.
    * - ``reference``
      - Source of a pure-PyTorch reference implementation for correctness
        checking (present on ``status:verified`` ops).
@@ -265,7 +275,7 @@ for the full tutorial), attach a ``TraceTemplate`` to the ``@flashinfer_api`` de
         },
         inputs={
             "hidden_states": Tensor(["batch_size", "hidden_size"]),
-            "weight":        Tensor(["hidden_size"]),
+            "weight":        Tensor(["hidden_size"], cacheable=True),
         },
         outputs={
             "output": Tensor(["batch_size", "hidden_size"], dtype_from="hidden_states"),

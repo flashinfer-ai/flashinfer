@@ -3162,6 +3162,7 @@ segment_gemm_run_trace = TraceTemplate(
         ),
         "weights": Tensor(
             ["batch_size", "K", "N"],
+            cacheable=True,
             description="Per-segment weight tensors (may be shared across segments).",
         ),
     },

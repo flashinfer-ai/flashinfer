@@ -180,7 +180,7 @@ rmsnorm_trace = TraceTemplate(
     },
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], cacheable=True),
     },
     outputs={
         "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
@@ -234,7 +234,7 @@ fused_add_rmsnorm_trace = TraceTemplate(
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
         "residual": Tensor(["batch_size", "hidden_size"]),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], cacheable=True),
     },
     outputs={
         "output": Tensor(
@@ -307,7 +307,7 @@ rmsnorm_quant_trace = TraceTemplate(
     },
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], cacheable=True),
         "scale": Scalar(
             "float32", description="Per-tensor quantization scale, shape (1,)."
         ),
@@ -390,7 +390,7 @@ fused_add_rmsnorm_quant_trace = TraceTemplate(
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
         "residual": Tensor(["batch_size", "hidden_size"]),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], cacheable=True),
         "scale": Scalar(
             "float32", description="Per-tensor quantization scale, shape (1,)."
         ),
@@ -455,7 +455,7 @@ gemma_rmsnorm_trace = TraceTemplate(
     },
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], cacheable=True),
     },
     outputs={
         "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
@@ -507,7 +507,7 @@ gemma_fused_add_rmsnorm_trace = TraceTemplate(
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
         "residual": Tensor(["batch_size", "hidden_size"]),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], cacheable=True),
     },
     outputs={
         "output": Tensor(["batch_size", "hidden_size"], dtype_from="input"),
@@ -570,10 +570,16 @@ layernorm_trace = TraceTemplate(
     inputs={
         "hidden_states": Tensor(["batch_size", "hidden_size"], param="input"),
         "weight": Tensor(
-            ["hidden_size"], param="gemma", description="Scale (gamma) tensor, float32."
+            ["hidden_size"],
+            param="gemma",
+            cacheable=True,
+            description="Scale (gamma) tensor, float32.",
         ),
         "bias": Tensor(
-            ["hidden_size"], param="beta", description="Bias (beta) tensor, float32."
+            ["hidden_size"],
+            param="beta",
+            cacheable=True,
+            description="Bias (beta) tensor, float32.",
         ),
     },
     outputs={
@@ -640,7 +646,7 @@ fused_rmsnorm_silu_trace = TraceTemplate(
     },
     inputs={
         "input": Tensor(["num_tokens", "hidden_size"]),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], cacheable=True),
         "eps": Scalar("float32", optional=True),
     },
     outputs={
@@ -737,7 +743,7 @@ _RMSNORM_FP4_AXES: dict[str, Var | Const] = {
 
 _RMSNORM_FP4_INPUTS: dict[str, Tensor | Scalar] = {
     "input": Tensor(["num_tokens", "hidden_size"]),
-    "weight": Tensor(["hidden_size"]),
+    "weight": Tensor(["hidden_size"], cacheable=True),
     "global_scale": Tensor(
         ["scalar"],
         dtype="float32",
@@ -891,7 +897,7 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
             ["num_tokens", "hidden_size"],
             description="Mutated in-place with input + residual.",
         ),
-        "weight": Tensor(["hidden_size"]),
+        "weight": Tensor(["hidden_size"], cacheable=True),
         "global_scale": Tensor(
             ["scalar"],
             dtype="float32",

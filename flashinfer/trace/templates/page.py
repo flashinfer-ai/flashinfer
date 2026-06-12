@@ -925,9 +925,10 @@ tgv_gemm_sm100_trace = TraceTemplate(
         "a": Tensor(["M", "K"]),
         "b": Tensor(
             ["K", "N"],
+            cacheable=True,
             description="Weight matrix in column-major layout.",
         ),
-        "bias": Tensor(["N"], description="Bias tensor."),
+        "bias": Tensor(["N"], cacheable=True, description="Bias tensor."),
     },
     outputs={
         "output": Tensor(["M", "N"], dtype_from="a"),

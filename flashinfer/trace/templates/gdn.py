@@ -201,6 +201,7 @@ gated_delta_rule_decode_trace = TraceTemplate(
         ),
         "A_log": Tensor(
             ["num_v_heads"],
+            cacheable=True,
             description="Log decay parameter (learnable). Used to compute g = exp(-exp(A_log) * softplus(a + dt_bias)).",
         ),
         "a": Tensor(
@@ -209,6 +210,7 @@ gated_delta_rule_decode_trace = TraceTemplate(
         ),
         "dt_bias": Tensor(
             ["num_v_heads"],
+            cacheable=True,
             description="Decay bias (learnable). Added to 'a' before softplus.",
         ),
         "b": Tensor(
@@ -449,6 +451,7 @@ gdn_prefill_trace = TraceTemplate(
         "A_log": Tensor(
             ["num_v_heads"],
             optional=True,
+            cacheable=True,
             description="Log decay parameter (conceptual; not passed directly — precomputed into g).",
         ),
         "a": Tensor(
@@ -459,6 +462,7 @@ gdn_prefill_trace = TraceTemplate(
         "dt_bias": Tensor(
             ["num_v_heads"],
             optional=True,
+            cacheable=True,
             description="Decay bias (conceptual; not passed directly — precomputed into g).",
         ),
         "b": Tensor(
@@ -709,6 +713,7 @@ gdn_mtp_trace = TraceTemplate(
         ),
         "A_log": Tensor(
             ["num_v_heads"],
+            cacheable=True,
             description="Log decay parameter (learnable). Used to compute g = exp(-exp(A_log) * softplus(a + dt_bias)).",
         ),
         "a": Tensor(
@@ -717,6 +722,7 @@ gdn_mtp_trace = TraceTemplate(
         ),
         "dt_bias": Tensor(
             ["num_v_heads"],
+            cacheable=True,
             description="Decay bias (learnable). Added to 'a' before softplus.",
         ),
         "b": Tensor(

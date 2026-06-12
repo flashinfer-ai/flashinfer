@@ -67,8 +67,8 @@ mhc_pre_big_fuse_trace = TraceTemplate(
         "dot_mix": Tensor(["num_tokens", "mhc_mix"], dtype="float32"),
         "sqrsum": Tensor(["num_tokens"], dtype="float32"),
         "residual": Tensor(["num_tokens", "hc", "hidden_size"], dtype="bfloat16"),
-        "mhc_scale": Tensor(["scale_size"], dtype="float32"),
-        "mhc_base": Tensor(["mhc_mix"], dtype="float32"),
+        "mhc_scale": Tensor(["scale_size"], dtype="float32", cacheable=True),
+        "mhc_base": Tensor(["mhc_mix"], dtype="float32", cacheable=True),
         "k": Scalar("int32"),
         **_MHC_PRE_SCALARS,
         "num_splits": Scalar("int32", optional=True),
@@ -90,8 +90,8 @@ mhc_pre_big_fuse_with_prenorm_trace = TraceTemplate(
     inputs={
         "dot_mix": Tensor(["num_tokens", "mhc_mix"], dtype="float32"),
         "residual": Tensor(["num_tokens", "hc", "hidden_size"], dtype="bfloat16"),
-        "mhc_scale": Tensor(["scale_size"], dtype="float32"),
-        "mhc_base": Tensor(["mhc_mix"], dtype="float32"),
+        "mhc_scale": Tensor(["scale_size"], dtype="float32", cacheable=True),
+        "mhc_base": Tensor(["mhc_mix"], dtype="float32", cacheable=True),
         **_MHC_PRE_SCALARS,
     },
     outputs={
