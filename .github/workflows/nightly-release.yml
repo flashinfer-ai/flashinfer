@@ -392,7 +392,7 @@ jobs:
           fi
 
   update-wheel-index:
-    needs: [setup, create-release, test-nightly-build]
+    needs: [setup, create-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flashinfer repo
