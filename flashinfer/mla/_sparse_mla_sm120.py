@@ -49,7 +49,6 @@ from typing import List, Optional
 
 import torch
 
-from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -59,9 +58,6 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..jit.mla import gen_sparse_mla_sm120_module
-from ..trace.templates.attention import (
-    sparse_mla_sm120_decode_dsv4_trace,
-)
 from ..utils import (
     register_custom_op,
     register_fake_op,
@@ -1192,7 +1188,6 @@ def sparse_mla_sm120_decode_dsv3_2(
 
 
 @supported_compute_capability([120, 121])
-@flashinfer_api(trace=sparse_mla_sm120_decode_dsv4_trace)
 def sparse_mla_sm120_decode_dsv4(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
