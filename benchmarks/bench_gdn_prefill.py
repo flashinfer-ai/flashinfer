@@ -28,6 +28,7 @@ Usage:
 import argparse
 import sys
 import time
+import gc
 
 import numpy as np
 import torch
@@ -42,6 +43,7 @@ try:
 
     _has_fla = True
 except ImportError:
+    fla_gdn = None
     _has_fla = False
 
 HEAD_CONFIGS = [
@@ -109,9 +111,29 @@ def bench_fi(args, endpoints, h_qk, h_v, d):
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
     state_out = torch.zeros_like(h0)
 
-    fn = lambda: chunk_gated_delta_rule(
-        q, k, v, g, beta, None, h0, True, cu_seqlens, False, None, state_out
-    )
+    q = [q.clone() for _ in range(args.iters)]
+    k = [k.clone() for _ in range(args.iters)]
+    v = [v.clone() for _ in range(args.iters)]
+    rotation_buffer_idx = 0
+
+    def fn():
+        nonlocal rotation_buffer_idx
+        chunk_gated_delta_rule(
+            q[rotation_buffer_idx % args.iters],
+            k[rotation_buffer_idx % args.iters],
+            v[rotation_buffer_idx % args.iters],
+            g,
+            beta,
+            None,
+            h0,
+            True,
+            cu_seqlens,
+            False,
+            None,
+            state_out,
+        )
+        rotation_buffer_idx += 1
+
     times = bench_gpu_time(
         fn,
         enable_cupti=args.use_cupti,
@@ -141,17 +163,27 @@ def bench_fla(args, endpoints, h_qk, h_v, d):
     beta = torch.rand(1, T, h_v, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
 
-    fn = lambda: fla_gdn(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        None,
-        initial_state=h0,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-    )
+    q = [q.clone() for _ in range(args.iters)]
+    k = [k.clone() for _ in range(args.iters)]
+    v = [v.clone() for _ in range(args.iters)]
+
+    rotation_buffer_idx = 0
+
+    def fn():
+        nonlocal rotation_buffer_idx
+        fla_gdn(
+            q[rotation_buffer_idx % args.iters],
+            k[rotation_buffer_idx % args.iters],
+            v[rotation_buffer_idx % args.iters],
+            g,
+            beta,
+            None,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+        rotation_buffer_idx += 1
+
     times = bench_gpu_time(
         fn,
         enable_cupti=args.use_cupti,
@@ -203,10 +235,9 @@ def main():
 
     for h_qk, h_v, d, h_label in HEAD_CONFIGS:
         for endpoints, s_label in SEQ_CONFIGS:
+            gc.collect()
             T = endpoints[-1]
             fi_ms = bench_fi(args, endpoints, h_qk, h_v, d)
-            time.sleep(args.cooling_time)
-            fla_ms = bench_fla(args, endpoints, h_qk, h_v, d)
             time.sleep(args.cooling_time)
             tflops = _gdn_tflops(T, h_v, d, fi_ms)
             row = (
@@ -214,7 +245,8 @@ def main():
                 f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
             )
             if _has_fla:
-                fla_ms = bench_fla(endpoints, h_qk, h_v, d, args.warmup, args.iters)
+                fla_ms = bench_fla(args, endpoints, h_qk, h_v, d)
+                time.sleep(args.cooling_time)
                 speedup = fla_ms / fi_ms
                 marker = "+" if speedup > 1.0 else "-"
                 row += f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
