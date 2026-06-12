@@ -118,7 +118,6 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     """Test MOE alltoall communication on single GPU."""
     torch.cuda.set_device(0)
     # Create a random input tensor
-    # 5 payloads (max): the trailing int32 represents the LoRA adapter ID slot.
     dtypes = [torch.bfloat16, torch.float16, torch.int32, torch.uint8, torch.int32]
     hidden_state_index = 0
     input_tensors = [
