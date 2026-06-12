@@ -1234,49 +1234,25 @@ class GatedDeltaNetChunkedKernel:
                 seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
                 checkpoint_offset = 0
-                if cutlass.const_expr(self.enable_checkpoints):
-                    checkpoint_offset = cu_checkpoints[batch_idx]
-                if cutlass.const_expr(self.use_initial_state):
-                    kv_acc_producer = self._load_initial_state(
-                        tidx,
-                        mS_init,
-                        head_idx,
-                        batch_idx,
-                        tmem_ptr,
-                        tiled_mma_kv,
-                        kv_acc_producer,
-                    )
                 sV_pisl = self._transform_to_position_independent_layout(
                     sV, v_smem_layout_staged.inner
                 )
                 sO_pisl = self._transform_to_position_independent_layout(
                     sO, o_smem_layout_staged.inner
                 )
-                (
-                    load_v_consumer,
-                    load_gate_consumer,
-                    shared_acc_consumer,
-                    kv_acc_consumer,
-                    q_state_acc_consumer,
-                    group_order_consumer,
-                    kv_acc_producer,
-                    state_inp_ready_producer,
-                    shared_inp_ready_producer,
-                    o_store_producer,
-                    checkpoint_idx,
-                ) = self.compute_group_1(
-                    tidx,
-                    tmem_ptr,
-                    scale,
-                    (tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv),
-                    (
-                        sV_pisl,
-                        sCumsumlog,
-                        sCumprod,
-                        sBeta,
-                        sO_pisl,
-                    ),
-                    (mS_checkpoints, checkpoint_offset, checkpoint_every_n_tokens),
+                if num_chunks_b > 0:
+                    if cutlass.const_expr(self.enable_checkpoints):
+                        checkpoint_offset = cu_checkpoints[batch_idx]
+                    if cutlass.const_expr(self.use_initial_state):
+                        kv_acc_producer = self._load_initial_state(
+                            tidx,
+                            mS_init,
+                            head_idx,
+                            batch_idx,
+                            tmem_ptr,
+                            tiled_mma_kv,
+                            kv_acc_producer,
+                        )
                     (
                         load_v_consumer,
                         load_gate_consumer,
@@ -1288,9 +1264,34 @@ class GatedDeltaNetChunkedKernel:
                         state_inp_ready_producer,
                         shared_inp_ready_producer,
                         o_store_producer,
-                    ),
-                    (True, 0, head_idx),
-                )
+                        checkpoint_idx,
+                    ) = self.compute_group_1(
+                        tidx,
+                        tmem_ptr,
+                        scale,
+                        (tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv),
+                        (
+                            sV_pisl,
+                            sCumsumlog,
+                            sCumprod,
+                            sBeta,
+                            sO_pisl,
+                        ),
+                        (mS_checkpoints, checkpoint_offset, checkpoint_every_n_tokens),
+                        (
+                            load_v_consumer,
+                            load_gate_consumer,
+                            shared_acc_consumer,
+                            kv_acc_consumer,
+                            q_state_acc_consumer,
+                            group_order_consumer,
+                            kv_acc_producer,
+                            state_inp_ready_producer,
+                            shared_inp_ready_producer,
+                            o_store_producer,
+                        ),
+                        (True, 0, head_idx),
+                    )
                 for chunk_idx in cutlass.range(1, num_chunks_b):
                     chunk_offset = batch_start + chunk_idx * self.b_t
                     (
@@ -1332,25 +1333,26 @@ class GatedDeltaNetChunkedKernel:
                         ),
                         (False, chunk_idx, head_idx),
                     )
-                if cutlass.const_expr(
-                    self.store_final_state or self.enable_checkpoints
-                ):
-                    kv_acc_consumer = self._store_final_state(
-                        tidx,
-                        mS_out,
-                        head_idx,
-                        batch_idx,
-                        tmem_ptr,
-                        tiled_mma_kv,
-                        kv_acc_consumer,
-                        seqlen_b,
-                        mS_checkpoints,
-                        checkpoint_offset,
-                        checkpoint_every_n_tokens,
-                    )
-                else:
-                    kv_acc_handle = kv_acc_consumer.wait_and_advance()
-                    kv_acc_handle.release()
+                if num_chunks_b > 0:
+                    if cutlass.const_expr(
+                        self.store_final_state or self.enable_checkpoints
+                    ):
+                        kv_acc_consumer = self._store_final_state(
+                            tidx,
+                            mS_out,
+                            head_idx,
+                            batch_idx,
+                            tmem_ptr,
+                            tiled_mma_kv,
+                            kv_acc_consumer,
+                            seqlen_b,
+                            mS_checkpoints,
+                            checkpoint_offset,
+                            checkpoint_every_n_tokens,
+                        )
+                    else:
+                        kv_acc_handle = kv_acc_consumer.wait_and_advance()
+                        kv_acc_handle.release()
 
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
@@ -1381,27 +1383,7 @@ class GatedDeltaNetChunkedKernel:
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
                 # First chunk: no previous state (S_prev = 0), skip GEMMs 3/4.
                 chunk_offset = batch_start
-                (
-                    shared_acc_producer,
-                    q_state_acc_producer,
-                    kv_acc_producer,
-                    load_k_consumer,
-                    load_q_consumer,
-                    load_v_consumer,
-                    a_inv_ready_consumer,
-                    qk_ready_consumer,
-                    state_inp_ready_consumer,
-                    shared_inp_ready_consumer,
-                ) = self.mma_warp(
-                    tmem_ptr,
-                    (
-                        tiled_mma_qk,
-                        tiled_mma_qs,
-                        tiled_mma_qkv,
-                        tiled_mma_qkv_ss,
-                        tiled_mma_kv,
-                    ),
-                    (sQ, sK, sK_trans, sV, sAinv, sQk),
+                if num_chunks_b > 0:
                     (
                         shared_acc_producer,
                         q_state_acc_producer,
@@ -1413,10 +1395,30 @@ class GatedDeltaNetChunkedKernel:
                         qk_ready_consumer,
                         state_inp_ready_consumer,
                         shared_inp_ready_consumer,
-                    ),
-                    (True,),
-                )
-
+                    ) = self.mma_warp(
+                        tmem_ptr,
+                        (
+                            tiled_mma_qk,
+                            tiled_mma_qs,
+                            tiled_mma_qkv,
+                            tiled_mma_qkv_ss,
+                            tiled_mma_kv,
+                        ),
+                        (sQ, sK, sK_trans, sV, sAinv, sQk),
+                        (
+                            shared_acc_producer,
+                            q_state_acc_producer,
+                            kv_acc_producer,
+                            load_k_consumer,
+                            load_q_consumer,
+                            load_v_consumer,
+                            a_inv_ready_consumer,
+                            qk_ready_consumer,
+                            state_inp_ready_consumer,
+                            shared_inp_ready_consumer,
+                        ),
+                        (True,),
+                    )
                 # Main loop: chunks 1..num_chunks_b-1 with previous state.
                 for chunk_idx in cutlass.range(1, num_chunks_b):  # noqa: B007
                     (
@@ -1514,14 +1516,15 @@ class GatedDeltaNetChunkedKernel:
                         stride=(mV.stride[0], mV.stride[1], mV.stride[2]),
                     ),
                 )
-                # Update K/Q/V descriptors
-                tensormap_manager.update_tensormap(
-                    (bounded_q, bounded_k, bounded_v),
-                    (tma_q.atom, tma_k.atom, tma_v.atom),
-                    (tensormap_q_ptr, tensormap_k_ptr, tensormap_v_ptr),
-                    self.tma_qkv_warp_id,
-                    (None, None, None),
-                )
+                if num_chunks_b > 0:
+                    # Update K/Q/V descriptors
+                    tensormap_manager.update_tensormap(
+                        (bounded_q, bounded_k, bounded_v),
+                        (tma_q.atom, tma_k.atom, tma_v.atom),
+                        (tensormap_q_ptr, tensormap_k_ptr, tensormap_v_ptr),
+                        self.tma_qkv_warp_id,
+                        (None, None, None),
+                    )
 
                 for chunk_idx in cutlass.range(num_chunks_b):
                     chunk_offset = batch_start + chunk_idx * self.b_t
@@ -1573,19 +1576,20 @@ class GatedDeltaNetChunkedKernel:
                         (load_gate_producer, load_beta_producer),
                         (chunk_offset, head_idx, False, batch_end),
                     )
-                # Last tile: is_last_tile=True, valid_tokens derived inside
-                load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
-                    tidx,
-                    (mGate, mBeta),
-                    (sCumsumlog, sCumprod, sBeta),
-                    (load_gate_producer, load_beta_producer),
-                    (
-                        batch_start + (num_chunks_b - 1) * self.b_t,
-                        head_idx,
-                        True,
-                        batch_end,
-                    ),
-                )
+                if num_chunks_b > 0:
+                    # Last tile: is_last_tile=True, valid_tokens derived inside
+                    load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
+                        tidx,
+                        (mGate, mBeta),
+                        (sCumsumlog, sCumprod, sBeta),
+                        (load_gate_producer, load_beta_producer),
+                        (
+                            batch_start + (num_chunks_b - 1) * self.b_t,
+                            head_idx,
+                            True,
+                            batch_end,
+                        ),
+                    )
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
             load_gate_producer.tail()
@@ -1623,15 +1627,16 @@ class GatedDeltaNetChunkedKernel:
                     ),
                 )
 
-                # Update O descriptor independently
-                tensormap_manager.update_tensormap(
-                    (bounded_o,),
-                    (tma_o.atom,),
-                    (tensormap_o_ptr,),
-                    self.epilogue_warp_id,
-                    (None,),
-                )
-                tensormap_manager.fence_tensormap_update(tensormap_o_ptr)
+                if num_chunks_b > 0:
+                    # Update O descriptor independently
+                    tensormap_manager.update_tensormap(
+                        (bounded_o,),
+                        (tma_o.atom,),
+                        (tensormap_o_ptr,),
+                        self.epilogue_warp_id,
+                        (None,),
+                    )
+                    tensormap_manager.fence_tensormap_update(tensormap_o_ptr)
 
                 for chunk_idx in cutlass.range(num_chunks_b):
                     chunk_offset = batch_start + chunk_idx * self.b_t
