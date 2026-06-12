@@ -154,6 +154,7 @@ def parse_gemm_args(line, parser):
             "b12x",
             "auto",
             "tinygemm",
+            "cutile",
         ],
         help="Kernel backends to test. Default: cudnn",
     )
@@ -311,7 +312,7 @@ def testGemmFp8NtGroupwise(args):
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
 
     def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
-        if backend in ["cutlass", "trtllm"]:
+        if backend in ["cutlass", "trtllm", "cutile"]:
             return flashinfer.gemm.gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
@@ -1680,7 +1681,15 @@ def testMmBf16(args):
         return res
 
     def run_backend(backend, a, b, bias, use_pdl, out_dtype):
-        if backend in ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]:
+        if backend in [
+            "cudnn",
+            "cutlass",
+            "tgv",
+            "cublaslt",
+            "tinygemm",
+            "cutile",
+            "auto",
+        ]:
             return flashinfer.mm_bf16(
                 a=a,
                 b=b,

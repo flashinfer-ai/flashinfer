@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -324,15 +325,6 @@ uint16_t getEnvNixlPort() {
 
 bool getEnvDisaggBenchmarkGenOnly() { return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"); }
 
-bool getEnvMoeA2AOneBlockPerToken() {
-  // Default true; return false only if env set to "0"
-  static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
-  if (!val.has_value()) {
-    return true;
-  }
-  return val.value() != 0;
-}
-
 static int sanitizeBlockSize(std::optional<int32_t> const& val) {
   // Default 256 when not set or invalid
   int block = val.value_or(256);
@@ -345,13 +337,23 @@ static int sanitizeBlockSize(std::optional<int32_t> const& val) {
   return block;
 }
 
+// Treat malformed values as unset so debug block-size knobs never become hard failures.
+static int getSanitizedBlockSizeFromEnv(char const* name) {
+  try {
+    return sanitizeBlockSize(getIntEnv(name));
+  } catch (std::exception const&) {
+    TLLM_LOG_WARNING("Invalid value for %s. Falling back to default block size.", name);
+    return sanitizeBlockSize(std::nullopt);
+  }
+}
+
 int getEnvMoeA2ADispatchBlockSize() {
-  static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE"));
+  static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE");
   return kBlock;
 }
 
 int getEnvMoeA2ACombineBlockSize() {
-  static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
+  static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE");
   return kBlock;
 }
 
