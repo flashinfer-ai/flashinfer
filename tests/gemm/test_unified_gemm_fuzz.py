@@ -64,7 +64,6 @@ from __future__ import annotations
 
 import os
 import random
-import warnings
 import zlib
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -339,7 +338,9 @@ _KNOWN_FAILURES = [
         lambda cfg: cfg.adapter.key == "mm_bf16"
         and cfg.out_dtype == torch.float16
         and _SM == 90
-        and _CUDNN_VER < 92301,
+        and _CUDNN_VER < 92301
+        and (cfg.m & (cfg.m - 1))
+        != 0,  # only NON-power-of-2 M triggers it (pow2 M is correct)
         "cuDNN runtime-fusion implicit-GEMM (fortNativeRuntimeFusionEngine) miscomputes mm_bf16 with "
         "fp16 OUTPUT for non-power-of-2 M on SM90/Hopper (garbage, ratio ~1); bf16 output and SM100 "
         "are unaffected. Root cause: the split-k partial-reduce kernel assumed row-major output, but "
@@ -696,20 +697,17 @@ def test_unified_gemm_fuzz(cfg: Cfg):
         raise  # a crash is a finding
 
     print(f"RATIO {cfg.adapter.quant_mode} {cfg.backend} ratio={_ratio(res, ref):.4g}")
-    known = _known_failure(cfg)
+    # Known findings are TOLERATED if they fail (xfail) but NOT flagged when they pass: the cuDNN
+    # finding only manifests when cuDNN actually engages split-k (an internal heuristic we can't
+    # predict from the config), so many predicate-matched configs legitimately pass. Fix-detection
+    # is the version gate in _KNOWN_FAILURES (the predicate goes False on cuDNN >= the fix).
     try:
         _assert_invariants(cfg, res, ref)
     except (AssertionError, pytest.fail.Exception):
+        known = _known_failure(cfg)
         if known:
-            pytest.xfail(
-                f"KNOWN FINDING: {known}"
-            )  # tolerated (still ran); flagged if it ever passes
+            pytest.xfail(f"KNOWN FINDING: {known}")
         raise
-    if known:
-        warnings.warn(
-            f"KNOWN-FAILURE config unexpectedly PASSED -- fixed? remove from _KNOWN_FAILURES: {known}",
-            stacklevel=2,
-        )
 
     # (3) determinism: re-run into a freshly-poisoned buffer; a deterministic backend must match
     #     bit-exactly.
