@@ -1392,6 +1392,9 @@ def get_trtllm_moe_sm100_module():
                     kwargs["gemm1_weights"],
                     kwargs["gemm2_weights"],
                     moe_inputs.gemm1_lora_delta,
+                    kwargs.get("gemm1_alpha"),
+                    kwargs.get("gemm1_beta"),
+                    kwargs.get("gemm1_clamp_limit"),
                     output,
                     kwargs["num_experts"],
                     self.top_k,
@@ -1606,9 +1609,20 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        gemm1_alpha: Optional[torch.Tensor] = None,
+        gemm1_beta: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         assert routing_logits is not None or topk_ids is not None, (
             "either routing_logits or topk_ids must be provided"
+        )
+        _validate_bf16_gemm1_activation_params(
+            activation_type,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
+            local_num_experts,
+            hidden_states.device,
         )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1682,6 +1696,9 @@ def get_trtllm_moe_sm100_module():
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm2_weights=gemm2_weights,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             num_experts=num_experts,
             n_group=n_group,
             topk_group=topk_group,
@@ -1706,6 +1723,9 @@ def get_trtllm_moe_sm100_module():
             gemm1_weights,
             gemm2_weights,
             gemm1_lora_delta,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
             output,
             num_experts,
             top_k,
@@ -1757,6 +1777,9 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        gemm1_alpha: Optional[torch.Tensor] = None,
+        gemm1_beta: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         _ = routing_replay_out
         seq_len = hidden_states.shape[0]
@@ -2644,6 +2667,36 @@ def get_trtllm_moe_sm100_module():
     )
 
 
+def _validate_bf16_gemm1_activation_params(
+    activation_type: int,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    local_num_experts: int,
+    device: torch.device,
+) -> None:
+    if gemm1_alpha is None and gemm1_beta is None and gemm1_clamp_limit is None:
+        return
+    if int(activation_type) != int(ActivationType.Swiglu):
+        raise ValueError(
+            "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
+            "for ActivationType.Swiglu."
+        )
+    for name, tensor in (
+        ("gemm1_alpha", gemm1_alpha),
+        ("gemm1_beta", gemm1_beta),
+        ("gemm1_clamp_limit", gemm1_clamp_limit),
+    ):
+        if tensor is not None:
+            check_shape_dtype_device(
+                tensor,
+                (local_num_experts,),
+                torch.float32,
+                device,
+                name,
+            )
+
+
 def _validate_routing_replay_out(
     routing_replay_out: Optional[torch.Tensor], top_k: int
 ) -> None:
@@ -2690,6 +2743,9 @@ def trtllm_bf16_moe(
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""BF16 MoE operation with autotuning support.
 
@@ -2783,6 +2839,17 @@ def trtllm_bf16_moe(
         kernel skips the write entirely.  The buffer may be larger than
         ``num_tokens`` for CUDA-graph pre-allocation; only rows
         ``[0, num_tokens)`` are written.
+    gemm1_alpha / gemm1_beta / gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 CUDA per-expert SwiGLU OA
+        parameters.  They are supported with ``ActivationType.Swiglu``.  Any
+        subset can be provided: ``gemm1_alpha=None`` uses ``alpha=1.0``,
+        ``gemm1_beta=None`` uses ``beta=0.0``, and
+        ``gemm1_clamp_limit=None`` applies no clamp.  Let GEMM1 output be split
+        as ``X1`` (linear/up half) and ``X2`` (gate half).  If a clamp limit is
+        provided, ``X1 = clamp(X1, -limit, limit)`` and
+        ``X2 = clamp(X2, max=limit)``.  The fused activation output is
+        ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw BF16-path values;
+        no host-side scalar dequant-scale conversion is applied.
 
     Returns
     -------
@@ -2792,6 +2859,14 @@ def trtllm_bf16_moe(
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_bf16_gemm1_activation_params(
+        activation_type,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        local_num_experts,
+        hidden_states.device,
+    )
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
         routing_bias,
@@ -2818,6 +2893,9 @@ def trtllm_bf16_moe(
         activation_type,
         norm_topk_prob,
         routing_replay_out,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
     )
 
     if do_finalize:
@@ -2852,6 +2930,9 @@ def trtllm_bf16_routed_moe(
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     routing_replay_out: Optional[torch.Tensor] = None,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     r"""Pre-routed BF16 MoE operation with autotuning support.
 
@@ -2940,6 +3021,17 @@ def trtllm_bf16_routed_moe(
         kernel skips the write entirely.  The buffer may be larger than
         ``num_tokens`` for CUDA-graph pre-allocation; only rows
         ``[0, num_tokens)`` are written.
+    gemm1_alpha / gemm1_beta / gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 CUDA per-expert SwiGLU OA
+        parameters.  They are supported with ``ActivationType.Swiglu``.  Any
+        subset can be provided: ``gemm1_alpha=None`` uses ``alpha=1.0``,
+        ``gemm1_beta=None`` uses ``beta=0.0``, and
+        ``gemm1_clamp_limit=None`` applies no clamp.  Let GEMM1 output be split
+        as ``X1`` (linear/up half) and ``X2`` (gate half).  If a clamp limit is
+        provided, ``X1 = clamp(X1, -limit, limit)`` and
+        ``X2 = clamp(X2, max=limit)``.  The fused activation output is
+        ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw BF16-path values;
+        no host-side scalar dequant-scale conversion is applied.
 
     Returns
     -------
@@ -2956,6 +3048,14 @@ def trtllm_bf16_routed_moe(
         =============  ==================  =========================================================================
     """
     _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_bf16_gemm1_activation_params(
+        activation_type,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        local_num_experts,
+        hidden_states.device,
+    )
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         None,
         None,
@@ -2982,6 +3082,9 @@ def trtllm_bf16_routed_moe(
         activation_type,
         True,  # norm_topk_prob: not used for pre-computed routing
         routing_replay_out,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
     )
 
     if do_finalize and gemm1_lora_delta is None:
