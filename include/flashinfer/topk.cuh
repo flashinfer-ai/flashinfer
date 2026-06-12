@@ -18,6 +18,8 @@
 
 #include <cuda.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cub/cub.cuh>
@@ -108,11 +110,13 @@ __device__ __forceinline__ int atom_add_release(int* ptr, int val) {
   // SM70 and newer use memory consistency qualifiers
   // Release pattern using acq_rel fence + relaxed modifier
   // (The fence also releases data that was weakly-written by other threads prior to the last
-  // syncthreads)
-  asm volatile("fence.acq_rel.gpu;\n");
+  // syncthreads). The "memory" clobber keeps the compiler from moving memory accesses across
+  // the fence/atomic pair.
+  asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
   asm volatile("atom.relaxed.gpu.global.add.s32 %0, [%1], %2;\n"
                : "=r"(old_val)
-               : "l"(ptr), "r"(val));
+               : "l"(ptr), "r"(val)
+               : "memory");
 #else
   __threadfence();
   old_val = atomicAdd(ptr, val);
@@ -207,11 +211,26 @@ inline cudaError_t RadixTopKClampGroupsToCoResidency(const void* kernel, uint32_
 inline cudaError_t LaunchRadixTopKMultiCTAKernel(const void* kernel, dim3 nblks, dim3 nthrs,
                                                  void** args, size_t smem_size,
                                                  cudaStream_t stream) {
+  // Device attributes are static; cache the cooperative-launch capability per device to
+  // avoid per-launch attribute queries on hot inference paths. cudaStreamIsCapturing stays
+  // per-call (capture state is dynamic).
+  static std::array<std::atomic<int>, 64> coop_launch_cache = {};  // -1 unknown, 0 no, 1 yes
   int device = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
   int supports_coop_launch = 0;
-  FLASHINFER_CUDA_CALL(
-      cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, device));
+  if (device >= 0 && device < static_cast<int>(coop_launch_cache.size())) {
+    int cached = coop_launch_cache[device].load(std::memory_order_relaxed);
+    if (cached == 0) {  // zero-initialized: not yet queried (stores are 1/2)
+      FLASHINFER_CUDA_CALL(
+          cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, device));
+      coop_launch_cache[device].store(supports_coop_launch ? 2 : 1, std::memory_order_relaxed);
+    } else {
+      supports_coop_launch = (cached == 2);
+    }
+  } else {
+    FLASHINFER_CUDA_CALL(
+        cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, device));
+  }
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
   FLASHINFER_CUDA_CALL(cudaStreamIsCapturing(stream, &capture_status));
   if (supports_coop_launch && capture_status == cudaStreamCaptureStatusNone) {
@@ -267,6 +286,10 @@ __device__ __forceinline__ void RadixGroupResetStateLastCTA(
     uint32_t ctas_per_group, uint32_t tx) {
   constexpr uint32_t RADIX = 256;
   __shared__ int s_is_last_cta;
+  // Converge the CTA before tx0's release-ordered exit mark so the fence's cumulativity
+  // covers every thread's prior writes (the syncthreads + thread-0 fence.acq_rel.gpu idiom
+  // documented on red_release/st_release above).
+  __syncthreads();
   if (tx == 0) {
     const int exit_target = (barrier_phase + 1) * static_cast<int>(ctas_per_group);
     s_is_last_cta = (atom_add_release(&state->arrival_counter, 1) + 1 == exit_target);
