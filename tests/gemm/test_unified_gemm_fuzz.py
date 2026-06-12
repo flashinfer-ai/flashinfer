@@ -427,22 +427,12 @@ _CONVENTION_DIVERGENCES = [
 
 # Tracked findings the fuzzer surfaced (xfail-but-RUN: the case still executes, a correctness
 # failure is tolerated to keep the suite green, and an unexpected PASS warns "fixed -> remove it").
+#
+# NOTE: the cuDNN-9.23.0 bf16-mm/bmm fp16-out SM90 garbage finding used to live here as an xfail.
+# It's gone because flashinfer now BANS cuDNN 9.23.0 for all GEMM/BMM (gemm_base.py
+# _cudnn_available_or_raise_for_backend) -> on 9.23.0 the cuDNN path is skipped (auto falls back),
+# and 9.23.1+ has the bug fixed, so the broken path is unreachable. No workaround needed.
 _KNOWN_FAILURES = [
-    (
-        lambda cfg: (
-            cfg.adapter.key in ("mm_bf16", "bmm_bf16")
-            and cfg.out_dtype == torch.float16
-            and _SM == 90
-            and _CUDNN_VER < 92301
-            and (cfg.m & (cfg.m - 1)) != 0
-        ),  # only NON-power-of-2 M triggers it (pow2 M is correct); bmm_bf16 shares the kernel
-        "cuDNN runtime-fusion implicit-GEMM (fortNativeRuntimeFusionEngine) miscomputes bf16 mm/bmm "
-        "with fp16 OUTPUT for non-power-of-2 M on SM90/Hopper (garbage, ratio ~1); bf16 output + SM100 "
-        "are unaffected. Root cause: the split-k partial-reduce kernel assumed row-major output, but "
-        "Hopper swaps A<->B so the output is column-major -> wrong reduce dims. Fixed by cuDNN commit "
-        "'fix hopper swap ab again' (a745f55cf). VERIFIED FIXED in cuDNN 9.23.1 (92301) and 9.30; "
-        "BROKEN in 9.23.0.x (92300). xfail gated to cuDNN<9.23.1; on >= it the test PASSES.",
-    ),
     (
         lambda cfg: cfg.adapter.key == "bmm_mxfp8" and cfg.b > 1 and (cfg.m % 128) != 0,
         "cuDNN bmm_mxfp8 (override-shape / dynamic-M path) returns GARBAGE/inf for batch indices > 0 "
