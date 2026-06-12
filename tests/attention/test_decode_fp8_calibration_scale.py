@@ -16,8 +16,33 @@ limitations under the License.
 
 import pytest
 import torch
+from tests.test_helpers.jit_utils import gen_decode_attention_modules
 
 import flashinfer
+from flashinfer.utils import has_flashinfer_jit_cache
+
+
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
+def warmup_jit():
+    flashinfer.jit.build_jit_specs(
+        gen_decode_attention_modules(
+            [torch.float16],  # q_dtypes
+            [
+                torch.float16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ],  # kv_dtypes
+            [128, 256],  # head_dims
+            [0, 1],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [False],  # use_logits_soft_caps
+        ),
+        verbose=False,
+    )
+    yield
 
 
 @pytest.mark.parametrize("kv_len", [7, 19, 39, 1170, 39275])

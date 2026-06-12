@@ -36,7 +36,7 @@ def warmup_jit():
             [torch.float16],  # q_dtypes
             [torch.float16],  # kv_dtypes
             [128, 256],  # head_dims
-            [0, 2],  # pos_encoding_modes
+            [2],  # pos_encoding_modes (ALIBI)
             [False],  # use_sliding_windows
             [False],  # use_logits_soft_caps
         )
@@ -44,7 +44,7 @@ def warmup_jit():
             [torch.float16],  # q_dtypes
             [torch.float16],  # kv_dtypes
             [128, 256],  # head_dims
-            [0, 2],  # pos_encoding_modes
+            [2],  # pos_encoding_modes (ALIBI)
             [False],  # use_sliding_windows
             [False],  # use_logits_soft_caps
             [False],  # use_fp16_qk_reductions
