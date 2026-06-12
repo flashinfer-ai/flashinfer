@@ -363,6 +363,34 @@ def _tgv_gemm_requirement(
 
 
 @supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _cutile_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
+    ] = "cudnn",
+):
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "The cuTile backend supports bfloat16 / float16 / float32 output only; "
+            f"got {out_dtype}."
+        )
+    if bias is not None:
+        raise ValueError(
+            "The cuTile backend ignores `bias`; pass bias=None or use the TGV / cuDNN backend."
+        )
+    if pdl:
+        raise ValueError(
+            "The cuTile backend ignores `pdl`; pass pdl=False or use the TGV / cuDNN backend."
+        )
+    return True
+
+
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
 def _tinygemm_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -480,6 +508,7 @@ def _heuristic_func_mm_bf16(
         "tgv": _tgv_gemm_requirement,
         "cublaslt": _cublaslt_mm_bf16_requirement,
         "tinygemm": _tinygemm_mm_bf16_requirement,
+        "cutile": _cutile_mm_bf16_requirement,
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
@@ -493,7 +522,7 @@ def mm_bf16(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal[
-        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
     ] = "cudnn",
 ) -> torch.Tensor:
     r"""MM BF16
@@ -520,13 +549,16 @@ def mm_bf16(
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
         ``"tgv"`` uses the TGV backend.
         ``"cublaslt"`` uses the cuBLASLt backend with heuristic algorithm search.
         ``"tinygemm"`` uses the TinyGEMM backend for small-M BF16 GEMM.
+        ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
+            persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
+            ``bias`` / ``pdl``. Requires SM >= 90.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -574,6 +606,16 @@ def mm_bf16(
             device=a.device,
             dtype=out_dtype,
         )
+
+    # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
+    # Handled before the SM100 dispatch table because it does not consume
+    # `workspace_buffer` and ignores `bias` / `pdl`.
+    if backend == "cutile":
+        from .kernels.cutile.mm_bf16_cutile import mm_bf16_cutile
+
+        # out_dtype validation already handled by ``_cutile_mm_bf16_requirement``
+        # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
+        return mm_bf16_cutile(a, b, out)
 
     workspace_buffer = _get_cache_buf(
         "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
@@ -632,6 +674,25 @@ def _cudnn_bmm_bf16_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _cutile_bmm_bf16_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
+):
+    # The cuTile ragged-BMM kernel's epilogue uses ``ct.astype(dot_acc, c.dtype)``,
+    # so the store dtype is whatever the caller passes in. We accept the three
+    # standard output dtypes used by upstream FlashInfer.
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "The cuTile backend supports bfloat16 / float16 / float32 output only "
+            f"for bmm_bf16; got {out_dtype}."
+        )
+    return True
+
+
 def _check_bmm_bf16_problem_size(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -686,6 +747,7 @@ def _heuristic_func_bmm_bf16(
     {
         "cutlass": _cutlass_bmm_bf16_requirement,
         "cudnn": _cudnn_bmm_bf16_requirement,
+        "cutile": _cutile_bmm_bf16_requirement,
     },
     common_check=_check_bmm_bf16_problem_size,
     heuristic_func=_heuristic_func_bmm_bf16,
@@ -696,7 +758,7 @@ def bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
 ) -> torch.Tensor:
     r"""BMM BF16
 
@@ -750,6 +812,16 @@ def bmm_bf16(
             device=A.device,
             dtype=out_dtype,
         )
+
+    # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
+    # Handled before the SM100 dispatch table because it does not consume
+    # `workspace_buffer`.
+    if backend == "cutile":
+        from .kernels.cutile.bmm_bf16_cutile import bmm_bf16_cutile
+
+        # out_dtype validation already handled by ``_cutile_bmm_bf16_requirement``
+        # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
+        return bmm_bf16_cutile(A, B, out)
 
     workspace_buffer = _get_cache_buf(
         "bmm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, A.device
@@ -6569,10 +6641,40 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     return True
 
 
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutile_gemm_fp8_nt_groupwise_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
+    mma_sm: int = 1,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
+):
+    # v1 supports only K-major scales + (1, 128, 128) granularity.
+    # MN-major and other granularities are documented follow-ups.
+    if scale_major_mode not in (None, "K"):
+        raise ValueError(
+            f"The cuTile backend currently supports scale_major_mode='K' only; "
+            f"got {scale_major_mode!r}."
+        )
+    m_g, n_g, k_g = scale_granularity_mnk
+    if m_g != 1 or (n_g, k_g) != (128, 128):
+        raise ValueError(
+            f"The cuTile backend currently supports scale_granularity_mnk=(1, 128, 128) only; "
+            f"got {scale_granularity_mnk}."
+        )
+    return True
+
+
 @backend_requirement(
     {
         "cutlass": _cutlass_gemm_fp8_nt_groupwise_requirement,
         "trtllm": _trtllm_gemm_fp8_nt_groupwise_requirement,
+        "cutile": _cutile_gemm_fp8_nt_groupwise_requirement,
     },
     common_check=_check_gemm_fp8_nt_groupwise_problem_size,
 )
@@ -6587,7 +6689,7 @@ def gemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["cutlass", "trtllm"] = "cutlass",
+    backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
 ) -> torch.Tensor:
     r"""Performs matrix multiplication with FP8 data types using groupwise scaling.
 
@@ -6638,8 +6740,16 @@ def gemm_fp8_nt_groupwise(
         If out is not specified, we will create an output tensor with this dtype.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "trtllm"]
+    backend: Literal["cutlass", "trtllm", "cutile"]
         The backend to use for the operation. Defaults to ``"cutlass"``.
+
+        ``"cutile"`` (sm_100 / sm_103 / sm_110 / sm_120 / sm_121) is a pure
+        ``cuda.tile`` Python kernel. v1 restrictions enforced by
+        ``_cutile_gemm_fp8_nt_groupwise_requirement``: ``scale_major_mode``
+        must be ``"K"`` (or ``None``), and ``scale_granularity_mnk`` must be
+        ``(1, 128, 128)``. ``out_dtype`` is restricted to bfloat16 / float16
+        (the function-level ``_validate_fp8_output_dtype`` rejects fp32 for
+        all FP8 backends).
 
     Returns
     -------
@@ -6715,6 +6825,20 @@ def gemm_fp8_nt_groupwise(
             out,
             False,
             -1,
+        )
+    elif backend == "cutile":
+        from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import (
+            gemm_fp8_nt_groupwise_cutile,
+        )
+
+        gemm_fp8_nt_groupwise_cutile(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode or "K",
         )
 
     return out
@@ -7000,6 +7124,7 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["trtllm", "cutile"] = "trtllm",
 ):
     if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(f"a must be a float8 tensor, but got {a.dtype}")
@@ -7073,6 +7198,7 @@ def group_gemm_fp8_nt_groupwise(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["trtllm", "cutile"] = "trtllm",
 ) -> torch.Tensor:
     r"""Perform group GEMM with FP8 data types using groupwise scaling. Currently only supported on NVIDIA
     Blackwell architecture.
@@ -7146,6 +7272,25 @@ def group_gemm_fp8_nt_groupwise(
     out_shape = (a.shape[0], n)
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
+
+    # cuTile backend: pure cuda.tile Python kernel. Iterates over groups and
+    # dispatches the existing ``gemm_fp8_nt_groupwise_cutile`` per group.
+    # Constraints are checked by ``_cutile_group_gemm_fp8_nt_groupwise_requirement``.
+    if backend == "cutile":
+        from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import (
+            group_gemm_fp8_nt_groupwise_cutile,
+        )
+
+        return group_gemm_fp8_nt_groupwise_cutile(
+            a=a,
+            b=b,
+            a_scale=a_scale,
+            b_scale=b_scale,
+            m_indptr=m_indptr,
+            out=out,
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode or "K",
+        )
 
     if is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter
