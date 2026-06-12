@@ -68,7 +68,6 @@ from .jit.fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
-from .jit.gdn import gen_gdn_prefill_sm90_module
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
@@ -691,8 +690,6 @@ def gen_all_modules(
                     )
                 )
             jit_specs.append(gen_trtllm_utils_module())
-        if has_sm90:
-            jit_specs.append(gen_gdn_prefill_sm90_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
         if has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121:
