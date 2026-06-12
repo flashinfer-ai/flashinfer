@@ -435,6 +435,7 @@ _CONVENTION_DIVERGENCES = [
 _KNOWN_FAILURES = [
     (
         lambda cfg: cfg.adapter.key == "bmm_mxfp8" and cfg.b > 1 and (cfg.m % 128) != 0,
+        "TRACKED: flashinfer-ai/flashinfer#3604. "
         "bmm_mxfp8 returns GARBAGE/inf for batch indices > 0 when b>1 AND M is not a multiple of 128 "
         "(batch 0 is always correct; b==1 is correct for any M; b>1 with M%128==0 is correct). This is "
         "BOTH-backend, not cuDNN-specific: verified on cuDNN/SM100 (9.23.0 AND 9.23.1) and CUTLASS/"
