@@ -110,6 +110,7 @@ else:
         _SKIP = f"scaled GEMM needs SM80+, got SM{_CC[0]}{_CC[1]}"
 pytestmark = pytest.mark.skipif(_SKIP is not None, reason=str(_SKIP))
 _SM = _CC[0] * 10 + _CC[1]
+_CUDNN_VER = torch.backends.cudnn.version() or 0  # e.g. 90300 == 9.23, 93000 == 9.30
 
 # A clean rejection ("not supported on this shape/arch/dtype") must SKIP, never fail; a crash
 # (CUDA error / illegal access / device assert) is always a finding and re-raises.
@@ -337,10 +338,13 @@ _KNOWN_FAILURES = [
     (
         lambda cfg: cfg.adapter.key == "mm_bf16"
         and cfg.out_dtype == torch.float16
-        and _SM == 90,
-        "cuDNN mm_bf16 with fp16 OUTPUT produces garbage on SM90/Hopper (ratio ~1); bf16 output is "
-        "correct and SM100 is correct -- a real arch-specific finding (the cross-arch oracle caught "
-        "it). Pending gh issue / fix.",
+        and _SM == 90
+        and _CUDNN_VER < 93000,
+        "cuDNN runtime-fusion implicit-GEMM (fortNativeRuntimeFusionEngine) miscomputes mm_bf16 with "
+        "fp16 OUTPUT for non-power-of-2 M on SM90/Hopper (garbage, ratio ~1); bf16 output and SM100 "
+        "are unaffected. A cuDNN 9.23-era regression -- VERIFIED FIXED in cuDNN 9.30 (ran the repro "
+        "against the local 9.30 build). xfail gated to cuDNN<9.30; on >=9.30 the test PASSES and this "
+        "entry can be removed once CI's cuDNN is >=the fix.",
     ),
 ]
 
