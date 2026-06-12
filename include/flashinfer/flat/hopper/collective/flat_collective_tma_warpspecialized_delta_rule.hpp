@@ -325,7 +325,7 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
       float sum = 0.0f;
       CUTE_UNROLL
       for (int iter = 1; iter < size(frag); ++iter) {
-        sum += __shfl_sync(0xFFFFFFFF, frag(iter - 1), 31);
+        sum = __shfl_sync(0xFFFFFFFF, frag(iter - 1), 31);
         frag(iter) += sum;
       }
 
