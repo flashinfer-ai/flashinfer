@@ -123,26 +123,6 @@ class TllmGenFmhaKernel {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
-      // The BF16Q+FP8KV K-only-transform kernels are an opt-in feature that is
-      // not wired up here yet; they share hash keys with the default
-      // full-transform kernels, so skip them at load. Delete this skip once
-      // hashID carries the transform-mode trait (PR #3544), which gives these
-      // metas distinct keys.
-      if (kernelMeta.mEnablesBf16QFp8KvKOnlyTransform) {
-        continue;
-      }
-      // Mixed-dtype SwapsMmaAb generation kernels ship in both
-      // groupsTokensHeadsQ variants since the BF16Q+FP8KV full-transform
-      // rework; the token-grouping variant needs selection heuristics that
-      // are not wired up here yet and shares hash keys with the non-grouping
-      // one, so skip it at load (matches the previous artifact's inventory).
-      // Delete this skip once hashID carries the groupsTokensHeadsQ trait
-      // (PR #3544).
-      if (kernelMeta.mGroupsTokensHeadsQ &&
-          kernelMeta.mKernelType == static_cast<int>(FmhaKernelType::SwapsMmaAbForGeneration) &&
-          kernelMeta.mDataTypeQ != kernelMeta.mDataTypeK) {
-        continue;
-      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV &&
           kernelMeta.mDataTypeO == mDtypeOut &&
@@ -850,6 +830,7 @@ class TllmGenFmhaKernel {
     // The copy of the selectKernelParams, which makes sure it won't modify the original
     // selectKernelParams when computing the number of CTAs.
     SelectKernelParams selectKernelParamsCopy = selectKernelParams;
+    selectKernelParamsCopy.mGroupsTokensHeadsQ = true;
     // Load the kernel.
     auto [func, kernelMeta] = loadKernel(params, selectKernelParamsCopy);
     // Compute numCtasX, numCtasY and numCtasZ.
@@ -951,6 +932,7 @@ class TllmGenFmhaKernel {
       selectKernelParams.mGroupsTokensHeadsQ = false;
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
       return;
     }
     selectKernelParams.mGroupsTokensHeadsQ = true;
@@ -961,18 +943,23 @@ class TllmGenFmhaKernel {
     if (numTokensHeadsQ <= 8) {
       tileSizeQ = 8;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 16) {
       tileSizeQ = 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 32) {
       tileSizeQ = 32;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 64) {
       tileSizeQ = 64;
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = params.mMaxSeqLenQ > 1;
     } else {
       tileSizeQ = 128;
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = params.mMaxSeqLenQ > 1;
     }
 
     // Normalize traits before the cost-model probe calls loadKernel().
@@ -982,6 +969,8 @@ class TllmGenFmhaKernel {
     // groups both tokensQ and headsQ into one CTA.
     if (params.mMaxSeqLenQ > 1) {
       selectTileSizeQForGqaGeneration(params, selectKernelParams);
+    } else {
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     }
   }
 
@@ -1067,6 +1056,10 @@ class TllmGenFmhaKernel {
       } else {
         selectGqGenerationKernel(params, selectKernelParams);
       }
+    }
+    if (!isCustomMask(selectKernelParams.mMaskType) &&
+        isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)) {
+      selectKernelParams.mGroupsTokensHeadsQ = true;
     }
 
     // For headDimV > 256, set headDimPerCtaV to 256 for context and keepsMmaAbForGeneration

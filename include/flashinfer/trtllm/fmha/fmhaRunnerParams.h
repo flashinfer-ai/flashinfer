@@ -428,6 +428,10 @@ struct TllmGenSelectKernelParams {
   bool mSelectNewKernel;
   // Do we enable skip softmax?
   bool mSkipsSoftmaxWhenPossible;
+  // Select kernels that transform K only for BF16Q+FP8KV paths.
+  bool mEnablesBf16QFp8KvKOnlyTransform;
+  // Select kernels that group both tokens and heads in the Q tile.
+  bool mGroupsTokensHeadsQ;
   // The tile scheduler.
   TileScheduler mTileScheduler;
   // The tile size for Q.
@@ -456,6 +460,8 @@ struct TllmGenSelectKernelParams {
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
+        mEnablesBf16QFp8KvKOnlyTransform(false),
+        mGroupsTokensHeadsQ(false),
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
