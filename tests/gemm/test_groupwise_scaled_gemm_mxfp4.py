@@ -220,6 +220,15 @@ def quantize_tensor(x, tile_size, n_padded, k_padded, quant_mode):
 
 
 def _quantize_tensor_impl(x, tile_size, n_padded, k_padded, quant_mode):
+    r"""Single-shot tile-wise MXFP4/MXFP8 quantization (see ``quantize_tensor``).
+
+    Pads ``x`` to ``n_padded`` (dim -2, optional) / ``k_padded`` (dim -1),
+    computes per-``tile_size``-group ue8m0 scales along the last dim, and
+    quantizes to the ``quant_mode`` target format.  Returns
+    ``(x_quant_data, x_scale_data)``.  Materializes ~10 fp32 temporaries the
+    size of ``x`` — call through the chunked ``quantize_tensor`` wrapper for
+    large inputs.
+    """
     # 1. Initial Setup
     ue8m0_bias = 127
     if quant_mode == QuantMode.MXFP8_E4M3:
