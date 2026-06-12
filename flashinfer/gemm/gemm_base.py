@@ -340,6 +340,8 @@ def _cudnn_mm_bf16_requirement(
     ] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
+    if not _cudnn_bf16_gemm_usable_or_skip(a, out_dtype, backend):
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -629,6 +631,8 @@ def _cudnn_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
+    if not _cudnn_bf16_gemm_usable_or_skip(A, out_dtype, backend):
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
@@ -2067,26 +2071,38 @@ def _check_cudnn_fp4_availability():
         ) from e
 
 
-_CUDNN_BANNED_GEMM_VERSION = 92300  # 9.23.0.x
-
-
 def _cudnn_available_or_raise_for_backend(backend):
     # When cudnn is not available:
     # Return False for auto backend or raise error for explicit cuDNN backend.
-    if not CUDNN_AVAILABLE:
-        if backend == "cudnn":
-            _check_cudnn_availability()
-        return False
-    # Ban cuDNN 9.23.0.x for ALL GEMM/BMM: this point release ships a confirmed correctness bug
-    # (bf16 GEMM with fp16 OUTPUT on SM90/Hopper for non-power-of-2 M returns garbage via the
-    # split-k Hopper-swap-A/B path) and is otherwise a known-bad build. Fixed in 9.23.1 (92301).
-    # Disable the whole cuDNN GEMM backend on exactly this version so users can't silently hit it:
-    # `auto` falls back to cutlass/cublas, explicit backend="cudnn" gets a clear, skippable error.
-    if cudnn.backend_version() == _CUDNN_BANNED_GEMM_VERSION:
+    if CUDNN_AVAILABLE:
+        return True
+    if backend == "cudnn":
+        _check_cudnn_availability()
+    return False
+
+
+def _cudnn_bf16_gemm_usable_or_skip(
+    a: torch.Tensor, out_dtype: torch.dtype, backend: str
+) -> bool:
+    """Precise ban for the cuDNN 9.23.0.x bf16-GEMM bug. cuDNN 9.23.0 (backend_version 92300)
+    miscomputes bf16 GEMM/BMM with **fp16 output on SM90/Hopper** for non-power-of-2 M: the split-k
+    partial-reduce kernel assumes row-major output, but Hopper swaps A<->B so the output is
+    column-major -> wrong reduce dims -> garbage (ratio ~1). bf16 OUTPUT, SM80/89/100, and the
+    non-bf16 dtype paths are all UNAFFECTED, and it's fixed in 9.23.1 (92301). So disable exactly
+    {SM90, fp16-out, 9.23.0.x}: auto falls back to cutlass/cublas, explicit cudnn raises a clear,
+    skippable error. (Envelope deliberately drops the non-pow2-M condition -- the actual trigger --
+    for robustness against the split-k tile heuristic; the over-restriction is only pow2-M
+    bf16->fp16 on SM90/9.23.0, which simply falls back.)"""
+    if (
+        CUDNN_AVAILABLE
+        and out_dtype == torch.float16
+        and cudnn.backend_version() == 92300
+        and get_compute_capability(a.device)[0] == 9
+    ):
         if backend == "cudnn":
             raise RuntimeError(
-                "cuDNN 9.23.0 is not supported for GEMM/BMM (known correctness bug on SM90 bf16->"
-                "fp16; whole-version banned out of caution). Upgrade to cuDNN >= 9.23.1."
+                "cuDNN 9.23.0 miscomputes bf16->fp16 GEMM/BMM on SM90/Hopper (non-power-of-2 M); "
+                "not supported. Use bf16 output, another backend, or upgrade to cuDNN >= 9.23.1."
             )
         return False
     return True

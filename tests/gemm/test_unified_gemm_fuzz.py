@@ -429,19 +429,22 @@ _CONVENTION_DIVERGENCES = [
 # failure is tolerated to keep the suite green, and an unexpected PASS warns "fixed -> remove it").
 #
 # NOTE: the cuDNN-9.23.0 bf16-mm/bmm fp16-out SM90 garbage finding used to live here as an xfail.
-# It's gone because flashinfer now BANS cuDNN 9.23.0 for all GEMM/BMM (gemm_base.py
-# _cudnn_available_or_raise_for_backend) -> on 9.23.0 the cuDNN path is skipped (auto falls back),
-# and 9.23.1+ has the bug fixed, so the broken path is unreachable. No workaround needed.
+# It's gone because flashinfer now precisely bans that envelope ({SM90, bf16->fp16, 9.23.0.x} in
+# gemm_base.py _cudnn_bf16_gemm_usable_or_skip) -> the cuDNN path is skipped there (auto falls
+# back), and 9.23.1+ has it fixed, so the broken path is unreachable. No workaround needed.
 _KNOWN_FAILURES = [
     (
         lambda cfg: cfg.adapter.key == "bmm_mxfp8" and cfg.b > 1 and (cfg.m % 128) != 0,
-        "cuDNN bmm_mxfp8 (override-shape / dynamic-M path) returns GARBAGE/inf for batch indices > 0 "
-        "when b>1 AND M is not a multiple of 128 (batch 0 is always correct; b==1 is correct for any "
-        "M; b>1 with M%128==0 is correct). Root cause: the override recomputes the per-batch "
-        "block-scale stride from an aligned/cache M while the buffer is laid out for the unpadded M, "
-        "so batch>0 indexes the wrong scale offset -- the known #3455 'b>1 SF-padding' follow-up. "
-        "Found by this fuzzer on cuDNN 9.23.0 (92300). Re-verify against newer cuDNN and drop the "
-        "entry once batch>0 is correct (it will then xpass -> a visible 'fixed' signal).",
+        "bmm_mxfp8 returns GARBAGE/inf for batch indices > 0 when b>1 AND M is not a multiple of 128 "
+        "(batch 0 is always correct; b==1 is correct for any M; b>1 with M%128==0 is correct). This is "
+        "BOTH-backend, not cuDNN-specific: verified on cuDNN/SM100 (9.23.0 AND 9.23.1) and CUTLASS/"
+        "SM120 (RTX 5080) -- identical fingerprint, 30 xfail / 0 xpass. Shared root cause: the default "
+        "mxfp8_quantize([b,m,k]) pads the FLATTENED b*m dim (round_up(b*m,128)), so the 128x4-swizzled "
+        "scale-factor tile interleaves batch boundaries and is not per-batch-separable; both the cuDNN "
+        "override-shape stride math and the CUTLASS kernel then index batch>0's scales wrong. The known "
+        "#3455 'b>1 SF-padding' follow-up; real fix = per-batch / rank_preserving 3D SF (#3457), which "
+        "is NOT in tree and is unfixed in 9.23.1. Keep this predicate arch/backend-agnostic; it xpasses "
+        "(a visible 'fixed' signal) once per-batch SF lands. See HANDOFF_SM120_MXFP8_BMM_VERIFY.md.",
     ),
 ]
 
