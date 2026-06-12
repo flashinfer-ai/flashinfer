@@ -12,7 +12,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("n", [80, 64])
 @pytest.mark.parametrize("k", [64, 256])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("backend", ["cutlass", "cudnn", "auto"])
+@pytest.mark.parametrize("backend", ["cutlass", "cudnn", "tgv", "auto"])
 def test_bmm_bf16(b, m, n, k, res_dtype, backend):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
@@ -29,6 +29,10 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
 
     if backend == "cudnn" and not CUDNN_AVAILABLE:
         pytest.skip("cuDNN is not available on this system.")
+
+    # The TGV (cute_ext) backend only supports bfloat16 output.
+    if backend == "tgv" and res_dtype != torch.bfloat16:
+        pytest.skip("bmm_bf16 with TGV backend only supports bfloat16 output.")
 
     # cuDNN on SM103 does not support bf16 input -> fp16 output
     if (
