@@ -725,19 +725,32 @@ def pytest_collection_modifyitems(config, items):
         return
 
     import concurrent.futures
+    import contextlib
     import os
+    import warnings
 
     from flashinfer.jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
 
-    # Skip variants whose .so already exists (warm JIT cache / AOT package).
-    specs = [
-        spec
-        for spec in (
-            gen_checkpointing_ssu_module(*variant)
-            for variant in _CHECKPOINTING_SSU_VARIANTS
+    # The prewarm is purely an optimization: any failure below degrades to
+    # the normal serial first-touch JIT compile at test time (where a real
+    # build error will surface attributed to the test that needs the module),
+    # and must never abort collection.
+    try:
+        # Skip variants whose .so already exists (warm JIT cache / AOT package).
+        specs = [
+            spec
+            for spec in (
+                gen_checkpointing_ssu_module(*variant)
+                for variant in _CHECKPOINTING_SSU_VARIANTS
+            )
+            if not spec.get_library_path().exists()
+        ]
+    except Exception as exc:  # noqa: BLE001 — best-effort prewarm
+        warnings.warn(
+            f"checkpointing_ssu prewarm skipped (spec generation failed): {exc}",
+            stacklevel=2,
         )
-        if not spec.get_library_path().exists()
-    ]
+        return
     if not specs:
         return
 
@@ -747,13 +760,31 @@ def pytest_collection_modifyitems(config, items):
     # .ninja_log, while each module's build.ninja sets builddir to the module
     # directory — so the per-test build_and_load() would find no log entries
     # for the batch-built outputs and recompile every module serially again.
-    # MAX_JOBS bounds each module's internal ninja parallelism; the pool
-    # provides cross-module parallelism (typical module has ~3 TUs).
+    #
+    # Concurrency: total concurrent compiler processes ~= pool workers x
+    # per-module ninja jobs (MAX_JOBS). Scale both from the core count so
+    # small CI runners are not oversubscribed, and treat a pre-set MAX_JOBS
+    # (the documented total ninja-job budget) as a cap.
     prev_max_jobs = os.environ.get("MAX_JOBS")
-    os.environ["MAX_JOBS"] = "3"
+    total_jobs = os.cpu_count() or 4
+    if prev_max_jobs:
+        with contextlib.suppress(ValueError):
+            total_jobs = min(total_jobs, max(1, int(prev_max_jobs)))
+    max_workers = max(1, total_jobs // 2)
+    os.environ["MAX_JOBS"] = str(max(1, total_jobs // max_workers))
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-            list(pool.map(lambda spec: spec.build(verbose=False), specs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(spec.build, verbose=False): spec for spec in specs}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:  # noqa: BLE001 — best-effort prewarm
+                    warnings.warn(
+                        f"checkpointing_ssu prewarm build failed for "
+                        f"{futures[fut].name}; affected tests fall back to "
+                        f"serial first-touch JIT: {exc}",
+                        stacklevel=2,
+                    )
     finally:
         if prev_max_jobs is None:
             os.environ.pop("MAX_JOBS", None)

@@ -2040,12 +2040,13 @@ def gated_delta_rule_mtp(
         same_pool,
     )
     if cache_key not in _compiled_kernels_mtp:
-        # First call for this shape: allocate default indices/output and do
-        # dlpack conversions once for compilation. Steady-state calls pass
-        # torch tensors straight to the compiled callable (tvm-ffi accepts
-        # either) and reuse these cached defaults when the caller doesn't
-        # provide their own. Batch-dependent dimensions are marked dynamic
-        # so the compiled kernel is reused across batch sizes.
+        # First call for this config: do dlpack conversions once for
+        # compilation (default_indices is only a compile-time template for
+        # the index tensors; this entry point requires
+        # initial_state_indices at runtime). Steady-state calls pass torch
+        # tensors straight to the compiled callable (tvm-ffi accepts
+        # either). Batch-dependent dimensions are marked dynamic so the
+        # compiled kernel is reused across batch sizes.
         default_indices = torch.arange(B, dtype=torch.int32, device=q.device)
         default_output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
@@ -2111,20 +2112,19 @@ def gated_delta_rule_mtp(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            # Defaults are batch-sized, so they live in a per-(B, device) map
-            # now that B is no longer part of the cache key.
-            "aux": {(B, q.device): (default_indices, default_output)},
+            # The default output is batch-sized, so it lives in a per-(B,
+            # device) map now that B is no longer part of the cache key.
+            # (No default indices needed at runtime: this entry point
+            # requires initial_state_indices.)
+            "aux": {(B, q.device): default_output},
         }
 
     cache = _compiled_kernels_mtp[cache_key]
     aux_map = cache["aux"]
     aux_key = (B, q.device)
     if aux_key not in aux_map:
-        aux_map[aux_key] = (
-            torch.arange(B, dtype=torch.int32, device=q.device),
-            torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype),
-        )
-    _default_indices_rt, default_output_rt = aux_map[aux_key]
+        aux_map[aux_key] = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
+    default_output_rt = aux_map[aux_key]
 
     if output_state_indices is None:
         output_state_indices = initial_state_indices
