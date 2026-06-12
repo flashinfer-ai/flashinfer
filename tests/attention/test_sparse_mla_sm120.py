@@ -465,6 +465,19 @@ def test_sparse_mla_sm120_decode_dsv4_public_api() -> None:
 
     torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
+    with pytest.raises(ValueError, match="only supports BF16 query"):
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=q.to(torch.float8_e4m3fn).unsqueeze(1),
+            swa_kv_cache=kv_packed,
+            workspace_buffer=torch.empty(1, dtype=torch.int8, device=device),
+            sparse_indices=indices,
+            swa_topk_lens=torch.full(
+                (num_tokens,), topk, device=device, dtype=torch.int32
+            ),
+            bmm1_scale=sm_scale,
+            kv_layout="NHD",
+        )
+
 
 def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
     """DSv4 dual-cache decode handles large compressed top-k."""

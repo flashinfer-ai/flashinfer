@@ -1023,10 +1023,9 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
         num_heads, head_dim = query.shape[-2:]
     else:
         raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
-    if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+    if query.dtype != torch.bfloat16:
         raise ValueError(
-            "SM120 DSv4 sparse MLA only supports BF16 or FP8 E4M3 query, "
-            f"got {query.dtype}"
+            f"SM120 DSv4 sparse MLA only supports BF16 query, got {query.dtype}"
         )
     if head_dim != 512:
         raise ValueError(f"Expected DSv4 query head dim 512, got {head_dim}")
@@ -1155,14 +1154,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     and ``swa_topk_lens`` describe the active SWA segment. To add a compressed
     segment, pass ``compressed_kv_cache`` as another packed uint8 pool and pass
     ``extra_sparse_indices`` with ``extra_sparse_topk_lens``. The SM120/SM121
-    path accepts BF16 or FP8 E4M3 query tensors and produces BF16 output.
+    path accepts BF16 query tensors and produces BF16 output.
 
     Parameters
     ----------
     query : torch.Tensor
         Dense query input ``[batch_size, q_len_per_request, num_heads, 512]``
         or varlen query input ``[sum_q, num_heads, 512]`` when
-        ``cum_seq_lens_q`` is provided. BF16 or FP8 E4M3.
+        ``cum_seq_lens_q`` is provided. SM100/SM103 accepts BF16 or FP8 E4M3;
+        SM120/SM121 accepts BF16.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
         uint8 head dim 584. Layout follows ``kv_layout``.
