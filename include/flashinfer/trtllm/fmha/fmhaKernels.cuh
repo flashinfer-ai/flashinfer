@@ -125,7 +125,9 @@ class TllmGenFmhaKernel {
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
       // The BF16Q+FP8KV K-only-transform kernels are an opt-in feature that is
       // not wired up here yet; they share hash keys with the default
-      // full-transform kernels, so skip them at load.
+      // full-transform kernels, so skip them at load. Delete this skip once
+      // hashID carries the transform-mode trait (PR #3544), which gives these
+      // metas distinct keys.
       if (kernelMeta.mEnablesBf16QFp8KvKOnlyTransform) {
         continue;
       }
@@ -134,6 +136,8 @@ class TllmGenFmhaKernel {
       // rework; the token-grouping variant needs selection heuristics that
       // are not wired up here yet and shares hash keys with the non-grouping
       // one, so skip it at load (matches the previous artifact's inventory).
+      // Delete this skip once hashID carries the groupsTokensHeadsQ trait
+      // (PR #3544).
       if (kernelMeta.mGroupsTokensHeadsQ &&
           kernelMeta.mKernelType == static_cast<int>(FmhaKernelType::SwapsMmaAbForGeneration) &&
           kernelMeta.mDataTypeQ != kernelMeta.mDataTypeK) {
@@ -1003,27 +1007,35 @@ class TllmGenFmhaKernel {
           "kernel-side sliding-window masking; fold the window into the packed custom mask "
           "instead.");
     } else {
-      FLASHINFER_CHECK(params.mAttentionWindowSize != INT_MAX &&
-                           params.mChunkedAttentionSize == INT_MAX,
-                       "SlidingWindowCustom spec-dec generation requires sliding-window attention "
-                       "and does not support chunked attention.");
+      FLASHINFER_CHECK(
+          params.mAttentionWindowSize != INT_MAX && params.mChunkedAttentionSize == INT_MAX,
+          "SlidingWindowCustom spec-dec generation requires sliding-window attention "
+          "and does not support chunked attention.");
     }
+    // groupsTokensHeadsQ is a pre-load kernel-key trait: the custom-mask Keeps
+    // cubins are token-grouped and the Swaps cubins are single-token, so set it
+    // with the kernel type here, before any loadKernel() probe hashes it.
     int const numTokensHeadsQ = params.mNumHeadsQPerKv * params.mMaxSeqLenQ;
     if (params.mForceSpecDecTreeKeeps) {
       selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 128;
+      selectKernelParams.mGroupsTokensHeadsQ = true;
     } else if (numTokensHeadsQ <= 8) {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 8;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 16) {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 16;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 64) {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 32;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else {
       selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 128;
+      selectKernelParams.mGroupsTokensHeadsQ = true;
     }
     selectKernelParams.mTileSizeKv = 128;
     selectKernelParams.mForceGmemReduction = true;
