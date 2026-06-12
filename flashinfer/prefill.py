@@ -4517,9 +4517,14 @@ def fmha_v2_prefill_deepseek(
 
 @functools.cache
 def get_trtllm_fmha_v2_module(
-    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
+    input_layout: str,
+    input_dtype: torch.dtype,
+    output_dtype: torch.dtype = None,
+    fp8_two_level_interval: int = 0,
 ):
-    return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
+    return gen_fmha_v2_module(
+        input_layout, input_dtype, output_dtype, fp8_two_level_interval
+    ).build_and_load()
 
 
 @flashinfer_api(trace=trtllm_fmha_v2_prefill_trace)
@@ -4550,6 +4555,7 @@ def trtllm_fmha_v2_prefill(
     chunked_attention_size: int = 0,
     save_softmax_stats: bool = False,
     skip_softmax_threshold_scale_factor: float = 0,
+    fp8_two_level_interval: int = 0,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""TRT-LLM FMHAv2 prefill attention.
 
@@ -4776,6 +4782,7 @@ def trtllm_fmha_v2_prefill(
         input_layout,
         query.dtype,
         o_dtype if query.dtype == torch.float8_e4m3fn else None,
+        fp8_two_level_interval,
     )
 
     # Allocate LSE tensor if saving softmax stats
