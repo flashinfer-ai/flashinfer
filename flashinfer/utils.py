@@ -268,7 +268,7 @@ _graph_capture_bufs: List[torch.Tensor] = []
 
 
 def _get_cache_buf_ring(
-    name: str, bytes: int, device: torch.device, num_slots: int = 8
+    name: str, nbytes: int, device: torch.device, num_slots: int = 8
 ) -> torch.Tensor:
     """Return a zero-initialized scratch buffer that is private to the calling
     CUDA stream (up to ``num_slots`` concurrently launching streams).
@@ -291,15 +291,15 @@ def _get_cache_buf_ring(
     by the next (stream-ordered) launch.
     """
     if torch.cuda.is_current_stream_capturing():
-        buf = torch.zeros(bytes, dtype=torch.uint8, device=device)
+        buf = torch.zeros(nbytes, dtype=torch.uint8, device=device)
         _graph_capture_bufs.append(buf)
         return buf
     key = (name, device)
     stream = torch.cuda.current_stream(device).cuda_stream
     with _ring_cache_lock:
         ring = _ring_cache_buf.get(key)
-        if ring is None or ring.slot_bytes < bytes:
-            ring = _RingBuf(bytes, num_slots, device)
+        if ring is None or ring.slot_bytes < nbytes or ring.num_slots < num_slots:
+            ring = _RingBuf(nbytes, num_slots, device)
             _ring_cache_buf[key] = ring
         return ring.get_slot(stream)
 
