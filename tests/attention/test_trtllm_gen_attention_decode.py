@@ -1239,6 +1239,11 @@ def test_trtllm_batch_decode_lse_contract(return_lse, provide_lse):
     )
 
 
+@pytest.mark.xfail(
+    reason="Dense paged GQA generation cubins (headDimQk=128) missing from flashinfer-cubin; "
+    "remove once TRT-LLM ships the matching instantiations",
+    strict=False,
+)
 def test_trtllm_batch_decode_non_causal_gqa() -> None:
     _test_trtllm_batch_decode(
         "trtllm-gen",
@@ -1260,6 +1265,11 @@ def test_trtllm_batch_decode_non_causal_gqa() -> None:
     )
 
 
+@pytest.mark.xfail(
+    reason="Dense paged GQA generation cubins (headDimQk=128) missing from flashinfer-cubin; "
+    "remove once TRT-LLM ships the matching instantiations",
+    strict=False,
+)
 def test_trtllm_batch_decode_non_causal_q_len1_compatibility() -> None:
     _test_trtllm_batch_decode(
         "trtllm-gen",
@@ -1281,6 +1291,11 @@ def test_trtllm_batch_decode_non_causal_q_len1_compatibility() -> None:
     )
 
 
+@pytest.mark.xfail(
+    reason="Dense paged GQA generation cubins (headDimQk=128) missing from flashinfer-cubin; "
+    "remove once TRT-LLM ships the matching instantiations",
+    strict=False,
+)
 def test_trtllm_batch_decode_non_causal_fp8_kv() -> None:
     _test_trtllm_batch_decode(
         "trtllm-gen",
@@ -1303,6 +1318,11 @@ def test_trtllm_batch_decode_non_causal_fp8_kv() -> None:
     )
 
 
+@pytest.mark.xfail(
+    reason="Dense paged GQA generation cubins (headDimQk=128) missing from flashinfer-cubin; "
+    "remove once TRT-LLM ships the matching instantiations",
+    strict=False,
+)
 def test_trtllm_batch_decode_non_causal_nvfp4_kv() -> None:
     _test_trtllm_batch_decode(
         "trtllm-gen",

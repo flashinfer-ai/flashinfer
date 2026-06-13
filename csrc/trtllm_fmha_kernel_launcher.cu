@@ -209,9 +209,8 @@ void trtllm_paged_attention_launcher(
   } else {
     // Generation.
     // Dense and causal are equivalent only when each CTA sees one query token.
-    runner_params.mMaskType =
-        (is_mla_decode || !is_causal) ? TrtllmGenAttentionMaskType::Dense
-                                      : TrtllmGenAttentionMaskType::Causal;
+    runner_params.mMaskType = (is_mla_decode || !is_causal) ? TrtllmGenAttentionMaskType::Dense
+                                                            : TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Generation;
     bool use_multi_block = true;
     runner_params.mTileScheduler =
@@ -421,10 +420,9 @@ void trtllm_paged_attention_decode(
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
-  TVM_FFI_CHECK(
-      is_causal || window_left == -1,
-      "Sliding-window non-causal attention is not supported for trtllm-gen decode. "
-      "Use window_left=-1 for dense bidirectional attention.");
+  TVM_FFI_CHECK(is_causal || window_left == -1,
+                "Sliding-window non-causal attention is not supported for trtllm-gen decode. "
+                "Use window_left=-1 for dense bidirectional attention.");
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),

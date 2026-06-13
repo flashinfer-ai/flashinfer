@@ -51,6 +51,11 @@ from tests.trace.reference_utils import (
                 is_causal=False,
             ),
             id="B2-Q4-Hq8-Hk2-D128-PS16-MP2-dense",
+            marks=pytest.mark.xfail(
+                reason="Dense paged GQA generation cubins (headDimQk=128) missing from "
+                "flashinfer-cubin; remove once TRT-LLM ships the matching instantiations",
+                strict=False,
+            ),
         ),
     ],
 )
