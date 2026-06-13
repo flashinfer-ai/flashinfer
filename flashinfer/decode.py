@@ -2628,6 +2628,8 @@ def trtllm_batch_decode_with_kv_cache(
         Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
         Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
         in HND layout, with dtype ``torch.float8_e4m3fn``.
+        NVFP4 KV cache does not support page sizes 16 or 32 in the XQA backend;
+        use page size 64 or 128 instead.
 
         **Contiguity requirements (trtllm-gen backend):**
 
@@ -2711,6 +2713,17 @@ def trtllm_batch_decode_with_kv_cache(
         )
 
     if backend == "xqa":
+        if is_nvfp4_kvcache:
+            nvfp4_page_size = (
+                k_cache.shape[-2] if kv_layout == "HND" else k_cache.shape[-3]
+            )
+            if nvfp4_page_size in (16, 32):
+                raise ValueError(
+                    "NVFP4 KV cache page_size 16 and 32 are not supported by "
+                    "FlashInfer XQA. Use page_size 64 or 128 instead. "
+                    f"Got page_size={nvfp4_page_size}."
+                )
+
         # xqa backend doesn't support nvfp4 output
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
             raise ValueError("xqa backend does not support nvfp4 output")
