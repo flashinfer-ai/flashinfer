@@ -724,6 +724,35 @@ def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def get_trtllm_gen_multi_ctas_kv_counter_bytes(
+    batch_size: int, num_qo_heads: int, sm_count: int
+) -> int:
+    """Return bytes needed by trtllm-gen multi-CTA KV counter semaphores."""
+    num_semaphores = round_up(max(batch_size * num_qo_heads, sm_count), 8)
+    return num_semaphores * 4
+
+
+def _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+    batch_size: int,
+    num_qo_heads: int,
+    sm_count: int,
+    device: torch.device,
+    owner: Optional[object] = None,
+) -> torch.Tensor:
+    counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if owner is None:
+        return torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
+    owner_key = owner if isinstance(owner, str) else str(id(owner))
+    return _get_cache_buf(
+        f"trtllm_gen_multi_ctas_kv_counter_{owner_key}",
+        counter_bytes,
+        device,
+        zero_init=True,
+    )
+
+
 class FP4Tensor:
     """Wrapper class for FP4 tensors.
 

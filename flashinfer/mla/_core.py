@@ -40,6 +40,7 @@ from ..utils import (
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
+    _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     is_sm12x_supported,
     log2e,
 )
@@ -497,7 +498,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         layout is ``[num_pages, page_size, 1, 512]``. A 3D HND shorthand
         ``[num_pages, page_size, 512]`` is also accepted.
     workspace_buffer : torch.Tensor
-        TRTLLM-GEN workspace buffer. Must be zero-initialized for first use.
+        TRTLLM-GEN workspace buffer. The multi-CTA KV counters are managed in a
+        separate internal buffer.
     sparse_indices : torch.Tensor
         Flattened concatenated sparse MLA physical token indices in query-token
         order with shape ``[sum_q, sparse_topk_capacity]``. The first 128
@@ -601,12 +603,17 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
 
     sm_count = get_device_sm_count(query.device)
+    multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+        batch_size, query_flat.size(1), sm_count, query.device
+    )
+    multi_ctas_kv_counter_buffer.zero_()
     run_func(
         out,
         query_flat,
         primary_kv_cache,
         swa_kv_cache,
         workspace_buffer,
+        multi_ctas_kv_counter_buffer,
         sparse_indices,
         seq_lens.contiguous(),
         sparse_topk_lens,
@@ -1095,33 +1102,9 @@ class BatchMLAPagedAttentionWrapper:
 # Autotuning support for trtllm_batch_decode_with_kv_cache_mla
 # ---------------------------------------------------------------------------
 
-# Trtllm-gen kernel has a hardcoded max_batch_size = 8192 cap in
-# csrc/trtllm_fmha_kernel_launcher.cu:200 (the counter-region semaphore array
-# is sized for this max). Profiling beyond this would alias semaphores and
-# produce non-representative measurements.
+# Keep the trtllm-gen autotune sweep bounded; actual counter storage is sized
+# dynamically per profiled batch.
 _TRTLLM_GEN_MLA_MAX_BATCH = 8192
-
-# Size of the trtllm-gen workspace counter region (multi-block semaphores)
-# per csrc/trtllm_fmha_kernel_launcher.cu:200: max_batch_size * max_num_qo_heads
-# * sizeof(uint32_t) = 8192 * 256 * 4 = 8 MB. trtllm-gen places this counter
-# slab at the head of the workspace_buffer and self-resets it at the end of
-# every launch, so back-to-back trtllm-gen launches keep it valid without any
-# host-side zeroing.
-_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES = 8192 * 256 * 4
-
-
-def _cute_dsl_workspace_view(workspace_buffer: torch.Tensor) -> torch.Tensor:
-    """Sub-view of the shared workspace that skips trtllm-gen's counter region.
-
-    cute-dsl carves its scratch from offset 0 of whatever buffer it is given;
-    offsetting past the 8 MB counter region keeps it from writing into the
-    bytes trtllm-gen needs zero on entry. Costs 8 MB of usable workspace
-    (callers should size the buffer accordingly; the recommended 128 MB has
-    ample headroom).
-    """
-    workspace_i8 = workspace_buffer.reshape(-1).view(torch.int8)
-    return workspace_i8[_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES:]
-
 
 def _round_to_seq_len_bucket(x: int) -> int:
     """Power-of-2 bucket for max_seq_len in autotune cache keys.
@@ -1193,14 +1176,8 @@ def _compute_mla_decode_buckets(
     if "cute-dsl" in runner_names:
         from ..cute_dsl.utils import get_num_sm
 
-        # cute-dsl gives up the counter region only when trtllm-gen shares the
-        # buffer, so its usable size excludes that reservation only then.
-        reserved = (
-            _TRTLLM_GEN_MLA_COUNTER_REGION_BYTES if "trtllm-gen" in runner_names else 0
-        )
         cute_dsl_cap = _cute_dsl_max_supported_batch(
-            workspace_bytes=workspace_buffer.numel() * workspace_buffer.element_size()
-            - reserved,
+            workspace_bytes=workspace_buffer.numel() * workspace_buffer.element_size(),
             q_len=q_len,
             num_heads=num_heads,
             kv_lora_rank=kv_lora_rank,
@@ -1488,6 +1465,14 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
+        multi_ctas_kv_counter_buffer = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size,
+            num_qo_heads,
+            self.sm_count,
+            query.device,
+            owner=f"mla_runner_{id(self)}",
+        )
+        multi_ctas_kv_counter_buffer.zero_()
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
@@ -1495,6 +1480,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             self.kv_cache,
             self.kv_cache,  # kv passed twice (K/V views over the same buffer)
             self.workspace_buffer,
+            multi_ctas_kv_counter_buffer,
             block_tables,
             seq_lens,
             max_q_len,
@@ -1554,20 +1540,12 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         return_lse: bool,
         sinks: Optional[torch.Tensor],
         cute_dsl_impl: str,
-        reserve_counter_region: bool = False,
     ):
         from ..cute_dsl.attention import cute_dsl_mla_decode
 
         self._run = cute_dsl_mla_decode
         self.kv_cache = kv_cache
-        # Only skip trtllm-gen's counter region when trtllm-gen shares this
-        # buffer (the "auto" path); a standalone cute-dsl runner owns the whole
-        # buffer and can use it from offset 0.
-        self.workspace_buffer = (
-            _cute_dsl_workspace_view(workspace_buffer)
-            if reserve_counter_region
-            else workspace_buffer
-        )
+        self.workspace_buffer = workspace_buffer
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -1701,7 +1679,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     ----------
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe] or [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache. Both 3D and 4D formats are supported for backward compatibility.
-    workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
+    workspace_buffer: workspace for trtllm-gen softmax stats/scratch or cute-dsl scratch.
     qk_nope_head_dim: qk_nope_head_dim, must be 128 or 64
     kv_lora_rank: kv_lora_rank, must be 512 or 256
     qk_rope_head_dim: qk_rope_head_dim, must be 64
@@ -2039,9 +2017,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 return_lse=return_lse,
                 sinks=cute_dsl_sinks,
                 cute_dsl_impl=cute_dsl_impl,
-                # Reserve trtllm-gen's counter region only when it co-runs on
-                # the shared workspace (the "auto" path).
-                reserve_counter_region="trtllm-gen" in runner_names,
             )
         )
 
@@ -2110,7 +2085,7 @@ def xqa_batch_decode_with_kv_cache_mla(
         dimension is the concatenation ``[ckv_cache, kpe_cache]``.  Both shapes are
         accepted for backward compatibility.
     workspace_buffer : torch.Tensor
-        Pre-allocated workspace buffer.  Must be zero-initialized on first use.
+        Pre-allocated backend scratch workspace buffer.
     qk_nope_head_dim : int
         Non-RoPE head dimension.  Must be ``128``.  Will be removed in 1.0; pass
         ``kv_lora_rank`` instead going forward.
