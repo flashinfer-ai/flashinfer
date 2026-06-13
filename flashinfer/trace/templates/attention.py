@@ -1422,8 +1422,9 @@ def _trtllm_paged_attention_reference(
 def _trtllm_batch_decode_reference(
     query, kv_cache, workspace_buffer, block_tables, seq_lens, max_seq_len, **kwargs
 ):
+    is_causal = kwargs.pop("is_causal", True)
     return _trtllm_paged_attention_reference(
-        query, kv_cache, block_tables, seq_lens, causal=False, **kwargs
+        query, kv_cache, block_tables, seq_lens, causal=is_causal, **kwargs
     )
 
 
@@ -1466,6 +1467,7 @@ def _trtllm_batch_decode_init(
     kv_cache_dim: int = 2,
     batch_size: int = 1,
     max_pages_per_seq: int = 0,
+    is_causal: bool = True,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1509,6 +1511,7 @@ def _trtllm_batch_decode_init(
         "bmm2_scale": 1.0,
         "kv_layout": "HND",
         "q_len_per_req": int(q_len_per_req),
+        "is_causal": is_causal,
     }
 
 
@@ -1615,6 +1618,11 @@ trtllm_batch_decode_trace = TraceTemplate(
         ),
         "bmm2_scale": Scalar(
             "float32", optional=True, description="Scale applied after softmax @ V."
+        ),
+        "is_causal": Scalar(
+            "bool",
+            optional=True,
+            description="Whether decode uses causal rather than dense attention.",
         ),
     },
     outputs={

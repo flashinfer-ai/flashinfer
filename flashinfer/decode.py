@@ -856,6 +856,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     device=float_workspace_buffer.device,
                 )
         self._backend = backend
+        self._is_causal = True
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -923,6 +924,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        is_causal: bool = True,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -993,6 +995,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
+        is_causal : bool
+            Whether to apply causal masking for speculative decode. Defaults to ``True``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1130,7 +1134,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_splits=kv_splits,
                 reduction="none" if disable_split_kv else "auto",
                 q_len_per_req=q_len_per_req,
-                is_causal=True,
+                is_causal=is_causal,
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
             )
@@ -1277,6 +1281,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         self._q_len_per_req = q_len_per_req
+        self._is_causal = is_causal
 
     begin_forward = plan
 
@@ -1673,6 +1678,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         value_block_scales,
                         skip_softmax_threshold_scale_factor,
                         True,  # uses_shared_paged_kv_idx
+                        self._is_causal,
                     ]
                 else:
                     run_args += [
@@ -2269,6 +2275,7 @@ class TrtllmGenDecodeModule:
         workspace_size: int,
         window_left: int = -1,
         enable_pdl: bool = None,
+        is_causal: bool = True,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         key_block_scales: Optional[torch.Tensor] = None,
@@ -2324,6 +2331,7 @@ class TrtllmGenDecodeModule:
             0,  # sparse_mla_top_k
             self._sm_count,
             enable_pdl,
+            is_causal,
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q
@@ -2399,6 +2407,7 @@ def get_trtllm_gen_decode_module(*args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        is_causal: bool = True,
     ) -> None:
         assert paged_kv_cache is not None
         assert num_qo_heads is not None
@@ -2422,6 +2431,7 @@ def get_trtllm_gen_decode_module(*args):
             workspace_size,
             window_left,
             enable_pdl,
+            is_causal,
             out=o,
             sinks=sinks,
             key_block_scales=key_block_scales,
@@ -2472,6 +2482,7 @@ def get_trtllm_gen_decode_module(*args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        is_causal: bool = True,
     ) -> None:
         pass
 
@@ -2509,6 +2520,7 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    is_causal: bool = True,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     uses_shared_paged_kv_idx: bool = True,
@@ -2616,6 +2628,11 @@ def trtllm_batch_decode_with_kv_cache(
         Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
+
+    is_causal : bool = True
+        Whether to apply causal masking in the TRTLLM-gen decode path. If ``False``,
+        use dense bidirectional attention. Only supported with ``window_left=-1``.
+        This has no numerical effect for ``q_len_per_req=1``.
 
     skip_softmax_threshold_scale_factor: Optional[float] = None
         threshold scale factor for skipping softmax operations.
@@ -2726,6 +2743,10 @@ def trtllm_batch_decode_with_kv_cache(
             raise NotImplementedError(
                 "xqa backend does not support return_lse/lse output"
             )
+        if not is_causal:
+            raise NotImplementedError(
+                "is_causal=False is only supported by the trtllm-gen backend"
+            )
 
         # Handle out and out_dtype
         if out_dtype is None:
@@ -2754,6 +2775,11 @@ def trtllm_batch_decode_with_kv_cache(
             mask=mask,
         )
     elif backend == "trtllm-gen":
+        if not is_causal and window_left != -1:
+            raise ValueError(
+                "Sliding-window non-causal attention is not supported for "
+                "trtllm-gen decode. Use window_left=-1 for dense bidirectional attention."
+            )
         # Convert NHD layout to HND if necessary
         if kv_layout == "NHD":
             k_cache = k_cache.transpose(-3, -2)
@@ -2896,6 +2922,7 @@ def trtllm_batch_decode_with_kv_cache(
             0,  # sparse_mla_top_k
             sm_count,
             enable_pdl,
+            is_causal,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,

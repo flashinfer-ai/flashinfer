@@ -208,11 +208,10 @@ void trtllm_paged_attention_launcher(
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
   } else {
     // Generation.
-    // Note that kernel names are still labeled as using a dense mask even when maskType is
-    // specified as causal, this is expected for better performance as each CTA will only process
-    // one tokenQ in those cases, so dense mask works the same as causal mask.
+    // Dense and causal are equivalent only when each CTA sees one query token.
     runner_params.mMaskType =
-        is_mla_decode ? TrtllmGenAttentionMaskType::Dense : TrtllmGenAttentionMaskType::Causal;
+        (is_mla_decode || !is_causal) ? TrtllmGenAttentionMaskType::Dense
+                                      : TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Generation;
     bool use_multi_block = true;
     runner_params.mTileScheduler =
@@ -304,7 +303,7 @@ void trtllm_paged_attention_decode(
     Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
     int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl,
-    int64_t workspace_size, Optional<TensorView> attention_sinks,
+    bool is_causal, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
@@ -422,6 +421,11 @@ void trtllm_paged_attention_decode(
       skip_softmax_threshold_scale_factor.value_or(0.0f);
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
+  TVM_FFI_CHECK(
+      is_causal || window_left == -1,
+      "Sliding-window non-causal attention is not supported for trtllm-gen decode. "
+      "Use window_left=-1 for dense bidirectional attention.");
+
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()), k_block_scales_ptr,
@@ -436,7 +440,7 @@ void trtllm_paged_attention_decode(
       /*sparse_mla_top_k_lens=*/nullptr, /*has_sliding_window_kv_pool=*/false,
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       sm_count, enable_pdl, workspace_size, k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads,
-      v_sf_stride_batch, /*is_causal=*/true, lse_stride_tokens, lse_stride_heads, stream);
+      v_sf_stride_batch, is_causal, lse_stride_tokens, lse_stride_heads, stream);
 }
 
 void trtllm_paged_attention_context(
