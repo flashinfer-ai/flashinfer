@@ -225,8 +225,6 @@ def create_shared_buffer(
     rank = dist.get_rank(group=group)
     handles = [None] * world_size
     dist.all_gather_object(handles, handle, group=group)
-    handles = [None] * world_size
-    dist.all_gather_object(handles, handle, group=group)
 
     pointers: List[int] = []
     for i, h in enumerate(handles):
