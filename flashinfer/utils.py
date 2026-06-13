@@ -432,6 +432,27 @@ def is_fa3_backend_supported(
     return True
 
 
+def is_legacy_decode_supported(dtype_kv: torch.dtype) -> bool:
+    """
+    Check if the legacy (non-tensor-cores) batch decode kernel supports the given KV dtype.
+
+    NVFP4 KV (uint8 packed) requires the tensor-cores path or the trtllm-gen backend.
+
+    Parameters
+    ----------
+    dtype_kv : torch.dtype
+        The data type of the key/value tensor.
+
+    Returns
+    -------
+    bool
+        True if the legacy decode kernel supports the given KV dtype, False otherwise.
+    """
+    if dtype_kv == torch.uint8:
+        return False
+    return True
+
+
 def is_cutlass_backend_supported(
     pos_encoding_mode: int,
     use_fp16_qk_reductions: bool,
