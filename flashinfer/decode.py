@@ -1103,6 +1103,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"cute-dsl decode backend does not support "
                     f"pos_encoding_mode={pos_encoding_mode!r}"
                 )
+            if not is_causal:
+                raise NotImplementedError(
+                    "cute-dsl decode backend does not support is_causal=False"
+                )
             self._max_kv_len = int(max(kv_lens_arr_host).item())
             kv_splits = None
             if fixed_split_size > 0:
