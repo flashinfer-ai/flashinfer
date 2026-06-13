@@ -1792,7 +1792,9 @@ def get_trtllm_moe_sm100_module():
         mutates_args=("routing_replay_out",),
     )
     def trtllm_fp8_per_tensor_scale_moe_op(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
@@ -1829,11 +1831,18 @@ def get_trtllm_moe_sm100_module():
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
-        topk_ids = torch.empty(
+        # Autotuner-only placeholders so MoEInputs.to_list() has stable shapes; the
+        # real routing tensors come from routing_logits or (topk_ids, expert_weights).
+        tuning_topk_ids = torch.empty(
             num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
         )
-        topk_weights = torch.empty(
-            num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
+        tuning_expert_weights_dtype = (
+            routing_logits.dtype
+            if routing_logits is not None
+            else (expert_weights.dtype if expert_weights is not None else torch.bfloat16)
+        )
+        tuning_expert_weights = torch.empty(
+            num_tokens, top_k, dtype=tuning_expert_weights_dtype, device=hidden_states.device
         )
 
         dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
@@ -1856,8 +1865,8 @@ def get_trtllm_moe_sm100_module():
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
-            topk_ids=topk_ids,
-            expert_weights=topk_weights,
+            topk_ids=tuning_topk_ids,
+            expert_weights=tuning_expert_weights,
             hidden_states=hidden_states,
             hidden_states_scale=None,
             gemm1_lora_delta=None,
@@ -1896,6 +1905,8 @@ def get_trtllm_moe_sm100_module():
         # Call the C++ function
         intermediate_output = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
+            topk_ids,
+            expert_weights,
             routing_bias,
             hidden_states,
             gemm1_weights,
@@ -1932,7 +1943,9 @@ def get_trtllm_moe_sm100_module():
 
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
     def _fake_trtllm_fp8_per_tensor_scale_moe(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         gemm1_weights: torch.Tensor,
@@ -3211,6 +3224,8 @@ def trtllm_fp8_per_tensor_scale_moe(
     _validate_routing_replay_out(routing_replay_out, top_k)
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
+        None,  # topk_ids — will be computed from routing_logits
+        None,  # expert_weights — will be computed from routing_logits
         routing_bias,
         hidden_states,
         gemm1_weights,
@@ -3234,6 +3249,118 @@ def trtllm_fp8_per_tensor_scale_moe(
         activation_type,
         norm_topk_prob,
         routing_replay_out,
+    )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
+
+
+def trtllm_fp8_per_tensor_scale_routed_moe(
+    topk_ids: torch.Tensor,
+    expert_weights: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    output1_scales_scalar: torch.Tensor,
+    output1_scales_gate_scalar: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    output2_scales_scalar: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    use_routing_scales_on_input: bool = False,
+    routing_method_type: int = 0,
+    do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: int = ActivationType.Swiglu.value,
+) -> Union[List[torch.Tensor], torch.Tensor]:
+    """FP8 per-tensor scale MoE with pre-computed routing.
+
+    Pre-routed sibling of :func:`trtllm_fp8_per_tensor_scale_moe`. Use when top-k expert IDs
+    and routing weights have already been computed (e.g. from a float32 Python softmax + top-k,
+    or by an upstream routing kernel). Routing is skipped entirely inside the fused kernel.
+
+    This is the path to use when the in-kernel softmax routing of the monolithic variant
+    misbehaves — most notably when ``max(router_logits) < 0``, where the kernel's internal
+    routing selects different experts than a reference float32 softmax + top-k.
+
+    Args:
+        topk_ids: ``[seq_len, top_k]`` int32 tensor of selected expert IDs.
+        expert_weights: ``[seq_len, top_k]`` bfloat16 or float32 tensor of per-token routing
+            weights (the values multiplied into each expert's contribution before combine).
+        routing_bias: ``[num_experts]`` tensor (unused on the pre-routed path; kept for
+            signature symmetry with the from-logits variant).
+        hidden_states: ``[seq_len, hidden_size]`` tensor of input hidden states.
+        gemm1_weights: ``[num_experts, M, hidden_size]`` first-layer weights, where
+            ``M = 2*intermediate_size`` for gated activations and ``intermediate_size`` for
+            non-gated activations.
+        output1_scales_scalar: ``[local_num_experts]`` first-layer output scales.
+        output1_scales_gate_scalar: ``[local_num_experts]`` first-layer gate scales.
+        gemm2_weights: ``[num_experts, hidden_size, intermediate_size]`` second-layer weights.
+        output2_scales_scalar: ``[local_num_experts]`` second-layer output scales.
+        num_experts: Total number of experts.
+        top_k: Number of experts per token.
+        n_group: Number of expert groups (unused for non-grouped routing).
+        topk_group: Number of groups for top-k routing (unused for non-grouped routing).
+        intermediate_size: Intermediate (FFN) hidden size.
+        local_expert_offset: Offset of local experts in the global expert space.
+        local_num_experts: Number of experts handled by this device.
+        routed_scaling_factor: Scaling factor for routing weights.
+        use_routing_scales_on_input: Whether to apply routing scales on input (Llama4 path).
+        routing_method_type: Routing method enum value (default: 0).
+        do_finalize: Whether to finalize and combine outputs (default: True).
+        enable_pdl: Enable Programmatic Dependent Launch (auto-enabled for >= sm90).
+        tune_max_num_tokens: Autotuner upper bound (default: 8192).
+        activation_type: Activation function enum (default: Swiglu).
+
+    Returns:
+        ``List[torch.Tensor]``, depending on ``do_finalize``:
+
+        =============  ==========================================================================
+        do_finalize    Returned tensors
+        =============  ==========================================================================
+        True           the final MoE output (single tensor)
+        False          ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``
+        =============  ==========================================================================
+    """
+    result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
+        None,  # routing_logits
+        topk_ids,
+        expert_weights,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        output1_scales_scalar,
+        output1_scales_gate_scalar,
+        gemm2_weights,
+        output2_scales_scalar,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        use_routing_scales_on_input,
+        routing_method_type,
+        do_finalize,
+        enable_pdl,
+        tune_max_num_tokens,
+        activation_type,
+        True,  # norm_topk_prob: unused on the pre-routed path
+        None,  # routing_replay_out: nothing to replay when routing was pre-computed
     )
 
     if do_finalize:
