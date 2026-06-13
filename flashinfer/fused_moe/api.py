@@ -244,6 +244,9 @@ class TrtllmFp4Config:
         intermediate_size: int,
         device=None,
         permute_cache=None,
+        gemm1_scales_global=None,
+        gemm2_scales_global=None,
+        intermediate_scale_global=None,
     ):
         """Build the ``trtllm_fp4_routed`` weight view from canonical bf16 weights.
 
@@ -260,6 +263,9 @@ class TrtllmFp4Config:
             intermediate_size=intermediate_size,
             device=device,
             permute_cache=permute_cache,
+            gemm1_scales_global=gemm1_scales_global,
+            gemm2_scales_global=gemm2_scales_global,
+            intermediate_scale_global=intermediate_scale_global,
         )
 
     def __repr__(self) -> str:
@@ -347,6 +353,9 @@ class CuteDslConfig:
         hidden_size: int,
         intermediate_size: int,
         device=None,
+        gemm1_scales_global=None,
+        gemm2_scales_global=None,
+        intermediate_scale_global=None,
     ):
         """Build the ``cute_dsl_nvfp4`` weight view from canonical bf16 weights.
 
@@ -362,6 +371,9 @@ class CuteDslConfig:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             device=device,
+            gemm1_scales_global=gemm1_scales_global,
+            gemm2_scales_global=gemm2_scales_global,
+            intermediate_scale_global=intermediate_scale_global,
         )
 
     def __repr__(self) -> str:
@@ -499,12 +511,20 @@ class MoEConfig:
 
 @dataclass
 class MoEActivationPack:
-    """Per-call transient data — pre-quantized NVFP4 activations + pre-routed indices."""
+    """Per-call transient data — pre-quantized NVFP4 activations + pre-routed indices.
+
+    ``hidden_states_scale_global`` is the global scale that was used to
+    quantize ``hidden_states_q`` (e.g. the calibrated ``(448 * 6) / amax``
+    from an NVFP4 checkpoint).  Runners fold it into the per-expert dequant
+    scalars at pack time (gh #3548).  ``None`` means the activations were
+    quantized with global scale 1.0 — full backward compatibility.
+    """
 
     hidden_states_q: Tensor  # [M, H//2] uint8 (packed NVFP4)
     hidden_states_scale: Tensor  # [M, H//16] float8_e4m3fn
     selected_experts: Tensor  # [M, top_k] int32
     final_scales: Tensor  # [M, top_k] float32
+    hidden_states_scale_global: Optional[Tensor] = None  # scalar float32
 
     @property
     def num_tokens(self) -> int:
