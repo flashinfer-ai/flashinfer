@@ -159,6 +159,16 @@ def is_float8(x: torch.Tensor) -> bool:
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
 
 
+def _apply_v_scale(out: torch.Tensor, v_scale: float) -> torch.Tensor:
+    """Apply v_scale to attention output without dtype-dependent branching.
+
+    Uses an unconditional float32 upcast-multiply-downcast path that works for
+    all dtypes including FP8. This avoids the ``is_float8(out)`` branch that
+    previously caused a torch.compile graph break.
+    """
+    return (out.to(torch.float32) * v_scale).to(out.dtype)
+
+
 def get_indptr(x: torch.Tensor) -> torch.Tensor:
     x = x.to(torch.int64)
     ret = torch.zeros(x.shape[0] + 1, dtype=x.dtype, device=x.device)
