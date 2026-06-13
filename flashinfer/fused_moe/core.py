@@ -2882,17 +2882,26 @@ def trtllm_bf16_moe(
         kernel skips the write entirely.  The buffer may be larger than
         ``num_tokens`` for CUDA-graph pre-allocation; only rows
         ``[0, num_tokens)`` are written.
-    gemm1_alpha / gemm1_beta / gemm1_clamp_limit : Optional[torch.Tensor]
+    gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 CUDA per-expert SwiGLU OA
-        parameters.  They are supported with ``ActivationType.Swiglu``.  Any
-        subset can be provided: ``gemm1_alpha=None`` uses ``alpha=1.0``,
-        ``gemm1_beta=None`` uses ``beta=0.0``, and
-        ``gemm1_clamp_limit=None`` applies no clamp.  Let GEMM1 output be split
-        as ``X1`` (linear/up half) and ``X2`` (gate half).  If a clamp limit is
-        provided, ``X1 = clamp(X1, -limit, limit)`` and
-        ``X2 = clamp(X2, max=limit)``.  The fused activation output is
-        ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw BF16-path values;
-        no host-side scalar dequant-scale conversion is applied.
+        alpha parameter.  Supported with ``ActivationType.Swiglu``.  Any
+        subset of ``gemm1_alpha``, ``gemm1_beta``, ``gemm1_clamp_limit``
+        can be provided independently.  When ``None`` (default),
+        ``alpha=1.0`` is used.  Let GEMM1 output be split as ``X1``
+        (linear/up half) and ``X2`` (gate half).  The fused activation
+        output is ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw
+        BF16-path values; no host-side scalar dequant-scale conversion is
+        applied.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 CUDA per-expert SwiGLU OA
+        beta parameter.  Supported with ``ActivationType.Swiglu``.  When
+        ``None`` (default), ``beta=0.0`` is used.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 CUDA per-expert clamp
+        limit.  Supported with ``ActivationType.Swiglu``.  When provided,
+        ``X1 = clamp(X1, -limit, limit)`` and
+        ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
+        is applied.
 
     Returns
     -------
@@ -3064,17 +3073,26 @@ def trtllm_bf16_routed_moe(
         kernel skips the write entirely.  The buffer may be larger than
         ``num_tokens`` for CUDA-graph pre-allocation; only rows
         ``[0, num_tokens)`` are written.
-    gemm1_alpha / gemm1_beta / gemm1_clamp_limit : Optional[torch.Tensor]
+    gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 CUDA per-expert SwiGLU OA
-        parameters.  They are supported with ``ActivationType.Swiglu``.  Any
-        subset can be provided: ``gemm1_alpha=None`` uses ``alpha=1.0``,
-        ``gemm1_beta=None`` uses ``beta=0.0``, and
-        ``gemm1_clamp_limit=None`` applies no clamp.  Let GEMM1 output be split
-        as ``X1`` (linear/up half) and ``X2`` (gate half).  If a clamp limit is
-        provided, ``X1 = clamp(X1, -limit, limit)`` and
-        ``X2 = clamp(X2, max=limit)``.  The fused activation output is
-        ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw BF16-path values;
-        no host-side scalar dequant-scale conversion is applied.
+        alpha parameter.  Supported with ``ActivationType.Swiglu``.  Any
+        subset of ``gemm1_alpha``, ``gemm1_beta``, ``gemm1_clamp_limit``
+        can be provided independently.  When ``None`` (default),
+        ``alpha=1.0`` is used.  Let GEMM1 output be split as ``X1``
+        (linear/up half) and ``X2`` (gate half).  The fused activation
+        output is ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw
+        BF16-path values; no host-side scalar dequant-scale conversion is
+        applied.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 CUDA per-expert SwiGLU OA
+        beta parameter.  Supported with ``ActivationType.Swiglu``.  When
+        ``None`` (default), ``beta=0.0`` is used.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 CUDA per-expert clamp
+        limit.  Supported with ``ActivationType.Swiglu``.  When provided,
+        ``X1 = clamp(X1, -limit, limit)`` and
+        ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
+        is applied.
 
     Returns
     -------
@@ -3403,18 +3421,29 @@ def trtllm_fp8_block_scale_moe(
         matches ``topk_indices``.  When ``None`` (default) the kernel skips
         the write entirely.  The buffer may be larger than ``num_tokens`` for
         CUDA-graph pre-allocation; only rows ``[0, num_tokens)`` are written.
-    gemm1_alpha / gemm1_beta / gemm1_clamp_limit : Optional[torch.Tensor]
-        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA
-        parameters. They are currently supported only for
-        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``. Any
-        subset can be provided: ``gemm1_alpha=None`` uses ``alpha=1.0``,
-        ``gemm1_beta=None`` uses ``beta=0.0``, and
-        ``gemm1_clamp_limit=None`` applies no clamp. Let GEMM1 output be split
-        as ``X1`` (linear/up half) and ``X2`` (gate half). If a clamp limit is
-        provided, ``X1 = clamp(X1, -limit, limit)`` and
-        ``X2 = clamp(X2, max=limit)``. The fused activation output is
-        ``X2 * sigmoid(alpha * X2) * (X1 + beta)``. Pass raw values for MxFp8;
-        no host-side scalar dequant-scale conversion is applied.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
+        parameter.  Currently supported only for
+        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``.  Any
+        subset of ``gemm1_alpha``, ``gemm1_beta``, ``gemm1_clamp_limit``
+        can be provided independently.  When ``None`` (default),
+        ``alpha=1.0`` is used.  Let GEMM1 output be split as ``X1``
+        (linear/up half) and ``X2`` (gate half).  The fused activation
+        output is ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw
+        values for MxFp8; no host-side scalar dequant-scale conversion is
+        applied.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA beta
+        parameter.  Currently supported only for
+        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``.
+        When ``None`` (default), ``beta=0.0`` is used.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 per-expert clamp limit.
+        Currently supported only for ``Fp8QuantizationType.MxFp8`` with
+        ``ActivationType.Swiglu``.  When provided,
+        ``X1 = clamp(X1, -limit, limit)`` and
+        ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
+        is applied.
 
     Returns
     -------
@@ -3610,18 +3639,29 @@ def trtllm_fp8_block_scale_routed_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` Identity.
-    gemm1_alpha / gemm1_beta / gemm1_clamp_limit : Optional[torch.Tensor]
-        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA
-        parameters. They are currently supported only for
-        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``. Any
-        subset can be provided: ``gemm1_alpha=None`` uses ``alpha=1.0``,
-        ``gemm1_beta=None`` uses ``beta=0.0``, and
-        ``gemm1_clamp_limit=None`` applies no clamp. Let GEMM1 output be split
-        as ``X1`` (linear/up half) and ``X2`` (gate half). If a clamp limit is
-        provided, ``X1 = clamp(X1, -limit, limit)`` and
-        ``X2 = clamp(X2, max=limit)``. The fused activation output is
-        ``X2 * sigmoid(alpha * X2) * (X1 + beta)``. Pass raw values for MxFp8;
-        no host-side scalar dequant-scale conversion is applied.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
+        parameter.  Currently supported only for
+        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``.  Any
+        subset of ``gemm1_alpha``, ``gemm1_beta``, ``gemm1_clamp_limit``
+        can be provided independently.  When ``None`` (default),
+        ``alpha=1.0`` is used.  Let GEMM1 output be split as ``X1``
+        (linear/up half) and ``X2`` (gate half).  The fused activation
+        output is ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw
+        values for MxFp8; no host-side scalar dequant-scale conversion is
+        applied.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA beta
+        parameter.  Currently supported only for
+        ``Fp8QuantizationType.MxFp8`` with ``ActivationType.Swiglu``.
+        When ``None`` (default), ``beta=0.0`` is used.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional ``[local_num_experts]`` float32 per-expert clamp limit.
+        Currently supported only for ``Fp8QuantizationType.MxFp8`` with
+        ``ActivationType.Swiglu``.  When provided,
+        ``X1 = clamp(X1, -limit, limit)`` and
+        ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
+        is applied.
 
     Returns
     -------
