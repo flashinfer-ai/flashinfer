@@ -86,6 +86,7 @@ from .jit.gemm import (
 )
 from .jit.mamba import (
     gen_selective_state_update_module,
+    gen_selective_state_update_sm100_module,
     gen_selective_state_update_sm90_module,
 )
 from .jit.mhc import gen_mhc_module
@@ -690,6 +691,31 @@ def gen_all_modules(
                     )
                 )
             jit_specs.append(gen_trtllm_utils_module())
+        if (
+            has_sm100
+            or has_sm100f
+            or has_sm103
+            or has_sm110
+            or has_sm120
+            or has_sm120f
+            or has_sm121
+        ):
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
+            ):
+                jit_specs.append(
+                    # same false positive as above
+                    gen_selective_state_update_sm100_module(  # type: ignore[call-arg]
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                    )
+                )
+        if has_sm90:
+            jit_specs.append(gen_gdn_prefill_sm90_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
         if has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121:
