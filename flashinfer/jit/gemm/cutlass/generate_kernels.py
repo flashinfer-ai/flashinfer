@@ -756,7 +756,12 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 120
-    supported_dtypes = [e2m1, (DataType.e4m3, e2m1)]
+    # W-MXFP8 enablement: add bare e4m3 (plain fp8xfp8) to emit the
+    # tma_warp_specialized launcher for (Sm120, e4m3, e4m3) that the dispatcher now
+    # references (pairs with the isValidSM120MOESpecialisation edit). Mirrors the SM100
+    # grouped list. Probes whether the SM120/121 grouped collective compiles for fp8
+    # weights at all.
+    supported_dtypes = [e2m1, (DataType.e4m3, e2m1), DataType.e4m3]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_mnk = [
@@ -838,7 +843,13 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
                 mainloop_schedule,
                 epi_schedule,
                 epi_fusion,
-                is_mx_fpx=(act_type == DataType.e4m3 and weight_type == e2m1),
+                # W-MXFP8 enablement: route (e4m3,e4m3) through the
+                # block-scaled (OpClassBlockScaledTensorOp) SM120 collective = W-MXFP8,
+                # instead of the plain-fp8 path that fell back to an SM90 collective and
+                # static_assert'd.
+                is_mx_fpx=(
+                    act_type == DataType.e4m3 and weight_type in (e2m1, DataType.e4m3)
+                ),
                 swap_ab=swap_ab,
             )
 

@@ -569,8 +569,12 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getAmpereConfi
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_hopper | fp8_only_flag);
 
+  // W-MXFP8 enablement: W-MXFP8 has a native SM120/121 TMA-WS grouped kernel, so
+  // it must NOT fall back to the Ampere/SM89 fp8 path (which would route to dispatchMoeGemmToCutlass
+  // <Sm89> and throw at :497). Exclude it like the other non-Ampere paths so getConfigs returns only
+  // the SM120 TMA-WS configs.
   if (!tensorrt_llm::kernels::cutlass_kernels::isValidAmpereMOESpecialisation<T, WeightType>() ||
-      (use_w4afp8 && sm != 89) || use_wfp4a16) {
+      (use_w4afp8 && sm != 89) || use_wfp4a16 || use_mxfp8) {
     return {};
   }
 
@@ -600,9 +604,13 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpec
       (use_fp4 || use_wfp4afp8) ? CutlassGemmConfig::FP4_ONLY : CutlassGemmConfig::NONE;
   static constexpr auto fp8fp4_mixed_flag =
       use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
+  // W-MXFP8 enablement: mark W-MXFP8 so the SM120 grouped path takes the
+  // block-scaled candidate-config branch instead of throwing "only supports nvfp4".
+  static constexpr auto mxfp8_flag =
+      use_mxfp8 ? CutlassGemmConfig::MXFP8_ONLY : CutlassGemmConfig::NONE;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_blackwell | enable_hopper |
-      fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag);
+      fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag | mxfp8_flag);
   TLLM_CHECK_WITH_INFO(!(enable_blackwell && enable_hopper),
                        "Blackwell and hopper flags are mutually exclusive");
 
@@ -614,8 +622,16 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::getTmaWarpSpec
         "implementations");
     return {};
   }
-  if ((sm == 120 || sm == 121) &&
-      !tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>()) {
+  // isValidSM120MOESpecialisation admits (e4m3,e4m3) for the W-MXFP8 block-scaled path,
+  // but PLAIN fp8xfp8 is NOT a valid SM120 grouped config — it must fall back to SM89.
+  // Gate the fp8xfp8 case on MX mode so plain fp8 still returns {} here (otherwise it
+  // would reach get_candidate_configs_sm120 and throw instead of falling back). Mirrors
+  // the execution-dispatch guard in moe_gemm_template_dispatch_tma_ws.h.
+  constexpr bool sm120_specialisation_valid =
+      tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>() &&
+      (IsMXFPX || !(std::is_same_v<T, __nv_fp8_e4m3> &&
+                    std::is_same_v<WeightType, __nv_fp8_e4m3>));
+  if ((sm == 120 || sm == 121) && !sm120_specialisation_valid) {
     TLLM_LOG_TRACE(
         "Blackwell SM120 is not supported for this configuration, not selecting any TMA WS "
         "implementations");
@@ -798,7 +814,10 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>::dispatchT
     }
   } else if (sm_ >= 90) {
     // For SM120+ pure FP8 MoE (not FP8 x FP4), redirect to SM89 (Ada) FP8 kernel implementations.
-    if constexpr (use_fp8 && !use_wfp4afp8) {
+    // W-MXFP8 enablement: EXCLUDE W-MXFP8 (use_mxfp8) — it has a native SM120/121
+    // TMA-WS block-scaled grouped kernel, so it must fall through to the TMA-WS dispatch below,
+    // not the SM89 fallback.
+    if constexpr (use_fp8 && !use_wfp4afp8 && !use_mxfp8) {
       if (sm_ >= 120) {
         cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType,
                                                       cutlass::arch::Sm89, EpilogueTag>(

@@ -497,7 +497,14 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
       TLLM_LOG_TRACE("At %s, SM120 config=%d", pretty_function,
                      (int)(gemm_config.tile_config_sm120));
       if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<
-                        T, WeightType, EpilogueTag, FUSION>()) {
+                        T, WeightType, EpilogueTag, FUSION>()
+                    // W-MXFP8 enablement: on SM120/121, plain (non-MX) fp8xfp8
+                    // grouped is invalid (falls back to an SM90 collective); only emit the MX
+                    // path so the MXFPX=false launcher is never referenced (else undefined
+                    // symbol at load).
+                    && (IsMXFPX ||
+                        !(std::is_same_v<T, __nv_fp8_e4m3> &&
+                          std::is_same_v<WeightType, __nv_fp8_e4m3>))) {
         switch (gemm_config.tile_config_sm120) {
           SHAPE_CASE(120, 128, 32, 64)
           SHAPE_CASE(120, 128, 32, 128)
