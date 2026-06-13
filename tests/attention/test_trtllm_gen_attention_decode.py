@@ -529,6 +529,7 @@ def sdpa_paged_reference(
     head_dim: int,
     kv_layout: str,
     window_left: int,
+    is_causal: bool = True,
 ):
     """Pure PyTorch SDPA reference for head dims unsupported by FlashInfer kernels.
 
@@ -593,14 +594,16 @@ def sdpa_paged_reference(
         k_t = k_exp.transpose(0, 1).float()  # [num_qo_heads, s_len, head_dim]
         v_t = v_exp.transpose(0, 1).float()  # [num_qo_heads, s_len, head_dim]
 
-        # Build causal mask: query position i can attend to kv position j if j <= (s_len - q_len) + i
-        kv_offset = s_len - q_len
-        q_pos = torch.arange(q_len, device=q_b.device).unsqueeze(1) + kv_offset
-        k_pos = torch.arange(s_len, device=q_b.device).unsqueeze(0)
-        causal_mask = k_pos <= q_pos  # [q_len, s_len]
-        if window_left >= 0:
-            causal_mask = causal_mask & (q_pos - k_pos <= window_left)
-        attn_mask = causal_mask.unsqueeze(0).expand(num_qo_heads, -1, -1)
+        if is_causal:
+            kv_offset = s_len - q_len
+            q_pos = torch.arange(q_len, device=q_b.device).unsqueeze(1) + kv_offset
+            k_pos = torch.arange(s_len, device=q_b.device).unsqueeze(0)
+            attn_mask = k_pos <= q_pos
+            if window_left >= 0:
+                attn_mask = attn_mask & (q_pos - k_pos <= window_left)
+            attn_mask = attn_mask.unsqueeze(0).expand(num_qo_heads, -1, -1)
+        else:
+            attn_mask = None
 
         out_b = torch.nn.functional.scaled_dot_product_attention(
             q_t,
@@ -640,6 +643,7 @@ def _test_trtllm_batch_decode(
     return_lse: bool | None = None,
     provide_lse: bool = False,
     use_bmm1_scale_log2: bool = False,
+    is_causal: bool = True,
 ) -> None:
     """
     Common function for testing trtllm-gen decode.
@@ -656,6 +660,10 @@ def _test_trtllm_batch_decode(
 
     if backend == "xqa" and skips_softmax:
         pytest.skip("xqa backend does not support skips_softmax")
+    if backend == "xqa" and not is_causal:
+        pytest.skip("is_causal=False is only covered by trtllm-gen decode")
+    if enable_sink and not is_causal:
+        pytest.skip("non-causal sink attention is outside this decode coverage")
 
     if skips_softmax and q_dtype != kv_dtype:
         pytest.skip(
@@ -770,6 +778,7 @@ def _test_trtllm_batch_decode(
             head_dim,
             kv_layout,
             window_left,
+            is_causal,
         )
     elif not enable_sink:
         if q_len_per_req is not None and q_len_per_req == 1:
@@ -792,7 +801,7 @@ def _test_trtllm_batch_decode(
                     "paged_kv_indices": plan_params_prefill.pop("indices"),
                     "paged_kv_last_page_len": plan_params_prefill.pop("last_page_len"),
                     "head_dim_qk": plan_params_prefill.pop("head_dim"),
-                    "causal": True,
+                    "causal": is_causal,
                     "logits_soft_cap": 0.0,
                 }
             )
@@ -814,7 +823,7 @@ def _test_trtllm_batch_decode(
             v_flat,
             sink,
             window_left,
-            True,
+            is_causal,
             sm_scale,
             mode="varlen",
             batch_size=batch_size,
@@ -822,7 +831,35 @@ def _test_trtllm_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
-    if q_len_per_req and q_len_per_req > 1:
+    if (
+        not is_causal
+        and q_len_per_req is not None
+        and q_len_per_req > 1
+        and not enable_sink
+        and head_dim <= 256
+    ):
+        causal_wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer_ref, kv_layout
+        )
+        causal_plan_params = plan_params.copy()
+        causal_plan_params.update(
+            {
+                "qo_indptr": q_indptr,
+                "paged_kv_indptr": causal_plan_params.pop("indptr"),
+                "paged_kv_indices": causal_plan_params.pop("indices"),
+                "paged_kv_last_page_len": causal_plan_params.pop("last_page_len"),
+                "head_dim_qk": causal_plan_params.pop("head_dim"),
+                "causal": True,
+                "logits_soft_cap": 0.0,
+            }
+        )
+        causal_wrapper_ref.plan(**causal_plan_params)
+        causal_ref = causal_wrapper_ref.run(ref_q, ref_kv_cache)
+        assert not torch.allclose(
+            output_ref.float(), causal_ref.float(), atol=1e-3, rtol=1e-3
+        )
+
+    if is_causal and q_len_per_req and q_len_per_req > 1:
         # only used for xqa speculative decoding
         mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
     else:
@@ -932,6 +969,7 @@ def _test_trtllm_batch_decode(
         mask=mask,
         max_q_len=max_q_len if max_q_len is not None else None,
         cum_seq_lens_q=q_indptr if max_q_len is not None else None,
+        is_causal=is_causal,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         kv_cache_sf=kv_cache_sf_kernel,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
@@ -1047,10 +1085,12 @@ def _test_trtllm_batch_decode(
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
         )
-        plan_params["q_data_type"] = q.dtype
-        plan_params["kv_data_type"] = kv_cache.dtype
-        plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
-        wrapper_trtllm_gen.plan(**plan_params)
+        wrapper_plan_params = plan_params.copy()
+        wrapper_plan_params["q_data_type"] = q.dtype
+        wrapper_plan_params["kv_data_type"] = kv_cache.dtype
+        wrapper_plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
+        wrapper_plan_params["is_causal"] = is_causal
+        wrapper_trtllm_gen.plan(**wrapper_plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
             q_input,
             kv_cache,
@@ -1250,6 +1290,135 @@ def test_trtllm_batch_decode_bmm1_scale_log2(q_dtype, kv_dtype, o_dtype, device_
         uses_shared_paged_kv_idx=True,
         use_bmm1_scale_log2=True,
     )
+
+
+@pytest.mark.xfail(
+    reason="Dense paged GQA generation cubins (headDimQk=128) missing from flashinfer-cubin; "
+    "remove once TRT-LLM ships the matching instantiations",
+    strict=False,
+)
+def test_trtllm_batch_decode_non_causal_gqa() -> None:
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        batch_size=2,
+        q_len_per_req=4,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=4,
+        window_left=-1,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
+        is_causal=False,
+    )
+
+
+@pytest.mark.xfail(
+    reason="Dense paged GQA generation cubins (headDimQk=128) missing from flashinfer-cubin; "
+    "remove once TRT-LLM ships the matching instantiations",
+    strict=False,
+)
+def test_trtllm_batch_decode_non_causal_q_len1_compatibility() -> None:
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        batch_size=2,
+        q_len_per_req=1,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=4,
+        window_left=-1,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
+        is_causal=False,
+    )
+
+
+@pytest.mark.xfail(
+    reason="Dense paged GQA generation cubins (headDimQk=128) missing from flashinfer-cubin; "
+    "remove once TRT-LLM ships the matching instantiations",
+    strict=False,
+)
+def test_trtllm_batch_decode_non_causal_fp8_kv() -> None:
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        batch_size=2,
+        q_len_per_req=4,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=4,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype="bf16",
+        kv_dtype="fp8",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
+        device_scale=True,
+        is_causal=False,
+    )
+
+
+@pytest.mark.xfail(
+    reason="Dense paged GQA generation cubins (headDimQk=128) missing from flashinfer-cubin; "
+    "remove once TRT-LLM ships the matching instantiations",
+    strict=False,
+)
+def test_trtllm_batch_decode_non_causal_nvfp4_kv() -> None:
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        batch_size=2,
+        q_len_per_req=4,
+        page_size=16,
+        num_kv_heads=2,
+        head_grp_size=4,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype="fp8",
+        kv_dtype="nvfp4",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
+        device_scale=True,
+        is_causal=False,
+    )
+
+
+def test_trtllm_batch_decode_non_causal_rejects_sliding_window() -> None:
+    _skip_if_not_blackwell()
+    q = torch.randn(8, 8, 128, dtype=torch.bfloat16, device=GPU_DEVICE)
+    kv_cache = torch.randn(4, 2, 2, 16, 128, dtype=torch.bfloat16, device=GPU_DEVICE)
+    block_tables = torch.arange(4, dtype=torch.int32, device=GPU_DEVICE).reshape(2, 2)
+    seq_lens = torch.full((2,), 32, dtype=torch.int32, device=GPU_DEVICE)
+    workspace = torch.empty(workspace_size, dtype=torch.int8, device=GPU_DEVICE)
+
+    with pytest.raises(ValueError, match="Sliding-window non-causal"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            q,
+            kv_cache,
+            workspace,
+            block_tables,
+            seq_lens,
+            max_seq_len=32,
+            window_left=127,
+            backend="trtllm-gen",
+            q_len_per_req=4,
+            is_causal=False,
+        )
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
