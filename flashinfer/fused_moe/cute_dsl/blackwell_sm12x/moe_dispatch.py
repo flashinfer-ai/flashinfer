@@ -1100,7 +1100,9 @@ def launch_sm120_static_moe(
             activation=activation,
             activation_precision=activation_precision,
         )
-        launch_ids = flat_ids
+        compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
+        compact_ids.copy_(flat_ids)
+        launch_ids = compact_ids
 
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
     runtime_args: Tuple[Any, ...] = (
