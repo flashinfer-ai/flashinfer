@@ -78,7 +78,21 @@ class CompilationContext:
                     major, minor = torch.cuda.get_device_capability(device)
                     self.TARGET_CUDA_ARCHS.add(self._normalize_cuda_arch(major, minor))
             except Exception as e:
-                logger.warning(f"Failed to get device capability: {e}.")
+                try:
+                    cuda_available = torch.cuda.is_available()
+                except Exception as availability_error:  # pragma: no cover - defensive
+                    cuda_available = f"<error: {availability_error!r}>"
+                try:
+                    device_count = torch.cuda.device_count()
+                except Exception as device_count_error:  # pragma: no cover - defensive
+                    device_count = f"<error: {device_count_error!r}>"
+                logger.warning(
+                    "Failed to get device capability: %r. "
+                    "torch.cuda.is_available()=%s, torch.cuda.device_count()=%s",
+                    e,
+                    cuda_available,
+                    device_count,
+                )
 
     def get_nvcc_flags_list(
         self, supported_major_versions: list[int] = None
