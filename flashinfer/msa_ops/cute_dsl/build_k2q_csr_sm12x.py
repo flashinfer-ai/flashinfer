@@ -105,11 +105,11 @@ class BuildK2qCsrSm12x:
         ).launch(grid=(nchunks, H, 1), block=(32, 1, 1), stream=stream)
 
         self._k_prefix_chunks(mTileCounts, mRowCounts, total_rows, nchunks).launch(
-            grid=(total_rows, H, 1), block=(1, 1, 1), stream=stream
+            grid=(total_rows, H, 1), block=(32, 1, 1), stream=stream
         )
 
         self._k_row_ptr(mRowCounts, mRowPtr, total_rows).launch(
-            grid=(H, 1, 1), block=(1, 1, 1), stream=stream
+            grid=(H, 1, 1), block=(32, 1, 1), stream=stream
         )
 
         self._k_scatter(
@@ -140,7 +140,7 @@ class BuildK2qCsrSm12x:
                 total_rows,
                 target_q_per_cta,
                 work_capacity,
-            ).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+            ).launch(grid=(total_rows, H, 1), block=(1, 1, 1), stream=stream)
 
     # -----------------------------------------------------------------------
     # H: per-(head, chunk) histogram of row hits, one warp per (chunk, head).
@@ -183,7 +183,10 @@ class BuildK2qCsrSm12x:
 
     # -----------------------------------------------------------------------
     # PR-chunks: exclusive prefix of tile_counts over the chunk axis (in
-    # place) + per-row totals. One thread per (head, row).
+    # place) + per-row totals. One warp per (head, row): the 32 lanes
+    # cooperatively scan the chunk axis in 32-wide tiles (Hillis-Steele warp
+    # scan), carrying ``running`` across tiles. Replaces the former single
+    # thread that walked all ``nchunks`` serially.
     # -----------------------------------------------------------------------
     @cute.kernel
     def _k_prefix_chunks(
@@ -194,19 +197,40 @@ class BuildK2qCsrSm12x:
         nchunks: cutlass.Int32,
     ):
         row, h, _ = cute.arch.block_idx()
+        lane, _, _ = cute.arch.thread_idx()
         if row < total_rows:
             running = cutlass.Int32(0)
-            c = cutlass.Int32(0)
-            while c < nchunks:
-                t = mTileCounts[h, c, row]
-                mTileCounts[h, c, row] = running
-                running += t
-                c += 1
-            mRowCounts[h, row] = running
+            c0 = cutlass.Int32(0)
+            while c0 < nchunks:
+                c = c0 + lane
+                v = cutlass.Int32(0)
+                if c < nchunks:
+                    v = mTileCounts[h, c, row]
+                # inclusive warp scan of this 32-wide tile (Hillis-Steele via
+                # idx-shuffle from lane-off; guarded so lane<off keeps its value)
+                x = v
+                off = 1
+                while off < 32:
+                    src = lane - off
+                    if src < 0:
+                        src = cutlass.Int32(0)
+                    nbr = cute.arch.shuffle_sync(x, src)
+                    if lane >= off:
+                        x += nbr
+                    off <<= 1
+                if c < nchunks:
+                    mTileCounts[h, c, row] = running + x - v  # exclusive
+                running += cute.arch.shuffle_sync(x, 31)  # tile total -> all lanes
+                c0 += 32
+            if lane == 0:
+                mRowCounts[h, row] = running
 
     # -----------------------------------------------------------------------
-    # PR-rows: exclusive prefix of row_counts over rows -> row_ptr. One thread
-    # per head.
+    # PR-rows: inclusive prefix of row_counts over rows -> row_ptr[1:]. One warp
+    # per head; the 32 lanes scan the row axis in 32-wide tiles (same warp-scan
+    # as PR-chunks), carrying ``running`` across tiles. Replaces the former
+    # single thread that walked all ``total_rows`` serially (a latent serial
+    # cliff at long context / many batches).
     # -----------------------------------------------------------------------
     @cute.kernel
     def _k_row_ptr(
@@ -216,13 +240,30 @@ class BuildK2qCsrSm12x:
         total_rows: cutlass.Int32,
     ):
         h, _, _ = cute.arch.block_idx()
-        mRowPtr[h, 0] = cutlass.Int32(0)
+        lane, _, _ = cute.arch.thread_idx()
+        if lane == 0:
+            mRowPtr[h, 0] = cutlass.Int32(0)
         running = cutlass.Int32(0)
-        row = cutlass.Int32(0)
-        while row < total_rows:
-            running += mRowCounts[h, row]
-            mRowPtr[h, row + 1] = running
-            row += 1
+        r0 = cutlass.Int32(0)
+        while r0 < total_rows:
+            row = r0 + lane
+            v = cutlass.Int32(0)
+            if row < total_rows:
+                v = mRowCounts[h, row]
+            x = v
+            off = 1
+            while off < 32:
+                src = lane - off
+                if src < 0:
+                    src = cutlass.Int32(0)
+                nbr = cute.arch.shuffle_sync(x, src)
+                if lane >= off:
+                    x += nbr
+                off <<= 1
+            if row < total_rows:
+                mRowPtr[h, row + 1] = running + x  # inclusive prefix over rows
+            running += cute.arch.shuffle_sync(x, 31)
+            r0 += 32
 
     # -----------------------------------------------------------------------
     # S: scatter queries into CSR order, ascending within each row.
@@ -279,8 +320,12 @@ class BuildK2qCsrSm12x:
             q += 1
 
     # -----------------------------------------------------------------------
-    # Scheduler: flat work-item emission. Single thread (order is irrelevant;
-    # the forward kernel consumes work items independently).
+    # Scheduler: flat work-item emission. One thread per (kv-head, row); each
+    # nonzero row reserves its contiguous block of work-item slots with a single
+    # atomic on the global work counter. Order across rows is implementation-
+    # defined (the forward kernel consumes work items independently), matching
+    # the CUDA kernel's atomic-reservation scheme. ``mWorkCount`` is pre-zeroed
+    # by the wrapper, so the post-kernel value is the total work-item count.
     # -----------------------------------------------------------------------
     @cute.kernel
     def _k_scheduler(
@@ -294,29 +339,24 @@ class BuildK2qCsrSm12x:
         target_q_per_cta: cutlass.Int32,
         work_capacity: cutlass.Int32,
     ):
-        widx = cutlass.Int32(0)
-        h = cutlass.Int32(0)
-        while h < H:
-            row = cutlass.Int32(0)
-            while row < total_rows:
-                cnt = mRowPtr[h, row + 1] - mRowPtr[h, row]
-                if cnt > 0:
-                    batch_idx = mRowCoords[row, 0]
-                    kv_block_idx = mRowCoords[row, 1]
-                    nch = (cnt + target_q_per_cta - 1) // target_q_per_cta
-                    cc = cutlass.Int32(0)
-                    while cc < nch:
-                        if widx < work_capacity:
-                            q_begin = cc * target_q_per_cta
-                            q_count = cutlass.min(target_q_per_cta, cnt - q_begin)
-                            mSched[widx, 0] = h
-                            mSched[widx, 1] = row
-                            mSched[widx, 2] = q_begin
-                            mSched[widx, 3] = q_count
-                            mSched[widx, 4] = batch_idx
-                            mSched[widx, 5] = kv_block_idx
-                        widx += 1
-                        cc += 1
-                row += 1
-            h += 1
-        mWorkCount[0] = widx
+        row, h, _ = cute.arch.block_idx()
+        if row < total_rows and h < H:
+            cnt = mRowPtr[h, row + 1] - mRowPtr[h, row]
+            if cnt > 0:
+                nch = (cnt + target_q_per_cta - 1) // target_q_per_cta
+                base = _atomic_add_i32(nch, mWorkCount.iterator)
+                batch_idx = mRowCoords[row, 0]
+                kv_block_idx = mRowCoords[row, 1]
+                cc = cutlass.Int32(0)
+                while cc < nch:
+                    widx = base + cc
+                    if widx < work_capacity:
+                        q_begin = cc * target_q_per_cta
+                        q_count = cutlass.min(target_q_per_cta, cnt - q_begin)
+                        mSched[widx, 0] = h
+                        mSched[widx, 1] = row
+                        mSched[widx, 2] = q_begin
+                        mSched[widx, 3] = q_count
+                        mSched[widx, 4] = batch_idx
+                        mSched[widx, 5] = kv_block_idx
+                    cc += 1

@@ -140,13 +140,20 @@ def _run_csr_cudsl(
     H, total_q, _ = q2k_indices.shape
     device = q2k_indices.device
 
-    # outputs initialized to the CUDA kernel's defaults
+    # outputs initialized to the CUDA kernel's defaults. Only the buffers whose
+    # *unwritten* entries are actually read need clearing:
+    #   - row_ptr: needed for the degenerate early-return below (total_rows==0);
+    #     in the normal path the kernel writes every entry.
+    #   - q_indices: unused tail slots must read back as -1.
+    #   - split_counts: queries with no valid blocks are never written -> 0.
+    #   - work_count: the parallel scheduler atomic-accumulates onto it.
+    # qsplit_indices and scheduler_metadata tails are never read (the forward
+    # consumes only [row_ptr[r], row_ptr[r+1]) / [0, work_count)), matching the
+    # CUDA kernel which leaves them uninitialized -> skip those memsets.
     row_ptr.zero_()
     q_indices.fill_(-1)
     if has_schedule:
-        qsplit_indices.fill_(-1)
         split_counts.zero_()
-        scheduler_metadata.zero_()
         work_count.zero_()
 
     if total_q == 0 or total_rows == 0 or H == 0 or max_kv_blocks == 0:
