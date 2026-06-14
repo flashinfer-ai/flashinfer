@@ -842,10 +842,10 @@ class SparseAttentionForwardKvMajorSm12x:
                 # O_tile = P V
                 acc_O.fill(0.0)
                 if cutlass.const_expr(self._pv_fp8_mma):
-                    # v1: round-trip P through SMEM as e4m3 (x448; the C->A
-                    # register-layout identity used for the bf16 path does
-                    # not hold for the fp8 k=32 atom). The 1/448 is folded
-                    # into the row normalizer at the store phase.
+                    # Round-trip P through SMEM as e4m3 (x448; the C->A register
+                    # identity from the bf16 path does not hold for the fp8 k=32
+                    # atom; 1/448 is folded into the row normalizer at store). A
+                    # register-direct variant was tried and measured slower.
                     for r in cutlass.range_constexpr(n_rows):
                         p_row_coord = tScS_mn[r, 0][0]
                         for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):

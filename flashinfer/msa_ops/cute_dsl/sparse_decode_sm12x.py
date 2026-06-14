@@ -24,8 +24,9 @@ KV-major kernel, this kernel:
 - uses a dense static grid ``(topk, total_q, Hkv)`` driven directly by
   ``q2k_indices`` — no schedule tensors at all (split counts are computed
   in-kernel by the slot-0 CTA);
-- uses an M=16 tile (group_size <= 16 query heads of one token) instead of
-  a 64-row tile that is mostly padding;
+- uses an M=16 tile (the <=16 query heads of one token) instead of a 64-row
+  tile that is mostly padding; multiple query tokens (seqlen_q>1, e.g. MTP) are
+  handled as separate tiles;
 - stages the KV block as two 64-token sub-blocks with online softmax,
   halving SMEM (~39KB) so two CTAs fit per SM (the prefill kernel's 85KB
   forces one CTA/SM, leaving decode latency-bound);
