@@ -140,16 +140,9 @@ def _run_csr_cudsl(
     H, total_q, _ = q2k_indices.shape
     device = q2k_indices.device
 
-    # outputs initialized to the CUDA kernel's defaults. Only the buffers whose
-    # *unwritten* entries are actually read need clearing:
-    #   - row_ptr: needed for the degenerate early-return below (total_rows==0);
-    #     in the normal path the kernel writes every entry.
-    #   - q_indices: unused tail slots must read back as -1.
-    #   - split_counts: queries with no valid blocks are never written -> 0.
-    #   - work_count: the parallel scheduler atomic-accumulates onto it.
-    # qsplit_indices and scheduler_metadata tails are never read (the forward
-    # consumes only [row_ptr[r], row_ptr[r+1]) / [0, work_count)), matching the
-    # CUDA kernel which leaves them uninitialized -> skip those memsets.
+    # Clear only buffers whose unwritten entries are read: row_ptr (the
+    # total_rows==0 early-return), q_indices (-1 tail), split_counts (zero-block
+    # queries), work_count (scheduler accumulates). qsplit/sched tails go unread.
     row_ptr.zero_()
     q_indices.fill_(-1)
     if has_schedule:
@@ -377,7 +370,7 @@ def msa_build_k2q_csr_schedule(
 
     - ``qsplit_indices``: like ``q_indices`` but each entry packs the
       batch-local query index (low 24 bits) with the query's *split slot*
-      (high 8 bits) — the rank of this KV block among the query's valid
+      (high 8 bits), the rank of this KV block among the query's valid
       selected blocks. The forward kernel writes its partial output for the
       query at that slot.
     - ``split_counts [total_q, Hkv]``: number of valid selected blocks per

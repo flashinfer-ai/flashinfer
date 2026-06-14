@@ -182,11 +182,9 @@ class BuildK2qCsrSm12x:
             q += 1
 
     # -----------------------------------------------------------------------
-    # PR-chunks: exclusive prefix of tile_counts over the chunk axis (in
-    # place) + per-row totals. One warp per (head, row): the 32 lanes
-    # cooperatively scan the chunk axis in 32-wide tiles (Hillis-Steele warp
-    # scan), carrying ``running`` across tiles. Replaces the former single
-    # thread that walked all ``nchunks`` serially.
+    # PR-chunks: in-place exclusive prefix of tile_counts over the chunk axis,
+    # plus per-row totals. One warp per (head, row); the 32 lanes scan the chunk
+    # axis in 32-wide tiles with a Hillis-Steele warp scan.
     # -----------------------------------------------------------------------
     @cute.kernel
     def _k_prefix_chunks(
@@ -227,10 +225,8 @@ class BuildK2qCsrSm12x:
 
     # -----------------------------------------------------------------------
     # PR-rows: inclusive prefix of row_counts over rows -> row_ptr[1:]. One warp
-    # per head; the 32 lanes scan the row axis in 32-wide tiles (same warp-scan
-    # as PR-chunks), carrying ``running`` across tiles. Replaces the former
-    # single thread that walked all ``total_rows`` serially (a latent serial
-    # cliff at long context / many batches).
+    # per head; the 32 lanes scan the row axis in 32-wide tiles (same warp scan
+    # as PR-chunks), so long context (large total_rows) stays cheap.
     # -----------------------------------------------------------------------
     @cute.kernel
     def _k_row_ptr(
@@ -320,12 +316,9 @@ class BuildK2qCsrSm12x:
             q += 1
 
     # -----------------------------------------------------------------------
-    # Scheduler: flat work-item emission. One thread per (kv-head, row); each
-    # nonzero row reserves its contiguous block of work-item slots with a single
-    # atomic on the global work counter. Order across rows is implementation-
-    # defined (the forward kernel consumes work items independently), matching
-    # the CUDA kernel's atomic-reservation scheme. ``mWorkCount`` is pre-zeroed
-    # by the wrapper, so the post-kernel value is the total work-item count.
+    # Scheduler: one thread per (kv-head, row); each nonzero row reserves its
+    # work-item slots via one atomicAdd on the pre-zeroed global counter. Emission
+    # order is irrelevant: the forward consumes work items independently.
     # -----------------------------------------------------------------------
     @cute.kernel
     def _k_scheduler(
