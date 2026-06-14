@@ -33,6 +33,7 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from flashinfer.utils import is_sm12x_supported
 
@@ -303,12 +304,10 @@ def test_m3_proxy_topk_accept_m3_proxy_config():
     accept M3's lightning-indexer proxy config (``index_n_heads`` query heads,
     1 KV head, ``index_head_dim=128``) with no unsupported error.
 
-    This is an op-*acceptance* (coverage) check, not a semantic-equivalence one:
-    M3's indexer max-pools per-key scores over its ``index_n_heads`` proxy heads
-    *before* the top-k, whereas ``msa_proxy_score`` emits a per-head ``max_score``
-    that ``msa_topk_select`` ranks per head. Mapping the proxy-head reduction onto
-    the flashinfer ops (the handoff's open "proxy head config" item) is a separate
-    correctness question tracked outside this coverage test."""
+    This is an op-*acceptance* (coverage) check; the semantic-equivalence one —
+    that ``msa_proxy_score`` + an amax over the ``index_n_heads`` proxy heads +
+    ``msa_topk_select`` reproduces M3's indexer block selection — is
+    :func:`test_m3_indexer_proxy_head_equivalence`."""
     from flashinfer.msa_ops import msa_proxy_score, msa_topk_select
 
     torch.manual_seed(0)
@@ -405,3 +404,162 @@ def test_m3_kv_dtype_matrix_at_m3_shapes(kv_kind):
     )
     assert out1.shape == (1, Hq, 128)
     assert torch.isfinite(out1.float()).all()
+
+
+# ===========================================================================
+# Proxy-head equivalence (handoff §7.3): flashinfer proxy_score + amax over the
+# index_n_heads proxy heads + topk_select == M3's lightning-indexer selection.
+# ===========================================================================
+
+
+def _build_m3_indexer(dtype: torch.dtype, local_blocks: int):
+    """Instantiate the real ``MiniMaxM3VLIndexer`` (random weights) + a matching
+    rotary embedding, with the full-M3 lightning-indexer config."""
+    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import (
+        MiniMaxM3VLTextConfig,
+    )
+    from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
+        MiniMaxM3VLIndexer,
+        MiniMaxM3VLRotaryEmbedding,
+    )
+
+    cfg = MiniMaxM3VLTextConfig(
+        num_attention_heads=M3_CANONICAL["num_qo_heads"],
+        num_key_value_heads=M3_CANONICAL["num_kv_heads"],
+        head_dim=M3_CANONICAL["head_dim"],
+        index_n_heads=M3_INDEX_N_HEADS,
+        index_head_dim=M3_INDEX_HEAD_DIM,
+        index_block_size=M3_CANONICAL["block_size"],
+        index_topk_blocks=M3_CANONICAL["topk"],
+        index_local_blocks=local_blocks,
+        hidden_size=512,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=16384,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 5000000.0,
+            "partial_rotary_factor": 0.5,
+        },
+    )
+    indexer = MiniMaxM3VLIndexer(cfg, layer_idx=0).to("cuda").to(dtype).eval()
+    rotary = MiniMaxM3VLRotaryEmbedding(cfg).to("cuda")
+    return cfg, indexer, rotary
+
+
+def _run_indexer_capturing_proj(cfg, indexer, rotary, hidden_states, position_ids):
+    """Run the real indexer forward, capturing the post-rope idx_q / idx_k it
+    feeds into its score matmul (by wrapping the module-level
+    ``apply_rotary_pos_emb``). Returns (block_indices, idx_q, idx_k)."""
+    import transformers.models.minimax_m3_vl.modeling_minimax_m3_vl as mod
+
+    cap: dict = {}
+    orig = mod.apply_rotary_pos_emb
+
+    def _wrap(q, k, cos, sin, unsqueeze_dim=1):
+        qe, ke = orig(q, k, cos, sin, unsqueeze_dim)
+        if q.shape[1] == cfg.index_n_heads:  # the indexer's call (vs main attn)
+            cap["q"], cap["k"] = qe.detach(), ke.detach()
+        return qe, ke
+
+    pos_emb = rotary(hidden_states, position_ids)
+    mod.apply_rotary_pos_emb = _wrap
+    try:
+        with torch.no_grad():
+            block_indices = indexer(hidden_states, pos_emb, None, position_ids)
+    finally:
+        mod.apply_rotary_pos_emb = orig
+    return block_indices, cap["q"], cap["k"]
+
+
+def _reference_block_scores(idx_q, idx_k, position_ids, block_size):
+    """M3's indexer block-score computation from the (captured, post-rope) idx_q
+    / idx_k: causal-masked QK^T, max over keys-in-block, then max over the
+    index_n_heads proxy heads -> [B, S_q, num_key_blocks]."""
+    qf, kf = idx_q.float(), idx_k.float()
+    k_len = kf.shape[2]
+    scores = torch.matmul(qf, kf.transpose(-1, -2))  # [B, H_idx, Sq, Sk]
+    k_pos = torch.arange(k_len, device=idx_q.device)
+    future = k_pos[None, None, None, :] > position_ids[:, None, :, None]
+    scores = scores.masked_fill(future, float("-inf"))
+    nb = -(-k_len // block_size)
+    pad = nb * block_size - k_len
+    if pad:
+        scores = F.pad(scores, (0, pad), value=float("-inf"))
+    scores = scores.view(*scores.shape[:3], nb, block_size)
+    return scores.amax(dim=-1).amax(dim=1)  # [B, Sq, nb]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_m3_indexer_proxy_head_equivalence(dtype):
+    """Resolve handoff §7.3: flashinfer's proxy pipeline reproduces M3's
+    lightning-indexer block selection. M3 computes per-(head, query, block) maxes
+    then **maxes over the index_n_heads proxy heads** before the top-k;
+    ``msa_proxy_score`` emits exactly the per-head block maxes, so an
+    ``amax(dim=0)`` over the proxy heads recovers M3's single per-query block
+    scores, and ``msa_topk_select`` on those recovers M3's selection.
+
+    Two assertions: (1) flashinfer reduced max_score == the indexer's internal
+    block_scores (tight tol on the shared bf16/fp16 inputs); (2) the selected
+    block set per query matches the real indexer's block_indices (tie-invariant).
+    ``index_local_blocks=0`` keeps the comparison to the pure proxy+select path
+    (the local-window boost is an identical post-score scatter on both sides)."""
+    from flashinfer.msa_ops import msa_proxy_score, msa_topk_select
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    cfg, indexer, rotary = _build_m3_indexer(dtype, local_blocks=0)
+    block, topk = cfg.index_block_size, cfg.index_topk_blocks
+    seq = 4096  # > topk*block = 2048 -> genuinely sparse (32 blocks, pick 16)
+    hidden = torch.randn(1, seq, cfg.hidden_size, device=dev, dtype=dtype)
+    position_ids = torch.arange(seq, device=dev)[None]
+
+    block_indices, idx_q, idx_k = _run_indexer_capturing_proj(
+        cfg, indexer, rotary, hidden, position_ids
+    )
+    ref_bs = _reference_block_scores(idx_q, idx_k, position_ids, block)[0]  # (Sq, nb)
+
+    # flashinfer proxy: idx_q (B,H_idx,Sq,D)->(Sq,H_idx,D), idx_k (B,1,Sq,D)->(Sq,1,D)
+    q = idx_q[0].transpose(0, 1).contiguous()
+    k = idx_k[0].transpose(0, 1).contiguous()
+    cu = torch.tensor([0, seq], device=dev, dtype=torch.int32)
+    max_score = msa_proxy_score(q, k, cu, cu, causal=True)  # (H_idx, mkt, Sq)
+    reduced = max_score.amax(dim=0)  # (mkt, Sq) == M3's amax over proxy heads
+    torch.cuda.synchronize()
+
+    # (1) score equivalence: reduced max_score == indexer block_scores. The proxy
+    # (bf16/fp16 tensor-core, fp32 accumulate) and the fp32 reference matmul use
+    # identical rounded inputs, so they differ only by accumulation order
+    # (observed max|diff| ~2e-5; tol is set well below the boundary score gaps).
+    ref_t = ref_bs.transpose(0, 1)  # (nb, Sq) to match reduced (mkt, Sq)
+    assert reduced.shape == ref_t.shape, (reduced.shape, ref_t.shape)
+    fin_r, fin_b = torch.isfinite(reduced), torch.isfinite(ref_t)
+    assert torch.equal(fin_r, fin_b), "block -inf (fully-future) mask mismatch"
+    score_diff = (reduced[fin_r] - ref_t[fin_b]).abs().max().item()
+    tol = 2e-3
+    assert score_diff < tol, f"proxy vs indexer block_scores max|diff|={score_diff}"
+
+    # (2) selection equivalence (tie-invariant). Compare the *scores* of the
+    # selected blocks, not raw indices, for two reasons: (a) exact-tie blocks at
+    # the top-k boundary are broken arbitrarily and legitimately differ; (b) for a
+    # query with fewer than `topk` causally-valid blocks, M3 masks the surplus
+    # slots to -1 while msa_topk_select fills them with extra future (-inf-scored)
+    # blocks — both map to a -inf selected-score (the downstream attention
+    # re-masks those causally, so it is a benign padding-contract difference).
+    # Equal sorted selected-scores per row therefore == same finite block set.
+    sel_fi = msa_topk_select(reduced[None].contiguous(), topk)[:, 0, :]  # (Sq,topk)
+    sel_m3 = block_indices[0].to(dev)  # (Sq, topk), topk-order, -1 padded
+
+    ms = reduced.transpose(0, 1)  # (Sq, mkt) scores per query
+
+    def _sorted_scores(sel):
+        g = torch.gather(ms, 1, sel.long().clamp_min(0))
+        g = torch.where(sel >= 0, g, torch.full_like(g, float("-inf")))
+        return g.sort(dim=1, descending=True).values
+
+    a, b = _sorted_scores(sel_fi), _sorted_scores(sel_m3)
+    assert torch.equal(torch.isfinite(a), torch.isfinite(b)), (
+        "finite selected-block count per row differs"
+    )
+    both = torch.isfinite(a) & torch.isfinite(b)
+    sel_diff = (a[both] - b[both]).abs().max().item()
+    assert sel_diff < tol, f"selected-block score mismatch max|diff|={sel_diff}"
