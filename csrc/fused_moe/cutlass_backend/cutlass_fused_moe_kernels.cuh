@@ -54,6 +54,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_prebuild.h"
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
@@ -2683,6 +2684,12 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
                                           : 0;
 
   size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+  size_t const precomputed_scheduler_workspace_size =
+      (using_tma_ws && (use_w4afp8 || use_wfp4a16))
+          ? cutlass_kernels_oss::detail::precomputed_scheduler_workspace_size(
+                num_experts_per_node, num_moe_inputs,
+                std::max(hidden_size, is_gated_activation ? inter_size * 2 : inter_size))
+          : 0;
 
   // lora related
   size_t const lora_input_size =
@@ -2762,6 +2769,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
   ADD(fp4_act_scale);
   ADD_NAME(tma_ws_gemm1_workspace, tma_ws_size);
   ADD_NAME(tma_ws_gemm2_workspace, tma_ws_size);
+  ADD(precomputed_scheduler_workspace);
   ADD(gemm_workspace);
   ADD(lora_input);
   ADD(lora_fc1_result);
@@ -2893,10 +2901,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     tma_ws_grouped_gemm1_input_.configureWorkspace(
         getWsPtr(int8_t{}, "tma_ws_gemm1_workspace"), num_experts_per_node,
         getWsPtr(int8_t{}, "gemm_workspace"), workspaces.at("gemm_workspace").first,
+        getWsPtr(int8_t{}, "precomputed_scheduler_workspace"),
+        workspaces.at("precomputed_scheduler_workspace").first,
         getScalingType());
     tma_ws_grouped_gemm2_input_.configureWorkspace(
         getWsPtr(int8_t{}, "tma_ws_gemm2_workspace"), num_experts_per_node,
         getWsPtr(int8_t{}, "gemm_workspace"), workspaces.at("gemm_workspace").first,
+        getWsPtr(int8_t{}, "precomputed_scheduler_workspace"),
+        workspaces.at("precomputed_scheduler_workspace").first,
         getScalingType());
   }
 
@@ -4471,6 +4483,11 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
       (is_w4afp8_quant || is_wfp4a16_quant) ? num_experts_per_node * sizeof(float) : 0;
   size_t alpha_scale_ptr_array_size = num_experts_per_node * sizeof(float**);
   size_t gemm_workspace_size = mInterface->getGemmWorkspaceSize(num_experts_per_node);
+  size_t precomputed_scheduler_workspace_size =
+      (is_tma_ws_input && (is_w4afp8_quant || is_wfp4a16_quant))
+          ? cutlass_kernels_oss::detail::precomputed_scheduler_workspace_size(
+                num_experts_per_node, num_expanded_tokens, std::max(hidden_size, fc1_out_size))
+          : 0;
 
   // Routing info
   size_t expert_first_token_offset_size =
@@ -4540,6 +4557,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   ADD(w4a8_alpha);
   ADD(alpha_scale_ptr_array);
   ADD(fp4_act_scale_flat);
+  ADD(precomputed_scheduler_workspace);
   ADD(gemm_workspace);
   ADD(swiglu_alpha);
   ADD(swiglu_beta);
@@ -4721,6 +4739,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(
   GET_WS_PTR(float*, token_topk_unpermuted_scales);
   GET_WS_PTR(int8_t*, tma_ws_input_workspace);
   GET_WS_PTR(void*, gemm_workspace);
+  GET_WS_PTR(void*, precomputed_scheduler_workspace);
   GET_WS_PTR(float*, alpha_scale_ptr_array);
   GET_WS_PTR(TmaWarpSpecializedGroupedGemmInput::ElementSF*, fp4_act_scale_flat);
   GET_WS_PTR(int*, num_active_experts_per_node);
@@ -4733,7 +4752,10 @@ void GemmProfilerBackend::prepareTmaWsInputs(
 
   TmaWarpSpecializedGroupedGemmInput dummy_tma_ws_input;
   dummy_tma_ws_input.configureWorkspace(tma_ws_input_workspace, mNumExpertsPerNode, gemm_workspace,
-                                        workspaces.at("gemm_workspace").first, mScalingType);
+                                        workspaces.at("gemm_workspace").first,
+                                        precomputed_scheduler_workspace,
+                                        workspaces.at("precomputed_scheduler_workspace").first,
+                                        mScalingType);
   dummy_tma_ws_input.enable_pdl = enable_pdl;  // Set enable_pdl for dummy input
   tma_ws_input_workspace += tma_ws_size;
 
@@ -4748,7 +4770,10 @@ void GemmProfilerBackend::prepareTmaWsInputs(
     // pointers to save space.
     auto& cache_element = mTmaInputCache[use_finalize_fusion][swap_ab][i];
     cache_element.configureWorkspace(tma_ws_input_workspace, mNumExpertsPerNode, gemm_workspace,
-                                     workspaces.at("gemm_workspace").first, mScalingType);
+                                     workspaces.at("gemm_workspace").first,
+                                     precomputed_scheduler_workspace,
+                                     workspaces.at("precomputed_scheduler_workspace").first,
+                                     mScalingType);
     cache_element.enable_pdl = enable_pdl;  // Set enable_pdl for cache element
     tma_ws_input_workspace += tma_ws_size;
 

@@ -43,6 +43,8 @@
 #include "cutlass_extensions/compute_occupancy.h"
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
+#include "cutlass_extensions/gemm/kernel/sm90_gemm_array_tma_warpspecialized_cooperative_precomputed.hpp"
+#include "cutlass_extensions/gemm/kernel/sm90_gemm_array_tma_warpspecialized_pingpong_precomputed.hpp"
 #include "cutlass_extensions/gemm_configs.h"
 
 #ifdef __GNUC__  // Check if the compiler is GCC or Clang
@@ -50,6 +52,7 @@
 #endif  // __GNUC__
 
 #include "moe_gemm_tma_ws_mixed_input_launcher.h"
+#include "moe_gemm_tma_ws_mixed_input_prebuild.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -163,9 +166,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       KernelSchedule>::CollectiveOp;
 
-  using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<cutlass::gemm::GroupProblemShape<Shape<int, int, int>>,
-                                           CollectiveMainloop, CollectiveEpilogue>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversalPrecomputedScheduler<
+      cutlass::gemm::GroupProblemShape<Shape<int, int, int>>, CollectiveMainloop,
+      CollectiveEpilogue>;
 
   using GemmGrouped = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   using StrideC = typename GemmKernel::InternalStrideC;
@@ -209,14 +212,27 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   // Optimize tile scheduling for better L2 locality
   using RasterOrderOptions =
       typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90Params::RasterOrderOptions;
-  arguments.scheduler.max_swizzle_size = 2;
-  arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;
+  arguments.scheduler.max_swizzle_size = detail::kPrecomputedSchedulerMaxSwizzle;
+  arguments.scheduler.raster_order = RasterOrderOptions::AlongM;
 
   assert(group_size == int(inputs.groupwise_quant_group_size));
   if (workspace_size != nullptr) {
     *workspace_size = gemm.get_workspace_size(arguments);
     return;
   }
+
+  static constexpr int CurrentTileShapeM = cute::size<0>(TileShape{});
+  static constexpr int CurrentTileShapeN = cute::size<1>(TileShape{});
+  static constexpr int CurrentClusterShapeM = cute::size<0>(ClusterShape{});
+  static constexpr int CurrentClusterShapeN = cute::size<1>(ClusterShape{});
+  auto precomputed_workspace =
+      detail::partition_precomputed_scheduler_workspace<CurrentTileShapeM, CurrentTileShapeN,
+                                                        CurrentClusterShapeM,
+                                                        CurrentClusterShapeN>(
+          hopper_inputs, inputs.num_experts, inputs.num_rows, inputs.n, sm_count_);
+  arguments.scheduler.precomputed_work_tiles = precomputed_workspace.work_tiles;
+  arguments.mainloop.ptr_A_prebuilt_tma_desc = precomputed_workspace.prebuilt_tma_desc_A;
+  arguments.mainloop.ptr_B_prebuilt_tma_descs = precomputed_workspace.prebuilt_tma_desc_B;
 
   if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size) {
     TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, %d < %d.",
@@ -241,6 +257,11 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
                           std::string(cutlass::cutlassGetStatusString(init_status));
     throw std::runtime_error("[Mixed dtype WS grouped GEMM] " + err_msg);
   }
+
+  detail::build_precomputed_work_tile_map<CurrentTileShapeM, CurrentTileShapeN,
+                                          CurrentClusterShapeM, CurrentClusterShapeN>(
+      precomputed_workspace, hopper_inputs.int4_groupwise_params.shape.problem_shapes,
+      inputs.num_experts, inputs.num_rows, inputs.n, gemm.params().mainloop, inputs.stream);
 
   auto run_status = gemm.run(inputs.stream);
   if (run_status != cutlass::Status::kSuccess) {
