@@ -101,14 +101,22 @@ def get_mtp_config(
     elif work_units <= 1024:
         tile_v, ilp_rows, use_smem_v = 32, 4, False
     else:
-        # Large batches: tile_v=64, smem_v on by default
-        tile_v = 64
-        use_smem_v = True
-        ilp_rows = 4
-        # State update ON + low T: ilp=8 helps, smem_v provides no benefit
-        if not disable_state_update and seq_len <= 2:
-            ilp_rows = 8
+        # Large batches: tile_v depends on T
+        if seq_len <= 2:
+            # Low T: tile_v=32 gives 2x CTAs, better DRAM page utilization
+            # smem_v=False is fine since V reuse is only 2x
+            tile_v = 32
             use_smem_v = False
+            ilp_rows = 4
+            # State update ON + low T: ilp=8 helps
+            if not disable_state_update:
+                ilp_rows = 8
+        else:
+            # High T: tile_v=64 with smem_v=True — V values cached in SMEM
+            # and reused across T timesteps, amortizing the GMEM load
+            tile_v = 64
+            use_smem_v = True
+            ilp_rows = 4
 
     # Clamp tile_v to v_dim (e.g. v_dim=64 models shouldn't use tile_v=128)
     tile_v = min(tile_v, v_dim)
@@ -415,7 +423,7 @@ def gdn_verify_kernel_mtp(
             # This overlaps h-state DRAM latency with warp 0's Phase 1 compute
             v_base_prefetch = i_v * tile_v + group_idx * rows_per_group
             if cutlass.const_expr(ilp_rows >= 4):
-                # Prefetch 4 h-state rows
+                # Prefetch first 4 h-state rows into r_h[0:3]
                 v_pf_d = v_base_prefetch + 3
                 if v_pf_d < V:
                     pf_a = cute.local_tile(
@@ -819,33 +827,91 @@ def gdn_verify_kernel_mtp(
                 v_idx_d = v_idx_a + 3
 
                 if v_idx_d < V:
-                    # Load h for 4 V-rows. Warps 1-3 skip first quad (prefetched in Phase 1).
-                    if warp_idx == 0 or row_quad > 0:
-                        h_tile_a = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_a, lane_in_group),
-                        )
-                        h_tile_b = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_b, lane_in_group),
-                        )
-                        h_tile_c = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_c, lane_in_group),
-                        )
-                        h_tile_d = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_d, lane_in_group),
-                        )
-                        cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
-                        cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
-                        cute.autovec_copy(h_tile_c, cute.slice_(r_h, (2, None)))
-                        cute.autovec_copy(h_tile_d, cute.slice_(r_h, (3, None)))
-                    # else: warps 1-3 on first quad — r_h already loaded during Phase 1
+                    # Load h for 4 V-rows.
+                    # T>2: Warp 0 loads all quads, warps 1-3 skip first (prefetched in Phase 1)
+                    if cutlass.const_expr(T > 6):
+                        if warp_idx == 0 or row_quad > 0:
+                            h_tile_a = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_a, lane_in_group),
+                            )
+                            h_tile_b = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_b, lane_in_group),
+                            )
+                            h_tile_c = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_c, lane_in_group),
+                            )
+                            h_tile_d = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_d, lane_in_group),
+                            )
+                            cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+                            cute.autovec_copy(h_tile_c, cute.slice_(r_h, (2, None)))
+                            cute.autovec_copy(h_tile_d, cute.slice_(r_h, (3, None)))
+
+                    # T<=2: Only warp 0 first quad loads; software pipeline handles rest
+                    if cutlass.const_expr(T <= 6):
+                        if warp_idx == 0 and row_quad == 0:
+                            h_tile_a = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_a, lane_in_group),
+                            )
+                            h_tile_b = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_b, lane_in_group),
+                            )
+                            h_tile_c = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_c, lane_in_group),
+                            )
+                            h_tile_d = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_d, lane_in_group),
+                            )
+                            cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+                            cute.autovec_copy(h_tile_c, cute.slice_(r_h, (2, None)))
+                            cute.autovec_copy(h_tile_d, cute.slice_(r_h, (3, None)))
+
+                        # Software pipeline: issue LDGs for NEXT row_quad into r_h[4:7]
+                        if row_quad < quarter_rows - 1:
+                            next_v_a = v_idx_a + 4
+                            if next_v_a + 3 < V:
+                                h_pf_a = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (flat_state_idx, next_v_a, lane_in_group),
+                                )
+                                h_pf_b = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (flat_state_idx, next_v_a + 1, lane_in_group),
+                                )
+                                h_pf_c = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (flat_state_idx, next_v_a + 2, lane_in_group),
+                                )
+                                h_pf_d = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (flat_state_idx, next_v_a + 3, lane_in_group),
+                                )
+                                cute.autovec_copy(h_pf_a, cute.slice_(r_h, (4, None)))
+                                cute.autovec_copy(h_pf_b, cute.slice_(r_h, (5, None)))
+                                cute.autovec_copy(h_pf_c, cute.slice_(r_h, (6, None)))
+                                cute.autovec_copy(h_pf_d, cute.slice_(r_h, (7, None)))
 
                     # Process all T time steps with all 4 h vectors in registers
                     for i_t in cutlass.range_constexpr(T):
@@ -1185,6 +1251,16 @@ def gdn_verify_kernel_mtp(
                             (flat_state_idx, v_idx_d, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
+
+                    # Software pipeline: move prefetched h-state to active slots.
+                    # Only for T<=2 (matches the prefetch LDG gate above).
+                    if cutlass.const_expr(T <= 6):
+                        if row_quad < quarter_rows - 1:
+                            for i in cutlass.range_constexpr(vec_size):
+                                r_h[0, i] = r_h[4, i]
+                                r_h[1, i] = r_h[5, i]
+                                r_h[2, i] = r_h[6, i]
+                                r_h[3, i] = r_h[7, i]
         elif cutlass.const_expr(ilp_rows == 2):
             # === 2-ROW ILP PATH: Process 2 V-rows simultaneously ===
             half_rows: cutlass.Constexpr[int] = rows_per_group // 2
@@ -1194,21 +1270,55 @@ def gdn_verify_kernel_mtp(
                 v_idx_b = v_idx_a + 1
 
                 if v_idx_b < V:
-                    # Load h for BOTH rows. Warps 1-3 skip first pair (prefetched).
-                    if warp_idx == 0 or row_pair > 0:
-                        h_tile_a = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_a, lane_in_group),
-                        )
-                        h_tile_b = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_b, lane_in_group),
-                        )
-                        cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
-                        cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
-                    # else: warps 1-3 on first pair — r_h already loaded during Phase 1
+                    # Load h for 2 V-rows.
+                    # T>2: Warp 0 loads all pairs, warps 1-3 skip first (prefetched in Phase 1)
+                    if cutlass.const_expr(T > 6):
+                        if warp_idx == 0 or row_pair > 0:
+                            h_tile_a = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_a, lane_in_group),
+                            )
+                            h_tile_b = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+
+                    # T<=2: Only warp 0 first pair loads; software pipeline handles rest
+                    if cutlass.const_expr(T <= 6):
+                        if warp_idx == 0 and row_pair == 0:
+                            h_tile_a = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_a, lane_in_group),
+                            )
+                            h_tile_b = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (flat_state_idx, v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                            cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+
+                        # Software pipeline: issue LDGs for NEXT row_pair into r_h[2:3]
+                        if row_pair < half_rows - 1:
+                            next_v_a = v_idx_a + 2
+                            if next_v_a + 1 < V:
+                                h_pf_a = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (flat_state_idx, next_v_a, lane_in_group),
+                                )
+                                h_pf_b = cute.local_tile(
+                                    h0_source,
+                                    (1, 1, vec_size),
+                                    (flat_state_idx, next_v_a + 1, lane_in_group),
+                                )
+                                cute.autovec_copy(h_pf_a, cute.slice_(r_h, (2, None)))
+                                cute.autovec_copy(h_pf_b, cute.slice_(r_h, (3, None)))
 
                     # Process all T time steps with both h vectors in registers
                     for i_t in cutlass.range_constexpr(T):
@@ -1322,6 +1432,14 @@ def gdn_verify_kernel_mtp(
                             (flat_state_idx, v_idx_b, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
+
+                    # Software pipeline: move prefetched h-state to active slots.
+                    # Only for T<=2 (matches the prefetch LDG gate above).
+                    if cutlass.const_expr(T <= 6):
+                        if row_pair < half_rows - 1:
+                            for i in cutlass.range_constexpr(vec_size):
+                                r_h[0, i] = r_h[2, i]
+                                r_h[1, i] = r_h[3, i]
         # === Cooperative output writeback from SMEM to GMEM (only if use_smem_v) ===
         if cutlass.const_expr(use_smem_v):
             cute.arch.barrier()  # Ensure all groups finished writing to sOutput
