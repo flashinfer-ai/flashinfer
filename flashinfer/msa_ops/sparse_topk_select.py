@@ -67,6 +67,48 @@ def _get_compiled_topk(topk: int):
     return compiled
 
 
+_radix_compile_cache: dict = {}
+
+
+def _get_compiled_radix_topk(topk: int):
+    """Compile the faithful radix-histogram top-k (CuTe-DSL port of the CUDA
+    ``IndexerTopKWithSortKernel``): O(max_k_tiles) per row vs the argmax port's
+    O(topk * max_k_tiles)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.topk_select_radix_sm12x import TopKSelectRadixSm12x
+
+    compiled = _radix_compile_cache.get(topk)
+    if compiled is not None:
+        return compiled
+
+    def fk(dtype, ndim, align):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            tuple(cute.sym_int() for _ in range(ndim)),
+            stride_order=tuple(reversed(range(ndim))),
+            assumed_align=align,
+        )
+
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = cute.compile(
+        TopKSelectRadixSm12x(topk=topk),
+        fk(cutlass.Float32, 3, 4),  # max_score (H, P, S)
+        fk(cutlass.Int32, 3, 4),  # out (S, H, topk)
+        cutlass.Int32(1),  # num_valid_pages
+        cutlass.Int32(0),  # force_begin
+        cutlass.Int32(0),  # force_end
+        cutlass.Int32(1),  # total_qo_len
+        cutlass.Int32(1),  # num_qo_heads
+        cutlass.Int32(1),  # max_k_tiles
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    _radix_compile_cache[topk] = compiled
+    return compiled
+
+
 @flashinfer_api
 def msa_topk_select(
     max_score: torch.Tensor,
@@ -75,7 +117,7 @@ def msa_topk_select(
     output: Optional[torch.Tensor] = None,
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
-    _backend: str = "cudsl",
+    _backend: str = "auto",
 ) -> torch.Tensor:
     """Select the top-K KV blocks per query token based on attention scores.
 
@@ -149,7 +191,17 @@ def msa_topk_select(
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
 
-    if _backend == "cuda":
+    # Resolve the default: the radix port is the fastest path across the MSA
+    # context envelope (max_k_tiles <= 2048, i.e. <=256K ctx) and beats both the
+    # CUDA kernel and the argmax port there. Above 2048 it exceeds its SMEM
+    # staging cap, so fall back to the general argmax port. (The argmax port is
+    # also marginally faster at tiny max_k_tiles <= ~64, but radix is close
+    # enough there that one default path keeps things simple.)
+    backend = _backend
+    if backend == "auto":
+        backend = "cudsl_radix" if max_k_tiles <= 2048 else "cudsl"
+
+    if backend == "cuda":
         workspace_size = num_qo_heads * max_k_tiles * total_qo_len
         workspace = torch.empty(
             workspace_size, dtype=torch.int32, device=max_score.device
@@ -162,6 +214,26 @@ def msa_topk_select(
             num_valid_pages,
             force_begin_blocks,
             force_end_blocks,
+        )
+    elif backend == "cudsl_radix":
+        # The single-pass radix stages the whole threshold bin (<= max_k_tiles)
+        # in a fixed 2048-slot SMEM buffer, so it is exact only within that
+        # envelope (covers MSA's <=128K-context max_k_tiles). Larger inputs
+        # should use the general argmax path ("cudsl").
+        if max_k_tiles > 2048:
+            raise ValueError(
+                f"cudsl_radix supports max_k_tiles <= 2048, got {max_k_tiles}; "
+                "use _backend='cudsl' for larger inputs"
+            )
+        _get_compiled_radix_topk(topk)(
+            max_score,
+            output,
+            int(num_valid_pages),
+            int(force_begin_blocks),
+            int(force_end_blocks),
+            int(total_qo_len),
+            int(num_qo_heads),
+            int(max_k_tiles),
         )
     else:
         _get_compiled_topk(topk)(

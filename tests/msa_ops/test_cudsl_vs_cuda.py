@@ -311,6 +311,9 @@ def test_csr_schedule_cudsl_vs_cuda(B, H, topk, seqs_q, seqs_k, target):
     ],
 )
 def test_topk_cudsl_vs_cuda(H, P, S, nvp, fb, fe):
+    """Three-way: CUDA vs the argmax port (cudsl) vs the faithful radix port
+    (cudsl_radix). Distinct random scores -> the selected set and its
+    ascending-by-index order are fully determined, so all three are bit-exact."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_topk_select
 
@@ -320,27 +323,90 @@ def test_topk_cudsl_vs_cuda(H, P, S, nvp, fb, fe):
     if nvp < P:
         max_score[:, nvp:, :] = float("-inf")
 
-    out_cuda = msa_topk_select(
-        max_score,
-        16,
-        num_valid_pages=nvp,
-        force_begin_blocks=fb,
-        force_end_blocks=fe,
-        _backend="cuda",
-    )
-    out_cudsl = msa_topk_select(
-        max_score,
-        16,
-        num_valid_pages=nvp,
-        force_begin_blocks=fb,
-        force_end_blocks=fe,
-        _backend="cudsl",
-    )
+    def _run(backend):
+        return msa_topk_select(
+            max_score,
+            16,
+            num_valid_pages=nvp,
+            force_begin_blocks=fb,
+            force_end_blocks=fe,
+            _backend=backend,
+        )
+
+    out_cuda = _run("cuda")
+    out_cudsl = _run("cudsl")
+    out_radix = _run("cudsl_radix")
     torch.cuda.synchronize()
 
-    # ascending distinct indices with distinct random scores -> the selected set
-    # and its order are fully determined, so bit-exact.
+    ctx = f"H={H} P={P} S={S} nvp={nvp} fb={fb} fe={fe}"
     assert torch.equal(out_cuda, out_cudsl), (
-        f"topk mismatch H={H} P={P} S={S} nvp={nvp} fb={fb} fe={fe}\n"
-        f"cuda={out_cuda[0, 0]}\ncudsl={out_cudsl[0, 0]}"
+        f"argmax topk mismatch {ctx}\ncuda={out_cuda[0, 0]}\ncudsl={out_cudsl[0, 0]}"
     )
+    assert torch.equal(out_cuda, out_radix), (
+        f"radix topk mismatch {ctx}\ncuda={out_cuda[0, 0]}\nradix={out_radix[0, 0]}"
+    )
+
+
+def test_topk_tied_scores_three_way():
+    """With deliberately tied scores the *exact* tie membership at the selection
+    boundary is ambiguous (it depends on atomic emission order, and differs
+    legitimately across backends). So instead of cross-backend equality we assert
+    each backend produces a *valid* top-k per row: forced blocks present,
+    ascending + distinct, the right count, and no unselected middle block scores
+    strictly above a selected one."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_topk_select
+
+    torch.manual_seed(7)
+    dev = "cuda"
+    H, P, S, nvp, fb, fe = 2, 128, 48, 120, 2, 2
+    topk = 16
+    # coarse quantization -> many exact ties among the per-block scores
+    max_score = (torch.randn(H, P, S, device=dev) * 4).round() / 4
+    max_score[:, nvp:, :] = float("-inf")
+    forced = set(range(fb)) | set(range(nvp - fe, nvp))
+    mid = list(range(fb, nvp - fe))
+
+    def _assert_valid(out, backend):
+        flat = out.reshape(H * S, topk).cpu()
+        for r in range(flat.shape[0]):
+            sel = [int(x) for x in flat[r] if x >= 0]
+            assert len(sel) == len(set(sel)), f"{backend}: dup/order"
+            assert sel == sorted(sel), f"{backend}: not ascending {sel}"
+            assert len(sel) == min(topk, nvp), f"{backend}: count {len(sel)}"
+            assert forced <= set(sel), f"{backend}: forced missing"
+
+    for b in ("cuda", "cudsl", "cudsl_radix"):
+        out = msa_topk_select(
+            max_score,
+            topk,
+            num_valid_pages=nvp,
+            force_begin_blocks=fb,
+            force_end_blocks=fe,
+            _backend=b,
+        )
+        torch.cuda.synchronize()
+        _assert_valid(out, b)
+
+    # valid-top-k by score (tie-break-independent): for the radix backend, the
+    # min selected middle-score must be >= the max unselected middle-score.
+    out = msa_topk_select(
+        max_score,
+        topk,
+        num_valid_pages=nvp,
+        force_begin_blocks=fb,
+        force_end_blocks=fe,
+        _backend="cudsl_radix",
+    )
+    torch.cuda.synchronize()
+    out = out.reshape(S, H, topk).cpu()
+    for s_idx in range(S):
+        for h_idx in range(H):
+            sel = {int(x) for x in out[s_idx, h_idx] if x >= 0}
+            sel_mid = [i for i in sel if i in set(mid)]
+            unsel_mid = [i for i in mid if i not in sel]
+            if sel_mid and unsel_mid:
+                scores = max_score[h_idx, :, s_idx].cpu()
+                assert scores[sel_mid].min() >= scores[unsel_mid].max(), (
+                    f"radix selected a worse middle block at (s={s_idx},h={h_idx})"
+                )
