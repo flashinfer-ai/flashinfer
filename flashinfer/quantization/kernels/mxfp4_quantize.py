@@ -867,31 +867,37 @@ def mxfp4_quantize_cute_dsl(
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to MXFP4 format using CuTe-DSL kernel.
+    r"""Quantize input tensor to MXFP4 format using the CuTe-DSL kernel.
 
-    This is a GPU implementation with dual-path optimization:
-    - LINEAR layout: flat SF-block based iteration with adaptive 1T/4T per SF
-      block dispatch — uses 4T/SF on low-SM GPUs (<=80 SMs) for coalesced
-      memory access, and 1T/SF on high-SM GPUs where enough SMs generate
-      sufficient outstanding memory requests
-    - SWIZZLED layout: row-based iteration with padding fast path (optimized)
+    GPU implementation with dual-path optimization:
 
-    The kernel is compiled once per (K, dtype, sf_layout, pdl, use_4t)
-    combination and handles varying M (batch size) at runtime without
+    - **LINEAR layout**: flat SF-block iteration with adaptive 1T/4T per
+      SF block.  4T/SF is used on low-SM GPUs (<=80 SMs) for coalesced
+      memory access; 1T/SF on high-SM GPUs where enough SMs generate
+      sufficient outstanding memory requests.
+    - **SWIZZLED layout**: row-based iteration with a padding fast path.
+
+    The kernel is compiled once per ``(K, dtype, sf_layout, pdl, use_4t)``
+    tuple and handles varying ``M`` (batch size) at runtime without
     recompilation.
 
-    Args:
-        input: Input tensor of shape [M, K] with dtype fp16/bf16
-        sf_layout: Scale factor layout (0=128x4, 1=8x4, 2=linear).
-        enable_pdl: Whether to enable PDL (Programmatic Dependent Launch).
-            If None, automatically detects based on device capability (SM >= 9.0).
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor of shape ``[M, K]`` with dtype fp16/bf16.
+    sf_layout : int
+        Scale-factor layout (``0=128x4``, ``1=8x4``, ``2=linear``).
+    enable_pdl : bool, optional
+        Whether to enable Programmatic Dependent Launch.  Auto-detected
+        from device capability (SM >= 9.0) when ``None``.
 
-    Returns:
-        Tuple of:
-            - fp4_tensor: Quantized tensor of shape [M, K/2] with dtype uint8
-            - scale_tensor: Scale factors as uint8 tensor
-              reshaped to [padded_rows, K/32]
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(fp4_tensor, scale_tensor)`` where ``fp4_tensor`` is the
+        quantized tensor of shape ``[M, K/2]`` with dtype ``uint8`` and
+        ``scale_tensor`` are the UE8M0 scale factors (``uint8``) reshaped
+        to ``[padded_rows, K/32]``.
     """
     from ...utils import device_support_pdl
 

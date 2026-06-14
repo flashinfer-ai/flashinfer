@@ -42,12 +42,35 @@ def get_holistic_attention_module(*args):
 
 
 class BatchAttention:
+    r"""Holistic batched attention wrapper that fuses paged-prefill and paged-decode requests
+    into a single kernel launch.
+
+    ``BatchAttention`` dispatches between prefill-style and decode-style execution per
+    request based on the ``qo_indptr`` / ``kv_indptr`` ranges supplied to :meth:`plan`, so a
+    serving stack can submit a mixed batch (e.g. some prompts in prefill, others in decode)
+    without splitting it into two separate wrappers.  Workspace buffers are owned by the
+    instance and reused across :meth:`plan` / :meth:`run` calls.
+
+    Parameters
+    ----------
+    kv_layout : str
+        Layout of the paged KV-cache tensors, either ``"NHD"`` (token-major) or
+        ``"HND"`` (head-major).  Defaults to ``"NHD"``.
+    device : str
+        CUDA device that owns the internal workspace buffers, e.g. ``"cuda"`` or
+        ``"cuda:0"``.  Defaults to ``"cuda"``.
+    """
+
     @flashinfer_api
     def __init__(
         self,
         kv_layout: str = "NHD",
         device: str = "cuda",
     ):
+        r"""Allocate workspace buffers and bind the wrapper to a CUDA device.
+
+        See :class:`BatchAttention` for the meaning of each parameter.
+        """
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
 
@@ -87,6 +110,49 @@ class BatchAttention:
         kv_data_type: torch.dtype = torch.bfloat16,
         use_profiler: bool = False,
     ) -> None:
+        r"""Plan the holistic attention kernel for a specific batch shape.
+
+        Should be called before any :meth:`run` call.  The plan is cached on the
+        instance and reused across subsequent :meth:`run` invocations with the same
+        layout.
+
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            CSR-style query offsets, shape ``[batch_size + 1]``, dtype ``int32``.
+        kv_indptr : torch.Tensor
+            CSR-style page offsets into ``kv_indices``, shape ``[batch_size + 1]``,
+            dtype ``int32``.
+        kv_indices : torch.Tensor
+            Page indices into the paged KV-cache, shape ``[kv_indptr[-1]]``,
+            dtype ``int32``.
+        kv_len_arr : torch.Tensor
+            Per-request KV-cache lengths in tokens, shape ``[batch_size]``,
+            dtype ``int32``.
+        num_qo_heads : int
+            Number of query / output heads.
+        num_kv_heads : int
+            Number of key / value heads.  Must divide ``num_qo_heads``.
+        head_dim_qk : int
+            Per-head dimension of the query / key tensors.
+        head_dim_vo : int
+            Per-head dimension of the value / output tensors.
+        page_size : int
+            Page size of the paged KV-cache.
+        causal : bool
+            Whether to apply a causal mask.  Defaults to ``False``.
+        sm_scale : float
+            Softmax scale.  If ``None``, defaults to ``1/sqrt(head_dim_qk)``.
+        logits_soft_cap : Optional[float]
+            Logits soft-cap value.  ``None`` or ``0`` disables capping.
+        q_data_type : torch.dtype
+            Dtype of the query tensor.  Defaults to ``torch.bfloat16``.
+        kv_data_type : torch.dtype
+            Dtype of the key / value tensors.  Defaults to ``torch.bfloat16``.
+        use_profiler : bool
+            Whether to compile the profiler-enabled variant of the kernel.  Defaults
+            to ``False``.
+        """
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         self._logits_soft_cap = logits_soft_cap
@@ -151,6 +217,42 @@ class BatchAttention:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Run the planned holistic attention kernel.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Query tensor, shape ``[total_qo_tokens, num_qo_heads, head_dim_qk]``.
+        kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            Either a single packed paged KV-cache tensor (when K and V share storage) or a
+            ``(k_cache, v_cache)`` pair.  Layout must match the ``kv_layout`` passed to
+            :meth:`__init__`.
+        out : Optional[torch.Tensor]
+            Optional output buffer.  If ``None``, a new tensor is allocated with the same
+            shape as ``q``.
+        lse : Optional[torch.Tensor]
+            Optional log-sum-exp buffer, shape ``[total_qo_tokens, num_qo_heads]``, dtype
+            ``float32``.  Allocated if ``None``.
+        k_scale : Optional[torch.Tensor]
+            FP8 dequantization scale for ``k``.  Pre-multiplied into ``sm_scale``.
+        v_scale : Optional[torch.Tensor]
+            FP8 dequantization scale for ``v``.  Applied to the output.
+        logits_soft_cap : float
+            Logits soft-cap value.  Must be consistent with the ``logits_soft_cap``
+            passed to :meth:`plan` (a non-zero value here requires a non-zero plan-time
+            value too).
+        profiler_buffer : Optional[torch.Tensor]
+            Profiler buffer.  Required if the wrapper was planned with
+            ``use_profiler=True``.
+        kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
+            Optional scale tensors for NVFP4 KV-cache (one tensor or a ``(k_sf, v_sf)``
+            pair, mirroring the structure of ``kv_cache``).
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor]
+            ``(out, lse)`` — the attention output and its log-sum-exp.
+        """
         if profiler_buffer is None:
             if self._use_profiler:
                 raise ValueError(

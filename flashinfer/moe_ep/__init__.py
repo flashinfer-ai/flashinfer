@@ -25,11 +25,74 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .algo_knobs import (
+    AlgoKnob,
+    FleetAlgoKnobNumChannelsPerRank,
+    FleetAlgoKnobNumQpsPerRank,
+    FleetAlgoKnobQuantization,
+    FleetAlgoKnobRdmaBufferSize,
+    FleetAlgoKnobTopologyCapacity,
+    HandleAlgoKnobNumReceivedTokens,
+    HandleAlgoKnobSplitOperation,
+    HandleAlgoKnobTopKWeights,
+    HandleAlgoKnobUserStream,
+)
+from .config import (
+    BootstrapConfig,
+    CombineInputParams,
+    CombineOutput,
+    DispatchInputParams,
+    DispatchOutput,
+    EpAlgorithm,
+    FleetParams,
+    HandleParams,
+    QuantType,
+)
+from ._validators import (
+    MoEEpArchError,
+    MoEEpConfigError,
+    validate_arch_for_backend,
+    validate_fleet_params,
+)
+from .fleet import Fleet, create_fleet
+from .handle import Handle
+from .layer import MoEEpLayer
+from .split_backends import NcclEpConfig, NvepConfig
+from .tensors import MoEEpTensors
+
 __all__ = [
+    "AlgoKnob",
+    "BootstrapConfig",
+    "CombineInputParams",
+    "CombineOutput",
+    "DispatchInputParams",
+    "DispatchOutput",
+    "EpAlgorithm",
+    "Fleet",
+    "FleetAlgoKnobNumChannelsPerRank",
+    "FleetAlgoKnobNumQpsPerRank",
+    "FleetAlgoKnobQuantization",
+    "FleetAlgoKnobRdmaBufferSize",
+    "FleetAlgoKnobTopologyCapacity",
+    "FleetParams",
+    "Handle",
+    "HandleAlgoKnobNumReceivedTokens",
+    "HandleAlgoKnobSplitOperation",
+    "HandleAlgoKnobTopKWeights",
+    "HandleAlgoKnobUserStream",
+    "HandleParams",
+    "MoEEpArchError",
+    "MoEEpConfigError",
+    "MoEEpLayer",
     "MoEEpNotBuiltError",
+    "MoEEpTensors",
+    "NcclEpConfig",
+    "NvepConfig",
+    "QuantType",
+    "available_backends",
+    "create_fleet",
     "have_nccl_ep",
     "have_nixl_ep",
-    "available_backends",
 ]
 
 
@@ -126,3 +189,12 @@ if _set_build_flags and not available_backends():
         RuntimeWarning,
         stacklevel=2,
     )
+
+# Trigger backend registration. Importing these modules populates
+# ``_BACKEND_REGISTRY`` via module-level assignments. Both imports are
+# pure-Python and don't touch libnccl_ep.so / nixl_ep_cpp.so — those
+# only load when a Fleet is actually instantiated. Must happen AFTER
+# MoEEpNotBuiltError / _require_built are defined above (the backend
+# modules `from .. import` them).
+from .nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
+from .nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
