@@ -299,9 +299,9 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_p, max_num_mma_kv_reg_p), NUM_MMA_KV_P, {
       using KTraits_P =
           KernelTraits<MASK_MODE_P, CTA_TILE_Q_P, NUM_MMA_Q_P, NUM_MMA_KV_P, NUM_MMA_D_QK,
-                       NUM_MMA_D_VO, NUM_WARPS_Q_P, NUM_WARPS_KV_P, POS_ENCODING_MODE, DTypeQ_P,
-                       DTypeKV_P, DTypeO_P, DTypeQKAccum_P, typename PrefillParams::IdType,
-                       PrefillAttentionVariant>;
+                       NUM_MMA_D_VO, NUM_WARPS_Q_P, NUM_WARPS_KV_P, POS_ENCODING_MODE, false,
+                       DTypeQ_P, DTypeKV_P, DTypeO_P, DTypeQKAccum_P,
+                       typename PrefillParams::IdType, PrefillAttentionVariant>;
 
       if constexpr (KTraits_P::IsInvalid()) {
         // Invalid configuration, skip
@@ -319,9 +319,9 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
         DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d), NUM_MMA_KV_D, {
           using KTraits_D =
               KernelTraits<MASK_MODE_D, CTA_TILE_Q_D, NUM_MMA_Q_D, NUM_MMA_KV_D, NUM_MMA_D_QK,
-                           NUM_MMA_D_VO, NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, DTypeQ_D,
-                           DTypeKV_D, DTypeO_D, DTypeQKAccum_D, typename DecodeParams::IdType,
-                           DecodeAttentionVariant>;
+                           NUM_MMA_D_VO, NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, false,
+                           DTypeQ_D, DTypeKV_D, DTypeO_D, DTypeQKAccum_D,
+                           typename DecodeParams::IdType, DecodeAttentionVariant>;
           if constexpr (KTraits_D::IsInvalid()) {
             // Invalid configuration, skip
             std::ostringstream err_msg;

@@ -128,6 +128,9 @@ def test_single_prefill_with_kv_cache_nvfp4(
 
     Reference uses dequantized KV with the standard fp16 kernel.
     """
+    cc = torch.cuda.get_device_capability(device="cuda:0")
+    if q_dtype != torch.float16 and cc[0] < 8:
+        pytest.skip(f"{q_dtype} need SM80+")
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
 

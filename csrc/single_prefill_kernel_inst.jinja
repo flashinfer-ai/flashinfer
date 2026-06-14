@@ -6,10 +6,16 @@ using namespace flashinfer;
 namespace flashinfer {
 
 constexpr auto use_custom_mask = {{ mask_mode }} == MaskMode::kCustom;
+constexpr auto use_per_token_head = {{ use_per_token_head }};
 
 template cudaError_t SinglePrefillWithKVCacheDispatched<
-    {{ head_dim_qk }}, {{ head_dim_vo }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, {{ variant_name }}, Params>(
+    {{ head_dim_qk }}, {{ head_dim_vo }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, false, {{ variant_name }}, Params>(
     Params params, {{ dtype_o }}* tmp,
     cudaStream_t stream);
+template cudaError_t SinglePrefillWithKVCacheDispatched<
+    {{ head_dim_qk }}, {{ head_dim_vo }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, true, {{ variant_name }}, Params>(
+    Params params, {{ dtype_o }}* tmp,
+    cudaStream_t stream);
+
 
 };

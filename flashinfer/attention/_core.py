@@ -59,6 +59,13 @@ class BatchAttention:
     device : str
         CUDA device that owns the internal workspace buffers, e.g. ``"cuda"`` or
         ``"cuda:0"``.  Defaults to ``"cuda"``.
+    use_per_token_head : bool
+        Whether to use FP8 per-token-head inline scales. When enabled, the KV cache
+        should have a float32 scale stored immediately after each token-head's FP8 data
+        (at offset ``head_dim`` in bytes). The KV cache tensor should be created with
+        stride ``head_dim + 16`` (16B aligned) along the head dimension to accommodate
+        the inline scale.
+        Defaults to ``False``.
     """
 
     @flashinfer_api
@@ -66,6 +73,7 @@ class BatchAttention:
         self,
         kv_layout: str = "NHD",
         device: str = "cuda",
+        use_per_token_head: bool = False,
     ):
         r"""Allocate workspace buffers and bind the wrapper to a CUDA device.
 
@@ -90,6 +98,7 @@ class BatchAttention:
             device=torch.device("cpu"),
             pin_memory=True,
         )
+        self._use_per_token_head = use_per_token_head
 
     @flashinfer_api
     def plan(
@@ -200,6 +209,7 @@ class BatchAttention:
             num_kv_heads,
             head_dim_vo,
             causal,
+            self._use_per_token_head,
         )
 
     @flashinfer_api(trace=batch_attention_run_trace)
@@ -209,8 +219,8 @@ class BatchAttention:
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         logits_soft_cap: float = 0.0,
         profiler_buffer: Optional[torch.Tensor] = None,
         kv_cache_sf: Optional[
@@ -233,9 +243,9 @@ class BatchAttention:
         lse : Optional[torch.Tensor]
             Optional log-sum-exp buffer, shape ``[total_qo_tokens, num_qo_heads]``, dtype
             ``float32``.  Allocated if ``None``.
-        k_scale : Optional[torch.Tensor]
+        k_scale : Optional[float]
             FP8 dequantization scale for ``k``.  Pre-multiplied into ``sm_scale``.
-        v_scale : Optional[torch.Tensor]
+        v_scale : Optional[float]
             FP8 dequantization scale for ``v``.  Applied to the output.
         logits_soft_cap : float
             Logits soft-cap value.  Must be consistent with the ``logits_soft_cap``
@@ -307,6 +317,7 @@ class BatchAttention:
             v_scale,
             sm_scale,
             logits_soft_cap,
+            self._use_per_token_head,
             # ADDITIONAL_FUNC_PARAMS (maybe_k_cache_sf, maybe_v_cache_sf)
             k_cache_sf,
             v_cache_sf,

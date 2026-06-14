@@ -5,6 +5,8 @@ using namespace flashinfer;
 
 namespace flashinfer {
 
+constexpr auto use_per_token_head = {{ use_per_token_head }};
+
 template cudaError_t
 BatchDecodeWithPagedKVCacheDispatched<{{ head_dim_qk }}, {{ pos_encoding_mode }}, {{ variant_name }}, Params>(
     Params params, {{ dtype_o }}* tmp_v,

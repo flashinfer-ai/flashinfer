@@ -25,8 +25,8 @@ using tvm::ffi::Optional;
 namespace flashinfer {
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, bool FORCE_DISABLE_KV_REPACK,
+          typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                                cudaStream_t stream);
 
@@ -34,10 +34,20 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
 
 using namespace flashinfer;
 
+#define DISPATCH_KV_REPACK(compute_capacity, FORCE_DISABLE_KV_REPACK, HEAD_DIM_VO, ...) \
+  if (compute_capacity.first >= 8) {                                                    \
+    constexpr bool FORCE_DISABLE_KV_REPACK = false;                                     \
+    __VA_ARGS__                                                                         \
+  } else {                                                                              \
+    constexpr bool FORCE_DISABLE_KV_REPACK = HEAD_DIM_VO >= 128;                        \
+    __VA_ARGS__                                                                         \
+  }
+
 void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
                                   ffi::TensorView tmp, ffi::TensorView o,
                                   Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
-                                  int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+                                  int64_t layout, int64_t window_left,
+                                  bool use_per_token_head ADDITIONAL_FUNC_PARAMS) {
   unsigned int head_dim_qk = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -100,10 +110,14 @@ void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::Ten
 
         ADDITIONAL_PARAMS_SETTER
 
-        cudaError_t status = flashinfer::SinglePrefillWithKVCacheDispatched<
-            HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-            /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant>(
-            params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
+        cudaError_t status;
+        auto compute_capacity = GetCudaComputeCapability();
+        DISPATCH_KV_REPACK(compute_capacity, FORCE_DISABLE_KV_REPACK, HEAD_DIM_VO, {
+          status = flashinfer::SinglePrefillWithKVCacheDispatched<
+              HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, FORCE_DISABLE_KV_REPACK,
+              AttentionVariant>(params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
+        });
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "SinglePrefillWithKVCache kernel launch failed, error: "
             << cudaGetErrorString(status);

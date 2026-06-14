@@ -24,7 +24,8 @@ Array<int64_t> BatchPagedAttentionPlan(TensorView float_workspace_buffer,
                                        TensorView page_locked_int_workspace_buffer,
                                        TensorView qo_indptr, TensorView kv_indptr,
                                        TensorView kv_len, int64_t batch_size, int64_t num_qo_heads,
-                                       int64_t num_kv_heads, int64_t head_dim_o, bool causal);
+                                       int64_t num_kv_heads, int64_t head_dim_o, bool causal,
+                                       bool use_per_token_head);
 
 void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_workspace_buffer,
                             Array<int64_t> plan_info_vec, TensorView q, TensorView k_cache,
@@ -32,7 +33,8 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
                             Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                             int64_t layout_code, int64_t num_qo_heads, int64_t num_kv_heads,
                             int64_t page_size, double v_scale, double sm_scale,
-                            double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS);
+                            double logits_soft_cap,
+                            bool use_per_token_head ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, &BatchPagedAttentionPlan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, &BatchPagedAttentionRun);

@@ -1056,6 +1056,9 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4(
     Reference is computed by dequantizing the packed KV back to q_dtype and running
     single_prefill_with_kv_cache per batch item.
     """
+    cc = torch.cuda.get_device_capability(device="cuda:0")
+    if q_dtype != torch.float16 and cc[0] < 8:
+        pytest.skip(f"{q_dtype} need SM80+")
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
 
@@ -1192,6 +1195,9 @@ def test_batch_prefill_with_ragged_kv_cache_nvfp4(
     Reference is computed by dequantizing the packed KV back to q_dtype and running
     single_prefill_with_kv_cache per batch item.
     """
+    cc = torch.cuda.get_device_capability(device="cuda:0")
+    if q_dtype != torch.float16 and cc[0] < 8:
+        pytest.skip(f"{q_dtype} need SM80+")
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
 

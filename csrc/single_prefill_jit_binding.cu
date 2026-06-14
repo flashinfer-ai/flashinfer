@@ -21,7 +21,8 @@ using tvm::ffi::Optional;
 void single_prefill_with_kv_cache(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
                                   ffi::TensorView tmp, ffi::TensorView o,
                                   Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
-                                  int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS);
+                                  int64_t layout, int64_t window_left,
+                                  bool use_per_token_head ADDITIONAL_FUNC_PARAMS);
 
 // Single-request prefill attention with KV-Cache operator
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, single_prefill_with_kv_cache);
