@@ -1,0 +1,322 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+MSA q2k -> k2q CSR builder for SM120/SM121 (CuTe-DSL port of
+``csrc/build_k2q_csr.cu``).
+
+Inverts the per-query top-K KV-block selection (``q2k``) into a KV-major CSR:
+for each (kv-head, KV-block row) the sorted list of batch-local query indices
+that selected it, plus (schedule variant) the per-query split-slot packing,
+per-(query,head) valid-block counts, and a flat work schedule.
+
+Design vs. the CUDA original
+----------------------------
+The CUDA kernel uses per-warp packed-int16 SMEM histograms and relies on the
+intra-warp lane-ordering of same-address SMEM atomics to keep each CSR row's
+queries ascending. This port instead uses a deterministic counting sort:
+
+* queries are partitioned into ``nchunks`` contiguous chunks; one warp owns one
+  (head, chunk) and processes its queries **sequentially**, mapping the 32
+  lanes to the query's ``topk`` slots (not to different queries). Because only
+  one query is in flight per warp-iteration, same-row same-address atomics are
+  issued strictly in query order across the lock-step iterations, so each row's
+  queries come out ascending without depending on intra-warp lane order.
+* per-(head, chunk, row) counts and cursors live in global memory (atomics),
+  so there is no ``total_rows``-sized SMEM budget to cap.
+
+The static row geometry (round-robin row map, per-query batch / batch-local
+index) is tiny and is precomputed host-side in the Python wrapper and passed
+in, replacing the CUDA ``build_row_map`` kernel.
+"""
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import dsl_user_op
+
+
+@dsl_user_op
+def _atomic_add_i32(a, ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
+    """Global int32 atomic add; returns the OLD value (CUDA >= 13.1 nvvm API)."""
+    return nvvm.atomicrmw(
+        op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=cutlass.Int32(a).ir_value()
+    )
+
+
+class BuildK2qCsrSm12x:
+    def __init__(self, topk: int, has_schedule: bool):
+        if topk not in (4, 8, 16, 32):
+            raise ValueError(f"topk must be 4, 8, 16, or 32, got {topk}")
+        self._topk = topk
+        self._has_schedule = has_schedule
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ2k: cute.Tensor,  # (H, S_Q, topk) int32
+        mRowMap: cute.Tensor,  # (B, max_kv_blocks) int32, -1 = inactive
+        mBatchOfQ: cute.Tensor,  # (S_Q,) int32
+        mQlocOfQ: cute.Tensor,  # (S_Q,) int32
+        mRowCoords: cute.Tensor,  # (total_rows, 2) int32 (batch, kv_block)
+        mRowPtr: cute.Tensor,  # (H, total_rows + 1) int32 (out)
+        mQIdx: cute.Tensor,  # (H, S_Q * topk) int32 (out)
+        mQSplit: cute.Tensor,  # (H, S_Q * topk) int32 (out / dummy)
+        mSplitCounts: cute.Tensor,  # (S_Q, H) int32 (out / dummy)
+        mSched: cute.Tensor,  # (capacity, 6) int32 (out / dummy)
+        mWorkCount: cute.Tensor,  # (1,) int32 (out / dummy)
+        mTileCounts: cute.Tensor,  # (H, nchunks, total_rows) int32 (scratch, zeroed)
+        mRowCounts: cute.Tensor,  # (H, total_rows) int32 (scratch)
+        H: cutlass.Int32,
+        S_Q: cutlass.Int32,
+        total_rows: cutlass.Int32,
+        max_kv_blocks: cutlass.Int32,
+        nchunks: cutlass.Int32,
+        q_per_chunk: cutlass.Int32,
+        target_q_per_cta: cutlass.Int32,
+        work_capacity: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._k_hist(
+            mQ2k,
+            mRowMap,
+            mBatchOfQ,
+            mTileCounts,
+            H,
+            S_Q,
+            total_rows,
+            max_kv_blocks,
+            nchunks,
+            q_per_chunk,
+        ).launch(grid=(nchunks, H, 1), block=(32, 1, 1), stream=stream)
+
+        self._k_prefix_chunks(mTileCounts, mRowCounts, total_rows, nchunks).launch(
+            grid=(total_rows, H, 1), block=(1, 1, 1), stream=stream
+        )
+
+        self._k_row_ptr(mRowCounts, mRowPtr, total_rows).launch(
+            grid=(H, 1, 1), block=(1, 1, 1), stream=stream
+        )
+
+        self._k_scatter(
+            mQ2k,
+            mRowMap,
+            mBatchOfQ,
+            mQlocOfQ,
+            mRowPtr,
+            mTileCounts,
+            mQIdx,
+            mQSplit,
+            mSplitCounts,
+            H,
+            S_Q,
+            total_rows,
+            max_kv_blocks,
+            nchunks,
+            q_per_chunk,
+        ).launch(grid=(nchunks, H, 1), block=(32, 1, 1), stream=stream)
+
+        if cutlass.const_expr(self._has_schedule):
+            self._k_scheduler(
+                mRowPtr,
+                mRowCoords,
+                mSched,
+                mWorkCount,
+                H,
+                total_rows,
+                target_q_per_cta,
+                work_capacity,
+            ).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+
+    # -----------------------------------------------------------------------
+    # H: per-(head, chunk) histogram of row hits, one warp per (chunk, head).
+    # -----------------------------------------------------------------------
+    @cute.kernel
+    def _k_hist(
+        self,
+        mQ2k: cute.Tensor,
+        mRowMap: cute.Tensor,
+        mBatchOfQ: cute.Tensor,
+        mTileCounts: cute.Tensor,
+        H: cutlass.Int32,
+        S_Q: cutlass.Int32,
+        total_rows: cutlass.Int32,
+        max_kv_blocks: cutlass.Int32,
+        nchunks: cutlass.Int32,
+        q_per_chunk: cutlass.Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        c, h, _ = cute.arch.block_idx()
+
+        q_start = c * q_per_chunk
+        q_end = cutlass.min(q_start + q_per_chunk, S_Q)
+        is_slot = lane < self._topk
+
+        q = q_start
+        while q < q_end:
+            row = cutlass.Int32(-1)
+            if is_slot:
+                kvb = mQ2k[h, q, lane]
+                if kvb >= 0 and kvb < max_kv_blocks:
+                    row = mRowMap[mBatchOfQ[q], kvb]
+            if row >= 0:
+                # distinct slots of one query -> distinct rows, so within an
+                # iteration the lanes touch distinct addresses; atomics make the
+                # cross-iteration accumulation coherent.
+                ptr = mTileCounts[h, c, None].iterator + row
+                _atomic_add_i32(1, ptr)
+            q += 1
+
+    # -----------------------------------------------------------------------
+    # PR-chunks: exclusive prefix of tile_counts over the chunk axis (in
+    # place) + per-row totals. One thread per (head, row).
+    # -----------------------------------------------------------------------
+    @cute.kernel
+    def _k_prefix_chunks(
+        self,
+        mTileCounts: cute.Tensor,
+        mRowCounts: cute.Tensor,
+        total_rows: cutlass.Int32,
+        nchunks: cutlass.Int32,
+    ):
+        row, h, _ = cute.arch.block_idx()
+        if row < total_rows:
+            running = cutlass.Int32(0)
+            c = cutlass.Int32(0)
+            while c < nchunks:
+                t = mTileCounts[h, c, row]
+                mTileCounts[h, c, row] = running
+                running += t
+                c += 1
+            mRowCounts[h, row] = running
+
+    # -----------------------------------------------------------------------
+    # PR-rows: exclusive prefix of row_counts over rows -> row_ptr. One thread
+    # per head.
+    # -----------------------------------------------------------------------
+    @cute.kernel
+    def _k_row_ptr(
+        self,
+        mRowCounts: cute.Tensor,
+        mRowPtr: cute.Tensor,
+        total_rows: cutlass.Int32,
+    ):
+        h, _, _ = cute.arch.block_idx()
+        mRowPtr[h, 0] = cutlass.Int32(0)
+        running = cutlass.Int32(0)
+        row = cutlass.Int32(0)
+        while row < total_rows:
+            running += mRowCounts[h, row]
+            mRowPtr[h, row + 1] = running
+            row += 1
+
+    # -----------------------------------------------------------------------
+    # S: scatter queries into CSR order, ascending within each row.
+    # -----------------------------------------------------------------------
+    @cute.kernel
+    def _k_scatter(
+        self,
+        mQ2k: cute.Tensor,
+        mRowMap: cute.Tensor,
+        mBatchOfQ: cute.Tensor,
+        mQlocOfQ: cute.Tensor,
+        mRowPtr: cute.Tensor,
+        mTileCounts: cute.Tensor,  # now holds per-chunk exclusive base offsets
+        mQIdx: cute.Tensor,
+        mQSplit: cute.Tensor,
+        mSplitCounts: cute.Tensor,
+        H: cutlass.Int32,
+        S_Q: cutlass.Int32,
+        total_rows: cutlass.Int32,
+        max_kv_blocks: cutlass.Int32,
+        nchunks: cutlass.Int32,
+        q_per_chunk: cutlass.Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        c, h, _ = cute.arch.block_idx()
+
+        q_start = c * q_per_chunk
+        q_end = cutlass.min(q_start + q_per_chunk, S_Q)
+        is_slot = lane < self._topk
+        topk_mask = cutlass.Int32(-1) if self._topk == 32 else ((1 << self._topk) - 1)
+        lane_lt = (1 << lane) - 1
+
+        q = q_start
+        while q < q_end:
+            row = cutlass.Int32(-1)
+            if is_slot:
+                kvb = mQ2k[h, q, lane]
+                if kvb >= 0 and kvb < max_kv_blocks:
+                    row = mRowMap[mBatchOfQ[q], kvb]
+            valid = row >= 0
+            vmask = cute.arch.vote_ballot_sync(valid) & topk_mask
+            if cutlass.const_expr(self._has_schedule):
+                split_slot = cute.arch.popc(vmask & lane_lt)
+                if lane == 0:
+                    mSplitCounts[q, h] = cute.arch.popc(vmask)
+            if valid:
+                base_ptr = mTileCounts[h, c, None].iterator + row
+                slot = _atomic_add_i32(1, base_ptr)
+                pos = mRowPtr[h, row] + slot
+                qloc = mQlocOfQ[q]
+                mQIdx[h, pos] = qloc
+                if cutlass.const_expr(self._has_schedule):
+                    mQSplit[h, pos] = qloc | (split_slot << 24)
+            q += 1
+
+    # -----------------------------------------------------------------------
+    # Scheduler: flat work-item emission. Single thread (order is irrelevant;
+    # the forward kernel consumes work items independently).
+    # -----------------------------------------------------------------------
+    @cute.kernel
+    def _k_scheduler(
+        self,
+        mRowPtr: cute.Tensor,
+        mRowCoords: cute.Tensor,
+        mSched: cute.Tensor,
+        mWorkCount: cute.Tensor,
+        H: cutlass.Int32,
+        total_rows: cutlass.Int32,
+        target_q_per_cta: cutlass.Int32,
+        work_capacity: cutlass.Int32,
+    ):
+        widx = cutlass.Int32(0)
+        h = cutlass.Int32(0)
+        while h < H:
+            row = cutlass.Int32(0)
+            while row < total_rows:
+                cnt = mRowPtr[h, row + 1] - mRowPtr[h, row]
+                if cnt > 0:
+                    batch_idx = mRowCoords[row, 0]
+                    kv_block_idx = mRowCoords[row, 1]
+                    nch = (cnt + target_q_per_cta - 1) // target_q_per_cta
+                    cc = cutlass.Int32(0)
+                    while cc < nch:
+                        if widx < work_capacity:
+                            q_begin = cc * target_q_per_cta
+                            q_count = cutlass.min(target_q_per_cta, cnt - q_begin)
+                            mSched[widx, 0] = h
+                            mSched[widx, 1] = row
+                            mSched[widx, 2] = q_begin
+                            mSched[widx, 3] = q_count
+                            mSched[widx, 4] = batch_idx
+                            mSched[widx, 5] = kv_block_idx
+                        widx += 1
+                        cc += 1
+                row += 1
+            h += 1
+        mWorkCount[0] = widx

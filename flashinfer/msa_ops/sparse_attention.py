@@ -260,7 +260,7 @@ def _get_sparse_combine_module():
     return _get_sparse_combine_module._mod
 
 
-def _combine_partials(
+def _combine_partials_cuda(
     o_partial: torch.Tensor,  # [topk, total_q, Hq, d]
     lse_partial: torch.Tensor,  # [topk, total_q, Hq] f32, log2 domain
     split_counts: torch.Tensor,  # [total_q, Hkv] int32
@@ -271,7 +271,10 @@ def _combine_partials(
     lse_t_partial: Optional[torch.Tensor] = None,
     lse_t_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused CUDA LSE-weighted reduction over each query's split slots."""
+    """Fused CUDA LSE-weighted reduction over each query's split slots.
+
+    Legacy CUDA C++ path, retained as the differential-test reference for the
+    CuTe-DSL port (:func:`_combine_partials_cudsl`)."""
     topk, total_q, num_qo_heads, head_dim = o_partial.shape
     out = torch.empty(
         (total_q, num_qo_heads, head_dim), dtype=out_dtype, device=o_partial.device
@@ -288,6 +291,139 @@ def _combine_partials(
         out_scale,
     )
     return out
+
+
+def _get_compiled_combine(
+    partial_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    topk: int,
+    head_dim: int,
+    has_lse_out: bool,
+    has_lse_t: bool,
+):
+    """Compile (once, cached) the CuTe-DSL combine kernel for a config.
+
+    All fake tensor dims are independent symbols: the kernel's loop bounds
+    (``topk``, ``head_dim``) come from the kernel object, not tensor shapes, so
+    the shapes only fix ndim/strides — letting unused optional tensors be
+    passed as small dummies at runtime without symbol conflicts."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.sparse_combine_sm12x import SparseCombineSm12x
+
+    key = (
+        "combine",
+        str(partial_dtype),
+        str(out_dtype),
+        topk,
+        head_dim,
+        has_lse_out,
+        has_lse_t,
+    )
+    compiled = _compile_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    def fsyms(dtype, ndim, align=16):
+        return _fake(
+            _cutlass_dtype(dtype),
+            tuple(cute.sym_int() for _ in range(ndim)),
+            align=align,
+        )
+
+    kernel_obj = SparseCombineSm12x(
+        head_dim=head_dim,
+        topk=topk,
+        partial_is_fp8=partial_dtype == torch.float8_e4m3fn,
+        has_lse_out=has_lse_out,
+        has_lse_t=has_lse_t,
+        num_threads=128,
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = cute.compile(
+        kernel_obj,
+        fsyms(partial_dtype, 4),  # o_partial (topk, total_q, Hq, d)
+        fsyms(torch.float32, 3, align=4),  # lse_partial
+        fsyms(torch.int32, 2, align=4),  # split_counts
+        fsyms(out_dtype, 3),  # out
+        fsyms(torch.float32, 2, align=4),  # lse_out (or dummy)
+        fsyms(torch.float32, 3, align=4),  # lse_t_partial (or dummy)
+        fsyms(torch.float32, 2, align=4),  # lse_t_out (or dummy)
+        cutlass.Float32(1.0),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    _compile_cache[key] = compiled
+    return compiled
+
+
+def _combine_partials_cudsl(
+    o_partial: torch.Tensor,  # [topk, total_q, Hq, d]
+    lse_partial: torch.Tensor,  # [topk, total_q, Hq] f32, log2 domain
+    split_counts: torch.Tensor,  # [total_q, Hkv] int32
+    group_size: int,
+    out_dtype: torch.dtype,
+    lse_out: Optional[torch.Tensor] = None,
+    out_scale: float = 1.0,
+    lse_t_partial: Optional[torch.Tensor] = None,
+    lse_t_out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused CuTe-DSL LSE-weighted reduction over each query's split slots."""
+    topk, total_q, num_qo_heads, head_dim = o_partial.shape
+    out = torch.empty(
+        (total_q, num_qo_heads, head_dim), dtype=out_dtype, device=o_partial.device
+    )
+    has_lse_out = lse_out is not None
+    has_lse_t = lse_t_out is not None
+    dev = o_partial.device
+    dummy2 = torch.empty((1, 1), dtype=torch.float32, device=dev)
+    dummy3 = torch.empty((1, 1, 1), dtype=torch.float32, device=dev)
+    compiled = _get_compiled_combine(
+        o_partial.dtype, out_dtype, topk, head_dim, has_lse_out, has_lse_t
+    )
+    compiled(
+        o_partial,
+        lse_partial,
+        split_counts,
+        out,
+        lse_out if has_lse_out else dummy2,
+        lse_t_partial if has_lse_t else dummy3,
+        lse_t_out if has_lse_t else dummy2,
+        float(out_scale),
+        int(total_q),
+        int(num_qo_heads),
+        int(group_size),
+    )
+    return out
+
+
+def _combine_partials(
+    o_partial: torch.Tensor,  # [topk, total_q, Hq, d]
+    lse_partial: torch.Tensor,  # [topk, total_q, Hq] f32, log2 domain
+    split_counts: torch.Tensor,  # [total_q, Hkv] int32
+    group_size: int,
+    out_dtype: torch.dtype,
+    lse_out: Optional[torch.Tensor] = None,
+    out_scale: float = 1.0,
+    lse_t_partial: Optional[torch.Tensor] = None,
+    lse_t_out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused LSE-weighted reduction over each query's split slots (CuTe-DSL)."""
+    return _combine_partials_cudsl(
+        o_partial,
+        lse_partial,
+        split_counts,
+        group_size,
+        out_dtype,
+        lse_out=lse_out,
+        out_scale=out_scale,
+        lse_t_partial=lse_t_partial,
+        lse_t_out=lse_t_out,
+    )
 
 
 def _combine_partials_torch(

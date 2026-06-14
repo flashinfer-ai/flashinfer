@@ -29,6 +29,44 @@ def _get_sparse_topk_select_module():
     return gen_sparse_topk_select_module().build_and_load()
 
 
+_topk_compile_cache: dict = {}
+
+
+def _get_compiled_topk(topk: int):
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.topk_select_sm12x import TopKSelectSm12x
+
+    compiled = _topk_compile_cache.get(topk)
+    if compiled is not None:
+        return compiled
+
+    def fk(dtype, ndim, align):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            tuple(cute.sym_int() for _ in range(ndim)),
+            stride_order=tuple(reversed(range(ndim))),
+            assumed_align=align,
+        )
+
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = cute.compile(
+        TopKSelectSm12x(topk=topk),
+        fk(cutlass.Float32, 3, 4),  # max_score (H, P, S)
+        fk(cutlass.Int32, 3, 4),  # out (S, H, topk)
+        cutlass.Int32(1),  # num_valid_pages
+        cutlass.Int32(0),  # force_begin
+        cutlass.Int32(0),  # force_end
+        cutlass.Int32(1),  # total_qo_len
+        cutlass.Int32(1),  # num_qo_heads
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    _topk_compile_cache[topk] = compiled
+    return compiled
+
+
 @flashinfer_api
 def msa_topk_select(
     max_score: torch.Tensor,
@@ -37,6 +75,7 @@ def msa_topk_select(
     output: Optional[torch.Tensor] = None,
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
+    _backend: str = "cudsl",
 ) -> torch.Tensor:
     """Select the top-K KV blocks per query token based on attention scores.
 
@@ -110,17 +149,29 @@ def msa_topk_select(
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
 
-    workspace_size = num_qo_heads * max_k_tiles * total_qo_len
-    workspace = torch.empty(workspace_size, dtype=torch.int32, device=max_score.device)
-
-    _get_sparse_topk_select_module().sparse_topk_select(
-        max_score,
-        output,
-        workspace,
-        topk,
-        num_valid_pages,
-        force_begin_blocks,
-        force_end_blocks,
-    )
+    if _backend == "cuda":
+        workspace_size = num_qo_heads * max_k_tiles * total_qo_len
+        workspace = torch.empty(
+            workspace_size, dtype=torch.int32, device=max_score.device
+        )
+        _get_sparse_topk_select_module().sparse_topk_select(
+            max_score,
+            output,
+            workspace,
+            topk,
+            num_valid_pages,
+            force_begin_blocks,
+            force_end_blocks,
+        )
+    else:
+        _get_compiled_topk(topk)(
+            max_score,
+            output,
+            int(num_valid_pages),
+            int(force_begin_blocks),
+            int(force_end_blocks),
+            int(total_qo_len),
+            int(num_qo_heads),
+        )
 
     return output
