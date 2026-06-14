@@ -1092,6 +1092,40 @@ def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
         assert (got[fin] - ref[fin]).abs().max().item() < 1e-2
 
 
+@pytest.mark.parametrize("Hq,Hkv", [(4, 1), (8, 2)])
+def test_msa_proxy_score_reduce_heads(Hq, Hkv):
+    """``reduce_heads=True`` returns the head-max-reduced (1, max_k_tiles,
+    total_q) score, bit-exactly equal to amax(dim=0) over the per-head output
+    (the M3 lightning-indexer block-score collapse), and the default per-head
+    path is unchanged."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_proxy_score
+
+    torch.manual_seed(151)
+    dev = "cuda"
+    total_q, total_k = 300, 4096
+    cu_q = torch.tensor([0, total_q], dtype=torch.int32, device=dev)
+    cu_k = torch.tensor([0, total_k], dtype=torch.int32, device=dev)
+    q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+
+    per_head = msa_proxy_score(q, k, cu_q, cu_k, causal=True)
+    reduced = msa_proxy_score(q, k, cu_q, cu_k, causal=True, reduce_heads=True)
+    torch.cuda.synchronize()
+
+    assert per_head.shape == (Hq, per_head.shape[1], total_q)
+    assert reduced.shape == (1, per_head.shape[1], total_q)
+    # post-kernel amax over the same per-head buffer -> bit-exact
+    assert torch.equal(reduced, per_head.amax(dim=0, keepdim=True))
+
+    # caller-provided output of the reduced shape is honored
+    out = torch.empty_like(reduced)
+    ret = msa_proxy_score(q, k, cu_q, cu_k, causal=True, reduce_heads=True, output=out)
+    torch.cuda.synchronize()
+    assert ret.data_ptr() == out.data_ptr()
+    assert torch.equal(ret, reduced)
+
+
 def test_msa_proxy_score_paged_fp8():
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score

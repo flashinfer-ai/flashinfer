@@ -37,6 +37,7 @@ def msa_proxy_score(
     max_seqlen_q: Optional[int] = None,
     max_k_tiles: Optional[int] = None,
     output: Optional[torch.Tensor] = None,
+    reduce_heads: bool = False,
     q_offset=None,
 ) -> torch.Tensor:
     """MSA dense proxy pass for SM120/SM121: per-KV-block max attention
@@ -68,13 +69,30 @@ def msa_proxy_score(
         Number of KV-block columns in the output; defaults to the maximum
         ``ceil(seqlen_k / 128)`` over the batch.
     output : torch.Tensor, optional
-        Pre-allocated ``(num_qo_heads, max_k_tiles, total_q)`` float32.
+        Pre-allocated float32 output. Shape is
+        ``(num_qo_heads, max_k_tiles, total_q)`` normally, or
+        ``(1, max_k_tiles, total_q)`` when ``reduce_heads=True``.
+    reduce_heads : bool
+        If ``True``, max-reduce the per-head ``max_score`` over the query-head
+        axis and return a single ``(1, max_k_tiles, total_q)`` score, recovering
+        the *one selection per query* that the MiniMax-M3 lightning indexer
+        produces (its ``block_scores = scores.amax(-1).amax(over index heads)``).
+        Use this when the query heads are an indexer's proxy heads that collapse
+        to a shared block selection. Defaults to ``False`` — the per-head
+        ``max_score`` of MSA's canonical *one-proxy-head-per-KV-head* pipeline,
+        where each head selects its own blocks.
+
+        The reduction is currently a post-kernel ``amax`` over the per-head
+        buffer (the kernel is one CTA per head, so a cross-head epilogue would
+        need cross-CTA float atomics); folding it into the kernel is a possible
+        future optimization (saves materializing the per-head buffer).
 
     Returns
     -------
     torch.Tensor
-        ``(num_qo_heads, max_k_tiles, total_q)`` float32 ``max_score``,
-        ready for :func:`msa_topk_select`.
+        Float32 ``max_score`` ready for :func:`msa_topk_select`:
+        ``(num_qo_heads, max_k_tiles, total_q)``, or
+        ``(1, max_k_tiles, total_q)`` when ``reduce_heads=True``.
     """
     import cutlass
     import cutlass.cute as cute
@@ -133,17 +151,20 @@ def msa_proxy_score(
         seqlens_k = cu_k_cpu[1:] - cu_k_cpu[:-1]
         max_k_tiles = int((seqlens_k.max().item() + _BLK_KV - 1) // _BLK_KV)
 
-    if output is None:
-        output = torch.empty(
-            (num_qo_heads, max_k_tiles, total_q), dtype=torch.float32, device=dev
-        )
-    else:
-        if output.shape != (num_qo_heads, max_k_tiles, total_q):
-            raise ValueError(
-                f"output must be ({num_qo_heads}, {max_k_tiles}, {total_q})"
-            )
+    per_head_shape = (num_qo_heads, max_k_tiles, total_q)
+    final_shape = (1, max_k_tiles, total_q) if reduce_heads else per_head_shape
+    if output is not None:
+        if output.shape != final_shape:
+            raise ValueError(f"output must be {final_shape}")
         if output.dtype != torch.float32:
             raise ValueError("output must be float32")
+
+    # The kernel always writes the per-head buffer; reduce_heads then collapses
+    # it. When not reducing and an output was given, that buffer *is* the output.
+    if reduce_heads or output is None:
+        per_head = torch.empty(per_head_shape, dtype=torch.float32, device=dev)
+    else:
+        per_head = output
 
     key = ("proxy", str(q.dtype), causal, paged, kv_fp8)
     compiled = _compile_cache.get(key)
@@ -188,7 +209,7 @@ def msa_proxy_score(
         q,
         k,
         pt_dev,
-        output,
+        per_head,
         cu_q_dev,
         cu_k,
         qoff_dev,
@@ -197,4 +218,11 @@ def msa_proxy_score(
         int(num_qo_heads),
         int(max_k_tiles),
     )
+
+    if not reduce_heads:
+        return per_head
+    if output is None:
+        output = torch.empty(final_shape, dtype=torch.float32, device=dev)
+    # max over the query-head axis -> one (block, query) score, M3-indexer style.
+    torch.amax(per_head, dim=0, keepdim=True, out=output)
     return output

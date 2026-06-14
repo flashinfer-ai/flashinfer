@@ -494,9 +494,9 @@ def test_m3_indexer_proxy_head_equivalence(dtype):
     """Resolve handoff §7.3: flashinfer's proxy pipeline reproduces M3's
     lightning-indexer block selection. M3 computes per-(head, query, block) maxes
     then **maxes over the index_n_heads proxy heads** before the top-k;
-    ``msa_proxy_score`` emits exactly the per-head block maxes, so an
-    ``amax(dim=0)`` over the proxy heads recovers M3's single per-query block
-    scores, and ``msa_topk_select`` on those recovers M3's selection.
+    ``msa_proxy_score`` emits exactly the per-head block maxes, so its
+    ``reduce_heads=True`` max over the proxy heads recovers M3's single per-query
+    block scores, and ``msa_topk_select`` on those recovers M3's selection.
 
     Two assertions: (1) flashinfer reduced max_score == the indexer's internal
     block_scores (tight tol on the shared bf16/fp16 inputs); (2) the selected
@@ -522,8 +522,10 @@ def test_m3_indexer_proxy_head_equivalence(dtype):
     q = idx_q[0].transpose(0, 1).contiguous()
     k = idx_k[0].transpose(0, 1).contiguous()
     cu = torch.tensor([0, seq], device=dev, dtype=torch.int32)
-    max_score = msa_proxy_score(q, k, cu, cu, causal=True)  # (H_idx, mkt, Sq)
-    reduced = max_score.amax(dim=0)  # (mkt, Sq) == M3's amax over proxy heads
+    # reduce_heads=True does M3's amax over the proxy heads inside the op.
+    reduced_t = msa_proxy_score(q, k, cu, cu, causal=True, reduce_heads=True)
+    assert reduced_t.shape[0] == 1 and reduced_t.shape[2] == seq
+    reduced = reduced_t[0]  # (mkt, Sq)
     torch.cuda.synchronize()
 
     # (1) score equivalence: reduced max_score == indexer block_scores. The proxy
@@ -546,7 +548,7 @@ def test_m3_indexer_proxy_head_equivalence(dtype):
     # blocks — both map to a -inf selected-score (the downstream attention
     # re-masks those causally, so it is a benign padding-contract difference).
     # Equal sorted selected-scores per row therefore == same finite block set.
-    sel_fi = msa_topk_select(reduced[None].contiguous(), topk)[:, 0, :]  # (Sq,topk)
+    sel_fi = msa_topk_select(reduced_t.contiguous(), topk)[:, 0, :]  # (Sq,topk)
     sel_m3 = block_indices[0].to(dev)  # (Sq, topk), topk-order, -1 padded
 
     ms = reduced.transpose(0, 1)  # (Sq, mkt) scores per query
