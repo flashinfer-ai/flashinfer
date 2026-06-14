@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from ...fused_moe.utils import last_positive_power_of_2
+from ...fused_moe.utils import next_positive_power_of_2
 
 _SM100_MMA_TILER_MN_CANDIDATES = [
     (128, 8),
@@ -30,26 +30,22 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
     (256, 256),
 ]
 
-# Tactic cache: (n, real_k, sm_count) -> dict[(m_bucket, is_8_aligned) -> tactic_tuple]
+# Tactic cache: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
-# M bucket boundaries — powers of 2 for fast bucketing via
-# last_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
-# Each bucket is precomputed for both 8-aligned and non-8-aligned M,
-# keyed as (bucket, is_8_aligned).
+# M bucket boundaries - powers of 2 for fast bucketing.  M values round up to
+# the next bucket so a swapped tactic's tile_n always covers the real M.
 _M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
-def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
+def _compute_tactic_for_m(m, n, real_k, sm_count):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
     Selects swap_ab, tile shape, and cluster shape sequentially:
 
-    1. **swap_ab**: Swap A and B operands when M is small (8-16) and
-       8-aligned, putting the larger N dimension on the M-axis to increase
-       the number of CTAs.  Also swaps when N is not 8-aligned (required
-       for memory alignment).
+    1. **swap_ab**: Swap A and B operands when M is small and N is larger,
+       putting the larger N dimension on the M-axis to increase CTA count.
 
     2. **Tile shape**: Scores all 8 candidates from _SM100_MMA_TILER_MN_CANDIDATES.
        The score balances three factors:
@@ -68,16 +64,12 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
 
     4. **Prefetch**: Disabled.
     """
-    n_aligned = n % 8 == 0
-
     swap_ab = False
-    if m_aligned and 8 <= rep_m <= 16 and n > rep_m:
-        swap_ab = True
-    if not swap_ab and not n_aligned and m_aligned:
+    if m <= 32 and n > m:
         swap_ab = True
 
-    prob_m = n if swap_ab else rep_m
-    prob_n = rep_m if swap_ab else n
+    prob_m = n if swap_ab else m
+    prob_n = m if swap_ab else n
 
     # Small-K penalty factor (loop-invariant).
     if real_k <= 1024:
@@ -145,9 +137,8 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
 def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
     """Select the best tactic for mm_fp4(backend='cute-dsl').
 
-    On the first call for a given (N, K), precomputes the optimal tactic
-    for each M bucket (~13 buckets, ~55-86 usec).  Subsequent calls with
-    any M just look up the bucket — runs in ~0.2 usec.
+    Computes and caches the optimal tactic for M rounded up to a power-of-two
+    bucket. Rounding up keeps small swapped tile_n choices valid for the real M.
 
     Args:
         m: M dimension of the GEMM problem.
@@ -160,15 +151,10 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
                         kernel_type, use_tma_store)
     """
     cache_key = (n, real_k, sm_count)
-    bucket_tactics = _SM100_MM_FP4_TACTIC_CACHE.get(cache_key)
-    if bucket_tactics is None:
-        bucket_tactics = {}
-        for rep_m in _M_BUCKETS:
-            for aligned in (True, False):
-                bucket_tactics[(rep_m, aligned)] = _compute_tactic_for_m(
-                    rep_m, n, real_k, sm_count, aligned
-                )
-        _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
-
-    bucket = min(last_positive_power_of_2(m), _M_BUCKETS[-1])
-    return bucket_tactics[(bucket, m % 8 == 0)]
+    cached_tactics = _SM100_MM_FP4_TACTIC_CACHE.setdefault(cache_key, {})
+    m_bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
+    tactic = cached_tactics.get(m_bucket)
+    if tactic is None:
+        tactic = _compute_tactic_for_m(m_bucket, n, real_k, sm_count)
+        cached_tactics[m_bucket] = tactic
+    return tactic
