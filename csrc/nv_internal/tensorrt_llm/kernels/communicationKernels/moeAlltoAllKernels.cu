@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
+#include "tensorrt_llm/kernels/quantization_utils.cuh"
 
 namespace tensorrt_llm::kernels::moe_alltoall {
 
@@ -117,6 +118,54 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
     default: {                                                          \
       FLASHINFER_CHECK(false, "Unsupported dtype for moe_a2a_combine"); \
     }                                                                   \
+  }
+
+// Quantized combine currently only supports FP16/BF16 inputs.
+#define SWITCH_QUANT_MODE(dtype, quant_mode, QUANT_MODE, ...)                          \
+  if constexpr (std::is_same_v<dtype, half> || std::is_same_v<dtype, __nv_bfloat16>) { \
+    switch (quant_mode) {                                                              \
+      case MoeA2ACombineQuantMode::NONE: {                                             \
+        constexpr auto QUANT_MODE = MoeA2ACombineQuantMode::NONE;                      \
+        __VA_ARGS__;                                                                   \
+        break;                                                                         \
+      }                                                                                \
+      case MoeA2ACombineQuantMode::MXFP8: {                                            \
+        constexpr auto QUANT_MODE = MoeA2ACombineQuantMode::MXFP8;                     \
+        __VA_ARGS__;                                                                   \
+        break;                                                                         \
+      }                                                                                \
+      default: {                                                                       \
+        FLASHINFER_CHECK(false, "Unsupported quant_mode for moe_a2a_combine");         \
+      }                                                                                \
+    }                                                                                  \
+  } else {                                                                             \
+    FLASHINFER_CHECK((quant_mode) == MoeA2ACombineQuantMode::NONE,                     \
+                     "All to All Combine Quantization currently only supports "        \
+                     "FP16/BF16");                                                     \
+    constexpr auto QUANT_MODE = MoeA2ACombineQuantMode::NONE;                          \
+    __VA_ARGS__;                                                                       \
+  }
+
+#define SWITCH_SWIZZLE_MODE(swizzle_mode, SWIZZLE_MODE, ...)                   \
+  switch (swizzle_mode) {                                                      \
+    case MoeA2ACombineSwizzleSFMode::LINEAR: {                                 \
+      constexpr auto SWIZZLE_MODE = MoeA2ACombineSwizzleSFMode::LINEAR;        \
+      __VA_ARGS__;                                                             \
+      break;                                                                   \
+    }                                                                          \
+    case MoeA2ACombineSwizzleSFMode::SWIZZLE_128x4: {                          \
+      constexpr auto SWIZZLE_MODE = MoeA2ACombineSwizzleSFMode::SWIZZLE_128x4; \
+      __VA_ARGS__;                                                             \
+      break;                                                                   \
+    }                                                                          \
+    case MoeA2ACombineSwizzleSFMode::SWIZZLE_8x4: {                            \
+      constexpr auto SWIZZLE_MODE = MoeA2ACombineSwizzleSFMode::SWIZZLE_8x4;   \
+      __VA_ARGS__;                                                             \
+      break;                                                                   \
+    }                                                                          \
+    default: {                                                                 \
+      FLASHINFER_CHECK(false, "Unsupported swizzle_mode for moe_a2a_combine"); \
+    }                                                                          \
   }
 
 #if DISABLE_TIMEOUT
@@ -497,20 +546,31 @@ __device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
 }
 
 // Accumulate across all valid ranks into registers, then store once per segment
-template <int VEC_SIZE, int TOP_K, typename T>
-__device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, int rank_id,
-                                        int max_tokens_per_rank,
+template <int VEC_SIZE_BYTES, int TOP_K, typename T,
+          MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
+          MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
+__device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, int row_idx,
+                                        int row_size, int rank_id, int max_tokens_per_rank,
                                         CombineKernelPointers const& ptrs) {
-  constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
+  constexpr int elems_per_vec = VEC_SIZE_BYTES / sizeof(T);
+  const int size_per_token = row_size * sizeof(T);
   using flashinfer::vec_t;
 
-  uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst_typed_base);
+  uint8_t* dst_bytes;
+  if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
+    dst_bytes = reinterpret_cast<uint8_t*>(static_cast<T*>(output_buffer) + row_idx * row_size);
+  } else {
+    // MXFP8 output stores one byte per logical element while accumulation reads T-sized inputs.
+    dst_bytes = static_cast<uint8_t*>(output_buffer) +
+                static_cast<size_t>(row_idx) * static_cast<size_t>(row_size);
+  }
 
-  int const stride = blockDim.x * VEC_SIZE;
+  int const stride = blockDim.x * VEC_SIZE_BYTES;
   int const local_token_idx = blockIdx.x;
 
-  for (int offset = threadIdx.x * VEC_SIZE; offset < size_per_token; offset += stride) {
-    vec_t<uint8_t, VEC_SIZE> acc[TOP_K];
+  for (int offset = threadIdx.x * VEC_SIZE_BYTES; offset < size_per_token; offset += stride) {
+    int logical_offset = offset / sizeof(T);
+    vec_t<uint8_t, VEC_SIZE_BYTES> acc[TOP_K];
 
 // Unrolled K accumulation using compact top-k lists
 #pragma unroll
@@ -688,30 +748,66 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
         accumulate_vec<T, elems_per_vec>(a0, ak);
       }
     }
-
-    acc[0].store(dst_bytes + offset);
+    if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
+      acc[0].store(dst_bytes + offset);
+    } else {
+      constexpr uint32_t sf_vec_size = QuantMode == MoeA2ACombineQuantMode::MXFP8 ? 32 : 16;
+      constexpr uint32_t threads_per_sf = sf_vec_size / elems_per_vec;
+      uint8_t scale;
+      auto store_sf = [&]() {
+        int64_t sf_offset;
+        const int64_t num_vecs_per_row = (row_size + sf_vec_size - 1) / sf_vec_size;
+        const int64_t sf_idx = logical_offset / sf_vec_size;
+        if constexpr (SwizzleMode == MoeA2ACombineSwizzleSFMode::LINEAR) {
+          sf_offset = row_idx * num_vecs_per_row + sf_idx;
+        } else if constexpr (SwizzleMode == MoeA2ACombineSwizzleSFMode::SWIZZLE_128x4) {
+          sf_offset = get_sf_out_offset_128x4(row_idx, sf_idx, num_vecs_per_row);
+        } else {  // SWIZZLE_8x4
+          sf_offset = get_sf_out_offset_8x4(row_idx, sf_idx, num_vecs_per_row);
+        }
+        if (threadIdx.x % threads_per_sf == 0) {
+          reinterpret_cast<uint8_t*>(sf_output)[sf_offset] = scale;
+        }
+      };
+      if constexpr (QuantMode == MoeA2ACombineQuantMode::MXFP8) {
+        static_assert(elems_per_vec == 8, "MXFP8 quantization requires 8 elements per vector");
+        auto packed_vec =
+            reinterpret_cast<tensorrt_llm::kernels::PackedVec<T, elems_per_vec>&>(acc[0]);
+        uint64_t fp8x8 =
+            tensorrt_llm::kernels::cvt_warp_fp16_to_mxfp8<T, 32, elems_per_vec>(packed_vec, &scale);
+        reinterpret_cast<uint64_t*>(dst_bytes)[logical_offset / elems_per_vec] = fp8x8;
+        store_sf();
+      }
+    }
   }
 }
 
 // Wrapper that selects vector width based on size_per_token alignment
-template <int TOP_K, typename T>
-__device__ void vectorized_combine(T* dst_typed_base, int size_per_token, int rank_id,
-                                   int max_tokens_per_rank, CombineKernelPointers const& ptrs) {
-  if (size_per_token % 16 == 0) {
-    vectorized_combine_impl<16, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                          max_tokens_per_rank, ptrs);
-  } else if (size_per_token % 8 == 0) {
-    vectorized_combine_impl<8, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                         max_tokens_per_rank, ptrs);
-  } else if (size_per_token % 4 == 0) {
-    vectorized_combine_impl<4, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                         max_tokens_per_rank, ptrs);
-  } else if (size_per_token % 2 == 0) {
-    vectorized_combine_impl<2, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                         max_tokens_per_rank, ptrs);
+template <int TOP_K, typename T, MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
+          MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
+__device__ void vectorized_combine(void* output_buffer, void* sf_output, int row_idx, int row_size,
+                                   int rank_id, int max_tokens_per_rank,
+                                   CombineKernelPointers const& ptrs) {
+  if constexpr (QuantMode != MoeA2ACombineQuantMode::NONE) {
+    vectorized_combine_impl<16, TOP_K, T, QuantMode, SwizzleMode>(
+        output_buffer, sf_output, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
   } else {
-    vectorized_combine_impl<1, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                         max_tokens_per_rank, ptrs);
+    if (row_size % 16 == 0) {
+      vectorized_combine_impl<16, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
+                                            max_tokens_per_rank, ptrs);
+    } else if (row_size % 8 == 0) {
+      vectorized_combine_impl<8, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
+                                           max_tokens_per_rank, ptrs);
+    } else if (row_size % 4 == 0) {
+      vectorized_combine_impl<4, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
+                                           max_tokens_per_rank, ptrs);
+    } else if (row_size % 2 == 0) {
+      vectorized_combine_impl<2, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
+                                           max_tokens_per_rank, ptrs);
+    } else {
+      vectorized_combine_impl<1, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
+                                           max_tokens_per_rank, ptrs);
+    }
   }
 }
 
@@ -752,13 +848,13 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T, int TOP_K>
+template <typename T, int TOP_K, MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
+          MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id,
     int ep_size) {
   int local_token_idx = blockIdx.x;
-  int const size_per_token = elements_per_token * sizeof(T);
 
   if (local_num_tokens == 0) {
     // Special case: If local_num_tokens == 0,
@@ -829,11 +925,10 @@ __global__ void moeA2ACombineKernel(
 
   if (local_num_tokens == 0) return;
 
-  // Get output location for this token (using src_data_ptrs[0] as output)
-  T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
-
   // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+  vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(ptrs.src_data_ptrs[0], ptrs.output_scales,
+                                                       local_token_idx, elements_per_token, rank_id,
+                                                       max_tokens_per_rank, ptrs);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
@@ -891,6 +986,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
 
   // Set output data pointer in src_data_ptrs[0]
   kernel_ptrs.src_data_ptrs[0] = params.output_data;
+  kernel_ptrs.output_scales = params.output_scales;
 
   // Fill recv buffer pointers
   for (int rank = 0; rank < params.ep_size; rank++) {
@@ -910,9 +1006,14 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   // Launch appropriate kernel with compact macros
   SWITCH_DTYPE(params.dtype, TKernelType, {
     SWITCH_TOP_K(params.top_k, TOP_K, {
-      moeA2ACombineKernel<TKernelType, TOP_K><<<grid_size_block, kBlockSize, 0, params.stream>>>(
-          kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-          params.local_num_tokens, params.ep_rank, params.ep_size);
+      SWITCH_QUANT_MODE(TKernelType, params.quant_mode, QUANT_MODE, {
+        SWITCH_SWIZZLE_MODE(params.swizzle_mode, SWIZZLE_MODE, {
+          moeA2ACombineKernel<TKernelType, TOP_K, QUANT_MODE, SWIZZLE_MODE>
+              <<<grid_size_block, kBlockSize, 0, params.stream>>>(
+                  kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+                  params.local_num_tokens, params.ep_rank, params.ep_size);
+        });
+      });
     });
   });
 }
