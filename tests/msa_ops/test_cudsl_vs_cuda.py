@@ -311,9 +311,9 @@ def test_csr_schedule_cudsl_vs_cuda(B, H, topk, seqs_q, seqs_k, target):
     ],
 )
 def test_topk_cudsl_vs_cuda(H, P, S, nvp, fb, fe):
-    """Three-way: CUDA vs the argmax port (cudsl) vs the faithful radix port
-    (cudsl_radix). Distinct random scores -> the selected set and its
-    ascending-by-index order are fully determined, so all three are bit-exact."""
+    """CUDA vs the CuTe-DSL radix port. Distinct random scores -> the selected
+    set and its ascending-by-index order are fully determined, so the two are
+    bit-exact."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_topk_select
 
@@ -334,20 +334,180 @@ def test_topk_cudsl_vs_cuda(H, P, S, nvp, fb, fe):
         )
 
     out_cuda = _run("cuda")
-    out_cudsl = _run("cudsl")
     out_radix = _run("cudsl_radix")
     torch.cuda.synchronize()
 
     ctx = f"H={H} P={P} S={S} nvp={nvp} fb={fb} fe={fe}"
-    assert torch.equal(out_cuda, out_cudsl), (
-        f"argmax topk mismatch {ctx}\ncuda={out_cuda[0, 0]}\ncudsl={out_cudsl[0, 0]}"
-    )
     assert torch.equal(out_cuda, out_radix), (
         f"radix topk mismatch {ctx}\ncuda={out_cuda[0, 0]}\nradix={out_radix[0, 0]}"
     )
 
 
-def test_topk_tied_scores_three_way():
+def _clustered_distinct(H, P, S, step_ulps, dev, seed):
+    """Per-(head, token) column: a random permutation of ``P`` *distinct* floats
+    packed into a narrow band starting at 1.0, spaced ``step_ulps`` ULPs apart.
+
+    A narrow band makes many scores share the high radix digits of the
+    order-preserving key, which overflows stage 1's threshold bin and forces the
+    multi-stage refinement (stages 2/3). Distinct values keep the top-k boundary
+    unambiguous, so the selected set (and its ascending-by-index order) is fully
+    determined and must be bit-exact across backends.
+
+    ``step_ulps == 1`` (consecutive representable floats) is maximally clustered:
+    for ``P`` a power of two it collapses both the high (stage 1) and mid (stage
+    2) digits to a single bin, so selection only resolves at the terminal stage 3.
+    """
+    ulp = 2.0**-23  # ULP of float32 in [1, 2)
+    vals = 1.0 + torch.arange(P, dtype=torch.float64) * (step_ulps * ulp)
+    vals = vals.to(torch.float32)
+    assert vals.unique().numel() == P, "band too narrow: values collapsed"
+    g = torch.Generator().manual_seed(seed)
+    out = torch.empty(H, P, S, dtype=torch.float32)
+    for h in range(H):
+        for s in range(S):
+            out[h, :, s] = vals[torch.randperm(P, generator=g)]
+    return out.to(dev)
+
+
+def _topk_reference(max_score, topk, nvp, fb, fe):
+    """Ground-truth MSA block selection for *distinct* scores (no tie ambiguity):
+    forced sink/window blocks always selected, plus the top ``topk - n_forced``
+    of the valid middle region by score, returned ascending-by-index with -1
+    tail padding. Layout matches ``msa_topk_select``: (total_qo_len, H, topk)."""
+    H, P, S = max_score.shape
+    out = torch.full((S, H, topk), -1, dtype=torch.int32)
+    forced = list(range(fb)) + list(range(nvp - fe, nvp))
+    n_forced = len(forced)
+    target = topk - n_forced
+    mid = list(range(fb, nvp - fe))  # valid middle (invalid >= nvp excluded)
+    for s in range(S):
+        for h in range(H):
+            chosen = []
+            k = min(target, len(mid))
+            if k > 0:
+                mid_scores = max_score[h, mid, s]
+                top = torch.topk(mid_scores, k).indices.tolist()
+                chosen = [mid[i] for i in top]
+            sel = sorted(forced + chosen)
+            for i, v in enumerate(sel):
+                out[s, h, i] = v
+    return out.to(max_score.device)
+
+
+@pytest.mark.parametrize(
+    "H,P,S,step_ulps,nvp,fb,fe",
+    [
+        # step_ulps >= 4 keeps every value resolvable by the 30-bit radix
+        # (it drops the bottom 2 bits), so the top-16 set is exact. The narrow
+        # band still collapses the high digit -> stage 1 overflows -> the
+        # selection resolves at stage 2 (the path that removes the 2048 cap).
+        (2, 4096, 8, 4, 4096, 0, 0),  # 4 ULP, P=2^12
+        (2, 4096, 8, 512, 4096, 0, 0),  # wider band
+        (2, 3000, 8, 8, 3000, 0, 0),  # non-power-of-two count
+        (2, 8192, 4, 4, 8192, 0, 0),  # P > 2x the old 2048 cap
+        (2, 4096, 8, 8, 4000, 3, 2),  # + clamp + forced sink/window
+        (1, 6000, 6, 64, 6000, 0, 0),  # single head, mid band
+    ],
+)
+def test_topk_multistage_radix(H, P, S, step_ulps, nvp, fb, fe):
+    """Exercises the multi-stage radix refinement (max_k_tiles > the old 2048
+    staging cap, clustered-but-resolvable scores forcing stage 2). The top-16
+    set is determined, so the radix port must match the torch reference.
+
+    The CUDA kernel is cross-checked only for the no-forced regime: when forced
+    (FLT_MAX) blocks coexist with a stage-0 overflow, CUDA's fp16 stage-0 emits
+    them and its match-all fp32 stage-1 re-emits them, producing *duplicate*
+    indices. The fp32-only port has no redundant match-all stage, so it is
+    correct in that regime too (validated against the reference)."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_topk_select
+
+    dev = "cuda"
+    max_score = _clustered_distinct(H, P, S, step_ulps, dev, seed=101)
+    if nvp < P:
+        max_score[:, nvp:, :] = float("-inf")
+
+    def _run(backend):
+        return msa_topk_select(
+            max_score,
+            16,
+            num_valid_pages=nvp,
+            force_begin_blocks=fb,
+            force_end_blocks=fe,
+            _backend=backend,
+        )
+
+    ref = _topk_reference(max_score, 16, nvp, fb, fe)
+    out_radix = _run("cudsl_radix")
+    torch.cuda.synchronize()
+
+    ctx = f"H={H} P={P} S={S} step={step_ulps} nvp={nvp} fb={fb} fe={fe}"
+    assert torch.equal(ref, out_radix), (
+        f"multi-stage radix vs reference mismatch {ctx}\n"
+        f"ref  ={ref[0, 0]}\nradix={out_radix[0, 0]}"
+    )
+
+    if fb == 0 and fe == 0:
+        out_cuda = _run("cuda")
+        torch.cuda.synchronize()
+        assert torch.equal(ref, out_cuda), (
+            f"CUDA vs reference mismatch (no-forced regime) {ctx}\n"
+            f"ref ={ref[0, 0]}\ncuda={out_cuda[0, 0]}"
+        )
+
+
+@pytest.mark.parametrize("nvp,fb,fe", [(4096, 0, 0), (4000, 3, 2)])
+def test_topk_multistage_stage3_valid(nvp, fb, fe):
+    """Drives the terminal stage 3: >2048 values spaced 1 ULP apart all share
+    the top 30 radix bits, so stage 1 and stage 2 both collapse to one bin and
+    selection only resolves at stage 3. Within a sub-4-ULP group the radix (like
+    CUDA) cannot order by the bottom 2 bits, so the exact tie membership at the
+    boundary is ambiguous; assert a *valid* top-k instead of exact equality:
+    forced present, distinct + ascending, right count, and (tolerating the
+    4-ULP radix resolution) no clearly-better middle block left unselected."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_topk_select
+
+    H, P, S, topk = 2, 4096, 8, 16
+    dev = "cuda"
+    max_score = _clustered_distinct(H, P, S, step_ulps=1, dev=dev, seed=202)
+    if nvp < P:
+        max_score[:, nvp:, :] = float("-inf")
+
+    out = msa_topk_select(
+        max_score,
+        topk,
+        num_valid_pages=nvp,
+        force_begin_blocks=fb,
+        force_end_blocks=fe,
+        _backend="cudsl_radix",
+    ).reshape(S, H, topk)
+    torch.cuda.synchronize()
+
+    forced = set(range(fb)) | set(range(nvp - fe, nvp))
+    mid = list(range(fb, nvp - fe))
+    ulp = 2.0**-23
+    for s in range(S):
+        for h in range(H):
+            sel = [int(x) for x in out[s, h] if x >= 0]
+            assert len(sel) == len(set(sel)), f"dup at (s={s},h={h}): {sel}"
+            assert sel == sorted(sel), f"not ascending at (s={s},h={h}): {sel}"
+            assert len(sel) == min(topk, nvp), f"count at (s={s},h={h})"
+            assert forced <= set(sel), f"forced missing at (s={s},h={h})"
+            sel_mid = [i for i in sel if i in set(mid)]
+            unsel_mid = [i for i in mid if i not in set(sel)]
+            if sel_mid and unsel_mid:
+                scores = max_score[h, :, s].cpu()
+                # any "better" unselected block can only beat a selected one by
+                # the unresolved bottom-2-bits (<= ~4 ULP near 1.0).
+                gap = scores[unsel_mid].max() - scores[sel_mid].min()
+                assert gap <= 4 * ulp + 1e-12, (
+                    f"radix dropped a clearly-better block at (s={s},h={h}): "
+                    f"gap={gap.item()}"
+                )
+
+
+def test_topk_tied_scores():
     """With deliberately tied scores the *exact* tie membership at the selection
     boundary is ambiguous (it depends on atomic emission order, and differs
     legitimately across backends). So instead of cross-backend equality we assert
@@ -376,7 +536,7 @@ def test_topk_tied_scores_three_way():
             assert len(sel) == min(topk, nvp), f"{backend}: count {len(sel)}"
             assert forced <= set(sel), f"{backend}: forced missing"
 
-    for b in ("cuda", "cudsl", "cudsl_radix"):
+    for b in ("cuda", "cudsl_radix"):
         out = msa_topk_select(
             max_score,
             topk,

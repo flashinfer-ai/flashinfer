@@ -15,44 +15,67 @@ limitations under the License.
 
 ---
 
-Faithful radix-histogram MSA top-K KV-block selection for SM120/SM121 — the
-complexity-parity replacement for the O(topk * max_k_tiles) iterative-argmax
-port in ``topk_select_sm12x.py``. CuTe-DSL port of the CUDA
-``IndexerTopKWithSortKernel`` (``csrc/include/sparse_topk_select.cuh``), itself
-derived from TensorRT-LLM's ``indexerTopK.cu``.
+Faithful multi-stage radix-select MSA top-K KV-block selection for SM120/SM121.
+CuTe-DSL port of the CUDA ``IndexerTopKWithSortKernel``
+(``csrc/include/sparse_topk_select.cuh``), itself derived from TensorRT-LLM's
+``indexerTopK.cu``. This is the sole CuTe-DSL top-k algorithm: it matches the
+CUDA kernel's MSD-radix structure and complexity (O(max_k_tiles) per row), so no
+separate fallback path is needed.
 
 Algorithm (one CTA per (head, query) row, ``kThreads`` threads):
 
 1. **Forced blocks** ``[0, fb)`` (sink) and ``[nvp - fe, nvp)`` (window) are
-   pre-placed into the selection and excluded from ranking — so the histogram
-   ranks only the contiguous middle region ``[fb, nvp - fe)`` and picks the
-   ``n_rest = topk - fb - fe`` highest scorers there.
-2. **Radix histogram** (single fp32 pass, 1024 bins = high 10 bits of the
-   order-preserving float-bit transform): each thread bins its slice of the
-   middle region with SMEM atomics. A **2-level scan** then finds the threshold
-   bin where the running count crosses ``n_rest`` (replacing ``cub::BlockScan``):
-   one warp sums the 32 contiguous 32-bin groups in parallel, then thread 0
-   walks the 32 group sums and refines within the one group that straddles the
-   threshold — a ~64-step critical path instead of a 1024-step serial scan
-   (which profiled as the dominant cost of an earlier single-thread version).
-3. **Classify**: ``bin < threshold`` ⇒ emit directly; ``bin == threshold`` ⇒
-   stage (key, index) for a tie-break sort.
-4. **Insertion sort** the staged threshold-bin items by score (ties by staging
-   index, matching the CUDA reference) and emit the remaining ``n_rest - base``.
-5. Sort the (≤ topk) selected indices **ascending by index** and write, ``-1``
-   tail-padding empty slots; indices ``>= num_valid_pages`` never enter the
-   ranking (the middle region ends at ``nvp - fe``).
+   pre-placed into the selection and excluded from ranking — so the radix ranks
+   only the contiguous middle region ``[fb, nvp - fe)`` and picks the
+   ``target = topk - fb - fe`` highest scorers there.
+2. **MSD radix select** over the order-preserving float-bit key (ascending key
+   == descending score), refining 10 bits at a time:
+     * stage 1 — high 10 bits (``key >> 22``), ranks the whole middle region;
+     * stage 2 — mid  10 bits (``(key >> 12) & 0x3ff``), ranks only elements
+       inside stage 1's threshold bin;
+     * stage 3 — low  10 bits (``(key >>  2) & 0x3ff``), ranks only elements
+       inside stage 2's threshold bin.
+   Each stage histograms its (pattern-matched) candidate set, then a **2-level
+   scan** finds the threshold bin where the running count crosses the remaining
+   ``need`` (replacing ``cub::BlockScan``): one warp sums the 32 contiguous
+   32-bin groups in parallel, then thread 0 walks the 32 group sums and refines
+   within the one group that straddles the threshold — a ~64-step critical path
+   instead of a 1024-step serial scan (which profiled as the dominant cost of an
+   earlier single-thread version).
+3. **Classify** each candidate: ``bin < threshold`` ⇒ emit directly (definitely
+   selected); ``bin == threshold`` ⇒ either stage it (if the threshold bin fits
+   the ``_STAGE_CAP`` buffer) for a tie-break sort, or — if it overflows — leave
+   it for the next, finer stage to refine.
+4. When a stage's threshold bin fits ``_STAGE_CAP``, **insertion sort** the
+   staged items by score (ties by staging index, matching the CUDA reference)
+   and emit the remaining ``need``. Stage 3 is terminal: any residual threshold
+   bin holds elements equal in bits 31..2 (true ties differing only in the
+   bottom 2 bits), so they are emitted directly up to ``need`` without staging —
+   this is why the buffer never needs to grow with ``max_k_tiles``.
+5. Sort the (<= topk) selected indices **ascending by index** and write, ``-1``
+   tail-padding empty slots.
 
-Because the staging buffer (``_STAGE_CAP``) holds the whole threshold bin, the
-CUDA fp16 stage-0 + fp32 stages 1-3 collapse to this single exact pass whenever
-``max_k_tiles <= _STAGE_CAP`` (true for MSA's <=128K-context envelope). The
-``max_score`` input is read column-strided directly (its raw bits via a uint32
-recast), so no transpose / workspace tensor is needed.
+Because the threshold bin shrinks by ~10 bits each stage and stage 3 emits
+residual ties directly, the fixed ``_STAGE_CAP`` staging buffer is always
+sufficient: there is no ``max_k_tiles`` ceiling from staging. The supported
+range matches the CUDA dispatcher (``max_k_tiles < 12288``); the Python wrapper
+raises above it.
+
+Two intentional, output-equivalent departures from the CUDA reference, each kept
+for simplicity (and validated bit-exact against CUDA on distinct-score inputs):
+
+* **No fp16 stage 0.** The CUDA kernel runs an extra fp16 10-bit pass before the
+  three fp32 stages. That pass is a register-level micro-opt (it never changes
+  the selected set — the fp32 stages refine fully regardless) and would require
+  an fp32->fp16 conversion here, so it is omitted; our benchmarks already show
+  the fp32-only radix beats the CUDA kernel across the MSA context envelope.
+* **No transpose / workspace.** ``max_score`` is read column-strided directly
+  (its raw bits via a uint32 recast) instead of via a transposed copy. The
+  CUDA transpose only enables float4-coalesced loads; correctness is identical.
 
 The final ascending-by-index sort is a single-thread insertion sort over the
 <= topk selected slots (vs the CUDA reference's warp bitonic sort): for topk=16
-the result is identical and the cost negligible, and it avoids a separate
-bitonic primitive.
+the result is identical and the cost negligible.
 """
 
 import cuda.bindings.driver as cuda
@@ -60,12 +83,19 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import nvvm
 
-_NUM_BINS = 1024  # high 10 bits of the float-bit radix key
-_RADIX_SHIFT = 22  # 32 - 10
-_STAGE_CAP = 2048  # threshold-bin staging capacity (== max supported max_k_tiles)
+_NUM_BINS = 1024  # 10-bit radix digit per stage
+_STAGE_CAP = 2048  # threshold-bin staging capacity (per stage, not per row)
 _KTHREADS = 256
 _GROUP = 32  # bins per group for the 2-level threshold scan (_NUM_BINS / _GROUP groups)
 _SENTINEL = 0x7FFFFFFF  # sorts to the tail; written out as -1
+
+# Per-stage radix-digit shifts of the 32-bit order-preserving key:
+#   stage 1: bits 31..22 (high 10), stage 2: bits 21..12 (mid 10),
+#   stage 3: bits 11..2  (low 10, drops bits 0-1 — those are true ties).
+_STAGE_SHIFT = {1: 22, 2: 12, 3: 2}
+# Pattern shift used to filter candidates to the previous stage's threshold bin
+# (stage 1 ranks everything, so it has no pattern filter).
+_MATCH_SHIFT = {2: 22, 3: 12}
 
 
 def _atomic_add_i32(a, ptr: cute.Pointer) -> cutlass.Int32:
@@ -132,6 +162,7 @@ class TopKSelectRadixSm12x:
             stage_idx: cute.struct.MemRange[cutlass.Int32, _STAGE_CAP]
             sel: cute.struct.MemRange[cutlass.Int32, 16]
             scal: cute.struct.MemRange[cutlass.Int32, 8]
+            pat: cute.struct.MemRange[cutlass.Uint32, 1]
 
         smem = cutlass.utils.SmemAllocator()
         st = smem.allocate(SharedStorage)
@@ -141,7 +172,9 @@ class TopKSelectRadixSm12x:
         stage_idx = st.stage_idx.get_tensor(cute.make_layout(_STAGE_CAP))
         sel = st.sel.get_tensor(cute.make_layout(16))
         scal = st.scal.get_tensor(cute.make_layout(8))
-        # scal slots: 0=found, 1=stage_count, 2=threshold, 3=base
+        pat = st.pat.get_tensor(cute.make_layout(1))
+        # scal slots: 0=found, 1=stage_count, 2=threshold, 3=base,
+        #             4=finalBinSize, 5=done, 6=need
 
         nvp = num_valid_pages
         mid_lo = force_begin
@@ -149,11 +182,7 @@ class TopKSelectRadixSm12x:
         n_forced = force_begin + force_end
         target = cutlass.Int32(self._topk) - n_forced
 
-        # clear histogram (strided over the block)
-        bb = tid
-        while bb < _NUM_BINS:
-            hist[bb] = cutlass.Int32(0)
-            bb += _KTHREADS
+        n_groups = _NUM_BINS // _GROUP
 
         # thread 0: seed forced indices + sentinel-fill the rest + init counters
         if tid == 0:
@@ -173,109 +202,219 @@ class TopKSelectRadixSm12x:
                 sel[k] = cutlass.Int32(_SENTINEL)
                 k += 1
             scal[0] = cutlass.Int32(0)  # found
-            scal[1] = cutlass.Int32(0)  # stage_count
+            pat[0] = cutlass.Uint32(0)  # accumulated radix pattern
+            # If every slot is forced (target <= 0) there is no middle to rank.
+            scal[5] = (
+                cutlass.Int32(0) if target > cutlass.Int32(0) else cutlass.Int32(1)
+            )
         cute.arch.barrier()
 
-        # ---- histogram over the middle region [mid_lo, mid_hi) --------------
-        b = mid_lo + tid
-        while b < mid_hi:
-            key = self._radix_key(mBits[h, b, q])
-            binv = cutlass.Int32(key >> _RADIX_SHIFT)
-            _atomic_add_i32(1, hist.iterator + binv)
-            b += _KTHREADS
-        cute.arch.barrier()
+        # ---- MSD radix-select stages (high -> mid -> low 10 bits) -----------
+        # The Python loop is unrolled at trace time, so `step` is a constant and
+        # the per-stage shift / pattern logic specializes statically. `done` is
+        # block-uniform (thread 0 writes it, all read after a barrier), so every
+        # `if dn == 0:` guard is uniform and the unconditional barriers between
+        # guarded blocks stay balanced across the CTA.
+        for step in (1, 2, 3):
+            shift = _STAGE_SHIFT[step]
 
-        # ---- 2-level threshold scan (replaces a 1024-iter serial scan) ------
-        # Phase A: first _NUM_BINS/_GROUP threads each sum one contiguous group
-        # of _GROUP bins (parallel). Phase B/C: thread 0 walks the (small) group
-        # sums to find the group holding the threshold, then refines within it.
-        # Critical serial path ~ 2*_GROUP instead of _NUM_BINS.
-        n_groups = _NUM_BINS // _GROUP
-        if tid < n_groups:
-            gs = cutlass.Int32(0)
-            gi = cutlass.Int32(0)
-            gbase = tid * _GROUP
-            while gi < _GROUP:
-                gs += hist[gbase + gi]
-                gi += 1
-            grpsum[tid] = gs
-        cute.arch.barrier()
+            # --- setup: refine pattern, reset stage_count, recompute need ----
+            if tid == 0:
+                if scal[5] == cutlass.Int32(0):
+                    if cutlass.const_expr(step == 2):
+                        pat[0] = cutlass.Uint32(scal[2]) << cutlass.Uint32(22)
+                    elif cutlass.const_expr(step == 3):
+                        pat[0] = pat[0] | (
+                            cutlass.Uint32(scal[2]) << cutlass.Uint32(12)
+                        )
+                    scal[1] = cutlass.Int32(0)  # stage_count
+                    scal[6] = target - scal[0]  # need (remaining to select)
+            cute.arch.barrier()
 
-        if tid == 0:
-            # Phase B: find the group whose running count crosses `target`.
-            running = cutlass.Int32(0)
-            grp = cutlass.Int32(n_groups)
-            base_grp = cutlass.Int32(0)
-            gg = cutlass.Int32(0)
-            while gg < n_groups:
-                s = grpsum[gg]
-                if (grp == n_groups) and (running < target) and (running + s >= target):
-                    grp = gg
-                    base_grp = running
-                running += s
-                gg += 1
-            # Default (target unreachable): all bins selected, base = total count.
-            threshold = cutlass.Int32(_NUM_BINS)
-            base = running
-            # Phase C: refine within the found group.
-            if grp < n_groups:
-                run2 = base_grp
-                bi = grp * _GROUP
-                end = bi + _GROUP
-                while bi < end:
-                    c = hist[bi]
-                    if (
-                        (threshold == _NUM_BINS)
-                        and (run2 < target)
-                        and (run2 + c >= target)
-                    ):
-                        threshold = bi
-                        base = run2
-                    run2 += c
-                    bi += 1
-            scal[2] = threshold
-            scal[3] = base
-        cute.arch.barrier()
+            pattern = pat[0]
 
-        threshold = scal[2]
-        base = scal[3]
-        do_middle = target > cutlass.Int32(0)
+            # --- clear histogram ---------------------------------------------
+            dn = scal[5]
+            if dn == cutlass.Int32(0):
+                bb = tid
+                while bb < _NUM_BINS:
+                    hist[bb] = cutlass.Int32(0)
+                    bb += _KTHREADS
+            cute.arch.barrier()
 
-        # ---- classify: direct-emit (bin<threshold) or stage (bin==threshold)-
-        if do_middle:
-            b = mid_lo + tid
-            while b < mid_hi:
-                key = self._radix_key(mBits[h, b, q])
-                binv = cutlass.Int32(key >> _RADIX_SHIFT)
-                if binv < threshold:
-                    slot = _atomic_add_i32(1, scal.iterator + 0)
-                    sel[n_forced + slot] = b
-                elif binv == threshold:
-                    s = _atomic_add_i32(1, scal.iterator + 1)
-                    if s < _STAGE_CAP:
-                        stage_key[s] = key
-                        stage_idx[s] = b
-                b += _KTHREADS
-        cute.arch.barrier()
+            # --- histogram over the pattern-matched candidates ---------------
+            dn = scal[5]
+            if dn == cutlass.Int32(0):
+                b = mid_lo + tid
+                while b < mid_hi:
+                    okey = self._radix_key(mBits[h, b, q])
+                    binv = cutlass.Int32((okey >> shift) & cutlass.Uint32(0x3FF))
+                    if cutlass.const_expr(step == 1):
+                        _atomic_add_i32(1, hist.iterator + binv)
+                    else:
+                        mshift = _MATCH_SHIFT[step]
+                        if (
+                            (okey ^ pattern) >> cutlass.Uint32(mshift)
+                        ) == cutlass.Uint32(0):
+                            _atomic_add_i32(1, hist.iterator + binv)
+                    b += _KTHREADS
+            cute.arch.barrier()
 
-        # ---- insertion-sort the staged threshold-bin items, emit the rest ---
-        if do_middle:
-            stage_count = scal[1]
-            ii = tid
-            while ii < stage_count:
-                ti = stage_key[ii]
-                rank = cutlass.Int32(0)
-                jj = cutlass.Int32(0)
-                while jj < stage_count:
-                    tj = stage_key[jj]
-                    # higher score == smaller key; ties broken by staging index
-                    if (ti > tj) or ((ti == tj) and (ii < jj)):
-                        rank += 1
-                    jj += 1
-                if base + rank < target:
-                    sel[n_forced + base + rank] = stage_idx[ii]
-                ii += _KTHREADS
-        cute.arch.barrier()
+            # --- 2-level threshold scan (replaces a 1024-iter serial scan) ---
+            # Phase A: first n_groups threads each sum one contiguous group of
+            # _GROUP bins (parallel). Phase B/C: thread 0 walks the (small) group
+            # sums to find the group holding the threshold, then refines within
+            # it. Critical serial path ~ 2*_GROUP instead of _NUM_BINS.
+            dn = scal[5]
+            if dn == cutlass.Int32(0):
+                if tid < n_groups:
+                    gs = cutlass.Int32(0)
+                    gi = cutlass.Int32(0)
+                    gbase = tid * _GROUP
+                    while gi < _GROUP:
+                        gs += hist[gbase + gi]
+                        gi += 1
+                    grpsum[tid] = gs
+            cute.arch.barrier()
+
+            dn = scal[5]
+            if dn == cutlass.Int32(0):
+                if tid == 0:
+                    need = scal[6]
+                    # Phase B: find the group whose running count crosses `need`.
+                    running = cutlass.Int32(0)
+                    grp = cutlass.Int32(n_groups)
+                    base_grp = cutlass.Int32(0)
+                    gg = cutlass.Int32(0)
+                    while gg < n_groups:
+                        s = grpsum[gg]
+                        if (
+                            (grp == n_groups)
+                            and (running < need)
+                            and (running + s >= need)
+                        ):
+                            grp = gg
+                            base_grp = running
+                        running += s
+                        gg += 1
+                    # Default (need unreachable): all candidates selected.
+                    threshold = cutlass.Int32(_NUM_BINS)
+                    base = running
+                    fbs = cutlass.Int32(0)
+                    # Phase C: refine within the found group.
+                    if grp < n_groups:
+                        run2 = base_grp
+                        bi = grp * _GROUP
+                        end = bi + _GROUP
+                        while bi < end:
+                            c = hist[bi]
+                            if (
+                                (threshold == _NUM_BINS)
+                                and (run2 < need)
+                                and (run2 + c >= need)
+                            ):
+                                threshold = bi
+                                base = run2
+                                fbs = c
+                            run2 += c
+                            bi += 1
+                    scal[2] = threshold
+                    scal[3] = base
+                    scal[4] = fbs
+                    if cutlass.const_expr(step == 3):
+                        # Terminal stage emits sub-threshold and threshold-bin
+                        # candidates in one concurrent pass, so they need
+                        # disjoint output ranges (matching CUDA's two-counter
+                        # scheme): sub-threshold fills [found, found+base) via
+                        # `found`; threshold-bin fills [found+base, target) via
+                        # this separate counter. Sharing one counter would let a
+                        # threshold-bin element race a guaranteed sub-threshold
+                        # one out of its slot.
+                        scal[1] = scal[0] + base
+            cute.arch.barrier()
+
+            # --- classify: direct-emit (bin<threshold) / stage / refine ------
+            dn = scal[5]
+            if dn == cutlass.Int32(0):
+                threshold = scal[2]
+                fbs = scal[4]
+                fits = fbs <= cutlass.Int32(_STAGE_CAP)
+                b = mid_lo + tid
+                while b < mid_hi:
+                    okey = self._radix_key(mBits[h, b, q])
+                    # `proceed` is always a dynamic (uniform-true for stage 1)
+                    # bool so the body below traces once, not per static branch.
+                    if cutlass.const_expr(step == 1):
+                        proceed = okey == okey
+                    else:
+                        mshift = _MATCH_SHIFT[step]
+                        proceed = (
+                            (okey ^ pattern) >> cutlass.Uint32(mshift)
+                        ) == cutlass.Uint32(0)
+                    if proceed:
+                        binv = cutlass.Int32((okey >> shift) & cutlass.Uint32(0x3FF))
+                        if binv < threshold:
+                            slot = _atomic_add_i32(1, scal.iterator + 0)
+                            if n_forced + slot < cutlass.Int32(self._topk):
+                                sel[n_forced + slot] = b
+                        elif binv == threshold:
+                            if cutlass.const_expr(step == 3):
+                                # Terminal stage: residual ties (equal in bits
+                                # 31..2) emit directly via the separate counter
+                                # (slot 1), capped at the topk slots.
+                                slot = _atomic_add_i32(1, scal.iterator + 1)
+                                if n_forced + slot < cutlass.Int32(self._topk):
+                                    sel[n_forced + slot] = b
+                            else:
+                                if fits:
+                                    s = _atomic_add_i32(1, scal.iterator + 1)
+                                    if s < cutlass.Int32(_STAGE_CAP):
+                                        stage_key[s] = okey
+                                        stage_idx[s] = b
+                    b += _KTHREADS
+            cute.arch.barrier()
+
+            if cutlass.const_expr(step != 3):
+                # --- insertion-sort the staged threshold-bin items, emit rest
+                dn = scal[5]
+                if dn == cutlass.Int32(0):
+                    fbs = scal[4]
+                    if fbs <= cutlass.Int32(_STAGE_CAP):
+                        stage_count = scal[1]
+                        base = scal[3]
+                        need = scal[6]
+                        ii = tid
+                        while ii < stage_count:
+                            ti = stage_key[ii]
+                            rank = cutlass.Int32(0)
+                            jj = cutlass.Int32(0)
+                            while jj < stage_count:
+                                tj = stage_key[jj]
+                                # higher score == smaller key; ties by stage index
+                                if (ti > tj) or ((ti == tj) and (ii < jj)):
+                                    rank += 1
+                                jj += 1
+                            if base + rank < need:
+                                slot = _atomic_add_i32(1, scal.iterator + 0)
+                                if n_forced + slot < cutlass.Int32(self._topk):
+                                    sel[n_forced + slot] = stage_idx[ii]
+                            ii += _KTHREADS
+                cute.arch.barrier()
+
+                # --- mark done if this stage's threshold bin fit the buffer --
+                # Only thread 0 reads/writes `done` here; guarding all threads on
+                # `dn = scal[5]` would race the write below (read vs write of the
+                # same slot with no intervening barrier).
+                if tid == 0:
+                    if scal[5] == cutlass.Int32(0):
+                        if scal[4] <= cutlass.Int32(_STAGE_CAP):
+                            scal[5] = cutlass.Int32(1)
+                cute.arch.barrier()
+            else:
+                # stage 3 is terminal regardless of bin size
+                if tid == 0:
+                    scal[5] = cutlass.Int32(1)
+                cute.arch.barrier()
 
         # ---- thread 0: ascending-by-index sort (<= topk slots) + write ------
         if tid == 0:

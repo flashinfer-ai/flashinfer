@@ -24,8 +24,8 @@ routine, all timed with CUPTI via ``bench_gpu_time``.
 The ``--backends`` flag selects the kernel implementation, not a vendor library:
 ``cudsl`` (the default CuTe-DSL path), ``cuda`` (the retained CUDA reference,
 available for ``MSATopkSelect`` / ``MSABuildCsr``), and ``cudsl_radix`` (the
-faithful radix top-k, ``MSATopkSelect`` only). Ops with a single implementation
-ignore unsupported backends with a warning.
+multi-stage radix top-k, the CuTe-DSL default for ``MSATopkSelect``). Ops with a
+single implementation ignore unsupported backends with a warning.
 """
 
 import math
@@ -49,7 +49,7 @@ BLK_KV = 128
 # Which kernel backends each MSA routine actually exposes.
 _ROUTINE_BACKENDS = {
     "MSAProxyScore": ["cudsl"],
-    "MSATopkSelect": ["cudsl", "cuda", "cudsl_radix"],
+    "MSATopkSelect": ["cudsl_radix", "cuda"],
     "MSABuildCsr": ["cudsl", "cuda"],
     "MSASparseAttentionKvMajor": ["cudsl"],
     "MSASparseDecode": ["cudsl"],
@@ -270,8 +270,8 @@ def testMSAProxyScore(args):
 def testMSATopkSelect(args):
     """Stage 2: select top-K KV blocks per (query, head) (msa_topk_select).
 
-    Supports cudsl / cuda / cudsl_radix backends so this routine doubles as the
-    proper-vs-argmax-vs-cuda top-k perf comparator."""
+    Supports cudsl_radix / cuda backends so this routine doubles as the
+    radix-vs-CUDA top-k perf comparator."""
     if args.verbose >= 1:
         print(f"[INFO] Running testMSATopkSelect | FlashInfer {flashinfer.__version__}")
     device = _common(args)
@@ -307,11 +307,24 @@ def testMSATopkSelect(args):
             input_args=(b,),
         )
         res.append(_record(args, b, times, total_q=total_q, total_kv=bs * s_kv))
-    # cross-backend refcheck: integer selection must agree bit-exact
+
+    # cross-backend refcheck: compare the *scores* of the selected blocks, not
+    # their indices. Exact ties at the top-k boundary are broken arbitrarily (by
+    # atomic emission order) and legitimately differ across backends, but every
+    # valid top-k selects the same multiset of scores, so sorted selected-scores
+    # must match bit-exact.
+    def _selected_scores(out):
+        # out (total_q, H, topk) int32 indices (-1 padded) -> sorted scores
+        msp = max_score.permute(2, 0, 1)  # (total_q, H, mkt)
+        g = torch.gather(msp, 2, out.long().clamp_min(0))
+        g = torch.where(out >= 0, g, torch.full_like(g, float("-inf")))
+        return g.sort(dim=-1, descending=True).values
+
     if args.refcheck and len(outputs) > 1:
         ref_b = next(iter(outputs))
+        ref_scores = _selected_scores(outputs[ref_b])
         for b, out in outputs.items():
-            if b != ref_b and not torch.equal(out, outputs[ref_b]):
+            if b != ref_b and not torch.equal(_selected_scores(out), ref_scores):
                 msg = f"[ERROR] topk backend {b} disagrees with {ref_b}"
                 if args.allow_output_mismatch:
                     print(msg)

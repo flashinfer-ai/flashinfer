@@ -29,51 +29,12 @@ def _get_sparse_topk_select_module():
     return gen_sparse_topk_select_module().build_and_load()
 
 
-_topk_compile_cache: dict = {}
-
-
-def _get_compiled_topk(topk: int):
-    import cutlass
-    import cutlass.cute as cute
-
-    from .cute_dsl.topk_select_sm12x import TopKSelectSm12x
-
-    compiled = _topk_compile_cache.get(topk)
-    if compiled is not None:
-        return compiled
-
-    def fk(dtype, ndim, align):
-        return cute.runtime.make_fake_compact_tensor(
-            dtype,
-            tuple(cute.sym_int() for _ in range(ndim)),
-            stride_order=tuple(reversed(range(ndim))),
-            assumed_align=align,
-        )
-
-    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    compiled = cute.compile(
-        TopKSelectSm12x(topk=topk),
-        fk(cutlass.Float32, 3, 4),  # max_score (H, P, S)
-        fk(cutlass.Int32, 3, 4),  # out (S, H, topk)
-        cutlass.Int32(1),  # num_valid_pages
-        cutlass.Int32(0),  # force_begin
-        cutlass.Int32(0),  # force_end
-        cutlass.Int32(1),  # total_qo_len
-        cutlass.Int32(1),  # num_qo_heads
-        stream_fake,
-        options="--enable-tvm-ffi",
-    )
-    _topk_compile_cache[topk] = compiled
-    return compiled
-
-
 _radix_compile_cache: dict = {}
 
 
 def _get_compiled_radix_topk(topk: int):
-    """Compile the faithful radix-histogram top-k (CuTe-DSL port of the CUDA
-    ``IndexerTopKWithSortKernel``): O(max_k_tiles) per row vs the argmax port's
-    O(topk * max_k_tiles)."""
+    """Compile the multi-stage radix-select top-k: the CuTe-DSL port of the CUDA
+    ``IndexerTopKWithSortKernel``, O(max_k_tiles) per row."""
     import cutlass
     import cutlass.cute as cute
 
@@ -191,15 +152,14 @@ def msa_topk_select(
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
 
-    # Resolve the default: the radix port is the fastest path across the MSA
-    # context envelope (max_k_tiles <= 2048, i.e. <=256K ctx) and beats both the
-    # CUDA kernel and the argmax port there. Above 2048 it exceeds its SMEM
-    # staging cap, so fall back to the general argmax port. (The argmax port is
-    # also marginally faster at tiny max_k_tiles <= ~64, but radix is close
-    # enough there that one default path keeps things simple.)
+    # The multi-stage radix port ("cudsl_radix") is the single CuTe-DSL
+    # algorithm: a faithful port of the CUDA IndexerTopK kernel that refines the
+    # threshold bin ~10 bits per stage, so its staging buffer never grows with
+    # max_k_tiles and it covers the full CUDA-supported range (< 12288, i.e.
+    # <=1.5M ctx). "cuda" runs the retained CUDA reference. "auto" uses radix.
     backend = _backend
     if backend == "auto":
-        backend = "cudsl_radix" if max_k_tiles <= 2048 else "cudsl"
+        backend = "cudsl_radix"
 
     if backend == "cuda":
         workspace_size = num_qo_heads * max_k_tiles * total_qo_len
@@ -216,14 +176,9 @@ def msa_topk_select(
             force_end_blocks,
         )
     elif backend == "cudsl_radix":
-        # The single-pass radix stages the whole threshold bin (<= max_k_tiles)
-        # in a fixed 2048-slot SMEM buffer, so it is exact only within that
-        # envelope (covers MSA's <=128K-context max_k_tiles). Larger inputs
-        # should use the general argmax path ("cudsl").
-        if max_k_tiles > 2048:
+        if max_k_tiles >= 12288:
             raise ValueError(
-                f"cudsl_radix supports max_k_tiles <= 2048, got {max_k_tiles}; "
-                "use _backend='cudsl' for larger inputs"
+                f"cudsl_radix supports max_k_tiles < 12288, got {max_k_tiles}"
             )
         _get_compiled_radix_topk(topk)(
             max_score,
@@ -236,14 +191,8 @@ def msa_topk_select(
             int(max_k_tiles),
         )
     else:
-        _get_compiled_topk(topk)(
-            max_score,
-            output,
-            int(num_valid_pages),
-            int(force_begin_blocks),
-            int(force_end_blocks),
-            int(total_qo_len),
-            int(num_qo_heads),
+        raise ValueError(
+            f"unknown _backend {_backend!r}; expected 'auto', 'cudsl_radix', or 'cuda'"
         )
 
     return output
