@@ -324,7 +324,8 @@ struct CollectiveMmaArrayMixedInput<
     }
   }
 
-  bool TensormapUpdateShapesStridesForAandScale = true;
+  int current_group_idx_ = 0;
+  cute::TmaDescriptor const* current_tma_desc_b_ = nullptr;
 
  public:
   static constexpr ConversionMode KernelConversionMode = get_conversion_mode();
@@ -358,10 +359,7 @@ struct CollectiveMmaArrayMixedInput<
       cute::ArrayEngine<WeightScaleRawElement, scale_elements> smem_scale;
     } tensors;
 
-    struct TensorMapStorage {
-      cute::TmaDescriptor smem_tensormap_A;
-      cute::TmaDescriptor smem_tensormap_B;
-    };
+    struct TensorMapStorage {};
 
     using PipelineStorage = typename MainloopPipeline::SharedStorage;
     PipelineStorage pipeline;
@@ -372,6 +370,8 @@ struct CollectiveMmaArrayMixedInput<
   using PipelineStorage = typename SharedStorage::PipelineStorage;
 
   static constexpr bool IsGroupedGemmKernel = !cute::is_same_v<InternalStrideA, StrideA>;
+  static constexpr bool RequiresTensormapUpdateOnBatchChange = false;
+  static constexpr bool RequiresPrebuiltTensormapAcquireOnBatchChange = IsGroupedGemmKernel;
 
   // kernel Arguments
   // Host side kernel arguments
@@ -383,6 +383,8 @@ struct CollectiveMmaArrayMixedInput<
     ElementScale const** ptr_S = nullptr;
     NonVoidStrideScale const* dS{};
     int chunk_size = 0;
+    cute::TmaDescriptor const* ptr_A_prebuilt_tma_desc = nullptr;
+    cute::TmaDescriptor const* ptr_B_prebuilt_tma_descs = nullptr;
   };
 
   // Device side kernel params
@@ -412,7 +414,8 @@ struct CollectiveMmaArrayMixedInput<
     TMA_A tma_load_a;
     TMA_B tma_load_b;
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
-    void* tensormaps;
+    cute::TmaDescriptor const* ptr_A_prebuilt_tma_desc;
+    cute::TmaDescriptor const* ptr_B_prebuilt_tma_descs;
     SwappedElementA const** ptr_A;
     SwappedStrideA ptr_dA;
     SwappedElementB const** ptr_B;
@@ -422,6 +425,7 @@ struct CollectiveMmaArrayMixedInput<
     int chunk_size;
     InternalSwappedStrideA dA;
     InternalSwappedStrideB dB;
+    int num_groups;
   };
 
   //
@@ -511,12 +515,16 @@ struct CollectiveMmaArrayMixedInput<
         make_tma_copy(GmemTiledCopyB{}, tensor_b, SmemLayoutB{}(_, _, cute::Int<0>{}),
                       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
                       size<0>(ClusterShape{}));  // mcast along M mode for this N load, if any
-    void* tensormaps = workspace;
+    int num_groups_val = 1;
+    if constexpr (IsGroupedGemmKernel) {
+      num_groups_val = problem_shapes.groups();
+    }
     auto args_setup = [&](auto ptr_A, auto ptr_B, int chunk_size = 0) -> Params {
       return {tma_load_a,
               tma_load_b,
               TmaTransactionBytes,
-              tensormaps,
+              args.ptr_A_prebuilt_tma_desc,
+              args.ptr_B_prebuilt_tma_descs,
               reinterpret_cast<SwappedElementA const**>(ptr_A),
               ptr_dA,
               reinterpret_cast<SwappedElementB const**>(ptr_B),
@@ -525,7 +533,8 @@ struct CollectiveMmaArrayMixedInput<
               args.dS,
               chunk_size,
               dA,
-              dB};
+              dB,
+              num_groups_val};
     };
 
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
@@ -542,23 +551,10 @@ struct CollectiveMmaArrayMixedInput<
   template <class ProblemShape>
   static size_t get_workspace_size(ProblemShape const& problem_shape, Arguments const& args,
                                    int sm_count) {
-    constexpr size_t SizeOfCuTensorMap = sizeof(cute::TmaDescriptor);
-
-    // Calculating workspace size
-    auto calculate_workspace_size = [SizeOfCuTensorMap, sm_count](uint32_t num_input_tensors) {
-      return num_input_tensors * SizeOfCuTensorMap * sm_count;
-    };
-
-    if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-      // Allocate gmem space for input tensormaps per each SM, A tensormap copies followed by B
-      // tensormap copies
-      return calculate_workspace_size(2);
-    } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      return calculate_workspace_size(2);
-    } else {
-      static_assert(cutlass::detail::dependent_false<KernelSchedule>,
-                    "Conversion mode not handled in get_workspace_size.");
-    }
+    (void)problem_shape;
+    (void)args;
+    (void)sm_count;
+    return 0;
   }
 
   template <class ProblemShape>
@@ -621,6 +617,10 @@ struct CollectiveMmaArrayMixedInput<
           "  CAN IMPLEMENT: Problem Size doesn't meet the minimum alignment requirements for "
           "TMA.\n");
     }
+    if constexpr (IsGroupedGemmKernel) {
+      implementable = implementable && args.ptr_A_prebuilt_tma_desc != nullptr;
+      implementable = implementable && args.ptr_B_prebuilt_tma_descs != nullptr;
+    }
     return implementable;
   }
 
@@ -648,10 +648,12 @@ struct CollectiveMmaArrayMixedInput<
 
     // TMA requires special handling of strides to deal with coord codomain mapping
     // Represent the full tensors -- get these from TMA
+    auto A_L = mainloop_params.num_groups;
+    auto B_L = mock_L;
     Tensor mA_mkl = mainloop_params.tma_load_a.get_tma_tensor(
-        shape(detail::get_gmem_layout(make_shape(M, K, mock_L), mainloop_params.dA)));  // (m,k,l)
+        shape(detail::get_gmem_layout(make_shape(M, K, A_L), mainloop_params.dA)));  // (m,k,l)
     Tensor mB_nkl = mainloop_params.tma_load_b.get_tma_tensor(
-        shape(detail::get_gmem_layout(make_shape(N, K, mock_L), mainloop_params.dB)));  // (n,k,l)
+        shape(detail::get_gmem_layout(make_shape(N, K, B_L), mainloop_params.dB)));  // (n,k,l)
 
     // Make tiled views, defer the slice
     Tensor gA_mkl = local_tile(mA_mkl, TileShape{}, make_coord(_, _, _),
@@ -714,8 +716,10 @@ struct CollectiveMmaArrayMixedInput<
 
     // Partition the inputs based on the current block coordinates.
     auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
-    Tensor gA = gA_mkl(_, _, m_coord, _, l_coord);  // (BLK_M,BLK_K,k)
-    Tensor gB = gB_nkl(_, _, n_coord, _, l_coord);  // (BLK_N,BLK_K,k)
+    auto a_l_coord = current_group_idx_;
+    auto b_l_coord = cute::Int<0>{};
+    Tensor gA = gA_mkl(_, _, m_coord, _, a_l_coord);  // (BLK_M,BLK_K,k)
+    Tensor gB = gB_nkl(_, _, n_coord, _, b_l_coord);  // (BLK_N,BLK_K,k)
 
     // Applies the mapping from block_tma_a
     Tensor tAgA = block_tma_a.partition_S(gA);  // (TMA,TMA_M,TMA_K,k)
@@ -758,9 +762,10 @@ struct CollectiveMmaArrayMixedInput<
 
       int write_stage = smem_pipe_write.index();
       if (cute::elect_one_sync()) {
-        copy(mainloop_params.tma_load_a.with(get<0>(input_tensormaps), *tma_barrier, mcast_mask_a),
+        copy(mainloop_params.tma_load_a.with(mainloop_params.ptr_A_prebuilt_tma_desc,
+                                             *tma_barrier, mcast_mask_a),
              tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, write_stage));
-        copy(mainloop_params.tma_load_b.with(get<1>(input_tensormaps), *tma_barrier, mcast_mask_b),
+        copy(mainloop_params.tma_load_b.with(current_tma_desc_b_, *tma_barrier, mcast_mask_b),
              tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, write_stage));
       }
       if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
@@ -1324,105 +1329,46 @@ struct CollectiveMmaArrayMixedInput<
   // Methods to perform different parts of TMA/Tensormap modifications
   //
   CUTLASS_DEVICE auto tensormaps_init(Params const& mainloop_params,
-                                      TensorMapStorage& shared_tensormaps, int32_t sm_count,
+                                      [[maybe_unused]] TensorMapStorage& shared_tensormaps,
+                                      [[maybe_unused]] int32_t sm_count,
                                       int32_t sm_idx) {
-    cute::TmaDescriptor* gmem_tensormap =
-        reinterpret_cast<cute::TmaDescriptor*>(mainloop_params.tensormaps);
-
-    cute::TmaDescriptor* tma_desc_a = &gmem_tensormap[sm_idx];
-    cute::TmaDescriptor* tma_desc_b = &gmem_tensormap[sm_idx + sm_count];
-
-    // Bringing tensormaps from params to smem for modification later
-    Tensor pA_tensormap =
-        make_tensor(mainloop_params.tma_load_a.get_tma_descriptor(), Int<1>{}, Int<1>{});
-    Tensor sA_tensormap =
-        make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_A), Int<1>{}, Int<1>{});
-    Tensor pB_tensormap =
-        make_tensor(mainloop_params.tma_load_b.get_tma_descriptor(), Int<1>{}, Int<1>{});
-    Tensor sB_tensormap =
-        make_tensor(make_smem_ptr(&shared_tensormaps.smem_tensormap_B), Int<1>{}, Int<1>{});
-
-    if (cute::elect_one_sync()) {
-      copy(recast<uint128_t>(pA_tensormap), recast<uint128_t>(sA_tensormap));
-      copy(recast<uint128_t>(pB_tensormap), recast<uint128_t>(sB_tensormap));
-    }
-
-    __syncwarp();
-
+    (void)sm_idx;
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
-      return cute::make_tuple(tma_desc_a, tma_desc_b);
+      return cute::make_tuple(mainloop_params.ptr_A_prebuilt_tma_desc,
+                              mainloop_params.ptr_B_prebuilt_tma_descs);
     } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      return cute::make_tuple(tma_desc_a, tma_desc_b);
+      return cute::make_tuple(mainloop_params.ptr_A_prebuilt_tma_desc,
+                              mainloop_params.ptr_B_prebuilt_tma_descs);
     } else {
       static_assert(cutlass::detail::dependent_false<KernelSchedule>,
                     "Conversion mode not handled in tensormaps_init.");
     }
   }
 
-  // Replace address for the global tensor (to be done by single thread)
   template <class... TMs>
-  CUTLASS_DEVICE void tensormaps_replace_global_address(TensorMapStorage& shared_tensormaps,
-                                                        Params const& mainloop_params,
-                                                        cute::tuple<TMs...> const& input_tensormaps,
-                                                        int32_t next_batch) {
-    // Replacing global_address for the next batch
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
-                                                    mainloop_params.ptr_B[next_batch]);
+  CUTLASS_DEVICE void tensormaps_cp_fence_release(
+      [[maybe_unused]] TensorMapStorage& shared_tensormaps,
+      [[maybe_unused]] cute::tuple<TMs...> const& input_tensormaps) {}
 
-    if (TensormapUpdateShapesStridesForAandScale) {
-      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
-                                                      mainloop_params.ptr_A[next_batch]);
-    } else {
-      cute::tma_descriptor_replace_addr_in_global_mem(get<0>(input_tensormaps),
-                                                      mainloop_params.ptr_A[next_batch]);
-    }
+  // The entire warp must call this function collectively.
+  template <class... TMs>
+  CUTLASS_DEVICE void tensormaps_fence_acquire(cute::tuple<TMs...> const& input_tensormaps) {
+    cute::tma_descriptor_fence_acquire(get<0>(input_tensormaps));
+    cute::tma_descriptor_fence_acquire(current_tma_desc_b_);
   }
 
-  // Replace dim and strides for the global tensor - used only for Grouped GEMM (to be done by
-  // single thread)
-  template <class ProblemShape_MNKL>
-  CUTLASS_DEVICE void tensormaps_replace_global_tensor_properties(
-      TensorMapStorage& shared_tensormaps, Params const& mainloop_params, int32_t next_group,
-      ProblemShape_MNKL problem_shape_mnkl) {
-    const uint32_t M = get<0>(problem_shape_mnkl);
-    const uint32_t N = get<1>(problem_shape_mnkl);
-    const uint32_t K = get<2>(problem_shape_mnkl);
-
-    // Replace all dims for consistency
-    constexpr int MaxTensorRank = 5;
-    cute::array<uint32_t, MaxTensorRank> prob_shape_A = {1, 1, 1, 1, 1};
-    cute::array<uint64_t, MaxTensorRank> prob_stride_A = {0, 0, 0, 0, 0};
-    cute::array<uint32_t, MaxTensorRank> prob_shape_B = {1, 1, 1, 1, 1};
-    cute::array<uint64_t, MaxTensorRank> prob_stride_B = {0, 0, 0, 0, 0};
-    SwappedElementB const* ptr_B = nullptr;
-    Tensor tensor_b = make_tensor(
-        ptr_B,
-        detail::get_gmem_layout(make_shape(N, K, Int<1>{}), mainloop_params.ptr_dB[next_group]));
-    cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, prob_shape_B,
-                                             prob_stride_B);
-
-    for (uint64_t& stride : prob_stride_B) {
-      stride = (stride * sizeof_bits_v<SwappedElementB>) / 8;
+  template <class InputTensors, class ProblemShape_MNKL>
+  CUTLASS_DEVICE InputTensors tensors_perform_update(
+      InputTensors const& input_tensors, Params const& mainloop_params,
+      [[maybe_unused]] ProblemShape_MNKL problem_shape_mnkl, int32_t next_batch) {
+    current_group_idx_ = next_batch;
+    current_tma_desc_b_ = mainloop_params.ptr_B_prebuilt_tma_descs + next_batch;
+    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
+      return cute::make_tuple(get<0>(input_tensors), get<1>(input_tensors),
+                              mainloop_params.ptr_S[next_batch], get<3>(input_tensors),
+                              get<4>(input_tensors));
     }
-
-    cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_B,
-                                                            prob_shape_B, prob_stride_B);
-
-    if (TensormapUpdateShapesStridesForAandScale) {
-      SwappedElementA const* ptr_A = nullptr;
-      Tensor tensor_a = make_tensor(
-          ptr_A,
-          detail::get_gmem_layout(make_shape(M, K, Int<1>{}), mainloop_params.ptr_dA[next_group]));
-      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a, prob_shape_A,
-                                               prob_stride_A);
-
-      // Convert strides to byte strides
-      for (uint64_t& stride : prob_stride_A) {
-        stride = (stride * sizeof_bits_v<SwappedElementA>) / 8;
-      }
-      cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A,
-                                                              prob_shape_A, prob_stride_A);
-    }
+    return input_tensors;
   }
 
   template <class... TMs, class ProblemShape_MNKL>
@@ -1431,58 +1377,11 @@ struct CollectiveMmaArrayMixedInput<
                                                 cute::tuple<TMs...> const& input_tensormaps,
                                                 ProblemShape_MNKL problem_shape_mnkl,
                                                 int32_t next_batch) {
-    if (cute::elect_one_sync()) {
-      // Replacing global_address for the next batch
-      tensormaps_replace_global_address(shared_tensormaps, mainloop_params, input_tensormaps,
-                                        next_batch);
-
-      if constexpr (IsGroupedGemmKernel) {
-        // Replacing global dims and strides for the next batch
-        tensormaps_replace_global_tensor_properties(shared_tensormaps, mainloop_params, next_batch,
-                                                    problem_shape_mnkl);
-      }
-    }
-  }
-
-  template <class... TMs>
-  CUTLASS_DEVICE void tensormaps_cp_fence_release(TensorMapStorage& shared_tensormaps,
-                                                  cute::tuple<TMs...> const& input_tensormaps) {
-    // [None][fix] Fix W4A8 MoE kernel issue
-    // https://github.com/NVIDIA/TensorRT-LLM/pull/7072
-    if (cute::elect_one_sync()) {
-      cute::tma_desc_commit_group();
-      cute::tma_desc_wait_group();
-    }
-
-    // Entire warp must do this (i.e. it's aligned)
-    tma_descriptor_cp_fence_release(get<1>(input_tensormaps), shared_tensormaps.smem_tensormap_B);
-
-    if (TensormapUpdateShapesStridesForAandScale) {
-      TensormapUpdateShapesStridesForAandScale = false;
-
-      tma_descriptor_cp_fence_release(get<0>(input_tensormaps), shared_tensormaps.smem_tensormap_A);
-    } else {
-      tma_descriptor_fence_release();
-    }
-  }
-
-  // The entire warp must call this function collectively (that is, the instructions are aligned)
-  template <class... TMs>
-  CUTLASS_DEVICE void tensormaps_fence_acquire(cute::tuple<TMs...> const& input_tensormaps) {
-    cute::tma_descriptor_fence_acquire(get<0>(input_tensormaps));
-    cute::tma_descriptor_fence_acquire(get<1>(input_tensormaps));
-  }
-
-  template <class InputTensors, class ProblemShape_MNKL>
-  CUTLASS_DEVICE InputTensors tensors_perform_update(
-      InputTensors const& input_tensors, [[maybe_unused]] Params const& mainloop_params,
-      [[maybe_unused]] ProblemShape_MNKL problem_shape_mnkl, [[maybe_unused]] int32_t next_batch) {
-    if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-      return cute::make_tuple(get<0>(input_tensors), get<1>(input_tensors),
-                              mainloop_params.ptr_S[next_batch], get<3>(input_tensors),
-                              get<4>(input_tensors));
-    }
-    return input_tensors;
+    (void)shared_tensormaps;
+    (void)mainloop_params;
+    (void)input_tensormaps;
+    (void)problem_shape_mnkl;
+    (void)next_batch;
   }
 };
 

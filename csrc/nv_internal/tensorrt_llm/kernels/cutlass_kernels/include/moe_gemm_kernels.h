@@ -215,6 +215,8 @@ struct TmaWarpSpecializedGroupedGemmInput {
 
   uint8_t* gemm_workspace = nullptr;
   size_t gemm_workspace_size = 0;
+  uint8_t* precomputed_scheduler_workspace = nullptr;
+  size_t precomputed_scheduler_workspace_size = 0;
 
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl{};
@@ -224,7 +226,9 @@ struct TmaWarpSpecializedGroupedGemmInput {
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 
   void configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace,
-                          size_t gemm_workspace_size, FpXBlockScalingType scaling_type);
+                          size_t gemm_workspace_size, void* precomputed_scheduler_workspace,
+                          size_t precomputed_scheduler_workspace_size,
+                          FpXBlockScalingType scaling_type);
 
   bool isValid() const { return stride_act != nullptr && ptr_act != nullptr; }
 

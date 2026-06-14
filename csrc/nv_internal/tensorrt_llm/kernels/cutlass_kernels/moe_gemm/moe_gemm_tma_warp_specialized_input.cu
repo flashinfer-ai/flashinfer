@@ -81,6 +81,8 @@ size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts,
 void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, int num_experts,
                                                             void* gemm_workspace,
                                                             size_t gemm_workspace_size,
+                                                            void* precomputed_scheduler_workspace,
+                                                            size_t precomputed_scheduler_workspace_size,
                                                             FpXBlockScalingType scaling_type) {
   auto buffers = workspaceBuffers(num_experts, scaling_type);
   std::array<int8_t*, 20> pointers{};
@@ -125,6 +127,9 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
 
   this->gemm_workspace = reinterpret_cast<uint8_t*>(gemm_workspace);
   this->gemm_workspace_size = gemm_workspace_size;
+  this->precomputed_scheduler_workspace =
+      reinterpret_cast<uint8_t*>(precomputed_scheduler_workspace);
+  this->precomputed_scheduler_workspace_size = precomputed_scheduler_workspace_size;
 }
 
 void TmaWarpSpecializedGroupedGemmInput::setFinalizeFusionParams(void* final_output,
@@ -175,6 +180,8 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const {
        << ", with Stride: " << (PrintType)fpX_block_scaling_factors_stride_weight << "\n";
     ss << "Gemm Workspace: " << (PrintType)gemm_workspace << ", with Size: " << gemm_workspace_size
        << "\n";
+    ss << "Precomputed Scheduler Workspace: " << (PrintType)precomputed_scheduler_workspace
+       << ", with Size: " << precomputed_scheduler_workspace_size << "\n";
   }
 
   return ss.str();
