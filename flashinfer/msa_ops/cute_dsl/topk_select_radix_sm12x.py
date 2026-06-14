@@ -25,35 +25,27 @@ separate fallback path is needed.
 Algorithm (one CTA per (head, query) row, ``kThreads`` threads):
 
 1. **Forced blocks** ``[0, fb)`` (sink) and ``[nvp - fe, nvp)`` (window) are
-   pre-placed into the selection and excluded from ranking — so the radix ranks
-   only the contiguous middle region ``[fb, nvp - fe)`` and picks the
-   ``target = topk - fb - fe`` highest scorers there.
-2. **MSD radix select** over the order-preserving float-bit key (ascending key
-   == descending score), refining 10 bits at a time:
-     * stage 1 — high 10 bits (``key >> 22``), ranks the whole middle region;
-     * stage 2 — mid  10 bits (``(key >> 12) & 0x3ff``), ranks only elements
-       inside stage 1's threshold bin;
-     * stage 3 — low  10 bits (``(key >>  2) & 0x3ff``), ranks only elements
-       inside stage 2's threshold bin.
-   Each stage histograms its (pattern-matched) candidate set, then a **2-level
-   scan** finds the threshold bin where the running count crosses the remaining
-   ``need`` (replacing ``cub::BlockScan``): one warp sums the 32 contiguous
-   32-bin groups in parallel, then thread 0 walks the 32 group sums and refines
-   within the one group that straddles the threshold — a ~64-step critical path
-   instead of a 1024-step serial scan (which profiled as the dominant cost of an
-   earlier single-thread version).
-3. **Classify** each candidate: ``bin < threshold`` ⇒ emit directly (definitely
-   selected); ``bin == threshold`` ⇒ either stage it (if the threshold bin fits
-   the ``_STAGE_CAP`` buffer) for a tie-break sort, or — if it overflows — leave
-   it for the next, finer stage to refine.
-4. When a stage's threshold bin fits ``_STAGE_CAP``, **insertion sort** the
-   staged items by score (ties by staging index, matching the CUDA reference)
-   and emit the remaining ``need``. Stage 3 is terminal: any residual threshold
-   bin holds elements equal in bits 31..2 (true ties differing only in the
-   bottom 2 bits), so they are emitted directly up to ``need`` without staging —
-   this is why the buffer never needs to grow with ``max_k_tiles``.
-5. Sort the (<= topk) selected indices **ascending by index** and write, ``-1``
-   tail-padding empty slots.
+   pre-placed and excluded from ranking, so the radix ranks only the contiguous
+   middle region ``[fb, nvp - fe)`` and picks the ``target = topk - fb - fe``
+   highest scorers there.
+2. MSD radix-select on the order-preserving float-bit key (ascending key ==
+   descending score), 10 bits per stage:
+     * stage 1: high 10 bits (``key >> 22``), ranks the whole middle region;
+     * stage 2: mid 10 bits (``(key >> 12) & 0x3ff``), only stage-1 threshold-bin elements;
+     * stage 3: low 10 bits (``(key >> 2) & 0x3ff``), only stage-2 threshold-bin elements.
+   Each stage histograms its candidates, then a 2-level scan finds the threshold
+   bin where the running count crosses the remaining ``need``: one warp sums the
+   32 contiguous 32-bin groups, then thread 0 walks the 32 sums and refines the
+   straddling group (a ~64-step critical path, not a 1024-step serial scan).
+3. Classify each candidate: ``bin < threshold`` emits directly; ``bin ==
+   threshold`` either stages it for a tie-break sort (if the bin fits
+   ``_STAGE_CAP``) or defers it to the next finer stage.
+4. When the threshold bin fits ``_STAGE_CAP``, insertion-sort the staged items by
+   score (ties by staging index, as in CUDA) and emit the remaining ``need``.
+   Stage 3 is terminal: a residual threshold bin holds true ties (equal in bits
+   31..2), emitted directly up to ``need``, so the buffer never grows with
+   ``max_k_tiles``.
+5. Sort the selected indices ascending and write, ``-1``-padding empty slots.
 
 Because the threshold bin shrinks by ~10 bits each stage and stage 3 emits
 residual ties directly, the fixed ``_STAGE_CAP`` staging buffer is always
@@ -61,21 +53,13 @@ sufficient: there is no ``max_k_tiles`` ceiling from staging. The supported
 range matches the CUDA dispatcher (``max_k_tiles < 12288``); the Python wrapper
 raises above it.
 
-Two intentional, output-equivalent departures from the CUDA reference, each kept
-for simplicity (and validated bit-exact against CUDA on distinct-score inputs):
-
-* **No fp16 stage 0.** The CUDA kernel runs an extra fp16 10-bit pass before the
-  three fp32 stages. That pass is a register-level micro-opt (it never changes
-  the selected set — the fp32 stages refine fully regardless) and would require
-  an fp32->fp16 conversion here, so it is omitted; our benchmarks already show
-  the fp32-only radix beats the CUDA kernel across the MSA context envelope.
-* **No transpose / workspace.** ``max_score`` is read column-strided directly
-  (its raw bits via a uint32 recast) instead of via a transposed copy. The
-  CUDA transpose only enables float4-coalesced loads; correctness is identical.
-
-The final ascending-by-index sort is a single-thread insertion sort over the
-<= topk selected slots (vs the CUDA reference's warp bitonic sort): for topk=16
-the result is identical and the cost negligible.
+Two output-equivalent simplifications vs the CUDA reference, validated bit-exact
+on distinct-score inputs. First, no fp16 pre-pass: the three fp32 stages select
+fully on their own (the fp16 pass is only a register micro-opt). Second, no
+transpose workspace: ``max_score`` is read column-strided via a uint32 recast,
+since the transpose only aids float4 coalescing. The final ascending-by-index
+sort is a single-thread insertion sort over the <= topk slots (bit-identical to
+the CUDA warp-bitonic sort at topk=16).
 """
 
 import cuda.bindings.driver as cuda
@@ -89,12 +73,11 @@ _KTHREADS = 256
 _GROUP = 32  # bins per group for the 2-level threshold scan (_NUM_BINS / _GROUP groups)
 _SENTINEL = 0x7FFFFFFF  # sorts to the tail; written out as -1
 
-# Per-stage radix-digit shifts of the 32-bit order-preserving key:
-#   stage 1: bits 31..22 (high 10), stage 2: bits 21..12 (mid 10),
-#   stage 3: bits 11..2  (low 10, drops bits 0-1 — those are true ties).
+# Per-stage radix-digit shift of the 32-bit key: stage 1 bits 31..22, stage 2
+# bits 21..12, stage 3 bits 11..2 (bits 0-1 dropped, they are true ties).
 _STAGE_SHIFT = {1: 22, 2: 12, 3: 2}
-# Pattern shift used to filter candidates to the previous stage's threshold bin
-# (stage 1 ranks everything, so it has no pattern filter).
+# Shift to filter candidates to the previous stage's threshold bin (stage 1 ranks
+# everything, so no filter).
 _MATCH_SHIFT = {2: 22, 3: 12}
 
 
@@ -144,7 +127,7 @@ class TopKSelectRadixSm12x:
     @cute.kernel
     def kernel(
         self,
-        mBits: cute.Tensor,  # (H, P, S) uint32 — raw bits of max_score
+        mBits: cute.Tensor,  # (H, P, S) uint32, raw bits of max_score
         mOut: cute.Tensor,  # (S, H, topk) int32
         num_valid_pages: cutlass.Int32,
         force_begin: cutlass.Int32,
@@ -260,11 +243,10 @@ class TopKSelectRadixSm12x:
                     b += _KTHREADS
             cute.arch.barrier()
 
-            # --- 2-level threshold scan (replaces a 1024-iter serial scan) ---
-            # Phase A: first n_groups threads each sum one contiguous group of
-            # _GROUP bins (parallel). Phase B/C: thread 0 walks the (small) group
-            # sums to find the group holding the threshold, then refines within
-            # it. Critical serial path ~ 2*_GROUP instead of _NUM_BINS.
+            # --- 2-level threshold scan ---
+            # Phase A: first n_groups threads each sum one contiguous _GROUP-bin
+            # group. Phase B/C: thread 0 finds the group holding the threshold and
+            # refines within it. Critical serial path ~ 2*_GROUP, not _NUM_BINS.
             dn = scal[5]
             if dn == cutlass.Int32(0):
                 if tid < n_groups:
@@ -323,13 +305,9 @@ class TopKSelectRadixSm12x:
                     scal[4] = fbs
                     if cutlass.const_expr(step == 3):
                         # Terminal stage emits sub-threshold and threshold-bin
-                        # candidates in one concurrent pass, so they need
-                        # disjoint output ranges (matching CUDA's two-counter
-                        # scheme): sub-threshold fills [found, found+base) via
-                        # `found`; threshold-bin fills [found+base, target) via
-                        # this separate counter. Sharing one counter would let a
-                        # threshold-bin element race a guaranteed sub-threshold
-                        # one out of its slot.
+                        # candidates concurrently, so they need disjoint output
+                        # ranges: sub-threshold via `found` [found, found+base),
+                        # threshold-bin via this counter [found+base, target).
                         scal[1] = scal[0] + base
             cute.arch.barrier()
 
@@ -401,10 +379,9 @@ class TopKSelectRadixSm12x:
                             ii += _KTHREADS
                 cute.arch.barrier()
 
-                # --- mark done if this stage's threshold bin fit the buffer --
-                # Only thread 0 reads/writes `done` here; guarding all threads on
-                # `dn = scal[5]` would race the write below (read vs write of the
-                # same slot with no intervening barrier).
+                # Mark done if this stage's threshold bin fit the buffer. Thread 0
+                # only: guarding all threads on scal[5] would race this write
+                # (read vs write of the same slot, no barrier between).
                 if tid == 0:
                     if scal[5] == cutlass.Int32(0):
                         if scal[4] <= cutlass.Int32(_STAGE_CAP):

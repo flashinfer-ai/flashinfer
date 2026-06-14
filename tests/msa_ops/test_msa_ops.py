@@ -832,7 +832,7 @@ def test_sparse_decode_nvfp4():
 
 def test_msa_topk_select_forced_and_clamped():
     """force_begin/force_end blocks must always be selected (within the topk
-    budget) and num_valid_pages must clamp the candidate range — mirrors
+    budget) and num_valid_pages must clamp the candidate range, mirrors
     MSA's smoke/test_sparse_topk_forced.py."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_topk_select
@@ -936,7 +936,7 @@ def test_fuzz_random_shapes():
 
 def test_fully_masked_selected_blocks():
     """Queries whose entire selection is above the causal diagonal must
-    produce exact zeros (and -inf LSE), with no NaN/Inf anywhere — the
+    produce exact zeros (and -inf LSE), with no NaN/Inf anywhere, the
     'Q near sequence start' stress from MSA's suite."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_attention_kvmajor
@@ -1411,7 +1411,7 @@ def test_temperature_lse():
 
 @pytest.mark.parametrize("which", ["kvmajor", "decode"])
 def test_fp8_q(which):
-    """All-fp8 inputs (Q, K, V all e4m3) — MSA's fp8 serving configuration.
+    """All-fp8 inputs (Q, K, V all e4m3), MSA's fp8 serving configuration.
     Q is upconverted in-kernel; reference uses the dequantized tensors."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import (

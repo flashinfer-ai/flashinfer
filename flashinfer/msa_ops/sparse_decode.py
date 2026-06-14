@@ -22,8 +22,8 @@ request. Each valid (kv-head, token, t) entry of ``q2k_indices`` becomes one
 work item of the KV-major forward kernel: one token (x its GQA query heads)
 attending one selected KV block, written to split slot ``t``. Because
 :func:`msa_topk_select` tail-pads invalid entries with -1, the slot is
-simply the list position and the split count is the valid prefix length —
-so the whole schedule is built with a handful of torch ops, with no CUDA
+simply the list position and the split count is the valid prefix length,
+so the whole schedule is built with a handful of torch ops and no CUDA
 scheduler kernels.
 """
 

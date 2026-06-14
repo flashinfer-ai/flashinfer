@@ -5,9 +5,9 @@ end-to-end on flashinfer kernels with no unsupported error.
 How it works
 ------------
 We run a MiniMax-M3 *text* model whose **attention** config is pinned to full
-M3 — 64 query heads, 4 KV heads (GQA group 16), ``head_dim=128``, lightning
+M3, 64 query heads, 4 KV heads (GQA group 16), ``head_dim=128``, lightning
 indexer ``index_n_heads=4`` / ``index_head_dim=128`` / ``index_block_size=128``
-/ ``index_topk_blocks=16``, causal — and only the memory-heavy,
+/ ``index_topk_blocks=16``, causal, and only the memory-heavy,
 *support-irrelevant* axes (``hidden_size``, layer count, MLP width, vocab) are
 shrunk so the model fits in a single consumer GPU. Its sparse-attention layer is
 routed into ``flashinfer.msa_ops`` through a registered custom
@@ -16,16 +16,16 @@ routed into ``flashinfer.msa_ops`` through a registered custom
 Why a reduced model still proves *full*-M3 coverage
 ---------------------------------------------------
 Every "unsupported" gate in ``flashinfer/msa_ops`` keys off a per-call **config
-tuple** — ``head_dim``, block size, ``topk``, the dtype matrix, ``num_qo_heads %
+tuple**, ``head_dim``, block size, ``topk``, the dtype matrix, ``num_qo_heads %
 num_kv_heads`` and the decode ``GQA group <= 16`` bound, the paged-vs-flat
 contract, device. None gate on ``total_q`` / ``total_k`` / layer count /
-``hidden_size`` / batch / sequence length — the kernels loop over those. So
+``hidden_size`` / batch / sequence length, the kernels loop over those. So
 support is invariant to the shrunk axes and fixed by the config tuple, which we
 pin to full M3 and assert against :data:`M3_CANONICAL`.
 
 Note on routing reality: transformers M3 today dispatches attention to the
 HF-Hub ``MiniMaxAI/msa`` kernel (SM100-gated, not flashinfer). This test
-substitutes a flashinfer-backed interface — demonstrating the port's coverage
+substitutes a flashinfer-backed interface, demonstrating the port's coverage
 and forming the basis for a future flashinfer attention backend.
 """
 
@@ -304,9 +304,9 @@ def test_m3_proxy_topk_accept_m3_proxy_config():
     accept M3's lightning-indexer proxy config (``index_n_heads`` query heads,
     1 KV head, ``index_head_dim=128``) with no unsupported error.
 
-    This is an op-*acceptance* (coverage) check; the semantic-equivalence one —
+    This is an op-*acceptance* (coverage) check; the semantic-equivalence one ,
     that ``msa_proxy_score`` + an amax over the ``index_n_heads`` proxy heads +
-    ``msa_topk_select`` reproduces M3's indexer block selection — is
+    ``msa_topk_select`` reproduces M3's indexer block selection, is
     :func:`test_m3_indexer_proxy_head_equivalence`."""
     from flashinfer.msa_ops import msa_proxy_score, msa_topk_select
 
@@ -333,7 +333,7 @@ def test_m3_proxy_topk_accept_m3_proxy_config():
 def test_m3_kv_dtype_matrix_at_m3_shapes(kv_kind):
     """The kvmajor prefill + decode kernels accept every M3 deployment KV dtype
     (bf16 / fp16 / fp8-E4M3 / NVFP4) at M3's exact head config (64 q / 4 kv,
-    head_dim 128, topk 16) — the quantized paths a vLLM deployment would use."""
+    head_dim 128, topk 16), the quantized paths a vLLM deployment would use."""
     from flashinfer.msa_ops import (
         msa_sparse_attention_kvmajor,
         msa_sparse_decode_attention,
@@ -545,7 +545,7 @@ def test_m3_indexer_proxy_head_equivalence(dtype):
     # the top-k boundary are broken arbitrarily and legitimately differ; (b) for a
     # query with fewer than `topk` causally-valid blocks, M3 masks the surplus
     # slots to -1 while msa_topk_select fills them with extra future (-inf-scored)
-    # blocks — both map to a -inf selected-score (the downstream attention
+    # blocks, both map to a -inf selected-score (the downstream attention
     # re-masks those causally, so it is a benign padding-contract difference).
     # Equal sorted selected-scores per row therefore == same finite block set.
     sel_fi = msa_topk_select(reduced_t.contiguous(), topk)[:, 0, :]  # (Sq,topk)

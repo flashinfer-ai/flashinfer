@@ -305,7 +305,7 @@ def _get_compiled_combine(
 
     All fake tensor dims are independent symbols: the kernel's loop bounds
     (``topk``, ``head_dim``) come from the kernel object, not tensor shapes, so
-    the shapes only fix ndim/strides — letting unused optional tensors be
+    the shapes only fix ndim/strides, so unused optional tensors can be
     passed as small dummies at runtime without symbol conflicts."""
     import cutlass
     import cutlass.cute as cute

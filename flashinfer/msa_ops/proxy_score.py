@@ -43,9 +43,9 @@ def msa_proxy_score(
     """MSA dense proxy pass for SM120/SM121: per-KV-block max attention
     logits (MSA's ``OnlyScore`` mode).
 
-    Computes ``max_score[h, t, q]`` — the maximum of the **unscaled**,
-    causally-masked ``Q K^T`` logits over the 128 tokens of KV block ``t``
-    — for every query token and query head. The output feeds directly into
+    Computes ``max_score[h, t, q]``, the maximum of the unscaled,
+    causally-masked ``Q K^T`` logits over the 128 tokens of KV block ``t``,
+    for every query token and query head. The output feeds directly into
     :func:`msa_topk_select`. KV blocks beyond a sequence's valid range, or
     entirely above the causal limit, yield ``-inf``.
 
@@ -78,7 +78,7 @@ def msa_proxy_score(
         the *one selection per query* that the MiniMax-M3 lightning indexer
         produces (its ``block_scores = scores.amax(-1).amax(over index heads)``).
         Use this when the query heads are an indexer's proxy heads that collapse
-        to a shared block selection. Defaults to ``False`` — the per-head
+        to a shared block selection. Defaults to ``False``, the per-head
         ``max_score`` of MSA's canonical *one-proxy-head-per-KV-head* pipeline,
         where each head selects its own blocks.
 
