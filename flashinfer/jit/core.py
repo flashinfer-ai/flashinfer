@@ -121,8 +121,7 @@ def check_cuda_arch():
     if not eligible:
         raise RuntimeError(
             "FlashInfer requires GPUs with sm75 or higher. "
-            f"Detected TARGET_CUDA_ARCHS={sorted(compilation_context.TARGET_CUDA_ARCHS)}. "
-            f"FLASHINFER_CUDA_ARCH_LIST={os.environ.get('FLASHINFER_CUDA_ARCH_LIST')!r}"
+            f"Detected TARGET_CUDA_ARCHS={sorted(compilation_context.TARGET_CUDA_ARCHS)}."
         )
 
 

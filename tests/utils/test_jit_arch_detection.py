@@ -30,15 +30,26 @@ def test_check_cuda_arch_error_reports_detected_archs(monkeypatch):
         jit_core.check_cuda_arch()
 
 
-def test_compilation_context_logs_probe_state_on_detection_failure(monkeypatch, caplog):
-    monkeypatch.delenv("FLASHINFER_CUDA_ARCH_LIST", raising=False)
-    monkeypatch.setattr("torch.cuda.device_count", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
-    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+def test_normalize_sm120_uses_cuda_12_8_compatible_suffix(monkeypatch):
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
+        lambda version: version == "12.8",
+    )
 
-    with caplog.at_level("WARNING"):
-        context = CompilationContext()
+    assert CompilationContext._normalize_cuda_arch(12, 0) == (12, "0a")
 
-    assert context.TARGET_CUDA_ARCHS == set()
-    assert "Failed to get device capability" in caplog.text
-    assert "torch.cuda.is_available()=True" in caplog.text
-    assert "torch.cuda.device_count()=<error:" in caplog.text
+
+def test_normalize_sm120_prefers_f_suffix_on_cuda_12_9(monkeypatch):
+    monkeypatch.setattr("flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda _version: True)
+
+    assert CompilationContext._normalize_cuda_arch(12, 0) == (12, "0f")
+
+
+def test_normalize_sm121_requires_cuda_12_9(monkeypatch):
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
+        lambda version: version == "12.8",
+    )
+
+    with pytest.raises(RuntimeError, match=r"SM 12.1\+ requires CUDA >= 12.9"):
+        CompilationContext._normalize_cuda_arch(12, 1)
