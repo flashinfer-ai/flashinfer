@@ -47,6 +47,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/trace.h"
 #include "cutlass/gemm/kernel/sm90_tile_scheduler.hpp"
+#include "cutlass_extensions/gemm/kernel/sm90_gemm_array_tma_warpspecialized_precomputed_decl.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_tile_scheduler_group_precomputed.hpp"
 #include "cutlass/arch/grid_dependency_control.h"
 
@@ -55,15 +56,6 @@
 namespace cutlass::gemm::kernel {
 
 ///////////////////////////////////////////////////////////////////////////////
-
-template <
-  class ProblemShape_,
-  class CollectiveMainloop_,
-  class CollectiveEpilogue_,
-  class TileScheduler_ = void,
-  class Enable = void
->
-class GemmUniversalPrecomputedScheduler;
 
 template <
   class ProblemShape_,

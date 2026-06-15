@@ -32,8 +32,10 @@
 
 #include "cutlass/fast_math.h"
 #include "cutlass/gemm_coord.hpp"
+#include "cutlass/arch/barrier.h"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
+#include "cutlass/pipeline/pipeline.hpp"
 #include "cute/layout.hpp"
 #include "cute/tensor.hpp"
 #include "cute/arch/cluster_sm90.hpp"
@@ -99,15 +101,6 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
 private:
   uint64_t current_work_linear_idx_ = 0;
   uint64_t total_grid_size_ = 0;
-
-  // Tracking current group, its starting linear idx and total tiles
-  struct GroupInfo {
-    int group_idx = 0;
-    uint64_t start_linear_idx = 0;
-    uint64_t total_tiles = 0;
-    uint64_t problem_blocks_along_raster_order = 0;
-    int32_t log_swizzle_size = 0;
-  } current_group_info_;
 
 public:
   struct WorkTileInfo {
@@ -212,7 +205,6 @@ public:
   // Sink scheduler params as a member
   Params scheduler_params;
   void *response_ptr_ = nullptr;
-  ProblemShape cached_problem_shapes_[2];
 
   //
   // Methods
@@ -240,28 +232,16 @@ public:
       hw_info,
       tile_shape, cluster_shape);
 
+    CUTLASS_ASSERT(arguments.precomputed_work_tiles != nullptr);
     Params params;
-    if (arguments.precomputed_work_tiles != nullptr) {
-      params.initialize_precomputed(
-        problem_blocks,
-        to_gemm_coord(cluster_shape),
-        hw_info,
-        arguments.max_swizzle_size,
-        RasterOrderOptions::AlongM
-      );
-      params.precomputed_work_tiles_ = arguments.precomputed_work_tiles;
-    }
-    else {
-      params.initialize(
-        problem_blocks,
-        problem_shapes,
-        to_gemm_coord(tile_shape),
-        to_gemm_coord(cluster_shape),
-        hw_info,
-        arguments.max_swizzle_size,
-        arguments.raster_order
-      );
-    }
+    params.initialize_precomputed(
+      problem_blocks,
+      to_gemm_coord(cluster_shape),
+      hw_info,
+      arguments.max_swizzle_size,
+      RasterOrderOptions::AlongM
+    );
+    params.precomputed_work_tiles_ = arguments.precomputed_work_tiles;
 
     return params;
   }
@@ -289,7 +269,7 @@ public:
       to_gemm_coord(cluster_shape),
       hw_info,
       arguments.max_swizzle_size,
-      arguments.precomputed_work_tiles != nullptr ? RasterOrderOptions::AlongM : arguments.raster_order,
+      RasterOrderOptions::AlongM,
       /* truncate_by_problem_size = */true
     );
   }
@@ -329,26 +309,7 @@ public:
 
   static bool
   can_implement(Arguments const& args) {
-    return true;
-  }
-
-  // Calculate the log of the swizzle size based on the problem CTAs and the max swizzle size
-  CUTLASS_DEVICE
-  static int32_t
-  get_log_swizzle_size(int problem_ctas_m, int problem_ctas_n, int max_swizzle_size) {
-    int min_cta_dim = platform::min(problem_ctas_m, problem_ctas_n);
-    if (max_swizzle_size >= 8 && min_cta_dim >= 6) {
-      return 3;
-    }
-    else if (max_swizzle_size >= 4 && min_cta_dim >= 3) {
-      return 2;
-    }
-    else if (max_swizzle_size >= 2 && min_cta_dim >= 2) {
-      return 1;
-    }
-    else {
-      return 0;
-    }
+    return args.precomputed_work_tiles != nullptr;
   }
 
   PersistentTileSchedulerSm90GroupPrecomputed() = default;
@@ -359,202 +320,23 @@ public:
     // MSVC requires protecting use of CUDA-specific nonstandard syntax,
     // like blockIdx and gridDim, with __CUDA_ARCH__.
 #if defined(__CUDA_ARCH__)
-    if (scheduler_params.precomputed_work_tiles_ != nullptr) {
-      current_work_linear_idx_ =
-          uint64_t(blockIdx.x) * uint64_t(gridDim.y) +
-          uint64_t(blockIdx.y) +
-          uint64_t(blockIdx.z) * uint64_t(gridDim.x) * uint64_t(gridDim.y);
-    }
-    else if (scheduler_params.raster_order_ == RasterOrder::AlongN) {
-      current_work_linear_idx_ = uint64_t(blockIdx.x) + uint64_t(blockIdx.y) * uint64_t(gridDim.x);
-    }
-    else {
-      current_work_linear_idx_ = uint64_t(blockIdx.x) * uint64_t(gridDim.y) + uint64_t(blockIdx.y);
-    }
+    CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
+    current_work_linear_idx_ =
+        uint64_t(blockIdx.x) * uint64_t(gridDim.y) +
+        uint64_t(blockIdx.y) +
+        uint64_t(blockIdx.z) * uint64_t(gridDim.x) * uint64_t(gridDim.y);
 
     total_grid_size_ = uint64_t(gridDim.x) * uint64_t(gridDim.y) * uint64_t(gridDim.z);
-    if (scheduler_params.precomputed_work_tiles_ != nullptr) {
-      return;
-    }
-
-    int lane_idx = canonical_lane_idx();
-    if (lane_idx < params_.problem_shapes_.groups()) {
-      cached_problem_shapes_[1] = params_.problem_shapes_.get_problem_shape(lane_idx);
-    }
-
-    uint64_t ctas_along_m, ctas_along_n;
-    ProblemShape problem_shape = params_.problem_shapes_.get_problem_shape(0);
-    if (is_tuple<decltype(cute::shape<0>(problem_shape))>::value ||
-        is_tuple<decltype(cute::shape<1>(problem_shape))>::value) {
-      ctas_along_m = cute::size(cute::ceil_div(cute::shape<0>(problem_shape), scheduler_params.cta_shape_.m()));
-      ctas_along_n = cute::size(cute::ceil_div(cute::shape<1>(problem_shape), scheduler_params.cta_shape_.n()));
-    }
-    else {
-      ctas_along_m = scheduler_params.divmod_cta_shape_m_.divide(cute::shape<0>(problem_shape) +  scheduler_params.divmod_cta_shape_m_.divisor - 1);
-      ctas_along_n = scheduler_params.divmod_cta_shape_n_.divide(cute::shape<1>(problem_shape) +  scheduler_params.divmod_cta_shape_n_.divisor - 1);
-    }
-    current_group_info_.log_swizzle_size = get_log_swizzle_size(ctas_along_m, ctas_along_n, params_.max_swizzle_size_);
-    auto problem_blocks_m = round_up(ctas_along_m, (1 << current_group_info_.log_swizzle_size) * params_.cluster_shape_.m());
-    auto problem_blocks_n = round_up(ctas_along_n, (1 << current_group_info_.log_swizzle_size) * params_.cluster_shape_.n());
-    current_group_info_.total_tiles = problem_blocks_m * problem_blocks_n;
-    current_group_info_.problem_blocks_along_raster_order = params_.raster_order_ == RasterOrder::AlongN ? problem_blocks_n : problem_blocks_m;
 
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
 #endif
   }
 
-  // get work_idx_m, work_idx_n from linear_idx while applying swizzle
-  template<class WorkTileInfo, class GroupInfo, class ProblemShape, class RasterOrder>
-  static
-  CUTLASS_DEVICE
-  WorkTileInfo
-  get_work_idx_m_and_n(
-      uint64_t linear_idx,
-      GroupInfo& group_info,
-      GroupProblemShape &problem_shapes,
-      ProblemShape (&cached_problem_shapes)[2],
-      GemmCoord cta_shape,
-      GemmCoord cluster_shape,
-      FastDivmodU64Pow2 const& divmod_cluster_shape_major,
-      FastDivmodU64Pow2 const& divmod_cluster_shape_minor,
-      FastDivmodU64 const& divmod_cta_shape_m,
-      FastDivmodU64 const& divmod_cta_shape_n,
-      int32_t max_swizzle_size,
-      RasterOrder raster_order) {
-
-    uint8_t valid_tile = 1;
-
-    // Use a warp to "speculatively" check if the work tile maps to the next 32 groups
-    int lane_idx = canonical_lane_idx();
-    int total_problem_groups = problem_shapes.groups();
-    if (linear_idx >= group_info.total_tiles + group_info.start_linear_idx) {
-      group_info.group_idx += lane_idx;
-      for ( ; ; group_info.group_idx += NumThreadsPerWarp) {
-        cached_problem_shapes[0] = cached_problem_shapes[1];
-        if (group_info.group_idx + NumThreadsPerWarp < total_problem_groups) {
-          cached_problem_shapes[1] = problem_shapes.get_problem_shape(group_info.group_idx + NumThreadsPerWarp);
-        }
-        if (group_info.group_idx < total_problem_groups) {
-          uint64_t ctas_along_m, ctas_along_n;
-          if (is_tuple<decltype(cute::shape<0>(cached_problem_shapes[0]))>::value ||
-              is_tuple<decltype(cute::shape<1>(cached_problem_shapes[0]))>::value) {
-            ctas_along_m = cute::size(cute::ceil_div(cute::shape<0>(cached_problem_shapes[0]), cta_shape.m()));
-            ctas_along_n = cute::size(cute::ceil_div(cute::shape<1>(cached_problem_shapes[0]), cta_shape.n()));
-          }
-          else {
-            ctas_along_m = divmod_cta_shape_m.divide(cute::shape<0>(cached_problem_shapes[0]) +  divmod_cta_shape_m.divisor - 1);
-            ctas_along_n = divmod_cta_shape_n.divide(cute::shape<1>(cached_problem_shapes[0]) +  divmod_cta_shape_n.divisor - 1);
-          }
-          group_info.log_swizzle_size = get_log_swizzle_size(ctas_along_m, ctas_along_n, max_swizzle_size);
-          auto problem_blocks_m = round_up(ctas_along_m, (1 << group_info.log_swizzle_size) * cluster_shape.m());
-          auto problem_blocks_n = round_up(ctas_along_n, (1 << group_info.log_swizzle_size) * cluster_shape.n());
-          group_info.problem_blocks_along_raster_order = raster_order == RasterOrder::AlongN ? problem_blocks_n : problem_blocks_m;
-          group_info.total_tiles = problem_blocks_m * problem_blocks_n;
-        }
-        else {
-          group_info.total_tiles = INT_MAX;
-        }
-
-        auto curr_total_tiles = group_info.total_tiles;
-
-        // Calculate prefix sum for start_linear_idx.
-        #pragma unroll
-        for (int i = 1; i < NumThreadsPerWarp; i *= 2) {
-          auto n = __shfl_up_sync(0xffffffff, curr_total_tiles, i);
-          curr_total_tiles = lane_idx >= i ? curr_total_tiles + n : curr_total_tiles;
-        }
-        group_info.start_linear_idx += curr_total_tiles - group_info.total_tiles;
-
-        uint32_t thread_succeed = __ballot_sync(0xffffffff, linear_idx < group_info.start_linear_idx + group_info.total_tiles);
-        if (thread_succeed) {
-          // Use the first succeeding thread.
-          int first_succeeding_thread = __ffs(thread_succeed) - 1;
-          group_info.group_idx = __shfl_sync(0xffffffff, group_info.group_idx, first_succeeding_thread);
-          group_info.start_linear_idx = __shfl_sync(0xffffffff, group_info.start_linear_idx, first_succeeding_thread);
-          group_info.total_tiles = __shfl_sync(0xffffffff, group_info.total_tiles, first_succeeding_thread);
-          group_info.problem_blocks_along_raster_order = __shfl_sync(0xffffffff, group_info.problem_blocks_along_raster_order, first_succeeding_thread);
-          group_info.log_swizzle_size = __shfl_sync(0xffffffff, group_info.log_swizzle_size, first_succeeding_thread);
-          if (group_info.group_idx + lane_idx < total_problem_groups) {
-            cached_problem_shapes[1] = problem_shapes.get_problem_shape(group_info.group_idx + lane_idx);
-          }
-          break;
-        }
-        // Update the start_linear_idx for all threads so that they're ready for the next iteration.
-        group_info.start_linear_idx = __shfl_sync(0xffffffff, group_info.start_linear_idx + group_info.total_tiles, NumThreadsPerWarp - 1);
-      }
-    }
-
-    if (group_info.group_idx >= total_problem_groups) {
-      return WorkTileInfo::invalid_work_tile();
-    }
-
-    uint64_t cluster_id, cluster_major_offset = 0, cluster_minor_offset = 0;
-    uint64_t blk_per_grid_dim = divmod_cluster_shape_minor.divide(linear_idx - group_info.start_linear_idx);
-    divmod_cluster_shape_major(cluster_id, cluster_major_offset, blk_per_grid_dim);
-
-    // With static schedulers, we launch grid such that all cluster are linear (1-D) order, i.e.,
-    // there can only be one cluster in the minor dimension. get_grid_shape() in scheduler params
-    // put cluster_shape.m/n() as the minor dimension based on raster order AlongN/M resp.
-    // Therefore, the offset of a CTA (inside a cluster) in the minor dimension can be directly be
-    // inferred by the blockIdx along the minor dimension.
-    if (raster_order == RasterOrder::AlongN) {
-      cluster_minor_offset = blockIdx.x;
-    }
-    else {
-      cluster_minor_offset = blockIdx.y;
-    }
-
-    uint64_t cluster_idx_minor, cluster_idx_major;
-
-    uint64_t cluster_idx_minor_div_swizzle, extra, offset;
-
-    offset = cluster_id & ((1 << group_info.log_swizzle_size) - 1);
-    extra = cluster_id >> group_info.log_swizzle_size;
-
-    uint64_t curr_group_cluster_blk_major = divmod_cluster_shape_major.divide(group_info.problem_blocks_along_raster_order);
-
-    cluster_idx_minor_div_swizzle = extra / curr_group_cluster_blk_major;
-    cluster_idx_major = extra % curr_group_cluster_blk_major;
-
-    cluster_idx_minor = cluster_idx_minor_div_swizzle * (1 << group_info.log_swizzle_size) + offset;
-
-    auto minor_work_idx = static_cast<int32_t>(cluster_idx_minor * divmod_cluster_shape_minor.divisor +
-                                               cluster_minor_offset);
-    auto major_work_idx = static_cast<int32_t>(cluster_idx_major * divmod_cluster_shape_major.divisor +
-                                               cluster_major_offset);
-
-    if (raster_order == RasterOrder::AlongN) {
-      return {minor_work_idx, major_work_idx, group_info.group_idx, valid_tile};
-    }
-    else {
-      return {major_work_idx, minor_work_idx, group_info.group_idx, valid_tile};
-    }
-  }
-
   CUTLASS_DEVICE
   WorkTileInfo
   get_current_work_for_linear_idx(uint64_t linear_idx) {
-    if (scheduler_params.precomputed_work_tiles_ != nullptr) {
-      return get_precomputed_work_tile(linear_idx, scheduler_params.precomputed_work_tiles_);
-    }
-
-    if (scheduler_params.pre_processed_problem_shapes && linear_idx >= scheduler_params.blocks_across_problem_) {
-      return WorkTileInfo::invalid_work_tile();
-    }
-    return get_work_idx_m_and_n<WorkTileInfo>(
-              linear_idx,
-              current_group_info_,
-              scheduler_params.problem_shapes_,
-              cached_problem_shapes_,
-              scheduler_params.cta_shape_,
-              scheduler_params.cluster_shape_,
-              scheduler_params.divmod_cluster_shape_major_,
-              scheduler_params.divmod_cluster_shape_minor_,
-              scheduler_params.divmod_cta_shape_m_,
-              scheduler_params.divmod_cta_shape_n_,
-              scheduler_params.max_swizzle_size_,
-              scheduler_params.raster_order_);
+    return get_precomputed_work_tile(linear_idx, scheduler_params.precomputed_work_tiles_);
   }
 
   CUTLASS_DEVICE

@@ -294,6 +294,10 @@ __device__ __forceinline__ void build_prebuilt_tma_descriptors(
                                     kPrebuiltTmaDescriptorWarpA);
   }
 
+  if (cute::get<1>(problem) == 0) {
+    return;
+  }
+
   {
     cute::TmaDescriptor& smem_desc = smem_tma_desc[kPrebuiltTmaDescriptorSlotB];
     if (threadIdx.x == kPrebuiltTmaDescriptorWarpB * 32) {

@@ -389,9 +389,18 @@ struct CollectiveMmaArrayMixedInput<
 
   // Device side kernel params
   struct Params {
-    // Assumption: StrideA is congruent with Problem_MK
+    // For grouped GEMM with non-layout stride: replace static-zero L stride with
+    // a static non-zero value so the A/weight TMA descriptor is created as 3D
+    // and can select the expert through the L coordinate. Int<32> is the
+    // minimum static value that becomes 16 bytes after FP4 subbyte upcast.
+    using TmaStrideA = cute::conditional_t<
+        IsGroupedGemmKernel && !cute::is_layout<InternalSwappedStrideA>::value,
+        decltype(cute::make_stride(cute::get<0>(InternalSwappedStrideA{}),
+                                   cute::get<1>(InternalSwappedStrideA{}),
+                                   cute::Int<32>{})),
+        InternalSwappedStrideA>;
     using LayoutA = decltype(detail::get_gmem_layout(
-        repeat_like(InternalSwappedStrideA{}, int32_t(0)), InternalSwappedStrideA{}));
+        repeat_like(TmaStrideA{}, int32_t(0)), TmaStrideA{}));
     using LayoutB = decltype(detail::get_gmem_layout(
         repeat_like(InternalSwappedStrideB{}, int32_t(0)), InternalSwappedStrideB{}));
 
@@ -502,8 +511,14 @@ struct CollectiveMmaArrayMixedInput<
       ptr_dA = SwappedStrideA{};
       ptr_dB = SwappedStrideB{};
     }
-    Tensor tensor_a = make_tensor(ptr_A_first_batch,
-                                  detail::get_gmem_layout(make_shape(init_M, init_K, mock_L), dA));
+    // Grouped A/weight uses TmaStrideA to force a 3D descriptor. The descriptor
+    // is later rebuilt once with the real expert count and reused for all groups.
+    typename Params::TmaStrideA tma_dA;
+    if constexpr (!IsGroupedGemmKernel || cute::is_layout<InternalSwappedStrideA>::value) {
+      tma_dA = dA;
+    }
+    Tensor tensor_a = make_tensor(
+        ptr_A_first_batch, detail::get_gmem_layout(make_shape(init_M, init_K, mock_L), tma_dA));
     Tensor tensor_b = make_tensor(ptr_B_first_batch,
                                   detail::get_gmem_layout(make_shape(init_N, init_K, mock_L), dB));
 
