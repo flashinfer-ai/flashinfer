@@ -779,8 +779,6 @@ def test_moe_combine_multi_rank_single_gpu(
         # e2m1_and_ufp8sf_scale_to_float: ufp8_type 1 = UE4M3 (NVFP4), 0 = UE8M0 (MXFP4).
         ufp8_type = 1 if is_nvfp4 else 0
         is_swizzled = sf_layout != SfLayout.layout_linear
-        # The combine ran with the default output_scalar_scale (SFScaleVal = 1.0), which
-        # NVFP4 applies and MXFP4 (UE8M0) ignores; decode with the matching global scale.
         global_sf = torch.tensor([1.0], dtype=torch.float32, device="cuda")
         for rank in range(world_size):
             if is_nvfp4:

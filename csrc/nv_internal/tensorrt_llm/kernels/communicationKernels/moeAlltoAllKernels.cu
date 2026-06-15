@@ -765,8 +765,6 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
     if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
       acc[0].store(dst_bytes + offset);
     } else {
-      // Scale-factor block size: NVFP4 uses 16, MXFP8 and MXFP4 use 32. Must match the
-      // SF_VEC_SIZE passed to the cvt routines below so SF indexing/layout stays consistent.
       constexpr uint32_t sf_vec_size = QuantMode == MoeA2ACombineQuantMode::NVFP4 ? 16 : 32;
       constexpr uint32_t threads_per_sf = sf_vec_size / elems_per_vec;
       uint8_t scale;
