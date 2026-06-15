@@ -254,9 +254,19 @@ def create_moe_tensors(
     device: str = "cuda",
     seed: int = 42,
     gated: bool = True,
+    use_per_token_activation: bool = False,
 ):
     """Create properly quantized MoE tensors for testing."""
     from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.quantization import (
+        SfLayout,
+        e2m1_and_ufp8sf_scale_to_float,
+        nvfp4_quantize,
+    )
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
     torch.manual_seed(seed)
@@ -266,11 +276,39 @@ def create_moe_tensors(
     x_bf16 = (
         torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
     )
-    a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-
-    x_quantized, x_sf = fp4_quantize(
-        x_bf16, global_scale=a1_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=False
-    )
+    x_per_token_scale = None
+    if use_per_token_activation:
+        x_global_scale = make_nvfp4_global_scale(
+            x_bf16,
+            per_token_activation=True,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+        x_quantized, x_sf, x_per_token_scale = nvfp4_quantize(
+            x_bf16,
+            x_global_scale,
+            sfLayout=SfLayout.layout_linear,
+            sf_vec_size=sf_vec_size,
+            backend="cuda",
+            per_token_activation=True,
+        )
+        x_ref = e2m1_and_ufp8sf_scale_to_float(
+            x_quantized.cpu(),
+            x_sf.view(torch.uint8).cpu().reshape(-1),
+            torch.ones(1, dtype=torch.float32),
+            sf_vec_size=sf_vec_size,
+            ufp8_type=1,
+            is_sf_swizzled_layout=False,
+        ).to(device)
+        x_ref = x_ref.float() * x_per_token_scale.unsqueeze(1)
+    else:
+        a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+        x_quantized, x_sf = fp4_quantize(
+            x_bf16,
+            global_scale=a1_gs,
+            sf_vec_size=sf_vec_size,
+            is_sf_swizzled_layout=False,
+        )
+        x_ref = x_bf16.float()
     x_sf = x_sf.unsqueeze(-1)
 
     # Routing
@@ -346,6 +384,8 @@ def create_moe_tensors(
         "x": x_quantized,
         "x_sf": x_sf,
         "x_bf16": x_bf16,
+        "x_ref": x_ref,
+        "x_per_token_scale": x_per_token_scale,
         "token_selected_experts": selected_experts,
         "token_final_scales": routing_weights,
         "w1_weight": w1_q,
@@ -493,7 +533,12 @@ class TestInputsHelperContract:
     refactor that reorders the wrapper's inputs list.
     """
 
-    def _build_synthetic_inputs(self, num_tokens: int, num_local_experts: int):
+    def _build_synthetic_inputs(
+        self,
+        num_tokens: int,
+        num_local_experts: int,
+        use_per_token_activation: bool = False,
+    ):
         """Mirror ``CuteDslMoEWrapper.run``'s inputs-list layout with
         small-but-shape-faithful tensors so the test runs in <1s on CPU."""
         n = num_tokens
@@ -503,7 +548,7 @@ class TestInputsHelperContract:
         intermediate = 64
         top_k = 8
         sf_vec = 16
-        return [
+        inputs = [
             torch.zeros(n, hidden // 2, dtype=torch.uint8),  # 0: x
             torch.zeros(n, hidden // sf_vec, dtype=torch.uint8),  # 1: x_sf
             torch.zeros(n, top_k, dtype=torch.int32),  # 2: token_selected_experts
@@ -523,10 +568,16 @@ class TestInputsHelperContract:
                 num_local_experts, hidden, intermediate // sf_vec, dtype=torch.uint8
             ),  # 9: w2_weight_sf
             torch.zeros(num_local_experts, dtype=torch.float32),  # 10: w2_alpha
-            torch.zeros(n, hidden, dtype=torch.bfloat16),  # 11: moe_output
         ]
+        if use_per_token_activation:
+            inputs.append(torch.ones(n, dtype=torch.float32))  # 11: per_token_scale
+        inputs.append(torch.zeros(n, hidden, dtype=torch.bfloat16))  # 11/12: moe_output
+        return inputs
 
-    def test_hook_replaces_input_2_and_passes_through_rest(self):
+    @pytest.mark.parametrize("use_per_token_activation", [False, True])
+    def test_hook_replaces_input_2_and_passes_through_rest(
+        self, use_per_token_activation: bool
+    ):
         """``inputs_pre_hook`` must replace ``inputs[2]``
         (token_selected_experts) and pass through every other input
         unchanged. Pins the contract with ``CuteDslMoEWrapper.run`` —
@@ -546,13 +597,18 @@ class TestInputsHelperContract:
         )
 
         inputs = self._build_synthetic_inputs(
-            num_tokens=64, num_local_experts=num_local_experts
+            num_tokens=64,
+            num_local_experts=num_local_experts,
+            use_per_token_activation=use_per_token_activation,
         )
         original_tse = inputs[2]
 
         output = helper.inputs_pre_hook(inputs)
 
-        assert len(output) == 12, f"Expected 12 outputs, got {len(output)}"
+        expected_len = 13 if use_per_token_activation else 12
+        assert len(output) == expected_len, (
+            f"Expected {expected_len} outputs, got {len(output)}"
+        )
         # Index 2 must be replaced (different object identity), with
         # the same shape and dtype.
         assert output[2] is not original_tse, (
@@ -1082,6 +1138,7 @@ class TestCuteDslFusedMoeFunctional:
             num_local_experts=num_local_experts,
             top_k=top_k,
             gated=gated,
+            use_per_token_activation=use_per_token_activation,
         )
 
         result = cute_dsl_fused_moe_nvfp4(
@@ -1101,6 +1158,7 @@ class TestCuteDslFusedMoeFunctional:
             num_local_experts=num_local_experts,
             activation=activation,
             use_per_token_activation=use_per_token_activation,
+            per_token_scale=tensors["x_per_token_scale"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1109,7 +1167,7 @@ class TestCuteDslFusedMoeFunctional:
         assert not torch.isinf(result).any()
 
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
+            hidden_states=tensors["x_ref"].float().cuda(),
             gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
             gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
             token_selected_experts=tensors["token_selected_experts"],
@@ -1200,6 +1258,7 @@ class TestCuteDslMoEWrapper:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            use_per_token_activation=use_per_token_activation,
         )
 
         # Create wrapper WITHOUT CUDA graph
@@ -1224,6 +1283,7 @@ class TestCuteDslMoEWrapper:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            per_token_scale=tensors["x_per_token_scale"],
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1231,7 +1291,7 @@ class TestCuteDslMoEWrapper:
         assert not torch.isinf(result).any()
 
         ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
+            hidden_states=tensors["x_ref"].float().cuda(),
             gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
             gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
             token_selected_experts=tensors["token_selected_experts"],

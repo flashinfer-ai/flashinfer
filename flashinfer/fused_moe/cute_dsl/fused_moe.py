@@ -151,6 +151,7 @@ def _moe_core_impl(
     gemm1_out: Optional[torch.Tensor] = None,
     gemm1_out_scale: Optional[torch.Tensor] = None,
     moe_output: Optional[torch.Tensor] = None,
+    per_token_scale: Optional[torch.Tensor] = None,
     # Stream resources
     aux_stream: Optional[torch.cuda.Stream] = None,
     main_event: Optional[torch.cuda.Event] = None,
@@ -195,6 +196,7 @@ def _moe_core_impl(
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
         moe_output: Pre-allocated final output buffer.
+        per_token_scale: Optional per-token input row scale for GEMM1.
         aux_stream: Auxiliary CUDA stream for async memset.
         main_event: CUDA event for main stream.
         memset_event: CUDA event for memset completion.
@@ -208,6 +210,16 @@ def _moe_core_impl(
     """
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
+
+    if use_per_token_activation:
+        if per_token_scale is None:
+            raise ValueError(
+                "per_token_scale is required when use_per_token_activation=True"
+            )
+    elif per_token_scale is not None:
+        raise ValueError(
+            "per_token_scale is only supported when use_per_token_activation=True"
+        )
 
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
@@ -285,6 +297,7 @@ def _moe_core_impl(
                 out=gemm1_out,
                 out_scale=None,
                 global_scale=None,
+                a_per_token_scale=per_token_scale,
                 topk=top_k,
                 c_dtype=_intermediate_c_dtype(output_dtype),
                 mma_tiler_mn=gemm1_mma_tiler_mn,
@@ -562,6 +575,7 @@ class CuteDslMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         use_fused_finalize: bool = True,
         moe_output: Optional[torch.Tensor] = None,
+        per_token_scale: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
         **kwargs,
     ) -> torch.Tensor:
@@ -591,6 +605,7 @@ class CuteDslMoEWrapper:
             gemm1_out=None,
             gemm1_out_scale=None,
             moe_output=moe_output,
+            per_token_scale=per_token_scale,
             aux_stream=self._aux_stream,
             main_event=self._main_event,
             memset_event=self._memset_event,
@@ -615,6 +630,7 @@ class CuteDslMoEWrapper:
         w2_weight: torch.Tensor,
         w2_weight_sf: torch.Tensor,
         w2_alpha: torch.Tensor,
+        per_token_scale: Optional[torch.Tensor] = None,
         tactic: Optional[Tuple] = None,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL NVFP4 fused-MoE forward pass.
@@ -647,6 +663,9 @@ class CuteDslMoEWrapper:
             Scale factors for ``w2_weight``.
         w2_alpha : torch.Tensor
             Per-expert global scale for GEMM2.
+        per_token_scale : Optional[torch.Tensor]
+            Per-token input row scale for GEMM1. Required when the wrapper was
+            constructed with ``use_per_token_activation=True``.
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
@@ -657,6 +676,15 @@ class CuteDslMoEWrapper:
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         num_tokens = token_selected_experts.size(0)
+        if self.use_per_token_activation:
+            if per_token_scale is None:
+                raise ValueError(
+                    "per_token_scale is required when use_per_token_activation=True"
+                )
+        elif per_token_scale is not None:
+            raise ValueError(
+                "per_token_scale is only supported when use_per_token_activation=True"
+            )
 
         moe_output = torch.empty(
             (num_tokens, self.hidden_size),
@@ -679,8 +707,10 @@ class CuteDslMoEWrapper:
             w2_weight,
             w2_weight_sf,
             w2_alpha,
-            moe_output,
         ]
+        if self.use_per_token_activation:
+            inputs.append(per_token_scale)
+        inputs.append(moe_output)
 
         if tactic is not None:
             # Use provided tactic
@@ -730,6 +760,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     output_dtype: torch.dtype = torch.bfloat16,
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
+    per_token_scale: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
     activation: str = "silu",
@@ -758,6 +789,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         gemm2_mma_tiler_mn=gemm2_mma_tiler_mn,
         gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
         moe_output=moe_output,
+        per_token_scale=per_token_scale,
         aux_stream=aux_stream,
         output_dtype=output_dtype,
         use_async_memset=True,
@@ -788,6 +820,7 @@ def cute_dsl_fused_moe_nvfp4(
     output_dtype: torch.dtype = torch.bfloat16,
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
+    per_token_scale: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
     activation: str = "silu",
@@ -841,6 +874,11 @@ def cute_dsl_fused_moe_nvfp4(
         Whether to use the fused finalize path.  Defaults to ``True``.
     moe_output : Optional[torch.Tensor]
         Pre-allocated output buffer.  Allocated internally if ``None``.
+    per_token_scale : Optional[torch.Tensor]
+        Per-token input row scale for GEMM1. Passing this enables the
+        TRTLLM-style per-token activation path, which also quantizes the
+        GEMM1/SwiGLU output with the standalone per-token NVFP4 quantizer
+        before GEMM2.
     aux_stream : Optional[torch.cuda.Stream]
         Optional auxiliary CUDA stream used to overlap setup work with the
         main computation.
@@ -860,6 +898,12 @@ def cute_dsl_fused_moe_nvfp4(
     """
     if num_local_experts is None:
         num_local_experts = num_experts
+    if per_token_scale is not None:
+        use_per_token_activation = True
+    elif use_per_token_activation:
+        raise ValueError(
+            "per_token_scale is required when use_per_token_activation=True"
+        )
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
@@ -898,8 +942,10 @@ def cute_dsl_fused_moe_nvfp4(
         w2_weight,
         w2_weight_sf,
         w2_alpha,
-        moe_output,
     ]
+    if use_per_token_activation:
+        inputs.append(per_token_scale)
+    inputs.append(moe_output)
 
     _, best_tactic = tuner.choose_one(
         "CuteDslFusedMoE::run_moe_nvfp4",
