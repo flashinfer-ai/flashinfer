@@ -594,18 +594,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             cutlass.Float32, global_scale.data_ptr(), cute.AddressSpace.gmem
         )
     else:
-        # These pointers are not dereferenced unless the kernel is generating
-        # FP4 output scale factors. Keep raw pointer arguments non-optional;
-        # the wrapper maps them to optional tensor views based on output dtype.
-        c_sf_ptr = make_ptr(
-            sf_dtype_cutlass,
-            b_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        norm_const_ptr = make_ptr(
-            cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem
-        )
+        c_sf_ptr = None
+        norm_const_ptr = None
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
     use_a_per_token_scale = a_per_token_scale is not None
