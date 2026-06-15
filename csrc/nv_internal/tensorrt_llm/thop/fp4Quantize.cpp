@@ -43,7 +43,7 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
     TVM_FFI_ICHECK_EQ(sfVecSize, 32) << "sfVecSize can only be 32, when sfUseUE8M0 is true";
   } else {
     TVM_FFI_ICHECK(globalScale.has_value()) << "globalScale is required when sfUseUE8M0 is false";
-    // CHECK_INPUT_AND_TYPE(globalScale.value(), torch::kFloat32);
+    CHECK_INPUT_AND_TYPE(globalScale.value(), (DLDataType{kDLFloat, 32, 1}));
     TVM_FFI_ICHECK_EQ(sfVecSize, 16) << "sfVecSize can only be 16, when sfUseUE8M0 is false";
   }
 

@@ -35,6 +35,20 @@ def ceil_div(a: int, b: int) -> int:
 
 
 def is_cute_dsl_available() -> bool:
+    r"""Return ``True`` when the optional CuTe DSL stack is importable.
+
+    Probes for ``cutlass`` and ``cutlass.cute`` via :func:`importlib.util.find_spec`.
+    Used by higher-level wrappers to decide whether to dispatch to a CuTe-DSL
+    backend (e.g. :func:`flashinfer.quantization.mxfp4_quantize`,
+    :class:`flashinfer.cute_dsl.attention.wrappers.BatchDecodeCuteDSLWrapper`)
+    or fall back to a plain-CUDA implementation.
+
+    Returns
+    -------
+    bool
+        ``True`` if both ``cutlass`` and ``cutlass.cute`` are importable in the
+        current Python environment.
+    """
     return (
         importlib.util.find_spec("cutlass") is not None
         and importlib.util.find_spec("cutlass.cute") is not None
@@ -571,8 +585,8 @@ def sm120_make_smem_layout_sfb(
 
     assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
 
-    assert tile_shape_mnk[1] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[1] must be divisible by 64"
+    assert tile_shape_mnk[1] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[1] must be divisible by 16"
     )
 
     assert tile_shape_mnk[2] % sf_vec_size == 0, (

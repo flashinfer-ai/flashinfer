@@ -172,42 +172,38 @@ def mm_M1_16_K7168_N128(
     out: torch.Tensor,
     launch_with_pdl: bool = True,
 ) -> None:
-    """Optimized GEMM for the router operation in Mistral Large 3.
+    r"""Optimized GEMM for the router operation in Mistral Large 3.
 
-    This function performs a highly optimized matrix multiplication specifically tailored
-    for the expert routing GEMM in Mistral Large 3's Mixture of Experts (MoE) architecture.
-    It computes out = mat_a @ mat_b where mat_a contains token embeddings and mat_b
-    contains expert routing weights.
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in Mistral Large 3's Mixture-of-Experts
+    (MoE) architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a``
+    is a small batch of token embeddings (1-16 rows) and ``mat_b`` is the
+    expert routing weight matrix.  Specialized for the dimensions used in
+    Mistral Large 3 MoE (``K = 7168``, ``N = 128``).
 
-    The implementation is optimized for the specific problem dimensions used in Mistral Large 3:
-    - Hidden dimension (K): 7168
-    - Number of experts (N): 128
-    - Number of tokens (M): 1-16
+    Parameters
+    ----------
+    mat_a : torch.Tensor
+        Input token embeddings of shape ``(M, K)`` where ``M`` is the number of
+        tokens (1-16) and ``K`` is the hidden dimension (7168).  Must be bfloat16,
+        row-major (contiguous).
+    mat_b : torch.Tensor
+        Expert routing weights of shape ``(K, N)`` where ``N`` is the number of
+        experts (128).  Must be bfloat16, column-major (transposed layout).
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(M, N)`` containing the routing
+        scores.  Must be bfloat16, row-major (contiguous).  Mutated in place.
+    launch_with_pdl : bool
+        Whether to launch the kernel using Programmatic Dependent Launch.
+        Defaults to ``True``.
 
-    Args:
-        mat_a (torch.Tensor): Input token embeddings of shape (M, K) where M is the number
-            of tokens (1-16) and K is the hidden dimension (7168). Must be bfloat16,
-            row-major (contiguous).
-        mat_b (torch.Tensor): Expert routing weights of shape (K, N) where K is the hidden
-            dimension (7168) and N is the number of experts (128). Must be bfloat16,
-            column-major (transposed layout).
-        out (torch.Tensor): Pre-allocated output tensor of shape (M, N) containing the
-            routing scores. Must be bfloat16, row-major (contiguous). This tensor is
-            mutated in-place.
-        launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to True.
-
-    Returns:
-        None: The result is written directly to the `out` tensor.
-
-    Raises:
-        ValueError: If tensor dimensions, strides, or data types do not match the
-            expected Mistral Large 3 router configuration.
-
-    Note:
-        This kernel is specialized for compute capability 10.0 (Blackwell architecture).
-        The specific problem size optimization makes this significantly faster than
-        general-purpose GEMM implementations for the router operation.
+    Notes
+    -----
+    Requires Blackwell SM100/SM103 architecture.  The specialized problem-size
+    optimization makes this significantly faster than general-purpose GEMM
+    implementations for the router op.  Raises ``ValueError`` if tensor
+    dimensions, strides, or dtypes do not match the expected Mistral Large 3
+    configuration.
     """
     get_dsv3_router_gemm_module().mm_M1_16_K7168_N128(
         mat_a, mat_b, out, launch_with_pdl
@@ -222,42 +218,38 @@ def mm_M1_16_K7168_N256(
     out: torch.Tensor,
     launch_with_pdl: bool = True,
 ) -> None:
-    """Optimized GEMM for the router operation in DeepSeek-V3.
+    r"""Optimized GEMM for the router operation in DeepSeek-V3.
 
-    This function performs a highly optimized matrix multiplication specifically tailored
-    for the expert routing GEMM in DeepSeek-V3's Mixture of Experts (MoE) architecture.
-    It computes out = mat_a @ mat_b where mat_a contains token embeddings and mat_b
-    contains expert routing weights.
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in DeepSeek-V3's Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    DeepSeek-V3 MoE (``K = 7168``, ``N = 256``).
 
-    The implementation is optimized for the specific problem dimensions used in DeepSeek-V3:
-    - Hidden dimension (K): 7168
-    - Number of experts (N): 256
-    - Number of tokens (M): 1-16
+    Parameters
+    ----------
+    mat_a : torch.Tensor
+        Input token embeddings of shape ``(M, K)`` where ``M`` is the number of
+        tokens (1-16) and ``K`` is the hidden dimension (7168).  Must be bfloat16,
+        row-major (contiguous).
+    mat_b : torch.Tensor
+        Expert routing weights of shape ``(K, N)`` where ``N`` is the number of
+        experts (256).  Must be bfloat16, column-major (transposed layout).
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(M, N)`` containing the routing
+        scores.  Must be float32, row-major (contiguous).  Mutated in place.
+    launch_with_pdl : bool
+        Whether to launch the kernel using Programmatic Dependent Launch.
+        Defaults to ``True``.
 
-    Args:
-        mat_a (torch.Tensor): Input token embeddings of shape (M, K) where M is the number
-            of tokens (1-16) and K is the hidden dimension (7168). Must be bfloat16,
-            row-major (contiguous).
-        mat_b (torch.Tensor): Expert routing weights of shape (K, N) where K is the hidden
-            dimension (7168) and N is the number of experts (256). Must be bfloat16,
-            column-major (transposed layout).
-        out (torch.Tensor): Pre-allocated output tensor of shape (M, N) containing the
-            routing scores. Must be float32, row-major (contiguous). This tensor is
-            mutated in-place.
-        launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to True.
-
-    Returns:
-        None: The result is written directly to the `out` tensor.
-
-    Raises:
-        ValueError: If tensor dimensions, strides, or data types do not match the
-            expected DeepSeek-V3 router configuration.
-
-    Note:
-        This kernel is specialized for compute capability 10.0 (Blackwell architecture).
-        The specific problem size optimization makes this significantly faster than
-        general-purpose GEMM implementations for the router operation.
+    Notes
+    -----
+    Requires Blackwell SM100/SM103 architecture.  The specialized
+    problem-size optimization makes this significantly faster than
+    general-purpose GEMM implementations for the router op.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected DeepSeek-V3 router configuration.
     """
     get_dsv3_router_gemm_module().mm_M1_16_K7168_N256(
         mat_a, mat_b, out, launch_with_pdl
@@ -272,40 +264,38 @@ def mm_M1_16_K6144_N256(
     out: torch.Tensor,
     launch_with_pdl: bool = True,
 ) -> None:
-    """Optimized GEMM for the router operation in GLM-MoE-DSA.
+    r"""Optimized GEMM for the router operation in GLM-MoE-DSA.
 
-    This function performs a highly optimized matrix multiplication specifically tailored
-    for the expert routing GEMM in GLM-MoE-DSA's Mixture of Experts (MoE) architecture.
-    It computes out = mat_a @ mat_b where mat_a contains token embeddings and mat_b
-    contains expert routing weights.
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in GLM-MoE-DSA's Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    GLM-MoE-DSA (``K = 6144``, ``N = 256``).
 
-    The implementation is optimized for the specific problem dimensions used in GLM-MoE-DSA:
-    - Hidden dimension (K): 6144
-    - Number of experts (N): 256
-    - Number of tokens (M): 1-16
+    Parameters
+    ----------
+    mat_a : torch.Tensor
+        Input token embeddings of shape ``(M, K)`` where ``M`` is the number of
+        tokens (1-16) and ``K`` is the hidden dimension (6144).  Must be bfloat16,
+        row-major (contiguous).
+    mat_b : torch.Tensor
+        Expert routing weights of shape ``(K, N)`` where ``N`` is the number of
+        experts (256).  Must be bfloat16, column-major (transposed layout).
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(M, N)`` containing the routing
+        scores.  Must be float32, row-major (contiguous).  Mutated in place.
+    launch_with_pdl : bool
+        Whether to launch the kernel using Programmatic Dependent Launch.
+        Defaults to ``True``.
 
-    Args:
-        mat_a (torch.Tensor): Input token embeddings of shape (M, K) where M is the number
-            of tokens (1-16) and K is the hidden dimension (6144). Must be bfloat16,
-            row-major (contiguous).
-        mat_b (torch.Tensor): Expert routing weights of shape (K, N) where K is the hidden
-            dimension (6144) and N is the number of experts (256). Must be bfloat16,
-            column-major (transposed layout).
-        out (torch.Tensor): Pre-allocated output tensor of shape (M, N) containing the
-            routing scores. Must be float32, row-major (contiguous). This tensor is
-            mutated in-place.
-        launch_with_pdl (bool, optional): Whether to launch the kernel using Persistent
-            Device-side Launch. Defaults to True.
-
-    Returns:
-        None: The result is written directly to the `out` tensor.
-
-    Raises:
-        ValueError: If tensor dimensions, strides, or data types do not match the
-            expected GLM-MoE-DSA router configuration.
-
-    Note:
-        This kernel is specialized for compute capability 10.0 (Blackwell architecture).
+    Notes
+    -----
+    Requires Blackwell SM100/SM103 architecture.  The specialized
+    problem-size optimization makes this significantly faster than
+    general-purpose GEMM implementations for the router op.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected GLM-MoE-DSA configuration.
     """
     get_dsv3_router_gemm_module().mm_M1_16_K6144_N256(
         mat_a, mat_b, out, launch_with_pdl
@@ -419,38 +409,43 @@ def tinygemm_bf16(
     bias: Optional[torch.Tensor] = None,
     use_pdl: bool = False,
 ) -> None:
-    """SM90+ optimized small GEMM: out = input @ weight.T + bias (equivalent to F.linear).
+    r"""SM90+ optimized small GEMM: ``out = input @ weight.T + bias`` (equivalent to F.linear).
 
-    A latency-optimized, warp-specialized GEMM designed for tiny batch sizes (ideally
-    1-8 rows, where a single TILE_N=8 tile covers the entire batch dimension) using
-    Ampere-style HMMA instructions. Uses TMA for async bulk data loads and
-    mma.sync.aligned.m16n8k16 tensor core instructions with BF16 input/weight/bias/output
-    and FP32 internal accumulation. The warp-specialized design (384 threads: 4 compute +
-    8 DMA warps) with 16 pipeline stages and 4x stage unroll trades off peak throughput
-    in favor of minimal latency.
+    A latency-optimized, warp-specialized GEMM designed for tiny batch sizes
+    (ideally 1-8 rows, where a single ``TILE_N=8`` tile covers the entire batch
+    dimension) using Ampere-style HMMA instructions.  Uses TMA for async bulk
+    data loads and ``mma.sync.aligned.m16n8k16`` tensor-core instructions with
+    BF16 input/weight/bias/output and FP32 internal accumulation.  The
+    warp-specialized design (384 threads: 4 compute + 8 DMA warps) with 16
+    pipeline stages and 4x stage unroll trades off peak throughput in favor of
+    minimal latency.  Adapted from the TensorRT-LLM ``tinygemm2`` kernel.
 
-    From TensorRT-LLM tinygemm2 kernel.
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input activations of shape ``(batch_size, input_features)``.  Must be
+        bfloat16, contiguous.  ``input_features`` must be a multiple of 64.
+    weight : torch.Tensor
+        Weight matrix of shape ``(output_features, input_features)``.  Must be
+        bfloat16, contiguous (row-major).  ``output_features`` must be a multiple
+        of 16.
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(batch_size, output_features)``.
+        Must be bfloat16, contiguous.  Mutated in place.
+    bias : Optional[torch.Tensor]
+        Optional bias vector of shape ``(output_features,)``.  Must be bfloat16,
+        contiguous.  If ``None``, zero bias is used.
+    use_pdl : bool
+        Enable Programmatic Dependent Launch (stream serialization).  When
+        ``True``, the kernel uses ``cudaGridDependencySynchronize()`` to overlap
+        DMA with the preceding kernel's compute.  Only enable when ALL preceding
+        stream operations also use PDL, otherwise the kernel hangs.  Defaults to
+        ``False``.
 
-    Args:
-        input: Input activations of shape (batch_size, input_features). Must be
-            bfloat16, contiguous. input_features must be a multiple of 64.
-        weight: Weight matrix of shape (output_features, input_features). Must be
-            bfloat16, contiguous (row-major). output_features must be a multiple of 16.
-        out: Pre-allocated output tensor of shape (batch_size, output_features).
-            Must be bfloat16, contiguous. Mutated in-place.
-        bias: Optional bias vector of shape (output_features,). Must be bfloat16,
-            contiguous. If None, zero bias is used.
-        use_pdl: Enable Programmatic Dependent Launch (stream serialization).
-            When True, the kernel uses cudaGridDependencySynchronize() to overlap
-            DMA with the preceding kernel's compute. Only enable when ALL preceding
-            stream operations also use PDL, otherwise the kernel hangs. Defaults
-            to False.
-
-    Raises:
-        ValueError: If tensor dimensions, dtypes, or alignment constraints are violated.
-
-    Note:
-        This kernel requires SM90+ (Hopper or newer).
+    Notes
+    -----
+    Requires SM90+ (Hopper or newer).  Raises ``ValueError`` if tensor
+    dimensions, dtypes, or alignment constraints are violated.
     """
     if bias is None:
         get_tinygemm2_module().tinygemm2_nobias_op(input, weight, out, use_pdl)

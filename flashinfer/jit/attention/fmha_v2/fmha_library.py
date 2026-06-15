@@ -109,8 +109,12 @@ def select_ldgsts(
             if head_size >= 256:
                 ldgsts_k = False
                 ldgsts_v = False
-            if head_size > 256:
-                ldgsts_q = False
+            # NOTE: head_size > 256 (e.g. 512) uses RELOAD_Q (D > CTA_P_TILE_K=64),
+            # but the tiled-noloop kernel still requires USE_LDGSTS to be true for at
+            # least one of Q/K/V (static_assert in
+            # fused_multihead_flash_attention_kernel_noloop_tiled.h). USE_LDGSTS_Q is
+            # orthogonal to RELOAD_Q (the latter only controls Q reload across D-tiles),
+            # so keep Q on cp.async to satisfy the kernel, mirroring the hd256 path.
             return (ldgsts_q, ldgsts_k, ldgsts_v)
         elif dtype == "e4m3":
             return (False, False, False)
@@ -343,6 +347,23 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.flash_attention
         and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
     )
+    # SM120 (Blackwell consumer) head_size 512 flash attention.
+    # Uses the dormant `head_size <= 512` arm in generate_kernel_spec
+    # (q_loop_step = kv_loop_step = 64, sm_mma=80, tiled noloop). Kept as a
+    # dedicated branch so the head_size<=256 cap in flash_valid stays intact
+    # for the other architectures (which have no 512 tiling validated).
+    flash_valid_sm120_hd512: bool = (
+        kspec.sm == 120
+        and kspec.dtype in ["fp16", "bf16"]
+        and kspec.head_size == 512
+        and kspec.head_size_v == 0
+        and kspec.sage_block_sizes is None
+        and kspec.version == 2
+        and not kspec.cross_mha
+        and kspec.flash_attention
+        and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
+        and bool(kspec.tiled)
+    )
     # SM90 non-flash ldgsts support (fixed seq len)
     non_flash_valid: bool = (
         kspec.sm == 90
@@ -439,6 +460,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
 
     return (
         flash_valid
+        or flash_valid_sm120_hd512
         or non_flash_valid
         or clip_valid
         or mla_valid_576_512
@@ -1268,7 +1290,7 @@ def generate_jit_sources(
         output_dtype_values,
     )
 
-    head_size_qk_sm120_values = [64, 128, 256]
+    head_size_qk_sm120_values = [64, 128, 256, 512]
     sm120_configs: itertools.product = itertools.product(
         [120] if include_sm120_kernels else [],
         dtype_values,  # fallback to avoid empty product

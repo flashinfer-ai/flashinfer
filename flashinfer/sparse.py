@@ -823,6 +823,12 @@ class VariableBlockSparseAttentionWrapper:
             The theta used in RoPE, if not provided, will be set to ``1e4``.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
+        q_data_type : Union[str, torch.dtype]
+            Dtype of the query tensor.  Used to specialize the JIT-compiled kernel.
+            Defaults to ``"float16"``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            Dtype of the key/value tensors.  When ``None``, defaults to
+            ``q_data_type``.
 
 
         The :meth:`plan` method should be called before any :meth:`run` or

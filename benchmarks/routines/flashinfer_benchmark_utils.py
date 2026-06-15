@@ -135,6 +135,16 @@ output_column_dict = {
         "has_z",
         "dt_softplus",
     ],
+    "gdn": [
+        "num_q_heads",
+        "num_k_heads",
+        "num_v_heads",
+        "head_size",
+        "state_layout",
+        "pool_mode",
+        "update_state",
+        "use_qk_l2norm",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -172,6 +182,7 @@ full_output_columns = (
     + output_column_dict["sampling"]
     + output_column_dict["rope"]
     + output_column_dict["mamba"]
+    + output_column_dict["gdn"]
     + output_column_dict["general"]
 )
 
@@ -200,6 +211,7 @@ benchmark_apis = {
         "cutlass_fused_moe",
         "cute_dsl_fp4_block_scale_moe",
         "b12x_fused_moe",
+        "unified_nvfp4_moe",
         "bgmv_moe",
     ],
     "moe_comm": [
@@ -259,6 +271,11 @@ benchmark_apis = {
     ],
     "mamba": [
         "selective_state_update",
+    ],
+    "gdn": [
+        "gated_delta_rule_decode",
+        "gated_delta_rule_mtp",
+        "chunk_gated_delta_rule",
     ],
 }
 
@@ -426,8 +443,8 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cudnn"],
         "10.3": ["cudnn"],
-        "12.0": [],
-        "12.1": [],
+        "12.0": ["cudnn"],
+        "12.1": ["cudnn"],
     },
     "mm_mxfp8": {
         "7.5": [],
@@ -435,11 +452,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass", "cute-dsl", "trtllm"],
-        "10.3": ["cutlass", "cute-dsl", "trtllm"],
-        "11.0": ["cutlass"],
-        "12.0": [],
-        "12.1": [],
+        "10.0": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
+        "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn"],
+        "11.0": ["cutlass", "cudnn"],
+        "12.0": ["cutlass", "cudnn"],
+        "12.1": ["cutlass", "cudnn"],
     },
     "tinygemm_bf16": {
         "7.5": [],
@@ -520,6 +537,12 @@ routine_cc_to_supported_backends = {
         "10.3": [],
         "12.0": ["b12x"],
         "12.1": ["b12x"],
+    },
+    # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
+    # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
+    "unified_nvfp4_moe": {
+        "10.0": ["unified"],
+        "10.3": ["unified"],
     },
     # NORM
     "rmsnorm": {
@@ -925,6 +948,43 @@ routine_cc_to_supported_backends = {
         "11.0": ["flashinfer", "triton"],
         "12.0": ["flashinfer", "triton"],
         "12.1": ["flashinfer", "triton"],
+    },
+    # GDN (Gated Delta Net)
+    "gated_delta_rule_decode": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["flashinfer", "triton"],
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+        "11.0": ["triton"],
+        "12.0": ["triton"],
+        "12.1": ["triton"],
+    },
+    "gated_delta_rule_mtp": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["flashinfer", "triton"],
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+        "11.0": ["triton"],
+        "12.0": ["triton"],
+        "12.1": ["triton"],
+    },
+    "chunk_gated_delta_rule": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["flashinfer", "fla"],
+        "10.0": ["flashinfer", "fla"],
+        "10.3": ["flashinfer", "fla"],
+        "11.0": [],
+        "12.0": [],
+        "12.1": [],
     },
 }
 
