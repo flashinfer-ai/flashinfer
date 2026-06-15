@@ -5401,6 +5401,12 @@ def _check_mm_fp4_problem_size(
             f"a and b must have float4_e2m1fn_x2 packed into uint8. "
             f"Got {a.dtype} and {b.dtype}."
         )
+    # a_descale is required for fp4 x fp4 mode
+    if a_descale is None:
+        raise ValueError(
+            "a_descale must be provided for fp4 x fp4 mm_fp4; pass None only "
+            "when a.dtype is torch.bfloat16 for W4A16 weight-only mode."
+        )
     if a_descale.dtype not in {
         torch.float8_e4m3fn,
         torch.uint8,
