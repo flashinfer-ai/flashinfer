@@ -219,8 +219,10 @@ def _moe_core_impl(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
-        use_per_token_activation: Quantize GEMM1/SwiGLU output with the
-            standalone per-token NVFP4 CuTe-DSL quantizer before GEMM2.
+        use_per_token_activation: Mirror TRTLLM explicit per-token activation
+            scaling: apply ``per_token_scale`` in the GEMM1/SwiGLU epilogue,
+            then quantize the GEMM1/SwiGLU output with the standalone
+            per-token NVFP4 CuTe-DSL quantizer before GEMM2.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -288,10 +290,10 @@ def _moe_core_impl(
         main_event.record()
         moe_output.record_stream(aux_stream)
 
-    # Step 2: GEMM1 + activation. In per-token mode the fused GEMM1 FP4
-    # epilogue is bypassed: materialize the activation, then reuse the
-    # standalone CuTe-DSL NVFP4 quantizer so 4over6/per-token semantics match
-    # the quantization API and the TRTLLM MoE split-launch pattern.
+    # Step 2: GEMM1 + activation. Per-token mode mirrors TRTLLM's explicit
+    # quantization path: the GEMM1 epilogue applies caller-provided input row
+    # scales, materializes activations, then the standalone CuTe-DSL per-token
+    # NVFP4 quantizer produces FC2 input and row scales for GEMM2.
     intermediate_per_token_scale = None
     if use_per_token_activation:
         intermediate, _ = (
@@ -521,8 +523,10 @@ class CuteDslMoEWrapper:
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
         use_per_token_activation : bool
-            Quantize the GEMM1/SwiGLU output with the standalone per-token
-            NVFP4 CuTe-DSL quantizer before GEMM2. Defaults to ``False``.
+            Mirror TRTLLM's explicit per-token activation path: apply
+            ``per_token_scale`` in GEMM1/SwiGLU, then quantize the
+            GEMM1/SwiGLU output with the standalone per-token NVFP4 CuTe-DSL
+            quantizer before GEMM2. Defaults to ``False``.
         """
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
@@ -925,9 +929,9 @@ def cute_dsl_fused_moe_nvfp4(
         Pre-allocated output buffer.  Allocated internally if ``None``.
     per_token_scale : Optional[torch.Tensor]
         Per-token input row scale for GEMM1. Passing this enables the
-        TRTLLM-style per-token activation path, which also quantizes the
-        GEMM1/SwiGLU output with the standalone per-token NVFP4 quantizer
-        before GEMM2.
+        TRTLLM-style explicit per-token activation path, which applies this
+        scale in GEMM1/SwiGLU and also quantizes the GEMM1/SwiGLU output with
+        the standalone per-token NVFP4 quantizer before GEMM2.
     aux_stream : Optional[torch.cuda.Stream]
         Optional auxiliary CUDA stream used to overlap setup work with the
         main computation.
@@ -941,8 +945,10 @@ def cute_dsl_fused_moe_nvfp4(
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     use_per_token_activation : bool
-        Quantize the GEMM1/SwiGLU output with the standalone per-token NVFP4
-        CuTe-DSL quantizer before GEMM2. Defaults to ``False``.
+        Mirror TRTLLM's explicit per-token activation path: apply
+        ``per_token_scale`` in GEMM1/SwiGLU, then quantize the GEMM1/SwiGLU
+        output with the standalone per-token NVFP4 CuTe-DSL quantizer before
+        GEMM2. Defaults to ``False``.
 
     Returns
     -------

@@ -397,7 +397,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         out_scale: Optional output scale factor tensor for FP4 quantized output.
         global_scale: Global scale factor for FP4 quantization, shape (1,), float32.
         a_per_token_scale: Optional per-token row scale for operand A,
-            shape (seq_len,), float32. Applied before SwiGLU.
+            shape (seq_len,), float32. Indexed by the original token ID and
+            applied before SwiGLU.
         topk: Number of experts per token. Default: 8
         ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"

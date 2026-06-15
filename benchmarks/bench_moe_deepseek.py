@@ -549,6 +549,10 @@ def bench_trtllm(
         get_w2_permute_indices_with_cache,
     )
     from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
     from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
@@ -563,9 +567,14 @@ def bench_trtllm(
 
     hg = inputs["hidden_gs"]
     if use_per_token_activation:
+        hidden_global_scale = make_nvfp4_global_scale(
+            inputs["hidden_bf16"],
+            per_token_activation=True,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
         hfp, hsf, hidden_per_token_scale = nvfp4_quantize(
             inputs["hidden_bf16"],
-            1.0 / (448.0 * 6.0),
+            hidden_global_scale,
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
             backend="cute-dsl",
