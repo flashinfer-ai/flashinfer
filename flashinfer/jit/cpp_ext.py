@@ -357,23 +357,14 @@ def _read_mem_available_gb() -> Optional[int]:
 
 @functools.cache
 def _memory_aware_job_cap() -> Optional[int]:
-    """A cap on parallel ninja jobs derived from available memory, or ``None``
-    to leave ninja's default parallelism untouched.
-
-    Cached (and so computed/logged once per process): the cap is a function of
-    available memory and CPU count, which are effectively static for a run, and
-    ``_get_num_workers`` is called for every operator's JIT compile.
-
-    When ``MAX_JOBS`` is unset, ninja runs roughly ``nproc + 2`` nvcc
-    processes. Each CUTLASS / FP4 nvcc compile can peak at several GiB, so on
-    memory-constrained or unified-memory systems (e.g. DGX Spark GB10 / SM121a)
-    the default can exhaust memory and OOM-kill nvcc (exit 137), crashing the
-    caller. Mirror the per-job memory budget the AOT build uses
-    (``scripts/jit_cache_build_common.sh``: ``max(8, FLASHINFER_NVCC_THREADS *
-    2)`` GiB/job) and cap accordingly. This only ever *lowers* parallelism
-    below ninja's default; when memory is ample it returns ``None`` so behavior
-    is unchanged.
-    """
+    """Parallel-ninja-job cap from available memory, or ``None`` to keep ninja's
+    default. Cached, so it is computed and logged once per process."""
+    # With MAX_JOBS unset, ninja runs ~nproc + 2 nvcc processes; each CUTLASS /
+    # FP4 compile can peak at several GiB, so on memory-constrained or
+    # unified-memory systems (e.g. DGX Spark GB10 / SM121a) the default
+    # OOM-kills nvcc (exit 137) and crashes the caller. Mirror the AOT per-job
+    # budget (scripts/jit_cache_build_common.sh: max(8, FLASHINFER_NVCC_THREADS
+    # * 2) GiB/job) and only ever lower below ninja's default.
     mem_available_gb = _read_mem_available_gb()
     if mem_available_gb is None:
         return None
