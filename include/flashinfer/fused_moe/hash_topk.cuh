@@ -108,19 +108,21 @@ __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ pa
 #endif
 
   const int64_t token_id = params.input_id[warp_id];
+  // 64-bit row base: warp_id * num_routed_experts can exceed 2^32 for large
+  // token counts, so widen before the multiply to avoid index overflow.
+  const int64_t logits_row = static_cast<int64_t>(warp_id) * params.num_routed_experts;
 
   float routed_weight = 0.0f;
   int32_t expert_id = 0;
   if (lane_id < params.topk) {
     expert_id = params.tid2eid[token_id * params.topk + lane_id];
-    routed_weight =
-        act_sqrt_softplus(params.router_logits[warp_id * params.num_routed_experts + expert_id]);
+    routed_weight = act_sqrt_softplus(params.router_logits[logits_row + expert_id]);
   }
 
   const float routed_sum = hash_topk_warp_reduce_sum(routed_weight);
   if (lane_id < topk_fused) {
     const bool is_shared = lane_id >= params.topk;
-    const uint32_t output_offset = warp_id * topk_fused + lane_id;
+    const int64_t output_offset = static_cast<int64_t>(warp_id) * topk_fused + lane_id;
     params.topk_ids[output_offset] =
         is_shared ? static_cast<int32_t>(params.num_routed_experts + lane_id - params.topk)
                   : expert_id;

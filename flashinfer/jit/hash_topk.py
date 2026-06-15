@@ -14,11 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
+
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
 
 
+@functools.cache
 def gen_hash_topk_module() -> JitSpec:
+    """Build the JIT spec for the DSv4 hash-based MoE routing module."""
     return gen_jit_spec(
         "hash_topk",
         [

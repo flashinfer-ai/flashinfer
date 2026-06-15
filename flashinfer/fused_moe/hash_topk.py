@@ -45,6 +45,12 @@ def _check_hash_topk_supported(
     routed_scaling_factor: float = 1.0,
     launch_with_pdl: bool = True,
 ) -> bool:
+    """Validate dtypes, shapes, device, and contiguity of hash_topk inputs.
+
+    Mirrors the TVM-FFI-side checks so direct FFI callers and the Python API
+    enforce the same contract. Returns ``True`` when all inputs are valid and
+    raises ``ValueError`` otherwise.
+    """
     if router_logits.dim() != 2:
         raise ValueError(
             f"router_logits must be 2D [num_tokens, num_experts], got {tuple(router_logits.shape)}"
@@ -113,6 +119,7 @@ def _check_hash_topk_supported(
 
 @functools.cache
 def get_hash_topk_module():
+    """Build, load, and cache the hash_topk JIT module as a custom op."""
     module = gen_hash_topk_module().build_and_load()
 
     @register_custom_op(
@@ -128,6 +135,7 @@ def get_hash_topk_module():
         routed_scaling_factor: float,
         launch_with_pdl: bool,
     ) -> None:
+        """Custom-op wrapper that writes routing results into the output tensors."""
         module.hash_topk(
             router_logits,
             input_ids,
