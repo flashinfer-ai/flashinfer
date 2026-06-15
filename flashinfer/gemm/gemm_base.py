@@ -5549,10 +5549,9 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-# NOTE: the CC list is the union of the two modes this checker serves:
-# fp4 x fp4 cute-dsl GEMM runs on SM100/103 only (enforced at runtime
-# below), while W4A16 (bf16 activation) cute-dsl runs on all of
-# SM100/103/110/120/121.
+# NOTE: the CC list is the union of the two modes this checker serves.
+# W4W4 (fp4 x fp4) cute-dsl GEMM runs on SM100/103 only
+# W4A16 (bf16 activation) cute-dsl runs on all of SM100/103/110/120/121.
 @supported_compute_capability([100, 103, 110, 120, 121])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
@@ -6336,9 +6335,9 @@ def mm_fp4(
 
     Two modes, selected by ``a.dtype``:
 
-    * **fp4 x fp4** (default): both operands are FP4-quantized with block
+    * **W4W4 (fp4 x fp4)** (default): both operands are FP4-quantized with block
       scales, as described in the parameter list below.
-    * **W4A16 (weight-only)**: ``a`` is ``torch.bfloat16`` (not quantized,
+    * **W4A16 (weight-only fp4)**: ``a`` is ``torch.bfloat16`` (not quantized,
       so ``a_descale`` must be ``None``) and ``b``/``b_descale`` are the
       backend-specific tensors returned by
       :func:`~flashinfer.prepare_w4a16_fp4_weights`.  Only the ``cudnn``
@@ -6424,10 +6423,7 @@ def mm_fp4(
     torch.Size([48, 256])
     """
 
-    # W4A16 weight-only mode: route to the dedicated dispatch (b is in a
-    # backend-specific prepared layout, so none of the fp4 x fp4 shape
-    # logic below applies).  Validation already ran in the
-    # @backend_requirement checks.
+    # W4A16 weight-only mode: route to the dedicated dispatch
     if a.dtype == torch.bfloat16:
         from .gemm_w4a16 import _mm_w4a16_fp4_dispatch  # noqa: PLC0415
 
