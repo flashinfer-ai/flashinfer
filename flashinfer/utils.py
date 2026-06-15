@@ -234,10 +234,12 @@ class _RingBuf:
     Slot assignment is pinned per CUDA stream: launches enqueued on the same
     stream are serialized by the stream and may safely reuse one slot (each
     kernel resets its state words to zero on exit), while launches from
-    different streams get disjoint slots. Slots are recycled round-robin once
-    more than ``num_slots`` distinct streams have been seen; a collision then
-    requires more than ``num_slots`` streams to have such kernels in flight
-    simultaneously on one device.
+    different streams get disjoint slots. Slot assignment is sticky and never
+    evicted, so slots recycle round-robin by *cumulative distinct* streams
+    seen over this buffer's lifetime: the k-th distinct stream maps to slot
+    ``(k - 1) % num_slots``. A recycled slot only corrupts state if the two
+    streams sharing it also run these kernels concurrently; in practice
+    inference uses 1-2 stream pools, well under ``num_slots``.
     """
 
     __slots__ = ["buf", "slot_bytes", "num_slots", "stream_slots", "next_slot"]
