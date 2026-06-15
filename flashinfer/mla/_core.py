@@ -1888,6 +1888,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
     sm_count = get_device_sm_count(query.device)
 
     block_size = kv_cache.size(-2)
+    trtllm_gen_not_supported_reason: Optional[str] = None
+    if block_size != 32 and block_size != 64:
+        trtllm_gen_not_supported_reason = (
+            f"trtllm-gen requires block_size in (32, 64), got {block_size}"
+        )
 
     if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
         raise ValueError("skip_softmax is not supported for sparse MLA")
@@ -1969,11 +1974,21 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(cute_dsl_reason)
         runner_names = ["cute-dsl"]
     elif backend == "trtllm-gen":
+        if trtllm_gen_not_supported_reason is not None:
+            raise ValueError(trtllm_gen_not_supported_reason)
         runner_names = ["trtllm-gen"]
     else:  # backend == "auto"
-        runner_names = ["trtllm-gen"]
+        runner_names = []
+        if trtllm_gen_not_supported_reason is None:
+            runner_names.append("trtllm-gen")
         if cute_dsl_reason is None:
             runner_names.append("cute-dsl")
+        if not runner_names:
+            raise ValueError(
+                f"auto: no backend supports this configuration "
+                f"(trtllm-gen: {trtllm_gen_not_supported_reason}; "
+                f"cute-dsl: {cute_dsl_reason})"
+            )
 
     runners: List[TunableRunner] = []
     if "trtllm-gen" in runner_names:
