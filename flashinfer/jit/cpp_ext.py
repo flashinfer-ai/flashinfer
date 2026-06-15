@@ -379,7 +379,13 @@ def _memory_aware_job_cap() -> Optional[int]:
         return None
 
     cpu_count = os.cpu_count() or 1
-    ninja_default = cpu_count + 2  # ninja's GuessParallelism for >2 cores
+    # ninja's GuessParallelism: 2 for <=1 core, 3 for 2 cores, else N + 2.
+    if cpu_count <= 1:
+        ninja_default = 2
+    elif cpu_count == 2:
+        ninja_default = 3
+    else:
+        ninja_default = cpu_count + 2
 
     try:
         nvcc_threads = max(1, int(os.environ.get("FLASHINFER_NVCC_THREADS", "1")))

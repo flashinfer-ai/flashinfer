@@ -213,3 +213,17 @@ def test_cap_warning_emitted_once_across_compiles(monkeypatch, caplog):
         r for r in caplog.records if "Capping ninja parallelism" in r.getMessage()
     ]
     assert len(cap_warnings) == 1
+
+
+def test_get_num_workers_low_core_matches_ninja_guess(monkeypatch):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    # 2-core box: ninja's GuessParallelism is 3, not 4. 24 GiB / 8 == 3, so the
+    # default already fits -> don't intervene.
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 2)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 24)
+    assert cpp_ext._get_num_workers() is None
+    # 16 GiB / 8 == 2 < 3 -> cap to 2.
+    cpp_ext._memory_aware_job_cap.cache_clear()
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 16)
+    assert cpp_ext._get_num_workers() == 2
