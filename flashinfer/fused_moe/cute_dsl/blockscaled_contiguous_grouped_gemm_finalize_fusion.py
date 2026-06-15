@@ -508,17 +508,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             f"a_per_token_scale must have at least {permuted_m} elements, "
             f"got {a_per_token_scale.numel()}"
         )
-        a_per_token_scale_data_ptr = a_per_token_scale.data_ptr()
+        a_per_token_scale_ptr = make_ptr(
+            cutlass.Float32,
+            a_per_token_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
     else:
-        # The compiled kernel does not dereference this pointer unless
-        # use_a_per_token_scale is true.
-        a_per_token_scale_data_ptr = alpha.data_ptr()
-    a_per_token_scale_ptr = make_ptr(
-        cutlass.Float32,
-        a_per_token_scale_data_ptr,
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
+        a_per_token_scale_ptr = None
 
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()

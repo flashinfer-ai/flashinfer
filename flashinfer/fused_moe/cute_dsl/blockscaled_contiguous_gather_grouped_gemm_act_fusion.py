@@ -594,8 +594,18 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             cutlass.Float32, global_scale.data_ptr(), cute.AddressSpace.gmem
         )
     else:
-        c_sf_ptr = None
-        norm_const_ptr = None
+        # These pointers are not dereferenced unless the kernel is generating
+        # FP4 output scale factors. Keep raw pointer arguments non-optional;
+        # the wrapper maps them to optional tensor views based on output dtype.
+        c_sf_ptr = make_ptr(
+            sf_dtype_cutlass,
+            b_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        norm_const_ptr = make_ptr(
+            cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem
+        )
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
     use_a_per_token_scale = a_per_token_scale is not None
@@ -611,14 +621,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             f"a_per_token_scale must have at least {seq_len} elements, "
             f"got {a_per_token_scale.numel()}"
         )
-        a_per_token_scale_data_ptr = a_per_token_scale.data_ptr()
+        a_per_token_scale_ptr = make_ptr(
+            cutlass.Float32,
+            a_per_token_scale.data_ptr(),
+            cute.AddressSpace.gmem,
+        )
     else:
-        a_per_token_scale_data_ptr = alpha.data_ptr()
-    a_per_token_scale_ptr = make_ptr(
-        cutlass.Float32,
-        a_per_token_scale_data_ptr,
-        cute.AddressSpace.gmem,
-    )
+        a_per_token_scale_ptr = None
     tile_idx_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
     )
