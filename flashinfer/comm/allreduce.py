@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+from ctypes import c_void_p, cast as ctypes_cast
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.workspace_tensor = workspace_tuple[1]
         self.mem_handles = workspace_tuple[2]
         self.metadata = workspace_tuple[3]
+        self._graph_visible_addresses = self.get_graph_visible_addresses()
 
     @property
     def backend(self) -> str:
@@ -177,6 +179,92 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         except ValueError as e:
             logger.warning("Workspace is insufficient for problem size. %s", e)
             return False
+
+    def get_graph_visible_addresses(self) -> dict:
+        """Return graph-visible pointer metadata for the TRTLLM workspace."""
+        return {
+            "ipc_handles": [list(handles) for handles in self.ipc_handles],
+            "workspace_tensor": self.workspace_tensor.detach().cpu().tolist(),
+            "workspace_tensor_data_ptr": int(self.workspace_tensor.data_ptr()),
+            "workspace_tensor_dtype": str(self.workspace_tensor.dtype),
+            "workspace_tensor_shape": list(self.workspace_tensor.shape),
+            "workspace_tensor_stride": list(self.workspace_tensor.stride()),
+            "workspace_tensor_device": str(self.workspace_tensor.device),
+        }
+
+    def validate_graph_visible_addresses(self) -> None:
+        """Validate that workspace pointers captured by CUDA graphs are stable."""
+        current = self.get_graph_visible_addresses()
+        if current != self._graph_visible_addresses:
+            raise RuntimeError(
+                "TRTLLM all-reduce graph-visible workspace pointers changed "
+                "during checkpoint restore"
+            )
+        for handle in self.mem_handles:
+            if hasattr(handle, "validate_graph_visible_addresses"):
+                handle.validate_graph_visible_addresses()
+
+    def detach_physical_keep_va(
+        self, *, synchronize: bool = True, barrier: bool = True
+    ) -> None:
+        """Detach checkpointable symmetric-memory backing while preserving VAs."""
+        self.validate_graph_visible_addresses()
+        for handle in self.mem_handles:
+            detach = getattr(handle, "detach_physical_keep_va", None)
+            if detach is None:
+                raise RuntimeError(
+                    "TRTLLM all-reduce workspace handle does not support "
+                    "graph-stable checkpoint pause"
+                )
+            detach(synchronize=synchronize, barrier=barrier)
+
+    def _reset_after_remap(self, *, barrier: bool = True) -> None:
+        """Reinitialize Lamport buffers and flags after physical remap."""
+        lamport_dtype = (
+            torch.float32 if self.metadata["use_fp32_lamport"] else torch.float16
+        )
+        self.mem_handles[2].lamport_initialize(self.rank, lamport_dtype)
+
+        flag_ptr = int(self.workspace_tensor[-1].item())
+        from .cuda_ipc import cudart
+
+        cudart.cudaMemset(flag_ptr, 0, 5 * 4)
+        lamport_comm_size_bytes = self.metadata["lamport_comm_size"].to_bytes(
+            4, byteorder="little"
+        )
+        cudart.cudaMemcpy(
+            c_void_p(flag_ptr + 3 * 4),
+            ctypes_cast(lamport_comm_size_bytes, c_void_p),
+            4,
+        )
+        if barrier:
+            self.mem_handles[0].comm_backend.barrier()
+
+    def remap_physical_same_va(
+        self,
+        *,
+        comm_backend: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        reset: bool = True,
+    ) -> None:
+        """Remap checkpointable symmetric-memory backing at the original VAs."""
+        for handle in self.mem_handles:
+            remap = getattr(handle, "remap_physical_same_va", None)
+            if remap is None:
+                raise RuntimeError(
+                    "TRTLLM all-reduce workspace handle does not support "
+                    "graph-stable checkpoint resume"
+                )
+            remap(
+                comm_backend=comm_backend,
+                synchronize=synchronize,
+                barrier=barrier,
+                zero_local=True,
+            )
+        if reset:
+            self._reset_after_remap(barrier=barrier)
+        self.validate_graph_visible_addresses()
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""

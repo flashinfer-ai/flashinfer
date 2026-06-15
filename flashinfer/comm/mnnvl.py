@@ -1283,6 +1283,8 @@ class SymmDeviceMemory:
         self.uc_handles: List[
             int
         ] = []  # std::vector<CUmemGenericAllocationHandle> mUcHandles
+        self._graph_visible_addresses: Optional[Dict[str, Any]] = None
+        self._mapped = False
 
         # Signal pad constants
         self.SIGNAL_PAD_ALIGNMENT = 16
@@ -1310,15 +1312,9 @@ class SymmDeviceMemory:
         )
 
         # Create handle exchanger
-        if is_mnnvl_fabric_supported(device_idx):
-            self._exchanger: HandleExchanger = FabricHandleExchanger(
-                self.comm_backend, self.group_rank, self.group_size
-            )
-        else:
-            self._exchanger = PosixFDHandleExchanger(
-                self.comm_backend, self.group_rank, self.group_size
-            )
+        self._exchanger: Optional[HandleExchanger] = self._create_handle_exchanger()
         self._alloc_mn_mcast_mem(buf_size, enable_multicast)
+        self._mapped = True
 
         if allocate_signal_pads:
             # Initialize signal pads
@@ -1332,11 +1328,12 @@ class SymmDeviceMemory:
 
             self.signal_pads_dev = alloc_and_copy_to_cuda(self.signal_pads)
         self.uc_ptrs_dev = alloc_and_copy_to_cuda(self.uc_ptrs)
+        self._graph_visible_addresses = self.get_graph_visible_addresses()
 
     def __del__(self):
         """Destructor - cleanup allocated memory"""
 
-        if hasattr(self, "_exchanger"):
+        if getattr(self, "_exchanger", None) is not None:
             self._exchanger.close()
 
         # Skip cleanup during Python finalization to avoid segfaults
@@ -1354,8 +1351,10 @@ class SymmDeviceMemory:
         # Free device pointers
         if self.signal_pads_dev:
             checkCudaErrors(cuda.cuMemFree(self.signal_pads_dev))
+            self.signal_pads_dev = 0
         if self.uc_ptrs_dev:
             checkCudaErrors(cuda.cuMemFree(self.uc_ptrs_dev))
+            self.uc_ptrs_dev = 0
 
         # Unmap UC regions and release their handles
         if hasattr(self, "uc_handles") and self.uc_handles:
@@ -1383,17 +1382,314 @@ class SymmDeviceMemory:
                 checkCudaErrors(
                     cuda.cuMemAddressFree(self.uc_base_ptr, self.total_uc_size)
                 )
+                self.uc_base_ptr = 0
 
         # Release MC handle
-        if hasattr(self, "mc_handle") and self.mc_handle and self.mc_handle != 0:
+        if hasattr(self, "mc_ptr") and self.mc_ptr:
+            if hasattr(self, "mc_handle") and self.mc_handle and self.mc_handle != 0:
+                try:
+                    checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
+                    checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
+                except Exception as e:
+                    logger.warning("Destructor: Failed to release MC handle: %s", e)
             try:
-                checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
                 checkCudaErrors(
                     cuda.cuMemAddressFree(self.mc_ptr, self.allocation_size)
                 )
-                checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
             except Exception as e:
-                logger.warning("Destructor: Failed to release MC handle: %s", e)
+                logger.warning("Destructor: Failed to free MC VA: %s", e)
+            self.mc_ptr = 0
+            self.mc_handle = 0
+
+    def _create_handle_exchanger(self) -> HandleExchanger:
+        if is_mnnvl_fabric_supported(self.device_idx):
+            return FabricHandleExchanger(
+                self.comm_backend, self.group_rank, self.group_size
+            )
+        return PosixFDHandleExchanger(
+            self.comm_backend, self.group_rank, self.group_size
+        )
+
+    def _close_handle_exchanger(self) -> None:
+        exchanger = getattr(self, "_exchanger", None)
+        if exchanger is not None:
+            exchanger.close()
+            self._exchanger = None
+
+    def _validate_comm(self, comm_backend: CommBackend) -> None:
+        comm_size = comm_backend.Get_size()
+        comm_rank = comm_backend.Get_rank()
+        if comm_size != self.group_size or comm_rank != self.group_rank:
+            raise RuntimeError(
+                "Restored symmetric-memory communicator does not match the "
+                "graph-visible allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{self.group_rank}/{self.group_size}"
+            )
+
+    def _collective_mapped_states(self, comm_backend: CommBackend) -> List[bool]:
+        mapped_states = comm_backend.allgather(self._mapped)
+        if len(mapped_states) != self.group_size:
+            raise RuntimeError(
+                "Symmetric-memory mapped-state allgather returned "
+                f"{len(mapped_states)} ranks, expected {self.group_size}"
+            )
+        if any(mapped_states) and not all(mapped_states):
+            raise RuntimeError("Inconsistent symmetric-memory mapped state across ranks")
+        return mapped_states
+
+    def _collective_allocation_metadata(self, comm_backend: CommBackend) -> None:
+        local_metadata = {
+            "group_rank": self.group_rank,
+            "group_size": self.group_size,
+            "buf_size": self.buf_size,
+            "allocation_size": self.allocation_size,
+            "signal_pad_offset": self.signal_pad_offset,
+            "total_uc_size": getattr(self, "total_uc_size", 0),
+            "has_multicast": bool(self.mc_ptr),
+        }
+        all_metadata = comm_backend.allgather(local_metadata)
+        if len(all_metadata) != self.group_size:
+            raise RuntimeError(
+                "Symmetric-memory metadata allgather returned "
+                f"{len(all_metadata)} ranks, expected {self.group_size}"
+            )
+        for rank, metadata in enumerate(all_metadata):
+            expected = {**local_metadata, "group_rank": rank}
+            if metadata != expected:
+                raise RuntimeError(
+                    "Inconsistent symmetric-memory allocation metadata across "
+                    f"ranks: rank {rank} has {metadata!r}, expected {expected!r}"
+                )
+
+    def get_graph_visible_addresses(self) -> Dict[str, Any]:
+        """Return the VA/layout state captured by graph-visible tensors."""
+        return {
+            "buf_size": self.buf_size,
+            "group_size": self.group_size,
+            "group_rank": self.group_rank,
+            "device_idx": self.device_idx,
+            "allocation_size": self.allocation_size,
+            "signal_pad_offset": self.signal_pad_offset,
+            "total_uc_size": getattr(self, "total_uc_size", 0),
+            "uc_base_ptr": int(getattr(self, "uc_base_ptr", 0)),
+            "uc_ptrs": list(self.uc_ptrs),
+            "uc_ptrs_dev": int(self.uc_ptrs_dev),
+            "signal_pads": list(self.signal_pads),
+            "signal_pads_dev": int(self.signal_pads_dev),
+            "mc_ptr": int(self.mc_ptr),
+            "has_multicast": bool(self.mc_ptr),
+        }
+
+    def validate_graph_visible_addresses(
+        self, expected: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Validate that graph-visible VAs and pointer arrays are stable."""
+        expected = expected or self._graph_visible_addresses
+        if expected is None:
+            raise RuntimeError("Missing captured symmetric-memory address metadata")
+        current = self.get_graph_visible_addresses()
+        for key, expected_value in expected.items():
+            if current.get(key) != expected_value:
+                raise RuntimeError(
+                    f"SymmDeviceMemory graph-visible address changed for {key}: "
+                    f"{current.get(key)!r} != {expected_value!r}"
+                )
+
+    def detach_physical_keep_va(
+        self, *, synchronize: bool = True, barrier: bool = True
+    ) -> None:
+        """Release UC/MC physical mappings while preserving graph-visible VAs."""
+        self._validate_comm(self.comm_backend)
+        mapped_states = self._collective_mapped_states(self.comm_backend)
+        if not any(mapped_states):
+            if barrier:
+                self.comm_backend.barrier()
+                self.comm_backend.barrier()
+            return
+        self._collective_allocation_metadata(self.comm_backend)
+        self.validate_graph_visible_addresses()
+        if synchronize:
+            checkCudaErrors(cuda.cuCtxSynchronize())
+        if barrier:
+            self.comm_backend.barrier()
+
+        if self.mc_handle:
+            checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
+            checkCudaErrors(cuda.cuMemRelease(self.mc_handle))
+            self.mc_handle = 0
+
+        for peer, handle in enumerate(self.uc_handles):
+            if handle:
+                checkCudaErrors(
+                    cuda.cuMemUnmap(self.uc_ptrs[peer], self.allocation_size)
+                )
+                checkCudaErrors(cuda.cuMemRelease(handle))
+                self.uc_handles[peer] = 0
+        self._mapped = False
+        self._close_handle_exchanger()
+
+        if barrier:
+            self.comm_backend.barrier()
+
+    def remap_physical_same_va(
+        self,
+        *,
+        comm_backend: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        zero_local: bool = True,
+    ) -> None:
+        """Create fresh UC/MC backing and map it into the original VAs."""
+        comm_backend = comm_backend or self.comm_backend
+        self._validate_comm(comm_backend)
+        mapped_states = self._collective_mapped_states(comm_backend)
+        if comm_backend is not self.comm_backend and any(mapped_states):
+            raise RuntimeError(
+                "Cannot refresh symmetric-memory communicator while allocation "
+                "is still mapped; call detach_physical_keep_va before checkpoint "
+                "remap"
+            )
+        if all(mapped_states):
+            if barrier:
+                comm_backend.barrier()
+                comm_backend.barrier()
+            return
+        self._collective_allocation_metadata(comm_backend)
+        self.validate_graph_visible_addresses()
+        if synchronize:
+            checkCudaErrors(cuda.cuCtxSynchronize())
+        if barrier:
+            comm_backend.barrier()
+
+        enable_multicast = bool(self.mc_ptr)
+        fresh: Optional[SymmDeviceMemory] = None
+        mapped_uc_peers: List[int] = []
+        mapped_mc = False
+        try:
+            fresh = SymmDeviceMemory(
+                buf_size=self.buf_size,
+                group_size=self.group_size,
+                group_rank=self.group_rank,
+                device_idx=self.device_idx,
+                comm_backend_for_handle_transfer=comm_backend,
+                enable_multicast=enable_multicast,
+                allocate_signal_pads=False,
+            )
+            if fresh.allocation_size != self.allocation_size:
+                raise RuntimeError(
+                    "Restored symmetric-memory allocation size changed: "
+                    f"{fresh.allocation_size} != {self.allocation_size}"
+                )
+
+            for peer_ptr in fresh.uc_ptrs:
+                checkCudaErrors(cuda.cuMemUnmap(peer_ptr, fresh.allocation_size))
+            checkCudaErrors(
+                cuda.cuMemAddressFree(fresh.uc_base_ptr, fresh.total_uc_size)
+            )
+            fresh.uc_ptrs = []
+            fresh.uc_base_ptr = 0
+            fresh.total_uc_size = 0
+
+            for peer, handle in enumerate(fresh.uc_handles):
+                checkCudaErrors(
+                    cuda.cuMemMap(
+                        self.uc_ptrs[peer], self.allocation_size, 0, handle, 0
+                    )
+                )
+                mapped_uc_peers.append(peer)
+            checkCudaErrors(
+                cuda.cuMemSetAccess(
+                    self.uc_base_ptr,
+                    self.total_uc_size,
+                    [self._get_mem_access_desc()],
+                    1,
+                )
+            )
+
+            if enable_multicast:
+                checkCudaErrors(cuda.cuMemUnmap(fresh.mc_ptr, fresh.allocation_size))
+                checkCudaErrors(
+                    cuda.cuMemAddressFree(fresh.mc_ptr, fresh.allocation_size)
+                )
+                fresh.mc_ptr = 0
+                checkCudaErrors(
+                    cuda.cuMemMap(
+                        self.mc_ptr,
+                        self.allocation_size,
+                        0,
+                        fresh.mc_handle,
+                        0,
+                    )
+                )
+                mapped_mc = True
+                checkCudaErrors(
+                    cuda.cuMemSetAccess(
+                        self.mc_ptr,
+                        self.allocation_size,
+                        [self._get_mem_access_desc()],
+                        1,
+                    )
+                )
+
+            if fresh.uc_ptrs_dev:
+                checkCudaErrors(cuda.cuMemFree(fresh.uc_ptrs_dev))
+                fresh.uc_ptrs_dev = 0
+
+            if zero_local:
+                checkCudaErrors(
+                    cuda.cuMemsetD8(
+                        self.uc_ptrs[self.group_rank], 0, self.allocation_size
+                    )
+                )
+
+            self.validate_graph_visible_addresses()
+            self._close_handle_exchanger()
+            self.uc_handles = fresh.uc_handles
+            self.mc_handle = fresh.mc_handle
+            self.comm_backend = comm_backend
+            self._exchanger = fresh._exchanger
+            self._mapped = True
+
+            fresh.uc_handles = []
+            fresh.uc_ptrs = []
+            fresh.uc_base_ptr = 0
+            fresh.total_uc_size = 0
+            fresh.mc_handle = 0
+            fresh.mc_ptr = 0
+            fresh._exchanger = None
+        except Exception as exc:
+            cleanup_errors = []
+            if mapped_mc:
+                try:
+                    checkCudaErrors(cuda.cuMemUnmap(self.mc_ptr, self.allocation_size))
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if enable_multicast and not fresh.mc_ptr and fresh.mc_handle:
+                try:
+                    checkCudaErrors(cuda.cuMemRelease(fresh.mc_handle))
+                    fresh.mc_handle = 0
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            for peer in reversed(mapped_uc_peers):
+                try:
+                    checkCudaErrors(
+                        cuda.cuMemUnmap(self.uc_ptrs[peer], self.allocation_size)
+                    )
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise RuntimeError(
+                    "Failed to roll back partial symmetric-memory remap after "
+                    f"{exc!r}: {cleanup_errors!r}"
+                ) from exc
+            raise
+        finally:
+            if fresh is not None:
+                del fresh
+
+        if barrier:
+            self.comm_backend.barrier()
 
     def get_signal_pad_ptrs_host(self) -> List[int]:
         """Get the raw array of signal pad pointers to all ranks (including self)"""
@@ -1530,20 +1826,27 @@ class SymmDeviceMemory:
             )
         )
 
-        # All-gather shareable handles
-        all_shareable_uc_handles = self._exchanger.allgather(local_shareable_uc_handle)
-        cuda.cuCtxSynchronize()
+        all_shareable_uc_handles = []
+        try:
+            # All-gather shareable handles
+            all_shareable_uc_handles = self._exchanger.allgather(
+                local_shareable_uc_handle
+            )
+            cuda.cuCtxSynchronize()
 
-        # Import remote handles
-        for p in range(self.group_size):
-            if p != self.group_rank:
-                self.uc_handles[p] = checkCudaErrors(
-                    cuda.cuMemImportFromShareableHandle(
-                        all_shareable_uc_handles[p],
-                        self._exchanger.handle_type,
+            # Import remote handles
+            for p in range(self.group_size):
+                if p != self.group_rank:
+                    self.uc_handles[p] = checkCudaErrors(
+                        cuda.cuMemImportFromShareableHandle(
+                            all_shareable_uc_handles[p],
+                            self._exchanger.handle_type,
+                        )
                     )
-                )
-                self._exchanger.cleanup(all_shareable_uc_handles[p])
+        finally:
+            self._exchanger.cleanup(local_shareable_uc_handle)
+            for handle in all_shareable_uc_handles:
+                self._exchanger.cleanup(handle)
 
         # Reserve address space for UC pointers
         self.uc_ptrs = [0] * self.group_size
@@ -1585,19 +1888,22 @@ class SymmDeviceMemory:
         else:
             shareable_mc_handle = None
 
-        # Broadcast multicast handle from rank 0
-        shareable_mc_handle = self._exchanger.broadcast(shareable_mc_handle, root=0)
-        cuda.cuCtxSynchronize()
+        try:
+            # Broadcast multicast handle from rank 0
+            shareable_mc_handle = self._exchanger.broadcast(shareable_mc_handle, root=0)
+            cuda.cuCtxSynchronize()
 
-        # Import multicast handle for non-root ranks
-        if self.group_rank != 0:
-            self.mc_handle = checkCudaErrors(
-                cuda.cuMemImportFromShareableHandle(
-                    shareable_mc_handle,
-                    self._exchanger.handle_type,
+            # Import multicast handle for non-root ranks
+            if self.group_rank != 0:
+                self.mc_handle = checkCudaErrors(
+                    cuda.cuMemImportFromShareableHandle(
+                        shareable_mc_handle,
+                        self._exchanger.handle_type,
+                    )
                 )
-            )
-            self._exchanger.cleanup(shareable_mc_handle)
+        finally:
+            if shareable_mc_handle is not None:
+                self._exchanger.cleanup(shareable_mc_handle)
 
         # Add device to multicast
         checkCudaErrors(cuda.cuMulticastAddDevice(self.mc_handle, self.device_idx))
@@ -1735,3 +2041,55 @@ class McastGPUBuffer:
     def get_buffer_ptrs_dev(self) -> int:
         """Get the buffer pointers device array"""
         return self.mcast_device_memory.get_buffer_ptrs_dev()
+
+    @property
+    def buffer_size(self) -> int:
+        """Return the usable local buffer size, excluding signal padding."""
+        return self.buf_size
+
+    @property
+    def buffer_ptrs(self) -> List[int]:
+        """Return host unicast pointers for all ranks."""
+        return self.mcast_device_memory.get_buffer_ptrs_host()
+
+    @property
+    def buffer_ptrs_dev(self) -> int:
+        """Return the device pointer array of unicast pointers."""
+        return self.mcast_device_memory.get_buffer_ptrs_dev()
+
+    @property
+    def multicast_ptr(self) -> int:
+        """Return the multicast pointer."""
+        return self.mcast_device_memory.get_multicast_ptr()
+
+    def get_graph_visible_addresses(self) -> Dict[str, Any]:
+        """Return graph-visible pointer metadata for this buffer."""
+        return self.mcast_device_memory.get_graph_visible_addresses()
+
+    def validate_graph_visible_addresses(self) -> None:
+        """Validate that graph-visible buffer pointers are stable."""
+        self.mcast_device_memory.validate_graph_visible_addresses()
+
+    def detach_physical_keep_va(
+        self, *, synchronize: bool = True, barrier: bool = True
+    ) -> None:
+        """Detach physical backing while preserving graph-visible VAs."""
+        self.mcast_device_memory.detach_physical_keep_va(
+            synchronize=synchronize, barrier=barrier
+        )
+
+    def remap_physical_same_va(
+        self,
+        *,
+        comm_backend: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        zero_local: bool = True,
+    ) -> None:
+        """Remap physical backing at the original graph-visible VAs."""
+        self.mcast_device_memory.remap_physical_same_va(
+            comm_backend=comm_backend,
+            synchronize=synchronize,
+            barrier=barrier,
+            zero_local=zero_local,
+        )

@@ -430,6 +430,28 @@ LamportTokenNumThreshold = 16
 _symm_workspace_refs: dict[int, list[torch.Tensor]] = {}
 
 
+def _alloc_symm_device_memory_buffer_bytes(
+    size_bytes: int,
+    world_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    comm_backend: CommBackend,
+    rank: int,
+) -> tuple[list[int], torch.Tensor, SymmDeviceMemory]:
+    handle = SymmDeviceMemory(
+        buf_size=size_bytes,
+        group_size=world_size,
+        group_rank=rank,
+        device_idx=device.index,
+        comm_backend_for_handle_transfer=comm_backend,
+    )
+    return (
+        handle.get_buffer_ptrs_host(),
+        torch.empty(0, dtype=dtype, device=device),
+        handle,
+    )
+
+
 @deprecated(
     "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
 )
@@ -655,16 +677,28 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     ]:
         aligned_size = round_up(size, 16)
 
-        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
-            aligned_size,
-            tp_size,
-            dtype,
-            device,
-            group_name,
-        )
+        if use_symm_dev_mem:
+            assert comm_backend is not None
+            ptrs, tensor, handle = _alloc_symm_device_memory_buffer_bytes(
+                aligned_size,
+                tp_size,
+                dtype,
+                device,
+                comm_backend,
+                tp_rank,
+            )
+        else:
+            ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+                aligned_size,
+                tp_size,
+                dtype,
+                device,
+                group_name,
+            )
         symm_refs.append((tensor, handle))
         ipc_handles.append(ptrs)
-        mem_handles.append(handle)
+        if use_symm_dev_mem:
+            mem_handles.append(handle)
 
     logger.debug(
         "rank %s allocated ipc_handles: %s",
