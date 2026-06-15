@@ -161,84 +161,6 @@ inline RadixDeterministicCollectScratch* MaybeGetRadixDeterministicCollectScratc
              : reinterpret_cast<RadixDeterministicCollectScratch*>(row_states_buffer + num_groups);
 }
 
-/*!
- * \brief Verify that one radix group can be fully co-resident and clamp the number of
- *        concurrently processed groups to the kernel's measured occupancy.
- *
- * The multi-CTA radix kernels synchronize the CTAs of each group with a software barrier
- * (AdvanceRadixGroupBarrier), which only completes when every CTA of the group is resident
- * on the device at the same time. The grid must therefore never exceed the number of CTAs
- * the device can actually co-schedule for this kernel, instead of assuming one CTA per SM.
- *
- * \param kernel Kernel entry point (query after cudaFuncSetAttribute for dynamic smem)
- * \param block_threads Number of threads per CTA
- * \param dyn_smem_bytes Dynamic shared memory per CTA
- * \param num_sms Number of SMs on the device
- * \param ctas_per_group Number of CTAs cooperating on one radix group
- * \param num_groups In/out: number of groups processed concurrently, clamped on return
- */
-inline cudaError_t RadixTopKClampGroupsToCoResidency(const void* kernel, uint32_t block_threads,
-                                                     size_t dyn_smem_bytes, int num_sms,
-                                                     uint32_t ctas_per_group,
-                                                     uint32_t* num_groups) {
-  int max_blocks_per_sm = 0;
-  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &max_blocks_per_sm, kernel, block_threads, dyn_smem_bytes));
-  const uint32_t max_coresident_ctas =
-      static_cast<uint32_t>(max_blocks_per_sm) * static_cast<uint32_t>(num_sms);
-  if (ctas_per_group > max_coresident_ctas) {
-    // Not even a single group can be fully co-resident: the software barrier would spin
-    // forever. Fail loudly instead of deadlocking the stream.
-    return cudaErrorCooperativeLaunchTooLarge;
-  }
-  *num_groups = std::min(*num_groups, max_coresident_ctas / ctas_per_group);
-  return cudaSuccess;
-}
-
-/*!
- * \brief Launch a multi-CTA radix top-k kernel with gang scheduling when available.
- *
- * A regular launch provides no co-residency guarantee: when concurrent kernels (other
- * streams or processes) hold enough SMs, a radix group can become only partially resident
- * and its resident CTAs spin forever in the software barrier. This manifested as permanent
- * sampler stream hangs on SM120/SM121 (issue #3610), where two concurrently running
- * multi-CTA kernels can starve each other indefinitely. cudaLaunchCooperativeKernel makes
- * the hardware gang-schedule the grid: no CTA starts executing until all of them can be
- * resident, so partial residency (and thus the deadlock) is impossible by construction.
- * During stream capture cooperative launches are not universally supported, so the regular
- * launch is kept there to preserve existing CUDA-graph behavior.
- */
-inline cudaError_t LaunchRadixTopKMultiCTAKernel(const void* kernel, dim3 nblks, dim3 nthrs,
-                                                 void** args, size_t smem_size,
-                                                 cudaStream_t stream) {
-  // Device attributes are static; cache the cooperative-launch capability per device to
-  // avoid per-launch attribute queries on hot inference paths. cudaStreamIsCapturing stays
-  // per-call (capture state is dynamic).
-  static std::array<std::atomic<int>, 64> coop_launch_cache = {};  // -1 unknown, 0 no, 1 yes
-  int device = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
-  int supports_coop_launch = 0;
-  if (device >= 0 && device < static_cast<int>(coop_launch_cache.size())) {
-    int cached = coop_launch_cache[device].load(std::memory_order_relaxed);
-    if (cached == 0) {  // zero-initialized: not yet queried (stores are 1/2)
-      FLASHINFER_CUDA_CALL(
-          cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, device));
-      coop_launch_cache[device].store(supports_coop_launch ? 2 : 1, std::memory_order_relaxed);
-    } else {
-      supports_coop_launch = (cached == 2);
-    }
-  } else {
-    FLASHINFER_CUDA_CALL(
-        cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, device));
-  }
-  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-  FLASHINFER_CUDA_CALL(cudaStreamIsCapturing(stream, &capture_status));
-  if (supports_coop_launch && capture_status == cudaStreamCaptureStatusNone) {
-    return cudaLaunchCooperativeKernel(kernel, nblks, nthrs, args, smem_size, stream);
-  }
-  return cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream);
-}
-
 // ==================== Common Device Functions for Radix Top-K ====================
 /*!
  * \brief Software barrier across all CTAs in the same radix group.
@@ -1658,16 +1580,11 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
           RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(
-          (const void*)kernel, BLOCK_THREADS, smem_size, num_sms, ctas_per_group, &num_groups));
-      total_ctas = num_groups * ctas_per_group;
-
       dim3 nblks(total_ctas);
       dim3 nthrs(BLOCK_THREADS);
       void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
                       &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args,
-                                                         smem_size, stream));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }
   });
 
@@ -1982,16 +1899,11 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
           RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(
-          (const void*)kernel, BLOCK_THREADS, smem_size, num_sms, ctas_per_group, &num_groups));
-      total_ctas = num_groups * ctas_per_group;
-
       dim3 nblks(total_ctas);
       dim3 nthrs(BLOCK_THREADS);
       void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
                       &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args,
-                                                         smem_size, stream));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }
   });
 
@@ -2083,19 +1995,7 @@ cudaError_t RadixTopKPageTableTransformMultiCTA(DType* input, IdType* output_pag
                                           RadixTopKMode::PageTableTransform, DType, IdType>;      \
     FLASHINFER_CUDA_CALL(                                                                         \
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));    \
-    if (!(SINGLE_CTA_FLAG)) {                                                                     \
-      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(                                     \
-          (const void*)kernel, THREADS, smem_size, num_sms, ctas_per_group, &num_groups));        \
-      total_ctas = num_groups * ctas_per_group;                                                   \
-      nblks.x = total_ctas;                                                                       \
-      det_scratch_buffer = MaybeGetRadixDeterministicCollectScratchBuffer(                        \
-          row_states_buffer, num_groups, single_cta, deterministic);                              \
-      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args, \
-                                                         smem_size, stream));                     \
-    } else {                                                                                      \
-      FLASHINFER_CUDA_CALL(                                                                       \
-          cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));                \
-    }                                                                                             \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream)); \
   } while (0)
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
@@ -2202,19 +2102,7 @@ cudaError_t RadixTopKRaggedTransformMultiCTA(DType* input, IdType* output_indice
                                           RadixTopKMode::RaggedTransform, DType, IdType>;         \
     FLASHINFER_CUDA_CALL(                                                                         \
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));    \
-    if (!(SINGLE_CTA_FLAG)) {                                                                     \
-      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(                                     \
-          (const void*)kernel, THREADS, smem_size, num_sms, ctas_per_group, &num_groups));        \
-      total_ctas = num_groups * ctas_per_group;                                                   \
-      nblks.x = total_ctas;                                                                       \
-      det_scratch_buffer = MaybeGetRadixDeterministicCollectScratchBuffer(                        \
-          row_states_buffer, num_groups, single_cta, deterministic);                              \
-      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args, \
-                                                         smem_size, stream));                     \
-    } else {                                                                                      \
-      FLASHINFER_CUDA_CALL(                                                                       \
-          cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));                \
-    }                                                                                             \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream)); \
   } while (0)
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
@@ -2323,19 +2211,7 @@ cudaError_t RadixTopKMultiCTA(DType* input, IdType* output_indices, DType* outpu
                                           RadixTopKMode::Basic, DType, IdType>;                   \
     FLASHINFER_CUDA_CALL(                                                                         \
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));    \
-    if (!(SINGLE_CTA_FLAG)) {                                                                     \
-      FLASHINFER_CUDA_CALL(RadixTopKClampGroupsToCoResidency(                                     \
-          (const void*)kernel, THREADS, smem_size, num_sms, ctas_per_group, &num_groups));        \
-      total_ctas = num_groups * ctas_per_group;                                                   \
-      nblks.x = total_ctas;                                                                       \
-      det_scratch_buffer = MaybeGetRadixDeterministicCollectScratchBuffer(                        \
-          row_states_buffer, num_groups, single_cta, deterministic);                              \
-      FLASHINFER_CUDA_CALL(LaunchRadixTopKMultiCTAKernel((const void*)kernel, nblks, nthrs, args, \
-                                                         smem_size, stream));                     \
-    } else {                                                                                      \
-      FLASHINFER_CUDA_CALL(                                                                       \
-          cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));                \
-    }                                                                                             \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream)); \
   } while (0)
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
