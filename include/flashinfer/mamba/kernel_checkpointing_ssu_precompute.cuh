@@ -112,32 +112,38 @@ struct CheckpointingSsuPrecomputeStorage {
 };
 
 // -----------------------------------------------------------------------------
-// Load this group's C and B (conv1d outputs) into the swizzled smem.C / smem.B
-// via cp.async — gmem→smem direct, no register footprint for the ~4 KB tiles.
-// C is the A-operand of BOTH the new-token MMA (W0/1, compute_cb_2warp) and the
-// old-token MMA (W2/3, compute_cb_old_2warp on the no-write path), so it is
-// loaded by ALL warps (each warp's own cp.async — no cross-warp sync before the
-// MMA — idempotent same-payload writes, exactly like load_post_pdl_wait_data,
-// common.cuh:671).  B (new) is only read by W0/1, so only they load it.  Caller
-// must have gdc_wait'd first (B/C are conv1d outputs).
+// Load this group's C (conv1d output) into the swizzled smem.C via cp.async —
+// gmem→smem direct, no register footprint for the ~4 KB tile.  C is the A-operand
+// of BOTH the new-token MMA (W0/1, compute_cb_2warp) and the old-token MMA (W2/3,
+// compute_cb_old_2warp on the no-write path), so it is loaded by ALL warps (each
+// warp's own cp.async — no cross-warp sync before the MMA — idempotent same-payload
+// writes, exactly like load_post_pdl_wait_data, common.cuh:671).
+// Committed, NOT drained here — the caller waits ONCE before the CB matmul so C/B
+// overlap old_B (load_old_B) in flight instead of serializing.  Caller must have
+// gdc_wait'd first (C is a conv1d output).
 template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
-__device__ __forceinline__ void load_group_BC(SmemT& smem, CheckpointingSsuParams const& params,
-                                              int warp, int lane, int group_idx, int64_t outer,
-                                              int seq_len) {
-  auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
+__device__ __forceinline__ void load_C(SmemT& smem, CheckpointingSsuParams const& params, int lane,
+                                       int group_idx, int64_t outer, int seq_len) {
   auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
-  int64_t const B_base = outer * params.B_stride_seq + (int64_t)group_idx * DSTATE;
   int64_t const C_base = outer * params.C_stride_seq + (int64_t)group_idx * DSTATE;
   using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
-  using BShape = cute::Shape<cute::Int<SmemT::NPREDICTED_PAD_MMA_N>, cute::Int<DSTATE>>;
   load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane, seq_len);
-  if (warp < 2) {
-    load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_token, lane,
-                                        seq_len);
-  }
   __pipeline_commit();
-  __pipeline_wait_prior(0);
-  __syncwarp();
+}
+
+// -----------------------------------------------------------------------------
+// Load this group's B (conv1d output) into the swizzled smem.B via cp.async.  B
+// (new) is the N-operand of the new-token MMA, only read by W0/1 — so only they
+// call this (the caller gates on warp < 2, the same warps that store_old_B).
+// Committed, NOT drained here (see load_C).  Caller must have gdc_wait'd first.
+template <typename input_t, int NPREDICTED, int DSTATE, typename SmemT>
+__device__ __forceinline__ void load_B(SmemT& smem, CheckpointingSsuParams const& params, int lane,
+                                       int group_idx, int64_t outer, int seq_len) {
+  auto const* __restrict__ B_ptr = reinterpret_cast<input_t const*>(params.B);
+  int64_t const B_base = outer * params.B_stride_seq + (int64_t)group_idx * DSTATE;
+  using BShape = cute::Shape<cute::Int<SmemT::NPREDICTED_PAD_MMA_N>, cute::Int<DSTATE>>;
+  load_tile_async<BShape, NPREDICTED>(smem.B, B_ptr + B_base, params.B_stride_token, lane, seq_len);
+  __pipeline_commit();
 }
 
 // Load this group's OLD B (cache, the buffered input-proj) into swizzled
@@ -156,9 +162,7 @@ __device__ __forceinline__ void load_old_B(SmemT& smem, CheckpointingSsuParams c
   using OldBShape = cute::Shape<cute::Int<SmemT::MAX_WINDOW_PAD_MMA_K>, cute::Int<DSTATE>>;
   load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, oldB_ptr + base, params.old_B_stride_token,
                                          lane, prev_k);
-  __pipeline_commit();
-  __pipeline_wait_prior(0);
-  __syncwarp();
+  __pipeline_commit();  // NOT drained here — see load_C/load_B; caller drains once before the MMA.
 }
 
 // -----------------------------------------------------------------------------
@@ -430,6 +434,18 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
+  // ── INTERNAL PDL (precompute → main): UNCONDITIONAL — the split's mechanism,
+  // not gated by ENABLE_PDL.  Fired FIRST (Triton fires gdc_launch_dependents at
+  // the top of its precompute, replay_selective_state_update.py:971).
+  // launch_dependents is a launch-eligibility hint, NOT a memory release: the
+  // main's own gdc_wait blocks until THIS grid fully completes + its stores are
+  // visible, so cb_scaled / cumAdt_vec / cb_old are always seen regardless of
+  // where we fire this.  Firing it early lets the main's (precompute-independent)
+  // state replay run concurrently with our conv1d wait + CB matmul — the whole
+  // point of the split.  The main is launched with the programmatic attr
+  // unconditionally (launch_checkpointing_ssu.cuh), so this always pairs.
+  cudaTriggerProgrammaticLaunchCompletion();  // main may co-launch now
+
   // ── Grid (batch, ngroups, head_tiles) ──
   int const seq = blockIdx.x;
   int const group_idx = blockIdx.y;
@@ -464,25 +480,13 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
   int const write_offset = must_checkpoint ? 0 : prev_k;
 
-  // ── INTERNAL PDL (precompute → main): UNCONDITIONAL — the split's mechanism,
-  // not gated by ENABLE_PDL.  Fired FIRST (Triton fires gdc_launch_dependents at
-  // the top of its precompute, replay_selective_state_update.py:971).
-  // launch_dependents is a launch-eligibility hint, NOT a memory release: the
-  // main's own gdc_wait blocks until THIS grid fully completes + its stores are
-  // visible, so cb_scaled / cumAdt_vec / cb_old are always seen regardless of
-  // where we fire this.  Firing it early lets the main's (precompute-independent)
-  // state replay run concurrently with our conv1d wait + CB matmul — the whole
-  // point of the split.  The main is launched with the programmatic attr
-  // unconditionally (launch_checkpointing_ssu.cuh), so this always pairs.
-  cudaTriggerProgrammaticLaunchCompletion();  // main may co-launch now
-
   // ── PHASE 1: load ALL heads' scalar coefficients into per-head smem, ALL 128
   // threads (dt + dt_bias + A always; old_dt / old_cumAdt on the no-write path).
   // Batching every head's LDGs lets the global-load latency OVERLAP; PHASE 2 then
   // does ZERO gmem loads.  bias + softplus deferred to PHASE 2 (smem).  These are
   // conv1d-INDEPENDENT (only B/C are conv1d outputs), so WHERE this runs is a free
   // choice — gated below: ENABLE_PDL (cliff) runs it BEFORE gdc_wait to fill the
-  // conv1d wait; standalone runs it AFTER load_group_BC to overlap the B/C cp.async
+  // conv1d wait; standalone runs it AFTER load_C/load_B to overlap the B/C cp.async
   // (hoisting it pre-wait standalone exposes the latency — ~1 us regress at big mtp).
   auto load_phase1_coeffs = [&]() {
     auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
@@ -538,39 +542,53 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
     }
   };
 
-  // ── EXTERNAL PDL (conv1d → precompute): gated by ENABLE_PDL — conv1d produces B/C,
-  // so wait before load_group_BC.  PHASE 1 (conv1d-independent) runs HERE, before the
-  // wait, so its LDGs fill the conv1d wait window.  No-op without a programmatic conv1d.
-  if constexpr (ENABLE_PDL) {
-    load_phase1_coeffs();
-    cudaGridDependencySynchronize();
-  }
-
-  // ── Load this group's C, B (conv1d outputs) into swizzled smem (cp.async) ──
-  load_group_BC<input_t, NPREDICTED, DSTATE>(smem, params, warp, lane, group_idx, outer, seq_len);
-  // NO-WRITE only: W2/3 also load this group's old B (cache) for the C6 MMA.
-  // must_checkpoint is uniform per CTA, so this branch is divergence-free.
+  // ── old_B (cache, conv1d-INDEPENDENT cp.async): hoisted BEFORE gdc_wait so it
+  // overlaps the conv1d wait (cliff) / the B/C cp.async (standalone) — old_B is the
+  // buffered cache, NOT a conv1d output.  The cp.async stays in flight across the
+  // grid-dep sync; the single drain below completes it.  NO-WRITE + W2/3 (the C6-MMA
+  // warps); must_checkpoint is uniform per CTA. ──
   if (!must_checkpoint && warp >= 2) {
     load_old_B<input_t, MAX_WINDOW, DSTATE>(smem, params, lane, cache_slot, buf_read, group_idx,
                                             prev_k);
   }
 
-  // ── old_B cache writeback (per-group, D-independent) ──
-  // The new B tokens become the buffered "old" for the next step's replay /
-  // CB_old.  Only the precompute holds smem.B (the main reads cb_scaled and
-  // never loads B), so it owns this writeback.  W0/1 hold smem.B; fires before
-  // the CB MMA so the STG overlaps it (hoisted exactly like the monolithic).
-  // store_old_B self-gates on head % HEADS_PER_GROUP — first_head qualifies.
+  // ── EXTERNAL PDL (conv1d → precompute): gated by ENABLE_PDL — conv1d produces B/C,
+  // so wait before load_C/load_B.  PHASE 1 (conv1d-independent) runs HERE too, before
+  // the wait, so its LDGs fill the conv1d wait window.  No-op without programmatic conv1d.
+  if constexpr (ENABLE_PDL) {
+    load_phase1_coeffs();
+    cudaGridDependencySynchronize();
+  }
+
+  // ── Load this group's C (all warps) + B (W0/1 only — the new-token N-operand,
+  // read only by the C·B warps) into swizzled smem (cp.async). ──
+  load_C<input_t, NPREDICTED, DSTATE>(smem, params, lane, group_idx, outer, seq_len);
+  if (warp < 2) {
+    load_B<input_t, NPREDICTED, DSTATE>(smem, params, lane, group_idx, outer, seq_len);
+  }
+
+  // Standalone (!ENABLE_PDL): no conv1d wait to hide behind, so run PHASE 1 HERE to
+  // overlap the B/C + old_B cp.async issued above instead of exposing its LDG latency.
+  if constexpr (!ENABLE_PDL) {
+    load_phase1_coeffs();
+  }
+
+  // ── Drain ALL cp.async ONCE (C/B from load_C/load_B + old_B from load_old_B) BEFORE
+  // any consumer — the helpers only commit, so the loads overlap in flight rather than
+  // each draining its own group (which serialized B/C → old_B).  MUST precede
+  // store_old_B (reads smem.B) AND the CB matmul (reads smem.B/C/old_B).  __syncwarp
+  // publishes them within each warp (loads are redundant per-warp). ──
+  __pipeline_wait_prior(0);
+  __syncwarp();
+
+  // ── old_B cache writeback (per-group, D-independent): the new B tokens become the
+  // buffered "old" for the next step.  Reads the now-drained smem.B.  W0/1 hold smem.B;
+  // the precompute owns this writeback (the main reads cb_scaled, never loads B).
+  // store_old_B self-gates on head % HEADS_PER_GROUP — first_head qualifies. ──
   if (warp < 2) {
     store_old_B<input_t, NPREDICTED, DSTATE, HEADS_PER_GROUP>(smem, params, warp, lane, first_head,
                                                               group_idx, cache_slot, buf_write,
                                                               write_offset, seq_len);
-  }
-
-  // Standalone (!ENABLE_PDL): no conv1d wait to hide behind, so run PHASE 1 HERE to
-  // overlap the B/C cp.async issued above instead of exposing its latency pre-wait.
-  if constexpr (!ENABLE_PDL) {
-    load_phase1_coeffs();
   }
 
   // ── Raw matmul-1 — ONCE per group, all 4 warps (no-write).  W0/1 → C·B (C5) →
