@@ -1,9 +1,12 @@
 import pytest
 import torch
 
-from flashinfer import mxfp8_quantize, SfLayout
+from flashinfer import mxfp8_grouped_quantize, mxfp8_quantize, SfLayout
 from flashinfer.utils import get_compute_capability
-from tests.utils_fp8 import assert_mxfp8_quantize_exact as _assert_mxfp8_quantize_exact
+from tests.utils_fp8 import (
+    assert_mxfp8_quantize_exact as _assert_mxfp8_quantize_exact,
+    mxfp8_quantize_reference,
+)
 
 
 def is_cute_dsl_available():
@@ -14,6 +17,31 @@ def is_cute_dsl_available():
         return _is_available()
     except ImportError:
         return False
+
+
+def is_cutile_available():
+    """Check if the cuTile backend is available for grouped MXFP8 quantization."""
+    try:
+        from flashinfer.cutile import is_cuda_tile_available
+
+        return is_cuda_tile_available()
+    except ImportError:
+        return False
+
+
+def _unswizzle_mxfp8_scales_128x4(
+    sf: torch.Tensor,
+    row: int,
+    col: int,
+) -> torch.Tensor:
+    scale_vec_size = 32
+    factor = scale_vec_size * 4
+    num_m_tiles = (row + 128 - 1) // 128
+    num_k_tiles = (col + factor - 1) // factor
+    sf_reshaped = sf.view(num_m_tiles, num_k_tiles, 32, 4, 4)
+    sf_unswizzled = sf_reshaped.transpose(1, 3)
+    sf_unswizzled = sf_unswizzled.reshape(num_m_tiles * 32 * 4, num_k_tiles * 4)
+    return sf_unswizzled[:row, : (col // scale_vec_size)].contiguous()
 
 
 @pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
@@ -53,6 +81,281 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
 
     if device == "cuda":
         torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("batch_shape", [(1, 120, 64), (2, 128, 128), (3, 256, 160)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize(batch_shape, dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+
+    torch.manual_seed(0)
+    b, m, k = batch_shape
+    x = (torch.randn(batch_shape, dtype=torch.float32, device="cuda") * 16).to(dtype)
+    x = x.contiguous()
+    mask = torch.randint(low=1, high=m + 1, size=(b,), dtype=torch.int32, device="cuda")
+
+    out, out_scale = mxfp8_grouped_quantize(x, mask)
+    out = out.permute(2, 0, 1)
+    out_scale = out_scale.permute(5, 2, 4, 0, 1, 3)
+
+    padded_m = (m + 127) // 128 * 128
+    padded_k = (k + 127) // 128 * 128
+    assert out.shape == (b, m, padded_k)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out_scale.shape == (b, padded_m // 128, padded_k // 128, 32, 4, 4)
+    assert out_scale.dtype == torch.uint8
+
+    for i in range(b):
+        mask_i = int(mask[i].item())
+        single_out, single_scale = mxfp8_quantize_reference(
+            x[i],
+            alignment=128,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+        torch.testing.assert_close(
+            out[i, :mask_i].contiguous().view(torch.uint8),
+            single_out[:mask_i].contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+        scale_ref = _unswizzle_mxfp8_scales_128x4(single_scale, m, padded_k)
+        scale_ans = _unswizzle_mxfp8_scales_128x4(out_scale[i], m, padded_k)
+        torch.testing.assert_close(
+            scale_ans[:mask_i],
+            scale_ref[:mask_i],
+            rtol=0,
+            atol=0,
+        )
+
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_empty_group(dtype):
+    """A zero-token group (mask=0) must not corrupt its non-empty neighbors."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+
+    torch.manual_seed(0)
+    b, m, k = 4, 160, 256
+    x = (torch.randn((b, m, k), dtype=torch.float32, device="cuda") * 16).to(dtype)
+    x = x.contiguous()
+    # Groups 0 and 2 are empty; groups 1 and 3 are full.
+    mask = torch.tensor([0, m, 0, m], dtype=torch.int32, device="cuda")
+
+    # Must not raise even with empty groups interleaved.
+    out, out_scale = mxfp8_grouped_quantize(x, mask)
+    out = out.permute(2, 0, 1)
+    out_scale = out_scale.permute(5, 2, 4, 0, 1, 3)
+
+    padded_m = (m + 127) // 128 * 128
+    padded_k = (k + 127) // 128 * 128
+    assert out.shape == (b, m, padded_k)
+    assert out_scale.shape == (b, padded_m // 128, padded_k // 128, 32, 4, 4)
+
+    for i in range(b):
+        mask_i = int(mask[i].item())
+        if mask_i == 0:
+            continue
+        single_out, single_scale = mxfp8_quantize_reference(
+            x[i],
+            alignment=128,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+        torch.testing.assert_close(
+            out[i, :mask_i].contiguous().view(torch.uint8),
+            single_out[:mask_i].contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        scale_ref = _unswizzle_mxfp8_scales_128x4(single_scale, m, padded_k)
+        scale_ans = _unswizzle_mxfp8_scales_128x4(out_scale[i], m, padded_k)
+        torch.testing.assert_close(
+            scale_ans[:mask_i],
+            scale_ref[:mask_i],
+            rtol=0,
+            atol=0,
+        )
+
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("batch_shape", [(2, 128, 256), (3, 256, 128)])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_cuda_graph(batch_shape):
+    """Grouped MXFP8 quantize must be CUDA-graph capturable and replay correctly."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+
+    torch.manual_seed(0)
+    b, m, k = batch_shape
+    x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
+    mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
+
+    # Eager warmup: populates the persistent-prefix buffer cache (allocating it
+    # mid-capture is rejected) and triggers the cuTile JIT compile.
+    out_eager, sf_eager = mxfp8_grouped_quantize(x, mask)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out_g, sf_g = mxfp8_grouped_quantize(x, mask)
+
+    g.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        out_g.contiguous().view(torch.uint8),
+        out_eager.contiguous().view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(sf_g, sf_eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch_shape", [(2, 256, 512), (3, 200, 160), (4, 128, 2048)])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_matches_gemm_sfa_layout(batch_shape):
+    """Contract test for the grouped MXFP8 quantizer -> masked grouped GEMM seam.
+
+    ``grouped_gemm_nt_masked`` consumes ``(A, SFA)`` in a specific physical
+    layout (``A`` logical ``(m, k, l)`` / physical ``(l, m, k)``; ``SFA``
+    logical ``(m32, m4, rm, k4, rk, l)`` / physical ``(l, rm, rk, m32, m4, k4)``).
+    This test asserts that ``mxfp8_grouped_quantize`` emits the same layout.
+
+    The oracle is the GEMM module's canonical scale builder
+    ``create_scale_factor_tensor``, so a failure points unambiguously at the
+    quantizer's output format rather than GEMM math. The per-element swizzle
+    values are covered separately by ``test_mxfp8_grouped_quantize``.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available")
+
+    from flashinfer.cute_dsl.utils import get_cutlass_dtype
+    from flashinfer.gemm import create_scale_factor_tensor
+
+    torch.manual_seed(0)
+    b, m, k = batch_shape
+    sf_vec_size = 32
+    device = torch.device("cuda:0")
+
+    x = torch.randn(batch_shape, dtype=torch.bfloat16, device=device)
+    mask = torch.full((b,), m, dtype=torch.int32, device=device)
+
+    out, sf = mxfp8_grouped_quantize(x, mask)
+
+    # Activation contract: A is logical (m, padded_k, l), physical (l, m, padded_k),
+    # i.e. K-contiguous, matching grouped_gemm_nt_masked's a_major="k".
+    padded_k = (k + 127) // 128 * 128
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.shape == (m, padded_k, b)
+    assert out.stride() == (padded_k, 1, m * padded_k)
+
+    # Scale contract: match the GEMM's own canonical SFA tensor for the same
+    # (l, m, k, sf_vec_size). The batch/group dimension l maps to b.
+    _, _, sfa_oracle = create_scale_factor_tensor(
+        b, m, k, sf_vec_size, get_cutlass_dtype("float8_e8m0fnu"), device
+    )
+    assert sf.shape == tuple(sfa_oracle.shape)
+    assert sf.stride() == tuple(sfa_oracle.stride())
+    # E8M0 scales are byte-sized: the quantizer stores them as uint8 while the
+    # GEMM types them as float8_e8m0fnu, so only the element size is compared.
+    # The call site reinterprets uint8 <-> float8_e8m0fnu via a dtype view.
+    assert sf.element_size() == sfa_oracle.element_size()
+
+
+@pytest.mark.parametrize(
+    "batch_shape", [(1, 120, 64), (2, 128, 128), (3, 256, 160), (4, 200, 2048)]
+)
+def test_mxfp8_grouped_quantize_fake_op_metadata(batch_shape):
+    """Portable metadata check for the grouped MXFP8 fake (meta) op.
+
+    The fake op only allocates empty tensors and applies the layout
+    permutes, so it runs on the meta device and needs no GPU, cuTile, or
+    SM100. This validates the metadata contract independently of the kernel.
+    """
+    from flashinfer.quantization.fp8_quantization import (
+        get_mxfp8_grouped_quantization_module,
+    )
+
+    fake_op = get_mxfp8_grouped_quantization_module()._fake_mxfp8_grouped_quantize
+
+    b, m, k = batch_shape
+    a = torch.empty((b, m, k), dtype=torch.bfloat16, device="meta")
+    mask = torch.empty((b,), dtype=torch.int32, device="meta")
+
+    out, sf = fake_op(a, mask)
+
+    padded_k = (k + 127) // 128 * 128
+    padded_m = (m + 127) // 128 * 128
+    assert out.shape == (m, padded_k, b)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.stride() == (padded_k, 1, m * padded_k)
+    assert sf.shape == (32, 4, padded_m // 128, 4, padded_k // 128, b)
+    assert sf.dtype == torch.uint8
+
+
+@pytest.mark.parametrize("batch_shape", [(2, 128, 128), (3, 256, 160)])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_fake_op_matches_real(batch_shape):
+    """The fake op's output metadata must match the real op's (drift guard).
+
+    This test pins the meta kernel to the cuTile kernel:
+    a failure means the two have diverged in shape/dtype/stride.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+
+    from flashinfer.quantization.fp8_quantization import (
+        get_mxfp8_grouped_quantization_module,
+    )
+
+    torch.manual_seed(0)
+    b, m, k = batch_shape
+    x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
+    mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
+
+    module = get_mxfp8_grouped_quantization_module()
+    out_real, sf_real = module.mxfp8_grouped_quantize_impl(x, mask)
+    out_fake, sf_fake = module._fake_mxfp8_grouped_quantize(x, mask)
+
+    assert out_fake.shape == out_real.shape
+    assert out_fake.dtype == out_real.dtype
+    assert out_fake.stride() == out_real.stride()
+    assert sf_fake.shape == sf_real.shape
+    assert sf_fake.dtype == sf_real.dtype
+    assert sf_fake.stride() == sf_real.stride()
 
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])

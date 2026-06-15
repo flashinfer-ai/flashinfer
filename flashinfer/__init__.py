@@ -77,7 +77,11 @@ from .quantization.fp4_quantization import (
     nvfp4_kv_dequantize,
     nvfp4_kv_quantize,
 )
-from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .quantization.fp8_quantization import (
+    mxfp8_dequantize_host,
+    mxfp8_grouped_quantize,
+    mxfp8_quantize,
+)
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
