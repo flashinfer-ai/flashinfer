@@ -2212,7 +2212,7 @@ class TestAllValidTactics:
             tensors["w2_weight_sf"],
             tensors["w2_alpha"],
         ]
-        valid_tactics = moe._get_runner(False).get_valid_tactics(inputs, None)
+        valid_tactics = moe._runner.get_valid_tactics(inputs, None)
         assert len(valid_tactics) > 0, "No valid tactics found"
 
         num_passed = 0

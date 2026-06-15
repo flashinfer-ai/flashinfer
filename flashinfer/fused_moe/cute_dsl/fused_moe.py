@@ -512,29 +512,35 @@ class CuteDslMoEWrapper:
                 )
             return wrapper._forward_with_tactic(*args, **kwargs)
 
-        self._runners = {
-            use_per_token_activation: CuteDslFusedMoENvfp4Runner(
-                forward_impl=_forward_with_tactic_weak,
-                num_experts=num_experts,
-                top_k=top_k,
-                num_local_experts=self.num_local_experts,
-                local_expert_offset=local_expert_offset,
-                use_fused_finalize=True,
-                output_dtype=output_dtype,
-                enable_pdl=enable_pdl,
-                activation=activation,
-                use_per_token_activation=use_per_token_activation,
-            )
-            for use_per_token_activation in (False, True)
-        }
+        self._runner = CuteDslFusedMoENvfp4Runner(
+            forward_impl=_forward_with_tactic_weak,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_fused_finalize=True,
+            output_dtype=output_dtype,
+            enable_pdl=enable_pdl,
+            activation=activation,
+            use_per_token_activation=False,
+        )
+        self._per_token_runner = CuteDslFusedMoENvfp4Runner(
+            forward_impl=_forward_with_tactic_weak,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=self.num_local_experts,
+            local_expert_offset=local_expert_offset,
+            use_fused_finalize=True,
+            output_dtype=output_dtype,
+            enable_pdl=enable_pdl,
+            activation=activation,
+            use_per_token_activation=True,
+        )
 
         if use_cuda_graph:
             self._aux_stream = torch.cuda.Stream(device=self.device)
             self._main_event = torch.cuda.Event()
             self._memset_event = torch.cuda.Event()
-
-    def _get_runner(self, use_per_token_activation: bool) -> CuteDslFusedMoENvfp4Runner:
-        return self._runners[use_per_token_activation]
 
     def _forward_with_tactic(
         self,
@@ -662,7 +668,7 @@ class CuteDslMoEWrapper:
         """
         num_tokens = token_selected_experts.size(0)
         use_per_token_activation = per_token_scale is not None
-        runner = self._get_runner(use_per_token_activation)
+        runner = self._per_token_runner if use_per_token_activation else self._runner
 
         moe_output = torch.empty(
             (num_tokens, self.hidden_size),
