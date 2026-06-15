@@ -171,7 +171,6 @@ def _moe_core_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -219,11 +218,6 @@ def _moe_core_impl(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
-        use_per_token_activation: Mirror TRTLLM explicit per-token activation
-            scaling: apply ``per_token_scale`` in the GEMM1/SwiGLU epilogue,
-            then quantize the GEMM1/SwiGLU output with the standalone
-            per-token NVFP4 CuTe-DSL quantizer before GEMM2.
-
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
@@ -231,16 +225,7 @@ def _moe_core_impl(
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
-
-    if use_per_token_activation:
-        if per_token_scale is None:
-            raise ValueError(
-                "per_token_scale is required when use_per_token_activation=True"
-            )
-    elif per_token_scale is not None:
-        raise ValueError(
-            "per_token_scale is only supported when use_per_token_activation=True"
-        )
+    use_per_token_activation = per_token_scale is not None
 
     # Allocate output if not provided.  The caller (wrapper or functional
     # API) should pass a [:num_tokens] slice of the pre-allocated buffer
@@ -480,7 +465,6 @@ class CuteDslMoEWrapper:
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-        use_per_token_activation: bool = False,
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -522,11 +506,6 @@ class CuteDslMoEWrapper:
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
-        use_per_token_activation : bool
-            Mirror TRTLLM's explicit per-token activation path: apply
-            ``per_token_scale`` in GEMM1/SwiGLU, then quantize the
-            GEMM1/SwiGLU output with the standalone per-token NVFP4 CuTe-DSL
-            quantizer before GEMM2. Defaults to ``False``.
         """
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
@@ -547,7 +526,6 @@ class CuteDslMoEWrapper:
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
-        self.use_per_token_activation = use_per_token_activation
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -567,29 +545,32 @@ class CuteDslMoEWrapper:
                 )
             return wrapper._forward_with_tactic(*args, **kwargs)
 
-        # Create auto-tuner runner. Use a weak trampoline instead of a bound
-        # method so the runner cannot keep CUDA graph resources alive after the
-        # wrapper drops out of scope.
-        self._runner = CuteDslFusedMoENvfp4Runner(
-            forward_impl=_forward_with_tactic_weak,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=self.num_local_experts,
-            local_expert_offset=local_expert_offset,
-            use_fused_finalize=True,
-            output_dtype=output_dtype,
-            enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            use_per_token_activation=use_per_token_activation,
-        )
+        self._runners = {
+            use_per_token_activation: CuteDslFusedMoENvfp4Runner(
+                forward_impl=_forward_with_tactic_weak,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=self.num_local_experts,
+                local_expert_offset=local_expert_offset,
+                use_fused_finalize=True,
+                output_dtype=output_dtype,
+                enable_pdl=enable_pdl,
+                activation_type=activation_type.value,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+                use_per_token_activation=use_per_token_activation,
+            )
+            for use_per_token_activation in (False, True)
+        }
 
         if use_cuda_graph:
             self._aux_stream = torch.cuda.Stream(device=self.device)
             self._main_event = torch.cuda.Event()
             self._memset_event = torch.cuda.Event()
+
+    def _get_runner(self, use_per_token_activation: bool) -> CuteDslFusedMoENvfp4Runner:
+        return self._runners[use_per_token_activation]
 
     def _forward_with_tactic(
         self,
@@ -657,7 +638,6 @@ class CuteDslMoEWrapper:
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
-            use_per_token_activation=self.use_per_token_activation,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -708,8 +688,8 @@ class CuteDslMoEWrapper:
         w2_alpha : torch.Tensor
             Per-expert global scale for GEMM2.
         per_token_scale : Optional[torch.Tensor]
-            Per-token input row scale for GEMM1. Required when the wrapper was
-            constructed with ``use_per_token_activation=True``.
+            Per-token input row scale for GEMM1. Passing this enables the
+            TRTLLM-style explicit per-token activation path.
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
@@ -720,15 +700,8 @@ class CuteDslMoEWrapper:
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         num_tokens = token_selected_experts.size(0)
-        if self.use_per_token_activation:
-            if per_token_scale is None:
-                raise ValueError(
-                    "per_token_scale is required when use_per_token_activation=True"
-                )
-        elif per_token_scale is not None:
-            raise ValueError(
-                "per_token_scale is only supported when use_per_token_activation=True"
-            )
+        use_per_token_activation = per_token_scale is not None
+        runner = self._get_runner(use_per_token_activation)
 
         moe_output = torch.empty(
             (num_tokens, self.hidden_size),
@@ -752,23 +725,23 @@ class CuteDslMoEWrapper:
             w2_weight_sf,
             w2_alpha,
         ]
-        if self.use_per_token_activation:
+        if use_per_token_activation:
             inputs.append(per_token_scale)
         inputs.append(moe_output)
 
         if tactic is not None:
             # Use provided tactic
-            return self._runner(inputs, tactic=tactic)
+            return runner(inputs, tactic=tactic)
 
         # Let tuner choose tactic
         _, best_tactic = tuner.choose_one(
             f"CuteDslMoEWrapper::run::{self.activation_type.name}",
-            [self._runner],
-            self._runner.tuning_config,
+            [runner],
+            runner.tuning_config,
             inputs,
         )
 
-        return self._runner(inputs, tactic=best_tactic)
+        return runner(inputs, tactic=best_tactic)
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
@@ -811,7 +784,6 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -845,7 +817,6 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
-        use_per_token_activation=use_per_token_activation,
     )
 
 
@@ -877,7 +848,6 @@ def cute_dsl_fused_moe_nvfp4(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -944,12 +914,6 @@ def cute_dsl_fused_moe_nvfp4(
         ``swiglu_alpha/beta/limit``.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
-    use_per_token_activation : bool
-        Mirror TRTLLM's explicit per-token activation path: apply
-        ``per_token_scale`` in GEMM1/SwiGLU, then quantize the GEMM1/SwiGLU
-        output with the standalone per-token NVFP4 CuTe-DSL quantizer before
-        GEMM2. Defaults to ``False``.
-
     Returns
     -------
     torch.Tensor
@@ -959,12 +923,7 @@ def cute_dsl_fused_moe_nvfp4(
 
     if num_local_experts is None:
         num_local_experts = num_experts
-    if per_token_scale is not None:
-        use_per_token_activation = True
-    elif use_per_token_activation:
-        raise ValueError(
-            "per_token_scale is required when use_per_token_activation=True"
-        )
+    use_per_token_activation = per_token_scale is not None
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
@@ -1017,14 +976,12 @@ def cute_dsl_fused_moe_nvfp4(
         runner.tuning_config,
         inputs,
         aux_stream=aux_stream,
-        use_per_token_activation=use_per_token_activation,
     )
 
     return runner(
         inputs,
         tactic=best_tactic,
         aux_stream=aux_stream,
-        use_per_token_activation=use_per_token_activation,
     )
 
 
