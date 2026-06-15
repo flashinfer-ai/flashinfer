@@ -1,0 +1,8 @@
+BUILD_NVEP=1 pip install -e ".[nvep]"
+pip install --no-deps 'nvidia-nccl-cu13>=2.30.4'
+BUILD_NCCL_EP_HERMETIC=1 pip install -e ".[nvep]"
+git submodule update --init --recursive 3rdparty/nccl
+CUDA_HOME=/usr/local/cuda pip install -e '3rdparty/nccl/bindings/nccl4py[cu13]'
+
+export BUILD_DIR=build_nvep/nccl
+make -C 3rdparty/nccl/contrib/nccl_ep   BUILDDIR="$(pwd)/build_nvep/nccl"   NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90"   _NCCL_EP_LSA_TEAM_SIZE_MIN=8   _NCCL_EP_LSA_TEAM_SIZE_MAX=8   _NCCL_EP_NUM_LSA_TEAMS_LIST="1"   lib -j"$(nproc)"
