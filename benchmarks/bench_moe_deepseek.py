@@ -222,9 +222,14 @@ def bench_cute_dsl(
     import contextlib
 
     from flashinfer.autotuner import autotune
+    from flashinfer import SfLayout, nvfp4_quantize
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.quantization.nvfp4_quantization_utils import (
+        current_nvfp4_4over6_config,
+        make_nvfp4_global_scale,
+    )
     from flashinfer.testing.utils import bench_gpu_time
 
     if num_local_experts is None:
@@ -236,8 +241,23 @@ def bench_cute_dsl(
     tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
     ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
-    xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
-    xs = xs.unsqueeze(-1)
+    if use_per_token_activation:
+        hidden_global_scale = make_nvfp4_global_scale(
+            inputs["hidden_bf16"],
+            per_token_activation=True,
+            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+        )
+        xf, xs, hidden_per_token_scale = nvfp4_quantize(
+            inputs["hidden_bf16"],
+            hidden_global_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
+        hidden_per_token_scale = None
+    xs = xs.view(torch.float8_e4m3fn).reshape(n, CFG.hidden_size // sv).unsqueeze(-1)
 
     # Expert range for this EP partition
     expert_start = local_expert_offset
@@ -310,6 +330,7 @@ def bench_cute_dsl(
                 w2_weight=w2q,
                 w2_weight_sf=w2s,
                 w2_alpha=alpha,
+                per_token_scale=hidden_per_token_scale,
             )
     else:
         # Use functional API
@@ -343,6 +364,7 @@ def bench_cute_dsl(
                 num_local_experts=num_local_experts,
                 local_expert_offset=local_expert_offset,
                 use_per_token_activation=use_per_token_activation,
+                per_token_scale=hidden_per_token_scale,
             )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation

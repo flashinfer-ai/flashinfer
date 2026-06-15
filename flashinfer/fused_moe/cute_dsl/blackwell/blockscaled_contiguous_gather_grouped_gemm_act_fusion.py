@@ -416,6 +416,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         gated: bool = True,
+        use_a_per_token_scale: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -471,6 +472,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
+        self.use_a_per_token_scale = use_a_per_token_scale
         self.topk = topk
         self.gated = gated
         self.out_n_factor = 2 if gated else 1
@@ -776,6 +778,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
+        a_per_token_scale: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -833,6 +836,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type num_non_exiting_tiles: cute.Tensor
         :param alpha: Alpha tensor for each group
         :type alpha: cute.Tensor
+        :param a_per_token_scale: Optional per-token row scale for operand A,
+            shape (orig_m,). Only used when use_a_per_token_scale is true.
+        :type a_per_token_scale: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
@@ -1107,6 +1113,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             token_id_mapping_tensor,
             num_non_exiting_tiles,
             alpha,
+            a_per_token_scale,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1193,6 +1200,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
+        a_per_token_scale: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2526,13 +2534,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
 
             # Get the first tile info
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
 
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
-            tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
-            tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
-            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+            for idx in cutlass.range(5, unroll_full=True):
+                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -2554,6 +2560,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                 expert_idx = mma_tile_coord_mnl[2]
                 alpha_val = alpha[expert_idx]
+                if cutlass.const_expr(self.use_a_per_token_scale):
+                    tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
+                    permuted_row = tile_m_start + epi_tidx
+                    if permuted_row < tile_info[4]:
+                        expanded_idx = token_id_mapping_tensor[permuted_row]
+                        token_idx = expanded_idx // self.topk
+                        alpha_val = alpha_val * a_per_token_scale[token_idx]
 
                 #
                 # Slice to per mma tile index
@@ -2984,10 +2997,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
-                tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
-                tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
-                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                for idx in cutlass.range(5, unroll_full=True):
+                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -3653,6 +3664,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: Optional[cute.Pointer],
+        a_per_token_scale_ptr: cute.Pointer,
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -3698,6 +3710,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             else None
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        a_per_token_scale = cute.make_tensor(
+            a_per_token_scale_ptr, layout=cute.make_layout((orig_m,))
+        )
 
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -3730,6 +3745,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             token_id_mapping,
             num_non_exiting_tiles,
             alpha,
+            a_per_token_scale,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
