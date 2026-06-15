@@ -355,9 +355,14 @@ def _read_mem_available_gb() -> Optional[int]:
     return None
 
 
+@functools.cache
 def _memory_aware_job_cap() -> Optional[int]:
     """A cap on parallel ninja jobs derived from available memory, or ``None``
     to leave ninja's default parallelism untouched.
+
+    Cached (and so computed/logged once per process): the cap is a function of
+    available memory and CPU count, which are effectively static for a run, and
+    ``_get_num_workers`` is called for every operator's JIT compile.
 
     When ``MAX_JOBS`` is unset, ninja runs roughly ``nproc + 2`` nvcc
     processes. Each CUTLASS / FP4 nvcc compile can peak at several GiB, so on

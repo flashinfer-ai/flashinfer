@@ -1,6 +1,18 @@
+import logging
 import subprocess
 
+import pytest
+
 from flashinfer.jit import core, cpp_ext
+
+
+@pytest.fixture(autouse=True)
+def _clear_job_cap_cache():
+    # _memory_aware_job_cap is @functools.cache'd; clear it so each test's
+    # monkeypatched memory/cpu values are recomputed.
+    cpp_ext._memory_aware_job_cap.cache_clear()
+    yield
+    cpp_ext._memory_aware_job_cap.cache_clear()
 
 
 def test_nvcc_parallelism_flags_use_flashinfer_nvcc_threads(monkeypatch):
@@ -186,3 +198,18 @@ def test_get_num_workers_none_when_meminfo_unavailable(monkeypatch):
     # Non-Linux / unreadable /proc/meminfo -> keep ninja's default parallelism.
     monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: None)
     assert cpp_ext._get_num_workers() is None
+
+
+def test_cap_warning_emitted_once_across_compiles(monkeypatch, caplog):
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    with caplog.at_level(logging.WARNING, logger="flashinfer.jit.cpp_ext"):
+        results = [cpp_ext._get_num_workers() for _ in range(5)]
+    # Every per-operator call returns the cap, but the warning is logged once.
+    assert results == [4, 4, 4, 4, 4]
+    cap_warnings = [
+        r for r in caplog.records if "Capping ninja parallelism" in r.getMessage()
+    ]
+    assert len(cap_warnings) == 1
