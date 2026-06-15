@@ -107,6 +107,46 @@ def quant_dequant_fp4_reference(
     return dequantized.float()
 
 
+def quant_dequant_fp4_per_token_reference(
+    tensor: torch.Tensor,
+    global_scale_inv: torch.Tensor,
+    sf_vec_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference per-token FP4 quantization for FC2 inputs.
+
+    Returns the dequantized tensor before applying the row scale, plus the
+    returned per-token scale. This mirrors the production MoE path where GEMM2
+    consumes the quantized activation and the finalize kernel applies the row
+    scale with the routing scale.
+    """
+    from flashinfer.quantization import (
+        SfLayout,
+        e2m1_and_ufp8sf_scale_to_float,
+        nvfp4_quantize,
+    )
+
+    tensor_bf16 = tensor.to(torch.bfloat16)
+    fp4_packed, sf, per_token_scale = nvfp4_quantize(
+        tensor_bf16,
+        global_scale_inv,
+        sfLayout=SfLayout.layout_linear,
+        sf_vec_size=sf_vec_size,
+        backend="cuda",
+        per_token_activation=True,
+    )
+
+    dequantized = e2m1_and_ufp8sf_scale_to_float(
+        fp4_packed.cpu(),
+        sf.view(torch.uint8).cpu(),
+        torch.ones(1, dtype=torch.float32),
+        sf_vec_size=sf_vec_size,
+        ufp8_type=1,
+        is_sf_swizzled_layout=False,
+    ).to(tensor.device)
+
+    return dequantized.float(), per_token_scale.to(tensor.device)
+
+
 def compute_reference_moe_fp4(
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
@@ -119,6 +159,7 @@ def compute_reference_moe_fp4(
     hidden_size: int,
     intermediate_size: int,
     fc2_input_scale: torch.Tensor = None,
+    use_per_token_activation: bool = False,
     num_local_experts: int = None,
     local_expert_offset: int = 0,
     gated: bool = True,
@@ -174,6 +215,7 @@ def compute_reference_moe_fp4(
             w1 = gemm1_weights[local_idx]
             gemm1_out = token_input @ w1.T
 
+            per_token_scale = None
             if gated:
                 linear = gemm1_out[:, :intermediate_size]
                 gate = gemm1_out[:, intermediate_size:]
@@ -182,14 +224,22 @@ def compute_reference_moe_fp4(
                 act_out = torch.relu(gemm1_out) ** 2
 
             if fc2_input_scale is not None:
-                act_out = quant_dequant_fp4_reference(
-                    act_out, fc2_input_scale, sf_vec_size=16
-                )
+                if use_per_token_activation:
+                    act_out, per_token_scale = quant_dequant_fp4_per_token_reference(
+                        act_out, fc2_input_scale, sf_vec_size=16
+                    )
+                else:
+                    act_out = quant_dequant_fp4_reference(
+                        act_out, fc2_input_scale, sf_vec_size=16
+                    )
 
             w2 = gemm2_weights[local_idx]
             gemm2_out = act_out @ w2.T
 
-            output[token_idx] += scale * gemm2_out.squeeze(0)
+            output_scale = scale
+            if per_token_scale is not None:
+                output_scale = output_scale * per_token_scale[0]
+            output[token_idx] += output_scale * gemm2_out.squeeze(0)
 
     return output
 
@@ -556,6 +606,126 @@ class TestInputsHelperContract:
             "torch.random.fork_rng + manual_seed pattern in "
             "generate_token_selected_experts is broken."
         )
+
+
+@cute_dsl_available
+class TestPerTokenFc2QuantControlFlow:
+    """Structural coverage for the CuTe DSL MoE per-token FC2-input path.
+
+    The numerical kernels require a Blackwell GPU, but the Python orchestration
+    is cheap to validate with monkeypatched kernel launches. This catches
+    regressions where per-token mode accidentally keeps the fused GEMM1 FP4
+    epilogue path alive or drops the returned row scale before GEMM2 finalize.
+    """
+
+    def test_per_token_fc2_input_quant_uses_standalone_quantizer(self, monkeypatch):
+        from flashinfer.fused_moe.cute_dsl import fused_moe as fused_moe_module
+
+        token_selected_experts = torch.zeros(2, 1, dtype=torch.int32)
+        token_final_scales = torch.ones(2, 1, dtype=torch.float32)
+        x = torch.zeros(2, 8, dtype=torch.uint8)
+        x_sf = torch.zeros(2, 1, dtype=torch.uint8)
+        w1_weight = torch.zeros(1, 32, 8, dtype=torch.uint8)
+        w1_weight_sf = torch.zeros(32, 4, 1, 4, 1, 1, dtype=torch.uint8)
+        w1_alpha = torch.ones(1, dtype=torch.float32)
+        fc2_input_scale = torch.ones(1, dtype=torch.float32)
+        w2_weight = torch.zeros(1, 16, 8, dtype=torch.uint8)
+        w2_weight_sf = torch.zeros(32, 4, 1, 4, 1, 1, dtype=torch.uint8)
+        w2_alpha = torch.ones(1, dtype=torch.float32)
+
+        tile_idx_to_expert_idx = torch.zeros(1, dtype=torch.int32)
+        tile_idx_to_mn_limit = torch.full((1,), 2, dtype=torch.int32)
+        expanded_idx_to_permuted_idx = torch.arange(2, dtype=torch.int32)
+        permuted_idx_to_expanded_idx = torch.arange(2, dtype=torch.int32)
+        total_num_padded_tokens = torch.tensor([128], dtype=torch.int32)
+        num_non_exiting_tiles = torch.ones(1, dtype=torch.int32)
+
+        def fake_moe_sort(**kwargs):
+            return (
+                tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx,
+                total_num_padded_tokens,
+                num_non_exiting_tiles,
+            )
+
+        intermediate_bf16 = torch.ones(128, 16, dtype=torch.bfloat16)
+        quantized_intermediate = torch.zeros(128, 8, dtype=torch.uint8)
+        quantized_scale_2d = torch.zeros(128, 1, dtype=torch.uint8)
+        quantized_scale_mma = torch.zeros(32, 4, 1, 4, 1, 1, dtype=torch.uint8)
+        per_token_scale = torch.arange(128, dtype=torch.float32)
+        finalize_calls = []
+
+        def fake_gemm1(**kwargs):
+            assert kwargs["c_dtype"] == "bfloat16"
+            assert kwargs["out_scale"] is None
+            assert kwargs["global_scale"] is None
+            return intermediate_bf16, None
+
+        def fake_quantize(input, global_scale_inv, sf_layout, enable_pdl):
+            assert input is intermediate_bf16
+            assert global_scale_inv is fc2_input_scale
+            return quantized_intermediate, quantized_scale_2d, per_token_scale
+
+        def fake_convert_sf_to_mma_layout(sf, m, k, num_groups=1, sf_vec_size=16):
+            assert sf is quantized_scale_2d
+            assert m == 128
+            assert k == 16
+            assert num_groups == 1
+            assert sf_vec_size == 16
+            return quantized_scale_mma
+
+        def fake_finalize(**kwargs):
+            finalize_calls.append(kwargs)
+
+        monkeypatch.setattr(fused_moe_module, "moe_sort", fake_moe_sort)
+        monkeypatch.setattr(
+            fused_moe_module,
+            "blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4",
+            fake_gemm1,
+        )
+        monkeypatch.setattr(
+            fused_moe_module,
+            "nvfp4_quantize_per_token_cute_dsl",
+            fake_quantize,
+        )
+        monkeypatch.setattr(
+            fused_moe_module, "convert_sf_to_mma_layout", fake_convert_sf_to_mma_layout
+        )
+        monkeypatch.setattr(
+            fused_moe_module,
+            "blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4",
+            fake_finalize,
+        )
+        monkeypatch.setattr(
+            fused_moe_module, "moe_output_memset_inplace", lambda _: None
+        )
+
+        out = fused_moe_module._moe_core_impl(
+            x=x,
+            x_sf=x_sf,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            w1_weight=w1_weight,
+            w1_weight_sf=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            fc2_input_scale=fc2_input_scale,
+            w2_weight=w2_weight,
+            w2_weight_sf=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            use_async_memset=False,
+            use_per_token_activation=True,
+        )
+
+        assert out.shape == (2, 16)
+        assert len(finalize_calls) == 1
+        assert finalize_calls[0]["a"] is quantized_intermediate
+        assert finalize_calls[0]["a_scale"] is quantized_scale_mma
+        assert finalize_calls[0]["a_per_token_scale"] is per_token_scale
 
 
 # =============================================================================
@@ -1003,6 +1173,7 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize(
         "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
     )
+    @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("top_k", [1, 2, 8])
     @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
     @pytest.mark.parametrize("num_experts", [256, 384])
@@ -1015,6 +1186,7 @@ class TestCuteDslFusedMoeFunctional:
         hidden_size: int,
         intermediate_size: int,
         num_experts: int,
+        use_per_token_activation: bool,
     ):
         """Accuracy test for functional API across configurations."""
         from flashinfer import cute_dsl_fused_moe_nvfp4
@@ -1048,6 +1220,7 @@ class TestCuteDslFusedMoeFunctional:
             top_k=top_k,
             num_local_experts=num_local_experts,
             activation=activation,
+            use_per_token_activation=use_per_token_activation,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1068,6 +1241,7 @@ class TestCuteDslFusedMoeFunctional:
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
             gated=gated,
+            use_per_token_activation=use_per_token_activation,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -1124,9 +1298,16 @@ class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
+    @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("top_k", [2, 8])
     @pytest.mark.parametrize("num_experts", [256, 384])
-    def test_wrapper_accuracy(self, num_tokens: int, top_k: int, num_experts: int):
+    def test_wrapper_accuracy(
+        self,
+        num_tokens: int,
+        top_k: int,
+        num_experts: int,
+        use_per_token_activation: bool,
+    ):
         """Accuracy test for wrapper API."""
         from flashinfer import CuteDslMoEWrapper
 
@@ -1148,6 +1329,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            use_per_token_activation=use_per_token_activation,
         )
 
         result = moe.run(
@@ -1180,6 +1362,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
+            use_per_token_activation=use_per_token_activation,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)

@@ -62,6 +62,11 @@ from ...trace.templates.moe import (
     cute_dsl_moe_wrapper_run_trace,
 )
 from ...autotuner import AutoTuner
+from ...cute_dsl.utils import convert_sf_to_mma_layout
+from ...quantization.kernels.nvfp4_quantize import (
+    SF_LAYOUT_128x4,
+    nvfp4_quantize_per_token_cute_dsl,
+)
 from ...utils import supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
@@ -83,6 +88,17 @@ from .tuner import (
 # =============================================================================
 
 _cuda_graph_resources: Dict[str, Any] = {}
+
+
+def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
+    if output_dtype == torch.float16:
+        return "float16"
+    if output_dtype == torch.bfloat16:
+        return "bfloat16"
+    raise ValueError(
+        "CuTe-DSL MoE per-token FC2 input quantization supports only "
+        f"torch.float16 and torch.bfloat16 intermediate dtypes, got {output_dtype}."
+    )
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -144,6 +160,7 @@ def _moe_core_impl(
     use_async_memset: bool = True,
     enable_pdl: bool = True,
     activation: str = "silu",
+    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -183,6 +200,8 @@ def _moe_core_impl(
         memset_event: CUDA event for memset completion.
         output_dtype: Output data type.
         use_async_memset: Use async memset on aux stream.
+        use_per_token_activation: Quantize GEMM1/SwiGLU output with the
+            standalone per-token NVFP4 CuTe-DSL quantizer before GEMM2.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -238,7 +257,10 @@ def _moe_core_impl(
         main_event.record()
         moe_output.record_stream(aux_stream)
 
-    # Step 2: GEMM1 + activation
+    # Step 2: GEMM1 + activation. In per-token mode the fused GEMM1 FP4
+    # epilogue is bypassed: materialize the activation, then reuse the
+    # standalone CuTe-DSL NVFP4 quantizer so 4over6/per-token semantics match
+    # the quantization API and the TRTLLM MoE split-launch pattern.
     if activation == "silu":
         gated = True
     elif activation == "relu2":
@@ -247,28 +269,68 @@ def _moe_core_impl(
         raise ValueError(
             f"CuteDSL MoE GEMM1 supports activation 'silu' or 'relu2', got {activation!r}."
         )
-    intermediate, intermediate_sf = (
-        blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
-            a=x,
-            b=w1_weight,
-            a_scale=x_sf,
-            b_scale=w1_weight_sf,
-            alpha=w1_alpha,
-            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            out=gemm1_out,
-            out_scale=gemm1_out_scale,
-            global_scale=fc2_input_scale,
-            topk=top_k,
-            c_dtype="float4_e2m1fn",
-            mma_tiler_mn=gemm1_mma_tiler_mn,
-            cluster_shape_mn=gemm1_cluster_shape_mn,
-            enable_pdl=enable_pdl,
-            gated=gated,
+    intermediate_per_token_scale = None
+    if use_per_token_activation:
+        intermediate, _ = (
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+                a=x,
+                b=w1_weight,
+                a_scale=x_sf,
+                b_scale=w1_weight_sf,
+                alpha=w1_alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                token_id_mapping=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                out=gemm1_out,
+                out_scale=None,
+                global_scale=None,
+                topk=top_k,
+                c_dtype=_intermediate_c_dtype(output_dtype),
+                mma_tiler_mn=gemm1_mma_tiler_mn,
+                cluster_shape_mn=gemm1_cluster_shape_mn,
+                enable_pdl=enable_pdl,
+                gated=gated,
+            )
         )
-    )
+        intermediate, intermediate_sf, intermediate_per_token_scale = (
+            nvfp4_quantize_per_token_cute_dsl(
+                intermediate,
+                fc2_input_scale,
+                sf_layout=SF_LAYOUT_128x4,
+                enable_pdl=enable_pdl,
+            )
+        )
+        intermediate_sf = convert_sf_to_mma_layout(
+            intermediate_sf,
+            m=intermediate.shape[0],
+            k=intermediate.shape[1] * 2,
+            num_groups=1,
+            sf_vec_size=16,
+        )
+    else:
+        intermediate, intermediate_sf = (
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+                a=x,
+                b=w1_weight,
+                a_scale=x_sf,
+                b_scale=w1_weight_sf,
+                alpha=w1_alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                token_id_mapping=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                out=gemm1_out,
+                out_scale=gemm1_out_scale,
+                global_scale=fc2_input_scale,
+                topk=top_k,
+                c_dtype="float4_e2m1fn",
+                mma_tiler_mn=gemm1_mma_tiler_mn,
+                cluster_shape_mn=gemm1_cluster_shape_mn,
+                enable_pdl=enable_pdl,
+                gated=gated,
+            )
+        )
 
     # Step 3: Zero the active output slice before GEMM2 finalize.
     # Finalize uses atomic scatter-add into `moe_output`, so it must start
@@ -306,6 +368,7 @@ def _moe_core_impl(
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
         out=moe_output,
+        a_per_token_scale=intermediate_per_token_scale,
         mma_tiler_mn=gemm2_mma_tiler_mn,
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
@@ -380,6 +443,7 @@ class CuteDslMoEWrapper:
         device: str = "cuda",
         enable_pdl: bool = True,
         activation: str = "silu",
+        use_per_token_activation: bool = False,
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -415,6 +479,9 @@ class CuteDslMoEWrapper:
             Device on which to allocate buffers.  Defaults to ``"cuda"``.
         enable_pdl : bool
             Enable Programmatic Dependent Launch.  Defaults to ``True``.
+        use_per_token_activation : bool
+            Quantize the GEMM1/SwiGLU output with the standalone per-token
+            NVFP4 CuTe-DSL quantizer before GEMM2. Defaults to ``False``.
         """
         self.num_experts = num_experts
         self.top_k = top_k
@@ -429,6 +496,7 @@ class CuteDslMoEWrapper:
         self.device = device
         self.enable_pdl = enable_pdl
         self.activation = activation
+        self.use_per_token_activation = use_per_token_activation
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -529,6 +597,7 @@ class CuteDslMoEWrapper:
             use_async_memset=True,
             enable_pdl=enable_pdl,
             activation=self.activation,
+            use_per_token_activation=self.use_per_token_activation,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -663,6 +732,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
     activation: str = "silu",
+    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -692,6 +762,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         use_async_memset=True,
         enable_pdl=enable_pdl,
         activation=activation,
+        use_per_token_activation=use_per_token_activation,
     )
 
 
@@ -719,6 +790,7 @@ def cute_dsl_fused_moe_nvfp4(
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
     activation: str = "silu",
+    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -776,6 +848,9 @@ def cute_dsl_fused_moe_nvfp4(
     activation : str
         FC1 activation: ``"silu"`` for gated SwiGLU (default) or ``"relu2"``
         for non-gated ReLU^2.
+    use_per_token_activation : bool
+        Quantize the GEMM1/SwiGLU output with the standalone per-token NVFP4
+        CuTe-DSL quantizer before GEMM2. Defaults to ``False``.
 
     Returns
     -------
@@ -797,8 +872,15 @@ def cute_dsl_fused_moe_nvfp4(
 
     tuner = AutoTuner.get()
 
+    def forward_impl(*args, **kwargs):
+        return _cute_dsl_fused_moe_nvfp4_impl(
+            *args,
+            **kwargs,
+            use_per_token_activation=use_per_token_activation,
+        )
+
     runner = CuteDslFusedMoENvfp4Runner(
-        forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
+        forward_impl=forward_impl,
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_local_experts,
