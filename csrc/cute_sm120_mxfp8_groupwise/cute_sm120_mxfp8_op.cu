@@ -88,24 +88,24 @@ void CutlassMXFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_
 
   TVM_FFI_ICHECK_EQ(a_scale.size(0), expected_a_scale_m)
       << "a_scale must have shape [" << expected_a_scale_m << ", " << expected_scale_k
-      << "] derived from deduce_sfa_layout, got [" << a_scale.size(0) << ", "
-      << a_scale.size(1) << "]";
+      << "] derived from deduce_sfa_layout, got [" << a_scale.size(0) << ", " << a_scale.size(1)
+      << "]";
   TVM_FFI_ICHECK_EQ(a_scale.size(1), expected_scale_k)
       << "a_scale must have shape [" << expected_a_scale_m << ", " << expected_scale_k
-      << "] derived from deduce_sfa_layout, got [" << a_scale.size(0) << ", "
-      << a_scale.size(1) << "]";
+      << "] derived from deduce_sfa_layout, got [" << a_scale.size(0) << ", " << a_scale.size(1)
+      << "]";
   TVM_FFI_ICHECK_EQ(b_scale.size(0), num_experts)
       << "b_scale must have shape [" << num_experts << ", " << expected_b_scale_n << ", "
-      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0)
-      << ", " << b_scale.size(1) << ", " << b_scale.size(2) << "]";
+      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0) << ", "
+      << b_scale.size(1) << ", " << b_scale.size(2) << "]";
   TVM_FFI_ICHECK_EQ(b_scale.size(1), expected_b_scale_n)
       << "b_scale must have shape [" << num_experts << ", " << expected_b_scale_n << ", "
-      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0)
-      << ", " << b_scale.size(1) << ", " << b_scale.size(2) << "]";
+      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0) << ", "
+      << b_scale.size(1) << ", " << b_scale.size(2) << "]";
   TVM_FFI_ICHECK_EQ(b_scale.size(2), expected_scale_k)
       << "b_scale must have shape [" << num_experts << ", " << expected_b_scale_n << ", "
-      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0)
-      << ", " << b_scale.size(1) << ", " << b_scale.size(2) << "]";
+      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0) << ", "
+      << b_scale.size(1) << ", " << b_scale.size(2) << "]";
 
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());
