@@ -137,39 +137,51 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
         pcfg.numAttrs = 1;
         FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
       };
-      // ── Head-tiling heuristic (fill the GPU at small batch) ──────────────────
-      // One CTA/group (HEADS_PER_CTA == HEADS_PER_GROUP) launches only
-      // batch·ngroups CTAs — at small batch that starves the GPU.  Tile heads
-      // across grid.z so #CTAs = batch·ngroups·ceil(HPG/hc) reaches one resident
-      // wave (S·O).  Largest hc on the HPG>>k chain with #CTAs >= S·O:
-      //   hc = HPG;  while (hc > 1 && hc > batch·nheads/(S·O)) hc >>= 1;
-      // (batch·G·h = batch·nheads.)  O is register-bound, hence ~constant in hc
-      // (shrinking per-head smem at small hc only relaxes the non-binding smem
-      // limit), so query it once for the untiled kernel.  S, O are device/kernel
-      // constants → cache statically.
+      // ── Head-tiling heuristic: balance precompute parallelism vs MAIN co-residency ──
+      // Tiling heads across grid.z sets #precompute CTAs = batch·ngroups·ceil(HPG/hc) =
+      // batch·nheads/hc.  S (sm_count) and the main's per-SM occupancy are device/kernel
+      // constants → cache statically; the hc choice is justified at hc_ideal below.
       static int const sm_count = [] {
         int dev = 0, s = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&s, cudaDevAttrMultiProcessorCount, dev);
         return s > 0 ? s : 1;
       }();
-      static int const occ = [] {
+      // The MAIN co-launches with the precompute (internal PDL, always on) and the two
+      // compete for SMs.  occ_main = main blocks resident per SM (it owns the same big
+      // smem as the monolith, so typically 1).  Query once for the real D_SPLIT kernel.
+      static int const occ_main = [] {
         int o = 0;
-        constexpr size_t qsmem =
-            sizeof(CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE,
-                                                     NUM_WARPS, HEADS_PER_GROUP>);
-        auto qfunc = checkpointing_ssu_precompute_kernel<
-            input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, NPREDICTED, MAX_WINDOW, DIM,
-            DSTATE, HEADS_PER_GROUP, HEADS_PER_GROUP, NUM_WARPS, true, VARLEN>;
-        if constexpr (qsmem > 48 * 1024) {
-          cudaFuncSetAttribute(qfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, qsmem);
+        constexpr size_t msmem = sizeof(
+            CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+        auto mf = checkpointing_ssu_main_kernel<
+            input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NPREDICTED,
+            MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN>;
+        if constexpr (msmem > 48 * 1024) {
+          cudaFuncSetAttribute(mf, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem);
         }
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, qfunc, NUM_WARPS * (int)warpSize, qsmem);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, mf, NUM_WARPS * (int)warpSize, msmem);
         return o > 0 ? o : 1;
       }();
-      int const hc_ideal = (params.batch * params.nheads) / (sm_count * occ);
+      // The main launches main_ctas = batch·nheads·D_SPLIT.  Cliff sweeps (b∈{8,16,64},
+      // B200): hc=2 is the robust optimum (hc=1 never beat it) ONCE the main is multi-wave
+      // and pipelines over the precompute.  But when the main alone fits in ≤1 resident
+      // wave it is FRAGILE — a big precompute footprint spills it into a 2nd wave
+      // (b=8: hc=2 → main 13.4µs vs hc=4 → 9.7µs, +3µs).  So back off to hc=4 there.  The
+      // earlier "fill one precompute wave" rule ignored the main and floored to hc=1 at
+      // small batch — exactly the over-saturation that starves the main.
+      // (Provisional: only D_SPLIT==1 / ngroups==1 / b∈{8,16,64} measured.)  Snap to HPG>>k.
+      int const main_ctas = params.batch * params.nheads * D_SPLIT;
+      int const hc_ideal = (main_ctas <= sm_count * occ_main) ? 4 : 2;
       int hc = HEADS_PER_GROUP;
       while (hc > 1 && hc > hc_ideal) hc >>= 1;
+      // DEBUG override (cliff co-residency experiments): FLASHINFER_SSU_HEADS_PER_CTA
+      // forces hc; dispatch_heads_per_cta snaps it to the HEADS_PER_GROUP>>k chain.
+      static int const hc_override = [] {
+        char const* e = std::getenv("FLASHINFER_SSU_HEADS_PER_CTA");
+        return e ? std::atoi(e) : 0;
+      }();
+      if (hc_override > 0) hc = hc_override;
       dispatch_heads_per_cta<HEADS_PER_GROUP>(hc, [&]<int HEADS_PER_CTA>() {
         if (params.dt_softplus) {
           launch_precompute.template operator()<HEADS_PER_CTA, true>();
