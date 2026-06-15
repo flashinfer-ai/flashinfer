@@ -51,10 +51,15 @@ def _resolve_expert_global_scales(
     """
     if scales is None:
         amax = weights_bf16.float().abs().nan_to_num().amax(dim=(1, 2))
-        # Guard all-zero (e.g. pruned/dummy) experts: amax = 0 would make the
-        # global scale inf and poison the block scales with non-finite values.
-        amax = amax.clamp_(min=torch.finfo(torch.float32).tiny)
-        return (448.0 * 6.0) / amax
+        # Guard all-zero (e.g. pruned/dummy) experts: amax == 0 makes the
+        # global scale inf and poisons the block scales. Clamping amax to
+        # finfo.tiny is not enough -- (448 * 6) / tiny still overflows to inf.
+        # Such experts quantize to 0 regardless of scale, so give them 1.0.
+        return torch.where(
+            amax > 0,
+            (448.0 * 6.0) / amax,
+            torch.ones_like(amax),
+        )
     scales = scales.to(device=device, dtype=torch.float32).reshape(-1)
     if scales.numel() == 1:
         scales = scales.expand(num_local_experts)
