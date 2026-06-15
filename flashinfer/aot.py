@@ -224,6 +224,14 @@ def gen_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
 
+    # head_dim > 256 FA2 modules are SM100+-only; skip them entirely when no
+    # SM100+ architecture is being targeted.
+    from .jit.core import current_compilation_context
+
+    has_sm100_or_newer = any(
+        major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    )
+
     # FA2 MHA / MQA / GQA
     for (
         (head_dim_qk, head_dim_vo),
@@ -238,6 +246,8 @@ def gen_attention(
         use_sliding_window_,
         use_logits_soft_cap_,
     ):
+        if (head_dim_qk > 256 or head_dim_vo > 256) and not has_sm100_or_newer:
+            continue
         yield from gen_fa2(
             dtype_qo=dtype_qo,
             dtype_kv=dtype_kv,
@@ -246,18 +256,21 @@ def gen_attention(
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
         )
-        yield gen_batch_attention_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            dtype_idx=torch.int32,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            # use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-            use_profiler=False,
-        )
+        # The holistic (persistent) batch-attention kernel
+        # does not support head_dim=512.
+        if head_dim_qk <= 256 and head_dim_vo <= 256:
+            yield gen_batch_attention_module(
+                dtype_q=dtype_qo,
+                dtype_kv=dtype_kv,
+                dtype_o=dtype_qo,
+                dtype_idx=torch.int32,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                pos_encoding_mode=0,
+                # use_sliding_window=use_sliding_window,
+                use_logits_soft_cap=use_logits_soft_cap,
+                use_profiler=False,
+            )
 
     # FA3 MHA / MQA / GQA
     if has_sm90:
@@ -874,7 +887,8 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
+        # Note: (512, 512): FA2 prefill/decode only; no holistic batch-attention kernel.
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256), (512, 512)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
         "f16_dtype": [torch.float16, torch.bfloat16],
         "f8_dtype": [torch.float8_e4m3fn],
