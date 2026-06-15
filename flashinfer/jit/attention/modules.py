@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List
+from typing import List, Optional
 
 import jinja2
 import torch
@@ -1186,6 +1186,20 @@ def gen_batch_attention_module(
     )
 
 
+def _fa2_head_dim_nvcc_flags(head_dim_qk: int, head_dim_vo: int) -> Optional[List[str]]:
+    """head_dim > 256 is only supported on SM100+.
+
+    Restrict compilation of those modules to SM100/110/120 so pre-SM100
+    builds neither compile nor expose them; requesting such a module on an
+    older GPU raises "No supported CUDA architectures found".
+    """
+    if head_dim_qk > 256 or head_dim_vo > 256:
+        return current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[10, 11, 12]
+        )
+    return None
+
+
 def gen_customize_single_decode_module(
     uri: str,
     dtype_q: torch.dtype,
@@ -1269,7 +1283,11 @@ def gen_customize_single_decode_module(
     generated_config_path = gen_directory / "single_decode_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
 
-    return gen_jit_spec(uri, source_paths)
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+    )
 
 
 def gen_customize_single_prefill_module(
@@ -1364,7 +1382,11 @@ def gen_customize_single_prefill_module(
         generated_config_path = gen_directory / "single_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
 
-        return gen_jit_spec(uri, source_paths)
+        return gen_jit_spec(
+            uri,
+            source_paths,
+            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+        )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
 
@@ -1513,7 +1535,11 @@ def gen_customize_batch_decode_module(
 
     generated_config_path = gen_directory / "batch_decode_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
-    return gen_jit_spec(uri, source_paths)
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+    )
 
 
 def gen_customize_batch_prefill_module(
@@ -1625,7 +1651,11 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
-        return gen_jit_spec(uri, source_paths)
+        return gen_jit_spec(
+            uri,
+            source_paths,
+            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+        )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
