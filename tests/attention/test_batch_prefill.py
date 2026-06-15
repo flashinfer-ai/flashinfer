@@ -6,6 +6,9 @@ from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_kv_scale_forwarding_effect(dtype):
+    cc = torch.cuda.get_device_capability(device="cuda")
+    if dtype != torch.float16 and cc[0] < 8:
+        pytest.skip(f"{dtype} need SM80+")
     torch.manual_seed(42)
 
     H_QO, H_KV, N_CTX, HEAD_DIM, PAGE_SIZE = 1, 1, 8, 64, 16
@@ -57,6 +60,9 @@ def test_kv_scale_forwarding_effect(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_kv_scale_forwarding_math_property(dtype: torch.dtype):
+    cc = torch.cuda.get_device_capability(device="cuda")
+    if dtype != torch.float16 and cc[0] < 8:
+        pytest.skip(f"{dtype} need SM80+")
     torch.manual_seed(0)
 
     # ---------------- parameters ----------------

@@ -25,14 +25,14 @@ namespace flashinfer {
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params>
+          bool FORCE_DISABLE_KV_REPACK, typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                    float* tmp_s, bool enable_pdl,
                                                    cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params>
+          bool FORCE_DISABLE_KV_REPACK, typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                     float* tmp_s, bool enable_pdl,
                                                     cudaStream_t stream);
@@ -43,6 +43,15 @@ using namespace flashinfer;
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
+
+#define DISPATCH_KV_REPACK(compute_capacity, FORCE_DISABLE_KV_REPACK, HEAD_DIM_VO, ...) \
+  if (compute_capacity.first >= 8) {                                                    \
+    constexpr bool FORCE_DISABLE_KV_REPACK = false;                                     \
+    __VA_ARGS__                                                                         \
+  } else {                                                                              \
+    constexpr bool FORCE_DISABLE_KV_REPACK = HEAD_DIM_VO >= 128;                        \
+    __VA_ARGS__                                                                         \
+  }
 
 Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
@@ -80,8 +89,8 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
                                       TensorView q, TensorView k, TensorView v,
                                       TensorView qo_indptr, TensorView kv_indptr, TensorView o,
                                       Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                                      int64_t layout, int64_t window_left,
-                                      bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+                                      int64_t layout, int64_t window_left, bool enable_pdl,
+                                      bool use_per_token_head ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -188,10 +197,13 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         cudaError_t status = cudaSuccess;
 
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-          status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
-              CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              RaggedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+          auto compute_capacity = GetCudaComputeCapability();
+          DISPATCH_KV_REPACK(compute_capacity, FORCE_DISABLE_KV_REPACK, HEAD_DIM_VO, {
+            status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
+                CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+                /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, FORCE_DISABLE_KV_REPACK,
+                AttentionVariant, RaggedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+          });
         });
 
         TVM_FFI_ICHECK(status == cudaSuccess)
@@ -207,8 +219,8 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                      TensorView paged_kv_indptr, TensorView paged_kv_indices,
                                      TensorView paged_kv_last_page_len, TensorView o,
                                      Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                                     int64_t layout, int64_t window_left,
-                                     bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+                                     int64_t layout, int64_t window_left, bool enable_pdl,
+                                     bool use_per_token_head ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -321,10 +333,13 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         cudaError_t status = cudaSuccess;
 
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-          status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-              CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+          auto compute_capacity = GetCudaComputeCapability();
+          DISPATCH_KV_REPACK(compute_capacity, FORCE_DISABLE_KV_REPACK, HEAD_DIM_VO, {
+            status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+                CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+                /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, FORCE_DISABLE_KV_REPACK,
+                AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+          });
         });
 
         TVM_FFI_ICHECK(status == cudaSuccess)

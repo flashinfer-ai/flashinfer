@@ -328,7 +328,31 @@
     __VA_ARGS__                                                                             \
   }
 
+#define DISPATCH_USE_PER_TOKEN_HEAD(use_per_token_head, USE_PER_TOKEN_HEAD, ...) \
+  if constexpr (is_fp8_type_v<DTypeKV>) {                                        \
+    if (use_per_token_head) {                                                    \
+      constexpr bool USE_PER_TOKEN_HEAD = true;                                  \
+      __VA_ARGS__                                                                \
+    } else {                                                                     \
+      constexpr bool USE_PER_TOKEN_HEAD = false;                                 \
+      __VA_ARGS__                                                                \
+    }                                                                            \
+  } else {                                                                       \
+    constexpr bool USE_PER_TOKEN_HEAD = false;                                   \
+    __VA_ARGS__                                                                  \
+  }
+
 namespace flashinfer {
+
+// Type trait to detect FP8 KV cache types.
+template <typename T>
+struct is_fp8_type : std::false_type {};
+template <>
+struct is_fp8_type<__nv_fp8_e4m3> : std::true_type {};
+template <>
+struct is_fp8_type<__nv_fp8_e5m2> : std::true_type {};
+template <typename T>
+inline constexpr bool is_fp8_type_v = is_fp8_type<T>::value;
 
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ constexpr T1 ceil_div(const T1 x, const T2 y) noexcept {

@@ -270,6 +270,12 @@ def test_batch_attention_correctness(
     test_dtype,
     logits_soft_cap,
 ):
+    cc = get_compute_capability(torch.device(device="cuda"))
+    if cc[0] < 8 and head_dim >= 256:
+        pytest.skip(
+            "BatchAttention CTA128 exceeds SM75 64KiB shared memory limit for hd>=256"
+        )
+
     num_qo_heads = num_kv_heads * gqa_group_size
     kv_lens = [p[0] for p in seq_len_pairs]
     qo_lens = [p[1] for p in seq_len_pairs]

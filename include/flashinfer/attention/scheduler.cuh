@@ -76,7 +76,7 @@ inline auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
     const uint32_t min_num_pages_per_batch = 1) {
   uint32_t low = min_num_pages_per_batch, high = 0;
   for (const IdType& elem : num_pages) {
-    high = max(high, elem);
+    high = max(high, static_cast<uint32_t>(elem));
   }
   uint32_t new_batch_size;
   while (low < high) {
@@ -93,7 +93,7 @@ inline auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
   }
   new_batch_size = 0;
   for (const IdType& elem : num_pages) {
-    new_batch_size += ceil_div(std::max(elem, 1), low);
+    new_batch_size += ceil_div(std::max(static_cast<uint32_t>(elem), 1u), low);
   }
   return std::make_tuple(low, new_batch_size);
 }
@@ -165,9 +165,17 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
     const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     gdy = num_kv_heads;
-    const uint32_t smem_size =
-        2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-        std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
+    constexpr uint32_t kv_size =
+        NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV);
+    constexpr uint32_t kv_sf_pth_size =
+        AttentionVariant::use_per_token_head
+            ? (NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * sizeof(float))
+            : 0;
+    constexpr uint32_t sync_state_size = bdy * bdz * HEAD_DIM * sizeof(float);
+    constexpr uint32_t kv_offset_size = tile_size_per_bdx * num_threads * sizeof(size_t);
+    constexpr uint32_t smem_md_size = 2 * bdy * bdz * sizeof(float);
+    const uint32_t smem_size = std::max(2 * kv_size + 2 * kv_sf_pth_size, sync_state_size) +
+                               std::max(kv_offset_size, smem_md_size);
 
     auto kernel =
         BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
@@ -1099,32 +1107,32 @@ struct HolisticPlanInfo {
   }
 };
 
-template <typename IdType>
-inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
-                                        void* int_buffer, void* page_locked_int_buffer,
-                                        size_t int_workspace_size_in_bytes,
-                                        HolisticPlanInfo<2>& plan_info, IdType* qo_indptr_h,
-                                        IdType* kv_indptr_h, IdType* kv_len_arr_h,
-                                        uint32_t batch_size, uint32_t num_qo_heads,
-                                        uint32_t num_kv_heads, uint32_t head_dim, bool causal,
-                                        cudaStream_t stream) {
+template <typename IdType, typename Kernel>
+inline cudaError_t TwoStageHolisticPlan(
+    void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
+    void* page_locked_int_buffer, size_t int_workspace_size_in_bytes,
+    HolisticPlanInfo<2>& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
+    uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+    bool causal, Kernel kernel, size_t smem_size, int num_threads, cudaStream_t stream) {
   constexpr uint32_t NUM_TASKS = 2;
   const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {128, 16};
   int num_sm = 0;
+  int max_blocks_per_sm = 0;
   int dev_id = 0;
 
   uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-
-  if (head_dim >= 256) {
-    // NOTE (Yilong): optimize this code path
-    // constraint gridDim due to cooperative group
-    num_sm *= 1;
-  } else {
-    // NOTE(Zihao): two cta per sm
-    num_sm *= 2;
+  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(smem_size)));
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &max_blocks_per_sm, kernel, num_threads, static_cast<int>(smem_size)));
+  if (max_blocks_per_sm < 1) {
+    FLASHINFER_ERROR(
+        "The kernel requires too much shared memory or registers. "
+        "Consider using FP8 KV cache or a different backend.");
   }
+  num_sm *= std::min(max_blocks_per_sm, 2);
 
   // step 0. determine the number of blocks in x and y dimensions
   std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec[NUM_TASKS];

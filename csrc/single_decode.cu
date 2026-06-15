@@ -32,10 +32,11 @@ using namespace flashinfer;
 
 void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, TensorView tmp,
                                  TensorView o, Optional<TensorView> maybe_lse, int64_t layout,
-                                 int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+                                 int64_t window_left,
+                                 bool use_per_token_head ADDITIONAL_FUNC_PARAMS) {
   CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
+  CHECK_CUDA(k);
+  CHECK_CUDA(v);
   CHECK_INPUT(tmp);
   CHECK_DEVICE(k, q);
   CHECK_DEVICE(v, q);
@@ -85,9 +86,29 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
         params.num_kv_heads = num_kv_heads;
         params.q_stride_n = num_qo_heads * head_dim_qk;
         params.q_stride_h = head_dim_qk;
+        unsigned int head_dim_vo_pad = head_dim_vo;
+        if constexpr (AttentionVariant::use_per_token_head) {
+          // inline scale into k/v cache and padding to 16B
+          head_dim_vo_pad = head_dim_vo + 16;
+          if (kv_layout == QKVLayout::kNHD) {
+            TVM_FFI_ICHECK_EQ(k.stride(0), num_kv_heads * head_dim_vo_pad);
+            TVM_FFI_ICHECK_EQ(v.stride(0), num_kv_heads * head_dim_vo_pad);
+          } else {
+            TVM_FFI_ICHECK_EQ(k.stride(0), kv_len * head_dim_vo_pad);
+            TVM_FFI_ICHECK_EQ(v.stride(0), kv_len * head_dim_vo_pad);
+          }
+          TVM_FFI_ICHECK_EQ(k.stride(1), head_dim_vo_pad);
+          TVM_FFI_ICHECK_EQ(v.stride(1), head_dim_vo_pad);
+          TVM_FFI_ICHECK_EQ(k.stride(2), 1);
+          TVM_FFI_ICHECK_EQ(v.stride(2), 1);
+        } else {
+          CHECK_CONTIGUOUS(k);
+          CHECK_CONTIGUOUS(v);
+        }
         params.kv_stride_n =
-            (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim_vo : head_dim_vo;
-        params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim_vo : kv_len * head_dim_vo;
+            (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim_vo_pad : head_dim_vo_pad;
+        params.kv_stride_h =
+            (kv_layout == QKVLayout::kNHD) ? head_dim_vo_pad : kv_len * head_dim_vo_pad;
         params.window_left = window_left;
         params.kv_chunk_size = 0;
 

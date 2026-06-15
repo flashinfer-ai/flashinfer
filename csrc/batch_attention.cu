@@ -28,6 +28,10 @@ using tvm::ffi::Optional;
 
 template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+const void* GetBatchPagedAttentionPersistentKernel(size_t& smem_size, uint32_t& num_threads);
+
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
 cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
                                           const uint32_t num_blks_x, const uint32_t num_blks_y,
                                           const cudaStream_t stream);
@@ -40,7 +44,8 @@ Array<int64_t> BatchPagedAttentionPlan(TensorView float_workspace_buffer,
                                        TensorView page_locked_int_workspace_buffer,
                                        TensorView qo_indptr, TensorView kv_indptr,
                                        TensorView kv_len, int64_t batch_size, int64_t num_qo_heads,
-                                       int64_t num_kv_heads, int64_t head_dim_o, bool causal) {
+                                       int64_t num_kv_heads, int64_t head_dim_o, bool causal,
+                                       bool use_per_token_head) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -51,12 +56,27 @@ Array<int64_t> BatchPagedAttentionPlan(TensorView float_workspace_buffer,
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
-  cudaError_t status = TwoStageHolisticPlan<IdType>(
-      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
-      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
-      int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
-      static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len.data_ptr()),
-      batch_size, num_qo_heads, num_kv_heads, head_dim_o, causal, stream);
+  cudaError_t status = cudaSuccess;
+  const MaskMode mask_mode = MaskMode::kNone;
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      AttentionVariant, PersistentParams, [&] {
+        size_t smem_size = 0;
+        uint32_t num_threads = 0;
+        auto kernel =
+            GetBatchPagedAttentionPersistentKernel<CTA_TILE_Q_1, CTA_TILE_Q_2, HEAD_DIM_QK,
+                                                   HEAD_DIM_VO, MASK_MODE, AttentionVariant,
+                                                   PersistentParams>(smem_size, num_threads);
+
+        status = TwoStageHolisticPlan<IdType, decltype(kernel)>(
+            float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+            int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+            int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
+            static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len.data_ptr()),
+            batch_size, num_qo_heads, num_kv_heads, head_dim_o, causal, kernel, smem_size,
+            static_cast<int>(num_threads), stream);
+        return true;
+      });
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan persistent paged attention, error: " << cudaGetErrorString(status);
@@ -71,8 +91,8 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
                             int64_t layout_code, int64_t num_qo_heads, int64_t num_kv_heads,
                             int64_t page_size,
                             double v_scale,  // must use double due to pytorch binding
-                            double sm_scale,
-                            double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
+                            double sm_scale, double logits_soft_cap,
+                            bool use_per_token_head ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS) {
   HolisticPlanInfo<2> plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
@@ -175,11 +195,30 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
           // will be problematic because of the params[i]
           ADDITIONAL_PARAMS_SETTER
           PROFILER_PARAMS_SETTER
+
+          if (use_per_token_head) {
+            constexpr uint32_t elem_sz = sizeof(DTypeKV);
+            int64_t k_strides[3] = {static_cast<int64_t>(k_stride_page) * elem_sz,
+                                    static_cast<int64_t>(k_stride_n) * elem_sz,
+                                    static_cast<int64_t>(k_stride_h) * elem_sz};
+            int64_t v_strides[3] = {static_cast<int64_t>(v_stride_page) * elem_sz,
+                                    static_cast<int64_t>(v_stride_n) * elem_sz,
+                                    static_cast<int64_t>(v_stride_h) * elem_sz};
+            params[i].block_paged_k = paged_kv_t<DTypeKV, IdType>(
+                num_kv_heads, static_cast<uint32_t>(page_size), HEAD_DIM_QK, 1, kv_layout,
+                static_cast<DTypeKV*>(k_cache.data_ptr()), nullptr, k_strides,
+                static_cast<IdType*>(kv_indices.data_ptr()), nullptr, nullptr);
+            params[i].block_paged_v = paged_kv_t<DTypeKV, IdType>(
+                num_kv_heads, static_cast<uint32_t>(page_size), HEAD_DIM_VO, 1, kv_layout,
+                static_cast<DTypeKV*>(v_cache.data_ptr()), nullptr, v_strides,
+                static_cast<IdType*>(kv_indices.data_ptr()), nullptr, nullptr);
+          }
         }
 
-        cudaError_t status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO,
-                                                           MASK_MODE, AttentionVariant>(
-            params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        cudaError_t status =
+            BatchPagedAttentionPersistent<CTA_TILE_Q_1, CTA_TILE_Q_2, HEAD_DIM_QK, HEAD_DIM_VO,
+                                          MASK_MODE, AttentionVariant>(
+                params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "Failed to run persistent paged attention, error: " << cudaGetErrorString(status);
         return true;
