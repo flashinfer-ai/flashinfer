@@ -22,7 +22,7 @@ namespace tensorrt_llm::kernels::moe_alltoall {
 
 // Configuration constants
 static constexpr int kMaxTopK = 22;     // Maximum supported top-k experts per token
-static constexpr int kMaxPayloads = 4;  // Maximum number of different payload types
+static constexpr int kMaxPayloads = 6;  // Maximum number of different payload types
 static constexpr int kMaxRanks = 64;    // Maximum supported EP size
 
 // Describes a single payload type to be communicated
@@ -61,6 +61,7 @@ struct DispatchKernelPointers {
 struct CombineKernelPointers {
   // Payload pointers
   void* src_data_ptrs[kMaxPayloads];                  // src_data_ptrs[0] is output
+  void* output_scales;                                // Optional output scales
   void const* recv_buffers[kMaxRanks][kMaxPayloads];  // 2D array of receive buffer pointers (const)
 
   // Completion flags for synchronization
@@ -120,6 +121,18 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
 // Prepare for dispatch: zero send_counters, local_token_counter and increment flag_val
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 
+enum class MoeA2ACombineQuantMode : uint32_t {
+  NONE,
+  MXFP8,
+};
+
+// NOTE(siyuan): keep this align with include/flashinfer/fp4_layout.cuh
+enum class MoeA2ACombineSwizzleSFMode : uint32_t {
+  SWIZZLE_128x4,
+  SWIZZLE_8x4,
+  LINEAR,
+};
+
 // Combine phase parameters
 struct MoeA2ACombineParams {
   // EP configuration
@@ -136,7 +149,12 @@ struct MoeA2ACombineParams {
   void const* prepare_payload;
 
   // Output tensor
-  void* output_data;  // Output buffer [local_num_tokens, elements_per_token]
+  MoeA2ACombineQuantMode quant_mode{MoeA2ACombineQuantMode::NONE};  // Output quantization mode
+  MoeA2ACombineSwizzleSFMode swizzle_mode{
+      MoeA2ACombineSwizzleSFMode::LINEAR};  // Output swizzle mode
+  void* output_data;                        // Output buffer [local_num_tokens, elements_per_token]
+  void* output_scales;                      // Optional output scales for quantized outputs
+
   // Payload information
   int elements_per_token;    // Number of elements per token
   nvinfer1::DataType dtype;  // Data type for proper summation

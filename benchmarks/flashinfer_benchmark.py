@@ -64,6 +64,10 @@ def run_test(args):
         from routines.mamba import run_mamba_test
 
         res = run_mamba_test(args)
+    elif args.routine in benchmark_apis["gdn"]:
+        from routines.gdn import run_gdn_test
+
+        res = run_gdn_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -114,7 +118,8 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["quantization"])
         + list(benchmark_apis["sampling"])
         + list(benchmark_apis["rope"])
-        + list(benchmark_apis["mamba"]),
+        + list(benchmark_apis["mamba"])
+        + list(benchmark_apis["gdn"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -267,6 +272,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.mamba import parse_mamba_args
 
         args = parse_mamba_args(line, parser)
+    elif args.routine in benchmark_apis["gdn"]:
+        from routines.gdn import parse_gdn_args
+
+        args = parse_gdn_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
