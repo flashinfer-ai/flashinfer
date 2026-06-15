@@ -782,6 +782,7 @@ def run_benchmark(
             use_cuda_graph,
             use_cupti,
             routing_bias_scale,
+            use_per_token_activation=use_per_token_activation,
         )
         for row, histogram_record in rows_and_histograms:
             _print_row(row, histogram_record)
@@ -812,31 +813,22 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    # Run all three backends
-    lat = {
-        "CuteDSL": bench_cute_dsl(
-            inputs,
-            warmup,
-            iters,
-            num_local,
-            local_offset,
-            use_cuda_graph,
-            use_cupti,
-            use_wrapper=use_wrapper,
-            do_autotune=do_autotune,
-            use_per_token_activation=use_per_token_activation,
-        ),
-        "CUTLASS": bench_cutlass(
-            inputs,
-            warmup,
-            iters,
-            num_local,
-            local_offset,
-            use_cuda_graph,
-            use_cupti,
-            do_autotune=do_autotune,
-        ),
-        "TRTLLM": bench_trtllm(
+    # Run backends that support the selected activation quantization contract.
+    lat = {}
+    lat["CuteDSL"] = bench_cute_dsl(
+        inputs,
+        warmup,
+        iters,
+        num_local,
+        local_offset,
+        use_cuda_graph,
+        use_cupti,
+        use_wrapper=use_wrapper,
+        do_autotune=do_autotune,
+        use_per_token_activation=use_per_token_activation,
+    )
+    if not use_per_token_activation:
+        lat["CUTLASS"] = bench_cutlass(
             inputs,
             warmup,
             iters,
@@ -845,9 +837,18 @@ def _benchmark_single(
             use_cuda_graph,
             use_cupti,
             do_autotune=do_autotune,
-            use_per_token_activation=use_per_token_activation,
-        ),
-    }
+        )
+    lat["TRTLLM"] = bench_trtllm(
+        inputs,
+        warmup,
+        iters,
+        num_local,
+        local_offset,
+        use_cuda_graph,
+        use_cupti,
+        do_autotune=do_autotune,
+        use_per_token_activation=use_per_token_activation,
+    )
 
     # Build results
     results = []
@@ -869,10 +870,16 @@ def _print_header(
     use_cuda_graph,
     use_cupti,
     routing_bias_scale,
+    use_per_token_activation=False,
 ):
     """Print benchmark header."""
     print("\n" + "=" * 120)
-    print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})")
+    if use_per_token_activation:
+        print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs TRTLLM (EP={ep_config})")
+    else:
+        print(
+            f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})"
+        )
     print("=" * 120)
     print(
         f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
@@ -888,27 +895,49 @@ def _print_header(
         f"Routing bias scale: {routing_bias_scale} "
         f"(larger values tend to create expert imbalance)"
     )
+    if use_per_token_activation:
+        print("CUTLASS omitted: it does not consume the per-token activation scale.")
     print("-" * 120)
-    print(
-        f"{'Tokens':>6} | "
-        f"{'CuteDSL':^15} | "
-        f"{'CUTLASS':^15} | "
-        f"{'TRTLLM':^15} | "
-        f"{'Speedup (CuteDSL/X)':^18} | "
-        f"{'Winner':^8} | "
-        f"{'Active':^7} | "
-        f"{'Stats':^14}"
-    )
-    print(
-        f"{'':>6} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'ms':>7} {'TFLOPS':>7} | "
-        f"{'CUTLASS':>9} {'TRTLLM':>9} | "
-        f"{'':^8} | "
-        f"{'experts':^7} | "
-        f"{'min/max/median':^14}"
-    )
+    if use_per_token_activation:
+        print(
+            f"{'Tokens':>6} | "
+            f"{'CuteDSL':^15} | "
+            f"{'TRTLLM':^15} | "
+            f"{'Speedup':^9} | "
+            f"{'Winner':^8} | "
+            f"{'Active':^7} | "
+            f"{'Stats':^14}"
+        )
+        print(
+            f"{'':>6} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'TRTLLM':>9} | "
+            f"{'':^8} | "
+            f"{'experts':^7} | "
+            f"{'min/max/median':^14}"
+        )
+    else:
+        print(
+            f"{'Tokens':>6} | "
+            f"{'CuteDSL':^15} | "
+            f"{'CUTLASS':^15} | "
+            f"{'TRTLLM':^15} | "
+            f"{'Speedup (CuteDSL/X)':^18} | "
+            f"{'Winner':^8} | "
+            f"{'Active':^7} | "
+            f"{'Stats':^14}"
+        )
+        print(
+            f"{'':>6} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'ms':>7} {'TFLOPS':>7} | "
+            f"{'CUTLASS':>9} {'TRTLLM':>9} | "
+            f"{'':^8} | "
+            f"{'experts':^7} | "
+            f"{'min/max/median':^14}"
+        )
     print("-" * 120)
 
 
@@ -916,10 +945,10 @@ def _print_row(results, histogram_record):
     """Print a single row of benchmark results."""
     # Extract values by backend
     r = {r.backend: r for r in results}
-    cute, cutlass, trtllm = r["CuteDSL"], r["CUTLASS"], r["TRTLLM"]
+    cute, trtllm = r["CuteDSL"], r["TRTLLM"]
+    cutlass = r.get("CUTLASS")
 
     # Calculate speedups (> 1.0 means CuteDSL is faster)
-    speedup_cutlass = cutlass.latency_ms / cute.latency_ms
     speedup_trtllm = trtllm.latency_ms / cute.latency_ms
 
     # Find winner
@@ -931,16 +960,28 @@ def _print_row(results, histogram_record):
         f"{histogram_record['max_count']:>3}/"
         f"{histogram_record['median_count']:>7.2f}"
     )
-    print(
-        f"{cute.tokens:>6} | "
-        f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
-        f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
-        f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
-        f"{speedup_cutlass:>8.2f}x {speedup_trtllm:>8.2f}x | "
-        f"{winner:^8} | "
-        f"{active_experts:>7} | "
-        f"{stats:>14}"
-    )
+    if cutlass is None:
+        print(
+            f"{cute.tokens:>6} | "
+            f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
+            f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
+            f"{speedup_trtllm:>8.2f}x | "
+            f"{winner:^8} | "
+            f"{active_experts:>7} | "
+            f"{stats:>14}"
+        )
+    else:
+        speedup_cutlass = cutlass.latency_ms / cute.latency_ms
+        print(
+            f"{cute.tokens:>6} | "
+            f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
+            f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
+            f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
+            f"{speedup_cutlass:>8.2f}x {speedup_trtllm:>8.2f}x | "
+            f"{winner:^8} | "
+            f"{active_experts:>7} | "
+            f"{stats:>14}"
+        )
 
 
 def _print_footer(ep_config, num_local):
