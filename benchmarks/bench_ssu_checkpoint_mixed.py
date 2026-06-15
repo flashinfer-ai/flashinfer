@@ -720,7 +720,13 @@ def main() -> None:
     parser.add_argument(
         "--ngroups", type=int, default=bench_ssu.NGROUPS // bench_ssu.TP_SIZE
     )
-    parser.add_argument("--output-prefix", type=str, default=None)
+    parser.add_argument(
+        "--output-prefix",
+        type=str,
+        default=None,
+        help='Filename stem for the CSV/PNG.  Pass "-" to skip writing both '
+        "(useful for throwaway optimization sweeps — keeps poll-watched dirs clean).",
+    )
     parser.add_argument(
         "--plot-only", type=Path, default=None, help="Existing CSV to plot from."
     )
@@ -818,8 +824,11 @@ def main() -> None:
             f"{r['p95_us']:>8.2f} | {r['p99_us']:>8.2f} |"
         )
 
-    write_csv(rows, csv_path)
-    plot_results(rows, png_path)
+    if args.output_prefix == "-":
+        print('\noutput-prefix is "-": skipping CSV/PNG write.')
+    else:
+        write_csv(rows, csv_path)
+        plot_results(rows, png_path)
 
 
 if __name__ == "__main__":
