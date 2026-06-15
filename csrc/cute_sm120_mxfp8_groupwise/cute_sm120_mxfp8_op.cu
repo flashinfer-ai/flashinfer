@@ -34,8 +34,7 @@ void CutlassMXFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_
   TVM_FFI_ICHECK(scale_granularity_k == 32 || scale_granularity_k == 128)
       << "scale_granularity_k must be 32 or 128; got " << scale_granularity_k;
 
-  // a_scale/b_scale stored as [k_align, m_padded]; .transpose(0,1) caller view is non-contiguous by
-  // design.
+  // Scale tensors are int32-packed UE8M0 views over TMA-aligned storage.
   CHECK_INPUT_AND_TYPE(a, dl_float8_e4m3fn);
   CHECK_INPUT_AND_TYPE(b, dl_float8_e4m3fn);
   CHECK_CUDA(a_scale);
@@ -47,6 +46,8 @@ void CutlassMXFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_
 
   CHECK_DIM(2, a);
   CHECK_DIM(3, b);
+  CHECK_DIM(2, a_scale);
+  CHECK_DIM(3, b_scale);
   CHECK_DIM(2, out);
   CHECK_DIM(1, m_indptr);
 
@@ -67,6 +68,44 @@ void CutlassMXFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_
 
   TVM_FFI_ICHECK_EQ(k % 16, 0) << "k must be multiple of 16; got k=" << k;
   TVM_FFI_ICHECK_EQ(n % 16, 0) << "n must be multiple of 16; got n=" << n;
+
+  auto ceil_div = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
+  auto align = [&](int64_t x, int64_t alignment) { return ceil_div(x, alignment) * alignment; };
+  auto compute_padded_offset = [](int64_t offset, int64_t problem_idx) {
+    constexpr int64_t kAlignment = 4;
+    return (offset + problem_idx * (kAlignment - 1)) / kAlignment * kAlignment;
+  };
+
+  constexpr int64_t kTmaAlignmentBytes = 16;
+  constexpr int64_t kPackedScaleBytes = sizeof(int32_t);
+  constexpr int64_t kScaleElementBytes = 1;
+  constexpr int64_t kScalePackFactor = kPackedScaleBytes / kScaleElementBytes;
+  constexpr int64_t kTmaScaleAlignment = kTmaAlignmentBytes / kPackedScaleBytes;
+  int64_t expected_scale_k = ceil_div(k, scale_granularity_k * kScalePackFactor);
+  int64_t expected_a_scale_m =
+      align(compute_padded_offset(total_rows, num_experts), kTmaScaleAlignment);
+  int64_t expected_b_scale_n = align(n, kTmaScaleAlignment);
+
+  TVM_FFI_ICHECK_EQ(a_scale.size(0), expected_a_scale_m)
+      << "a_scale must have shape [" << expected_a_scale_m << ", " << expected_scale_k
+      << "] derived from deduce_sfa_layout, got [" << a_scale.size(0) << ", "
+      << a_scale.size(1) << "]";
+  TVM_FFI_ICHECK_EQ(a_scale.size(1), expected_scale_k)
+      << "a_scale must have shape [" << expected_a_scale_m << ", " << expected_scale_k
+      << "] derived from deduce_sfa_layout, got [" << a_scale.size(0) << ", "
+      << a_scale.size(1) << "]";
+  TVM_FFI_ICHECK_EQ(b_scale.size(0), num_experts)
+      << "b_scale must have shape [" << num_experts << ", " << expected_b_scale_n << ", "
+      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0)
+      << ", " << b_scale.size(1) << ", " << b_scale.size(2) << "]";
+  TVM_FFI_ICHECK_EQ(b_scale.size(1), expected_b_scale_n)
+      << "b_scale must have shape [" << num_experts << ", " << expected_b_scale_n << ", "
+      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0)
+      << ", " << b_scale.size(1) << ", " << b_scale.size(2) << "]";
+  TVM_FFI_ICHECK_EQ(b_scale.size(2), expected_scale_k)
+      << "b_scale must have shape [" << num_experts << ", " << expected_b_scale_n << ", "
+      << expected_scale_k << "] derived from deduce_sfb_layout, got [" << b_scale.size(0)
+      << ", " << b_scale.size(1) << ", " << b_scale.size(2) << "]";
 
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());

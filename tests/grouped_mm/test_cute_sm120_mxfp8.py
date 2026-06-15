@@ -329,5 +329,71 @@ def test_moe_gemm_mxfp8_nt_groupwise(
     assert cos_sim > COS_SIM_THRESHOLD, f"cos_sim={cos_sim:.4f} < {COS_SIM_THRESHOLD}"
 
 
+@pytest.mark.parametrize("bad_scale", ["a_m", "a_k", "b_expert", "b_n", "b_k"])
+def test_moe_gemm_mxfp8_nt_groupwise_rejects_bad_scale_shape(bad_scale):
+    skip_if_not_sm120()
+    torch.random.manual_seed(0)
+
+    num_groups = 2
+    rows_per_group = 1
+    n = 4096
+    k = 4096
+    k_gran = 128
+    token_num = rows_per_group * num_groups
+
+    a = torch.randn((token_num, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(
+        (num_groups, n, k), dtype=torch.bfloat16, device="cuda"
+    ) / math.sqrt(k)
+    m_indptr = torch.tensor(
+        [i * rows_per_group for i in range(num_groups + 1)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    a_fp8, a_sf = per_token_cast_to_mxfp8_for_moe_gemm(a, m_indptr, gran_k=k_gran)
+    b_fp8_list, b_sf_ue8m0_list = [], []
+    for i in range(num_groups):
+        b_i_fp8, b_i_sf = per_block_cast_to_fp8(b[i], use_ue8m0=True, gran_k=k_gran)
+        b_fp8_list.append(b_i_fp8)
+        b_sf_ue8m0_list.append(b_i_sf)
+    b_fp8 = torch.stack(b_fp8_list, dim=0)
+    b_sf_ue8m0 = torch.stack(b_sf_ue8m0_list, dim=0)
+    b_sf = transform_sf_into_required_layout(
+        b_sf_ue8m0,
+        mn=n,
+        k=k,
+        recipe=(k_gran, k_gran),
+        num_groups=num_groups,
+        is_sfa=False,
+    )
+
+    expected_message = "a_scale must have shape"
+    if bad_scale == "a_m":
+        a_sf = a_sf[:-1, :]
+    elif bad_scale == "a_k":
+        a_sf = a_sf[:, :-1]
+    elif bad_scale == "b_expert":
+        b_sf = b_sf[:-1, :, :]
+        expected_message = "b_scale must have shape"
+    elif bad_scale == "b_n":
+        b_sf = b_sf[:, :-1, :]
+        expected_message = "b_scale must have shape"
+    elif bad_scale == "b_k":
+        b_sf = b_sf[:, :, :-1]
+        expected_message = "b_scale must have shape"
+
+    with pytest.raises(Exception, match=expected_message):
+        moe_gemm_mxfp8_nt_groupwise(
+            a_fp8,
+            b_fp8,
+            a_sf,
+            b_sf,
+            m_indptr,
+            scale_granularity_mnk=(1, 1, k_gran),
+            out_dtype=torch.bfloat16,
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
