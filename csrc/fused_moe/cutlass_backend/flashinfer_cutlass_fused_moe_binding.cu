@@ -739,6 +739,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         return static_cast<int64_t>(
             mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
       });
+    } else if (name == "get_valid_tactics_for_shape") {
+      return Function::FromTyped([this](int64_t stage, int64_t gemm_n, int64_t gemm_k) -> Array<int64_t> {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return getValidTacticsForShape(stage, gemm_n, gemm_k);
+      });
     } else if (name == "run_moe") {
       return Function::FromTyped(
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
@@ -811,6 +816,78 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   std::vector<Profile> mAllProfiles;
   int64_t mGemm1TacticCount{0};
   int64_t mGemm2TacticCount{0};
+
+  bool isProfileShapeSupported(Profile const& profile, int64_t gemm_n, int64_t gemm_k) const {
+    int64_t tile_m = 0;
+    int64_t tile_n = 0;
+    int64_t tile_k = 0;
+    if (profile.sm_version == 90) {
+      auto const [m, n, k] =
+          tensorrt_llm::cutlass_extensions::enum_to_shape_tuple(profile.tile_config_sm90);
+      tile_m = m;
+      tile_n = n;
+      tile_k = k;
+    } else if (profile.sm_version == 100) {
+      auto const [m, n, k] =
+          tensorrt_llm::cutlass_extensions::enum_to_shape_tuple(profile.tile_config_sm100);
+      tile_m = m;
+      tile_n = n;
+      tile_k = k;
+    } else if (profile.sm_version == 120) {
+      auto const [m, n, k] =
+          tensorrt_llm::cutlass_extensions::enum_to_shape_tuple(profile.tile_config_sm120);
+      tile_m = m;
+      tile_n = n;
+      tile_k = k;
+    }
+
+    if (tile_m <= 0 || tile_n <= 0 || tile_k <= 0 || gemm_n <= 0 || gemm_k <= 0) {
+      return false;
+    }
+    if (gemm_k < tile_k || gemm_k % tile_k != 0) {
+      return false;
+    }
+    if (gemm_n < tile_n) {
+      return false;
+    }
+    if (mUseW4GroupScaling && gemm_n % tile_m != 0) {
+      return false;
+    }
+    return true;
+  }
+
+  Array<int64_t> getValidTacticsForShape(int64_t stage, int64_t gemm_n, int64_t gemm_k) const {
+    int64_t begin = 0;
+    int64_t end = static_cast<int64_t>(mAllProfiles.size());
+    if (stage == 1) {
+      end = mGemm1TacticCount;
+    } else if (stage == 2) {
+      begin = mGemm1TacticCount;
+      end = mGemm1TacticCount + mGemm2TacticCount;
+    }
+
+    int64_t const total = static_cast<int64_t>(mAllProfiles.size());
+    if (begin < 0) {
+      begin = 0;
+    }
+    if (begin > total) {
+      begin = total;
+    }
+    if (end < begin) {
+      end = begin;
+    }
+    if (end > total) {
+      end = total;
+    }
+
+    Array<int64_t> tactics;
+    for (int64_t tactic_id = begin; tactic_id < end; ++tactic_id) {
+      if (!mUseW4GroupScaling || isProfileShapeSupported(mAllProfiles[tactic_id], gemm_n, gemm_k)) {
+        tactics.push_back(tactic_id);
+      }
+    }
+    return tactics;
+  }
 
   void setRunnerProfiles(Optional<Array<int64_t>> profile_ids) {
     if (mUseDeepSeekFP8BlockScaling) {

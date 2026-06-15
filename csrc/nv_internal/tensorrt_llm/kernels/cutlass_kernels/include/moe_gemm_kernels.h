@@ -217,6 +217,7 @@ struct TmaWarpSpecializedGroupedGemmInput {
   size_t gemm_workspace_size = 0;
   uint8_t* precomputed_scheduler_workspace = nullptr;
   size_t precomputed_scheduler_workspace_size = 0;
+  int64_t precomputed_scheduler_total_routed_tokens = 0;
 
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl{};

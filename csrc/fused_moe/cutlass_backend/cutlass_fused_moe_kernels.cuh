@@ -1341,10 +1341,35 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
                                    layout_info2.swap_ab ? gemm_m : gemm2_n, gemm2_k);
   }
 
+  bool const needs_zero_token_weight_desc =
+      layout_info1.int4_groupwise_params.enabled || layout_info2.int4_groupwise_params.enabled;
+
+  auto compute_tma_strides = [&]() {
+    assert(gemm_m <= INT32_MAX);
+    assert(gemm1_n > 0 && gemm1_n <= INT32_MAX);
+    assert(gemm1_k > 0 && gemm1_k <= INT32_MAX);
+    assert(gemm2_n > 0 && gemm2_n <= INT32_MAX);
+    assert(gemm2_k > 0 && gemm2_k <= INT32_MAX);
+    computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert);
+    computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert);
+  };
+
+  if (gemm_m != 0 || needs_zero_token_weight_desc) {
+    compute_tma_strides();
+  }
+
+  if (gemm_m == 0 && needs_zero_token_weight_desc) {
+    layout_info1.ptr_weight[expert] = safe_inc_ptr(weights1, expert * (gemm1_n * gemm1_k));
+    layout_info2.ptr_weight[expert] = safe_inc_ptr(weights2, expert * (gemm2_n * gemm2_k));
+  }
+
   // Skip expensive stride/pointer/SF setup for experts with no assigned tokens.
   // All problem shapes (including int4_groupwise) are initialized above so CUTLASS
-  // can correctly traverse the problem list. The remaining work (alpha scales,
-  // block scaling factors, strides, pointers) is only needed for active experts.
+  // can correctly traverse the problem list. For groupwise W4 paths, weight
+  // strides/pointers are initialized above because the prebuilt global weight
+  // TMA descriptor uses group 0 as its base even when that expert has no tokens.
+  // The remaining work (alpha scales, block scaling factors, activation/output
+  // pointers) is only needed for active experts.
   // For decode (1 token, top_k=8, 128 experts), this skips ~120 of 128 experts.
   if (gemm_m == 0) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -1378,14 +1403,6 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
                   quant_params.mxfp8_mxfp4);
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
                   quant_params.mxfp8_mxfp8);
-
-  assert(gemm_m <= INT32_MAX);
-  assert(gemm1_n > 0 && gemm1_n <= INT32_MAX);
-  assert(gemm1_k > 0 && gemm1_k <= INT32_MAX);
-  assert(gemm2_n > 0 && gemm2_n <= INT32_MAX);
-  assert(gemm2_k > 0 && gemm2_k <= INT32_MAX);
-  computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert);
-  computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert);
 
   computeTmaWarpSpecializedInputPointers(
       layout_info1, gemm_m, gemm1_n, gemm1_k, num_tokens_before_expert, expert, gemm1_in, weights1,
@@ -4137,6 +4154,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
 
     gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
     gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
+    gemm1_tma_ws_input.precomputed_scheduler_total_routed_tokens = expanded_num_rows;
+    gemm2_tma_ws_input.precomputed_scheduler_total_routed_tokens = expanded_num_rows;
     TLLM_CHECK_WITH_INFO(
         (gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) || !use_w4_groupwise,
         "Hopper w4 mixed input groupwise requires swap_ab");
@@ -4765,6 +4784,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(
   tma_ws_input_workspace += workspace_index * tma_ws_size;
 
   size_t num_expanded_tokens = num_tokens * mK;
+  dummy_tma_ws_input.precomputed_scheduler_total_routed_tokens = num_expanded_tokens;
   for (int64_t i = 0; i < NUM_ROUTING_SAMPLES; i++) {
     // Note: Even though we have separate TMA WS inputs for finalize fusion on/off we reuse the same
     // pointers to save space.
@@ -4775,6 +4795,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(
                                      workspaces.at("precomputed_scheduler_workspace").first,
                                      mScalingType);
     cache_element.enable_pdl = enable_pdl;  // Set enable_pdl for cache element
+    cache_element.precomputed_scheduler_total_routed_tokens = num_expanded_tokens;
     tma_ws_input_workspace += tma_ws_size;
 
     int64_t* expert_first_token_offset =

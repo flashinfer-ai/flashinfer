@@ -225,11 +225,14 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   static constexpr int CurrentTileShapeN = cute::size<1>(TileShape{});
   static constexpr int CurrentClusterShapeM = cute::size<0>(ClusterShape{});
   static constexpr int CurrentClusterShapeN = cute::size<1>(ClusterShape{});
+  int64_t const total_routed_tokens = hopper_inputs.precomputed_scheduler_total_routed_tokens;
+  TLLM_CHECK_WITH_INFO(total_routed_tokens > 0,
+                       "Precomputed scheduler requires total routed token count.");
   auto precomputed_workspace =
       detail::partition_precomputed_scheduler_workspace<CurrentTileShapeM, CurrentTileShapeN,
                                                         CurrentClusterShapeM,
                                                         CurrentClusterShapeN>(
-          hopper_inputs, inputs.num_experts, inputs.num_rows, inputs.n, sm_count_);
+          hopper_inputs, inputs.num_experts, total_routed_tokens, inputs.n, sm_count_);
   arguments.scheduler.precomputed_work_tiles = precomputed_workspace.work_tiles;
   arguments.mainloop.ptr_A_prebuilt_tma_desc = precomputed_workspace.prebuilt_tma_desc_A;
   arguments.mainloop.ptr_B_prebuilt_tma_descs = precomputed_workspace.prebuilt_tma_desc_B;
@@ -261,7 +264,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   detail::build_precomputed_work_tile_map<CurrentTileShapeM, CurrentTileShapeN,
                                           CurrentClusterShapeM, CurrentClusterShapeN>(
       precomputed_workspace, hopper_inputs.int4_groupwise_params.shape.problem_shapes,
-      inputs.num_experts, inputs.num_rows, inputs.n, gemm.params().mainloop, inputs.stream);
+      inputs.num_experts, total_routed_tokens, inputs.n, gemm.params().mainloop, inputs.stream);
 
   auto run_status = gemm.run(inputs.stream);
   if (run_status != cutlass::Status::kSuccess) {

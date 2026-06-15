@@ -427,7 +427,47 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             # a sentinel so the autotuner contract is never violated with an empty list.
             if not all_tactics:
                 return [-1]
-            return valid_tactics if valid_tactics else all_tactics
+            valid_tactics = valid_tactics if valid_tactics else all_tactics
+
+            if not self.use_w4_group_scaling:
+                return valid_tactics
+
+            if stage not in (1, 2):
+                return valid_tactics
+
+            x, fc1_expert_weights, _, fc2_expert_weights, _ = inputs
+            if stage == 1:
+                gemm_n = int(fc1_expert_weights.shape[1])
+                gemm_k = int(x.shape[1])
+            else:
+                gemm_n = int(fc2_expert_weights.shape[1])
+                if fc2_expert_weights.dtype == torch.uint8:
+                    gemm_k = int(fc2_expert_weights.shape[2]) * 2
+                elif fc2_expert_weights.dtype == torch.int64:
+                    gemm_k = int(fc2_expert_weights.shape[2]) * 16
+                else:
+                    gemm_k = int(fc2_expert_weights.shape[2])
+
+            try:
+                get_valid_tactics_for_shape = self.fused_moe_runner.get_valid_tactics_for_shape
+                shape_valid_tactics = set(
+                    int(t) for t in get_valid_tactics_for_shape(int(stage), int(gemm_n), int(gemm_k))
+                )
+            except AttributeError:
+                return valid_tactics
+            except Exception as e:
+                logger.warning(
+                    "get_valid_tactics_for_shape failed for stage %s, N=%d, K=%d: %s; "
+                    "including occupancy-valid tactics in autotuner",
+                    stage,
+                    gemm_n,
+                    gemm_k,
+                    e,
+                )
+                return valid_tactics
+
+            filtered_tactics = [t for t in valid_tactics if t in shape_valid_tactics]
+            return filtered_tactics if filtered_tactics else valid_tactics
 
         def forward(
             self,
