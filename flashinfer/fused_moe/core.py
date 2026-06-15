@@ -2311,6 +2311,14 @@ def get_trtllm_moe_sm100_module():
             assert topk_weights is not None, (
                 "topk_weights must be provided for UnpackedPrecomputed mode"
             )
+            # The finalize kernel reads the expert weights as args.mDtypeExpW,
+            # which is bfloat16 for this op (see runner.h: expert_weights is
+            # "[num_tokens, top_k] in bfloat16 = mDtypeExpW"). A user-provided
+            # fp32 buffer would be reinterpreted as bf16, so reject it up front.
+            assert topk_weights.dtype == torch.bfloat16, (
+                "topk_weights must be bfloat16 for UnpackedPrecomputed mode, got "
+                f"{topk_weights.dtype}"
+            )
         else:
             # For Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed), allocate OUTPUT buffers
             if topk_ids is None:
