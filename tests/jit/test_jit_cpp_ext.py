@@ -48,6 +48,29 @@ def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     assert "--dependency-output" not in ninja
 
 
+def test_ccbin_host_compiler_path_with_spaces_is_quoted(monkeypatch, tmp_path):
+    # A host-compiler path with spaces (typical on Windows, e.g.
+    # "C:\Program Files\...\cl.exe") must be quoted in the generated ninja
+    # command, otherwise the shell splits it and nvcc fails with
+    # "A single input file is required for a non-link phase". See #3515.
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
+    monkeypatch.setenv("CC", r"C:\Program Files\LLVM\bin\clang-cl.exe")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+    assert "-ccbin" in ninja
+    assert r'"C:\Program Files\LLVM\bin\clang-cl.exe"' in ninja
+
+
 def test_debug_jit_uses_sccache_compatible_nvcc_device_debug_flag(monkeypatch):
     monkeypatch.setenv("FLASHINFER_JIT_DEBUG", "1")
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
