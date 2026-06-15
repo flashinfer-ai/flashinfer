@@ -16,6 +16,7 @@ import torch
 
 import flashinfer
 from flashinfer import mm_fp4, prepare_w4a16_fp4_weights
+from flashinfer.autotuner import autotune
 from flashinfer.gemm.gemm_w4a16 import (
     _CUDNN_W4A16_MIN_BACKEND_VERSION,
     _unswizzle_sf_128x4,
@@ -207,13 +208,15 @@ def _make_random_fp4_weights(
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
+@pytest.mark.parametrize("auto_tuning", [False, True])
 @pytest.mark.parametrize("m,n,k", PROBLEM_SIZES)
-def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
+def test_backend_matches_handwritten_dequant_matmul(auto_tuning, backend, m, n, k):
     """Backend output must match a hand-rolled fp32 dequant + matmul.
 
     Reference = ``(a.float() @ dequant(b).T).to(bf16)``.  Every backend
     is expected to produce numerically equivalent output (up to ~1 bf16
-    ULP).
+    ULP).  Run with ``auto_tuning`` both off (fallback tactic) and on
+    (so the autotuner's selected tactic is exercised too).
     """
     _skip_if_backend_unavailable(backend)
     device = torch.device("cuda")
@@ -222,7 +225,8 @@ def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
 
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
-    out = mm_fp4(a, b_p, None, sf_p, alpha_p, backend=backend)
+    with autotune(auto_tuning):
+        out = mm_fp4(a, b_p, None, sf_p, alpha_p, backend=backend)
 
     weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
     ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
@@ -233,7 +237,8 @@ def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
-def test_backend_alpha_none_equals_alpha_one(backend):
+@pytest.mark.parametrize("auto_tuning", [False, True])
+def test_backend_alpha_none_equals_alpha_one(auto_tuning, backend):
     """alpha=None must produce identical output to alpha=tensor([1.0])."""
     _skip_if_backend_unavailable(backend)
     device = torch.device("cuda")
@@ -247,10 +252,10 @@ def test_backend_alpha_none_equals_alpha_one(backend):
         torch.ones(1, device=device, dtype=torch.float32),
         backend=backend,
     )
-    out_one = mm_fp4(a, b1, None, sf1, a1, backend=backend)
-
     b0, sf0, a0 = prepare_w4a16_fp4_weights(b_fp4, b_sf, None, backend=backend)
-    out_none = mm_fp4(a, b0, None, sf0, a0, backend=backend)
+    with autotune(auto_tuning):
+        out_one = mm_fp4(a, b1, None, sf1, a1, backend=backend)
+        out_none = mm_fp4(a, b0, None, sf0, a0, backend=backend)
 
     torch.testing.assert_close(out_none, out_one, atol=ATOL, rtol=RTOL)
 
