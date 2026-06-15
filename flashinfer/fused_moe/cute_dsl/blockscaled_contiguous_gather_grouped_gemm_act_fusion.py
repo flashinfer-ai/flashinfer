@@ -466,6 +466,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     if generate_sfc:
         if global_scale is None:
             raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
+    elif out_scale is not None or global_scale is not None:
+        raise ValueError(
+            "out_scale and global_scale are only supported when "
+            "c_dtype is 'float4_e2m1fn'"
+        )
 
     # Create output tensor if not provided
     if out is None:

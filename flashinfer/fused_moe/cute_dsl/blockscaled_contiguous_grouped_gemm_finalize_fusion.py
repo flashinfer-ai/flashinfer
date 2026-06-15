@@ -503,6 +503,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         assert a_per_token_scale.dtype == torch.float32, (
             "a_per_token_scale must have dtype torch.float32"
         )
+        assert a_per_token_scale.is_contiguous(), "a_per_token_scale must be contiguous"
         assert a_per_token_scale.numel() >= permuted_m, (
             f"a_per_token_scale must have at least {permuted_m} elements, "
             f"got {a_per_token_scale.numel()}"
