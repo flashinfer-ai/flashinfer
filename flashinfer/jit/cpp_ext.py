@@ -7,15 +7,15 @@ import re
 import subprocess
 import sys
 import sysconfig
-from packaging.version import Version
 from pathlib import Path
 from typing import List, Optional
 
-import tvm_ffi
 import torch
+import tvm_ffi
+from packaging.version import Version
 
-from . import env as jit_env
 from ..compilation_context import CompilationContext
+from . import env as jit_env
 
 logger = logging.getLogger(__name__)
 
@@ -341,11 +341,67 @@ def generate_ninja_build_for_op(
     return "\n".join(lines)
 
 
+def _read_mem_available_gb() -> Optional[int]:
+    """Available system memory in whole GiB from ``/proc/meminfo``, or ``None``
+    when it cannot be read (e.g. non-Linux)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    # MemAvailable is reported in kB.
+                    return int(line.split()[1]) // (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _memory_aware_job_cap() -> Optional[int]:
+    """A cap on parallel ninja jobs derived from available memory, or ``None``
+    to leave ninja's default parallelism untouched.
+
+    When ``MAX_JOBS`` is unset, ninja runs roughly ``nproc + 2`` nvcc
+    processes. Each CUTLASS / FP4 nvcc compile can peak at several GiB, so on
+    memory-constrained or unified-memory systems (e.g. DGX Spark GB10 / SM121a)
+    the default can exhaust memory and OOM-kill nvcc (exit 137), crashing the
+    caller. Mirror the per-job memory budget the AOT build uses
+    (``scripts/jit_cache_build_common.sh``: ``max(8, FLASHINFER_NVCC_THREADS *
+    2)`` GiB/job) and cap accordingly. This only ever *lowers* parallelism
+    below ninja's default; when memory is ample it returns ``None`` so behavior
+    is unchanged.
+    """
+    mem_available_gb = _read_mem_available_gb()
+    if mem_available_gb is None:
+        return None
+
+    cpu_count = os.cpu_count() or 1
+    ninja_default = cpu_count + 2  # ninja's GuessParallelism for >2 cores
+
+    try:
+        nvcc_threads = max(1, int(os.environ.get("FLASHINFER_NVCC_THREADS", "1")))
+    except ValueError:
+        nvcc_threads = 1
+    mem_per_job_gb = max(8, nvcc_threads * 2)
+
+    mem_cap = max(1, mem_available_gb // mem_per_job_gb)
+    if mem_cap >= ninja_default:
+        # Plenty of memory for the default parallelism; don't intervene.
+        return None
+    logger.warning(
+        "Capping ninja parallelism to %d job(s) (MAX_JOBS unset, %d GiB "
+        "available, budgeting %d GiB/job) to avoid OOM during JIT compilation; "
+        "set MAX_JOBS to override.",
+        mem_cap,
+        mem_available_gb,
+        mem_per_job_gb,
+    )
+    return mem_cap
+
+
 def _get_num_workers() -> Optional[int]:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
         return int(max_jobs)
-    return None
+    return _memory_aware_job_cap()
 
 
 def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
