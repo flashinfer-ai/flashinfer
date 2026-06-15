@@ -566,6 +566,7 @@ class CuteDslMoEWrapper:
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            use_per_token_activation=use_per_token_activation,
         )
 
         if use_cuda_graph:
@@ -927,15 +928,8 @@ def cute_dsl_fused_moe_nvfp4(
 
     tuner = AutoTuner.get()
 
-    def forward_impl(*args, **kwargs):
-        return _cute_dsl_fused_moe_nvfp4_impl(
-            *args,
-            **kwargs,
-            use_per_token_activation=use_per_token_activation,
-        )
-
     runner = CuteDslFusedMoENvfp4Runner(
-        forward_impl=forward_impl,
+        forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_local_experts,
@@ -947,6 +941,7 @@ def cute_dsl_fused_moe_nvfp4(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        use_per_token_activation=use_per_token_activation,
     )
 
     inputs = [
@@ -970,9 +965,15 @@ def cute_dsl_fused_moe_nvfp4(
         runner.tuning_config,
         inputs,
         aux_stream=aux_stream,
+        use_per_token_activation=use_per_token_activation,
     )
 
-    return runner(inputs, tactic=best_tactic, aux_stream=aux_stream)
+    return runner(
+        inputs,
+        tactic=best_tactic,
+        aux_stream=aux_stream,
+        use_per_token_activation=use_per_token_activation,
+    )
 
 
 __all__ = [

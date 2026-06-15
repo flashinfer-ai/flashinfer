@@ -262,6 +262,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         local_expert_offset: Starting expert index for this partition.
         use_fused_finalize: Whether to use fused finalize (default: True).
         output_dtype: Output data type (default: torch.bfloat16).
+        use_per_token_activation: Whether GEMM1 materializes activations for
+            standalone per-token NVFP4 quantization before GEMM2.
     """
 
     def __init__(
@@ -278,6 +280,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        use_per_token_activation: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         self.forward_impl = forward_impl
@@ -293,6 +296,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.use_per_token_activation = use_per_token_activation
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -388,6 +392,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
+                self.use_per_token_activation,
             )
         )
 
@@ -447,7 +452,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         sf_dtype = cutlass.Float8E4M3FN
         sf_vec_size = 16
 
-        gemm1_c_dtype = cutlass.Float4E2M1FN
+        if self.use_per_token_activation:
+            if self.output_dtype == torch.float16:
+                gemm1_c_dtype = cutlass.Float16
+            elif self.output_dtype == torch.bfloat16:
+                gemm1_c_dtype = cutlass.BFloat16
+            else:
+                return []
+        else:
+            gemm1_c_dtype = cutlass.Float4E2M1FN
         gemm2_out_dtype = cutlass.BFloat16
 
         token_final_scales = inputs[3]
