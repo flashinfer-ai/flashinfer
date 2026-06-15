@@ -245,7 +245,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         2: token_selected_experts (num_tokens, top_k) - expert assignments
         3: token_final_scales (num_tokens, top_k) - routing weights
         4-10: weight tensors (fixed size, don't depend on num_tokens)
-        11: moe_output (num_tokens, hidden_size) - output buffer
+        11: per_token_scale (num_tokens,) - optional input row scale in
+            per-token activation mode, otherwise moe_output
+        12: moe_output (num_tokens, hidden_size) - output buffer in per-token
+            activation mode
 
     Args:
         forward_impl: The actual MoE implementation function.
@@ -255,8 +258,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         local_expert_offset: Starting expert index for this partition.
         use_fused_finalize: Whether to use fused finalize (default: True).
         output_dtype: Output data type (default: torch.bfloat16).
-        use_per_token_activation: Whether GEMM1 materializes activations for
-            standalone per-token NVFP4 quantization before GEMM2.
+        use_per_token_activation: Whether to mirror TRTLLM's explicit
+            per-token activation path: apply input row scales in GEMM1/SwiGLU,
+            then materialize activations for standalone per-token NVFP4
+            quantization before GEMM2.
     """
 
     def __init__(
@@ -538,7 +543,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             inputs: List of input tensors:
                 [x, x_sf, token_selected_experts, token_final_scales,
                  w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
-                 w2_weight, w2_weight_sf, w2_alpha, moe_output (optional)]
+                 w2_weight, w2_weight_sf, w2_alpha, per_token_scale (optional),
+                 moe_output (optional)]
             tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic) or None for default.
             do_preparation: If True, perform one-time setup (not used).
             **kwargs: Additional keyword arguments passed to forward_impl.

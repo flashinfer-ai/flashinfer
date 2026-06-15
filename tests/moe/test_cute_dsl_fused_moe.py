@@ -178,6 +178,9 @@ def compute_reference_moe_fp4(
         hidden_size: Hidden dimension
         intermediate_size: Intermediate dimension
         fc2_input_scale: Optional scale for FC2 input quantization
+        use_per_token_activation: Use the TRTLLM-style explicit per-token path:
+            the input has already been dequantized with its row scale, and the
+            GEMM1/SwiGLU output is quantized per token before GEMM2.
         num_local_experts: Number of local experts (for EP). Defaults to num_experts.
         local_expert_offset: Starting expert ID for this EP rank. Defaults to 0.
 

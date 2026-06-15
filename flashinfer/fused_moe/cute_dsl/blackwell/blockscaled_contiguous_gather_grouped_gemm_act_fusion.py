@@ -799,7 +799,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param alpha: Alpha tensor for each group
         :type alpha: cute.Tensor
         :param a_per_token_scale: Optional per-token row scale for operand A,
-            shape (orig_m,). Only used when use_a_per_token_scale is true.
+            shape (orig_m,). Indexed by the original token ID decoded from
+            token_id_mapping_tensor. Only used when use_a_per_token_scale is true.
         :type a_per_token_scale: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
@@ -1675,7 +1676,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # Get the first tile info
+            # Five fields: tile_m, tile_n, expert, valid, mn_limit. The
+            # epilogue uses mn_limit to guard padded rows before loading
+            # optional per-token input scales.
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
@@ -2495,7 +2498,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # Get the first tile info
+            # Five fields: tile_m, tile_n, expert, valid, mn_limit. The
+            # epilogue uses mn_limit to guard padded rows before loading
+            # optional per-token input scales.
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
 
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
