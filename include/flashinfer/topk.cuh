@@ -18,8 +18,6 @@
 
 #include <cuda.h>
 
-#include <array>
-#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cub/cub.cuh>
