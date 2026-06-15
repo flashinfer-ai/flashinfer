@@ -252,47 +252,6 @@ def msa_sparse_attention(
     return output
 
 
-def _get_sparse_combine_module():
-    from .jit import gen_sparse_combine_module
-
-    if not hasattr(_get_sparse_combine_module, "_mod"):
-        _get_sparse_combine_module._mod = gen_sparse_combine_module().build_and_load()
-    return _get_sparse_combine_module._mod
-
-
-def _combine_partials_cuda(
-    o_partial: torch.Tensor,  # [topk, total_q, Hq, d]
-    lse_partial: torch.Tensor,  # [topk, total_q, Hq] f32, log2 domain
-    split_counts: torch.Tensor,  # [total_q, Hkv] int32
-    group_size: int,
-    out_dtype: torch.dtype,
-    lse_out: Optional[torch.Tensor] = None,
-    out_scale: float = 1.0,
-    lse_t_partial: Optional[torch.Tensor] = None,
-    lse_t_out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Fused CUDA LSE-weighted reduction over each query's split slots.
-
-    Legacy CUDA C++ path, retained as the differential-test reference for the
-    CuTe-DSL port (:func:`_combine_partials_cudsl`)."""
-    topk, total_q, num_qo_heads, head_dim = o_partial.shape
-    out = torch.empty(
-        (total_q, num_qo_heads, head_dim), dtype=out_dtype, device=o_partial.device
-    )
-    _get_sparse_combine_module().sparse_combine(
-        o_partial,
-        lse_partial,
-        split_counts,
-        out,
-        lse_out,
-        lse_t_partial,
-        lse_t_out,
-        group_size,
-        out_scale,
-    )
-    return out
-
-
 def _get_compiled_combine(
     partial_dtype: torch.dtype,
     out_dtype: torch.dtype,

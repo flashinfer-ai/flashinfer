@@ -14,19 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
 from typing import Optional
 
 import torch
 
 from ..api_logging import flashinfer_api
 from ..utils import is_sm12x_supported
-from .jit import gen_sparse_topk_select_module
-
-
-@functools.cache
-def _get_sparse_topk_select_module():
-    return gen_sparse_topk_select_module().build_and_load()
 
 
 _radix_compile_cache: dict = {}
@@ -78,7 +71,6 @@ def msa_topk_select(
     output: Optional[torch.Tensor] = None,
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
-    _backend: str = "auto",
 ) -> torch.Tensor:
     """Select the top-K KV blocks per query token based on attention scores.
 
@@ -175,47 +167,19 @@ def msa_topk_select(
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
 
-    # The multi-stage radix port ("cudsl_radix") is the single CuTe-DSL
-    # algorithm: a faithful port of the CUDA IndexerTopK kernel that refines the
-    # threshold bin ~10 bits per stage, so its staging buffer never grows with
-    # max_k_tiles and it covers the full CUDA-supported range (< 12288, i.e.
-    # <=1.5M ctx). "cuda" runs the retained CUDA reference. "auto" uses radix.
-    backend = _backend
-    if backend == "auto":
-        backend = "cudsl_radix"
-
-    if backend == "cuda":
-        workspace_size = num_qo_heads * max_k_tiles * total_qo_len
-        workspace = torch.empty(
-            workspace_size, dtype=torch.int32, device=max_score.device
-        )
-        _get_sparse_topk_select_module().sparse_topk_select(
-            max_score,
-            output,
-            workspace,
-            topk,
-            num_valid_pages,
-            force_begin_blocks,
-            force_end_blocks,
-        )
-    elif backend == "cudsl_radix":
-        if max_k_tiles >= 12288:
-            raise ValueError(
-                f"cudsl_radix supports max_k_tiles < 12288, got {max_k_tiles}"
-            )
-        _get_compiled_radix_topk(topk)(
-            max_score,
-            output,
-            int(num_valid_pages),
-            int(force_begin_blocks),
-            int(force_end_blocks),
-            int(total_qo_len),
-            int(num_qo_heads),
-            int(max_k_tiles),
-        )
-    else:
-        raise ValueError(
-            f"unknown _backend {_backend!r}; expected 'auto', 'cudsl_radix', or 'cuda'"
-        )
+    # Multi-stage radix select refines the threshold bin ~10 bits per stage, so
+    # its staging buffer is bounded and it supports max_k_tiles < 12288 (~1.5M ctx).
+    if max_k_tiles >= 12288:
+        raise ValueError(f"max_k_tiles must be < 12288, got {max_k_tiles}")
+    _get_compiled_radix_topk(topk)(
+        max_score,
+        output,
+        int(num_valid_pages),
+        int(force_begin_blocks),
+        int(force_end_blocks),
+        int(total_qo_len),
+        int(num_qo_heads),
+        int(max_k_tiles),
+    )
 
     return output

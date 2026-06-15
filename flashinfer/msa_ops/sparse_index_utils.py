@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -22,12 +21,6 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..utils import is_sm12x_supported
-from .jit import gen_build_k2q_csr_module
-
-
-@functools.cache
-def _get_build_k2q_csr_module():
-    return gen_build_k2q_csr_module().build_and_load()
 
 
 # Compiled CuTe-DSL CSR builders, keyed by (topk, has_schedule).
@@ -216,7 +209,6 @@ def msa_build_k2q_csr(
     blk_kv: int = 128,
     row_ptr: Optional[torch.Tensor] = None,
     q_indices: Optional[torch.Tensor] = None,
-    _backend: str = "cudsl",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Invert per-query top-K KV block indices into a KV-major CSR structure.
 
@@ -324,31 +316,17 @@ def msa_build_k2q_csr(
             raise ValueError(f"q_indices must be int32, got {q_indices.dtype}")
 
     cu_q_dev = cu_seqlens_q.to(device, non_blocking=True)
-    cu_k_dev = cu_seqlens_k.to(device, non_blocking=True)
 
-    if _backend == "cuda":
-        _get_build_k2q_csr_module().build_k2q_csr(
-            q2k_indices,
-            cu_q_dev,
-            cu_k_dev,
-            row_ptr,
-            q_indices,
-            topk,
-            blk_kv,
-            total_rows,
-            max_kv_blocks,
-        )
-    else:
-        _run_csr_cudsl(
-            q2k_indices,
-            cu_q_dev,
-            cu_k_cpu,
-            total_rows,
-            max_kv_blocks,
-            topk,
-            row_ptr,
-            q_indices,
-        )
+    _run_csr_cudsl(
+        q2k_indices,
+        cu_q_dev,
+        cu_k_cpu,
+        total_rows,
+        max_kv_blocks,
+        topk,
+        row_ptr,
+        q_indices,
+    )
 
     return row_ptr, q_indices
 
@@ -361,7 +339,6 @@ def msa_build_k2q_csr_schedule(
     blk_kv: int = 128,
     target_q_per_cta: int = 128,
     max_seqlen_q: int = 0,
-    _backend: str = "cudsl",
 ) -> MsaAttentionSchedule:
     """Build the KV-major CSR plus the flat work schedule for the sparse
     forward kernel.
@@ -422,43 +399,23 @@ def msa_build_k2q_csr_schedule(
     work_count = torch.empty((1,), dtype=torch.int32, device=device)
 
     cu_q_dev = cu_seqlens_q.to(device, non_blocking=True)
-    cu_k_dev = cu_seqlens_k.to(device, non_blocking=True)
 
-    if _backend == "cuda":
-        _get_build_k2q_csr_module().build_k2q_csr_schedule(
-            q2k_indices,
-            cu_q_dev,
-            cu_k_dev,
-            row_ptr,
-            q_indices,
-            qsplit_indices,
-            split_counts,
-            scheduler_metadata,
-            work_count,
-            topk,
-            blk_kv,
-            total_rows,
-            max_kv_blocks,
-            target_q_per_cta,
-            max_seqlen_q,
-        )
-    else:
-        _run_csr_cudsl(
-            q2k_indices,
-            cu_q_dev,
-            cu_k_cpu,
-            total_rows,
-            max_kv_blocks,
-            topk,
-            row_ptr,
-            q_indices,
-            target_q_per_cta=target_q_per_cta,
-            qsplit_indices=qsplit_indices,
-            split_counts=split_counts,
-            scheduler_metadata=scheduler_metadata,
-            work_count=work_count,
-            work_capacity=work_capacity,
-        )
+    _run_csr_cudsl(
+        q2k_indices,
+        cu_q_dev,
+        cu_k_cpu,
+        total_rows,
+        max_kv_blocks,
+        topk,
+        row_ptr,
+        q_indices,
+        target_q_per_cta=target_q_per_cta,
+        qsplit_indices=qsplit_indices,
+        split_counts=split_counts,
+        scheduler_metadata=scheduler_metadata,
+        work_count=work_count,
+        work_capacity=work_capacity,
+    )
 
     return MsaAttentionSchedule(
         row_ptr=row_ptr,
