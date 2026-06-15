@@ -878,6 +878,29 @@ def test_msa_topk_select_forced_and_clamped():
     assert (v < nvp).all()
 
 
+def test_msa_topk_select_input_guards():
+    """Out-of-range num_valid_pages and oversized forced regions must be rejected
+    (the radix path does not clamp internally, so the wrapper validates)."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_topk_select
+
+    dev = "cuda"
+    H, P, S, topk = 2, 64, 8, 16
+    max_score = torch.randn(H, P, S, dtype=torch.float32, device=dev)
+    # num_valid_pages out of (0, max_k_tiles]
+    with pytest.raises(ValueError, match="num_valid_pages"):
+        msa_topk_select(max_score, topk, num_valid_pages=P + 1)
+    with pytest.raises(ValueError, match="num_valid_pages"):
+        msa_topk_select(max_score, topk, num_valid_pages=0)
+    # forced regions exceeding the topk budget / the valid range
+    with pytest.raises(ValueError, match="topk"):
+        msa_topk_select(max_score, topk, force_begin_blocks=10, force_end_blocks=10)
+    with pytest.raises(ValueError, match="num_valid_pages"):
+        msa_topk_select(
+            max_score, topk, num_valid_pages=4, force_begin_blocks=3, force_end_blocks=3
+        )
+
+
 def test_fuzz_random_shapes():
     """Seeded random-shape sweep (MSA-style fuzzing) with element-wise checks
     against the reference, on both prefill kernels."""
@@ -981,7 +1004,9 @@ def test_fully_masked_selected_blocks():
         assert torch.isfinite(out.float()).all(), f"NaN/Inf in {name}"
         assert (out[:64].float() == 0).all(), f"{name}: masked rows must be zero"
     assert (lse[:64] == float("-inf")).all(), "LSE of masked rows must be -inf"
-    assert torch.isfinite(lse[64:]).all() or True  # rows with empty selection allowed
+    # rows 64+ select >=1 block, but some selections may be fully causally masked
+    # (-> LSE -inf). The real invariant is "no NaN": LSE must be finite or -inf.
+    assert not torch.isnan(lse[64:]).any(), "LSE must be finite or -inf, never NaN"
     ref = _ref_sparse_attention(
         q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), True, scale
     )

@@ -137,6 +137,29 @@ def msa_topk_select(
     if num_valid_pages is None:
         num_valid_pages = max_k_tiles
 
+    # Input guards. The retained CUDA kernel clamps these internally (and MSA's own
+    # Python wrapper asserts them), but the default CuTe-DSL radix path does not, so
+    # validate here for both: out of range num_valid_pages would read max_score out
+    # of bounds, and oversized forced regions would overrun the radix kernel's fixed
+    # forced-index buffer or produce negative (underflowed) block indices.
+    if not 0 < num_valid_pages <= max_k_tiles:
+        raise ValueError(
+            f"num_valid_pages must be in (0, max_k_tiles={max_k_tiles}], "
+            f"got {num_valid_pages}"
+        )
+    if force_begin_blocks < 0 or force_end_blocks < 0:
+        raise ValueError("force_begin_blocks / force_end_blocks must be >= 0")
+    if force_begin_blocks + force_end_blocks > topk:
+        raise ValueError(
+            f"force_begin_blocks + force_end_blocks ({force_begin_blocks} + "
+            f"{force_end_blocks}) must be <= topk ({topk})"
+        )
+    if force_begin_blocks + force_end_blocks > num_valid_pages:
+        raise ValueError(
+            f"force_begin_blocks + force_end_blocks ({force_begin_blocks} + "
+            f"{force_end_blocks}) must be <= num_valid_pages ({num_valid_pages})"
+        )
+
     if output is None:
         output = torch.empty(
             (total_qo_len, num_qo_heads, topk),

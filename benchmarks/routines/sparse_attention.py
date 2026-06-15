@@ -48,7 +48,7 @@ BLK_KV = 128
 
 # Which kernel backends each MSA routine actually exposes.
 _ROUTINE_BACKENDS = {
-    "MSAProxyScore": ["cudsl"],
+    "MSAProxyScore": ["cudsl", "fp4"],
     "MSATopkSelect": ["cudsl_radix", "cuda"],
     "MSABuildCsr": ["cudsl", "cuda"],
     "MSASparseAttentionKvMajor": ["cudsl"],
@@ -83,8 +83,12 @@ def parse_sparse_attention_args(line, parser):
         required=False,
         nargs="+",
         default=["cudsl"],
-        choices=["cudsl", "cuda", "cudsl_radix"],
-        help="Kernel implementation(s) to test. Default: cudsl.",
+        choices=["cudsl", "cuda", "cudsl_radix", "fp4"],
+        help=(
+            "Kernel implementation(s) to test. Default: cudsl. For MSAProxyScore, "
+            "'fp4' (NVFP4 tensor-core proxy) compares against the 'cudsl' bf16 "
+            "reference."
+        ),
     )
     parser.add_argument("--batch_size", type=int, default=1, help="Number of requests.")
     parser.add_argument(
@@ -227,7 +231,13 @@ def _record(args, backend, times, *, tflops=0.0, tb_per_sec=0.0, total_q=0, tota
 # per-op routines
 # --------------------------------------------------------------------------- #
 def testMSAProxyScore(args):
-    """Stage 1: dense per-KV-block max logits (msa_proxy_score)."""
+    """Stage 1: dense per-KV-block max logits (msa_proxy_score).
+
+    Backends: ``cudsl`` (bf16 reference) and ``fp4`` (NVFP4 tensor-core proxy). The
+    fp4 backend quantizes the same bf16 q/k to NVFP4 so the two are directly
+    comparable; the index K is read from HBM at ~4 bits/elem on the fp4 path (the
+    bandwidth win) vs 16 bits on bf16.
+    """
     if args.verbose >= 1:
         print(f"[INFO] Running testMSAProxyScore | FlashInfer {flashinfer.__version__}")
     device = _common(args)
@@ -243,13 +253,44 @@ def testMSAProxyScore(args):
     k = torch.randn(total_kv, Hkv, 128, device=device, dtype=q_dtype) / 3
     cu_q, cu_k = _cu_seqlens(bs, s_qo, device), _cu_seqlens(bs, s_kv, device)
 
-    def run(_b):
-        return msa_proxy_score(
-            q, k, cu_q, cu_k, causal=args.causal, max_k_tiles=args.max_k_tiles
+    backends = _resolve_backends(args)
+    if "fp4" in backends:
+        from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
+
+        q_fp4, q_sc, q_g = quantize_bf16_qk_to_nvfp4(q)
+        k_fp4, k_sc, k_g = quantize_bf16_qk_to_nvfp4(k)
+
+    def run(b):
+        if b == "cudsl":
+            return msa_proxy_score(
+                q, k, cu_q, cu_k, causal=args.causal, max_k_tiles=args.max_k_tiles
+            )
+        return msa_proxy_score_fp4(
+            q_fp4,
+            k_fp4,
+            q_sc,
+            k_sc,
+            q_g,
+            k_g,
+            cu_q,
+            cu_k,
+            causal=args.causal,
+            max_k_tiles=args.max_k_tiles,
         )
 
+    # K-read bytes/elem for the analytical bandwidth metric: bf16 reads 2 B/elem,
+    # NVFP4 reads 0.5 (packed e2m1) + 1/16 (e4m3 block scale) = 0.5625 B/elem.
+    bytes_per_elem = {"cudsl": 2.0, "fp4": 0.5625}
+
     res = []
-    for b in _resolve_backends(args):
+    outputs = {}
+    for b in backends:
+        if args.refcheck:
+            try:
+                outputs[b] = run(b).float().clone()
+            except Exception as e:
+                print(f"[WARNING] {b} proxy failed: {e}")
+                continue
         times = bench_gpu_time(
             fn=run,
             dry_run_iters=args.dry_run_iters,
@@ -258,12 +299,60 @@ def testMSAProxyScore(args):
             use_cuda_graph=False,
             input_args=(b,),
         )
-        # dense QK over the proxy: 2 * total_q * total_kv * Hq * head_dim (per request)
+        median = float(np.median(times))  # milliseconds
+        # dense QK over the proxy: 2 * total_q * total_kv * Hq * head_dim (per
+        # request). times are in ms, so 1e9*ms == 1e12*s gives TFLOPs / TB/s.
         flops = 2 * bs * s_qo * s_kv * Hq * 128
-        tflops = flops / (1e9 * float(np.median(times)))
+        tflops = flops / (1e9 * median)
+        # Physical HBM K bytes: the index K is one kv_head wide, read once per
+        # kv_head (the qo_head re-reads within a GQA group are largely L2-served).
+        # Using Hkv (not Hq) keeps the number a physical-DRAM estimate; the bf16 vs
+        # fp4 ratio is the headline signal either way.
+        k_read_bytes = bs * Hkv * s_kv * 128 * bytes_per_elem[b]
+        tb_per_sec = k_read_bytes / (1e9 * median)
         res.append(
-            _record(args, b, times, tflops=tflops, total_q=total_q, total_kv=total_kv)
+            _record(
+                args,
+                b,
+                times,
+                tflops=tflops,
+                tb_per_sec=tb_per_sec,
+                total_q=total_q,
+                total_kv=total_kv,
+            )
         )
+
+    # refcheck: fp4 scores are lossy vs the bf16 reference *by design* (the index
+    # K is stored at 4 bits). Per-block-max scores can shift by >10% on a single
+    # extreme block, so raw-score tolerance is not the right gate; top-k selection
+    # overlap is the deployment metric (exercised in tests/msa_ops/test_proxy_fp4.py).
+    # Here we report mean/max rel error and fail only on a gross mismatch that
+    # would indicate a real bug, not fp4 rounding.
+    if args.refcheck:
+        if "cudsl" not in outputs or len(outputs) < 2:
+            print(
+                "[WARNING] proxy refcheck skipped: it compares against the 'cudsl' "
+                "bf16 reference, so run it alongside >=1 other backend "
+                "(e.g. --backends cudsl fp4)."
+            )
+        else:
+            ref = outputs["cudsl"]
+            for b, out in outputs.items():
+                if b == "cudsl":
+                    continue
+                finite = torch.isfinite(ref) & torch.isfinite(out)
+                denom = ref[finite].abs().clamp_min(1e-3)
+                rel = (out[finite] - ref[finite]).abs() / denom
+                mean_rel, max_rel = rel.mean().item(), rel.max().item()
+                print(
+                    f"[REFCHECK] {b} vs cudsl(bf16): mean rel {mean_rel:.4f}, "
+                    f"max rel {max_rel:.4f} (fp4 is lossy; selection overlap is the "
+                    f"deployment metric)"
+                )
+                if mean_rel > 0.5 and not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"{b} proxy mean rel err {mean_rel:.4f} vs bf16 (>0.5)"
+                    )
     return res
 
 
