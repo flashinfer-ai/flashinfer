@@ -462,14 +462,34 @@ static void launch_pipeline(const int* q2k_ptr, const int* cu_q_ptr, const int* 
   err = cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev);
   TVM_FFI_ICHECK(err == cudaSuccess) << cudaGetErrorString(err);
 
-  // SMEM budget: conservative 228KB cap (SM100=228KB, SM120=256KB).
+  // SMEM budget, queried from the device (carveout-aware) rather than hardcoded.
+  // The per-SM capacity is the occupancy budget; the per-block opt-in maximum is
+  // the hard ceiling on what a single CTA may request via cudaFuncSetAttribute.
+  // These differ a lot across Blackwell: datacenter SM100 has 228KB/SM, but the
+  // consumer/Pro SM120/SM121 parts (RTX 5080, RTX PRO 6000, GB10) have only
+  // ~100KB/SM and a ~99KB per-block opt-in cap. The old hardcoded 228KB launched
+  // fine on SM100 but let per_cta_smem reach 114KB, which exceeds the consumer
+  // per-block limit once the per-warp histogram grows large (total_rows ~50k+),
+  // aborting cudaFuncSetAttribute below.
+  int smem_per_sm = 0, smem_per_block_optin = 0;
+  err = cudaDeviceGetAttribute(&smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+  TVM_FFI_ICHECK(err == cudaSuccess) << cudaGetErrorString(err);
+  err = cudaDeviceGetAttribute(&smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  TVM_FFI_ICHECK(err == cudaSuccess) << cudaGetErrorString(err);
+
   int per_warp_smem = ((total_rows + 1) >> 1) * (int)sizeof(int);
   int kWarps_pick = 4;
-  while (kWarps_pick > 1 && (kWarps_pick * per_warp_smem) * 2 > 228 * 1024) kWarps_pick >>= 1;
+  // keep >=2 CTAs/SM resident: per-CTA smem <= half the per-SM budget.
+  while (kWarps_pick > 1 && (kWarps_pick * per_warp_smem) * 2 > smem_per_sm) kWarps_pick >>= 1;
   if (kWarps_pick < 1) kWarps_pick = 1;
 
   int per_cta_smem = kWarps_pick * per_warp_smem;
-  int max_ctas_per_sm = std::max(1, (228 * 1024) / std::max(1, per_cta_smem));
+  // a single CTA cannot opt into more than the device per-block maximum.
+  TVM_FFI_ICHECK(per_cta_smem <= smem_per_block_optin)
+      << "build_k2q_csr: required shared memory " << per_cta_smem
+      << " B exceeds the device per-block opt-in limit " << smem_per_block_optin
+      << " B (total_rows=" << total_rows << "); context too large for this GPU.";
+  int max_ctas_per_sm = std::max(1, smem_per_sm / std::max(1, per_cta_smem));
   if (max_ctas_per_sm > 8) max_ctas_per_sm = 8;
 
   constexpr int kMinQPerCta = 256;
