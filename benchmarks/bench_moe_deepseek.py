@@ -304,7 +304,6 @@ def bench_cute_dsl(
             max_num_tokens=n,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
-            use_per_token_activation=use_per_token_activation,
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
@@ -363,7 +362,6 @@ def bench_cute_dsl(
                 top_k=CFG.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=local_expert_offset,
-                use_per_token_activation=use_per_token_activation,
                 per_token_scale=hidden_per_token_scale,
             )
 
