@@ -509,6 +509,10 @@ def msa_sparse_attention_kvmajor(
             f"GQA group size {group_size} must divide m_block_size {m_block_size}"
         )
     topk = q2k_indices.shape[2]
+    # CSR builder compiles for a compact q2k layout; reject a strided q2k (e.g. a
+    # bare permute of msa_topk_select's output), matching msa_sparse_attention.
+    if not q2k_indices.is_contiguous():
+        raise ValueError("q2k_indices must be contiguous")
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
 

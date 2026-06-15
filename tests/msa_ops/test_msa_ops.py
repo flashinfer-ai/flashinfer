@@ -901,6 +901,37 @@ def test_msa_topk_select_input_guards():
         )
 
 
+def test_q2k_indices_must_be_contiguous():
+    """Decode and kvmajor compile for a compact q2k layout; a strided q2k (the
+    natural bare permute of msa_topk_select's output) must be rejected with a
+    clear message, like the q-major path."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import (
+        msa_sparse_attention_kvmajor,
+        msa_sparse_decode_attention,
+    )
+
+    dev, dtype = "cuda", torch.bfloat16
+    B, sq, Hq, Hkv, topk = 2, 1, 4, 2, 8
+    cu_k = torch.tensor([0, 512, 1024], dtype=torch.int32, device=dev)
+    total_q, total_k = B * sq, 1024
+    q = torch.randn(total_q, Hq, 128, dtype=dtype, device=dev)
+    k = torch.randn(total_k, Hkv, 128, dtype=dtype, device=dev)
+    v = torch.randn_like(k)
+    cu_q = torch.tensor([0, 1, 2], dtype=torch.int32, device=dev)
+    # (total_q, Hkv, topk) then permute -> (Hkv, total_q, topk) but strided.
+    idx_strided = torch.zeros(
+        total_q, Hkv, topk, dtype=torch.int32, device=dev
+    ).permute(1, 0, 2)
+    assert not idx_strided.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        msa_sparse_decode_attention(
+            q, k, v, idx_strided, cu_seqlens_k=cu_k, seqlen_q=sq, causal=True
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        msa_sparse_attention_kvmajor(q, k, v, idx_strided, cu_q, cu_k, causal=True)
+
+
 def test_fuzz_random_shapes():
     """Seeded random-shape sweep (MSA-style fuzzing) with element-wise checks
     against the reference, on both prefill kernels."""

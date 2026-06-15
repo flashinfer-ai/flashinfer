@@ -213,6 +213,10 @@ def msa_sparse_decode_attention(
         total_q,
     ):
         raise ValueError("q2k_indices must be int32 (num_kv_heads, total_q, topk)")
+    # Compiled for a compact layout; reject a strided q2k (e.g. a bare permute of
+    # msa_topk_select's output) here, matching msa_sparse_attention's guard.
+    if not q2k_indices.is_contiguous():
+        raise ValueError("q2k_indices must be contiguous")
     topk = q2k_indices.shape[2]
     kv_fp8 = k.dtype == torch.float8_e4m3fn
     kv_nvfp4 = k.dtype == torch.uint8
