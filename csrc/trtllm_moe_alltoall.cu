@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "flashinfer/utils.cuh"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
@@ -341,6 +342,10 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
 
   // Handle quantization parameters if output scales are provided
   if (outputScales.has_value()) {
+    // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
+    auto const sm_version = tensorrt_llm::common::getSMVersion();
+    TVM_FFI_ICHECK(sm_version >= 100)
+        << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
     TVM_FFI_ICHECK(payload.dtype() == dl_bfloat16 || payload.dtype() == dl_float16)
         << "Quantization only supports for fp16 or bf16 inputs";
     params.output_scales = outputScales.value().data_ptr();
