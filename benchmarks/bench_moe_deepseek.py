@@ -205,6 +205,7 @@ def bench_cute_dsl(
     use_cupti=True,
     use_wrapper=False,
     do_autotune=True,
+    use_per_token_activation=False,
 ):
     """Benchmark CuteDSL MoE.
 
@@ -283,6 +284,7 @@ def bench_cute_dsl(
             max_num_tokens=n,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
+            use_per_token_activation=use_per_token_activation,
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
@@ -340,6 +342,7 @@ def bench_cute_dsl(
                 top_k=CFG.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=local_expert_offset,
+                use_per_token_activation=use_per_token_activation,
             )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
@@ -507,6 +510,7 @@ def bench_trtllm(
     use_cuda_graph=True,
     use_cupti=True,
     do_autotune=True,
+    use_per_token_activation=False,
 ):
     """Benchmark TRT-LLM-Gen MoE.
 
@@ -515,6 +519,7 @@ def bench_trtllm(
     """
     import contextlib
 
+    from flashinfer import SfLayout, nvfp4_quantize
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe, RoutingMethodType
     from flashinfer.fused_moe.core import (
@@ -535,7 +540,17 @@ def bench_trtllm(
     expert_end = local_expert_offset + num_local_experts
 
     hg = inputs["hidden_gs"]
-    hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
+    if use_per_token_activation:
+        hfp, hsf, hidden_per_token_scale = nvfp4_quantize(
+            inputs["hidden_bf16"],
+            1.0 / (448.0 * 6.0),
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
+        hidden_per_token_scale = None
     hfp = hfp.view(torch.uint8).reshape(n, CFG.hidden_size // 2)
     hsc = (
         hsf.view(torch.float8_e4m3fn)
@@ -610,6 +625,7 @@ def bench_trtllm(
             local_num_experts=num_local_experts,
             routed_scaling_factor=CFG.routed_scaling_factor,
             routing_method_type=RoutingMethodType.DeepSeekV3,
+            per_token_scale=hidden_per_token_scale,
             do_finalize=True,
         )
 
@@ -668,6 +684,7 @@ def run_benchmark(
     use_cupti=True,
     use_wrapper=True,
     routing_bias_scale=0.01,
+    use_per_token_activation=False,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -696,6 +713,8 @@ def run_benchmark(
         use_cupti: Whether to use CUPTI for accurate GPU timing
         use_wrapper: Whether to use CuteDslMoEWrapper API (recommended)
         routing_bias_scale: Scale for random routing bias generation
+        use_per_token_activation: Whether supported FP4 MoE backends should use
+            per-token NVFP4 activation scaling.
 
     Returns:
         List of BenchResult objects
@@ -722,6 +741,7 @@ def run_benchmark(
             use_wrapper=use_wrapper,
             routing_bias_scale=routing_bias_scale,
             do_autotune=do_autotune,
+            use_per_token_activation=use_per_token_activation,
         )
         results.extend(row)
         rows_and_histograms.append((row, histogram_record))
@@ -752,6 +772,7 @@ def _benchmark_single(
     use_wrapper=True,
     routing_bias_scale=0.01,
     do_autotune=True,
+    use_per_token_activation=False,
 ):
     """Benchmark all backends for a single token count.
 
@@ -774,6 +795,7 @@ def _benchmark_single(
             use_cupti,
             use_wrapper=use_wrapper,
             do_autotune=do_autotune,
+            use_per_token_activation=use_per_token_activation,
         ),
         "CUTLASS": bench_cutlass(
             inputs,
@@ -794,6 +816,7 @@ def _benchmark_single(
             use_cuda_graph,
             use_cupti,
             do_autotune=do_autotune,
+            use_per_token_activation=use_per_token_activation,
         ),
     }
 
@@ -981,6 +1004,11 @@ def main():
         help="Use functional API instead of CuteDslMoEWrapper for CuteDSL benchmark",
     )
     parser.add_argument(
+        "--use-per-token-activation",
+        action="store_true",
+        help=("Use per-token NVFP4 activation scaling for supported FP4 MoE backends."),
+    )
+    parser.add_argument(
         "--routing-bias-scale",
         type=float,
         default=0.01,
@@ -1003,6 +1031,7 @@ def main():
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
+    print(f"Per-token activation: {args.use_per_token_activation}")
 
     run_benchmark(
         token_counts=tokens,
@@ -1015,6 +1044,7 @@ def main():
         use_cupti=not args.no_cupti,
         use_wrapper=not args.functional_api,
         routing_bias_scale=args.routing_bias_scale,
+        use_per_token_activation=args.use_per_token_activation,
     )
 
     return 0

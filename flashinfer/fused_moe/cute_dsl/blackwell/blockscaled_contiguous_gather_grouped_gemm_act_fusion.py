@@ -3646,13 +3646,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
-        c_sf_ptr: cute.Pointer,
+        c_sf_ptr: Optional[cute.Pointer],
         alpha_ptr: cute.Pointer,
         tile_idx_to_group_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
         token_id_mapping_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
-        global_sf_ptr: cute.Pointer,
+        global_sf_ptr: Optional[cute.Pointer],
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -3686,12 +3686,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((m, interm_size, 1), order=(1, 0, 2))
         )
-        c_sf = cute.make_tensor(
-            c_sf_ptr,
-            layout=cute.make_ordered_layout(
-                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
-                order=(2, 1, 4, 0, 3, 5),
-            ),
+        c_sf = (
+            cute.make_tensor(
+                c_sf_ptr,
+                layout=cute.make_ordered_layout(
+                    (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
+                    order=(2, 1, 4, 0, 3, 5),
+                ),
+            )
+            if cutlass.const_expr(c_sf_ptr is not None)
+            else None
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
 
@@ -3707,7 +3711,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles = cute.make_tensor(
             num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
         )
-        global_sf = cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
+        global_sf = (
+            cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
+            if cutlass.const_expr(global_sf_ptr is not None)
+            else None
+        )
 
         return self(
             a,

@@ -68,6 +68,11 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from ...autotuner import AutoTuner
+from ...cute_dsl.utils import convert_sf_to_mma_layout
+from ...quantization.kernels.nvfp4_quantize import (
+    SF_LAYOUT_128x4,
+    nvfp4_quantize_per_token_cute_dsl,
+)
 from ...utils import supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
@@ -90,6 +95,17 @@ from .tuner import (
 # =============================================================================
 
 _cuda_graph_resources: Dict[str, Any] = {}
+
+
+def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
+    if output_dtype == torch.float16:
+        return "float16"
+    if output_dtype == torch.bfloat16:
+        return "bfloat16"
+    raise ValueError(
+        "CuTe-DSL MoE per-token FC2 input quantization supports only "
+        f"torch.float16 and torch.bfloat16 intermediate dtypes, got {output_dtype}."
+    )
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -154,6 +170,7 @@ def _moe_core_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -200,6 +217,8 @@ def _moe_core_impl(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
+        use_per_token_activation: Quantize GEMM1/SwiGLU output with the
+            standalone per-token NVFP4 CuTe-DSL quantizer before GEMM2.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -257,33 +276,80 @@ def _moe_core_impl(
         main_event.record()
         moe_output.record_stream(aux_stream)
 
-    # Step 2: GEMM1 + activation
-    intermediate, intermediate_sf = (
-        blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
-            a=x,
-            b=w1_weight,
-            a_scale=x_sf,
-            b_scale=w1_weight_sf,
-            alpha=w1_alpha,
-            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            out=gemm1_out,
-            out_scale=gemm1_out_scale,
-            global_scale=fc2_input_scale,
-            topk=top_k,
-            c_dtype="float4_e2m1fn",
-            mma_tiler_mn=gemm1_mma_tiler_mn,
-            cluster_shape_mn=gemm1_cluster_shape_mn,
-            enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            gated=gated,
+    # Step 2: GEMM1 + activation. In per-token mode the fused GEMM1 FP4
+    # epilogue is bypassed: materialize the activation, then reuse the
+    # standalone CuTe-DSL NVFP4 quantizer so 4over6/per-token semantics match
+    # the quantization API and the TRTLLM MoE split-launch pattern.
+    intermediate_per_token_scale = None
+    if use_per_token_activation:
+        intermediate, _ = (
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+                a=x,
+                b=w1_weight,
+                a_scale=x_sf,
+                b_scale=w1_weight_sf,
+                alpha=w1_alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                token_id_mapping=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                out=gemm1_out,
+                out_scale=None,
+                global_scale=None,
+                topk=top_k,
+                c_dtype=_intermediate_c_dtype(output_dtype),
+                mma_tiler_mn=gemm1_mma_tiler_mn,
+                cluster_shape_mn=gemm1_cluster_shape_mn,
+                enable_pdl=enable_pdl,
+                activation_type=activation_type.value,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+                gated=gated,
+            )
         )
-    )
+        intermediate, intermediate_sf, intermediate_per_token_scale = (
+            nvfp4_quantize_per_token_cute_dsl(
+                intermediate,
+                fc2_input_scale,
+                sf_layout=SF_LAYOUT_128x4,
+                enable_pdl=enable_pdl,
+            )
+        )
+        intermediate_sf = convert_sf_to_mma_layout(
+            intermediate_sf,
+            m=intermediate.shape[0],
+            k=intermediate.shape[1] * 2,
+            num_groups=1,
+            sf_vec_size=16,
+        )
+    else:
+        intermediate, intermediate_sf = (
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+                a=x,
+                b=w1_weight,
+                a_scale=x_sf,
+                b_scale=w1_weight_sf,
+                alpha=w1_alpha,
+                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                token_id_mapping=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                out=gemm1_out,
+                out_scale=gemm1_out_scale,
+                global_scale=fc2_input_scale,
+                topk=top_k,
+                c_dtype="float4_e2m1fn",
+                mma_tiler_mn=gemm1_mma_tiler_mn,
+                cluster_shape_mn=gemm1_cluster_shape_mn,
+                enable_pdl=enable_pdl,
+                activation_type=activation_type.value,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
+                gated=gated,
+            )
+        )
 
     # Step 3: Zero the active output slice before GEMM2 finalize.
     # Finalize uses atomic scatter-add into `moe_output`, so it must start
@@ -321,6 +387,7 @@ def _moe_core_impl(
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
         out=moe_output,
+        a_per_token_scale=intermediate_per_token_scale,
         mma_tiler_mn=gemm2_mma_tiler_mn,
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
@@ -398,6 +465,7 @@ class CuteDslMoEWrapper:
         swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        use_per_token_activation: bool = False,
     ):
         r"""Configure the CuTe-DSL NVFP4 fused-MoE wrapper.
 
@@ -439,6 +507,9 @@ class CuteDslMoEWrapper:
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
+        use_per_token_activation : bool
+            Quantize the GEMM1/SwiGLU output with the standalone per-token
+            NVFP4 CuTe-DSL quantizer before GEMM2. Defaults to ``False``.
         """
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
 
@@ -459,6 +530,7 @@ class CuteDslMoEWrapper:
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        self.use_per_token_activation = use_per_token_activation
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -565,6 +637,7 @@ class CuteDslMoEWrapper:
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            use_per_token_activation=self.use_per_token_activation,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -702,6 +775,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -734,6 +808,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        use_per_token_activation=use_per_token_activation,
     )
 
 
@@ -764,6 +839,7 @@ def cute_dsl_fused_moe_nvfp4(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    use_per_token_activation: bool = False,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -825,6 +901,9 @@ def cute_dsl_fused_moe_nvfp4(
         ``swiglu_alpha/beta/limit``.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
+    use_per_token_activation : bool
+        Quantize the GEMM1/SwiGLU output with the standalone per-token NVFP4
+        CuTe-DSL quantizer before GEMM2. Defaults to ``False``.
 
     Returns
     -------
@@ -848,8 +927,15 @@ def cute_dsl_fused_moe_nvfp4(
 
     tuner = AutoTuner.get()
 
+    def forward_impl(*args, **kwargs):
+        return _cute_dsl_fused_moe_nvfp4_impl(
+            *args,
+            **kwargs,
+            use_per_token_activation=use_per_token_activation,
+        )
+
     runner = CuteDslFusedMoENvfp4Runner(
-        forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
+        forward_impl=forward_impl,
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_local_experts,
