@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from typing import Tuple, Type, Union
+from typing import Optional, Tuple, Type, Union
 
 
 import cuda.bindings.driver as cuda
@@ -638,7 +638,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         stream: cuda.CUstream,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
-        a_per_token_scale: cute.Tensor,
+        a_per_token_scale: Optional[cute.Tensor],
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM operation in steps:
@@ -674,7 +674,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :param token_final_scales: Token-wise scaling factors, shape (m, topK)
         :type token_final_scales: cute.Tensor
         :param a_per_token_scale: Optional per-row scale for operand A, shape (permuted_m,)
-        :type a_per_token_scale: cute.Tensor
+        :type a_per_token_scale: Optional[cute.Tensor]
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
         :raises TypeError: If input data types are incompatible with the MMA instruction.
@@ -1032,7 +1032,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         alpha: cute.Tensor,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
-        a_per_token_scale: cute.Tensor,
+        a_per_token_scale: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2709,7 +2709,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         permuted_idx_to_expanded_idx_ptr: cute.Pointer,
         num_non_exiting_tiles_ptr: cute.Pointer,
         token_final_scales_ptr: cute.Pointer,
-        a_per_token_scale_ptr: cute.Pointer,
+        a_per_token_scale_ptr: Optional[cute.Pointer],
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
@@ -2763,8 +2763,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             token_final_scales_ptr,
             layout=cute.make_ordered_layout((num_tokens, top_k), order=(1, 0)),
         )
-        a_per_token_scale = cute.make_tensor(
-            a_per_token_scale_ptr, layout=cute.make_layout((m,))
+        a_per_token_scale = (
+            cute.make_tensor(a_per_token_scale_ptr, layout=cute.make_layout((m,)))
+            if cutlass.const_expr(a_per_token_scale_ptr is not None)
+            else None
         )
 
         return self(
