@@ -19,6 +19,10 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.msa import (
+    msa_sparse_attention_kvmajor_trace,
+    msa_sparse_attention_trace,
+)
 from ..utils import is_sm12x_supported
 
 _BLK_KV = 128
@@ -76,7 +80,7 @@ def _fake(dtype, shape, align=16):
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=msa_sparse_attention_trace)
 def msa_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -412,7 +416,7 @@ def _combine_partials_torch(
     return out.to(out_dtype)
 
 
-@flashinfer_api
+@flashinfer_api(trace=msa_sparse_attention_kvmajor_trace)
 def msa_sparse_attention_kvmajor(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -19,6 +19,10 @@ from typing import Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.msa import (
+    msa_proxy_score_fp4_trace,
+    msa_proxy_score_trace,
+)
 from ..utils import is_sm12x_supported
 
 _BLK_KV = 128
@@ -45,7 +49,7 @@ def _proxy_split_k(base_ctas: int, max_k_tiles: int, device) -> int:
     return max(1, min(splits, max_k_tiles))
 
 
-@flashinfer_api
+@flashinfer_api(trace=msa_proxy_score_trace)
 def msa_proxy_score(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -298,7 +302,7 @@ def quantize_bf16_qk_to_nvfp4(
     return x_fp4, x_scale, 1.0 / float(global_scale)
 
 
-@flashinfer_api
+@flashinfer_api(trace=msa_proxy_score_fp4_trace)
 def msa_proxy_score_fp4(
     q_fp4: torch.Tensor,
     k_fp4: torch.Tensor,

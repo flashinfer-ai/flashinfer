@@ -32,6 +32,7 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.msa import msa_sparse_decode_attention_trace
 from .sparse_index_utils import MsaAttentionSchedule
 
 
@@ -120,7 +121,7 @@ def msa_build_decode_schedule(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=msa_sparse_decode_attention_trace)
 def msa_sparse_decode_attention(
     q: torch.Tensor,
     k: torch.Tensor,
