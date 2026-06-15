@@ -1962,71 +1962,105 @@ def delta_rule_prefill_dsl(
     if kernel_dtype is None:
         raise RuntimeError(f"DSL kernel only supports fp16/bf16 inputs, got {q.dtype}")
 
-    q_t = q.contiguous()
-    k_t = k.contiguous()
-    v_t = v.contiguous()
-    o_t = o
+    if k.dtype != q.dtype or v.dtype != q.dtype or o.dtype != q.dtype:
+        raise RuntimeError(
+            f"q/k/v/o dtypes must match, got {q.dtype}, {k.dtype}, {v.dtype}, {o.dtype}"
+        )
+    if alpha is not None and alpha.dtype != torch.float32:
+        raise RuntimeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
+    if beta is not None and beta.dtype != torch.float32:
+        raise RuntimeError(f"beta must have dtype torch.float32, got {beta.dtype}")
+    if init_state is not None and init_state.dtype != torch.float32:
+        raise RuntimeError(
+            f"init_state must have dtype torch.float32, got {init_state.dtype}"
+        )
+    if state.dtype != torch.float32:
+        raise RuntimeError(f"state must have dtype torch.float32, got {state.dtype}")
+    if cu_seqlens.dtype != torch.int64:
+        raise RuntimeError(
+            f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+        )
 
-    total_seqlen = q_t.shape[0]
-    num_o_heads = o_t.shape[1]
-    q_tma = q_t.as_strided(
+    for name, tensor in (
+        ("q", q),
+        ("k", k),
+        ("v", v),
+        ("o", o),
+        ("state", state),
+        ("cu_seqlens", cu_seqlens),
+    ):
+        if not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+    for name, tensor in (("alpha", alpha), ("beta", beta), ("init_state", init_state)):
+        if tensor is not None and not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+
+    total_seqlen = q.shape[0]
+    num_o_heads = o.shape[1]
+    q_tma = q.as_strided(
         (total_seqlen, D, num_q_heads),
         (num_q_heads * D, 1, D),
     )
-    k_tma = k_t.as_strided(
+    k_tma = k.as_strided(
         (D, total_seqlen, num_k_heads),
         (1, num_k_heads * D, D),
     )
-    v_tma = v_t.as_strided(
+    v_tma = v.as_strided(
         (D, total_seqlen, num_v_heads),
         (1, num_v_heads * D, D),
     )
-    o_tma = o_t.as_strided(
+    o_tma = o.as_strided(
         (D, total_seqlen, num_o_heads),
         (1, num_o_heads * D, D),
     )
-    _dummy_f32 = torch.zeros(1, dtype=torch.float32, device=q.device)
-    _dummy_i64 = torch.zeros(1, dtype=torch.int64, device=q.device)
-    alpha_t = alpha.contiguous() if needs_alpha else _dummy_f32
-    beta_t = beta.contiguous() if needs_beta else _dummy_f32
-    init_state_t = init_state.contiguous() if needs_init_state else _dummy_f32
-    state_checkpoints_t = (
-        state_checkpoints.contiguous() if needs_checkpointing else _dummy_f32
-    )
-    checkpoint_cu_t = (
-        checkpoint_cu_starts.to(torch.int64).contiguous()
-        if needs_checkpointing
-        else _dummy_i64
-    )
-    total_checkpoints = state_checkpoints_t.shape[0] if needs_checkpointing else 1
+    total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
     sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
     tensormaps_t = torch.empty(sm_count * 128, dtype=torch.uint8, device=q.device)
-    cu_int64 = cu_seqlens.to(torch.int64).contiguous()
 
     stream_val = torch.cuda.current_stream().cuda_stream
     stream = cuda_driver.CUstream(stream_val)
+
+    enable_tvm_ffi = True
+    if enable_tvm_ffi:
+        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
+            *args, **{**kwargs, "enable_tvm_ffi": True}
+        )
 
     # Keep head counts and varlen extents runtime values across cached compiles.
     q_cute = from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1)
     k_cute = from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
     v_cute = from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
     o_cute = from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    alpha_cute = from_dlpack(
-        alpha_t.reshape(-1), assumed_align=16
-    ).mark_layout_dynamic()
-    beta_cute = from_dlpack(beta_t.reshape(-1), assumed_align=16).mark_layout_dynamic()
+    alpha_cute = (
+        from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic()
+        if needs_alpha
+        else None
+    )
+    beta_cute = (
+        from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic()
+        if needs_beta
+        else None
+    )
     state_cute = from_dlpack(state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-    init_state_cute = from_dlpack(
-        init_state_t.reshape(-1), assumed_align=16
-    ).mark_layout_dynamic()
-    state_checkpoints_cute = from_dlpack(
-        state_checkpoints_t.reshape(-1), assumed_align=16
-    ).mark_layout_dynamic()
-    checkpoint_cu_cute = from_dlpack(
-        checkpoint_cu_t, assumed_align=8
-    ).mark_layout_dynamic()
+    init_state_cute = (
+        from_dlpack(init_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
+        if needs_init_state
+        else None
+    )
+    state_checkpoints_cute = (
+        from_dlpack(
+            state_checkpoints.reshape(-1), assumed_align=16
+        ).mark_layout_dynamic()
+        if needs_checkpointing
+        else None
+    )
+    checkpoint_cu_cute = (
+        from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
+        if needs_checkpointing
+        else None
+    )
     tensormaps_cute = from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic()
-    cu_cute = from_dlpack(cu_int64, assumed_align=8).mark_layout_dynamic()
+    cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
 
     delta_rule_kernel = _FullyFusedDeltaRuleSm120(
         needs_alpha, needs_beta, needs_init_state, needs_checkpointing, kernel_dtype
