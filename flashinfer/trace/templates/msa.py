@@ -114,7 +114,9 @@ def _msa_proxy_score_reference(q, k, cu_seqlens_q, cu_seqlens_k, causal=True):
     cu_k = cu_seqlens_k.to(torch.long)
     seqlens_k = (cu_k[1:] - cu_k[:-1]).tolist()
     mkt = max((s + BLK_KV - 1) // BLK_KV for s in seqlens_k) if seqlens_k else 0
-    out = torch.full((Hq, mkt, total_q), float("-inf"), dtype=torch.float32)
+    out = torch.full(
+        (Hq, mkt, total_q), float("-inf"), dtype=torch.float32, device=q.device
+    )
     for b in range(cu_q.numel() - 1):
         qlo, qhi = int(cu_q[b]), int(cu_q[b + 1])
         klo, khi = int(cu_k[b]), int(cu_k[b + 1])
@@ -123,8 +125,8 @@ def _msa_proxy_score_reference(q, k, cu_seqlens_q, cu_seqlens_k, causal=True):
         for h in range(Hq):
             s = q[qlo:qhi, h].float() @ k[klo:khi, h // G].float().T  # unscaled
             if causal:
-                qi = torch.arange(sq).unsqueeze(1) + (sk - sq)
-                ki = torch.arange(sk).unsqueeze(0)
+                qi = torch.arange(sq, device=q.device).unsqueeze(1) + (sk - sq)
+                ki = torch.arange(sk, device=q.device).unsqueeze(0)
                 s = s.masked_fill(ki > qi, float("-inf"))
             for t in range(nb):
                 out[h, t, qlo:qhi] = s[:, t * BLK_KV : (t + 1) * BLK_KV].amax(dim=1)
@@ -293,7 +295,9 @@ def _msa_proxy_score_fp4_reference(
     cu_k = cu_seqlens_k.to(torch.long)
     seqlens_k = (cu_k[1:] - cu_k[:-1]).tolist()
     mkt = max((s + BLK_KV - 1) // BLK_KV for s in seqlens_k) if seqlens_k else 0
-    out = torch.full((Hq, mkt, total_q), float("-inf"), dtype=torch.float32)
+    out = torch.full(
+        (Hq, mkt, total_q), float("-inf"), dtype=torch.float32, device=q_fp4.device
+    )
     for b in range(cu_q.numel() - 1):
         qlo, qhi = int(cu_q[b]), int(cu_q[b + 1])
         klo, khi = int(cu_k[b]), int(cu_k[b + 1])
@@ -302,8 +306,8 @@ def _msa_proxy_score_fp4_reference(
         for h in range(Hq):
             s = q_deq[qlo:qhi, h] @ k_deq[klo:khi, h // G].T
             if causal:
-                qi = torch.arange(sq).unsqueeze(1) + (sk - sq)
-                ki = torch.arange(sk).unsqueeze(0)
+                qi = torch.arange(sq, device=q_fp4.device).unsqueeze(1) + (sk - sq)
+                ki = torch.arange(sk, device=q_fp4.device).unsqueeze(0)
                 s = s.masked_fill(ki > qi, float("-inf"))
             for t in range(nb):
                 out[h, t, qlo:qhi] = s[:, t * BLK_KV : (t + 1) * BLK_KV].amax(dim=1)

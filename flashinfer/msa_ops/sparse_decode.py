@@ -251,6 +251,12 @@ def msa_sparse_decode_attention(
         cu_k = cu_seqlens_k.to(dev)
         pt_dev = torch.zeros((1, 1), dtype=torch.int32, device=dev)
 
+    # v mirrors k (same layout/dtype for bf16/fp16, fp8, and packed NVFP4); the
+    # kernel indexes v with k-derived coordinates, so a mismatched v would read
+    # out of bounds.
+    if v.shape != k.shape or v.dtype != k.dtype:
+        raise ValueError("v must have the same shape and dtype as k")
+
     cu_q_loc = torch.arange(0, total_q + 1, seqlen_q, dtype=torch.int32, device=dev)
     qoff_dev = _q_offset_tensor(q_offset, cu_q_loc, cu_k, dev)
 

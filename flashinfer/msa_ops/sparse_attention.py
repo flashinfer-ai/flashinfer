@@ -556,6 +556,12 @@ def msa_sparse_attention_kvmajor(
         if k.ndim != 3:
             raise ValueError("flat k/v must be (total_k, num_kv_heads, head_dim)")
 
+    # v mirrors k (same layout/dtype for bf16/fp16, fp8, and packed NVFP4); the
+    # kernel indexes v with k-derived coordinates, so a mismatched v would read
+    # out of bounds.
+    if v.shape != k.shape or v.dtype != k.dtype:
+        raise ValueError("v must have the same shape and dtype as k")
+
     if schedule is None:
         schedule = msa_build_k2q_csr_schedule(
             q2k_indices,
