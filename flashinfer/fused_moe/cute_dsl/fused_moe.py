@@ -278,32 +278,30 @@ def _moe_core_impl(
     # Step 2: GEMM1 + activation
     intermediate_per_token_scale = None
     if use_per_token_activation:
-        intermediate, _ = (
-            blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
-                a=x,
-                b=w1_weight,
-                a_scale=x_sf,
-                b_scale=w1_weight_sf,
-                alpha=w1_alpha,
-                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                token_id_mapping=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                out=gemm1_out,
-                out_scale=None,
-                global_scale=None,
-                a_per_token_scale=per_token_scale,
-                topk=top_k,
-                c_dtype=_intermediate_c_dtype(output_dtype),
-                mma_tiler_mn=gemm1_mma_tiler_mn,
-                cluster_shape_mn=gemm1_cluster_shape_mn,
-                enable_pdl=enable_pdl,
-                activation_type=activation_type.value,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                swiglu_limit=swiglu_limit,
-                gated=gated,
-            )
+        intermediate, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+            a=x,
+            b=w1_weight,
+            a_scale=x_sf,
+            b_scale=w1_weight_sf,
+            alpha=w1_alpha,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            token_id_mapping=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            out=gemm1_out,
+            out_scale=None,
+            global_scale=None,
+            a_per_token_scale=per_token_scale,
+            topk=top_k,
+            c_dtype=_intermediate_c_dtype(output_dtype),
+            mma_tiler_mn=gemm1_mma_tiler_mn,
+            cluster_shape_mn=gemm1_cluster_shape_mn,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            gated=gated,
         )
         intermediate, intermediate_sf, intermediate_per_token_scale = (
             nvfp4_quantize_per_token_cute_dsl(
@@ -663,8 +661,9 @@ class CuteDslMoEWrapper:
         w2_weight: torch.Tensor,
         w2_weight_sf: torch.Tensor,
         w2_alpha: torch.Tensor,
-        per_token_scale: Optional[torch.Tensor] = None,
         tactic: Optional[Tuple] = None,
+        *,
+        per_token_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run the CuTe-DSL NVFP4 fused-MoE forward pass.
 
@@ -696,12 +695,12 @@ class CuteDslMoEWrapper:
             Scale factors for ``w2_weight``.
         w2_alpha : torch.Tensor
             Per-expert global scale for GEMM2.
-        per_token_scale : Optional[torch.Tensor]
-            Per-token input row scale for GEMM1. Passing this enables the
-            per-token activation path.
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
+        per_token_scale : Optional[torch.Tensor]
+            Per-token input row scale for GEMM1. Passing this enables the
+            per-token activation path.
 
         Returns
         -------
@@ -850,13 +849,14 @@ def cute_dsl_fused_moe_nvfp4(
     output_dtype: torch.dtype = torch.bfloat16,
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
-    per_token_scale: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    *,
+    per_token_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -906,9 +906,6 @@ def cute_dsl_fused_moe_nvfp4(
         Whether to use the fused finalize path.  Defaults to ``True``.
     moe_output : Optional[torch.Tensor]
         Pre-allocated output buffer.  Allocated internally if ``None``.
-    per_token_scale : Optional[torch.Tensor]
-        Per-token input row scale for GEMM1. Passing this enables the
-        per-token activation path.
     aux_stream : Optional[torch.cuda.Stream]
         Optional auxiliary CUDA stream used to overlap setup work with the
         main computation.
@@ -921,6 +918,9 @@ def cute_dsl_fused_moe_nvfp4(
         ``swiglu_alpha/beta/limit``.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
+    per_token_scale : Optional[torch.Tensor]
+        Per-token input row scale for GEMM1. Passing this enables the
+        per-token activation path.
     Returns
     -------
     torch.Tensor
