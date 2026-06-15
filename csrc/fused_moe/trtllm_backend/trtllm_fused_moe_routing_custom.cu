@@ -121,6 +121,12 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
           params.mPtrTopKWeights[warpIdx * params.mTopK + laneIdx] =
               OutputT{warpTopKScore[laneIdx]};
         }
+        // Routing replay: record selected expert IDs. Layout: [num_tokens, topK]
+        // -- same indexing as mPtrTopKPacked / mPtrTopKWeights.
+        if (params.mPtrRoutingReplayOut != nullptr) {
+          params.mPtrRoutingReplayOut[warpIdx * params.mTopK + laneIdx] =
+              static_cast<int16_t>(warpTopKExpertIdx[laneIdx]);
+        }
       }
     }  // end if (validToken)
   } else if (params.mPtrTopKPacked != nullptr) {
@@ -436,6 +442,12 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
           params.mPtrTopKWeights[tokenIdx * params.mTopK + laneIdx] =
               OutputT{warpTopKScore[laneIdx]};
         }
+        // Routing replay: record selected expert IDs. Layout: [num_tokens, topK]
+        // -- same indexing as mPtrTopKWeights.
+        if (params.mPtrRoutingReplayOut != nullptr) {
+          params.mPtrRoutingReplayOut[tokenIdx * params.mTopK + laneIdx] =
+              static_cast<int16_t>(warpTopKExpertIdx[laneIdx]);
+        }
       }
     } else if (params.mPtrTopKPacked != nullptr) {
       if (laneIdx < params.mTopK) {
@@ -667,6 +679,12 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
       if (laneIdx < params.mTopK) {
         smemPackedScoreIdx[warpIdx * params.mTopK + laneIdx] =
             TypePacked{warpTopKScore[laneIdx], static_cast<int16_t>(warpTopKExpertIdx[laneIdx])};
+        // Routing replay: record selected expert IDs. Layout: [num_tokens, topK]
+        // -- warpTokenIdx is the global token index for this warp.
+        if (params.mPtrRoutingReplayOut != nullptr) {
+          params.mPtrRoutingReplayOut[warpTokenIdx * params.mTopK + laneIdx] =
+              static_cast<int16_t>(warpTopKExpertIdx[laneIdx]);
+        }
       }
     }
   }
@@ -755,6 +773,12 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(warpTopKScore[laneIdx]),
                                           static_cast<int16_t>(warpTopKExpertIdx[laneIdx])};
       params.mPtrTopKPacked[tokenIdx * params.mTopK + laneIdx] = packedScore;
+      // Routing replay: record selected expert IDs. Layout: [num_tokens, topK]
+      // -- same indexing as mPtrTopKPacked.
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[tokenIdx * params.mTopK + laneIdx] =
+            static_cast<int16_t>(warpTopKExpertIdx[laneIdx]);
+      }
     }
   }
 
@@ -947,6 +971,12 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
       PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(topScores[laneIdx]),
                                           static_cast<int16_t>(expertIdx)};
       params.mPtrTopKPacked[int64_t{tokenIdx} * int64_t{params.mTopK} + laneIdx] = packedScore;
+      // Routing replay: record selected expert IDs. Layout: [num_tokens, topK]
+      // -- same indexing as mPtrTopKPacked.
+      if (params.mPtrRoutingReplayOut != nullptr) {
+        params.mPtrRoutingReplayOut[int64_t{tokenIdx} * int64_t{params.mTopK} + laneIdx] =
+            static_cast<int16_t>(expertIdx);
+      }
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -1316,16 +1346,19 @@ void run(Data const& data, void* stream) {
     bool const canUseCoop =
         (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
     bool useCoop = false;
+    CoopLaunchSMCounts coopLaunchSMCounts{0, 0};
     int numBlocksCoop = 0;
 
     if (canUseCoop) {
       static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-      numBlocksCoop = smCount - kReservedSMsForOverlapping;
+      coopLaunchSMCounts = getCoopLaunchSMCounts(smCount);
+      numBlocksCoop = coopLaunchSMCounts.moeSms;
       int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
       useCoop = (data.mNumTokens <= maxTokensCoop);
     }
 
     if (useCoop) {
+      logCoopLaunchSMCounts(coopLaunchSMCounts);
       launchInitExpertCounts(mutableData, numThreadsHist, stream);
       launchCoopKernel(mutableData, numBlocksCoop, numThreadsHist, stream);
     } else {

@@ -218,11 +218,15 @@ gqa_paged_decode_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(["batch_size", "num_qo_heads", "head_dim"], dtype_from="q"),
         "lse": Tensor(
             ["batch_size", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -410,11 +414,15 @@ gqa_paged_prefill_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype_from="q"),
         "lse": Tensor(
             ["total_q", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -571,6 +579,9 @@ gqa_ragged_prefill_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(
@@ -580,6 +591,7 @@ gqa_ragged_prefill_trace = TraceTemplate(
         ),
         "lse": Tensor(
             ["total_q", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -769,13 +781,18 @@ mla_paged_decode_trace = TraceTemplate(
                 "based on head dimensions before matrix absorption. Set during plan(), not run()."
             ),
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(
-            ["batch_size", "num_qo_heads", "head_dim_ckv"], dtype_from="q_nope"
+            ["batch_size", "num_qo_heads", "head_dim_ckv"],
+            dtype_from="q_nope",
         ),
         "lse": Tensor(
             ["batch_size", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),

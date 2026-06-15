@@ -15,11 +15,19 @@ limitations under the License.
 """
 
 from collections import defaultdict
+import os
 
 import numpy as np
 import torch
 
 import flashinfer
+from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    current_nvfp4_4over6_config,
+    env_flag_enabled as _env_flag_enabled,
+    make_nvfp4_global_scale,
+    nvfp4_e4m3_max,
+)
 from flashinfer.testing.utils import bench_gpu_time
 
 from .flashinfer_benchmark_utils import (
@@ -30,6 +38,31 @@ from .flashinfer_benchmark_utils import (
     filter_backends_by_compute_capability,
     warn_if_pdl_unsupported,
 )
+
+
+def _assert_nvfp4_refcheck_tensor_equal(
+    name: str,
+    backend: str,
+    ref_backend: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+):
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} shape mismatch: "
+            f"{backend}={actual.shape}, {ref_backend}={expected.shape}"
+        )
+    if actual.dtype != expected.dtype:
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} dtype mismatch: "
+            f"{backend}={actual.dtype}, {ref_backend}={expected.dtype}"
+        )
+    if not torch.equal(actual, expected):
+        mismatch_pct = (actual != expected).float().mean().item() * 100
+        raise AssertionError(
+            f"[nvfp4_quantize] {name} value mismatch: "
+            f"{backend} vs {ref_backend}, mismatch={mismatch_pct:.4f}%"
+        )
 
 
 def run_quantization_test(args):
@@ -149,6 +182,12 @@ def parse_quantization_args(line, parser):
         required=False,
         default=16,
         help="Scale factor vector size for NVFP4 quantization. Default: 16",
+    )
+    parser.add_argument(
+        "--per_token_activation",
+        action="store_true",
+        default=False,
+        help="Benchmark NVFP4 per-token activation quantization.",
     )
 
     args = parser.parse_args(line)
@@ -571,6 +610,8 @@ def testNvfp4Quantize(args):
     do_shuffle = args.do_shuffle
     sf_vec_size = args.sf_vec_size
     enable_pdl = args.enable_pdl
+    per_token_activation = args.per_token_activation
+    nvfp4_4over6_config = current_nvfp4_4over6_config()
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -595,6 +636,8 @@ def testNvfp4Quantize(args):
         raise ValueError(
             f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size}) for nvfp4_quantize"
         )
+    if per_token_activation and sf_vec_size != 16:
+        raise ValueError("Per-token NVFP4 quantization only supports sf_vec_size=16")
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
@@ -611,7 +654,12 @@ def testNvfp4Quantize(args):
     ## Prepare input tensors
     input_shape = (m, k)
     input_tensor = torch.randn(input_shape, dtype=input_dtype, device=device)
-    global_sf_tensor = torch.tensor([global_scale], dtype=torch.float32, device=device)
+    global_sf_tensor = make_nvfp4_global_scale(
+        input_tensor,
+        per_token_activation=per_token_activation,
+        global_scale=global_scale,
+        nvfp4_4over6_config=nvfp4_4over6_config,
+    )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
@@ -621,6 +669,10 @@ def testNvfp4Quantize(args):
         print(f"[VVERBOSE] {do_shuffle = }")
         print(f"[VVERBOSE] {sf_vec_size = }")
         print(f"[VVERBOSE] {enable_pdl = }")
+        print(f"[VVERBOSE] {per_token_activation = }")
+        for name in NVFP4_QUANT_ENV_VARS:
+            print(f"[VVERBOSE] {name} = {os.environ.get(name, '<unset>')}")
+        print(f"[VVERBOSE] nvfp4_e4m3_max = {nvfp4_e4m3_max(nvfp4_4over6_config):.0f}")
 
     def run_backend(backend, input_tensor, global_sf_tensor):
         return flashinfer.nvfp4_quantize(
@@ -631,6 +683,7 @@ def testNvfp4Quantize(args):
             sf_vec_size=sf_vec_size,
             enable_pdl=enable_pdl,
             backend=backend,
+            per_token_activation=per_token_activation,
         )
 
     # Storage for timing results and outputs
@@ -638,8 +691,17 @@ def testNvfp4Quantize(args):
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            x_q, sf = run_backend(cur_backend, input_tensor, global_sf_tensor)
-            outputs[cur_backend] = (x_q.detach().clone(), sf.detach().clone())
+            result = run_backend(cur_backend, input_tensor, global_sf_tensor)
+            if per_token_activation:
+                x_q, sf, per_token_scale = result
+                outputs[cur_backend] = (
+                    x_q.detach().clone(),
+                    sf.detach().clone(),
+                    per_token_scale.detach().clone(),
+                )
+            else:
+                x_q, sf = result
+                outputs[cur_backend] = (x_q.detach().clone(), sf.detach().clone())
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -652,20 +714,49 @@ def testNvfp4Quantize(args):
     tested_backends = list(outputs.keys())
     if len(tested_backends) > 0:
         if run_refcheck:
+            ref_backend = tested_backends[0]
+            ref_output = outputs[ref_backend]
             for i in range(len(tested_backends)):
-                x_q, sf = outputs[tested_backends[i]]
+                cur_backend = tested_backends[i]
+                if per_token_activation:
+                    x_q, sf, per_token_scale = outputs[cur_backend]
+                else:
+                    x_q, sf = outputs[cur_backend]
+                    per_token_scale = None
                 if args.verbose >= 2:
                     print(
-                        f"[VVERBOSE] Backend {tested_backends[i]}: "
+                        f"[VVERBOSE] Backend {cur_backend}: "
                         f"x_q.shape = {x_q.shape}, x_q.dtype = {x_q.dtype}, "
                         f"sf.shape = {sf.shape}, sf.dtype = {sf.dtype}"
                     )
+                    if per_token_scale is not None:
+                        print(
+                            f"[VVERBOSE] Backend {cur_backend}: "
+                            f"per_token_scale.shape = {per_token_scale.shape}, "
+                            f"per_token_scale.dtype = {per_token_scale.dtype}"
+                        )
                 # Verify output shape (M, K/2) for FP4
                 expected_shape = (m, k // 2)
                 if x_q.shape != expected_shape:
                     print(
                         f"[WARNING] Unexpected output shape: {x_q.shape}, expected {expected_shape}"
                     )
+                if cur_backend != ref_backend:
+                    ref_x_q, ref_sf = ref_output[:2]
+                    _assert_nvfp4_refcheck_tensor_equal(
+                        "x_q", cur_backend, ref_backend, x_q, ref_x_q
+                    )
+                    _assert_nvfp4_refcheck_tensor_equal(
+                        "sf", cur_backend, ref_backend, sf, ref_sf
+                    )
+                    if per_token_activation:
+                        _assert_nvfp4_refcheck_tensor_equal(
+                            "per_token_scale",
+                            cur_backend,
+                            ref_backend,
+                            per_token_scale,
+                            ref_output[2],
+                        )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -683,6 +774,8 @@ def testNvfp4Quantize(args):
                 + num_elements // 2  # quantized output write (fp4 = 0.5 byte)
                 + num_scale_factors * 1  # scale factors write (1 byte each, e4m3)
             )
+            if per_token_activation:
+                problem_bytes += m * 4  # per-token fp32 scale writes
             problem_flops = num_elements * 3  # rough estimate
             tflops = problem_flops / (10**9 * median_time)
             tb_per_sec = problem_bytes / (10**9 * median_time)
@@ -704,6 +797,17 @@ def testNvfp4Quantize(args):
                 cur_res["do_shuffle"] = do_shuffle
                 cur_res["sf_vec_size"] = sf_vec_size
                 cur_res["enable_pdl"] = enable_pdl
+                cur_res["per_token_activation"] = per_token_activation
+                cur_res["use_4over6"] = nvfp4_4over6_config is not None
+                cur_res["disable_quant_fast_math"] = _env_flag_enabled(
+                    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
+                )
+                if nvfp4_4over6_config is not None:
+                    cur_res["nvfp4_4over6_err_mode"] = nvfp4_4over6_config.err_mode_name
+                    cur_res["nvfp4_4over6_err_use_fast_math"] = (
+                        nvfp4_4over6_config.err_use_fast_math
+                    )
+                    cur_res["nvfp4_4over6_e4m3_max"] = nvfp4_4over6_config.e4m3_max
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
