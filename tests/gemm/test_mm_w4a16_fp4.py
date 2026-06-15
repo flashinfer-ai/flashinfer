@@ -15,11 +15,10 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer import mm_fp4, prepare_w4a16_fp4_weights
 from flashinfer.gemm.gemm_w4a16 import (
     _CUDNN_W4A16_MIN_BACKEND_VERSION,
     _unswizzle_sf_128x4,
-    mm_w4a16_fp4,
-    prepare_w4a16_fp4_weights,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -66,7 +65,7 @@ def _skip_if_backend_unavailable(backend: str) -> None:
     device = torch.device("cuda")
     cc = get_compute_capability(device)
     cc_number = cc[0] * 10 + cc[1]
-    if not mm_w4a16_fp4.is_backend_supported(backend, cc_number):
+    if not mm_fp4.is_backend_supported(backend, cc_number):
         pytest.skip(f"{backend} not supported on compute capability {cc_number}")
     if backend == "cudnn":
         try:
@@ -84,8 +83,8 @@ def _skip_if_compute_capability_unsupported() -> None:
     """Skip the current test if no W4A16 backend supports this device."""
     cc = get_compute_capability(torch.device("cuda"))
     cc_number = cc[0] * 10 + cc[1]
-    if not mm_w4a16_fp4.is_compute_capability_supported(cc_number):
-        pytest.skip(f"mm_w4a16_fp4 not supported on compute capability {cc_number}")
+    if not mm_fp4.is_backend_supported("cudnn", cc_number):
+        pytest.skip(f"W4A16 mm_fp4 not supported on compute capability {cc_number}")
 
 
 PROBLEM_SIZES = [
@@ -223,7 +222,7 @@ def test_backend_matches_handwritten_dequant_matmul(backend, m, n, k):
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
 
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
-    out = mm_w4a16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
+    out = mm_fp4(a, b_p, None, sf_p, alpha_p, backend=backend)
 
     weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
     ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
@@ -248,10 +247,10 @@ def test_backend_alpha_none_equals_alpha_one(backend):
         torch.ones(1, device=device, dtype=torch.float32),
         backend=backend,
     )
-    out_one = mm_w4a16_fp4(a, b1, sf1, a1, backend=backend)
+    out_one = mm_fp4(a, b1, None, sf1, a1, backend=backend)
 
     b0, sf0, a0 = prepare_w4a16_fp4_weights(b_fp4, b_sf, None, backend=backend)
-    out_none = mm_w4a16_fp4(a, b0, sf0, a0, backend=backend)
+    out_none = mm_fp4(a, b0, None, sf0, a0, backend=backend)
 
     torch.testing.assert_close(out_none, out_one, atol=ATOL, rtol=RTOL)
 
@@ -269,9 +268,10 @@ def test_backend_out_dtype_override(backend):
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
-    out = mm_w4a16_fp4(
+    out = mm_fp4(
         a,
         b_p,
+        None,
         sf_p,
         alpha_p,
         backend=backend,
@@ -291,16 +291,17 @@ def test_backend_preallocated_out(backend):
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
     out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
     out_ptr_before = out.data_ptr()
-    returned = mm_w4a16_fp4(
+    returned = mm_fp4(
         a,
         b_p,
+        None,
         sf_p,
         alpha_p,
         backend=backend,
         out=out,
     )
     assert returned.data_ptr() == out_ptr_before
-    ref = mm_w4a16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
+    ref = mm_fp4(a, b_p, None, sf_p, alpha_p, backend=backend)
     torch.testing.assert_close(returned, ref, atol=ATOL, rtol=RTOL)
 
 
@@ -314,9 +315,10 @@ def test_backend_shape_mismatch_raises(backend):
     b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
     a_wrong_k = torch.randn((m, k * 2), device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
-        mm_w4a16_fp4(
+        mm_fp4(
             a_wrong_k,
             b_p,
+            None,
             sf_p,
             alpha_p,
             backend=backend,
@@ -333,7 +335,8 @@ def test_backend_shape_mismatch_raises(backend):
 
 @pytest.mark.parametrize("bad_dtype", [torch.float32, torch.float16])
 def test_a_dtype_must_be_bfloat16(bad_dtype):
-    """Only bfloat16 activations are supported (fp16 deferred)."""
+    """Only bfloat16 selects W4A16 mode; other dtypes hit the fp4 x fp4
+    validation (which rejects non-fp4 inputs with ValueError)."""
     _skip_if_compute_capability_unsupported()
     device = torch.device("cuda")
     b_fp4, b_sf, alpha = _make_random_fp4_weights(64, 128, device)
@@ -341,8 +344,8 @@ def test_a_dtype_must_be_bfloat16(bad_dtype):
         b_fp4, b_sf, alpha, backend="cute-dsl"
     )
     a_bad = torch.randn((4, 128), device=device, dtype=bad_dtype)
-    with pytest.raises(TypeError):
-        mm_w4a16_fp4(a_bad, b_p, sf_p, alpha_p, backend="cute-dsl")
+    with pytest.raises(ValueError):
+        mm_fp4(a_bad, b_p, None, sf_p, alpha_p, backend="cute-dsl")
 
 
 def test_b_dtype_must_be_uint8_in_prepare():

@@ -313,8 +313,9 @@ try:
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
-# ── GEMM w4a16 fp4 (Blackwell SM100+: M×7168@2048×7168, block=16) ───────────
-# b/b_descale shapes are the *prepared* layouts (prepare_w4a16_fp4_weights).
+# ── GEMM w4a16 fp4: mm_fp4 weight-only mode (bf16 a, a_descale=None) ─────────
+# Blackwell SM100+: M×7168@2048×7168, block=16. b/b_descale shapes are the
+# *prepared* layouts (prepare_w4a16_fp4_weights).
 try:
     M, K, N, BSW = 128, 7168, 2048, 16
     a_w4 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
@@ -322,8 +323,8 @@ try:
     # cuDNN layout: canonical packed weight + linear fp8 scales.
     b_w4 = torch.zeros(N, K // 2, dtype=torch.uint8, device=device)
     sf_w4 = torch.ones(N, K // BSW, dtype=torch.float8_e4m3fn, device=device)
-    flashinfer.mm_w4a16_fp4(
-        a_w4, b_w4, sf_w4, alpha_w4, backend="cudnn", block_size=BSW
+    flashinfer.mm_fp4(
+        a_w4, b_w4, None, sf_w4, alpha_w4, backend="cudnn", block_size=BSW
     )
 except Exception:
     pass  # Requires Blackwell (SM100+) and cuDNN >= 9.23.1
@@ -334,8 +335,8 @@ try:
     # cute-DSL layout: tile-packed int32 weight + S0E5M3 uint8 scales.
     b_w4 = torch.zeros(K // 16, N * 2, dtype=torch.int32, device=device)
     sf_w4 = torch.ones(K // BSW, N, dtype=torch.uint8, device=device)
-    flashinfer.mm_w4a16_fp4(
-        a_w4, b_w4, sf_w4, alpha_w4, backend="cute-dsl", block_size=BSW
+    flashinfer.mm_fp4(
+        a_w4, b_w4, None, sf_w4, alpha_w4, backend="cute-dsl", block_size=BSW
     )
 except Exception:
     pass  # Requires Blackwell (SM100+)

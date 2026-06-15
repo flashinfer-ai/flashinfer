@@ -14,7 +14,7 @@ from tests.trace.reference_utils import (
     "shape_kwargs", [dict(M=32, N=1024, K=1024), dict(M=16, N=2048, K=512)]
 )
 def test_mm_w4a16_fp4_reference_correctness(backend, shape_kwargs):
-    """flashinfer.mm_w4a16_fp4 kernel vs reference (dequant + matmul).
+    """flashinfer.mm_fp4 W4A16 mode kernel vs reference (dequant + matmul).
 
     The trace inits build *prepared* (backend-specific) weights via
     ``prepare_w4a16_fp4_weights``; each backend's reference dequantizes
@@ -33,16 +33,17 @@ def test_mm_w4a16_fp4_reference_correctness(backend, shape_kwargs):
     }[backend]
     try:
         inputs = tpl.init(**shape_kwargs)
-        api = flashinfer.mm_w4a16_fp4(
+        api = flashinfer.mm_fp4(
             inputs["a"],
             inputs["b"],
+            inputs["a_descale"],
             inputs["b_descale"],
             inputs["alpha"],
             backend=backend,
             block_size=inputs["block_size"],
         )
     except Exception as exc:
-        pytest.skip(f"mm_w4a16_fp4 ({backend}) unavailable: {exc}")
+        pytest.skip(f"W4A16 mm_fp4 ({backend}) unavailable: {exc}")
     _assert_finite(inputs["a"])
     ref = tpl.reference(
         inputs["a"],

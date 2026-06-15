@@ -468,12 +468,12 @@ mm_fp4_trace = TraceTemplate(
 )
 
 
-# ── W4A16 FP4 GEMM (mm_w4a16_fp4) ────────────────────────────────────────────
+# ── W4A16 FP4 GEMM (mm_fp4 with bf16 activations) ───────────────────────────
 #
-# ``mm_w4a16_fp4`` consumes *prepared* weights whose layout is backend-
-# specific (see ``flashinfer.prepare_w4a16_fp4_weights``), so each backend
-# gets its own template and ``trace=`` is a dispatch callable keyed on the
-# ``backend`` kwarg (same pattern as the trtllm MoE routing templates).
+# The W4A16 mode of ``mm_fp4`` consumes *prepared* weights whose layout is
+# backend-specific (see ``flashinfer.prepare_w4a16_fp4_weights``), so each
+# backend gets its own template and ``mm_fp4``'s ``trace=`` is a dispatch
+# callable (same pattern as the trtllm MoE routing templates).
 
 # E2M1 nibble codebook (low 3 bits magnitude, bit 3 sign).
 _E2M1_CODEBOOK = (
@@ -574,7 +574,7 @@ def _mm_w4a16_fp4_cudnn_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.mm_w4a16_fp4`` (cuDNN backend).
+    """Build inputs for ``flashinfer.mm_fp4`` in W4A16 mode (cuDNN backend).
 
     Sourced from ``tests/gemm/test_mm_w4a16_fp4.py``: quantize a randn
     bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
@@ -583,17 +583,17 @@ def _mm_w4a16_fp4_cudnn_init(
     """
     del K_div_2, K_div_block_size
     from flashinfer import (  # noqa: PLC0415
-        mm_w4a16_fp4,
+        mm_fp4,
         nvfp4_quantize,
         prepare_w4a16_fp4_weights,
     )
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
-        raise NotImplementedError("mm_w4a16_fp4 init requires a CUDA device")
+        raise NotImplementedError("W4A16 mm_fp4 init requires a CUDA device")
     major, minor = torch.cuda.get_device_capability(torch.device(device))
-    if not mm_w4a16_fp4.is_compute_capability_supported(major * 10 + minor):
-        raise NotImplementedError(f"mm_w4a16_fp4 is not supported on SM{major}{minor}")
+    if not mm_fp4.is_backend_supported("cudnn", major * 10 + minor):
+        raise NotImplementedError(f"W4A16 mm_fp4 is not supported on SM{major}{minor}")
 
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
@@ -609,6 +609,7 @@ def _mm_w4a16_fp4_cudnn_init(
     return {
         "a": a,
         "b": b_p,
+        "a_descale": None,
         "b_descale": sf_p,
         "alpha": alpha_p,
         "backend": "cudnn",
@@ -628,7 +629,7 @@ def _mm_w4a16_fp4_cute_dsl_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.mm_w4a16_fp4`` (cute-DSL backend).
+    """Build inputs for ``flashinfer.mm_fp4`` in W4A16 mode (cute-DSL backend).
 
     Sourced from ``tests/gemm/test_mm_w4a16_fp4.py``: quantize a randn
     bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
@@ -637,17 +638,17 @@ def _mm_w4a16_fp4_cute_dsl_init(
     """
     del K_div_16, K_div_block_size, N_mul_2
     from flashinfer import (  # noqa: PLC0415
-        mm_w4a16_fp4,
+        mm_fp4,
         nvfp4_quantize,
         prepare_w4a16_fp4_weights,
     )
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
-        raise NotImplementedError("mm_w4a16_fp4 init requires a CUDA device")
+        raise NotImplementedError("W4A16 mm_fp4 init requires a CUDA device")
     major, minor = torch.cuda.get_device_capability(torch.device(device))
-    if not mm_w4a16_fp4.is_compute_capability_supported(major * 10 + minor):
-        raise NotImplementedError(f"mm_w4a16_fp4 is not supported on SM{major}{minor}")
+    if not mm_fp4.is_backend_supported("cute-dsl", major * 10 + minor):
+        raise NotImplementedError(f"W4A16 mm_fp4 is not supported on SM{major}{minor}")
 
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
@@ -663,6 +664,7 @@ def _mm_w4a16_fp4_cute_dsl_init(
     return {
         "a": a,
         "b": b_p,
+        "a_descale": None,
         "b_descale": sf_p,
         "alpha": alpha_p,
         "backend": "cute-dsl",
@@ -752,26 +754,31 @@ mm_w4a16_fp4_cute_dsl_trace = TraceTemplate(
     init=_mm_w4a16_fp4_cute_dsl_init,
 )
 
-_MM_W4A16_FP4_TRACE_BY_BACKEND = {
-    "cudnn": mm_w4a16_fp4_cudnn_trace,
-    "cute-dsl": mm_w4a16_fp4_cute_dsl_trace,
-}
 
+def mm_fp4_trace_dispatch(**kwargs):
+    """Return the TraceTemplate matching the ``mm_fp4`` call's mode.
 
-def mm_w4a16_fp4_trace_dispatch(**kwargs):
-    """Return the TraceTemplate matching the call's ``backend`` kwarg.
-
-    Pass as ``trace=mm_w4a16_fp4_trace_dispatch`` to ``@flashinfer_api``;
-    returns ``None`` (no trace) for unknown backends.
+    A bfloat16 ``a`` selects the W4A16 weight-only mode, whose template
+    depends on the prepared weight layout (int32 -> cute-dsl, uint8 ->
+    cudnn); anything else is the regular fp4 x fp4 template.  Pass as
+    ``trace=mm_fp4_trace_dispatch`` to ``@flashinfer_api``.
     """
-    return _MM_W4A16_FP4_TRACE_BY_BACKEND.get(kwargs.get("backend"))
+    a = kwargs.get("a")
+    if a is not None and a.dtype == torch.bfloat16:
+        b = kwargs.get("b")
+        if b is not None and b.dtype == torch.int32:
+            return mm_w4a16_fp4_cute_dsl_trace
+        return mm_w4a16_fp4_cudnn_trace
+    return mm_fp4_trace
 
 
 # Expose the templates so _attach_fi_trace auto-registers them for the
 # consistency tests (same pattern as the MoE routing dispatchers).
-mm_w4a16_fp4_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _MM_W4A16_FP4_TRACE_BY_BACKEND.values()
-)
+mm_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mm_fp4_trace,
+    mm_w4a16_fp4_cudnn_trace,
+    mm_w4a16_fp4_cute_dsl_trace,
+]
 
 
 # ── Batched matmuls (BMM) ────────────────────────────────────────────────────

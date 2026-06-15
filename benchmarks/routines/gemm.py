@@ -44,8 +44,8 @@ def run_gemm_test(args):
         return testBmmMxfp8(args)
     elif args.routine == "mm_fp4":
         return testMmFp4(args)
-    elif args.routine == "mm_w4a16_fp4":
-        return testMmW4A16Fp4(args)
+    elif args.routine == "mm_fp4_w4a16":
+        return testMmFp4W4A16(args)
     elif args.routine == "mm_mxfp8":
         return testMmMxfp8(args)
     elif args.routine == "mm_bf16":
@@ -202,7 +202,7 @@ def parse_gemm_args(line, parser):
             args.input_dtype = "bfloat16"
         if not has_mat2_dtype_arg:
             args.mat2_dtype = "bfloat16"
-    if args.routine == "mm_w4a16_fp4":
+    if args.routine == "mm_fp4_w4a16":
         if not has_backends_arg:
             args.backends = ["cute-dsl"]
         if not has_input_dtype_arg:
@@ -1362,13 +1362,13 @@ def _dequantize_w4a16_fp4_ref(b, b_descale, alpha, n, k, block_size):
     return weight
 
 
-def testMmW4A16Fp4(args):
-    """Benchmark mm_w4a16_fp4 (W4A16 FP4 GEMM).
+def testMmFp4W4A16(args):
+    """Benchmark mm_fp4 in W4A16 weight-only mode (bf16 activation, FP4 weight).
 
     Weights are produced by ``flashinfer.nvfp4_quantize(sfLayout=layout_128x4)``
     -- the same canonical format the new API expects.  Per-backend prep
     (``prepare_w4a16_fp4_weights``) runs once at setup and is NOT timed;
-    only the ``mm_w4a16_fp4`` call is.
+    only the ``mm_fp4`` (W4A16 mode) call is.
 
     Constraints:
       * N must be divisible by 64 (the weight-prepack / kernel N tile).
@@ -1386,7 +1386,7 @@ def testMmW4A16Fp4(args):
     tagged with an ``_autotune`` backend suffix.
     """
     if args.verbose >= 1:
-        print("[INFO] Running testMmW4A16Fp4")
+        print("[INFO] Running testMmFp4W4A16")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
@@ -1404,20 +1404,20 @@ def testMmW4A16Fp4(args):
 
     if input_dtype != torch.bfloat16:
         raise ValueError(
-            f"mm_w4a16_fp4 benchmark requires input_dtype=bfloat16, got {args.input_dtype}"
+            f"mm_fp4_w4a16 benchmark requires input_dtype=bfloat16, got {args.input_dtype}"
         )
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
-            f"mm_w4a16_fp4 benchmark requires out_dtype in (bfloat16, float16), got {args.out_dtype}"
+            f"mm_fp4_w4a16 benchmark requires out_dtype in (bfloat16, float16), got {args.out_dtype}"
         )
     if n % 64 != 0:
         # N must be a multiple of the 64-wide N tile used by the weight
         # prepack and the cute-dsl kernel.  The 128x4 SF swizzle only *pads*
         # N to 128, and prepare_w4a16_fp4_weights unswizzles the padded
         # tail, so any n % 64 == 0 works.
-        raise ValueError("mm_w4a16_fp4 benchmark requires n % 64 == 0")
+        raise ValueError("mm_fp4_w4a16 benchmark requires n % 64 == 0")
     if k % 16 != 0:
-        raise ValueError("mm_w4a16_fp4 benchmark requires k % 16 == 0 (FP4 block size)")
+        raise ValueError("mm_fp4_w4a16 benchmark requires k % 16 == 0 (FP4 block size)")
 
     torch.manual_seed(args.random_seed)
     a = torch.randn((m, k), device=device, dtype=input_dtype) * 0.5
@@ -1442,9 +1442,12 @@ def testMmW4A16Fp4(args):
 
     def make_runner(b_p, sf_p, alpha_p, backend):
         def run(a):
-            return flashinfer.mm_w4a16_fp4(
+            # W4A16 weight-only mode of mm_fp4: bf16 activation a, no
+            # a_descale; b_p/sf_p are prepare_w4a16_fp4_weights outputs.
+            return flashinfer.mm_fp4(
                 a,
                 b_p,
+                None,
                 sf_p,
                 alpha_p,
                 backend=backend,
@@ -1478,7 +1481,7 @@ def testMmW4A16Fp4(args):
         return
 
     # cuDNN sweeps its execution plans + M buckets; cute-dsl sweeps its tile
-    # shape + perf-knob config space (both via mm_w4a16_fp4's TunableRunners).
+    # shape + perf-knob config space (both via mm_fp4 W4A16 TunableRunners).
     autotune_supported_backends = ["cudnn", "cute-dsl"]
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
@@ -1489,7 +1492,7 @@ def testMmW4A16Fp4(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(
-                        f"[INFO] Autotune warmup for mm_w4a16_fp4 {cur_backend}: "
+                        f"[INFO] Autotune warmup for mm_fp4_w4a16 {cur_backend}: "
                         f"{warmup_iters} iters"
                     )
                 with autotune(True, cache=cache_path):

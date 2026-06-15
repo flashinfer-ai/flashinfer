@@ -24,7 +24,6 @@ from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwis
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
 from .gemm_w4a16 import (
-    mm_w4a16_fp4 as mm_w4a16_fp4,
     prepare_w4a16_fp4_weights as prepare_w4a16_fp4_weights,
 )
 
@@ -106,7 +105,6 @@ __all__ = (
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
         "fp8_blockscale_gemm_sm90",
-        "mm_w4a16_fp4",
         "prepare_w4a16_fp4_weights",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
