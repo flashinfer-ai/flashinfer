@@ -636,7 +636,9 @@ class TestInputsHelperContract:
         # Every other input MUST pass through with object identity preserved.
         # If this breaks, the hook is mutating something it shouldn't, OR the
         # wrapper's inputs-list ordering has drifted from the hook's unpacking.
-        for i in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+        for i in range(len(inputs)):
+            if i == 2:
+                continue
             assert output[i] is inputs[i], (
                 f"inputs[{i}] must pass through the hook unchanged (object identity). "
                 f"This typically indicates the inputs-list ordering in "

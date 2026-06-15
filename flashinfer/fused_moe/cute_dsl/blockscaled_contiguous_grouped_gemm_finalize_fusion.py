@@ -512,7 +512,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             cutlass.Float32,
             a_per_token_scale.data_ptr(),
             cute.AddressSpace.gmem,
-            assumed_align=16,
         )
     else:
         a_per_token_scale_ptr = None
