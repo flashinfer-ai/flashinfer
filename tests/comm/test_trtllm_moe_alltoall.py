@@ -694,7 +694,11 @@ def test_moe_combine_multi_rank_single_gpu(
             )
         )
 
+    output_scalar_scale = 1.0
     if quant_mode != CombineQuantMode.NONE:
+        output_scalar_scale = (
+            2.5  # arbitrary non-one scalar to test scaling path in the kernel
+        )
         # High-precision (bf16) combine output. The quantized kernel output is
         # validated by dequantizing it and comparing against this reference.
         reference_result = combine_from_single_rank(
@@ -741,6 +745,7 @@ def test_moe_combine_multi_rank_single_gpu(
         output_dtype=output_dtype,
         output_scales_list=output_scales_list,
         sf_layout=sf_layout,
+        output_scalar_scale=output_scalar_scale,
     )
 
     if quant_mode == CombineQuantMode.NONE:
@@ -779,7 +784,9 @@ def test_moe_combine_multi_rank_single_gpu(
         # e2m1_and_ufp8sf_scale_to_float: ufp8_type 1 = UE4M3 (NVFP4), 0 = UE8M0 (MXFP4).
         ufp8_type = 1 if is_nvfp4 else 0
         is_swizzled = sf_layout != SfLayout.layout_linear
-        global_sf = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+        global_sf = torch.tensor(
+            [output_scalar_scale], dtype=torch.float32, device="cuda"
+        )
         for rank in range(world_size):
             if is_nvfp4:
                 ref_fp4, ref_sf = nvfp4_quantize(
