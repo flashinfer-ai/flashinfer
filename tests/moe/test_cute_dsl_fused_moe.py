@@ -1006,8 +1006,10 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize("top_k", [1, 2, 8])
     @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
     @pytest.mark.parametrize("num_experts", [256, 384])
+    @pytest.mark.parametrize("activation", ["silu", "relu2"])
     def test_numerical_accuracy(
         self,
+        activation: str,
         num_tokens: int,
         top_k: int,
         hidden_size: int,
@@ -1017,6 +1019,7 @@ class TestCuteDslFusedMoeFunctional:
         """Accuracy test for functional API across configurations."""
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
+        gated = activation == "silu"
         num_local_experts = num_experts
 
         tensors = create_moe_tensors(
@@ -1026,6 +1029,7 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             top_k=top_k,
+            gated=gated,
         )
 
         result = cute_dsl_fused_moe_nvfp4(
@@ -1043,6 +1047,7 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
+            activation=activation,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1062,78 +1067,7 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
-        )
-
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
-
-    @pytest.mark.parametrize(
-        "hidden_size,intermediate_size", [(256, 512), (1024, 2048)]
-    )
-    @pytest.mark.parametrize("top_k", [1, 8, 22])
-    @pytest.mark.parametrize("num_tokens", [128, 1024])
-    @pytest.mark.parametrize("num_experts", [512])
-    def test_numerical_accuracy_relu2(
-        self,
-        num_tokens: int,
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        num_experts: int,
-    ):
-        """Accuracy test for the non-gated ReLU^2 activation path."""
-        from flashinfer import cute_dsl_fused_moe_nvfp4
-
-        num_local_experts = num_experts
-
-        tensors = create_moe_tensors(
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            top_k=top_k,
-            gated=False,
-        )
-
-        result = cute_dsl_fused_moe_nvfp4(
-            x=tensors["x"],
-            x_sf=tensors["x_sf"],
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            w1_weight=tensors["w1_weight"],
-            w1_weight_sf=tensors["w1_weight_sf"],
-            w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=tensors["fc2_input_scale"],
-            w2_weight=tensors["w2_weight"],
-            w2_weight_sf=tensors["w2_weight_sf"],
-            w2_alpha=tensors["w2_alpha"],
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_local_experts,
-            activation="relu2",
-        )
-
-        assert result.shape == (num_tokens, hidden_size)
-        assert result.dtype == torch.bfloat16
-        assert not torch.isnan(result).any()
-        assert not torch.isinf(result).any()
-
-        ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_local_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
-            gated=False,
+            gated=gated,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -1177,75 +1111,6 @@ class TestCuteDslFusedMoeFunctional:
 
         assert result.shape == (num_tokens, hidden_size)
         assert not torch.isnan(result).any()
-
-    def test_wrapper_autotune_relu2(self):
-        """Wrapper + autotune on the non-gated ReLU^2 path.
-
-        Exercises get_valid_tactics / runner caching for activation="relu2",
-        which a no-autotune run skips (it falls back to the default tactic).
-        """
-        from flashinfer import CuteDslMoEWrapper, autotune
-
-        num_tokens, hidden_size, intermediate_size = 256, 1024, 2048
-        num_experts, top_k = 384, 22
-
-        tensors = create_moe_tensors(
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            num_local_experts=num_experts,
-            top_k=top_k,
-            gated=False,
-        )
-
-        moe = CuteDslMoEWrapper(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            use_cuda_graph=False,
-            activation="relu2",
-        )
-
-        with autotune(True):
-            result = moe.run(
-                x=tensors["x"],
-                x_sf=tensors["x_sf"],
-                token_selected_experts=tensors["token_selected_experts"],
-                token_final_scales=tensors["token_final_scales"],
-                w1_weight=tensors["w1_weight"],
-                w1_weight_sf=tensors["w1_weight_sf"],
-                w1_alpha=tensors["w1_alpha"],
-                fc2_input_scale=tensors["fc2_input_scale"],
-                w2_weight=tensors["w2_weight"],
-                w2_weight_sf=tensors["w2_weight_sf"],
-                w2_alpha=tensors["w2_alpha"],
-            )
-
-        assert result.shape == (num_tokens, hidden_size)
-        assert not torch.isnan(result).any()
-        assert not torch.isinf(result).any()
-
-        ref_output = compute_reference_moe_fp4(
-            hidden_states=tensors["x_bf16"].float().cuda(),
-            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
-            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            fc2_input_scale=tensors["fc2_input_scale"],
-            gated=False,
-        )
-
-        passed, percent_within, atol = check_accuracy(result, ref_output)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
 
 
 # =============================================================================
@@ -1430,11 +1295,13 @@ class TestCuteDslMoEWrapper:
             f"CUDA graph accuracy: {percent_within * 100:.2f}% (atol={atol:.4f})"
         )
 
-    def test_wrapper_with_autotune(self):
+    @pytest.mark.parametrize("activation", ["silu", "relu2"])
+    def test_wrapper_with_autotune(self, activation: str):
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
 
+        gated = activation == "silu"
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
         num_experts, top_k = 256, 2
 
@@ -1445,6 +1312,7 @@ class TestCuteDslMoEWrapper:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            gated=gated,
         )
 
         moe = CuteDslMoEWrapper(
@@ -1453,6 +1321,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            activation=activation,
         )
 
         with autotune(True):
@@ -1485,6 +1354,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
+            gated=gated,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
