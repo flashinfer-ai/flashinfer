@@ -1,10 +1,7 @@
 """Unit tests for split-path inner kernels (identity + registry).
 
 4-GPU multirank test:
-    torchrun --nproc_per_node=4 -m pytest \\
-        tests/moe_ep_v2/test_split_kernels.py \\
-        -v -m "nvep and gpu_4" \\
-        --backend=nccl_ep      # or nixl_ep
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep_v2/test_split_kernels.py -v -m "nvep and gpu_4" --backend=nccl_ep      # or nixl_ep
 """
 
 from __future__ import annotations

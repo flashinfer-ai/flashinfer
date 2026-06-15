@@ -1,10 +1,7 @@
 """Phase 2 / C3 — multi-rank roundtrip on 8 GPUs.
 
 Launched via torchrun:
-    torchrun --nproc_per_node=8 -m pytest \\
-        tests/moe_ep/test_moe_ep_layer_multirank.py \\
-        -v -m "nvep and gpu_8" \\
-        --backend=nccl_ep      # or nixl_ep
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_layer_multirank.py -v -m "nvep and gpu_4" --backend=nccl_ep      # or nixl_ep
 
 The identity inner compute makes ``dispatch → identity → combine`` a
 roundtrip of the per-rank ``hidden_states`` weighted by ``sum(topk_weights)``.

@@ -1,9 +1,7 @@
 """Multi-rank smoke + correctness tests for MoEEpMegaLayer.
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest \\
-        tests/moe_ep_v2/test_moe_ep_mega_multirank.py \\
-        -v -m "gpu_4 and arch_blackwell"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep_v2/test_moe_ep_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and the ``deep_gemm`` package with
 ``fp8_fp4_mega_moe`` support.
