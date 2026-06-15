@@ -265,10 +265,7 @@ def _moe_core_impl(
         raise ValueError(
             f"CuteDSL MoE GEMM1 supports activation 'silu' or 'relu2', got {activation!r}."
         )
-    # Step 2: GEMM1 + activation. Per-token mode mirrors TRTLLM's explicit
-    # quantization path: the GEMM1 epilogue applies caller-provided input row
-    # scales, materializes activations, then the standalone CuTe-DSL per-token
-    # NVFP4 quantizer produces FC2 input and row scales for GEMM2.
+    # Step 2: GEMM1 + activation
     intermediate_per_token_scale = None
     if use_per_token_activation:
         intermediate, _ = (
@@ -512,6 +509,9 @@ class CuteDslMoEWrapper:
                 )
             return wrapper._forward_with_tactic(*args, **kwargs)
 
+        # Create auto-tuner runner. Use a weak trampoline instead of a bound
+        # method so the runner cannot keep CUDA graph resources alive after the
+        # wrapper drops out of scope.
         self._runner = CuteDslFusedMoENvfp4Runner(
             forward_impl=_forward_with_tactic_weak,
             num_experts=num_experts,
@@ -656,7 +656,7 @@ class CuteDslMoEWrapper:
             Per-expert global scale for GEMM2.
         per_token_scale : Optional[torch.Tensor]
             Per-token input row scale for GEMM1. Passing this enables the
-            TRTLLM-style explicit per-token activation path.
+            per-token activation path.
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
@@ -857,9 +857,7 @@ def cute_dsl_fused_moe_nvfp4(
         Pre-allocated output buffer.  Allocated internally if ``None``.
     per_token_scale : Optional[torch.Tensor]
         Per-token input row scale for GEMM1. Passing this enables the
-        TRTLLM-style explicit per-token activation path, which applies this
-        scale in GEMM1/SwiGLU and also quantizes the GEMM1/SwiGLU output with
-        the standalone per-token NVFP4 quantizer before GEMM2.
+        per-token activation path.
     aux_stream : Optional[torch.cuda.Stream]
         Optional auxiliary CUDA stream used to overlap setup work with the
         main computation.

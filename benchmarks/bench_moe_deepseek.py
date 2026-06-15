@@ -813,7 +813,6 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    # Run backends that support the selected activation quantization contract.
     lat = {}
     lat["CuteDSL"] = bench_cute_dsl(
         inputs,

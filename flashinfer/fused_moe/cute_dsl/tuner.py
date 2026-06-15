@@ -245,10 +245,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         2: token_selected_experts (num_tokens, top_k) - expert assignments
         3: token_final_scales (num_tokens, top_k) - routing weights
         4-10: weight tensors (fixed size, don't depend on num_tokens)
-        11: per_token_scale (num_tokens,) - optional input row scale in
-            per-token activation mode, otherwise moe_output
-        12: moe_output (num_tokens, hidden_size) - output buffer in per-token
-            activation mode
+        11: moe_output, or per_token_scale when per-token activation is enabled
+        12: moe_output when per-token activation is enabled
 
     Args:
         forward_impl: The actual MoE implementation function.
@@ -258,10 +256,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         local_expert_offset: Starting expert index for this partition.
         use_fused_finalize: Whether to use fused finalize (default: True).
         output_dtype: Output data type (default: torch.bfloat16).
-        use_per_token_activation: Whether to mirror TRTLLM's explicit
-            per-token activation path: apply input row scales in GEMM1/SwiGLU,
-            then materialize activations for standalone per-token NVFP4
-            quantization before GEMM2.
+        use_per_token_activation: Whether inputs include per-token row scales
+            for GEMM1.
     """
 
     def __init__(
@@ -357,7 +353,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                         ).to(torch.float32),
                         *(
                             [
-                                # 11: per_token_scale — input row scale for GEMM1.
                                 lambda shapes, dtype, device: torch.ones(
                                     shapes, dtype=torch.float32, device=device
                                 )
@@ -365,7 +360,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                             if use_per_token_activation
                             else []
                         ),
-                        # 11/12: moe_output — output buffer
                         lambda shapes, dtype, device: torch.empty(
                             shapes, dtype=dtype, device=device
                         ),

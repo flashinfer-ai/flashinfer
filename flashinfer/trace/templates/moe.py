@@ -2742,7 +2742,7 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             ["num_tokens"],
             dtype="float32",
             optional=True,
-            description="Optional per-token input row scale. Presence enables the explicit per-token activation path.",
+            description="Optional per-token input row scale.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),

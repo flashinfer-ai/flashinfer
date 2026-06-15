@@ -1676,9 +1676,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # Five fields: tile_m, tile_n, expert, valid, mn_limit. The
-            # epilogue uses mn_limit to guard padded rows before loading
-            # optional per-token input scales.
+            # Get the first tile info
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
@@ -2498,9 +2496,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
-            # Five fields: tile_m, tile_n, expert, valid, mn_limit. The
-            # epilogue uses mn_limit to guard padded rows before loading
-            # optional per-token input scales.
+            # Get tile info, including mn_limit for padded-row checks.
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
 
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)

@@ -182,9 +182,7 @@ def compute_reference_moe_fp4(
         hidden_size: Hidden dimension
         intermediate_size: Intermediate dimension
         fc2_input_scale: Optional scale for FC2 input quantization
-        use_per_token_activation: Use the TRTLLM-style explicit per-token path:
-            the input has already been dequantized with its row scale, and the
-            GEMM1/SwiGLU output is quantized per token before GEMM2.
+        use_per_token_activation: Use per-token activation.
         num_local_experts: Number of local experts (for EP). Defaults to num_experts.
         local_expert_offset: Starting expert ID for this EP rank. Defaults to 0.
 
@@ -583,8 +581,8 @@ class TestInputsHelperContract:
             torch.zeros(num_local_experts, dtype=torch.float32),  # 10: w2_alpha
         ]
         if use_per_token_activation:
-            inputs.append(torch.ones(n, dtype=torch.float32))  # 11: per_token_scale
-        inputs.append(torch.zeros(n, hidden, dtype=torch.bfloat16))  # 11/12: moe_output
+            inputs.append(torch.ones(n, dtype=torch.float32))  # per_token_scale
+        inputs.append(torch.zeros(n, hidden, dtype=torch.bfloat16))  # moe_output
         return inputs
 
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
