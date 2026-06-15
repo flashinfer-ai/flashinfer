@@ -424,6 +424,9 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     intermediate_size = n // (2 if gated else 1)
     permuted_m = token_id_mapping.shape[0]
 
+    if n % 128 != 0:
+        raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
+
     # Check compute capability
     major, minor = get_compute_capability(a.device)
     if major != 10:
