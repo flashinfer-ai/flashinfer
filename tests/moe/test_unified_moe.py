@@ -955,10 +955,15 @@ def _compute_ref(act_pack, tensors, shape):
 
 
 @sm100_required
-class TestCalibratedGlobalScales:
-    """The unified API must reproduce the reference when the activations were
-    quantized with a real calibrated NVFP4 global scale, not just the trivial
-    1.0 the other tests use (gh #3548)."""
+class TestUnifiedMoECalibratedScales:
+    """Calibrated (non-1.0) global scales must reach the kernels (gh #3548).
+
+    The activations are quantized with the real calibrated scale ``(448*6)/amax``
+    with real per-expert global scales (the ``prepare_*_weights`` default),
+    and the gemm1→gemm2 requant uses a calibrated intermediate scale.  Before
+    the fix the activation scale never reached the kernel and the output
+    silently inflated by ~``a1_gs``.
+    """
 
     @pytest.mark.parametrize("backend_key", ["cute_dsl_nvfp4", "trtllm_fp4_routed"])
     def test_backend_matches_reference_with_calibrated_scales(self, backend_key):
