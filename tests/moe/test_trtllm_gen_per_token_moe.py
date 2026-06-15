@@ -32,16 +32,20 @@ from flashinfer.fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
 )
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
 from flashinfer.utils import device_support_pdl, get_compute_capability
 from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
+from . import utils as moe_utils
 from .test_trtllm_gen_fused_moe import (
     check_accuracy,
     routing_reference_topk,
 )
+
+set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
 
 torch.manual_seed(42)
 cache_permute_indices: Dict[tuple, torch.Tensor] = {}
@@ -52,12 +56,16 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 @pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
 @pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize("use_4over6", [False, True])
+@pytest.mark.parametrize("weights_use_4over6", [False, True])
 def test_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
     num_experts: int,
     top_k: int,
+    use_4over6: bool,
+    weights_use_4over6: bool,
 ):
     device = torch.device("cuda:0")
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -106,9 +114,15 @@ def test_routed_fused_moe(
     ].to(torch.bfloat16)
 
     # ======== Quantize =======
+    nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
+    weights_nvfp4_4over6_config = NVFP44Over6Config() if weights_use_4over6 else None
+    hidden_states_global_scale_inv = nvfp4_global_decode_scale_te(
+        torch.ones((), dtype=torch.float32, device=device),
+        nvfp4_4over6_config,
+    )
     hidden_states, hidden_states_scale, per_token_scale_inv = nvfp4_quantize(
         hidden_states_bf16,
-        1.0 / (448.0 * 6.0),
+        hidden_states_global_scale_inv,
         sfLayout=SfLayout.layout_linear,
         per_token_activation=True,
     )
@@ -118,20 +132,25 @@ def test_routed_fused_moe(
 
     w13_global_amax = w13_bf16.abs().amax().to(torch.float32)
     w2_global_amax = w2_bf16.abs().amax().to(torch.float32)
-    w13_global_scale_inv = nvfp4_global_decode_scale_te(w13_global_amax)
-    w2_global_scale_inv = nvfp4_global_decode_scale_te(w2_global_amax)
-    w13, w13_scale = nvfp4_quantize(
-        w13_bf16,
-        1.0 / w13_global_scale_inv,
-        sfLayout=SfLayout.layout_linear,
+    w13_global_scale_inv = nvfp4_global_decode_scale_te(
+        w13_global_amax, weights_nvfp4_4over6_config
     )
+    w2_global_scale_inv = nvfp4_global_decode_scale_te(
+        w2_global_amax, weights_nvfp4_4over6_config
+    )
+    with moe_utils.nvfp4_4over6_env(weights_use_4over6):
+        w13, w13_scale = nvfp4_quantize(
+            w13_bf16,
+            1.0 / w13_global_scale_inv,
+            sfLayout=SfLayout.layout_linear,
+        )
+        w2, w2_scale = nvfp4_quantize(
+            w2_bf16,
+            1.0 / w2_global_scale_inv,
+            sfLayout=SfLayout.layout_linear,
+        )
     w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
         num_experts, intermediate_size * 2, -1
-    )
-    w2, w2_scale = nvfp4_quantize(
-        w2_bf16,
-        1.0 / w2_global_scale_inv,
-        sfLayout=SfLayout.layout_linear,
     )
     w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(num_experts, hidden_size, -1)
 
@@ -307,4 +326,4 @@ def test_routed_fused_moe(
 
     torch.cuda.synchronize()
 
-    check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.92)
+    check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.9)

@@ -33,6 +33,7 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     filter_backends_by_compute_capability,
+    warn_if_pdl_unsupported,
 )
 from .moe_utils import (
     calculate_fp4_global_scale,
@@ -75,6 +76,19 @@ def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
     return {}
 
 
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    """Whether the activation splits FC1 output into gate/up halves (FC1 weight has 2*intermediate
+    rows). SwigluStep's clamp limit defaults to 7.0 (the Step-3 model value) in the kernel, so no
+    swiglu_limit tensor needs to be passed.
+    """
+    return activation_type in (
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.SwigluBias,
+        ActivationType.SwigluStep,
+    )
+
+
 def run_moe_test(args):
     """
     Run a MOE test.
@@ -97,6 +111,10 @@ def run_moe_test(args):
         return testCuteDslFp4BlockScaleMoe(args)
     elif args.routine == "b12x_fused_moe":
         return testB12xFusedMoe(args)
+    elif args.routine == "bgmv_moe":
+        return testBgmvMoe(args)
+    elif args.routine == "unified_nvfp4_moe":
+        return testUnifiedNvfp4Moe(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -118,7 +136,7 @@ def parse_moe_args(line, parser):
         "--intermediate_size",
         type=int,
         required=True,
-        help="Intermediate dimension size.",
+        help="Intermediate dimension size (not used for bgmv_moe).",
     )
     # Note: num_experts/top_k is added by add_common_moe_args
     parser.add_argument(
@@ -293,6 +311,29 @@ def parse_moe_args(line, parser):
         required=False,
         default=0,
         help="Expert parallel rank for cutlass_fused_moe.",
+    )
+
+    # BGMV MoE specific arguments
+    parser.add_argument(
+        "--rank",
+        type=int,
+        required=False,
+        default=32,
+        help="LoRA rank for bgmv_moe benchmark.",
+    )
+    parser.add_argument(
+        "--num_loras",
+        type=int,
+        required=False,
+        default=8,
+        help="Number of LoRA adapters for bgmv_moe benchmark.",
+    )
+    parser.add_argument(
+        "--num_slices",
+        type=int,
+        required=False,
+        default=1,
+        help="Number of weight slices for bgmv_moe benchmark (e.g., 2 for gate+up).",
     )
 
     args = parser.parse_args(line)
@@ -678,6 +719,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
             do_finalize=True,
+            enable_pdl=args.enable_pdl,
             **_activation_kwarg(trtllm_fp4_block_scale_moe, activation_type),
         )
 
@@ -845,7 +887,7 @@ def testCutlassFusedMoe(args):
 
     # Create base tensors
     activation_type = args.activation_type
-    is_gated = activation_type in (ActivationType.Swiglu, ActivationType.Geglu)
+    is_gated = is_gated_activation(activation_type)
     w1_rows = (2 if is_gated else 1) * intermediate_size
 
     torch.manual_seed(args.random_seed)
@@ -928,6 +970,7 @@ def testCutlassFusedMoe(args):
                 ep_rank=ep_rank,
                 quant_scales=None,
                 output=out,
+                enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -996,6 +1039,7 @@ def testCutlassFusedMoe(args):
                 ep_rank=ep_rank,
                 quant_scales=quant_scales,
                 output=out,
+                enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -1082,6 +1126,7 @@ def testCutlassFusedMoe(args):
                 quant_scales=quant_scales,
                 input_sf=input_sf,
                 output=out,
+                enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -1135,7 +1180,7 @@ def testCutlassFusedMoe(args):
         num_experts,
         top_k,
         median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated,
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -1151,7 +1196,7 @@ def testCutlassFusedMoe(args):
         routing_logits_dtype=router_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        is_gated=is_gated,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -1432,6 +1477,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
+            enable_pdl=args.enable_pdl,
         )
 
         # Warmup call to populate workspace cache before timed region
@@ -1458,6 +1504,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             max_num_tokens=num_tokens,
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
+            enable_pdl=args.enable_pdl,
         )
         runner = moe.run
 
@@ -1613,6 +1660,7 @@ def testB12xFusedMoe(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print("[INFO] Running testB12xFusedMoe")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -2038,7 +2086,7 @@ def testTrtllmFp8BlockScaleMoe(args):
             routing_method_type=routing_method_type,
             use_shuffled_weight=use_shuffled_weight,
             weight_layout=weight_layout,
-            enable_pdl=True,
+            enable_pdl=args.enable_pdl,
         )
 
     # Benchmark timing
@@ -2272,6 +2320,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
+            enable_pdl=args.enable_pdl,
             **_activation_kwarg(trtllm_fp8_per_tensor_scale_moe, activation_type),
         )
 
@@ -2352,6 +2401,681 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         cur_res["activation_type"] = args.activation_type.name
+        res.append(cur_res)
+
+    return res
+
+
+# =============================================================================
+# Unified NVFP4 MoE — MoELayer-based cross-backend autotune
+# =============================================================================
+
+
+def testUnifiedNvfp4Moe(args):
+    """MoELayer cross-backend autotune for NVFP4.
+
+    Exercises the unified MoE API: per-shape, builds MoELayer over
+    {CuteDslConfig, TrtllmFp4Config}, registers both backend-native weight
+    views on a single MoEWeightPack, dispatches once, reports the winner
+    and both backends' best-tactic latencies.
+
+    Emits one result row per backend candidate so CSV output carries the
+    cross-backend comparison directly.
+    """
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.fused_moe import (
+        ActivationConfig,
+        CuteDslConfig,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEActivationPack,
+        MoEConfig,
+        MoELayer,
+        MoEWeightPack,
+        QuantConfig,
+        QuantVariant,
+        RoutingConfig,
+        TrtllmFp4Config,
+    )
+    from flashinfer.fused_moe.api import BackendOptions
+
+    if args.verbose >= 1:
+        print("[INFO] Running testUnifiedNvfp4Moe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    local_expert_offset = args.local_expert_offset
+    local_num_experts = args.local_num_experts or num_experts
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
+
+    res = []
+    backends = ["unified"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    if args.verbose >= 1:
+        print(
+            f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
+            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}, "
+            f"local_experts={local_num_experts}"
+        )
+
+    # ---- Build shared bf16 reference weights ------------------------------
+    torch.manual_seed(0)
+    w1_bf16 = (
+        torch.randn(
+            local_num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w2_bf16 = (
+        torch.randn(
+            local_num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+
+    # ---- Backend-native weight views — first-class prepare helpers (CR2) --
+    # Both views are built from the SAME canonical bf16 weights, so the two
+    # backends are directly comparable (and a shared reference is meaningful).
+    cute_dsl_view = CuteDslConfig.prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=local_num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    trtllm_view = TrtllmFp4Config.prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=local_num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+
+    # ---- Activation pack --------------------------------------------------
+    # The activation (NVFP4-quantized hidden states + pre-routed indices) still
+    # comes from the canonical test data creator; only weight prep is
+    # first-class today (activation-prep promotion tracked under CR2).
+    import os
+    import sys
+
+    _repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from tests.moe.test_cute_dsl_fused_moe import (
+        check_accuracy,
+        compute_reference_moe_fp4,
+        create_moe_tensors,
+    )
+
+    # Wide-EP (MVP): model a single rank as a complete MoE over its
+    # local_num_experts experts — route the activation WITHIN the local experts
+    # (selected ids in [0, local_num_experts)) so every token is computed
+    # locally. This is the "local-only" proxy: it avoids the unfaithful
+    # global-routing-but-local-weights setup (most tokens skipped) and keeps the
+    # derived FLOP/bandwidth metrics correct (all tokens computed, active
+    # experts <= local). For EP=1 (local == global) this is unchanged.
+    routing_num_experts = local_num_experts
+    routing_top_k = min(top_k, local_num_experts)
+    cute_dsl_data = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=routing_num_experts,
+        num_local_experts=local_num_experts,
+        top_k=routing_top_k,
+        device=device,
+    )
+    # cute_dsl_data["x_sf"] is already unsqueezed to [M, H//16, 1]; strip that
+    # for the Pack (runner re-applies unsqueeze in pack_inputs).
+    x_sf = cute_dsl_data["x_sf"].squeeze(-1)
+    act_pack = MoEActivationPack(
+        hidden_states_q=cute_dsl_data["x"],
+        hidden_states_scale=x_sf,
+        selected_experts=cute_dsl_data["token_selected_experts"],
+        final_scales=cute_dsl_data["token_final_scales"],
+    )
+
+    num_active_experts = int(act_pack.selected_experts.unique().numel())
+
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)
+    weight_pack.prepare_for("trtllm_fp4_routed", trtllm_view)
+
+    # ---- MoELayer config --------------------------------------------------
+    config = MoEConfig(
+        routing=RoutingConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=args.n_group,
+            topk_group=args.topk_group,
+            routed_scaling_factor=args.routed_scaling_factor,
+        ),
+        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        experts=ExpertConfig(
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+        ),
+        activation=ActivationConfig(),
+        backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+        execution=ExecutionConfig(tune_max_num_tokens=max(num_tokens, 8192)),
+    )
+
+    # ---- Dispatch: trigger cross-backend selection ------------------------
+    with autotune(True):
+        layer = MoELayer(config, device=device)
+        _ = layer(act_pack, weight_pack)
+
+    winner_key = layer.winner_backend or "?"
+    if args.verbose >= 1:
+        print(
+            f"[INFO] MoELayer winner: {winner_key} "
+            f"(candidates: {[r.backend_key for r in layer.runners]})"
+        )
+
+    # ---- Optional shared-reference accuracy check (CR10/CR11) -------------
+    # Both backend views derive from the same bf16 weights, so a single bf16
+    # reference is valid for every candidate.  Catches shared-mode errors that
+    # cross-backend agreement would miss.
+    ref_output = None
+    if args.refcheck:
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=cute_dsl_data["x_bf16"].float().to(device),
+            gemm1_weights=w1_bf16.float().to(device),
+            gemm2_weights=w2_bf16.float().to(device),
+            token_selected_experts=act_pack.selected_experts,
+            token_final_scales=act_pack.final_scales,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=cute_dsl_data["fc2_input_scale"],
+        )
+
+    # ---- Per-backend best-tactic timing (one result row per candidate) ----
+    tuner = AutoTuner.get()
+    for runner in layer.runners:
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        with autotune(True):
+            _, tactic = tuner.choose_one(
+                custom_op=f"moe_{runner.backend_key}",
+                runners=[runner],
+                tuning_config=runner.tuning_config,
+                inputs=inputs,
+            )
+
+        def _call(r=runner, i=inputs, t=tactic):
+            return r.forward(i, tactic=t)
+
+        times = bench_gpu_time(
+            fn=_call,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=not args.no_cuda_graph,
+            cold_l2_cache=True,
+        )
+        median_time = float(np.median(times))
+        std_time = float(np.std(times))
+        # Use the actual routing geometry (local experts / clamped top_k), not
+        # the global config, so the wide-EP local-only proxy reports honest
+        # FLOP/byte counts. For EP=1 these equal num_experts/top_k.
+        tflops = calculate_moe_tflops(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            routing_num_experts,
+            routing_top_k,
+            median_time,
+        )
+        tb_per_sec = calculate_moe_kernel_bandwidth(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            routing_num_experts,
+            routing_top_k,
+            median_time,
+            input_dtype,
+            weight_dtype,
+            input_format="nvfp4",
+            weight_format="nvfp4",
+            routing_logits_dtype=None,
+            active_experts=num_active_experts,
+            verbose=args.verbose,
+        )
+
+        # Tag: "unified/<backend>" + star the winner
+        is_winner = runner.backend_key == winner_key
+        backend_label = f"unified/{runner.backend_key}" + ("*" if is_winner else "")
+        print_perf_metrics(backend_label, median_time, std_time, tflops, tb_per_sec)
+
+        # Shared-reference accuracy check for this candidate (CR10/CR11).
+        refcheck_passed = None
+        if ref_output is not None:
+            out = runner.forward(inputs, tactic=tactic)
+            refcheck_passed, pct, atol = check_accuracy(out, ref_output)
+            status = "PASS" if refcheck_passed else "FAIL"
+            print(
+                f"[REFCHECK] {backend_label}: {status} "
+                f"({pct * 100:.2f}% within atol={atol:.4f} vs bf16 reference)"
+            )
+            if not refcheck_passed and not args.allow_output_mismatch:
+                print(
+                    f"[ERROR] {backend_label} failed reference check. "
+                    f"Re-run with --allow_output_mismatch to continue past mismatches."
+                )
+
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["backend"] = backend_label
+            cur_res["refcheck_passed"] = refcheck_passed
+            cur_res["num_tokens"] = num_tokens
+            cur_res["hidden_size"] = hidden_size
+            cur_res["intermediate_size"] = intermediate_size
+            cur_res["num_experts"] = num_experts
+            cur_res["top_k"] = top_k
+            cur_res["local_expert_offset"] = local_expert_offset
+            cur_res["local_num_experts"] = local_num_experts
+            cur_res["input_dtype"] = input_dtype
+            cur_res["weight_dtype"] = weight_dtype
+            cur_res["fp4_mode"] = "nvfp4"
+            res.append(cur_res)
+
+    return res
+
+
+def testBgmvMoe(args):
+    """
+    Benchmark BGMV MoE kernels for multi-LoRA inference.
+
+    Measures the performance of the fused shrink + expand CUDA kernels
+    that apply LoRA adapters in MoE models. Compares against FlashInfer's
+    grouped_mm_bf16 as a baseline.
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        list: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testBgmvMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    rank = args.rank
+    num_loras = args.num_loras
+    num_slices = getattr(args, "num_slices", 1)
+    res = []
+
+    if args.verbose >= 1:
+        print(
+            f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
+            f"rank={rank}, experts={num_experts}, top_k={top_k}, "
+            f"num_loras={num_loras}, num_slices={num_slices}"
+        )
+
+    # Import BGMV MoE kernels
+    from flashinfer.fused_moe.bgmv_moe import (
+        bgmv_moe_shrink,
+        bgmv_moe_expand,
+        fill_w_ptr,
+    )
+
+    # Generate test data
+    num_pairs = num_tokens * top_k
+    feat_out = hidden_size
+
+    x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device) * 0.1
+    lora_a_weights = [
+        torch.randn(
+            num_loras, num_experts, rank, hidden_size, dtype=input_dtype, device=device
+        )
+        * 0.01
+        for _ in range(num_slices)
+    ]
+    lora_b_weights = [
+        torch.randn(
+            num_loras, num_experts, feat_out, rank, dtype=input_dtype, device=device
+        )
+        * 0.01
+        for _ in range(num_slices)
+    ]
+
+    sorted_token_ids = torch.arange(
+        num_tokens, device=device, dtype=torch.int64
+    ).repeat_interleave(top_k)
+    expert_ids = torch.randint(
+        0, num_experts, (num_pairs,), device=device, dtype=torch.int64
+    )
+    topk_weights = (
+        torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1)
+        .view(-1)
+        .to(torch.float32)
+    )
+    lora_indices = torch.randint(
+        0, num_loras, (num_tokens,), device=device, dtype=torch.int64
+    )
+
+    # Pre-allocate buffers for BGMV MoE
+    w_ptr_a = torch.zeros(num_slices, num_experts, dtype=torch.int64, device=device)
+    lora_stride_a = 0
+    for s in range(num_slices):
+        lora_stride_a = fill_w_ptr(w_ptr_a, lora_a_weights[s], num_experts, s)
+
+    w_ptr_b = torch.zeros(num_slices, num_experts, dtype=torch.int64, device=device)
+    lora_stride_b = 0
+    for s in range(num_slices):
+        lora_stride_b = fill_w_ptr(w_ptr_b, lora_b_weights[s], num_experts, s)
+
+    shrink_out = torch.zeros(
+        num_slices, num_pairs, rank, dtype=input_dtype, device=device
+    )
+    slice_start_loc = torch.zeros(num_slices, dtype=torch.int64, device=device)
+    for s in range(num_slices):
+        slice_start_loc[s] = s * feat_out
+    output_slices = [feat_out] * num_slices
+
+    y_accum = torch.zeros(
+        num_tokens, feat_out * num_slices, dtype=torch.float32, device=device
+    )
+
+    # Define benchmark function (shrink + expand)
+    def run_bgmv_moe(
+        shrink_out,
+        x,
+        w_ptr_a,
+        sorted_token_ids,
+        expert_ids,
+        lora_indices,
+        lora_stride_a,
+        y_accum,
+        w_ptr_b,
+        topk_weights,
+        slice_start_loc,
+        output_slices,
+        lora_stride_b,
+    ):
+        shrink_out.zero_()
+        y_accum.zero_()
+        bgmv_moe_shrink(
+            shrink_out,
+            x,
+            w_ptr_a,
+            sorted_token_ids,
+            expert_ids,
+            lora_indices,
+            lora_stride_a,
+        )
+        bgmv_moe_expand(
+            y_accum,
+            shrink_out,
+            w_ptr_b,
+            sorted_token_ids,
+            expert_ids,
+            topk_weights,
+            lora_indices,
+            slice_start_loc,
+            output_slices,
+            lora_stride_b,
+        )
+
+    is_cuda_graph_compatible = not args.no_cuda_graph
+
+    # Benchmark BGMV MoE
+    times = bench_gpu_time(
+        fn=run_bgmv_moe,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        cold_l2_cache=True,
+        input_args=(
+            shrink_out,
+            x,
+            w_ptr_a,
+            sorted_token_ids,
+            expert_ids,
+            lora_indices,
+            lora_stride_a,
+            y_accum,
+            w_ptr_b,
+            topk_weights,
+            slice_start_loc,
+            output_slices,
+            lora_stride_b,
+        ),
+    )
+
+    bgmv_median = np.median(times)
+    bgmv_std = np.std(times)
+
+    # Benchmark grouped_mm_bf16 as baseline comparison (single-slice only)
+    gg_kernel_median = float("nan")
+    gg_full_median = float("nan")
+    if num_slices != 1:
+        print(
+            "[INFO] grouped_mm_bf16 baseline skipped: only supported for num_slices=1"
+        )
+    else:
+        try:
+            from flashinfer.grouped_mm import grouped_mm_bf16
+
+            # For grouped GEMM, sort tokens by (lora_id, expert_id) and build m_indptr
+            num_groups = num_loras * num_experts
+
+            # Assign each pair a group_id = lora_id * num_experts + expert_id
+            lora_ids_expanded = lora_indices[sorted_token_ids]
+            group_ids = lora_ids_expanded * num_experts + expert_ids
+            group_ids[lora_ids_expanded < 0] = num_groups
+
+            # Sort by group_id
+            sorted_indices = torch.argsort(group_ids)
+            sorted_group_ids = group_ids[sorted_indices]
+
+            valid_mask = sorted_group_ids < num_groups
+            num_valid = valid_mask.sum().item()
+
+            sorted_token_indices = sorted_token_ids[sorted_indices[:num_valid]]
+            g_input = x[sorted_token_indices]
+
+            # Build m_indptr
+            counts = torch.zeros(num_groups + 1, dtype=torch.int32, device=device)
+            valid_groups = sorted_group_ids[:num_valid]
+            for g in range(num_groups):
+                counts[g + 1] = counts[g] + (valid_groups == g).sum().to(torch.int32)
+            g_m_indptr = counts
+
+            # Reshape LoRA weights for grouped GEMM
+            g_lora_a = lora_a_weights[0].view(
+                num_loras * num_experts, rank, hidden_size
+            )
+            g_lora_b = lora_b_weights[0].view(num_loras * num_experts, feat_out, rank)
+
+            g_shrink_out = torch.zeros(
+                num_valid, rank, dtype=input_dtype, device=device
+            )
+            g_expand_out = torch.zeros(
+                num_valid, feat_out, dtype=input_dtype, device=device
+            )
+
+            # Warmup
+            grouped_mm_bf16(g_input, g_lora_a, g_m_indptr, out=g_shrink_out)
+            grouped_mm_bf16(g_shrink_out, g_lora_b, g_m_indptr, out=g_expand_out)
+            torch.cuda.synchronize()
+
+            # Benchmark: kernel only (pre-sorted, no sort overhead)
+            def run_gg_kernel(
+                g_input, g_lora_a, g_m_indptr, g_shrink_out, g_lora_b, g_expand_out
+            ):
+                g_shrink_out.zero_()
+                g_expand_out.zero_()
+                grouped_mm_bf16(g_input, g_lora_a, g_m_indptr, out=g_shrink_out)
+                grouped_mm_bf16(g_shrink_out, g_lora_b, g_m_indptr, out=g_expand_out)
+
+            gg_kernel_times = bench_gpu_time(
+                fn=run_gg_kernel,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                sleep_after_run=False,
+                enable_cupti=args.use_cupti,
+                use_cuda_graph=is_cuda_graph_compatible,
+                cold_l2_cache=True,
+                input_args=(
+                    g_input,
+                    g_lora_a,
+                    g_m_indptr,
+                    g_shrink_out,
+                    g_lora_b,
+                    g_expand_out,
+                ),
+            )
+            gg_kernel_median = np.median(gg_kernel_times)
+
+            # Benchmark: sort + kernel (full end-to-end)
+            def run_gg_full(
+                x,
+                sorted_token_ids,
+                lora_indices,
+                expert_ids,
+                num_experts,
+                num_groups,
+                g_lora_a,
+                g_lora_b,
+                g_m_indptr,
+                g_shrink_out,
+                g_expand_out,
+            ):
+                _lora_ids = lora_indices[sorted_token_ids]
+                _group_ids = _lora_ids * num_experts + expert_ids
+                _group_ids[_lora_ids < 0] = num_groups
+                _sorted_indices = torch.argsort(_group_ids)
+                _sorted_token_indices = sorted_token_ids[_sorted_indices[:num_valid]]
+                _g_input = x[_sorted_token_indices]
+                g_shrink_out.zero_()
+                g_expand_out.zero_()
+                grouped_mm_bf16(_g_input, g_lora_a, g_m_indptr, out=g_shrink_out)
+                grouped_mm_bf16(g_shrink_out, g_lora_b, g_m_indptr, out=g_expand_out)
+
+            gg_full_times = bench_gpu_time(
+                fn=run_gg_full,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                sleep_after_run=False,
+                enable_cupti=args.use_cupti,
+                use_cuda_graph=False,  # sort is not cuda-graph compatible
+                cold_l2_cache=True,
+                input_args=(
+                    x,
+                    sorted_token_ids,
+                    lora_indices,
+                    expert_ids,
+                    num_experts,
+                    num_groups,
+                    g_lora_a,
+                    g_lora_b,
+                    g_m_indptr,
+                    g_shrink_out,
+                    g_expand_out,
+                ),
+            )
+            gg_full_median = np.median(gg_full_times)
+
+        except (ImportError, RuntimeError) as e:
+            print(f"[INFO] grouped_mm_bf16 baseline skipped: {e}")
+
+    # Print comparison results
+    def _fmt(v):
+        return f"{v:.3f}" if v == v else "N/A"
+
+    def _speedup(baseline, kernel):
+        if baseline != baseline or kernel != kernel or kernel == 0:
+            return "N/A"
+        return f"{baseline / kernel:.2f}x"
+
+    print(f"\n{'=' * 70}")
+    print(
+        f"  BGMV MoE Benchmark: tokens={num_tokens}, hidden={hidden_size}, "
+        f"rank={rank}, experts={num_experts}, top_k={top_k}"
+    )
+    print(f"{'=' * 70}")
+    print(f"  {'Method':<25} {'Median (ms)':>12} {'Speedup vs BGMV MoE':>20}")
+    print(f"  {'-' * 25} {'-' * 12} {'-' * 20}")
+    print(f"  {'BGMV MoE (this PR)':<25} {_fmt(bgmv_median):>12} {'—':>20}")
+    print(
+        f"  {'grouped_mm (kernel)':<25} {_fmt(gg_kernel_median):>12} {_speedup(gg_kernel_median, bgmv_median):>20}"
+    )
+    print(
+        f"  {'grouped_mm (sort+kern)':<25} {_fmt(gg_full_median):>12} {_speedup(gg_full_median, bgmv_median):>20}"
+    )
+    print(f"{'=' * 70}\n")
+
+    # Also print in standard format
+    flops = num_slices * num_pairs * (hidden_size * rank + rank * feat_out) * 2
+    tflops = flops / (bgmv_median * 1e-3) / 1e12
+
+    backend = "bgmv_moe"
+    print_perf_metrics(backend, bgmv_median, bgmv_std, tflops, 0.0)
+
+    if args.output_path is not None:
+        cur_res = defaultdict(str)
+        cur_res["routine"] = args.routine
+        cur_res["median_time"] = bgmv_median
+        cur_res["std_time"] = bgmv_std
+        cur_res["tflops"] = tflops
+        cur_res["backend"] = backend
+        cur_res["num_tokens"] = num_tokens
+        cur_res["hidden_size"] = hidden_size
+        cur_res["num_experts"] = num_experts
+        cur_res["top_k"] = top_k
+        cur_res["rank"] = rank
+        cur_res["num_loras"] = num_loras
+        cur_res["num_slices"] = num_slices
+        cur_res["input_dtype"] = str(input_dtype)
+        cur_res["gg_kernel_median"] = gg_kernel_median
+        cur_res["gg_full_median"] = gg_full_median
         res.append(cur_res)
 
     return res

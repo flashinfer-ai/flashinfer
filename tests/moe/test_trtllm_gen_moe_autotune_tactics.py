@@ -82,6 +82,7 @@ def _moe_profile_shapes(
         "expert_weights": _bucket(inputs["expert_weights"]),
         "hidden_states": _bucket(inputs["hidden_states"]),
         "hidden_states_scale": _bucket(inputs["hidden_states_scale"], dim=scale_dim),
+        "gemm1_lora_delta": (0,),
         "per_token_scale": (0,),
     }
     return tuple(by_name[name] for name in MoEInputs._FIELDS)
@@ -99,7 +100,7 @@ def _force_tactic_in_autotuner_cache(
     tactic: list[int] | None,
     custom_op: str,
 ) -> None:
-    file_key = str((custom_op, _TEST_RUNNER, profile_shapes))
+    file_key = str((custom_op, _TEST_RUNNER, profile_shapes, ()))
     tuner = AutoTuner.get()
     tuner.profiling_cache.clear()
     tuner._file_configs.clear()
@@ -331,6 +332,7 @@ def _enumerate_valid_tactics(
             WeightLayout.MajorK.value,
             False,  # use_per_token_scaling
             num_tokens,
+            False,  # has_gemm1_lora_delta
         )
     )
 
@@ -683,6 +685,7 @@ def _enumerate_fp8_valid_tactics(
             cfg["weight_layout"],
             False,  # use_per_token_scaling
             num_tokens,
+            False,  # has_gemm1_lora_delta
         )
     )
 

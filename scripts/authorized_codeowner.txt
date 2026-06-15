@@ -4,6 +4,7 @@ Anerudhan
 azhurkevich
 bkryu
 cyx-6
+dhiraj113
 dierksen
 djmmoss
 IwakuraRein
@@ -15,6 +16,7 @@ kaixih
 nv-yunzheq
 nvmbreughe
 paul841029
+qsang-nv
 saltyminty
 sergachev
 sricketts

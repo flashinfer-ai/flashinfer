@@ -14,6 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# Unified MoE API
+from .api import (  # noqa: F401
+    ActivationConfig,
+    BackendOptions,
+    CuteDslConfig,
+    CutlassConfig,
+    ExecutionConfig,
+    ExpertConfig,
+    MoEActivationPack,
+    MoEConfig,
+    MoEWeightPack,
+    QuantConfig,
+    QuantVariant,
+    RoutingConfig,
+    TrtllmBf16Config,
+    TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
+)
+from .layer import MoELayer  # noqa: F401
+from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner  # noqa: F401
+
+# Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
     convert_to_block_layout,
     cutlass_fused_moe,
@@ -33,6 +57,7 @@ from .core import (
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
+    trtllm_mxint4_block_scale_routed_moe,
 )
 
 from ..tllm_enums import (
@@ -44,6 +69,14 @@ from ..tllm_enums import (
 
 from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
+)
+
+from .bgmv_moe import (  # noqa: F401
+    bgmv_moe as bgmv_moe,
+    bgmv_moe_shrink as bgmv_moe_shrink,
+    bgmv_moe_expand as bgmv_moe_expand,
+    fill_w_ptr as fill_w_ptr,
+    has_bgmv_moe as has_bgmv_moe,
 )
 
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
@@ -60,6 +93,28 @@ except ImportError:
     _cute_dsl_available = False
 
 __all__ = [
+    # Unified API
+    "ActivationConfig",
+    "BackendOptions",
+    "CuteDslConfig",
+    "CutlassConfig",
+    "ExecutionConfig",
+    "ExpertConfig",
+    "CuteDslNvfp4Runner",
+    "MoEActivationPack",
+    "MoEConfig",
+    "MoELayer",
+    "MoEWeightPack",
+    "TrtllmFp4RoutedRunner",
+    "QuantConfig",
+    "QuantVariant",
+    "RoutingConfig",
+    "TrtllmBf16Config",
+    "TrtllmFp4Config",
+    "TrtllmFp8BlockConfig",
+    "TrtllmFp8PerTensorConfig",
+    "TrtllmMxInt4Config",
+    # Legacy flat APIs
     "ActivationType",
     "Fp8QuantizationType",
     "RoutingMethodType",
@@ -82,7 +137,13 @@ __all__ = [
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_mxint4_block_scale_moe",
+    "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "bgmv_moe",
+    "bgmv_moe_shrink",
+    "bgmv_moe_expand",
+    "fill_w_ptr",
+    "has_bgmv_moe",
 ]
 
 # Add CuteDSL exports if available

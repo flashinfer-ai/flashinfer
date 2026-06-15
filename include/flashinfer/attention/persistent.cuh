@@ -641,6 +641,9 @@ template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, ui
 cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
                                           const uint32_t num_blks_x, const uint32_t num_blks_y,
                                           const cudaStream_t stream) {
+  static_assert(HEAD_DIM_VO <= 256 && HEAD_DIM_QK <= 256,
+                "BatchAttention (holistic persistent) kernel does not support "
+                "head_dim > 256; use the FA2 prefill/decode path for large head dims.");
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;

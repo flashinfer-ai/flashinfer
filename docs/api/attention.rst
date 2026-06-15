@@ -16,6 +16,7 @@ Single Request Decoding
     :toctree: ../generated
 
     single_decode_with_kv_cache
+    single_decode_with_kv_cache_with_jit_module
 
 Batch Decoding
 --------------
@@ -25,8 +26,15 @@ Batch Decoding
 
     cudnn_batch_decode_with_kv_cache
     trtllm_batch_decode_with_kv_cache
+    xqa_batch_decode_with_kv_cache
 
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
+    :members:
+    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+
+    .. automethod:: __init__
+
+.. autoclass:: BatchDecodeMlaWithPagedKVCacheWrapper
     :members:
     :exclude-members: begin_forward, end_forward, forward, forward_return_lse
 
@@ -64,6 +72,7 @@ Single Request Prefill/Append Attention
 
     single_prefill_with_kv_cache
     single_prefill_with_kv_cache_return_lse
+    single_prefill_with_kv_cache_with_jit_module
 
 Batch Prefill/Append Attention
 ------------------------------
@@ -73,6 +82,9 @@ Batch Prefill/Append Attention
 
     cudnn_batch_prefill_with_kv_cache
     trtllm_batch_context_with_kv_cache
+    trtllm_ragged_attention_deepseek
+    fmha_v2_prefill_deepseek
+    trtllm_fmha_v2_prefill
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
@@ -83,6 +95,27 @@ Batch Prefill/Append Attention
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
     :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+
+    .. automethod:: __init__
+
+
+Unified BatchAttention
+----------------------
+
+.. currentmodule:: flashinfer.attention
+
+The ``BatchAttention`` class provides a holistic attention wrapper that automatically dispatches
+between paged-prefill and paged-decode based on per-request sequence lengths. It is the
+recommended entry point for serving stacks that batch mixed prefill/decode requests in a
+single kernel launch.
+
+.. autoclass:: BatchAttention
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BatchAttentionWithAttentionSinkWrapper
+    :members:
 
     .. automethod:: __init__
 
@@ -103,6 +136,7 @@ PageAttention for MLA
     :toctree: ../generated
 
     trtllm_batch_decode_with_kv_cache_mla
+    xqa_batch_decode_with_kv_cache_mla
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:

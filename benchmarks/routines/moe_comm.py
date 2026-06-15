@@ -1339,7 +1339,7 @@ def test_moe_a2a_dispatch_combine(args):
                             routing_method_type=1,  # Renormalize: TopK -> Softmax
                             use_shuffled_weight=False,
                             weight_layout=int(WeightLayout.MajorK),
-                            enable_pdl=True,
+                            enable_pdl=args.enable_pdl,
                             output=combine_payload.view(total_tokens, hidden_size),
                         )
 
