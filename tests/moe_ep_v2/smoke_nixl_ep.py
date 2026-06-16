@@ -1,7 +1,7 @@
 """NIXL-EP smoke entry point.
 
 Usage:
-    torchrun --nproc_per_node=8 tests/moe_ep_v2/smoke_nixl_ep.py
+    torchrun --nproc_per_node=4 tests/moe_ep_v2/smoke_nixl_ep.py
 
 Same shape as the NCCL-EP smoke, but constructs a torch.distributed.TCPStore
 for the NIXL Buffer rendezvous (NIXL doesn't share NCCL's communicator).

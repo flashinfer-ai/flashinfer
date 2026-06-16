@@ -1,7 +1,7 @@
 """NCCL-EP smoke entry point.
 
 Usage:
-    torchrun --nproc_per_node=8 tests/moe_ep_v2/smoke_nccl_ep.py
+    torchrun --nproc_per_node=4 tests/moe_ep_v2/smoke_nccl_ep.py
 
 Constructs an :class:`MoEEpLayer` with ``backend="nccl_ep"`` and runs one
 dispatch → identity → combine → complete pass. Asserts the output has the

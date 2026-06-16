@@ -11,6 +11,16 @@ def _split_fleet_params():
     return FleetParams(num_experts=2, max_tokens_per_rank=4, token_hidden_size=8)
 
 
+def _nvep_fleet_params():
+    from flashinfer.moe_ep_v2 import FleetParams
+
+    return FleetParams(
+        num_experts=8,
+        max_tokens_per_rank=128,
+        token_hidden_size=4096,
+    )
+
+
 def _mega_fleet_params():
     import torch
 
@@ -52,7 +62,7 @@ def test_factory_returns_split_for_nvep_config():
 
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0),
-        fleet_params=_split_fleet_params(),
+        fleet_params=_nvep_fleet_params(),
         backend=NvepConfig(),
     )
     assert isinstance(layer, MoEEpSplitLayer)
