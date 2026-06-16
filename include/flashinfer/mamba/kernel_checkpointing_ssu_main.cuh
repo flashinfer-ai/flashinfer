@@ -329,7 +329,11 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1,
           bool VARLEN = false, int MAIN_HEADS_PER_CTA = 1>
-__global__ void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
+// __maxnreg__(64): cap registers at 64 so the main reaches 8 resident blocks/SM
+// (65536/(64·128)=8), matching the lean storage's smem 8-block headroom.  Peak live
+// registers are ~61 (ncu_reader/sass_live_regs.py), so the cap sits ABOVE true pressure
+// → no spills; it only sheds the allocator's 63→65 padding that was capping us at 7.
+__global__ __maxnreg__(64) void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
   static_assert(DIM % D_SPLIT == 0, "DIM must be divisible by D_SPLIT");
   constexpr int D_PER_CTA = DIM / D_SPLIT;
   static_assert(D_PER_CTA >= 32, "D_PER_CTA must be >= 32 (output MMA m16n8 with _1×4 layout)");
