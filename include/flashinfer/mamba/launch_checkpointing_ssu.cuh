@@ -48,7 +48,8 @@ void dispatch_heads_per_cta(int hc, Fn&& fn) {
 // `launchCheckpointingSsu` (below) is the runtime dispatcher.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int D_SPLIT, bool VARLEN>
-void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t stream) {
+void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_per_cta,
+                                int precompute_heads_per_cta, cudaStream_t stream) {
   constexpr int NUM_WARPS = 4;
 
   FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
@@ -175,13 +176,16 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
       int const hc_ideal = (main_ctas <= sm_count * occ_main) ? 4 : 2;
       int hc = HEADS_PER_GROUP;
       while (hc > 1 && hc > hc_ideal) hc >>= 1;
-      // DEBUG override (cliff co-residency experiments): FLASHINFER_SSU_HEADS_PER_CTA
-      // forces hc; dispatch_heads_per_cta snaps it to the HEADS_PER_GROUP>>k chain.
-      static int const hc_override = [] {
+      // Overrides (both snap to the HEADS_PER_GROUP>>k chain in dispatch_heads_per_cta):
+      //  • precompute_heads_per_cta — the exposed HOST handle (Python-tunable; 0 = heuristic);
+      //  • FLASHINFER_SSU_HEADS_PER_CTA — an ad-hoc env for quick sweeps.
+      // Precedence: explicit handle > env > heuristic.
+      static int const hc_env = [] {
         char const* e = std::getenv("FLASHINFER_SSU_HEADS_PER_CTA");
         return e ? std::atoi(e) : 0;
       }();
-      if (hc_override > 0) hc = hc_override;
+      if (hc_env > 0) hc = hc_env;
+      if (precompute_heads_per_cta > 0) hc = precompute_heads_per_cta;
       dispatch_heads_per_cta<HEADS_PER_GROUP>(hc, [&]<int HEADS_PER_CTA>() {
         if (params.dt_softplus) {
           launch_precompute.template operator()<HEADS_PER_CTA, true>();
@@ -190,32 +194,41 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
         }
       });
 
-      // Main: grid (D_SPLIT, batch, nheads), same smem as the monolithic.
-      auto mfunc =
-          checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                        state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                        HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN>;
-      constexpr size_t msmem = sizeof(
-          CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
-      if constexpr (msmem > 0) {
-        FLASHINFER_CUDA_CHECK(
-            cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
-      }
-      // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr
-      // hard-wired to 1, independent of ENABLE_PDL) — the split's mechanism, not
-      // a user knob.  Its gdc_wait (unconditional in the kernel body) blocks for
-      // the precompute before reading cb_scaled, so this is always correct.
-      cudaLaunchAttribute main_attrs[1];
-      main_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      main_attrs[0].val.programmaticStreamSerializationAllowed = 1;
-      cudaLaunchConfig_t mcfg;
-      mcfg.gridDim = dim3(D_SPLIT, params.batch, params.nheads);
-      mcfg.blockDim = dim3(warpSize, NUM_WARPS);
-      mcfg.dynamicSmemBytes = msmem;
-      mcfg.stream = stream;
-      mcfg.attrs = main_attrs;
-      mcfg.numAttrs = 1;
-      FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
+      // Main: grid (D_SPLIT, batch, ngroups·ceil(HPG/MHC)).  Per-CTA smem is UNCHANGED
+      // from the monolithic — head-tiling reuses the same single buffers across the
+      // MHC heads, so occupancy is identical and only the CTA count drops (fewer waves).
+      // main_heads_per_cta is a HOST knob (Python-tunable); dispatch_heads_per_cta snaps
+      // it to the HPG>>k chain and binds it to the MAIN_HEADS_PER_CTA template arg — it
+      // never reaches the kernel as a runtime value.
+      dispatch_heads_per_cta<HEADS_PER_GROUP>(main_heads_per_cta, [&]<int MHC>() {
+        auto mfunc = checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t,
+                                                   stateIndex_t, state_scale_t, NPREDICTED,
+                                                   MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP,
+                                                   PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN, MHC>;
+        constexpr size_t msmem = sizeof(
+            CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+        if constexpr (msmem > 0) {
+          FLASHINFER_CUDA_CHECK(
+              cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
+        }
+        // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr
+        // hard-wired to 1, independent of ENABLE_PDL) — the split's mechanism, not
+        // a user knob.  Its gdc_wait (unconditional in the kernel body) blocks for
+        // the precompute before reading cb_scaled, so this is always correct.
+        cudaLaunchAttribute main_attrs[1];
+        main_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        main_attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t mcfg;
+        // grid.z = ngroups·(HPG/MHC); MHC divides HPG (kernel static_assert), so the
+        // integer divide is the exact ceil.  Each CTA owns MHC consecutive heads in a group.
+        mcfg.gridDim = dim3(D_SPLIT, params.batch, params.ngroups * (HEADS_PER_GROUP / MHC));
+        mcfg.blockDim = dim3(warpSize, NUM_WARPS);
+        mcfg.dynamicSmemBytes = msmem;
+        mcfg.stream = stream;
+        mcfg.attrs = main_attrs;
+        mcfg.numAttrs = 1;
+        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
+      });
       return;
     } else {
       FLASHINFER_CHECK(false,
@@ -299,11 +312,13 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, cudaStream_t str
 // specializations after this commit.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
-void launchCheckpointingSsu(CheckpointingSsuParams& params, cudaStream_t stream) {
+void launchCheckpointingSsu(CheckpointingSsuParams& params, int main_heads_per_cta,
+                            int precompute_heads_per_cta, cudaStream_t stream) {
   bool const is_varlen = (params.cu_seqlens != nullptr);
   auto launch = [&]<int D_SPLIT, bool VARLEN>() {
     launchCheckpointingSsuImpl<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                               state_scale_t, D_SPLIT, VARLEN>(params, stream);
+                               state_scale_t, D_SPLIT, VARLEN>(params, main_heads_per_cta,
+                                                               precompute_heads_per_cta, stream);
   };
   auto launch_d_split = [&]<int D_SPLIT>() {
     if (is_varlen) {

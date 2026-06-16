@@ -55,7 +55,9 @@ void checkpointing_ssu(
     Optional<TensorView> cu_seqlens,   // (batch+1,) int32, varlen mode
     Optional<TensorView> cb_scaled,    // two-kernel: bf16 (batch, nheads, 32, 8) fragA-native
     Optional<TensorView> cumAdt_vec,   // two-kernel: f32 (batch, nheads, T_pad) raw cumAdt
-    Optional<TensorView> cb_old) {     // two-kernel: bf16 (batch, nheads, 32, K_old/2) fragA-native
+    Optional<TensorView> cb_old,       // two-kernel: bf16 (batch, nheads, 32, K_old/2) fragA-native
+    int64_t main_heads_per_cta,        // two-kernel MAIN: consecutive heads per CTA (host knob)
+    int64_t precompute_heads_per_cta) {  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
 
   bool const is_varlen = cu_seqlens.has_value();
 
@@ -454,6 +456,29 @@ void checkpointing_ssu(
   FLASHINFER_CHECK(dim / d_split >= 32, "d_split=", d_split, " gives D_PER_CTA=", dim / d_split,
                    " < 32 (output MMA m16n8 atom floor with _1×4 warp layout)");
 
+  // ── Validate main_heads_per_cta (two-kernel MAIN head-tiling, host knob) ──
+  // Consecutive heads each main CTA processes; must be >= 1 and divide HEADS_PER_GROUP
+  // (= nheads/ngroups).  The launcher snaps it to the HPG>>k chain and binds it to the
+  // MAIN_HEADS_PER_CTA template arg (it never reaches the kernel as a runtime value).
+  {
+    int64_t const hpg = nheads / ngroups;
+    FLASHINFER_CHECK(main_heads_per_cta >= 1 && hpg % main_heads_per_cta == 0,
+                     "main_heads_per_cta=", main_heads_per_cta,
+                     " must be >= 1 and divide HEADS_PER_GROUP (nheads/ngroups=", hpg, ")");
+  }
+
+  // ── Validate precompute_heads_per_cta (two-kernel PRECOMPUTE head-tiling, host knob) ──
+  // 0 = use the launcher's co-residency heuristic; >0 overrides (must divide HEADS_PER_GROUP).
+  {
+    int64_t const hpg = nheads / ngroups;
+    FLASHINFER_CHECK(precompute_heads_per_cta >= 0 &&
+                         (precompute_heads_per_cta == 0 || hpg % precompute_heads_per_cta == 0),
+                     "precompute_heads_per_cta=", precompute_heads_per_cta,
+                     " must be 0 (heuristic) or a positive divisor of HEADS_PER_GROUP "
+                     "(nheads/ngroups=",
+                     hpg, ")");
+  }
+
   p.batch = batch;
   p.nheads = nheads;
   p.dim = dim;
@@ -550,7 +575,7 @@ void checkpointing_ssu(
   const cudaStream_t stream = get_stream(state.device());
 
   launchCheckpointingSsu<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t>(
-      p, stream);
+      p, static_cast<int>(main_heads_per_cta), static_cast<int>(precompute_heads_per_cta), stream);
 }
 
 }  // namespace flashinfer::mamba::checkpointing

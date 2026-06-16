@@ -850,6 +850,15 @@ def _make_run_closure(
         _cb = inputs.cb_scaled if _two else None
         _ca = inputs.cumAdt_vec if _two else None
         _cbo = inputs.cb_old if _two else None
+        # MAIN head-tiling knob (two-kernel only): heads-per-CTA the main loops over.
+        # Swept via env, mirroring the precompute's FLASHINFER_SSU_HEADS_PER_CTA.  1 =
+        # today's per-head main; monolith ("cuda-incr") always uses 1.
+        _mhc = (
+            int(os.environ.get("FLASHINFER_SSU_MAIN_HEADS_PER_CTA", "1")) if _two else 1
+        )
+        # PRECOMPUTE head-tiling knob (two-kernel only): 0 = launcher co-residency heuristic;
+        # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
+        _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
         if with_conv1d:
 
             def _run():
@@ -879,6 +888,8 @@ def _make_run_closure(
                     # split's internal precompute→main PDL is unconditional in the
                     # launcher, so it is NOT controlled here.
                     enable_pdl=external_pdl,
+                    main_heads_per_cta=_mhc,
+                    precompute_heads_per_cta=_phc,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
@@ -911,6 +922,8 @@ def _make_run_closure(
                     # precompute→main PDL is unconditional in the launcher, so it
                     # is active regardless of this flag.
                     enable_pdl=False,
+                    main_heads_per_cta=_mhc,
+                    precompute_heads_per_cta=_phc,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,

@@ -102,6 +102,8 @@ def _checkpointing_ssu(
     cb_scaled: Optional[torch.Tensor],
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
+    main_heads_per_cta: int,
+    precompute_heads_per_cta: int,
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -160,6 +162,8 @@ def _checkpointing_ssu(
         cb_scaled,
         cumAdt_vec,
         cb_old,
+        main_heads_per_cta,
+        precompute_heads_per_cta,
     )
 
 
@@ -191,6 +195,8 @@ def _checkpointing_ssu_fake(
     cb_scaled: Optional[torch.Tensor],
     cumAdt_vec: Optional[torch.Tensor],
     cb_old: Optional[torch.Tensor],
+    main_heads_per_cta: int,
+    precompute_heads_per_cta: int,
     enable_pdl: bool,
     philox_rounds: int,
     state_dtype: torch.dtype,
@@ -240,6 +246,8 @@ def checkpointing_ssu(
     cb_scaled: Optional[torch.Tensor] = None,
     cumAdt_vec: Optional[torch.Tensor] = None,
     cb_old: Optional[torch.Tensor] = None,
+    main_heads_per_cta: int = 1,
+    precompute_heads_per_cta: int = 0,
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
@@ -293,6 +301,16 @@ def checkpointing_ssu(
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
+    main_heads_per_cta : int
+        Two-kernel MAIN head-tiling: number of consecutive heads (within one group)
+        each main CTA processes in a loop, amortizing the per-group C / old_B loads and
+        cutting the main's CTA count (fewer waves).  Must divide nheads/ngroups; the
+        launcher snaps it to the HEADS_PER_GROUP>>k chain.  Default 1 (today's per-head
+        behavior).  Tuning knob — two-kernel path only.
+    precompute_heads_per_cta : int
+        Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
+        launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
+        snapped to the HEADS_PER_GROUP>>k chain).  Tuning knob — two-kernel path only.
     enable_pdl : bool
         When True the kernel is launched with
         `cudaLaunchAttributeProgrammaticStreamSerialization`, enabling the
@@ -496,6 +514,8 @@ def checkpointing_ssu(
         cb_scaled,
         cumAdt_vec,
         cb_old,
+        main_heads_per_cta,
+        precompute_heads_per_cta,
         enable_pdl,
         philox_rounds=philox_rounds,
         state_dtype=state.dtype,
