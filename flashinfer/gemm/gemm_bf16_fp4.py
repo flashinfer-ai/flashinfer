@@ -6,6 +6,7 @@ from typing import List, Literal, Optional, Tuple, cast
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.gemm import mm_bf16_fp4_trace_dispatch
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -20,6 +21,7 @@ from ..fused_moe.utils import (
 )
 from ..utils import (
     _get_cache_buf,
+    backend_requirement,
     get_native_fp4_dtype,
     supported_compute_capability,
 )
@@ -43,7 +45,7 @@ if CUDNN_AVAILABLE:
 
 
 # Earliest cuDNN backend version supporting W4A16 GEMM
-_CUDNN_W4A16_MIN_BACKEND_VERSION = 92301
+_CUDNN_BF16_FP4_MIN_BACKEND_VERSION = 92301
 
 
 def _check_mm_w4a16_fp4_problem_size(
@@ -52,7 +54,7 @@ def _check_mm_w4a16_fp4_problem_size(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: str,  # one of {'cudnn', 'cute-dsl'}; validated at runtime
+    backend: Literal["cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -82,7 +84,7 @@ def _cudnn_w4a16_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: str,  # one of {'cudnn', 'cute-dsl'}; validated at runtime
+    backend: Literal["cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -96,15 +98,15 @@ def _cudnn_w4a16_fp4_requirement(
     if b.dtype != torch.uint8:
         raise ValueError(
             f"cudnn W4A16 expects the uint8 prepared weight from "
-            f"prepare_w4a16_fp4_weights(..., backend='cudnn'); got {b.dtype}."
+            f"prepare_bf16_fp4_weights(..., backend='cudnn'); got {b.dtype}."
         )
     _check_cudnn_fp4_availability()
 
     backend_version = cudnn.backend_version()
-    if backend_version < _CUDNN_W4A16_MIN_BACKEND_VERSION:
+    if backend_version < _CUDNN_BF16_FP4_MIN_BACKEND_VERSION:
         raise ValueError(
             f"cuDNN W4A16 FP4 GEMM requires backend version >= "
-            f"{_CUDNN_W4A16_MIN_BACKEND_VERSION} (9.23.1), found {backend_version}. "
+            f"{_CUDNN_BF16_FP4_MIN_BACKEND_VERSION} (9.23.1), found {backend_version}. "
         )
     return True
 
@@ -116,7 +118,7 @@ def _cute_dsl_w4a16_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: str,  # one of {'cudnn', 'cute-dsl'}; validated at runtime
+    backend: Literal["cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -125,7 +127,7 @@ def _cute_dsl_w4a16_fp4_requirement(
     if b.dtype != torch.int32:
         raise ValueError(
             f"cute-dsl W4A16 expects the int32 tile-packed weight from "
-            f"prepare_w4a16_fp4_weights(..., backend='cute-dsl'); got {b.dtype}."
+            f"prepare_bf16_fp4_weights(..., backend='cute-dsl'); got {b.dtype}."
         )
     _check_cute_dsl_availability()
     return True
@@ -137,7 +139,7 @@ def _cute_dsl_w4a16_fp4_requirement(
 
 
 @flashinfer_api
-def prepare_w4a16_fp4_weights(
+def prepare_bf16_fp4_weights(
     b: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
@@ -158,9 +160,8 @@ def prepare_w4a16_fp4_weights(
 
     Each backend transforms these into whatever layout its compute kernel
     expects.  The returned ``(b, b_descale, alpha)`` tuple must be passed
-    back to :func:`flashinfer.mm_fp4` (W4A16 mode) with the *same*
-    ``backend`` -- the shapes / dtypes may not match other backends'
-    expectations.
+    back to :func:`flashinfer.mm_bf16_fp4` with the *same* ``backend`` --
+    the shapes / dtypes may not match other backends' expectations.
 
     Args:
         b: ``(N, K // 2)`` ``uint8`` packed FP4 weight.
@@ -168,15 +169,14 @@ def prepare_w4a16_fp4_weights(
             ``nvfp4_quantize``.  Either 1-D byte buffer or 2-D tensor.
         alpha: Optional ``(1,) float32`` global scalar.  Pass ``None``
             (default) for implicit ``alpha=1.0``.  Returned unchanged;
-            forward the returned tuple to :func:`flashinfer.mm_fp4`.
+            forward the returned tuple to :func:`flashinfer.mm_bf16_fp4`.
         backend: Identifier of a supported backend (``"cudnn"`` or
             ``"cute-dsl"``).
         block_size: SF block size.  Always 16 for FP4.
 
     Returns:
         ``(b_prepared, b_descale_prepared, alpha_prepared)`` -- pass all
-        three to :func:`flashinfer.mm_fp4` (W4A16 mode) with the same
-        ``backend``.
+        three to :func:`flashinfer.mm_bf16_fp4` with the same ``backend``.
 
     Raises:
         ValueError: ``backend`` is unknown, or an input has an invalid
@@ -212,25 +212,64 @@ def prepare_w4a16_fp4_weights(
     raise ValueError(f"Unknown backend {backend!r}.  Supported: 'cudnn', 'cute-dsl'.")
 
 
-def _mm_w4a16_fp4_dispatch(
+@backend_requirement(
+    {
+        "cudnn": _cudnn_w4a16_fp4_requirement,
+        "cute-dsl": _cute_dsl_w4a16_fp4_requirement,
+    },
+    common_check=_check_mm_w4a16_fp4_problem_size,
+)
+@flashinfer_api(trace=mm_bf16_fp4_trace_dispatch)
+def mm_bf16_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     *,
-    backend: str,  # one of {'cudnn', 'cute-dsl'}; validated at runtime
+    backend: Literal["cudnn", "cute-dsl"],
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
-    """W4A16 FP4 GEMM compute entry: ``out = (a @ dequant(b).T) * alpha``.
+    """BF16 x FP4 GEMM (W4A16): ``out = (a @ dequant(b).T) * alpha``.
 
-    Internal -- reached through :func:`flashinfer.mm_fp4` with a bfloat16
-    ``a`` and ``a_descale=None`` (validation happens in mm_fp4's
-    ``@backend_requirement`` checks).  ``b``, ``b_descale``, and ``alpha``
-    must be the tensors returned by :func:`prepare_w4a16_fp4_weights` with
-    the same ``backend``; mixing backends is undefined.
+    Weight-only quantized GEMM: bf16 activations ``a`` against an FP4
+    (nvfp4) weight that has been prepared for ``backend`` by
+    :func:`prepare_bf16_fp4_weights`.  ``b``, ``b_descale``, and ``alpha``
+    must be the tensors that function returned with the *same* ``backend``;
+    mixing backends (preparing with one, computing with another) is
+    undefined.
+
+    Example:
+        .. code-block:: python
+
+            # 1) Prepare weights for a backend (once, at model load).
+            b_p, sf_p, alpha_p = flashinfer.prepare_bf16_fp4_weights(
+                b, b_descale, alpha, backend="cute-dsl",
+            )
+            # 2) Run the GEMM with the *same* backend tag.
+            out = flashinfer.mm_bf16_fp4(
+                a, b_p, sf_p, alpha_p, backend="cute-dsl",
+            )
+
+    Args:
+        a: ``(M, K)`` activation matrix in ``torch.bfloat16``.  This is
+            the only currently supported activation dtype; fp16 support
+            can be added when needed.
+        b: Prepared weight tensor (backend-specific layout).
+        b_descale: Prepared scale-factor tensor (backend-specific layout).
+        alpha: Optional ``(1,) float32`` global scalar.  Pass through
+            whatever ``prepare_bf16_fp4_weights`` returned -- it may be
+            ``None`` if the backend folded it into ``b_descale``.
+        backend: Same identifier passed to ``prepare_bf16_fp4_weights``.
+        out_dtype: Output dtype.  Defaults to ``a.dtype`` (``bfloat16``).
+        out: Optional preallocated ``(M, N)`` output tensor.
+        block_size: SF block size.  Always 16 for FP4.
+        enable_pdl: Enable Programmatic Dependent Launch
+
+    Returns:
+        ``(M, N)`` tensor of ``out_dtype``.
     """
     out_dtype = out_dtype or a.dtype
     if backend == "cudnn":
@@ -918,7 +957,7 @@ def _get_cute_dsl_w4a16_gemm(
     import cutlass.cute as cute
     from flashinfer.cute_dsl.utils import get_max_active_clusters
 
-    from .kernels.dense_gemm_w4a16_blackwell import (
+    from .kernels.dense_gemm_bf16_fp4_blackwell import (
         BlackwellDenseGemmW4A16Kernel,
     )
 
@@ -1076,7 +1115,7 @@ def _prepare_cute_dsl(
         S0E5M3, the format the cute-DSL kernel decodes.
     ``alpha`` is passed through unchanged (the compute step normalizes it
     to a ``(1,) float32`` scalar).  Pair the returned tensors with
-    ``mm_fp4(a, b, None, b_descale, alpha, backend='cute-dsl')``.
+    ``mm_bf16_fp4(a, b, b_descale, alpha, backend='cute-dsl')``.
     """
     n = int(b.shape[0])
     k = int(b.shape[1]) * 2
@@ -1267,7 +1306,7 @@ def _compute_cute_dsl(
     if b.dtype != torch.int32:
         raise TypeError(
             f"cute-dsl backend expects the packed int32 weight from "
-            f"prepare_w4a16_fp4_weights(..., backend='cute-dsl'); got {b.dtype}."
+            f"prepare_bf16_fp4_weights(..., backend='cute-dsl'); got {b.dtype}."
         )
     if out_dtype != a.dtype:
         raise NotImplementedError(
@@ -1310,5 +1349,6 @@ def _compute_cute_dsl(
 
 
 __all__ = [
-    "prepare_w4a16_fp4_weights",
+    "prepare_bf16_fp4_weights",
+    "mm_bf16_fp4",
 ]

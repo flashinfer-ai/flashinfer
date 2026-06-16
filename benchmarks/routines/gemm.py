@@ -44,8 +44,8 @@ def run_gemm_test(args):
         return testBmmMxfp8(args)
     elif args.routine == "mm_fp4":
         return testMmFp4(args)
-    elif args.routine == "mm_fp4_w4a16":
-        return testMmFp4W4A16(args)
+    elif args.routine == "mm_bf16_fp4":
+        return testMmBf16Fp4(args)
     elif args.routine == "mm_mxfp8":
         return testMmMxfp8(args)
     elif args.routine == "mm_bf16":
@@ -202,7 +202,7 @@ def parse_gemm_args(line, parser):
             args.input_dtype = "bfloat16"
         if not has_mat2_dtype_arg:
             args.mat2_dtype = "bfloat16"
-    if args.routine == "mm_fp4_w4a16":
+    if args.routine == "mm_bf16_fp4":
         if not has_backends_arg:
             args.backends = ["cute-dsl"]
         if not has_input_dtype_arg:
@@ -1333,9 +1333,9 @@ def testMmFp4(args):
     return res
 
 
-# E2M1 (FP4) codebook, signed (codes 0-7 positive, 8-15 negative), matching
+# E2M1 (FP4) value table, signed (codes 0-7 positive, 8-15 negative), matching
 # ``flashinfer.nvfp4_quantize``.
-_E2M1_CODEBOOK_FP32 = (
+_E2M1_VALUES_FP32 = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 )  # fmt: skip
@@ -1343,14 +1343,14 @@ _E2M1_CODEBOOK_FP32 = (
 
 def _dequantize_w4a16_fp4_ref(b, b_descale, alpha, n, k, block_size):
     """fp32 ground-truth dequant of the canonical nvfp4 weight (refcheck gold):
-    unpack FP4 nibbles -> codebook -> per-block SF (unswizzled) -> optional
+    unpack FP4 nibbles -> values -> per-block SF (unswizzled) -> optional
     alpha.  Returns the ``(N, K)`` fp32 weight matrix."""
     import torch
-    from flashinfer.gemm.gemm_w4a16 import _unswizzle_sf_128x4
+    from flashinfer.gemm.gemm_bf16_fp4 import _unswizzle_sf_128x4
 
     device = b.device
     k_sf = k // block_size
-    lut = torch.tensor(_E2M1_CODEBOOK_FP32, dtype=torch.float32, device=device)
+    lut = torch.tensor(_E2M1_VALUES_FP32, dtype=torch.float32, device=device)
     b_int = b.to(torch.int64)
     codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
     values = lut[codes]
@@ -1362,17 +1362,17 @@ def _dequantize_w4a16_fp4_ref(b, b_descale, alpha, n, k, block_size):
     return weight
 
 
-def testMmFp4W4A16(args):
-    """Benchmark mm_fp4 in W4A16 weight-only mode (bf16 activation, FP4 weight).
+def testMmBf16Fp4(args):
+    """Benchmark mm_bf16_fp4 (bf16 activation x FP4 weight, W4A16).
 
     Weights are produced by ``flashinfer.nvfp4_quantize(sfLayout=layout_128x4)``
     -- the same canonical format the new API expects.  Per-backend prep
-    (``prepare_w4a16_fp4_weights``) runs once at setup and is NOT timed;
-    only the ``mm_fp4`` (W4A16 mode) call is.
+    (``prepare_bf16_fp4_weights``) runs once at setup and is NOT timed;
+    only the ``mm_bf16_fp4`` call is.
 
     Constraints:
       * N must be divisible by 64 (the weight-prepack / kernel N tile).
-        The 128x4 SF swizzle only pads N to 128; prepare_w4a16_fp4_weights
+        The 128x4 SF swizzle only pads N to 128; prepare_bf16_fp4_weights
         unswizzles the padded tail, so any N % 64 == 0 works.
       * K must be divisible by 16 (FP4 block size).
       * input_dtype must be bfloat16 (the only A dtype currently
@@ -1386,7 +1386,7 @@ def testMmFp4W4A16(args):
     tagged with an ``_autotune`` backend suffix.
     """
     if args.verbose >= 1:
-        print("[INFO] Running testMmFp4W4A16")
+        print("[INFO] Running testMmBf16Fp4")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     device = get_device(args)
@@ -1404,20 +1404,20 @@ def testMmFp4W4A16(args):
 
     if input_dtype != torch.bfloat16:
         raise ValueError(
-            f"mm_fp4_w4a16 benchmark requires input_dtype=bfloat16, got {args.input_dtype}"
+            f"mm_bf16_fp4 benchmark requires input_dtype=bfloat16, got {args.input_dtype}"
         )
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
-            f"mm_fp4_w4a16 benchmark requires out_dtype in (bfloat16, float16), got {args.out_dtype}"
+            f"mm_bf16_fp4 benchmark requires out_dtype in (bfloat16, float16), got {args.out_dtype}"
         )
     if n % 64 != 0:
         # N must be a multiple of the 64-wide N tile used by the weight
         # prepack and the cute-dsl kernel.  The 128x4 SF swizzle only *pads*
-        # N to 128, and prepare_w4a16_fp4_weights unswizzles the padded
+        # N to 128, and prepare_bf16_fp4_weights unswizzles the padded
         # tail, so any n % 64 == 0 works.
-        raise ValueError("mm_fp4_w4a16 benchmark requires n % 64 == 0")
+        raise ValueError("mm_bf16_fp4 benchmark requires n % 64 == 0")
     if k % 16 != 0:
-        raise ValueError("mm_fp4_w4a16 benchmark requires k % 16 == 0 (FP4 block size)")
+        raise ValueError("mm_bf16_fp4 benchmark requires k % 16 == 0 (FP4 block size)")
 
     torch.manual_seed(args.random_seed)
     a = torch.randn((m, k), device=device, dtype=input_dtype) * 0.5
@@ -1442,12 +1442,11 @@ def testMmFp4W4A16(args):
 
     def make_runner(b_p, sf_p, alpha_p, backend):
         def run(a):
-            # W4A16 weight-only mode of mm_fp4: bf16 activation a, no
-            # a_descale; b_p/sf_p are prepare_w4a16_fp4_weights outputs.
-            return flashinfer.mm_fp4(
+            # mm_bf16_fp4: bf16 activation a against the prepared FP4
+            # weight; b_p/sf_p are prepare_bf16_fp4_weights outputs.
+            return flashinfer.mm_bf16_fp4(
                 a,
                 b_p,
-                None,
                 sf_p,
                 alpha_p,
                 backend=backend,
@@ -1461,7 +1460,7 @@ def testMmFp4W4A16(args):
     backends_to_remove = []
     for backend in backends:
         try:
-            b_p, sf_p, alpha_p = flashinfer.prepare_w4a16_fp4_weights(
+            b_p, sf_p, alpha_p = flashinfer.prepare_bf16_fp4_weights(
                 b_fp4, b_sf, alpha, backend=backend
             )
             runner = make_runner(b_p, sf_p, alpha_p, backend)
@@ -1481,7 +1480,7 @@ def testMmFp4W4A16(args):
         return
 
     # cuDNN sweeps its execution plans + M buckets; cute-dsl sweeps its tile
-    # shape + perf-knob config space (both via mm_fp4 W4A16 TunableRunners).
+    # shape + perf-knob config space (both via mm_bf16_fp4 TunableRunners).
     autotune_supported_backends = ["cudnn", "cute-dsl"]
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
@@ -1492,7 +1491,7 @@ def testMmFp4W4A16(args):
             if cur_backend in autotune_supported_backends:
                 if args.verbose >= 1:
                     print(
-                        f"[INFO] Autotune warmup for mm_fp4_w4a16 {cur_backend}: "
+                        f"[INFO] Autotune warmup for mm_bf16_fp4 {cur_backend}: "
                         f"{warmup_iters} iters"
                     )
                 with autotune(True, cache=cache_path):

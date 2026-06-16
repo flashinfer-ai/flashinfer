@@ -1,45 +1,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the W4A16 FP4 GEMM API.
-
-The cross-backend contract tests sweep over every supported backend
-listed in :data:`ALL_BACKENDS` (currently ``cudnn`` and ``cute-dsl``).
-When a new backend is added, append its identifier to that list and the
-full numeric / behaviour grid runs against it automatically.
-
-Inputs are bf16 throughout; fp16 activations are out of scope for the
-current API.
-"""
+"""Tests for the BF16 x FP4 (W4A16) GEMM API ``mm_bf16_fp4``."""
 
 import pytest
 import torch
 
 import flashinfer
-from flashinfer import mm_fp4, prepare_w4a16_fp4_weights
+from flashinfer import mm_bf16_fp4, prepare_bf16_fp4_weights
 from flashinfer.autotuner import autotune
-from flashinfer.gemm.gemm_w4a16 import (
-    _CUDNN_W4A16_MIN_BACKEND_VERSION,
+from flashinfer.gemm.gemm_bf16_fp4 import (
+    _CUDNN_BF16_FP4_MIN_BACKEND_VERSION,
     _unswizzle_sf_128x4,
 )
 from flashinfer.utils import get_compute_capability
 
 
-# E2M1 (FP4) codebook, signed (codes 0-7 positive, 8-15 negative), matching
+# E2M1 (FP4) value table, signed (codes 0-7 positive, 8-15 negative), matching
 # ``flashinfer.nvfp4_quantize``.
-_E2M1_CODEBOOK_FP32 = (
+_E2M1_VALUES_FP32 = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 )  # fmt: skip
 
 
 def _dequantize_w4a16_fp4_torch(b, b_descale, alpha, n, k, block_size):
-    """fp32 ground-truth dequant of the canonical nvfp4 weight: unpack FP4
-    nibbles -> codebook -> per-block SF (unswizzled) -> optional alpha.
-    Returns the ``(N, K)`` fp32 weight matrix (the GEMM reference dequants
-    in fp32 then matmuls)."""
+    """PyTorch implementation of swizzled nvfp4 dequantization to fp32."""
     device = b.device
     k_sf = k // block_size
-    lut = torch.tensor(_E2M1_CODEBOOK_FP32, dtype=torch.float32, device=device)
+    lut = torch.tensor(_E2M1_VALUES_FP32, dtype=torch.float32, device=device)
     b_int = b.to(torch.int64)
     codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
     values = lut[codes]
@@ -66,16 +54,16 @@ def _skip_if_backend_unavailable(backend: str) -> None:
     device = torch.device("cuda")
     cc = get_compute_capability(device)
     cc_number = cc[0] * 10 + cc[1]
-    if not mm_fp4.is_backend_supported(backend, cc_number):
+    if not mm_bf16_fp4.is_backend_supported(backend, cc_number):
         pytest.skip(f"{backend} not supported on compute capability {cc_number}")
     if backend == "cudnn":
         try:
             import cudnn
         except ImportError:
             pytest.skip("cuDNN not available")
-        if cudnn.backend_version() < _CUDNN_W4A16_MIN_BACKEND_VERSION:
+        if cudnn.backend_version() < _CUDNN_BF16_FP4_MIN_BACKEND_VERSION:
             pytest.skip(
-                f"cuDNN W4A16 needs backend >= {_CUDNN_W4A16_MIN_BACKEND_VERSION}, "
+                f"cuDNN W4A16 needs backend >= {_CUDNN_BF16_FP4_MIN_BACKEND_VERSION}, "
                 f"found {cudnn.backend_version()}"
             )
 
@@ -84,8 +72,8 @@ def _skip_if_compute_capability_unsupported() -> None:
     """Skip the current test if no W4A16 backend supports this device."""
     cc = get_compute_capability(torch.device("cuda"))
     cc_number = cc[0] * 10 + cc[1]
-    if not mm_fp4.is_backend_supported("cudnn", cc_number):
-        pytest.skip(f"W4A16 mm_fp4 not supported on compute capability {cc_number}")
+    if not mm_bf16_fp4.is_backend_supported("cudnn", cc_number):
+        pytest.skip(f"mm_bf16_fp4 not supported on compute capability {cc_number}")
 
 
 PROBLEM_SIZES = [
@@ -224,9 +212,9 @@ def test_backend_matches_handwritten_dequant_matmul(auto_tuning, backend, m, n, 
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
 
-    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
     with autotune(auto_tuning):
-        out = mm_fp4(a, b_p, None, sf_p, alpha_p, backend=backend)
+        out = mm_bf16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
 
     weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
     ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
@@ -246,16 +234,16 @@ def test_backend_alpha_none_equals_alpha_one(auto_tuning, backend):
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
     b_fp4, b_sf, _ = _make_random_fp4_weights(n, k, device)
 
-    b1, sf1, a1 = prepare_w4a16_fp4_weights(
+    b1, sf1, a1 = prepare_bf16_fp4_weights(
         b_fp4,
         b_sf,
         torch.ones(1, device=device, dtype=torch.float32),
         backend=backend,
     )
-    b0, sf0, a0 = prepare_w4a16_fp4_weights(b_fp4, b_sf, None, backend=backend)
+    b0, sf0, a0 = prepare_bf16_fp4_weights(b_fp4, b_sf, None, backend=backend)
     with autotune(auto_tuning):
-        out_one = mm_fp4(a, b1, None, sf1, a1, backend=backend)
-        out_none = mm_fp4(a, b0, None, sf0, a0, backend=backend)
+        out_one = mm_bf16_fp4(a, b1, sf1, a1, backend=backend)
+        out_none = mm_bf16_fp4(a, b0, sf0, a0, backend=backend)
 
     torch.testing.assert_close(out_none, out_one, atol=ATOL, rtol=RTOL)
 
@@ -272,11 +260,10 @@ def test_backend_out_dtype_override(backend):
     m, n, k = SMOKE_MNK
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
-    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
-    out = mm_fp4(
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
+    out = mm_bf16_fp4(
         a,
         b_p,
-        None,
         sf_p,
         alpha_p,
         backend=backend,
@@ -293,20 +280,19 @@ def test_backend_preallocated_out(backend):
     m, n, k = SMOKE_MNK
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
-    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
     out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
     out_ptr_before = out.data_ptr()
-    returned = mm_fp4(
+    returned = mm_bf16_fp4(
         a,
         b_p,
-        None,
         sf_p,
         alpha_p,
         backend=backend,
         out=out,
     )
     assert returned.data_ptr() == out_ptr_before
-    ref = mm_fp4(a, b_p, None, sf_p, alpha_p, backend=backend)
+    ref = mm_bf16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
     torch.testing.assert_close(returned, ref, atol=ATOL, rtol=RTOL)
 
 
@@ -317,13 +303,12 @@ def test_backend_shape_mismatch_raises(backend):
     device = torch.device("cuda")
     m, n, k = SMOKE_MNK
     b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
-    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend=backend)
     a_wrong_k = torch.randn((m, k * 2), device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
-        mm_fp4(
+        mm_bf16_fp4(
             a_wrong_k,
             b_p,
-            None,
             sf_p,
             alpha_p,
             backend=backend,
@@ -340,17 +325,16 @@ def test_backend_shape_mismatch_raises(backend):
 
 @pytest.mark.parametrize("bad_dtype", [torch.float32, torch.float16])
 def test_a_dtype_must_be_bfloat16(bad_dtype):
-    """Only bfloat16 selects W4A16 mode; other dtypes hit the fp4 x fp4
-    validation (which rejects non-fp4 inputs with ValueError)."""
+    """Only bfloat16 activations are supported (fp16 deferred)."""
     _skip_if_compute_capability_unsupported()
     device = torch.device("cuda")
     b_fp4, b_sf, alpha = _make_random_fp4_weights(64, 128, device)
-    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
         b_fp4, b_sf, alpha, backend="cute-dsl"
     )
     a_bad = torch.randn((4, 128), device=device, dtype=bad_dtype)
-    with pytest.raises(ValueError):
-        mm_fp4(a_bad, b_p, None, sf_p, alpha_p, backend="cute-dsl")
+    with pytest.raises(TypeError):
+        mm_bf16_fp4(a_bad, b_p, sf_p, alpha_p, backend="cute-dsl")
 
 
 def test_b_dtype_must_be_uint8_in_prepare():
@@ -360,7 +344,7 @@ def test_b_dtype_must_be_uint8_in_prepare():
     b_bad = torch.zeros((64, 64), device=device, dtype=torch.int32)
     b_descale = torch.zeros((4096,), device=device, dtype=torch.uint8)
     with pytest.raises(TypeError):
-        prepare_w4a16_fp4_weights(b_bad, b_descale, None, backend="cute-dsl")
+        prepare_bf16_fp4_weights(b_bad, b_descale, None, backend="cute-dsl")
 
 
 def test_alpha_dtype_must_be_float32():
@@ -370,4 +354,4 @@ def test_alpha_dtype_must_be_float32():
     b_fp4, b_sf, _ = _make_random_fp4_weights(64, 128, device)
     alpha_bad = torch.ones(1, device=device, dtype=torch.bfloat16)
     with pytest.raises(TypeError):
-        prepare_w4a16_fp4_weights(b_fp4, b_sf, alpha_bad, backend="cute-dsl")
+        prepare_bf16_fp4_weights(b_fp4, b_sf, alpha_bad, backend="cute-dsl")

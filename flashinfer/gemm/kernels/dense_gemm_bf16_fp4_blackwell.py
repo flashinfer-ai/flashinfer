@@ -118,7 +118,7 @@ def f16x2_unpack(
 
 
 # FP4 weight packing constants (must match _cute_dsl_pack_fp4_weight in
-# flashinfer/gemm/gemm_w4a16.py).
+# flashinfer/gemm/gemm_bf16_fp4.py).
 _PACK_TILE_K: cutlass.Constexpr = 16
 _PACK_TILE_N: cutlass.Constexpr = 64
 _PACK_INTS_PER_TILE: cutlass.Constexpr = 128  # 128 int32 per (16K x 64N) block
@@ -1321,7 +1321,7 @@ class BlackwellDenseGemmW4A16Kernel:
           u32_1 @ sB_packed[k_block_idx, n_warp_idx * 64 + lane * 2 + 1, stage]
 
         Byte layout inside each int32 (see ``_cute_dsl_pack_fp4_weight`` in
-        ``flashinfer/gemm/gemm_w4a16.py``):
+        ``flashinfer/gemm/gemm_bf16_fp4.py``):
           u32_0:
             byte 0: K=tc_row,    tc_row+1 at N=base_n        -> (mma_i=0,1, nn=0)
             byte 1: K=tc_row+8,  tc_row+9 at N=base_n        -> (mma_i=2,3, nn=0)

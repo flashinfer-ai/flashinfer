@@ -31,7 +31,7 @@ from ..trace.templates.gemm import (
     fp8_blockscale_gemm_sm90_trace,
     gemm_fp8_nt_groupwise_trace,
     mm_bf16_trace,
-    mm_fp4_trace_dispatch,
+    mm_fp4_trace,
     mm_fp8_trace,
     mm_mxfp8_trace,
 )
@@ -5352,39 +5352,6 @@ def _check_mm_fp4_problem_size(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    # W4A16 mixed-precision mode: bf16 activations x prepared FP4 weight.
-    # b/b_descale carry backend-specific layouts (see
-    # prepare_w4a16_fp4_weights), so the generic fp4 x fp4 shape/dtype
-    # checks below do not apply.
-    if a.dtype == torch.bfloat16:
-        from .gemm_w4a16 import (  # noqa: PLC0415
-            _check_mm_w4a16_fp4_problem_size,
-        )
-
-        if a_descale is not None:
-            raise ValueError(
-                "a_descale must be None for W4A16 mm_fp4 (bfloat16 activation); "
-                "the activation is not quantized."
-            )
-        if not use_nvfp4:
-            raise ValueError("W4A16 mm_fp4 only supports nvfp4 (use_nvfp4=True).")
-        if use_8x4_sf_layout:
-            raise ValueError(
-                "W4A16 mm_fp4 only supports weights prepared from the 128x4 "
-                "SF layout (use_8x4_sf_layout=False)."
-            )
-        return _check_mm_w4a16_fp4_problem_size(
-            a,
-            b,
-            b_descale,
-            alpha,
-            backend=backend,
-            out_dtype=out_dtype,
-            out=out,
-            block_size=block_size,
-            enable_pdl=enable_pdl,
-        )
-
     # Generic checks
     ## pre-check the input tensor, block scale tensor and alpha tensor
     if a.ndim != 2 or b.ndim != 2:
@@ -5400,12 +5367,6 @@ def _check_mm_fp4_problem_size(
         raise ValueError(
             f"a and b must have float4_e2m1fn_x2 packed into uint8. "
             f"Got {a.dtype} and {b.dtype}."
-        )
-    # a_descale is required for fp4 x fp4 mode
-    if a_descale is None:
-        raise ValueError(
-            "a_descale must be provided for fp4 x fp4 mm_fp4; pass None only "
-            "when a.dtype is torch.bfloat16 for W4A16 weight-only mode."
         )
     if a_descale.dtype not in {
         torch.float8_e4m3fn,
@@ -5451,24 +5412,6 @@ def _cudnn_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    if a.dtype == torch.bfloat16:
-        # W4A16 mode: delegate to the w4a16 checker (cuDNN >= 9.23.1 and a
-        # cudnn-prepared uint8 weight).  It raises ValueError on mismatch,
-        # which lets backend="auto" skip this backend cleanly.
-        from .gemm_w4a16 import _cudnn_w4a16_fp4_requirement  # noqa: PLC0415
-
-        if not _cudnn_available_or_raise_for_backend(backend):
-            return False
-        try:
-            return _cudnn_w4a16_fp4_requirement(a, b, b_descale, alpha, backend=backend)
-        except (ValueError, RuntimeError):
-            # RuntimeError comes from _check_cudnn_fp4_availability on old
-            # cuDNN builds; swallow it under "auto" so other backends can
-            # be considered (auto only catches ValueError itself).
-            if backend == "cudnn":
-                raise
-            return False
-
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
 
@@ -5511,11 +5454,6 @@ def _trtllm_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    if a.dtype == torch.bfloat16:
-        raise ValueError(
-            "W4A16 mm_fp4 (bfloat16 activation) is only supported by the "
-            "'cudnn' and 'cute-dsl' backends."
-        )
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
     if out_dtype != torch.bfloat16:
@@ -5543,11 +5481,6 @@ def _cutlass_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    if a.dtype == torch.bfloat16:
-        raise ValueError(
-            "W4A16 mm_fp4 (bfloat16 activation) is only supported by the "
-            "'cudnn' and 'cute-dsl' backends."
-        )
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if not use_nvfp4:
@@ -5555,10 +5488,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-# NOTE: the CC list is the union of the two modes this checker serves.
-# W4W4 (fp4 x fp4) cute-dsl GEMM runs on SM100/103 only
-# W4A16 (bf16 activation) cute-dsl runs on all of SM100/103/110/120/121.
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -5575,16 +5505,6 @@ def _cute_dsl_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    if a.dtype == torch.bfloat16:
-        # W4A16 mode: requires the cute-dsl-prepared int32 weight.
-        from .gemm_w4a16 import _cute_dsl_w4a16_fp4_requirement  # noqa: PLC0415
-
-        return _cute_dsl_w4a16_fp4_requirement(a, b, b_descale, alpha, backend=backend)
-
-    # fp4 x fp4 mode is only supported on SM100/103 (the decorator's CC
-    # list is the union with the W4A16 mode; see note above).
-    if not _match_sm_version(a.device, ["100", "103"]):
-        raise ValueError("cute-dsl fp4 x fp4 GEMM is only supported on SM100/SM103.")
     # cute_dsl backend requires 128x4 scale factor layout.
     # The kernel internally uses CUTLASS BlockScaledBasicChunk which expects
     # M/N padded to 128, K padded to 4 -- matching FlashInfer's quantization
@@ -5612,11 +5532,6 @@ def _b12x_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    if a.dtype == torch.bfloat16:
-        raise ValueError(
-            "W4A16 mm_fp4 (bfloat16 activation) is only supported by the "
-            "'cudnn' and 'cute-dsl' backends."
-        )
     # b12x backend requires CUDA 13+, 128x4 scale factor layout, and NVFP4 only.
     if get_cuda_version().major < 13:
         raise ValueError(
@@ -6168,13 +6083,6 @@ def _heuristic_func_mm_fp4(
       - On SM100 (B200) - use cudnn (faster based on benchmarks).
 
     """
-    # W4A16 mode: the prepared weight layout already determines the backend
-    # (uint8 -> cudnn, int32 -> cute-dsl); the per-backend requirement
-    # checkers reject the mismatching layout, so suitable_backends is the
-    # single backend the weights were prepared for.
-    if a.dtype == torch.bfloat16:
-        return suitable_backends
-
     cuda_major = get_cuda_version().major
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
@@ -6322,11 +6230,11 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
 )
-@flashinfer_api(trace=mm_fp4_trace_dispatch)
+@flashinfer_api(trace=mm_fp4_trace)
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_descale: Optional[torch.Tensor],
+    a_descale: torch.Tensor,
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
@@ -6339,32 +6247,16 @@ def mm_fp4(
 ) -> torch.Tensor:
     r"""MM FP4
 
-    Two modes, selected by ``a.dtype``:
-
-    * **W4W4 (fp4 x fp4)** (default): both operands are FP4-quantized with block
-      scales, as described in the parameter list below.
-    * **W4A16 (weight-only fp4)**: ``a`` is ``torch.bfloat16`` (not quantized,
-      so ``a_descale`` must be ``None``) and ``b``/``b_descale`` are the
-      backend-specific tensors returned by
-      :func:`~flashinfer.prepare_w4a16_fp4_weights`.  Only the ``cudnn``
-      and ``cute-dsl`` backends support this mode; ``backend="auto"``
-      resolves from the prepared weight layout (uint8 -> cudnn,
-      int32 -> cute-dsl).
-
     Parameters
     ----------
     a: torch.Tensor
         Input tensor, shape (m, k), fp4 e2m1fn_x2 or uint8.
-        ``torch.bfloat16`` selects the W4A16 weight-only mode.
 
     b: torch.Tensor
         Mat2 tensor, shape (k, n), should be column major, fp4 e2m1fn_x2 or uint8.
-        In W4A16 mode: the prepared weight from
-        :func:`~flashinfer.prepare_w4a16_fp4_weights` (backend-specific layout).
 
-    a_descale: Optional[torch.Tensor]
+    a_descale: torch.Tensor
         Block scale tensor for A, shape (m, k // block_size), float8_e4m3fn or uint8.
-        Must be ``None`` in W4A16 mode.
 
     b_descale: torch.Tensor
         Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
@@ -6428,27 +6320,6 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
-
-    # W4A16 weight-only mode: route to the dedicated dispatch
-    if a.dtype == torch.bfloat16:
-        from .gemm_w4a16 import _mm_w4a16_fp4_dispatch  # noqa: PLC0415
-
-        w4a16_backend = backend
-        if backend == "auto":
-            # suitable_auto_backends holds exactly the backend matching the
-            # prepared weight layout (see _heuristic_func_mm_fp4).
-            w4a16_backend = mm_fp4.suitable_auto_backends[0]
-        return _mm_w4a16_fp4_dispatch(
-            a,
-            b,
-            b_descale,
-            alpha,
-            backend=w4a16_backend,
-            out_dtype=out_dtype,
-            out=out,
-            block_size=block_size,
-            enable_pdl=enable_pdl,
-        )
 
     # allocate the output tensor if not provided
     if out is None:

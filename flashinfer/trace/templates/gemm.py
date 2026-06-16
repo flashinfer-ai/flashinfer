@@ -468,15 +468,15 @@ mm_fp4_trace = TraceTemplate(
 )
 
 
-# ── W4A16 FP4 GEMM (mm_fp4 with bf16 activations) ───────────────────────────
+# ── BF16 x FP4 GEMM (mm_bf16_fp4, W4A16 weight-only) ───────────────────────────
 #
-# The W4A16 mode of ``mm_fp4`` consumes *prepared* weights whose layout is
-# backend-specific (see ``flashinfer.prepare_w4a16_fp4_weights``), so each
+# ``mm_bf16_fp4`` consumes *prepared* weights whose layout is
+# backend-specific (see ``flashinfer.prepare_bf16_fp4_weights``), so each
 # backend gets its own template and ``mm_fp4``'s ``trace=`` is a dispatch
 # callable (same pattern as the trtllm MoE routing templates).
 
-# E2M1 nibble codebook (low 3 bits magnitude, bit 3 sign).
-_E2M1_CODEBOOK = (
+# E2M1 nibble value table (low 3 bits magnitude, bit 3 sign).
+_E2M1_VALUES = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 )  # fmt: skip
@@ -492,7 +492,7 @@ def _w4a16_matmul(a, weight_kn, alpha):
     return (a.to(torch.float32) @ weight_kn).to(a.dtype)
 
 
-def _mm_w4a16_fp4_cudnn_reference(a, b, b_descale, alpha=None, block_size=16):
+def _mm_bf16_fp4_cudnn_reference(a, b, b_descale, alpha=None, block_size=16):
     """Reference for the cuDNN-prepared layout.
 
     b: [N, K//2] uint8, two FP4 codes per byte (low nibble = even K).
@@ -500,19 +500,19 @@ def _mm_w4a16_fp4_cudnn_reference(a, b, b_descale, alpha=None, block_size=16):
     """
     n, k_half = b.shape
     k = k_half * 2
-    lut = torch.tensor(_E2M1_CODEBOOK, dtype=torch.float32, device=b.device)
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=b.device)
     b_int = b.to(torch.int64)
     codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
     sf = b_descale.to(torch.float32).repeat_interleave(block_size, dim=1)
     return _w4a16_matmul(a, (lut[codes] * sf).T, alpha)
 
 
-def _mm_w4a16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16):
+def _mm_bf16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16):
     """Reference for the cute-DSL-prepared layout.
 
     b: [K//16, N*2] int32 -- FP4 bytes permuted into (16K x 64N) MMA tiles
     of 128 int32 each (inverts
-    ``flashinfer.gemm.gemm_w4a16._cute_dsl_pack_fp4_weight``).
+    ``flashinfer.gemm.gemm_bf16_fp4._cute_dsl_pack_fp4_weight``).
     b_descale: [K//block_size, N] uint8 -- S0E5M3 per-block scales
     (fp16 value = byte << 7 reinterpreted as fp16 bits).
     """
@@ -550,7 +550,7 @@ def _mm_w4a16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16)
         .reshape(k // 2, n)
     )
 
-    lut = torch.tensor(_E2M1_CODEBOOK, dtype=torch.float32, device=device)
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=device)
     b_int = b_kn.to(torch.int64)
     codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=1).reshape(k, n)
     # S0E5M3 -> fp16: the byte is the top 8 bits of the fp16 bit pattern.
@@ -563,7 +563,7 @@ def _mm_w4a16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16)
     return _w4a16_matmul(a, lut[codes] * sf, alpha)
 
 
-def _mm_w4a16_fp4_cudnn_init(
+def _mm_bf16_fp4_cudnn_init(
     *,
     M: int,
     N: int = 2048,
@@ -574,26 +574,26 @@ def _mm_w4a16_fp4_cudnn_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.mm_fp4`` in W4A16 mode (cuDNN backend).
+    """Build inputs for ``flashinfer.mm_bf16_fp4`` (cuDNN backend).
 
-    Sourced from ``tests/gemm/test_mm_w4a16_fp4.py``: quantize a randn
+    Sourced from ``tests/gemm/test_mm_bf16_fp4.py``: quantize a randn
     bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
-    repack with ``prepare_w4a16_fp4_weights``.  Requires SM100+ at
+    repack with ``prepare_bf16_fp4_weights``.  Requires SM100+ at
     runtime; CPU smoke tests skip.
     """
     del K_div_2, K_div_block_size
     from flashinfer import (  # noqa: PLC0415
-        mm_fp4,
+        mm_bf16_fp4,
         nvfp4_quantize,
-        prepare_w4a16_fp4_weights,
+        prepare_bf16_fp4_weights,
     )
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
-        raise NotImplementedError("W4A16 mm_fp4 init requires a CUDA device")
+        raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
     major, minor = torch.cuda.get_device_capability(torch.device(device))
-    if not mm_fp4.is_backend_supported("cudnn", major * 10 + minor):
-        raise NotImplementedError(f"W4A16 mm_fp4 is not supported on SM{major}{minor}")
+    if not mm_bf16_fp4.is_backend_supported("cudnn", major * 10 + minor):
+        raise NotImplementedError(f"mm_bf16_fp4 is not supported on SM{major}{minor}")
 
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
@@ -603,13 +603,12 @@ def _mm_w4a16_fp4_cudnn_init(
         w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
     )
     alpha = torch.tensor([1.0 / g_w.item()], dtype=torch.float32, device=device)
-    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
         b_fp4, b_sf, alpha, backend="cudnn", block_size=block_size
     )
     return {
         "a": a,
         "b": b_p,
-        "a_descale": None,
         "b_descale": sf_p,
         "alpha": alpha_p,
         "backend": "cudnn",
@@ -617,7 +616,7 @@ def _mm_w4a16_fp4_cudnn_init(
     }
 
 
-def _mm_w4a16_fp4_cute_dsl_init(
+def _mm_bf16_fp4_cute_dsl_init(
     *,
     M: int,
     N: int = 2048,
@@ -629,26 +628,26 @@ def _mm_w4a16_fp4_cute_dsl_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.mm_fp4`` in W4A16 mode (cute-DSL backend).
+    """Build inputs for ``flashinfer.mm_bf16_fp4`` (cute-DSL backend).
 
-    Sourced from ``tests/gemm/test_mm_w4a16_fp4.py``: quantize a randn
+    Sourced from ``tests/gemm/test_mm_bf16_fp4.py``: quantize a randn
     bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
-    repack with ``prepare_w4a16_fp4_weights``.  Requires SM100+ at
+    repack with ``prepare_bf16_fp4_weights``.  Requires SM100+ at
     runtime; CPU smoke tests skip.
     """
     del K_div_16, K_div_block_size, N_mul_2
     from flashinfer import (  # noqa: PLC0415
-        mm_fp4,
+        mm_bf16_fp4,
         nvfp4_quantize,
-        prepare_w4a16_fp4_weights,
+        prepare_bf16_fp4_weights,
     )
     from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
-        raise NotImplementedError("W4A16 mm_fp4 init requires a CUDA device")
+        raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
     major, minor = torch.cuda.get_device_capability(torch.device(device))
-    if not mm_fp4.is_backend_supported("cute-dsl", major * 10 + minor):
-        raise NotImplementedError(f"W4A16 mm_fp4 is not supported on SM{major}{minor}")
+    if not mm_bf16_fp4.is_backend_supported("cute-dsl", major * 10 + minor):
+        raise NotImplementedError(f"mm_bf16_fp4 is not supported on SM{major}{minor}")
 
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
@@ -658,13 +657,12 @@ def _mm_w4a16_fp4_cute_dsl_init(
         w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
     )
     alpha = torch.tensor([1.0 / g_w.item()], dtype=torch.float32, device=device)
-    b_p, sf_p, alpha_p = prepare_w4a16_fp4_weights(
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
         b_fp4, b_sf, alpha, backend="cute-dsl", block_size=block_size
     )
     return {
         "a": a,
         "b": b_p,
-        "a_descale": None,
         "b_descale": sf_p,
         "alpha": alpha_p,
         "backend": "cute-dsl",
@@ -672,9 +670,9 @@ def _mm_w4a16_fp4_cute_dsl_init(
     }
 
 
-mm_w4a16_fp4_cudnn_trace = TraceTemplate(
-    op_type="gemm_w4a16_fp4",
-    name_prefix="mm_w4a16_fp4_cudnn",
+mm_bf16_fp4_cudnn_trace = TraceTemplate(
+    op_type="gemm_bf16_fp4",
+    name_prefix="mm_bf16_fp4_cudnn",
     description=(
         "W4A16 GEMM C = (A @ dequant(B).T) * alpha, cuDNN-prepared weights. "
         "A is bf16; B is fp4 (e2m1fn_x2 packed as uint8) with fp8-e4m3 "
@@ -708,14 +706,14 @@ mm_w4a16_fp4_cudnn_trace = TraceTemplate(
         "C": Tensor(["M", "N"], dtype_from="a"),
     },
     tags=["status:verified", "quantization:fp4"],
-    reference=_mm_w4a16_fp4_cudnn_reference,
+    reference=_mm_bf16_fp4_cudnn_reference,
     check=_fp4_gemm_check,
-    init=_mm_w4a16_fp4_cudnn_init,
+    init=_mm_bf16_fp4_cudnn_init,
 )
 
-mm_w4a16_fp4_cute_dsl_trace = TraceTemplate(
-    op_type="gemm_w4a16_fp4",
-    name_prefix="mm_w4a16_fp4_cute_dsl",
+mm_bf16_fp4_cute_dsl_trace = TraceTemplate(
+    op_type="gemm_bf16_fp4",
+    name_prefix="mm_bf16_fp4_cute_dsl",
     description=(
         "W4A16 GEMM C = (A @ dequant(B).T) * alpha, cute-DSL-prepared weights. "
         "A is bf16; B is fp4 repacked into (16K x 64N) MMA tiles as int32 "
@@ -749,35 +747,30 @@ mm_w4a16_fp4_cute_dsl_trace = TraceTemplate(
         "C": Tensor(["M", "N"], dtype_from="a"),
     },
     tags=["status:verified", "quantization:fp4"],
-    reference=_mm_w4a16_fp4_cute_dsl_reference,
+    reference=_mm_bf16_fp4_cute_dsl_reference,
     check=_fp4_gemm_check,
-    init=_mm_w4a16_fp4_cute_dsl_init,
+    init=_mm_bf16_fp4_cute_dsl_init,
 )
 
 
-def mm_fp4_trace_dispatch(**kwargs):
-    """Return the TraceTemplate matching the ``mm_fp4`` call's mode.
+def mm_bf16_fp4_trace_dispatch(**kwargs):
+    """Return the TraceTemplate for an ``mm_bf16_fp4`` call by backend.
 
-    A bfloat16 ``a`` selects the W4A16 weight-only mode, whose template
-    depends on the prepared weight layout (int32 -> cute-dsl, uint8 ->
-    cudnn); anything else is the regular fp4 x fp4 template.  Pass as
-    ``trace=mm_fp4_trace_dispatch`` to ``@flashinfer_api``.
+    The prepared weight layout differs per backend (int32 -> cute-dsl,
+    uint8 -> cudnn), so each gets its own template.  Pass as
+    ``trace=mm_bf16_fp4_trace_dispatch`` to ``@flashinfer_api``.
     """
-    a = kwargs.get("a")
-    if a is not None and a.dtype == torch.bfloat16:
-        b = kwargs.get("b")
-        if b is not None and b.dtype == torch.int32:
-            return mm_w4a16_fp4_cute_dsl_trace
-        return mm_w4a16_fp4_cudnn_trace
-    return mm_fp4_trace
+    b = kwargs.get("b")
+    if b is not None and b.dtype == torch.int32:
+        return mm_bf16_fp4_cute_dsl_trace
+    return mm_bf16_fp4_cudnn_trace
 
 
 # Expose the templates so _attach_fi_trace auto-registers them for the
 # consistency tests (same pattern as the MoE routing dispatchers).
-mm_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    mm_fp4_trace,
-    mm_w4a16_fp4_cudnn_trace,
-    mm_w4a16_fp4_cute_dsl_trace,
+mm_bf16_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mm_bf16_fp4_cudnn_trace,
+    mm_bf16_fp4_cute_dsl_trace,
 ]
 
 
