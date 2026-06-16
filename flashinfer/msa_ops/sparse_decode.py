@@ -19,12 +19,12 @@ Minimax Sparse Attention decode path for SM120/SM121.
 
 A decode step is a varlen batch with a short, uniform ``seqlen_q`` per
 request. Each valid (kv-head, token, t) entry of ``q2k_indices`` becomes one
-work item of the KV-major forward kernel: one token (x its GQA query heads)
-attending one selected KV block, written to split slot ``t``. Because
-:func:`msa_topk_select` tail-pads invalid entries with -1, the slot is
-simply the list position and the split count is the valid prefix length,
-so the whole schedule is built with a handful of torch ops and no CUDA
-scheduler kernels.
+work item: one token (x its GQA query heads) attending one selected KV block,
+written to split slot ``t``. The kernel addresses that work directly from a
+static ``(topk, total_q, Hkv)`` grid (no schedule tensors); because
+:func:`msa_topk_select` tail-pads invalid entries with -1, the slot is simply
+the list position and the split count is the valid prefix length, computed
+in-kernel. The split partials are reduced by the shared combine kernel.
 """
 
 from typing import Optional
@@ -33,92 +33,6 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_decode_attention_trace
-from .sparse_index_utils import MsaAttentionSchedule
-
-
-@flashinfer_api
-def msa_build_decode_schedule(
-    q2k_indices: torch.Tensor,  # (Hkv, total_q, topk) int32, -1 tail-padded
-    cu_seqlens_q: torch.Tensor,  # (B + 1,) int32, device
-    cu_seqlens_k: torch.Tensor,  # (B + 1,) int32, device
-) -> MsaAttentionSchedule:
-    """Build a KV-major schedule for decode: one work item per valid
-    (kv-head, token, selected-block) entry.
-
-    ``q2k_indices`` must be ascending with ``-1`` entries tail-padded (as
-    produced by :func:`msa_topk_select`); the split slot of an entry is
-    its position ``t`` in the list.
-    """
-    num_kv_heads, total_q, topk = q2k_indices.shape
-    dev = q2k_indices.device
-
-    q_global = torch.arange(total_q, device=dev, dtype=torch.int32)
-    # batch of each token and its batch-local index
-    batch_of_q = (
-        torch.bucketize(q_global.long(), cu_seqlens_q.long(), right=True) - 1
-    ).to(torch.int32)
-    q_local = q_global - cu_seqlens_q[batch_of_q.long()]
-
-    valid = q2k_indices >= 0  # (Hkv, total_q, topk)
-    split_counts = valid.sum(dim=2).t().contiguous().to(torch.int32)  # (total_q, Hkv)
-
-    # qsplit: q_local | (slot << 24), laid out flat at qi * topk + t
-    slots = torch.arange(topk, device=dev, dtype=torch.int32)
-    qsplit = (q_local.view(1, total_q, 1) | (slots.view(1, 1, topk) << 24)).expand(
-        num_kv_heads, total_q, topk
-    )
-    qsplit_indices = qsplit.reshape(num_kv_heads, total_q * topk).contiguous()
-
-    # identity row_ptr: work item row r covers qsplit entries [r, r + 1)
-    total_rows = total_q * topk
-    row_ptr = (
-        torch.arange(total_rows + 1, device=dev, dtype=torch.int32)
-        .view(1, -1)
-        .expand(num_kv_heads, -1)
-        .contiguous()
-    )
-
-    # Static dense work list: one item per (h, token, t) entry, valid or
-    # not; q_count = 0 marks padding (the kernel exits immediately). This
-    # keeps the build free of device syncs (no nonzero) and makes the whole
-    # decode step CUDA-graph capturable.
-    n_items = num_kv_heads * total_q * topk
-    h_idx = (
-        torch.arange(num_kv_heads, device=dev, dtype=torch.int32)
-        .view(-1, 1, 1)
-        .expand(num_kv_heads, total_q, topk)
-    )
-    rows = (
-        torch.arange(total_q * topk, device=dev, dtype=torch.int32)
-        .view(1, total_q, topk)
-        .expand(num_kv_heads, -1, -1)
-    )
-    batches = batch_of_q.view(1, total_q, 1).expand(num_kv_heads, -1, topk)
-    meta = torch.stack(
-        [
-            h_idx.reshape(-1),
-            rows.reshape(-1),
-            torch.zeros(n_items, device=dev, dtype=torch.int32),
-            valid.reshape(-1).to(torch.int32),  # q_count: 1 valid, 0 padding
-            batches.reshape(-1),
-            q2k_indices.reshape(-1).clamp(min=0),
-        ],
-        dim=1,
-    ).contiguous()
-    work_count = torch.full((1,), n_items, dtype=torch.int32, device=dev)
-
-    return MsaAttentionSchedule(
-        row_ptr=row_ptr,
-        q_indices=qsplit_indices,  # unused by the kernel; kept for shape parity
-        qsplit_indices=qsplit_indices,
-        split_counts=split_counts,
-        scheduler_metadata=meta,
-        work_count=work_count,
-        work_capacity=meta.shape[0],
-        total_rows=total_rows,
-        max_kv_blocks=0,  # not consumed on the decode path; avoids a D2H sync
-        topk=topk,
-    )
 
 
 @flashinfer_api(trace=msa_sparse_decode_attention_trace)
