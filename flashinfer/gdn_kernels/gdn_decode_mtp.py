@@ -2336,17 +2336,22 @@ def run_mtp_decode(
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        # Mark the batch (mode 0) dim dynamic so one cubin serves all batch
+        # Mark the leading (mode 0) dim dynamic so one cubin serves all batch
         # sizes; explicit stride_order avoids ambiguous auto-deduction at
-        # B=1/T=1. h0_source/intermediate_states are pool-scoped — their dim 0
-        # (pool_size*HV / pool_size*T*HV) is also marked dynamic since pool_size
-        # left the cache key.
+        # B=1/T=1. h0_source's pool-slot dim is marked too since pool_size left
+        # the cache key.
         h0_source_tensor = from_dlpack(
             h0_source, assumed_align=16
         ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-        intermediate_states_tensor = from_dlpack(
-            intermediate_states, assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
+        if cache_intermediate_states:
+            # Only the real cache buffer has a meaningful leading dim; the
+            # caching-off dummy ([1,1,1]) is never read by the kernel.
+            intermediate_states_tensor = (
+                intermediate_states_tensor.mark_compact_shape_dynamic(
+                    mode=0, stride_order=(0, 1, 2), divisibility=1
+                )
+            )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
         a_tensor = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1, 2), divisibility=1
