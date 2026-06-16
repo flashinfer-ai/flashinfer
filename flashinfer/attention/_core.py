@@ -157,7 +157,7 @@ class BatchAttention:
             logits_soft_cap = 0.0
         self._logits_soft_cap = logits_soft_cap
 
-        # head_dim > 256 is for holistic (persistent) kernel.
+        # head_dim > 256 is not supported for holistic (persistent) kernel.
         if head_dim_qk > 256 or head_dim_vo > 256:
             raise ValueError(
                 "BatchAttention (holistic persistent kernel) does not support "
