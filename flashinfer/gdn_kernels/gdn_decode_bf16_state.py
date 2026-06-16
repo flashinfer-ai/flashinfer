@@ -1729,12 +1729,18 @@ def gated_delta_rule_mtp_wide_vec(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
-    # Slot stride may be larger than HV*V*K (vLLM packs conv+ssm on the same
-    # page). Include in the cache key so padded vs tight pools each get their
-    # own compiled kernel — cute.compile bakes the stride into the cubin.
-    pool_slot_stride = int(initial_state_source.stride(0))
     # B is absent from the key: per-batch tensors are marked dynamic below so one
-    # cubin serves every batch size (no inference-time recompile).
+    # cubin serves every batch size (no inference-time recompile). A contiguous
+    # pool also marks its slot dim dynamic (sentinel -1 keys) so the cubin is
+    # pool-size agnostic; a padded/strided pool (vLLM packs conv+ssm on one page)
+    # keeps its real pool_size/stride baked into the cubin via the cache key.
+    contiguous_pool = initial_state_source.is_contiguous()
+    if contiguous_pool:
+        pool_size_key = -1
+        pool_slot_stride = -1
+    else:
+        pool_size_key = pool_size
+        pool_slot_stride = int(initial_state_source.stride(0))
     cache_key = (
         "v3_mtp_bf16_tiled_dynB",
         T_val,
@@ -1742,7 +1748,7 @@ def gated_delta_rule_mtp_wide_vec(
         HV_val,
         K_val,
         V_val,
-        pool_size,
+        pool_size_key,
         pool_slot_stride,
         tile_v,
         effective_disable_final,
@@ -1763,7 +1769,11 @@ def gated_delta_rule_mtp_wide_vec(
         )
 
     if cache_key not in _compiled_kernels_wide_vec:
-        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+        if contiguous_pool:
+            # Mark the pool slot dim dynamic so one cubin serves all pool sizes.
+            h_ = _mark_batch_dynamic(h0_source)
+        else:
+            h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
             # Dummy [1,1,1] tensor (caching off) has no unique stride-1 dim.
@@ -1983,11 +1993,17 @@ def gated_delta_rule_mtp(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
-    # Slot stride may be larger than HV*V*K (vLLM's packed conv+ssm page).
-    # Include in cache key — cute.compile bakes the stride into the cubin.
-    pool_slot_stride = int(initial_state_source.stride(0))
     # B is absent from the key: per-batch tensors are marked dynamic below so one
-    # cubin serves every batch size (no inference-time recompile).
+    # cubin serves every batch size. A contiguous pool also marks its slot dim
+    # dynamic (sentinel -1 keys) for pool-size agnosticism; a padded/strided pool
+    # keeps its real pool_size/stride baked into the cubin via the cache key.
+    contiguous_pool = initial_state_source.is_contiguous()
+    if contiguous_pool:
+        pool_size_key = -1
+        pool_slot_stride = -1
+    else:
+        pool_size_key = pool_size
+        pool_slot_stride = int(initial_state_source.stride(0))
     cache_key = (
         "mtp_bf16_dynB",
         T,
@@ -1995,7 +2011,7 @@ def gated_delta_rule_mtp(
         HV,
         K,
         V,
-        pool_size,
+        pool_size_key,
         pool_slot_stride,
         tile_v,
         ilp_rows,
@@ -2015,7 +2031,11 @@ def gated_delta_rule_mtp(
         output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
     if cache_key not in _compiled_kernels_mtp:
-        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+        if contiguous_pool:
+            # Mark the pool slot dim dynamic so one cubin serves all pool sizes.
+            h_ = _mark_batch_dynamic(h0_source)
+        else:
+            h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
             inter_ = _mark_batch_dynamic(intermediate_states)
