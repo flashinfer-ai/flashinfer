@@ -286,7 +286,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             s, t = coord_tensor[i]
             pred = s >= t
             if cutlass.const_expr(is_final_block):
-                pred = pred and (s < B or t < B)
+                pred = pred and (s < B and t < B)
             if not pred:
                 frag[i] = cutlass.Float32(0.0)
 
