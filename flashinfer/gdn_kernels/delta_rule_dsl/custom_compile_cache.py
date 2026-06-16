@@ -1,5 +1,4 @@
 import os
-import subprocess
 import tempfile
 import types
 import typing
@@ -75,17 +74,22 @@ def _option_value(options, option_type):
     return None
 
 
+def _has_option_value(options, option_type, option_value):
+    for option in _as_options_tuple(options):
+        if isinstance(option, option_type) and option.value == option_value:
+            return True
+    return False
+
+
 def _needs_sm120a_tma_patch(options):
-    return _option_value(options, cute.GPUArch) == "sm_120a"
+    return _has_option_value(options, cute.GPUArch, "sm_120a")
 
 
-def _patched_compile_options(options):
+def _patched_compile_options(options, dump_dir):
     options = _as_options_tuple(options)
-    if not _needs_sm120a_tma_patch(options):
-        return options
 
-    has_keep_ptx = any(isinstance(option, cute.KeepPTX) for option in options)
-    has_dump_dir = any(isinstance(option, DumpDir) for option in options)
+    has_keep_ptx = _has_option_value(options, cute.KeepPTX, True)
+    has_dump_dir = _option_value(options, DumpDir)
     extras = []
     if not has_keep_ptx:
         extras.append(cute.KeepPTX(True))
@@ -94,10 +98,6 @@ def _patched_compile_options(options):
         if dump_dir:
             os.makedirs(dump_dir, exist_ok=True)
     else:
-        dump_dir = os.environ.get(
-            "FLASHINFER_DSL_TMA_PATCH_DIR", "/tmp/flashinfer_dsl_tma_patch"
-        )
-        os.makedirs(dump_dir, exist_ok=True)
         extras.append(DumpDir(dump_dir))
     return options + tuple(extras)
 
@@ -128,41 +128,20 @@ def _patch_sm120a_tma_ptx(ptx_text: str) -> str:
             lines.append(line_body + line_end)
         patched = "".join(lines)
 
-    if patched == ptx_text:
-        return ptx_text
-    return patched.replace("\x00", "")
+    return patched
 
 
-def _assemble_sm120a_cubin(ptx: str) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="flashinfer_dsl_tma_patch_") as tmp_dir:
-        ptx_path = os.path.join(tmp_dir, "kernel.ptx")
-        cubin_path = os.path.join(tmp_dir, "kernel.cubin")
-        with open(ptx_path, "w", encoding="utf-8") as f:
-            f.write(ptx)
-
-        cuda_path = os.environ.get("CUDA_PATH", "/usr/local/cuda")
-        ptxas = os.path.join(cuda_path, "bin", "ptxas")
-        cmd = [ptxas, "-arch=sm_120a", ptx_path, "-o", cubin_path]
-        result = subprocess.run(cmd, check=False, text=True, capture_output=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                "failed to assemble patched sm120a TMA PTX\n"
-                f"command: {' '.join(cmd)}\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-
-        with open(cubin_path, "rb") as f:
-            return f.read()
-
-
-def _install_patched_cubin_loader(compiled_fn, patched_cubin: bytes):
+def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
     import ctypes
 
+    import cuda.bindings.driver as cuda_driver
     import cuda.bindings.runtime as cuda_runtime
 
     from cutlass.base_dsl.common import DSLRuntimeError
     from cutlass.base_dsl.runtime.cuda import checkCudaErrors
+
+    jit_options = [cuda_driver.CUjit_option.CU_JIT_TARGET]
+    jit_option_values = [cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A]
 
     def _load_cuda_library(self):
         if self.engine is None:
@@ -176,8 +155,14 @@ def _install_patched_cubin_loader(compiled_fn, patched_cubin: bytes):
         )
 
         library_obj = checkCudaErrors(
-            cuda_runtime.cudaLibraryLoadData(
-                patched_cubin, None, None, 0, None, None, 0
+            cuda_driver.cuLibraryLoadData(
+                patched_ptx.encode("utf-8"),
+                jit_options,
+                jit_option_values,
+                len(jit_options),
+                None,
+                None,
+                0,
             )
         )
         library = ctypes.c_void_p(int(library_obj))
@@ -204,23 +189,20 @@ def _install_patched_cubin_loader(compiled_fn, patched_cubin: bytes):
 
         return [library_obj]
 
-    compiled_fn._flat_patched_cubin = patched_cubin
+    compiled_fn._flat_patched_ptx = patched_ptx
+    compiled_fn._flat_patched_ptx_jit_options = tuple(jit_options)
+    compiled_fn._flat_patched_ptx_jit_option_values = tuple(jit_option_values)
     compiled_fn._load_cuda_library = types.MethodType(_load_cuda_library, compiled_fn)
-    if compiled_fn.artifacts is not None:
-        compiled_fn.artifacts.CUBIN = patched_cubin
 
 
-def _maybe_patch_sm120a_tma(compiled_fn, options):
-    if not _needs_sm120a_tma_patch(options):
-        return compiled_fn
+def _patch_sm120a_tma(compiled_fn, options):
     ptx = _read_ptx_text(getattr(compiled_fn, "__ptx__", None))
     if not ptx:
         return compiled_fn
     patched_ptx = _patch_sm120a_tma_ptx(ptx)
     if patched_ptx == ptx:
         return compiled_fn
-    patched_cubin = _assemble_sm120a_cubin(patched_ptx)
-    _install_patched_cubin_loader(compiled_fn, patched_cubin)
+    _install_patched_ptx_loader(compiled_fn, patched_ptx)
     return compiled_fn
 
 
@@ -230,11 +212,18 @@ def cached_compile(func, *args, compile_options=None, **kwargs):
 
     if compiled_fn is None:
         compiler = cute.compile
-        effective_compile_options = _patched_compile_options(compile_options)
+        effective_compile_options = compile_options
+        if _needs_sm120a_tma_patch(compile_options):
+            tempdir = tempfile.TemporaryDirectory(prefix="cutedsl_patch_")
+            effective_compile_options = _patched_compile_options(
+                compile_options, tempdir.name
+            )
         if effective_compile_options:
             compiler = cute.compile[effective_compile_options]
         compiled_fn = compiler(func, *args, **kwargs)
-        compiled_fn = _maybe_patch_sm120a_tma(compiled_fn, effective_compile_options)
+        if _needs_sm120a_tma_patch(compile_options):
+            compiled_fn = _patch_sm120a_tma(compiled_fn, effective_compile_options)
+            tempdir.cleanup()
         _in_mem_compile_cache[cache_key] = compiled_fn
 
     return compiled_fn
