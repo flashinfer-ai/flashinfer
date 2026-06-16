@@ -721,14 +721,10 @@ def run_nontranspose_decode(
         scale: Query scale factor.
         use_qk_l2norm: Whether to apply L2 normalization.
     """
-    # Compile kernel with TVM FFI (cached). use_small_batch selects the kernel
-    # variant and is part of the key; B is not (per-batch tensors are marked
-    # dynamic below so one cubin per variant serves all batch sizes).
     use_small_batch = B < SMALL_BATCH_THRESHOLD_NT
     cache_key = (use_small_batch, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel_nontranspose(*cache_key)
 
-    # Batch-sized aux tensors live in a per-(B, device) sub-map.
     aux_map = cache.setdefault("aux", {})
     aux_key = (B, q.device)
     if aux_key not in aux_map:
@@ -747,10 +743,6 @@ def run_nontranspose_decode(
         else:
             run_func = run_gdn_decode_kernel_big_batch_nontranspose
 
-        # Convert tensors to CuTe format for compilation only. Mark the batch
-        # (mode 0) dim dynamic so one cubin serves all batch sizes; explicit
-        # stride_order avoids ambiguous auto-deduction at B=1/T=1. h0_source is
-        # [B*HV, K, V] (dim 0 scales with batch).
         h0_source_tensor = from_dlpack(
             h0_source, assumed_align=16
         ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)

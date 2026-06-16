@@ -2302,8 +2302,6 @@ def run_mtp_decode(
     major, _ = torch.cuda.get_device_capability(q.device)
     use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
 
-    # B and pool_size are intentionally absent: per-batch and pool tensors are
-    # marked dynamic below, so one cubin per variant serves all batch/pool sizes.
     cache_key = (
         T,
         H,
@@ -2326,7 +2324,6 @@ def run_mtp_decode(
     else:
         cache = _get_compiled_mtp_kernel(*cache_key)
 
-    # cu_seqlens is batch-sized (dummy when is_varlen=False); per-(B, device) map.
     cu_seqlens_map = cache.setdefault("cu_seqlens", {})
     cu_key = (B, q.device)
     if cu_key not in cu_seqlens_map:
@@ -2336,17 +2333,12 @@ def run_mtp_decode(
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        # Mark the leading (mode 0) dim dynamic so one cubin serves all batch
-        # sizes; explicit stride_order avoids ambiguous auto-deduction at
-        # B=1/T=1. h0_source's pool-slot dim is marked too since pool_size left
-        # the cache key.
         h0_source_tensor = from_dlpack(
             h0_source, assumed_align=16
         ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
         if cache_intermediate_states:
-            # Only the real cache buffer has a meaningful leading dim; the
-            # caching-off dummy ([1,1,1]) is never read by the kernel.
+            # Caching-off dummy ([1,1,1]) is never read; skip marking it.
             intermediate_states_tensor = (
                 intermediate_states_tensor.mark_compact_shape_dynamic(
                     mode=0, stride_order=(0, 1, 2), divisibility=1

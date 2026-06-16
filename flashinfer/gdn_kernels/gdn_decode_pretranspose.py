@@ -978,8 +978,6 @@ def run_pretranspose_decode(
     )
     cache = _get_compiled_decode_kernel(*cache_key)
 
-    # Get or create h0_indices and cu_seqlens (cached per (B, device); B is no
-    # longer in the compile cache key, so the batch-sized aux tensors live here).
     aux_map = cache.setdefault("aux", {})
     aux_key = (B, q.device)
     if aux_key not in aux_map:
@@ -1002,11 +1000,6 @@ def run_pretranspose_decode(
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        # Convert tensors to CuTe format for compilation only. Mark the batch
-        # (mode 0) dim dynamic so one cubin serves all batch sizes. Explicit
-        # stride_order avoids ambiguous auto-deduction at B=1/T=1. Pool state
-        # ([pool_size, HV, V, K]) keeps its baked layout (pool stays in the
-        # cache key); only non-pool state ([B*HV, V, K]) scales with batch.
         h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
         if not use_pool_indexing:
             h0_source_tensor = h0_source_tensor.mark_compact_shape_dynamic(

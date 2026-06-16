@@ -52,8 +52,7 @@ from flashinfer.cute_dsl.utils import get_num_sm
 
 
 def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
-    # stride_order is explicit because auto-deduction is ambiguous when the
-    # batch dim is size 1 (B=1, T=1 -> several dims share equal strides).
+    # explicit stride_order: auto-deduction is ambiguous at B=1/T=1.
     stride_order = tuple(sorted(range(torch_t.dim()), key=lambda d: -torch_t.stride(d)))
     return from_dlpack(
         torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
@@ -1280,7 +1279,6 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     )
 
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
-    # Runtime batch extent (q's leading dim is dynamic): keeps B out of the cubin.
     B = cute.size(q.shape[0])
     grid_size = B * HV * num_v_tiles
 
@@ -1361,7 +1359,6 @@ def _run_wide_vec(
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
-    # Runtime batch extent (q's leading dim is dynamic): keeps B out of the cubin.
     B = cute.size(q.shape[0])
     grid_size = B * HV * num_v_tiles
     smem_bytes = (
@@ -1729,11 +1726,8 @@ def gated_delta_rule_mtp_wide_vec(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
-    # B is absent from the key: per-batch tensors are marked dynamic below so one
-    # cubin serves every batch size (no inference-time recompile). A contiguous
-    # pool also marks its slot dim dynamic (sentinel -1 keys) so the cubin is
-    # pool-size agnostic; a padded/strided pool (vLLM packs conv+ssm on one page)
-    # keeps its real pool_size/stride baked into the cubin via the cache key.
+    # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
+    # agnostic); padded/strided pool keeps real pool_size/stride in the key.
     contiguous_pool = initial_state_source.is_contiguous()
     if contiguous_pool:
         pool_size_key = -1
@@ -1770,7 +1764,6 @@ def gated_delta_rule_mtp_wide_vec(
 
     if cache_key not in _compiled_kernels_wide_vec:
         if contiguous_pool:
-            # Mark the pool slot dim dynamic so one cubin serves all pool sizes.
             h_ = _mark_batch_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
@@ -1993,10 +1986,8 @@ def gated_delta_rule_mtp(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
-    # B is absent from the key: per-batch tensors are marked dynamic below so one
-    # cubin serves every batch size. A contiguous pool also marks its slot dim
-    # dynamic (sentinel -1 keys) for pool-size agnosticism; a padded/strided pool
-    # keeps its real pool_size/stride baked into the cubin via the cache key.
+    # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
+    # agnostic); padded/strided pool keeps real pool_size/stride in the key.
     contiguous_pool = initial_state_source.is_contiguous()
     if contiguous_pool:
         pool_size_key = -1
@@ -2032,7 +2023,6 @@ def gated_delta_rule_mtp(
 
     if cache_key not in _compiled_kernels_mtp:
         if contiguous_pool:
-            # Mark the pool slot dim dynamic so one cubin serves all pool sizes.
             h_ = _mark_batch_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
