@@ -408,18 +408,18 @@ def test_proxy_split_k_heuristic():
     """The kv-block split factor is 1 once the base grid fills the SMs and grows
     as the base grid shrinks (low-batch decode), capped by max_k_tiles."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops.proxy_score import _proxy_split_k
+    from flashinfer.msa_ops.proxy_score import _proxy_split_k_fp4
 
     dev = torch.device("cuda")
     sm = torch.cuda.get_device_properties(dev).multi_processor_count
     # large base grid -> no split
-    assert _proxy_split_k(4 * sm, 512, dev) == 1
+    assert _proxy_split_k_fp4(4 * sm, 512, dev) == 1
     # trivial / degenerate -> no split
-    assert _proxy_split_k(8, 1, dev) == 1
-    assert _proxy_split_k(0, 512, dev) == 1
+    assert _proxy_split_k_fp4(8, 1, dev) == 1
+    assert _proxy_split_k_fp4(0, 512, dev) == 1
     # small base grid -> split enough to reach ~2 CTAs/SM, capped by max_k_tiles
-    assert _proxy_split_k(8, 512, dev) == -(-2 * sm // 8)
-    assert _proxy_split_k(4, 8, dev) == 8  # clamped to max_k_tiles
+    assert _proxy_split_k_fp4(8, 512, dev) == -(-2 * sm // 8)
+    assert _proxy_split_k_fp4(4, 8, dev) == 8  # clamped to max_k_tiles
 
 
 @pytest.mark.parametrize("Hq,Hkv", [(4, 1), (32, 2)])
@@ -429,7 +429,7 @@ def test_proxy_fp4_split_k_decode(Hq, Hkv):
     and the 16-head packed decoder (Hq=32/Hkv=2) against the torch ref."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
-    from flashinfer.msa_ops.proxy_score import _proxy_split_k
+    from flashinfer.msa_ops.proxy_score import _proxy_split_k_fp4
 
     torch.manual_seed(88 + Hq)
     dev = "cuda"
@@ -444,7 +444,7 @@ def test_proxy_fp4_split_k_decode(Hq, Hkv):
     base = (1 if group_size == 16 else -(-seqlen_q // 128)) * (
         Hkv if group_size == 16 else Hq
     )
-    assert _proxy_split_k(base, nb, torch.device(dev)) > 1, "test must split"
+    assert _proxy_split_k_fp4(base, nb, torch.device(dev)) > 1, "test must split"
 
     q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev) * 2
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2

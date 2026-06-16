@@ -14,39 +14,209 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from typing import Optional, Tuple
 
 import torch
 
 from ..api_logging import flashinfer_api
+from ..autotuner import AutoTuner, TunableRunner, TuningConfig
 from ..trace.templates.msa import (
     msa_proxy_score_fp4_trace,
     msa_proxy_score_trace,
 )
-from ..utils import is_sm12x_supported
+from ..utils import get_device_sm_count, is_sm12x_supported
 
 _BLK_KV = 128
 _SF_VEC_SIZE = 16
 
 
-def _proxy_split_k(base_ctas: int, max_k_tiles: int, device) -> int:
+def _proxy_split_k(
+    base_ctas: int,
+    max_k_tiles: int,
+    device,
+    *,
+    wave_target: float,
+    gate_factor: float,
+    ceil_to_target: bool,
+) -> int:
     """KV-block split factor that fills the GPU when the base proxy grid is small.
 
     The proxy output is per-(head, kv_block, query), so the kv-block range can be
     split across CTAs with no cross-split reduction (each split writes disjoint
-    columns). At long context with low batch the base grid (e.g. B8 q1 -> 64 CTAs)
-    is smaller than the SM count, so the kernel starves; splitting the kv blocks
-    across more CTAs fills it. Returns 1 (the unsplit schedule) whenever the base
-    grid already covers the SMs, so high-batch / prefill is unchanged.
+    columns). When the base grid underfills the SMs (long context, low batch) the
+    kernel starves; splitting the kv blocks fills it. Returns 1 (unsplit) once the
+    base grid already covers ``gate_factor`` SM-waves, leaving high-batch / prefill
+    unchanged.
+
+    ``wave_target`` is the SM-wave count to fill to. fp4 (less bandwidth-bound, 4-bit
+    K) fills to 2 waves and ceils to actually reach it; bf16 reloads its Q tile at
+    2 B/elem per split so over-splitting regresses, so it targets ~1.5 waves and
+    rounds. Both are measured optima; the per-dtype knobs are bound below.
     """
     if base_ctas <= 0 or max_k_tiles <= 1:
         return 1
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    target = 2 * num_sms  # the kernels run >=2 resident CTAs/SM (min_blocks_per_mp)
-    if base_ctas >= target:
+    num_sms = get_device_sm_count(device)
+    if base_ctas >= gate_factor * num_sms:
         return 1
-    splits = -(-target // base_ctas)  # ceil, so we actually reach the target
+    target = wave_target * num_sms
+    splits = (
+        -(-int(target) // base_ctas) if ceil_to_target else round(target / base_ctas)
+    )
     return max(1, min(splits, max_k_tiles))
+
+
+# fp4: fill 2 SM-waves, ceil to reach the target (4-bit K, over-split is cheap).
+_proxy_split_k_fp4 = functools.partial(
+    _proxy_split_k, wave_target=2.0, gate_factor=2.0, ceil_to_target=True
+)
+# bf16: target ~1.5 waves and round (Q reload per split makes over-split regress).
+_proxy_split_k_bf16 = functools.partial(
+    _proxy_split_k, wave_target=1.5, gate_factor=1.0, ceil_to_target=False
+)
+
+
+class _ProxySplitKRunner(TunableRunner):
+    """Autotunes the proxy kv-block split factor (``num_splits``).
+
+    The split factor is a runtime arg (no recompile per tactic), so one compiled
+    kernel covers every candidate. ``tactic`` *is* the split factor; ``tactic==-1``
+    falls back to the closed-form heuristic, so eager (un-tuned) behavior is
+    unchanged. No ``DynamicTensorSpec`` is used: the proxy is varlen, and the
+    autotuner would otherwise synthesize a shape-correct but value-invalid
+    ``cu_seqlens``; with static inputs it profiles the candidates on the caller's
+    real (valid) tensors and caches by shape + ``get_cache_key_extras``.
+    """
+
+    def __init__(
+        self,
+        call_fn,
+        *,
+        max_seqlen_q,
+        max_k_tiles,
+        base_ctas,
+        device,
+        heuristic,
+        causal,
+        paged,
+        reduce_heads,
+    ):
+        # call_fn(inputs, num_splits) -> output; lets one runner serve both the
+        # bf16 and (longer-signature) fp4 proxy invocations.
+        self._call = call_fn
+        self._msq = int(max_seqlen_q)
+        self._mkt = int(max_k_tiles)
+        self._base = int(base_ctas)
+        self._device = device
+        self._heuristic = heuristic  # callable(base_ctas, max_k_tiles, device) -> int
+        self._causal = bool(causal)
+        self._paged = bool(paged)
+        self._reduce = bool(reduce_heads)
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def get_valid_tactics(self, inputs, profile):
+        # Candidate split factors: powers of two filling up to ~4 SM-waves, capped
+        # by the kv-block count (a split cannot exceed max_k_tiles). The closed-form
+        # heuristic value is always included so a tuned op is never worse than eager
+        # (the heuristic may pick a non-power-of-two, e.g. 3).
+        num_sms = get_device_sm_count(self._device)
+        cap = min(self._mkt, max(1, -(-4 * num_sms // max(self._base, 1))))
+        cands = {s for s in (1, 2, 4, 8, 16, 32) if s <= cap}
+        cands.add(self._heuristic(self._base, self._mkt, self._device))
+        return sorted(cands)
+
+    def get_cache_key_extras(self, inputs):
+        # max_seqlen_q / max_k_tiles are varlen-derived (not in any tensor shape),
+        # so they must key the cache; causal/paged/reduce flip the work pattern.
+        return (self._causal, self._paged, self._reduce, self._msq, self._mkt)
+
+    def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
+        ns = (
+            tactic
+            if tactic >= 0
+            else self._heuristic(self._base, self._mkt, self._device)
+        )
+        return self._call(inputs, int(ns))
+
+
+# (op, shape) keys that have been through the autotuner this process. Until a
+# given shape is tuned, the proxy uses its closed-form heuristic directly and
+# skips choose_one entirely: the decode proxy is tiny at low batch, where
+# choose_one's per-call lock and bookkeeping (~tens of us) would dominate the
+# kernel. Keying by shape (not bare op name) keeps that fast path for untuned
+# shapes even after a different shape of the same op has been tuned.
+_PROXY_TUNED: set = set()
+
+
+def _proxy_tuned_key(
+    op_name, *, causal, paged, reduce_heads, max_seqlen_q, max_k_tiles, base_ctas
+):
+    # base_ctas folds in batch/heads/max_seqlen_q, so this matches the autotuner's
+    # own cache granularity (shape + get_cache_key_extras) closely enough to gate on.
+    return (
+        op_name,
+        bool(causal),
+        bool(paged),
+        bool(reduce_heads),
+        int(max_seqlen_q),
+        int(max_k_tiles),
+        int(base_ctas),
+    )
+
+
+def _run_proxy_autotuned(
+    op_name,
+    call_fn,
+    tensors,
+    *,
+    max_seqlen_q,
+    max_k_tiles,
+    base_ctas,
+    device,
+    heuristic,
+    causal,
+    paged,
+    reduce_heads,
+):
+    """Pick the split factor via the autotuner (cached per shape+device), then run.
+
+    Un-tuned, this uses the closed-form heuristic directly (zero autotuner overhead,
+    matching the pre-autotuner default); under ``with autotune():`` it profiles the
+    candidates and caches the winner, after which choose_one is consulted per call.
+    ``call_fn(inputs, num_splits)`` performs the actual compiled-kernel launch.
+    """
+    tuner = AutoTuner.get()
+    tuning = tuner.is_tuning_mode
+    tuned_key = _proxy_tuned_key(
+        op_name,
+        causal=causal,
+        paged=paged,
+        reduce_heads=reduce_heads,
+        max_seqlen_q=max_seqlen_q,
+        max_k_tiles=max_k_tiles,
+        base_ctas=base_ctas,
+    )
+    if tuning:
+        _PROXY_TUNED.add(tuned_key)
+    elif tuned_key not in _PROXY_TUNED:
+        call_fn(tensors, heuristic(base_ctas, max_k_tiles, device))
+        return
+
+    runner = _ProxySplitKRunner(
+        call_fn,
+        max_seqlen_q=max_seqlen_q,
+        max_k_tiles=max_k_tiles,
+        base_ctas=base_ctas,
+        device=device,
+        heuristic=heuristic,
+        causal=causal,
+        paged=paged,
+        reduce_heads=reduce_heads,
+    )
+    runner_sel, tactic = tuner.choose_one(op_name, [runner], TuningConfig(), tensors)
+    runner_sel(inputs=tensors, tactic=tactic)
 
 
 @flashinfer_api(trace=msa_proxy_score_trace)
@@ -225,23 +395,46 @@ def msa_proxy_score(
             cutlass.Int32(1),
             cutlass.Int32(1),
             cutlass.Int32(1),
+            cutlass.Int32(1),
             stream_fake,
             options="--enable-tvm-ffi",
         )
         _compile_cache[key] = compiled
 
-    compiled(
-        q,
-        k,
-        pt_dev,
-        per_head,
-        cu_q_dev,
-        cu_k,
-        qoff_dev,
-        int(max_seqlen_q),
-        int(batch_size),
-        int(num_qo_heads),
-        int(max_k_tiles),
+    # base grid CTAs: one per (q-tile, batch, head) with 64-row q-tiles. Feeds the
+    # split-K factor (see _proxy_split_k); num_splits is a runtime arg, not a cache key.
+    base_ctas = ((max_seqlen_q + 63) // 64) * batch_size * num_qo_heads
+
+    def _call(tensors, ns):
+        q_, k_, pt_, ph_, cq_, ck_, qoff_ = tensors
+        compiled(
+            q_,
+            k_,
+            pt_,
+            ph_,
+            cq_,
+            ck_,
+            qoff_,
+            int(max_seqlen_q),
+            int(batch_size),
+            int(num_qo_heads),
+            int(max_k_tiles),
+            ns,
+        )
+        return ph_
+
+    _run_proxy_autotuned(
+        "msa_proxy_score",
+        _call,
+        [q, k, pt_dev, per_head, cu_q_dev, cu_k, qoff_dev],
+        max_seqlen_q=max_seqlen_q,
+        max_k_tiles=max_k_tiles,
+        base_ctas=base_ctas,
+        device=dev,
+        heuristic=_proxy_split_k_bf16,
+        causal=causal,
+        paged=paged,
+        reduce_heads=reduce_heads,
     )
 
     if not reduce_heads:
@@ -454,16 +647,13 @@ def msa_proxy_score_fp4(
         and max_seqlen_q <= MsaProxyScoreFp4MmaDecodePackedSm12x._PACK_Q_LEN
     )
 
-    # split-K factor (kv-block axis): fill the GPU when the base grid underfills
-    # the SMs. The packed path is one CTA per (batch, kv_head); the general path is
-    # one CTA per (q-tile, batch, head) with 128-row q-tiles. num_splits passes
-    # through to the kernel as a runtime arg, so the compiled module is reused (it
-    # is not part of the cache key).
+    # base grid CTAs (feeds split-K, see _proxy_split_k): the packed path is one
+    # CTA per (batch, kv_head); the general path one per (q-tile, batch, head) with
+    # 128-row q-tiles. num_splits is a runtime arg, not part of the cache key.
     if use_packed:
         base_ctas = batch_size * num_kv_heads
     else:
         base_ctas = ((max_seqlen_q + 127) // 128) * batch_size * num_qo_heads
-    num_splits = _proxy_split_k(base_ctas, int(max_k_tiles), dev)
 
     key = ("proxy_fp4", causal, paged, use_packed)
     compiled = _compile_cache.get(key)
@@ -525,23 +715,40 @@ def msa_proxy_score_fp4(
         )
         _compile_cache[key] = compiled
 
-    compiled(
-        q_fp4,
-        k_fp4,
-        q_scale,
-        k_scale,
-        pt_dev,
-        per_head,
-        cu_q_dev,
-        cu_k,
-        qoff_dev,
-        float(q_global_scale),
-        float(k_global_scale),
-        int(max_seqlen_q),
-        int(batch_size),
-        int(num_qo_heads),
-        int(max_k_tiles),
-        int(num_splits),
+    def _call(tensors, ns):
+        qf, kf, qs, ks, pt_, ph_, cq_, ck_, qoff_ = tensors
+        compiled(
+            qf,
+            kf,
+            qs,
+            ks,
+            pt_,
+            ph_,
+            cq_,
+            ck_,
+            qoff_,
+            float(q_global_scale),
+            float(k_global_scale),
+            int(max_seqlen_q),
+            int(batch_size),
+            int(num_qo_heads),
+            int(max_k_tiles),
+            ns,
+        )
+        return ph_
+
+    _run_proxy_autotuned(
+        "msa_proxy_score_fp4",
+        _call,
+        [q_fp4, k_fp4, q_scale, k_scale, pt_dev, per_head, cu_q_dev, cu_k, qoff_dev],
+        max_seqlen_q=max_seqlen_q,
+        max_k_tiles=max_k_tiles,
+        base_ctas=base_ctas,
+        device=dev,
+        heuristic=_proxy_split_k_fp4,
+        causal=causal,
+        paged=paged,
+        reduce_heads=reduce_heads,
     )
 
     if not reduce_heads:

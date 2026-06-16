@@ -107,6 +107,7 @@ class MsaProxyScoreSm12x:
         batch_size: cutlass.Int32,
         num_qo_heads: cutlass.Int32,
         max_k_tiles: cutlass.Int32,
+        num_splits: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(
@@ -118,6 +119,12 @@ class MsaProxyScoreSm12x:
             raise TypeError("Only Float16 or BFloat16 q is supported")
         self._dtype: Type[cutlass.Numeric] = mQ.element_type
 
+        # split-K: fold a kv-block split factor into grid x. At long context with
+        # low batch the base grid (1, batch, heads) is < #SMs (e.g. B8 q1 -> 32
+        # CTAs) so the GPU starves; splitting each sequence's kv-block range across
+        # CTAs fills it. The output is per-(head, kv_block, query), so the splits
+        # write disjoint columns and need no reduction. The host passes
+        # num_splits==1 when the base grid already fills the SMs.
         self.kernel(
             mQ,
             mK,
@@ -127,9 +134,10 @@ class MsaProxyScoreSm12x:
             mCuK,
             mQOffset,
             max_k_tiles,
+            num_splits,
         ).launch(
             grid=(
-                cute.ceil_div(max_seqlen_q, self._m_block_size),
+                cute.ceil_div(max_seqlen_q, self._m_block_size) * num_splits,
                 batch_size,
                 num_qo_heads,
             ),
@@ -148,9 +156,13 @@ class MsaProxyScoreSm12x:
         mCuK: cute.Tensor,
         mQOffset: cute.Tensor,
         max_k_tiles: cutlass.Int32,
+        num_splits: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, batch_idx, qo_head = cute.arch.block_idx()
+        bx, batch_idx, qo_head = cute.arch.block_idx()
+        # grid x packs (m_block, split): splits of one m_block are adjacent.
+        m_block = bx // num_splits
+        split_idx = bx % num_splits
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
@@ -280,9 +292,13 @@ class MsaProxyScoreSm12x:
                 )
 
             # ///////////////////////////////////////////////////////////////
-            # Dense loop over output tiles [0, max_k_tiles)
+            # split-K: this CTA owns kv_block = split_idx, split_idx + num_splits,
+            # ... < max_k_tiles (disjoint across splits, union covers every column
+            # once, no reduction). num_splits==1 -> the original [0, max_k_tiles).
             # ///////////////////////////////////////////////////////////////
-            for kv_block in cutlass.range(max_k_tiles):
+            n_iter = cute.ceil_div(max_k_tiles, num_splits)
+            for it in cutlass.range(n_iter):
+                kv_block = split_idx + it * num_splits
                 if kv_block < num_kv_blocks:
                     # previous iteration's K fragment reads must be complete
                     self.cta_sync_barrier.arrive_and_wait()
@@ -402,8 +418,10 @@ class MsaProxyScoreSm12x:
                             # all 4 quad threads hold the same value; the
                             # duplicate stores are idempotent
                             mMaxScore[qo_head, kv_block, q_start + q_loc] = tile_max
-                else:
-                    # tile beyond this sequence's valid range -> -inf
+                elif kv_block < max_k_tiles:
+                    # padding tile in [num_kv_blocks, max_k_tiles) -> -inf. Bounded
+                    # by max_k_tiles because split-K can stride kv_block past the
+                    # last output column (those overshoot blocks write nothing).
                     for r in cutlass.range_constexpr(n_rows):
                         row_local2 = tScS_mn[r, 0][0]
                         q_loc2 = m_block * self._m_block_size + row_local2
