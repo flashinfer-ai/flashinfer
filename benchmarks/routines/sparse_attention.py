@@ -262,8 +262,16 @@ def testMSAProxyScore(args):
     def run(_b=None):
         if is_fp4:
             return msa_proxy_score_fp4(
-                q_fp4, k_fp4, q_sc, k_sc, q_g, k_g, cu_q, cu_k,
-                causal=args.causal, max_k_tiles=args.max_k_tiles,
+                q_fp4,
+                k_fp4,
+                q_sc,
+                k_sc,
+                q_g,
+                k_g,
+                cu_q,
+                cu_k,
+                causal=args.causal,
+                max_k_tiles=args.max_k_tiles,
             )
         return msa_proxy_score(
             q, k, cu_q, cu_k, causal=args.causal, max_k_tiles=args.max_k_tiles
