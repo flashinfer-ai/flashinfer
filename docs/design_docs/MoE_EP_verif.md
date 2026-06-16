@@ -203,3 +203,43 @@ Both LL layouts now pass the multi-GPU functional test
 dispatch→compute→combine matches the same `MoELayer` kernel run non-EP to
 `rel-err ≈ 0.0045` (EXPERT_MAJOR **and** RANK_MAJOR). Single-GPU layout-bridge /
 numerics / smoke remain covered by the rest of `tests/moe_ep/`.
+
+## 4. High-Throughput (HT) — FLAT layout
+
+HT uses `nccl.ep.Layout.FLAT`. Geometry follows `contrib/nccl_ep/ep_test.py` (the
+`nccl_ep_b200_ib` config): rank-derived `top_k = min(8, world)`,
+`num_experts = min(256, top_k·world)`, `num_local_experts = num_experts/world`,
+hidden 7168, intermediate 2048, bf16. `-t` is **per-rank**; we test 4096 and 8192.
+
+Run (add `--ep-test-geometry` + `--algorithm ht`; the CSV adds bandwidth columns):
+```bash
+torchrun … benchmarks/bench_moe_ep.py --reference --ep-test-geometry --algorithm ht \
+  --backend nccl_ep --quant bf16 --tokens-per-rank 4096 --warmup 5 --repeat 20
+```
+
+**Compute correctness.** HT FLAT recv is token-major (each row a token carrying its
+received LOCAL `topk_idx`, `-1` = non-local) and combine sums **unweighted** — i.e.
+semantically identical to LL RANK_MAJOR. The compute therefore applies the routing
+weights at the real top_k (received-routing bridge). Validated 8× B200 bf16 by
+`tests/moe_ep/test_moe_ep_ht_correctness.py`: EP matches the non-EP kernel to
+`rel-err ≈ 0.007` at 4096 and 8192 tokens/rank.
+
+### Results — Pre-Nyx B200, HT FLAT, bf16, 8 GPU (single node, NVLink)
+
+| tokens/rank | global tok | dispatch µs | compute µs | combine µs | e2e µs | tok/s | dispatch GB/s | combine GB/s |
+|------|------|------|------|------|------|------|------|------|
+| 4096 | 32768 | 721.5  | 23650.6 | 1871.4 | 28511.9 | 1.15 M | 81.4 | 31.4 |
+| 8192 | 65536 | 1283.5 | 47372.3 | 3210.3 | 54287.2 | 1.21 M | 91.5 | 36.6 |
+
+Bandwidth is the ep_bench send-side convention (unique `(token,node)` selections ×
+hidden × dtype / stage time, decimal GB); single-node so the RDMA columns are 0.
+Compute dominates e2e at these large per-rank sizes, but dispatch/combine are timed
+independently so the bandwidth is a clean comm figure.
+
+> **HT cross-node (16+ GPU) is currently blocked by a library bug.** Multi-node HT
+> (MNNVL) aborts with `CUDA error nccl_ep.cc:2884 'an illegal memory access was
+> encountered'`. It is **size-independent** (reproduces at 128 *and* 4096/8192
+> tokens/rank) and our recv-buffer sizing matches `ep_test.py`, so it is a
+> cross-node `nccl.ep` HT issue, not a FlashInfer-side bug (cf. the earlier
+> `nccl_ep.cc:3269` HT multi-rank failure). Single-node (8 GPU, intra-tray NVLink)
+> HT works. Multi-node HT tables are pending the library fix.
