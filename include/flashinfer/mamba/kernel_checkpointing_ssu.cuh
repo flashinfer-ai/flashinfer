@@ -548,19 +548,24 @@ __device__ __forceinline__ void compute_and_store_output(
       make_tiled_copy_B(Copy_Atom<SM75_U16x2_LDSM_T, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B_trans = s2r_B_trans.get_slice(tid);
 
-  // ── Load CB_scaled A operand into frag_CB_A ──
-  // Monolithic: LDSM from swizzled smem.CB_scaled (computed by warps 0,1 between
-  // syncs).  Two-kernel main (READ_PRECOMPUTED_CB): one LDG.128/lane from gmem
-  // cb_scaled (fragA-native) — no smem / LDSM / swizzle.  Same frag_CB_A either way.
-  constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
-  auto layout_cb_swz =
-      make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
-  Tensor smem_CB = make_tensor(
-      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_swz);
-  Tensor frag_CB_A = thr_mma.partition_fragment_A(smem_CB);
+  // ── Load CB_scaled A operand into frag_CB_A (registers) ──
+  // Only the fragment SHAPE/partition is needed up front; the DATA path differs:
+  //   • READ_PRECOMPUTED_CB (two-kernel main): one LDG.128/lane from gmem cb_scaled
+  //     (fragA-native).  The shape comes from a coordinate-only identity tensor, so this
+  //     path touches NO smem.CB_scaled — the main's lean storage omits that 2 KB buffer.
+  //   • monolithic: LDSM from swizzled smem.CB_scaled (computed by warps 0,1 between syncs).
+  // partition_fragment_A keys only off the (M, K) shape, so the identity tensor yields the
+  // exact same register fragment as the swizzled smem tensor would.
+  Tensor frag_CB_A = thr_mma.partition_fragment_A(
+      make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<NPREDICTED_PAD_MMA_M>{})));
   if constexpr (READ_PRECOMPUTED_CB) {
     load_cb_fragA<NPREDICTED_PAD_MMA_M / 2, input_t>(frag_CB_A, lane, cb_gmem_head);
   } else {
+    constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
+    auto layout_cb_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M,
+                                                 NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
+    Tensor smem_CB = make_tensor(
+        make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_swz);
     auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
     auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
     cute::copy(s2r_A, smem_CB_s2r, frag_CB_A_view);
@@ -708,7 +713,6 @@ __device__ __forceinline__ void compute_no_write_output(
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
-  constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
   int const tid = warp * warpSize + lane;
 
   // ── TiledMMA for matmul-3 + matmul-4-new (K=NPREDICTED_PAD_MMA_M=16 fits K_BIG). ──
@@ -763,14 +767,19 @@ __device__ __forceinline__ void compute_no_write_output(
   // ── Load CB_scaled A operand (new tokens, cols [0, NPREDICTED_PAD_MMA_M)) ──
   // Monolithic: LDSM from smem.  Two-kernel main (READ_PRECOMPUTED_CB): LDG from
   // gmem cb_scaled (fragA-native), REGS = NPREDICTED_PAD_MMA_M/2 = 8 (K=16).
-  auto layout_cb_swz =
-      make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
-  Tensor smem_CB = make_tensor(
-      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_swz);
-  Tensor frag_CB_A = thr_mma.partition_fragment_A(smem_CB);
+  // Shape from a coordinate-only identity tensor → READ_PRECOMPUTED_CB touches no
+  // smem.CB_scaled (the lean main storage omits it); data LDG'd from gmem.  Monolith uses
+  // the real swizzled smem tensor (shape is identical, so the register fragment matches).
+  Tensor frag_CB_A = thr_mma.partition_fragment_A(
+      make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<NPREDICTED_PAD_MMA_M>{})));
   if constexpr (READ_PRECOMPUTED_CB) {
     load_cb_fragA<NPREDICTED_PAD_MMA_M / 2, input_t>(frag_CB_A, lane, cb_gmem_head);
   } else {
+    constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
+    auto layout_cb_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M,
+                                                 NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
+    Tensor smem_CB = make_tensor(
+        make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_swz);
     auto smem_CB_s2r = s2r_thr_A.partition_S(smem_CB);
     auto frag_CB_A_view = s2r_thr_A.retile_D(frag_CB_A);
     cute::copy(s2r_A, smem_CB_s2r, frag_CB_A_view);
@@ -781,16 +790,21 @@ __device__ __forceinline__ void compute_no_write_output(
   // byte-compatible with compute_CB_old_2warp's write).  Two-kernel main: LDG
   // from gmem cb_old (fragA-native), REGS = MAX_WINDOW_PAD_MMA_K/2 (4 @ K=8, 8 @
   // K=16) — matches the m16n8k{K_old} A-frag from tiled_mma_old.
-  auto layout_cb_full = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
-  Tensor smem_CB_full = make_tensor(
-      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)), layout_cb_full);
-  Tensor smem_CB_old =
-      local_tile(smem_CB_full, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
-                 make_coord(_0{}, NPREDICTED_PAD_MMA_M / MAX_WINDOW_PAD_MMA_K));
-  Tensor frag_CB_old_A = thr_mma_old.partition_fragment_A(smem_CB_old);
+  // Same pattern: shape from an identity tensor (M, K_old) → no smem.CB_scaled on the
+  // READ path; data LDG'd from gmem cb_old.  Monolith LDSMs the CB_old region of smem.
+  Tensor frag_CB_old_A = thr_mma_old.partition_fragment_A(
+      make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
   if constexpr (READ_PRECOMPUTED_CB) {
     load_cb_fragA<MAX_WINDOW_PAD_MMA_K / 2, input_t>(frag_CB_old_A, lane, cb_old_gmem_head);
   } else {
+    constexpr int CB_ROW_STRIDE = SmemT::CB_ROW_STRIDE;
+    auto layout_cb_full = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, CB_ROW_STRIDE>();
+    Tensor smem_CB_full =
+        make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.CB_scaled)),
+                    layout_cb_full);
+    Tensor smem_CB_old = local_tile(
+        smem_CB_full, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+        make_coord(_0{}, NPREDICTED_PAD_MMA_M / MAX_WINDOW_PAD_MMA_K));
     auto smem_CB_old_s2r = s2r_thr_A_old.partition_S(smem_CB_old);
     auto frag_CB_old_A_view = s2r_thr_A_old.retile_D(frag_CB_old_A);
     cute::copy(s2r_A_old, smem_CB_old_s2r, frag_CB_old_A_view);

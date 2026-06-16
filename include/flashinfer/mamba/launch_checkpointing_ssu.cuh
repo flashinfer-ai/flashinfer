@@ -153,8 +153,8 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       // smem as the monolith, so typically 1).  Query once for the real D_SPLIT kernel.
       static int const occ_main = [] {
         int o = 0;
-        constexpr size_t msmem = sizeof(
-            CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+        constexpr size_t msmem = sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED,
+                                                                    MAX_WINDOW, D_PER_CTA, DSTATE>);
         auto mf = checkpointing_ssu_main_kernel<
             input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NPREDICTED,
             MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN>;
@@ -205,8 +205,8 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
                                                    stateIndex_t, state_scale_t, NPREDICTED,
                                                    MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP,
                                                    PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN, MHC>;
-        constexpr size_t msmem = sizeof(
-            CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+        constexpr size_t msmem = sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED,
+                                                                    MAX_WINDOW, D_PER_CTA, DSTATE>);
         if constexpr (msmem > 0) {
           FLASHINFER_CUDA_CHECK(
               cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));

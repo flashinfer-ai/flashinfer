@@ -55,6 +55,47 @@
 namespace flashinfer::mamba::checkpointing {
 
 // -----------------------------------------------------------------------------
+// Lean smem storage for the MAIN kernel.  Same layout as CheckpointingSsuStorage EXCEPT it
+// omits the three buffers the main never touches — it reads cb_scaled / cb_old from gmem
+// (fragA-native, the READ_PRECOMPUTED_CB path in compute_*_output), never loads new-B (CB is
+// precomputed), and uses the precomputed cumAdt instead of computing dt_proc:
+//   • CB_scaled (~2 KB)   • B (~2 KB)   • dt_proc (tiny)
+// Dropping ~4 KB takes the main from 7 → 8 resident blocks/SM (smem was the co-limiter with
+// regs), adding a wave of warps to hide its DRAM-latency stalls (long_scoreboard ~39%,
+// eligible-warps 0.71).  The static constexpr layout constants mirror CheckpointingSsuStorage
+// exactly so the shared load/compute helpers (templated on SmemT) bind unchanged.
+template <typename input_t, typename state_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
+          int DSTATE>
+struct CheckpointingSsuMainStorage {
+  static constexpr int NPREDICTED = NPREDICTED_;
+  static constexpr int MAX_WINDOW = MAX_WINDOW_;
+  static constexpr int D_SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(D_PER_CTA);
+  static constexpr int NPREDICTED_PAD_MMA_M = next_multiple_of<MMA_prop::M>(NPREDICTED);
+  static constexpr int NPREDICTED_PAD_MMA_N = next_multiple_of<MMA_prop::N>(NPREDICTED);
+  static constexpr int MAX_WINDOW_PAD_MMA_K = next_multiple_of<MMA_prop::K_SMALL>(MAX_WINDOW);
+  static constexpr int NPREDICTED_SWIZZLE_R =
+      next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
+  static constexpr int CB_ROW_STRIDE = SmemSwizzle<input_t>::ATOM_COLS;
+
+  // C (matmul-3 A-operand) — per-group conv1d output.
+  alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];
+  // x (matmul-4 B-operand) — per-head new-token conv1d output.
+  alignas(16) input_t x[NPREDICTED_PAD_MMA_M * D_SMEM_COLS];
+  // z — the gate (conv1d-independent).
+  alignas(16) input_t z[NPREDICTED_SWIZZLE_R * D_SMEM_COLS];
+  // old_x — replay A-operand (write path) / cb_old@old_x (no-write); per-head cache.
+  alignas(16) input_t old_x[MAX_WINDOW_PAD_MMA_K * D_SMEM_COLS];
+  // old_B — replay B-operand (write path); per-group cache.
+  alignas(16) input_t old_B[MAX_WINDOW_PAD_MMA_K * DSTATE];
+  float old_dt[MAX_WINDOW];
+  float old_cumAdt[MAX_WINDOW];
+  // cumAdt — precompute output (cumAdt_vec) → exp() β epilogue.
+  float cumAdt[NPREDICTED];
+  // state — per-CTA D-slice of the SSM state.
+  alignas(16) state_t state[D_PER_CTA * DSTATE];
+};
+
+// -----------------------------------------------------------------------------
 // Main-kernel load — the conv1d-INDEPENDENT (pre-gdc_wait) set: state, old_x, z
 // always; old_B + old_dt + old_cumAdt only when must_checkpoint (they feed the
 // replay).  On the no-write path the precompute baked old_B/old_dt/old_cumAdt
@@ -72,12 +113,12 @@ namespace flashinfer::mamba::checkpointing {
 // (cb_scaled is precomputed) and dt + cumAdt scan.  Single async group, drained
 // by one commit + wait + syncwarp (like load_data).
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
-          int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
+          int D_PER_CTA, int DSTATE, int NUM_WARPS, bool IS_FIRST, typename SmemT>
 __device__ __forceinline__ void load_main_data(SmemT& smem, CheckpointingSsuParams const& params,
                                                int lane, int warp, int d_tile, int head,
                                                int group_idx, int64_t cache_slot, int buf_read,
                                                int64_t outer, int seq_len, bool must_checkpoint,
-                                               int prev_k, bool is_first) {
+                                               int prev_k) {
   using namespace cute;
   int const d_tile_off = d_tile * D_PER_CTA;
 
@@ -127,9 +168,10 @@ __device__ __forceinline__ void load_main_data(SmemT& smem, CheckpointingSsuPara
   if (must_checkpoint) {
     // old_B is per-GROUP (no head term in oB_base) → load ONCE for the head-tile (is_first)
     // and reuse across the loop's heads.  old_dt/old_cumAdt are per-HEAD → load every head.
-    if (warp == 1 && is_first)
-      load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
-                                             params.old_B_stride_token, lane);
+    if constexpr (IS_FIRST)
+      if (warp == 1)
+        load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
+                                               params.old_B_stride_token, lane);
     if (warp == 2)
       load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, MAX_WINDOW, smem.old_dt,
                          smem.old_cumAdt);
@@ -164,10 +206,11 @@ __device__ __forceinline__ void load_main_data(SmemT& smem, CheckpointingSsuPara
 // cross-warp hazard — only the cross-LANE LDSM read inside each warp — so the
 // caller publishes with a cheap __syncwarp instead of a block barrier, keeping
 // the post-wait critical path free of __syncthreads.
-template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, typename SmemT>
+template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, bool IS_FIRST,
+          typename SmemT>
 __device__ __forceinline__ void load_conv_inputs(SmemT& smem, CheckpointingSsuParams const& params,
                                                  int lane, int d_tile, int head, int group_idx,
-                                                 int64_t outer, int seq_len, bool is_first) {
+                                                 int64_t outer, int seq_len) {
   int const d_tile_off = d_tile * D_PER_CTA;
   auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
   auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
@@ -177,7 +220,7 @@ __device__ __forceinline__ void load_conv_inputs(SmemT& smem, CheckpointingSsuPa
   using XShape = cute::Shape<cute::Int<SmemT::NPREDICTED_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
   // C is per-GROUP (C_base has no head term) → load ONCE for the head-tile (is_first) and
   // reuse across the loop's heads.  x is per-HEAD → load every head.
-  if (is_first)
+  if constexpr (IS_FIRST)
     load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane,
                                         seq_len);
   load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane, seq_len);
@@ -196,27 +239,27 @@ __device__ __forceinline__ void load_conv_inputs(SmemT& smem, CheckpointingSsuPa
 // gdc_wait so they run once per head-tile and are reused across the loop's heads.
 template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
           int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS,
-          bool MUST_CHECKPOINT, typename SmemT>
+          bool MUST_CHECKPOINT, bool IS_FIRST, typename SmemT>
 __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams const& params,
                                              int lane, int warp, int d_tile, int head,
                                              int group_idx, int seq, int64_t cache_slot,
                                              int buf_read, int prev_k, int64_t outer, int seq_len,
                                              int64_t out_seq_base, int write_offset,
-                                             int64_t rand_seed, bool is_first) {
+                                             int64_t rand_seed) {
   // Inter-head barrier: the PREVIOUS head's output / store_old_x READ smem.state & smem.x
   // while THIS head's load_main_data / load_conv_inputs WRITE them — sync so the buffer
-  // reuse can't race.  (C / old_B are write-once on is_first, unaffected.)  No-op for the
-  // tile's first head (nothing precedes it).
-  if (!is_first) __syncthreads();
+  // reuse can't race.  (C / old_B are write-once on IS_FIRST, unaffected.)  Compile-time-
+  // elided for the tile's first head (nothing precedes it) so MHC=1 keeps the flat body.
+  if constexpr (!IS_FIRST) __syncthreads();
 
   // D (tie_hdim scalar); A / dt_bias not needed here (no C1/C2).
   auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
   float const D_val = D_ptr ? toFloat(D_ptr[head]) : 0.f;
 
   // ── PRE-gdc_wait: cache + state replay (precompute-INDEPENDENT, overlaps precompute) ──
-  load_main_data<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-      smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read, outer, seq_len,
-      MUST_CHECKPOINT, prev_k, is_first);
+  load_main_data<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                 IS_FIRST>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot, buf_read,
+                           outer, seq_len, MUST_CHECKPOINT, prev_k);
 
   if constexpr (MUST_CHECKPOINT) {
     __syncthreads();  // state (per-warp split) visible cross-warp before the replay
@@ -234,11 +277,11 @@ __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams
   // INTERNAL PDL gdc_wait — ONE-SHOT (first head of the tile only).  Once head 0 has waited,
   // the precompute is finished + visible for the WHOLE CTA, so later heads read
   // cb_scaled / cumAdt_vec without re-waiting.  No-op without a programmatic predecessor.
-  if (is_first) cudaGridDependencySynchronize();
+  if constexpr (IS_FIRST) cudaGridDependencySynchronize();
 
   // ── POST-gdc_wait: conv1d outputs (C once per tile, x per head) + precompute cumAdt_vec ──
-  load_conv_inputs<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
-      smem, params, lane, d_tile, head, group_idx, outer, seq_len, is_first);
+  load_conv_inputs<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, IS_FIRST>(
+      smem, params, lane, d_tile, head, group_idx, outer, seq_len);
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   auto const* __restrict__ cumAdt_ptr = reinterpret_cast<float const*>(params.cumAdt_vec);
   if (lane < seq_len) {
@@ -295,7 +338,7 @@ __global__ void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
   assert(params.d_split == D_SPLIT);
 
   using SmemT =
-      CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
+      CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
@@ -309,9 +352,18 @@ __global__ void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
   constexpr int HEAD_TILES = HEADS_PER_GROUP / MAIN_HEADS_PER_CTA;
   int const d_tile = blockIdx.x;
   int const seq = blockIdx.y;
-  int const group_idx = blockIdx.z / HEAD_TILES;
-  int const head_tile = blockIdx.z % HEAD_TILES;
-  int const first_head = group_idx * HEADS_PER_GROUP + head_tile * MAIN_HEADS_PER_CTA;
+  int group_idx, first_head;
+  if constexpr (MAIN_HEADS_PER_CTA == 1) {
+    // Degenerate head-tile (one head per CTA): first_head == blockIdx.z, exactly the old
+    // per-head grid.  Skip the div/mod/mul so the compiler addresses straight off %ctaid.z
+    // instead of materializing first_head/head_tile in registers.
+    first_head = blockIdx.z;
+    group_idx = blockIdx.z / HEADS_PER_GROUP;
+  } else {
+    group_idx = blockIdx.z / HEAD_TILES;
+    int const head_tile = blockIdx.z % HEAD_TILES;
+    first_head = group_idx * HEADS_PER_GROUP + head_tile * MAIN_HEADS_PER_CTA;
+  }
   int const lane = threadIdx.x;
   int const warp = threadIdx.y;
 
@@ -350,21 +402,34 @@ __global__ void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
   // state stays in smem per head (no gmem round-trip — the replay's C8 write is the only HBM
   // state I/O).  External PDL fires once, after ALL heads' outputs are written.
   // ════════════════════════════════════════════════════════════════════════
+  // PEEL head 0 (IS_FIRST=true) from the rest (IS_FIRST=false) so IS_FIRST is COMPILE-TIME:
+  // the per-group C / old_B loads, the one-shot gdc_wait and the inter-head __syncthreads all
+  // fold via `if constexpr`.  At MAIN_HEADS_PER_CTA==1 the `h = 1` loop is empty, so this
+  // collapses to a single inlined IS_FIRST=true body — bit-AND-perf-identical to the old flat
+  // per-head main (no loop, no runtime is_first branch, no extra address math).
   if (must_checkpoint) {
     // rand_seed: computed ONCE for the write path (replay), reused by every head of the tile.
     int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
-    for (int h = 0; h < MAIN_HEADS_PER_CTA; ++h) {
+    process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                 PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, /*IS_FIRST=*/true>(
+        smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read, prev_k,
+        outer, seq_len, out_seq_base, write_offset, rand_seed);
+    for (int h = 1; h < MAIN_HEADS_PER_CTA; ++h) {
       process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                   PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true>(
+                   PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, /*IS_FIRST=*/false>(
           smem, params, lane, warp, d_tile, first_head + h, group_idx, seq, cache_slot, buf_read,
-          prev_k, outer, seq_len, out_seq_base, write_offset, rand_seed, /*is_first=*/h == 0);
+          prev_k, outer, seq_len, out_seq_base, write_offset, rand_seed);
     }
   } else {
-    for (int h = 0; h < MAIN_HEADS_PER_CTA; ++h) {
+    process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                 PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, /*IS_FIRST=*/true>(
+        smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read, prev_k,
+        outer, seq_len, out_seq_base, write_offset, /*rand_seed=*/0);
+    for (int h = 1; h < MAIN_HEADS_PER_CTA; ++h) {
       process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                   PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false>(
+                   PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, /*IS_FIRST=*/false>(
           smem, params, lane, warp, d_tile, first_head + h, group_idx, seq, cache_slot, buf_read,
-          prev_k, outer, seq_len, out_seq_base, write_offset, /*rand_seed=*/0, /*is_first=*/h == 0);
+          prev_k, outer, seq_len, out_seq_base, write_offset, /*rand_seed=*/0);
     }
   }
 
