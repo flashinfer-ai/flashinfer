@@ -587,6 +587,7 @@ _COSSIN_INPUTS: Dict[str, _InputT] = {
     "cos_sin_cache": Tensor(
         ["max_seq_len", "rotary_dim"],
         dtype="float32",
+        cacheable=True,
         description="Precomputed cos+sin cache; cos first half, sin second half.",
     ),
     "is_neox": Scalar(
@@ -769,6 +770,7 @@ _ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
     "cos_sin_cache": Tensor(
         ["max_seq_len", "rotary_dim"],
         dtype="float32",
+        cacheable=True,
         description="Cos concatenated with sin along the last axis.",
     ),
     "pos_ids": Tensor(["nnz"], dtype="int32"),
@@ -926,6 +928,7 @@ _MLA_ROPE_QUANT_INPUTS: Dict[str, _InputT] = {
     "cos_sin_cache": Tensor(
         ["max_seq_len", "rotary_dim"],
         dtype="float32",
+        cacheable=True,
         description="Cos concatenated with sin along the last axis.",
     ),
     "pos_ids": Tensor(["nnz"], dtype="int64"),
@@ -1219,7 +1222,9 @@ rope_quantize_fp8_append_paged_kv_cache_trace = TraceTemplate(
             optional=True,
             description="GQA/MHA value tensor (None for MLA).",
         ),
-        "cos_sin_cache": Tensor(["max_seq_len", "rotary_dim"], dtype="float32"),
+        "cos_sin_cache": Tensor(
+            ["max_seq_len", "rotary_dim"], dtype="float32", cacheable=True
+        ),
         "pos_ids": Tensor(["nnz"], dtype="int32"),
         "k_cache": Tensor(
             ["num_pages", "page_size", "num_k_heads", "head_dim"],

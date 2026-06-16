@@ -985,7 +985,7 @@ fused_topk_deepseek_trace = TraceTemplate(
     },
     inputs={
         "scores": Tensor(["num_tokens", "num_experts"]),
-        "bias": Tensor(["num_experts"]),
+        "bias": Tensor(["num_experts"], cacheable=True),
         "n_group": Scalar("int32"),
         "topk_group": Scalar("int32"),
         "topk": Scalar("int32"),
