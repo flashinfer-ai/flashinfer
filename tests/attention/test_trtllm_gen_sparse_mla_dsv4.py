@@ -256,6 +256,60 @@ def gen_testcase() -> tuple[RawTestParamForDecode, ...]:
                         sparse_case="swa128+topk128x",
                     )
 
+    # Smaller head counts use the sparse MLA small-head kernel selection path.
+    swa_seq_len, c4_seq_len, c128_seq_len = DECODE_SEQ_LEN_CASES[0]
+    c128_topk = _round_up(c128_seq_len + (DECODE_BATCH_SIZE - 1) * C128_PAGE_SIZE, 4)
+    for h_q in (8, 16, 32):
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            for kv_layout in ("HND", "NHD"):
+                add_case(
+                    b=DECODE_BATCH_SIZE,
+                    h_q=h_q,
+                    s_q=DECODE_Q_LEN,
+                    h_kv=1,
+                    s_kv=swa_seq_len,
+                    is_varlen=True,
+                    topk=DSV4_SWA_TOPK,
+                    block_size=SWA_PAGE_SIZE,
+                    dtype=dtype,
+                    kv_layout=kv_layout,
+                    sparse_case="swa128",
+                )
+                add_case(
+                    b=DECODE_BATCH_SIZE,
+                    h_q=h_q,
+                    s_q=DECODE_Q_LEN,
+                    h_kv=1,
+                    s_kv=swa_seq_len,
+                    is_varlen=True,
+                    topk=DSV4_SWA_TOPK,
+                    extra_s_k=c4_seq_len,
+                    extra_topk=h_q * 8,
+                    block_size=SWA_PAGE_SIZE,
+                    extra_block_size=C4_PAGE_SIZE,
+                    have_extra_topk_length=True,
+                    dtype=dtype,
+                    kv_layout=kv_layout,
+                    sparse_case="swa128+topk4x",
+                )
+                add_case(
+                    b=DECODE_BATCH_SIZE,
+                    h_q=h_q,
+                    s_q=DECODE_Q_LEN,
+                    h_kv=1,
+                    s_kv=swa_seq_len,
+                    is_varlen=True,
+                    topk=DSV4_SWA_TOPK,
+                    extra_s_k=c128_seq_len,
+                    extra_topk=c128_topk,
+                    block_size=SWA_PAGE_SIZE,
+                    extra_block_size=C128_PAGE_SIZE,
+                    have_extra_topk_length=True,
+                    dtype=dtype,
+                    kv_layout=kv_layout,
+                    sparse_case="swa128+topk128x",
+                )
+
     # Guard seq_lens-driven SWA masking. With q_len == kv_len == 128, early
     # query tokens have fewer than 128 valid SWA entries, so the kernel must use
     # real seq_lens instead of treating every SWA tile as full.

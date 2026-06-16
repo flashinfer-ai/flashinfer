@@ -247,6 +247,9 @@ def gen_moe_alltoall_module() -> JitSpec:
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
         ],
+        extra_cuda_cflags=[
+            "-DENABLE_BF16",
+        ],
     )
 
 
