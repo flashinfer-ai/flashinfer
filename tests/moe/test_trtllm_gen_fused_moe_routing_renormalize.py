@@ -17,8 +17,6 @@ limitations under the License.
 import pytest
 import torch
 
-pytest_plugins = ["tests.moe.trtllm_gen_fused_moe_common"]
-
 from tests.moe.trtllm_gen_fused_moe_common import (
     ActivationType,
     BF16Moe,
@@ -31,6 +29,11 @@ from tests.moe.trtllm_gen_fused_moe_common import (
     WeightLayout,
     run_moe_test,
 )
+
+
+@pytest.fixture(scope="module")
+def cache_permute_indices():
+    return {}
 
 
 # Test: Renormalize routing

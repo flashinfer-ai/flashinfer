@@ -19,8 +19,6 @@ import torch
 
 from flashinfer.utils import get_compute_capability
 
-pytest_plugins = ["tests.moe.trtllm_gen_fused_moe_common"]
-
 from tests.moe.trtllm_gen_fused_moe_common import (
     ActivationType,
     BF16Moe,
@@ -41,6 +39,11 @@ from tests.moe.trtllm_gen_fused_moe_common import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
 )
+
+
+@pytest.fixture(scope="module")
+def cache_permute_indices():
+    return {}
 
 
 # Test: Sigmoid routing (Sigmoid -> TopK, no renormalization)
@@ -1742,7 +1745,7 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
 )
 @pytest.mark.parametrize(
     "activation_type",
-    [pytest.param(ActivationType.Swiglu.value, id="Swiglu")],
+    [pytest.param(ActivationType.Swiglu, id="Swiglu")],
 )
 def test_moe_lora_delta(
     num_tokens,
