@@ -478,37 +478,32 @@ __global__ void __launch_bounds__(TILE_M == 64 ? 256 : 384, 1)
           float scale_0_second_part = smem_scales_a[s][r_0] * scale_b_r_second_part;
           float scale_1_second_part = smem_scales_a[s][r_1] * scale_b_r_second_part;
 
-          // Cross-boundary NaN guard. For padding rows at or past the per-group row
-          // boundary (row >= m_boundary), the raw wgmma accumulator can be Inf/NaN
-          // because it sums over in-bounds-but-stale fp8 input. Those rows carry a
-          // per-token scale of 0, so scale * accum would be 0 * Inf = NaN. Add exactly
-          // 0.f for cross rows instead of scale * accum so no NaN is produced.
           if (!IS_UNIFORM_SCALE_B && iters_in_former_scales_b < TILE_N / 8) {
             for (int i = 0; i < iters_in_former_scales_b; i++) {
-              final_accum[i * 4 + 0] += cross_0 ? 0.f : scale_0 * accum[i * 4];
-              final_accum[i * 4 + 1] += cross_0 ? 0.f : scale_0 * accum[i * 4 + 1];
+              final_accum[i * 4 + 0] += scale_0 * accum[i * 4];
+              final_accum[i * 4 + 1] += scale_0 * accum[i * 4 + 1];
             }
             for (int i = 0; i < iters_in_former_scales_b; i++) {
-              final_accum[i * 4 + 2] += cross_1 ? 0.f : scale_1 * accum[i * 4 + 2];
-              final_accum[i * 4 + 3] += cross_1 ? 0.f : scale_1 * accum[i * 4 + 3];
+              final_accum[i * 4 + 2] += scale_1 * accum[i * 4 + 2];
+              final_accum[i * 4 + 3] += scale_1 * accum[i * 4 + 3];
             }
 
             for (int i = iters_in_former_scales_b; i < WGMMA_OP::NUM_ACCUM / 4; i++) {
-              final_accum[i * 4 + 0] += cross_0 ? 0.f : scale_0_second_part * accum[i * 4];
-              final_accum[i * 4 + 1] += cross_0 ? 0.f : scale_0_second_part * accum[i * 4 + 1];
+              final_accum[i * 4 + 0] += scale_0_second_part * accum[i * 4];
+              final_accum[i * 4 + 1] += scale_0_second_part * accum[i * 4 + 1];
             }
             for (int i = iters_in_former_scales_b; i < WGMMA_OP::NUM_ACCUM / 4; i++) {
-              final_accum[i * 4 + 2] += cross_1 ? 0.f : scale_1_second_part * accum[i * 4 + 2];
-              final_accum[i * 4 + 3] += cross_1 ? 0.f : scale_1_second_part * accum[i * 4 + 3];
+              final_accum[i * 4 + 2] += scale_1_second_part * accum[i * 4 + 2];
+              final_accum[i * 4 + 3] += scale_1_second_part * accum[i * 4 + 3];
             }
           } else {
             for (int i = 0; i < WGMMA_OP::NUM_ACCUM / 4; i++) {
-              final_accum[i * 4 + 0] += cross_0 ? 0.f : scale_0 * accum[i * 4];
-              final_accum[i * 4 + 1] += cross_0 ? 0.f : scale_0 * accum[i * 4 + 1];
+              final_accum[i * 4 + 0] += scale_0 * accum[i * 4];
+              final_accum[i * 4 + 1] += scale_0 * accum[i * 4 + 1];
             }
             for (int i = 0; i < WGMMA_OP::NUM_ACCUM / 4; i++) {
-              final_accum[i * 4 + 2] += cross_1 ? 0.f : scale_1 * accum[i * 4 + 2];
-              final_accum[i * 4 + 3] += cross_1 ? 0.f : scale_1 * accum[i * 4 + 3];
+              final_accum[i * 4 + 2] += scale_1 * accum[i * 4 + 2];
+              final_accum[i * 4 + 3] += scale_1 * accum[i * 4 + 3];
             }
           }
         }
@@ -526,8 +521,9 @@ __global__ void __launch_bounds__(TILE_M == 64 ? 256 : 384, 1)
       // originate from cross-boundary padding rows and, via the reused shared-memory
       // staging buffer (smem_c), bleed a NaN into a valid row's output. Valid rows are
       // always finite, so zeroing non-finite lanes leaves every real output unchanged.
+      // Mirrors the same guard applied in the deep_gemm fp8_gemm_impl.cuh epilogue.
 #pragma unroll
-      for (int _q = 0; _q < WGMMA_OP::NUM_ACCUM; ++_q) {
+      for (int _q = 0; _q < NUM_ACCUMS; ++_q) {
         if (!isfinite(final_accum[_q])) final_accum[_q] = 0.f;
       }
       __syncthreads();
@@ -989,22 +985,16 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
       input_line += 32;
     }
 
-    // Reduce the per-token [1x128] block amax with a warp MAX (find_max_elem_in_warp,
-    // like the other 1x128 quantizers in this file). The block's fp8 scale is amax/448,
-    // so this reduction must yield the true max-abs over the 128 lanes; an over-estimated
-    // amax can overflow fp32 to +Inf, making the reciprocal scale 448/Inf = 0 and
-    // producing 0 or 0*Inf = NaN in the requantized activation buffer.
-    InputType amax = find_max_elem_in_warp(
+    InputType amax = kernel_utils::warpReduceSum(
         max(max(fabs(float(input_frag[0])), fabs(float(input_frag[1]))),
             max(fabs(float(input_frag[2])), fabs(float(input_frag[3])))));
 
-    // Defensive finite clamp: if the block amax is non-finite (e.g. an input value
-    // exceeds the representable range), clamp it to the max finite value so the scale
-    // stays finite and no 0*Inf = NaN can reach the requantized buffer. For finite
-    // inputs this branch is never taken, leaving the result of the MAX above unchanged.
-    float amax_f = float(amax);
-    if (!isfinite(amax_f)) amax_f = 3.3895313892515355e38f;  // finite bf16 max
-    float scale = amax_f != 0.f ? 448.f / amax_f : 1.f;
+    // Half seems to be slower, probably because we need float values below
+    // anyway. InputType amax = kernel_utils::warpReduceSum(
+    //     __hmax(__hmax(__habs(input_frag[0]), __habs(input_frag[1])),
+    //         __hmax(__habs(input_frag[2]), __habs(input_frag[3]))));
+
+    float scale = amax != InputType(0.f) ? 448.f / float(amax) : 1.f;
 
     if (kernel_utils::elect_one_sync(lane_id)) {
       scale_output = float(1.f / scale);
@@ -1012,9 +1002,6 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
 
     for (int i = 0; i < 4; i++) {
       float value = float(input_frag[i]) * scale;
-      // Defensively prevent a non-finite quantized value (from Inf*0 = NaN or a
-      // genuinely Inf input) from reaching the requantized fp8 buffer; clamp it to 0.
-      if (!isfinite(value)) value = 0.f;
       if (scales_idx_x * 128 + i * 32 + lane_id < dim_x) {
         output_line[lane_id] = OutputType(value);
       }

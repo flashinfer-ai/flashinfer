@@ -319,6 +319,38 @@ def _assert_finite_and_correct(
     )
 
 
+def _check_moe_finite_and_correct(
+    batch_size,
+    num_experts,
+    top_k,
+    *,
+    hidden_size,
+    intermediate_size,
+    activation_scale,
+    seed,
+    hit_floor=0.85,
+    check_elementwise=True,
+):
+    """Build the FP8 block-scale MoE problem, run the cutlass kernel, and assert
+    the output is finite and matches the high-precision oracle. Shared by the
+    deep_gemm (default) and the DG-disabled cutlass-fallback test paths so the
+    finite-sanitize guard in both grouped-GEMM epilogues is exercised by
+    identical logic."""
+    inp = _make_moe_inputs(
+        batch_size,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        activation_scale,
+        seed,
+    )
+    out = _run_kernel(inp, num_experts, hidden_size)
+    _assert_finite_and_correct(
+        out, inp, num_experts, hit_floor=hit_floor, check_elementwise=check_elementwise
+    )
+
+
 # -----------------------------------------------------------------------------
 # End-to-end regression for the cross-boundary 0*Inf NaN.
 #
@@ -351,60 +383,87 @@ def _assert_finite_and_correct(
     ],
 )
 def test_moe_finite_and_correct(batch_size, num_experts, top_k):
-    """MoE output stays finite and matches the oracle across the BLOCK_M tile
-    boundary and routing densities (guards the cross-boundary 0*Inf NaN)."""
-    hidden_size, intermediate_size = 4096, 1024
-    inp = _make_moe_inputs(
+    """deep_gemm path (default): MoE output stays finite and matches the oracle
+    across the BLOCK_M tile boundary and routing densities (cross-boundary 0*Inf
+    NaN guard). Production reduction depth (K=4096) leaves a small fraction of
+    elements just outside the FP8 tolerance; the 0.75 floor still fails a
+    scale-error kernel."""
+    _check_moe_finite_and_correct(
         batch_size,
-        hidden_size,
-        intermediate_size,
         num_experts,
         top_k,
+        hidden_size=4096,
+        intermediate_size=1024,
         activation_scale=2.0,
         seed=7,
+        hit_floor=0.75,
     )
-    out = _run_kernel(inp, num_experts, hidden_size)
-    # Production reduction depth (K=4096) leaves a small fraction of elements
-    # just outside the FP8 tolerance; 0.75 still fails a scale-error kernel.
-    _assert_finite_and_correct(out, inp, num_experts, hit_floor=0.75)
 
 
 # -----------------------------------------------------------------------------
-# Small-M activation requant amax sanity. Pushes activation magnitudes near the
-# FP8 representable range; the per-token [1x128] requant must stay finite and
-# produce a correctly-scaled output. (The unpatched reduction is already a warp
-# MAX, so this passes on both kernels; it guards the requant amax path.)
+# Large-activation finiteness stress. Pushes activation magnitudes near the FP8
+# representable range so the largest products are the most likely to reach Inf,
+# exercising the epilogue finite-sanitize. Asserts finiteness always; the nominal
+# (un-stressed) cases also assert full element-wise correctness.
 # -----------------------------------------------------------------------------
 @requires_sm90
 @pytest.mark.parametrize(
-    "batch_size, stress_amax",
+    "batch_size, stress",
     [
-        pytest.param(1, True, id="M1_stress_amax"),
-        pytest.param(2, True, id="M2_stress_amax"),
-        pytest.param(5, True, id="M5_stress_amax"),
+        pytest.param(1, True, id="M1_stress"),
+        pytest.param(2, True, id="M2_stress"),
+        pytest.param(5, True, id="M5_stress"),
         pytest.param(1, False, id="M1_nominal"),
         pytest.param(5, False, id="M5_nominal"),
     ],
 )
-def test_small_m_requant_amax_finite(batch_size, stress_amax):
-    """Small-M activation requant must stay finite near the FP8 range."""
-    hidden_size, intermediate_size, num_experts, top_k = 512, 256, 4, 2
-    activation_scale = (FP8_MAX * 0.5) if stress_amax else 2.0
-    inp = _make_moe_inputs(
+def test_large_activation_finite(batch_size, stress):
+    """Large activation magnitudes near the FP8 range stress the epilogue
+    finite-sanitize; under stress assert finiteness + scale sanity, otherwise
+    full element-wise correctness."""
+    _check_moe_finite_and_correct(
         batch_size,
-        hidden_size,
-        intermediate_size,
+        4,
+        2,
+        hidden_size=512,
+        intermediate_size=256,
+        activation_scale=(FP8_MAX * 0.5) if stress else 2.0,
+        seed=1234,
+        check_elementwise=not stress,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Cutlass-blockscale fallback path. With TRTLLM_DG_ENABLED=0 the grouped MoE is
+# routed through the non-persistent Fp8Gemm fallback kernel (a different file
+# from the deep_gemm path) whose epilogue carries the same finite-sanitize. The
+# dispatch reads TRTLLM_DG_ENABLED per call (getDeepGemmEnabled), so the env set
+# here takes effect in-process. Reuses the identical finite+correct check.
+# -----------------------------------------------------------------------------
+@requires_sm90
+@pytest.mark.parametrize(
+    "batch_size, num_experts, top_k",
+    [
+        pytest.param(2, 64, 8, id="M2_64e"),
+        pytest.param(8, 64, 8, id="M8_64e"),
+        pytest.param(32, 32, 8, id="M32_32e"),
+    ],
+)
+def test_moe_finite_and_correct_dg_disabled(
+    monkeypatch, batch_size, num_experts, top_k
+):
+    """Cutlass-blockscale fallback (TRTLLM_DG_ENABLED=0): same finite+correct
+    guard as the deep_gemm path, covering the fallback epilogue's sanitize."""
+    monkeypatch.setenv("TRTLLM_DG_ENABLED", "0")
+    _check_moe_finite_and_correct(
+        batch_size,
         num_experts,
         top_k,
-        activation_scale,
-        seed=1234,
-    )
-    out = _run_kernel(inp, num_experts, hidden_size)
-    # Under deliberate amax stress, a few output elements carry large genuine
-    # FP8 rounding error, so assert finiteness + scale sanity rather than
-    # element-wise correctness. The nominal cases assert full correctness.
-    _assert_finite_and_correct(
-        out, inp, num_experts, check_elementwise=not stress_amax
+        hidden_size=4096,
+        intermediate_size=1024,
+        activation_scale=2.0,
+        seed=7,
+        hit_floor=0.75,
     )
 
 
