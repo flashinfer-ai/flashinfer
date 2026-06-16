@@ -55,13 +55,13 @@ def test_mm_fp8(
     assert cos_sim > 0.99
 
 
-def test_mm_fp8_rejects_non_sm100():
-    # mm_fp8's only backend is the SM100 TRT-LLM Gen cubin; on any other arch
-    # (e.g. consumer Blackwell sm_120/sm_121) the kernel image is missing and the
+def test_mm_fp8_rejects_non_sm10x():
+    # mm_fp8's only backend is the SM10x TRT-LLM Gen cubin; on any other arch,
+    # e.g. consumer Blackwell sm_120/sm_121, the kernel image is missing and the
     # launch used to fail opaquely. Assert it now raises a clear error instead.
     major = get_compute_capability(torch.device(device="cuda"))[0]
     if major == 10:
-        pytest.skip("negative test needs a non-SM100 GPU to exercise the guard")
+        pytest.skip("negative test needs a non-SM10x GPU to exercise the guard")
 
     a = torch.randn([16, 128], device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
@@ -69,7 +69,7 @@ def test_mm_fp8_rejects_non_sm100():
     b = torch.randn([1, 256, 128], device="cuda", dtype=torch.bfloat16).to(
         torch.float8_e4m3fn
     )
-    with pytest.raises(NotImplementedError, match="SM100"):
+    with pytest.raises(NotImplementedError, match="datacenter Blackwell"):
         mm_fp8(a, b)
 
 

@@ -126,7 +126,7 @@ def trtllm_low_latency_gemm(
     out: torch.Tensor,
 ) -> None:
     r"""GEMM optimized for low M dimension. B needs to be shuffled and its layout needs to be adjusted.
-    Only supported on SM100 (datacenter Blackwell) GPUs.
+    Only supported on SM10x datacenter Blackwell GPUs.
 
     Parameters
     ----------
@@ -172,8 +172,8 @@ def trtllm_low_latency_gemm(
     major, minor = get_compute_capability(A.device)
     if major != 10:
         raise NotImplementedError(
-            "trtllm_low_latency_gemm / mm_fp8 requires an SM100 (datacenter "
-            "Blackwell, e.g. B200) GPU; the TRT-LLM Gen FP8 kernel is not "
+            "trtllm_low_latency_gemm / mm_fp8 requires an SM10x datacenter "
+            "Blackwell GPU, e.g. SM100/B200; the TRT-LLM Gen FP8 kernel is not "
             f"available on compute capability {major}.{minor}."
         )
 
