@@ -16,6 +16,19 @@ pip install nvshmem4py-cu12
 
 # Find and filter test files based on pytest.ini exclusions
 find_test_files() {
+    SEARCH_DIR="${TEST_PATH:-tests/}"
+
+    if [ -n "$TEST_PATH" ]; then
+        if [ ! -d "${SEARCH_DIR}" ]; then
+            echo "ERROR: TEST_PATH '${SEARCH_DIR}' does not exist or is not a directory."
+            echo "Available test directories:"
+            find tests/ -maxdepth 1 -type d | sort | tail -n +2 | sed 's/^/  /'
+            exit 1
+        fi
+        echo "🎯 TEST_PATH set: scoping test discovery to ${SEARCH_DIR}"
+        echo ""
+    fi
+
     echo "Reading pytest.ini for excluded directories..."
     EXCLUDED_DIRS=""
     if [ -f "./pytest.ini" ]; then
@@ -28,10 +41,10 @@ find_test_files() {
         fi
     fi
 
-    echo "Finding all test_*.py files in tests/ directory..."
+    echo "Finding all test_*.py files in ${SEARCH_DIR} directory..."
 
     # Find all test_*.py files
-    ALL_TEST_FILES=$(find tests/ -name "test_*.py" -type f | sort)
+    ALL_TEST_FILES=$(find "${SEARCH_DIR}" -name "test_*.py" -type f | sort)
 
     # Filter out excluded files based on directory exclusions
     TEST_FILES=""
@@ -59,7 +72,7 @@ find_test_files() {
     TEST_FILES=$(echo "$TEST_FILES" | xargs)
 
     if [ -z "$TEST_FILES" ]; then
-        echo "No test files found in tests/ directory (after exclusions)"
+        echo "No test files found in ${SEARCH_DIR} directory (after exclusions)"
         exit 1
     fi
 

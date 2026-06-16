@@ -35,6 +35,20 @@ def ceil_div(a: int, b: int) -> int:
 
 
 def is_cute_dsl_available() -> bool:
+    r"""Return ``True`` when the optional CuTe DSL stack is importable.
+
+    Probes for ``cutlass`` and ``cutlass.cute`` via :func:`importlib.util.find_spec`.
+    Used by higher-level wrappers to decide whether to dispatch to a CuTe-DSL
+    backend (e.g. :func:`flashinfer.quantization.mxfp4_quantize`,
+    :class:`flashinfer.cute_dsl.attention.wrappers.BatchDecodeCuteDSLWrapper`)
+    or fall back to a plain-CUDA implementation.
+
+    Returns
+    -------
+    bool
+        ``True`` if both ``cutlass`` and ``cutlass.cute`` are importable in the
+        current Python environment.
+    """
     return (
         importlib.util.find_spec("cutlass") is not None
         and importlib.util.find_spec("cutlass.cute") is not None
@@ -96,6 +110,33 @@ def cutlass_to_torch_dtype(cutlass_dtype):
 def get_num_sm(device: torch.device) -> int:
     # get the compute capability of the device, which would be cached
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _current_cuda_stream_impl():
+    """Return the current Torch CUDA stream as a CUDA driver stream handle."""
+    import cuda.bindings.driver as cuda
+
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+
+def current_cuda_stream():  # noqa: F811
+    """Lazy wrapper that applies torch._dynamo.disable on first call to avoid
+    importing torch._dynamo at module load time (which fails in containers
+    running as unmapped UIDs without /etc/passwd entries)."""
+    global current_cuda_stream
+    _ensure_user_env()
+    current_cuda_stream = torch._dynamo.disable(_current_cuda_stream_impl)
+    return current_cuda_stream()
+
+
+def _ensure_user_env():
+    """Ensure a USER env var exists so that torch._dynamo initialization
+    (which calls getpass.getuser()) doesn't crash in containers running
+    as UIDs without /etc/passwd entries."""
+    import os
+
+    if not any(os.environ.get(v) for v in ("LOGNAME", "USER", "LNAME", "USERNAME")):
+        os.environ["USER"] = str(os.getuid())
 
 
 # Cache for HardwareInfo - it's expensive to create on every call
@@ -544,8 +585,8 @@ def sm120_make_smem_layout_sfb(
 
     assert sf_vec_size == 16 or sf_vec_size == 32, "sf_vec_size must be 16 or 32"
 
-    assert tile_shape_mnk[1] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[1] must be divisible by 64"
+    assert tile_shape_mnk[1] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[1] must be divisible by 16"
     )
 
     assert tile_shape_mnk[2] % sf_vec_size == 0, (

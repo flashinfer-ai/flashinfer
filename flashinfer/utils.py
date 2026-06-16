@@ -575,8 +575,8 @@ def is_sm120a_supported(device: torch.device) -> bool:
 
 
 def is_sm120f_supported(device: torch.device) -> bool:
-    major, minor = get_compute_capability(device)
-    return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.9")
+    major, _ = get_compute_capability(device)
+    return major == 12 and version_at_least(torch.version.cuda, "12.9")
 
 
 def is_sm121a_supported(device: torch.device) -> bool:
@@ -880,8 +880,7 @@ def get_shuffle_matrix_sf_a_row_indices(
     # M, K from the input
     M, K = input_tensor.shape
     assert M % 128 == 0
-    assert K % 4 == 0
-
+    # K % 4 alignment is not required here, downstream block_scale_interleave kernel pads K to a multiple of 4 internally
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices

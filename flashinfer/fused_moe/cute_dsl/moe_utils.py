@@ -42,32 +42,40 @@ def get_max_num_tiles(
     tile_size: int,
 ) -> int:
     """
-    Calculate the maximum number of tiles for grouped GEMM.
+    Calculate the tight upper bound on the number of tiles produced by
+    moe_sort for a given (num_tokens, top_k, num_local_experts, tile_size).
 
-    This follows the same logic as TRT-LLM's GroupedGemmInputsHelper.get_max_num_tiles().
+    Mirrors TRT-LLM's ``GroupedGemmInputsHelper.get_max_num_tiles()`` in
+    ``tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py``. The compact
+    closed-form expression is the tight worst-case bound on
+    ``sum_e ceil(K_e / tile_size)`` subject to ``sum_e K_e = E`` (where E
+    = num_tokens * top_k and K_e is the per-local-expert token count).
+
+    The worst case is achieved when (L-1) experts each have exactly 1
+    token (each contributing 1 fully-padded tile) and one expert has the
+    remaining ``E - L + 1`` tokens. Using the identity
+    ``ceil((X+1)/T) = floor(X/T) + 1`` (valid for non-negative integer X),
+    that worst case simplifies to ``L + floor((E - L) / T)``, which is
+    algebraically equal to ``(E + (T - 1) * L) // T``.
 
     Args:
         num_tokens: Number of input tokens.
         top_k: Number of experts per token.
         num_local_experts: Number of local experts (for expert parallelism).
-        tile_size: Tile size for scheduling.
+        tile_size: Tile size for scheduling (moe_sort's mPaddingLog2 /
+            mTileTokensDim).
 
     Returns:
-        Maximum number of tiles.
+        Maximum number of tiles. Sized to fit any routing distribution
+        of ``num_tokens * top_k`` expanded tokens across ``num_local_experts``
+        local experts.
     """
     num_expanded_tokens = num_tokens * top_k
 
     if num_expanded_tokens <= num_local_experts:
         return num_expanded_tokens
 
-    # First, distribute one token to each expert
-    num_remaining_tokens = num_expanded_tokens - num_local_experts
-    max_num_tiles = num_local_experts
-
-    # Greedily fill remaining tokens into tiles
-    max_num_tiles += (num_remaining_tokens + tile_size - 1) // tile_size
-
-    return max_num_tiles
+    return (num_expanded_tokens + (tile_size - 1) * num_local_experts) // tile_size
 
 
 def get_max_num_permuted_tokens(
@@ -321,6 +329,66 @@ def moe_output_memset(
     )
 
 
+def moe_output_memset_inplace(output: torch.Tensor) -> None:
+    """
+    Zero the active MoE output slice via ``cudaMemsetAsync`` on the current
+    CUDA stream.
+
+    Dense-only port of TRT-LLM's
+    ``torch.ops.trtllm.moe_output_memset_inplace`` Path A
+    (``cuteDslMoeUtilsOp.cpp:moe_output_memset_inplace`` at the
+    ``!enable_alltoall || ep_size <= top_k`` branch). Functionally
+    equivalent to ``output.zero_()`` but with lower per-call launch overhead
+    (one ``cudaMemsetAsync`` vs PyTorch's ``FillFunctor`` kernel launch —
+    saves ~2-3 µs per call at the cells where memset cost is visible).
+
+    This entry point exposes only Path A. Current callers of the
+    monolithic CuteDSL MoE API handle all-to-all outside this function,
+    so TRT-LLM's internal-alltoall Path B (the sparse
+    ``moeOutputMemset`` kernel) is not part of this API. The existing
+    sparse ``moe_output_memset`` binding remains available if a future
+    internal-alltoall integration needs it.
+
+    The wrapper passes PyTorch's current CUDA stream pointer explicitly
+    to the C++ binding (via ``_get_cuda_stream_ptr()``). This is
+    required because the underlying ``get_current_stream()`` C++ helper
+    resolves through ``TVMFFIEnvGetStream``, which does NOT track
+    PyTorch's ``torch.cuda.stream(...)`` Python context — without the
+    explicit pointer the memset would queue on TVM's env stream and
+    would not overlap aux-stream memset with surrounding GEMM work.
+    Same pattern as ``moe_sort`` in this file.
+
+    Args:
+        output: Output tensor to zero. Shape: ``[num_tokens, hidden_size]``.
+                Supported dtypes: ``torch.float16``, ``torch.bfloat16``.
+    """
+    if output.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "moe_output_memset_inplace only supports torch.float16 and "
+            f"torch.bfloat16, got {output.dtype}"
+        )
+    if output.dim() != 2:
+        raise ValueError(
+            "moe_output_memset_inplace expects a 2D tensor, "
+            f"got shape {tuple(output.shape)}"
+        )
+    if not output.is_contiguous():
+        raise ValueError(
+            "moe_output_memset_inplace requires a contiguous tensor; "
+            "cudaMemsetAsync zeros a dense byte range from data_ptr()"
+        )
+
+    module = _get_moe_utils_module()
+    dtype_suffix = _get_dtype_suffix(output.dtype)
+
+    num_tokens, hidden_size = output.shape
+
+    func_name = f"flashinfer_moe_output_memset_inplace_{dtype_suffix}"
+    func = module[func_name]
+
+    func(output.data_ptr(), num_tokens, hidden_size, _get_cuda_stream_ptr())
+
+
 # ============================ moe_sort ============================
 
 
@@ -486,10 +554,10 @@ def moe_sort(
     Example:
         >>> import torch
         >>> from flashinfer.cute_dsl_moe_utils import moe_sort
+        >>> from flashinfer.fused_moe.utils import make_random_topk_ids
         >>>
         >>> num_tokens, num_experts, top_k = 128, 8, 2
-        >>> token_selected_experts = torch.randint(0, num_experts, (num_tokens, top_k),
-        ...                                        dtype=torch.int32, device="cuda")
+        >>> token_selected_experts = make_random_topk_ids(num_experts, num_tokens, top_k, device="cuda")
         >>> token_final_scales = torch.randn(num_tokens, top_k, device="cuda")
         >>>
         >>> (tile_idx_to_expert_idx, tile_idx_to_mn_limit,
@@ -551,39 +619,36 @@ def moe_sort(
 
     if out_expanded_idx_to_permuted_idx is not None:
         expanded_idx_to_permuted_idx = out_expanded_idx_to_permuted_idx
-        # Reset to -1 for masked experts (kernel expects this)
-        expanded_idx_to_permuted_idx.fill_(-1)
     else:
-        expanded_idx_to_permuted_idx = torch.full(
-            (num_tokens, top_k), -1, dtype=torch.int32, device=device
+        expanded_idx_to_permuted_idx = torch.empty(
+            (num_tokens, top_k), dtype=torch.int32, device=device
         )
 
     if out_permuted_idx_to_expanded_idx is not None:
         permuted_idx_to_expanded_idx = out_permuted_idx_to_expanded_idx
-        permuted_idx_to_expanded_idx.zero_()
     else:
-        permuted_idx_to_expanded_idx = torch.zeros(
+        permuted_idx_to_expanded_idx = torch.empty(
             (max_num_permuted_tokens,), dtype=torch.int32, device=device
         )
 
     if out_total_num_padded_tokens is not None:
         total_num_padded_tokens_tensor = out_total_num_padded_tokens
-        total_num_padded_tokens_tensor.zero_()
     else:
-        total_num_padded_tokens_tensor = torch.zeros(
+        total_num_padded_tokens_tensor = torch.empty(
             (1,), dtype=torch.int32, device=device
         )
 
     if out_num_non_exiting_tiles is not None:
         num_non_exiting_tiles = out_num_non_exiting_tiles
-        num_non_exiting_tiles.zero_()
     else:
-        num_non_exiting_tiles = torch.zeros((1,), dtype=torch.int32, device=device)
+        num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    # Allocate expert counts buffer for large token counts (>1024)
-    # Required size: 2 * num_experts
+    # Allocate expert counts buffer for large token counts (>1024).
+    # Required size: 2 * num_experts. The kernel zeros this internally via
+    # launchInitExpertCounts before reading, so no Python-side init is needed
+    # (matching trt-llm's torch::empty allocation pattern).
     if num_tokens > 1024:
-        expert_counts = torch.zeros(
+        expert_counts = torch.empty(
             (2 * num_experts,), dtype=torch.int32, device=device
         )
         expert_counts_ptr = expert_counts.data_ptr()

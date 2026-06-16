@@ -108,7 +108,13 @@ from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
+from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
+from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
+from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
+from .kda_decode import recurrent_kda as recurrent_kda
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
+from . import mhc as mhc
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import layernorm as layernorm
@@ -117,6 +123,16 @@ from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
+from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
+from .norm import (
+    fused_dit_residual_layernorm_scale_shift as fused_dit_residual_layernorm_scale_shift,
+)
+from .norm import (
+    fused_dit_gate_residual_layernorm_scale_shift as fused_dit_gate_residual_layernorm_scale_shift,
+)
+from .norm import (
+    fused_dit_gate_residual_layernorm_gamma_beta as fused_dit_gate_residual_layernorm_gamma_beta,
+)
 
 try:
     from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
@@ -188,3 +204,26 @@ from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
 from .fi_trace import fi_trace as fi_trace
+
+# ---------------------------------------------------------------------------
+# Trace Apply (opt-in): zero-code kernel substitution from the FlashInfer Trace.
+# Activated only when FLASHINFER_TRACE_APPLY=1. This is the single edit to
+# existing flashinfer code required by the Trace Apply design — the package
+# itself lives in flashinfer/trace_apply/. Failures here must never break a
+# normal import, so the install is best-effort.
+# ---------------------------------------------------------------------------
+import os as _os
+
+if _os.environ.get("FLASHINFER_TRACE_APPLY", "0") not in ("0", "", "false", "False"):
+    try:
+        from . import trace_apply as trace_apply
+
+        trace_apply._enable_apply_from_env()
+    except Exception as _trace_apply_err:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger("flashinfer.trace_apply").warning(
+            "FLASHINFER_TRACE_APPLY is set but enabling Trace Apply failed: %s "
+            "(continuing without Trace Apply).",
+            _trace_apply_err,
+        )

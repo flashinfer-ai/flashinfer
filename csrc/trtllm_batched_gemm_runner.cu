@@ -91,9 +91,11 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
   auto const configs = bmm.getBatchedGemmConfigs();
 
   mPassingConfigIndices.clear();
+  auto sm_version = getSMVersion();
 
   for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
-    auto const options = configs[i].mOptions;
+    auto const config = configs[i];
+    auto const options = config.mOptions;
     auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
     // When we include low-latency kernels we can set transposeMmaOutput via constructor
     if (options.mDtypeA == mOptions.dtypeA && options.mDtypeB == mOptions.dtypeB &&
@@ -103,6 +105,26 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
         tileSize == mOptions.tileSize && options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
+      if (mOptions.biasType == batchedGemm::gemm::BiasType::None) {
+        // Prevent accidental fallback to MN bias, we should only fallback to M or N cubins
+        if (options.mBiasType == batchedGemm::gemm::BiasType::Mn) continue;
+      }
+
+      // We can pass nullptr bias to get biasType::None for any bias kernel.
+      // Therefore we only need to validate the bias type if bias is enabled
+      if (mOptions.biasType != batchedGemm::gemm::BiasType::None) {
+        if (options.mBiasType != mOptions.biasType) continue;
+        if (options.mFusedBiasShuffleMode != mOptions.fusedBiasShuffleMode) continue;
+        if (options.mBiasDtype != mOptions.biasDtype) continue;
+      }
+      if (mOptions.usePerTokenScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+      }
+      if (mOptions.usePerChannelScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+      }
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
@@ -111,8 +133,17 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
         continue;
       }
-
+      // if patchF2fp is enabled, sm100f cubins cannot be used for sm103
+      if (options.mPatchF2fp && sm_version == 103) {
+        if (config.mSm != tg::CudaArch::Sm103a) continue;
+      }
+      if (options.mPatchF2fp && sm_version == 100) {
+        if (config.mSm != tg::CudaArch::Sm100a && config.mSm != tg::CudaArch::Sm100f) continue;
+      }
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
+        // Skip cubins with clusterZ > 1 due to correctness issues described in
+        // https://github.com/flashinfer-ai/flashinfer/issues/3197
+        if (options.mClusterDimZ > 1) continue;
         mPassingConfigIndices.push_back(i);
       }
     }
@@ -128,7 +159,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mEltwiseActType: " << (int64_t)mOptions.eltwiseActType
             << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
             << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
-            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;
+            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize
+            << ", mBiasType: " << (int64_t)mOptions.biasType
+            << ", mFusedBiasShuffleMode: " << (int64_t)mOptions.fusedBiasShuffleMode
+            << ", mBiasDtype: " << tg::dtypeToString(mOptions.biasDtype)
+            << ", mUsePerTokenScaling: " << mOptions.usePerTokenScaling
+            << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
@@ -170,8 +206,9 @@ void TrtllmGenBatchedGemmRunner::run(
     float const* scaleGateC, float const* ptrBias, float const* ptrAlpha, float const* ptrBeta,
     float const* ptrClampLimit, void* c, void* outSfC, int32_t const* routeMap,
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
-    int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-    CUstream stream, int device, int32_t configIndex, bool enable_pdl) {
+    int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
+    int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
+    int32_t configIndex, bool enable_pdl) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData{};
@@ -248,6 +285,9 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
   gemmData.mInputBuffers.mPtrNumNonExitingCtas = numNonExitingCtas;
 
+  // Pointer used to gather bias rows when mBiasType == BiasType::Mn
+  gemmData.mInputBuffers.mPtrPermutedIdxToBiasRowIdx = permutedIdxToBiasRowIdx;
+
   // Outputs
   gemmData.mOutputBuffers.mPtrC = c;
   gemmData.mOutputBuffers.mPtrSfC = outSfC;
@@ -282,7 +322,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       /* ptrBeta */ nullptr, /* ptrClampLimit */ nullptr, c, outSfC,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
+      /* numNonExitingCtas */ nullptr, /* permutedIdxToBiasRowIdx */ nullptr, workspace, stream,
+      device, configIndex, enable_pdl);
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -300,7 +341,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       outSfC,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
+      /* numNonExitingCtas */ nullptr, /* permutedIdxToBiasRowIdx */ nullptr, workspace, stream,
+      device, configIndex, enable_pdl);
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -317,7 +359,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       /* outSfC */ nullptr,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
+      /* numNonExitingCtas */ nullptr, /* permutedIdxToBiasRowIdx */ nullptr, workspace, stream,
+      device, configIndex, enable_pdl);
 }
 
 std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(

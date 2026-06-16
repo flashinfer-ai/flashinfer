@@ -122,6 +122,11 @@
       __VA_ARGS__                                          \
       break;                                               \
     }                                                      \
+    case 32: {                                             \
+      constexpr uint32_t CTA_TILE_Q = 32;                  \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
     case 16: {                                             \
       constexpr uint32_t CTA_TILE_Q = 16;                  \
       __VA_ARGS__                                          \
@@ -382,6 +387,12 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
 }
 
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+  if (head_dim >= 512) {
+    if (avg_packed_qo_len <= 32) {
+      return 16;  // decode / short-q (incl. speculative decode): lean CTA16
+    }
+    return 32;  // Long-q prefill use CTA_TILE_Q=32
+  }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;
   } else {
@@ -444,6 +455,22 @@ __forceinline__ __device__ int get_lane_id() {
   int lane_id;
   asm("mov.u32 %0, %%laneid;" : "=r"(lane_id));
   return lane_id;
+}
+
+/*!
+ * \brief Non-atomic global load for short (2 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ short ld_na_global_s16(const short* addr) {
+  short val;
+  asm volatile("ld.global.cs.b16 %0, [%1];" : "=h"(val) : "l"(addr));
+  return val;
+}
+
+/*!
+ * \brief Non-atomic global store for short (2 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ void st_na_global_s16(short* addr, short val) {
+  asm volatile("st.global.cs.b16 [%0], %1;" ::"l"(addr), "h"(val));
 }
 
 /*!

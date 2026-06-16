@@ -22,8 +22,16 @@ class RoutingMethodType(IntEnum):
     SigmoidRenorm = (6,)
     # MiniMax2: Sigmoid + Bias -> TopK -> ScaledSumNormalize (routeScale=1.0, epsilon=1e-20)
     MiniMax2 = (7,)
+    # Sigmoid: Sigmoid -> TopK (no renormalization)
+    Sigmoid = (8,)
     # Unspecified
-    Unspecified = (8,)
+    Unspecified = (9,)
+
+    # Eval-safe repr (``RoutingMethodType.Default`` rather than IntEnum's default
+    # ``<RoutingMethodType.Default: 0>``) so configs that embed this member
+    # round-trip through ``eval(repr(cfg))`` — relied on by the unified MoE API.
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}.{self.name}"
 
 
 # Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
@@ -35,8 +43,23 @@ class ActivationType(IntEnum):
     Geglu = 4
     SwigluBias = 5
     Relu2 = 6
-    Identity = 7
-    InvalidType = 8
+    SwigluStep = 7
+    GegluTanh = 8
+    Identity = 9
+    InvalidType = 10
+
+    # Eval-safe repr — see ``RoutingMethodType.__repr__``.
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}.{self.name}"
+
+    @property
+    def is_gated(self) -> bool:
+        """True for activations that consume a gate branch (SwiGLU family)."""
+        return self in (
+            ActivationType.Swiglu,
+            ActivationType.Geglu,
+            ActivationType.SwigluBias,
+        )
 
 
 class DtypeTrtllmGen(IntEnum):
@@ -92,9 +115,9 @@ def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:
 def deduce_trtllm_gen_tensor_dtype(
     x: torch.Tensor, scale: Optional[torch.Tensor]
 ) -> DtypeTrtllmGen:
-    hidden_size = x.shape[-1]
+    x_numel = x.numel()
     if x.dtype == torch.uint8:  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
-        hidden_size *= 2
+        x_numel *= 2
     if x.dtype == torch.bfloat16:
         dtype = DtypeTrtllmGen.Bfloat16
     elif x.dtype == torch.float8_e4m3fn:
@@ -103,7 +126,7 @@ def deduce_trtllm_gen_tensor_dtype(
         x.dtype == torch.uint8
     ):  # FIXME(siyuan): use torch.float4_e2m1x2 after torch 2.8
         assert scale is not None, "Scale tensor must be provided for float4x2 input"
-        if scale.shape[-1] == hidden_size // 16:
+        if scale.numel() == x_numel // 16:
             dtype = DtypeTrtllmGen.E2m1
         else:
             dtype = DtypeTrtllmGen.MxE2m1
