@@ -313,7 +313,7 @@ try:
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
-# ── GEMM bf16 x fp4: mm_bf16_fp4 (W4A16 weight-only) ────────────────────────
+# ── GEMM bf16 x fp4: mm_bf16_fp4 (weight-only) ──────────────────────────────
 # Blackwell SM100+: M×7168@2048×7168, block=16. b/b_descale shapes are the
 # *prepared* layouts (prepare_bf16_fp4_weights).
 try:

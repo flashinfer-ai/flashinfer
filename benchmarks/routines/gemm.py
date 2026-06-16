@@ -1341,7 +1341,7 @@ _E2M1_VALUES_FP32 = (
 )  # fmt: skip
 
 
-def _dequantize_w4a16_fp4_ref(b, b_descale, alpha, n, k, block_size):
+def _dequantize_bf16_fp4_ref(b, b_descale, alpha, n, k, block_size):
     """PyTorch implementation of swizzled nvfp4 dequantization to fp32."""
     import torch
     from flashinfer.gemm.gemm_bf16_fp4 import _unswizzle_sf_128x4
@@ -1361,7 +1361,7 @@ def _dequantize_w4a16_fp4_ref(b, b_descale, alpha, n, k, block_size):
 
 
 def testMmBf16Fp4(args):
-    """Benchmark mm_bf16_fp4 (bf16 activation x FP4 weight, W4A16).
+    """Benchmark mm_bf16_fp4 (bf16 activation x FP4 weight, bf16 x fp4).
 
     Weights are produced by ``flashinfer.nvfp4_quantize(sfLayout=layout_128x4)``
     -- the same format the new API expects.
@@ -1492,7 +1492,7 @@ def testMmBf16Fp4(args):
 
     ref = None
     if run_refcheck:
-        weight_fp32 = _dequantize_w4a16_fp4_ref(b_fp4, b_sf, alpha, n, k, 16)
+        weight_fp32 = _dequantize_bf16_fp4_ref(b_fp4, b_sf, alpha, n, k, 16)
         ref = (a.float() @ weight_fp32.T).to(out_dtype)
 
     res = []

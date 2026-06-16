@@ -26,7 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""W4A16 dense GEMM for Blackwell (SM100/103/120/121).
+"""bf16 x fp4 dense GEMM for Blackwell (SM100/103/120/121).
 
 Built on top of ``dense_gemm_bf16_blackwell.py`` from cutlass examples at
 https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py
@@ -125,7 +125,7 @@ _PACK_TILE_N: cutlass.Constexpr = 64
 _PACK_INTS_PER_TILE: cutlass.Constexpr = 128  # 128 int32 per (16K x 64N) block
 
 
-class BlackwellDenseGemmW4A16Kernel:
+class BlackwellDenseGemmBf16Fp4Kernel:
     """Warp-MMA dense GEMM for Blackwell, FP4-weight A bf16/fp16 input.
 
     A: (M, K, L) bf16/fp16.
@@ -162,7 +162,7 @@ class BlackwellDenseGemmW4A16Kernel:
         tile_swizzle: int = 1,
         raster_along_m: bool = True,
     ):
-        """W4A16 kernel.
+        """bf16 x fp4 kernel.
 
         Args:
             acc_dtype: accumulator dtype (always Float32 for this kernel).
@@ -201,12 +201,12 @@ class BlackwellDenseGemmW4A16Kernel:
 
         if self.tile_shape_mnk[1] % _PACK_TILE_N != 0:
             raise ValueError(
-                f"W4A16 requires tile_N % {_PACK_TILE_N} == 0 "
+                f"bf16 x fp4 requires tile_N % {_PACK_TILE_N} == 0 "
                 f"(got tile_N={self.tile_shape_mnk[1]})"
             )
         if self.tile_shape_mnk[2] % _PACK_TILE_K != 0:
             raise ValueError(
-                f"W4A16 requires tile_K % {_PACK_TILE_K} == 0 "
+                f"bf16 x fp4 requires tile_K % {_PACK_TILE_K} == 0 "
                 f"(got tile_K={self.tile_shape_mnk[2]})"
             )
 
@@ -1417,7 +1417,7 @@ class BlackwellDenseGemmW4A16Kernel:
         max_active_clusters: cutlass.Constexpr,
         current_stream,
     ):
-        """W4A16 wrapper for the FlashInfer compile interface.
+        """bf16 x fp4 wrapper for the FlashInfer compile interface.
 
         Args:
             mA:        (m, k) input tensor A, bf16 or fp16.

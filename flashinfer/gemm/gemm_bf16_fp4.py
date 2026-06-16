@@ -44,11 +44,11 @@ if CUDNN_AVAILABLE:
     import cudnn
 
 
-# Earliest cuDNN backend version supporting W4A16 GEMM
+# Earliest cuDNN backend version supporting bf16 x fp4 GEMM
 _CUDNN_BF16_FP4_MIN_BACKEND_VERSION = 92301
 
 
-def _check_mm_w4a16_fp4_problem_size(
+def _check_mm_bf16_fp4_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
@@ -78,7 +78,7 @@ def _check_mm_w4a16_fp4_problem_size(
 
 
 @supported_compute_capability([100, 103, 110, 120, 121])
-def _cudnn_w4a16_fp4_requirement(
+def _cudnn_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
@@ -97,7 +97,7 @@ def _cudnn_w4a16_fp4_requirement(
     """
     if b.dtype != torch.uint8:
         raise ValueError(
-            f"cudnn W4A16 expects the uint8 prepared weight from "
+            f"cudnn bf16 x fp4 expects the uint8 prepared weight from "
             f"prepare_bf16_fp4_weights(..., backend='cudnn'); got {b.dtype}."
         )
     _check_cudnn_fp4_availability()
@@ -105,14 +105,14 @@ def _cudnn_w4a16_fp4_requirement(
     backend_version = cudnn.backend_version()
     if backend_version < _CUDNN_BF16_FP4_MIN_BACKEND_VERSION:
         raise ValueError(
-            f"cuDNN W4A16 FP4 GEMM requires backend version >= "
+            f"cuDNN bf16 x fp4 GEMM requires backend version >= "
             f"{_CUDNN_BF16_FP4_MIN_BACKEND_VERSION} (9.23.1), found {backend_version}. "
         )
     return True
 
 
 @supported_compute_capability([100, 103, 110, 120, 121])
-def _cute_dsl_w4a16_fp4_requirement(
+def _cute_dsl_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
@@ -126,7 +126,7 @@ def _cute_dsl_w4a16_fp4_requirement(
 ):
     if b.dtype != torch.int32:
         raise ValueError(
-            f"cute-dsl W4A16 expects the int32 tile-packed weight from "
+            f"cute-dsl bf16 x fp4 expects the int32 tile-packed weight from "
             f"prepare_bf16_fp4_weights(..., backend='cute-dsl'); got {b.dtype}."
         )
     _check_cute_dsl_availability()
@@ -147,7 +147,7 @@ def prepare_bf16_fp4_weights(
     backend: Literal["cudnn", "cute-dsl"],
     block_size: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Prepare FP4 W4A16 weights for a specific backend.
+    """Prepare FP4 weights for the bf16 x fp4 GEMM, for a specific backend.
 
     The caller is expected to start with weights in the canonical format
     that :func:`flashinfer.nvfp4_quantize` produces with
@@ -214,10 +214,10 @@ def prepare_bf16_fp4_weights(
 
 @backend_requirement(
     {
-        "cudnn": _cudnn_w4a16_fp4_requirement,
-        "cute-dsl": _cute_dsl_w4a16_fp4_requirement,
+        "cudnn": _cudnn_bf16_fp4_requirement,
+        "cute-dsl": _cute_dsl_bf16_fp4_requirement,
     },
-    common_check=_check_mm_w4a16_fp4_problem_size,
+    common_check=_check_mm_bf16_fp4_problem_size,
 )
 @flashinfer_api(trace=mm_bf16_fp4_trace_dispatch)
 def mm_bf16_fp4(
@@ -232,14 +232,11 @@ def mm_bf16_fp4(
     block_size: int = 16,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
-    """BF16 x FP4 GEMM (W4A16): ``out = (a @ dequant(b).T) * alpha``.
+    """BF16 x FP4 GEMM: ``out = (a @ dequant(b).T) * alpha``.
 
-    Weight-only quantized GEMM: bf16 activations ``a`` against an FP4
-    (nvfp4) weight that has been prepared for ``backend`` by
-    :func:`prepare_bf16_fp4_weights`.  ``b``, ``b_descale``, and ``alpha``
-    must be the tensors that function returned with the *same* ``backend``;
-    mixing backends (preparing with one, computing with another) is
-    undefined.
+    Intended to support **W4A16** workloads (4-bit weights, 16-bit activations)
+    nvfp4 weights must be prepared for ``backend`` by
+    :func:`prepare_bf16_fp4_weights`.  ``b``, ``b_descale``, and ``alpha``.
 
     Example:
         .. code-block:: python
@@ -328,7 +325,7 @@ def _unswizzle_sf_128x4(sf_swizzled: torch.Tensor, n: int, k_sf: int) -> torch.T
 _OVERRIDE_SHAPE_CACHE_M = 8192
 
 
-def _w4a16_b_descale_layout(batch, n, k, block_size):
+def _bf16_fp4_b_descale_layout(batch, n, k, block_size):
     """Return ``(dim, stride, reordering_type)`` for the B scale-factor tensor."""
     k_sf = k // block_size
     dim = (batch, k_sf, n)
@@ -336,7 +333,7 @@ def _w4a16_b_descale_layout(batch, n, k, block_size):
     return dim, stride, cudnn.tensor_reordering.NONE
 
 
-def _build_w4a16_fp4_graph_common(
+def _build_bf16_fp4_graph_common(
     graph,
     a_cudnn_tensor,
     b_cudnn_tensor,
@@ -389,7 +386,7 @@ def _build_w4a16_fp4_graph_common(
 
 
 @functools.lru_cache(maxsize=1024)
-def build_cudnn_w4a16_fp4_graph(
+def build_cudnn_bf16_fp4_graph(
     batch,
     m,
     n,
@@ -402,7 +399,7 @@ def build_cudnn_w4a16_fp4_graph(
     use_nvfp4,
     policy=None,
 ):
-    """Build a fixed-shape cuDNN W4A16 FP4 GEMM graph (no override-shape)."""
+    """Build a fixed-shape cuDNN bf16 x fp4 GEMM graph (no override-shape)."""
     _check_cudnn_fp4_availability()
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -414,8 +411,8 @@ def build_cudnn_w4a16_fp4_graph(
     # b weight bytes are row-major (N, K); present as column-major (K, N).
     b_shape = (batch, k, n)
     b_stride = (k * n, 1, k)
-    b_descale_shape, b_descale_stride, b_descale_reordering = _w4a16_b_descale_layout(
-        batch, n, k, block_size
+    b_descale_shape, b_descale_stride, b_descale_reordering = (
+        _bf16_fp4_b_descale_layout(batch, n, k, block_size)
     )
 
     stream = torch.cuda.current_stream(device)
@@ -434,7 +431,7 @@ def build_cudnn_w4a16_fp4_graph(
             reordering_type=b_descale_reordering,
         )
 
-        _build_w4a16_fp4_graph_common(
+        _build_bf16_fp4_graph_common(
             graph,
             a_cudnn_tensor,
             b_cudnn_tensor,
@@ -454,7 +451,7 @@ def build_cudnn_w4a16_fp4_graph(
 
 
 @functools.lru_cache(maxsize=1024)
-def build_cudnn_w4a16_fp4_graph_override_shape(
+def build_cudnn_bf16_fp4_graph_override_shape(
     batch,
     n,
     k,
@@ -467,7 +464,7 @@ def build_cudnn_w4a16_fp4_graph_override_shape(
     cache_m: int = _OVERRIDE_SHAPE_CACHE_M,
     policy=None,
 ):
-    """Build a cuDNN W4A16 FP4 GEMM graph with override-shape support."""
+    """Build a cuDNN bf16 x fp4 GEMM graph with override-shape support."""
     _check_cudnn_fp4_availability()
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -478,8 +475,8 @@ def build_cudnn_w4a16_fp4_graph_override_shape(
     a_stride = [cache_m * k, k, 1]
     b_shape = [batch, k, n]
     b_stride = [k * n, 1, k]
-    b_descale_shape, b_descale_stride, b_descale_reordering = _w4a16_b_descale_layout(
-        batch, n, k, block_size
+    b_descale_shape, b_descale_stride, b_descale_reordering = (
+        _bf16_fp4_b_descale_layout(batch, n, k, block_size)
     )
 
     stream = torch.cuda.current_stream(device)
@@ -505,7 +502,7 @@ def build_cudnn_w4a16_fp4_graph_override_shape(
         reordering_type=b_descale_reordering,
     )
 
-    _build_w4a16_fp4_graph_common(
+    _build_bf16_fp4_graph_common(
         graph,
         a_cudnn_tensor,
         b_cudnn_tensor,
@@ -524,7 +521,7 @@ def build_cudnn_w4a16_fp4_graph_override_shape(
     return graph
 
 
-def _w4a16_variant_pack(a, b, b_descale, alpha, out):
+def _bf16_fp4_variant_pack(a, b, b_descale, alpha, out):
     """Build the {uid: tensor} variant pack shared by both execute paths."""
     variant_pack = {
         UIDs.A_UID.value: a,
@@ -537,7 +534,7 @@ def _w4a16_variant_pack(a, b, b_descale, alpha, out):
     return variant_pack
 
 
-def execute_cudnn_w4a16_fp4_graph(
+def execute_cudnn_bf16_fp4_graph(
     graph,
     a,
     b,
@@ -547,7 +544,7 @@ def execute_cudnn_w4a16_fp4_graph(
     workspace_buffer,
     tactic: int = -1,
 ):
-    variant_pack = _w4a16_variant_pack(a, b, b_descale, alpha, out)
+    variant_pack = _bf16_fp4_variant_pack(a, b, b_descale, alpha, out)
 
     workspace_size = _get_cudnn_workspace_size(graph, tactic)
     if workspace_buffer.numel() < workspace_size:
@@ -563,7 +560,7 @@ def execute_cudnn_w4a16_fp4_graph(
         )
 
 
-def execute_cudnn_w4a16_fp4_graph_override_shape(
+def execute_cudnn_bf16_fp4_graph_override_shape(
     graph,
     a,
     b,
@@ -574,7 +571,7 @@ def execute_cudnn_w4a16_fp4_graph_override_shape(
     block_size: int = 16,
     tactic: int = 0,
 ):
-    """Execute the W4A16 graph, overriding A / output to the real M."""
+    """Execute the bf16 x fp4 graph, overriding A / output to the real M."""
     m, k = int(a.shape[0]), int(a.shape[1])
     n = int(b.shape[0])
     batch = 1
@@ -583,13 +580,13 @@ def execute_cudnn_w4a16_fp4_graph_override_shape(
     a_stride = (m * k, k, 1)
     b_shape = (batch, k, n)
     b_stride = (k * n, 1, k)
-    b_descale_shape, b_descale_stride, _ = _w4a16_b_descale_layout(
+    b_descale_shape, b_descale_stride, _ = _bf16_fp4_b_descale_layout(
         batch, n, k, block_size
     )
     out_shape = (batch, m, n)
     out_stride = (m * n, n, 1)
 
-    variant_pack = _w4a16_variant_pack(a, b, b_descale, alpha, out)
+    variant_pack = _bf16_fp4_variant_pack(a, b, b_descale, alpha, out)
 
     override_uids = [
         UIDs.A_UID.value,
@@ -621,7 +618,7 @@ def execute_cudnn_w4a16_fp4_graph_override_shape(
 
 
 # Autotuner sweeps M (token count) of the bf16 activation ``a``
-_W4A16_FP4_TUNING_CONFIG = TuningConfig(
+_BF16_FP4_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -640,13 +637,13 @@ _W4A16_FP4_TUNING_CONFIG = TuningConfig(
 )
 
 
-def _cudnn_w4a16_fp4_runner(tuning_config):
-    """Build a ``CudnnW4a16Fp4Runner`` bound to the active tuning config."""
+def _cudnn_bf16_fp4_runner(tuning_config):
+    """Build a ``CudnnBf16Fp4Runner`` bound to the active tuning config."""
     m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
         tuning_config, spec_idx=0
     )
 
-    class CudnnW4a16Fp4Runner(TunableRunner):
+    class CudnnBf16Fp4Runner(TunableRunner):
         def __init__(self):
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
@@ -660,7 +657,7 @@ def _cudnn_w4a16_fp4_runner(tuning_config):
             actual_m, k = int(a.shape[0]), int(a.shape[1])
             n = int(b.shape[0])
             cache_m = self._m_bucket_mapper(actual_m)
-            return build_cudnn_w4a16_fp4_graph_override_shape(
+            return build_cudnn_bf16_fp4_graph_override_shape(
                 batch=1,
                 n=n,
                 k=k,
@@ -695,7 +692,7 @@ def _cudnn_w4a16_fp4_runner(tuning_config):
                     a, b, alpha, out_dtype, block_size, use_nvfp4
                 )
             else:
-                graph = build_cudnn_w4a16_fp4_graph(
+                graph = build_cudnn_bf16_fp4_graph(
                     batch=1,
                     m=int(a.shape[0]),
                     n=int(b.shape[0]),
@@ -732,7 +729,7 @@ def _cudnn_w4a16_fp4_runner(tuning_config):
                 graph = self._get_override_graph(
                     a, b, alpha, out_dtype, block_size, use_nvfp4
                 )
-                execute_cudnn_w4a16_fp4_graph_override_shape(
+                execute_cudnn_bf16_fp4_graph_override_shape(
                     graph,
                     a,
                     b,
@@ -744,7 +741,7 @@ def _cudnn_w4a16_fp4_runner(tuning_config):
                     tactic=max(tactic, 0),
                 )
             else:
-                graph = build_cudnn_w4a16_fp4_graph(
+                graph = build_cudnn_bf16_fp4_graph(
                     batch=1,
                     m=int(a.shape[0]),
                     n=int(b.shape[0]),
@@ -757,7 +754,7 @@ def _cudnn_w4a16_fp4_runner(tuning_config):
                     use_nvfp4=use_nvfp4,
                     policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
                 )
-                execute_cudnn_w4a16_fp4_graph(
+                execute_cudnn_bf16_fp4_graph(
                     graph,
                     a,
                     b,
@@ -769,7 +766,7 @@ def _cudnn_w4a16_fp4_runner(tuning_config):
                 )
             return out
 
-    return CudnnW4a16Fp4Runner()
+    return CudnnBf16Fp4Runner()
 
 
 def _prepare_cudnn(
@@ -782,7 +779,7 @@ def _prepare_cudnn(
 
     The weight bytes ``(N, K//2)`` are already in the layout the cuDNN graph
     consumes (see the module banner).  The scale factor, however, must be
-    *non-swizzled* for the cuDNN W4A16 path (cuDNN does not support the
+    *non-swizzled* for the cuDNN bf16 x fp4 path (cuDNN does not support the
     128x4-swizzled SF layout), so we unswizzle the canonical 128x4 SF into a
     linear ``(N, K // block_size)`` FP8-E4M3 tensor.
     """
@@ -823,12 +820,12 @@ def _compute_cudnn(
             raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
 
     workspace_buffer = _get_cache_buf(
-        "mm_w4a16_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        "mm_bf16_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
-    tuning_config = _W4A16_FP4_TUNING_CONFIG
+    tuning_config = _BF16_FP4_TUNING_CONFIG
     tuner = AutoTuner.get()
-    runner = _cudnn_w4a16_fp4_runner(tuning_config)
+    runner = _cudnn_bf16_fp4_runner(tuning_config)
 
     use_nvfp4 = True
     inputs = [
@@ -843,7 +840,7 @@ def _compute_cudnn(
         workspace_buffer,
     ]
     chosen_runner, tactic = tuner.choose_one(
-        "w4a16_fp4_gemm",
+        "bf16_fp4_gemm",
         [runner],
         tuning_config,
         inputs,
@@ -856,10 +853,10 @@ def _compute_cudnn(
 # cute-DSL backend
 # =============================================================================
 
-_W4A16_ALPHA_ONE_CACHE: dict = {}
+_BF16_FP4_ALPHA_ONE_CACHE: dict = {}
 
 
-def _prepare_w4a16_alpha(
+def _prepare_bf16_fp4_alpha(
     alpha: Optional[torch.Tensor], device: torch.device
 ) -> torch.Tensor:
     """Normalize ``alpha`` to a ``(1,) float32`` tensor for the kernel.
@@ -868,20 +865,20 @@ def _prepare_w4a16_alpha(
     scalar so the hot path doesn't allocate.
     """
     if alpha is None:
-        cached = _W4A16_ALPHA_ONE_CACHE.get(device)
+        cached = _BF16_FP4_ALPHA_ONE_CACHE.get(device)
         if cached is None:
             cached = torch.tensor([1.0], dtype=torch.float32, device=device)
-            _W4A16_ALPHA_ONE_CACHE[device] = cached
+            _BF16_FP4_ALPHA_ONE_CACHE[device] = cached
         return cached
     if alpha.dim() == 0:
         return alpha.to(device=device, dtype=torch.float32).unsqueeze(0)
     return alpha.to(device=device, dtype=torch.float32).reshape(1)
 
 
-def _select_w4a16_tile_shape(
+def _select_bf16_fp4_tile_shape(
     m: int, n: int, k: int
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
-    """Pick a CTA tile shape AND MMA atom_layout for the cute-DSL W4A16 kernel.
+    """Pick a CTA tile shape AND MMA atom_layout for the cute-DSL bf16 x fp4 kernel.
 
     Returns ``(tile_shape_mnk, atom_layout)``.
 
@@ -916,10 +913,10 @@ def _select_w4a16_tile_shape(
     return ((64, 64, tile_k), (2, 2, 1))
 
 
-_CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE: dict = {}
+_CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE: dict = {}
 
 
-def _get_cute_dsl_w4a16_gemm(
+def _get_cute_dsl_bf16_fp4_gemm(
     tile_shape_mnk: Tuple[int, int, int],
     a_dtype: torch.dtype,
     c_dtype: torch.dtype,
@@ -945,7 +942,7 @@ def _get_cute_dsl_w4a16_gemm(
         enable_pdl,
         tile_swizzle,
     )
-    cached = _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE.get(cache_key)
+    cached = _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -956,7 +953,7 @@ def _get_cute_dsl_w4a16_gemm(
     from flashinfer.cute_dsl.utils import get_max_active_clusters
 
     from .kernels.dense_gemm_bf16_fp4_blackwell import (
-        BlackwellDenseGemmW4A16Kernel,
+        BlackwellDenseGemmBf16Fp4Kernel,
     )
 
     a_cutlass_dtype = getattr(cutlass, _TORCH_TO_CUTLASS_DTYPE_ATTR[a_dtype])
@@ -988,7 +985,7 @@ def _get_cute_dsl_w4a16_gemm(
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    gemm = BlackwellDenseGemmW4A16Kernel(
+    gemm = BlackwellDenseGemmBf16Fp4Kernel(
         acc_dtype=cutlass.Float32,
         tile_shape_mnk=tile_shape_mnk,
         atom_layout=atom_layout,
@@ -1012,7 +1009,7 @@ def _get_cute_dsl_w4a16_gemm(
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
-    _CUTE_DSL_MM_FP4_W4A16_KERNEL_CACHE[cache_key] = compiled
+    _CUTE_DSL_MM_BF16_FP4_KERNEL_CACHE[cache_key] = compiled
     return compiled
 
 
@@ -1035,7 +1032,7 @@ _CUTE_DSL_PACK_INTS_PER_TILE: int = 128  # int32s per (16K x 64N) repack block
 
 
 def _cute_dsl_pack_fp4_weight(b: torch.Tensor) -> torch.Tensor:
-    """Repack a packed FP4 weight for the W4A16 cute-DSL kernel."""
+    """Repack a packed FP4 weight for the bf16 x fp4 cute-DSL kernel."""
     if b.dtype != torch.uint8:
         b = b.view(torch.uint8)
 
@@ -1128,7 +1125,7 @@ def _prepare_cute_dsl(
 # =============================================================================
 
 
-def _w4a16_cute_dsl_tactic_configs(
+def _bf16_fp4_cute_dsl_tactic_configs(
     n: int, k: int
 ) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int], int, int, int]]:
     """Enumerate cute-DSL tactic configs for a given ``(N, K)``.
@@ -1194,7 +1191,7 @@ def _w4a16_cute_dsl_tactic_configs(
     return configs
 
 
-_W4A16_CUTE_DSL_TUNING_CONFIG = TuningConfig(
+_BF16_FP4_CUTE_DSL_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -1213,10 +1210,10 @@ _W4A16_CUTE_DSL_TUNING_CONFIG = TuningConfig(
 )
 
 
-def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
-    """Build a ``CuteDslW4a16Fp4Runner`` for the cute-DSL W4A16 GEMM."""
+def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
+    """Build a ``CuteDslBf16Fp4Runner`` for the cute-DSL bf16 x fp4 GEMM."""
 
-    class CuteDslW4a16Fp4Runner(TunableRunner):
+    class CuteDslBf16Fp4Runner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             a, b, _, _, out_dtype, _, block_size = inputs
             n = int(b.shape[1]) // 2
@@ -1231,7 +1228,7 @@ def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             _, b, _, _, _, _, block_size = inputs
             n = int(b.shape[1]) // 2
             k = int(b.shape[0]) * int(block_size)
-            return list(range(len(_w4a16_cute_dsl_tactic_configs(n, k))))
+            return list(range(len(_bf16_fp4_cute_dsl_tactic_configs(n, k))))
 
         def forward(
             self,
@@ -1246,7 +1243,7 @@ def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             m = int(a.shape[0])
             if tactic < 0:
                 # Fallback == pre-autotuner heuristic (M-aware), default knobs.
-                tile_shape_mnk, atom_layout = _select_w4a16_tile_shape(m, n, k)
+                tile_shape_mnk, atom_layout = _select_bf16_fp4_tile_shape(m, n, k)
                 pipeline_depth, use_fp16_mma, tile_swizzle = 1, 1, 1
             else:
                 (
@@ -1255,8 +1252,8 @@ def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     pipeline_depth,
                     use_fp16_mma,
                     tile_swizzle,
-                ) = _w4a16_cute_dsl_tactic_configs(n, k)[tactic]
-            compiled = _get_cute_dsl_w4a16_gemm(
+                ) = _bf16_fp4_cute_dsl_tactic_configs(n, k)[tactic]
+            compiled = _get_cute_dsl_bf16_fp4_gemm(
                 tile_shape_mnk,
                 a.dtype,
                 out_dtype,
@@ -1269,7 +1266,7 @@ def _cute_dsl_w4a16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             compiled(a, b, b_sf_u8, out, alpha_for_launch)
             return out
 
-    return CuteDslW4a16Fp4Runner()
+    return CuteDslBf16Fp4Runner()
 
 
 def _compute_cute_dsl(
@@ -1319,15 +1316,15 @@ def _compute_cute_dsl(
             raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
 
     b_sf_u8 = b_descale.view(torch.uint8).contiguous()
-    alpha_for_launch = _prepare_w4a16_alpha(alpha, a.device)
+    alpha_for_launch = _prepare_bf16_fp4_alpha(alpha, a.device)
 
     tuner = AutoTuner.get()
-    runner = _cute_dsl_w4a16_fp4_runner(enable_pdl=enable_pdl)
+    runner = _cute_dsl_bf16_fp4_runner(enable_pdl=enable_pdl)
     inputs = [a, b, b_sf_u8, alpha_for_launch, out_dtype, out, block_size]
     chosen_runner, tactic = tuner.choose_one(
-        "w4a16_fp4_cute_dsl_gemm",
+        "bf16_fp4_cute_dsl_gemm",
         [runner],
-        _W4A16_CUTE_DSL_TUNING_CONFIG,
+        _BF16_FP4_CUTE_DSL_TUNING_CONFIG,
         inputs,
     )
     chosen_runner(inputs=inputs, tactic=tactic)

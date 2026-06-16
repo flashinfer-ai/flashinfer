@@ -468,7 +468,7 @@ mm_fp4_trace = TraceTemplate(
 )
 
 
-# ── BF16 x FP4 GEMM (mm_bf16_fp4, W4A16 weight-only) ───────────────────────────
+# ── BF16 x FP4 GEMM (mm_bf16_fp4, weight-only) ──────────────────────────────
 #
 # ``mm_bf16_fp4`` consumes *prepared* weights whose layout is
 # backend-specific (see ``flashinfer.prepare_bf16_fp4_weights``), so each
@@ -482,8 +482,8 @@ _E2M1_VALUES = (
 )  # fmt: skip
 
 
-def _w4a16_matmul(a, weight_kn, alpha):
-    """Final fp32 matmul shared by both W4A16 references.
+def _bf16_fp4_matmul(a, weight_kn, alpha):
+    """Final fp32 matmul shared by both bf16 x fp4 references.
 
     ``weight_kn`` is the dequantized fp32 weight in (K, N) layout.
     """
@@ -504,7 +504,7 @@ def _mm_bf16_fp4_cudnn_reference(a, b, b_descale, alpha=None, block_size=16):
     b_int = b.to(torch.int64)
     codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
     sf = b_descale.to(torch.float32).repeat_interleave(block_size, dim=1)
-    return _w4a16_matmul(a, (lut[codes] * sf).T, alpha)
+    return _bf16_fp4_matmul(a, (lut[codes] * sf).T, alpha)
 
 
 def _mm_bf16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16):
@@ -560,7 +560,7 @@ def _mm_bf16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16):
         .to(torch.float32)
         .repeat_interleave(block_size, dim=0)
     )
-    return _w4a16_matmul(a, lut[codes] * sf, alpha)
+    return _bf16_fp4_matmul(a, lut[codes] * sf, alpha)
 
 
 def _mm_bf16_fp4_cudnn_init(
@@ -674,7 +674,7 @@ mm_bf16_fp4_cudnn_trace = TraceTemplate(
     op_type="gemm_bf16_fp4",
     name_prefix="mm_bf16_fp4_cudnn",
     description=(
-        "W4A16 GEMM C = (A @ dequant(B).T) * alpha, cuDNN-prepared weights. "
+        "bf16 x fp4 GEMM C = (A @ dequant(B).T) * alpha, cuDNN-prepared weights. "
         "A is bf16; B is fp4 (e2m1fn_x2 packed as uint8) with fp8-e4m3 "
         "per-block scales in linear [N, K//block_size] layout."
     ),
@@ -715,7 +715,7 @@ mm_bf16_fp4_cute_dsl_trace = TraceTemplate(
     op_type="gemm_bf16_fp4",
     name_prefix="mm_bf16_fp4_cute_dsl",
     description=(
-        "W4A16 GEMM C = (A @ dequant(B).T) * alpha, cute-DSL-prepared weights. "
+        "bf16 x fp4 GEMM C = (A @ dequant(B).T) * alpha, cute-DSL-prepared weights. "
         "A is bf16; B is fp4 repacked into (16K x 64N) MMA tiles as int32 "
         "[K//16, N*2] with S0E5M3 per-block scales [K//block_size, N]."
     ),

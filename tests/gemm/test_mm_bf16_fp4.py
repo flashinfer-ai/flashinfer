@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the BF16 x FP4 (W4A16) GEMM API ``mm_bf16_fp4``."""
+"""Tests for the BF16 x FP4 GEMM API ``mm_bf16_fp4``."""
 
 import pytest
 import torch
@@ -23,7 +23,7 @@ _E2M1_VALUES_FP32 = (
 )  # fmt: skip
 
 
-def _dequantize_w4a16_fp4_torch(b, b_descale, alpha, n, k, block_size):
+def _dequantize_bf16_fp4_torch(b, b_descale, alpha, n, k, block_size):
     """PyTorch implementation of swizzled nvfp4 dequantization to fp32."""
     device = b.device
     k_sf = k // block_size
@@ -63,13 +63,13 @@ def _skip_if_backend_unavailable(backend: str) -> None:
             pytest.skip("cuDNN not available")
         if cudnn.backend_version() < _CUDNN_BF16_FP4_MIN_BACKEND_VERSION:
             pytest.skip(
-                f"cuDNN W4A16 needs backend >= {_CUDNN_BF16_FP4_MIN_BACKEND_VERSION}, "
+                f"cuDNN bf16 x fp4 needs backend >= {_CUDNN_BF16_FP4_MIN_BACKEND_VERSION}, "
                 f"found {cudnn.backend_version()}"
             )
 
 
 def _skip_if_compute_capability_unsupported() -> None:
-    """Skip the current test if no W4A16 backend supports this device."""
+    """Skip the current test if no bf16 x fp4 backend supports this device."""
     cc = get_compute_capability(torch.device("cuda"))
     cc_number = cc[0] * 10 + cc[1]
     if not mm_bf16_fp4.is_backend_supported("cudnn", cc_number):
@@ -214,7 +214,7 @@ def test_backend_matches_handwritten_dequant_matmul(auto_tuning, backend, m, n, 
     with autotune(auto_tuning):
         out = mm_bf16_fp4(a, b_p, sf_p, alpha_p, backend=backend)
 
-    weight_fp32 = _dequantize_w4a16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+    weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
     ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
 
     _assert_close_to_reference(out, ref, backend)
