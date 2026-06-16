@@ -61,8 +61,23 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
       __VA_ARGS__;                                  \
       break;                                        \
     }                                               \
+    case 18: {                                      \
+      constexpr int TOP_K = 18;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
     case 16: {                                      \
       constexpr int TOP_K = 16;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
+    case 14: {                                      \
+      constexpr int TOP_K = 14;                     \
+      __VA_ARGS__;                                  \
+      break;                                        \
+    }                                               \
+    case 12: {                                      \
+      constexpr int TOP_K = 12;                     \
       __VA_ARGS__;                                  \
       break;                                        \
     }                                               \
@@ -187,18 +202,33 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
 // Helper Functions for Expert-to-Rank Mapping
 // ============================================================================
 
-__device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank) {
-  // Compute which rank owns a given expert using contiguous partitioning
-  // Experts are divided evenly across EP ranks:
-  // - Rank 0 gets experts [0, num_experts_per_rank)
-  // - Rank 1 gets experts [num_experts_per_rank, 2*num_experts_per_rank)
-  // - etc.
-  // Example: 32 experts, 4 ranks -> 8 experts per rank
-  // - Rank 0: experts 0-7
-  // - Rank 1: experts 8-15
-  // - Rank 2: experts 16-23
-  // - Rank 3: experts 24-31
-  return expert_id / num_experts_per_rank;
+// Compute which rank owns a given expert using contiguous ceil/floor partitioning.
+// Supports non-divisible distribution when num_experts % ep_size != 0:
+//   base      = num_experts / ep_size
+//   remainder = num_experts % ep_size
+//   - Ranks [0, remainder) each own (base + 1) experts.
+//   - Ranks [remainder, ep_size) each own base experts.
+//
+// Example A (uniform): 32 experts, 4 ranks -> base=8, remainder=0
+//   - Rank 0: experts 0-7, Rank 1: 8-15, Rank 2: 16-23, Rank 3: 24-31
+// Example B (non-divisible): 384 experts, 5 ranks -> base=76, remainder=4
+//   - Ranks 0-3: 77 experts each, Rank 4: 76 experts
+//
+// base and remainder are precomputed by the caller once outside the per-token TOP_K loop
+// so the hot path performs at most one integer divide.
+__device__ __forceinline__ int compute_target_rank_id(int expert_id, int base, int remainder) {
+  // Fast path for the uniform (num_experts % ep_size == 0) case: identical to the
+  // pre-ceil/floor implementation, so existing divisible deployments incur no overhead.
+  if (remainder == 0) {
+    return expert_id / base;
+  }
+  int const split = remainder * (base + 1);  // boundary expert id
+  if (expert_id < split) {
+    // Falls inside the (base + 1)-sized prefix block.
+    return expert_id / (base + 1);
+  }
+  // Falls inside the base-sized suffix block.
+  return remainder + (expert_id - split) / base;
 }
 
 // ============================================================================
@@ -335,7 +365,7 @@ __global__ void moeA2ADispatchKernel(
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
-    int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank, bool enable_pdl) {
+    int local_num_tokens, int rank_id, int ep_size, int num_experts, bool enable_pdl) {
   int thread_idx = threadIdx.x;
   int local_token_idx = blockIdx.x;
 
@@ -361,10 +391,15 @@ __global__ void moeA2ADispatchKernel(
     int* smem_topk_send_indices = smem + TOP_K;
 
     uint64_t already_copied = 0;
+    // Precompute the ceil/floor partition parameters once per thread, outside the
+    // per-token TOP_K loop.  The fast path (remainder == 0) then collapses to a single
+    // integer divide per call, matching the pre-PR uniform-partition cost exactly.
+    int const ep_base = num_experts / ep_size;
+    int const ep_remainder = num_experts - ep_base * ep_size;  // == num_experts % ep_size
     for (int k = 0; k < TOP_K; k++) {
       int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-      // Use contiguous partitioning to determine target rank
-      int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+      // Use contiguous ceil/floor partitioning (supports non-divisible num_experts % ep_size).
+      int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
 
       if (already_copied & (1ULL << target_rank)) {
         if (thread_idx == 0) {
@@ -556,7 +591,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                              kBlockSize, shared_bytes, params.stream, params.token_selected_experts,
                              kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
                              params.local_num_tokens, params.ep_rank, params.ep_size,
-                             params.num_experts_per_rank, params.enable_pdl);
+                             params.num_experts, params.enable_pdl);
   })
 }
 

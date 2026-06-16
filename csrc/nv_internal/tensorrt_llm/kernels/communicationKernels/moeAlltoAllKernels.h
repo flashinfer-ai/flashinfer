@@ -80,9 +80,9 @@ struct MoeA2ADispatchParams {
   bool enable_pdl;  // True: launch with programmatic dependent launch
 
   // EP configuration
-  int ep_size;               // Number of EP ranks
-  int ep_rank;               // Current EP rank
-  int num_experts_per_rank;  // Number of experts per rank (num_experts / ep_size)
+  int ep_size;      // Number of EP ranks
+  int ep_rank;      // Current EP rank
+  int num_experts;  // Total number of experts (supports non-divisible num_experts % ep_size)
 
   // Token configuration
   int local_num_tokens;     // Number of tokens on this rank

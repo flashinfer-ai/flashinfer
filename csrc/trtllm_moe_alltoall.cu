@@ -157,8 +157,8 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
   TVM_FFI_ICHECK_EQ(workspace.size(0), epSize);
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize);
   TVM_FFI_ICHECK(runtimeMaxTokensPerRank > 0);
-  TVM_FFI_ICHECK(numExperts >= epSize && numExperts % epSize == 0)
-      << "num_experts must be divisible by ep_size";
+  // Non-divisible num_experts % ep_size is supported via ceil/floor expert-to-rank partitioning.
+  TVM_FFI_ICHECK(numExperts >= epSize) << "num_experts must be >= ep_size";
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
 
   // Calculate payload descriptors and sizes from input tensors
@@ -199,7 +199,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
   params.enable_pdl = enablePdl;
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
-  params.num_experts_per_rank = static_cast<int>(numExperts / epSize);
+  params.num_experts = static_cast<int>(numExperts);
   params.local_num_tokens = localNumTokens;
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
