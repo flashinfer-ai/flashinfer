@@ -153,18 +153,11 @@ def _mm_mxfp8_reference(A, B, a_descale, b_descale):
 
 
 def _mm_fp4_reference(A, B, a_descale, b_descale, block_size=16):
-    """Dequantize FP4 inputs and compute C = A @ B.
-
-    A and B are fp4 e2m1fn values packed two-per-byte as uint8.
-    a_descale: [M, K//block_size], b_descale: [K, N//block_size].
-    The reference unpacks the nibbles and applies the block scales.
-    """
+    """Dequantize FP4 inputs and compute C = A @ B."""
 
     def _unpack_fp4(packed, rows, cols):
-        # Each byte holds two fp4 nibbles (low nibble = first element).
         lo = (packed & 0x0F).to(torch.float32)
         hi = ((packed >> 4) & 0x0F).to(torch.float32)
-        # Interleave low/high nibbles along the last dimension.
         out = torch.stack([lo, hi], dim=-1).reshape(rows, cols)
         return out
 
@@ -475,7 +468,7 @@ mm_fp4_trace = TraceTemplate(
 # backend gets its own template and ``mm_fp4``'s ``trace=`` is a dispatch
 # callable (same pattern as the trtllm MoE routing templates).
 
-# E2M1 nibble value table (low 3 bits magnitude, bit 3 sign).
+# E2M1 value table (low 3 bits magnitude, bit 3 sign).
 _E2M1_VALUES = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -495,7 +488,7 @@ def _bf16_fp4_matmul(a, weight_kn, alpha):
 def _mm_bf16_fp4_cudnn_reference(a, b, b_descale, alpha=None, block_size=16):
     """Reference for the cuDNN-prepared layout.
 
-    b: [N, K//2] uint8, two FP4 codes per byte (low nibble = even K).
+    b: [N, K//2] uint8, two FP4 codes per byte.
     b_descale: [N, K//block_size] float8_e4m3fn per-block scales (linear).
     """
     n, k_half = b.shape
@@ -512,7 +505,7 @@ def _mm_bf16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16):
 
     b: [K//16, N*2] int32 -- FP4 bytes permuted into (16K x 64N) MMA tiles
     of 128 int32 each (inverts
-    ``flashinfer.gemm.gemm_bf16_fp4._cute_dsl_pack_fp4_weight``).
+    ``flashinfer.gemm.gemm_bf16_fp4_cute_dsl._cute_dsl_pack_fp4_weight``).
     b_descale: [K//block_size, N] uint8 -- S0E5M3 per-block scales
     (fp16 value = byte << 7 reinterpreted as fp16 bits).
     """
