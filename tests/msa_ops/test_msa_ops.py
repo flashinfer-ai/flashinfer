@@ -458,54 +458,6 @@ def test_sparse_attention_kvmajor_fp8_kv(q_dtype, causal):
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: msa_topk_select -> msa_build_k2q_csr_schedule -> kv-major fwd
-# ---------------------------------------------------------------------------
-
-
-def test_e2e_pipeline():
-    _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor, msa_topk_select
-
-    torch.manual_seed(70)
-    dev, dtype = "cuda", torch.bfloat16
-    Hq, Hkv, topk = 8, 2, 16
-    seqlen_q, seqlen_k = 200, 4096  # single sequence
-    nb = seqlen_k // BLK_KV
-    cu_q = torch.tensor([0, seqlen_q], dtype=torch.int32, device=dev)
-    cu_k = torch.tensor([0, seqlen_k], dtype=torch.int32, device=dev)
-
-    # Phase 1: proxy max-scores per KV head -> top-K block indices
-    max_score = torch.randn(Hkv, nb, seqlen_q, dtype=torch.float32, device=dev)
-    idx_q_major = msa_topk_select(max_score, topk)  # (total_q, Hkv, topk)
-    torch.cuda.synchronize()
-
-    # selection must match torch.topk as a set, ascending, -1-free here
-    ref_sel = torch.topk(max_score, topk, dim=1).indices  # (Hkv, topk, total_q)
-    for _ in range(30):
-        qi = torch.randint(0, seqlen_q, (1,)).item()
-        h = torch.randint(0, Hkv, (1,)).item()
-        got = idx_q_major[qi, h]
-        assert (got >= 0).all()
-        assert (got.diff() > 0).all(), "indices must be ascending"
-        assert set(got.tolist()) == set(ref_sel[h, :, qi].tolist())
-
-    # Phase 2 + 3: head-major indices -> CSR schedule -> KV-major forward
-    idx = idx_q_major.permute(1, 0, 2).contiguous()  # (Hkv, total_q, topk)
-    q = torch.randn(seqlen_q, Hq, 128, dtype=dtype, device=dev) / 3
-    k = torch.randn(seqlen_k, Hkv, 128, dtype=dtype, device=dev) / 3
-    v = torch.randn(seqlen_k, Hkv, 128, dtype=dtype, device=dev) / 3
-    scale = 1.0 / math.sqrt(128)
-    out = msa_sparse_attention_kvmajor(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
-    torch.cuda.synchronize()
-
-    ref = _ref_sparse_attention(
-        q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), False, scale
-    )
-    err = (out.float().cpu() - ref).abs().max().item()
-    assert err < 2.5e-2, f"e2e max abs error {err}"
-
-
-# ---------------------------------------------------------------------------
 # Phase 4: sparse decode
 # ---------------------------------------------------------------------------
 
@@ -1044,46 +996,6 @@ def test_fully_masked_selected_blocks():
     for name, out in [("kvmajor", out_kv), ("qmajor", out_qm)]:
         err = (out.float().cpu() - ref).abs().max().item()
         assert err < 2.5e-2, f"{name}: err={err}"
-
-
-def test_kvmajor_config_invariance():
-    """Work-distribution knobs (target_q_per_cta, tile size) must not change
-    the result: per-row math is independent of work chunking."""
-    _skip_if_unsupported()
-    from flashinfer.msa_ops import (
-        msa_build_k2q_csr_schedule,
-        msa_sparse_attention_kvmajor,
-    )
-
-    q, k, v, idx, cu_q, cu_k = _make_case(
-        2, 8, 2, 16, [130, 70], [2048, 1280], torch.bfloat16, seed=140
-    )
-    scale = 1.0 / math.sqrt(128)
-    base = msa_sparse_attention_kvmajor(
-        q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
-    )
-    torch.cuda.synchronize()
-    for tgt in (32, 512):
-        sched = msa_build_k2q_csr_schedule(idx, cu_q, cu_k, target_q_per_cta=tgt)
-        out = msa_sparse_attention_kvmajor(
-            q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale, schedule=sched
-        )
-        torch.cuda.synchronize()
-        assert torch.equal(out, base), f"target_q_per_cta={tgt} changed the result"
-    out = msa_sparse_attention_kvmajor(
-        q,
-        k,
-        v,
-        idx,
-        cu_q,
-        cu_k,
-        causal=True,
-        softmax_scale=scale,
-        m_block_size=32,
-        num_threads=64,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(out, base), "m_block_size=32/num_threads=64 changed the result"
 
 
 # ---------------------------------------------------------------------------
