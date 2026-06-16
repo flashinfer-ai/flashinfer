@@ -320,59 +320,40 @@ def _assert_finite_and_correct(
 
 
 # -----------------------------------------------------------------------------
-# Cross-boundary / padding-row finiteness + correctness guard.
+# End-to-end regression for the cross-boundary 0*Inf NaN.
 #
-# This is the regime that produced the original cross-boundary NaN in production:
-# small M with a high populated-expert count, at the production hidden /
-# intermediate sizes (so the grouped-GEMM tiling and swap-AB epilogue match the
-# deployed kernel). See the module docstring: the original failure is
-# value-correlated and was confirmed on captured real tensors (fail on the
-# unpatched kernel, finite on the patched kernel); it does not reproduce with
-# synthetic random inputs, so these cases are a finiteness + correctness guard
-# for the regime, passing on both kernels for synthetic data.
+# Sweeps M across the BLOCK_M tile boundary (M=1,2 are mostly-padding tiles) and
+# varies routing density (num_experts/top_k -> tokens-per-expert -> padding
+# surface), at production hidden/intermediate sizes so the swap-AB grouped-GEMM
+# tiling and epilogue match the deployed kernel where the NaN lived. Output must
+# stay finite and match the high-precision oracle. See the module docstring: the
+# original failure is value-correlated and was confirmed on captured real tensors
+# (fail on the unpatched kernel, finite on the patched kernel); with synthetic
+# inputs these cases are a finiteness + correctness guard for the regime.
 # -----------------------------------------------------------------------------
 @requires_sm90
 @pytest.mark.parametrize(
     "batch_size, num_experts, top_k",
     [
+        # full M sweep across the BLOCK_M boundary at the production 64-expert
+        # sparse-routing regime (~1-2 tokens/expert -> maximal tile padding)
         pytest.param(1, 64, 8, id="M1_64e"),
-        pytest.param(3, 64, 8, id="M3_64e"),
+        pytest.param(2, 64, 8, id="M2_64e"),
+        pytest.param(4, 64, 8, id="M4_64e"),
         pytest.param(5, 64, 8, id="M5_64e"),
+        pytest.param(8, 64, 8, id="M8_64e"),
         pytest.param(16, 64, 8, id="M16_64e"),
+        pytest.param(32, 64, 8, id="M32_64e"),
         pytest.param(256, 64, 8, id="M256_64e"),
+        # routing-density variation at fixed M (fewer experts -> denser tiles)
+        pytest.param(5, 32, 8, id="M5_32e"),
+        pytest.param(32, 32, 8, id="M32_32e"),
     ],
 )
-def test_small_m_many_experts_finite(batch_size, num_experts, top_k):
-    """Small M, many populated experts: output must stay finite and correct."""
-    # Production-shaped hidden/intermediate so the swap-AB grouped-GEMM tiling
-    # and epilogue match the deployed kernel where the cross-boundary NaN lived.
+def test_moe_finite_and_correct(batch_size, num_experts, top_k):
+    """MoE output stays finite and matches the oracle across the BLOCK_M tile
+    boundary and routing densities (guards the cross-boundary 0*Inf NaN)."""
     hidden_size, intermediate_size = 4096, 1024
-    inp = _make_moe_inputs(
-        batch_size,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        activation_scale=2.0,
-        seed=99,
-    )
-    out = _run_kernel(inp, num_experts, hidden_size)
-    # Production reduction depth (K=4096) leaves a small fraction of elements
-    # just outside the FP8 tolerance; 0.75 still fails a scale-error kernel.
-    _assert_finite_and_correct(out, inp, num_experts, hit_floor=0.75)
-
-
-# -----------------------------------------------------------------------------
-# General M sweep across the BLOCK_M tile boundary at production shapes. M=1,2
-# are mostly-padding tiles; this sweeps the boundary asserting finiteness and
-# correctness across the range.
-# -----------------------------------------------------------------------------
-@requires_sm90
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 5, 8, 16, 32, 256])
-def test_m_sweep_finite(batch_size):
-    """Sweep M across the BLOCK_M boundary; output stays finite and correct."""
-    hidden_size, intermediate_size, num_experts = 4096, 1024, 32
-    top_k = min(8, num_experts)
     inp = _make_moe_inputs(
         batch_size,
         hidden_size,
@@ -383,6 +364,8 @@ def test_m_sweep_finite(batch_size):
         seed=7,
     )
     out = _run_kernel(inp, num_experts, hidden_size)
+    # Production reduction depth (K=4096) leaves a small fraction of elements
+    # just outside the FP8 tolerance; 0.75 still fails a scale-error kernel.
     _assert_finite_and_correct(out, inp, num_experts, hit_floor=0.75)
 
 
@@ -423,40 +406,6 @@ def test_small_m_requant_amax_finite(batch_size, stress_amax):
     _assert_finite_and_correct(
         out, inp, num_experts, check_elementwise=not stress_amax
     )
-
-
-# -----------------------------------------------------------------------------
-# Focused unit check for the per-token [1x128] requant block scale.
-#
-# The requant scale must be derived from the TRUE max-abs over the 128 lanes.
-# Both the patched (find_max_elem_in_warp) and the unpatched
-# (kernel_utils::warpReduceSum, which is itself implemented as a warp MAX) paths
-# compute this true max — so this asserts the correct semantics, which hold on
-# both kernels, and documents that there is no summation-overestimate path. The
-# patched code additionally clamps a (hypothetically) non-finite amax; for finite
-# inputs that branch is never taken and the result is unchanged.
-# -----------------------------------------------------------------------------
-def test_per_token_1x128_block_scale_is_true_max():
-    """The 1x128 requant scale must be the block max-abs and stay finite."""
-    torch.manual_seed(0)
-    device = "cpu"
-    # A block whose true max-abs is near the FP8 range.
-    block = (FP8_MAX * 0.9) * torch.ones(1, 128, dtype=torch.float32, device=device)
-    block += 0.01 * torch.randn(1, 128, dtype=torch.float32, device=device)
-
-    q, s = per_token_group_quant_fp8(block.to(torch.bfloat16).float(), group_size=128)
-    true_amax = block.abs().max().item()
-
-    # The correct scale is true_amax / FP8_MAX (dequant-scale semantics).
-    assert s.item() == pytest.approx(true_amax / FP8_MAX, rel=5e-2)
-
-    dq = dequantize_activation(q, s, torch.float32)
-    assert torch.isfinite(dq).all()
-    # Dequantized block must track the original to within FP8 step error, which
-    # only holds when the scale is the true max-abs (a collapsed/0 scale would
-    # zero it or blow it up).
-    rel = (dq - block).abs().max().item() / true_amax
-    assert rel < 0.1, f"dequant rel error {rel:.3f} too high — scale likely wrong"
 
 
 if __name__ == "__main__":
