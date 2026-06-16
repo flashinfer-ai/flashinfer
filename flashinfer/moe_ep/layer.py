@@ -102,22 +102,27 @@ class MoEEpLayer(nn.Module):
             import dataclasses
 
             from ..fused_moe.layer import MoELayer
-            from .config import EpLayout
+            from .config import EpAlgorithm, EpLayout
 
             cfg = self._compute_config
-            if self._fleet_params.layout is EpLayout.RANK_MAJOR:
-                # RANK_MAJOR: each received token carries its real top-k routing;
-                # the runner runs at the model's top_k with do_finalize=True (the
-                # per-token weighted pre-reduce across local experts).  The bridge
+            received_routing = (
+                self._fleet_params.layout is EpLayout.RANK_MAJOR
+                or self._fleet_params.algorithm is EpAlgorithm.HIGH_THROUGHPUT
+            )
+            if received_routing:
+                # RANK_MAJOR and HT FLAT are token-major: each received token carries
+                # its real top-k routing (received local topk_idx, -1 = non-local).
+                # The runner runs at the model's top_k with do_finalize=True (the
+                # per-token weighted pre-reduce across local experts); the bridge
                 # masks non-local picks to weight 0.
                 compute_cfg = cfg
             else:
-                # EXPERT_MAJOR / HT: each dispatched row is already assigned to
-                # exactly one local expert, so the inner MoE kernel runs with
-                # top_k=1 regardless of the model's real top-k (which lives in
-                # dispatch/combine).  The bridge synthesizes top_k=1 routing
-                # (selected_experts [M, 1], final_scales == 1) to match; the
-                # kernel's check_routing() asserts expert_indices.size(1) == top_k.
+                # EXPERT_MAJOR: each dispatched row is already assigned to exactly one
+                # local expert, so the inner MoE kernel runs with top_k=1 regardless
+                # of the model's real top-k (which lives in dispatch/combine).  The
+                # bridge synthesizes top_k=1 routing (selected_experts [M, 1],
+                # final_scales == 1) to match; the kernel's check_routing() asserts
+                # expert_indices.size(1) == top_k.
                 compute_cfg = dataclasses.replace(
                     cfg, routing=dataclasses.replace(cfg.routing, top_k=1)
                 )
@@ -149,7 +154,7 @@ class MoEEpLayer(nn.Module):
             return self._inner_compute_identity(expert_tensors, d.num_tokens)
 
         from ..fused_moe.api import QuantVariant
-        from .config import EpLayout
+        from .config import EpAlgorithm, EpLayout
 
         is_nvfp4 = self._compute_config.quant.variant is QuantVariant.NVFP4
         offset = self._compute_config.experts.local_expert_offset
@@ -157,9 +162,13 @@ class MoEEpLayer(nn.Module):
         # back to the combine layout is identical for both LL layouts.
         dim0, dim1, _ = expert_tensors.shape
 
-        if self._fleet_params.layout is EpLayout.RANK_MAJOR:
-            # RANK_MAJOR recv is [world, max_tokens_per_rank, hidden]; drive compute
-            # from the library's received per-token routing, masked to local experts.
+        is_ht = self._fleet_params.algorithm is EpAlgorithm.HIGH_THROUGHPUT
+        if is_ht or self._fleet_params.layout is EpLayout.RANK_MAJOR:
+            # RANK_MAJOR recv [world, max_tokens_per_rank, hidden] and HT FLAT recv
+            # [num_local_experts, max_tokens_per_rank, hidden] are both token-major:
+            # each received row is a token carrying its received LOCAL topk_idx
+            # (-1 = non-local). Drive compute from that routing, masked to local
+            # experts, weighted (combine sums unweighted for both layouts).
             from ._compute_bridge import (
                 build_activation_pack_rank_major,
                 reshape_for_combine,
@@ -167,9 +176,9 @@ class MoEEpLayer(nn.Module):
 
             if d.recv_topk_idx is None or d.recv_topk_weights is None:
                 raise RuntimeError(
-                    "RANK_MAJOR compute requires the dispatch to return "
-                    "recv_topk_idx / recv_topk_weights (the received per-token "
-                    "routing); got None."
+                    f"{'HT' if is_ht else 'RANK_MAJOR'} compute requires the dispatch "
+                    "to return recv_topk_idx / recv_topk_weights (the received "
+                    "per-token routing); got None."
                 )
             act_pack = build_activation_pack_rank_major(
                 expert_tensors,

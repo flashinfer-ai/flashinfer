@@ -299,6 +299,10 @@ class NcclEpHandle(Handle):
         if weights.dtype != torch.float32:
             weights = weights.to(torch.float32)
 
+        # HT FLAT recv is token-major: each row is a received token carrying its
+        # received LOCAL topk_idx (-1 = non-local) in out_idx. The compute bridge
+        # masks non-local picks (and padding rows, whose topk_idx is -1) to weight 0,
+        # so the recv buffer can be uninitialized (matches the RANK_MAJOR path).
         out_t = torch.empty(num_recv, hidden, dtype=x.dtype, device=x.device)
         out_w = torch.empty(num_recv, self._top_k, dtype=torch.float32, device=x.device)
         out_idx = torch.empty(num_recv, self._top_k, dtype=torch.int64, device=x.device)
@@ -316,8 +320,9 @@ class NcclEpHandle(Handle):
         self._handle.dispatch(
             inputs, outputs, layout_info=None, config=config, stream=self._stream
         )
-        if self._staged:
-            self._handle.complete(stream=self._stream)
+        # Finish the dispatch (incl. cross-rank RECEIVE) before compute reads the
+        # recv buffer — unconditional, matching the LL paths and ep_test.py.
+        self._handle.complete(stream=self._stream)
 
         # Keepalives.
         self._dispatch_inputs = inputs
@@ -327,7 +332,12 @@ class NcclEpHandle(Handle):
         self._dispatch_out_idx = out_idx
 
         out_3d = out_t.view(self._num_local_experts, max_per_rank, hidden)
-        return DispatchOutput(expert_tensors=out_3d, num_tokens=num_recv)
+        return DispatchOutput(
+            expert_tensors=out_3d,
+            num_tokens=num_recv,
+            recv_topk_idx=out_idx,
+            recv_topk_weights=out_w,
+        )
 
     # ----------------------------------------------------------------- combine
 
