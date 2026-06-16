@@ -43,7 +43,7 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Float32, Int32, Uint32
 
-from ...cute_dsl.fp4_common import (
+from ....cute_dsl.fp4_common import (
     cvt_s0e5m3_to_f16x2_broadcast,
     f16x2_to_f32x2,
     fp4_decode_4bytes,

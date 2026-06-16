@@ -952,7 +952,7 @@ def _get_cute_dsl_bf16_fp4_gemm(
     import cutlass.cute as cute
     from flashinfer.cute_dsl.utils import get_max_active_clusters
 
-    from .kernels.dense_gemm_bf16_fp4_blackwell import (
+    from .kernels.cute_dsl.dense_gemm_bf16_fp4_blackwell import (
         BlackwellDenseGemmBf16Fp4Kernel,
     )
 
