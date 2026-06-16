@@ -13,48 +13,39 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Regression tests for two numerical-stability fixes in the SM90 FP8 block-scale
-grouped GEMM that backs the CUTLASS fused MoE path
+Regression tests for the NaN-output fix in the SM90 FP8 block-scale grouped GEMM
+that backs the CUTLASS fused MoE path
 (``cutlass_fused_moe(..., use_deepseek_fp8_block_scale=True)``).
 
-1. Cross-boundary / padding-row ``0 * Inf`` (the primary fix).
-   In the swap-AB grouped GEMM, rows at or past a per-expert row boundary are
-   padding rows. With many experts and small token counts, a tile is mostly
-   padding; those rows accumulate over in-bounds-but-stale FP8 input and the raw
-   accumulator can reach Inf, while their per-token scale is 0, so
-   ``scale * accum`` evaluates to ``0 * Inf = NaN``. Because the persistent-kernel
-   epilogue reuses a shared-memory staging buffer, that NaN can bleed into a
-   valid row's output. The fix gates the cross-row contribution (adds exactly
-   ``0.f`` for padding rows) and finite-sanitizes the accumulator before the bf16
-   store, at the block-scale kernel epilogue and the two swap-AB sites in
-   ``deep_gemm/fp8_gemm_impl.cuh``. Valid rows are always finite, so every real
-   output element is unchanged and the tensor-core path is untouched.
+The bug: rows at or past a per-expert row boundary are padding rows. With many
+experts and small token counts a tile is mostly padding; those rows accumulate
+over in-bounds-but-stale FP8 input and the accumulator can reach Inf/NaN. Because
+the persistent-kernel epilogue reuses a shared-memory staging buffer, that
+non-finite value can bleed into a valid row's bf16 output. The fix
+finite-sanitizes the accumulator (zeros any non-finite lane) before the bf16
+store, applied uniformly at both grouped-GEMM implementations the MoE path can
+dispatch to:
+  - ``deep_gemm/fp8_gemm_impl.cuh`` — at the static and swap-AB epilogue sites
+    (the path used whenever the deep_gemm JIT compiler is available; the default);
+  - ``cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh`` — at
+    its epilogue (the ``TRTLLM_DG_ENABLED=0`` fallback).
+Valid rows are always finite, so every real output element is unchanged and the
+tensor-core path is untouched.
 
-   Reproduction note (important before strengthening these tests): on real
-   serving traffic this fires at small M with a high populated-expert count, and
-   it is *value-correlated* — it depends on the specific interaction of the
-   quantized expert weights, their per-128-block weight-scale dynamic range (real
-   scales span ~1e-27 .. ~1e-4), and the grouped-GEMM tiling. It was confirmed to
-   fail on the unpatched kernel and pass on the patched kernel on captured
-   real-routing tensors (a full output row of NaN -> all finite). It could **not**
-   be reproduced with fully synthetic random inputs: neither a sweep over M,
-   routing concentration and activation magnitude, nor injecting the same extreme
-   weight-scale dynamic range, triggered it on the unpatched kernel. The tests
-   below therefore exercise the same small-M / many-expert regime as a finiteness
-   + correctness guard; they pass on both the patched and unpatched kernels for
-   synthetic inputs and exist to prevent regressions in that regime, not to
-   reproduce the original value-dependent trigger.
-
-2. Per-token ``[1 x 128]`` activation-requant amax (defensive).
-   The patch also switches the per-token requant amax reduction to
-   ``find_max_elem_in_warp`` and adds finite clamps. Note that the unpatched
-   reduction (``kernel_utils::warpReduceSum`` in this file) is *already* a warp
-   MAX despite its name — it is implemented as
-   ``val = max(val, __shfl_xor_sync(...))`` — so the requant scale is the true
-   block max-abs on both kernels and there is no summation-overflow path to
-   reproduce. The change is a defensive finiteness guard, not a behavioural fix.
-   ``test_per_token_1x128_block_scale_is_true_max`` documents and pins the
-   correct semantics (true max, finite, no scale collapse).
+Reproduction note (important before strengthening these tests): on real serving
+traffic this fires at small M with a high populated-expert count, and it is
+*value-correlated* — it depends on the specific interaction of the quantized
+expert weights, their per-128-block weight-scale dynamic range (real scales span
+~1e-27 .. ~1e-4), and the grouped-GEMM tiling. It was confirmed to fail on the
+unpatched kernel and pass on the patched kernel using real expert weights with
+serving-shaped global-sparse routing. It could **not** be reproduced with fully
+synthetic random inputs: sweeping M, routing concentration and activation
+magnitude — even injecting the same extreme weight-scale dynamic range — did not
+trigger it on the unpatched kernel. The tests below therefore exercise the same
+small-M / many-expert regime as a finiteness + correctness guard; with synthetic
+inputs they pass on both the patched and unpatched kernels, and exist to prevent
+regressions in that regime, not to reproduce the original value-dependent
+trigger.
 
 Every kernel case asserts the output is finite (the NaN failure mode) AND, where
 the activation magnitude is in a normal range, numerically correct against a
