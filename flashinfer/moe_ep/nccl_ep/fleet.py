@@ -110,7 +110,7 @@ class NcclEpFleet(Fleet):
     def _build_group_config(self):
         """Build :class:`nccl.ep.GroupConfig` from params + fleet knobs."""
         p = self._params
-        return self._nccl_ep.GroupConfig(
+        kwargs = dict(
             algorithm=_map_algorithm(p.algorithm),
             num_experts=p.num_experts,
             max_dispatch_tokens_per_rank=p.max_tokens_per_rank,
@@ -119,6 +119,16 @@ class NcclEpFleet(Fleet):
             num_qp_per_rank=self._knob_or_auto(FleetAlgoKnobNumQpsPerRank, "n"),
             num_channels=self._knob_or_auto(FleetAlgoKnobNumChannelsPerRank, "n"),
         )
+        # HT mode requires an explicit per-rank recv budget (> 0 and
+        # >= max_dispatch_tokens_per_rank); LL auto-derives it from 0. Match
+        # contrib/nccl_ep/ep_test.py (max_recv_tokens_per_rank = num_tokens *
+        # n_ranks): the per-rank recv-slot budget is max_dispatch_tokens_per_rank
+        # * world_size. (Distinct from the dispatch output buffer, which the
+        # handle sizes as max_tokens_per_rank * num_local_experts.)
+        if p.algorithm == EpAlgorithm.HIGH_THROUGHPUT:
+            world = self._bootstrap.world_size
+            kwargs["max_recv_tokens_per_rank"] = p.max_tokens_per_rank * world
+        return self._nccl_ep.GroupConfig(**kwargs)
 
     # @flashinfer_api  # disabled per PR #3453 review
     def create_handle(

@@ -40,6 +40,10 @@ cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
 nvep = [
   "cuda-python>=13.0",
   "nccl4py>=0.3.1",
+  # NCCL-EP group-create fails on B200 with older NCCL (2.27.x/2.29.x); >=2.30.7
+  # carries the B200 EP support. Ensure this wheel's libnccl is loaded (first on
+  # LD_LIBRARY_PATH) rather than a base-image system NCCL.
+  "nvidia-nccl-cu13>=2.30.7",
 ]
 
 [project.scripts]

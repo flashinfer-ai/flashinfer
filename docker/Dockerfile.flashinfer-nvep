@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Reference Dockerfile for building FlashInfer with the moe_ep transport
-# backends enabled (NIXL-EP + NCCL-EP from in-tree git submodules).
+# backends enabled: NIXL-EP is compiled from the in-tree git submodule;
+# NCCL-EP is the released `nccl4py>=0.3.1` wheel (the `[nvep]` extra), which
+# ships the `nccl.ep` API + bundled libnccl_ep.so (no in-tree NCCL build).
 #
 # Usage:
 #   cd /path/to/flashinfer

@@ -65,6 +65,100 @@ B300 ≈ B200 (B300 slightly faster compute).
 6. `nccl-ep-v0.1.0` migration: dropped legacy `contrib/nccl_ep/python` install in
    `build_in_container.sh` + Dockerfile; `nccl.ep` ships in nccl4py.
 
+## LL vs HT (algorithm axis)
+
+`MoEEpLayer`/`NcclEpHandle` is now **algorithm-aware** (`FleetParams.algorithm`):
+LL uses the `EXPERT_MAJOR` receive layout; HT uses `FLAT` (dispatch exchanges
+`topk_weights`/`topk_idx`, recv `[num_recv, H]` reshaped to the bridge's 3D view).
+`bench_moe_ep.py --algorithm {ll,ht}` selects it; `--reference` is the ep_bench
+geometry (hidden=7168, experts=256, top_k=8, 128 tok/rank).
+
+**LL — B200, reference config (full bf16 compute):**
+
+| GPUs | Nodes | dispatch µs | compute µs | combine µs | e2e µs | tok/s |
+|---|---|---|---|---|---|---|
+| 8 | 2 | 172.5 | 3428.9 | 45.1 | 3837.8 | 0.27M |
+| 16 | 4 | 195.0 | 3381.3 | 45.2 | 3813.9 | 0.54M |
+| 32 | 8 | 184.8 | 3408.3 | 47.2 | 3851.4 | 1.06M |
+| 64 | 16 | 204.8 | 3292.2 | 46.9 | 3736.3 | 2.19M |
+
+**HT — single-rank works; multi-rank blocked by the nccl4py library on Blackwell.**
+HT (FLAT) runs end-to-end at `world_size=1`, but **every multi-rank HT run (≥2 GPUs,
+both intra-node NVLink and inter-node RDMA) aborts inside the library**:
+`CUDA error nccl_ep.cc:3269 'invalid argument'`. The flashinfer wrapper drives the
+HT API per `contrib/nccl_ep/ep_test.py` (single-rank validates it); the failure is
+below our layer. Consistent with HT being Hopper-optimized + experimental
+(README: "Hopper architecture features … warp-specialized pipelines, TMA";
+RELEASE.md: "HT mode … being tuned," "limited QA coverage"). The HT table is
+therefore unfillable on GB200 with nccl4py 0.3.1 — escalate to the NCCL-EP team.
+(The README reference is itself LL-only, so there is no HT reference to match.)
+
+## Platforms & NCCL-EP runtime dependency (DOCA-GPUNetIO + GDRCopy)
+
+NCCL-EP's group creation (`ncclEpCreateGroup`) sets up the **GIN (GPU-Initiated
+Networking)** transport, which requires **DOCA-GPUNetIO + GDRCopy** at runtime —
+**even single-node**. The `nccl4py` wheel + matching `nvidia-nccl-cuXX` alone are
+NOT sufficient: a minimal container without DOCA/GDRCopy fails at
+`NCCL error 5 (ncclInvalidUsage) at nccl_ep.cc:1438`. (This is why Lyris worked —
+its full `build_in_container.sh` installs DOCA/GDRCopy — while early minimal
+Pre-Nyx/Ptyche builds did not.) So "no NCCL build" ≠ "no heavy deps": DOCA +
+GDRCopy are required; UCX/NIXL are only needed for NIXL-EP.
+
+| Platform | GPU | Build | NCCL-EP LL |
+|---|---|---|---|
+| Lyris | GB200 (4/node) | full build_in_container.sh | ✅ (table above) |
+| Ptyche | GB200-NVL36 (4/node, aarch64) | minimal + DOCA-GPUNetIO + GDRCopy | ✅ full sweep below |
+| Pre-Nyx | B200 (8/node, x86) | minimal + DOCA/GDRCopy + **NCCL≥2.30.7** | ✅ full sweep below (multi-node needs `NCCL_MNNVL_ENABLE=1`) |
+
+Minimal NCCL-EP-only container = cuda:13 base + IB userspace (`rdma-core`,
+`libibverbs`, `ibverbs-providers`) + **DOCA-GPUNetIO + GDRCopy** + torch +
+flashinfer runtime deps + `nccl4py` (+ matching `nvidia-nccl-cuXX`) + `pip install
+--no-deps -e .`. ~15–20 min (vs ~40 for the full NIXL stack).
+
+**Ptyche (GB200-NVL36) — LL, reference config, bf16, full compute** (per-stage median µs):
+
+| GPUs | nodes | dispatch µs | compute µs | combine µs | e2e µs | tok/s |
+|------|-------|-------------|------------|------------|--------|-------|
+| 8    | 2     | 170.2 | 3508.8 | 46.8 | 3930.7 | 0.26 M |
+| 16   | 4     | 165.0 | 3427.3 | 49.6 | 3827.9 | 0.54 M |
+| 32   | 8     | 187.1 | 3323.5 | 47.3 | 3741.9 | 1.09 M |
+| 64   | 16    | 193.0 | 3296.1 | 49.6 | 3736.2 | 2.19 M |
+
+Matches Lyris GB200: dispatch ~165–193 µs and combine ~47–50 µs flat across scale;
+compute-bound; tok/s ~linear with GPU count.
+
+**NCCL version note:** `libnccl_ep.so` binds whatever `libnccl.so.2` is first on
+`LD_LIBRARY_PATH`. The cuda:13 base image ships system NCCL **2.27.7**, and the
+wheel-path autodetect (`nvidia.nccl.__file__`, a namespace pkg → empty) silently
+left the wheel NCCL off the path — so the GB200 runs above actually used
+**2.27.7** (works fine on GB200). Always put the wheel lib dir
+(`.../site-packages/nvidia/nccl/lib`) explicitly first.
+
+**Pre-Nyx B200 — RESOLVED: needs NCCL ≥ 2.30.7.** The earlier `ncclInvalidUsage`
+at `nccl_ep.cc:1438` was an **NCCL-version** problem, not a hardware limitation:
+NCCL **2.27.7** (base-image system) and **2.29.7** both fail EP group-create on
+B200, but **2.30.7** carries the B200 EP support and succeeds. Two more
+requirements on B200:
+- bind the **2.30.7** wheel `libnccl` first on `LD_LIBRARY_PATH` (resolve by
+  `ncclGetVersion>=23007`; the `nvidia.nccl.__file__` autodetect returns empty);
+- set **`NCCL_MNNVL_ENABLE=1` for multi-node** runs (single-node intra-tray NVLink
+  works without it).
+DOCA-GPUNetIO + GDRCopy are still required (GIN), as on GB200.
+
+**Pre-Nyx (B200, 8 GPU/node) — LL, reference config, bf16, full compute, NCCL 2.30.7:**
+
+| GPUs | nodes | MNNVL | dispatch µs | compute µs | combine µs | e2e µs | tok/s |
+|------|-------|-------|-------------|------------|------------|--------|-------|
+| 8    | 1     | 0 | 125.6 | 3650.0 | 49.4 | 3959.8 | 0.26 M |
+| 16   | 2     | 1 | 254.7 | 3468.4 | 76.4 | 3946.5 | 0.52 M |
+| 32   | 4     | 1 | 360.3 | 3338.7 | 66.0 | 3906.3 | 1.05 M |
+| 64   | 8     | 1 | 394.6 | 3209.2 | 60.1 | 3807.5 | 2.15 M |
+
+8-GPU single-node (intra-tray NVLink) has the cheapest dispatch (~126 µs); multi-node
+(IB, MNNVL) dispatch rises with node count. tok/s ~linear; compute-bound throughout —
+consistent with GB200. **`report.md` (the standalone-B200 bug report) is now obsolete**
+(B200 works with NCCL ≥ 2.30.7); keep only as a note that the fix is the NCCL version.
+
 ## Open follow-ups (revisit)
 
 - **NVFP4 compute illegal memory access** — fails in the fused grouped-GEMM (CuteDSL /
@@ -75,17 +169,20 @@ B300 ≈ B200 (B300 slightly faster compute).
   single-process workaround.
 - **Perf numbers are functional medians**, not tuned; combine NVTX + CUDA-graph capture
   for production-grade measurement.
-- **nccl_ep build of `libnccl_ep.so` is vestigial** now (probe uses `find_spec('nccl.ep')`);
-  the lib loads via `LD_LIBRARY_PATH` to `build_nvep/nccl/lib` — consider staging it onto
-  nccl4py's loader path so `LD_LIBRARY_PATH` isn't required.
+- ~~nccl_ep build of `libnccl_ep.so` is vestigial~~ **RESOLVED:** NCCL-EP now comes from
+  the released `nccl4py>=0.3.1` wheel (validated `0.3.1` on GB200) — no submodule build,
+  no `LD_LIBRARY_PATH` to `build_nvep/nccl/lib`. The `[nvep]` extra installs it; only
+  NIXL-EP is compiled in-tree. See `MoE_EP_verif.md` §1 (Install & run flow).
 
 ## How to reproduce on Lyris
 
 - Container image (built once, reused): `/home/agopal/flashinfer-work/flashinfer-ep.sqsh`
-  (cuda:13.0 base + UCX/DOCA/GDRCopy + torch 2.12 + flashinfer + nccl4py + cutlass-dsl).
+  (cuda:13.0 base + UCX/DOCA/GDRCopy + torch 2.12 + flashinfer + **nccl4py 0.3.1 wheel** +
+  cutlass-dsl).
 - Checkout: `/home/agopal/flashinfer-work/flashinfer-compute` (this branch, editable install).
-- Env preamble inside the container (see `run_*.sh`): prepend
-  `build_nvep/nccl/lib` + the nvidia-nccl wheel lib dir to `LD_LIBRARY_PATH`.
+- Env preamble inside the container (see `run_*.sh`): prepend the **nvidia-nccl wheel lib
+  dir** + UCX/DOCA to `LD_LIBRARY_PATH`. The old `build_nvep/nccl/lib` entry is no longer
+  needed (NCCL-EP is now the nccl4py wheel).
 - Sweep: `sbatch /home/agopal/flashinfer-work/sweep_{gb200,gb300}_N{2,4}.sbatch`
   (account `coreai_libraries_cudnn`, partitions `gb200-backfill` / `gb300-backfill`).
 - Driver: `benchmarks/bench_moe_ep.py --tokens .. --backend .. --quant {bf16,nvfp4}`.

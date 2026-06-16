@@ -246,3 +246,53 @@ def test_handle_create_uses_expert_major_and_int64_topk(
     assert fake_handle.layout == fake_nccl_ep.Layout.EXPERT_MAJOR
     # topk_idx is wrapped in a fake Tensor; the underlying buffer is int64.
     assert fake_handle.topk_idx.buffer.dtype == torch.int64
+
+
+def test_handle_create_uses_rank_major_layout(fake_nccl_ep, bypass_build_checks):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("handle alloc needs a CUDA device")
+
+    from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobTopKWeights
+    from flashinfer.moe_ep.config import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        HandleParams,
+    )
+    from flashinfer.moe_ep.nccl_ep.fleet import NcclEpFleet
+
+    params = FleetParams(
+        num_experts=8,
+        max_tokens_per_rank=128,
+        token_hidden_size=7168,
+        algorithm=EpAlgorithm.LOW_LATENCY,
+        layout=EpLayout.RANK_MAJOR,
+    )
+    fleet = NcclEpFleet(BootstrapConfig(world_size=4, rank=0), params)
+
+    topk_ids = torch.zeros(16, 2, dtype=torch.int32, device="cuda")
+    weights = torch.ones(16, 2, dtype=torch.float32, device="cuda")
+    fleet.create_handle(
+        HandleParams(topk_ids=topk_ids),
+        algo_knobs=[HandleAlgoKnobTopKWeights(weights=weights)],
+    )
+
+    fake_handle = fake_nccl_ep._log["handles"][-1]
+    assert fake_handle.layout == fake_nccl_ep.Layout.RANK_MAJOR
+    assert fake_handle.topk_idx.buffer.dtype == torch.int64
+
+
+def test_fleet_params_rejects_rank_major_under_ht():
+    from flashinfer.moe_ep.config import EpAlgorithm, EpLayout, FleetParams
+
+    with pytest.raises(ValueError):
+        FleetParams(
+            num_experts=8,
+            max_tokens_per_rank=128,
+            token_hidden_size=7168,
+            algorithm=EpAlgorithm.HIGH_THROUGHPUT,
+            layout=EpLayout.RANK_MAJOR,
+        )

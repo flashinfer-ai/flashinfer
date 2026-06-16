@@ -118,6 +118,19 @@ uv pip install --python "${VENV}/bin/python" \
 uv pip install --python "${VENV}/bin/python" --no-deps \
     "nixl-cu13>=1.0.1"
 
+# FlashInfer runtime deps + the [nvep] extra, installed explicitly here (WITH
+# their own deps) so the editable flashinfer install below can use --no-deps.
+# Why: torch 2.12's `cuda-toolkit[nvjitlink]` metapackage pin trips uv's
+# resolver during the editable `-e .` resolution (nvidia-nvjitlink METADATA
+# mismatch). Installing the leaf deps first + `--no-deps -e .` sidesteps that.
+# nccl4py>=0.3.1 = NCCL-EP (nccl.ep + bundled libnccl_ep.so); cuda-python and
+# nccl4py's cuda.core/cuda-bindings come along here.
+uv pip install --python "${VENV}/bin/python" \
+    numpy einops ninja nvidia-ml-py click requests tabulate tqdm \
+    "nvidia-cutlass-dsl>=4.5.0" "nvidia-cudnn-frontend>=1.13.0" \
+    "cuda-tile>=1.4.0" "cuda-python>=13.0" "nccl4py>=0.3.1" \
+    "nvidia-nccl-cu13>=2.30.7"   # B200 NCCL-EP needs >=2.30.7; load this first on LD_LIBRARY_PATH
+
 # ---- 6. FlashInfer + both EP backends -------------------------------------
 # Wipe any half-populated meson subproject extracts from prior aborted runs.
 # Meson refuses to setup a subproject whose dir exists but lacks a
@@ -144,14 +157,14 @@ fi
 # may have referenced a removed subproject).
 rm -rf "${REPO_ROOT}/build_nvep/nixl" "${REPO_ROOT}/build_nvep/nccl"
 
-echo "=== building flashinfer + moe_ep backends (this is the long step) ==="
+echo "=== building flashinfer + NIXL-EP (this is the long step) ==="
 cd "${REPO_ROOT}"
-# The `[nvep]` extra pulls the released `nccl4py>=0.3.1` wheel (NCCL-EP: the
-# `nccl.ep` API + bundled libnccl_ep.so) — no in-tree NCCL build. BUILD_NIXL_EP
-# still builds NIXL-EP from the submodule via the build hook.
+# Build flashinfer + compile NIXL-EP from the submodule. --no-deps because all
+# runtime deps (incl. nccl4py for NCCL-EP) were installed above; this avoids the
+# torch/cuda-toolkit nvjitlink resolution conflict under uv.
 BUILD_NIXL_EP=1 \
     uv pip install --python "${VENV}/bin/python" \
-        --no-build-isolation -e ".[nvep]"
+        --no-build-isolation --no-deps -e .
 
 # ---- 7. persist env for subsequent srun on the same container --------------
 cat > /etc/profile.d/flashinfer.sh <<EOF

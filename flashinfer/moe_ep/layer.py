@@ -29,6 +29,7 @@ from .config import (
     BootstrapConfig,
     CombineInputParams,
     DispatchInputParams,
+    DispatchOutput,
     FleetParams,
     HandleParams,
 )
@@ -101,17 +102,25 @@ class MoEEpLayer(nn.Module):
             import dataclasses
 
             from ..fused_moe.layer import MoELayer
+            from .config import EpLayout
 
-            # EP-local compute is a per-expert grouped GEMM: each dispatched row
-            # is already assigned to exactly one local expert, so the inner MoE
-            # kernel runs with top_k=1 regardless of the model's real top-k
-            # (which lives in dispatch/combine).  The bridge synthesizes top_k=1
-            # routing (selected_experts [M, 1], final_scales == 1) to match; the
-            # kernel's check_routing() asserts expert_indices.size(1) == top_k.
             cfg = self._compute_config
-            compute_cfg = dataclasses.replace(
-                cfg, routing=dataclasses.replace(cfg.routing, top_k=1)
-            )
+            if self._fleet_params.layout is EpLayout.RANK_MAJOR:
+                # RANK_MAJOR: each received token carries its real top-k routing;
+                # the runner runs at the model's top_k with do_finalize=True (the
+                # per-token weighted pre-reduce across local experts).  The bridge
+                # masks non-local picks to weight 0.
+                compute_cfg = cfg
+            else:
+                # EXPERT_MAJOR / HT: each dispatched row is already assigned to
+                # exactly one local expert, so the inner MoE kernel runs with
+                # top_k=1 regardless of the model's real top-k (which lives in
+                # dispatch/combine).  The bridge synthesizes top_k=1 routing
+                # (selected_experts [M, 1], final_scales == 1) to match; the
+                # kernel's check_routing() asserts expert_indices.size(1) == top_k.
+                compute_cfg = dataclasses.replace(
+                    cfg, routing=dataclasses.replace(cfg.routing, top_k=1)
+                )
             self._compute = MoELayer(compute_cfg)
         return self._compute
 
@@ -125,32 +134,64 @@ class MoEEpLayer(nn.Module):
         """
         return expert_tensors
 
-    def _inner_compute(
-        self, expert_tensors: "torch.Tensor", num_tokens: int
-    ) -> "torch.Tensor":
-        """Per-expert grouped GEMM over the dispatched tokens.
+    def _inner_compute(self, d: "DispatchOutput") -> "torch.Tensor":
+        """Grouped-GEMM expert FFN over the dispatched tokens.
 
-        Bridges the 3D expert-major dispatch output to the token-major compute
-        pack (top_k=1, final_scales=1 — combine owns the real reweight), runs
+        Bridges the 3D dispatch output to the token-major compute pack, runs
         ``flashinfer.fused_moe.MoELayer``, and reshapes back to the 3D combine
-        layout.  See :mod:`flashinfer.moe_ep._compute_bridge`.
+        layout.  EXPERT_MAJOR / HT use a top_k=1 pre-routed pack (combine owns the
+        reweight); RANK_MAJOR uses the received per-token routing at the real
+        top_k with do_finalize (this rank applies the weights).  See
+        :mod:`flashinfer.moe_ep._compute_bridge`.
         """
+        expert_tensors = d.expert_tensors
         if self._compute_config is None:
-            return self._inner_compute_identity(expert_tensors, num_tokens)
+            return self._inner_compute_identity(expert_tensors, d.num_tokens)
 
         from ..fused_moe.api import QuantVariant
-        from ._compute_bridge import build_activation_pack, reshape_for_combine
+        from .config import EpLayout
 
-        num_local_experts, cap, _ = expert_tensors.shape
         is_nvfp4 = self._compute_config.quant.variant is QuantVariant.NVFP4
+        offset = self._compute_config.experts.local_expert_offset
+        # dim0/dim1 are the two leading dims of the 3D dispatch output; the reshape
+        # back to the combine layout is identical for both LL layouts.
+        dim0, dim1, _ = expert_tensors.shape
 
-        act_pack = build_activation_pack(
-            expert_tensors,
-            local_expert_offset=self._compute_config.experts.local_expert_offset,
-            is_nvfp4=is_nvfp4,
-        )
+        if self._fleet_params.layout is EpLayout.RANK_MAJOR:
+            # RANK_MAJOR recv is [world, max_tokens_per_rank, hidden]; drive compute
+            # from the library's received per-token routing, masked to local experts.
+            from ._compute_bridge import (
+                build_activation_pack_rank_major,
+                reshape_for_combine,
+            )
+
+            if d.recv_topk_idx is None or d.recv_topk_weights is None:
+                raise RuntimeError(
+                    "RANK_MAJOR compute requires the dispatch to return "
+                    "recv_topk_idx / recv_topk_weights (the received per-token "
+                    "routing); got None."
+                )
+            act_pack = build_activation_pack_rank_major(
+                expert_tensors,
+                d.recv_topk_idx,
+                d.recv_topk_weights,
+                num_local_experts=self._compute_config.experts.local_num_experts,
+                local_expert_offset=offset,
+                is_nvfp4=is_nvfp4,
+            )
+        else:
+            # EXPERT_MAJOR (and HT's expert-major-shaped view): each padded row is
+            # pre-assigned to one local expert (expert = row // cap).
+            from ._compute_bridge import build_activation_pack, reshape_for_combine
+
+            act_pack = build_activation_pack(
+                expert_tensors,
+                local_expert_offset=offset,
+                is_nvfp4=is_nvfp4,
+            )
+
         out_2d = self._ensure_compute()(act_pack, self._weights)
-        return reshape_for_combine(out_2d, num_local_experts, cap)
+        return reshape_for_combine(out_2d, dim0, dim1)
 
     # @flashinfer_api  # disabled per PR #3453 review
     def forward(self, t: "MoEEpTensors") -> "torch.Tensor":
@@ -166,7 +207,7 @@ class MoEEpLayer(nn.Module):
 
         if not self.enable_timing:
             d = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
-            expert_out = self._inner_compute(d.expert_tensors, d.num_tokens)
+            expert_out = self._inner_compute(d)
             c = handle.combine(
                 CombineInputParams(
                     x=[expert_out], out=torch.empty_like(t.hidden_states)
@@ -190,7 +231,7 @@ class MoEEpLayer(nn.Module):
         d = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
         ev["dispatch"][1].record()
         ev["compute"][0].record()
-        expert_out = self._inner_compute(d.expert_tensors, d.num_tokens)
+        expert_out = self._inner_compute(d)
         ev["compute"][1].record()
         ev["combine"][0].record()
         c = handle.combine(

@@ -1,27 +1,40 @@
 """MoE Expert-Parallel benchmark: dispatch → compute → combine.
 
-Sweeps the matrix in ``docs/design_docs/MoE_EP_verif.md``:
-tokens ∈ {8192, 16384} × world-size ∈ {8, 16} × backend ∈ {nccl_ep, nixl_ep}
-× quant ∈ {nvfp4, bf16}, on GB200 (SM100) / GB300 (SM103).
+Canonical cases mirror the NCCL-EP ``ep_bench`` reference
+(``3rdparty/nccl/contrib/nccl_ep/README.md``): **128 tokens/rank, hidden 7168,
+top-k 8, 256 experts, BF16**, swept over **8/16/32/64 GPUs** and over the two EP
+**algorithms — Low-Latency (LL) and High-Throughput (HT)** (one table each).
+Select that geometry with ``--reference`` and the algorithm with
+``--algorithm {ll,ht}``; the GPU count comes from the torchrun world size.
 
-Launch (one process per GPU):
+Launch (one process per GPU; 4 GPU/node on GB200 → N nodes = GPUs/4):
 
-    torchrun --nproc_per_node=8 benchmarks/bench_moe_ep.py \
-        --tokens 8192 --backend nccl_ep --quant nvfp4
-
-    # 16 GPUs across 2 nodes:
-    torchrun --nnodes 2 --nproc_per_node=8 --rdzv_backend c10d \
+    # LL, EXPERT_MAJOR (default), reference geometry, 8 GPUs (2 GB200 nodes):
+    torchrun --nnodes 2 --nproc_per_node 4 --rdzv_backend c10d \
         --rdzv_endpoint $HOST:$PORT benchmarks/bench_moe_ep.py \
-        --tokens 16384 --backend nixl_ep --quant bf16
+        --reference --algorithm ll --backend nccl_ep --quant bf16
 
-``--tokens`` is the **global** batch; per-rank tokens (= ``max_tokens_per_rank``)
-is ``tokens // world_size``.  Rank 0 prints one CSV row.  Use ``--baseline`` to
-time the comm-only identity path (the "vs identity-stub" column).
+    # LL, RANK_MAJOR variant: add --layout rank_major
+    # HT variant: --algorithm ht
+    # Ad-hoc (non-reference) sizing still works via --tokens / --tokens-per-rank.
 
-Weights are random but correctly shaped/typed — this measures latency, not
-accuracy (correctness is covered by tests/moe_ep/). NVFP4 weight views are built
-with the canonical prepare helpers; bf16 weights use the trtllm BlockMajorK
-shuffle.
+``--tokens-per-rank`` (the reference uses 128) fixes per-rank work as GPUs scale
+and takes precedence over the global ``--tokens``. Rank 0 prints one CSV row
+(prefixed with the algorithm + layout). ``--baseline`` times the comm-only
+identity path. Weights are random but correctly shaped/typed — this measures
+latency, not accuracy (correctness is covered by tests/moe_ep/).
+
+Note: NCCL-EP HT uses the FLAT receive layout; the LL path supports two layouts,
+selected with ``--layout {expert_major,rank_major}``:
+  * EXPERT_MAJOR — recv [num_local_experts, per_rank*world, hidden]; every padded
+    row is pre-assigned to one expert (the inner compute is a top_k=1 batch).
+  * RANK_MAJOR — recv [world, per_rank, hidden]; tokens grouped by source rank.
+    The inner compute is driven by the library's received per-token routing at the
+    model's real top_k (do_finalize pre-reduce), with non-local picks masked to
+    weight 0 — far less padded work than EXPERT_MAJOR, which is the point of
+    measuring it.
+``--algorithm ht`` is wired end-to-end and exercises HT once the FLAT-layout
+handle lands (``--layout`` is ignored under HT).
 """
 
 from __future__ import annotations
@@ -34,11 +47,49 @@ _here = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _here]
 
 
+# Canonical benchmark cases, mirroring the NCCL-EP `ep_bench` reference
+# (contrib/nccl_ep/README.md): BF16 dispatch+combine, LL mode, 128 tokens/rank,
+# hidden 7168, top-k 8, 256 experts, swept over 8/16/32/64 GPUs (1/2/4/8 nodes @
+# 8 GPU/node; on GB200 that's 2/4/8/16 nodes @ 4 GPU/node). `--reference` selects
+# this geometry; the GPU count comes from the launcher (torchrun world size).
+#
+# Algorithm: NCCL-EP supports two algorithms — Low-Latency (LL) and
+# High-Throughput (HT). The reference table is LL-only. `--algorithm {ll,ht}`
+# selects which to benchmark; run once per algorithm to produce the LL and HT
+# tables. (HT requires the backend's FLAT-layout handle path.)
+_REFERENCE = dict(
+    num_experts=256, top_k=8, hidden=7168, intermediate=2048, tokens_per_rank=128
+)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--tokens", type=int, default=8192, help="global token count")
     p.add_argument("--backend", choices=["nccl_ep", "nixl_ep"], default="nccl_ep")
-    p.add_argument("--quant", choices=["nvfp4", "bf16"], default="nvfp4")
+    p.add_argument(
+        "--algorithm",
+        choices=["ll", "ht"],
+        default="ll",
+        help="EP algorithm: ll = Low-Latency, ht = High-Throughput",
+    )
+    p.add_argument("--quant", choices=["nvfp4", "bf16"], default="bf16")
+    p.add_argument(
+        "--layout",
+        choices=["expert_major", "rank_major"],
+        default="expert_major",
+        help="LL receive layout (ll only; ht always uses FLAT). expert_major: "
+        "recv [num_local_experts, per_rank*world, hidden]; rank_major: recv "
+        "[world, per_rank, hidden] (far less padded compute)",
+    )
+    p.add_argument(
+        "--reference",
+        action="store_true",
+        help="use the ep_bench reference geometry (hidden=7168, experts=256, "
+        "top_k=8, 128 tokens/rank)",
+    )
+    # Sizing. --tokens-per-rank (preferred, matches the reference) wins over the
+    # global --tokens; the reference uses 128 tokens/rank.
+    p.add_argument("--tokens-per-rank", type=int, default=None)
+    p.add_argument("--tokens", type=int, default=8192, help="global token count")
     p.add_argument("--num-experts", type=int, default=256)
     p.add_argument("--top-k", type=int, default=8)
     p.add_argument("--hidden", type=int, default=7168)
@@ -50,7 +101,15 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="time the comm-only identity path (no compute_config)",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.reference:
+        args.num_experts = _REFERENCE["num_experts"]
+        args.top_k = _REFERENCE["top_k"]
+        args.hidden = _REFERENCE["hidden"]
+        args.intermediate = _REFERENCE["intermediate"]
+        if args.tokens_per_rank is None:
+            args.tokens_per_rank = _REFERENCE["tokens_per_rank"]
+    return args
 
 
 def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, device):
@@ -129,11 +188,14 @@ def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, 
         from flashinfer import shuffle_matrix_a
         from flashinfer.fused_moe.core import convert_to_block_layout
 
-        # BlockMajorK shuffled weights for the trtllm bf16 routed runner — mirrors
-        # the per-expert recipe in tests/moe/test_dpsk_fused_moe_fp8.py. Validate
-        # the exact layout on-cluster; timing is layout-shape-sensitive only.
+        # BlockMajorK shuffled weights for the trtllm bf16 routed runner. Recipe
+        # validated against tests/moe/test_trtllm_gen_routed_fused_moe.py
+        # (epilogue_tile_m=64, block_k=128). Note: epilogue_tile_m only permutes
+        # weight rows (same FLOPs), so it doesn't affect timing — but 64 is the
+        # numerically-correct value (128 produces wrong output; see
+        # tests/moe_ep/test_moe_ep_compute_correctness.py).
         def _block_major_k(w):
-            epilogue_tile_m = 128
+            epilogue_tile_m = 64
             block_k = 128
             shuffled = []
             for i in range(w.shape[0]):
@@ -168,6 +230,7 @@ def main() -> int:
     from flashinfer.moe_ep import (
         BootstrapConfig,
         EpAlgorithm,
+        EpLayout,
         FleetParams,
         MoEEpLayer,
         MoEEpTensors,
@@ -181,9 +244,26 @@ def main() -> int:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    per_rank = args.tokens // world_size
+    # --tokens-per-rank (the reference uses 128/rank) takes precedence over the
+    # global --tokens, so the per-rank transport work is fixed as GPUs scale.
+    if args.tokens_per_rank is not None:
+        per_rank = args.tokens_per_rank
+        args.tokens = per_rank * world_size
+    else:
+        per_rank = args.tokens // world_size
     local_num_experts = args.num_experts // world_size
     local_expert_offset = rank * local_num_experts
+    ep_algorithm = (
+        EpAlgorithm.HIGH_THROUGHPUT
+        if args.algorithm == "ht"
+        else EpAlgorithm.LOW_LATENCY
+    )
+    ep_layout = (
+        EpLayout.RANK_MAJOR if args.layout == "rank_major" else EpLayout.EXPERT_MAJOR
+    )
+    # RANK_MAJOR is LL-only; fall back to EXPERT_MAJOR under HT (which ignores it).
+    if ep_algorithm is EpAlgorithm.HIGH_THROUGHPUT:
+        ep_layout = EpLayout.EXPERT_MAJOR
 
     g = torch.Generator(device="cuda").manual_seed(42 + rank)
     x = torch.randn(
@@ -226,8 +306,17 @@ def main() -> int:
         max_tokens_per_rank=per_rank,
         token_hidden_size=args.hidden,
         dtype_bytes=2,
-        algorithm=EpAlgorithm.LOW_LATENCY,
+        algorithm=ep_algorithm,
+        layout=ep_layout,
     )
+
+    # Compute batch size differs by layout: EXPERT_MAJOR pads to
+    # num_local_experts * (per_rank * world); RANK_MAJOR processes per_rank * world
+    # received tokens (round-robin to one local expert each).
+    if ep_layout is EpLayout.RANK_MAJOR:
+        compute_max_tokens = per_rank * world_size
+    else:
+        compute_max_tokens = local_num_experts * per_rank * world_size
 
     if args.baseline:
         compute_config, weights = None, None
@@ -236,7 +325,7 @@ def main() -> int:
             args,
             local_num_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
-            max_tokens=local_num_experts * per_rank * world_size,
+            max_tokens=compute_max_tokens,
             device=device,
         )
 
@@ -288,9 +377,10 @@ def main() -> int:
     dist.barrier()
     if rank == 0:
         mode = "identity" if args.baseline else args.quant
+        layout_name = "ht_flat" if args.algorithm == "ht" else args.layout
         print(
-            "BENCH_CSV,tokens,gpus,backend,quant,dispatch_us,compute_us,combine_us,e2e_us,tok_s\n"
-            f"BENCH_CSV,{args.tokens},{world_size},{args.backend},{mode},"
+            "BENCH_CSV,algo,layout,tokens,gpus,backend,quant,dispatch_us,compute_us,combine_us,e2e_us,tok_s\n"
+            f"BENCH_CSV,{args.algorithm},{layout_name},{args.tokens},{world_size},{args.backend},{mode},"
             f"{d_us:.1f},{cp_us:.1f},{cb_us:.1f},{e2e_us:.1f},{tok_s:.1f}"
         )
     dist.destroy_process_group()
