@@ -728,6 +728,13 @@ def main() -> None:
         "(useful for throwaway optimization sweeps — keeps poll-watched dirs clean).",
     )
     parser.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="Version/label woven into the auto output filename, e.g. --tag v0.9 → "
+        "ssu_checkpoint_mixed_v0.9_b..._conv1d.  Ignored if --output-prefix is set.",
+    )
+    parser.add_argument(
         "--plot-only", type=Path, default=None, help="Existing CSV to plot from."
     )
     # Conv1d combined timing (measures total span: conv1d + SSU, captures PDL overlap)
@@ -761,7 +768,9 @@ def main() -> None:
     args.kernels = [k.strip() for k in args.kernels.split(",") if k.strip()]
 
     prefix = args.output_prefix or (
-        f"ssu_checkpoint_mixed_b{'_'.join(str(b) for b in args.batch_sizes)}"
+        f"ssu_checkpoint_mixed"
+        f"{('_' + args.tag) if args.tag else ''}"
+        f"_b{'_'.join(str(b) for b in args.batch_sizes)}"
         f"_{args.state_dtype}_K{args.num_pnat_samples}"
         f"{'_conv1d' if args.with_conv1d else ''}"
     )
