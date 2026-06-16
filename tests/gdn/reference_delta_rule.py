@@ -560,7 +560,6 @@ def decode_delta_rule(
     B = q.size(0)
     num_q_heads = q.size(1)
     num_k_heads = k.size(1)
-    # State and output are always based on num_v_heads (matches kernel's HV dimension)
     num_v_heads = v.size(1)
     K = q.size(2)
 
@@ -630,8 +629,7 @@ def decode_delta_rule(
     # Process each batch and head
     # ============================================
     # All (batch, head) pairs are independent, so the recurrent update below is
-    # vectorized over [B, num_heads] (the Triton-kernel step structure in the
-    # docstring is unchanged; only the per-(b,h) Python loop is batched).
+    # vectorized over [B, num_heads].
 
     # Step 1: Apply gating to hidden state: h *= exp(g)
     h_state = state.to(torch.float32) * torch.exp(g)[:, :, None, None]  # [B,H,K,V]
@@ -770,7 +768,7 @@ def verify_delta_rule(
     # Process each time step sequentially (only t carries a dependency; the
     # per-(batch, head) updates are independent and vectorized over [B, H]).
     for t in range(T):
-        # Recurrent update (following Triton kernel)
+        # Recurrent update
         # 1. Apply decay (state read as fp32)
         h_state = current_state.to(torch.float32) * g[:, t, :, None, None]
 
