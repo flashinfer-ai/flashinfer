@@ -52,7 +52,6 @@ from flashinfer.fused_moe.core import (
     _maybe_get_cached_w3_w1_permute_indices,
     Fp8QuantizationType,
 )
-from flashinfer.utils import get_compute_capability
 from .utils import is_gated_activation, skip_checks, QuantMode
 
 
