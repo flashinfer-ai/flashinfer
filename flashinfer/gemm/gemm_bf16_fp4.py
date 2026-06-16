@@ -620,9 +620,7 @@ def execute_cudnn_w4a16_fp4_graph_override_shape(
     )
 
 
-# Autotuner sweeps M (token count) of the bf16 activation ``a`` and keeps
-# the output ``out`` in lockstep.  The FP4 weight ``b`` and its scale are
-# M-independent and stay fixed during profiling.
+# Autotuner sweeps M (token count) of the bf16 activation ``a``
 _W4A16_FP4_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -1053,11 +1051,6 @@ def _cute_dsl_pack_fp4_weight(b: torch.Tensor) -> torch.Tensor:
     n_tiles = n // _CUTE_DSL_PACK_TILE_N
     k_half_per_tile = _CUTE_DSL_PACK_TILE_K // 2  # 8 packed K-rows per tile
 
-    # The repack is a fixed permutation of each (8 K-half x 64 N) source tile
-    # into 128 int32 (4 bytes each).  The within-tile byte mapping depends only
-    # on the layout, so build the 512-entry permutation once and apply it with a
-    # single small-index gather -- far cheaper than materializing the full
-    # (K_tiles, N_tiles, 128, 4) int64 index tensors of the per-element gather.
     u32_pos = torch.arange(
         _CUTE_DSL_PACK_INTS_PER_TILE, device=device, dtype=torch.long
     )
@@ -1201,13 +1194,6 @@ def _w4a16_cute_dsl_tactic_configs(
     return configs
 
 
-# Autotuner sweeps M (token count) of the bf16 activation ``a`` and keeps the
-# output ``out`` in lockstep.  The packed weight ``b``, its scale, and ``alpha``
-# are M-independent and stay fixed during profiling.
-#
-# inputs layout (see _compute_cute_dsl):
-#   [0]=a  [1]=b (packed int32)  [2]=b_sf (uint8)  [3]=alpha
-#   [4]=out_dtype  [5]=out  [6]=block_size
 _W4A16_CUTE_DSL_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(

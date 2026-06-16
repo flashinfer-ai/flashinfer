@@ -1342,9 +1342,7 @@ _E2M1_VALUES_FP32 = (
 
 
 def _dequantize_w4a16_fp4_ref(b, b_descale, alpha, n, k, block_size):
-    """fp32 ground-truth dequant of the canonical nvfp4 weight (refcheck gold):
-    unpack FP4 nibbles -> values -> per-block SF (unswizzled) -> optional
-    alpha.  Returns the ``(N, K)`` fp32 weight matrix."""
+    """PyTorch implementation of swizzled nvfp4 dequantization to fp32."""
     import torch
     from flashinfer.gemm.gemm_bf16_fp4 import _unswizzle_sf_128x4
 
@@ -1366,9 +1364,7 @@ def testMmBf16Fp4(args):
     """Benchmark mm_bf16_fp4 (bf16 activation x FP4 weight, W4A16).
 
     Weights are produced by ``flashinfer.nvfp4_quantize(sfLayout=layout_128x4)``
-    -- the same canonical format the new API expects.  Per-backend prep
-    (``prepare_bf16_fp4_weights``) runs once at setup and is NOT timed;
-    only the ``mm_bf16_fp4`` call is.
+    -- the same format the new API expects.
 
     Constraints:
       * N must be divisible by 64 (the weight-prepack / kernel N tile).
@@ -1378,12 +1374,7 @@ def testMmBf16Fp4(args):
       * input_dtype must be bfloat16 (the only A dtype currently
         supported; fp16 deferred).
 
-    Refcheck uses an fp32 dequant + matmul of the canonical FP4 weight as
-    the gold reference.
-
-    With ``--autotune``, the cuDNN (execution plans) and cute-dsl (tile
-    shape + perf-knob configs) backends are profiled; autotuned results are
-    tagged with an ``_autotune`` backend suffix.
+    Refcheck uses an fp32 dequant + matmul.
     """
     if args.verbose >= 1:
         print("[INFO] Running testMmBf16Fp4")
@@ -1479,8 +1470,6 @@ def testMmBf16Fp4(args):
         print("[ERROR] No backends passed validation. Exiting.")
         return
 
-    # cuDNN sweeps its execution plans + M buckets; cute-dsl sweeps its tile
-    # shape + perf-knob config space (both via mm_bf16_fp4 TunableRunners).
     autotune_supported_backends = ["cudnn", "cute-dsl"]
     cache_path = getattr(args, "autotune_cache", None)
     if getattr(args, "autotune", False):
@@ -1501,8 +1490,6 @@ def testMmBf16Fp4(args):
         with autotune(False, cache=cache_path):
             pass
 
-    # Gold reference: fp32 dequant of the canonical FP4 weight + matmul, cast
-    # to out_dtype (the same math the removed "torch" backend computed).
     ref = None
     if run_refcheck:
         weight_fp32 = _dequantize_w4a16_fp4_ref(b_fp4, b_sf, alpha, n, k, 16)
@@ -1516,10 +1503,7 @@ def testMmBf16Fp4(args):
         + (k // 16) * n  # FP8-E4M3 per-block SF
         + m * n * out_dtype.itemsize
     )
-    # Refcheck tolerance vs the fp32-accurate gold.  The cute-dsl and cudnn
-    # kernels dequantize the FP4 weight to bf16 before the tensor-core matmul,
-    # so they carry ~1 bf16 ULP of weight rounding (up to ~1.5e-2 relative)
-    # that the fp32 reference does not.
+
     refcheck_tol = dict(rtol=1.5e-2, atol=1.5e-2)
     for backend in backends:
         runner = backend_runners[backend]

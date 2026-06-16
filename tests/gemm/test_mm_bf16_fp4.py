@@ -142,10 +142,8 @@ PROBLEM_SIZES = [
     (17, 3072, 3072),
 ]
 
-# Single mid-size shape used by the secondary contract tests
-# (alpha=None, out_dtype override, preallocated out, K-mismatch).  They
-# don't need to sweep the full numeric grid -- they only check that the
-# behaviour is consistent across backends.
+# Default shape for API sanity tests.
+# (alpha=None, out_dtype override, preallocated out, K-mismatch).
 SMOKE_MNK = (16, 1024, 1024)
 
 ATOL = 1.5e-2

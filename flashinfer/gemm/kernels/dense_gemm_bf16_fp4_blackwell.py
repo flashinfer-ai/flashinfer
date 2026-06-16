@@ -28,7 +28,8 @@
 
 """W4A16 dense GEMM for Blackwell (SM100/103/120/121).
 
-Built on top of ``dense_gemm_bf16_blackwell.py`` from cutlass examples.
+Built on top of ``dense_gemm_bf16_blackwell.py`` from cutlass examples at
+https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py
 """
 
 from typing import Optional, Tuple, Type
