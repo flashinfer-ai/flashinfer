@@ -16,41 +16,29 @@ limitations under the License.
 ---
 
 NVFP4 MSA proxy-score kernel for SM120/SM121: the FP4 counterpart of
-:mod:`proxy_score_sm12x`, porting MSA's ``fp4_indexer_block_scores`` so the index
-K is read at ~4 bits/elem. The full-KV index read is the dominant decode-step cost
-(the one stage MSA does not sparsify), so cutting its HBM bytes ~4x is the point.
+:mod:`proxy_score_sm12x`, porting MSA's ``fp4_indexer_block_scores`` so the index K
+is read at ~4 bits/elem. The full-KV index read is the dominant decode-step cost (the
+one stage MSA does not sparsify), so cutting its HBM bytes ~4x is the point. Contract
+is identical to the bf16 proxy (per-block max of the unscaled post-mask QK^T, -inf for
+invalid blocks); inputs are pre-quantized (packed e2m1 + e4m3 per-16 block scales +
+per-tensor fp32 global scales) and the bf16 proxy stays the precision reference.
 
-Contract is identical to the bf16 proxy: for every (query head, KV block, query
-token) it emits the max over the 128 tokens of the block of the UNSCALED, post-mask
-QK^T logit, with -inf for invalid / causally-masked blocks. Inputs are pre-quantized
-(packed e2m1 + e4m3 per-16 block scales + per-tensor fp32 global scales), matching
-the deployed MSA indexer; the bf16 proxy stays as the precision reference.
+QK^T runs directly on the SM120 fp4 tensor cores (``MmaMXF4NVF4Op``, m16n8k64, atom
+(4,2,1)), operands kept in fp4 (no in-SM dequant): the e4m3 block scales are applied
+in-instruction via ``mma.set(WarpField.SFA/SFB)`` and the two monotone global scales
+multiply the per-row block-max at store time. SF smem layout / fragment partition /
+mainloop are ported from ``dense_blockscaled_gemm_sm120_b12x`` with the proxy's own
+block-max epilogue; scales use the same cuBLAS 128x4 tiled layout as the rest of the
+MSA stack, so the NVFP4 index-K cache is bit-compatible across it.
 
-The bandwidth win lives in the *HBM read* — Q/K come in as packed fp4 (64 B/row) plus
-e4m3 scales (8 B/row) instead of bf16 (256 B/row). We compute QK^T directly on the
-SM120 fp4 tensor cores (``MmaMXF4NVF4Op``, m16n8k64, atom (4,2,1)), keeping the
-operands in fp4 (no in-SM dequant): the e4m3 per-16 block scales are applied
-in-instruction via ``mma.set(WarpField.SFA/SFB)``, and the two per-tensor global
-scales are monotone so they multiply the per-row block-max once at store time. The SF
-smem layout / fragment partition / set+gemm mainloop are ported from
-``dense_blockscaled_gemm_sm120_b12x``; the block-max epilogue is the proxy's own
-warp-level reduction, independent of the MMA thread layout. Scales use the same
-**cuBLAS 128x4 tiled** layout as ``sparse_fwd_kvmajor_sm12x`` / the decode kernel, so
-the NVFP4 index-K cache is bit-compatible across the whole MSA stack.
+Two schedules, both flat + paged K with a kv-block split factor (split-K) to fill the
+SMs at low batch: the general per-(q-tile, batch, head) :class:`MsaProxyScoreFp4MmaSm12x`
+and a 16-head q_len<=8 :class:`MsaProxyScoreFp4MmaDecodePackedSm12x` that scores all 16
+heads of a kv_head from one shared index-K read.
 
-Two schedules: the general per-(q-tile, batch, head) kernel
-(:class:`MsaProxyScoreFp4MmaSm12x`) and a 16-head q_len<=8 packed-decode kernel
-(:class:`MsaProxyScoreFp4MmaDecodePackedSm12x`) that scores all 16 heads of a kv_head
-against each KV block from one shared index-K read. Both handle flat (cu_seqlens) and
-paged K, and fold a kv-block split factor into the grid (split-K) to fill the SMs at
-long context / low batch.
-
-HISTORY — an earlier variant dequantized fp4->bf16 in-SM and ran the bf16
-``MmaF16BF16Op`` mainloop, on the premise that a memory-bound proxy makes the GEMM
-free. Measured on SM120 the dequant path lost at long context (it stayed
-latency/occupancy bound), while the fp4-MMA path here wins once its epilogue and
-occupancy are right, so the dequant kernel was dropped. SM100's original uses a
-tcgen05 fp4-MMA (TMEM); SM120 has no TMEM, so this is rebuilt on warp-level mma.sync.
+(An earlier fp4->bf16 in-SM dequant variant was dropped: it stayed latency-bound at
+long context where this fp4-MMA path wins. SM100's tcgen05 fp4-MMA has no SM120 TMEM
+equivalent, so this is rebuilt on warp-level mma.sync.)
 """
 
 import cuda.bindings.driver as cuda
@@ -381,18 +369,10 @@ class MsaProxyScoreFp4MmaSm12x:
             # ... < max_k_tiles (disjoint across splits, union covers all columns
             # once, no reduction). num_splits==1 -> the original [0, max_k_tiles).
             #
-            # NOTE: cp.async double-buffering of the K loads was implemented and
-            # measured here (4B and 16B variants) but REVERTED: it regressed the
-            # high-throughput shapes (B128 q1 k4k -25%) and did not help the
-            # latency-bound ones. Root cause is REGISTERS, not smem: min_blocks_per_mp=2
-            # caps regs at 65536/(2*256)=128/thread to keep 2 CTAs/SM, and the CTAs
-            # already hide the K-load latency through that warp occupancy. Adding a
-            # second K stage (two partition sets + pipeline state) under the same
-            # 128-reg ceiling just spills more to local memory, with no occupancy
-            # gain to pay for it (smem -- 19.5KB vs 28.5KB -- fits 2 CTAs either
-            # way, so it is never the limiter). Synchronous load + high occupancy
-            # wins here. (4B and 16B regressed ~equally => cost is the spilling /
-            # pipeline machinery, not the cp.async issue count.)
+            # cp.async K double-buffering was tried here and reverted: at
+            # min_blocks_per_mp=2 the kernel is register-bound (128 regs/thread), so a
+            # 2nd K stage just spills to local memory with no occupancy gain, and the
+            # CTAs already hide the K-load latency. Sync load + high occupancy wins.
             n_iter = cute.ceil_div(max_k_tiles, num_splits)
             for it in cutlass.range(n_iter):
                 kv_block = split_idx + it * num_splits

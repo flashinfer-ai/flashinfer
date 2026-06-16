@@ -407,8 +407,8 @@ def test_m3_kv_dtype_matrix_at_m3_shapes(kv_kind):
 
 
 # ===========================================================================
-# Proxy-head equivalence (handoff §7.3): flashinfer proxy_score + amax over the
-# index_n_heads proxy heads + topk_select == M3's lightning-indexer selection.
+# Proxy-head equivalence: flashinfer proxy_score + amax over the index_n_heads
+# proxy heads + topk_select == M3's lightning-indexer selection.
 # ===========================================================================
 
 
@@ -491,8 +491,8 @@ def _reference_block_scores(idx_q, idx_k, position_ids, block_size):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_m3_indexer_proxy_head_equivalence(dtype):
-    """Resolve handoff §7.3: flashinfer's proxy pipeline reproduces M3's
-    lightning-indexer block selection. M3 computes per-(head, query, block) maxes
+    """flashinfer's proxy pipeline reproduces M3's lightning-indexer block
+    selection. M3 computes per-(head, query, block) maxes
     then **maxes over the index_n_heads proxy heads** before the top-k;
     ``msa_proxy_score`` emits exactly the per-head block maxes, so its
     ``reduce_heads=True`` max over the proxy heads recovers M3's single per-query

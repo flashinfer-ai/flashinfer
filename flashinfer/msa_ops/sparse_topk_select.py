@@ -129,11 +129,11 @@ def msa_topk_select(
     if num_valid_pages is None:
         num_valid_pages = max_k_tiles
 
-    # Input guards. The retained CUDA kernel clamps these internally (and MSA's own
-    # Python wrapper asserts them), but the default CuTe-DSL radix path does not, so
-    # validate here for both: out of range num_valid_pages would read max_score out
-    # of bounds, and oversized forced regions would overrun the radix kernel's fixed
-    # forced-index buffer or produce negative (underflowed) block indices.
+    # Input guards. The CuTe-DSL radix kernel does not clamp these internally (MSA's
+    # own Python wrapper asserts them), so validate here: out of range num_valid_pages
+    # would read max_score out of bounds, and oversized forced regions would overrun
+    # the radix kernel's fixed forced-index buffer or produce negative (underflowed)
+    # block indices.
     if not 0 < num_valid_pages <= max_k_tiles:
         raise ValueError(
             f"num_valid_pages must be in (0, max_k_tiles={max_k_tiles}], "
