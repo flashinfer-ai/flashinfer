@@ -129,6 +129,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -748,6 +749,7 @@ def gdn_wide_vec_kernel(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1246,6 +1248,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1270,7 +1273,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     )
 
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
-    grid_size = q.shape[0] * HV * num_v_tiles
+    grid_size = B * HV * num_v_tiles
 
     smem_bytes = 128
     if T > 1:
@@ -1296,6 +1299,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         softplus_threshold,
         scale,
         HV,
+        B,
         T,
         H,
         K,
@@ -1336,6 +1340,7 @@ def _run_wide_vec(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
+    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1349,7 +1354,7 @@ def _run_wide_vec(
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
-    grid_size = q.shape[0] * HV * num_v_tiles
+    grid_size = B * HV * num_v_tiles
     smem_bytes = (
         4 * T * (K + 8)  # sQ FP32
         + 4 * T * (K + 8)  # sK FP32
@@ -1373,6 +1378,7 @@ def _run_wide_vec(
         softplus_threshold,
         scale,
         HV,
+        B,
         T,
         H,
         K,
@@ -1716,25 +1722,18 @@ def gated_delta_rule_mtp_wide_vec(
     )
 
     # Slot stride may be larger than HV*V*K (vLLM packs conv+ssm on the same
-    # page). For such padded (non-contiguous) pools the stride is baked into
-    # the cubin, so pool_size/stride stay in the cache key. Contiguous pools
-    # get a dynamic slot dimension instead, and B is always a runtime value,
-    # so one compiled kernel serves every batch size per config.
-    contiguous_pool = initial_state_source.is_contiguous()
-    if contiguous_pool:
-        pool_size_key = -1
-        pool_slot_stride = -1
-    else:
-        pool_size_key = pool_size
-        pool_slot_stride = int(initial_state_source.stride(0))
+    # page). Include in the cache key so padded vs tight pools each get their
+    # own compiled kernel — cute.compile bakes the stride into the cubin.
+    pool_slot_stride = int(initial_state_source.stride(0))
     cache_key = (
         "v3_mtp_bf16_tiled",
+        B_val,
         T_val,
         H_val,
         HV_val,
         K_val,
         V_val,
-        pool_size_key,
+        pool_size,
         pool_slot_stride,
         tile_v,
         effective_disable_final,
@@ -1761,34 +1760,21 @@ def gated_delta_rule_mtp_wide_vec(
         # Both read and write index tensors share the same shape/dtype so
         # the same dlpack handle works for both slots.
         h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        if contiguous_pool:
-            h_.mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-            )
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        inter_.mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2), divisibility=1
-        )
         q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-        q_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
         k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-        k_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
         v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-        v_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
         a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-        a_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
-        b_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
-        o_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
         h0_idx_ = from_dlpack(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        ).mark_layout_dynamic()
+        )
         h0_out_idx_ = from_dlpack(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        ).mark_layout_dynamic()
+        )
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -1809,6 +1795,7 @@ def gated_delta_rule_mtp_wide_vec(
                 softplus_threshold,
                 scale,
                 HV_val,
+                B_val,
                 T_val,
                 H_val,
                 K_val,
@@ -1822,26 +1809,19 @@ def gated_delta_rule_mtp_wide_vec(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            "aux": {(B_val, q.device): (default_indices, default_output)},
+            "default_indices": default_indices,
+            "output": default_output,
         }
 
     cache = _compiled_kernels_wide_vec[cache_key]
-    aux_map = cache["aux"]
-    aux_key = (B_val, q.device)
-    if aux_key not in aux_map:
-        aux_map[aux_key] = (
-            torch.arange(B_val, dtype=torch.int32, device=q.device),
-            torch.empty(B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype),
-        )
-    default_indices_rt, default_output_rt = aux_map[aux_key]
     if initial_state_indices is None:
-        initial_state_indices = default_indices_rt
+        initial_state_indices = cache["default_indices"]
     if output_state_indices is None:
         # Single-pool: read==write. Reuse the same indices tensor — no extra
         # allocation, kernel still produces the same address for both slots.
         output_state_indices = initial_state_indices
     if output is None:
-        output = default_output_rt
+        output = cache["output"]
 
     cache["compiled"](
         h0_source,
@@ -2008,25 +1988,17 @@ def gated_delta_rule_mtp(
     )
 
     # Slot stride may be larger than HV*V*K (vLLM's packed conv+ssm page).
-    # For such padded (non-contiguous) pools the stride is baked into the
-    # cubin, so pool_size/stride stay in the cache key. Contiguous pools get
-    # a dynamic slot dimension instead, and B is always a runtime value, so
-    # one compiled kernel serves every batch size per config.
-    contiguous_pool = initial_state_source.is_contiguous()
-    if contiguous_pool:
-        pool_size_key = -1
-        pool_slot_stride = -1
-    else:
-        pool_size_key = pool_size
-        pool_slot_stride = int(initial_state_source.stride(0))
+    # Include in cache key — cute.compile bakes the stride into the cubin.
+    pool_slot_stride = int(initial_state_source.stride(0))
     cache_key = (
         "mtp_bf16",
+        B,
         T,
         H,
         HV,
         K,
         V,
-        pool_size_key,
+        pool_size,
         pool_slot_stride,
         tile_v,
         ilp_rows,
@@ -2040,41 +2012,28 @@ def gated_delta_rule_mtp(
         same_pool,
     )
     if cache_key not in _compiled_kernels_mtp:
-        # First call for this config: compile the kernel.
-        # Batch-dependent dimensions are marked dynamic so the
-        # compiled kernel is reused across batch sizes.
+        # First call for this shape: allocate default indices/output and do
+        # dlpack conversions once for compilation. Steady-state calls pass
+        # torch tensors straight to the compiled callable (tvm-ffi accepts
+        # either) and reuse these cached defaults when the caller doesn't
+        # provide their own.
         default_indices = torch.arange(B, dtype=torch.int32, device=q.device)
         default_output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
         h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        if contiguous_pool:
-            h_.mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-            )
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        inter_.mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2), divisibility=1
-        )
         q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-        q_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
         k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-        k_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
         v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-        v_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
         a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-        a_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
-        b_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = from_dlpack(default_output, assumed_align=32, enable_tvm_ffi=True)
-        o_.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2, 3), divisibility=1)
-        h0_idx_ = from_dlpack(
-            default_indices, assumed_align=32, enable_tvm_ffi=True
-        ).mark_layout_dynamic()
+        h0_idx_ = from_dlpack(default_indices, assumed_align=32, enable_tvm_ffi=True)
         h0_out_idx_ = from_dlpack(
             default_indices, assumed_align=32, enable_tvm_ffi=True
-        ).mark_layout_dynamic()
+        )
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
@@ -2095,6 +2054,7 @@ def gated_delta_rule_mtp(
                 softplus_threshold,
                 scale,
                 HV,
+                B,
                 T,
                 H,
                 K,
@@ -2108,20 +2068,16 @@ def gated_delta_rule_mtp(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            "aux": {(B, q.device): default_output},
+            "default_indices": default_indices,
+            "output": default_output,
         }
 
     cache = _compiled_kernels_mtp[cache_key]
-    aux_map = cache["aux"]
-    aux_key = (B, q.device)
-    if aux_key not in aux_map:
-        aux_map[aux_key] = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
-    default_output_rt = aux_map[aux_key]
 
     if output_state_indices is None:
         output_state_indices = initial_state_indices
     if output is None:
-        output = default_output_rt
+        output = cache["output"]
 
     cache["compiled"](
         h0_source,
