@@ -10,14 +10,13 @@ supplies bf16 weights and activation/routing tensors via
   - Forward: ``MoEEpMegaLayer.forward(MoEEpTensors)``
 
 Launch (example, 4 GPUs on one node):
-    torchrun --nproc_per_node=4 \\
-        benchmarks/bench_deepseek_v4_mega_moe_experts_moe_ep_v2.py
+    torchrun --nproc_per_node=4 benchmarks/moe_ep/bench_deepseek_v4_mega_moe_flashinfer.py
 
     torchrun --nproc_per_node=4 \\
-        benchmarks/bench_deepseek_v4_mega_moe_experts_moe_ep_v2.py \\
+        benchmarks/moe_ep/bench_deepseek_v4_mega_moe_flashinfer.py \\
         --num-tokens 4096 --num-max-tokens 4096 --warmup 10 --repeat 50
 
-Use the same CLI flags as bench_deepseek_v4_mega_moe_experts.py for comparable runs.
+Use the same CLI flags as bench_deepseek_v4_mega_moe_vLLM.py for comparable runs.
 
 Requires:
     - flashinfer with ``moe_ep_v2`` mega path

@@ -9,13 +9,13 @@ weights and activation/routing tensors via ``bench_deepseek_v4_mega_moe_common``
   - Forward: ``experts(...)`` inside ``set_forward_context`` (custom op)
 
 Launch (example, 4 GPUs on one node):
-    torchrun --nproc_per_node=4 benchmarks/bench_deepseek_v4_mega_moe_experts.py
+    torchrun --nproc_per_node=4 benchmarks/moe_ep/bench_deepseek_v4_mega_moe_vLLM.py
 
-    torchrun --nproc_per_node=4 benchmarks/bench_deepseek_v4_mega_moe_experts.py \\
+    torchrun --nproc_per_node=4 benchmarks/moe_ep/bench_deepseek_v4_mega_moe_vLLM.py \\
         --num-tokens 4096 --num-max-tokens 4096 --warmup 10 --repeat 50
 
     # vLLM-only gate or hash routing (not comparable to moe_ep_v2):
-    torchrun --nproc_per_node=4 benchmarks/bench_deepseek_v4_mega_moe_experts.py \\
+    torchrun --nproc_per_node=4 benchmarks/moe_ep/bench_deepseek_v4_mega_moe_vLLM.py \\
         --no-random-routing
 
 Requires:
@@ -455,6 +455,9 @@ def main() -> int:
     finally:
         _destroy_symm_buffers()
         config_ctx.__exit__(None, None, None)
+        from vllm.distributed.parallel_state import destroy_model_parallel
+
+        destroy_model_parallel()
         if dist.is_initialized():
             dist.destroy_process_group()
 
