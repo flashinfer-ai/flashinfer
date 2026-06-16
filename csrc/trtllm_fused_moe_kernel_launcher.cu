@@ -360,6 +360,23 @@ class FusedMoeLauncher {
     }
   }
 
+  void check_optional_per_expert_float_tensor(Optional<TensorView> const& tensor,
+                                              std::string const& tensor_name) const {
+    if (!tensor.has_value()) {
+      return;
+    }
+    auto const& value = tensor.value();
+    TVM_FFI_ICHECK(value.device().device_type == kDLCUDA)
+        << tensor_name << " must be a CUDA tensor.";
+    TVM_FFI_ICHECK(value.device().device_id == hidden_states.device().device_id)
+        << tensor_name << " must be on the same device as hidden_states.";
+    TVM_FFI_ICHECK_EQ(value.dtype(), dl_float32) << tensor_name << " must be float32.";
+    TVM_FFI_ICHECK_EQ(value.ndim(), 1) << tensor_name << " must be 1D.";
+    TVM_FFI_ICHECK_EQ(value.size(0), args->local_num_experts)
+        << tensor_name << " must have shape [local_num_experts].";
+    TVM_FFI_ICHECK(value.IsContiguous()) << tensor_name << " must be contiguous.";
+  }
+
   void check_routing_common() const {
     TVM_FFI_ICHECK(args->top_k > 0 && args->top_k <= args->num_experts)
         << "top_k must be between 1 and num_experts";
@@ -652,12 +669,17 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
                   Optional<TensorView> const& routing_bias, TensorView const& expert_indices,
                   TensorView const& expert_weights, TensorView const& hidden_states,
                   TensorView const& gemm1_weights, TensorView const& gemm2_weights,
-                  Optional<TensorView> const& gemm1_bias)
+                  Optional<TensorView> const& gemm1_bias, Optional<TensorView> const& gemm1_alpha,
+                  Optional<TensorView> const& gemm1_beta,
+                  Optional<TensorView> const& gemm1_clamp_limit)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm1_bias,
                          Optional<TensorView>(), Optional<TensorView>(), gemm2_weights,
                          Optional<TensorView>(), Optional<TensorView>()),
         expert_indices(expert_indices),
-        expert_weights(expert_weights) {}
+        expert_weights(expert_weights),
+        gemm1_alpha(gemm1_alpha),
+        gemm1_beta(gemm1_beta),
+        gemm1_clamp_limit(gemm1_clamp_limit) {}
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
@@ -725,6 +747,14 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
         << "BF16 Moe: weight_layout must be BlockMajorK";
     check_weights_shape("gemm1");
     check_weights_shape("gemm2");
+    check_optional_per_expert_float_tensor(gemm1_alpha, "gemm1_alpha");
+    check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
+    check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+    if (gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value()) {
+      TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
+          << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
+             "ActivationType::Swiglu.";
+    }
 
     TVM_FFI_ICHECK_EQ(args->intermediate_size % 128, 0)
         << "the second dimension of weights must be a multiple of 128.";
@@ -755,6 +785,13 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
       args->output = output.data_ptr();
     }
     args->output_scale = nullptr;
+    args->gemm1_alpha =
+        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+    args->gemm1_beta =
+        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
@@ -790,6 +827,9 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
  private:
   TensorView expert_weights;
   TensorView expert_indices;
+  Optional<TensorView> gemm1_alpha;
+  Optional<TensorView> gemm1_beta;
+  Optional<TensorView> gemm1_clamp_limit;
 };
 
 class Fp8PerTensorLauncher : public FusedMoeLauncher {
@@ -1976,19 +2016,18 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 };
 
-Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
-                              Optional<TensorView> const& routing_bias,
-                              TensorView const& expert_indices, TensorView const& expert_weights,
-                              TensorView const& hidden_states, TensorView const& gemm1_weights,
-                              TensorView const& gemm2_weights,
-                              Optional<TensorView> const& gemm1_lora_delta, TensorView output,
-                              int64_t num_experts, int64_t top_k, Optional<int64_t> n_group,
-                              Optional<int64_t> topk_group, int64_t intermediate_size,
-                              int64_t local_expert_offset, int64_t local_num_experts,
-                              Optional<double> routed_scaling_factor, int64_t routing_method_type,
-                              bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
-                              bool enable_pdl, Array<int64_t> moe_tactic, int64_t activation_type,
-                              bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+Array<Tensor> trtllm_bf16_moe(
+    Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
+    TensorView const& expert_indices, TensorView const& expert_weights,
+    TensorView const& hidden_states, TensorView const& gemm1_weights,
+    TensorView const& gemm2_weights, Optional<TensorView> const& gemm1_lora_delta,
+    Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
+    Optional<TensorView> const& gemm1_clamp_limit, TensorView output, int64_t num_experts,
+    int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
+    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
+    Optional<double> routed_scaling_factor, int64_t routing_method_type, bool use_shuffled_weight,
+    int64_t weight_layout, bool do_finalize, bool enable_pdl, Array<int64_t> moe_tactic,
+    int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
   // Just some basic type validation first and leave more checks to the launcher
   if (routing_logits.has_value()) {
     TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
@@ -2043,9 +2082,9 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
     args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
-    auto launcher = std::make_unique<Bf16MoeLauncher>(routing_logits, routing_bias, expert_indices,
-                                                      expert_weights, hidden_states, gemm1_weights,
-                                                      gemm2_weights, gemm1_lora_delta);
+    auto launcher = std::make_unique<Bf16MoeLauncher>(
+        routing_logits, routing_bias, expert_indices, expert_weights, hidden_states, gemm1_weights,
+        gemm2_weights, gemm1_lora_delta, gemm1_alpha, gemm1_beta, gemm1_clamp_limit);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout, activation, static_cast<int64_t>(gemm1_bias_type_enum),
                    norm_topk_prob);

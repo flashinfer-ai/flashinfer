@@ -44,8 +44,9 @@ class ActivationType(IntEnum):
     SwigluBias = 5
     Relu2 = 6
     SwigluStep = 7
-    Identity = 8
-    InvalidType = 9
+    GegluTanh = 8
+    Identity = 9
+    InvalidType = 10
 
     # Eval-safe repr — see ``RoutingMethodType.__repr__``.
     def __repr__(self) -> str:

@@ -68,7 +68,6 @@ from .jit.fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
-from .jit.gdn import gen_gdn_prefill_sm90_module
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
@@ -90,7 +89,7 @@ from .jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from .jit.mhc import gen_mhc_module
-from .jit.mla import gen_mla_module
+from .jit.mla import gen_mla_module, gen_sparse_mla_sm120_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -704,8 +703,6 @@ def gen_all_modules(
                     )
                 )
             jit_specs.append(gen_trtllm_utils_module())
-        if has_sm90:
-            jit_specs.append(gen_gdn_prefill_sm90_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
         if has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121:
@@ -735,6 +732,10 @@ def gen_all_modules(
                 has_sm121,
             )
         )
+
+    # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
+    if has_sm120 or has_sm121:
+        jit_specs.append(gen_sparse_mla_sm120_module())
 
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
