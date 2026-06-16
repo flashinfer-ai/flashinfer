@@ -33,8 +33,14 @@ selected with ``--layout {expert_major,rank_major}``:
     model's real top_k (do_finalize pre-reduce), with non-local picks masked to
     weight 0 — far less padded work than EXPERT_MAJOR, which is the point of
     measuring it.
-``--algorithm ht`` is wired end-to-end and exercises HT once the FLAT-layout
-handle lands (``--layout`` is ignored under HT).
+``--algorithm ht`` exercises HT FLAT (``--layout`` ignored). For the HT
+``nccl_ep_b200_ib`` config, add ``--ep-test-geometry`` (rank-derived
+top_k=min(8,world), num_experts=min(256, top_k*world), per contrib/nccl_ep/
+ep_test.py) and sweep ``--tokens-per-rank {4096,8192}``.
+
+The CSV reports BOTH per-stage latency (µs) and dispatch/combine bandwidth (GB/s,
+ep_bench send-side convention: unique (token,node) selections × hidden × dtype /
+stage time; ``*_rdma_*`` = remote-node only).
 """
 
 from __future__ import annotations
@@ -85,6 +91,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="use the ep_bench reference geometry (hidden=7168, experts=256, "
         "top_k=8, 128 tokens/rank)",
+    )
+    p.add_argument(
+        "--ep-test-geometry",
+        action="store_true",
+        help="derive top_k / num_experts from world size like contrib/nccl_ep/"
+        "ep_test.py: top_k=min(8,world), num_experts=min(256, top_k*world). This is "
+        "the geometry the nccl_ep_b200_ib HT benchmark uses (resolved in main() once "
+        "world size is known); overrides --num-experts / --top-k.",
     )
     # Sizing. --tokens-per-rank (preferred, matches the reference) wins over the
     # global --tokens; the reference uses 128 tokens/rank.
@@ -251,6 +265,10 @@ def main() -> int:
         args.tokens = per_rank * world_size
     else:
         per_rank = args.tokens // world_size
+    # ep_test.py geometry (the nccl_ep_b200_ib HT config): rank-derived experts/top_k.
+    if args.ep_test_geometry:
+        args.top_k = min(8, world_size)
+        args.num_experts = min(256, args.top_k * world_size)
     local_num_experts = args.num_experts // world_size
     local_expert_offset = rank * local_num_experts
     ep_algorithm = (
@@ -374,14 +392,40 @@ def main() -> int:
     # tok/s on the global batch (all ranks dispatch `tokens` total).
     tok_s = (args.tokens / (e2e_us * 1e-6)) if e2e_us > 0 else float("nan")
 
+    # Dispatch/combine bandwidth (GB/s), ep_bench send-side convention: bytes moved
+    # = unique (token, node) selections * hidden * dtype_bytes; rdma = remote-node
+    # only. GB are decimal (bytes / 1e9), matching contrib/nccl_ep/ep_bench.cu. This
+    # is a per-rank (rank 0) figure. (combine returns the same data volume.)
+    ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", min(world_size, 8)))
+    num_nodes = max(1, world_size // ranks_per_node)
+    experts_per_node = max(1, args.num_experts // num_nodes)
+    my_node = rank // ranks_per_node
+    node_of_expert = (topk_ids // experts_per_node).clamp_(0, num_nodes - 1)
+    onehot = torch.zeros(per_rank, num_nodes, dtype=torch.bool, device=device)
+    onehot.scatter_(1, node_of_expert, True)
+    send_tokens = int(onehot.sum().item())
+    remote = onehot.clone()
+    remote[:, my_node] = False
+    rdma_tokens = int(remote.sum().item())
+    send_bytes = send_tokens * args.hidden * 2
+    rdma_bytes = rdma_tokens * args.hidden * 2
+    disp_s, comb_s = d_us * 1e-6, cb_us * 1e-6
+
+    def _gbps(b, s):
+        return (b / 1e9) / s if s > 0 else 0.0
+
+    disp_gbps, disp_rdma = _gbps(send_bytes, disp_s), _gbps(rdma_bytes, disp_s)
+    comb_gbps, comb_rdma = _gbps(send_bytes, comb_s), _gbps(rdma_bytes, comb_s)
+
     dist.barrier()
     if rank == 0:
         mode = "identity" if args.baseline else args.quant
         layout_name = "ht_flat" if args.algorithm == "ht" else args.layout
         print(
-            "BENCH_CSV,algo,layout,tokens,gpus,backend,quant,dispatch_us,compute_us,combine_us,e2e_us,tok_s\n"
+            "BENCH_CSV,algo,layout,tokens,gpus,backend,quant,dispatch_us,compute_us,combine_us,e2e_us,tok_s,disp_gbps,disp_rdma_gbps,comb_gbps,comb_rdma_gbps\n"
             f"BENCH_CSV,{args.algorithm},{layout_name},{args.tokens},{world_size},{args.backend},{mode},"
-            f"{d_us:.1f},{cp_us:.1f},{cb_us:.1f},{e2e_us:.1f},{tok_s:.1f}"
+            f"{d_us:.1f},{cp_us:.1f},{cb_us:.1f},{e2e_us:.1f},{tok_s:.1f},"
+            f"{disp_gbps:.1f},{disp_rdma:.1f},{comb_gbps:.1f},{comb_rdma:.1f}"
         )
     dist.destroy_process_group()
     return 0
