@@ -1,4 +1,4 @@
-"""Phase 2 / C3 — multi-rank roundtrip on 4+ GPUs.
+"""Phase 2 / C3 — multi-rank roundtrip on 4+ GPUs via MoEEpLayer + Identity kernel.
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep_v2/test_moe_ep_layer_multirank.py -v -m "nvep and gpu_4" --backend=nccl_ep      # or nixl_ep
@@ -17,20 +17,20 @@ import pytest
 
 
 def pytest_generate_tests(metafunc):
-    """Generate `backend` param values from --backend CLI."""
-    if "backend" not in metafunc.fixturenames:
+    """Generate `comm_backend` param values from --backend CLI."""
+    if "comm_backend" not in metafunc.fixturenames:
         return
-    cli = metafunc.config.getoption("--backend")
+    cli = metafunc.config.getoption("--backend", default=None)
     if cli == "both" or cli is None:
-        metafunc.parametrize("backend", ["nccl_ep", "nixl_ep"])
+        metafunc.parametrize("comm_backend", ["nccl_ep", "nixl_ep"])
     else:
-        metafunc.parametrize("backend", [cli])
+        metafunc.parametrize("comm_backend", [cli])
 
 
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-def test_moe_ep_roundtrip_ll_bf16_h4096(backend):
-    """Identity inner compute → dispatch+combine roundtrips hidden_states.
+def test_moe_ep_roundtrip_ll_bf16_h4096(comm_backend):
+    """MoEEpLayer + IdentityConfig roundtrips hidden_states on 4+ GPUs.
 
     With softmax-normalized topk_weights, sum(topk_weights, dim=-1)==1, so
     after combine reweights by them the output equals the input within bf16
@@ -43,8 +43,12 @@ def test_moe_ep_roundtrip_ll_bf16_h4096(backend):
         BootstrapConfig,
         EpAlgorithm,
         FleetParams,
-        MoEEpSplitLayer,
+        IdentityConfig,
+        MoEEpLayer,
         MoEEpTensors,
+        NCCLEPConfig,
+        NvepConfig,
+        SplitConfig,
     )
 
     backend_name = "nccl" if torch.cuda.is_available() else "gloo"
@@ -83,7 +87,7 @@ def test_moe_ep_roundtrip_ll_bf16_h4096(backend):
         torch.randn(num_tokens, topk, device="cuda", generator=g), dim=-1
     )
 
-    if backend == "nixl_ep":
+    if comm_backend == "nixl_ep":
         master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
         master_port = int(os.environ.get("MASTER_PORT", "29500"))
         tcp_store = dist.TCPStore(
@@ -95,23 +99,23 @@ def test_moe_ep_roundtrip_ll_bf16_h4096(backend):
     else:
         tcp_store = None
 
-    bootstrap = BootstrapConfig(
-        world_size=world_size,
-        rank=rank,
-        stream=torch.cuda.current_stream().cuda_stream,
-        nccl_comm=None,
-        tcp_store=tcp_store,
-    )
-    layer = MoEEpSplitLayer(
-        bootstrap,
-        FleetParams(
+    comm = NvepConfig() if comm_backend == "nixl_ep" else NCCLEPConfig()
+    layer = MoEEpLayer(
+        bootstrap=BootstrapConfig(
+            world_size=world_size,
+            rank=rank,
+            stream=torch.cuda.current_stream().cuda_stream,
+            nccl_comm=None,
+            tcp_store=tcp_store,
+        ),
+        fleet_params=FleetParams(
             num_experts=num_experts,
             max_tokens_per_rank=num_tokens,
             token_hidden_size=hidden,
             dtype_bytes=2,
             algorithm=EpAlgorithm.LOW_LATENCY,
         ),
-        backend=backend,
+        backend=SplitConfig(comm=comm, kernel=IdentityConfig()),
     )
 
     t = MoEEpTensors(hidden_states=x, topk_ids=topk_ids, topk_weights=topk_weights)
@@ -124,4 +128,4 @@ def test_moe_ep_roundtrip_ll_bf16_h4096(backend):
     # is effectively a roundtrip: y ≈ x within bf16 tolerance.
     torch.testing.assert_close(y, x, atol=5e-2, rtol=5e-2)
     layer.destroy()
-    print(f"rank {rank}: {backend} roundtrip OK")
+    print(f"rank {rank}: {comm_backend} identity roundtrip OK")
