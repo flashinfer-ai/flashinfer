@@ -1731,10 +1731,10 @@ def gated_delta_rule_mtp_wide_vec(
     contiguous_pool = initial_state_source.is_contiguous()
     if contiguous_pool:
         pool_size_key = -1
-        pool_slot_stride = -1
+        pool_slot_stride: tuple[int, ...] = (-1,)
     else:
         pool_size_key = pool_size
-        pool_slot_stride = int(initial_state_source.stride(0))
+        pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
     cache_key = (
         "v3_mtp_bf16_tiled_dynB",
         T_val,
@@ -1991,10 +1991,10 @@ def gated_delta_rule_mtp(
     contiguous_pool = initial_state_source.is_contiguous()
     if contiguous_pool:
         pool_size_key = -1
-        pool_slot_stride = -1
+        pool_slot_stride: tuple[int, ...] = (-1,)
     else:
         pool_size_key = pool_size
-        pool_slot_stride = int(initial_state_source.stride(0))
+        pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
     cache_key = (
         "mtp_bf16_dynB",
         T,
