@@ -77,6 +77,8 @@ struct CombineKernelPointers {
 
 // Dispatch phase parameters
 struct MoeA2ADispatchParams {
+  bool enable_pdl;  // True: launch with programmatic dependent launch
+
   // EP configuration
   int ep_size;               // Number of EP ranks
   int ep_rank;               // Current EP rank
@@ -135,6 +137,8 @@ enum class MoeA2ACombineSwizzleSFMode : uint32_t {
 
 // Combine phase parameters
 struct MoeA2ACombineParams {
+  bool enable_pdl;  // True: launch with programmatic dependent launch
+
   // EP configuration
   int ep_size;  // Number of EP ranks
   int ep_rank;  // Current EP rank
@@ -144,6 +148,10 @@ struct MoeA2ACombineParams {
   int max_tokens_per_rank;  // Maximum tokens per rank for pre-allocation TODO: Rename to
                             // runtime_max_tokens_per_rank
   int top_k;                // Number of experts per token
+
+  // If true, recv buffers contain FP8 data (either pre-staged or quantized in-place by prepare).
+  // The combine kernel reads FP8 and writes BF16 output.
+  bool use_low_precision;
 
   // Prepare-only field: original payload tensor pointer used to stage into workspace
   void const* prepare_payload;
@@ -188,6 +196,6 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 // invalid_id: value to fill for invalid tokens' expert ids
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters,
                                         int32_t invalid_id, int ep_size, int max_tokens_per_rank,
-                                        int top_k, cudaStream_t stream);
+                                        int top_k, cudaStream_t stream, bool enable_pdl);
 
 }  // namespace tensorrt_llm::kernels::moe_alltoall

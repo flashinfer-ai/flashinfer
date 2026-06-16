@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <cooperative_groups.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 #include <type_traits>
@@ -27,6 +28,8 @@
 #include "tensorrt_llm/kernels/quantization_utils.cuh"
 
 namespace tensorrt_llm::kernels::moe_alltoall {
+
+using tensorrt_llm::common::launchWithPdlWhenEnabled;
 
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
@@ -112,6 +115,11 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
     }                                                                   \
     case nvinfer1::DataType::kFLOAT: {                                  \
       using TYPE = float;                                               \
+      __VA_ARGS__;                                                      \
+      break;                                                            \
+    }                                                                   \
+    case nvinfer1::DataType::kFP8: {                                    \
+      using TYPE = __nv_fp8_e4m3;                                       \
       __VA_ARGS__;                                                      \
       break;                                                            \
     }                                                                   \
@@ -295,7 +303,11 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
 }
 
 __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token_counter,
-                                            int ep_size, uint32_t* flag_val_ptr) {
+                                            int ep_size, uint32_t* flag_val_ptr, bool enable_pdl) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (enable_pdl) cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   // Zero send_counters
   if (idx < ep_size) {
@@ -323,7 +335,7 @@ __global__ void moeA2ADispatchKernel(
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
-    int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank) {
+    int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank, bool enable_pdl) {
   int thread_idx = threadIdx.x;
   int local_token_idx = blockIdx.x;
 
@@ -332,9 +344,16 @@ __global__ void moeA2ADispatchKernel(
     // we need to keep the threads where local_token_idx == 0 alive to participate in the
     // synchronization. Other threads should return.
     if (local_token_idx > 0) return;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (enable_pdl) cudaGridDependencySynchronize();
+#endif
   } else {
     // Threads that do not have a token to process should return.
     if (local_token_idx >= local_num_tokens) return;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (enable_pdl) cudaGridDependencySynchronize();
+#endif
 
     // Prepare per-policy shared-memory tiles for this token
     extern __shared__ int smem[];
@@ -395,6 +414,10 @@ __global__ void moeA2ADispatchKernel(
 
     __syncthreads();
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
 
   bool is_first_warp = threadIdx.x / warpSize == 0;
   if (is_first_warp) {
@@ -471,8 +494,10 @@ __global__ void moeA2ADispatchKernel(
 }
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params) {
-  moeA2APrepareDispatchKernel<<<1, params.ep_size, 0, params.stream>>>(
-      params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
+  launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", params.enable_pdl,
+                           moeA2APrepareDispatchKernel, 1, params.ep_size, 0, params.stream,
+                           params.send_counters, params.local_token_counter, params.ep_size,
+                           params.flag_val, params.enable_pdl);
 }
 
 // ============================================================================
@@ -517,8 +542,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
 
   int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
-
-  // Configure kernel launch: one block per token
+  // Configure kernel launch: one block per token.
   int grid_size = params.local_num_tokens;
   // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
   // synchronization.
@@ -526,41 +550,52 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     grid_size = 1;
   }
   int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-  SWITCH_TOP_K(params.top_k, TOP_K,
-               moeA2ADispatchKernel<TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                   params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                   params.ep_size, params.num_experts_per_rank))
+  SWITCH_TOP_K(params.top_k, TOP_K, {
+    auto kernel_fn = moeA2ADispatchKernel<TOP_K>;
+    launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+                             kBlockSize, shared_bytes, params.stream, params.token_selected_experts,
+                             kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
+                             params.local_num_tokens, params.ep_rank, params.ep_size,
+                             params.num_experts_per_rank, params.enable_pdl);
+  })
 }
 
 // ============================================================================
 // Combine kernels
 // ============================================================================
 
-template <typename T, int ELEMS_PER_VEC>
-__device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
-#pragma unroll
-  for (int j = 0; j < ELEMS_PER_VEC; ++j) {
-    dst[j] += src[j];
-  }
-}
-
-// Accumulate across all valid ranks into registers, then store once per segment
-template <int VEC_SIZE_BYTES, int TOP_K, typename T,
+// Accumulate across all valid ranks into float32 registers, then store as T (QuantMode==NONE)
+// or quantize the result to MXFP8 with a per-block scale factor (QuantMode==MXFP8).
+//
+// InT: input element type in the recv buffer (defaults to T for same-type accumulation;
+//      __nv_fp8_e4m3 for the low-precision combine path).  sizeof(InT) must divide VEC_SIZE_BYTES.
+// T:   output / accumulation-cast element type (and the input type when InT == T).
+//
+// Unified path: load VEC_SIZE_BYTES bytes, reinterpret as InT[elems_per_vec], accumulate as
+// float32, then either cast_store as T (NONE) or convert to MXFP8 + emit the block scale factor
+// (MXFP8, which always uses InT == T).  Block-per-token indexing
+// (threadIdx.x/blockDim.x/blockIdx.x).
+template <int VEC_SIZE_BYTES, int TOP_K, typename T, typename InT = T,
           MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, int row_idx,
-                                        int row_size, int rank_id, int max_tokens_per_rank,
+                                        int row_size, int stride_per_token, int rank_id,
+                                        int max_tokens_per_rank,
                                         CombineKernelPointers const& ptrs) {
-  constexpr int elems_per_vec = VEC_SIZE_BYTES / sizeof(T);
-  const int size_per_token = row_size * sizeof(T);
   using flashinfer::vec_t;
 
-  uint8_t* dst_bytes;
+  // elems_per_vec: number of InT elements per VEC_SIZE_BYTES-byte load (constexpr).
+  constexpr int elems_per_vec = VEC_SIZE_BYTES / static_cast<int>(sizeof(InT));
+  // size_per_token: byte span of one token in the recv buffer (InT-typed).
+  const int size_per_token = row_size * static_cast<int>(sizeof(InT));
+
+  // Output base pointers.  NONE writes T elements; MXFP8 writes packed fp8 bytes.
+  T* dst_typed_base = nullptr;
+  uint8_t* dst_bytes = nullptr;
   if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
-    dst_bytes = reinterpret_cast<uint8_t*>(static_cast<T*>(output_buffer) + row_idx * row_size);
+    dst_typed_base = static_cast<T*>(output_buffer) + static_cast<size_t>(row_idx) * row_size;
   } else {
-    // MXFP8 output stores one byte per logical element while accumulation reads T-sized inputs.
+    // MXFP8 output stores one byte per logical element while accumulation reads InT inputs.
     dst_bytes = static_cast<uint8_t*>(output_buffer) +
                 static_cast<size_t>(row_idx) * static_cast<size_t>(row_size);
   }
@@ -568,17 +603,23 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
   int const stride = blockDim.x * VEC_SIZE_BYTES;
   int const local_token_idx = blockIdx.x;
 
+  // offset is a byte offset into the recv buffer, stepping by VEC_SIZE_BYTES bytes.
   for (int offset = threadIdx.x * VEC_SIZE_BYTES; offset < size_per_token; offset += stride) {
-    int logical_offset = offset / sizeof(T);
-    vec_t<uint8_t, VEC_SIZE_BYTES> acc[TOP_K];
+    int logical_offset = offset / static_cast<int>(sizeof(InT));
+    // Per-k vec_t<float, elems_per_vec> accumulators, zero-initialised via fill().
+    vec_t<float, elems_per_vec> acc[TOP_K];
 
-// Unrolled K accumulation using compact top-k lists
+    // Pass 1: issue all TOP_K loads back-to-back without any type conversion.
+    // Raw InT bytes are loaded directly into acc[k]'s register storage, reinterpreted as
+    // vec_t<InT, elems_per_vec> (VEC_SIZE_BYTES bytes, fitting in the low end of acc[k]'s
+    // sizeof(float)*elems_per_vec allocation).  Separating load from cast lets the compiler
+    // schedule all VEC_SIZE_BYTES-byte global loads consecutively, hiding memory latency across k.
 #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
       int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
       int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
       if (dst_idx < 0) {
-        acc[k].fill(0);
+        acc[k].fill(0.0f);
         continue;
       }
 
@@ -586,170 +627,170 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
       size_t base_source_rank =
           static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
           static_cast<size_t>(dst_idx);
-      size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
+      // stride_per_token: byte distance between tokens in the recv buffer.
+      // Equals size_per_token for normal cases; may differ for FP8 in-place
+      // (BF16-stride workspace but FP8-sized payload).
+      size_t base_token = base_source_rank * static_cast<size_t>(stride_per_token);
 
-      // Load directly into the per-k accumulator; reduce across k below
-      acc[k].load(recv_buffer + base_token + offset);
+      reinterpret_cast<vec_t<InT, elems_per_vec>&>(acc[k]).load(
+          reinterpret_cast<InT const*>(recv_buffer + base_token + offset));
     }
 
-    // Reduce acc[TOP_K] into acc[0]
+    // Pass 2: in-place cast InT → float, iterating j in descending order.
+    // float[j] occupies bytes [j*4, j*4+3]; InT[j] occupies [j*sizeof(InT), ...).
+    // For sizeof(InT) < sizeof(float), high-j float writes land above all remaining
+    // InT bytes, so descending order is always write-after-read safe.
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+      if (ptrs.topk_send_indices[local_token_idx * TOP_K + k] < 0)
+        continue;  // acc[k] already holds 0.0f from fill() above
+#pragma unroll
+      for (int j = elems_per_vec - 1; j >= 0; --j)
+        acc[k][j] = static_cast<float>(reinterpret_cast<InT const*>(&acc[k])[j]);
+    }
+    // Reduce acc[TOP_K] into acc[0] via unrolled tree-reduction.
+    // acc[k][j] uses vec_t::operator[] which returns float& — no indirection overhead.
     if constexpr (TOP_K == 22) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      T* a6 = reinterpret_cast<T*>(&acc[6]);
-      T* a7 = reinterpret_cast<T*>(&acc[7]);
-      T* a8 = reinterpret_cast<T*>(&acc[8]);
-      T* a9 = reinterpret_cast<T*>(&acc[9]);
-      T* a10 = reinterpret_cast<T*>(&acc[10]);
-      T* a11 = reinterpret_cast<T*>(&acc[11]);
-      T* a12 = reinterpret_cast<T*>(&acc[12]);
-      T* a13 = reinterpret_cast<T*>(&acc[13]);
-      T* a14 = reinterpret_cast<T*>(&acc[14]);
-      T* a15 = reinterpret_cast<T*>(&acc[15]);
-      T* a16 = reinterpret_cast<T*>(&acc[16]);
-      T* a17 = reinterpret_cast<T*>(&acc[17]);
-      T* a18 = reinterpret_cast<T*>(&acc[18]);
-      T* a19 = reinterpret_cast<T*>(&acc[19]);
-      T* a20 = reinterpret_cast<T*>(&acc[20]);
-      T* a21 = reinterpret_cast<T*>(&acc[21]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a6, a7);
-      accumulate_vec<T, elems_per_vec>(a8, a9);
-      accumulate_vec<T, elems_per_vec>(a10, a11);
-      accumulate_vec<T, elems_per_vec>(a12, a13);
-      accumulate_vec<T, elems_per_vec>(a14, a15);
-      accumulate_vec<T, elems_per_vec>(a16, a17);
-      accumulate_vec<T, elems_per_vec>(a18, a19);
-      accumulate_vec<T, elems_per_vec>(a20, a21);
-
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a4, a6);
-      accumulate_vec<T, elems_per_vec>(a8, a10);
-      accumulate_vec<T, elems_per_vec>(a12, a14);
-      accumulate_vec<T, elems_per_vec>(a16, a18);
-
-      accumulate_vec<T, elems_per_vec>(a0, a4);
-      accumulate_vec<T, elems_per_vec>(a8, a12);
-      accumulate_vec<T, elems_per_vec>(a16, a20);
-
-      accumulate_vec<T, elems_per_vec>(a0, a8);
-      accumulate_vec<T, elems_per_vec>(a0, a16);
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[1][j];
+        acc[2][j] += acc[3][j];
+        acc[4][j] += acc[5][j];
+        acc[6][j] += acc[7][j];
+        acc[8][j] += acc[9][j];
+        acc[10][j] += acc[11][j];
+        acc[12][j] += acc[13][j];
+        acc[14][j] += acc[15][j];
+        acc[16][j] += acc[17][j];
+        acc[18][j] += acc[19][j];
+        acc[20][j] += acc[21][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[2][j];
+        acc[4][j] += acc[6][j];
+        acc[8][j] += acc[10][j];
+        acc[12][j] += acc[14][j];
+        acc[16][j] += acc[18][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[4][j];
+        acc[8][j] += acc[12][j];
+        acc[16][j] += acc[20][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[8][j];
+        acc[0][j] += acc[16][j];
+      }
     } else if constexpr (TOP_K == 16) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      T* a6 = reinterpret_cast<T*>(&acc[6]);
-      T* a7 = reinterpret_cast<T*>(&acc[7]);
-      T* a8 = reinterpret_cast<T*>(&acc[8]);
-      T* a9 = reinterpret_cast<T*>(&acc[9]);
-      T* a10 = reinterpret_cast<T*>(&acc[10]);
-      T* a11 = reinterpret_cast<T*>(&acc[11]);
-      T* a12 = reinterpret_cast<T*>(&acc[12]);
-      T* a13 = reinterpret_cast<T*>(&acc[13]);
-      T* a14 = reinterpret_cast<T*>(&acc[14]);
-      T* a15 = reinterpret_cast<T*>(&acc[15]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a6, a7);
-      accumulate_vec<T, elems_per_vec>(a8, a9);
-      accumulate_vec<T, elems_per_vec>(a10, a11);
-      accumulate_vec<T, elems_per_vec>(a12, a13);
-      accumulate_vec<T, elems_per_vec>(a14, a15);
-
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a4, a6);
-      accumulate_vec<T, elems_per_vec>(a8, a10);
-      accumulate_vec<T, elems_per_vec>(a12, a14);
-
-      accumulate_vec<T, elems_per_vec>(a0, a4);
-      accumulate_vec<T, elems_per_vec>(a8, a12);
-
-      accumulate_vec<T, elems_per_vec>(a0, a8);
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[1][j];
+        acc[2][j] += acc[3][j];
+        acc[4][j] += acc[5][j];
+        acc[6][j] += acc[7][j];
+        acc[8][j] += acc[9][j];
+        acc[10][j] += acc[11][j];
+        acc[12][j] += acc[13][j];
+        acc[14][j] += acc[15][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[2][j];
+        acc[4][j] += acc[6][j];
+        acc[8][j] += acc[10][j];
+        acc[12][j] += acc[14][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[4][j];
+        acc[8][j] += acc[12][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[8][j];
+      }
     } else if constexpr (TOP_K == 10) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      T* a6 = reinterpret_cast<T*>(&acc[6]);
-      T* a7 = reinterpret_cast<T*>(&acc[7]);
-      T* a8 = reinterpret_cast<T*>(&acc[8]);
-      T* a9 = reinterpret_cast<T*>(&acc[9]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a6, a7);
-      accumulate_vec<T, elems_per_vec>(a8, a9);
-
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a4, a6);
-
-      accumulate_vec<T, elems_per_vec>(a0, a4);
-      accumulate_vec<T, elems_per_vec>(a0, a8);
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[1][j];
+        acc[2][j] += acc[3][j];
+        acc[4][j] += acc[5][j];
+        acc[6][j] += acc[7][j];
+        acc[8][j] += acc[9][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[2][j];
+        acc[4][j] += acc[6][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[4][j];
+        acc[0][j] += acc[8][j];
+      }
     } else if constexpr (TOP_K == 8) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      T* a6 = reinterpret_cast<T*>(&acc[6]);
-      T* a7 = reinterpret_cast<T*>(&acc[7]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a6, a7);
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a4, a6);
-      accumulate_vec<T, elems_per_vec>(a0, a4);
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[1][j];
+        acc[2][j] += acc[3][j];
+        acc[4][j] += acc[5][j];
+        acc[6][j] += acc[7][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[2][j];
+        acc[4][j] += acc[6][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[4][j];
+      }
     } else if constexpr (TOP_K == 6) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a0, a4);
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[1][j];
+        acc[2][j] += acc[3][j];
+        acc[4][j] += acc[5][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[2][j];
+        acc[0][j] += acc[4][j];
+      }
     } else if constexpr (TOP_K == 4) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a0, a2);
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[1][j];
+        acc[2][j] += acc[3][j];
+      }
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[2][j];
+      }
     } else if constexpr (TOP_K == 2) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
+#pragma unroll
+      for (int j = 0; j < elems_per_vec; ++j) {
+        acc[0][j] += acc[1][j];
+      }
     } else if constexpr (TOP_K == 1) {
       // nothing to do
     } else {
-      // Fallback for any future unspecialized TOP_K instantiations.
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
+      // Generic fallback: accumulate all into acc[0]
 #pragma unroll
       for (int k = 1; k < TOP_K; ++k) {
-        T* ak = reinterpret_cast<T*>(&acc[k]);
-        accumulate_vec<T, elems_per_vec>(a0, ak);
+#pragma unroll
+        for (int j = 0; j < elems_per_vec; ++j) {
+          acc[0][j] += acc[k][j];
+        }
       }
     }
+    // Epilogue: store the float accumulator as T (NONE) or quantize to MXFP8 + scale factor.
     if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
-      acc[0].store(dst_bytes + offset);
+      // cast_store: converts float->T element-by-element then writes via vectorized int4 store.
+      acc[0].cast_store(dst_typed_base + offset / static_cast<int>(sizeof(InT)));
     } else {
       constexpr uint32_t sf_vec_size = QuantMode == MoeA2ACombineQuantMode::MXFP8 ? 32 : 16;
       constexpr uint32_t threads_per_sf = sf_vec_size / elems_per_vec;
@@ -771,8 +812,13 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
       };
       if constexpr (QuantMode == MoeA2ACombineQuantMode::MXFP8) {
         static_assert(elems_per_vec == 8, "MXFP8 quantization requires 8 elements per vector");
-        auto packed_vec =
-            reinterpret_cast<tensorrt_llm::kernels::PackedVec<T, elems_per_vec>&>(acc[0]);
+        // Cast the float32 accumulator down to T to feed the MXFP8 converter's PackedVec input.
+        tensorrt_llm::kernels::PackedVec<T, elems_per_vec> packed_vec;
+        T* packed_elems = reinterpret_cast<T*>(&packed_vec);
+#pragma unroll
+        for (int j = 0; j < elems_per_vec; ++j) {
+          packed_elems[j] = static_cast<T>(acc[0][j]);
+        }
         uint64_t fp8x8 =
             tensorrt_llm::kernels::cvt_warp_fp16_to_mxfp8<T, 32, elems_per_vec>(packed_vec, &scale);
         reinterpret_cast<uint64_t*>(dst_bytes)[logical_offset / elems_per_vec] = fp8x8;
@@ -782,66 +828,201 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
   }
 }
 
-// Wrapper that selects vector width based on size_per_token alignment
-template <int TOP_K, typename T, MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
+// Wrapper that selects vector width based on size_per_token alignment.
+// QuantMode==NONE writes T (optionally upcast from an fp8 InT); QuantMode==MXFP8 writes packed
+// fp8 + scale factors (always InT == T, fixed 16-byte / 8-element vectors).
+// stride_per_token: byte distance between tokens in the recv buffer (may differ from
+// size_per_token when FP8 in-place uses a BF16-stride workspace with an FP8-sized payload).
+// InT: input element type in recv buffer (defaults to T for same-type accumulation).
+template <int TOP_K, typename T, typename InT = T,
+          MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __device__ void vectorized_combine(void* output_buffer, void* sf_output, int row_idx, int row_size,
-                                   int rank_id, int max_tokens_per_rank,
+                                   int stride_per_token, int rank_id, int max_tokens_per_rank,
                                    CombineKernelPointers const& ptrs) {
+  const int size_per_token = row_size * static_cast<int>(sizeof(InT));
   if constexpr (QuantMode != MoeA2ACombineQuantMode::NONE) {
-    vectorized_combine_impl<16, TOP_K, T, QuantMode, SwizzleMode>(
-        output_buffer, sf_output, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
+    // MXFP8 requires 16-byte vectors (8 bf16/half elements per vec).
+    vectorized_combine_impl<16, TOP_K, T, InT, QuantMode, SwizzleMode>(
+        output_buffer, sf_output, row_idx, row_size, stride_per_token, rank_id, max_tokens_per_rank,
+        ptrs);
   } else {
-    if (row_size % 16 == 0) {
-      vectorized_combine_impl<16, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                            max_tokens_per_rank, ptrs);
-    } else if (row_size % 8 == 0) {
-      vectorized_combine_impl<8, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
-    } else if (row_size % 4 == 0) {
-      vectorized_combine_impl<4, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
-    } else if (row_size % 2 == 0) {
-      vectorized_combine_impl<2, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+    // Each branch is guarded by if constexpr (sizeof(InT) <= VEC_SIZE_BYTES) so the compiler
+    // never instantiates vectorized_combine_impl with elems_per_vec == 0.
+    if (size_per_token % 16 == 0) {
+      if constexpr (static_cast<int>(sizeof(InT)) <= 16)
+        vectorized_combine_impl<16, TOP_K, T, InT>(output_buffer, nullptr, row_idx, row_size,
+                                                   stride_per_token, rank_id, max_tokens_per_rank,
+                                                   ptrs);
+    } else if (size_per_token % 8 == 0) {
+      if constexpr (static_cast<int>(sizeof(InT)) <= 8)
+        vectorized_combine_impl<8, TOP_K, T, InT>(output_buffer, nullptr, row_idx, row_size,
+                                                  stride_per_token, rank_id, max_tokens_per_rank,
+                                                  ptrs);
+    } else if (size_per_token % 4 == 0) {
+      if constexpr (static_cast<int>(sizeof(InT)) <= 4)
+        vectorized_combine_impl<4, TOP_K, T, InT>(output_buffer, nullptr, row_idx, row_size,
+                                                  stride_per_token, rank_id, max_tokens_per_rank,
+                                                  ptrs);
+    } else if (size_per_token % 2 == 0) {
+      if constexpr (static_cast<int>(sizeof(InT)) <= 2)
+        vectorized_combine_impl<2, TOP_K, T, InT>(output_buffer, nullptr, row_idx, row_size,
+                                                  stride_per_token, rank_id, max_tokens_per_rank,
+                                                  ptrs);
     } else {
-      vectorized_combine_impl<1, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+      if constexpr (static_cast<int>(sizeof(InT)) <= 1)
+        vectorized_combine_impl<1, TOP_K, T, InT>(output_buffer, nullptr, row_idx, row_size,
+                                                  stride_per_token, rank_id, max_tokens_per_rank,
+                                                  ptrs);
     }
   }
 }
 
-// Copy payload to recv buffer using vectorized copy; one block per token
-__global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t const* payload_bytes,
-                                           int bytes_per_token, int ep_size,
+// ---- vec_convert: per-vector type conversion, specialized by PTX where available ----
+// Generic: SrcT -> float -> DstT (all architectures, all type combinations).
+template <size_t VEC_SIZE, typename SrcT, typename DstT>
+__device__ __forceinline__ void vec_convert(flashinfer::vec_t<DstT, VEC_SIZE>& out,
+                                            flashinfer::vec_t<SrcT, VEC_SIZE> const& in) {
+#pragma unroll
+  for (int j = 0; j < VEC_SIZE; ++j) out[j] = DstT(static_cast<float>(in[j]));
+}
+
+// BF16 -> FP8 e4m3: use CUDA intrinsic (SM100+, Blackwell).
+// Inline PTX "cvt.rn.satfinite.e4m3x2.bf16x2 %h, %r" is rejected by SM100a ptxas
+// ("Unexpected instruction types for cvt") because SM100a requires a 32-bit output
+// register for this instruction.  __nv_fp8x2_e4m3(bfloat162) emits the correct form.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+template <size_t VEC_SIZE, std::enable_if_t<(VEC_SIZE % 2 == 0), int> = 0>
+__device__ __forceinline__ void vec_convert(flashinfer::vec_t<__nv_fp8_e4m3, VEC_SIZE>& out,
+                                            flashinfer::vec_t<__nv_bfloat16, VEC_SIZE> const& in) {
+  __nv_fp8x2_e4m3* out_fp8x2 = reinterpret_cast<__nv_fp8x2_e4m3*>(&out);
+  __nv_bfloat162 const* in_bf16x2 = reinterpret_cast<__nv_bfloat162 const*>(&in);
+#pragma unroll
+  for (int p = 0; p < static_cast<int>(VEC_SIZE) / 2; ++p)
+    out_fp8x2[p] = __nv_fp8x2_e4m3(in_bf16x2[p]);
+}
+#endif
+
+// FP16 -> FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.f16x2 (SM89+, Hopper).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+template <size_t VEC_SIZE, std::enable_if_t<(VEC_SIZE % 2 == 0), int> = 0>
+__device__ __forceinline__ void vec_convert(flashinfer::vec_t<__nv_fp8_e4m3, VEC_SIZE>& out,
+                                            flashinfer::vec_t<half, VEC_SIZE> const& in) {
+  uint32_t const* src_u32 = reinterpret_cast<uint32_t const*>(&in);
+  uint16_t* dst_u16 = reinterpret_cast<uint16_t*>(&out);
+#pragma unroll
+  for (int p = 0; p < VEC_SIZE / 2; ++p) {
+    uint16_t d;
+    asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(d) : "r"(src_u32[p]));
+    dst_u16[p] = d;
+  }
+}
+#endif
+
+// ---- vectorized_quant_impl: load -> sync -> convert -> store ----
+// VEC_SIZE is in elements (not bytes), so both SrcT and DstT vectors hold VEC_SIZE values.
+// Block-per-token: threadIdx.x indexes vectors within the token, blockDim.x is the stride.
+template <int VEC_SIZE, typename SrcT, typename DstT>
+__device__ void vectorized_quant_impl(DstT* dst, SrcT const* src, int num_elements) {
+  using flashinfer::vec_t;
+
+  // num_elements is a multiple of VEC_SIZE here (selected by the wrapper).
+  int const num_vecs = num_elements / VEC_SIZE;
+  // Round the iteration bound up to a multiple of blockDim.x so every thread reaches the
+  // __syncthreads() the same number of times (a divergent barrier would deadlock when
+  // num_vecs is not a multiple of blockDim.x, e.g. hidden=7168 with 256 threads).
+  int const vec_iters = ((num_vecs + blockDim.x - 1) / blockDim.x) * blockDim.x;
+
+  for (int iter = threadIdx.x; iter < vec_iters; iter += blockDim.x) {
+    bool const active = iter < num_vecs;
+    int const e = iter * VEC_SIZE;
+    vec_t<SrcT, VEC_SIZE> in_vec;
+    if (active) in_vec.load(src + e);
+
+    // Sync so all threads finish loading inputs before any thread writes output.  This avoids
+    // write-after-read hazards in the FP8 in-place case where this kernel's output is read as
+    // input on the next iteration.  All threads participate (active guards the work, not the sync).
+    __syncthreads();
+
+    if (active) {
+      vec_t<DstT, VEC_SIZE> out_vec;
+      vec_convert(out_vec, in_vec);
+      out_vec.store(dst + e);
+    }
+  }
+}
+
+template <typename SrcT, typename DstT>
+__device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements) {
+  if (num_elements % 16 == 0)
+    vectorized_quant_impl<16, SrcT, DstT>(dst, src, num_elements);
+  else if (num_elements % 8 == 0)
+    vectorized_quant_impl<8, SrcT, DstT>(dst, src, num_elements);
+  else if (num_elements % 4 == 0)
+    vectorized_quant_impl<4, SrcT, DstT>(dst, src, num_elements);
+  else if (num_elements % 2 == 0)
+    vectorized_quant_impl<2, SrcT, DstT>(dst, src, num_elements);
+  else
+    vectorized_quant_impl<1, SrcT, DstT>(dst, src, num_elements);
+}
+
+// LOW_PRECISION=false: vectorized byte-copy (SrcT = payload dtype).
+// LOW_PRECISION=true:  vectorized SrcT->FP8 quantization via vectorized_quant<SrcT, fp8_e4m3>.
+// stride_per_token: byte distance between tokens in recv_buffer_bytes (host-computed, avoids
+//   per-thread recomputation):
+//   - FP8 external payload: elements_per_token x 1  (compact FP8 layout)
+//   - FP8 in-place / byte-copy: elements_per_token x sizeof(SrcT)  (payload-dtype stride)
+// Copy payload to recv buffer; one block per token.
+template <bool LOW_PRECISION, typename SrcT>
+__global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* payload,
+                                           int elements_per_token, int ep_size,
                                            int max_tokens_per_rank, uint32_t* flag_val_ptr,
-                                           int const* recv_counters) {
+                                           int const* recv_counters, int stride_per_token,
+                                           bool enable_pdl) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (enable_pdl) cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     // Increment flag_val for this combine round
     *flag_val_ptr = *flag_val_ptr + 1;
   }
 
-  if (payload_bytes == nullptr) return;
+  // Copy path: null payload means data is already in workspace — nothing to do.
+  if (!LOW_PRECISION && payload == nullptr) return;
 
-  int slot_idx = blockIdx.x;
+  int global_token_idx = blockIdx.x;
 
-  int total_slots = ep_size * max_tokens_per_rank;
-  if (slot_idx >= total_slots) return;
+  int global_token_num = ep_size * max_tokens_per_rank;
+  if (global_token_idx >= global_token_num) return;
 
-  // Map global token to (source_rank, token_idx)
-  int source_rank = slot_idx / max_tokens_per_rank;
-  int token_idx = slot_idx % max_tokens_per_rank;
+  // Map global_token_idx to (rank_idx, local_token_idx)
+  int rank_idx = global_token_idx / max_tokens_per_rank;
+  int local_token_idx = global_token_idx % max_tokens_per_rank;
 
-  // Skip invalid tokens beyond per-source recv count
-  if (token_idx >= recv_counters[source_rank]) return;
+  // Skip invalid tokens beyond per-rank recv count
+  if (local_token_idx >= recv_counters[rank_idx]) return;
 
-  // Calculate source and destination pointers for this token
-  size_t slot_offset = static_cast<size_t>(slot_idx) * bytes_per_token;
-  uint8_t* dst_ptr = recv_buffer_bytes + slot_offset;
-  uint8_t const* src_ptr = payload_bytes + slot_offset;
+  size_t const token_offset = static_cast<size_t>(global_token_idx) * stride_per_token;
 
-  // Copy one token's data using vectorized copy
-  vectorized_copy(dst_ptr, src_ptr, bytes_per_token);
+  if constexpr (LOW_PRECISION) {
+    // Source pointer: external payload or in-place from workspace.
+    SrcT const* src_ptr = (payload != nullptr)
+                              ? static_cast<SrcT const*>(payload) +
+                                    static_cast<size_t>(global_token_idx) * elements_per_token
+                              : reinterpret_cast<SrcT const*>(recv_buffer_bytes + token_offset);
+
+    // Destination: stride_per_token encodes the correct layout for both paths
+    // (compact FP8 for external, payload-dtype stride for in-place).
+    __nv_fp8_e4m3* dst_ptr = reinterpret_cast<__nv_fp8_e4m3*>(recv_buffer_bytes + token_offset);
+
+    vectorized_quant<SrcT, __nv_fp8_e4m3>(dst_ptr, src_ptr, elements_per_token);
+  } else {
+    // Generic byte copy (payload guaranteed non-null by early return above).
+    vectorized_copy(recv_buffer_bytes + token_offset,
+                    static_cast<uint8_t const*>(payload) + token_offset, stride_per_token);
+  }
 }
 
 // ============================================================================
@@ -852,8 +1033,8 @@ template <typename T, int TOP_K, MoeA2ACombineQuantMode QuantMode = MoeA2ACombin
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
-    int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id,
-    int ep_size) {
+    int max_tokens_per_rank, int elements_per_token, int stride_per_token, int local_num_tokens,
+    int rank_id, int ep_size, bool enable_pdl) {
   int local_token_idx = blockIdx.x;
 
   if (local_num_tokens == 0) {
@@ -865,6 +1046,10 @@ __global__ void moeA2ACombineKernel(
     // Threads that do not have a token to process should return.
     if (local_token_idx >= local_num_tokens) return;
   }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (enable_pdl) cudaGridDependencySynchronize();
+#endif
 
 #if !DISABLE_SYNC_FOR_PROFILING
   // In-kernel readiness synchronization at start of combine:
@@ -925,40 +1110,57 @@ __global__ void moeA2ACombineKernel(
 
   if (local_num_tokens == 0) return;
 
-  // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(ptrs.src_data_ptrs[0], ptrs.output_scales,
-                                                       local_token_idx, elements_per_token, rank_id,
-                                                       max_tokens_per_rank, ptrs);
+  // Dispatch the combine path:
+  //   - T == fp8_e4m3: low-precision combine, FP8 recv buffer -> BF16 output (InT=fp8, NONE quant).
+  //   - otherwise: same-type accumulate, then store as T (NONE) or quantize to MXFP8 (QuantMode).
+  // vectorized_combine derives the per-token output pointer from row_idx (= local_token_idx).
+  if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
+    // src_data_ptrs[0] points to a BF16 output buffer (set by moeA2ACombineOp for low precision).
+    vectorized_combine<TOP_K, __nv_bfloat16, __nv_fp8_e4m3>(
+        ptrs.src_data_ptrs[0], nullptr, local_token_idx, elements_per_token, stride_per_token,
+        rank_id, max_tokens_per_rank, ptrs);
+  } else {
+    vectorized_combine<TOP_K, T, T, QuantMode, SwizzleMode>(
+        ptrs.src_data_ptrs[0], ptrs.output_scales, local_token_idx, elements_per_token,
+        stride_per_token, rank_id, max_tokens_per_rank, ptrs);
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (enable_pdl) cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   constexpr int kBlockSize = 256;
 
-  // Calculate bytes per token based on dtype
-  int element_size;
-  switch (params.dtype) {
-    case nvinfer1::DataType::kHALF:
-      element_size = sizeof(half);
-      break;
-    case nvinfer1::DataType::kBF16:
-      element_size = sizeof(__nv_bfloat16);
-      break;
-    case nvinfer1::DataType::kFLOAT:
-      element_size = sizeof(float);
-      break;
-    default:
-      FLASHINFER_CHECK(false, "Unsupported dtype for combine prepare");
-      return;
-  }
+  // FP8 in-place (use_low_precision, prepare_payload==nullptr): each CTA writes FP8 at the
+  // BF16-stride position, so CTAs never race — all tokens must be processed.  Copy path with a
+  // null payload is a no-op; 1 block suffices for the flag increment only.
+  int grid = (params.use_low_precision || params.prepare_payload != nullptr)
+                 ? params.ep_size * params.max_tokens_per_rank
+                 : 1;
 
-  int bytes_per_token = params.elements_per_token * element_size;
-  int grid_size_block =
-      params.prepare_payload == nullptr ? 1 : params.ep_size * params.max_tokens_per_rank;
+  uint8_t* recv_buffer_bytes =
+      static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank]));
+  void const* payload = params.prepare_payload;
 
-  moeA2APrepareCombineKernel<<<grid_size_block, kBlockSize, 0, params.stream>>>(
-      static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])),
-      static_cast<uint8_t const*>(params.prepare_payload), bytes_per_token, params.ep_size,
-      params.max_tokens_per_rank, params.flag_val, params.recv_counters);
+  // stride_per_token (host-computed, avoids per-thread recompute):
+  //   FP8 external: EPT x 1            (compact FP8, dst packed tightly)
+  //   FP8 in-place / byte-copy: EPT x sizeof(SrcT)  (payload-dtype stride)
+  SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
+    SWITCH_DTYPE(params.dtype, SrcT, {
+      bool const low_precision_staged = LOW_PRECISION && (params.prepare_payload != nullptr);
+      int const stride_per_token = low_precision_staged
+                                       ? params.elements_per_token
+                                       : params.elements_per_token * static_cast<int>(sizeof(SrcT));
+      auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT>;
+      launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", params.enable_pdl, kernel_fn, grid,
+                               kBlockSize, 0, params.stream, recv_buffer_bytes, payload,
+                               params.elements_per_token, params.ep_size,
+                               params.max_tokens_per_rank, params.flag_val, params.recv_counters,
+                               stride_per_token, params.enable_pdl);
+    });
+  });
 }
 
 // ============================================================================
@@ -1003,15 +1205,34 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
 
+  int grid = grid_size_block;  // one block per token
+
+  // stride_per_token: byte distance between tokens in the recv buffer.
+  //   FP8 external payload: EPT × 1            (compact FP8 layout)
+  //   FP8 in-place / non-FP8: EPT × sizeof(PayloadT)  (payload-dtype stride)
+  bool const low_precision_staged = params.use_low_precision && (params.prepare_payload != nullptr);
+  int stride_per_token;
+  SWITCH_DTYPE(params.dtype, PayloadT, {
+    stride_per_token = low_precision_staged
+                           ? params.elements_per_token
+                           : params.elements_per_token * static_cast<int>(sizeof(PayloadT));
+  });
+
+  // When use_low_precision is set the recv buffers contain FP8 data regardless of params.dtype,
+  // so dispatch the FP8 accumulation kernel in that case.
+  auto const effective_dtype = params.use_low_precision ? nvinfer1::DataType::kFP8 : params.dtype;
+
   // Launch appropriate kernel with compact macros
-  SWITCH_DTYPE(params.dtype, TKernelType, {
+  SWITCH_DTYPE(effective_dtype, TKernelType, {
     SWITCH_TOP_K(params.top_k, TOP_K, {
       SWITCH_QUANT_MODE(TKernelType, params.quant_mode, QUANT_MODE, {
         SWITCH_SWIZZLE_MODE(params.swizzle_mode, SWIZZLE_MODE, {
-          moeA2ACombineKernel<TKernelType, TOP_K, QUANT_MODE, SWIZZLE_MODE>
-              <<<grid_size_block, kBlockSize, 0, params.stream>>>(
-                  kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-                  params.local_num_tokens, params.ep_rank, params.ep_size);
+          auto kernel_fn = moeA2ACombineKernel<TKernelType, TOP_K, QUANT_MODE, SWIZZLE_MODE>;
+          launchWithPdlWhenEnabled("moeA2ACombineKernel", params.enable_pdl, kernel_fn, grid,
+                                   kBlockSize, 0, params.stream, kernel_ptrs,
+                                   params.max_tokens_per_rank, params.elements_per_token,
+                                   stride_per_token, params.local_num_tokens, params.ep_rank,
+                                   params.ep_size, params.enable_pdl);
         });
       });
     });
@@ -1022,7 +1243,11 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
 __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr,
                                               int32_t const* recv_counters_ptr, int ep_size,
                                               int max_tokens_per_rank, int top_k,
-                                              int32_t invalid_id) {
+                                              int32_t invalid_id, bool enable_pdl) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (enable_pdl) cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int total_tokens = ep_size * max_tokens_per_rank;
   if (tid >= total_tokens) return;
@@ -1040,12 +1265,14 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr,
 
 void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv_counters,
                                         int32_t invalid_id, int ep_size, int max_tokens_per_rank,
-                                        int top_k, cudaStream_t stream) {
+                                        int top_k, cudaStream_t stream, bool enable_pdl) {
   constexpr int kBlockSize = 256;
   int total_tokens = ep_size * max_tokens_per_rank;
   int grid = ceilDiv(total_tokens, kBlockSize);
-  moeA2ASanitizeExpertIdsKernel<<<grid, kBlockSize, 0, stream>>>(
-      expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
+  launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", enable_pdl,
+                           moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0, stream, expert_ids,
+                           recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id,
+                           enable_pdl);
 }
 
 }  // namespace tensorrt_llm::kernels::moe_alltoall

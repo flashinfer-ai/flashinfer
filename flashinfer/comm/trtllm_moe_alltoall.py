@@ -17,7 +17,7 @@ from ..api_logging import flashinfer_api
 from .mnnvl import MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
-from ..utils import register_custom_op
+from ..utils import register_custom_op, device_support_pdl
 from ..tllm_enums import SfLayout
 
 
@@ -61,6 +61,7 @@ def get_moe_alltoall_module():
         ep_size: int,
         top_k: int,
         num_experts: int,
+        enable_pdl: bool,
     ):
         """
         Dispatch tokens and payloads to expert ranks.
@@ -75,6 +76,7 @@ def get_moe_alltoall_module():
             ep_size: Total expert parallel size
             top_k: Number of experts per token
             num_experts: Total number of experts
+            enable_pdl: Whether to use programmatic dependent launch
 
         Returns:
             recv_offsets: List of offsets for each payload in the workspace
@@ -91,6 +93,7 @@ def get_moe_alltoall_module():
             ep_size,
             top_k,
             num_experts,
+            enable_pdl,
         )
 
     @register_custom_op(
@@ -111,6 +114,8 @@ def get_moe_alltoall_module():
         output_dtype: Optional[torch.dtype] = None,
         output_scales: Optional[torch.Tensor] = None,
         sf_layout: SfLayout = SfLayout.layout_linear,
+        use_low_precision: bool = False,
+        enable_pdl: bool = True,
     ) -> torch.Tensor:
         """
         Combine expert outputs back to originating tokens.
@@ -131,6 +136,8 @@ def get_moe_alltoall_module():
             output_scales: Optional output scale tensor for quantized outputs
                 currently support ue8m0 (packed in torch.uint8) with vector size of 32
             sf_layout: Output swizzle layout
+            use_low_precision: If True, quantize payload to FP8 before combine
+            enable_pdl: Whether to use programmatic dependent launch
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
         """
@@ -148,6 +155,8 @@ def get_moe_alltoall_module():
             output_dtype,
             output_scales,
             sf_layout.value,
+            use_low_precision,
+            enable_pdl,
         )
 
     @register_custom_op(
@@ -160,9 +169,10 @@ def get_moe_alltoall_module():
         metainfo: torch.Tensor,
         ep_rank: int,
         invalid_expert_id: int,
+        enable_pdl: bool,
     ):
         return module.moe_a2a_sanitize_expert_ids(
-            expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
+            expert_ids, workspace, metainfo, ep_rank, invalid_expert_id, enable_pdl
         )
 
     @register_custom_op(
@@ -311,6 +321,7 @@ def moe_a2a_dispatch(
     ep_size: int,
     top_k: int,
     num_experts: int,
+    enable_pdl: Optional[bool] = None,
 ):
     r"""Dispatch tokens and payloads to their target expert ranks.
 
@@ -335,6 +346,9 @@ def moe_a2a_dispatch(
         Number of experts assigned per token.
     num_experts : int
         Total number of experts.
+    enable_pdl : Optional[bool]
+        Whether to use programmatic dependent launch.  ``None`` auto-detects
+        from the device.
 
     Returns
     -------
@@ -345,6 +359,8 @@ def moe_a2a_dispatch(
         is the workspace offset reserved for the matching
         :func:`moe_a2a_combine` call.
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(token_selected_experts.device)
     recv_offsets, recv_sizes, combine_payload_offset = (
         get_moe_alltoall_module().moe_a2a_dispatch(
             token_selected_experts,
@@ -356,6 +372,7 @@ def moe_a2a_dispatch(
             ep_size,
             top_k,
             num_experts,
+            enable_pdl,
         )
     )
 
@@ -392,6 +409,8 @@ def moe_a2a_combine(
     output_dtype: Optional[torch.dtype] = None,
     output_scales: Optional[torch.Tensor] = None,
     sf_layout: SfLayout = SfLayout.layout_linear,
+    use_low_precision: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
@@ -426,12 +445,27 @@ def moe_a2a_combine(
     payload_in_workspace : bool
         ``True`` if ``payload`` is already a workspace-backed view (skips
         the staging copy).  Defaults to ``False``.
+    output_dtype : Optional[torch.dtype]
+        Optional output data type; currently supports
+        ``torch.bfloat16`` and ``torch.float8_e4m3fn``.
+    output_scales : Optional[torch.Tensor]
+        Optional output scale tensor for quantized (MXFP8) outputs.
+    sf_layout : SfLayout
+        Output scale-factor swizzle layout.
+    use_low_precision : bool
+        If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
+        accumulating; the combine upcasts to a bf16 output.
+    enable_pdl : Optional[bool]
+        Whether to use programmatic dependent launch.  ``None`` auto-detects
+        from the device.
 
     Returns
     -------
     torch.Tensor
         ``[local_num_tokens, *]`` tensor with the combined outputs.
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(payload.device)
     return get_moe_alltoall_module().moe_a2a_combine(
         payload,
         local_num_tokens,
@@ -446,6 +480,8 @@ def moe_a2a_combine(
         output_dtype,
         output_scales,
         sf_layout,
+        use_low_precision,
+        enable_pdl,
     )
 
 
@@ -456,6 +492,7 @@ def moe_a2a_sanitize_expert_ids(
     metainfo: torch.Tensor,
     ep_rank: int,
     invalid_expert_id: int,
+    enable_pdl: Optional[bool] = None,
 ):
     r"""Replace expert IDs not owned by this rank with ``invalid_expert_id``.
 
@@ -473,9 +510,14 @@ def moe_a2a_sanitize_expert_ids(
     invalid_expert_id : int
         Value to write where the original expert lies outside this rank's
         local range.
+    enable_pdl : Optional[bool]
+        Whether to use programmatic dependent launch.  ``None`` auto-detects
+        from the device.
     """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(expert_ids.device)
     return get_moe_alltoall_module().moe_a2a_sanitize_expert_ids(
-        expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
+        expert_ids, workspace, metainfo, ep_rank, invalid_expert_id, enable_pdl
     )
 
 
@@ -832,6 +874,7 @@ class MoeAlltoAll:
         output_dtype: Optional[torch.dtype] = None,
         output_scales: Optional[torch.Tensor] = None,
         sf_layout: SfLayout = SfLayout.layout_linear,
+        use_low_precision: bool = False,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -846,6 +889,16 @@ class MoeAlltoAll:
         payload_in_workspace : bool
             ``True`` if ``payload`` is already a workspace-backed view (skips
             the staging copy).  Defaults to ``False``.
+        output_dtype : Optional[torch.dtype]
+            Optional output data type (``torch.bfloat16`` or
+            ``torch.float8_e4m3fn``).
+        output_scales : Optional[torch.Tensor]
+            Optional output scale tensor for quantized (MXFP8) outputs.
+        sf_layout : SfLayout
+            Output scale-factor swizzle layout.
+        use_low_precision : bool
+            If ``True``, quantize the recv-buffer payload to FP8 (e4m3) before
+            accumulating; the combine upcasts to a bf16 output.
 
         Returns
         -------
@@ -873,6 +926,7 @@ class MoeAlltoAll:
             output_dtype,
             output_scales,
             sf_layout,
+            use_low_precision,
         )
 
         # Reset state for next round
