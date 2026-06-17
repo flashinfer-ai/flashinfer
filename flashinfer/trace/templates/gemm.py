@@ -924,6 +924,7 @@ def _bmm_mxfp8_init(
     from flashinfer import mxfp8_quantize  # noqa: PLC0415
 
     def quantize_per_batch_swizzled(x):
+        """Quantize one batched matrix with independent 128-row scale padding."""
         b, rows, cols = x.shape
         rows_pad = math.ceil(rows / 128) * 128
         padded_cols = math.ceil(cols / 32) * 32
