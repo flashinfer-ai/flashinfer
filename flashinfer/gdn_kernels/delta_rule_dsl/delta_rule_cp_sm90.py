@@ -15,6 +15,7 @@ from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu import warpgroup
 from cutlass.cute.typing import Shape
 
+from ...utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_inverse_hmma import CollectiveInverse
 from .collective_store_tma import CollectiveStoreTma
@@ -3862,8 +3863,8 @@ def cp_delta_rule_prefill_dsl_sm90(
         torch.bfloat16: cutlass.BFloat16,
     }[q.dtype]
 
-    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    tensormaps_t = torch.empty(sm_count * 128, dtype=torch.uint8, device=q.device)
+    workspace_size = get_device_sm_count(q.device) * 128
+    tensormaps_t = _get_cache_buf("gdn_cp_prefill_tensormaps", workspace_size, q.device)
     stream_val = torch.cuda.current_stream().cuda_stream
     stream = cuda_driver.CUstream(stream_val)
 
@@ -3945,7 +3946,7 @@ def cp_delta_rule_dsl_sm90(
         raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")
     if cp_chunk_len is None:
         num_heads = max(q.shape[1], v.shape[1])
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_sms = get_device_sm_count(q.device)
         cp_chunk_len = choose_cp_chunk_len_host(
             max_seqlen,
             num_heads,

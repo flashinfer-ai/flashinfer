@@ -2384,7 +2384,7 @@ def delta_rule_prefill_dsl_sm90(
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
 
     workspace_size = get_device_sm_count(q.device) * 128
-    tensormaps_t = _get_cache_buf("gdn_cp_prefill_tensormaps", workspace_size, q.device)
+    tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, q.device)
 
     stream_val = torch.cuda.current_stream().cuda_stream
     stream = cuda_driver.CUstream(stream_val)

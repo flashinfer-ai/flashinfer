@@ -21,9 +21,7 @@ import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
-from .utils import (
-    get_compute_capability,
-)
+from .utils import get_compute_capability, get_device_sm_count
 from .gdn_kernels import (
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
@@ -277,10 +275,11 @@ def chunk_gated_delta_rule(
     device = q.device
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
+    _sm_count = get_device_sm_count(device)
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     _arch_major = get_compute_capability(device)[0]
     cp_heuristic_matches = _arch_major == 9 and num_seqs * num_sab_heads < max(
-        1, torch.cuda.get_device_properties(device).multi_processor_count // 2
+        1, _sm_count // 2
     )
     if use_cp is True or (use_cp == "auto" and cp_heuristic_matches):
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
