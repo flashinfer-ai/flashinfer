@@ -59,6 +59,7 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm90_module,
@@ -500,6 +501,8 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
+    if has_sm120:
+        jit_specs.append(gen_nvfp4_attention_sm120_module())
 
     if add_act:
         for act_name in act_func_def_str:
