@@ -16,29 +16,16 @@ limitations under the License.
 ---
 
 NVFP4 MSA proxy-score kernel for SM120/SM121: the FP4 counterpart of
-:mod:`proxy_score_sm12x`, porting MSA's ``fp4_indexer_block_scores`` so the index K
-is read at ~4 bits/elem. The full-KV index read is the dominant decode-step cost (the
-one stage MSA does not sparsify), so cutting its HBM bytes ~4x is the point. Contract
-is identical to the bf16 proxy (per-block max of the unscaled post-mask QK^T, -inf for
-invalid blocks); inputs are pre-quantized (packed e2m1 + e4m3 per-16 block scales +
-per-tensor fp32 global scales) and the bf16 proxy stays the precision reference.
+:mod:`proxy_score_sm12x` (porting MSA's ``fp4_indexer_block_scores``), reading the
+index K at ~4 bits/elem. Same contract as the bf16 proxy (per-block max of the
+unscaled post-mask QK^T, -inf for invalid blocks); inputs are pre-quantized (packed
+e2m1 + e4m3 per-16 block scales + per-tensor fp32 global scales).
 
-QK^T runs directly on the SM120 fp4 tensor cores (``MmaMXF4NVF4Op``, m16n8k64, atom
-(4,2,1)), operands kept in fp4 (no in-SM dequant): the e4m3 block scales are applied
-in-instruction via ``mma.set(WarpField.SFA/SFB)`` and the two monotone global scales
-multiply the per-row block-max at store time. SF smem layout / fragment partition /
+QK^T runs on the SM120 fp4 tensor cores (``MmaMXF4NVF4Op``); the SF smem layout and
 mainloop are ported from ``dense_blockscaled_gemm_sm120_b12x`` with the proxy's own
-block-max epilogue; scales use the same cuBLAS 128x4 tiled layout as the rest of the
-MSA stack, so the NVFP4 index-K cache is bit-compatible across it.
-
-Two schedules, both flat + paged K with a kv-block split factor (split-K) to fill the
-SMs at low batch: the general per-(q-tile, batch, head) :class:`MsaProxyScoreFp4MmaSm12x`
-and a 16-head q_len<=8 :class:`MsaProxyScoreFp4MmaDecodePackedSm12x` that scores all 16
-heads of a kv_head from one shared index-K read.
-
-(An earlier fp4->bf16 in-SM dequant variant was dropped: it stayed latency-bound at
-long context where this fp4-MMA path wins. SM100's tcgen05 fp4-MMA has no SM120 TMEM
-equivalent, so this is rebuilt on warp-level mma.sync.)
+block-max epilogue. Two schedules (flat + paged K, split-K): the general per-(q-tile,
+batch, head) :class:`MsaProxyScoreFp4MmaSm12x` and a 16-head q_len<=8
+:class:`MsaProxyScoreFp4MmaDecodePackedSm12x`.
 """
 
 import cuda.bindings.driver as cuda
@@ -69,24 +56,10 @@ class MsaProxyScoreFp4MmaSm12x:
     """Warp-level NVFP4 tensor-core MMA proxy: the general per-(q-tile, batch, head)
     schedule.
 
-    Keeps the operands in fp4 and computes Q.K^T directly on the SM120 fp4 tensor
-    cores (``MmaMXF4NVF4Op``, m16n8k64, atom_layout (4,2,1)) instead of dequantizing
-    to bf16 first. On SM120 this beats the dequant approach once the epilogue and
-    occupancy are right (see the module docstring), so it is the only fp4 path.
-
-    Scope: fixed M=128 q-tile, head_dim==kv_block==128. Handles both flat
-    (cu_seqlens) and paged K via ``paged``; the only paged-vs-flat difference is the
-    K-block address (a ``mPageTable[batch, kv_block]`` lookup), since a KV page and
-    the proxy's kv-block are both 128 tokens. The 16-head packed-decode schedule has
-    its own subclass (:class:`MsaProxyScoreFp4MmaDecodePackedSm12x`).
-
-    The fp4-MMA folds the e4m3 per-16 block scales in-instruction via
-    ``mma.set(WarpField.SFA/SFB)``; the two per-tensor global scales are monotone
-    so they multiply the per-row block-max at store time. The SF smem layout /
-    fragment-partition / set+gemm mainloop are ported from
-    ``dense_blockscaled_gemm_sm120_b12x``; the block-max epilogue reduces the fp32
-    accumulator per row through a small (1KB) cross-warp scratch, independent of the
-    MMA thread layout.
+    Fixed M=128 q-tile, head_dim == kv_block == 128. Handles flat (cu_seqlens) and
+    paged K via ``paged`` (the only difference is a ``mPageTable[batch, kv_block]``
+    lookup). The 16-head packed-decode schedule is its own subclass
+    (:class:`MsaProxyScoreFp4MmaDecodePackedSm12x`).
     """
 
     _M = 128  # q-tile rows (== one cuBLAS 128-row SF block, so sfa_tiles_per_block==1)

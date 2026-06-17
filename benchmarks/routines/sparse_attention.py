@@ -13,18 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Benchmark routines for Minimax Sparse Attention (MSA) on SM120 / SM121.
+Benchmark routines for Minimax Sparse Attention (MSA).
 
 MSA runs as a pipeline of stage ops rather than a single fused call:
     proxy_score -> topk_select -> build_k2q_csr(_schedule) -> kv-major prefill
                                                               \\-> decode
-This module exposes one routine per stage plus an end-to-end ``MSAPipeline``
-routine, all timed with CUPTI via ``bench_gpu_time``.
-
-Every MSA op has a single CuTe-DSL implementation (``--backends cudsl``, the
-default). Precision is chosen per op via ``--q_dtype`` / ``--kv_dtype``: e.g.
-``MSAProxyScore --q_dtype nvfp4`` runs the NVFP4 tensor-core indexer and
-``--q_dtype bfloat16`` the bf16 indexer.
+plus an end-to-end ``MSAPipeline`` routine. Precision is chosen per op via
+``--q_dtype`` / ``--kv_dtype``.
 """
 
 import argparse
@@ -49,8 +44,6 @@ BLK_KV = 128
 # Which kernel backends each MSA routine actually exposes.
 _ROUTINE_BACKENDS = {
     "MSAProxyScore": ["cudsl"],
-    "MSATopkSelect": ["cudsl"],
-    "MSABuildCsr": ["cudsl"],
     "MSASparseAttentionKvMajor": ["cudsl"],
     "MSASparseDecode": ["cudsl"],
     "MSAPipeline": ["cudsl"],
@@ -61,10 +54,6 @@ def run_sparse_attention_test(args):
     """Route an MSA routine to its test function."""
     if args.routine == "MSAProxyScore":
         return testMSAProxyScore(args)
-    elif args.routine == "MSATopkSelect":
-        return testMSATopkSelect(args)
-    elif args.routine == "MSABuildCsr":
-        return testMSABuildCsr(args)
     elif args.routine == "MSASparseAttentionKvMajor":
         return testMSASparseAttentionKvMajor(args)
     elif args.routine == "MSASparseDecode":
@@ -339,100 +328,6 @@ def testMSAProxyScore(args):
             raise AssertionError(
                 f"nvfp4 proxy mean rel err {mean_rel:.4f} vs bf16 (>0.5)"
             )
-    return res
-
-
-def testMSATopkSelect(args):
-    """Stage 2: select top-K KV blocks per (query, head) (msa_topk_select)."""
-    if args.verbose >= 1:
-        print(f"[INFO] Running testMSATopkSelect | FlashInfer {flashinfer.__version__}")
-    device = _common(args)
-    if device is None:
-        return []
-    from flashinfer.msa_ops import msa_topk_select
-
-    bs, s_qo, s_kv = args.batch_size, args.s_qo, args.s_kv
-    Hq = args.num_qo_heads
-    total_q = bs * s_qo
-    mkt = args.max_k_tiles or -(-s_kv // BLK_KV)
-    max_score = torch.randn(Hq, mkt, total_q, device=device, dtype=torch.float32)
-
-    def run(b):
-        return msa_topk_select(max_score, args.topk)
-
-    res = []
-    backends = _resolve_backends(args)
-    outputs = {}
-    for b in backends:
-        if args.refcheck:
-            try:
-                outputs[b] = run(b).clone()
-            except Exception as e:
-                print(f"[WARNING] {b} topk failed (not yet implemented?): {e}")
-                continue
-        times = bench_gpu_time(
-            fn=run,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            enable_cupti=args.use_cupti,
-            use_cuda_graph=False,
-            input_args=(b,),
-        )
-        res.append(_record(args, b, times, total_q=total_q, total_kv=bs * s_kv))
-
-    # cross-backend refcheck: compare the *scores* of the selected blocks, not
-    # their indices. Exact ties at the top-k boundary are broken arbitrarily (by
-    # atomic emission order) and legitimately differ across backends, but every
-    # valid top-k selects the same multiset of scores, so sorted selected-scores
-    # must match bit-exact.
-    def _selected_scores(out):
-        # out (total_q, H, topk) int32 indices (-1 padded) -> sorted scores
-        msp = max_score.permute(2, 0, 1)  # (total_q, H, mkt)
-        g = torch.gather(msp, 2, out.long().clamp_min(0))
-        g = torch.where(out >= 0, g, torch.full_like(g, float("-inf")))
-        return g.sort(dim=-1, descending=True).values
-
-    if args.refcheck and len(outputs) > 1:
-        ref_b = next(iter(outputs))
-        ref_scores = _selected_scores(outputs[ref_b])
-        for b, out in outputs.items():
-            if b != ref_b and not torch.equal(_selected_scores(out), ref_scores):
-                msg = f"[ERROR] topk backend {b} disagrees with {ref_b}"
-                if args.allow_output_mismatch:
-                    print(msg)
-                else:
-                    raise AssertionError(msg)
-    return res
-
-
-def testMSABuildCsr(args):
-    """Stage 2: invert q->k selection into a KV-major CSR schedule."""
-    if args.verbose >= 1:
-        print(f"[INFO] Running testMSABuildCsr | FlashInfer {flashinfer.__version__}")
-    device = _common(args)
-    if device is None:
-        return []
-    from flashinfer.msa_ops import msa_build_k2q_csr_schedule
-
-    bs, s_qo, s_kv = args.batch_size, args.s_qo, args.s_kv
-    Hkv = args.num_kv_heads
-    cu_q, cu_k = _cu_seqlens(bs, s_qo, device), _cu_seqlens(bs, s_kv, device)
-    q2k = _rand_q2k(bs, s_qo, s_kv, Hkv, args.topk, device)
-
-    def run(b):
-        return msa_build_k2q_csr_schedule(q2k, cu_q, cu_k, BLK_KV)
-
-    res = []
-    for b in _resolve_backends(args):
-        times = bench_gpu_time(
-            fn=run,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            enable_cupti=args.use_cupti,
-            use_cuda_graph=False,
-            input_args=(b,),
-        )
-        res.append(_record(args, b, times, total_q=bs * s_qo, total_kv=bs * s_kv))
     return res
 
 

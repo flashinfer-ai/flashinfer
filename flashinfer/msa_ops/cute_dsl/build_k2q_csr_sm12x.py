@@ -19,28 +19,10 @@ MSA q2k -> k2q CSR builder for SM120/SM121 (CuTe-DSL port of
 ``csrc/build_k2q_csr.cu``).
 
 Inverts the per-query top-K KV-block selection (``q2k``) into a KV-major CSR:
-for each (kv-head, KV-block row) the sorted list of batch-local query indices
-that selected it, plus (schedule variant) the per-query split-slot packing,
-per-(query,head) valid-block counts, and a flat work schedule.
-
-Design vs. the CUDA original
-----------------------------
-The CUDA kernel uses per-warp packed-int16 SMEM histograms and relies on the
-intra-warp lane-ordering of same-address SMEM atomics to keep each CSR row's
-queries ascending. This port instead uses a deterministic counting sort:
-
-* queries are partitioned into ``nchunks`` contiguous chunks; one warp owns one
-  (head, chunk) and processes its queries **sequentially**, mapping the 32
-  lanes to the query's ``topk`` slots (not to different queries). Because only
-  one query is in flight per warp-iteration, same-row same-address atomics are
-  issued strictly in query order across the lock-step iterations, so each row's
-  queries come out ascending without depending on intra-warp lane order.
-* per-(head, chunk, row) counts and cursors live in global memory (atomics),
-  so there is no ``total_rows``-sized SMEM budget to cap.
-
-The static row geometry (round-robin row map, per-query batch / batch-local
-index) is tiny and is precomputed host-side in the Python wrapper and passed
-in, replacing the CUDA ``build_row_map`` kernel.
+for each (kv-head, KV-block row) the sorted batch-local query indices that
+selected it, plus (schedule variant) the per-query split-slot packing,
+per-(query,head) valid-block counts, and a flat work schedule. The static row
+geometry is precomputed host-side in the wrapper.
 """
 
 import inspect

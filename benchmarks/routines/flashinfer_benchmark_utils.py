@@ -289,8 +289,6 @@ benchmark_apis = {
     ],
     "sparse_attention": [
         "MSAProxyScore",
-        "MSATopkSelect",
-        "MSABuildCsr",
         "MSASparseAttentionKvMajor",
         "MSASparseDecode",
         "MSAPipeline",
