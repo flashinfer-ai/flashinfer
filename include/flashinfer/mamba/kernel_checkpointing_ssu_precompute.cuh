@@ -166,6 +166,72 @@ __device__ __forceinline__ void load_old_B(SmemT& smem, CheckpointingSsuParams c
 }
 
 // -----------------------------------------------------------------------------
+// PHASE 1: load ALL heads' scalar coefficients into per-head smem, ALL 128 threads
+// (dt + dt_bias + A always; old_dt / old_cumAdt on the no-write path).  Batching every
+// head's LDGs lets the global-load latency OVERLAP; PHASE 2 then does ZERO gmem loads.
+// bias + softplus deferred to PHASE 2 (smem).  conv1d-INDEPENDENT (only B/C are conv1d
+// outputs), so WHERE the caller runs it is a free choice — see the two call sites.
+template <typename dt_t, typename weight_t, typename matrixA_t, int NPREDICTED, int MAX_WINDOW,
+          int HEADS_PER_CTA, int NUM_WARPS, typename SmemT>
+__device__ __forceinline__ void load_phase1_coeffs(SmemT& smem,
+                                                   CheckpointingSsuParams const& params, int warp,
+                                                   int lane, int first_head, int seq_len,
+                                                   int64_t outer, int64_t cache_slot, int buf_read,
+                                                   bool must_checkpoint, int prev_k) {
+  auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
+  auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
+  int const flat_tid = warp * warpSize + lane;
+  constexpr int CTA_THREADS = NUM_WARPS * 32;
+  // dt[t, head]: heads contiguous in gmem (stride 1), tokens strided (dt_stride_token).
+  // idx → (t, h) with h = idx % HEADS_PER_CTA so consecutive threads hit consecutive
+  // heads → coalesced read.
+  auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
+  constexpr int DT_N = HEADS_PER_CTA * NPREDICTED;
+#pragma unroll
+  for (int idx = flat_tid; idx < DT_N; idx += CTA_THREADS) {
+    int const h = idx % HEADS_PER_CTA;
+    int const t = idx / HEADS_PER_CTA;
+    float v = 0.f;
+    if (t < seq_len)
+      v = toFloat(dt_ptr[outer * params.dt_stride_seq + (int64_t)t * params.dt_stride_token +
+                         first_head + h]);
+    smem.dt[h][t] = v;  // raw; bias + softplus applied in PHASE 2
+  }
+  // Per-head dt_bias + A (one thread per head; heads contiguous → coalesced).
+  if (flat_tid < HEADS_PER_CTA) {
+    smem.A[flat_tid] = toFloat(A_ptr[first_head + flat_tid]);
+    smem.dt_bias[flat_tid] = dt_bias_ptr ? toFloat(dt_bias_ptr[first_head + flat_tid]) : 0.f;
+  }
+  // NO-WRITE only: old_dt / old_cumAdt[head, t] (f32 cache) — tokens contiguous (stride 1),
+  // heads strided (stride_head).  idx → (h, t) with t = idx % MAX_WINDOW so consecutive
+  // threads hit consecutive tokens → coalesced read.  Masked to the valid window
+  // (t < prev_k); the rest is zeroed so the C7 tail read (old_cumAdt[prev_k-1]) and the
+  // scale_store mask stay well-defined.
+  if (!must_checkpoint) {
+    auto const* __restrict__ odt_ptr = reinterpret_cast<float const*>(params.old_dt);
+    auto const* __restrict__ oca_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
+    int64_t const odt_base =
+        cache_slot * params.old_dt_stride_seq + (int64_t)buf_read * params.old_dt_stride_dbuf;
+    int64_t const oca_base = cache_slot * params.old_cumAdt_stride_seq +
+                             (int64_t)buf_read * params.old_cumAdt_stride_dbuf;
+    constexpr int OLD_N = HEADS_PER_CTA * MAX_WINDOW;
+#pragma unroll
+    for (int idx = flat_tid; idx < OLD_N; idx += CTA_THREADS) {
+      int const h = idx / MAX_WINDOW;
+      int const t = idx % MAX_WINDOW;
+      float dv = 0.f, cv = 0.f;
+      if (t < prev_k) {
+        int64_t const hh = (int64_t)(first_head + h);
+        dv = odt_ptr[odt_base + hh * params.old_dt_stride_head + t];
+        cv = oca_ptr[oca_base + hh * params.old_cumAdt_stride_head + t];
+      }
+      smem.old_dt[h][t] = dv;
+      smem.old_cumAdt[h][t] = cv;
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
 // C1: scalar per-lane LDG of dt[outer, t, head] + bias + softplus → per-warp
 // smem.dt[warp].  dt is tiny (NPREDICTED floats/head, T-axis stride
 // dt_stride_token = nheads), so an on-the-fly strided LDG is fine — no cp.async.
@@ -458,10 +524,14 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
   if (cache_slot == params.pad_slot_id) return;
+  // prev_k is on the critical path — must_checkpoint (and load_old_B's row extent) consume it
+  // first, and there's no executed work before that consume to hide the load.  Issue it FIRST,
+  // via __ldg (read-only path), so its latency overlaps the buf_read load instead of fully
+  // stalling must_checkpoint on a cold dependent global load.
+  auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
+  int const prev_k = __ldg(&prev_ptr[cache_slot]);
   auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
   int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
-  auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
-  int const prev_k = prev_ptr[cache_slot];
 
   int seq_len;
   int64_t outer;
@@ -480,68 +550,6 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
   int const write_offset = must_checkpoint ? 0 : prev_k;
 
-  // ── PHASE 1: load ALL heads' scalar coefficients into per-head smem, ALL 128
-  // threads (dt + dt_bias + A always; old_dt / old_cumAdt on the no-write path).
-  // Batching every head's LDGs lets the global-load latency OVERLAP; PHASE 2 then
-  // does ZERO gmem loads.  bias + softplus deferred to PHASE 2 (smem).  These are
-  // conv1d-INDEPENDENT (only B/C are conv1d outputs), so WHERE this runs is a free
-  // choice — gated below: ENABLE_PDL (cliff) runs it BEFORE gdc_wait to fill the
-  // conv1d wait; standalone runs it AFTER load_C/load_B to overlap the B/C cp.async
-  // (hoisting it pre-wait standalone exposes the latency — ~1 us regress at big mtp).
-  auto load_phase1_coeffs = [&]() {
-    auto const* __restrict__ A_ptr = reinterpret_cast<matrixA_t const*>(params.A);
-    auto const* __restrict__ dt_bias_ptr = reinterpret_cast<weight_t const*>(params.dt_bias);
-    int const flat_tid = warp * warpSize + lane;
-    constexpr int CTA_THREADS = NUM_WARPS * 32;
-    // dt[t, head]: heads contiguous in gmem (stride 1), tokens strided
-    // (dt_stride_token).  idx → (t, h) with h = idx % HEADS_PER_CTA so consecutive
-    // threads hit consecutive heads → coalesced read.
-    auto const* __restrict__ dt_ptr = reinterpret_cast<dt_t const*>(params.dt);
-    constexpr int DT_N = HEADS_PER_CTA * NPREDICTED;
-#pragma unroll
-    for (int idx = flat_tid; idx < DT_N; idx += CTA_THREADS) {
-      int const h = idx % HEADS_PER_CTA;
-      int const t = idx / HEADS_PER_CTA;
-      float v = 0.f;
-      if (t < seq_len)
-        v = toFloat(dt_ptr[outer * params.dt_stride_seq + (int64_t)t * params.dt_stride_token +
-                           first_head + h]);
-      smem.dt[h][t] = v;  // raw; bias + softplus applied in PHASE 2
-    }
-    // Per-head dt_bias + A (one thread per head; heads contiguous → coalesced).
-    if (flat_tid < HEADS_PER_CTA) {
-      smem.A[flat_tid] = toFloat(A_ptr[first_head + flat_tid]);
-      smem.dt_bias[flat_tid] = dt_bias_ptr ? toFloat(dt_bias_ptr[first_head + flat_tid]) : 0.f;
-    }
-    // NO-WRITE only: old_dt / old_cumAdt[head, t] (f32 cache) — tokens contiguous
-    // (stride 1), heads strided (stride_head).  idx → (h, t) with t = idx %
-    // MAX_WINDOW so consecutive threads hit consecutive tokens → coalesced read.
-    // Masked to the valid window (t < prev_k); the rest is zeroed so the C7 tail
-    // read (old_cumAdt[prev_k-1]) and the scale_store mask stay well-defined.
-    if (!must_checkpoint) {
-      auto const* __restrict__ odt_ptr = reinterpret_cast<float const*>(params.old_dt);
-      auto const* __restrict__ oca_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
-      int64_t const odt_base =
-          cache_slot * params.old_dt_stride_seq + (int64_t)buf_read * params.old_dt_stride_dbuf;
-      int64_t const oca_base = cache_slot * params.old_cumAdt_stride_seq +
-                               (int64_t)buf_read * params.old_cumAdt_stride_dbuf;
-      constexpr int OLD_N = HEADS_PER_CTA * MAX_WINDOW;
-#pragma unroll
-      for (int idx = flat_tid; idx < OLD_N; idx += CTA_THREADS) {
-        int const h = idx / MAX_WINDOW;
-        int const t = idx % MAX_WINDOW;
-        float dv = 0.f, cv = 0.f;
-        if (t < prev_k) {
-          int64_t const hh = (int64_t)(first_head + h);
-          dv = odt_ptr[odt_base + hh * params.old_dt_stride_head + t];
-          cv = oca_ptr[oca_base + hh * params.old_cumAdt_stride_head + t];
-        }
-        smem.old_dt[h][t] = dv;
-        smem.old_cumAdt[h][t] = cv;
-      }
-    }
-  };
-
   // ── old_B (cache, conv1d-INDEPENDENT cp.async): hoisted BEFORE gdc_wait so it
   // overlaps the conv1d wait (cliff) / the B/C cp.async (standalone) — old_B is the
   // buffered cache, NOT a conv1d output.  The cp.async stays in flight across the
@@ -556,7 +564,9 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // so wait before load_C/load_B.  PHASE 1 (conv1d-independent) runs HERE too, before
   // the wait, so its LDGs fill the conv1d wait window.  No-op without programmatic conv1d.
   if constexpr (ENABLE_PDL) {
-    load_phase1_coeffs();
+    load_phase1_coeffs<dt_t, weight_t, matrixA_t, NPREDICTED, MAX_WINDOW, HEADS_PER_CTA, NUM_WARPS>(
+        smem, params, warp, lane, first_head, seq_len, outer, cache_slot, buf_read, must_checkpoint,
+        prev_k);
     cudaGridDependencySynchronize();
   }
 
@@ -570,7 +580,9 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // Standalone (!ENABLE_PDL): no conv1d wait to hide behind, so run PHASE 1 HERE to
   // overlap the B/C + old_B cp.async issued above instead of exposing its LDG latency.
   if constexpr (!ENABLE_PDL) {
-    load_phase1_coeffs();
+    load_phase1_coeffs<dt_t, weight_t, matrixA_t, NPREDICTED, MAX_WINDOW, HEADS_PER_CTA, NUM_WARPS>(
+        smem, params, warp, lane, first_head, seq_len, outer, cache_slot, buf_read, must_checkpoint,
+        prev_k);
   }
 
   // ── Drain ALL cp.async ONCE (C/B from load_C/load_B + old_B from load_old_B) BEFORE
@@ -621,7 +633,9 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   float raw_cb[CB_NEW_REGS];
 #pragma unroll
   for (int e = 0; e < CB_NEW_REGS; ++e) raw_cb[e] = smem.CB[e * warpSize + lane];
+
   float raw_cb_old[CB_OLD_REGS];  // NO-WRITE only (loaded + used iff !must_checkpoint)
+
   if (!must_checkpoint) {
 #pragma unroll
     for (int e = 0; e < CB_OLD_REGS; ++e) raw_cb_old[e] = smem.CB_old[e * warpSize + lane];
