@@ -19,14 +19,10 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..trace.templates.msa import (
-    msa_sparse_attention_kvmajor_trace,
-    msa_sparse_attention_trace,
-)
+from ..trace.templates.msa import msa_sparse_attention_trace
 from ..utils import is_sm12x_supported
 
 _BLK_KV = 128
-_MAX_KV_BLOCKS = 4096  # SMEM selection-map capacity: max_seqlen_k <= 4096 * 128
 
 _compile_cache: dict = {}
 
@@ -78,196 +74,6 @@ def _fake(dtype, shape, align=16):
         stride_order=tuple(reversed(range(len(shape)))),
         assumed_align=align,
     )
-
-
-@flashinfer_api(trace=msa_sparse_attention_trace)
-def msa_sparse_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q2k_indices: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: Optional[int] = None,
-    causal: bool = False,
-    softmax_scale: Optional[float] = None,
-    output: Optional[torch.Tensor] = None,
-    q_offset=None,
-) -> torch.Tensor:
-    """Minimax Sparse Attention forward pass for SM120/SM121.
-
-    Computes attention where each query token attends only to its top-K
-    selected KV blocks (of ``blk_kv = 128`` tokens each), as chosen by
-    :func:`msa_topk_select`.
-
-    This is the q-major kernel: each CTA processes a tile of query
-    tokens for one query head and gathers the union of the tile's selected
-    KV blocks.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        Shape ``(total_q, num_qo_heads, head_dim)``, bf16 or fp16, varlen
-        packed. ``head_dim`` must be 128.
-    k, v : torch.Tensor
-        Shape ``(total_k, num_kv_heads, head_dim)``, same dtype as ``q``.
-        ``num_qo_heads`` must be a multiple of ``num_kv_heads`` (GQA).
-    q2k_indices : torch.Tensor
-        Shape ``(num_kv_heads, total_q, topk)``, int32. Per (kv-head, query
-        token): batch-local KV block indices to attend, ascending, ``-1``
-        padded. Shared across the q heads in each GQA group.
-    cu_seqlens_q, cu_seqlens_k : torch.Tensor
-        Shape ``(batch_size + 1,)``, int32 cumulative sequence lengths.
-    max_seqlen_q : int, optional
-        Maximum query length over the batch; computed from ``cu_seqlens_q``
-        if omitted.
-    causal : bool
-        Apply right-aligned causal masking within selected blocks.
-    softmax_scale : float, optional
-        Defaults to ``head_dim ** -0.5``.
-    output : torch.Tensor, optional
-        Pre-allocated output, same shape/dtype as ``q``.
-
-    Returns
-    -------
-    torch.Tensor
-        Shape ``(total_q, num_qo_heads, head_dim)``, dtype of ``q``. Query
-        tokens with no valid selected blocks produce zeros.
-    """
-    import cutlass
-
-    from .cute_dsl import SparseAttentionForwardSm12x
-
-    if not is_sm12x_supported(q.device):
-        raise RuntimeError(
-            "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
-        )
-
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"q must be bf16 or fp16, got {q.dtype}")
-    if k.dtype != q.dtype or v.dtype != q.dtype:
-        raise ValueError("q, k, v must share a dtype")
-    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-        raise ValueError("q, k, v must be 3D (total_tokens, num_heads, head_dim)")
-    total_q, num_qo_heads, head_dim = q.shape
-    total_k, num_kv_heads, head_dim_k = k.shape
-    if head_dim != 128 or head_dim_k != 128:
-        raise ValueError(f"head_dim must be 128, got {head_dim}/{head_dim_k}")
-    if v.shape != k.shape:
-        raise ValueError("k and v must have the same shape")
-    if num_qo_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"num_qo_heads ({num_qo_heads}) must be a multiple of "
-            f"num_kv_heads ({num_kv_heads})"
-        )
-    if q2k_indices.dtype != torch.int32 or q2k_indices.ndim != 3:
-        raise ValueError("q2k_indices must be int32 of shape (Hkv, total_q, topk)")
-    if q2k_indices.shape[0] != num_kv_heads or q2k_indices.shape[1] != total_q:
-        raise ValueError(
-            f"q2k_indices shape {tuple(q2k_indices.shape)} does not match "
-            f"(num_kv_heads={num_kv_heads}, total_q={total_q}, topk)"
-        )
-    topk = q2k_indices.shape[2]
-    if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
-        raise ValueError("cu_seqlens_q/cu_seqlens_k must be int32")
-    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
-        raise ValueError("cu_seqlens_q/cu_seqlens_k must be 1D")
-    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
-        raise ValueError("cu_seqlens_q/cu_seqlens_k must have the same length")
-    for t in (q, k, v, q2k_indices, cu_seqlens_q, cu_seqlens_k):
-        if not t.is_contiguous():
-            raise ValueError("all input tensors must be contiguous")
-    for name, t in (("k", k), ("v", v), ("q2k_indices", q2k_indices)):
-        if t.device != q.device:
-            raise ValueError(f"{name} must be on the same device as q ({q.device})")
-
-    batch_size = cu_seqlens_q.numel() - 1
-    cu_q_cpu = cu_seqlens_q.cpu()
-    cu_k_cpu = cu_seqlens_k.cpu()
-    if int(cu_q_cpu[-1]) != total_q or int(cu_k_cpu[-1]) != total_k:
-        raise ValueError(
-            "cu_seqlens_q[-1]/cu_seqlens_k[-1] must equal total_q/total_k "
-            f"({total_q}/{total_k})"
-        )
-    if max_seqlen_q is None:
-        max_seqlen_q = int((cu_q_cpu[1:] - cu_q_cpu[:-1]).max().item())
-    max_seqlen_k = int((cu_k_cpu[1:] - cu_k_cpu[:-1]).max().item())
-    if (max_seqlen_k + _BLK_KV - 1) // _BLK_KV > _MAX_KV_BLOCKS:
-        raise ValueError(
-            f"max_seqlen_k {max_seqlen_k} exceeds the supported limit of "
-            f"{_MAX_KV_BLOCKS * _BLK_KV} tokens"
-        )
-
-    if softmax_scale is None:
-        softmax_scale = head_dim**-0.5
-
-    if output is None:
-        output = torch.empty_like(q)
-    else:
-        if output.shape != q.shape or output.dtype != q.dtype:
-            raise ValueError("output must match q's shape and dtype")
-        if not output.is_contiguous():
-            raise ValueError("output must be contiguous")
-        if output.device != q.device:
-            raise ValueError(f"output must be on the same device as q ({q.device})")
-
-    cu_q_dev = cu_seqlens_q.to(q.device, non_blocking=True)
-    cu_k_dev = cu_seqlens_k.to(q.device, non_blocking=True)
-    qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k_dev, q.device)
-
-    import cutlass.cute as cute
-
-    dtype_key = str(q.dtype)
-    key = (dtype_key, topk, causal)
-    compiled = _compile_cache.get(key)
-    if compiled is None:
-        cdt = _cutlass_dtype(q.dtype)
-        i32 = _cutlass_dtype(torch.int32)
-        s_tq, s_hq, s_tk, s_hkv, s_b1, s_b0 = (cute.sym_int() for _ in range(6))
-        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel_obj = SparseAttentionForwardSm12x(
-            head_dim=head_dim,
-            m_block_size=64,
-            n_block_size=_BLK_KV,
-            topk=topk,
-            num_threads=128,
-            is_causal=causal,
-            max_kv_blocks=_MAX_KV_BLOCKS,
-        )
-        compiled = cute.compile(
-            kernel_obj,
-            _fake(cdt, (s_tq, s_hq, head_dim)),
-            _fake(cdt, (s_tk, s_hkv, head_dim)),
-            _fake(cdt, (s_tk, s_hkv, head_dim)),
-            _fake(cdt, (s_tq, s_hq, head_dim)),
-            _fake(i32, (s_hkv, s_tq, topk), align=4),
-            _fake(i32, (s_b1,), align=4),
-            _fake(i32, (s_b1,), align=4),
-            _fake(i32, (s_b0,), align=4),
-            cutlass.Float32(1.0),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            stream_fake,
-            options="--enable-tvm-ffi",
-        )
-        _compile_cache[key] = compiled
-
-    compiled(
-        q,
-        k,
-        v,
-        output,
-        q2k_indices,
-        cu_q_dev,
-        cu_k_dev,
-        qoff_dev,
-        float(softmax_scale),
-        int(max_seqlen_q),
-        int(batch_size),
-        int(num_qo_heads),
-    )
-    return output
 
 
 def _get_compiled_combine(
@@ -430,8 +236,8 @@ def _combine_partials_torch(
     return out.to(out_dtype)
 
 
-@flashinfer_api(trace=msa_sparse_attention_kvmajor_trace)
-def msa_sparse_attention_kvmajor(
+@flashinfer_api(trace=msa_sparse_attention_trace)
+def msa_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -458,18 +264,21 @@ def msa_sparse_attention_kvmajor(
     qk_dtype: Optional[torch.dtype] = None,
     pv_dtype: Optional[torch.dtype] = None,
 ):
-    """Minimax Sparse Attention forward for SM120/SM121.
+    """Minimax Sparse Attention forward (prefill) for SM120/SM121.
 
-    Same semantics as :func:`msa_sparse_attention`, but follows MSA's KV-major
-    design: work is distributed over (kv-head, KV block) CSR rows built by
-    :func:`msa_build_k2q_csr_schedule`, each KV block is loaded once and shared
-    by all queries that selected it, and per-block partial outputs are
-    combined with a fused LSE-weighted reduction.
+    Each query attends only the top-K KV blocks selected in ``q2k_indices``.
+    Work is distributed over (kv-head, KV block) CSR rows built by
+    :func:`msa_build_k2q_csr` so each block is loaded once and shared by all
+    queries that selected it.
 
-    Parameters are as in :func:`msa_sparse_attention`, with these additions:
+    ``q``/``k``/``v`` are ``(total_tokens, num_heads, head_dim)`` with varlen
+    offsets ``cu_seqlens_q``/``cu_seqlens_k``; ``q2k_indices`` is
+    ``(num_kv_heads, total_q, topk)`` int32 (ascending, -1 padded).
+
+    Notable optional parameters:
 
     schedule : MsaAttentionSchedule, optional
-        Pre-computed schedule (from :func:`msa_build_k2q_csr_schedule`) to
+        Pre-computed schedule (from :func:`msa_build_k2q_csr`) to
         amortize index preprocessing across layers.
     page_table : torch.Tensor, optional
         Enables the paged-KV path: ``k``/``v`` are then
@@ -492,12 +301,12 @@ def msa_sparse_attention_kvmajor(
     import cutlass
     import cutlass.cute as cute
 
-    from .cute_dsl import SparseAttentionForwardKvMajorSm12x
-    from .sparse_index_utils import msa_build_k2q_csr_schedule
+    from .cute_dsl import SparseAttentionForwardSm12x
+    from .sparse_index_utils import msa_build_k2q_csr
 
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
-            "msa_sparse_attention_kvmajor requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
         )
     q_fp8 = q.dtype == torch.float8_e4m3fn
     compute_dtype = torch.bfloat16 if q_fp8 else q.dtype
@@ -527,7 +336,7 @@ def msa_sparse_attention_kvmajor(
     if num_threads % 32 != 0:
         raise ValueError(f"num_threads must be a multiple of 32, got {num_threads}")
     # CSR builder compiles for a compact q2k layout; reject a strided q2k (e.g. a
-    # bare permute of msa_topk_select's output), matching msa_sparse_attention.
+    # bare permute of msa_topk_select's output).
     if q2k_indices.dtype != torch.int32 or q2k_indices.ndim != 3:
         raise ValueError("q2k_indices must be int32 of shape (Hkv, total_q, topk)")
     if not q2k_indices.is_contiguous():
@@ -594,7 +403,7 @@ def msa_sparse_attention_kvmajor(
             raise ValueError(f"{name} must be contiguous")
 
     if schedule is None:
-        schedule = msa_build_k2q_csr_schedule(
+        schedule = msa_build_k2q_csr(
             q2k_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -656,7 +465,7 @@ def msa_sparse_attention_kvmajor(
         vsf_dev = ksf_dev
 
     key = (
-        "kvmajor",
+        "sparse_attn",
         str(q.dtype),
         q_fp8,
         qk_fp8_mma,
@@ -683,7 +492,7 @@ def msa_sparse_attention_kvmajor(
         s_pb, s_pm, s_ksf, s_vsf, s_tr, s_qs, s_cap = (cute.sym_int() for _ in range(7))
         kv_shape = (s_tk, s_hkv, _BLK_KV, kv_last) if paged else (s_tk, s_hkv, kv_last)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel_obj = SparseAttentionForwardKvMajorSm12x(
+        kernel_obj = SparseAttentionForwardSm12x(
             head_dim=head_dim,
             m_block_size=m_block_size,
             n_block_size=_BLK_KV,

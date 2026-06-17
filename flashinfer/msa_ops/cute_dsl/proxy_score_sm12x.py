@@ -30,9 +30,9 @@ above the causal limit — produce ``-inf``, which is what
 :func:`msa_topk_select` expects for invalid tiles.
 
 There is no softmax, no PV matmul and no output tensor: this is a QK GEMM
-with a fused per-block row-max epilogue. Structurally it is the q-major
-sparse kernel with the selection map, online softmax and V machinery
-deleted, and the KV loop made dense.
+with a fused per-block row-max epilogue. Structurally it is the sparse
+attention forward with the selection map, online softmax and V machinery
+removed, and the KV loop made dense.
 """
 
 from typing import Type

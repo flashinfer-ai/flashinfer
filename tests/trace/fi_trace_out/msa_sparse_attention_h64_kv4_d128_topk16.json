@@ -1,6 +1,6 @@
 {
   "name": "msa_sparse_attention_h64_kv4_d128_topk16",
-  "description": "MSA q-major sparse attention (prefill): each query attends only its top-K selected KV blocks (128 tokens each) from q2k_indices. One CTA per query-tile/head gathers the tile's union of selected blocks.",
+  "description": "MSA sparse attention (prefill): each query attends only its top-K selected KV blocks (128 tokens each) from q2k_indices. Work is distributed over (kv-head, KV block) CSR rows so each block is loaded once and shared by all queries that selected it.",
   "op_type": "msa_sparse",
   "tags": [
     "fi_api:flashinfer.msa_ops.sparse_attention.msa_sparse_attention",

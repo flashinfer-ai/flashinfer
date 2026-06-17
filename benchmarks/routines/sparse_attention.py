@@ -16,8 +16,8 @@ limitations under the License.
 Benchmark routines for Minimax Sparse Attention (MSA).
 
 MSA runs as a pipeline of stage ops rather than a single fused call:
-    proxy_score -> topk_select -> build_k2q_csr(_schedule) -> kv-major prefill
-                                                              \\-> decode
+    proxy_score -> topk_select -> build_k2q_csr -> prefill
+                                                \\-> decode
 plus an end-to-end ``MSAPipeline`` routine. Precision is chosen per op via
 ``--q_dtype`` / ``--kv_dtype``.
 """
@@ -44,7 +44,7 @@ BLK_KV = 128
 # Which kernel backends each MSA routine actually exposes.
 _ROUTINE_BACKENDS = {
     "MSAProxyScore": ["cudsl"],
-    "MSASparseAttentionKvMajor": ["cudsl"],
+    "MSASparseAttention": ["cudsl"],
     "MSASparseDecode": ["cudsl"],
     "MSAPipeline": ["cudsl"],
 }
@@ -54,8 +54,8 @@ def run_sparse_attention_test(args):
     """Route an MSA routine to its test function."""
     if args.routine == "MSAProxyScore":
         return testMSAProxyScore(args)
-    elif args.routine == "MSASparseAttentionKvMajor":
-        return testMSASparseAttentionKvMajor(args)
+    elif args.routine == "MSASparseAttention":
+        return testMSASparseAttention(args)
     elif args.routine == "MSASparseDecode":
         return testMSASparseDecode(args)
     elif args.routine == "MSAPipeline":
@@ -108,7 +108,7 @@ def parse_sparse_attention_args(line, parser):
         "--kv_dtype",
         type=str,
         default="bfloat16",
-        help="KV dtype: bfloat16/float16/fp8_e4m3/nvfp4 (kvmajor/decode/pipeline).",
+        help="KV dtype: bfloat16/float16/fp8_e4m3/nvfp4 (prefill/decode/pipeline).",
     )
     args = parser.parse_args(line)
     if args.verbose >= 1:
@@ -331,16 +331,16 @@ def testMSAProxyScore(args):
     return res
 
 
-def testMSASparseAttentionKvMajor(args):
+def testMSASparseAttention(args):
     """Stage 3: KV-major sparse prefill (hot path); auto-builds CSR + combine."""
     if args.verbose >= 1:
         print(
-            f"[INFO] Running testMSASparseAttentionKvMajor | FlashInfer {flashinfer.__version__}"
+            f"[INFO] Running testMSASparseAttention | FlashInfer {flashinfer.__version__}"
         )
     device = _common(args)
     if device is None:
         return []
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     bs, s_qo, s_kv = args.batch_size, args.s_qo, args.s_kv
     Hq, Hkv = args.num_qo_heads, args.num_kv_heads
@@ -356,7 +356,7 @@ def testMSASparseAttentionKvMajor(args):
     scale = 1.0 / math.sqrt(128)
 
     def run(_b):
-        return msa_sparse_attention_kvmajor(
+        return msa_sparse_attention(
             q,
             k_in,
             v_in,
@@ -443,7 +443,7 @@ def testMSASparseDecode(args):
 
 
 def testMSAPipeline(args):
-    """End-to-end MSA prefill: proxy_score -> topk_select -> kvmajor."""
+    """End-to-end MSA prefill: proxy_score -> topk_select -> prefill."""
     if args.verbose >= 1:
         print(f"[INFO] Running testMSAPipeline | FlashInfer {flashinfer.__version__}")
     device = _common(args)
@@ -451,7 +451,7 @@ def testMSAPipeline(args):
         return []
     from flashinfer.msa_ops import (
         msa_proxy_score,
-        msa_sparse_attention_kvmajor,
+        msa_sparse_attention,
         msa_topk_select,
     )
 
@@ -475,7 +475,7 @@ def testMSAPipeline(args):
         # map per-(qo-head) selection onto the per-kv-head q2k layout the
         # attention kernel consumes: take the first kv-group head's selection.
         q2k = sel[:, :: (Hq // Hkv), :].transpose(0, 1).contiguous().to(torch.int32)
-        return msa_sparse_attention_kvmajor(
+        return msa_sparse_attention(
             q,
             k_in,
             v_in,

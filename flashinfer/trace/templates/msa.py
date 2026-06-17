@@ -14,15 +14,14 @@
 
 """TraceTemplates for Minimax Sparse Attention (MSA) numeric operations.
 
-These cover the five numeric MSA pipeline ops (SM120/SM121):
+These cover the four numeric MSA pipeline ops (SM120/SM121):
 
 +------------------------------------+-----------+-------------------------------+
 | Template                           | Stage     | What it computes              |
 +====================================+===========+===============================+
 | ``msa_proxy_score``                | indexer   | per-KV-block max of Q K^T     |
 | ``msa_proxy_score_fp4``            | indexer   | same, NVFP4 Q/K (bandwidth)   |
-| ``msa_sparse_attention``           | prefill   | q-major top-K block attention |
-| ``msa_sparse_attention_kvmajor``   | prefill   | kv-major top-K block attention|
+| ``msa_sparse_attention``           | prefill   | top-K block attention         |
 | ``msa_sparse_decode_attention``    | decode    | top-K block decode attention  |
 +------------------------------------+-----------+-------------------------------+
 
@@ -426,7 +425,7 @@ msa_proxy_score_fp4_trace = TraceTemplate(
     init=_msa_proxy_score_fp4_init,
 )
 
-# ── msa_sparse_attention / msa_sparse_attention_kvmajor (prefill) ──────────────
+# ── msa_sparse_attention (prefill) ─────────────────────────────────────────────
 
 
 @torch.no_grad()
@@ -487,7 +486,7 @@ def _msa_sparse_attention_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for the q-major MSA sparse attention.
+    """Build inputs for MSA sparse attention.
 
     Builds random varlen Q/K/V and a per-(kv-head, query) ``q2k_indices`` of
     ascending in-range block ids (the format produced by ``msa_topk_select``).
@@ -563,36 +562,10 @@ msa_sparse_attention_trace = TraceTemplate(
     op_type="msa_sparse",
     name_prefix="msa_sparse_attention",
     description=(
-        "MSA q-major sparse attention (prefill): each query attends only its "
-        "top-K selected KV blocks (128 tokens each) from q2k_indices. One CTA "
-        "per query-tile/head gathers the tile's union of selected blocks."
-    ),
-    axes=_msa_sparse_attention_axes(),
-    inputs=_msa_sparse_attention_inputs(),
-    outputs={
-        "output": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype_from="q"),
-    },
-    constraints=[
-        "q2k_indices.shape[0] == num_kv_heads",
-        "q2k_indices.shape[1] == total_q",
-        "q2k_indices.shape[-1] == topk",
-        "total_q == cu_seqlens_q[-1].item()",
-    ],
-    tags=["status:verified", "stage:prefill", "sparse:topk"],
-    reference=_msa_sparse_attention_reference,
-    check=_msa_attention_check,
-    init=_msa_sparse_attention_init,
-)
-
-
-msa_sparse_attention_kvmajor_trace = TraceTemplate(
-    op_type="msa_sparse",
-    name_prefix="msa_sparse_attention_kvmajor",
-    description=(
-        "MSA kv-major sparse attention (prefill): same top-K block semantics as "
-        "msa_sparse_attention, but work is distributed over (kv-head, KV block) "
-        "CSR rows so each block is loaded once and shared by all queries that "
-        "selected it, with a fused LSE-weighted combine."
+        "MSA sparse attention (prefill): each query attends only its top-K "
+        "selected KV blocks (128 tokens each) from q2k_indices. Work is "
+        "distributed over (kv-head, KV block) CSR rows so each block is loaded "
+        "once and shared by all queries that selected it."
     ),
     axes=_msa_sparse_attention_axes(),
     inputs=_msa_sparse_attention_inputs(),

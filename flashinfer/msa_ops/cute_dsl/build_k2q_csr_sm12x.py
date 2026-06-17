@@ -20,9 +20,9 @@ MSA q2k -> k2q CSR builder for SM120/SM121 (CuTe-DSL port of
 
 Inverts the per-query top-K KV-block selection (``q2k``) into a KV-major CSR:
 for each (kv-head, KV-block row) the sorted batch-local query indices that
-selected it, plus (schedule variant) the per-query split-slot packing,
-per-(query,head) valid-block counts, and a flat work schedule. The static row
-geometry is precomputed host-side in the wrapper.
+selected it, plus the per-query split-slot packing, per-(query,head)
+valid-block counts, and a flat work schedule. The static row geometry is
+precomputed host-side in the wrapper.
 """
 
 import inspect

@@ -15,7 +15,6 @@ limitations under the License.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 
@@ -207,151 +206,13 @@ def msa_build_k2q_csr(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     blk_kv: int = 128,
-    row_ptr: Optional[torch.Tensor] = None,
-    q_indices: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Invert per-query top-K KV block indices into a KV-major CSR structure.
-
-    Given ``q2k_indices`` mapping each (head, query token) to its selected KV
-    blocks (the output of :func:`msa_topk_select`, transposed to head-major),
-    builds the inverse mapping: for each (head, KV block row), the sorted list
-    of query tokens that selected it. This KV-major layout is what the sparse
-    attention kernel consumes.
-
-    Rows are packed round-robin across batches: row order is
-    (level 0 of every batch that has it, level 1 of every batch, ...), where a
-    "level" is the i-th KV block of a sequence. Query indices within each row
-    are in ascending (batch-local) order.
-
-    Parameters
-    ----------
-    q2k_indices : torch.Tensor
-        Shape ``(num_qo_heads, total_qo_len, topk)``, dtype int32, contiguous.
-        KV-block indices per (head, query token); ``-1`` marks invalid slots.
-        ``topk`` must be 4, 8, 16, or 32.
-    cu_seqlens_q : torch.Tensor
-        Shape ``(batch_size + 1,)``, dtype int32. Cumulative query lengths.
-    cu_seqlens_k : torch.Tensor
-        Shape ``(batch_size + 1,)``, dtype int32. Cumulative KV lengths.
-        Must be on CPU or will be copied to CPU to compute row geometry.
-    blk_kv : int
-        KV block size. Must be 128.
-    row_ptr : torch.Tensor, optional
-        Pre-allocated output, shape ``(num_qo_heads, total_rows + 1)``, int32.
-    q_indices : torch.Tensor, optional
-        Pre-allocated output, shape ``(num_qo_heads, total_qo_len * topk)``,
-        int32.
-
-    Returns
-    -------
-    row_ptr : torch.Tensor
-        Shape ``(num_qo_heads, total_rows + 1)``, dtype int32. CSR row
-        pointers; row r of head h covers
-        ``q_indices[h, row_ptr[h, r]:row_ptr[h, r + 1]]``.
-    q_indices : torch.Tensor
-        Shape ``(num_qo_heads, total_qo_len * topk)``, dtype int32.
-        Batch-local query indices, ascending within each row; unused tail
-        slots are ``-1``.
-    """
-    if not is_sm12x_supported(q2k_indices.device):
-        raise RuntimeError(
-            "msa_build_k2q_csr requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
-        )
-
-    if q2k_indices.dtype != torch.int32:
-        raise ValueError(f"q2k_indices must be int32, got {q2k_indices.dtype}")
-    if not q2k_indices.is_contiguous():
-        raise ValueError("q2k_indices must be contiguous")
-    if q2k_indices.ndim != 3:
-        raise ValueError(
-            f"q2k_indices must be 3D (num_qo_heads, total_qo_len, topk), "
-            f"got {q2k_indices.ndim}D"
-        )
-    if blk_kv != 128:
-        raise ValueError(f"blk_kv must be 128, got {blk_kv}")
-
-    num_qo_heads, total_qo_len, topk = q2k_indices.shape
-    if topk not in (4, 8, 16, 32):
-        raise ValueError(f"topk must be 4, 8, 16, or 32, got {topk}")
-
-    if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
-        raise ValueError("cu_seqlens_q and cu_seqlens_k must be int32")
-    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
-        raise ValueError("cu_seqlens_q and cu_seqlens_k must be 1D")
-    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
-        raise ValueError("cu_seqlens_q and cu_seqlens_k must have the same length")
-    if int(cu_seqlens_q.cpu()[-1]) != total_qo_len:
-        raise ValueError(
-            "cu_seqlens_q[-1] must equal q2k_indices.shape[1] (total_qo_len)"
-        )
-
-    # Row geometry (computed on CPU): rows per batch = ceil(seqlen_k / blk_kv)
-    cu_k_cpu = cu_seqlens_k.cpu()
-    seqlens_k = cu_k_cpu[1:] - cu_k_cpu[:-1]
-    rows_per_batch = (seqlens_k + blk_kv - 1) // blk_kv
-    total_rows = int(rows_per_batch.sum().item())
-    max_kv_blocks = int(rows_per_batch.max().item()) if rows_per_batch.numel() else 0
-
-    device = q2k_indices.device
-    if row_ptr is None:
-        row_ptr = torch.empty(
-            (num_qo_heads, total_rows + 1), dtype=torch.int32, device=device
-        )
-    else:
-        if row_ptr.shape != (num_qo_heads, total_rows + 1):
-            raise ValueError(
-                f"row_ptr shape must be ({num_qo_heads}, {total_rows + 1}), "
-                f"got {tuple(row_ptr.shape)}"
-            )
-        if row_ptr.dtype != torch.int32:
-            raise ValueError(f"row_ptr must be int32, got {row_ptr.dtype}")
-        if row_ptr.device != device or not row_ptr.is_contiguous():
-            raise ValueError("row_ptr must be contiguous and on q2k_indices.device")
-
-    if q_indices is None:
-        q_indices = torch.empty(
-            (num_qo_heads, total_qo_len * topk), dtype=torch.int32, device=device
-        )
-    else:
-        if q_indices.shape != (num_qo_heads, total_qo_len * topk):
-            raise ValueError(
-                f"q_indices shape must be ({num_qo_heads}, {total_qo_len * topk}), "
-                f"got {tuple(q_indices.shape)}"
-            )
-        if q_indices.dtype != torch.int32:
-            raise ValueError(f"q_indices must be int32, got {q_indices.dtype}")
-        if q_indices.device != device or not q_indices.is_contiguous():
-            raise ValueError("q_indices must be contiguous and on q2k_indices.device")
-
-    cu_q_dev = cu_seqlens_q.to(device, non_blocking=True)
-
-    _run_csr_cudsl(
-        q2k_indices,
-        cu_q_dev,
-        cu_k_cpu,
-        total_rows,
-        max_kv_blocks,
-        topk,
-        row_ptr,
-        q_indices,
-    )
-
-    return row_ptr, q_indices
-
-
-@flashinfer_api
-def msa_build_k2q_csr_schedule(
-    q2k_indices: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    blk_kv: int = 128,
     target_q_per_cta: int = 128,
     max_seqlen_q: int = 0,
 ) -> MsaAttentionSchedule:
     """Build the KV-major CSR plus the flat work schedule for the sparse
     forward kernel.
 
-    In addition to :func:`msa_build_k2q_csr`'s outputs, this produces:
+    Produces the CSR (``row_ptr`` / ``q_indices``) plus:
 
     - ``qsplit_indices``: like ``q_indices`` but each entry packs the
       batch-local query index (low 24 bits) with the query's *split slot*
@@ -367,7 +228,7 @@ def msa_build_k2q_csr_schedule(
     """
     if not is_sm12x_supported(q2k_indices.device):
         raise RuntimeError(
-            "msa_build_k2q_csr_schedule requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_build_k2q_csr requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
         )
     if q2k_indices.dtype != torch.int32 or q2k_indices.ndim != 3:
         raise ValueError("q2k_indices must be int32 of shape (Hkv, total_q, topk)")

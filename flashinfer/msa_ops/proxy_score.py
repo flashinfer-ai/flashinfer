@@ -455,7 +455,7 @@ def quantize_bf16_qk_to_nvfp4(
     Helper for tests / benchmarks / standalone callers; a real deployment
     quantizes the index Q/K once upstream and stores them packed. Produces the
     cuBLAS **128x4 tiled** scale-factor layout shared by the MSA stack
-    (``msa_proxy_score_fp4`` / kvmajor / decode), so one NVFP4 cache feeds all.
+    (``msa_proxy_score_fp4`` / ``msa_sparse_attention`` / decode), so one NVFP4 cache feeds all.
 
     Parameters
     ----------
@@ -546,7 +546,7 @@ def msa_proxy_score_fp4(
         Flat uint8 e4m3 block scales in the cuBLAS 128x4 tiled layout, indexed by
         logical row ``token*num_heads + head`` (paged K: ``(page*num_kv_heads +
         kv_head)*128 + token_in_page``). Produced by
-        :func:`quantize_bf16_qk_to_nvfp4`; shared with kvmajor / decode.
+        :func:`quantize_bf16_qk_to_nvfp4`; shared with the attention + decode kernels.
     q_global_scale, k_global_scale : float
         Per-tensor inverse global scales (``1 / global_scale``) from
         :func:`quantize_bf16_qk_to_nvfp4`.

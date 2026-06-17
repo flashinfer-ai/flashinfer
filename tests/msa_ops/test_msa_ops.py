@@ -100,7 +100,8 @@ def test_build_k2q_csr(B, H, topk, seqs_q, seqs_k):
                 sel = torch.randperm(nb)[:n].sort().values.to(torch.int32)
                 q2k[h, qi, :n] = sel.to(dev)
 
-    row_ptr, q_idx = msa_build_k2q_csr(q2k, cu_q, cu_k, blk_kv=BLK_KV)
+    sched = msa_build_k2q_csr(q2k, cu_q, cu_k, blk_kv=BLK_KV)
+    row_ptr, q_idx = sched.row_ptr, sched.q_indices
     torch.cuda.synchronize()
 
     ref_ptr, ref_lists, total_rows = _ref_build_k2q_csr(q2k, cu_q, cu_k, BLK_KV)
@@ -116,7 +117,7 @@ def test_build_k2q_csr(B, H, topk, seqs_q, seqs_k):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3a: msa_sparse_attention (q-major SM12x kernel)
+# Phase 3: msa_sparse_attention (sparse prefill)
 # ---------------------------------------------------------------------------
 
 
@@ -161,64 +162,13 @@ def _ref_sparse_attention(q, k, v, idx, cu_q, cu_k, causal, scale):
         (2, 4, 2, 16, [100, 37], [2048, 700], False),
         (2, 2, 2, 16, [130, 64], [1024, 512], True),
         (1, 8, 2, 8, [200], [4096], False),
+        (1, 16, 1, 16, [333], [3000], False),
+        (2, 8, 8, 16, [97, 211], [1111, 2222], True),
     ],
 )
 def test_sparse_attention(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_attention
-
-    torch.manual_seed(42)
-    dev, dtype = "cuda", torch.bfloat16
-    cu_q = torch.tensor(
-        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
-    )
-    cu_k = torch.tensor(
-        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
-    )
-    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
-    q = torch.randn(total_q, Hq, 128, dtype=dtype, device=dev) / 3
-    k = torch.randn(total_k, Hkv, 128, dtype=dtype, device=dev) / 3
-    v = torch.randn(total_k, Hkv, 128, dtype=dtype, device=dev) / 3
-
-    idx = torch.full((Hkv, total_q, topk), -1, dtype=torch.int32, device=dev)
-    for b in range(B):
-        nb = (seqs_k[b] + BLK_KV - 1) // BLK_KV
-        lo, hi = int(cu_q[b]), int(cu_q[b + 1])
-        n = min(topk, nb)
-        for h in range(Hkv):
-            for qi in range(lo, hi):
-                # vary the number of selected blocks; leave some rows empty
-                nsel = torch.randint(0, n + 1, (1,)).item()
-                if nsel > 0:
-                    sel = torch.randperm(nb)[:nsel].sort().values.to(torch.int32)
-                    idx[h, qi, :nsel] = sel.to(dev)
-
-    scale = 1.0 / math.sqrt(128)
-    out = msa_sparse_attention(
-        q, k, v, idx, cu_q, cu_k, causal=causal, softmax_scale=scale
-    )
-    torch.cuda.synchronize()
-    ref = _ref_sparse_attention(
-        q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), causal, scale
-    )
-    err = (out.float().cpu() - ref).abs().max().item()
-    assert err < 2.5e-2, f"max abs error {err}"
-
-
-@pytest.mark.parametrize(
-    "B,Hq,Hkv,topk,seqs_q,seqs_k,causal",
-    [
-        (1, 1, 1, 4, [70], [1000], False),
-        (2, 4, 2, 16, [100, 37], [2048, 700], False),
-        (2, 2, 2, 16, [130, 64], [1024, 512], True),
-        (1, 8, 2, 8, [200], [4096], False),
-        (1, 16, 1, 16, [333], [3000], False),
-        (2, 8, 8, 16, [97, 211], [1111, 2222], True),
-    ],
-)
-def test_sparse_attention_kvmajor(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
-    _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
 
     torch.manual_seed(7)
     dev, dtype = "cuda", torch.bfloat16
@@ -246,7 +196,7 @@ def test_sparse_attention_kvmajor(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
                     idx[h, qi, :nsel] = sel.to(dev)
 
     scale = 1.0 / math.sqrt(128)
-    out = msa_sparse_attention_kvmajor(
+    out = msa_sparse_attention(
         q, k, v, idx, cu_q, cu_k, causal=causal, softmax_scale=scale
     )
     torch.cuda.synchronize()
@@ -291,15 +241,15 @@ def _make_case(B, Hq, Hkv, topk, seqs_q, seqs_k, dtype, seed, min_sel=0):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("topk", [16, 32])
-def test_sparse_attention_kvmajor_dtypes_topk(dtype, topk):
+def test_sparse_attention_dtypes_topk(dtype, topk):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     q, k, v, idx, cu_q, cu_k = _make_case(
         2, 4, 2, topk, [100, 64], [2048, 1024], dtype, seed=20 + topk
     )
     scale = 1.0 / math.sqrt(128)
-    out = msa_sparse_attention_kvmajor(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
+    out = msa_sparse_attention(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
     torch.cuda.synchronize()
     ref = _ref_sparse_attention(
         q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), False, scale
@@ -308,15 +258,15 @@ def test_sparse_attention_kvmajor_dtypes_topk(dtype, topk):
     assert err < 3.5e-2, f"max abs error {err}"
 
 
-def test_sparse_attention_kvmajor_lse():
+def test_sparse_attention_lse():
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     q, k, v, idx, cu_q, cu_k = _make_case(
         2, 4, 2, 16, [80, 50], [1024, 640], torch.bfloat16, seed=30
     )
     scale = 1.0 / math.sqrt(128)
-    out, lse = msa_sparse_attention_kvmajor(
+    out, lse = msa_sparse_attention(
         q, k, v, idx, cu_q, cu_k, softmax_scale=scale, return_softmax_lse=True
     )
     torch.cuda.synchronize()
@@ -342,18 +292,16 @@ def test_sparse_attention_kvmajor_lse():
         assert abs(lse[qi, hq].item() - ref_lse) < 1e-2
 
 
-def test_sparse_attention_kvmajor_paged():
+def test_sparse_attention_paged():
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     seqs_q, seqs_k = [150, 90], [2048, 1280]  # multiples of 128
     q, k, v, idx, cu_q, cu_k = _make_case(
         2, 8, 2, 16, seqs_q, seqs_k, torch.bfloat16, seed=40
     )
     scale = 1.0 / math.sqrt(128)
-    out_flat = msa_sparse_attention_kvmajor(
-        q, k, v, idx, cu_q, cu_k, softmax_scale=scale
-    )
+    out_flat = msa_sparse_attention(q, k, v, idx, cu_q, cu_k, softmax_scale=scale)
 
     Hkv = k.shape[1]
     num_pages_per = [s // BLK_KV for s in seqs_k]
@@ -372,7 +320,7 @@ def test_sparse_attention_kvmajor_paged():
             k_pg[pg] = k[rows].transpose(0, 1)
             v_pg[pg] = v[rows].transpose(0, 1)
     seqused = torch.tensor(seqs_k, dtype=torch.int32, device=k.device)
-    out_paged = msa_sparse_attention_kvmajor(
+    out_paged = msa_sparse_attention(
         q,
         k_pg.contiguous(),
         v_pg.contiguous(),
@@ -409,9 +357,9 @@ def test_fused_combine_matches_torch():
 
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
-def test_sparse_attention_kvmajor_fp8_kv(q_dtype, causal):
+def test_sparse_attention_fp8_kv(q_dtype, causal):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     torch.manual_seed(60)
     dev = "cuda"
@@ -438,7 +386,7 @@ def test_sparse_attention_kvmajor_fp8_kv(q_dtype, causal):
                     sel = torch.randperm(nb)[:nsel].sort().values.to(torch.int32)
                     idx[h, qi, :nsel] = sel.to(dev)
     scale = 1.0 / math.sqrt(128)
-    out = msa_sparse_attention_kvmajor(
+    out = msa_sparse_attention(
         q, k8, v8, idx, cu_q, cu_k, causal=causal, softmax_scale=scale
     )
     torch.cuda.synchronize()
@@ -634,9 +582,9 @@ def _nvfp4_quant(x2d):
 
 
 @pytest.mark.parametrize("causal", [False, True])
-def test_sparse_attention_kvmajor_nvfp4(causal):
+def test_sparse_attention_nvfp4(causal):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     torch.manual_seed(100)
     dev = "cuda"
@@ -666,7 +614,7 @@ def test_sparse_attention_kvmajor_nvfp4(causal):
 
     kq, ksf, kg = _nvfp4_quant(k.reshape(-1, 128))
     vq, vsf, vg = _nvfp4_quant(v.reshape(-1, 128))
-    out = msa_sparse_attention_kvmajor(
+    out = msa_sparse_attention(
         q,
         kq.reshape(total_k, Hkv, 64),
         vq.reshape(total_k, Hkv, 64),
@@ -854,12 +802,12 @@ def test_msa_topk_select_input_guards():
 
 
 def test_q2k_indices_must_be_contiguous():
-    """Decode and kvmajor compile for a compact q2k layout; a strided q2k (the
+    """Decode and prefill compile for a compact q2k layout; a strided q2k (the
     natural bare permute of msa_topk_select's output) must be rejected with a
-    clear message, like the q-major path."""
+    clear message."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import (
-        msa_sparse_attention_kvmajor,
+        msa_sparse_attention,
         msa_sparse_decode_attention,
     )
 
@@ -881,16 +829,16 @@ def test_q2k_indices_must_be_contiguous():
             q, k, v, idx_strided, cu_seqlens_k=cu_k, seqlen_q=sq, causal=True
         )
     with pytest.raises(ValueError, match="contiguous"):
-        msa_sparse_attention_kvmajor(q, k, v, idx_strided, cu_q, cu_k, causal=True)
+        msa_sparse_attention(q, k, v, idx_strided, cu_q, cu_k, causal=True)
 
 
 def test_fuzz_random_shapes():
     """Seeded random-shape sweep (MSA-style fuzzing) with element-wise checks
-    against the reference, on both prefill kernels."""
+    against the reference."""
     _skip_if_unsupported()
     import random
 
-    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     rng = random.Random(2026)
     dev, dtype = "cuda", torch.bfloat16
@@ -929,15 +877,13 @@ def test_fuzz_random_shapes():
             q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), causal, scale
         )
         tag = f"it={it} B={B} Hq={Hq} Hkv={Hkv} topk={topk} causal={causal}"
-        for name, fn in [
-            ("qmajor", msa_sparse_attention),
-            ("kvmajor", msa_sparse_attention_kvmajor),
-        ]:
-            out = fn(q, k, v, idx, cu_q, cu_k, causal=causal, softmax_scale=scale)
-            torch.cuda.synchronize()
-            assert torch.isfinite(out.float()).all(), f"NaN/Inf {name} {tag}"
-            err = (out.float().cpu() - ref).abs().max().item()
-            assert err < 2.5e-2, f"{name} {tag}: err={err}"
+        out = msa_sparse_attention(
+            q, k, v, idx, cu_q, cu_k, causal=causal, softmax_scale=scale
+        )
+        torch.cuda.synchronize()
+        assert torch.isfinite(out.float()).all(), f"NaN/Inf {tag}"
+        err = (out.float().cpu() - ref).abs().max().item()
+        assert err < 2.5e-2, f"{tag}: err={err}"
 
 
 def test_fully_masked_selected_blocks():
@@ -945,7 +891,7 @@ def test_fully_masked_selected_blocks():
     produce exact zeros (and -inf LSE), with no NaN/Inf anywhere, the
     'Q near sequence start' stress from MSA's suite."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     torch.manual_seed(130)
     dev, dtype = "cuda", torch.bfloat16
@@ -968,7 +914,7 @@ def test_fully_masked_selected_blocks():
         idx[0, qi, :nsel] = sel.to(torch.int32).to(dev)
     scale = 1.0 / math.sqrt(128)
 
-    out_kv, lse = msa_sparse_attention_kvmajor(
+    out_kv, lse = msa_sparse_attention(
         q,
         k,
         v,
@@ -979,11 +925,8 @@ def test_fully_masked_selected_blocks():
         softmax_scale=scale,
         return_softmax_lse=True,
     )
-    out_qm = msa_sparse_attention(
-        q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
-    )
     torch.cuda.synchronize()
-    for name, out in [("kvmajor", out_kv), ("qmajor", out_qm)]:
+    for name, out in [("prefill", out_kv)]:
         assert torch.isfinite(out.float()).all(), f"NaN/Inf in {name}"
         assert (out[:64].float() == 0).all(), f"{name}: masked rows must be zero"
     assert (lse[:64] == float("-inf")).all(), "LSE of masked rows must be -inf"
@@ -993,7 +936,7 @@ def test_fully_masked_selected_blocks():
     ref = _ref_sparse_attention(
         q.cpu(), k.cpu(), v.cpu(), idx.cpu(), cu_q.cpu(), cu_k.cpu(), True, scale
     )
-    for name, out in [("kvmajor", out_kv), ("qmajor", out_qm)]:
+    for name, out in [("prefill", out_kv)]:
         err = (out.float().cpu() - ref).abs().max().item()
         assert err < 2.5e-2, f"{name}: err={err}"
 
@@ -1146,7 +1089,7 @@ def test_e2e_full_pipeline_from_raw_tensors():
     _skip_if_unsupported()
     from flashinfer.msa_ops import (
         msa_proxy_score,
-        msa_sparse_attention_kvmajor,
+        msa_sparse_attention,
         msa_topk_select,
     )
 
@@ -1175,7 +1118,7 @@ def test_e2e_full_pipeline_from_raw_tensors():
         assert (sel * BLK_KV <= q_pos).all(), "selected fully-masked block"
     # Stage 3: sparse attention over the selection
     scale = 1.0 / math.sqrt(128)
-    out = msa_sparse_attention_kvmajor(
+    out = msa_sparse_attention(
         q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
     )
     torch.cuda.synchronize()
@@ -1224,7 +1167,6 @@ def test_q_offset_override():
     from flashinfer.msa_ops import (
         msa_proxy_score,
         msa_sparse_attention,
-        msa_sparse_attention_kvmajor,
     )
 
     torch.manual_seed(180)
@@ -1263,8 +1205,7 @@ def test_q_offset_override():
         q_offsets.cpu(),
     )
     for name, fn in [
-        ("qmajor", msa_sparse_attention),
-        ("kvmajor", msa_sparse_attention_kvmajor),
+        ("prefill", msa_sparse_attention),
     ]:
         out = fn(
             q,
@@ -1299,16 +1240,16 @@ def test_partial_dtype_options(pdt):
     """Non-default partial_dtype must agree with the bf16-partials baseline
     (fp32 tighter, fp8 looser)."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     q, k, v, idx, cu_q, cu_k = _make_case(
         2, 4, 2, 16, [100, 64], [2048, 1024], torch.bfloat16, seed=190
     )
     scale = 1.0 / math.sqrt(128)
-    base = msa_sparse_attention_kvmajor(
+    base = msa_sparse_attention(
         q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
     )
-    out = msa_sparse_attention_kvmajor(
+    out = msa_sparse_attention(
         q,
         k,
         v,
@@ -1330,7 +1271,7 @@ def test_temperature_lse():
     """return_temperature_lse: LSE computed with the exponent multiplied by
     lse_temperature_scale (MSA semantics), merged across splits."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     torch.manual_seed(200)
     T = 0.7
@@ -1338,7 +1279,7 @@ def test_temperature_lse():
         2, 4, 2, 16, [80, 50], [1024, 640], torch.bfloat16, seed=200
     )
     scale = 1.0 / math.sqrt(128)
-    out, lse, lse_t = msa_sparse_attention_kvmajor(
+    out, lse, lse_t = msa_sparse_attention(
         q,
         k,
         v,
@@ -1377,19 +1318,19 @@ def test_temperature_lse():
     assert checked > 20
 
 
-@pytest.mark.parametrize("which", ["kvmajor", "decode"])
+@pytest.mark.parametrize("which", ["prefill", "decode"])
 def test_fp8_q(which):
     """All-fp8 inputs (Q, K, V all e4m3), MSA's fp8 serving configuration.
     Q is upconverted in-kernel; reference uses the dequantized tensors."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import (
-        msa_sparse_attention_kvmajor,
+        msa_sparse_attention,
         msa_sparse_decode_attention,
     )
 
     torch.manual_seed(210)
     dev = "cuda"
-    if which == "kvmajor":
+    if which == "prefill":
         Hq, Hkv, topk = 8, 2, 16
         seqs_q, seqs_k = [120, 70], [2048, 1280]
         B = 2
@@ -1417,8 +1358,8 @@ def test_fp8_q(which):
                 sel = torch.randperm(nb)[:nsel].sort().values
                 idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
     scale = 1.0 / math.sqrt(128)
-    if which == "kvmajor":
-        out = msa_sparse_attention_kvmajor(
+    if which == "prefill":
+        out = msa_sparse_attention(
             q8, k8, v8, idx, cu_q, cu_k, causal=True, softmax_scale=scale
         )
     else:
@@ -1453,7 +1394,7 @@ def test_fp8_qk_native_mma():
     upconvert path bit-for-bit-ish (e4m3 values are exact in bf16; only f32
     accumulation order can differ) and with the dequantized reference."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     torch.manual_seed(230)
     dev = "cuda"
@@ -1479,7 +1420,7 @@ def test_fp8_qk_native_mma():
                 sel = torch.randperm(nb)[:nsel].sort().values
                 idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
     scale = 1.0 / math.sqrt(128)
-    out_native = msa_sparse_attention_kvmajor(
+    out_native = msa_sparse_attention(
         q8,
         k8,
         v8,
@@ -1490,7 +1431,7 @@ def test_fp8_qk_native_mma():
         softmax_scale=scale,
         qk_dtype=torch.float8_e4m3fn,
     )
-    out_upconv = msa_sparse_attention_kvmajor(
+    out_upconv = msa_sparse_attention(
         q8, k8, v8, idx, cu_q, cu_k, causal=True, softmax_scale=scale
     )
     torch.cuda.synchronize()
@@ -1515,7 +1456,7 @@ def test_fp8_pv_native_mma():
     (x448, compensated), V pre-transposed in SMEM. Accuracy is the fp8-P
     quantization class (MSA's own fp8 threshold: cosine > 0.999)."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention_kvmajor
+    from flashinfer.msa_ops import msa_sparse_attention
 
     torch.manual_seed(240)
     dev = "cuda"
@@ -1542,7 +1483,7 @@ def test_fp8_pv_native_mma():
                 sel = torch.randperm(nb)[:nsel].sort().values
                 idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
     scale = 1.0 / math.sqrt(128)
-    out = msa_sparse_attention_kvmajor(
+    out = msa_sparse_attention(
         q8,
         k8,
         v8,

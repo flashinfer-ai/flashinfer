@@ -19,7 +19,7 @@ Slim sparse decode kernel for SM120/SM121
 
 Decode shape: one query token (x its GQA query heads) attending one selected
 128-token KV block per CTA. Compared to running decode through the prefill
-KV-major kernel, this kernel:
+``msa_sparse_attention`` kernel, this kernel:
 
 - uses a dense static grid ``(topk, total_q, Hkv)`` driven directly by
   ``q2k_indices`` — no schedule tensors at all (split counts are computed

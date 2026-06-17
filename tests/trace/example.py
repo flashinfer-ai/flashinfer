@@ -56,7 +56,6 @@ moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 msa_proxy_score_fp4_h4_kv1.json
 msa_proxy_score_h4_kv1_d128.json
 msa_sparse_attention_h64_kv4_d128_topk16.json
-msa_sparse_attention_kvmajor_h64_kv4_d128_topk16.json
 msa_sparse_decode_attention_h64_kv4_d128_topk16.json
 mxfp8_grouped_quantize_k4096.json
 rmsnorm_h4096.json
@@ -1226,10 +1225,6 @@ with contextlib.suppress(Exception):
 
     with contextlib.suppress(Exception):
         _msa.msa_sparse_attention(
-            _sp_q, _sp_k, _sp_v, _sp_idx, _idx_cu_q, _idx_cu_k, causal=True
-        )
-    with contextlib.suppress(Exception):
-        _msa.msa_sparse_attention_kvmajor(
             _sp_q, _sp_k, _sp_v, _sp_idx, _idx_cu_q, _idx_cu_k, causal=True
         )
 
