@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import logging
+import math
 import warnings
 from collections import defaultdict
 from dataclasses import astuple, replace
@@ -9342,6 +9343,55 @@ def _check_bmm_mxfp8_problem_size(
     return True
 
 
+def _mxfp8_swizzled_scale_shape(rows: int, cols: int) -> Tuple[int, int]:
+    return (_pad_up(rows, 128), _pad_up(_pad_up(cols, 32) // 32, 4))
+
+
+def _prepare_bmm_mxfp8_cutlass_scale(
+    scale: torch.Tensor,
+    batch_size: int,
+    rows: int,
+    cols: int,
+    name: str,
+) -> torch.Tensor:
+    expected_shape = (batch_size, *_mxfp8_swizzled_scale_shape(rows, cols))
+    expected_len = math.prod(expected_shape)
+
+    if scale.ndim == 3:
+        if tuple(scale.shape) != expected_shape:
+            raise ValueError(
+                f"{name} shape mismatch for per-batch swizzled layout. "
+                f"Expected {expected_shape}, got {tuple(scale.shape)}."
+            )
+        return scale.contiguous().reshape(-1)
+
+    if scale.ndim != 1:
+        raise ValueError(
+            f"{name} must be 1D flattened or 3D per-batch swizzled scale, "
+            f"got {tuple(scale.shape)}."
+        )
+
+    if scale.numel() == expected_len:
+        return scale.contiguous()
+
+    legacy_len = _mxfp8_swizzled_scale_len(
+        batch_size * rows, cols, SfLayout.layout_128x4
+    )
+    if scale.numel() == legacy_len:
+        raise ValueError(
+            f"{name} uses the legacy combined-batch swizzled layout from "
+            "mxfp8_quantize on a 3D tensor. bmm_mxfp8 requires scales padded "
+            "per batch so batches do not share 128-row scale tiles. Quantize "
+            "each batch independently or pass rank-preserving scales with "
+            f"shape {expected_shape}."
+        )
+
+    raise ValueError(
+        f"{name} length mismatch for per-batch swizzled layout. "
+        f"Expected {expected_len}, got {scale.numel()}."
+    )
+
+
 @supported_compute_capability([120, 121])
 def _cutlass_bmm_mxfp8_requirement(
     A: torch.Tensor,
@@ -9352,8 +9402,8 @@ def _cutlass_bmm_mxfp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ):
-    # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales.
-    if A_scale.ndim != 1 or B_scale.ndim != 1:
+    # SM120/121 CUTLASS MXFP8 supports flattened or rank-preserving swizzled scales.
+    if A_scale.ndim not in (1, 3) or B_scale.ndim not in (1, 3):
         return False
     return True
 
@@ -9411,11 +9461,13 @@ def bmm_mxfp8(
 
     A_scale: torch.Tensor
         Scale tensor for A, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
-        layout produced by ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
+        layout. The CUTLASS backend accepts flattened or rank-preserving scales
+        padded independently for each batch item.
 
     B_scale: torch.Tensor
         Scale tensor for B, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
-        layout, as returned by quantizing the [b, n, k] weight (see ``B``).
+        layout. The CUTLASS backend accepts flattened or rank-preserving scales
+        padded independently for each batch item.
 
     dtype: torch.dtype
         out dtype, bf16 or fp16.
@@ -9426,14 +9478,12 @@ def bmm_mxfp8(
     backend: Literal["cudnn", "cutlass", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
-        be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
-        shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
-        Both the cuDNN and CUTLASS backends read the scale tensors in the
-        F8_128x4 swizzled layout; linear-layout scales are not supported.
-        Both layouts are flat 1D buffers, so a linear scale whose length happens
-        to match the padded swizzled length cannot be detected at runtime. Ensure
-        the scale was produced with the swizzled layout rather than relying on a
-        warning.
+        use the swizzled ``SfLayout.layout_128x4`` convention and be padded per
+        batch. Pass ``B`` in the standard shape ``[b, k, n]`` (column-major);
+        the CUTLASS path transposes internally.
+        Both the cuDNN and CUTLASS backends require the swizzled layout. A flat
+        linear-layout scale with the same element count cannot be detected at
+        runtime.
 
     Returns
     -------
@@ -9467,6 +9517,12 @@ def bmm_mxfp8(
         B_cutlass = B.transpose(1, 2)
         if not B_cutlass.is_contiguous():
             B_cutlass = B_cutlass.contiguous()
+        A_scale = _prepare_bmm_mxfp8_cutlass_scale(
+            A_scale, A.shape[0], A.shape[1], A.shape[2], "A_scale"
+        )
+        B_scale = _prepare_bmm_mxfp8_cutlass_scale(
+            B_scale, B.shape[0], B.shape[2], B.shape[1], "B_scale"
+        )
         raw_module = _load_gemm_sm120_mxfp8_module()
         raw_module.mxfp8_gemm(A, B_cutlass, A_scale, B_scale, out, workspace_buffer, -1)
         return out
