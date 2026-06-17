@@ -2260,9 +2260,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
+            # NOTE(spark-hijinks): the segment_packbits kernel requires the
+            # indptr on the mask's device (CHECK_DEVICE in quantization.cu),
+            # but mask_indptr inherits qo_indptr's device, which callers
+            # (e.g. vLLM) routinely keep on CPU while the mask is on GPU.
             packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
-                mask_indptr,
+                mask_indptr.to(custom_mask.device),
                 bitorder="little",
             )
 
