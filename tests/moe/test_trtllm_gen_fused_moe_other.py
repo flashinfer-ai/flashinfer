@@ -19,7 +19,7 @@ import torch
 
 from flashinfer.utils import get_compute_capability
 
-from tests.moe.trtllm_gen_fused_moe_common import (
+from tests.moe.trtllm_gen_fused_moe_utils import (
     ActivationType,
     BF16Moe,
     FP4Moe,
