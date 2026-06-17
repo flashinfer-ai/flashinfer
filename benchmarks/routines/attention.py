@@ -383,11 +383,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "[INFO] FA2_TC backend does not support speculative decode. Skipping."
             )
             remove_fa2_tc = True
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] FA2_TC backend does not support FP8. Skipping.")
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            print("[INFO] FA2_TC backend does not support FP8 query. Skipping.")
             remove_fa2_tc = True
         if remove_fa2_tc:
             backends.remove("fa2_tc")
@@ -1146,7 +1143,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print(f"[VVERBOSE] {kv_last_page_len.shape = }")
         print(f"[VVERBOSE] {scale = }")
 
-    # Helper function to convert to FP8 (matches test_trtllm_gen_attention.py approach)
+    # Helper function to convert to FP8 (matches test_trtllm_gen_attention_decode.py approach)
     def to_float8(x, dtype=torch.float8_e4m3fn):
         finfo = torch.finfo(dtype)
         min_val, max_val = x.aminmax()

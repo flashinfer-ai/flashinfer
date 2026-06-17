@@ -162,8 +162,8 @@ def create_kv_cache(
             dim=1,
         )
     elif kv_dtype == "nvfp4":
-        k_cache, k_scale, k_global_scale = to_nvfp4(k_cache / 4.0)
-        v_cache, v_scale, v_global_scale = to_nvfp4(v_cache / 4.0)
+        k_cache, k_scale, k_global_scale = to_nvfp4(k_cache)
+        v_cache, v_scale, v_global_scale = to_nvfp4(v_cache)
         k_cache_dq = nvfp4_to_float(k_cache, k_scale, k_global_scale)
         v_cache_dq = nvfp4_to_float(v_cache, v_scale, v_global_scale)
         ref_kv_cache = torch.stack(
@@ -581,7 +581,7 @@ def test_xqa_batch_decode(
 
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [12],
-    reason="XQA with NVFP4 KV is only supported on SM120 GPUs",
+    reason="XQA with NVFP4 KV is only supported on SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",

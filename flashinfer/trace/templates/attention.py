@@ -218,11 +218,15 @@ gqa_paged_decode_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(["batch_size", "num_qo_heads", "head_dim"], dtype_from="q"),
         "lse": Tensor(
             ["batch_size", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -410,11 +414,15 @@ gqa_paged_prefill_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype_from="q"),
         "lse": Tensor(
             ["total_q", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -571,6 +579,9 @@ gqa_ragged_prefill_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(
@@ -580,6 +591,7 @@ gqa_ragged_prefill_trace = TraceTemplate(
         ),
         "lse": Tensor(
             ["total_q", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -769,13 +781,18 @@ mla_paged_decode_trace = TraceTemplate(
                 "based on head dimensions before matrix absorption. Set during plan(), not run()."
             ),
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(
-            ["batch_size", "num_qo_heads", "head_dim_ckv"], dtype_from="q_nope"
+            ["batch_size", "num_qo_heads", "head_dim_ckv"],
+            dtype_from="q_nope",
         ),
         "lse": Tensor(
             ["batch_size", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -1146,6 +1163,175 @@ dsa_paged_trace = TraceTemplate(
     tags=["status:verified", "sparse:topk"],
     reference=_dsa_paged_reference,
 )
+
+
+# ── Sparse MLA SM120 (DSv4 + DSv3.2 families) ─────────────────────────────────
+
+sparse_mla_sm120_paged_trace = TraceTemplate(
+    op_type="sparse_mla_paged_sm120",
+    name_prefix="sparse_mla_sm120_paged",
+    description=(
+        "Sparse-MLA paged attention on SM120. Byte-packed FP8 KV cache + "
+        "per-token top-K paged slot IDs + optional attn_sink (per-head "
+        "pre-softmax bias). Supports optional dual-cache mode "
+        "(extra_kv_cache + extra_indices + extra_topk_length) for DSv4 "
+        "C4A / C128A layers, sharing a single online-softmax denominator "
+        "across both caches. The 576-dim inline-scale cache supports DSv3.2 "
+        "power-of-2 FP32 scales and GLM arbitrary FP32 scales. "
+        "Auto-dispatches decode (num_tokens <= 64) vs "
+        "prefill internally. This is the backend trace for the SM120 sparse "
+        "MLA implementation routed by flashinfer.mla APIs."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of query tokens (batch * s_q)."),
+        "num_heads": Const(
+            description="Number of query heads after TP split.", abbrev="h"
+        ),
+        "head_dim_qk": Const(
+            description="Query head dim. 512 = DSv4 family, 576 = DSv3.2/GLM family.",
+            abbrev="dqk",
+        ),
+        "head_dim_v": Const(
+            description="Value head dim. 512 for both DSV3_2 and DSV4.",
+            abbrev="dv",
+        ),
+        "topk": Const(
+            description="Number of top-K paged slots per query token.",
+            abbrev="topk",
+        ),
+        "page_block_size": Const(
+            description="KV cache page block size (64 for both DSV4 and DSV3_2).",
+            abbrev="ps",
+        ),
+        "num_pages": Var(description="Total allocated pages in the KV cache."),
+        "extra_num_pages": Var(
+            description="Pages in the optional secondary KV cache (dual-cache mode)."
+        ),
+        "extra_topk": Const(
+            description="Top-K width for the secondary cache. 0 = single-cache.",
+            abbrev="xtopk",
+        ),
+        "extra_page_block_size": Const(
+            description="Page block size of the secondary cache (may differ from main).",
+            abbrev="xps",
+        ),
+        "kv_bytes_per_token": Const(
+            description="Byte-packed FP8 token stride (weights + interleaved scales).",
+            abbrev="kvb",
+        ),
+    },
+    inputs={
+        "q": Tensor(
+            ["num_tokens", "num_heads", "head_dim_qk"],
+            description="Query tensor, dtype bf16.",
+        ),
+        "kv_cache": Tensor(
+            ["num_pages", "page_block_size", "1", "kv_bytes_per_token"],
+            dtype="uint8",
+            description=(
+                "Paged main KV cache. Byte-packed FP8 (weights + interleaved scales). "
+                "The h_kv=1 axis is kept for shape compatibility with FlashMLA layouts."
+            ),
+        ),
+        "indices": Tensor(
+            ["num_tokens", "topk"],
+            dtype="int32",
+            description="Paged slot IDs per query token. -1 marks invalid / out-of-window.",
+        ),
+        "output": Tensor(
+            ["num_tokens", "num_heads", "head_dim_v"],
+            dtype_from="q",
+            description="In-place output buffer.",
+        ),
+        "out_lse": Tensor(
+            ["num_tokens", "num_heads"],
+            dtype="float32",
+            description="In-place log-sum-exp (2-based; merges attn_sink when present).",
+        ),
+        "sm_scale": Scalar(
+            "float32", description="Softmax scale, typically 1/sqrt(head_dim_qk)."
+        ),
+        "topk_length": Tensor(
+            ["num_tokens"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Effective top-k length per query token. Required for sliding-window "
+                "MLA near sequence start; None for uniform top-k."
+            ),
+        ),
+        "attn_sink": Tensor(
+            ["num_heads"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "Per-head learnable bias added pre-softmax. FlashMLA V4 convention: "
+                "output *= sigmoid(lse - sink) and lse' = log(exp(lse) + exp(sink))."
+            ),
+        ),
+        "extra_kv_cache": Tensor(
+            [
+                "extra_num_pages",
+                "extra_page_block_size",
+                "1",
+                "kv_bytes_per_token",
+            ],
+            dtype="uint8",
+            optional=True,
+            description=(
+                "Optional secondary KV cache (DSv4 C4A / C128A dual-cache layers). "
+                "When provided, extra_indices must also be passed. DSV4 only."
+            ),
+        ),
+        "extra_indices": Tensor(
+            ["num_tokens", "extra_topk"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Paged slot IDs for the secondary cache. -1 marks "
+                "invalid / out-of-window slots."
+            ),
+        ),
+        "extra_topk_length": Tensor(
+            ["num_tokens"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Effective top-k length per query token for the secondary cache."
+            ),
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "num_heads", "head_dim_v"],
+            dtype_from="q",
+            description="Attention output (also mutated in place above).",
+        ),
+        "out_lse": Tensor(
+            ["num_tokens", "num_heads"],
+            dtype="float32",
+            description="The 2-based log-sum-exp of attention logits (sink-merged).",
+        ),
+    },
+    constraints=[
+        "indices.shape[0] == num_tokens",
+        "indices.shape[-1] == topk",
+        "kv_cache.shape[1] == page_block_size",
+        "head_dim_qk in (512, 576)",
+        "head_dim_v == 512",
+        "extra_indices.shape[0] == num_tokens",
+        "extra_indices.shape[-1] == extra_topk",
+        "extra_kv_cache.shape[1] == extra_page_block_size",
+    ],
+    tags=[
+        "status:wip",  # init + reference deferred to a follow-up; trace JSON
+        # is still useful as a call-site descriptor.
+        "sparse:topk",
+        "backend:sm120",
+        "model:dsv4_or_dsv32",
+    ],
+)
+
 
 # ── Single prefill / single decode (non-batched) ──────────────────────────────
 
