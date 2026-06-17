@@ -7,6 +7,23 @@ from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
 
+def _mxfp8_quantize_per_batch_swizzled(x):
+    b, m, k = x.shape
+    m_pad = ((m + 127) // 128) * 128
+    padded_k = ((k + 31) // 32) * 32
+    sf_cols = (((padded_k // 32) + 3) // 4) * 4
+
+    x_padded = torch.zeros((b, m_pad, k), device=x.device, dtype=x.dtype)
+    x_padded[:, :m, :] = x
+    x_q_padded, x_scale = mxfp8_quantize(
+        x_padded.reshape(b * m_pad, k),
+        is_sf_swizzled_layout=True,
+    )
+    x_q = x_q_padded.reshape(b, m_pad, padded_k)[:, :m, :].contiguous()
+    x_scale = x_scale.reshape(b, m_pad, sf_cols).contiguous()
+    return x_q, x_scale
+
+
 @pytest.mark.parametrize("b", [1, 16])
 @pytest.mark.parametrize("m", [128, 256, 512])
 @pytest.mark.parametrize("n", [128, 256, 512])
@@ -74,6 +91,73 @@ def test_bmm_mxfp8(
     assert cos_sim > min_cos_sim, (
         f"Cosine similarity {cos_sim:.4f} is too low (expected > {min_cos_sim})"
     )
+
+
+def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales():
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] != 12:
+        pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
+
+    b, m, n, k = 2, 17, 128, 128
+    input_dtype = torch.bfloat16
+    out_dtype = torch.bfloat16
+
+    input_mat = torch.randn([b, m, k], device="cuda", dtype=input_dtype)
+    input_mxfp8, input_scale = _mxfp8_quantize_per_batch_swizzled(input_mat)
+
+    mat2_row_major = torch.randn([b, n, k], device="cuda", dtype=input_dtype)
+    mat2_mxfp8_row_major, mat2_scale = _mxfp8_quantize_per_batch_swizzled(
+        mat2_row_major
+    )
+    mat2_mxfp8 = mat2_mxfp8_row_major.transpose(-2, -1).contiguous()
+
+    reference = torch.bmm(input_mat, mat2_row_major.transpose(-2, -1))
+    res = bmm_mxfp8(
+        input_mxfp8,
+        mat2_mxfp8,
+        input_scale,
+        mat2_scale,
+        out_dtype,
+        backend="cutlass",
+    )
+
+    min_cos_sim = 0.9
+    cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
+    assert cos_sim > min_cos_sim, (
+        f"Cosine similarity {cos_sim:.4f} is too low (expected > {min_cos_sim})"
+    )
+
+
+def test_bmm_mxfp8_cutlass_rejects_combined_batch_scales():
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] != 12:
+        pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
+
+    b, m, n, k = 2, 17, 128, 128
+    input_dtype = torch.bfloat16
+    out_dtype = torch.bfloat16
+
+    input_mat = torch.randn([b, m, k], device="cuda", dtype=input_dtype)
+    input_mxfp8, legacy_input_scale = mxfp8_quantize(
+        input_mat,
+        is_sf_swizzled_layout=True,
+    )
+
+    mat2_row_major = torch.randn([b, n, k], device="cuda", dtype=input_dtype)
+    mat2_mxfp8_row_major, mat2_scale = _mxfp8_quantize_per_batch_swizzled(
+        mat2_row_major
+    )
+    mat2_mxfp8 = mat2_mxfp8_row_major.transpose(-2, -1).contiguous()
+
+    with pytest.raises(ValueError, match="legacy combined-batch swizzled layout"):
+        bmm_mxfp8(
+            input_mxfp8,
+            mat2_mxfp8,
+            legacy_input_scale,
+            mat2_scale,
+            out_dtype,
+            backend="cutlass",
+        )
 
 
 if __name__ == "__main__":
