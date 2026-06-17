@@ -16,11 +16,10 @@ limitations under the License.
 ---
 
 Faithful multi-stage radix-select MSA top-K KV-block selection for SM120/SM121.
-CuTe-DSL port of the CUDA ``IndexerTopKWithSortKernel``
-(``csrc/include/sparse_topk_select.cuh``), itself derived from TensorRT-LLM's
-``indexerTopK.cu``. This is the sole CuTe-DSL top-k algorithm: it matches the
-CUDA kernel's MSD-radix structure and complexity (O(max_k_tiles) per row), so no
-separate fallback path is needed.
+CuTe-DSL port of the CUDA ``IndexerTopKWithSortKernel``, derived from
+TensorRT-LLM's ``indexerTopK.cu``. This is the sole CuTe-DSL top-k algorithm:
+it matches that kernel's MSD-radix structure and complexity (O(max_k_tiles) per
+row), so no separate fallback path is needed.
 
 Algorithm (one CTA per (head, query) row, ``kThreads`` threads):
 

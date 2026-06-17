@@ -15,8 +15,7 @@ limitations under the License.
 
 ---
 
-MSA fused split-KV combine for SM120/SM121 (CuTe-DSL port of
-``csrc/sparse_combine.cu``).
+MSA fused split-KV combine for SM120/SM121.
 
 Reduces per-KV-block partial outputs into the final attention output with
 log2-domain LSE weighting:

@@ -15,8 +15,7 @@ limitations under the License.
 
 ---
 
-MSA q2k -> k2q CSR builder for SM120/SM121 (CuTe-DSL port of
-``csrc/build_k2q_csr.cu``).
+MSA q2k -> k2q CSR builder for SM120/SM121.
 
 Inverts the per-query top-K KV-block selection (``q2k``) into a KV-major CSR:
 for each (kv-head, KV-block row) the sorted batch-local query indices that
