@@ -282,9 +282,11 @@ def test_prefill_kernel_nonfull(
     )
 
 
+@pytest.mark.parametrize("use_cp", [False, True])
 @pytest.mark.parametrize(
     "num_q_heads,num_k_heads,num_v_heads", [(1, 1, 1), (16, 16, 64)]
 )
+@pytest.mark.parametrize("seq_len", [256, 255])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_zero_length_sequence(
     qkv_factory,
@@ -292,17 +294,20 @@ def test_prefill_kernel_zero_length_sequence(
     num_q_heads: int,
     num_k_heads: int,
     num_v_heads: int,
-    head_size: int = 128,
-    seq_len: int = 64,
+    seq_len: int,
+    use_cp: bool,
     scale: float = 0.1,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
 
     random.seed(seed)
     torch.random.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
+    head_size = 128
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = max(num_q_heads, num_v_heads)
     dtype = getattr(torch, dtype)
@@ -347,6 +352,7 @@ def test_prefill_kernel_zero_length_sequence(
         cu_seq_lens_with_empty,
         True,
         output=our_o,
+        use_cp=use_cp,
     )
     torch.cuda.synchronize()
 
