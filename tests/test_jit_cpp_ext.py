@@ -1,3 +1,4 @@
+import io
 import subprocess
 
 from flashinfer.jit import core, cpp_ext
@@ -115,6 +116,107 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
             "8",
         ]
     ]
+
+
+def test_run_ninja_uses_ninja_default_when_max_jobs_is_invalid(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setenv("MAX_JOBS", "auto")
+    monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: 31.0)
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 20)
+    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
+
+    cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
+
+    assert "-j" not in commands[0]
+
+
+def test_get_available_memory_prefers_linux_mem_available(monkeypatch):
+    meminfo = io.StringIO(
+        "MemTotal:       131072000 kB\n"
+        "MemFree:          1024000 kB\n"
+        "MemAvailable:   104857600 kB\n"
+    )
+
+    monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: meminfo)
+    monkeypatch.setattr(cpp_ext, "_get_total_memory_gib", lambda: 1.0)
+
+    assert cpp_ext._get_available_memory_gib() == 100.0
+
+
+def test_get_available_memory_falls_back_to_total_memory(monkeypatch):
+    monkeypatch.setattr(cpp_ext, "_get_linux_mem_available_gib", lambda: None)
+    monkeypatch.setattr(cpp_ext, "_get_total_memory_gib", lambda: 64.0)
+
+    assert cpp_ext._get_available_memory_gib() == 64.0
+
+
+def test_run_ninja_limits_jobs_when_available_memory_is_low(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: 31.0)
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 20)
+    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
+
+    cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
+
+    assert commands == [
+        [
+            "ninja",
+            "-v",
+            "-C",
+            str(tmp_path.resolve()),
+            "-f",
+            str((tmp_path / "build.ninja").resolve()),
+            "-j",
+            "3",
+        ]
+    ]
+
+
+def test_run_ninja_uses_ninja_default_when_memory_is_unknown(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: None)
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 20)
+    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
+
+    cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
+
+    assert "-j" not in commands[0]
+
+
+def test_run_ninja_uses_ninja_default_when_memory_supports_all_cpus(
+    monkeypatch, tmp_path
+):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.delenv("MAX_JOBS", raising=False)
+    monkeypatch.setattr(cpp_ext, "_get_available_memory_gib", lambda: 128.0)
+    monkeypatch.setattr(cpp_ext.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
+
+    cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
+
+    assert "-j" not in commands[0]
 
 
 def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
