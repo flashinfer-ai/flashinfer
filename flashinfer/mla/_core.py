@@ -2139,7 +2139,7 @@ def _cute_dsl_incompatibility_reason(
     try:
         from ..cute_dsl.attention.mla_dispatch import _resolve_impl
         resolved_impl = _resolve_impl(requested=cute_dsl_impl, kwargs={"sinks": sinks})
-    except ValueError as e:
+    except (ValueError, ImportError) as e:
         return f"cute-dsl backend (MLA decode kernel): {e}"
 
     try:
