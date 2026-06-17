@@ -170,13 +170,25 @@ def msa_sparse_attention(
     topk = q2k_indices.shape[2]
     if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
         raise ValueError("cu_seqlens_q/cu_seqlens_k must be int32")
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
+        raise ValueError("cu_seqlens_q/cu_seqlens_k must be 1D")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError("cu_seqlens_q/cu_seqlens_k must have the same length")
     for t in (q, k, v, q2k_indices, cu_seqlens_q, cu_seqlens_k):
         if not t.is_contiguous():
             raise ValueError("all input tensors must be contiguous")
+    for name, t in (("k", k), ("v", v), ("q2k_indices", q2k_indices)):
+        if t.device != q.device:
+            raise ValueError(f"{name} must be on the same device as q ({q.device})")
 
     batch_size = cu_seqlens_q.numel() - 1
     cu_q_cpu = cu_seqlens_q.cpu()
     cu_k_cpu = cu_seqlens_k.cpu()
+    if int(cu_q_cpu[-1]) != total_q or int(cu_k_cpu[-1]) != total_k:
+        raise ValueError(
+            "cu_seqlens_q[-1]/cu_seqlens_k[-1] must equal total_q/total_k "
+            f"({total_q}/{total_k})"
+        )
     if max_seqlen_q is None:
         max_seqlen_q = int((cu_q_cpu[1:] - cu_q_cpu[:-1]).max().item())
     max_seqlen_k = int((cu_k_cpu[1:] - cu_k_cpu[:-1]).max().item())
@@ -196,6 +208,8 @@ def msa_sparse_attention(
             raise ValueError("output must match q's shape and dtype")
         if not output.is_contiguous():
             raise ValueError("output must be contiguous")
+        if output.device != q.device:
+            raise ValueError(f"output must be on the same device as q ({q.device})")
 
     cu_q_dev = cu_seqlens_q.to(q.device, non_blocking=True)
     cu_k_dev = cu_seqlens_k.to(q.device, non_blocking=True)
@@ -497,6 +511,8 @@ def msa_sparse_attention_kvmajor(
         raise ValueError("pv_dtype=float8_e4m3fn requires fp8 V")
     if not q_fp8 and q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"q must be bf16/fp16/fp8_e4m3, got {q.dtype}")
+    if q.ndim != 3:
+        raise ValueError("q must be 3D (total_q, num_qo_heads, head_dim)")
     total_q, num_qo_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     if head_dim != 128:
@@ -508,11 +524,15 @@ def msa_sparse_attention_kvmajor(
         raise ValueError(
             f"GQA group size {group_size} must divide m_block_size {m_block_size}"
         )
-    topk = q2k_indices.shape[2]
+    if num_threads % 32 != 0:
+        raise ValueError(f"num_threads must be a multiple of 32, got {num_threads}")
     # CSR builder compiles for a compact q2k layout; reject a strided q2k (e.g. a
     # bare permute of msa_topk_select's output), matching msa_sparse_attention.
+    if q2k_indices.dtype != torch.int32 or q2k_indices.ndim != 3:
+        raise ValueError("q2k_indices must be int32 of shape (Hkv, total_q, topk)")
     if not q2k_indices.is_contiguous():
         raise ValueError("q2k_indices must be contiguous")
+    topk = q2k_indices.shape[2]
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
 
@@ -566,6 +586,13 @@ def msa_sparse_attention_kvmajor(
     if v.shape != k.shape or v.dtype != k.dtype:
         raise ValueError("v must have the same shape and dtype as k")
 
+    for name, t in (("k", k), ("v", v), ("q2k_indices", q2k_indices)):
+        if t.device != q.device:
+            raise ValueError(f"{name} must be on the same device as q ({q.device})")
+    for name, t in (("q", q), ("k", k), ("v", v)):
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
     if schedule is None:
         schedule = msa_build_k2q_csr_schedule(
             q2k_indices,
@@ -573,6 +600,15 @@ def msa_sparse_attention_kvmajor(
             cu_seqlens_k,
             blk_kv=_BLK_KV,
             target_q_per_cta=target_q_per_cta,
+        )
+    elif schedule.topk != topk or schedule.split_counts.shape != (
+        total_q,
+        num_kv_heads,
+    ):
+        # A schedule built for a different topk / total_q / head count would index
+        # o_partial and the CSR head rows out of range; reject it instead.
+        raise ValueError(
+            "caller-provided schedule does not match (total_q, num_kv_heads, topk)"
         )
 
     dev = q.device

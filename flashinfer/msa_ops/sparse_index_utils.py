@@ -280,6 +280,10 @@ def msa_build_k2q_csr(
         raise ValueError("cu_seqlens_q and cu_seqlens_k must be 1D")
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have the same length")
+    if int(cu_seqlens_q.cpu()[-1]) != total_qo_len:
+        raise ValueError(
+            "cu_seqlens_q[-1] must equal q2k_indices.shape[1] (total_qo_len)"
+        )
 
     # Row geometry (computed on CPU): rows per batch = ceil(seqlen_k / blk_kv)
     cu_k_cpu = cu_seqlens_k.cpu()
@@ -301,6 +305,8 @@ def msa_build_k2q_csr(
             )
         if row_ptr.dtype != torch.int32:
             raise ValueError(f"row_ptr must be int32, got {row_ptr.dtype}")
+        if row_ptr.device != device or not row_ptr.is_contiguous():
+            raise ValueError("row_ptr must be contiguous and on q2k_indices.device")
 
     if q_indices is None:
         q_indices = torch.empty(
@@ -314,6 +320,8 @@ def msa_build_k2q_csr(
             )
         if q_indices.dtype != torch.int32:
             raise ValueError(f"q_indices must be int32, got {q_indices.dtype}")
+        if q_indices.device != device or not q_indices.is_contiguous():
+            raise ValueError("q_indices must be contiguous and on q2k_indices.device")
 
     cu_q_dev = cu_seqlens_q.to(device, non_blocking=True)
 
@@ -370,6 +378,17 @@ def msa_build_k2q_csr_schedule(
 
     num_kv_heads, total_q, topk = q2k_indices.shape
     device = q2k_indices.device
+
+    if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
+        raise ValueError("cu_seqlens_q and cu_seqlens_k must be int32")
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
+        raise ValueError("cu_seqlens_q and cu_seqlens_k must be 1D")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError("cu_seqlens_q and cu_seqlens_k must have the same length")
+    if int(cu_seqlens_q.cpu()[-1]) != total_q:
+        raise ValueError("cu_seqlens_q[-1] must equal q2k_indices.shape[1] (total_q)")
+    if target_q_per_cta <= 0:
+        raise ValueError(f"target_q_per_cta must be positive, got {target_q_per_cta}")
 
     cu_k_cpu = cu_seqlens_k.cpu()
     seqlens_k = cu_k_cpu[1:] - cu_k_cpu[:-1]

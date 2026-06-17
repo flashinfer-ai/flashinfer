@@ -167,13 +167,18 @@ class SparseDecodeForwardSm12x:
         G = self._group_size
         kv_block = mQ2K[kv_head, qi, slot]
 
-        # slot-0 CTA publishes the split count (valid prefix length)
+        # slot-0 CTA publishes the split count: the leading run of valid blocks.
+        # combine reads slots [0, cnt) and a slot is written only when kv_block
+        # >= 0, so a -1 hole must stop the count rather than skip past it.
         if slot == 0:
             if tidx == 0:
                 cnt = cutlass.Int32(0)
+                in_prefix = cutlass.Boolean(True)
                 for t in cutlass.range_constexpr(self._topk):
-                    if mQ2K[kv_head, qi, t] >= 0:
+                    if in_prefix and mQ2K[kv_head, qi, t] >= 0:
                         cnt = cnt + 1
+                    else:
+                        in_prefix = cutlass.Boolean(False)
                 mSplitCounts[qi, kv_head] = cnt
 
         if kv_block >= 0:

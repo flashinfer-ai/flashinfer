@@ -926,8 +926,6 @@ class SparseAttentionForwardKvMajorSm12x:
                         mLse[slot, q_global, hq] = row_lse[r]
                         if cutlass.const_expr(self._return_temperature_lse):
                             mLseT[slot, q_global, hq] = row_lse_t[r]
-                        if cutlass.const_expr(self._return_temperature_lse):
-                            mLseT[slot, q_global, hq] = row_lse_t[r]
 
     @cute.jit
     def _threadquad_reduce_max(self, val):

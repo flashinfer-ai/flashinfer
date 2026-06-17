@@ -104,6 +104,10 @@ def msa_sparse_decode_attention(
         raise RuntimeError(
             "msa_sparse_decode_attention requires SM120 or SM121 and CUDA >= 12.8"
         )
+    if q.ndim != 3:
+        raise ValueError("q must be 3D (total_q, num_qo_heads, head_dim)")
+    if seqlen_q <= 0:
+        raise ValueError(f"seqlen_q must be positive, got {seqlen_q}")
     total_q, num_qo_heads, head_dim = q.shape
     if total_q % seqlen_q != 0:
         raise ValueError(
@@ -122,9 +126,10 @@ def msa_sparse_decode_attention(
     group_size = num_qo_heads // num_kv_heads
     if group_size > 16:
         raise ValueError(f"GQA group size {group_size} must be <= 16 for decode")
-    if q2k_indices.dtype != torch.int32 or q2k_indices.shape[:2] != (
-        num_kv_heads,
-        total_q,
+    if (
+        q2k_indices.ndim != 3
+        or q2k_indices.dtype != torch.int32
+        or q2k_indices.shape[:2] != (num_kv_heads, total_q)
     ):
         raise ValueError("q2k_indices must be int32 (num_kv_heads, total_q, topk)")
     # Compiled for a compact layout; reject a strided q2k (e.g. a bare permute of
@@ -132,6 +137,8 @@ def msa_sparse_decode_attention(
     if not q2k_indices.is_contiguous():
         raise ValueError("q2k_indices must be contiguous")
     topk = q2k_indices.shape[2]
+    if topk <= 0:
+        raise ValueError("q2k_indices topk dimension must be positive")
     kv_fp8 = k.dtype == torch.float8_e4m3fn
     kv_nvfp4 = k.dtype == torch.uint8
     if kv_nvfp4:
@@ -139,6 +146,10 @@ def msa_sparse_decode_attention(
             raise ValueError("k and v must both be packed uint8 for NVFP4")
         if k_scale is None or v_scale is None:
             raise ValueError("NVFP4 KV requires k_scale and v_scale")
+        if k_scale.dtype != torch.uint8 or v_scale.dtype != torch.uint8:
+            raise ValueError("k_scale/v_scale must be uint8 (E4M3 bytes)")
+        if k_scale.device != q.device or v_scale.device != q.device:
+            raise ValueError("k_scale/v_scale must be on the same device as q")
     elif not kv_fp8 and k.dtype != compute_dtype:
         raise ValueError("k/v dtype must match q (or be fp8/packed NVFP4)")
     if softmax_scale is None:
@@ -151,8 +162,14 @@ def msa_sparse_decode_attention(
     if paged:
         if seqused_k is None:
             raise ValueError("paged decode requires seqused_k")
+        if seqused_k.dtype != torch.int32 or seqused_k.ndim != 1:
+            raise ValueError("seqused_k must be 1D int32")
         if seqused_k.numel() != batch_size:
             raise ValueError(f"seqused_k must have batch_size ({batch_size}) entries")
+        if page_table.dtype != torch.int32 or page_table.ndim != 2:
+            raise ValueError("page_table must be int32 of shape (batch, max_pages)")
+        if page_table.shape[0] != batch_size:
+            raise ValueError("page_table batch dimension must match q batch_size")
         kv_last = (head_dim // 2) if kv_nvfp4 else head_dim
         if k.ndim != 4 or k.shape[2] != 128 or k.shape[3] != kv_last:
             raise ValueError(
@@ -164,6 +181,10 @@ def msa_sparse_decode_attention(
     else:
         if cu_seqlens_k is None:
             raise ValueError("flat decode requires cu_seqlens_k")
+        if cu_seqlens_k.dtype != torch.int32 or cu_seqlens_k.ndim != 1:
+            raise ValueError("cu_seqlens_k must be 1D int32")
+        if cu_seqlens_k.numel() != batch_size + 1:
+            raise ValueError("cu_seqlens_k must have batch_size + 1 entries")
         if k.ndim != 3:
             raise ValueError("flat k/v must be (total_k, num_kv_heads, head_dim)")
         cu_k = cu_seqlens_k.to(dev)
@@ -180,6 +201,13 @@ def msa_sparse_decode_attention(
 
     if partial_dtype is None:
         partial_dtype = compute_dtype
+    if partial_dtype not in (
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+    ):
+        raise ValueError(f"unsupported partial_dtype {partial_dtype}")
     o_partial = torch.empty(
         (topk, total_q, num_qo_heads, head_dim), dtype=partial_dtype, device=dev
     )

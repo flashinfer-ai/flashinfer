@@ -27,6 +27,7 @@ default). Precision is chosen per op via ``--q_dtype`` / ``--kv_dtype``: e.g.
 ``--q_dtype bfloat16`` the bf16 indexer.
 """
 
+import argparse
 import math
 from collections import defaultdict
 
@@ -108,7 +109,10 @@ def parse_sparse_attention_args(line, parser):
         help="KV-block columns for proxy/topk (default ceil(s_kv/128)).",
     )
     parser.add_argument(
-        "--causal", action="store_true", default=True, help="Causal masking."
+        "--causal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Causal masking (use --no-causal to disable).",
     )
     parser.add_argument("--q_dtype", type=str, default="bfloat16")
     parser.add_argument(
@@ -147,7 +151,7 @@ def _cu_seqlens(batch_size, s, device):
 def _rand_q2k(batch_size, s_qo, s_kv, num_kv_heads, topk, device):
     """Random ascending, -1-padded block selection (msa_topk_select output format)."""
     total_q = batch_size * s_qo
-    nb = s_kv // BLK_KV
+    nb = -(-s_kv // BLK_KV)
     idx = torch.full(
         (num_kv_heads, total_q, topk), -1, dtype=torch.int32, device=device
     )
@@ -162,7 +166,7 @@ def _rand_q2k(batch_size, s_qo, s_kv, num_kv_heads, topk, device):
 def _maybe_quantize_kv(k, v, kv_dtype):
     """Return (k_in, v_in, extra_kwargs) for the requested KV dtype."""
     if kv_dtype in (torch.bfloat16, torch.float16):
-        return k, v, {}
+        return k.to(kv_dtype), v.to(kv_dtype), {}
     if kv_dtype == torch.float8_e4m3fn:
         return k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn), {}
     # nvfp4 (uint8-packed)
