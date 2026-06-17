@@ -9111,6 +9111,7 @@ def _check_bmm_mxfp8_problem_size(
 
 
 def _mxfp8_swizzled_scale_shape(rows: int, cols: int) -> Tuple[int, int]:
+    """Return the per-batch swizzled MXFP8 scale shape for a matrix."""
     return (_pad_up(rows, 128), _pad_up(_pad_up(cols, 32) // 32, 4))
 
 
@@ -9121,6 +9122,7 @@ def _prepare_bmm_mxfp8_cutlass_scale(
     cols: int,
     name: str,
 ) -> torch.Tensor:
+    """Validate and flatten a CUTLASS BMM MXFP8 swizzled scale tensor."""
     expected_shape = (batch_size, *_mxfp8_swizzled_scale_shape(rows, cols))
     expected_len = math.prod(expected_shape)
 
@@ -9138,13 +9140,11 @@ def _prepare_bmm_mxfp8_cutlass_scale(
             f"got {tuple(scale.shape)}."
         )
 
-    if scale.numel() == expected_len:
-        return scale.contiguous()
-
     legacy_len = _mxfp8_swizzled_scale_len(
         batch_size * rows, cols, SfLayout.layout_128x4
     )
-    if scale.numel() == legacy_len:
+    is_ambiguous_1d = batch_size > 1 and rows % 128 != 0 and legacy_len == expected_len
+    if scale.numel() == legacy_len and (legacy_len != expected_len or is_ambiguous_1d):
         raise ValueError(
             f"{name} uses the legacy combined-batch swizzled layout from "
             "mxfp8_quantize on a 3D tensor. bmm_mxfp8 requires scales padded "
@@ -9152,6 +9152,9 @@ def _prepare_bmm_mxfp8_cutlass_scale(
             "each batch independently or pass rank-preserving scales with "
             f"shape {expected_shape}."
         )
+
+    if scale.numel() == expected_len:
+        return scale.contiguous()
 
     raise ValueError(
         f"{name} length mismatch for per-batch swizzled layout. "
@@ -9171,6 +9174,8 @@ def _cutlass_bmm_mxfp8_requirement(
 ):
     # SM120/121 CUTLASS MXFP8 supports flattened or rank-preserving swizzled scales.
     if A_scale.ndim not in (1, 3) or B_scale.ndim not in (1, 3):
+        return False
+    if A.shape[2] % 32 != 0 or B.shape[2] % 32 != 0:
         return False
     return True
 

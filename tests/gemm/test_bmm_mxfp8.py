@@ -6,10 +6,11 @@ import torch.nn.functional as F
 
 from flashinfer import autotune, bmm_mxfp8
 from flashinfer.fp8_quantization import mxfp8_quantize
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm12x_supported
 
 
 def _mxfp8_quantize_per_batch_swizzled(x):
+    """Quantize each batch with independent 128-row swizzled scale padding."""
     b, m, k = x.shape
     m_pad = ((m + 127) // 128) * 128
     padded_k = ((k + 31) // 32) * 32
@@ -104,12 +105,12 @@ def test_bmm_mxfp8(
     )
 
 
-def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales():
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] != 12:
+@pytest.mark.parametrize("m", [17, 100])
+def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales(m):
+    if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
 
-    b, m, n, k = 2, 17, 128, 128
+    b, n, k = 2, 128, 128
     input_dtype = torch.bfloat16
     out_dtype = torch.bfloat16
 
@@ -139,12 +140,12 @@ def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales():
     )
 
 
-def test_bmm_mxfp8_cutlass_rejects_combined_batch_scales():
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] != 12:
+@pytest.mark.parametrize("m", [17, 100])
+def test_bmm_mxfp8_cutlass_rejects_combined_batch_scales(m):
+    if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
 
-    b, m, n, k = 2, 17, 128, 128
+    b, n, k = 2, 128, 128
     input_dtype = torch.bfloat16
     out_dtype = torch.bfloat16
 

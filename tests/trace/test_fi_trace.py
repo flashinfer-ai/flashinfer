@@ -150,6 +150,21 @@ def test_gemm_trace_check_tolerances_match_unit_tests():
     assert not bmm_mxfp8_trace.check([ref], [torch.tensor([1.0, 0.6])])
 
 
+def test_bmm_mxfp8_trace_uses_per_batch_swizzled_scale_shapes():
+    from flashinfer.trace.templates.gemm import bmm_mxfp8_trace
+
+    assert bmm_mxfp8_trace.inputs["A_scale"].dim_names == [
+        "batch_size",
+        "M_pad",
+        "K_blocks_pad",
+    ]
+    assert bmm_mxfp8_trace.inputs["B_scale"].dim_names == [
+        "batch_size",
+        "N_pad",
+        "K_blocks_pad",
+    ]
+
+
 def test_attention_trace_check_tolerances_match_unit_tests():
     from flashinfer.trace.templates.attention import (
         single_decode_with_kv_cache_trace,
