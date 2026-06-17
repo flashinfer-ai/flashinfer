@@ -768,3 +768,19 @@ msa_sparse_decode_attention_trace = TraceTemplate(
     check=_msa_attention_check,
     init=_msa_sparse_decode_attention_init,
 )
+
+
+def _bind_init_dependency(init_fn):
+    # Inline ``_msa_varlen_cu_seqlens`` (a module-level helper the init snippets
+    # call) into each dumped JSON's "init" field so it stays self-contained. We
+    # leave __signature__ alone, unlike moe.py, to keep the Var-axis init params.
+    init_fn._trace_init_dependencies = (_msa_varlen_cu_seqlens,)
+    return init_fn
+
+
+_msa_proxy_score_init = _bind_init_dependency(_msa_proxy_score_init)
+_msa_proxy_score_fp4_init = _bind_init_dependency(_msa_proxy_score_fp4_init)
+_msa_sparse_attention_init = _bind_init_dependency(_msa_sparse_attention_init)
+_msa_sparse_decode_attention_init = _bind_init_dependency(
+    _msa_sparse_decode_attention_init
+)
