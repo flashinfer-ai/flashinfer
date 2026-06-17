@@ -2059,7 +2059,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t packed_qo_len = qo_len * group_size;
-  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
+  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO, HEAD_DIM_QK);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. Unlike the paged
@@ -2133,6 +2133,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     }
 
     // control NUM_MMA_KV for maximum warp occupancy
+    FA2_REJECT_IF_KV_SMEM_INSUFFICIENT();
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
       using KTraits =
           KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
@@ -3555,6 +3556,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
     FLASHINFER_ERROR(err_msg.str());
   }
 
+  FA2_REJECT_IF_KV_SMEM_INSUFFICIENT();
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
@@ -3740,6 +3742,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     FLASHINFER_ERROR(err_msg.str());
   }
 
+  FA2_REJECT_IF_KV_SMEM_INSUFFICIENT();
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
