@@ -2682,8 +2682,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``.
     cute_dsl_impl : str = "auto"
-        Which cute-dsl implementation to use.  Honored only when
-        ``backend="cute-dsl"``; ignored for other backends.
+        Which cute-dsl implementation to use. Honored when
+        ``backend="cute-dsl"`` and when ``backend="auto"`` considers the
+        cute-dsl candidate; ignored for non-cute-dsl backends.
 
         * ``"auto"`` (default) — picks monolithic by default, automatically
           promoted to modular when the call uses a feature monolithic
