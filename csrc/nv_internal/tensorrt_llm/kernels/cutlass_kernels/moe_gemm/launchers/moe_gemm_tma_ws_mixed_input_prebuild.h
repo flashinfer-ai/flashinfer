@@ -34,17 +34,19 @@ namespace detail {
 
 using namespace cute;
 
+using TmaWarpSpecializedGroupedGemmInput =
+    tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using PrecomputedWorkTileCodec = cutlass::gemm::kernel::detail::PrecomputedGroupWorkTile;
 
 static constexpr int kPrecomputedSchedulerThreads = 128;
 static constexpr int kPrecomputedSchedulerMaxSwizzle = 2;
 static constexpr uint64_t kPrecomputedSchedulerSentinelTiles = 4096;
 
-CUTLASS_HOST_DEVICE inline uint64_t div_round_up(uint64_t value, uint64_t divisor) {
+CUTLASS_HOST_DEVICE uint64_t div_round_up(uint64_t value, uint64_t divisor) {
   return (value + divisor - 1) / divisor;
 }
 
-CUTLASS_HOST_DEVICE inline uint64_t round_up_to_multiple(uint64_t value, uint64_t multiple) {
+CUTLASS_HOST_DEVICE uint64_t round_up_to_multiple(uint64_t value, uint64_t multiple) {
   return div_round_up(value, multiple) * multiple;
 }
 

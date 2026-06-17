@@ -316,6 +316,23 @@ public:
 
   // Note: constructing this tile scheduler can touch global memory that was
   // written to by the prior kernel.
+  CUTLASS_DEVICE explicit PersistentTileSchedulerSm90GroupPrecomputed(Params const& params_) : scheduler_params(params_) {
+    // MSVC requires protecting use of CUDA-specific nonstandard syntax,
+    // like blockIdx and gridDim, with __CUDA_ARCH__.
+#if defined(__CUDA_ARCH__)
+    CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
+    current_work_linear_idx_ =
+        uint64_t(blockIdx.x) * uint64_t(gridDim.y) +
+        uint64_t(blockIdx.y) +
+        uint64_t(blockIdx.z) * uint64_t(gridDim.x) * uint64_t(gridDim.y);
+
+    total_grid_size_ = uint64_t(gridDim.x) * uint64_t(gridDim.y) * uint64_t(gridDim.z);
+
+#else
+    CUTLASS_ASSERT(false && "This line should never be reached");
+#endif
+  }
+
   CUTLASS_DEVICE explicit PersistentTileSchedulerSm90GroupPrecomputed(Params const& params_, SchedulerResponse* response_ptr) : scheduler_params(params_), response_ptr_(response_ptr) {
     // MSVC requires protecting use of CUDA-specific nonstandard syntax,
     // like blockIdx and gridDim, with __CUDA_ARCH__.
@@ -331,6 +348,12 @@ public:
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
 #endif
+  }
+
+  CUTLASS_DEVICE
+  WorkTileInfo
+  get_current_work() {
+    return get_current_work_for_linear_idx(current_work_linear_idx_);
   }
 
   CUTLASS_DEVICE
@@ -378,6 +401,18 @@ public:
       scheduler_pipeline.producer_commit(scheduler_pipe_producer_state);
     }
     return cute::make_tuple(work_tile_with_callback_info, true);
+  }
+
+  CUTLASS_DEVICE
+  void
+  advance_to_next_work() {
+    current_work_linear_idx_ += total_grid_size_;
+  }
+
+  CUTLASS_DEVICE
+  void
+  advance_to_next_work(uint32_t advance_count) {
+    current_work_linear_idx_ += total_grid_size_ * uint64_t(advance_count);
   }
 
   // Returns whether the block assigned this work should compute the epilogue for the corresponding
@@ -505,6 +540,17 @@ public:
     scheduler_pipeline.consumer_release(scheduler_pipe_consumer_state);
 
     return cute::make_tuple(work_tile_with_callback_info, true);
+  }
+
+  CUTLASS_DEVICE
+  auto
+  fetch_next_work(WorkTileInfo work_tile_info) {
+    if (continue_current_work(work_tile_info)) {
+      return cute::make_tuple(work_tile_info, true);
+    }
+
+    advance_to_next_work();
+    return cute::make_tuple(get_current_work(), true);
   }
 
   // Returns the initial work tile info that will be computed over

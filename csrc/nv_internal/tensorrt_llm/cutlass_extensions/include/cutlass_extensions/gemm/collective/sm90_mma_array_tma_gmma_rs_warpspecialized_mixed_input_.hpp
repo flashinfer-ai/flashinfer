@@ -48,7 +48,7 @@ struct CollectiveMmaArrayMixedInput<
     GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_,
     SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
  public:
-  enum class ConversionMode { DirectConvert, ConvertAndScale };
+  enum class ConversionMode { DirectConvert, ConvertAndScale, ConvertAndScaleWithZero };
 
   //
   // Type Aliases
@@ -92,6 +92,11 @@ struct CollectiveMmaArrayMixedInput<
   // the scale / zero is void.
   using NonVoidElementScale =
       cute::conditional_t<cute::is_void_v<ElementScale>, float, ElementScale>;
+  using NonVoidElementZero =
+      cute::conditional_t<cute::is_void_v<ElementZero>, float, ElementZero>;
+  static constexpr bool HasActivationScale = false;
+  using ElementActivationScale = void;
+  using NonVoidElementActivationScale = cutlass::float_ue8m0_t;
 
   using StrideA = StrideA_;
   using InternalStrideA = cute::remove_pointer_t<StrideA>;
@@ -193,6 +198,18 @@ struct CollectiveMmaArrayMixedInput<
       SwappedSmemLayoutAtomA{}, select<0, 2>(TileShape{}), InternalSwappedStrideA{}));
   using SmemLayoutB = decltype(detail::get_smem_layout<DispatchPolicy::Stages>(
       SwappedSmemLayoutAtomB{}, select<1, 2>(TileShape{}), InternalSwappedStrideB{}));
+
+  using SmemLayoutAtomScale =
+      Layout<Shape<decltype(cute::shape<0>(SwappedSmemLayoutAtomA{})), cute::Int<1>>>;
+  using ScaleTileShape =
+      decltype(make_shape(shape<0>(TileShape{}), shape<1>(SmemLayoutAtomScale{})));
+  using SmemLayoutScale = decltype(tile_to_shape(
+      SmemLayoutAtomScale{},
+      make_shape(shape<0>(ScaleTileShape{}), shape<1>(ScaleTileShape{}), Int<Stages>{}),
+      cute::conditional_t<::cutlass::gemm::detail::is_major<0, NonVoidStrideScale>(),
+                          Step<_2, _1, _3>, Step<_1, _2, _3>>{}));
+  using SmemLayoutActivationScale = void;
+  using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
 
   using WeightScaleRawElement = NonVoidElementScale;
   static_assert(!cutlass::detail::is_Array_v<NonVoidElementScale>,
@@ -338,9 +355,13 @@ struct CollectiveMmaArrayMixedInput<
       KernelConversionMode == ConversionMode::ConvertAndScale &&
       cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
       cute::is_same_v<ElementB, cutlass::bfloat16_t>;
+  static constexpr bool UseFP4ToFP8LookupTable =
+      KernelConversionMode == ConversionMode::ConvertAndScale &&
+      cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+      cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
   static constexpr bool UseInt4ToFP8LookupTable =
       KernelConversionMode == ConversionMode::ConvertAndScale &&
-      cute::is_same_v<ElementA, cutlass::int4_t> &&
+      cute::is_same_v<ElementA, cutlass::int4b_t> &&
       cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
   static constexpr size_t SmemAlignmentA = cutlass::detail::alignment_for_swizzle(SmemLayoutA{});
   static constexpr size_t SmemAlignmentB = cutlass::detail::alignment_for_swizzle(SmemLayoutB{});

@@ -41,6 +41,7 @@
 #include "cutlass/util/reference/host/tensor_norm.h"
 #include "cutlass/util/tensor_view_io.h"
 #include "cutlass_extensions/compute_occupancy.h"
+#include "cutlass_extensions/epilogue/collective/sm90_epilogue_array_tma_warpspecialized_mixed_input.hpp"
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_gemm_array_tma_warpspecialized_cooperative_precomputed.hpp"
@@ -147,7 +148,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
       cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong,
       cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>;  // Epilogue to launch
 
-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+  using CollectiveEpilogue =
+      typename tensorrt_llm::cutlass_extensions::epilogue::collective::MixedInputSm90TmaEpilogueBuilder<
       cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
       ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC, ElementD,

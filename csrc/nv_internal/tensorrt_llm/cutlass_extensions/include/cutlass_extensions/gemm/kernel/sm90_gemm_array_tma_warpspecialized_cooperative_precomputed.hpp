@@ -30,6 +30,8 @@
  **************************************************************************************************/
 #pragma once
 
+#include <type_traits>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/workspace.h"
 #include "cutlass/fast_math.h"
@@ -49,11 +51,41 @@
 #include "cutlass/gemm/kernel/sm90_tile_scheduler.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_gemm_array_tma_warpspecialized_precomputed_decl.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_tile_scheduler_group_precomputed.hpp"
-#include "cutlass/arch/grid_dependency_control.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::kernel {
+
+///////////////////////////////////////////////////////////////////////////////
+
+#ifndef CUTLASS_EXTENSIONS_PRECOMPUTED_TENSORMAP_TRAITS_HPP_
+#define CUTLASS_EXTENSIONS_PRECOMPUTED_TENSORMAP_TRAITS_HPP_
+
+template <class CollectiveMainloop, class = void>
+struct RequiresBatchTensormapUpdate {
+  static constexpr bool value = true;
+};
+
+template <class CollectiveMainloop>
+struct RequiresBatchTensormapUpdate<
+    CollectiveMainloop,
+    std::void_t<decltype(CollectiveMainloop::RequiresTensormapUpdateOnBatchChange)>> {
+  static constexpr bool value = CollectiveMainloop::RequiresTensormapUpdateOnBatchChange;
+};
+
+template <class CollectiveMainloop, class = void>
+struct RequiresBatchTensormapAcquire {
+  static constexpr bool value = false;
+};
+
+template <class CollectiveMainloop>
+struct RequiresBatchTensormapAcquire<
+    CollectiveMainloop,
+    std::void_t<decltype(CollectiveMainloop::RequiresPrebuiltTensormapAcquireOnBatchChange)>> {
+  static constexpr bool value = CollectiveMainloop::RequiresPrebuiltTensormapAcquireOnBatchChange;
+};
+
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -71,17 +103,6 @@ class GemmUniversalPrecomputedScheduler<
   cute::enable_if_t<cute::is_base_of_v<KernelPtrArrayTmaWarpSpecializedCooperative, typename CollectiveMainloop_::DispatchPolicy::Schedule>>
 >
 {
-  // Get the type of the scheduler response.
-  template<typename TileScheduler, typename = void>
-  struct TileSchedulerResponseGetter {
-    using Type = typename TileScheduler::CLCResponse;
-  };
-
-  template<typename TileScheduler>
-  struct TileSchedulerResponseGetter<TileScheduler, void_t<typename TileScheduler::SchedulerResponse>> {
-    using Type = typename TileScheduler::SchedulerResponse;
-  };
-
 public:
   //
   // Type Aliases
@@ -124,28 +145,18 @@ public:
   using EpilogueParams = typename CollectiveEpilogue::Params;
 
   static_assert(ArchTag::kMinComputeCapability >= 90);
+  static_assert(cute::is_void_v<TileScheduler_>,
+    "Ptr-Array Cooperative and Grouped Gemm Cooperative kernel only supports the default scheduler.");
 
   static constexpr bool IsGroupedGemmKernel = !cute::is_same_v<InternalStrideA, StrideA>;
-  static constexpr uint32_t MinTensorMapWorkspaceAlignment = 64;
 
-  static_assert(
-    cute::is_void_v<TileScheduler_>
-    or (
-      IsGroupedGemmKernel
-      and cute::is_any_of_v<TileScheduler_, GroupScheduler>
-    ),
-    "Ptr-Array Cooperative and Grouped Gemm Cooperative kernel only supports the default scheduler.");
   static_assert(IsGroupedGemmKernel,
     "Precomputed grouped scheduler kernel is only for grouped ptr-array GEMM.");
 
   using SchedulerTag = GroupScheduler;
   using TileScheduler = detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8>;
-
   using TileSchedulerArguments = typename TileScheduler::Arguments;
   using TileSchedulerParams = typename TileScheduler::Params;
-  using TileSchedulerResponse = typename TileSchedulerResponseGetter<TileScheduler>::Type;
-
-  static constexpr auto TileSchedulerStages = 8;
 
   static constexpr uint32_t NumLoadWarpGroups = 1;
   static constexpr uint32_t NumMmaThreads = size(TiledMma{});
@@ -153,29 +164,10 @@ public:
   static constexpr uint32_t MaxThreadsPerBlock = NumMmaThreads + (NumLoadWarpGroups * NumThreadsPerWarpGroup);
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static constexpr uint32_t NumProducerThreads = CollectiveMainloop::NumProducerThreadEvents;
-  static constexpr bool     IsMainloopAuxiliaryLoadNeeded = detail::HasAuxiliaryLoad_v<typename CollectiveMainloop::DispatchPolicy>;
-
-  /// Register requirement for Load and Math WGs
-  static constexpr int RegsPerThread =
-    2 * size<0>(TileShape{}) * size<1>(TileShape{}) / NumMmaThreads *
-    sizeof(ElementAccumulator) / sizeof(uint32_t);
-
-  // Detect if this is SM120 blockscaled kernel which hits low register pressure
-  // on smaller tiles
-  template <typename T>
-  struct IsSm120BlockScaled : cute::false_type {};
-
-  template <int Stages, int SchedStages, class ClusterShape, class KernelSchedule>
-  struct IsSm120BlockScaled<MainloopSm120ArrayTmaWarpSpecializedBlockScaled<Stages, SchedStages, ClusterShape, KernelSchedule>>
-    : cute::true_type {};
-
-  static constexpr bool IsLowRegisterPressure = IsSm120BlockScaled<DispatchPolicy>::value && (RegsPerThread <= 64);
 
   /// Register requirement for Load and Math WGs
   static constexpr uint32_t LoadRegisterRequirement = 40;
   static constexpr uint32_t MmaRegisterRequirement = 232;
-
-  static constexpr bool IsSm120Family = cute::is_same_v<typename DispatchPolicy::ArchTag, arch::Sm120>;
 
   // 1 stage ordered sequence between mainloop and epilogue producer load threads
   using LoadWarpOrderBarrier = cutlass::OrderedSequenceBarrier<1,2>;
@@ -191,17 +183,13 @@ public:
     } tensors;
 
     struct PipelineStorage : cute::aligned_struct<16, _1> {
-      using TileSchedulerPipelineStorage = typename TileScheduler::PipelineStorage;
       using MainloopPipelineStorage = typename CollectiveMainloop::PipelineStorage;
       using EpiLoadPipelineStorage = typename CollectiveEpilogue::PipelineStorage;
 
-      alignas(16) TileSchedulerPipelineStorage scheduler;
       alignas(16) MainloopPipelineStorage mainloop;
       alignas(16) EpiLoadPipelineStorage epi_load;
       alignas(16) typename LoadWarpOrderBarrier::SharedStorage load_order;
     } pipelines;
-
-    alignas(16) TileSchedulerResponse scheduler_response[TileSchedulerStages];
 
     struct TensorMapStorage : cute::aligned_struct<128, _1> {
       using MainloopTensorMapStorage = typename CollectiveMainloop::TensorMapStorage;
@@ -275,16 +263,16 @@ public:
 
     void* epilogue_workspace = workspace_ptr + workspace_offset;
     workspace_offset += CollectiveEpilogue::get_workspace_size(problem_shapes, args.epilogue, sm_count);
-    workspace_offset = round_nearest(workspace_offset, MinTensorMapWorkspaceAlignment);
+    workspace_offset = round_nearest(workspace_offset,  MinWorkspaceAlignment);
 
     void* mainloop_workspace = workspace_ptr + workspace_offset;
     workspace_offset += CollectiveMainloop::get_workspace_size(problem_shapes, args.mainloop, sm_count);
-    workspace_offset = round_nearest(workspace_offset, MinTensorMapWorkspaceAlignment);
+    workspace_offset = round_nearest(workspace_offset,  MinWorkspaceAlignment);
 
     void* scheduler_workspace = workspace_ptr + workspace_offset;
     workspace_offset += TileScheduler::template get_workspace_size<typename ProblemShape::UnderlyingProblemShape, ElementAccumulator>(
       args.scheduler, typename ProblemShape::UnderlyingProblemShape{}, args.hw_info, NumMmaWarpGroups);
-    workspace_offset = round_nearest(workspace_offset, MinTensorMapWorkspaceAlignment);
+    workspace_offset = round_nearest(workspace_offset,  MinWorkspaceAlignment);
 
     TileSchedulerParams scheduler;
     if constexpr (IsGroupedGemmKernel) {
@@ -313,8 +301,7 @@ public:
     if constexpr (IsGroupedGemmKernel) {
       // Group GEMM currently only supports rank-3 problem shapes
       implementable &= (args.mode == GemmUniversalMode::kGrouped && rank(typename ProblemShape::UnderlyingProblemShape{}) == 3);
-    }
-    else {
+    } else {
       implementable &= (args.mode == GemmUniversalMode::kArray && rank(typename ProblemShape::UnderlyingProblemShape{}) == 4);
     }
     if (!implementable) {
@@ -341,14 +328,14 @@ public:
     }
 
     workspace_size += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue, sm_count);
-    workspace_size = round_nearest(workspace_size, MinTensorMapWorkspaceAlignment);
+    workspace_size = round_nearest(workspace_size,  MinWorkspaceAlignment);
 
     workspace_size += CollectiveMainloop::get_workspace_size(args.problem_shape, args.mainloop, sm_count);
-    workspace_size = round_nearest(workspace_size, MinTensorMapWorkspaceAlignment);
+    workspace_size = round_nearest(workspace_size,  MinWorkspaceAlignment);
 
     workspace_size += TileScheduler::template get_workspace_size<typename ProblemShape::UnderlyingProblemShape, ElementAccumulator>(
       args.scheduler, typename ProblemShape::UnderlyingProblemShape{}, args.hw_info, NumMmaWarpGroups, NumEpilogueSubTiles);
-    workspace_size = round_nearest(workspace_size, MinTensorMapWorkspaceAlignment);
+    workspace_size = round_nearest(workspace_size,  MinWorkspaceAlignment);
 
     return workspace_size;
   }
@@ -364,14 +351,14 @@ public:
 
     status = CollectiveEpilogue::initialize_workspace(args.problem_shape, args.epilogue, workspace_ptr + workspace_offset, stream, cuda_adapter);
     workspace_offset += CollectiveEpilogue::get_workspace_size(args.problem_shape, args.epilogue, args.hw_info.sm_count);
-    workspace_offset = round_nearest(workspace_offset, MinTensorMapWorkspaceAlignment);
+    workspace_offset = round_nearest(workspace_offset,  MinWorkspaceAlignment);
     if (status != Status::kSuccess) {
       return status;
     }
 
     status = CollectiveMainloop::initialize_workspace(args.problem_shape, args.mainloop, workspace_ptr + workspace_offset, stream, cuda_adapter);
     workspace_offset += CollectiveMainloop::get_workspace_size(args.problem_shape, args.mainloop, args.hw_info.sm_count);
-    workspace_offset = round_nearest(workspace_offset, MinTensorMapWorkspaceAlignment);
+    workspace_offset = round_nearest(workspace_offset,  MinWorkspaceAlignment);
     if (status != Status::kSuccess) {
       return status;
     }
@@ -380,10 +367,11 @@ public:
       args.scheduler, workspace_ptr + workspace_offset, stream, typename ProblemShape::UnderlyingProblemShape{}, args.hw_info, NumMmaWarpGroups, NumEpilogueSubTiles, NumAccumulatorMtxs, cuda_adapter);
     workspace_offset += TileScheduler::template get_workspace_size<typename ProblemShape::UnderlyingProblemShape, ElementAccumulator>(
       args.scheduler, typename ProblemShape::UnderlyingProblemShape{}, args.hw_info, NumMmaWarpGroups, NumEpilogueSubTiles);
-    workspace_offset = round_nearest(workspace_offset, MinTensorMapWorkspaceAlignment);
+    workspace_offset = round_nearest(workspace_offset,  MinWorkspaceAlignment);
     if (status != Status::kSuccess) {
       return status;
     }
+
     return status;
   }
 
@@ -414,14 +402,9 @@ public:
     using namespace cute;
     using X = Underscore;
 
-#  if (defined(__CUDA_ARCH_FEAT_SM90_ALL) || defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL) ||\
-      CUDA_ARCH_CONDITIONAL_OR_FAMILY(1200) || CUDA_ARCH_CONDITIONAL_OR_FAMILY(1210))
-#    define ENABLE_SM90_KERNEL_LEVEL 1
-#  endif
-
-// Any Tensor Op MMA Atom in the ISA is arch conditional.
-#if ! defined(ENABLE_SM90_KERNEL_LEVEL)
-    CUTE_INVALID_CONTROL_PATH("ERROR : Arch conditional MMA instruction used without targeting appropriate compute capability. Aborting.\n");
+// Any Tensor Op MMA Atom in the WGMMA ISA is arch conditional to sm90a.
+#if ! defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    printf("ERROR : Arch conditional MMA instruction used without targeting sm90a compute capability. Aborting.\n");
 #else
 
     // Preconditions
@@ -448,17 +431,13 @@ public:
     };
     enum class ProducerWarpRole {
       Mainloop = 0,
-      MainloopAux = 1,
+      Warp1 = 1,
       Epilogue = 2,
-      Scheduler = 3
+      Warp3 = 3
     };
 
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-
-    // In a warp specialized kernel, collectives expose data movement and compute operations separately
-    CollectiveMainloop collective_mainloop;
-    CollectiveEpilogue collective_epilogue(params.epilogue, shared_storage.tensors.epilogue);
 
     int thread_idx = int(threadIdx.x);
     int lane_idx = canonical_lane_idx();
@@ -474,32 +453,10 @@ public:
 
     // Note: Tma Descriptor Prefetch (from either const or param) is not applicable here
 
-    // TileScheduler pipeline
-    using TileSchedulerPipeline = typename TileScheduler::Pipeline;
-    typename TileSchedulerPipeline::Params tile_scheduler_pipeline_params;
-    if constexpr (cute::is_same_v<SchedulerTag, GroupScheduler>) {
-      if (warp_group_role == WarpGroupRole::Producer
-        && producer_warp_role == ProducerWarpRole::Scheduler) {
-        tile_scheduler_pipeline_params.role = TileSchedulerPipeline::ThreadCategory::Producer;
-      }
-      else {
-        tile_scheduler_pipeline_params.role = TileSchedulerPipeline::ThreadCategory::Consumer;
-      }
-      tile_scheduler_pipeline_params.consumer_arv_count = NumMmaThreads
-                                                        + NumThreadsPerWarp * (
-                                                          1                                                           // Main DMA warp
-                                                          + (collective_epilogue.is_producer_load_needed() ? 1 : 0)   // Epilog DMA warp
-                                                          + (IsMainloopAuxiliaryLoadNeeded ? 1 : 0)                   // Aux DMA warp
-                                                        );
-      tile_scheduler_pipeline_params.producer_arv_count = 1;
-    }
-    TileSchedulerPipeline tile_scheduler_pipeline(shared_storage.pipelines.scheduler, tile_scheduler_pipeline_params);
     // Mainloop Load pipeline
     using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
     typename MainloopPipeline::Params mainloop_pipeline_params;
-    if (warp_group_role == WarpGroupRole::Producer
-      && (producer_warp_role == ProducerWarpRole::Mainloop
-       || producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    if (warp_group_role == WarpGroupRole::Producer && producer_warp_role == ProducerWarpRole::Mainloop) {
       mainloop_pipeline_params.role = MainloopPipeline::ThreadCategory::Producer;
     }
     if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
@@ -541,13 +498,11 @@ public:
 
     // Initialize starting pipeline states for the collectives
     // Epilogue store pipe is producer-only (consumer is TMA unit, waits via scoreboarding)
-    typename TileSchedulerPipeline::PipelineState tile_scheduler_pipe_consumer_state;
     typename CollectiveMainloop::PipelineState mainloop_pipe_consumer_state;
     typename CollectiveEpilogue::LoadPipelineState epi_load_pipe_consumer_state;
 
     // For the DMA Load (producer) we start with an opposite phase
     // i.e., we skip all waits since we know that the buffer is indeed empty
-    PipelineState tile_scheduler_pipe_producer_state = cutlass::make_producer_start_state<TileSchedulerPipeline>();
     PipelineState mainloop_pipe_producer_state = cutlass::make_producer_start_state<MainloopPipeline>();
     PipelineState epi_load_pipe_producer_state = cutlass::make_producer_start_state<EpiLoadPipeline>();
     PipelineState epi_store_pipe_producer_state = cutlass::make_producer_start_state<EpiStorePipeline>();
@@ -571,24 +526,16 @@ public:
     const auto c_tile_count = CollectiveEpilogue::get_load_pipe_increment(blk_shape);
     const auto d_tile_count = CollectiveEpilogue::get_store_pipe_increment(blk_shape);
 
+    TileScheduler scheduler{params.scheduler};
+
+    // In a warp specialized kernel, collectives expose data movement and compute operations separately
+    CollectiveMainloop collective_mainloop;
+    CollectiveEpilogue collective_epilogue(params.epilogue, shared_storage.tensors.epilogue);
+
     // Wait for all thread blocks in the Cluster
     cluster_wait_fn();
 
-    // Ensure memory ops in this kernel are not done prior to completion of dependent grids.
-    cutlass::arch::wait_on_dependent_grids();
-
-    auto scheduler = [&] () {
-      // Group scheduler requires a different constructor that takes a response ptr
-      if constexpr (cute::is_same_v<SchedulerTag, GroupScheduler>) {
-        return TileScheduler{params.scheduler, shared_storage.scheduler_response};
-      }
-      else {
-        return TileScheduler{params.scheduler};
-      }
-    } ();
-
     auto work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
-
     if (not work_tile_info.is_valid()) {
       // When problem shapes are only on device, the grid launched may be larger than the total number of blocks across groups
       return;
@@ -611,26 +558,10 @@ public:
     auto k_tile_count = size<3>(gA_mkl);
 
     if (warp_group_role == WarpGroupRole::Producer) {
-      if constexpr (!IsLowRegisterPressure) {
-        cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
-      }
+      cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
-      if (producer_warp_role == ProducerWarpRole::Scheduler) {
-        // GroupScheduler requires a producer warp to iterate over the group infos and push
-        // the work tile infos to the downstream pipelines.
-        if constexpr (cute::is_same_v<SchedulerTag, GroupScheduler>) {
-          do {
-            auto [next_work_tile_info, increment_pipe] = scheduler.advance_to_next_work(tile_scheduler_pipeline, tile_scheduler_pipe_producer_state);
-            work_tile_info = next_work_tile_info;
-            if (increment_pipe) {
-              ++tile_scheduler_pipe_producer_state;
-            }
-          } while (work_tile_info.is_valid());
-          tile_scheduler_pipeline.producer_tail(tile_scheduler_pipe_producer_state);
-        }
-      }
       // Mainloop Producer Warp
-      else if (producer_warp_role == ProducerWarpRole::Mainloop) {
+      if (producer_warp_role == ProducerWarpRole::Mainloop) {
         int32_t curr_batch = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl)); // Usually just returns work_tile_info.L_idx;
         int32_t const mock_l_coord = 0;
         int32_t const sm_idx = blockIdx.x + (blockIdx.y * gridDim.x);
@@ -638,30 +569,28 @@ public:
 
         // Fetch a copy of tensormaps for the CTA
         auto input_tensormaps = collective_mainloop.tensormaps_init(params.mainloop, shared_storage.tensormaps.mainloop, sm_count, sm_idx);
-
         // Update tensormap for the initial batch for the CTA
-        collective_mainloop.tensormaps_perform_update(
-          shared_storage.tensormaps.mainloop,
-          params.mainloop,
-          input_tensormaps,
-          problem_shape_MNKL,
-          curr_batch
-        );
-        // Ensure warp is converged before issuing tensormap fence release
-        __syncwarp();
-        // Entire warp must do this (i.e. it's aligned)
-        collective_mainloop.tensormaps_cp_fence_release(shared_storage.tensormaps.mainloop, input_tensormaps);
+        if (work_tile_info.is_valid()) {
+          collective_mainloop.tensormaps_perform_update(
+            shared_storage.tensormaps.mainloop,
+            params.mainloop,
+            input_tensormaps,
+            problem_shape_MNKL,
+            curr_batch
+          );
+          // Ensure warp is converged before issuing tensormap fence release
+          __syncwarp();
+          // Entire warp must do this (i.e. it's aligned)
+          collective_mainloop.tensormaps_cp_fence_release(shared_storage.tensormaps.mainloop, input_tensormaps);
+        }
 
         bool do_load_order_arrive = true;
         bool did_batch_change = true;
-        do {
+        bool needs_tensormap_acquire = work_tile_info.is_valid();
+        while (work_tile_info.is_valid()) {
           if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
-            auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
-                work_tile_info, tile_scheduler_pipeline, tile_scheduler_pipe_consumer_state);
+            auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
             work_tile_info = next_work_tile_info;
-            if (increment_pipe) {
-              ++tile_scheduler_pipe_consumer_state;
-            }
             continue;
           }
 
@@ -677,7 +606,10 @@ public:
 
           if (did_batch_change) {
             load_inputs = collective_mainloop.tensors_perform_update(load_inputs, params.mainloop, problem_shape_MNKL, curr_batch);
-            collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
+            if (needs_tensormap_acquire || RequiresBatchTensormapAcquire<CollectiveMainloop>::value) {
+              collective_mainloop.tensormaps_fence_acquire(input_tensormaps);
+              needs_tensormap_acquire = false;
+            }
           }
 
           collective_mainloop.load(
@@ -692,8 +624,9 @@ public:
             block_rank_in_cluster,
             shared_storage.tensors.mainloop
           );
-          // Pipeline state is only advanced if there are K tiles to compute
-          mainloop_pipe_producer_state.advance(work_k_tile_count);
+          // Update starting pipeline state for the next tile
+          // Wait for the last TMA stage to complete loading, before issuing tensormap updates
+          mainloop_pipe_producer_state.advance(work_k_tile_count - 1);
 
           // Signal for the epilogue load warp to begin
           if (do_load_order_arrive) {
@@ -702,11 +635,8 @@ public:
           }
 
           // Get next work tile
-          auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info, tile_scheduler_pipeline, tile_scheduler_pipe_consumer_state);
+          auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
           work_tile_info = next_work_tile_info;
-          if (increment_pipe) {
-            ++tile_scheduler_pipe_consumer_state;
-          }
           auto next_batch = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl)); // Usually just returns work_tile_info.L_idx
           did_batch_change = next_batch != curr_batch;
           if (work_tile_info.is_valid() && did_batch_change) {
@@ -714,85 +644,34 @@ public:
             if constexpr (IsGroupedGemmKernel) {
               problem_shape_MNKL = append<4>(params.problem_shape.get_problem_shape(curr_batch), 1);
             }
-            collective_mainloop.tensormaps_perform_update(
-              shared_storage.tensormaps.mainloop,
-              params.mainloop,
-              input_tensormaps,
-              problem_shape_MNKL,
-              curr_batch
-            );
-            // Ensure warp is converged before issuing tensor replace
-            __syncwarp();
-            // Entire warp must do this (i.e. it's aligned)
-            collective_mainloop.tensormaps_cp_fence_release(shared_storage.tensormaps.mainloop, input_tensormaps);
+            if constexpr (RequiresBatchTensormapUpdate<CollectiveMainloop>::value) {
+              // Purpose of this pipeline state is to make sure TMA loads have finished before doing descriptor updates
+              // Since this state is waiting for loads to finish, it must start in the inverted phase.
+              typename CollectiveMainloop::PipelineState mainloop_pipe_tma_consumer_state =
+                {mainloop_pipe_producer_state.index(), !mainloop_pipe_producer_state.phase(), mainloop_pipe_producer_state.count()};
+              mainloop_pipeline.consumer_wait(mainloop_pipe_tma_consumer_state);
+              collective_mainloop.tensormaps_perform_update(
+                shared_storage.tensormaps.mainloop,
+                params.mainloop,
+                input_tensormaps,
+                problem_shape_MNKL,
+                curr_batch
+              );
+              // Ensure warp is converged before issuing tensor replace
+              __syncwarp();
+              // Entire warp must do this (i.e. it's aligned)
+              collective_mainloop.tensormaps_cp_fence_release(shared_storage.tensormaps.mainloop, input_tensormaps);
+              needs_tensormap_acquire = true;
+            }
           }
-        } while (work_tile_info.is_valid()); // Scheduler work fetch loop
+          // Advance the producer state for the last remaining stage that was being waited for above
+          mainloop_pipe_producer_state.advance(1);
+        } // Scheduler work fetch loop
 
         // Make sure all Consumer Warp Groups have been waited upon
         collective_mainloop.load_tail(mainloop_pipeline, mainloop_pipe_producer_state);
       } // Mainloop Producer Warp End
-      else if (producer_warp_role == ProducerWarpRole::MainloopAux) {
-        if constexpr (IsMainloopAuxiliaryLoadNeeded) {
-          int32_t curr_batch = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl)); // Usually just returns work_tile_info.L_idx;
-          int32_t const mock_l_coord = 0;
 
-          bool did_batch_change = true;
-          do {
-            if (!TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
-              auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info, tile_scheduler_pipeline, tile_scheduler_pipe_consumer_state);
-              work_tile_info = next_work_tile_info;
-              if (increment_pipe) {
-                ++tile_scheduler_pipe_consumer_state;
-              }
-              continue;
-            }
-
-            // Compute m_coord, n_coord, l_coord with the post-tiled m-shape and n-shape
-            auto m_coord = idx2crd(work_tile_info.M_idx, shape<2>(gA_mkl));
-            auto n_coord = idx2crd(work_tile_info.N_idx, shape<2>(gB_nkl));
-            auto blk_coord = make_coord(m_coord, n_coord, _, mock_l_coord);
-
-            // Get the number of K tiles to compute for this work as well as the starting K tile offset of the work.
-            auto work_k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, blk_shape);
-            auto work_k_tile_start = TileScheduler::get_work_k_tile_start(work_tile_info);
-            auto k_tile_iter = cute::make_coord_iterator(idx2crd(work_k_tile_start, shape<3>(gA_mkl)), shape<3>(gA_mkl));
-
-            if (did_batch_change) {
-              load_inputs = collective_mainloop.tensors_perform_update(load_inputs, params.mainloop, problem_shape_MNKL, curr_batch);
-            }
-
-            collective_mainloop.load_auxiliary(
-              params.mainloop,
-              mainloop_pipeline,
-              mainloop_pipe_producer_state,
-              load_inputs,
-              blk_coord,
-              k_tile_iter, work_k_tile_count,
-              lane_idx,
-              block_rank_in_cluster,
-              shared_storage.tensors.mainloop
-            );
-
-            // Update starting pipeline state for the next tile
-            mainloop_pipe_producer_state.advance(work_k_tile_count);
-
-            // Get next work tile
-            auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info, tile_scheduler_pipeline, tile_scheduler_pipe_consumer_state);
-            work_tile_info = next_work_tile_info;
-            if (increment_pipe) {
-              ++tile_scheduler_pipe_consumer_state;
-            }
-            auto next_batch = idx2crd(work_tile_info.L_idx, shape<4>(gB_nkl)); // Usually just returns work_tile_info.L_idx
-            did_batch_change = next_batch != curr_batch;
-            if (work_tile_info.is_valid() && did_batch_change) {
-              curr_batch = next_batch;
-              if constexpr (IsGroupedGemmKernel) {
-                problem_shape_MNKL = append<4>(params.problem_shape.get_problem_shape(curr_batch), 1);
-              }
-            }
-          } while (work_tile_info.is_valid()); // Scheduler work fetch loop
-        } // End of auxiliary load needed check
-      } // Mainloop Auxiliary Load Producer Warp End
       // Epilogue Producer Warp
       else if (producer_warp_role == ProducerWarpRole::Epilogue && collective_epilogue.is_producer_load_needed()) {
         int32_t const sm_idx = blockIdx.x + (blockIdx.y * gridDim.x);
@@ -803,26 +682,28 @@ public:
         bool did_batch_change = true;
         constexpr bool IsEpiLoad = true;
 
-        collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
-          shared_storage.tensormaps.epilogue,
-          params.epilogue,
-          epi_load_tensormap,
-          problem_shape_MNKL,
-          work_tile_info.L_idx,
-          0
-        );
+        if (work_tile_info.is_valid()) {
+          collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
+            shared_storage.tensormaps.epilogue,
+            params.epilogue,
+            epi_load_tensormap,
+            problem_shape_MNKL,
+            work_tile_info.L_idx,
+            0
+          );
 
-        // Converge before issuing tensormap fence release since fence is aligned
-        __syncwarp();
-        collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(shared_storage.tensormaps.epilogue, epi_load_tensormap, 0);
+          // Converge before issuing tensormap fence release since fence is aligned
+          __syncwarp();
+          collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(shared_storage.tensormaps.epilogue, epi_load_tensormap, 0);
+        }
 
         load_order_barrier.wait();
 
-        do {
+        while (work_tile_info.is_valid()) {
           int32_t curr_batch = work_tile_info.L_idx;
 
           // Get next work tile
-          auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info, tile_scheduler_pipeline, tile_scheduler_pipe_consumer_state);
+          auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
 
           if (TileScheduler::compute_epilogue(work_tile_info, params.scheduler)) {
             if constexpr (IsGroupedGemmKernel) {
@@ -839,6 +720,8 @@ public:
               collective_epilogue.template tensormaps_fence_acquire<IsEpiLoad>(epi_load_tensormap);
             }
 
+            bool wait = work_tile_info.is_valid() && curr_batch != next_work_tile_info.L_idx;
+
             epi_load_pipe_producer_state = collective_epilogue.load(
               epi_load_pipeline,
               epi_load_pipe_producer_state,
@@ -849,14 +732,12 @@ public:
               lane_idx,
               shared_storage.tensors.epilogue,
               epi_load_tensormap,
-              work_tile_info.reduction_subtile_idx()
+              work_tile_info.reduction_subtile_idx(),
+              wait
             );
           }
 
           work_tile_info = next_work_tile_info;
-          if (increment_pipe) {
-            ++tile_scheduler_pipe_consumer_state;
-          }
           did_batch_change = curr_batch != work_tile_info.L_idx;
 
           if (work_tile_info.is_valid() && did_batch_change) {
@@ -881,7 +762,7 @@ public:
             }
           }
 
-        } while (work_tile_info.is_valid()); // Scheduler work fetch loop
+        } // Scheduler work fetch loop
 
         // Make sure all Consumer Warp Groups have been waited upon
         collective_epilogue.load_tail(epi_load_pipeline, epi_load_pipe_producer_state);
@@ -889,9 +770,7 @@ public:
     } // Producer Warp Group End
 
     else if (warp_group_role == WarpGroupRole::Consumer0 || warp_group_role == WarpGroupRole::Consumer1) {
-      if constexpr (!IsLowRegisterPressure) {
-        cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
-      }
+      cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
       // Index of warp group within consumer warp groups
       int consumer_warp_group_idx = warp_group_role == WarpGroupRole::Consumer0 ? 0 : 1;
@@ -906,24 +785,27 @@ public:
       bool did_batch_change = true;
       constexpr bool IsEpiLoad = false;
 
-      if (warp_idx_in_warp_group == 0) {
-        collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
-          shared_storage.tensormaps.epilogue,
-          params.epilogue,
-          epi_store_tensormap,
-          problem_shape_MNKL,
-          work_tile_info.L_idx,
-          consumer_warp_group_idx
-        );
+      if (work_tile_info.is_valid()) {
 
-        // Converge before issuing tensormap fence release since fence is aligned
-        __syncwarp();
-        collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(shared_storage.tensormaps.epilogue,
-                                                                    epi_store_tensormap,
-                                                                    consumer_warp_group_idx);
+        if (warp_idx_in_warp_group == 0) {
+          collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
+            shared_storage.tensormaps.epilogue,
+            params.epilogue,
+            epi_store_tensormap,
+            problem_shape_MNKL,
+            work_tile_info.L_idx,
+            consumer_warp_group_idx
+          );
+
+          // Converge before issuing tensormap fence release since fence is aligned
+          __syncwarp();
+          collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(shared_storage.tensormaps.epilogue,
+                                                                     epi_store_tensormap,
+                                                                     consumer_warp_group_idx);
+        }
       }
 
-      do {
+      while (work_tile_info.is_valid()) {
         if constexpr (IsGroupedGemmKernel) {
           problem_shape_MNKL = append<4>(params.problem_shape.get_problem_shape(work_tile_info.L_idx), 1);
         }
@@ -942,31 +824,19 @@ public:
         // MSVC CTAD breaks if we say "Tensor" here, so we use "auto" instead.
         auto accumulators = partition_fragment_C(tiled_mma, take<0,2>(blk_shape));               // (MMA,MMA_M,MMA_N)
 
+        static_assert(cute::is_same_v<TileScheduler,
+            detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8>>);
         if (TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
 
-          if constexpr (IsSm120Family) {
-            collective_mainloop.mma(
-              mainloop_pipeline,
-              mainloop_pipe_consumer_state,
-              accumulators,
-              work_k_tile_count,
-              mma_thread_idx,
-              shared_storage.tensors.mainloop,
-              params.mainloop,
-              blk_coord
-            );
-          }
-          else {
-            collective_mainloop.mma(
-              mainloop_pipeline,
-              mainloop_pipe_consumer_state,
-              accumulators,
-              work_k_tile_count,
-              mma_thread_idx,
-              shared_storage.tensors.mainloop,
-              params.mainloop
-            );
-          }
+          collective_mainloop.mma(
+            mainloop_pipeline,
+            mainloop_pipe_consumer_state,
+            accumulators,
+            work_k_tile_count,
+            mma_thread_idx,
+            shared_storage.tensors.mainloop,
+            params.mainloop
+          );
 
           // Make sure the math instructions are done and free buffers before entering the epilogue
           collective_mainloop.mma_tail(
@@ -1013,16 +883,8 @@ public:
         }
 
         // Get next work tile
-        auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info, tile_scheduler_pipeline, tile_scheduler_pipe_consumer_state);
-
-        if (!next_work_tile_info.is_valid()) {
-          cutlass::arch::launch_dependent_grids();
-        }
-
+        auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(work_tile_info);
         work_tile_info = next_work_tile_info;
-        if (increment_pipe) {
-          ++tile_scheduler_pipe_consumer_state;
-        }
 
         did_batch_change = curr_batch != work_tile_info.L_idx;
         if (work_tile_info.is_valid() && did_batch_change) {
@@ -1047,7 +909,7 @@ public:
           }
         }
 
-      } while (work_tile_info.is_valid()); // Scheduler work fetch loop
+      } // Scheduler work fetch loop
 
       // Cooperative only needs TMA to complete at the very end of the kernel
       if (do_store_tail) {
