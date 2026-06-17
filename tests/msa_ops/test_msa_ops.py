@@ -266,7 +266,7 @@ def test_sparse_attention_lse():
         2, 4, 2, 16, [80, 50], [1024, 640], torch.bfloat16, seed=30
     )
     scale = 1.0 / math.sqrt(128)
-    out, lse = msa_sparse_attention(
+    _, lse = msa_sparse_attention(
         q, k, v, idx, cu_q, cu_k, softmax_scale=scale, return_softmax_lse=True
     )
     torch.cuda.synchronize()
@@ -1279,7 +1279,7 @@ def test_temperature_lse():
         2, 4, 2, 16, [80, 50], [1024, 640], torch.bfloat16, seed=200
     )
     scale = 1.0 / math.sqrt(128)
-    out, lse, lse_t = msa_sparse_attention(
+    _, lse, lse_t = msa_sparse_attention(
         q,
         k,
         v,
