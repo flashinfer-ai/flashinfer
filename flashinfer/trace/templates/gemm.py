@@ -486,10 +486,13 @@ def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
 def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
     """Reference MXFP8 BMM (block size 32)."""
     block = 32
+    k_blocks = math.ceil(A.shape[-1] / block)
     A_f = A.to(torch.float32)
     B_f = B.to(torch.float32)
-    a_scale = A_scale.to(torch.float32).repeat_interleave(block, dim=-1)
-    b_scale = B_scale.to(torch.float32).repeat_interleave(block, dim=-2)
+    a_scale = A_scale[:, : A.shape[-2], :k_blocks].to(torch.float32)
+    b_scale = B_scale[:, : B.shape[-1], :k_blocks].transpose(-2, -1).to(torch.float32)
+    a_scale = a_scale.repeat_interleave(block, dim=-1)[..., : A.shape[-1]]
+    b_scale = b_scale.repeat_interleave(block, dim=-2)[:, : B.shape[-2], :]
     return torch.matmul(A_f * a_scale, B_f * b_scale).to(dtype)
 
 
@@ -605,24 +608,43 @@ def _bmm_mxfp8_init(
     N: int = 64,
     K: int = 128,
     K_div_32: int = 0,  # derived
+    M_pad: int = 0,  # derived
+    N_pad: int = 0,  # derived
+    K_blocks_pad: int = 0,  # derived
     device: str = "cuda",
     seed: int = 0,
 ):
     """Build inputs for ``bmm_mxfp8`` (block size 32).
 
     Sourced from ``tests/gemm/test_bmm_mxfp8.py``: ``input`` and
-    ``mat2`` are ``randn`` bf16 passed through
-    ``flashinfer.mxfp8_quantize`` to produce float8_e4m3fn data and
-    uint8 block scales.
+    ``mat2`` are ``randn`` bf16 passed through ``flashinfer.mxfp8_quantize``
+    with per-batch padding to produce float8_e4m3fn data and rank-preserving
+    swizzled uint8 block scales.
     """
-    del K_div_32
+    del K_div_32, M_pad, N_pad, K_blocks_pad
     from flashinfer import mxfp8_quantize  # noqa: PLC0415
+
+    def quantize_per_batch_swizzled(x):
+        b, rows, cols = x.shape
+        rows_pad = math.ceil(rows / 128) * 128
+        padded_cols = math.ceil(cols / 32) * 32
+        sf_cols = math.ceil((padded_cols // 32) / 4) * 4
+        x_padded = torch.zeros((b, rows_pad, cols), dtype=x.dtype, device=x.device)
+        x_padded[:, :rows, :] = x
+        x_q_padded, x_scale = mxfp8_quantize(
+            x_padded.reshape(b * rows_pad, cols),
+            is_sf_swizzled_layout=True,
+        )
+        x_q = x_q_padded.reshape(b, rows_pad, padded_cols)[:, :rows, :].contiguous()
+        x_scale = x_scale.reshape(b, rows_pad, sf_cols).contiguous()
+        return x_q, x_scale
 
     torch.manual_seed(seed)
     a_bf16 = torch.randn(batch_size, M, K, dtype=torch.bfloat16, device=device)
-    b_bf16 = torch.randn(batch_size, K, N, dtype=torch.bfloat16, device=device)
-    A, A_scale = mxfp8_quantize(a_bf16, is_sf_swizzled_layout=True)
-    B, B_scale = mxfp8_quantize(b_bf16, is_sf_swizzled_layout=True)
+    b_bf16 = torch.randn(batch_size, N, K, dtype=torch.bfloat16, device=device)
+    A, A_scale = quantize_per_batch_swizzled(a_bf16)
+    B_row_major, B_scale = quantize_per_batch_swizzled(b_bf16)
+    B = B_row_major.transpose(-2, -1).contiguous()
     return {
         "A": A,
         "B": B,
@@ -636,7 +658,7 @@ bmm_mxfp8_trace = TraceTemplate(
     op_type="bmm_mxfp8",
     description=(
         "MXFP8 batched matmul (MX block size 32). A, B are float8_e4m3fn; "
-        "A_scale/B_scale are uint8 block scales (block size 32 along K)."
+        "A_scale/B_scale are per-batch swizzled uint8 block scales."
     ),
     axes={
         "batch_size": Var(),
@@ -644,15 +666,20 @@ bmm_mxfp8_trace = TraceTemplate(
         "N": Const(),
         "K": Const(),
         "K_div_32": Var(description="K // 32 (MX block count)."),
+        "M_pad": Var(description="M padded to a 128-row swizzled scale tile."),
+        "N_pad": Var(description="N padded to a 128-row swizzled scale tile."),
+        "K_blocks_pad": Var(description="K // 32 padded to a 4-column scale tile."),
     },
     inputs={
         "A": Tensor(["batch_size", "M", "K"]),
         "B": Tensor(["batch_size", "K", "N"]),
         "A_scale": Tensor(
-            ["batch_size", "M", "K_div_32"], description="MX block scales for A."
+            ["batch_size", "M_pad", "K_blocks_pad"],
+            description="Per-batch swizzled MX block scales for A.",
         ),
         "B_scale": Tensor(
-            ["batch_size", "K_div_32", "N"], description="MX block scales for B."
+            ["batch_size", "N_pad", "K_blocks_pad"],
+            description="Per-batch swizzled MX block scales for B.",
         ),
         "dtype": Scalar("int32", description="Output dtype enum."),
     },
