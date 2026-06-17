@@ -2082,12 +2082,17 @@ def _cute_dsl_incompatibility_reason(
     is_var_seq: bool,
     return_lse: bool,
     lse: Optional[torch.Tensor],
+    cute_dsl_impl: str = "auto",
 ) -> Optional[str]:
     """Return None if cute-dsl can handle this call, else a human-readable reason.
 
     Used by both the explicit ``backend="cute-dsl"`` path (raises the reason
     as a ``ValueError``) and the ``backend="auto"`` filter (silently drops
     cute-dsl from the runners list).
+
+    ``cute_dsl_impl`` mirrors the dispatcher's impl selection so the
+    eligibility check validates against the constraints of the impl that will
+    actually run (modular vs monolithic).
     """
     cc = get_compute_capability(query.device)
     if cc[0] < 10:
@@ -2132,7 +2137,16 @@ def _cute_dsl_incompatibility_reason(
 
     _, q_len, num_heads, _ = query.shape
     try:
-        from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
+        from ..cute_dsl.attention.mla_dispatch import _resolve_impl
+        resolved_impl = _resolve_impl(requested=cute_dsl_impl, kwargs={"sinks": sinks})
+    except ValueError as e:
+        return f"cute-dsl backend (MLA decode kernel): {e}"
+
+    try:
+        if resolved_impl == "monolithic":
+            from ..cute_dsl.attention.monolithic.mla_decode import _check_can_implement
+        else:
+            from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
 
         _check_can_implement(
             torch_dtype=query.dtype,
@@ -3043,6 +3057,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         is_var_seq,
         return_lse,
         lse,
+        cute_dsl_impl,
     )
     if backend == "cute-dsl":
         if cute_dsl_reason is not None:
