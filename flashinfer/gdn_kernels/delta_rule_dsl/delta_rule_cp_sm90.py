@@ -1,19 +1,12 @@
-from dataclasses import dataclass
 from enum import IntEnum
 
 import torch
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import T
-from cutlass._mlir.dialects import llvm
-import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
 import cutlass.pipeline as pipeline
-from cutlass.cute import core as cute_core
-from cutlass.cute.atom import Trait, make_atom
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.nvgpu import warpgroup
-from cutlass.cute.typing import Shape
 
 from ...utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
@@ -22,6 +15,8 @@ from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import KeyedCompileMixin, cached_compile
 from .helpers import (
     SM90,
+    TF32,
+    WarpMmaTF32Op,
     load_tensor_as_c,
     load_tensor_as_a,
     round_down,
@@ -48,51 +43,6 @@ class NamedBarrier(IntEnum):
     MATH_WG0 = 4
     MATH_WG1 = 5
     MATH_SYNC = 6
-
-
-@dataclass(frozen=True)
-class WarpMmaTF32Op(warp.WarpMmaOp):
-    shape_mnk: Shape
-
-    def __post_init__(self) -> None:
-        if self.shape_mnk != (16, 8, 8):
-            raise ValueError(
-                f"WarpMmaTF32Op only supports (16, 8, 8), got {self.shape_mnk}"
-            )
-
-    def _make_trait(self, *, loc=None, ip=None, **kwargs):
-        shape_mnk = cute_core._pack_shape(self.shape_mnk, loc=loc, ip=ip)
-        ty = _cute_nvgpu_ir.MmaAtomSM80Type.get(
-            shape_mnk.type.attribute,
-            cutlass.TFloat32.mlir_type,
-            cutlass.TFloat32.mlir_type,
-            cutlass.Float32.mlir_type,
-        )
-        return WarpMmaTF32Trait(make_atom(ty, loc=loc, ip=ip))
-
-    def _verify_fragment_A(self, input, *, loc=None, ip=None):
-        return True
-
-    def _verify_fragment_B(self, input, *, loc=None, ip=None):
-        return True
-
-
-class WarpMmaTF32Trait(Trait):
-    pass
-
-
-@cute.jit
-def round_to_tf32_f32(value: cutlass.Float32) -> cutlass.Float32:
-    bits = llvm.inline_asm(
-        T.i32(),
-        [value.ir_value()],
-        "cvt.rz.tf32.f32 $0, $1;",
-        "=r,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return cutlass.Float32(llvm.bitcast(T.f32(), bits))
 
 
 class CPDeltaRuleTPrecomputeSm90(KeyedCompileMixin):
@@ -1905,46 +1855,6 @@ class CPDeltaRuleFixupSm90(KeyedCompileMixin):
         return tensor_producer_state
 
     @cute.jit
-    def convert_fp32_to_tf32_residual(
-        self,
-        tensor: cute.Tensor,
-    ):
-        residual = cute.make_rmem_tensor_like(tensor, cutlass.Float32)
-        for i in cutlass.range_constexpr(cute.size(residual)):
-            value = tensor[i]
-            residual[i] = value - round_to_tf32_f32(value)
-        return cute.recast_tensor(residual, cutlass.TFloat32)
-
-    @cute.jit
-    def convert_tf32_c_to_kpermuted_a(
-        self,
-        tCrC: cute.Tensor,
-        tCrA: cute.Tensor,
-    ):
-        for i in cutlass.range(cute.size(tCrA), unroll_full=True):
-            tCrA[i] = tCrC[i]
-        for m in cutlass.range_constexpr(cute.size(tCrA, mode=[1])):
-            for k in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
-                tmp = tCrA[(1, 0), m, k]
-                tCrA[(1, 0), m, k] = tCrA[(0, 1), m, k]
-                tCrA[(0, 1), m, k] = tmp
-
-    @cute.jit
-    def load_tf32_kpermuted_b(
-        self,
-        tCrB: cute.Tensor,
-        sB_NK: cute.Tensor,
-        lane_idx: cutlass.Int32,
-    ):
-        sB_8x8 = cute.flat_divide(sB_NK, (8, 8))
-        n = lane_idx // 4
-        k = lane_idx - n * 4
-        for iter_n in cutlass.range_constexpr(cute.size(tCrB, mode=[1])):
-            for iter_k in cutlass.range_constexpr(cute.size(tCrB, mode=[2])):
-                tCrB[0, iter_n, iter_k] = sB_8x8[n, k * 2, iter_n, iter_k]
-                tCrB[1, iter_n, iter_k] = sB_8x8[n, k * 2 + 1, iter_n, iter_k]
-
-    @cute.jit
     def store_fixed_state(
         self,
         tiled_store_C,
@@ -2050,7 +1960,7 @@ class CPDeltaRuleFixupSm90(KeyedCompileMixin):
             cute.autovec_copy(tSMgInitialState, tSMrState_cv)
 
         for chunk_idx in cutlass.range(start, num_chunks, unroll=1):
-            self.convert_tf32_c_to_kpermuted_a(tSMrState, tSMrS)
+            TF32.convert_tf32_c_to_kpermuted_a(tSMrState, tSMrS)
             n_pipeline.consumer_wait(n_consumer_state)
             m_pipeline.consumer_wait(m_consumer_state)
             cute.arch.fence_view_async_shared()
@@ -2058,7 +1968,7 @@ class CPDeltaRuleFixupSm90(KeyedCompileMixin):
                 tSMsN[None, None, None, n_consumer_state.index], tSMrState_cv
             )
 
-            self.load_tf32_kpermuted_b(
+            TF32.load_tf32_kpermuted_b(
                 tSMrM, sM_NK[None, None, m_consumer_state.index], lane_idx
             )
             for iter_k in cutlass.range_constexpr(self.k_tiles):
@@ -2070,11 +1980,11 @@ class CPDeltaRuleFixupSm90(KeyedCompileMixin):
                 )
                 cute.gemm(tiled_mma, tSMrState, tSMrS_h, tSMrM_h, tSMrState)
                 if cutlass.const_expr(self.use_3xtf32):
-                    tSMrM_l = self.convert_fp32_to_tf32_residual(
+                    tSMrM_l = TF32.convert_fp32_to_tf32_residual(
                         tSMrM[None, None, iter_k]
                     )
                     cute.gemm(tiled_mma, tSMrState, tSMrS_h, tSMrM_l, tSMrState)
-                    tSMrS_l = self.convert_fp32_to_tf32_residual(
+                    tSMrS_l = TF32.convert_fp32_to_tf32_residual(
                         tSMrS[None, None, iter_k]
                     )
                     tSMrM_h = cute.recast_tensor(
