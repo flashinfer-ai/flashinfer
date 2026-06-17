@@ -211,19 +211,15 @@ def cached_compile(func, *args, compile_options=None, **kwargs):
     compiled_fn = _in_mem_compile_cache.get(cache_key)
 
     if compiled_fn is None:
-        compiler = cute.compile
-        effective_compile_options = compile_options
-        if _needs_sm120a_tma_patch(compile_options):
-            tempdir = tempfile.TemporaryDirectory(prefix="cutedsl_patch_")
-            effective_compile_options = _patched_compile_options(
-                compile_options, tempdir.name
-            )
-        if effective_compile_options:
-            compiler = cute.compile[effective_compile_options]
-        compiled_fn = compiler(func, *args, **kwargs)
-        if _needs_sm120a_tma_patch(compile_options):
-            compiled_fn = _patch_sm120a_tma(compiled_fn, effective_compile_options)
-            tempdir.cleanup()
+        _needs_patch = _needs_sm120a_tma_patch(compile_options)
+        if not _needs_patch:
+            compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
+        else:
+            with tempfile.TemporaryDirectory(prefix="cutedsl_patch_") as tempdir:
+                compile_options = _patched_compile_options(compile_options, tempdir)
+                compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
+                compiled_fn = _patch_sm120a_tma(compiled_fn, compile_options)
+
         _in_mem_compile_cache[cache_key] = compiled_fn
 
     return compiled_fn
