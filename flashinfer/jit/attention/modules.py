@@ -23,6 +23,7 @@ import torch
 from .. import env as jit_env
 from ..core import (
     JitSpec,
+    common_nvcc_flags,
     gen_jit_spec,
     logger,
     sm90a_nvcc_flags,
@@ -33,11 +34,16 @@ from ..utils import (
     dtype_map,
     dtype_map_kv,
     filename_safe_dtype_map,
+    filename_safe_dtype_map_kv,
     mask_mode_literal,
     pos_encoding_mode_literal,
     write_if_different,
 )
-from .utils import generate_additional_params
+from .utils import (
+    generate_additional_params,
+    generate_sf_stride_setter_lines,
+    get_sf_stride_tensor_names,
+)
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
 
@@ -54,7 +60,7 @@ def get_single_decode_uri(
 ) -> str:
     return (
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
@@ -77,7 +83,7 @@ def get_batch_decode_uri(
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -100,7 +106,7 @@ def get_batch_mla_uri(
 ) -> str:
     return (
         f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv_{head_dim_ckv}_"
@@ -217,7 +223,7 @@ def get_batch_decode_mla_uri(
 ) -> str:
     return (
         f"batch_decode_mla_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv{head_dim_ckv}_"
@@ -329,7 +335,7 @@ def get_single_prefill_uri(
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
@@ -356,7 +362,7 @@ def get_pod_uri(
 ) -> str:
     return (
         f"pod_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_{head_dim}_"
         f"posenc_p_{pos_encoding_mode_p}_"
@@ -385,7 +391,7 @@ def get_batch_prefill_uri(
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -410,7 +416,7 @@ def get_batch_prefill_attention_sink_uri(
 ) -> str:
     return (
         f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -432,7 +438,7 @@ def get_batch_attention_uri(
 ) -> str:
     return (
         f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -1563,6 +1569,20 @@ def gen_customize_batch_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
+    require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if require_fp4_kv_cache:
+        missing_sf_tensors = [
+            name
+            for name in ("maybe_k_cache_sf", "maybe_v_cache_sf")
+            if name not in additional_tensor_names
+        ]
+        if missing_sf_tensors:
+            raise ValueError(
+                "NVFP4 KV paged prefill JIT modules require scale-factor tensors "
+                f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
+                "as additional tensors."
+            )
+
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1570,6 +1590,7 @@ def gen_customize_batch_prefill_module(
         "dtype_kv": dtype_map_kv[dtype_kv],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
+        "require_fp4_kv_cache": require_fp4_kv_cache,
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
@@ -1651,10 +1672,13 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
+        extra_cuda_cflags = _fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo)
+        if kwargs["require_fp4_kv_cache"]:
+            extra_cuda_cflags = (extra_cuda_cflags or []) + common_nvcc_flags
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+            extra_cuda_cflags=extra_cuda_cflags,
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -1751,7 +1775,7 @@ def get_fmha_cutlass_sm100a_uri(
     return "fmha_cutlass_sm100a"
     # return (
     #     f"fmha_cutlass_sm100a_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-    #     f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+    #     f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
     #     f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
     #     f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
     #     f"head_dim_qk_{head_dim_qk}_"
@@ -1888,6 +1912,9 @@ def gen_customize_batch_attention_module(
             )
         ]
         + [f"params[i].{var} = {var};" for var in additional_scalar_names]
+        + generate_sf_stride_setter_lines(
+            get_sf_stride_tensor_names(additional_tensor_names), prefix="params[i]."
+        )
     )
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
