@@ -96,6 +96,7 @@ def test_bmm_mxfp8(
 
 @pytest.mark.parametrize("m", [17, 100])
 def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales(m):
+    """Verify CUTLASS BMM works with per-batch scales for non-128-aligned M."""
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
 
@@ -131,6 +132,7 @@ def test_bmm_mxfp8_cutlass_non_aligned_m_per_batch_scales(m):
 
 @pytest.mark.parametrize("m", [17, 100])
 def test_bmm_mxfp8_cutlass_rejects_combined_batch_scales(m):
+    """Reject legacy combined-batch scales that can silently corrupt later batches."""
     if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
 

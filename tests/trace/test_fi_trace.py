@@ -149,6 +149,7 @@ def test_gemm_trace_check_tolerances_match_unit_tests():
 
 
 def test_bmm_mxfp8_trace_uses_per_batch_swizzled_scale_shapes():
+    """Check trace metadata matches the CUTLASS per-batch scale contract."""
     from flashinfer.trace.templates.gemm import bmm_mxfp8_trace
 
     assert bmm_mxfp8_trace.inputs["A_scale"].dim_names == [
