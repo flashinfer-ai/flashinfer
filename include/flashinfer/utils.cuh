@@ -389,8 +389,13 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
-inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
-  if (head_dim >= 512) {
+inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
+                                     uint32_t head_dim_qk = 0) {
+  // head_dim is the VO dim at the batch-prefill call sites; head_dim_qk (when
+  // nonzero) lets asymmetric (QK != VO) configurations report the dim that
+  // actually drives shared-memory cost.
+  const uint32_t qk = head_dim_qk ? head_dim_qk : head_dim;
+  if (qk >= 512) {
     if (avg_packed_qo_len <= 32) {
       return 16;  // decode / short-q (incl. speculative decode): lean CTA16
     }
@@ -406,7 +411,24 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
         // avg_packed_qo_len <= 64
         return 64;
       } else {
-        // avg_packed_qo_len <= 16
+        // avg_packed_qo_len <= 16: prefer the 1x4 warp layout (cta_tile_q=16),
+        // but ONLY if one NUM_MMA_KV step fits shared memory. With 4 kv-warps a
+        // step costs (qk+vo)*16*4*sizeof(dtype); at (512,256) bf16 that is 96KB
+        // + a 16KB Q tile > the ~100KB/SM budget of CC 12.x consumer Blackwell
+        // (and would yield the unrecoverable "Unsupported max_mma_kv: 0"
+        // dispatch failure). Fall back to cta_tile_q=64 (4x1 layout, 4x
+        // cheaper KV step) exactly like the Turing branch below. sizeof
+        // assumed 2 (worst case): only configurations that could not run at
+        // all are moved.
+        int dev_id = 0, max_smem_per_sm = 0;
+        cudaGetDevice(&dev_id);
+        cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                               dev_id);
+        const uint32_t q_tile_smem = 16 * qk * 2;
+        const uint32_t kv_step_smem_1x4 = (qk + head_dim) * 16 * 4 * 2;
+        if (q_tile_smem + kv_step_smem_1x4 > (uint32_t)max_smem_per_sm) {
+          return 64;
+        }
         return 16;
       }
     } else {
