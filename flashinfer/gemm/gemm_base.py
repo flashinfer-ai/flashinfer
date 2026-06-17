@@ -4439,9 +4439,7 @@ def _get_sm100_block_scaled_tactics(
     for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
         for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
             for swap_ab in (False, True):
-                if not swap_ab and not n_aligned:
-                    continue
-                if swap_ab and not n_aligned:
+                if not n_aligned:
                     continue
 
                 if swap_ab:
