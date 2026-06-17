@@ -43,6 +43,9 @@ struct paged_kv_t {
   uint32_t stride_page;
   uint32_t stride_n;
   uint32_t stride_h;
+  uint32_t v_stride_page;
+  uint32_t v_stride_n;
+  uint32_t v_stride_h;
 
   // Internal layout:
   // [max_num_pages, num_heads, page_size, head_dim] if layout == HND
@@ -69,6 +72,9 @@ struct paged_kv_t {
         stride_page(0),
         stride_n(0),
         stride_h(0),
+        v_stride_page(0),
+        v_stride_n(0),
+        v_stride_h(0),
         k_data(nullptr),
         v_data(nullptr),
         indices(nullptr),
@@ -103,10 +109,13 @@ struct paged_kv_t {
         last_page_len(last_page_len),
         rope_pos_offset(rope_pos_offset) {
     stride_page = num_heads * page_size * head_dim;
+    v_stride_page = stride_page;
     this->k_data = k_data;
     this->v_data = v_data;
     stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
     stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;
+    v_stride_n = stride_n;
+    v_stride_h = stride_h;
   }
 
   /*!
@@ -138,10 +147,39 @@ struct paged_kv_t {
         last_page_len(last_page_len),
         rope_pos_offset(rope_pos_offset) {
     stride_page = kv_strides[0];
+    v_stride_page = stride_page;
     this->k_data = k_data;
     this->v_data = v_data;
     stride_n = layout == QKVLayout::kHND ? kv_strides[2] : kv_strides[1];
     stride_h = layout == QKVLayout::kHND ? kv_strides[1] : kv_strides[2];
+    v_stride_n = stride_n;
+    v_stride_h = stride_h;
+  }
+
+  /*!
+   * \brief Construct a paged key-value cache with independent K/V strides.
+   */
+  __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
+                                      uint32_t batch_size, QKVLayout layout, DType* k_data,
+                                      DType* v_data, const int64_t* k_strides,
+                                      const int64_t* v_strides, IdType* indices, IdType* indptr,
+                                      IdType* last_page_len, IdType* rope_pos_offset = nullptr)
+      : num_heads(num_heads),
+        page_size(page_size),
+        head_dim(head_dim),
+        batch_size(batch_size),
+        indices(indices),
+        indptr(indptr),
+        last_page_len(last_page_len),
+        rope_pos_offset(rope_pos_offset) {
+    stride_page = k_strides[0];
+    v_stride_page = v_strides[0];
+    this->k_data = k_data;
+    this->v_data = v_data;
+    stride_n = layout == QKVLayout::kHND ? k_strides[2] : k_strides[1];
+    stride_h = layout == QKVLayout::kHND ? k_strides[1] : k_strides[2];
+    v_stride_n = layout == QKVLayout::kHND ? v_strides[2] : v_strides[1];
+    v_stride_h = layout == QKVLayout::kHND ? v_strides[1] : v_strides[2];
   }
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
@@ -162,6 +200,12 @@ struct paged_kv_t {
                                                              size_t entry_idx,
                                                              size_t feat_idx) const {
     return page_idx * stride_page + head_idx * stride_h + entry_idx * stride_n + feat_idx;
+  }
+
+  __host__ __device__ __forceinline__ size_t get_v_elem_offset(size_t page_idx, size_t head_idx,
+                                                               size_t entry_idx,
+                                                               size_t feat_idx) const {
+    return page_idx * v_stride_page + head_idx * v_stride_h + entry_idx * v_stride_n + feat_idx;
   }
 
   /*!
@@ -199,13 +243,31 @@ struct paged_kv_t {
 
   __device__ __forceinline__ DType* get_v_ptr(IdType page_iter, uint32_t head_idx,
                                               uint32_t entry_idx, uint32_t feat_idx) const {
-    return v_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    return v_data + get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+  }
+
+  __device__ __forceinline__ size_t protective_get_k_offset(IdType page_iter, uint32_t head_idx,
+                                                            uint32_t entry_idx,
+                                                            uint32_t feat_idx,
+                                                            IdType last_indptr) const {
+    return protective_get_kv_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
+  }
+
+  __device__ __forceinline__ size_t protective_get_v_offset(IdType page_iter, uint32_t head_idx,
+                                                            uint32_t entry_idx,
+                                                            uint32_t feat_idx,
+                                                            IdType last_indptr) const {
+    if (page_iter < last_indptr) {
+      return get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    } else {
+      return 0;
+    }
   }
 
   __device__ __forceinline__ DType* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
                                                          uint32_t entry_idx, uint32_t feat_idx,
                                                          IdType last_indptr) const {
-    return v_data + protective_get_kv_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
+    return v_data + protective_get_v_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
   }
 };
 

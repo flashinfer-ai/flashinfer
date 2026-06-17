@@ -265,7 +265,10 @@ struct BlockBatchPagedAttentionPersistent {
              v_smem_offset_w = get_permuted_offset<SWIZZLE_MODE_KV, UPCAST_STRIDE_V>(
                  warp_idx * KTraits::KV_THR_LAYOUT_ROW + lane_idx / KTraits::KV_THR_LAYOUT_COL,
                  lane_idx % KTraits::KV_THR_LAYOUT_COL);
-    size_t thr_local_kv_offset[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 / KTraits::NUM_WARPS_Q];
+    size_t thr_local_kv_offset_k[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 /
+                                 KTraits::NUM_WARPS_Q];
+    size_t thr_local_kv_offset_v[NUM_MMA_KV * KTraits::KV_THR_LAYOUT_COL / 2 /
+                                 KTraits::NUM_WARPS_Q];
 
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
@@ -322,9 +325,12 @@ struct BlockBatchPagedAttentionPersistent {
 
       prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
                                kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
-                               kv_indices, thr_local_kv_offset);
+                               kv_indices, thr_local_kv_offset_k);
+      prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
+                               kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
+                               kv_indices, thr_local_kv_offset_v);
       page_produce_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
-                                      kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
+                                      kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset_k,
                                       kv_end, warp_idx, lane_idx);
       page_produce_kv_sf<false, KTraits>(
           smem_storage, maybe_k_cache_sf, block_iter_base + kv_tile_idx * CTA_TILE_KV,
@@ -333,7 +339,7 @@ struct BlockBatchPagedAttentionPersistent {
           kv_end, warp_idx, lane_idx);
       cp_async::commit_group();
       page_produce_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
-                                     kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
+                                     kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset_v,
                                      kv_end, warp_idx, lane_idx);
       page_produce_kv_sf<true, KTraits>(
           smem_storage, maybe_v_cache_sf, block_iter_base + kv_tile_idx * CTA_TILE_KV,
@@ -348,7 +354,10 @@ struct BlockBatchPagedAttentionPersistent {
           kv_tile_idx + 1 > NUM_STAGES, {
             prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
                                      packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h,
-                                     k_stride_n, block_size, kv_indices, thr_local_kv_offset);
+                                     k_stride_n, block_size, kv_indices, thr_local_kv_offset_k);
+            prefetch_offest<KTraits>(block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
+                                     packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h,
+                                     v_stride_n, block_size, kv_indices, thr_local_kv_offset_v);
             cp_async::wait_group<1>();
             __syncthreads();
 
@@ -376,7 +385,7 @@ struct BlockBatchPagedAttentionPersistent {
             __syncthreads();
             page_produce_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
                                             kv_start + (kv_tile_idx - 1) * CTA_TILE_KV,
-                                            thr_local_kv_offset, kv_end, warp_idx, lane_idx);
+                                            thr_local_kv_offset_k, kv_end, warp_idx, lane_idx);
             page_produce_kv_sf<false, KTraits>(
                 smem_storage, maybe_k_cache_sf, block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
                 packed_kv_bound, kv_head_idx, params.k_sf_stride_page, params.k_sf_stride_h,
@@ -395,7 +404,7 @@ struct BlockBatchPagedAttentionPersistent {
 
             page_produce_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
                                            kv_start + (kv_tile_idx - 1) * CTA_TILE_KV,
-                                           thr_local_kv_offset, kv_end, warp_idx, lane_idx);
+                                           thr_local_kv_offset_v, kv_end, warp_idx, lane_idx);
             page_produce_kv_sf<true, KTraits>(
                 smem_storage, maybe_v_cache_sf, block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
                 packed_kv_bound, kv_head_idx, params.v_sf_stride_page, params.v_sf_stride_h,

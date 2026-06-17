@@ -472,6 +472,44 @@ struct vec_cast<half, __nv_fp4x2_e2m1> {
 #endif
   }
 };
+
+template <>
+struct vec_cast<float, __nv_fp4x2_e2m1> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(float* dst, const __nv_fp4x2_e2m1* src) {
+    static_assert(vec_size % 2 == 0, "vec_size must be even for fp4x2 dequantization");
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      uint32_t fp16x2;
+      // Valid fp4x2 bytes are at even positions (stride 2); odd positions are padding.
+      uint32_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
+      asm volatile(
+          "{\n"
+          ".reg .b8 fp4_byte;\n"
+          "mov.b32 {fp4_byte, _, _, _}, %1;\n"
+          "cvt.rn.f16x2.e2m1x2 %0, fp4_byte;\n"
+          "}"
+          : "=r"(fp16x2)
+          : "r"(b));
+      __half2 h2 = *reinterpret_cast<__half2*>(&fp16x2);
+      reinterpret_cast<float2*>(dst)[i] = __half22float2(h2);
+    }
+#else
+    constexpr float lut[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      uint8_t b = reinterpret_cast<const uint8_t*>(src)[i * 2];
+      dst[i * 2 + 0] = lut[b & 0x0F];
+      dst[i * 2 + 1] = lut[(b >> 4) & 0x0F];
+    }
+#endif
+  }
+};
+
 template <>
 struct vec_cast<nv_bfloat16, __nv_fp4x2_e2m1> {
   template <size_t vec_size>
@@ -1172,6 +1210,67 @@ struct vec_t<__nv_fp8_e5m2, vec_size> {
 };
 
 #if defined(FLASHINFER_ENABLE_FP4_E2M1) && CUDA_VERSION >= 12080
+/******************* vec_t<__nv_fp4x2_e2m1> *******************/
+
+// __nv_fp4x2_e2m1 is used as a one-byte packed container for FP4 KV-cache data.
+// The current FA2 NVFP4 path stores valid packed bytes at even positions and padding at odd
+// positions, so vec_size still counts logical elements in the surrounding kernels.
+template <size_t vec_size>
+struct vec_t<__nv_fp4x2_e2m1, vec_size> {
+  static_assert(vec_size % 16 == 0, "Invalid vector size");
+  int4 data[vec_size / 16];
+
+  FLASHINFER_INLINE __nv_fp4x2_e2m1& operator[](size_t i) {
+    return ((__nv_fp4x2_e2m1*)data)[i];
+  }
+  FLASHINFER_INLINE const __nv_fp4x2_e2m1& operator[](size_t i) const {
+    return ((const __nv_fp4x2_e2m1*)data)[i];
+  }
+  FLASHINFER_INLINE __nv_fp4x2_e2m1* ptr() { return reinterpret_cast<__nv_fp4x2_e2m1*>(&data); }
+  FLASHINFER_INLINE void fill(__nv_fp4x2_e2m1 val) {
+    uint32_t val8 = __nv_fp4x2_storage_t(val.__x);
+    uint32_t val16 = (val8 << 8) | val8;
+    uint32_t val32 = (val16 << 16) | val16;
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 16; ++i) {
+      data[i].x = val32;
+      data[i].y = val32;
+      data[i].z = val32;
+      data[i].w = val32;
+    }
+  }
+  FLASHINFER_INLINE void load(const __nv_fp4x2_e2m1* ptr) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 16; ++i) {
+      data[i] = ((int4*)ptr)[i];
+    }
+  }
+  FLASHINFER_INLINE void store(__nv_fp4x2_e2m1* ptr) const {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 16; ++i) {
+      ((int4*)ptr)[i] = data[i];
+    }
+  }
+  template <typename T>
+  FLASHINFER_INLINE void cast_from(const vec_t<T, vec_size>& src) {
+    cast_from_impl(*this, src);
+  }
+  template <typename T>
+  FLASHINFER_INLINE void cast_load(const T* ptr) {
+    cast_load_impl(*this, ptr);
+  }
+  template <typename T>
+  FLASHINFER_INLINE void cast_store(T* ptr) const {
+    cast_store_impl(ptr, *this);
+  }
+  FLASHINFER_INLINE static void memcpy(__nv_fp4x2_e2m1* dst, const __nv_fp4x2_e2m1* src) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 16; ++i) {
+      ((int4*)dst)[i] = ((int4*)src)[i];
+    }
+  }
+};
+
 /******************* vec_t<__nv_fp4_e2m1> *******************/
 
 // __nv_fp4_e2m1 x 2
