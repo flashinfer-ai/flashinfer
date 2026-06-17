@@ -146,9 +146,8 @@ void mxfp8_gemm_sm120_impl(TensorView mat1, TensorView mat2, TensorView mat1Scal
   };
   {
     const int64_t k_scales = scale_len(k);
-    const int64_t batch_count = (mat1.ndim() == 2) ? 1 : b;
-    int64_t expected_a = batch_count * swizzled_len(m, k_scales);
-    int64_t expected_b = batch_count * swizzled_len(n, k_scales);
+    int64_t expected_a = b * swizzled_len(m, k_scales);
+    int64_t expected_b = b * swizzled_len(n, k_scales);
     TVM_FFI_ICHECK_EQ(mat1Scale.size(0), expected_a)
         << "mxfp8_gemm_sm120: mat1Scale size mismatch, expected " << expected_a << ", got "
         << mat1Scale.size(0);
