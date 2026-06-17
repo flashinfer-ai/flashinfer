@@ -62,10 +62,16 @@ sort is a single-thread insertion sort over the <= topk slots (bit-identical to
 the CUDA warp-bitonic sort at topk=16).
 """
 
+import inspect
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import nvvm
+
+# nvvm.atomicrmw's signature comes from the cutlass-dsl libs wheel, not the pinned DSL
+# version: libs-base needs a leading ``res`` (result type) arg, libs-cu13 infers it.
+_ATOMICRMW_NEEDS_RES = "res" in inspect.signature(nvvm.atomicrmw).parameters
 
 _NUM_BINS = 1024  # 10-bit radix digit per stage
 _STAGE_CAP = 2048  # threshold-bin staging capacity (per stage, not per row)
@@ -83,9 +89,12 @@ _MATCH_SHIFT = {2: 22, 3: 12}
 
 def _atomic_add_i32(a, ptr: cute.Pointer) -> cutlass.Int32:
     """int32 atomic add (SMEM/global generic ptr); returns the OLD value."""
-    return nvvm.atomicrmw(
-        op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=cutlass.Int32(a).ir_value()
-    )
+    av = cutlass.Int32(a).ir_value()
+    if _ATOMICRMW_NEEDS_RES:
+        return nvvm.atomicrmw(
+            res=av.type, op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=av
+        )
+    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=av)
 
 
 class TopKSelectRadixSm12x:

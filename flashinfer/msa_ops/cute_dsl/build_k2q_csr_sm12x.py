@@ -43,19 +43,28 @@ index) is tiny and is precomputed host-side in the Python wrapper and passed
 in, replacing the CUDA ``build_row_map`` kernel.
 """
 
+import inspect
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import dsl_user_op
 
+# nvvm.atomicrmw's signature comes from the cutlass-dsl libs wheel, not the pinned DSL
+# version: libs-base needs a leading ``res`` (result type) arg, libs-cu13 infers it.
+_ATOMICRMW_NEEDS_RES = "res" in inspect.signature(nvvm.atomicrmw).parameters
+
 
 @dsl_user_op
 def _atomic_add_i32(a, ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
     """Global int32 atomic add; returns the OLD value (CUDA >= 13.1 nvvm API)."""
-    return nvvm.atomicrmw(
-        op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=cutlass.Int32(a).ir_value()
-    )
+    av = cutlass.Int32(a).ir_value()
+    if _ATOMICRMW_NEEDS_RES:
+        return nvvm.atomicrmw(
+            res=av.type, op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=av
+        )
+    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=av)
 
 
 class BuildK2qCsrSm12x:
