@@ -2600,7 +2600,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError("XQA MLA does not support sparse_mla_top_k")
         if not is_sm12x_supported(query.device):
             raise ValueError(
-                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+                "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
             )
         fp8_ok = (
             query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
@@ -2968,7 +2968,7 @@ def xqa_batch_decode_with_kv_cache_mla(
         )
     if not is_sm12x_supported(query.device):
         raise ValueError(
-            "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+            "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 12.9)"
         )
     fp8_ok = (
         query.dtype == torch.float8_e4m3fn and kv_cache.dtype == torch.float8_e4m3fn
