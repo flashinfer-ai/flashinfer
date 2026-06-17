@@ -4433,7 +4433,6 @@ def _get_sm100_block_scaled_tactics(
     )
 
     batch_size = 1
-    m_aligned = m % 8 == 0
     n_aligned = n % 8 == 0
 
     valid_tactics = []
@@ -4442,7 +4441,7 @@ def _get_sm100_block_scaled_tactics(
             for swap_ab in (False, True):
                 if not swap_ab and not n_aligned:
                     continue
-                if swap_ab and not m_aligned:
+                if swap_ab and not n_aligned:
                     continue
 
                 if swap_ab:
@@ -5645,15 +5644,7 @@ def _cute_dsl_gemm_fp4_runner(
                 a.device,
             )
 
-            if m == 1:
-                if n <= 1024:
-                    allowed_tiles = {(256, 64)}
-                elif n >= 8192:
-                    allowed_tiles = {(128, 128)}
-                else:
-                    allowed_tiles = {(128, 64)}
-                sm100_base = [t for t in sm100_base if t[0] in allowed_tiles]
-            elif m in (8, 16):
+            if m <= 32:
                 allowed_tiles = {
                     (128, 8),
                     (128, 16),
@@ -5743,6 +5734,9 @@ def _cute_dsl_gemm_fp4_runner(
             sf_vec_size = 16 if use_nvfp4 else 32
             sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
+
+            if n % 8 != 0:
+                raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={n}")
 
             if tactic is None or tactic == -1:
                 # Use analytical heuristic to pick the best tactic based on
@@ -6133,6 +6127,8 @@ def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
 
 
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -6162,6 +6158,8 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
 
 
 _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index

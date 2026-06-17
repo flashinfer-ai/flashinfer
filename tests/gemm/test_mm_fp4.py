@@ -114,7 +114,9 @@ def _test_mm_fp4(
 
 
 # TODO: Consdier splitting this function up for the various backends
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 48, 64, 128, 256, 512])
+@pytest.mark.parametrize(
+    "m", [1, 2, 4, 8, 9, 12, 15, 16, 17, 20, 24, 31, 32, 48, 64, 128, 256, 512]
+)
 @pytest.mark.parametrize("n", [128, 256, 512])
 @pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
