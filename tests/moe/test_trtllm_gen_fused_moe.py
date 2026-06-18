@@ -1230,6 +1230,9 @@ class FP8BlockScaleMoe(Moe):
         hidden_states_quant = kwargs["hidden_states_quant"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
         gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
+        gemm1_alpha = kwargs.get("gemm1_alpha")
+        gemm1_beta = kwargs.get("gemm1_beta")
+        gemm1_clamp_limit = kwargs.get("gemm1_clamp_limit")
         permute_info = kwargs.get("permute_info")
 
         # Generate block scales and quantize hidden states at runtime
@@ -1282,6 +1285,9 @@ class FP8BlockScaleMoe(Moe):
                     tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
                     fp8_quantization_type=quantization_mode,
                     activation_type=activation_type,
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_beta=gemm1_beta,
+                    gemm1_clamp_limit=gemm1_clamp_limit,
                 )
             else:
                 output = trtllm_fp8_block_scale_moe(
@@ -1309,6 +1315,9 @@ class FP8BlockScaleMoe(Moe):
                     fp8_quantization_type=quantization_mode,
                     activation_type=activation_type,
                     norm_topk_prob=norm_topk_prob,
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_beta=gemm1_beta,
+                    gemm1_clamp_limit=gemm1_clamp_limit,
                 )
         if isinstance(output, list):
             return output[0].to(torch.float)
@@ -2716,6 +2725,9 @@ def run_moe_reference_dsfp8(args):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_alpha=args.gemm1_alpha,
+        gemm1_beta=args.gemm1_beta,
+        gemm1_clamp_limit=args.gemm1_clamp_limit,
     )
 
     return run_moe_dequant(
@@ -2757,6 +2769,9 @@ def run_moe_reference_per_tensor_scale_fp8(args):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_alpha=args.gemm1_alpha,
+        gemm1_beta=args.gemm1_beta,
+        gemm1_clamp_limit=args.gemm1_clamp_limit,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
@@ -2848,6 +2863,9 @@ def run_moe_reference_mxint4(args):
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
         gemm1_lora_delta=args.gemm1_lora_delta,
+        gemm1_alpha=args.gemm1_alpha,
+        gemm1_beta=args.gemm1_beta,
+        gemm1_clamp_limit=args.gemm1_clamp_limit,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.MXINT4_BF16_BF16), args_dequant
@@ -2929,6 +2947,7 @@ def run_moe_test(
     gemm1_clamp_limit=None,
     routing_bias_dtype=None,
     norm_topk_prob=True,
+    check_reference=True,
 ):
     """Common test logic for all routing methods."""
     skip_checks(
@@ -3131,14 +3150,15 @@ def run_moe_test(
     )
 
     # Compare outputs
-    tolerances = moe_impl.get_tolerances()
-    check_accuracy(
-        output_dequant_reference,
-        output_dequant_actual,
-        atol=tolerances["atol"],
-        rtol=tolerances["rtol"],
-        percent=tolerances["percent"],
-    )
+    if check_reference:
+        tolerances = moe_impl.get_tolerances()
+        check_accuracy(
+            output_dequant_reference,
+            output_dequant_actual,
+            atol=tolerances["atol"],
+            rtol=tolerances["rtol"],
+            percent=tolerances["percent"],
+        )
 
     return output_dequant_reference, output_dequant_actual, args_dequant
 
@@ -5052,6 +5072,232 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
+    """FP8 block-scale OA params are currently scoped to MxFp8 SwiGLU."""
+    kwargs = {
+        "routing_logits": torch.empty((1, 1), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((1, 1), dtype=torch.bfloat16),
+        "hidden_states_scale": torch.empty((1, 1), dtype=torch.float32),
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.bfloat16),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "num_experts": 1,
+        "top_k": 1,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": 1,
+        "local_expert_offset": 0,
+        "local_num_experts": 1,
+        "routed_scaling_factor": None,
+        "routing_method_type": RoutingMethodType.Renormalize.value,
+    }
+    per_expert = torch.ones((1,), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
+        trtllm_fp8_block_scale_moe(
+            **kwargs,
+            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            activation_type=ActivationType.Swiglu.value,
+            gemm1_alpha=per_expert,
+        )
+
+    with pytest.raises(ValueError, match="ActivationType.Swiglu"):
+        trtllm_fp8_block_scale_moe(
+            **kwargs,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=ActivationType.Geglu.value,
+            gemm1_clamp_limit=per_expert,
+        )
+
+    routed_kwargs = {
+        key: value for key, value in kwargs.items() if key != "routing_logits"
+    }
+    routed_kwargs["topk_ids"] = torch.empty((1, 1), dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="Fp8QuantizationType.MxFp8"):
+        trtllm_fp8_block_scale_routed_moe(
+            **routed_kwargs,
+            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+            activation_type=ActivationType.Swiglu.value,
+            gemm1_beta=per_expert,
+        )
+
+    with pytest.raises(ValueError, match="ActivationType.Swiglu"):
+        trtllm_fp8_block_scale_routed_moe(
+            **routed_kwargs,
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+            activation_type=ActivationType.Geglu.value,
+            gemm1_alpha=per_expert,
+        )
+
+
+def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
+    """TRT-LLM Gen MxFp8 MoE applies raw fused FC1 SwiGLU OA params."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    num_experts = 64
+    num_tokens = 8
+    hidden_size = 512
+    intermediate_size = 512
+    top_k = 1
+    padding = 8
+    routing_method_type = RoutingMethodType.Renormalize
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP8BlockScaleMoe],
+    }
+
+    hidden_states = torch.zeros(
+        (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
+    )
+    hidden_states[:, 0] = torch.tensor(
+        [-3.0, -1.0, 0.25, 1.0, 3.0, -4.0, 2.0, 0.5],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    hidden_states[:, 1] = torch.tensor(
+        [-3.0, -0.5, 0.75, 2.5, 4.0, 6.0, -8.0, 1.5],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    selected_experts = torch.arange(num_tokens, device="cuda", dtype=torch.long)
+    expert_logits = torch.full(
+        (num_tokens, num_experts), -80.0, device="cuda", dtype=torch.bfloat16
+    )
+    expert_logits[torch.arange(num_tokens, device="cuda"), selected_experts] = 80.0
+    permute_info, scores = routing_reference_renormalize(
+        expert_logits, top_k, num_experts, padding
+    )
+
+    gemm1_weights = torch.zeros(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.zeros(
+        (num_experts, hidden_size, intermediate_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    for expert_idx in range(num_tokens):
+        gemm1_weights[expert_idx, 0, 0] = 1.0
+        gemm1_weights[expert_idx, intermediate_size, 1] = 1.0
+        gemm2_weights[expert_idx, 0, 0] = 1.0
+
+    moe_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
+    moe_impl._cache_permute_indices = cache_permute_indices
+
+    def per_expert(value):
+        return torch.full((num_experts,), value, device="cuda", dtype=torch.float32)
+
+    def run_case(gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None):
+        weights_data = moe_impl.quantize_weights(
+            gemm1_weights, gemm2_weights, hidden_states
+        )
+        inputs_data = moe_impl.quantize_inputs(
+            hidden_states, weights_data["hidden_states_scale_global"]
+        )
+        quant_data = {**weights_data, **inputs_data}
+        args = moe_args(
+            num_tokens,
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            top_k,
+            padding,
+            quant_data["hidden_states"],
+            quant_data["hidden_states_scale"],
+            quant_data["hidden_states_scale_global"],
+            scores,
+            quant_data["gemm1_weights"],
+            quant_data["gemm1_scales"],
+            quant_data["gemm1_scales_global"],
+            quant_data["gemm2_weights"],
+            quant_data["gemm2_scales"],
+            quant_data["gemm2_scales_global"],
+            permute_info,
+            False,
+            ActivationType.Swiglu,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+        )
+
+        output_ref, args_dequant = moe_impl.compute_reference(args)
+        static_data = moe_impl.prepare_static_weights_for_kernel(
+            args_dequant,
+            args,
+            gemm1_weights,
+            gemm2_weights,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            weight_processing,
+        )
+        output_actual = moe_impl.call_moe(
+            static_data,
+            hidden_states,
+            None,
+            expert_logits=expert_logits,
+            routing_bias=None,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_groups=None,
+            top_k_groups=None,
+            intermediate_size=intermediate_size,
+            routed_scaling=None,
+            routing_method_type=routing_method_type,
+            do_finalize=True,
+            activation_type=ActivationType.Swiglu,
+            hidden_states_scale=inputs_data["hidden_states_scale"],
+            hidden_states_quant=inputs_data["hidden_states"],
+            enable_autotune=False,
+            enable_pdl=True,
+            gemm1_bias=None,
+            gemm2_bias=None,
+            gemm1_lora_delta=None,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            permute_info=permute_info,
+            norm_topk_prob=True,
+        )
+        return output_ref, output_actual
+
+    output_default_ref, output_default = run_case()
+    output_noop_ref, output_noop = run_case(
+        gemm1_alpha=per_expert(1.0), gemm1_clamp_limit=per_expert(1.0e9)
+    )
+
+    torch.testing.assert_close(output_default, output_default_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output_noop, output_noop_ref, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(output_default, output_noop, atol=1e-2, rtol=1e-2)
+
+    alpha = per_expert(1.702)
+    beta = per_expert(1.0)
+    clamp_limit = per_expert(2.0)
+    output_oa_ref, output_oa = run_case(
+        gemm1_alpha=alpha, gemm1_clamp_limit=clamp_limit
+    )
+    output_beta_oa_ref, output_beta_oa = run_case(
+        gemm1_alpha=alpha, gemm1_beta=beta, gemm1_clamp_limit=clamp_limit
+    )
+
+    # Match the existing MXFP8xMXFP8 MoE test tolerance. This deterministic
+    # identity-like setup still exercises MxFp8 quantization, block scales, and
+    # the fused SwiGLU epilogue, so exact arithmetic parity is not expected.
+    torch.testing.assert_close(output_oa, output_oa_ref, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(output_beta_oa, output_beta_oa_ref, atol=1e-1, rtol=1e-1)
+    assert not torch.allclose(output_default, output_oa, atol=1e-2, rtol=1e-2)
+    assert not torch.allclose(output_oa, output_beta_oa, atol=1e-2, rtol=1e-2)
 
 
 # ====================================================================================

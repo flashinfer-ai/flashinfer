@@ -63,9 +63,13 @@ except (ImportError, RuntimeError):
     chunk_gated_delta_rule_sm100 = None  # type: ignore
 
 try:
-    from .delta_rule_dsl import chunk_gated_delta_rule_sm90
+    from .delta_rule_dsl import (
+        chunk_gated_delta_rule_sm90,
+        chunk_gated_delta_rule_sm120,
+    )
 except (ImportError, RuntimeError):
     chunk_gated_delta_rule_sm90 = None  # type: ignore
+    chunk_gated_delta_rule_sm120 = None  # type: ignore
 
 __all__ = [
     "gated_delta_rule",
@@ -80,4 +84,5 @@ __all__ = [
     "get_mtp_config",
     "chunk_gated_delta_rule_sm90",
     "chunk_gated_delta_rule_sm100",
+    "chunk_gated_delta_rule_sm120",
 ]
