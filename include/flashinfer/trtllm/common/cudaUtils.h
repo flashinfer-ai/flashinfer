@@ -27,6 +27,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_types.h>
+#ifdef ENABLE_FP8
+#include <cuda_fp8.h>
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -157,6 +160,144 @@ template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T
           typename = std::enable_if_t<std::is_integral<U>::value>>
 auto constexpr ceilDiv(T numerator, U denominator) {
   return (numerator + denominator - 1) / denominator;
+}
+
+template <typename T>
+struct num_elems;
+template <>
+struct num_elems<float> {
+  static constexpr int value = 1;
+};
+template <>
+struct num_elems<float2> {
+  static constexpr int value = 2;
+};
+template <>
+struct num_elems<float4> {
+  static constexpr int value = 4;
+};
+template <>
+struct num_elems<half> {
+  static constexpr int value = 1;
+};
+template <>
+struct num_elems<half2> {
+  static constexpr int value = 2;
+};
+#ifdef ENABLE_BF16
+template <>
+struct num_elems<__nv_bfloat16> {
+  static constexpr int value = 1;
+};
+template <>
+struct num_elems<__nv_bfloat162> {
+  static constexpr int value = 2;
+};
+#endif
+#ifdef ENABLE_FP8
+template <>
+struct num_elems<__nv_fp8_e4m3> {
+  static constexpr int value = 1;
+};
+template <>
+struct num_elems<__nv_fp8x2_e4m3> {
+  static constexpr int value = 2;
+};
+#endif
+
+template <typename T, int num>
+struct packed_as;
+template <typename T>
+struct packed_as<T, 1> {
+  using type = T;
+};
+template <>
+struct packed_as<half, 2> {
+  using type = half2;
+};
+template <>
+struct packed_as<float, 2> {
+  using type = float2;
+};
+template <>
+struct packed_as<int8_t, 2> {
+  using type = int16_t;
+};
+template <>
+struct packed_as<int32_t, 2> {
+  using type = int2;
+};
+template <>
+struct packed_as<half2, 1> {
+  using type = half;
+};
+template <>
+struct packed_as<float2, 1> {
+  using type = float;
+};
+#ifdef ENABLE_BF16
+template <>
+struct packed_as<__nv_bfloat16, 2> {
+  using type = __nv_bfloat162;
+};
+template <>
+struct packed_as<__nv_bfloat162, 1> {
+  using type = __nv_bfloat16;
+};
+#endif
+#ifdef ENABLE_FP8
+template <>
+struct packed_as<__nv_fp8_e4m3, 2> {
+  using type = __nv_fp8x2_e4m3;
+};
+template <>
+struct packed_as<__nv_fp8x2_e4m3, 1> {
+  using type = __nv_fp8_e4m3;
+};
+template <>
+struct packed_as<__nv_fp8_e5m2, 2> {
+  using type = __nv_fp8x2_e5m2;
+};
+template <>
+struct packed_as<__nv_fp8x2_e5m2, 1> {
+  using type = __nv_fp8_e5m2;
+};
+#endif
+
+inline __device__ float2 operator*(float2 a, float2 b) { return make_float2(a.x * b.x, a.y * b.y); }
+inline __device__ float2 operator+(float2 a, float2 b) { return make_float2(a.x + b.x, a.y + b.y); }
+inline __device__ float2 operator-(float2 a, float2 b) { return make_float2(a.x - b.x, a.y - b.y); }
+
+inline __device__ float2 operator*(float2 a, float b) { return make_float2(a.x * b, a.y * b); }
+inline __device__ float2 operator+(float2 a, float b) { return make_float2(a.x + b, a.y + b); }
+inline __device__ float2 operator-(float2 a, float b) { return make_float2(a.x - b, a.y - b); }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Device query helpers — thin wrappers around CUDA runtime queries.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int getSMVersion() {
+  int device{-1};
+  FLASHINFER_CHECK(cudaGetDevice(&device) == cudaSuccess, "cudaGetDevice failed");
+  int sm_major = 0;
+  int sm_minor = 0;
+  FLASHINFER_CHECK(
+      cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess,
+      "cudaDeviceGetAttribute(ComputeCapabilityMajor) failed");
+  FLASHINFER_CHECK(
+      cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess,
+      "cudaDeviceGetAttribute(ComputeCapabilityMinor) failed");
+  return sm_major * 10 + sm_minor;
+}
+
+inline int getMultiProcessorCount() {
+  int device{-1};
+  FLASHINFER_CHECK(cudaGetDevice(&device) == cudaSuccess, "cudaGetDevice failed");
+  int count = 0;
+  FLASHINFER_CHECK(
+      cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) == cudaSuccess,
+      "cudaDeviceGetAttribute(MultiProcessorCount) failed");
+  return count;
 }
 
 }  // namespace tensorrt_llm::common

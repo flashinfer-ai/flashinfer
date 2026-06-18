@@ -154,6 +154,11 @@ struct BatchPrefillPagedParams {
   int64_t o_stride_h;
   int64_t nnz_qo;
 
+  // NOTE: For sparse paged KV cache, we need the stride between pages
+  // This is paged_k_cache.stride(0), not the layout stride
+  int64_t k_page_stride;  // Stride between pages for K
+  int64_t v_page_stride;  // Stride between pages for V
+
   int num_qo_heads;
   int num_kv_heads;
   int group_size;

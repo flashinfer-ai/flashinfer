@@ -443,7 +443,6 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
   padded_batch_size =
       (enable_cuda_graph) ? (split_kv ? max_grid_size / gdy : batch_size) : new_batch_size;
   plan_info.padded_batch_size = padded_batch_size;
-
   auto [request_indices_vec, kv_tile_indices_vec, o_indptr_vec] =
       DecodeSplitKVIndptr(indptr_h, batch_size, kv_chunk_size_in_pages);
 
@@ -700,6 +699,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
                                int32_t fixed_split_size, bool disable_split_kv,
+                               int64_t num_colocated_ctas,  // for POD attention, limit prefill
+                                                            // splits by #colocated decode CTAs
                                cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -714,7 +715,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
   int num_blocks_per_sm = 2;
-  int max_grid_size = num_blocks_per_sm * num_sm;
+  int64_t available_ctas = static_cast<int64_t>(num_blocks_per_sm) * num_sm - num_colocated_ctas;
+  int max_grid_size = static_cast<int>(std::max<int64_t>(0, available_ctas));
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
   // step 2: determine kv_chunk_size

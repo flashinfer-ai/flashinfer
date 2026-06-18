@@ -379,7 +379,11 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
        params.v_ptr,
        get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM_VO, params.v_stride_n,
                        params.v_stride_h),  // layout_V
-       params.kv_indices, params.window_left, params.additional_params});
+       params.kv_indices, params.window_left,
+       params.k_page_stride,                     // Stride between pages for K
+       params.v_page_stride,                     // Stride between pages for V
+       static_cast<uint32_t>(params.page_size),  // Page size
+       params.additional_params});
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           params.o_ptr,

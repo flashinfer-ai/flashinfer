@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 # flashinfer-cli
+import os
 import click
 from tabulate import tabulate  # type: ignore[import-untyped]
 
@@ -79,13 +80,14 @@ env_variables = {
     "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
     "FLASHINFER_CUDA_VERSION": get_cuda_version(),
     "FLASHINFER_CUBINS_REPOSITORY": FLASHINFER_CUBINS_REPOSITORY,
-    "CUDA_HOME": get_cuda_path(),
     "CUDA_VERSION": get_cuda_version(),
 }
 try:
     env_variables["CUDA_HOME"] = get_cuda_path()
+    found_nvcc = os.path.isfile(os.path.join(env_variables["CUDA_HOME"], "bin", "nvcc"))
 except Exception:
-    env_variables["CUDA_HOME"] = "Not Found"
+    env_variables["CUDA_HOME"] = ""
+    found_nvcc = False
 
 
 @cli.command("show-config")
@@ -124,6 +126,11 @@ def show_config_cmd():
     click.secho("=== Torch Version Info ===", fg="yellow")
     click.secho("Torch version:", fg="magenta", nl=False)
     click.secho(f" {torch.__version__}", fg="cyan")
+    click.secho("CUDA runtime available:", fg="magenta", nl=False)
+    if torch.cuda.is_available():
+        click.secho(" Yes", fg="green")
+    else:
+        click.secho(" No", fg="red")
     click.secho("", fg="white")
 
     # Section: Environment Variables
@@ -131,6 +138,11 @@ def show_config_cmd():
     for name, value in env_variables.items():
         click.secho(f"{name}:", fg="magenta", nl=False)
         click.secho(f" {value}", fg="cyan")
+    click.secho("NVCC found:", fg="magenta", nl=False)
+    if found_nvcc:
+        click.secho(" Yes", fg="green")
+    else:
+        click.secho(" No", fg="red")
     click.secho("", fg="white")
 
     # Section: Artifact path
@@ -317,6 +329,131 @@ def list_modules_cmd(module_name):
             click.secho(
                 f"  {status.name} - {click.style(status.status, fg=status_color)}"
             )
+
+
+@cli.command("export-compile-commands")
+@click.argument("path", required=False, default="compile_commands.json")
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Output file path (overrides PATH argument)",
+)
+def export_compile_commands_cmd(path, output):
+    """Export compile commands to compile_commands.json
+
+    PATH: Output file path (default: compile_commands.json)
+    """
+    import json
+
+    # --output option overrides PATH argument
+    output_path = output if output is not None else path
+
+    # Register default modules if none exist
+    _ensure_modules_registered()
+
+    # Get all registered specs
+    all_specs = jit_spec_registry.get_all_specs()
+
+    if not all_specs:
+        click.secho("No modules found to export.", fg="yellow")
+        return
+
+    # Collect all compile commands
+    all_compile_commands = []
+    for spec in all_specs.values():
+        try:
+            compile_commands = spec.get_compile_commands()
+            all_compile_commands.extend(compile_commands)
+        except Exception as e:
+            click.secho(
+                f"Warning: Failed to generate compile commands for {spec.name}: {e}",
+                fg="yellow",
+            )
+
+    # Write to output file
+    try:
+        with open(output_path, "w") as f:
+            json.dump(all_compile_commands, f, indent=2)
+        click.secho(
+            f"✅ Successfully exported {len(all_compile_commands)} compile commands to {output_path}",
+            fg="green",
+        )
+    except Exception as e:
+        click.secho(f"❌ Failed to write compile commands: {e}", fg="red")
+
+
+@cli.command("replay")
+@click.option(
+    "--dir",
+    "dump_dir",
+    required=True,
+    help="Directory containing dump files (or root directory of session)",
+)
+def replay_cmd(dump_dir):
+    """Replay API calls from dump directory"""
+    from .api_logging import replay_sequence, replay_from_dump
+
+    device = "cuda"
+
+    if not os.path.exists(dump_dir):
+        click.secho(f"❌ Directory not found: {dump_dir}", fg="red")
+        return
+
+    # Check if this is a single dump or a session / sequence root
+    is_single_dump = os.path.exists(os.path.join(dump_dir, "metadata.jsonl"))
+
+    try:
+        if is_single_dump:
+            click.secho(f"Replaying single dump from {dump_dir}...", fg="cyan")
+            result = replay_from_dump(
+                dump_dir, compare_outputs=True, device=device, run=True
+            )
+            if result.get("comparison_match"):
+                click.secho("✅ Replay passed (outputs matched)", fg="green")
+            elif result.get("execution_error"):
+                click.secho(
+                    f"❌ Execution failed: {result['execution_error']}", fg="red"
+                )
+            else:
+                click.secho("⚠️  Replay finished but outputs did not match", fg="yellow")
+        else:
+            # Session / sequence replay
+            click.secho(f"Replaying session from {dump_dir}...", fg="cyan")
+            results = replay_sequence(dump_dir, device=device)
+
+            passed = 0
+            failed = 0
+
+            for i, res in enumerate(results):
+                dump_name = (
+                    os.path.basename(res.get("dump_dir", ""))
+                    if "dump_dir" in res
+                    else f"call_{i + 1}"
+                )
+                # If replay_from_dump returned successfully, metadata might have the name
+                if "metadata" in res and "function_name" in res["metadata"]:
+                    func_name = res["metadata"]["function_name"]
+                    dump_name = f"{func_name} ({dump_name})"
+
+                if "error" in res:
+                    click.secho(
+                        f"[{i + 1}] {dump_name}: ❌ Error: {res['error']}", fg="red"
+                    )
+                    failed += 1
+                elif res.get("comparison_match"):
+                    click.secho(f"[{i + 1}] {dump_name}: ✅ Passed", fg="green")
+                    passed += 1
+                else:
+                    click.secho(f"[{i + 1}] {dump_name}: ⚠️  Mismatch", fg="yellow")
+                    failed += 1
+
+            click.secho(
+                f"\nSummary: {passed} passed, {failed} failed/mismatch", fg="white"
+            )
+
+    except Exception as e:
+        click.secho(f"❌ Replay failed: {e}", fg="red")
 
 
 if __name__ == "__main__":

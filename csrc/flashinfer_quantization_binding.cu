@@ -15,10 +15,10 @@
  */
 #include "tvm_ffi_utils.h"
 
-void packbits(Tensor x, const std::string& bitorder, Tensor y);
+void packbits(TensorView x, const std::string& bitorder, TensorView y);
 
-void segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr,
-                      const std::string& bitorder, Tensor y);
+void segment_packbits(TensorView x, TensorView input_indptr, TensorView output_indptr,
+                      const std::string& bitorder, TensorView y);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(packbits, packbits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(segment_packbits, segment_packbits);

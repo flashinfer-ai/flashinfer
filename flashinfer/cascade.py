@@ -19,9 +19,16 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 
+from .api_logging import flashinfer_api
 from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit.cascade import gen_cascade_module
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
+from .trace.templates.attention import multi_level_cascade_run_trace
+from .trace.templates.cascade import (
+    merge_state_in_place_trace,
+    merge_state_trace,
+    merge_states_trace,
+)
 from .utils import register_custom_op, register_fake_op
 
 
@@ -30,6 +37,7 @@ def get_cascade_module():
     return gen_cascade_module().build_and_load()
 
 
+@flashinfer_api(trace=merge_state_trace)
 @register_custom_op("flashinfer::merge_state", mutates_args=())
 def merge_state(
     v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
@@ -96,6 +104,7 @@ def _fake_merge_state(
     return v, s
 
 
+@flashinfer_api(trace=merge_state_in_place_trace)
 @register_custom_op("flashinfer::merge_state_in_place", mutates_args=("v", "s"))
 def merge_state_in_place(
     v: torch.Tensor,
@@ -156,6 +165,7 @@ def _fake_merge_state_in_place(
     pass
 
 
+@flashinfer_api(trace=merge_states_trace)
 @register_custom_op("flashinfer::merge_states", mutates_args=())
 def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Merge multiple attention states (v, s).
@@ -287,6 +297,7 @@ class MultiLevelCascadeAttentionWrapper:
     BatchPrefillWithPagedKVCacheWrapper
     """
 
+    @flashinfer_api
     def __init__(
         self,
         num_levels,
@@ -349,6 +360,7 @@ class MultiLevelCascadeAttentionWrapper:
                     paged_kv_indptr_buf_arr,
                     paged_kv_indices_buf_arr,
                     paged_kv_last_page_len_buf_arr,
+                    strict=True,
                 )
             ]
         else:
@@ -381,10 +393,11 @@ class MultiLevelCascadeAttentionWrapper:
             be the same as the device of the input tensors.
         """
         for wrapper, int_workspace_buffer in zip(
-            self._batch_prefill_wrappers, int_workspace_buffers
+            self._batch_prefill_wrappers, int_workspace_buffers, strict=True
         ):
             wrapper.reset_workspace_buffer(float_workspace_buffer, int_workspace_buffer)
 
+    @flashinfer_api
     def plan(
         self,
         qo_indptr_arr: List[torch.Tensor],
@@ -479,6 +492,7 @@ class MultiLevelCascadeAttentionWrapper:
                 paged_kv_indptr_arr,
                 paged_kv_indices_arr,
                 paged_kv_last_page_len,
+                strict=True,
             )
         ):
             wrapper.plan(
@@ -504,6 +518,7 @@ class MultiLevelCascadeAttentionWrapper:
 
     begin_forward = plan
 
+    @flashinfer_api(trace=multi_level_cascade_run_trace)
     def run(
         self,
         q: torch.Tensor,
@@ -627,9 +642,21 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self, float_workspace_buffer: torch.Tensor, kv_layout: str = "NHD"
     ) -> None:
+        r"""Allocate workspace for shared-prefix batch decode attention.
+
+        Parameters
+        ----------
+        float_workspace_buffer : torch.Tensor
+            User-provided float workspace buffer (e.g. 128 MiB) on the same CUDA device as
+            the inputs.  Shared with the underlying :class:`BatchDecodeWithPagedKVCacheWrapper`.
+        kv_layout : str
+            Layout of the KV-cache tensors, either ``"NHD"`` or ``"HND"``.  Defaults to
+            ``"NHD"``.
+        """
         self._batch_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             float_workspace_buffer, kv_layout
         )
@@ -654,6 +681,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             float_workspace_buffer, int_workspace_buffer
         )
 
+    @flashinfer_api
     def begin_forward(
         self,
         unique_kv_indptr: torch.Tensor,
@@ -669,13 +697,16 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
 
         Parameters
         ----------
-        indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
-        indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
-        last_page_len : torch.Tensor
-            The number of entries in the last page of each request in the paged kv
-            cache, shape: ``[batch_size]``
+        unique_kv_indptr : torch.Tensor
+            CSR-style page offsets into ``unique_kv_indices`` for the *per-request*
+            (non-shared) suffix of each KV cache, shape ``[batch_size + 1]``, dtype
+            ``int32``.
+        unique_kv_indices : torch.Tensor
+            Page indices of the non-shared suffix of the paged KV cache,
+            shape ``[unique_kv_indptr[-1]]``, dtype ``int32``.
+        unique_kv_last_page_len : torch.Tensor
+            Number of valid entries on the last page of each request's unique
+            suffix, shape ``[batch_size]``, dtype ``int32``.
         num_qo_heads : int
             The number of query/output heads
         num_kv_heads : int
@@ -715,6 +746,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             data_type=data_type,
         )
 
+    @flashinfer_api
     def forward(
         self,
         q: torch.Tensor,
@@ -778,6 +810,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         merge_state_in_place(V_shared, S_shared, V_unique, S_unique)
         return V_shared
 
+    @flashinfer_api
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect"""
         pass
@@ -874,6 +907,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     layers). This wrapper class manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self, float_workspace_buffer: torch.Tensor, kv_layout: str = "NHD"
     ) -> None:
@@ -912,6 +946,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             float_workspace_buffer, int_workspace_buffer
         )
 
+    @flashinfer_api
     def begin_forward(
         self,
         qo_indptr: torch.Tensor,
@@ -967,6 +1002,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             page_size,
         )
 
+    @flashinfer_api
     def forward(
         self,
         q: torch.Tensor,
@@ -991,7 +1027,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
             ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
             :attr:`kv_layout` is ``HND``.
-        v_shared ; torch.Tensor
+        v_shared : torch.Tensor
             The shared prefix value tensor, shape:
             ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
             ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
@@ -1058,6 +1094,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         merge_state_in_place(V_shared, S_shared, V_unique, S_unique)
         return V_shared
 
+    @flashinfer_api
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect"""
         pass

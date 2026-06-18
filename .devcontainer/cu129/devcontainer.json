@@ -2,7 +2,7 @@
     "name": "CUDA Development Container",
     "build": {
         "dockerfile": "../../docker/Dockerfile.cu129.dev",
-        "context": "../../docker/"
+        "context": "../../"
     },
     "runArgs": [
         "--gpus=all"

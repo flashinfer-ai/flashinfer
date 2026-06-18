@@ -1,69 +1,58 @@
 import pytest
 import torch
 
-from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
+from flashinfer import mxfp8_quantize, SfLayout
+from flashinfer.utils import get_compute_capability
+from tests.utils_fp8 import assert_mxfp8_quantize_exact as _assert_mxfp8_quantize_exact
 
 
-@pytest.mark.parametrize("m", [1, 1024])
-@pytest.mark.parametrize("k", [1024])
+def is_cute_dsl_available():
+    """Check if CuTe-DSL is available."""
+    try:
+        from flashinfer.cute_dsl import is_cute_dsl_available as _is_available
+
+        return _is_available()
+    except ImportError:
+        return False
+
+
+@pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
-def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backend):
+    if device == "cuda":
+        major, _ = get_compute_capability(torch.device(device))
+        if major < 10:
+            pytest.skip(
+                "mxfp8 quantization is not supported on compute capability < 10"
+            )
+
+    # Skip cute-dsl backend for CPU or if not available
+    if backend == "cute-dsl":
+        if device == "cpu":
+            pytest.skip("cute-dsl backend only supports CUDA")
+        if not is_cute_dsl_available():
+            pytest.skip("CuTe-DSL is not available")
+
     a = 16 * torch.randn([m, k], dtype=dtype).to(device).contiguous()
 
     if device == "cpu":
         a = a.float()
 
-    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout)
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
 
-    if device == "cuda":
-        a_fp8 = a_fp8.cpu()
-        a_sf = a_sf.cpu()
-
-    a_pt = mxfp8_dequantize_host(
-        a_fp8.view(torch.uint8),
-        a_sf.view(torch.uint8).reshape(-1),
-        is_sf_swizzled_layout,
+    _assert_mxfp8_quantize_exact(
+        a,
+        a_fp8,
+        a_sf,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
     )
 
     if device == "cuda":
-        a_pt = a_pt.cuda()
-
-    torch.cuda.synchronize()
-
-    def check_accuracy(a, b, atol, rtol, percent):
-        if torch.any(torch.isnan(a)):
-            raise Exception("NaN in a")
-        if torch.any(torch.isnan(b)):
-            raise Exception("NaN in b")
-        assert a.shape == b.shape
-        left = torch.abs(a - b)
-        right = atol + rtol * torch.abs(b)
-        count = torch.sum(left > right)
-        mismatch_percent = count / a.numel()
-        if mismatch_percent > 1 - percent:
-            raise Exception(
-                "Mismatch percentage is %f for rtol %f" % (mismatch_percent, rtol)
-            )
-
-    check_accuracy(a_pt, a, 8, 0, 0.999)
-
-
-def mxfp8_quantize_check_accuracy(a, b, atol, rtol, percent):
-    if torch.any(torch.isnan(a)):
-        raise Exception("NaN in a")
-    if torch.any(torch.isnan(b)):
-        raise Exception("NaN in b")
-    assert a.shape == b.shape
-    left = torch.abs(a - b)
-    right = atol + rtol * torch.abs(b)
-    count = torch.sum(left > right)
-    mismatch_percent = count / a.numel()
-    if mismatch_percent > 1 - percent:
-        raise Exception(
-            "Mismatch percentage is %f for rtol %f" % (mismatch_percent, rtol)
-        )
+        torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])
@@ -76,34 +65,33 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
 
     a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout)
 
-    a_pt = mxfp8_dequantize_host(
-        a_fp8.view(torch.uint8), a_sf.view(torch.uint8), is_sf_swizzled_layout
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
 
-    torch.cuda.synchronize()
 
-    mxfp8_quantize_check_accuracy(a_pt, a, 8, 0, 0.999)
-
-
-@pytest.mark.parametrize("m", [1, 2, 16, 1024])
-@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("m", [1, 2, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 512, 1024, 8192])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend):
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
 
-    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, 32)
-    a_pt = mxfp8_dequantize_host(
-        a_fp8.cpu().view(torch.uint8),
-        a_sf.cpu().view(torch.uint8),
-        is_sf_swizzled_layout,
-    )
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, 32, backend=backend)
 
-    torch.cuda.synchronize()
-    mxfp8_quantize_check_accuracy(
-        a_pt.cpu().to(torch.float32), a.cpu().to(torch.float32), 8, 0, 0.999
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])
@@ -111,33 +99,478 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("alignment", [64, 128])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_alignment_torch_device(
-    m, k, dtype, is_sf_swizzled_layout, alignment
+    m, k, dtype, is_sf_swizzled_layout, alignment, backend
 ):
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
     padded_k = ((k + alignment - 1) // alignment) * alignment
 
     # Quantize it on device.
-    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, alignment)
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, alignment, backend=backend)
     assert a_fp8.shape[1] == padded_k
-
-    # Dequantize it on host.
-    a_pt = mxfp8_dequantize_host(
-        a_fp8.cpu().view(torch.uint8),
-        a_sf.cpu().view(torch.uint8),
-        is_sf_swizzled_layout,
-    )
 
     # Check if the bits of paddings are zero.
     paddings = a_fp8.view(torch.int8)[:, k:]
     assert torch.all(paddings == 0), "Paddings should be zero"
 
+    _assert_mxfp8_quantize_exact(
+        a,
+        a_fp8,
+        a_sf,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        alignment=alignment,
+    )
     torch.cuda.synchronize()
 
-    mxfp8_quantize_check_accuracy(
-        a_pt[:, :k].cpu().to(torch.float32), a.cpu().to(torch.float32), 8, 0, 0.999
+
+@pytest.mark.parametrize("m", [1, 3, 128, 2048])
+@pytest.mark.parametrize("k", [128, 1024])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_denormal_inputs(m, k, dtype, is_sf_swizzled_layout, backend):
+    """Test that very small denormalized inputs do not produce NaN.
+
+    This test covers a bug where inputs small enough to cause E8M0 scale factor
+    underflow would result in NaN outputs due to 0 * infinity computations.
+    """
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    torch.random.manual_seed(42)
+
+    # Create very small denormalized values (below float32 normal range ~1.17e-38)
+    # These values caused NaN in the original buggy implementation
+    a = (torch.randn([m, k], dtype=torch.float32) * 1e-38).to(dtype).cuda().contiguous()
+
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
+
+    # The primary check: no NaN values should be produced
+    nan_count = torch.isnan(a_fp8.float()).sum().item()
+    assert nan_count == 0, f"Found {nan_count} NaN values in output (expected 0)"
+
+    # Secondary check: no Inf values should be produced
+    inf_count = torch.isinf(a_fp8.float()).sum().item()
+    assert inf_count == 0, f"Found {inf_count} Inf values in output (expected 0)"
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_all_zeros(dtype, is_sf_swizzled_layout, backend):
+    """Test that all-zero inputs produce all-zero outputs without NaN."""
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    m, k = 128, 1024
+    a = torch.zeros([m, k], dtype=dtype, device="cuda").contiguous()
+
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
+
+    # No NaN values
+    assert not torch.isnan(a_fp8.float()).any(), "NaN found in output for zero input"
+
+    # All outputs should be zero
+    assert (a_fp8.float() == 0).all(), "Non-zero output for zero input"
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_mixed_magnitude(dtype, is_sf_swizzled_layout, backend):
+    """Test mixed inputs: some blocks with normal values, some with denormals.
+
+    This mimics real-world scenarios where different regions of a tensor
+    may have vastly different magnitudes.
+    """
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    torch.random.manual_seed(123)
+
+    m, k = 256, 1024
+    a = torch.randn([m, k], dtype=torch.float32)
+
+    # Make some rows have very small values (denormals)
+    # Rows 0-63: normal magnitude
+    # Rows 64-127: very small (denormal range)
+    # Rows 128-191: normal magnitude
+    # Rows 192-255: extremely small
+    a[64:128, :] *= 1e-38
+    a[192:256, :] *= 1e-40
+
+    a = a.to(dtype).cuda().contiguous()
+
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
+
+    # No NaN values should be produced anywhere
+    nan_mask = torch.isnan(a_fp8.float())
+    nan_count = nan_mask.sum().item()
+    if nan_count > 0:
+        nan_positions = torch.where(nan_mask)
+        first_nan_row = nan_positions[0][0].item()
+        first_nan_col = nan_positions[1][0].item()
+        pytest.fail(
+            f"Found {nan_count} NaN values. First NaN at row={first_nan_row}, col={first_nan_col}"
+        )
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_single_denormal_in_block(dtype, is_sf_swizzled_layout, backend):
+    """Test a block where most values are normal but one is a tiny denormal.
+
+    This specifically tests the scenario from the original bug report where
+    a single float32 denormal value in a block would become NaN due to
+    0 * infinity when FTZ mode flushes it to zero.
+    """
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    m, k = 64, 1024
+    # Start with small but normal-range values
+    a = torch.full([m, k], 1e-36, dtype=torch.float32)
+
+    # Insert a few extremely small values (float32 denormals) at specific positions
+    # These are the values that triggered NaN in the original bug
+    denormal_positions = [(0, 498), (0, 911), (32, 100), (63, 512)]
+    for row, col in denormal_positions:
+        a[row, col] = 9.18e-40  # A float32 denormal value
+
+    a = a.to(dtype).cuda().contiguous()
+
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
+
+    # Check that no NaN is produced
+    nan_mask = torch.isnan(a_fp8.float())
+    assert not nan_mask.any(), f"Found NaN at positions: {torch.where(nan_mask)}"
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_extreme_scale_inputs(dtype, is_sf_swizzled_layout, backend):
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    a = torch.zeros((2, 128), dtype=dtype, device="cuda")
+    a[:, 32:64] = float("inf")
+    a[:, 64:96] = 448.0
+    a[:, 96:128] = -448.0
+
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+
+
+# =============================================================================
+# CuTe-DSL Compilation Cache Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+def test_cute_dsl_compilation_cache_m_agnostic(is_sf_swizzled_layout):
+    """
+    Test that the CuTe-DSL compilation cache is M-agnostic.
+
+    Different M values with the same K should reuse the cached kernel,
+    meaning no recompilation occurs when only M changes.
+    """
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    from flashinfer.quantization.kernels.mxfp8_quantize import (
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
+    )
+
+    # Get the appropriate cache based on layout
+    if is_sf_swizzled_layout:
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
+    else:
+        cache_fn = _get_compiled_kernel_mxfp8_linear
+
+    # Clear the cache to start fresh
+    cache_fn.cache_clear()
+
+    # Fixed parameters for this test
+    K = 1024
+    dtype = torch.float16
+
+    # First call with M=1 - should compile
+    a1 = torch.randn([1, K], dtype=dtype, device="cuda")
+    mxfp8_quantize(a1, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_m1 = cache_fn.cache_info()
+    assert cache_info_after_m1.misses == 1, "First call should be a cache miss"
+    assert cache_info_after_m1.hits == 0, "First call should have no hits"
+
+    # Second call with M=16 (different M, same K) - should reuse cached kernel
+    a2 = torch.randn([16, K], dtype=dtype, device="cuda")
+    mxfp8_quantize(a2, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_m16 = cache_fn.cache_info()
+    assert cache_info_after_m16.misses == 1, (
+        "Second call with different M should still be 1 miss"
+    )
+    assert cache_info_after_m16.hits == 1, (
+        "Second call should be a cache hit (M-agnostic)"
+    )
+
+    # Third call with M=1024 (different M again, same K) - should reuse cached kernel
+    a3 = torch.randn([1024, K], dtype=dtype, device="cuda")
+    mxfp8_quantize(a3, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_m1024 = cache_fn.cache_info()
+    assert cache_info_after_m1024.misses == 1, (
+        "Third call with different M should still be 1 miss"
+    )
+    assert cache_info_after_m1024.hits == 2, (
+        "Third call should be a cache hit (M-agnostic)"
+    )
+
+    # Clean up
+    cache_fn.cache_clear()
+
+
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+def test_cute_dsl_compilation_cache_k_specific(is_sf_swizzled_layout):
+    """
+    Test that the CuTe-DSL compilation cache is K-specific.
+
+    Different K values should create separate cached kernels,
+    meaning recompilation occurs when K changes.
+    """
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    from flashinfer.quantization.kernels.mxfp8_quantize import (
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
+    )
+
+    # Get the appropriate cache based on layout
+    if is_sf_swizzled_layout:
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
+    else:
+        cache_fn = _get_compiled_kernel_mxfp8_linear
+
+    # Clear the cache to start fresh
+    cache_fn.cache_clear()
+
+    dtype = torch.float16
+    M = 16  # Fixed M
+
+    # First call with K=1024 - should compile
+    a1 = torch.randn([M, 1024], dtype=dtype, device="cuda")
+    mxfp8_quantize(a1, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_k1024 = cache_fn.cache_info()
+    assert cache_info_after_k1024.misses == 1, "First call should be a cache miss"
+
+    # Second call with K=2048 (different K) - should compile new kernel
+    a2 = torch.randn([M, 2048], dtype=dtype, device="cuda")
+    mxfp8_quantize(a2, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_k2048 = cache_fn.cache_info()
+    assert cache_info_after_k2048.misses == 2, (
+        "Second call with different K should be a cache miss"
+    )
+
+    # Third call with K=1024 again - should hit cache
+    a3 = torch.randn([M, 1024], dtype=dtype, device="cuda")
+    mxfp8_quantize(a3, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_k1024_again = cache_fn.cache_info()
+    assert cache_info_after_k1024_again.misses == 2, (
+        "Third call with same K=1024 should not add miss"
+    )
+    assert cache_info_after_k1024_again.hits >= 1, (
+        "Third call with same K=1024 should hit cache"
+    )
+
+    # Clean up
+    cache_fn.cache_clear()
+
+
+# =============================================================================
+# Backend-parity tests across all SF layouts (128x4 / 8x4 / linear)
+# =============================================================================
+
+MXFP8_SF_LAYOUTS = [
+    SfLayout.layout_128x4,
+    SfLayout.layout_8x4,
+    SfLayout.layout_linear,
+]
+
+
+@pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 1024, 8192])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sf_layout", MXFP8_SF_LAYOUTS)
+def test_mxfp8_quantize_layout_backend_parity(m, k, dtype, sf_layout):
+    """CUDA and CuTe-DSL backends must exactly match element-wise."""
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    torch.random.manual_seed(0)
+    a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
+
+    a_fp8_cuda, a_sf_cuda = mxfp8_quantize(
+        a, sf_swizzle_layout=sf_layout, backend="cuda"
+    )
+    a_fp8_cute, a_sf_cute = mxfp8_quantize(
+        a, sf_swizzle_layout=sf_layout, backend="cute-dsl"
+    )
+
+    assert a_fp8_cuda.shape == a_fp8_cute.shape, (
+        f"Quantized output shape mismatch for {sf_layout.name}: "
+        f"cuda={a_fp8_cuda.shape}, cute={a_fp8_cute.shape}"
+    )
+    if not torch.equal(a_fp8_cuda, a_fp8_cute):
+        mismatch = a_fp8_cuda != a_fp8_cute
+        mismatch_count = int(mismatch.sum().item())
+        first_index = tuple(
+            int(x) for x in torch.nonzero(mismatch, as_tuple=False)[0].cpu()
+        )
+        raise AssertionError(
+            f"Quantized output element mismatch for {sf_layout.name}: "
+            f"{mismatch_count}/{a_fp8_cuda.numel()} elements differ; "
+            f"first mismatch at index {first_index}: "
+            f"cuda={a_fp8_cuda[first_index].float().item()}, "
+            f"cute={a_fp8_cute[first_index].float().item()}"
+        )
+
+    assert a_sf_cuda.shape == a_sf_cute.shape, (
+        f"Scale factor shape mismatch for {sf_layout.name}: "
+        f"cuda={a_sf_cuda.shape}, cute={a_sf_cute.shape}"
+    )
+    if not torch.equal(a_sf_cuda, a_sf_cute):
+        mismatch = a_sf_cuda != a_sf_cute
+        mismatch_count = int(mismatch.sum().item())
+        first_index = tuple(
+            int(x) for x in torch.nonzero(mismatch, as_tuple=False)[0].cpu()
+        )
+        raise AssertionError(
+            f"Scale factor element mismatch for {sf_layout.name}: "
+            f"{mismatch_count}/{a_sf_cuda.numel()} elements differ; "
+            f"first mismatch at index {first_index}: "
+            f"cuda={int(a_sf_cuda[first_index].item())}, "
+            f"cute={int(a_sf_cute[first_index].item())}"
+        )
+
+
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+def test_cute_dsl_compilation_cache_dtype_specific(is_sf_swizzled_layout):
+    """
+    Test that the CuTe-DSL compilation cache is dtype-specific.
+
+    Different dtypes (fp16 vs bf16) should create separate cached kernels.
+    """
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    from flashinfer.quantization.kernels.mxfp8_quantize import (
+        _get_compiled_kernel_mxfp8_linear,
+        _get_compiled_kernel_mxfp8_swizzled,
+    )
+
+    # Get the appropriate cache based on layout
+    if is_sf_swizzled_layout:
+        cache_fn = _get_compiled_kernel_mxfp8_swizzled
+    else:
+        cache_fn = _get_compiled_kernel_mxfp8_linear
+
+    # Clear the cache to start fresh
+    cache_fn.cache_clear()
+
+    K = 1024
+    M = 16
+
+    # First call with float16 - should compile
+    a1 = torch.randn([M, K], dtype=torch.float16, device="cuda")
+    mxfp8_quantize(a1, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_fp16 = cache_fn.cache_info()
+    assert cache_info_after_fp16.misses == 1, "First call (fp16) should be a cache miss"
+
+    # Second call with bfloat16 (different dtype, same K) - should compile new kernel
+    a2 = torch.randn([M, K], dtype=torch.bfloat16, device="cuda")
+    mxfp8_quantize(a2, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_bf16 = cache_fn.cache_info()
+    assert cache_info_after_bf16.misses == 2, (
+        "Second call (bf16) should be a cache miss (dtype-specific)"
+    )
+
+    # Third call with float16 again - should hit cache
+    a3 = torch.randn([M, K], dtype=torch.float16, device="cuda")
+    mxfp8_quantize(a3, is_sf_swizzled_layout, backend="cute-dsl")
+    cache_info_after_fp16_again = cache_fn.cache_info()
+    assert cache_info_after_fp16_again.misses == 2, (
+        "Third call (fp16 again) should not add miss"
+    )
+    assert cache_info_after_fp16_again.hits >= 1, (
+        "Third call (fp16 again) should hit cache"
+    )
+
+    # Clean up
+    cache_fn.cache_clear()
 
 
 if __name__ == "__main__":

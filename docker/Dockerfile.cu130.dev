@@ -47,11 +47,10 @@ ENV PATH="/home/$USERNAME/conda/envs/py312/bin:$PATH"
 # Install torch and other python packages
 COPY requirements.txt /install/requirements.txt
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
-# use nightly/cu130 temporarily and change to cu130 when torch releases stable version
-RUN bash /install/install_python_packages.sh nightly/cu130 && pip3 install pre-commit
+RUN bash /install/install_python_packages.sh cu130 && pip3 install pre-commit
 
 # Install mpi4py in the conda environment
-RUN conda install -n py312 -y mpi4py
+RUN conda install -n py312 -y mpi4py mpich
 
 # Install oh-my-zsh
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended

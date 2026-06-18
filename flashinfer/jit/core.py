@@ -1,21 +1,23 @@
 import dataclasses
+import functools
 import logging
 import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union, Hashable
 
 import tvm_ffi
 from filelock import FileLock
 
 from ..compilation_context import CompilationContext
 from . import env as jit_env
-from .cpp_ext import generate_ninja_build_for_op, run_ninja
+from .cpp_ext import generate_ninja_build_for_op, get_nvcc_parallelism_flags, run_ninja
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
-os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
+# Note: Do NOT create FLASHINFER_CSRC_DIR here - it's the package directory
+# which may be read-only after installation
 
 
 class MissingJITCacheError(RuntimeError):
@@ -60,6 +62,33 @@ class FlashInferJITLogger(logging.Logger):
             )
         )
 
+    def debug_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`debug`][logging.Logger.debug], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.debug, msg, *args)
+
+    def info_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`info`][logging.Logger.info], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.info, msg, *args)
+
+    def warning_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`warning`][logging.Logger.warning], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.warning, msg, *args)
+
+    @functools.lru_cache(maxsize=None)
+    def _print_once(self, log_method, msg: str, *args: Hashable) -> None:
+        """Helper method to log messages only once per unique (msg, args) combination."""
+        # Note: stacklevel=3 to show the caller's location, not this helper method
+        log_method(msg, *args, stacklevel=3)
+
 
 logger = FlashInferJITLogger("flashinfer.jit")
 
@@ -90,12 +119,20 @@ common_nvcc_flags = [
     "-DFLASHINFER_ENABLE_FP8_E8M0",
     "-DFLASHINFER_ENABLE_FP4_E2M1",
 ]
-sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
+sm89_nvcc_flags = [
+    "-gencode=arch=compute_89,code=sm_89",
+    "-DFLASHINFER_ENABLE_FP8_E8M0",
+]
+sm90a_nvcc_flags = [
+    "-gencode=arch=compute_90a,code=sm_90a",
+    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
 sm100f_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"] + common_nvcc_flags
 sm110a_nvcc_flags = ["-gencode=arch=compute_110a,code=sm_110a"] + common_nvcc_flags
 sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_flags
+sm120f_nvcc_flags = ["-gencode=arch=compute_120f,code=sm_120f"] + common_nvcc_flags
 sm121a_nvcc_flags = ["-gencode=arch=compute_121a,code=sm_121a"] + common_nvcc_flags
 
 current_compilation_context = CompilationContext()
@@ -193,6 +230,10 @@ class JitSpec:
         return jit_env.FLASHINFER_JIT_DIR / self.name / "build.ninja"
 
     @property
+    def build_dir(self) -> Path:
+        return jit_env.FLASHINFER_JIT_DIR / self.name
+
+    @property
     def jit_library_path(self) -> Path:
         return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
 
@@ -203,7 +244,7 @@ class JitSpec:
 
     def get_object_paths(self) -> List[Path]:
         object_paths = []
-        jit_dir = self.jit_library_path.parent
+        jit_dir = self.build_dir
         for source in self.sources:
             is_cuda = source.suffix == ".cu"
             object_suffix = ".cuda.o" if is_cuda else ".o"
@@ -229,7 +270,7 @@ class JitSpec:
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
-        ninja_path.parent.mkdir(parents=True, exist_ok=True)
+        self.build_dir.mkdir(parents=True, exist_ok=True)
         content = generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
@@ -257,17 +298,15 @@ class JitSpec:
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
-            # Write ninja file if it doesn't exist (deferred case)
-            if not self.is_ninja_generated:
-                self.write_ninja()
-            run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
+            self.write_ninja()
+            run_ninja(self.build_dir, self.ninja_path, verbose)
 
-    def load(self, so_path: Path, class_name: str = None):
+    def load(self, so_path: Path):
         return tvm_ffi.load_module(str(so_path))
 
-    def build_and_load(self, class_name: str = None):
+    def build_and_load(self):
         if self.is_aot:
-            return self.load(self.aot_path, class_name)
+            return self.load(self.aot_path)
 
         # Guard both build and load with the same lock to avoid race condition
         # where another process is building the library and removes the .so file.
@@ -275,9 +314,91 @@ class JitSpec:
             so_path = self.jit_library_path
             verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
             self.build(verbose, need_lock=False)
-            result = self.load(so_path, class_name)
+            result = self.load(so_path)
 
         return result
+
+    def get_compile_commands(self) -> List[dict]:
+        """
+        Generate compile_commands.json entries for this JitSpec.
+
+        Returns:
+            A list of dictionaries, each representing a compile command entry
+            for a source file in this JitSpec.
+        """
+        from .cpp_ext import (
+            get_cuda_path,
+            build_common_cflags,
+            build_cflags,
+            build_cuda_cflags,
+        )
+
+        cuda_home = get_cuda_path()
+
+        # Build flags
+        common_cflags = build_common_cflags(cuda_home, self.extra_include_dirs)
+        cflags = build_cflags(common_cflags, self.extra_cflags)
+        cuda_cflags = build_cuda_cflags(common_cflags, self.extra_cuda_cflags)
+
+        # Replace $common_cflags and $cuda_home placeholders
+        def expand_flags(
+            flags: List[str], common_cflags_expanded: List[str]
+        ) -> List[str]:
+            expanded = []
+            for flag in flags:
+                if flag == "$common_cflags":
+                    expanded.extend(common_cflags_expanded)
+                elif "$cuda_home" in flag:
+                    expanded.append(flag.replace("$cuda_home", cuda_home))
+                else:
+                    expanded.append(flag)
+            return expanded
+
+        # Expand common_cflags first (it has $cuda_home placeholders)
+        common_cflags_expanded = [
+            flag.replace("$cuda_home", cuda_home) for flag in common_cflags
+        ]
+        cflags_expanded = expand_flags(cflags, common_cflags_expanded)
+        cuda_cflags_expanded = expand_flags(cuda_cflags, common_cflags_expanded)
+
+        # Get compilers
+        cxx = os.environ.get("CXX", "c++")
+        nvcc = os.environ.get("FLASHINFER_NVCC", f"{cuda_home}/bin/nvcc")
+
+        # Build directory
+        build_dir = str(self.build_dir.resolve())
+
+        # Generate entries for each source file
+        compile_commands = []
+        for source in self.sources:
+            is_cuda = source.suffix == ".cu"
+
+            if is_cuda:
+                compiler = nvcc
+                flags = cuda_cflags_expanded
+                object_suffix = ".cuda.o"
+            else:
+                compiler = cxx
+                flags = cflags_expanded
+                object_suffix = ".o"
+
+            obj_name = source.with_suffix(object_suffix).name
+            output_file = os.path.join(build_dir, obj_name)
+
+            # Build the command string
+            command_parts = [compiler, "-c", str(source.resolve())]
+            command_parts += flags
+            command_parts += ["-o", output_file]
+
+            compile_commands.append(
+                {
+                    "directory": build_dir,
+                    "command": " ".join(command_parts),
+                    "file": str(source.resolve()),
+                }
+            )
+
+        return compile_commands
 
 
 def gen_jit_spec(
@@ -290,35 +411,51 @@ def gen_jit_spec(
     needs_device_linking: bool = False,
 ) -> JitSpec:
     check_cuda_arch()
-    verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+    # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
+    debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
+    verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
+    debug = (debug_env if debug_env is not None else verbose_env) == "1"
 
-    cflags = ["-std=c++17", "-Wno-switch-bool"]
+    # Only add default C++ standard if not specified in extra flags
+    cflags_has_std = extra_cflags is not None and any(
+        f.startswith("-std=") for f in extra_cflags
+    )
+    cuda_cflags_has_std = extra_cuda_cflags is not None and any(
+        f.startswith("-std=") for f in extra_cuda_cflags
+    )
+
+    cflags = ["-Wno-switch-bool"]
+    if not cflags_has_std:
+        cflags.insert(0, "-std=c++17")
+
     cuda_cflags = [
-        "-std=c++17",
-        f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
+        *get_nvcc_parallelism_flags(),
         "-use_fast_math",
+        "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
-    if verbose:
+    if not cuda_cflags_has_std:
+        cuda_cflags.insert(0, "-std=c++17")
+
+    if debug:
         cflags += ["-O0", "-g"]
         cuda_cflags += [
             "-g",
             "-O0",
-            "-G",
+            "--device-debug",
             "-lineinfo",
             "--ptxas-options=-v",
-            "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
             "-DCUTLASS_DEBUG_TRACE_LEVEL=2",
         ]
     else:
         # non debug mode
         cuda_cflags += ["-DNDEBUG", "-O3"]
-        cflags += ["-O3"]
+        cflags += ["-DNDEBUG", "-O3"]
 
-    # useful for ncu
+    # useful for ncu source correlation
     if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":
         cuda_cflags += ["-lineinfo"]
 
@@ -365,9 +502,8 @@ def build_jit_specs(
         if skip_prebuilt and spec.aot_path.exists():
             continue
         lines.append(f"subninja {spec.ninja_path}")
-        if not spec.is_ninja_generated:
-            with FileLock(spec.lock_path, thread_local=False):
-                spec.write_ninja()
+        with FileLock(spec.lock_path, thread_local=False):
+            spec.write_ninja()
     if not lines:
         return
 

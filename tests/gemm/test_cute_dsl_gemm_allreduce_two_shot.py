@@ -258,6 +258,8 @@ def run(
         l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype, all_reduce != "none"
     )
 
+    major, minor = torch.cuda.get_device_capability()
+
     # Build GEMM object
     gemm = PersistentDenseGemmKernel(
         acc_dtype,
@@ -266,6 +268,7 @@ def run(
         cluster_shape_mn,
         use_tma_store,
         all_reduce=all_reduce,
+        sm_version=f"sm_{major}{minor}",
     )
 
     if not can_implement:
@@ -484,7 +487,7 @@ def test_cute_dsl_gemm_allreduce_two_shot(world_size):
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
 
-    if get_compute_capability(torch.device("cuda")) != (10, 0):
+    if get_compute_capability(torch.device("cuda")) not in [(10, 0), (10, 3)]:
         pytest.skip("cute_dsl_gemm_allreduce_two_shot requires SM100")
 
     print(f"Running test for world_size={world_size}")

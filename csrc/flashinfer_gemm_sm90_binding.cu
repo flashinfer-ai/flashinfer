@@ -15,10 +15,11 @@
  */
 #include "tvm_ffi_utils.h"
 
-void CutlassSegmentGEMMSM90(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
-                            Tensor all_problems, Tensor x_ptr, Tensor w_ptr, Tensor y_ptr,
-                            Tensor x_stride, Tensor weight_stride, Tensor y_stride,
-                            Tensor empty_x_data, Tensor empty_y_data, bool weight_column_major);
+void CutlassSegmentGEMMSM90(TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+                            TensorView all_problems, TensorView x_ptr, TensorView w_ptr,
+                            TensorView y_ptr, TensorView x_stride, TensorView weight_stride,
+                            TensorView y_stride, TensorView empty_x_data, TensorView empty_y_data,
+                            bool weight_column_major);
 
 // "Cutlass Segment GEMM operator for SM90"
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cutlass_segment_gemm_sm90, CutlassSegmentGEMMSM90);

@@ -13,7 +13,12 @@ Prerequisites
 
 - OS: Linux only
 
-- Python: 3.9, 3.10, 3.11, 3.12, 3.13
+- Python: 3.10, 3.11, 3.12, 3.13, 3.14
+
+- CUDA: 12.6, 12.8, 13.0, 13.1
+
+.. note::
+   FlashInfer strives to follow PyTorch's supported CUDA versions plus the latest CUDA release.
 
 Quick Start
 ^^^^^^^^^^^
@@ -78,6 +83,16 @@ You can follow the steps below to install FlashInfer from source code:
 
        python -m pip install --no-build-isolation -e . -v
 
+   .. note::
+      When using ``--no-build-isolation``, pip does not automatically install build
+      dependencies. FlashInfer requires ``setuptools>=77``. If you encounter an error
+      like ``AttributeError: module 'setuptools.build_meta' has no attribute
+      'prepare_metadata_for_build_editable'``, upgrade pip and setuptools first:
+
+      .. code-block:: bash
+
+          python -m pip install --upgrade pip setuptools
+
 4. (Optional) Build optional packages:
 
    Build ``flashinfer-cubin``:
@@ -92,7 +107,7 @@ You can follow the steps below to install FlashInfer from source code:
 
    .. code-block:: bash
 
-       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 12.0a"
+       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
        cd flashinfer-jit-cache
        python -m build --no-isolation --wheel
        python -m pip install dist/*.whl

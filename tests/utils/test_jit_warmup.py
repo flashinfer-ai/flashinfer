@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import torch
+import pytest
 
 import flashinfer
 from flashinfer.utils import PosEncodingMode
@@ -57,6 +58,10 @@ def test_warmpup_llama():
     )
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] != 9,
+    reason="fa3 backend is only supported on SM90",
+)
 def test_warmpup_llama_sm90():
     flashinfer.jit.build_jit_specs(
         [

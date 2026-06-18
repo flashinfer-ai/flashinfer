@@ -62,6 +62,12 @@ def _create_build_metadata():
     # Get git version
     git_version = get_git_version(cwd=Path(__file__).parent.parent)
 
+    # Append local version suffix if available
+    local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
+    if local_version:
+        # Use + to create a local version identifier that will appear in wheel name
+        version = f"{version}+{local_version}"
+
     # Create build metadata in the source tree
     package_dir = Path(__file__).parent / "flashinfer_cubin"
     build_meta_file = package_dir / "_build_meta.py"

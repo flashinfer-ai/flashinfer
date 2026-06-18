@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights
- * reserved. SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights
+ * reserved. SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -31,8 +36,13 @@
 #define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
 
 #if IS_MLA
+#if defined(MLA_BF16) && MLA_BF16
+#define INPUT_ELEM __nv_bfloat16
+#define INPUT_ELEM2 __nv_bfloat162
+#else
 #define INPUT_ELEM __nv_fp8_e4m3
 #define INPUT_ELEM2 __nv_fp8x2_e4m3
+#endif
 #define HEAD_ELEMS_V 512
 #else
 // 1 means fp16 and 0 means bf16 input/output
@@ -78,6 +88,12 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define CACHE_ELEM_ENUM 2
 #endif
 
+#if CACHE_ELEM_ENUM == 3
+#define ENABLE_4BIT_KV_CACHE 1
+#else
+#define ENABLE_4BIT_KV_CACHE 0
+#endif
+
 // don't modify
 #define USE_KV_CACHE true
 
@@ -90,21 +106,6 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 // 0 means contiguous KV cache (non-paged).
 #ifndef TOKENS_PER_PAGE
 #define TOKENS_PER_PAGE 32
-#endif
-
-// don't modify
-#ifndef USE_PAGED_KV_CACHE
-#define USE_PAGED_KV_CACHE (TOKENS_PER_PAGE > 0)
-#endif
-
-// Paged KV Cache Format
-// 0 - XQA Original
-// 1 - separate K and V cache pools, each with layout (batch, seq_len, head, head_elem) for
-// VLLM/SGLang
-#ifdef USE_PAGED_KV_CACHE
-#ifndef PAGED_KV_CACHE_LAYOUT
-#define PAGED_KV_CACHE_LAYOUT 0
-#endif
 #endif
 
 // don't modify
@@ -129,7 +130,16 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 // 1 - naive PDL
 // 2 - aggressive PDL (implemented only in mha_sm90.cu for now)
 #ifndef ENABLE_PDL
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if __CUDA_ARCH__ == 900
 #define ENABLE_PDL 2
+#else
+#define ENABLE_PDL 1
+#endif
+#else
+/* default for host or older architectures */
+#define ENABLE_PDL 0
+#endif
 #endif
 
 #ifndef USE_INPUT_KV
@@ -161,8 +171,7 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #endif
 
 // true should be better if warpTile.x * cacheElemSize < 128. otherwise use false.
-#define GRP_LOAD_V \
-  (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && USE_PAGED_KV_CACHE && BEAM_WIDTH > 1)
+#define GRP_LOAD_V (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && BEAM_WIDTH > 1)
 
 // use custom barrier for NVRTC to avoid pulling in many headers
 #ifndef USE_CUSTOM_BARRIER
@@ -183,8 +192,51 @@ static_assert(CACHE_ELEM_ENUM != 0);
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
+#if ENABLE_4BIT_KV_CACHE
+#include <cuda_fp4.h>
+#endif
+
 template <int32_t elemTypeEnum>
-using ElemType = mha::conditional_t<
-    elemTypeEnum == 0, INPUT_ELEM,
-    mha::conditional_t<elemTypeEnum == 1, int8_t,
-                       mha::conditional_t<elemTypeEnum == 2, __nv_fp8_e4m3, void>>>;
+struct ElemTypeConverter;
+// Specialization for elemTypeEnum = 0 (half/bf16)
+template <>
+struct ElemTypeConverter<0> {
+  using Type = INPUT_ELEM;
+  using ContainerType = INPUT_ELEM;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = void;
+  static constexpr int QuantVectorSize = 1;
+};
+
+// Specialization for elemTypeEnum = 1 (int8)
+template <>
+struct ElemTypeConverter<1> {
+  using Type = int8_t;
+  using ContainerType = int8_t;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = void;
+  static constexpr int QuantVectorSize = 1;
+};
+
+// Specialization for elemTypeEnum = 2 (fp8)
+template <>
+struct ElemTypeConverter<2> {
+  using Type = __nv_fp8_e4m3;
+  using ContainerType = __nv_fp8_e4m3;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = void;
+  static constexpr int QuantVectorSize = 1;
+};
+
+#if ENABLE_4BIT_KV_CACHE
+// Specialization for elemTypeEnum = 3 (NVFP4)
+template <>
+struct ElemTypeConverter<3> {
+  using Type = __nv_fp4_e2m1;
+  using ContainerType = __nv_fp4x2_e2m1;
+  static constexpr int ElemsPerContainer = 2;
+  using ScalingFactorType = __nv_fp8_e4m3;
+  static constexpr int QuantVectorSize = 16;
+};
+#endif

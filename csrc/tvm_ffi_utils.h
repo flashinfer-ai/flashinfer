@@ -18,11 +18,13 @@
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/function.h>
 
 #include "dlpack/dlpack.h"
 
 using tvm::ffi::Tensor;
+using tvm::ffi::TensorView;
 namespace ffi = tvm::ffi;
 
 inline constexpr int64_t encode_dlpack_dtype(DLDataType dtype) {
@@ -91,6 +93,23 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
     }                                                                                    \
   }()
 
+// Dispatcher for FP32/FP16/BF16 data types
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dlpack_dtype, c_type, ...)              \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      case float32_code: {                                                               \
+        using c_type = float;                                                            \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+        _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                          \
+        _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                         \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
 #define _DISPATCH_CASE_I32(c_type, ...) \
   case int32_code: {                    \
     using c_type = int32_t;             \
@@ -147,6 +166,20 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
     }                                                                                    \
   }()
 
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_FP8(dlpack_dtype, c_type, ...)               \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
 #ifdef FLASHINFER_ENABLE_F32
 #define _DISPATCH_CASE_F32(c_type, ...) \
   case float32_code: {                  \
@@ -168,11 +201,37 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 #define _DISPATCH_SF_CASE_FP8_E8M0(c_type, ...)
 #endif
 
+#if defined(FLASHINFER_ENABLE_FP8_E4M3) && \
+    (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#define _DISPATCH_SF_CASE_FP8_UE4M3(c_type, ...) \
+  case uint8_code: {                             \
+    using c_type = __nv_fp8_e4m3;                \
+    return __VA_ARGS__();                        \
+  }
+#else
+#define _DISPATCH_SF_CASE_FP8_UE4M3(c_type, ...)
+#endif
+
 #define DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(dlpack_dtype, c_type, ...)                \
   [&]() -> bool {                                                                   \
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                    \
       _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                       \
       _DISPATCH_SF_CASE_FP8_E8M0(c_type, __VA_ARGS__)                               \
+      default:                                                                      \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__                                \
+                              << " failed to dispatch scaling factor data type "    \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits; \
+        return false;                                                               \
+    }                                                                               \
+  }()
+
+// We require a separate definition since both E8M0 and UE4M3 are passed as
+// uint8
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF_UE4M3(dlpack_dtype, c_type, ...)          \
+  [&]() -> bool {                                                                   \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                    \
+      _DISPATCH_CASE_F32(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_SF_CASE_FP8_UE4M3(c_type, __VA_ARGS__)                              \
       default:                                                                      \
         TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__                                \
                               << " failed to dispatch scaling factor data type "    \
@@ -220,38 +279,63 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 
 inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, const char* a_name,
                         const char* b_name) {
-  TVM_FFI_ICHECK_EQ(a->ndim, b->ndim) << a_name << "->ndim and " << b_name << "->ndim mismatch";
-  for (int i = 0; i < a->ndim; ++i) {
-    TVM_FFI_ICHECK_EQ(a->shape[i], b->shape[i])
-        << a_name << "->shape[" << i << "] and " << b_name << "->shape[" << i << "] mismatch";
+  TVM_FFI_ICHECK_EQ(a.ndim(), b.ndim()) << a_name << ".ndim() and " << b_name << ".ndim() mismatch";
+  for (int i = 0; i < a.ndim(); ++i) {
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+        << a_name << ".size(" << i << ") and " << b_name << ".size(" << i << ") mismatch";
+  }
+}
+
+inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorView& b,
+                        const char* a_name, const char* b_name) {
+  TVM_FFI_ICHECK_EQ(a.ndim(), b.ndim()) << a_name << ".ndim() and " << b_name << ".ndim() mismatch";
+  for (int i = 0; i < a.ndim(); ++i) {
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+        << a_name << ".size(" << i << ") and " << b_name << ".size(" << i << ") mismatch";
   }
 }
 
 #define CHECK_CUDA(x) \
-  TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCUDA) << #x " must be a CUDA tensor";
+  TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCUDA) << #x " must be a CUDA tensor";
 #define CHECK_CPU(x) \
-  TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCPU) << #x " must be a host tensor";
+  TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCPU) << #x " must be a host tensor";
 #define CHECK_CONTIGUOUS(x) TVM_FFI_ICHECK(x.IsContiguous()) << #x " must be contiguous";
-#define CHECK_LAST_DIM_CONTIGUOUS(x)            \
-  TVM_FFI_ICHECK_EQ(x->strides[x->ndim - 1], 1) \
+#define CHECK_LAST_DIM_CONTIGUOUS(x) \
+  TVM_FFI_ICHECK_EQ(x.stride(-1), 1) \
   #x "must be contiguous at last dimension";
 #define CHECK_INPUT(x) \
   CHECK_CUDA(x);       \
   CHECK_CONTIGUOUS(x)
 #define CHECK_INPUT_TYPE(x, st) \
-  TVM_FFI_ICHECK_EQ(x->dtype, st) << "Inconsistency of Tensor type: " #x;
+  TVM_FFI_ICHECK_EQ(x.dtype(), st) << "Inconsistency of Tensor type: " #x;
 #define CHECK_INPUT_AND_TYPE(x, st) \
   CHECK_CUDA(x);                    \
   CHECK_CONTIGUOUS(x);              \
   CHECK_INPUT_TYPE(x, st)
+#define CHECK_MAYBE_INPUT_TYPE(maybe_x, st) \
+  if (maybe_x.has_value()) {                \
+    CHECK_INPUT_TYPE(maybe_x.value(), st);  \
+  }
+#define CHECK_MAYBE_INPUT_TYPES(maybe_x, st1, st2)                                   \
+  if (maybe_x.has_value()) {                                                         \
+    TVM_FFI_ICHECK(maybe_x.value().dtype() == st1 || maybe_x.value().dtype() == st2) \
+        << "Inconsistency of Tensor type: " #maybe_x " must be " #st1 " or " #st2;   \
+  }
+#define CHECK_SAME_DTYPE(x, y)           \
+  TVM_FFI_ICHECK(x.dtype() == y.dtype()) \
+      << "Inconsistency of Tensor type: " #x " dtype must match " #y " dtype";
+#define CHECK_MAYBE_SAME_DTYPE(maybe_x, y) \
+  if (maybe_x.has_value()) {               \
+    CHECK_SAME_DTYPE(maybe_x.value(), y);  \
+  }
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
   CHECK_CUDA(x);                           \
   CHECK_LAST_DIM_CONTIGUOUS(x)
-#define CHECK_DIM(d, x) TVM_FFI_ICHECK_EQ(x->ndim, d) << #x " must be a " #d "D tensor";
+#define CHECK_DIM(d, x) TVM_FFI_ICHECK_EQ(x.ndim(), d) << #x " must be a " #d "D tensor";
 #define CHECK_SHAPE(a, b) check_shape(a, b, #a, #b)
-#define CHECK_DEVICE(a, b)                                         \
-  TVM_FFI_ICHECK_EQ(a->device.device_type, b->device.device_type); \
-  TVM_FFI_ICHECK_EQ(a->device.device_id, b->device.device_id);
+#define CHECK_DEVICE(a, b)                                           \
+  TVM_FFI_ICHECK_EQ(a.device().device_type, b.device().device_type); \
+  TVM_FFI_ICHECK_EQ(a.device().device_id, b.device().device_id);
 
 inline cudaStream_t get_current_stream() {
   int device;
@@ -263,10 +347,12 @@ inline cudaStream_t get_stream(DLDevice device) {
   return static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 }
 
-inline int64_t get_element_size(ffi::Tensor x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
+inline int64_t get_element_size(ffi::Tensor x) { return (x.dtype().bits * x.dtype().lanes) / 8; }
 
-inline int64_t get_numel(ffi::Tensor x) { return x.shape().Product(); }
+inline int64_t get_element_size(ffi::TensorView x) {
+  return (x.dtype().bits * x.dtype().lanes) / 8;
+}
 
 inline ffi::Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
-  return ffi::Tensor::FromDLPackAlloc(TVMFFIEnvGetTensorAllocator(), shape, dtype, device);
+  return ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, shape, dtype, device);
 }

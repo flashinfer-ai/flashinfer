@@ -188,15 +188,12 @@ struct CollectiveBuilderMixedInput<
           ? (IsArrayOfPointersGemm
                  ? detail::compute_stage_count_or_override_single_affine_transformed_input<
                        Sm90ReducedSmemCapacityBytes, RealElementA, RealElementB, ElementScale,
-                       ElementZero, TileShape_MNK, StageCountType::bytes, SmemAlignment>(
-                       StageCountType{})
+                       ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{})
                  : detail::compute_stage_count_or_override_single_affine_transformed_input<
                        detail::sm90_smem_capacity_bytes, RealElementA, RealElementB, ElementScale,
-                       ElementZero, TileShape_MNK, StageCountType::bytes, SmemAlignment>(
-                       StageCountType{}))
+                       ElementZero, TileShape_MNK, SmemAlignment>(StageCountType{}))
           : detail::compute_stage_count_or_override<detail::sm90_smem_capacity_bytes, ElementAMma,
-                                                    ElementBMma, TileShape_MNK,
-                                                    StageCountType::bytes, SmemAlignment>(
+                                                    ElementBMma, TileShape_MNK, SmemAlignment>(
                 StageCountType{});
 
   using DispatchPolicy = cute::conditional_t<

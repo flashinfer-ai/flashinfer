@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstring>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -67,8 +68,8 @@ std::vector<int64_t> prioritizePredefinedConfigs(
   if (n /* out_dim */ == 0 && k /* in_dim */ == 0) {
     auto pred = [](BatchedGemmConfig const& config) {
       BatchedGemmOptions const& options = config.mOptions;
-      return options.mNumStages == 4 && options.mNumStagesMma == 2 && options.mTileK == 256 &&
-             options.mTileScheduler == TileScheduler::Persistent;
+      return options.mNumStagesA == 4 && options.mNumStagesB == 4 && options.mNumStagesMma == 2 &&
+             options.mTileK == 256 && options.mTileScheduler == TileScheduler::Persistent;
     };
     prioritizedIndices = bubbleUpConfig(sortedIndices, pred);
   }
@@ -90,9 +91,11 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
   auto const configs = bmm.getBatchedGemmConfigs();
 
   mPassingConfigIndices.clear();
+  auto sm_version = getSMVersion();
 
   for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
-    auto const options = configs[i].mOptions;
+    auto const config = configs[i];
+    auto const options = config.mOptions;
     auto const tileSize = mOptions.transposeMmaOutput ? options.mTileN : options.mTileM;
     // When we include low-latency kernels we can set transposeMmaOutput via constructor
     if (options.mDtypeA == mOptions.dtypeA && options.mDtypeB == mOptions.dtypeB &&
@@ -100,28 +103,75 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
-        tileSize == mOptions.tileSize &&
-        options.mUseShuffledMatrixA == mOptions.useShuffledMatrixA &&
+        tileSize == mOptions.tileSize && options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
+      if (mOptions.biasType == batchedGemm::gemm::BiasType::None) {
+        // Prevent accidental fallback to MN bias, we should only fallback to M or N cubins
+        if (options.mBiasType == batchedGemm::gemm::BiasType::Mn) continue;
+      }
+
+      // We can pass nullptr bias to get biasType::None for any bias kernel.
+      // Therefore we only need to validate the bias type if bias is enabled
+      if (mOptions.biasType != batchedGemm::gemm::BiasType::None) {
+        if (options.mBiasType != mOptions.biasType) continue;
+        if (options.mFusedBiasShuffleMode != mOptions.fusedBiasShuffleMode) continue;
+        if (options.mBiasDtype != mOptions.biasDtype) continue;
+      }
+      if (mOptions.usePerTokenScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+      }
+      if (mOptions.usePerChannelScaling) {
+        if (options.mTransposeMmaOutput && !options.mUsePerTokenSfA) continue;
+        if (!options.mTransposeMmaOutput && !options.mUsePerTokenSfB) continue;
+      }
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
         }
       }
-
+      if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
+        continue;
+      }
+      // if patchF2fp is enabled, sm100f cubins cannot be used for sm103
+      if (options.mPatchF2fp && sm_version == 103) {
+        if (config.mSm != tg::CudaArch::Sm103a) continue;
+      }
+      if (options.mPatchF2fp && sm_version == 100) {
+        if (config.mSm != tg::CudaArch::Sm100a && config.mSm != tg::CudaArch::Sm100f) continue;
+      }
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
+        // Skip cubins with clusterZ > 1 due to correctness issues described in
+        // https://github.com/flashinfer-ai/flashinfer/issues/3197
+        if (options.mClusterDimZ > 1) continue;
         mPassingConfigIndices.push_back(i);
       }
     }
   }
 
-  FLASHINFER_CHECK(!mPassingConfigIndices.empty(), "No kernel found for the given options");
+  std::ostringstream error_msg;
+  error_msg << "No kernel found for the given options: "
+            << "mDtypeA: " << tg::dtypeToString(mOptions.dtypeA)
+            << ", mDtypeB: " << tg::dtypeToString(mOptions.dtypeB)
+            << ", mDtypeC: " << tg::dtypeToString(mOptions.dtypeC)
+            << ", mUseDeepSeekFp8: " << mOptions.deepSeekFp8
+            << ", mActType: " << (int64_t)mOptions.actType
+            << ", mEltwiseActType: " << (int64_t)mOptions.eltwiseActType
+            << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
+            << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
+            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize
+            << ", mBiasType: " << (int64_t)mOptions.biasType
+            << ", mFusedBiasShuffleMode: " << (int64_t)mOptions.fusedBiasShuffleMode
+            << ", mBiasDtype: " << tg::dtypeToString(mOptions.biasDtype)
+            << ", mUsePerTokenScaling: " << mOptions.usePerTokenScaling
+            << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
+  FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
     int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
   gemmData.mProblemDimensions.mBatchM = !mOptions.transposeMmaOutput;
@@ -135,6 +185,10 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
   auto bmm = BatchedGemmInterface();
 
@@ -152,15 +206,17 @@ void TrtllmGenBatchedGemmRunner::run(
     float const* scaleGateC, float const* ptrBias, float const* ptrAlpha, float const* ptrBeta,
     float const* ptrClampLimit, void* c, void* outSfC, int32_t const* routeMap,
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
-    int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-    CUstream stream, int device, int32_t configIndex, bool enable_pdl) {
+    int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
+    int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
+    int32_t configIndex, bool enable_pdl) {
   auto bmm = BatchedGemmInterface();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
 
   auto const configs = bmm.getBatchedGemmConfigs();
 
   auto const& config = configs[configIndex];
+  // printf("running config %d: %s\n", configIndex, config.mFunctionName);
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
@@ -195,6 +251,9 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
   gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
   gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -205,6 +264,8 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? sfA : sfB;
   gemmData.mInputBuffers.mPtrScaleC = scaleC;
   gemmData.mInputBuffers.mPtrScaleGate = scaleGateC;
+  // For simplicity pass set scaleAct to scaleGateC
+  gemmData.mInputBuffers.mPtrScaleAct = scaleGateC;
   gemmData.mInputBuffers.mPtrPerTokenSfA =
       mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
   gemmData.mInputBuffers.mPtrPerTokenSfB =
@@ -224,6 +285,9 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
   gemmData.mInputBuffers.mPtrNumNonExitingCtas = numNonExitingCtas;
 
+  // Pointer used to gather bias rows when mBiasType == BiasType::Mn
+  gemmData.mInputBuffers.mPtrPermutedIdxToBiasRowIdx = permutedIdxToBiasRowIdx;
+
   // Outputs
   gemmData.mOutputBuffers.mPtrC = c;
   gemmData.mOutputBuffers.mPtrSfC = outSfC;
@@ -234,8 +298,9 @@ void TrtllmGenBatchedGemmRunner::run(
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-  auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
-                           multiProcessorCount, enable_pdl, globalTrtllmGenBatchedGemmModuleCache);
+  auto const err =
+      bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+              enable_pdl, /*pinnedHostBuffer=*/nullptr, globalTrtllmGenBatchedGemmModuleCache);
 
   FLASHINFER_CHECK(err == 0,
                    "Error occurred when running GEMM!"
@@ -257,7 +322,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       /* ptrBeta */ nullptr, /* ptrClampLimit */ nullptr, c, outSfC,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
+      /* numNonExitingCtas */ nullptr, /* permutedIdxToBiasRowIdx */ nullptr, workspace, stream,
+      device, configIndex, enable_pdl);
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -275,7 +341,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       outSfC,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
+      /* numNonExitingCtas */ nullptr, /* permutedIdxToBiasRowIdx */ nullptr, workspace, stream,
+      device, configIndex, enable_pdl);
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -292,7 +359,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
       /* outSfC */ nullptr,
       /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
       /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
-      /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex, enable_pdl);
+      /* numNonExitingCtas */ nullptr, /* permutedIdxToBiasRowIdx */ nullptr, workspace, stream,
+      device, configIndex, enable_pdl);
 }
 
 std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
@@ -303,7 +371,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
 
   int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -318,6 +386,10 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
   auto cmpFunc = [&configs, &gemmData, &bmm, &multiProcessorCount](int64_t idx0, int64_t idx1) {
     auto const& optionsA = configs[idx0].mOptions;
@@ -367,6 +439,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
 
     return false;
   };
+
   // Sort configs by options.
   std::vector<int64_t> sortedIndices = mPassingConfigIndices;
   std::sort(sortedIndices.begin(), sortedIndices.end(), cmpFunc);
@@ -378,8 +451,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   // Filter out invalid configs.
   std::vector<int64_t> validConfigIndices;
   for (auto const& configIndex : prioritizedIndices) {
-    auto const& config = configs[configIndex];
-    auto isValidConfig = bmm.isValidConfig(config, gemmData);
+    auto isValidConfig = bmm.isValidConfig(configs[configIndex], gemmData);
     if (isValidConfig) {
       validConfigIndices.push_back(configIndex);
     }
@@ -408,7 +480,7 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const bmm = BatchedGemmInterface();
   auto const configs = bmm.getBatchedGemmConfigs();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -420,9 +492,15 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
   gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
   gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
   auto const& config = configs[configIndex];
 

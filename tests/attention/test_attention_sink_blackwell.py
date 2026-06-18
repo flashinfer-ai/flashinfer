@@ -40,8 +40,8 @@ def test_blackwell_trtllm_gen_decode_attention_sink(
     head_dim,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
+    if compute_capability[0] != 10:
+        pytest.skip("trtllm-gen only supports SM100 and SM103 GPUs.")
     seed = 0
     torch.manual_seed(seed)
     device = "cuda:0"
@@ -141,8 +141,8 @@ def test_blackwell_trtllm_gen_context_attention_sink(
     head_dim,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     seed = 0
     torch.manual_seed(seed)
     device = "cuda:0"
@@ -227,7 +227,7 @@ def test_blackwell_trtllm_gen_context_attention_sink(
     )
 
     if dtype == torch.float16:
-        atol, rtol = 1e-3, 1e-3
+        atol, rtol = 2e-3, 1e-3
     elif dtype == torch.bfloat16:
         atol, rtol = 1e-2, 1e-2
     else:

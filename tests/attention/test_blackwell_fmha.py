@@ -347,38 +347,183 @@ def test_blackwell_cutlass_qo_kv_varlen(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 9, 12])
+@pytest.mark.parametrize("qo_len", [177, 377])
+@pytest.mark.parametrize("kv_len", [544, 977])
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads",
+    [
+        (128, 128),  # DeepSeek-R1 MHA (Multi-head Attention for Prefill)
+    ],
+)
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo,sm_scale",
+    [
+        (
+            192,
+            128,
+            1.0 / math.sqrt(192),
+        ),  # DeepSeek-R1: qk_nope(128) + qk_rope(64) = 192, v=128
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_blackwell_cutlass_fmha_fp8(
+    batch_size,
+    qo_len,
+    kv_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    sm_scale,
+    causal,
+):
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+
+    if not is_sm100a_supported(torch.device("cuda")) and not is_sm110a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("only SM100A and SM110A are supported on this device")
+
+    torch.manual_seed(42)
+    dtype_in = torch.float8_e4m3fn
+    dtype_out = torch.bfloat16
+
+    # Create FP8 tensors by generating half precision then converting
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim_qk, dtype=torch.half, device="cuda"
+    ).to(dtype_in)
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    k = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim_qk, dtype=torch.half, device="cuda"
+    ).to(dtype_in)
+    v = torch.randn(
+        batch_size * kv_len, num_kv_heads, head_dim_vo, dtype=torch.half, device="cuda"
+    ).to(dtype_in)
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    )
+
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout="NHD",
+        backend="cutlass",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=dtype_in,
+        kv_data_type=dtype_in,
+        o_data_type=dtype_out,
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    # Verify output is bfloat16
+    assert o.dtype == dtype_out, f"Expected output dtype {dtype_out}, got {o.dtype}"
+
+    gqa_group_ratio = num_qo_heads // num_kv_heads
+    k_repeated = torch.repeat_interleave(k, gqa_group_ratio, dim=1)
+    v_repeated = torch.repeat_interleave(v, gqa_group_ratio, dim=1)
+
+    # Reference implementation with FP8 inputs, upcast to float32, output as bfloat16
+    qo_len_ref = q.shape[0] // batch_size
+    kv_len_ref = k_repeated.shape[0] // batch_size
+    num_qo_heads_ref = q.shape[1]
+    head_dim_qk_ref = q.shape[2]
+    head_dim_vo_ref = v_repeated.shape[2]
+
+    logits = (
+        torch.einsum(
+            "bmhd,bnhd->bhmn",
+            q.view(batch_size, qo_len_ref, num_qo_heads_ref, head_dim_qk_ref).float(),
+            k_repeated.view(
+                batch_size, kv_len_ref, num_qo_heads_ref, head_dim_qk_ref
+            ).float(),
+        )
+        * sm_scale
+    )
+
+    if causal:
+        mask = torch.arange(
+            kv_len_ref - qo_len_ref, kv_len_ref, device=q.device
+        ).unsqueeze(1) >= torch.arange(0, kv_len_ref, device=q.device).unsqueeze(0)
+    else:
+        mask = torch.ones(qo_len_ref, kv_len_ref, device=q.device)
+
+    logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+    lse_ref = torch.logsumexp(logits, -1).transpose(-1, -2)
+    p = torch.softmax(logits, dim=-1)
+    o_ref = (
+        torch.einsum(
+            "bhmn,bnhd->bmhd",
+            p,
+            v_repeated.view(
+                batch_size, kv_len_ref, num_qo_heads_ref, head_dim_vo_ref
+            ).float(),
+        )
+        .contiguous()
+        .view(batch_size * qo_len_ref, num_qo_heads_ref, head_dim_vo_ref)
+        .to(dtype_out)  # Convert to bfloat16 for FP8 output
+    )
+    lse_ref = (lse_ref * math.log2(math.e)).flatten(0, 1)
+
+    # FP8 has lower precision, use relaxed tolerances
+    torch.testing.assert_close(o, o_ref, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
-    test_blackwell_cutlass_fmha(
-        9,
-        377,
-        977,
-        1,
-        1,
-        192,
-        128,
-        1,
-        False,
-        torch.bfloat16,
+    test_blackwell_cutlass_fmha_fp8(
+        batch_size=9,
+        qo_len=377,
+        kv_len=977,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        sm_scale=1,
+        causal=False,
     )
+    # test_blackwell_cutlass_fmha(
+    #     9,
+    #     377,
+    #     977,
+    #     1,
+    #     1,
+    #     192,
+    #     128,
+    #     1,
+    #     False,
+    #     torch.bfloat16,
+    # )
 
-    test_blackwell_cutlass_varlen(
-        [0, 1274, 2568, 3915, 5194, 6498, 7839, 8192],
-        32,
-        4,
-        128,
-        128,
-        1,
-        True,
-        torch.bfloat16,
-    )
+    # test_blackwell_cutlass_varlen(
+    #     [0, 1274, 2568, 3915, 5194, 6498, 7839, 8192],
+    #     32,
+    #     4,
+    #     128,
+    #     128,
+    #     1,
+    #     True,
+    #     torch.bfloat16,
+    # )
 
-    test_blackwell_cutlass_qo_kv_varlen(
-        [0, 10, 20, 30, 40, 50, 60, 100],
-        [0, 50, 50, 50, 50, 50, 50, 50],
-        32,
-        8,
-        128,
-        128,
-        1,
-        torch.bfloat16,
-    )
+    # test_blackwell_cutlass_qo_kv_varlen(
+    #     [0, 10, 20, 30, 40, 50, 60, 100],
+    #     [0, 50, 50, 50, 50, 50, 50, 50],
+    #     32,
+    #     8,
+    #     128,
+    #     128,
+    #     1,
+    #     torch.bfloat16,
+    # )

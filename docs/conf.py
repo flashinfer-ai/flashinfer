@@ -24,7 +24,7 @@ autodoc_mock_imports = [
 
 project = "FlashInfer"
 author = "FlashInfer Contributors"
-copyright = f"2023-2025, {author}"
+copyright = f"2023-2026, {author}"
 
 version = flashinfer.__version__
 release = flashinfer.__version__
@@ -38,6 +38,7 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.autosummary",
     "sphinx.ext.mathjax",
+    "sphinx_gallery.gen_gallery",
 ]
 
 autodoc_default_flags = ["members"]
@@ -47,10 +48,23 @@ source_suffix = [".rst"]
 
 language = "en"
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "tutorials/jax_tvm_ffi/README.rst",
+]
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = "sphinx"
+
+sphinx_gallery_conf = {
+    "examples_dirs": "tutorials/jax_tvm_ffi",
+    "gallery_dirs": "tutorials/generated/jax_tvm_ffi",
+    "filename_pattern": r".*\.py",
+    "plot_gallery": "False",
+    "download_all_examples": False,
+}
 
 # A list of ignored prefixes for module index sorting.
 # If true, `todo` and `todoList` produce output, else they produce nothing.

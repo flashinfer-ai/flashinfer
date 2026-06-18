@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "requests", "filelock", "torch", "tqdm", "numpy", "apache-tvm-ffi==0.1.0b15"]
+requires = ["setuptools>=61.0", "wheel", "requests", "filelock", "torch", "tqdm", "numpy", "apache-tvm-ffi>=0.1,<0.2", "nvidia-ml-py"]
 build-backend = "build_backend"
 backend-path = ["."]
 

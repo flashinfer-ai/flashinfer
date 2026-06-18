@@ -31,6 +31,7 @@
 #include "../../exception.h"
 // #include <tensorrt_llm/common/assert.h>
 #include "flashinfer/trtllm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 
 namespace moe::dev {
 
@@ -89,64 +90,68 @@ namespace moe::dev {
     FLASHINFER_WARN("Unsupported dtypeElt");                                                       \
   }
 
-#define LAUNCH_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream)                         \
-  if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                   \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float), kernel, numBlocks, numThreads,     \
-               smemSize, stream);                                                                  \
-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {            \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, float), kernel, numBlocks,           \
-               numThreads, smemSize, stream);                                                      \
-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {        \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, float), kernel, numBlocks, numThreads, \
-               smemSize, stream);                                                                  \
-  } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {        \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t), kernel, numBlocks,   \
-               numThreads, smemSize, stream);                                                      \
-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {        \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t), kernel,        \
-               numBlocks, numThreads, smemSize, stream);                                           \
-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {    \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t), kernel,          \
-               numBlocks, numThreads, smemSize, stream);                                           \
+#define LAUNCH_NUM_TOKENS_PER_CTA(data, type, numTokensPerCta, kernel, numBlocks, numThreads,      \
+                                  smemSize, stream)                                                \
+  if (numTokensPerCta == 4) {                                                                      \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(type, 4), kernel, numBlocks, numThreads, smemSize, stream); \
+  } else if (numTokensPerCta == 2) {                                                               \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(type, 2), kernel, numBlocks, numThreads, smemSize, stream); \
+  } else if (numTokensPerCta == 1) {                                                               \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(type, 1), kernel, numBlocks, numThreads, smemSize, stream); \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported pair");                                                           \
+    FLASHINFER_WARN("Unsupported numTokensPerCta");                                                \
   }
 
-#define LAUNCH_ROUTING(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)     \
-  if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                   \
-    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, float), kernel, numBlocks, numThreads,     \
-               smemSize, stream);                                                             \
-  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                        \
-    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16), kernel, numBlocks, \
-               numThreads, smemSize, stream);                                                 \
-  } else {                                                                                    \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                 \
+#define LAUNCH_ACTIVATION(data, kernel, numTokensPerCta, numBlocks, numThreads, smemSize, stream) \
+  if (data.mDtypeElt == tg::Dtype::Fp16) {                                                        \
+    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::half_t, numTokensPerCta, kernel, numBlocks,          \
+                              numThreads, smemSize, stream);                                      \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3) {                                                 \
+    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::float_e4m3_t, numTokensPerCta, kernel, numBlocks,    \
+                              numThreads, smemSize, stream);                                      \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                             \
+    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::bfloat16_t, numTokensPerCta, kernel, numBlocks,      \
+                              numThreads, smemSize, stream);                                      \
+  } else {                                                                                        \
+    FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
   }
 
-#define LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
-                                       stream, extraFlag, forceFloatInput)                        \
-  if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag) {                                          \
-    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, float, true), kernel, numBlocks, numThreads,   \
-               smemSize, stream);                                                                 \
-  } else if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                \
-    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, float, false), kernel, numBlocks, numThreads,  \
-               smemSize, stream);                                                                 \
-  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag && forceFloatInput) {            \
-    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, true), kernel, numBlocks,       \
+#define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                  \
+  if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                  \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float, topK), kernel, numBlocks,          \
                numThreads, smemSize, stream);                                                     \
-  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && extraFlag) {                               \
-    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, true), kernel,          \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {           \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, float, topK), kernel, numBlocks,    \
+               numThreads, smemSize, stream);                                                     \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {       \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, float, topK), kernel, numBlocks,      \
+               numThreads, smemSize, stream);                                                     \
+  } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t, topK), kernel,       \
                numBlocks, numThreads, smemSize, stream);                                          \
-  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16 && forceFloatInput) {                         \
-    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, false), kernel, numBlocks,      \
-               numThreads, smemSize, stream);                                                     \
-  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
-    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, false), kernel,         \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t, topK), kernel, \
+               numBlocks, numThreads, smemSize, stream);                                          \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {   \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t, topK), kernel,   \
                numBlocks, numThreads, smemSize, stream);                                          \
   } else {                                                                                        \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                     \
+    FLASHINFER_WARN("Unsupported pair");                                                          \
   }
 
+#define LAUNCH_TOPK_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream) \
+  if (data.topK % 4 == 0) {                                                     \
+    LAUNCH_EXPW(data, kernel, 4, numBlocks, numThreads, smemSize, stream);      \
+  } else if (data.topK % 2 == 0) {                                              \
+    LAUNCH_EXPW(data, kernel, 2, numBlocks, numThreads, smemSize, stream);      \
+  } else {                                                                      \
+    LAUNCH_EXPW(data, kernel, 1, numBlocks, numThreads, smemSize, stream);      \
+  }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NOTE: Old routing-specific macros (LAUNCH_TILEN, LAUNCH_ROUTING_LLAMA4,
+// LAUNCH_ROUTING_DEEPSEEK_*, LAUNCH_ROUTING_WITH_NUM_EXPERTS) have been moved to
+// RoutingDevKernel.h which uses the new template signature with runtime isPow2/UsePdl.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace activation {
@@ -175,9 +180,10 @@ struct Data {
   int32_t const* totalNumPaddedTokens;
 };
 
-template <typename Type_, bool UsePdl_>
+template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
 struct KernelParams {
   using Type = Type_;
+  static constexpr int32_t NumTokensPerCta = NumTokensPerCta_;
   static constexpr bool UsePdl = UsePdl_;
 
   Type const* inPtr;
@@ -367,10 +373,11 @@ struct Data {
   int32_t const* totalNumPaddedTokens;
 };
 
-template <typename Type_, typename TypeExpW_, bool UsePdl_>
+template <typename Type_, typename TypeExpW_, int TopKUnrollFactor_, bool UsePdl_>
 struct KernelParams {
   using Type = Type_;
   using TypeExpW = TypeExpW_;
+  static constexpr int TopKUnrollFactor = TopKUnrollFactor_;
   static constexpr bool UsePdl = UsePdl_;
 
   Type const* inPtr;

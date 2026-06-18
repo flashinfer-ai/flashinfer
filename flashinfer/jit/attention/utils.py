@@ -30,11 +30,14 @@ def generate_additional_params(
             for dtype, var in zip(
                 additional_tensor_dtypes,
                 additional_tensor_names,
+                strict=True,
             )
         ]
         + [
             f"{dtype} {var};\n"
-            for dtype, var in zip(additional_scalar_dtypes, additional_scalar_names)
+            for dtype, var in zip(
+                additional_scalar_dtypes, additional_scalar_names, strict=True
+            )
         ]
     )
     additional_func_params = "".join(
@@ -48,18 +51,22 @@ def generate_additional_params(
         ]
         + [
             f", {dtype} {var}"
-            for dtype, var in zip(additional_scalar_dtypes, additional_scalar_names)
+            for dtype, var in zip(
+                additional_scalar_dtypes, additional_scalar_names, strict=True
+            )
         ]
     )
     if is_sm90_template:
         additional_params_setter = " \\\n".join(
             [
                 (
-                    f"params.additional_params.{var} = {var} ? static_cast<{dtype}*>({var}.value()->data): nullptr;"
+                    f"params.additional_params.{var} = {var} ? static_cast<{dtype}*>({var}.value().data_ptr()): nullptr;"
                     if var.startswith("maybe")
-                    else f"params.additional_params.{var} = static_cast<{dtype}*>({var}->data);"
+                    else f"params.additional_params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
                 )
-                for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
+                for dtype, var in zip(
+                    additional_tensor_dtypes, additional_tensor_names, strict=True
+                )
             ]
             + [
                 f"params.additional_params.{var} = {var};"
@@ -70,11 +77,13 @@ def generate_additional_params(
         additional_params_setter = " \\\n".join(
             [
                 (
-                    f"params.{var} = {var} ? static_cast<{dtype}*>({var}.value()->data): nullptr;"
+                    f"params.{var} = {var} ? static_cast<{dtype}*>({var}.value().data_ptr()): nullptr;"
                     if var.startswith("maybe")
-                    else f"params.{var} = static_cast<{dtype}*>({var}->data);"
+                    else f"params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
                 )
-                for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
+                for dtype, var in zip(
+                    additional_tensor_dtypes, additional_tensor_names, strict=True
+                )
             ]
             + [f"params.{var} = {var};" for var in additional_scalar_names]
         )

@@ -42,6 +42,7 @@ from .attention import (
     gen_customize_single_prefill_module as gen_customize_single_prefill_module,
 )
 from .attention import gen_fmha_cutlass_sm100a_module as gen_fmha_cutlass_sm100a_module
+from .attention import gen_batch_pod_module as gen_batch_pod_module
 from .attention import gen_pod_module as gen_pod_module
 from .attention import gen_single_decode_module as gen_single_decode_module
 from .attention import gen_single_prefill_module as gen_single_prefill_module
@@ -54,6 +55,10 @@ from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
 from .attention import gen_trtllm_gen_fmha_module as gen_trtllm_gen_fmha_module
+from .attention import gen_fmha_v2_module as gen_fmha_v2_module
+from .attention import (
+    gen_trtllm_fmha_v2_sm120_module as gen_trtllm_fmha_v2_sm120_module,
+)
 from .core import JitSpec as JitSpec
 from .core import JitSpecStatus as JitSpecStatus
 from .core import JitSpecRegistry as JitSpecRegistry
@@ -68,6 +73,7 @@ from .core import sm100f_nvcc_flags as sm100f_nvcc_flags
 from .core import sm103a_nvcc_flags as sm103a_nvcc_flags
 from .core import sm110a_nvcc_flags as sm110a_nvcc_flags
 from .core import sm120a_nvcc_flags as sm120a_nvcc_flags
+from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
 from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
@@ -75,7 +81,27 @@ from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
-from .comm import gen_nvshmem_module as gen_nvshmem_module
+from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
+from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
+from .dsv3_optimizations import (
+    gen_dsv3_router_gemm_module as gen_dsv3_router_gemm_module,
+)
+from .dsv3_optimizations import (
+    gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
+)
+from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
+from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
+from .fp4_kv_dequantization import (
+    gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
+)
+from .fp4_kv_quantization import (
+    gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
+)
+from .nvfp4_attention_sm120 import (
+    gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
+)
+from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
+from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
 
 
 cuda_lib_path = os.environ.get(

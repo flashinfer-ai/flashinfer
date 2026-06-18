@@ -116,15 +116,15 @@ void tgv_gemm_impl(input_type* mat1_ptr, input_type* mat2_ptr, output_type* outp
 
 }  // namespace
 
-Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, int64_t tactic,
-                bool pdl) {
+void tgv_gemm(TensorView mat1, TensorView mat2, Optional<TensorView> bias, int64_t tactic,
+              TensorView out, bool pdl) {
   // Input validation
-  TVM_FFI_ICHECK_EQ(mat1->device.device_type, kDLCUDA) << "mat1 tensor must be on CUDA";
-  TVM_FFI_ICHECK_EQ(mat2->device.device_type, kDLCUDA) << "mat2 tensor must be on CUDA";
-  TVM_FFI_ICHECK_EQ(mat1->ndim, 2) << "mat1 tensor must be 2D (M, K)";
-  TVM_FFI_ICHECK_EQ(mat2->ndim, 2) << "mat2 tensor must be 2D (K, N)";
-  TVM_FFI_ICHECK_EQ(mat1->shape[1], mat2->shape[0]) << "mat1.K must match mat2.K";
-  TVM_FFI_ICHECK_EQ(mat1->dtype, mat2->dtype) << "mat1 and mat2 must have the same dtype";
+  TVM_FFI_ICHECK_EQ(mat1.device().device_type, kDLCUDA) << "mat1 tensor must be on CUDA";
+  TVM_FFI_ICHECK_EQ(mat2.device().device_type, kDLCUDA) << "mat2 tensor must be on CUDA";
+  TVM_FFI_ICHECK_EQ(mat1.ndim(), 2) << "mat1 tensor must be 2D (M, K)";
+  TVM_FFI_ICHECK_EQ(mat2.ndim(), 2) << "mat2 tensor must be 2D (K, N)";
+  TVM_FFI_ICHECK_EQ(mat1.size(1), mat2.size(0)) << "mat1.K must match mat2.K";
+  TVM_FFI_ICHECK_EQ(mat1.dtype(), mat2.dtype()) << "mat1 and mat2 must have the same dtype";
 
   // No heuristic for now, we use 64x8 with 8 DMA stages as the default tactic.
   if (tactic == -1) {
@@ -144,9 +144,9 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, i
   TVM_FFI_ICHECK(cta_m == 64 || cta_m == 128) << "cta_m must be one of: 64, 128";
 
   // Get dimensions
-  int M = mat1->shape[0];
-  int K = mat1->shape[1];
-  int N = mat2->shape[1];
+  int M = mat1.size(0);
+  int K = mat1.size(1);
+  int N = mat2.size(1);
 
   int64_t element_size = get_element_size(mat1);
   TVM_FFI_ICHECK(int64_t(M) * N * element_size < std::numeric_limits<int32_t>::max())
@@ -158,44 +158,46 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, i
 
   // validity check for bias
   if (bias.has_value()) {
-    TVM_FFI_ICHECK_EQ(bias.value()->device.device_type, kDLCUDA) << "Bias tensor must be on CUDA";
-    TVM_FFI_ICHECK_EQ(bias.value()->ndim, 1) << "Bias tensor must be 1D (M,)";
-    TVM_FFI_ICHECK_EQ(bias.value()->shape[0], M) << "Bias tensor must have M elements";
-    TVM_FFI_ICHECK_EQ(bias.value()->dtype, mat1->dtype)
+    TVM_FFI_ICHECK_EQ(bias.value().device().device_type, kDLCUDA) << "Bias tensor must be on CUDA";
+    TVM_FFI_ICHECK_EQ(bias.value().ndim(), 1) << "Bias tensor must be 1D (M,)";
+    TVM_FFI_ICHECK_EQ(bias.value().size(0), M) << "Bias tensor must have M elements";
+    TVM_FFI_ICHECK_EQ(bias.value().dtype(), mat1.dtype())
         << "Bias tensor must have the same dtype as input matrices";
-    TVM_FFI_ICHECK_EQ(bias.value()->strides[0], 1) << "Bias tensor must be M contiguous";
+    TVM_FFI_ICHECK_EQ(bias.value().stride(0), 1) << "Bias tensor must be M contiguous";
   }
 
   // Create output tensor [N, M] row major
-  Tensor C = alloc_tensor({N, M}, mat1->dtype, mat1->device);
+  TVM_FFI_ICHECK_EQ(out.size(0), N);
+  TVM_FFI_ICHECK_EQ(out.size(1), M);
+  TVM_FFI_ICHECK_EQ(out.dtype(), mat1.dtype());
 
   // manually calculate the L stride
   // A [M, K] row major
-  int stride_A_M = mat1->strides[0];
-  int stride_A_K = mat1->strides[1];
+  int stride_A_M = mat1.stride(0);
+  int stride_A_K = mat1.stride(1);
   int stride_A_L = M * K;
   // B [K, N] column major
-  int stride_B_N = mat2->strides[1];
-  int stride_B_K = mat2->strides[0];
+  int stride_B_N = mat2.stride(1);
+  int stride_B_K = mat2.stride(0);
   int stride_B_L = N * K;
   // original C [N, M] row major
-  int stride_C_M = C->strides[1];
-  int stride_C_N = C->strides[0];
+  int stride_C_M = out.stride(1);
+  int stride_C_N = out.stride(0);
   int stride_C_L = M * N;
 
   // Get CUDA stream
-  cudaStream_t stream = get_stream(C->device);
+  cudaStream_t stream = get_stream(out.device());
 
   // Dispatch based on dtype
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(mat1->dtype, c_type, [&] {
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(mat1.dtype(), c_type, [&] {
     using cutlass_input_type = flashinfer::cutlass_dtype_t<c_type>;
     using cutlass_output_type = flashinfer::cutlass_dtype_t<c_type>;
 
-    cutlass_input_type* mat1_ptr = static_cast<cutlass_input_type*>(mat1->data);
-    cutlass_input_type* mat2_ptr = static_cast<cutlass_input_type*>(mat2->data);
-    cutlass_output_type* output_ptr = static_cast<cutlass_output_type*>(C->data);
+    cutlass_input_type* mat1_ptr = static_cast<cutlass_input_type*>(mat1.data_ptr());
+    cutlass_input_type* mat2_ptr = static_cast<cutlass_input_type*>(mat2.data_ptr());
+    cutlass_output_type* output_ptr = static_cast<cutlass_output_type*>(out.data_ptr());
     cutlass_output_type* bias_ptr =
-        bias.has_value() ? static_cast<cutlass_output_type*>(bias.value()->data) : nullptr;
+        bias.has_value() ? static_cast<cutlass_output_type*>(bias.value().data_ptr()) : nullptr;
 
     tgv_gemm_impl<cutlass_input_type, cutlass_output_type>(
         mat1_ptr, mat2_ptr, output_ptr, bias_ptr, M, N, K, stride_A_M, stride_A_K, stride_A_L,
@@ -203,22 +205,15 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, i
         dma_stage, pdl, stream);
     return true;
   });
-
-  // original C is [N, M] row major
-  // after transpose, it's [M, N] column major
-  // the storage is unchanged, only the logical coordinates are changed
-  std::swap(C->shape[0], C->shape[1]);
-  std::swap(C->strides[0], C->strides[1]);
-  return C;
 }
 
 // Keep backward compatibility functions
-Tensor bf16_gemm(Tensor const& mat1, Tensor const& mat2, std::optional<Tensor> bias, int64_t tactic,
-                 bool pdl) {
+void bf16_gemm(TensorView mat1, TensorView mat2, std::optional<TensorView> bias, int64_t tactic,
+               TensorView out, bool pdl) {
   // Check that inputs are bfloat16 for backward compatibility
-  TVM_FFI_ICHECK_EQ(mat1->dtype, dl_bfloat16) << "mat1 tensor must be bfloat16";
-  TVM_FFI_ICHECK_EQ(mat2->dtype, dl_bfloat16) << "mat2 tensor must be bfloat16";
-  return tgv_gemm(mat1, mat2, bias, tactic, pdl);
+  TVM_FFI_ICHECK_EQ(mat1.dtype(), dl_bfloat16) << "mat1 tensor must be bfloat16";
+  TVM_FFI_ICHECK_EQ(mat2.dtype(), dl_bfloat16) << "mat2 tensor must be bfloat16";
+  tgv_gemm(mat1, mat2, bias, tactic, out, pdl);
 }
 
 int64_t tgv_gemm_tactic_num() {

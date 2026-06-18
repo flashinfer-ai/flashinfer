@@ -18,7 +18,10 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing.utils import (
+    bench_gpu_time,
+    attention_tflops_per_sec_with_actual_seq_lens,
+)
 
 
 def bench_single_prefill(seq_len, num_heads, causal, head_dim):
@@ -41,10 +44,15 @@ def bench_single_prefill(seq_len, num_heads, causal, head_dim):
     )
 
     def flops(ms):
-        if causal:
-            return seq_len * seq_len * num_qo_heads * head_dim * 2 / ms / 1e9
-        else:
-            return seq_len * seq_len * num_qo_heads * head_dim * 4 / ms / 1e9
+        return attention_tflops_per_sec_with_actual_seq_lens(
+            torch.tensor([seq_len]),
+            torch.tensor([seq_len]),
+            head_dim,
+            head_dim,
+            num_qo_heads,
+            causal,
+            ms,
+        )
 
     print(
         f"bench_single_prefill (seq_len={seq_len}, num_heads={num_heads}, causal={causal}, head_dim={head_dim}), fa2-template: {flops(sm80_ms):.3f} TFLOPs/s, fa3-template: {flops(sm90_ms):.3f} TFLOPs/s"
@@ -97,14 +105,15 @@ def bench_batch_ragged_prefill(batch_size, num_heads, seq_len, causal, head_dim)
     )
 
     def flops(ms):
-        if causal:
-            return (
-                batch_size * seq_len * seq_len * num_qo_heads * head_dim * 2 / ms / 1e9
-            )
-        else:
-            return (
-                batch_size * seq_len * seq_len * num_qo_heads * head_dim * 4 / ms / 1e9
-            )
+        return attention_tflops_per_sec_with_actual_seq_lens(
+            torch.full((batch_size,), seq_len),
+            torch.full((batch_size,), seq_len),
+            head_dim,
+            head_dim,
+            num_qo_heads,
+            causal,
+            ms,
+        )
 
     print(
         f"bench_batch_ragged_prefill (batch_size={batch_size}, num_heads={num_heads}, seq_len={seq_len}, causal={causal}, head_dim={head_dim}), fa2-template: {flops(sm80_ms):.3f} TFLOPs/s, fa3-template: {flops(sm90_ms):.3f} TFLOPs/s"
@@ -176,14 +185,15 @@ def bench_batch_paged_prefill(
     )
 
     def flops(ms):
-        if causal:
-            return (
-                batch_size * seq_len * seq_len * num_qo_heads * head_dim * 2 / ms / 1e9
-            )
-        else:
-            return (
-                batch_size * seq_len * seq_len * num_qo_heads * head_dim * 4 / ms / 1e9
-            )
+        return attention_tflops_per_sec_with_actual_seq_lens(
+            torch.full((batch_size,), seq_len),
+            torch.full((batch_size,), seq_len),
+            head_dim,
+            head_dim,
+            num_qo_heads,
+            causal,
+            ms,
+        )
 
     print(
         f"bench_batch_paged_prefill (page_size={page_size} batch_size={batch_size}, num_heads={num_heads}, seq_len={seq_len}, causal={causal}, head_dim={head_dim}), fa2-template: {flops(sm80_ms):.3f} TFLOPs/s, fa3-template: {flops(sm90_ms):.3f} TFLOPs/s"

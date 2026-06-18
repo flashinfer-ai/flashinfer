@@ -46,7 +46,7 @@ Types and Enums
     AllReduceFusionPattern
     AllReduceStrategyConfig
     AllReduceStrategyType
-    FP4QuantizationSFLayout
+    QuantizationSFLayout
 
 Core Operations
 ~~~~~~~~~~~~~~~
@@ -80,6 +80,18 @@ Initialization and Utilities
     trtllm_lamport_initialize_all
     compute_fp4_swizzled_layout_sf_size
 
+Unified AllReduce Fusion API
+----------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    allreduce_fusion
+    create_allreduce_fusion_workspace
+    AllReduceFusionWorkspace
+    TRTLLMAllReduceFusionWorkspace
+    MNNVLAllReduceFusionWorkspace
+
 vLLM AllReduce
 --------------
 
@@ -108,15 +120,6 @@ Core Classes
     MnnvlMemory
     McastGPUBuffer
 
-Utility Functions
-~~~~~~~~~~~~~~~~~
-
-.. autosummary::
-    :toctree: ../generated
-
-    create_tensor_from_cuda_memory
-    alloc_and_copy_to_cuda
-
 TensorRT-LLM MNNVL AllReduce
 ----------------------------
 
@@ -126,5 +129,56 @@ TensorRT-LLM MNNVL AllReduce
     :toctree: ../generated
 
     trtllm_mnnvl_all_reduce
+    trtllm_mnnvl_allreduce
+    trtllm_mnnvl_fused_allreduce_add_rmsnorm
+    trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
     trtllm_mnnvl_fused_allreduce_rmsnorm
     mpi_barrier
+
+MNNVL A2A (Throughput Backend)
+-------------------------------
+
+.. currentmodule:: flashinfer.comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    moe_a2a_initialize
+    moe_a2a_dispatch
+    moe_a2a_combine
+    moe_a2a_sanitize_expert_ids
+    moe_a2a_get_workspace_size_per_rank
+    moe_a2a_wrap_payload_tensor_in_workspace
+
+.. autoclass:: MoeAlltoAll
+    :members:
+    :inherited-members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+DCP All-to-All (Context-Parallel Attention Reduction)
+-----------------------------------------------------
+
+.. currentmodule:: flashinfer.comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    decode_cp_a2a_workspace_size
+    decode_cp_a2a_allocate_mnnvl_workspace
+    decode_cp_a2a_init_workspace
+    decode_cp_a2a_alltoall
+
+Mixed Communication
+-------------------
+
+.. currentmodule:: flashinfer.comm.mixed_comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    MixedCommOp
+    MixedCommMode
+    MixedCommHandler
+    run_mixed_comm

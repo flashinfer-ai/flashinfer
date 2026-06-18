@@ -142,15 +142,17 @@ struct OnlineSoftmaxWithSink {
 struct AttentionSink : AttentionVariantBase {
   float sm_scale_log2;
   float log_sink;
+  float scale_pv;
   int qo_len, kv_len;
 
   // Init
   template <typename MainloopParams, typename BlockCoord>
   __device__ __host__ AttentionSink(const MainloopParams& params, const BlockCoord& block_coord) {
     sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
-    auto [_, qo_head_idx, __, ___, ____, qo_len_, kv_len_, batch_idx] =
+    auto [_, qo_head_idx, kv_head_idx, ___, ____, qo_len_, kv_len_, batch_idx] =
         block_coord;
     log_sink = params.additional_params.sink[qo_head_idx] * math::log2e;
+    scale_pv = get_v_scale(params.additional_params, kv_head_idx);
 
     qo_len = qo_len_;
     kv_len = kv_len_;

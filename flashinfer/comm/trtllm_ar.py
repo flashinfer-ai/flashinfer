@@ -19,14 +19,19 @@ import logging
 from ctypes import c_void_p, cast
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
+from typing_extensions import deprecated
 
+from flashinfer.comm.mnnvl import CommBackend, SymmDeviceMemory, TorchDistBackend
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from ..jit.comm import gen_trtllm_comm_module
 from ..utils import register_custom_op, round_up
-from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
+
+logger = logging.getLogger(__name__)
+from .cuda_ipc import cudart
+from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
 
 class AllReduceStrategyType:
@@ -74,6 +79,18 @@ class AllReduceFusionPattern:
     kARResidualRMSNormOutFP8Quant = 4
     # All-reduce followed by residual add, RMS norm and FP4 quantization, with norm output
     kARResidualRMSNormOutFP4Quant = 5
+    # MoE reduction + all-reduce + residual add + RMS norm (+ optional quantization)
+    # Fuses expert weighted reduction with allreduce and norm in a single kernel.
+    kMoEReductionARResidualRMSNorm = 6
+    # MoE finalize + all-reduce + residual add + RMS norm
+    # Fuses top-k expert gather/scale with allreduce and norm in a single kernel.
+    # Supports shared expert output addition (e.g. DeepSeek architecture).
+    kMoEFinalizeARResidualRMSNorm = 7
+    # All-reduce followed by residual add, RMS norm and per-token-group FP8 quantization
+    # with UE8M0 packed scales
+    kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8
+    # Same as kARResidualRMSNormPerTokenGroupFP8PackedQuant, with norm output
+    kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9
 
 
 class QuantizationSFLayout:
@@ -121,6 +138,9 @@ def get_trtllm_comm_module():
             buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype
         )
 
+    @deprecated(
+        "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
+    )
     @register_custom_op(
         "flashinfer::trtllm_custom_all_reduce",
         mutates_args=[
@@ -221,6 +241,7 @@ def get_trtllm_comm_module():
             "rms_eps",
             "scale_factor",
             "layout_code",
+            "block_quant_group_size",
         ],
     )
     def trtllm_allreduce_fusion(
@@ -245,6 +266,8 @@ def get_trtllm_comm_module():
         rms_eps: Optional[float],
         scale_factor: Optional[Union[torch.Tensor, float]],
         layout_code: Optional[QuantizationSFLayout],
+        block_quant_group_size: Optional[int] = None,
+        weight_bias: Optional[float] = None,
     ) -> None:
         module.trtllm_allreduce_fusion(
             allreduce_in,
@@ -268,6 +291,8 @@ def get_trtllm_comm_module():
             rms_eps,
             scale_factor,
             layout_code,
+            block_quant_group_size,
+            weight_bias,
         )
 
     @register_custom_op(
@@ -317,6 +342,7 @@ def get_trtllm_comm_module():
         norm_out: Optional[torch.Tensor],
         quant_out: Optional[torch.Tensor],
         scale_out: Optional[torch.Tensor],
+        weight_bias: Optional[float] = None,
     ) -> None:
         module.trtllm_moe_allreduce_fusion(
             world_size,
@@ -339,19 +365,22 @@ def get_trtllm_comm_module():
             norm_out,
             quant_out,
             scale_out,
+            weight_bias,
         )
 
     @register_custom_op(
         "flashinfer::trtllm_moe_finalize_allreduce_fusion",
-        mutates_args=["residual_out", "norm_out"],
+        mutates_args=["residual_out", "norm_out", "quant_out", "scale_out"],
     )
     def trtllm_moe_finalize_allreduce_fusion(
         allreduce_in: torch.Tensor,
         residual_in: torch.Tensor,
         norm_weight: torch.Tensor,
         expanded_idx_to_permuted_idx: torch.Tensor,
-        norm_out: torch.Tensor,
-        residual_out: torch.Tensor,
+        norm_out: Optional[torch.Tensor],
+        residual_out: Optional[torch.Tensor],
+        quant_out: Optional[torch.Tensor],
+        scale_out: Optional[torch.Tensor],
         launch_with_pdl: bool,
         workspace: torch.Tensor,
         world_rank: int,
@@ -359,6 +388,8 @@ def get_trtllm_comm_module():
         eps: float,
         shared_expert_output: Optional[torch.Tensor],
         expert_scale_factor: Optional[torch.Tensor],
+        routed_scaling_factor: Optional[float],
+        weight_bias: Optional[float] = None,
     ) -> None:
         module.trtllm_moe_finalize_allreduce_fusion(
             allreduce_in,
@@ -367,6 +398,8 @@ def get_trtllm_comm_module():
             expanded_idx_to_permuted_idx,
             norm_out,
             residual_out,
+            quant_out,
+            scale_out,
             launch_with_pdl,
             workspace,
             world_rank,
@@ -374,6 +407,8 @@ def get_trtllm_comm_module():
             eps,
             shared_expert_output,
             expert_scale_factor,
+            routed_scaling_factor,
+            weight_bias,
         )
 
     return SimpleNamespace(
@@ -392,7 +427,12 @@ OneShotMaxToken = 128
 MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
 
+_symm_workspace_refs: dict[int, list[torch.Tensor]] = {}
 
+
+@deprecated(
+    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
+)
 def trtllm_create_ipc_workspace_for_all_reduce(
     rank: int,
     tp_size: int,
@@ -441,24 +481,42 @@ def trtllm_create_ipc_workspace_for_all_reduce(
     flag_size = FLAG_SIZE * tp_size * 2
     lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
 
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    group_name = (
+        group.group_name
+        if group is not None
+        else torch.distributed.group.WORLD.group_name
+    )
+    symm_refs: list[torch.Tensor] = []
     ipc_handles = list()
 
-    for size in [
-        buffer_size,
-        buffer_size,
-        flag_size,
-        flag_size,
-        lamport_buffer_size,
-        lamport_buffer_size,
-        lamport_buffer_size,
+    for size, dtype in [
+        (buffer_size, torch.float32),
+        (buffer_size, torch.float32),
+        (flag_size, torch.int32),
+        (flag_size, torch.int32),
+        (lamport_buffer_size, torch.float16),
+        (lamport_buffer_size, torch.float16),
+        (lamport_buffer_size, torch.float16),
     ]:
-        # all sizes should be aligned to 1LU << 21 bytes (2MB)
-        aligned_size = round_up(size, 1 << 21)
-        ipc_handles.append(create_shared_buffer(aligned_size, group))
+        aligned_size = round_up(size, 16)
+        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+            aligned_size,
+            tp_size,
+            dtype,
+            device,
+            group_name,
+        )
+        symm_refs.append((tensor, handle))
+        ipc_handles.append(ptrs)
 
-    print(
-        f"rank {rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
+    logger.debug(
+        "rank %s allocated ipc_handles: %s",
+        rank,
+        [[hex(handle) for handle in sublist] for sublist in ipc_handles],
     )
+
+    _symm_workspace_refs[id(ipc_handles)] = symm_refs
 
     trtllm_lamport_initialize_all(
         ipc_handles[4][rank],
@@ -476,16 +534,16 @@ def trtllm_create_ipc_workspace_for_all_reduce(
 def trtllm_destroy_ipc_workspace_for_all_reduce(
     workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
-    """
-    Note:
-    This function is used to destroy a workspace for all reduce.
-    The workspace is a list of IPC handles.
-    The workspace should be destroyed after calling trtllm_custom_all_reduce.
-    The workspace can be reused for multiple all reduce calls under the same configuration.
-    """
+    """Destroy a workspace created by trtllm_create_ipc_workspace_for_all_reduce.
 
-    for ipc_handle in workspace:
-        free_shared_buffer(ipc_handle, group)
+    Releases the symmetric memory references held internally. The workspace
+    list should not be used after this call.
+
+    Args:
+        workspace: The ipc_handles list returned by the create function.
+        group: Unused, kept for API compatibility.
+    """
+    _symm_workspace_refs.pop(id(workspace), None)
 
 
 BarrierFlagCount = 256
@@ -493,6 +551,9 @@ BarrierFlagCount = 256
 MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)  # MAX_INT32 rounded down to 2MB
 
 
+@deprecated(
+    "use the unified API allreduce.py instead. It will internally call trtllm_create_ipc_workspace_for_all_reduce_fusion."
+)
 def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     tp_rank: int,
     tp_size: int,
@@ -500,7 +561,14 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     hidden_dim,
     use_fp32_lamport: bool = False,
     group: Optional[ProcessGroup] = None,
-) -> Tuple[List[List[int]], torch.Tensor]:
+    create_metadata: bool = False,
+    comm_backend: Optional[CommBackend] = None,
+    use_symm_dev_mem: bool = False,
+) -> Union[
+    Tuple[List[List[int]], torch.Tensor],
+    Tuple[List[List[int]], torch.Tensor, dict],
+    Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict],
+]:
     """
     Parameters:
     - tp_rank: the rank of the current process.
@@ -509,6 +577,22 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     - hidden_dim: the dimension of the hidden states.
     - use_fp32_lamport: if True, we will use fp32 datatype in allreduce fusion.
     - group: the process group to use.
+    - create_metadata: if True, return metadata dict as third element (default: False).
+    - comm_backend: the communication backend to use.
+    - use_symm_dev_mem: if True, we will use symmetric device memory for the workspace.
+
+    Returns:
+    - If create_metadata=False: (ipc_handles, workspace_tensor)
+    - If create_metadata=True: and use_symm_dev_mem=False: (ipc_handles, workspace_tensor, metadata)
+      where metadata contains: tp_rank, tp_size, max_token_num, hidden_dim,
+      use_fp32_lamport, buffer_size, flag_size, lamport_comm_size, lamport_buffer_size
+    - If create_metadata=True: and use_symm_dev_mem=True: (ipc_handles, workspace_tensor, mem_handles,metadata)
+      where metadata contains: tp_rank, tp_size, max_token_num, hidden_dim,
+      use_fp32_lamport, buffer_size, flag_size, lamport_comm_size, lamport_buffer_size
+      and mem_handles is a list of SymmDeviceMemory objects.
+
+    Note: The optional parameters make the API clunky at this time. This will be refactored in the future, at the cost of backward compatibility, where the default behavior will be
+    create_metadata=True and use_symm_dev_mem=True.
 
     Note:
     We would init 3 IPC buffers for trtllm_custom_all_reduce_fusion.
@@ -517,14 +601,21 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     where:
     - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(half)
     - flag_size: tp_size * BarrierFlagCount * sizeof(int)
-    - lamport_buffer_size: tp_size * max(max_token_num, OneShotMaxToken) * tp_size * hidden_dim * sizeof(half)
-
+    - lamport_buffer_size: tp_size * max_token_num * tp_size * hidden_dim * sizeof(half)
+      where sizeof(elem) = 2 (fp16/bf16) or 4 (fp32 when use_fp32_lamport=True)
     The workspace is passed as workspace field in AllReduceFusionParams.
 
     We use tp_size and world_size here interchangeably (allReduceFusion).
 
     Reference: trtllm, cpp/tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.cu, Workspace init
     """
+
+    if comm_backend is None and use_symm_dev_mem:
+        comm_backend = TorchDistBackend(group=group)
+
+    # No need to support all variations. In the future we only support create_metadata=True and use_symm_dev_mem=True.
+    if use_symm_dev_mem and not create_metadata:
+        raise ValueError("use_symm_dev_mem is only supported when create_metadata=True")
 
     buffer_size = tp_size * max_token_num * hidden_dim * 2
     flag_size = tp_size * BarrierFlagCount * 4
@@ -543,22 +634,48 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     lamport_buffer_size = lamport_comm_size * 3
 
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    group_name = (
+        group.group_name
+        if group is not None
+        else torch.distributed.group.WORLD.group_name
+    )
+    symm_refs: list[torch.Tensor] = []
+
     # we should init 3 buffers for all reduce fusion:
     # [buffer_size, flag_size, lamport_buffer_size]
 
     ipc_handles: List[List[int]] = list()
-    for size in [buffer_size, flag_size, lamport_buffer_size]:
-        # todo(review): confirm we need this alignment
-        # all sizes should be aligned to 1LU << 21 bytes (2MB)
-        aligned_size = round_up(size, 1 << 21)
-        ipc_handles.append(create_shared_buffer(aligned_size, group))
+    mem_handles: List[SymmDeviceMemory] = list()
+    lamport_buffer_dtype = torch.float16 if not use_fp32_lamport else torch.float32
+    for size, dtype in [
+        (buffer_size, torch.float32),
+        (flag_size, torch.int32),
+        (lamport_buffer_size, lamport_buffer_dtype),
+    ]:
+        aligned_size = round_up(size, 16)
 
-    print(
-        f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
+        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+            aligned_size,
+            tp_size,
+            dtype,
+            device,
+            group_name,
+        )
+        symm_refs.append((tensor, handle))
+        ipc_handles.append(ptrs)
+        mem_handles.append(handle)
+
+    logger.debug(
+        "rank %s allocated ipc_handles: %s",
+        tp_rank,
+        [[hex(handle) for handle in sublist] for sublist in ipc_handles],
     )
 
+    _symm_workspace_refs[id(ipc_handles)] = symm_refs
+
     # Initialize lamport buffer
-    aligned_lamport_buffer_size = round_up(lamport_buffer_size, 1 << 21)
+    aligned_lamport_buffer_size = round_up(lamport_buffer_size, 16)
     if use_fp32_lamport:
         trtllm_lamport_initialize(
             ipc_handles[2][tp_rank], aligned_lamport_buffer_size // 4, torch.float32
@@ -594,50 +711,74 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     cudart.cudaMemcpy(
         c_void_p(flag_ptr.value + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
     )
-    print("set flag_ptr[3] = lamport_comm_size: ", lamport_comm_size)
+    logger.debug("set flag_ptr[3] = lamport_comm_size: %s", lamport_comm_size)
     # add flag_ptr to workspace
     workspace.append(flag_ptr.value)
 
     for i in range(len(workspace)):
-        print(f"Rank {tp_rank} workspace[{i}] {hex(workspace[i])}")
+        logger.debug("Rank %s workspace[%d] %s", tp_rank, i, hex(workspace[i]))
 
     # Store workspace pointers in device tensor
     workspace_tensor = torch.tensor(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
 
-    dist.barrier(group=group)  # must sync after create_workspace
+    if use_symm_dev_mem:
+        comm_backend.barrier()  # must sync after create_workspace
+    else:
+        dist.barrier(group=group)
 
-    return ipc_handles, workspace_tensor
+    if create_metadata:
+        metadata = {
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "max_token_num": max_token_num,
+            "hidden_dim": hidden_dim,
+            "use_fp32_lamport": use_fp32_lamport,
+            "buffer_size": buffer_size,
+            "flag_size": flag_size,
+            "lamport_comm_size": lamport_comm_size,
+            "lamport_buffer_size": lamport_buffer_size,
+        }
+        if use_symm_dev_mem:
+            return ipc_handles, workspace_tensor, mem_handles, metadata
+        else:
+            return ipc_handles, workspace_tensor, metadata
+
+    else:
+        return ipc_handles, workspace_tensor
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
     workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
-    """
-    Parameters:
-    - workspace: the workspace to destroy.
-    - group: the process group to use.
+    """Destroy a workspace created by trtllm_create_ipc_workspace_for_all_reduce_fusion.
 
-    Note:
-    This function is used to destroy a workspace for all reduce fusion.
-    The workspace is a list of IPC handles.
-    The workspace should be destroyed after calling trtllm_custom_all_reduce_fusion.
-    The workspace can be reused for multiple all reduce fusion calls under the same configuration.
-    """
+    Releases the symmetric memory references held internally. The workspace
+    list should not be used after this call.
 
-    for ipc_handle in workspace:
-        free_shared_buffer(ipc_handle, group)
+    Args:
+        workspace: The ipc_handles list returned by the create function.
+        group: Unused, kept for API compatibility.
+    """
+    _symm_workspace_refs.pop(id(workspace), None)
 
 
 # allReduce fused quant utils
-def compute_fp4_swizzled_layout_sf_size(total_row, total_column):
-    """
-    Helper function to compute the padded size of the fp4 swizzled layout.
+def compute_fp4_swizzled_layout_sf_size(total_row: int, total_column: int) -> int:
+    r"""Compute the padded size (rows times columns) of the FP4 swizzled layout.
 
-    Parameters:
-    - total_row: the total number of rows.
-    - total_column: the total number of columns.
+    Parameters
+    ----------
+    total_row : int
+        Logical row count of the un-padded layout.
+    total_column : int
+        Logical column count of the un-padded layout.
+
+    Returns
+    -------
+    int
+        ``padded_row * padded_column`` for the swizzled layout.
     """
 
     def pad_up(x, y):
@@ -649,6 +790,17 @@ def compute_fp4_swizzled_layout_sf_size(total_row, total_column):
 
 
 def trtllm_lamport_initialize(buffer_ptr: int, size: int, dtype: torch.dtype) -> None:
+    r"""Initialize a single Lamport-style buffer to negative zero.
+
+    Parameters
+    ----------
+    buffer_ptr : int
+        Device pointer to the buffer.
+    size : int
+        Number of elements in the buffer.
+    dtype : torch.dtype
+        Element dtype of the buffer.
+    """
     get_trtllm_comm_module().trtllm_lamport_initialize(buffer_ptr, size, dtype)
 
 
@@ -659,15 +811,20 @@ def trtllm_lamport_initialize_all(
     size: int,
     dtype: torch.dtype,
 ) -> None:
-    """
-    Initialize 3 lamport buffers by negative zero.
+    r"""Initialize three Lamport buffers to negative zero.
 
-    Parameters:
-    - buffer_0_ptr: the pointer to the first buffer.
-    - buffer_1_ptr: the pointer to the second buffer.
-    - buffer_2_ptr: the pointer to the third buffer.
-    - size: the size of the buffer.
-    - dtype: the data type of the buffer.
+    Parameters
+    ----------
+    buffer_0_ptr : int
+        Device pointer to the first buffer.
+    buffer_1_ptr : int
+        Device pointer to the second buffer.
+    buffer_2_ptr : int
+        Device pointer to the third buffer.
+    size : int
+        Number of elements in each buffer.
+    dtype : torch.dtype
+        Element dtype of each buffer.
     """
 
     get_trtllm_comm_module().trtllm_lamport_initialize_all(
@@ -675,6 +832,9 @@ def trtllm_lamport_initialize_all(
     )
 
 
+@deprecated(
+    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+)
 def trtllm_custom_all_reduce(
     inp: torch.Tensor,
     out: torch.Tensor,
@@ -751,6 +911,72 @@ def trtllm_custom_all_reduce(
     )
 
 
+# Heuristics based on all configs of trtllm_allreduce_fusion on B200.
+# Empirically, the fusion pattern and fp32_acc are irrelevant to the decision.
+_use_oneshot_heuristics: dict[int, int] = {
+    2: 512,
+    4: 64,
+    8: 42,
+}
+
+
+def _should_use_oneshot(
+    token_num: int, hidden_dim: int, dtype: torch.dtype, world_size: int
+) -> bool:
+    comm_size_mb = (
+        token_num * hidden_dim * 2 * world_size * dtype.itemsize / 1024 / 1024
+    )
+    return comm_size_mb <= _use_oneshot_heuristics[world_size]
+
+
+def check_trtllm_allreduce_fusion_workspace_metadata(
+    token_num: int,
+    hidden_dim: int,
+    world_size: int,
+    dtype: torch.dtype,
+    metadata: dict,
+) -> None:
+    errors = []
+    required_keys = ["max_token_num", "tp_size", "hidden_dim", "use_fp32_lamport"]
+    for key in required_keys:
+        if key not in metadata:
+            errors.append(f"Workspace metadata is missing required key: {key}")
+    if errors:
+        error_msg = "Workspace metadata validation failed:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise ValueError(error_msg)
+
+    # world_size must match tp_size (flag size depends on it)
+    if world_size != metadata["tp_size"]:
+        errors.append(
+            f"world_size ({world_size}) does not match workspace tp_size ({metadata['tp_size']}). "
+            f"Workspace was created for tp_size={metadata['tp_size']}."
+        )
+
+    # token_num * hidden_dim must not exceed max_token_num * hidden_dim
+    if token_num * hidden_dim > metadata["max_token_num"] * metadata["hidden_dim"]:
+        errors.append(
+            f"token_num ({token_num}) * hidden_dim ({hidden_dim}) exceeds workspace max_token_num ({metadata['max_token_num']}) * hidden_dim ({metadata['hidden_dim']}). "
+            f"This may cause Illegal Memory Access."
+        )
+
+    # use_fp32_lamport must match
+    if metadata["use_fp32_lamport"] != (dtype == torch.float32):
+        errors.append(
+            f"use_fp32_lamport ({metadata['use_fp32_lamport']}) does not match allreduce_in.dtype ({dtype}). "
+            f"Workspace was created for use_fp32_lamport={metadata['use_fp32_lamport']}."
+        )
+    if errors:
+        error_msg = "Workspace validation failed:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise ValueError(error_msg)
+
+
+@deprecated(
+    "use the unified API allreduce.py instead. It will internally call trtllm_allreduce_fusion."
+)
 def trtllm_allreduce_fusion(
     allreduce_in: torch.Tensor,
     world_size: int,
@@ -773,6 +999,9 @@ def trtllm_allreduce_fusion(
     rms_eps: Optional[float],
     scale_factor: Optional[Union[torch.Tensor, float]],
     layout_code: Optional[QuantizationSFLayout],
+    metadata: Optional[dict] = None,
+    block_quant_group_size: Optional[int] = None,
+    weight_bias: Optional[float] = None,
 ) -> None:
     """
     Parameters:
@@ -783,7 +1012,7 @@ def trtllm_allreduce_fusion(
     - hidden_dim: the dimension of the hidden states.
     - workspace_ptrs: the workspace pointers.
     - launch_with_pdl: whether to launch with pdl.
-    - use_oneshot: whether to use oneshot.
+    - use_oneshot: whether to use oneshot. If None, internal heuristics will be used.
     - trigger_completion_at_end: whether to trigger completion at the end.
     - fp32_acc: whether to use fp32 accumulation.
     - pattern_code: the pattern code.
@@ -797,14 +1026,33 @@ def trtllm_allreduce_fusion(
     - rms_eps: the rms epsilon value.
     - scale_factor: the scale factor. For cudaGraphs safety, it should be a tensor.
     - layout_code: the layout code.
-
-    Note:
-    Regarding the `use_oneshot` parameter, you could force to use the one-shot strategy based on your use case.
-    Otherwise, it would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode.
+    - metadata: optional workspace metadata dict from create_ipc_workspace_for_all_reduce_fusion.
+                If provided, validates that token_num <= max_token_num, world_size == tp_size,
+                and hidden_dim == workspace hidden_dim. Raises ValueError if validation fails.
+    - block_quant_group_size: group size (in elements along hidden_dim) for per-token-group
+                              block-wise FP8 quantization patterns
+                              (e.g. ``kPerTokenGroupFP8Packed`` / DeepSeek-style FP8 with
+                              UE8M0 packed scales). Number of consecutive elements that
+                              share a single scale factor. Must be > 0 and divide
+                              ``hidden_dim`` when the pattern requires it; ignored
+                              (treated as 0 / unused) for patterns that do not perform
+                              block-quantization.
+    - weight_bias: bias added to rms_gamma before scaling.
+                   None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
+                   1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
+                   Ignored for kAllReduce and quant-only patterns that don't apply RMSNorm.
     """
 
+    # Validate against workspace metadata if provided
+    if metadata is not None:
+        check_trtllm_allreduce_fusion_workspace_metadata(
+            token_num, hidden_dim, world_size, allreduce_in.dtype, metadata
+        )
+
     if use_oneshot is None:
-        use_oneshot = token_num <= 128
+        use_oneshot = _should_use_oneshot(
+            token_num, hidden_dim, allreduce_in.dtype, world_size
+        )
 
     if not use_oneshot:
         assert token_num > world_size, "sequence length should be larger than tp_size"
@@ -847,8 +1095,10 @@ def trtllm_allreduce_fusion(
         scale_out=scale_out,
         rms_gamma=rms_gamma,
         rms_eps=rms_eps,
+        weight_bias=weight_bias,
         scale_factor=scale_factor,
         layout_code=layout_code,
+        block_quant_group_size=block_quant_group_size,
     )
 
 
@@ -873,6 +1123,7 @@ def trtllm_moe_allreduce_fusion(
     norm_out: Optional[torch.Tensor],
     quant_out: Optional[torch.Tensor],
     scale_out: Optional[torch.Tensor],
+    weight_bias: Optional[float] = None,
 ) -> None:
     """
     Parameters:
@@ -896,6 +1147,9 @@ def trtllm_moe_allreduce_fusion(
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
     - scale_out: the scale output tensor. Initialization referece: tests/comm/test_trtllm_moe_allreduce_fusion.py
+    - weight_bias: bias added to rms_gamma before scaling.
+                   None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
+                   1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
     """
 
     required_lamport_comm_size = moe_reduction_token_input.numel() * 2 * world_size
@@ -927,6 +1181,7 @@ def trtllm_moe_allreduce_fusion(
         norm_out=norm_out,
         quant_out=quant_out,
         scale_out=scale_out,
+        weight_bias=weight_bias,
     )
 
 
@@ -935,8 +1190,10 @@ def trtllm_moe_finalize_allreduce_fusion(
     residual_in: torch.Tensor,
     norm_weight: torch.Tensor,
     expanded_idx_to_permuted_idx: torch.Tensor,
-    norm_out: torch.Tensor,
-    residual_out: torch.Tensor,
+    norm_out: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    quant_out: Optional[torch.Tensor],
+    scale_out: Optional[torch.Tensor],
     workspace_ptrs: torch.Tensor,
     launch_with_pdl: bool,
     world_rank: int,
@@ -944,6 +1201,8 @@ def trtllm_moe_finalize_allreduce_fusion(
     eps: float,
     shared_expert_output: Optional[torch.Tensor],
     expert_scale_factor: Optional[torch.Tensor],
+    routed_scaling_factor: Optional[float],
+    weight_bias: Optional[float] = None,
 ) -> None:
     """
     Parameters:
@@ -953,6 +1212,8 @@ def trtllm_moe_finalize_allreduce_fusion(
     - expanded_idx_to_permuted_idx: the expanded index to permuted index tensor. [token_num, top_k]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - residual_out: the residual output tensor. [token_num, hidden_dim]
+    - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
+    - scale_out: the scale output tensor. [token_num // SF_VEC_SIZE, hidden_dim], fp16/bf16 -> fp4
     - workspace_ptrs: the workspace pointers.
     - launch_with_pdl: whether to launch with pdl.
     - world_rank: the rank of the current process.
@@ -960,6 +1221,10 @@ def trtllm_moe_finalize_allreduce_fusion(
     - eps: the epsilon value.
     - shared_expert_output: the shared expert output tensor. [token_num, hidden_dim]
     - expert_scale_factor: the expert scale factor tensor. [token_num, top_k]
+    - routed_scaling_factor: the routed scaling factor.
+    - weight_bias: bias added to rms_gamma before scaling.
+                   None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
+                   1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
     """
 
     required_lamport_comm_size = allreduce_in.numel() * 2 * world_size
@@ -977,6 +1242,8 @@ def trtllm_moe_finalize_allreduce_fusion(
         expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
         norm_out=norm_out,
         residual_out=residual_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
         workspace=workspace_ptrs,
         launch_with_pdl=launch_with_pdl,
         world_rank=world_rank,
@@ -984,4 +1251,6 @@ def trtllm_moe_finalize_allreduce_fusion(
         eps=eps,
         shared_expert_output=shared_expert_output,
         expert_scale_factor=expert_scale_factor,
+        routed_scaling_factor=routed_scaling_factor,
+        weight_bias=weight_bias,
     )

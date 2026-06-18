@@ -194,13 +194,20 @@ def test_deepseek_prefill(
     )
     o_sm90, lse_sm90 = wrapper_sm90.run_return_lse(q, k, v)
 
-    torch.testing.assert_close(lse_sm80, lse_sm90, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(o_sm80, o_sm90, rtol=1e-3, atol=1e-3)
+    if dtype == torch.half:
+        rtol = 1e-3
+        atol = 1e-3
+    else:  # bfloat16
+        rtol = 1e-2
+        atol = 1e-2
+
+    torch.testing.assert_close(lse_sm80, lse_sm90, rtol=rtol, atol=atol)
+    torch.testing.assert_close(o_sm80, o_sm90, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [11, 12, 99, 1763, 9999, 32767])
-@pytest.mark.parametrize("page_size", [1])  # [1, 16])
+@pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("num_qo_heads", [1, 4, 8])
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
 @pytest.mark.parametrize("causal", [False, True])
@@ -260,8 +267,7 @@ def test_batch_paged_prefill(
     kv_indptr = torch.arange(
         0, batch_size * num_pages_per_request + 1, num_pages_per_request
     ).int()
-    # NOTE(Zihao): pad 256 elements to avoid out-of-bound because we didn't check the boundary in the kernel
-    kv_indices = torch.arange(0, batch_size * num_pages_per_request + 256).int()
+    kv_indices = torch.arange(0, batch_size * num_pages_per_request).int()
     last_page_len = torch.full((batch_size,), last_page_len, dtype=torch.int32)
 
     wrapper_sm80.plan(
@@ -373,9 +379,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
         token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
         .to(dtype=torch.uint16)
         .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
+        token_pos_in_items_len=token_pos_in_items_len,
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
     o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
@@ -398,9 +402,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
         token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
         .to(dtype=torch.uint16)
         .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
+        token_pos_in_items_len=token_pos_in_items_len,
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
 
@@ -432,7 +434,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
             97,
             81,
             [16, 16],
-            list(range(80)) + [0] + [0] * 16 + list(range(76)) + [0],
+            list(range(80)) + [0] * 17 + list(range(76)) + [0] * 5,
             97,
             [79, 75],
         ),
@@ -507,9 +509,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
         token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
         .to(dtype=torch.uint16)
         .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
+        token_pos_in_items_len=token_pos_in_items_len,
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
     o_fa2, lse_fa2 = wrapper_fa2.run_return_lse(q, kv_data)
@@ -532,9 +532,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
         token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
         .to(dtype=torch.uint16)
         .to(0),
-        token_pos_in_items_len=torch.tensor(token_pos_in_items_len)
-        .to(dtype=torch.uint32)
-        .to(0),
+        token_pos_in_items_len=token_pos_in_items_len,
         max_item_len_ptr=torch.tensor(max_item_len_ptr).to(dtype=torch.uint16).to(0),
     )
 

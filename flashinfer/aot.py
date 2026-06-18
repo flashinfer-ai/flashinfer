@@ -25,48 +25,15 @@ import os
 import shutil
 from itertools import product
 from pathlib import Path
-from typing import List, Tuple, Iterator, Optional
+from typing import Iterator, List, Optional, Tuple
 
 import torch
-
 from packaging.version import Version
+
+from .compilation_context import CompilationContext
+from .jit import JitSpec, build_jit_specs
+from .jit import env as jit_env
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
-from .jit.cascade import gen_cascade_module
-from .jit.fp4_quantization import (
-    gen_fp4_quantization_sm90_module,
-    gen_fp4_quantization_sm100_module,
-    gen_fp4_quantization_sm103_module,
-    gen_fp4_quantization_sm110_module,
-    gen_fp4_quantization_sm120_module,
-    gen_fp4_quantization_sm121_module,
-)
-from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
-from .jit.fused_moe import (
-    gen_cutlass_fused_moe_sm120_module,
-    gen_cutlass_fused_moe_sm100_module,
-    gen_cutlass_fused_moe_sm90_module,
-    gen_trtllm_gen_fused_moe_sm100_module,
-)
-from .jit.gemm import (
-    gen_gemm_module,
-    gen_gemm_sm90_module,
-    gen_gemm_sm100_module,
-    gen_gemm_sm100_module_cutlass_fp4,
-    gen_gemm_sm100_module_cutlass_fp8,
-    gen_tgv_gemm_sm10x_module,
-    gen_gemm_sm120_module,
-    gen_gemm_sm120_module_cutlass_fp4,
-    gen_trtllm_gen_gemm_module,
-)
-from .jit.spdlog import gen_spdlog_module
-from .jit.mla import gen_mla_module
-from .jit.norm import gen_norm_module
-from .jit.page import gen_page_module
-from .jit.quantization import gen_quantization_module
-from .jit.rope import gen_rope_module
-from .jit.sampling import gen_sampling_module
-from .jit.tllm_utils import gen_trtllm_utils_module
-from .jit.xqa import gen_xqa_module
 from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
@@ -77,11 +44,73 @@ from .jit.attention import (
     gen_single_decode_module,
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
+    gen_trtllm_fmha_v2_sm120_module,
 )
-from .jit import JitSpec, build_jit_specs
-from .jit import env as jit_env
+from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
-from .compilation_context import CompilationContext
+from .jit.fp4_quantization import (
+    gen_fp4_quantization_sm90_module,
+    gen_fp4_quantization_sm100_module,
+    gen_fp4_quantization_sm103_module,
+    gen_fp4_quantization_sm110_module,
+    gen_fp4_quantization_sm120_module,
+    gen_fp4_quantization_sm120f_module,
+    gen_fp4_quantization_sm121_module,
+)
+from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
+from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
+from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fused_moe import (
+    gen_cutlass_fused_moe_sm90_module,
+    gen_cutlass_fused_moe_sm100_module,
+    gen_cutlass_fused_moe_sm103_module,
+    gen_cutlass_fused_moe_sm120_module,
+    gen_trtllm_gen_fused_moe_sm100_module,
+)
+from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
+from .jit.gemm import (
+    gen_fp8_blockscale_gemm_sm90_module,
+    gen_gemm_module,
+    gen_gemm_sm90_module,
+    gen_gemm_sm100_module,
+    gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_fp8,
+    gen_gemm_sm100_module_cutlass_mxfp8,
+    gen_gemm_sm120_module,
+    gen_gemm_sm120_module_cutlass_fp4,
+    gen_mm_bf16_cublaslt_module,
+    gen_gemm_sm120_module_cutlass_mxfp8,
+    gen_tgv_gemm_sm10x_module,
+    gen_trtllm_gen_gemm_module,
+    gen_trtllm_low_latency_gemm_module,
+)
+from .jit.mamba import (
+    gen_selective_state_update_module,
+    gen_selective_state_update_sm90_module,
+)
+from .jit.mhc import gen_mhc_module
+from .jit.mla import gen_mla_module, gen_sparse_mla_sm120_module
+from .jit.api_log_stats import gen_api_log_stats_module
+from .jit.norm import gen_norm_module
+from .jit.rmsnorm_silu import (
+    gen_rmsnorm_silu_module,
+    select_knobs,
+    _estimate_ctas_per_row,
+    _compute_default_knobs,
+    _SUPPORTED_C,
+    _SUPPORTED_TOKENS,
+)
+from .jit.page import gen_page_module
+from .jit.quantization import gen_quantization_module
+from .jit.rope import gen_rope_module
+from .jit.sampling import gen_sampling_module
+from .jit.spdlog import gen_spdlog_module
+from .jit.moe_utils import gen_moe_utils_module
+from .jit.tllm_utils import gen_trtllm_utils_module
+from .jit.topk import gen_topk_module
+from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
 def gen_fa2(
@@ -197,6 +226,14 @@ def gen_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
 
+    # head_dim > 256 FA2 modules are SM100+-only; skip them entirely when no
+    # SM100+ architecture is being targeted.
+    from .jit.core import current_compilation_context
+
+    has_sm100_or_newer = any(
+        major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    )
+
     # FA2 MHA / MQA / GQA
     for (
         (head_dim_qk, head_dim_vo),
@@ -211,6 +248,8 @@ def gen_attention(
         use_sliding_window_,
         use_logits_soft_cap_,
     ):
+        if (head_dim_qk > 256 or head_dim_vo > 256) and not has_sm100_or_newer:
+            continue
         yield from gen_fa2(
             dtype_qo=dtype_qo,
             dtype_kv=dtype_kv,
@@ -219,18 +258,21 @@ def gen_attention(
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
         )
-        yield gen_batch_attention_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            dtype_idx=torch.int32,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            # use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-            use_profiler=False,
-        )
+        # The holistic (persistent) batch-attention kernel
+        # does not support head_dim=512.
+        if head_dim_qk <= 256 and head_dim_vo <= 256:
+            yield gen_batch_attention_module(
+                dtype_q=dtype_qo,
+                dtype_kv=dtype_kv,
+                dtype_o=dtype_qo,
+                dtype_idx=torch.int32,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                pos_encoding_mode=0,
+                # use_sliding_window=use_sliding_window,
+                use_logits_soft_cap=use_logits_soft_cap,
+                use_profiler=False,
+            )
 
     # FA3 MHA / MQA / GQA
     if has_sm90:
@@ -355,25 +397,31 @@ def gen_attention(
 
 
 def gen_xqa(
-    use_fp16_: List[bool],
+    input_type_: List[torch.dtype],
+    fp8_kv_cache_: List[bool],
     token_per_page_: List[int],
     head_size_: List[int],
     head_grp_size_: List[int],
     use_sliding_window_: List[bool],
     has_sm90: bool,
+    has_sm100: bool,
+    has_sm120: bool,
+    has_sm121: bool,
 ) -> Iterator[JitSpec]:
     """Generate XQA modules for various configurations."""
-    if not has_sm90:
+    if not has_sm90 and not has_sm100 and not has_sm120 and not has_sm121:
         return  # XQA requires SM90+
 
     for (
-        use_fp16,
+        input_type,
+        fp8_kv_cache,
         token_per_page,
         head_size,
         head_grp_size,
         use_sliding_window,
     ) in product(
-        use_fp16_,
+        input_type_,
+        fp8_kv_cache_,
         token_per_page_,
         head_size_,
         head_grp_size_,
@@ -385,13 +433,31 @@ def gen_xqa(
         if token_per_page not in [16, 32, 64, 128]:
             continue
 
+        if fp8_kv_cache:
+            kv_cache_dtype = torch.float8_e4m3fn
+        else:
+            kv_cache_dtype = input_type
+
         yield gen_xqa_module(
-            use_fp16=use_fp16,
-            token_per_page=token_per_page,
-            head_size=head_size,
-            head_grp_size=head_grp_size,
+            input_dtype=input_type,
+            kv_cache_dtype=kv_cache_dtype,
+            page_size=token_per_page,
+            head_dim=head_size,
+            head_group_ratio=head_grp_size,
             use_sliding_window=use_sliding_window,
+            output_dtype=input_type,
         )
+
+    if has_sm120 or has_sm121:
+        for token_per_page in token_per_page_:
+            yield gen_xqa_module_mla(
+                input_dtype=torch.float8_e4m3fn,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                page_size=token_per_page,
+                head_dim=576,
+                head_group_ratio=128,
+                use_sliding_window=False,
+            )
 
 
 def gen_all_modules(
@@ -412,12 +478,14 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
+    has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
 
     jit_specs += list(
@@ -434,6 +502,8 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
+    if has_sm120:
+        jit_specs.append(gen_nvfp4_attention_sm120_module())
 
     if add_act:
         for act_name in act_func_def_str:
@@ -441,8 +511,12 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
+        # Multi-LoRA MoE BGMV kernel
+        jit_specs.append(gen_bgmv_moe_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
+            # fp8 blockscale GEMM (SM90)
+            jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
         if has_sm100:
@@ -451,6 +525,7 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             # Add TGV GEMM modules for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)
@@ -460,6 +535,7 @@ def gen_all_modules(
             )
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
+            jit_specs.append(gen_trtllm_low_latency_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
         if has_sm100f:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
@@ -467,60 +543,204 @@ def gen_all_modules(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
+            jit_specs.append(gen_moe_utils_module())
+        if has_sm100 or has_sm103:
+            jit_specs.append(gen_mm_bf16_cublaslt_module())
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
+            jit_specs.append(gen_cutlass_fused_moe_sm103_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
         if has_sm120:
             jit_specs.append(gen_fp4_quantization_sm120_module())
-            jit_specs.append(gen_cutlass_fused_moe_sm120_module())
-            jit_specs.append(gen_gemm_sm120_module())
-            jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
+        if has_sm120 or has_sm121:
+            # SM120 and SM121 share the same kernels for fused MOE, GEMM, and attention.
+            # The SM120 module generators use supported_major_versions=[12] which
+            # compiles for all SM12x targets.
+            jit_specs.append(gen_cutlass_fused_moe_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module_cute_mxfp8())
+            jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
+            jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
+            jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
+        if has_sm120f:
+            jit_specs.append(gen_fp4_quantization_sm120f_module())
 
     if add_comm:
-        from .jit.comm import gen_trtllm_comm_module, gen_vllm_comm_module
-        from .jit.comm import gen_nvshmem_module
-        from .jit.comm import gen_comm_alltoall_module
-        from .jit.comm import gen_trtllm_mnnvl_comm_module
+        from .jit.comm import (
+            gen_comm_alltoall_module,
+            gen_dcp_alltoall_module,
+            gen_moe_alltoall_module,
+            gen_trtllm_comm_module,
+            gen_trtllm_mnnvl_comm_module,
+            gen_vllm_comm_module,
+        )
 
-        jit_specs.append(gen_nvshmem_module())
         jit_specs.append(gen_comm_alltoall_module())
         if has_sm100:
             jit_specs.append(gen_trtllm_comm_module())
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
+            jit_specs.append(gen_moe_alltoall_module())
+            # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
+            # a known state-space inference bug on cp.async.bulk that aborts
+            # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
+            # SM90/SM12x users still get this via JIT.
+            jit_specs.append(gen_dcp_alltoall_module())
         jit_specs.append(gen_vllm_comm_module())
 
     if add_misc:
         jit_specs += [
+            gen_api_log_stats_module(),
             gen_cascade_module(),
+            gen_mhc_module(),
             gen_norm_module(),
             gen_page_module(),
             gen_quantization_module(),
             gen_rope_module(),
             gen_sampling_module(),
+            gen_topk_module(),
         ]
-        if has_sm90:
+        # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
+        if has_sm100:
+            for C in _SUPPORTED_C:
+                for tokens in _SUPPORTED_TOKENS:
+                    for dtype in ["bf16", "fp8", "nvfp4"]:
+                        knobs = select_knobs(C, tokens, dtype)
+                        if knobs is None:
+                            continue
+                        wm, sc, kcfg, occ, bpl = knobs
+                        cpr = _estimate_ctas_per_row(C, sc, kcfg, bpl)
+                        jit_specs.append(
+                            gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
+                        )
+            # Fallback configs for common hidden sizes not in the LUT.
+            # Fallback knobs depend only on (C, dtype), not num_tokens,
+            # so one module per (C, dtype) covers all token counts.
+            _FALLBACK_C = [
+                768,
+                1280,
+                1536,
+                2048,
+                2560,
+                3072,
+                4096,
+                5120,
+                6144,
+                8192,
+            ]
+            for C in _FALLBACK_C:
+                for dtype in ["bf16", "fp8", "nvfp4"]:
+                    knobs = _compute_default_knobs(C, dtype)
+                    if knobs is None:
+                        continue
+                    wm, sc, kcfg, occ, bpl = knobs
+                    cpr = _estimate_ctas_per_row(C, sc, kcfg, bpl)
+                    jit_specs.append(
+                        gen_rmsnorm_silu_module(C, dtype, wm, cpr, bpl, kcfg, occ)
+                    )
+        # selective_state_update: one module per dtype combo per GPU arch
+        _ssu_dtype_combos = [
+            # (state,        input,          weight,         matrixA,      stateIndex, state_scale_dtype)
+            (
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                None,
+            ),
+            # int16 state (block-scaled quantization, scale stored as float32)
+            (
+                torch.int16,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                torch.float32,
+            ),
+            (
+                torch.float32,
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.float32,
+                torch.int64,
+                None,
+            ),
+        ]
+        _ssu_dims = [64]
+        _ssu_dstates = [128]
+        _ssu_ntokens = [1, 4, 6, 8]
+        _ssu_cu_seqlens_dtypes = [torch.int32, torch.int64]
+        _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
+        # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
+        # the AOT build target has no Ampere-or-newer arch, skip it silently.
+        if has_sm80 or has_sm90 or has_sm100:
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
+            ):
+                jit_specs.append(
+                    # false positive: mypy can't resolve the signature because flashinfer.jit deps (filelock etc.)
+                    # are absent in mypy's isolated env, causing it to infer an incorrect function signature
+                    gen_selective_state_update_module(
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                    )  # type: ignore[call-arg]
+                )
+        if has_sm90 or has_sm100:
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
+            ):
+                jit_specs.append(
+                    # same false positive as above
+                    gen_selective_state_update_sm90_module(  # type: ignore[call-arg]
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                    )
+                )
             jit_specs.append(gen_trtllm_utils_module())
+        # FP4 KV cache quantization/dequantization
+        jit_specs.append(gen_fp4_kv_dequantization_module())
+        if has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121:
+            jit_specs.append(gen_fp4_kv_quantization_module())
 
-    if add_xqa:
+    if (
+        add_xqa and get_cuda_version() > Version("12.8")
+    ):  # TODO: Earlier cuda versions have compile issues, will be fixed in future releases
         # Define XQA configurations to iterate over
-        xqa_use_fp16_ = [True, False]  # fp16 and bf16
+        xqa_input_type_ = [torch.float16, torch.bfloat16]
+        xqa_fp8_kv_cache_ = [True, False]
         xqa_token_per_page_ = [16, 32, 64, 128]
         xqa_head_size_ = [64, 128, 256]
         xqa_head_grp_size_ = [1, 2, 4, 8]  # Different group sizes for MQA/GQA
 
         jit_specs += list(
             gen_xqa(
-                xqa_use_fp16_,
+                xqa_input_type_,
+                xqa_fp8_kv_cache_,
                 xqa_token_per_page_,
                 xqa_head_size_,
                 xqa_head_grp_size_,
                 use_sliding_window_,
                 has_sm90,
+                has_sm100,
+                has_sm120,
+                has_sm121,
             )
         )
+
+    # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
+    if has_sm120 or has_sm121:
+        jit_specs.append(gen_sparse_mla_sm120_module())
 
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
@@ -672,7 +892,8 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
+        # Note: (512, 512): FA2 prefill/decode only; no holistic batch-attention kernel.
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256), (512, 512)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
         "f16_dtype": [torch.float16, torch.bfloat16],
         "f8_dtype": [torch.float8_e4m3fn],
@@ -701,15 +922,20 @@ def detect_sm_capabilities():
         return get_cuda_version() >= Version(version)
 
     # Check https://docs.nvidia.com/cuda/parallel-thread-execution/#release-notes
-    # for CUDA version and SM compatibility
+    # for CUDA version and SM compatibility.
+    # `sm80` is true if any 8.x arch (sm_80/sm_86/sm_89) is in the build —
+    # all support cp.async, which the SSU MTP-simple kernel requires.
+    has_any_sm8x = any(major == 8 for major, _ in compilation_context.TARGET_CUDA_ARCHS)
     return {
+        "sm80": has_any_sm8x and get_cuda_version() >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),
         "sm103": has_sm("compute_103", "12.9"),
-        "sm110": has_sm("compute_110", "12.9"),
-        "sm120": has_sm("compute_120", "13.0"),
-        "sm121": has_sm("compute_121", "13.0"),
+        "sm110": has_sm("compute_110", "13.0"),
+        "sm120": has_sm("compute_120", "12.8"),
+        "sm120f": has_sm("compute_120f", "12.9"),
+        "sm121": has_sm("compute_121", "12.9"),
     }
 
 

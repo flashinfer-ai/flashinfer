@@ -1,0 +1,64 @@
+# CODEOWNERS — manually maintained, not auto-generated.
+#
+# Rules:
+#   - Last matching pattern wins (GitHub semantics).
+#   - Catch-all ensures every PR gets at least one core-maintainer review.
+#   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
+
+# ── Catch-all: core maintainers review everything not covered below ──
+* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc
+
+# ── Attention ──
+csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
+
+# ── GEMM ──
+flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu
+include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu
+tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu
+
+# ── Grouped GEMM ──
+flashinfer/grouped_mm/           @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+include/flashinfer/grouped_mm/   @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+tests/grouped_mm/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+
+# ── MOE ──
+csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees
+
+# ── Communication ──
+flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
+include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
+tests/comm/                    @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq
+
+# ── Norm ──
+flashinfer/norm.py             @kahyunnam @yzh119 @bkryu @yongwww
+tests/norm/                    @kahyunnam @yzh119 @bkryu @yongwww
+
+# ── GDN ──
+benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+
+# ── MAMBA ──
+csrc/checkpointing_ssu*         @kahyunnam @yzh119 @jimmyzho @ishovkun
+csrc/selective_state_update*    @kahyunnam @yzh119 @jimmyzho @ishovkun
+csrc/seq_chunk_cumsum*          @kahyunnam @yzh119 @jimmyzho @ishovkun
+flashinfer/jit/mamba/           @kahyunnam @yzh119 @jimmyzho @ishovkun
+flashinfer/mamba/               @kahyunnam @yzh119 @jimmyzho @ishovkun
+include/flashinfer/mamba/       @kahyunnam @yzh119 @jimmyzho @ishovkun
+tests/mamba/                    @kahyunnam @yzh119 @jimmyzho @ishovkun
+
+# ── Autotuner ──
+‎flashinfer/autotuner.py                  @qiching
+‎tests/autotuner/test_autotuner_core.py   @qiching

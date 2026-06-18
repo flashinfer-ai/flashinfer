@@ -12,6 +12,8 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#include "variants.cuh"
+
 namespace flashinfer {
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
@@ -316,7 +318,7 @@ CUTLASS_DEVICE void mma_f16(
   consumer_wait(pipeline_v, smem_pipe_read_v);
   gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()),
                                        tOrO);
-  attention_updater.finalize(tSrS);
+  attention_updater.finalize(tSrS, get_variant_scale_pv(variant));
   warpgroup_wait<0>();
   pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
   ++smem_pipe_read_v;

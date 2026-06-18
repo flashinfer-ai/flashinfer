@@ -21,8 +21,9 @@
 #include <cstdint>
 #include <vector>
 
-#include "trtllmGen_bmm_export/Enums.h"
-#include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmOptions.h"
+#include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -47,11 +48,27 @@ enum class ActType {
   GeGlu,
 };
 
+// Type of the element-wise activation to apply after the Gemm
+enum class EltwiseActType {
+  None = 0,
+  // Gelu is defined as the following operation:
+  // act = x0 * phi(x0)
+  // where x0 is the output of the Gemm
+  // phi is the CDF of standard normal distribution approximated by
+  // phi(x) = 0.5 * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+  Gelu,
+  // Relu2 (also known as squared Relu) is defined as the following operation:
+  // act = relu(x0) ^ 2
+  // where x0 is the output of the Gemm.
+  Relu2,
+};
+
 struct TrtllmGenBatchedGemmRunnerOptions {
   batchedGemm::trtllm::gen::Dtype dtypeA;
   batchedGemm::trtllm::gen::Dtype dtypeB;
   batchedGemm::trtllm::gen::Dtype dtypeC;
   ActType actType{ActType::SwiGlu};
+  EltwiseActType eltwiseActType{EltwiseActType::None};
   bool deepSeekFp8{false};
   bool fusedAct{false};
   bool routeAct{false};
@@ -59,8 +76,16 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool transposeMmaOutput{false};
   int32_t tileSize{8};
   int32_t epilogueTileM{128};
-  bool useShuffledMatrixA{false};
+  bool useShuffledMatrix{false};
   batchedGemm::gemm::MatrixLayout weightLayout{batchedGemm::gemm::MatrixLayout::MajorK};
+  batchedGemm::gemm::BiasType biasType{batchedGemm::gemm::BiasType::None};
+  batchedGemm::gemm::FusedBiasShuffleMode fusedBiasShuffleMode{
+      batchedGemm::gemm::FusedBiasShuffleMode::None};
+  batchedGemm::trtllm::gen::Dtype biasDtype{batchedGemm::trtllm::gen::Dtype::Fp32};
+  // whether to apply row-wise scaling factors to the activations
+  bool usePerTokenScaling{false};
+  // whether to apply row-wise scaling factors to the weights
+  bool usePerChannelScaling{false};
 };
 
 class TrtllmGenBatchedGemmRunner {
@@ -81,8 +106,9 @@ class TrtllmGenBatchedGemmRunner {
            float const* bias, float const* gatedActAlpha, float const* gatedActBeta,
            float const* clampLimit, void* c, void* outSfC, int32_t const* routeMap,
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
-           int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-           CUstream stream, int device, int32_t configIndex, bool enable_pdl);
+           int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
+           int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
+           int32_t configIndex, bool enable_pdl);
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,

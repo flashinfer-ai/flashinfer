@@ -20,6 +20,8 @@
 #include <optional>
 #include <string>
 
+#include "tensorrt_llm/common/quantization.h"
+
 namespace tensorrt_llm::common {
 // Useful when you want to inject some debug code controllable with env var.
 std::optional<int32_t> getIntEnv(char const* name);
@@ -64,7 +66,7 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string getEnvKVCacheTransferOutputPath();
+std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
@@ -91,5 +93,26 @@ bool getEnvKVCacheTransferUseAsyncBuffer();
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
+
+// TODO: For DEV purpose temporarily.
+// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
+int getEnvMoeA2ADispatchBlockSize();
+// Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
+int getEnvMoeA2ACombineBlockSize();
+
+// Disable the fast fp4 quantization math and align with the TransformerEngine
+bool getEnvDisableFP4QuantFastMath();
+
+// Enable the NVFP4 4over6 scale-candidate quantization mode.
+bool getEnvNVFP4Use4Over6();
+
+// Select the candidate error used by the NVFP4 4over6 scale-candidate path.
+NVFP44Over6ErrMode getEnvNVFP44Over6ErrMode();
+
+// Enable fast math in the NVFP4 4over6 scale-candidate error path.
+bool getEnvNVFP44Over6ErrUseFastMath();
+
+// Use 256 instead of 448 for the NVFP4 4over6 E4M3 scaling convention.
+bool getEnvNVFP44Over6E4M3Use256();
 
 }  // namespace tensorrt_llm::common
