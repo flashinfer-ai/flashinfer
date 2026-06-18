@@ -60,3 +60,23 @@ def test_explicit_backend_does_not_warn(_cc, buf):
 )
 def test_no_warn_on_hopper(_cc, buf):
     assert _make(buf, "auto") == []
+
+
+@pytest.mark.parametrize("compute_capability", [(12, 0), (12, 1)])
+def test_auto_warns_without_cutlass_hint_on_sm12x(compute_capability):
+    _fresh_state()
+    with (
+        patch(
+            "flashinfer.mla._batch_mla._wrapper._get_compute_capability",
+            return_value=compute_capability,
+        ),
+        warnings.catch_warnings(record=True) as w,
+    ):
+        warnings.simplefilter("always")
+        BatchMLAPagedAttentionWrapper._maybe_warn_blackwell_auto_fallback(
+            torch.device("cpu"), "fa2"
+        )
+    messages = [str(x.message) for x in w if WARN_TAG in str(x.message)]
+    assert len(messages) == 1
+    assert "flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla" in messages[0]
+    assert "backend='cutlass'" not in messages[0]

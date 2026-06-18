@@ -133,14 +133,18 @@ class BatchMLAPagedAttentionWrapper:
         if major < 10:
             return
         cls._blackwell_auto_fallback_warned = True
+        cutlass_hint = (
+            "; backend='cutlass' is the closest in-wrapper alternative but may be "
+            "slower than this fallback for decode shapes."
+            if major in (10, 11)
+            else "."
+        )
         warnings.warn(
             f"BatchMLAPagedAttentionWrapper: backend='auto' selected "
             f"'{selected_backend}' on SM{major}{minor}, which is not Blackwell-native "
             f"and gives poor MLA decode performance. For decode, use "
             f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
-            f"(Blackwell-native trtllm-gen); backend='cutlass' is the closest "
-            f"in-wrapper alternative but may be slower than this fallback for "
-            f"decode shapes.",
+            f"(Blackwell-native trtllm-gen){cutlass_hint}",
             UserWarning,
             stacklevel=3,
         )
