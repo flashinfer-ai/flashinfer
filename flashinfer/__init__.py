@@ -124,6 +124,13 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
+from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
+from .nvfp4_attention_sm120 import (
+    nvfp4_attention_sm120_fwd as nvfp4_attention_sm120_fwd,
+)
+from .nvfp4_attention_sm120 import (
+    nvfp4_attention_sm120_quantize_qkv as nvfp4_attention_sm120_quantize_qkv,
+)
 from .norm import (
     fused_dit_residual_layernorm_scale_shift as fused_dit_residual_layernorm_scale_shift,
 )

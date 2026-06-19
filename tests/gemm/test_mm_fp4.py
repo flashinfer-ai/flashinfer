@@ -8,7 +8,12 @@ from flashinfer import (
     nvfp4_quantize,
     mxfp4_quantize,
 )
-from flashinfer.utils import get_compute_capability, LibraryError
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm12x_supported,
+    version_at_least,
+    LibraryError,
+)
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
 
 
@@ -139,6 +144,59 @@ def test_mm_fp4_backend_auto(
 ):
     # Some test cases for auto backend.
     _test_mm_fp4(m, n, k, res_dtype, "auto", use_128x4_sf_layout, auto_tuning, fp4_type)
+
+
+# Regression (#3560): b12x must accept ragged K (real floor K%32==0, not tile_k=128).
+# K=192 (packed_k=96) is the shape #3560 broke; both auto_tuning values hit distinct paths.
+@pytest.mark.parametrize("k", [96, 192])
+@pytest.mark.parametrize("auto_tuning", [False, True])
+def test_mm_fp4_b12x_ragged_k(k, auto_tuning):
+    _test_mm_fp4(
+        m=64,
+        n=512,
+        k=k,
+        res_dtype=torch.bfloat16,
+        backend="b12x",
+        use_128x4_sf_layout=True,
+        auto_tuning=auto_tuning,
+        fp4_type="nvfp4",
+    )
+
+
+# K % 32 != 0 violates TMA 16-byte alignment; explicit b12x must reject cleanly.
+def test_mm_fp4_b12x_misaligned_k_raises():
+    device = torch.device("cuda")
+    if not (
+        is_sm12x_supported(device) and version_at_least(torch.version.cuda, "13.0")
+    ):
+        pytest.skip("b12x backend requires SM120/SM121 + CUDA 13+.")
+    m, n, k = 64, 512, 112  # k % 32 == 16
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    g_in = (448 * 6) / a.float().abs().nan_to_num().max()
+    g_w = (448 * 6) / b.float().abs().nan_to_num().max()
+    a_fp4, a_s = nvfp4_quantize(
+        a, g_in, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    b_fp4, b_s = nvfp4_quantize(
+        b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            1.0 / (g_in * g_w),
+            torch.bfloat16,
+            res,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="b12x",
+            use_nvfp4=True,
+            skip_check=False,
+        )
 
 
 if __name__ == "__main__":
