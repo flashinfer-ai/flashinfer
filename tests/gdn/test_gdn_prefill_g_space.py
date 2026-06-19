@@ -43,7 +43,7 @@ def _skip_if_unsupported():
         pytest.skip("GDN prefill requires SM90, SM100, or SM120")
 
 
-def _make_inputs(seq_len=128, num_heads=4, head_size=64, device="cuda"):
+def _make_inputs(seq_len=128, num_heads=4, head_size=128, device="cuda"):
     """Minimal synthetic inputs for chunk_gated_delta_rule."""
     torch.manual_seed(42)
     q = torch.randn(seq_len, num_heads, head_size, dtype=torch.bfloat16, device=device)
@@ -99,6 +99,11 @@ def test_invalid_g_space_typo():
             )
 
 
+# ---------------------------------------------------------------------------
+# Hardware-dependent equivalence tests
+# ---------------------------------------------------------------------------
+
+
 def test_g_none_any_g_space_no_error():
     """When g=None the all-ones gate is used; g_space should be validated but not applied."""
     device = torch.device("cuda")
@@ -111,11 +116,6 @@ def test_g_none_any_g_space_no_error():
             q, k, v, g=None, cu_seqlens=cu_seqlens, g_space=space
         )
         assert not out.isnan().any(), f"NaN output with g=None, g_space={space!r}"
-
-
-# ---------------------------------------------------------------------------
-# Hardware-dependent equivalence tests
-# ---------------------------------------------------------------------------
 
 
 def test_g_space_ln_matches_manual_exp():
