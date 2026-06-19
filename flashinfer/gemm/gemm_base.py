@@ -5542,14 +5542,15 @@ def _b12x_gemm_fp4_requirement(
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
-    # K must be a multiple of 128 (tile_k = sf_vec_size * 8); a is packed FP4 (M, K//2).
+    # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not tile_k=128: the
+    # mainloop predicates the partial tile, so ragged K (192) works. Mirror can_implement.
     real_k = a.shape[1] * 2
-    if real_k % 128 != 0:
+    if real_k % 32 != 0:
         if backend != "b12x":
             return False  # let "auto" fall back to cutlass/cudnn
         raise ValueError(
-            "b12x FP4 GEMM requires the contraction dim K to be a multiple of 128 "
-            f"(tile_k = sf_vec_size * 8). Got K={real_k}."
+            "b12x FP4 GEMM requires the contraction dim K to be a multiple of 32 "
+            f"(TMA 16-byte alignment). Got K={real_k}."
         )
     _check_cute_dsl_availability()
     return True
