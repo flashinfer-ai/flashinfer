@@ -67,7 +67,6 @@ __device__ void moe_kernel_topk_BS8(
   static_assert(use_tma<Dims>::value, "BS8 path requires USE_TMA");
   using CoreDims = MoECoreDims<Dims>;
 
-  MONO_PHASE_TIMESTAMP(t_start);
 
   // ── Zero-init the single-buffer `down_partial_out[BS][HIDDEN]` ─────
   //
@@ -169,9 +168,8 @@ __device__ void moe_kernel_topk_BS8(
   //         K_BLOCKS_TOTAL `cp.async.bulk.tensor.2d` instructions
   //         covering the full per-block BF16 input tile via
   //         `moe_load_full_bf16_input` (Option B, design
-  //         "TMA-granularity decision").  Both gated under
-  //         `MONO_PROFILE_SKIP_PREFETCH_UP` so the matching wait in
-  //         the Phase-2 dispatch (added in task 4.2) is paired-elided.
+  //         "TMA-granularity decision").  The matching wait lives in
+  //         the Phase-2 dispatch (added in task 4.2).
   //       - Other prefetch lanes do nothing in Phase 1.
   //   * warp ∈ [0, 8) (calc warps): unchanged `topK_BS8` +
   //     `sync_calc_threads<>()` (256-thread `bar.sync 15`).
@@ -181,7 +179,6 @@ __device__ void moe_kernel_topk_BS8(
   if (warp_id >= CoreDims::CALC_WARP_COUNT) {
     // Prefetch warps + TMA launcher thread (warp ∈ [8, 12)).
     if (is_tma_launcher_thread<Dims>()) {
-#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
       // Single mbarrier arm covers all K_BLOCKS_TOTAL bulk loads.
       // The helper itself does not arm — see the doc comment on
       // `moe_load_full_bf16_input` for the caller contract.
@@ -191,27 +188,16 @@ __device__ void moe_kernel_topk_BS8(
       mbarrier_arrive_expect_tx(&u_tma->bar_rwin,
                                 /*tx_bytes=*/RWIN_TX_BYTES);
       moe_load_full_bf16_input<Dims>(activations_desc, u_tma->bf16_in_full, &u_tma->bar_rwin);
-#endif
     }
     // Other prefetch lanes (warp 8 lanes 1..31, warps 9..11) do
     // nothing in Phase 1.  Phase 2 (task 4.2) re-engages them as
     // BF16→FP8 quantization workers.
   } else {
-    // Calc warps (warp ∈ [0, 8)).  Routing is intentionally NOT
-    // guarded by MONO_PROFILE_SKIP_CALC_UP: `shmem->expert_count` /
-    // `shmem->experts[e].id` drive the helper's expert loop bounds
-    // and an uninitialized expert_count could be anything from 0
-    // to 2^32 (runaway loop).  Routing is intentionally NOT guarded by
-    // MONO_PROFILE_SKIP_CALC_UP: `shmem->expert_count` /
-    // `shmem->experts[e].id` drive the helper's expert loop bounds
-    // and an uninitialized expert_count could be anything from 0
-    // to 2^32 (runaway loop).  `topK_BS8` and `prepare_moe_topk_BS8`
-    // run regardless; only the per-expert QUANT / WGMMA / writeback
-    // work is compiled out.
+    // Calc warps (warp ∈ [0, 8)).  `topK_BS8` and `prepare_moe_topk_BS8`
+    // build `shmem->expert_count` / `shmem->experts[e].id`, which drive
+    // the downstream per-expert loop bounds.
     topK_BS8<Dims>(top_k, scoring_func, renormalize, router_logits, batch_size, shmem);
-    MONO_PHASE_TIMESTAMP(t_after_topk);
     sync_calc_threads<Dims>();
-    MONO_PHASE_TIMESTAMP(t_after_sync_calc);
     // `prepare_moe_topk_BS8` is no longer called from the calc-warp
     // branch — it now runs in the Phase-2 dispatch below on warp 0
     // only, alongside `routing_phase_quantize` on warps 1..11
@@ -233,18 +219,6 @@ __device__ void moe_kernel_topk_BS8(
   //     `moe_streaming_quantize_k128` once per (token, k_block) pair
   //     across the 11 warps in stride-11 partition (Req 2.4).
   //
-  // The wait on `bar_rwin` and the `routing_phase_quantize` body are
-  // gated on different `MONO_PROFILE_SKIP_*` flags so they can be
-  // toggled independently:
-  //   * `MONO_PROFILE_SKIP_PREFETCH_UP` elides BOTH the Phase-1
-  //     `bar_rwin` arm + 16 TMA issues AND this Phase-2 wait
-  //     (paired-elision, Req 1.8, 8.7) — so warps 1..11 never block
-  //     on a routing-window mbarrier that was never armed.
-  //   * `MONO_PROFILE_SKIP_CALC_UP` elides the
-  //     `routing_phase_quantize` body itself (Req 2.9); warp 0's
-  //     `prepare_moe_topk_BS8` keeps running so downstream phases
-  //     still see a valid `expert_count` / `experts[]`.
-  //
   // The trailing `__syncthreads()` is the SINGLE block-wide sync
   // that ends Phase 2 (Req 2.10): it publishes BOTH warp 0's routing
   // metadata writes AND warps 1..11's `fp8_act_full` / `act_scale`
@@ -256,19 +230,14 @@ __device__ void moe_kernel_topk_BS8(
   if (warp_id == 0) {
     prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem, spec);
   } else {
-#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     uint32_t parity_rwin = 0;
     while (!mbarrier_try_wait_parity(&u_tma->bar_rwin, parity_rwin)) {
     }
-#endif
-#ifndef MONO_PROFILE_SKIP_CALC_UP
     routing_phase_quantize<Dims>(u_tma->bf16_in_full, u_tma->fp8_act_full, shmem->act_scale,
                                  batch_size);
-#endif
   }
   __syncthreads();
 
-  MONO_PHASE_TIMESTAMP(t_after_routing);
 
   // ── Phase 2: setup up-projection group mapping ──────────────────────────
   // GRID=128 design, expert-group parallelism (WGMMA path):
@@ -329,7 +298,6 @@ __device__ void moe_kernel_topk_BS8(
         /*expert_stride=*/UP_GROUPS);
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_up);
 
   // ── Site #2 — Expert-local barrier (Phase 2b) ────────────────────────
   //
@@ -355,7 +323,6 @@ __device__ void moe_kernel_topk_BS8(
                                    /*seed_blockidx=*/up_group * UP_GRID, expert_phase);
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_barrier2);
 
   // ── Phase 4 (WGMMA): dual-WG streaming down-projection ────────────────
   // Each block owns DOWN_COL_TILE output cols; blocks partition into
@@ -375,7 +342,6 @@ __device__ void moe_kernel_topk_BS8(
                                                      batch_size, spec, shmem, down_weights_desc,
                                                      down_activations_desc);
 
-  MONO_PHASE_TIMESTAMP(t_after_down);
 
   // ── Site #3 — Col-stripe-local barrier (Phase 2b) ────────────────────
   //
@@ -401,7 +367,6 @@ __device__ void moe_kernel_topk_BS8(
                                       /*seed_blockidx=*/col_stripe_id, colstripe_phase);
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_barrier3);
 
   // ── Phase 5 (WGMMA): bf16 cast + writeback ─────────────────────────
   // Each Phase-5 block reads its own DOWN_COL_TILE output cols ×
@@ -452,7 +417,6 @@ __device__ void moe_kernel_topk_BS8(
     }
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_phase5);
 }
 
 /**

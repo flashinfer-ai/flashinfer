@@ -261,8 +261,9 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
                 "All instantiated BS8 variants set USE_TMA=true and the "
                 "kernel asserts use_tma in moe_kernel_topk_BS8 — the "
                 "non-TMA branch is unreachable.");
-  // `spec` is only used for MONO_PROFILE_PHASE_TIMING; suppress unused-
-  // parameter warnings under non-instrumented builds.
+  // `spec` is currently unused by this helper; suppress the
+  // unused-parameter warning (kept on the signature for symmetry with
+  // the other phase helpers and possible future use).
   (void)spec;
 
   // Only warp 0 (threads 0–31) participates; the other calc threads exit
@@ -387,7 +388,6 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     __syncwarp();
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_prepare_phaseA);
 
   // ────────── Phase B — Fused prefix sum + active-expert enum ─────────────
 
@@ -479,7 +479,6 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     shm->expert_count = expert_count;
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_prepare_phaseB);
 
   // ───────────────── Phase C — Slot assignment ────────────────────────────
   // Identical math to the v3 Pass 3 — see the long comment block in git
@@ -521,7 +520,6 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
         static_cast<uint8_t>(tma_shm->expert_slot_start[eid1] + rank1_intra + rank1_carry);
   }
 
-  MONO_PHASE_TIMESTAMP(t_after_prepare_phaseC);
 }
 
 }  // namespace moe_monokernel

@@ -10,21 +10,12 @@
 
 // Software grid-wide barrier for the MoE monokernel.
 //
-// Replaces `cooperative_groups::this_grid().sync()` so the kernel can
-// launch via the standard `cudaLaunchKernel` / `<<<>>>` path and thus be
-// captured into a CUDA Graph (see the
-// `moe-monokernel-software-grid-sync` spec, Requirement 1 and
-// Requirement 5).  The primitive implements Component A ("Software
-// `Grid_Barrier` primitive") of the design document.
-//
 // Safety: the software barrier is a spin on a global-memory flag.
 // Deadlock is only possible if the grid runs in multiple temporal waves.
 // The monokernel enforces one-block-per-SM co-residency
 // (`GRID_SIZE <= SM_count`, `__launch_bounds__(BLOCK_SIZE, 1)`, opt-in
 // dynamic SHM > per-SM/2), so every block is scheduled from launch and
-// cannot forever-pend while another spins.  See Requirement 4 for the
-// full co-residency invariant; the host-side launcher enforces the
-// runtime half of those checks.
+// cannot forever-pend while another spins.
 
 namespace moe_monokernel {
 
@@ -36,9 +27,8 @@ namespace moe_monokernel {
  * `GRID_SIZE_STATIC` blocks have arrived at this call.  On exit every
  * global-memory write issued by any block before the call is visible
  * to every global-memory read issued by any block after the call
- * (Req 2.1, 2.6).
  *
- * Protocol (design Component A, "Protocol" and "Fence discipline"):
+ * Protocol:
  *
  *   1. `__syncthreads()` publishes pre-barrier per-thread writes
  *      across the block.
@@ -63,24 +53,24 @@ namespace moe_monokernel {
  *      fold-back `atomicAdd`.  This preserves the high-bit
  *      invariant `SEED + (N - 1) = 0x80000000u` for the current
  *      call regardless of the interleaving of atomicExch vs
- *      atomicAdd (Req 2.2, 2.3).
- *   4. Non-seed blocks issue `atomicAdd(c, 1u)` (Req 2.3).
+ *      atomicAdd.
+ *   4. Non-seed blocks issue `atomicAdd(c, 1u)`.
  *   5. Every thread spins on `atomicAdd(c, 0u)` until bit 31 flips
  *      set.  Using `atomicAdd(c, 0u)` (vs a plain load) forces an
  *      uncached device-scope read so the high-bit transition is
- *      observed promptly (Req 2.4).
+ *      observed promptly.
  *   6. `__threadfence()` pairs with the pre-arrival release so
  *      post-barrier reads happen-after the bit-31 observation, and
  *      `__syncthreads()` gathers the block before the caller uses
- *      the post-barrier invariant (Req 2.6).
+ *      the post-barrier invariant.
  *   7. `++phase` advances the register-resident phase counter so
  *      the next call targets the other ping-pong slot.  The two
  *      slots guarantee that call N+2's seeder cannot observe a
- *      stale high-bit from call N (Req 2.5 — "ping-pong reset").
+ *      stale high-bit from call N.
  *
  * The degenerate `GRID_SIZE_STATIC == 1` branch short-circuits: a
  * single block has no cross-block ordering to enforce and its prior
- * writes are already self-visible (Req 2.7).  We still `++phase` so
+ * writes are already self-visible.  Still `++phase` so
  * the call count stays consistent across code paths.
  *
  * @tparam GRID_SIZE_STATIC   Compile-time block count
@@ -90,7 +80,7 @@ namespace moe_monokernel {
  *                            fold at compile time.
  * @param  counters           Device pointer to the two-slot ping-pong
  *                            counter pair (e.g.
- *                            `&spec->grid_barrier.slot[0]`, Req 2.8).
+ *                            `&spec->grid_barrier.slot[0]`).
  *                            Must be zero-initialized by the host on
  *                            first use; self-maintaining thereafter.
  * @param  phase              In/out register-resident phase counter;
@@ -101,7 +91,7 @@ namespace moe_monokernel {
  */
 template <uint32_t GRID_SIZE_STATIC>
 __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, uint32_t& phase) {
-  // Degenerate case (Req 2.7): single-block grid has no cross-block
+  // Degenerate case: single-block grid has no cross-block
   // ordering to enforce; the block's prior writes are already
   // self-visible.  We still bump `phase` so the call count stays
   // consistent if a later call ever takes a different branch.
@@ -120,7 +110,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
   // H200, so `SEED >= 0x80000000u - 131` never wraps.
   constexpr uint32_t SEED = 0x80000000u - (GRID_SIZE_STATIC - 1u);
 
-  // Ping-pong slot selection (Req 2.5, design "Ping-pong reset"):
+  // Ping-pong slot selection:
   // successive calls alternate slots so a block racing one call ahead
   // cannot observe a stale high-bit from the previous call on the
   // same slot.
@@ -134,7 +124,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
   if (threadIdx.x == 0) {
     // Step 2 (fence discipline, step 2): release pre-barrier global
     // writes to the device so other SMs observe them before our
-    // arrival on the counter (Req 2.6).
+    // arrival on the counter.
     __threadfence();
 
     if (blockIdx.x == 0) {
@@ -161,7 +151,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
         atomicAdd(c, to_fold);
       }
     } else {
-      // Non-seed blocks arrive exactly once (Req 2.3).  The
+      // Non-seed blocks arrive exactly once.  The
       // atomicAdd is device-scope; its ordering relative to the
       // seeder's exchange is provided by the atomic RMW itself plus
       // the preceding `__threadfence()`.
@@ -174,7 +164,6 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
   // Using `atomicAdd(c, 0u)` forces an uncached device-scope read;
   // it compiles to the same ld.acquire.gpu pattern as an inline-PTX
   // acquire load on SM90 and is portable across CUDA versions.
-  // (Req 2.4.)
   while ((atomicAdd(c, 0u) & 0x80000000u) == 0u) {
     // Empty spin body.  The memory subsystem coalesces repeated
     // reads of the same address from the same SM, so the spin's
@@ -190,7 +179,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
   // thread proceeds together with a consistent post-barrier view.
   __syncthreads();
 
-  // Step 7 (Req 2.5): advance the phase so the next call targets
+  // Step 7 : advance the phase so the next call targets
   // the other ping-pong slot.  The slot we just exited is left at
   // `0x80000000u`; the self-maintaining reset discipline overwrites
   // it via `atomicExch` on the next call that lands on this slot
@@ -211,22 +200,21 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
  * call for this `id`.  On exit every global-memory write issued by
  * any block in the arrival set before the call is visible to every
  * global-memory read issued by any block in the arrival set after
- * the call (Req 8.1, 8.3, 8.6).
+ * the call.
  *
  * The protocol is identical to `grid_barrier` above; only the slot
  * address, seed thread, and seed value differ:
  *
  *   - Slot address: `counter_region + id * 2 + (phase & 1)`.  The
  *     per-id Counter_Pair makes disjoint `id` namespaces
- *     non-interfering (Req 8.2, 8.5).
+ *     non-interfering.
  *   - Seed_Thread: thread 0 of the block whose `blockIdx.x ==
  *     seed_thread_blockidx` (the lowest `blockIdx.x` in the arrival
  *     set by convention).
  *   - Seed value: `0x80000000u - (arrival_count - 1u)` (runtime,
  *     not constexpr — see note below).
  *   - `++phase` on exit; the two ping-pong slots cover reuse of the
- *     same (region, id) across successive kernel invocations
- *     (Req 8.4).
+ *     same (region, id) across successive kernel invocations.
  *
  * See the `grid_barrier` doxygen above for the step-by-step fence
  * discipline and the seed correctness argument (both carry over
@@ -239,7 +227,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
  * runtime argument so this gate is a runtime branch rather than a
  * compile-time `if constexpr`; at every expected call site the value
  * is a compile-time constant (`UP_GRID`, `DOWN_GROUPS`) so the
- * compiler folds both the gate and the `SEED` computation (Req 9.8).
+ * compiler folds both the gate and the `SEED` computation.
  *
  * Caller contract:
  *
@@ -272,17 +260,14 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
  *     that block is in the arrival set
  *     `{c + DOWN_GRID * g : g ∈ [0, DOWN_GROUPS)}` at `g == 0`.)
  *
- * Design note — why not template on `arrival_count`?  The primitive
- * is reused for multiple call sites whose arrival counts differ
- * (UP_GRID = 8 for Expert_Barrier, DOWN_GROUPS = 16 for
- * ColStripe_Barrier).  Making `arrival_count` a template non-type
- * parameter would force two separate device-function instantiations
- * for what is otherwise identical code.  The value is a compile-time
- * constant at every call site, so the compiler constant-folds `SEED`
- * and the degenerate-case gate just as effectively without the extra
- * instantiation.
- *
- * Validates: Requirements 8.1, 8.2, 8.3, 8.4, 8.6, 9.8.
+ * Design note — The primitive is reused for multiple call sites whose 
+ * arrival counts differ (UP_GRID = 8 for Expert_Barrier, DOWN_GROUPS 
+ * = 16 for ColStripe_Barrier).  Making `arrival_count` a template 
+ * non-type parameter would force two separate device-function 
+ * instantiations for what is otherwise identical code.  The value is 
+ * a compile-time constant at every call site, so the compiler 
+ * constant-folds `SEED` and the degenerate-case gate just as 
+ * effectively without the extra instantiation.
  *
  * @param counter_region          Device pointer to the base of the
  *                                Counter_Pair array for this region
@@ -293,8 +278,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
  *                                for site #3).  Must be
  *                                zero-initialized by the host on first
  *                                use; self-maintaining thereafter via
- *                                the ping-pong reset discipline
- *                                (Req 8.5).
+ *                                the ping-pong reset discipline.
  * @param id                      Barrier id within the region
  *                                (expert-group index or col-stripe
  *                                index).
@@ -315,7 +299,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
 __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_region, uint32_t id,
                                                 uint32_t arrival_count,
                                                 uint32_t seed_thread_blockidx, uint32_t& phase) {
-  // Degenerate case (Req 9.8): a single-block arrival set has no
+  // Degenerate case: a single-block arrival set has no
   // cross-block ordering to enforce; the block's prior writes are
   // already self-visible.  We still bump `phase` so the call count
   // stays consistent across kernel invocations (the slot still
@@ -339,10 +323,9 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
   // note in the doxygen above.
   const uint32_t SEED = 0x80000000u - (arrival_count - 1u);
 
-  // Slot address: per-id Counter_Pair with ping-pong slot selection
-  // (Req 8.4, design Component B "Protocol").  The `id * 2` stride
-  // matches the `uint32_t counter[N_IDS][2]` layout declared in
-  // `MoEGemmSpec<Dims>::partial_barrier`.
+  // Slot address: per-id Counter_Pair with ping-pong slot selection.
+  // The `id * 2` stride matches the `uint32_t counter[N_IDS][2]` 
+  // layout declared in `MoEGemmSpec<Dims>::partial_barrier`.
   const uint32_t slot = phase & 1u;
   uint32_t* c = counter_region + id * 2u + slot;
 
@@ -353,7 +336,7 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
   if (threadIdx.x == 0) {
     // Step 2 (fence discipline, step 2): release pre-barrier global
     // writes to the device so other arrival-set members observe
-    // them before our arrival on the counter (Req 8.6).
+    // them before our arrival on the counter.
     __threadfence();
 
     if (blockIdx.x == seed_thread_blockidx) {
@@ -383,7 +366,7 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
         atomicAdd(c, to_fold);
       }
     } else {
-      // Non-seed arrival-set members arrive exactly once (Req 8.3).
+      // Non-seed arrival-set members arrive exactly once.
       // The atomicAdd is device-scope; its ordering relative to the
       // seeder's exchange is provided by the atomic RMW itself plus
       // the preceding `__threadfence()`.
@@ -411,7 +394,7 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
   // thread proceeds together with a consistent post-barrier view.
   __syncthreads();
 
-  // Step 7 (Req 8.4): advance the phase so the next call targets
+  // Step 7: advance the phase so the next call targets
   // the other ping-pong slot.  The slot we just exited is left at
   // `0x80000000u`; the self-maintaining reset discipline overwrites
   // it via `atomicExch` on the next call that lands on this slot
@@ -444,8 +427,6 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
  *
  * See the `partial_barrier` doxygen above for the full protocol,
  * fence discipline, and caller contract.
- *
- * Validates: Requirements 9.6, 9.8.
  *
  * @param expert_counters         Device pointer to the base of the
  *                                expert Counter_Pair array
@@ -492,7 +473,6 @@ __device__ __forceinline__ void expert_barrier(uint32_t* __restrict__ expert_cou
  * See the `partial_barrier` doxygen above for the full protocol,
  * fence discipline, and caller contract.
  *
- * Validates: Requirements 9.7, 9.8.
  *
  * @param colstripe_counters      Device pointer to the base of the
  *                                col-stripe Counter_Pair array

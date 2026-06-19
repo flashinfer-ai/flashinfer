@@ -9,104 +9,39 @@
 
 #include "moe_interface.h"
 
-// ── Profiling build flags ──────────────────────────────────────────────────
-// Define one of these to isolate the cost of calc vs prefetch warps.
-//
-// Per-phase fine-grained flags (preferred for analyzing a single phase
-// in isolation while leaving the others functionally correct):
-//
-//   MONO_PROFILE_SKIP_CALC_UP        : up-proj calc warps are compiled out
-//   MONO_PROFILE_SKIP_PREFETCH_UP    : up-proj prefetches are compiled out
-//   MONO_PROFILE_SKIP_CALC_DOWN      : down-proj calc warps are compiled out
-//   MONO_PROFILE_SKIP_PREFETCH_DOWN  : down-proj prefetches are compiled out
-//
-// Legacy global flags (cascade to BOTH up- and down-projection variants
-// below).  Convenient for the "how much of total kernel time is waiting
-// on data?" experiment, but cannot isolate a single phase:
-//
-//   MONO_PROFILE_SKIP_CALC     : calc warp bodies compiled out in BOTH
-//                                up- and down-projections.
-//   MONO_PROFILE_SKIP_PREFETCH : prefetch warp bodies compiled out in
-//                                BOTH up- and down-projections.
-//
-// Skipping calc means the calc warps still participate in syncs (so the
-// kernel doesn't deadlock) but compute nothing; skipping prefetch leaves
-// the matching consumer waits compiled out as well, so calc warps read
-// undefined SHM data.  Either flag produces garbage output — useful only
-// for wall-clock timing comparisons.
-//
-// Branch bodies in the kernel are wrapped with the corresponding
-// #ifndef guards — see the is_prefetch_warp / !is_prefetch_warp sites
-// in moe_up_projection.cu and moe_down_projection.cu.
-
-// Legacy globals cascade to the per-phase variants.  This keeps existing
-// CMake configurations (which set the global flags) working unchanged
-// while letting new analysis target a single phase.
-#ifdef MONO_PROFILE_SKIP_CALC
-#ifndef MONO_PROFILE_SKIP_CALC_UP
-#define MONO_PROFILE_SKIP_CALC_UP
-#endif
-#ifndef MONO_PROFILE_SKIP_CALC_DOWN
-#define MONO_PROFILE_SKIP_CALC_DOWN
-#endif
+// Full 32-lane warp mask for the `*_sync` warp intrinsics.  Previously
+// supplied by the vLLM tree's `cuda_utils.h`; defined here so the megamoe
+// sources are self-contained under FlashInfer's JIT build.
+#ifndef FULL_MASK
+#define FULL_MASK 0xffffffffu
 #endif
 
-#ifdef MONO_PROFILE_SKIP_PREFETCH
-#ifndef MONO_PROFILE_SKIP_PREFETCH_UP
-#define MONO_PROFILE_SKIP_PREFETCH_UP
+// ── Default pipeline variants ───────────────────────────────────────────────
+// Two scheduling optimizations are enabled by default.  Both are pure
+// pipeline / data-movement reschedules — they do not change the kernel's
+// numerical result (verified bit-identical against the non-variant path),
+// only how work overlaps:
+//
+//   MONO_PROFILE_BARW_4DEEP       : up-proj weight TMA pipeline is 2-deep
+//                                   (4 mbarrier slots, lookahead `(s+2)&3`)
+//                                   instead of single-deep, hiding more of
+//                                   the cross-/intra-expert weight TMA
+//                                   latency behind compute.
+//   MONO_PROFILE_DEFER_UP_EPILOGUE: the up-proj SiLU+fp8-quant writeback is
+//                                   deferred onto the prefetch warps during
+//                                   the next expert's first K-loop iters,
+//                                   overlapping it with calc-warp WGMMA.
+//
+// Define MONO_PROFILE_NO_BARW_4DEEP / MONO_PROFILE_NO_DEFER_UP_EPILOGUE (e.g.
+// via an nvcc -D flag) to fall back to the simpler single-deep / inline-
+// epilogue paths, which are kept compiled-out below for A/B comparison.
+#if !defined(MONO_PROFILE_BARW_4DEEP) && !defined(MONO_PROFILE_NO_BARW_4DEEP)
+#define MONO_PROFILE_BARW_4DEEP
 #endif
-#ifndef MONO_PROFILE_SKIP_PREFETCH_DOWN
-#define MONO_PROFILE_SKIP_PREFETCH_DOWN
-#endif
+#if !defined(MONO_PROFILE_DEFER_UP_EPILOGUE) && !defined(MONO_PROFILE_NO_DEFER_UP_EPILOGUE)
+#define MONO_PROFILE_DEFER_UP_EPILOGUE
 #endif
 
-// ── Phase-timing instrumentation ───────────────────────────────────────────
-// Define MONO_PROFILE_PHASE_TIMING to enable per-phase clock64() timestamps
-// written by block 0, thread 0 at each phase boundary.  The timestamps are
-// stored in a small GM struct at the tail of MoEGemmSpec and can be read
-// back from Python to compute per-phase wall-clock breakdowns.
-//
-// The overhead is negligible (one clock64() read + one GM store per phase
-// boundary, on a single thread) and does NOT affect kernel correctness.
-//
-// Enable via CMake:
-//   set_source_files_properties("csrc/moe/moe_monokernel/moe_wrapper.cu"
-//     PROPERTIES COMPILE_DEFINITIONS "MONO_PROFILE_PHASE_TIMING")
-
-#ifdef MONO_PROFILE_PHASE_TIMING
-#define MONO_PHASE_TIMESTAMP(field)             \
-  do {                                          \
-    if (blockIdx.x == 0 && threadIdx.x == 0) {  \
-      spec->phase_timestamps.field = clock64(); \
-    }                                           \
-  } while (0)
-// Like MONO_PHASE_TIMESTAMP but additionally gated on a runtime
-// condition.  Use to record a timestamp on only the first iteration
-// of a loop without overwriting on subsequent iterations.
-#define MONO_PHASE_TIMESTAMP_IF(field, cond)             \
-  do {                                                   \
-    if ((cond) && blockIdx.x == 0 && threadIdx.x == 0) { \
-      spec->phase_timestamps.field = clock64();          \
-    }                                                    \
-  } while (0)
-// Like MONO_PHASE_TIMESTAMP_IF but with a caller-chosen recording
-// thread.  Use when the timestamp must be taken from a thread
-// OTHER than calc-warp 0 lane 0 — e.g. warp 8 lane 0 (= the
-// first prefetch warp, also the TMA launcher) for measuring
-// prefetch-warp deferred work.  `tid_pred` is the literal
-// `threadIdx.x` value of the recording thread (e.g. `8u * 32u`
-// for warp 8 lane 0).
-#define MONO_PHASE_TIMESTAMP_IF_TID(field, cond, tid_pred)        \
-  do {                                                            \
-    if ((cond) && blockIdx.x == 0 && threadIdx.x == (tid_pred)) { \
-      spec->phase_timestamps.field = clock64();                   \
-    }                                                             \
-  } while (0)
-#else
-#define MONO_PHASE_TIMESTAMP(field) ((void)0)
-#define MONO_PHASE_TIMESTAMP_IF(field, cond) ((void)0)
-#define MONO_PHASE_TIMESTAMP_IF_TID(field, cond, tid_pred) ((void)0)
-#endif
 
 namespace moe_monokernel {
 
@@ -272,7 +207,7 @@ struct MoEGemmSpec {
   // fp32 scales into these buffers; the WGMMA down-projection consumes
   // them directly (no bf16→fp8 re-quantization pass).
   //
-  // Layouts (per Req 2):
+  // Layouts:
   //   temp_fp8        [TEMP_ROWS][N]            fp8
   //   temp_act_scale  [TEMP_ROWS][N / 64]       fp32
   //                   one scale per (virtual_row, up_block_idx)
@@ -351,47 +286,35 @@ struct MoEGemmSpec {
       (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
   float act_scale[Dims::BS][ACT_SCALE_BLOCKS];
 
-  // ── Software barrier counters (Req 13.3, 2.8, 8.5) ────────────────────
+  // ── Software barrier counters ────────────────────
   //
   // Placed at the TAIL of `MoEGemmSpec<Dims>`, AFTER `act_scale`, so
   // `TEMP_FP8_OFFSET = offsetof(MoEGemmSpec<Dims>, temp_fp8)` stays
   // byte-identical to its pre-migration value.  The host-side TMA
   // descriptor factory in `moe_wrapper.cu` derives the device pointer
-  // to `spec->temp_fp8` from that compile-time constant (spec R13.3,
-  // Design "Byte-offset check"), so inserting any new field BEFORE
+  // to `spec->temp_fp8` from that compile-time constant, 
+  // so inserting any new field BEFORE
   // `temp_fp8` would silently break the down-activation TMA path.
   //
-  // Lifetime / initialization (Req 13.1, 13.2):
+  // Lifetime / initialization:
   //   * Host zero-initializes the whole scratchpad (including these
   //     counters) once per process via `cudaMemsetAsync` on the first
-  //     launch (Design Component C "Scratchpad barrier counter
-  //     zero-initialization").
+  //     launch.
   //   * Subsequent launches inherit the counter state from the
   //     previous kernel's exit: the ping-pong discipline is
   //     self-maintaining — each barrier call's seed `atomicExch`
   //     overwrites the prior-call `0x80000000` on the same slot in its
   //     atomic step, and any arrivals that landed on the slot between
   //     calls are folded back in by the seed-thread's follow-up
-  //     `atomicAdd(c, prior)` (Design Component A "Seed correctness
-  //     argument" and "Ping-pong reset").  No host re-zero is required
+  //     `atomicAdd(c, prior)`.  No host re-zero is required
   //     across kernel invocations.
   //
-  // Call-site mapping (Design "Site #1"…"Site #5"):
+  // Call-site mapping:
   //   * `grid_barrier.slot[2]` — the Phase-1 full-grid ping-pong pair.
   //     Used by:
-  //       - Site #1 (BS64 only) — top-of-kernel output zero-out
-  //         publishes to Phase 1. Eliminated for BS8 under
-  //         `if constexpr (Dims::BS > 8)` because the BS8 Phase-5
-  //         reduction `=`-writes every output element (Req 3.4, 3.5).
   //       - Sites #2, #3 (BS8) — Phase 3→4 and Phase 4→5. These are
   //         Grid_Barrier in Phase 1 and get downgraded to
   //         Expert_Barrier / ColStripe_Barrier (below) in Phase 2b.
-  //       - Site #4 (BS64) — up→down projection boundary.
-  //       - Site #5 (BS64) — `moe_scale_activation_BSx` publishes
-  //         `spec->act_scale` to every downstream reader.
-  //     All BS64 sites share the same ping-pong pair because every
-  //     block calls them in the same static order, and the phase
-  //     counter is threaded through the one `grid_phase` register.
   //
   //   * `partial_barrier.expert_slot[NUM_EXPERTS][2]` — Phase-2b
   //     Expert_Barrier counter region, one Counter_Pair per expert
@@ -423,163 +346,6 @@ struct MoEGemmSpec {
     uint32_t expert_slot[Dims::NUM_EXPERTS][2];
     uint32_t colstripe_slot[DOWN_GRID][2];
   } partial_barrier;
-
-  // ── Phase-timing instrumentation (MONO_PROFILE_PHASE_TIMING) ───────────
-  // Per-phase clock64() timestamps written by block 0, thread 0.
-  // Only meaningful when MONO_PROFILE_PHASE_TIMING is defined; otherwise
-  // the struct is still present (keeps layout stable) but never written.
-  //
-  // Phases (BS8 path):
-  //   t_start          : kernel entry
-  //   t_after_routing  : after topK + prepare_moe_topk + __syncthreads()
-  //   t_after_up       : after moe_up_projection_BS8_allexperts_wgmma_tma
-  //   t_after_barrier2 : after expert_barrier (site #2)
-  //   t_after_down     : after moe_down_projection_BS8_allexperts_wgmma_tma
-  //   t_after_barrier3 : after colstripe_barrier (site #3)
-  //   t_after_phase5   : after Phase 5 reduction + writeback
-  //
-  // Routing sub-phases (filled by topK_BS8 / prepare_moe_topk_BS8):
-  //   t_after_topk             : after topK_BS8 (warps return)
-  //   t_after_sync_calc        : after sync_calc_threads<>() helper
-  //   t_after_prepare_phaseA   : after Phase A (zero counts + tally + cache
-  //   eids) t_after_prepare_phaseB   : after Phase B (fused prefix sum +
-  //   experts[] enum) t_after_prepare_phaseC   : after Phase C (slot
-  //   assignment) t_after_prepare_sync     : after the trailing __syncthreads()
-  struct {
-    int64_t t_start;
-    int64_t t_after_topk;
-    int64_t t_after_sync_calc;
-    int64_t t_after_prepare_phaseA;
-    int64_t t_after_prepare_phaseB;
-    int64_t t_after_prepare_phaseC;
-    int64_t t_after_routing;
-    // Up-projection sub-phases (block 0 — calc warp 0 lane 0):
-    //   t_up_after_preloop          : after pre-loop bar_w[0] arm,
-    //                                 before the expert loop.
-    //
-    //   ── First expert K-loop (e == expert_start) ──
-    //   t_up_e0_iter0_after_wait    : after iter-0 bar_w wait
-    //                                 (cross-expert TMA arrival).
-    //   t_up_e0_iter0_after_compute : after iter-0 K-substep WGMMAs
-    //                                 + scale-apply complete.
-    //   t_up_e0_iter1_after_wait    : after iter-1 bar_w wait
-    //                                 (steady-state TMA wait).
-    //   t_up_e0_iter1_after_compute : after iter-1 compute.
-    //   t_up_after_expert0_kloop    : after expert 0's K-loop ends
-    //                                 (= last WGMMA's final scale-
-    //                                 apply complete).
-    //
-    //   ── First expert epilogue (e == expert_start) ──
-    //   t_up_after_expert0_wgmma_out: after the wgmma_out SHM store
-    //                                 + publish __syncthreads.
-    //   t_up_after_expert0_writeback: after the SiLU+fp8-quant
-    //                                 writeback + trailing
-    //                                 __syncthreads at the bottom
-    //                                 of expert 0's loop body.
-    //
-    //   ── Second expert iter 0 / iter 1 (e == expert_start + stride) ──
-    //   t_up_e1_iter0_after_wait    : after iter-0 bar_w wait of
-    //                                 expert 1.  Δ to
-    //                                 `t_up_after_expert0_writeback`
-    //                                 = the cross-expert "gap"
-    //                                 from the end of expert 0's
-    //                                 epilogue to the start of
-    //                                 expert 1's first WGMMA.
-    //   t_up_e1_iter0_after_compute : after expert 1's iter-0
-    //                                 compute.
-    //   t_up_e1_iter1_after_wait    : after expert 1's iter-1
-    //                                 wait.
-    //   t_up_e1_iter1_after_compute : after expert 1's iter-1
-    //                                 compute.
-    int64_t t_up_after_preloop;
-    int64_t t_up_e0_iter0_after_wait;
-    int64_t t_up_e0_iter0_after_compute;
-    int64_t t_up_e0_iter1_after_wait;
-    int64_t t_up_e0_iter1_after_compute;
-    int64_t t_up_after_expert0_kloop;
-    int64_t t_up_after_expert0_wgmma_out;
-    int64_t t_up_after_expert0_writeback;
-    int64_t t_up_e1_iter0_after_wait;
-    int64_t t_up_e1_iter0_after_compute;
-    int64_t t_up_e1_iter1_after_wait;
-    int64_t t_up_e1_iter1_after_compute;
-    // ── Prefetch-warp deferred SiLU body (only meaningful when
-    // MONO_PROFILE_DEFER_UP_EPILOGUE is defined; recorded on
-    // threadIdx.x == 256, i.e. warp 8 lane 0). ──
-    //
-    // Bracketed timestamps around the deferred SiLU+quant writeback
-    // body for the PREVIOUS expert (expert 0), running on prefetch
-    // warps inside expert 1's K-loop.  Tokens are split across two
-    // K-loop iterations:
-    //   iter 0 (s == 0): tokens [0..3]
-    //   iter 1 (s == 1): tokens [4..7]
-    //
-    //   t_up_e1_pf_iter0_before_silu : warp 8 lane 0 immediately
-    //                                  before the helper call at
-    //                                  iter 0.
-    //   t_up_e1_pf_iter0_after_silu  : same thread immediately
-    //                                  after.  Δ = 4-warp parallel
-    //                                  per-iter SiLU body cost.
-    //   t_up_e1_pf_iter1_before_silu : same for iter 1 (tokens
-    //                                  4..7).
-    //   t_up_e1_pf_iter1_after_silu  : same.
-    //
-    // Comparing the (after_silu - before_silu) Δ on each iter
-    // against the calc-warp `(after_compute - after_wait)` Δ for
-    // the same iter tells us whether the PF body fits inside the
-    // calc compute window:
-    //   * PF Δ ≤ calc Δ → PF hidden, calc is the long pole.
-    //   * PF Δ > calc Δ → calc waits for PF at the inter-iter
-    //                     sync, PF is the long pole.
-    int64_t t_up_e1_pf_iter0_before_silu;
-    int64_t t_up_e1_pf_iter0_after_silu;
-    int64_t t_up_e1_pf_iter1_before_silu;
-    // ── Iter-1 PF body section breakdown ──────────────────────────────
-    //
-    // Recorded on warp 8 lane 0 (= threadIdx.x == 256) inside the
-    // INLINED iter-1 deferred SiLU body for tokens 4..7.  Each
-    // timestamp marks the END of a section; the Δs measure the
-    // section costs.  Only meaningful when both
-    // MONO_PROFILE_PHASE_TIMING and MONO_PROFILE_DEFER_UP_EPILOGUE
-    // are defined.
-    //
-    //   Section A — topk scan + SHM lookups (`topk_ids_flat`,
-    //     `topk_weights_flat`, `sorted_slot`)
-    //   Section B — 4 wgmma_out SHM reads (gate1/up1/gate2/up2)
-    //   Section C — SiLU compute (2× `__expf` SFU ops + the
-    //     `rw * up * gate / (1 + exp(-gate))` chain)
-    //   Section D — warp-reduce-max + fp8 quantize (5-stage
-    //     `__shfl_xor_sync` chain + `inv_scale` reciprocal)
-    //   Section E — GM stores (2 fp8 byte stores + 1 fp32 scale
-    //     store)
-    int64_t t_up_e1_pf_iter1_after_topk_lookup;
-    int64_t t_up_e1_pf_iter1_after_wgmma_read;
-    int64_t t_up_e1_pf_iter1_after_silu_compute;
-    int64_t t_up_e1_pf_iter1_after_warp_reduce;
-    int64_t t_up_e1_pf_iter1_after_silu;
-    int64_t t_after_up;
-    int64_t t_after_barrier2;
-    // Down-projection sub-phases (block 0, thread 0 — calc warp 0 lane 0):
-    //   t_down_after_prologue          : after zero out_accum + mbarrier
-    //                                    init + block-wide __syncthreads
-    //                                    that publishes both.
-    //   t_down_after_expert0_kloop     : after the FIRST expert's K-loop
-    //                                    (4 K-steps for Qwen3.5).
-    //   t_down_after_expert0_accum     : after the FIRST expert's
-    //                                    accumulate loop + tail
-    //                                    __syncthreads.
-    //   t_after_down                   : after the GM writeback of
-    //                                    out_accum → down_partial_out
-    //                                    (kept as the existing
-    //                                    Phase-4-end timestamp).
-    int64_t t_down_after_prologue;
-    int64_t t_down_after_expert0_kloop;
-    int64_t t_down_after_expert0_accum;
-    int64_t t_down_after_all_experts;
-    int64_t t_after_down;
-    int64_t t_after_barrier3;
-    int64_t t_after_phase5;
-  } phase_timestamps;
 };
 
 // Maximum supported dimensions for shared memory and scratchpad allocation
@@ -872,8 +638,7 @@ struct MoE_SHM {
     //   * `fp8_act_full` — routing-phase-quantized FP8 buffer covering
     //     all `K_BLOCKS_TOTAL` 128-K substeps.  Written by Phase 2's
     //     `routing_phase_quantize` (warps 1..11), read by the Phase-3
-    //     up-projection K-loop with no double-buffer slot alternation
-    //     (Req 3.4, 3.5).
+    //     up-projection K-loop with no double-buffer slot alternation.
     //   * `a_down_wgmma` — down-projection activation buffer (Phase 4).
     //     Populated by the down-proj's per-expert TMA bulk activation
     //     load and consumed by the down-proj WGMMA K-loop.  Aliases
@@ -911,29 +676,25 @@ struct MoE_SHM {
       // (= Dims::HIDDEN_STATES / K_STEP_WGMMA).  Equal to 16 for
       // Qwen3.5 (HIDDEN_STATES = 2048).  Used by the new Phase-1
       // routing-window TMA load (covers the full BF16 input tile in
-      // K_BLOCKS_TOTAL bulk loads — Option B in the design's
-      // "TMA-granularity decision") and by the new single-buffer
+      // K_BLOCKS_TOTAL bulk loads) and by the new single-buffer
       // `fp8_act_full` that covers all K substeps for Phase-3
-      // direct FP8 reads (Req 3.4, 3.5; design "Single-buffer
-      // fp8_act covering all K substeps").
+      // direct FP8 reads.
       static constexpr uint32_t K_BLOCKS_TOTAL = Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
 
       // ── BS-dependent sizing clamp for the BS8-path-only fields ─────
       // The new `bf16_in_full` and `fp8_act_full` fields below are
-      // consumed only by the BS8 TMA+WGMMA path (this entire fusion is
-      // scoped to that path — see the spec's Req 7.1, 7.2, 7.3, 7.6).
+      // consumed only by the BS8 TMA+WGMMA path.
       // The `tiny_wgmma_tma` variant of `union U` is, however, present
       // in `MoE_SHM<Dims>` for every Dims, and `sizeof(MoE_SHM<Dims>)`
       // takes the max across all union members.  To keep the BS64
       // path's `MoE_SHM<Dims>` size byte-identical to the
-      // pre-optimization baseline (Req 7.1), we collapse the BS-
+      // pre-optimization baseline, we collapse the BS-
       // dependent extents of the new fields to 1 when `Dims::BS > 8`
       // and to their natural value otherwise.  The runtime BS8
       // dispatch never reads the BS64-instantiated views; the
       // `tiny_wgmma_tma` union member is the only active path.
       //
-      // Tile-major shape (Req 1.4, 1.5; design "TMA-granularity
-      // decision"): the BF16 input SHM buffer is shaped as
+      // Tile-major shape: the BF16 input SHM buffer is shaped as
       // `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` rather than the natural-
       // looking `[BS][HIDDEN_STATES]` because the activation TMA
       // descriptor (`create_activations_tma_desc`) is configured with
@@ -1000,8 +761,7 @@ struct MoE_SHM {
 
       // ── NEW: single-buffer fp8_act covering all K substeps ──────────
       // Single-buffer FP8 activation buffer for the BS8 TMA+WGMMA
-      // post-fusion Phase-3 reads (Req 3.4, 3.5; design "Single-buffer
-      // fp8_act covering all K substeps").  Indexed by `k_block ∈
+      // post-fusion Phase-3 reads.  Indexed by `k_block ∈
       // [0, K_BLOCKS_TOTAL)`; the up-proj K-loop reads
       // `fp8_act_full[s * UP_K_SUBSTEPS + kk][...]` with no slot
       // alternation.  Layout per `k_block`:
@@ -1029,8 +789,8 @@ struct MoE_SHM {
       //
       // The BS-dependent extent (`FP8_ACT_FULL_K_BLOCKS`) collapses
       // to 1 for `Dims::BS > 8` so the BS64 path's `MoE_SHM<Dims>`
-      // size stays byte-identical to the pre-optimization baseline
-      // (Req 7.1).  See the BF16_IN_FULL_BS / BF16_IN_FULL_K
+      // size stays byte-identical to the pre-optimization baseline.
+      // See the BF16_IN_FULL_BS / BF16_IN_FULL_K
       // comment above K_BLOCKS_TOTAL for the rationale.
       static constexpr uint32_t FP8_ACT_T_TILE_PADDED = CoreDims::T_TILE + 1u;
       alignas(1024) AQ_element fp8_act_full[FP8_ACT_FULL_K_BLOCKS][FP8_ACT_NUM_CHUNKS]
@@ -1068,8 +828,7 @@ struct MoE_SHM {
         // `w_wgmma` and `w_down_wgmma` alias the same SHM bytes, so
         // the alignas applies to both views.
         //
-        // ── NEW: full BF16 input tile, unioned with w_wgmma + w_down_wgmma
-        // (Req 4.1, 4.2, 4.3; design "Data Models" / "Aliasing safety").
+        // ── NEW: full BF16 input tile, unioned with w_wgmma + w_down_wgmma.
         //
         // `bf16_in_full[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]`
         //   = 16 × 8 × 128 × 2 = 32 KB for Qwen3.5.
@@ -1104,7 +863,7 @@ struct MoE_SHM {
         // `BF16_IN_FULL_BS` / `BF16_IN_FULL_K`) so the field
         // collapses to a 1×1×1 placeholder for `Dims::BS > 8`,
         // keeping the BS64 path's `MoE_SHM<Dims>` size byte-
-        // identical to the pre-optimization baseline (Req 7.1).
+        // identical to the pre-optimization baseline.
         // See the BF16_IN_FULL_K_BLOCKS / BF16_IN_FULL_BS /
         // BF16_IN_FULL_K comment above for the rationale.
         //
@@ -1263,7 +1022,7 @@ struct MoE_SHM {
 #endif
       alignas(16) uint64_t bar_a[2];  // 16 B
 
-      // ── NEW: routing-window mbarrier (Req 1.5, 1.6) ─────────────────
+      // ── routing-window mbarrier ─────────────────
       // Single mbarrier (`arrival_count = 1`) used to hand off the
       // Phase-1 routing-window TMA load (full BF16 input tile, 32 KB)
       // from the TMA launcher thread to warps 1..11 at the start of
@@ -1384,13 +1143,13 @@ struct MoE_SHM {
 #endif
     } tiny_wgmma_tma;
 
-    // ── Aliasing safety static_asserts (Req 4.1, 4.7) ─────────────────
+    // ── Aliasing safety static_asserts ─────────────────
     // The new `bf16_in_full` field of `TinyDataWGMMA_TMA` is unioned
     // with `w_wgmma` and `w_down_wgmma` so the BS8 TMA+WGMMA Phase-1/2
     // BF16 input tile shares bytes with the up- and down-projection
-    // weight tiles (lifetimes are strictly disjoint — see design
-    // "Aliasing safety (Req 4.7)").  Verify at compile time that the
-    // three views start at the same offset within `TinyDataWGMMA_TMA`
+    // weight tiles (lifetimes are strictly disjoint.
+    // Verify at compile time that the three views start at the same 
+    // offset within `TinyDataWGMMA_TMA`
     // so a future layout change that accidentally moves `bf16_in_full`
     // out of the anonymous union (and therefore breaks aliasing) is
     // caught at the build step rather than producing silent SHM
@@ -1409,13 +1168,13 @@ struct MoE_SHM {
     // `BF16_IN_FULL_K=1` collapse the bf16 view to a 2-byte
     // placeholder but the union offset invariant is unchanged — the
     // asserts pass and the BS64 SHM footprint stays byte-identical to
-    // the pre-optimization baseline (Req 7.1).
+    // the pre-optimization baseline.
     static_assert(offsetof(typename U::TinyDataWGMMA_TMA, bf16_in_full) ==
                       offsetof(typename U::TinyDataWGMMA_TMA, w_wgmma),
-                  "bf16_in_full must alias w_wgmma exactly (Req 4.1).");
+                  "bf16_in_full must alias w_wgmma exactly.");
     static_assert(offsetof(typename U::TinyDataWGMMA_TMA, bf16_in_full) ==
                       offsetof(typename U::TinyDataWGMMA_TMA, w_down_wgmma),
-                  "bf16_in_full must alias w_down_wgmma exactly (Req 4.7).");
+                  "bf16_in_full must alias w_down_wgmma exactly.");
   } u;
 
   static_assert(Dims::NUM_EXPERTS <= 65535,

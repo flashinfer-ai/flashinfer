@@ -21,14 +21,14 @@
  * never `#include`d by other TUs.
  */
 
-// Torch headers must come first so the `TORCH_CHECK` expansion sees the
-// standard <c10/util/Exception.h> helpers.  The monokernel pattern is that
-// every TU that needs torch pulls in <torch/all.h> (see moe_wrapper.cu and
-// gpt_oss_router_gemm.cu in this tree).
+// Host-side TMA descriptor factories.  The only error path is a failed
+// `cuTensorMapEncodeTiled`, reported via TVM-FFI's `TVM_FFI_ICHECK` so the
+// failure surfaces as a Python exception (FlashInfer is framework-agnostic
+// through TVM-FFI; no Torch/ATen headers in this tree).
 #include <cuda.h>
-#include <torch/all.h>
 
 #include "moe_tma.h"
+#include "tvm_ffi_utils.h"
 
 namespace moe_monokernel {
 
@@ -82,12 +82,12 @@ CUtensorMap create_up_weight_tma_desc(const void* weights_ptr, uint32_t num_expe
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-  // On failure, raise a TORCH_CHECK naming the failing tensor so the
+  // On failure, raise a TVM_FFI_ICHECK naming the failing tensor so the
   // Python stack trace points directly at "up-projection weights".
-  TORCH_CHECK(res == CUDA_SUCCESS,
-              "cuTensorMapEncodeTiled failed for up-projection weights: "
-              "CUresult=",
-              static_cast<int>(res), " (num_experts=", num_experts, ", N=", N, ", K=", K, ")");
+  TVM_FFI_ICHECK(res == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed for up-projection weights: CUresult="
+      << static_cast<int>(res) << " (num_experts=" << num_experts << ", N=" << N << ", K=" << K
+      << ")";
 
   return desc;
 }
@@ -135,11 +135,11 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr, uint32_t ba
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-  // R5.5: on failure, raise a TORCH_CHECK naming the failing tensor so the
+  // R5.5: on failure, raise a TVM_FFI_ICHECK naming the failing tensor so the
   // Python stack trace points directly at "activations".
-  TORCH_CHECK(res == CUDA_SUCCESS,
-              "cuTensorMapEncodeTiled failed for activations: CUresult=", static_cast<int>(res),
-              " (batch_size_cap=", batch_size_cap, ", K_hidden=", K_hidden, ")");
+  TVM_FFI_ICHECK(res == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed for activations: CUresult=" << static_cast<int>(res)
+      << " (batch_size_cap=" << batch_size_cap << ", K_hidden=" << K_hidden << ")";
 
   return desc;
 }
@@ -160,10 +160,10 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr, uint32_t num_ex
   // produce the same canonical Major::K B128 SHM layout from the
   // consumer's perspective; the WGMMA A descriptor still references a
   // single 128-row sub-atom per WGMMA call.
-  TORCH_CHECK(row_box == 128u || row_box == 256u,
-              "create_down_weight_tma_desc: row_box must be 128 or 256, got ", row_box);
-  TORCH_CHECK(K % row_box == 0, "create_down_weight_tma_desc: K=", K,
-              " must be a multiple of row_box=", row_box);
+  TVM_FFI_ICHECK(row_box == 128u || row_box == 256u)
+      << "create_down_weight_tma_desc: row_box must be 128 or 256, got " << row_box;
+  TVM_FFI_ICHECK(K % row_box == 0)
+      << "create_down_weight_tma_desc: K=" << K << " must be a multiple of row_box=" << row_box;
   //
   // Axis ordering: innermost = N (reduction), outer = flattened
   // `expert_id * K + output_row`.  This matches the down-proj GM
@@ -192,10 +192,10 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr, uint32_t num_ex
       CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-  TORCH_CHECK(
-      res == CUDA_SUCCESS,
-      "cuTensorMapEncodeTiled failed for down-projection weights: CUresult=", static_cast<int>(res),
-      " (num_experts=", num_experts, ", K=", K, ", N=", N, ", row_box=", row_box, ")");
+  TVM_FFI_ICHECK(res == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed for down-projection weights: CUresult="
+      << static_cast<int>(res) << " (num_experts=" << num_experts << ", K=" << K << ", N=" << N
+      << ", row_box=" << row_box << ")";
 
   return desc;
 }
@@ -258,10 +258,9 @@ CUtensorMap create_down_activation_tma_desc(const void* activations_ptr, uint32_
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-  TORCH_CHECK(res == CUDA_SUCCESS,
-              "cuTensorMapEncodeTiled failed for down-projection "
-              "activations: CUresult=",
-              static_cast<int>(res), " (temp_rows=", temp_rows, ", N=", N, ")");
+  TVM_FFI_ICHECK(res == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed for down-projection activations: CUresult="
+      << static_cast<int>(res) << " (temp_rows=" << temp_rows << ", N=" << N << ")";
 
   return desc;
 }

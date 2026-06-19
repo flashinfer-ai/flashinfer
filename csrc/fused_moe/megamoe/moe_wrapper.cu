@@ -1,12 +1,23 @@
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/all.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
 
-#include <ATen/cuda/Atomic.cuh>
+#include <cstdio>
 
-#include "cuda_utils.h"
 #include "src/moe.cu"
+#include "tvm_ffi_utils.h"
+
+// FlashInfer is framework-agnostic through TVM-FFI, so this binding takes
+// `TensorView` operands (not `torch::Tensor`) and reports errors through
+// `TVM_FFI_ICHECK`.  The vLLM tree's `cuda_utils.h` (which supplied
+// `CUDA_CHECK`) does not exist here; define a self-contained equivalent that
+// raises a TVM-FFI error on a non-success CUDA status.
+#define CUDA_CHECK(call)                                                  \
+  do {                                                                    \
+    cudaError_t _e = (call);                                             \
+    TVM_FFI_ICHECK(_e == cudaSuccess)                                     \
+        << "CUDA error " << cudaGetErrorString(_e) << " at " << __FILE__ \
+        << ":" << __LINE__;                                              \
+  } while (0)
 
 // ── TEMP_FP8_OFFSET regression anchor (spec R13.3) ─────────────────────────
 //
@@ -43,44 +54,46 @@ static_assert(
  * specified @p dims and configurable top_k, scoring_func, and renormalize.
  */
 #define MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(name, dims)                                      \
-  void name(const torch::Tensor& activations_in, const torch::Tensor& router_logits,               \
-            const torch::Tensor& expert_weights_up, const torch::Tensor& expert_scales_up,         \
-            const torch::Tensor& expert_weights_down, const torch::Tensor& expert_scales_down,     \
-            torch::Tensor& activations_out, torch::Tensor& scratchpad, int64_t top_k,              \
-            int64_t scoring_func, bool renormalize) {                                              \
-    TORCH_CHECK(activations_in.is_cuda(),                                                          \
-                "Optimized MoE kernel must be called with CUDA tensors only.");                    \
-    TORCH_CHECK(router_logits.is_cuda(),                                                           \
-                "Optimized MoE kernel must be called with CUDA tensors only.");                    \
-    TORCH_CHECK(expert_weights_up.is_cuda(),                                                       \
-                "Optimized MoE kernel must be called with CUDA tensors only.");                    \
-    TORCH_CHECK(expert_scales_up.is_cuda(),                                                        \
-                "Optimized MoE kernel must be called with CUDA tensors only.");                    \
-    TORCH_CHECK(expert_weights_down.is_cuda(),                                                     \
-                "Optimized MoE kernel must be called with CUDA tensors only.");                    \
-    TORCH_CHECK(expert_scales_down.is_cuda(),                                                      \
-                "Optimized MoE kernel must be called with CUDA tensors only.");                    \
-    TORCH_CHECK(activations_out.is_cuda(),                                                         \
-                "Optimized MoE kernel must be called with CUDA tensors only.");                    \
-    TORCH_CHECK(scratchpad.is_cuda(),                                                              \
-                "Optimized MoE kernel must be called with CUDA tensors only.");                    \
-    TORCH_CHECK(top_k >= 1 && top_k <= 8, "top_k must be between 1 and 8.");                       \
-    TORCH_CHECK(scoring_func == 0 || scoring_func == 1,                                            \
-                "scoring_func must be 0 (sigmoid) or 1 (softmax).");                               \
-                                                                                                   \
-    const auto* activations_in_ptr = activations_in.data_ptr<at::BFloat16>();                      \
-    const auto* router_logits_ptr = router_logits.data_ptr<at::BFloat16>();                        \
-    const auto* expert_weights_up_ptr = expert_weights_up.data_ptr<at::Float8_e4m3fn>();           \
-    const auto* expert_scales_up_ptr = expert_scales_up.data_ptr<float>();                         \
-    const auto* expert_weights_down_ptr = expert_weights_down.data_ptr<at::Float8_e4m3fn>();       \
-    const auto* expert_scales_down_ptr = expert_scales_down.data_ptr<float>();                     \
-    auto* activations_out_ptr = activations_out.data_ptr<at::BFloat16>();                          \
-    char* scratchpad_ptr = reinterpret_cast<char*>(scratchpad.data_ptr<float>());                  \
+  void name(TensorView activations_in, TensorView router_logits, TensorView expert_weights_up,     \
+            TensorView expert_scales_up, TensorView expert_weights_down,                            \
+            TensorView expert_scales_down, TensorView activations_out, TensorView scratchpad,      \
+            int64_t top_k, int64_t scoring_func, bool renormalize) {                               \
+    CHECK_INPUT(activations_in);                                                                    \
+    CHECK_INPUT(router_logits);                                                                     \
+    CHECK_INPUT(expert_weights_up);                                                                 \
+    CHECK_INPUT(expert_scales_up);                                                                  \
+    CHECK_INPUT(expert_weights_down);                                                               \
+    CHECK_INPUT(expert_scales_down);                                                                \
+    CHECK_INPUT(activations_out);                                                                   \
+    CHECK_INPUT(scratchpad);                                                                        \
+    CHECK_INPUT_TYPE(activations_in, dl_bfloat16);                                                  \
+    CHECK_INPUT_TYPE(router_logits, dl_bfloat16);                                                   \
+    CHECK_INPUT_TYPE(expert_weights_up, dl_float8_e4m3fn);                                          \
+    CHECK_INPUT_TYPE(expert_scales_up, dl_float32);                                                 \
+    CHECK_INPUT_TYPE(expert_weights_down, dl_float8_e4m3fn);                                        \
+    CHECK_INPUT_TYPE(expert_scales_down, dl_float32);                                               \
+    CHECK_INPUT_TYPE(activations_out, dl_bfloat16);                                                 \
+    TVM_FFI_ICHECK(top_k >= 1 && top_k <= 8) << "top_k must be between 1 and 8.";                   \
+    TVM_FFI_ICHECK(scoring_func == 0 || scoring_func == 1)                                          \
+        << "scoring_func must be 0 (sigmoid) or 1 (softmax).";                                      \
                                                                                                    \
     using namespace moe_monokernel;                                                                \
+    ffi::CUDADeviceGuard device_guard(activations_in.device().device_id);                           \
+    const auto* activations_in_ptr = static_cast<const A_element*>(activations_in.data_ptr());      \
+    const auto* router_logits_ptr = static_cast<const __nv_bfloat16*>(router_logits.data_ptr());    \
+    const auto* expert_weights_up_ptr = static_cast<const W_element*>(expert_weights_up.data_ptr()); \
+    const auto* expert_scales_up_ptr = static_cast<const S_element*>(expert_scales_up.data_ptr());   \
+    const auto* expert_weights_down_ptr =                                                           \
+        static_cast<const W_element*>(expert_weights_down.data_ptr());                              \
+    const auto* expert_scales_down_ptr =                                                            \
+        static_cast<const S_element*>(expert_scales_down.data_ptr());                               \
+    auto* activations_out_ptr = static_cast<R_element*>(activations_out.data_ptr());                \
+    char* scratchpad_ptr = reinterpret_cast<char*>(scratchpad.data_ptr());                          \
+                                                                                                   \
     const uint32_t num_tokens = activations_in.size(0);                                            \
     const size_t shmem_size = get_moe_shmem_size<dims>();                                          \
-    const size_t scratchpad_size = scratchpad.nbytes();                                            \
+    const size_t scratchpad_size =                                                                  \
+        static_cast<size_t>(scratchpad.numel()) * get_element_size(scratchpad);                    \
     const uint32_t top_k_u32 = static_cast<uint32_t>(top_k);                                       \
     const ScoringFunc sf = static_cast<ScoringFunc>(scoring_func);                                 \
                                                                                                    \
@@ -145,7 +158,7 @@ static_assert(
                            (void*)&activations_desc,                                               \
                            (void*)&down_weights_desc,                                              \
                            (void*)&down_activations_desc};                                         \
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();                                  \
+    const cudaStream_t stream = get_stream(activations_in.device());                               \
     CUDA_CHECK(cudaFuncSetAttribute(moe_kernel_topk<dims>,                                         \
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));     \
     /* One-time diagnostic: compute and print occupancy + shmem so that a                          \
@@ -182,11 +195,10 @@ static_assert(
            count / occupancy are device-property-time static, so gating                            \
            under `_diag_printed` keeps the check one-shot per process                              \
            and off the hot path. */                                                                \
-        TORCH_CHECK(dims::KernelConfig::GRID_SIZE <= static_cast<uint32_t>(sm_count),              \
-                    "moe_monokernel requires GRID_SIZE (=", dims::KernelConfig::GRID_SIZE,         \
-                    ") <= SM count (=", sm_count,                                                  \
-                    ") for software grid barrier co-residency invariant "                          \
-                    "(spec R4.1).");                                                               \
+        TVM_FFI_ICHECK(dims::KernelConfig::GRID_SIZE <= static_cast<uint32_t>(sm_count))            \
+            << "moe_monokernel requires GRID_SIZE (=" << dims::KernelConfig::GRID_SIZE             \
+            << ") <= SM count (=" << sm_count                                                      \
+            << ") for software grid barrier co-residency invariant (spec R4.1).";                  \
         /*TORCH_CHECK(max_blocks_per_sm == 1,                                                      \
                     "moe_monokernel requires max_active_blocks_per_SM == 1 "                       \
                     "(observed ",                                                                  \
