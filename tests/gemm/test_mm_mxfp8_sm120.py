@@ -141,7 +141,9 @@ def test_probe_mxfp8_gemm_tactics_sm12x():
 
     # At least the three small-tile configs (128x32, 128x64, 128x128) x 2 variants
     # must be supported on any SM12x device.
-    assert len(valid) >= 6, f"Expected at least 6 valid tactics, got {len(valid)}: {valid}"
+    assert len(valid) >= 6, (
+        f"Expected at least 6 valid tactics, got {len(valid)}: {valid}"
+    )
 
     # All returned tactics must be within range.
     total = raw_module.mxfp8_gemm_tactic_num()

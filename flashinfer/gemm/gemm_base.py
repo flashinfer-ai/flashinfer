@@ -4044,8 +4044,12 @@ def _probe_mxfp8_gemm_tactics(module, device_id: int) -> List[int]:
     a = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=dev)
     # b as [N, K] contiguous – the C++ binding expects mat2 with shape [N, K].
     b = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=dev)
-    sfa = torch.zeros(_pad_up(M, 128) * _pad_up(k_scales, 4), dtype=torch.uint8, device=dev)
-    sfb = torch.zeros(_pad_up(N, 128) * _pad_up(k_scales, 4), dtype=torch.uint8, device=dev)
+    sfa = torch.zeros(
+        _pad_up(M, 128) * _pad_up(k_scales, 4), dtype=torch.uint8, device=dev
+    )
+    sfb = torch.zeros(
+        _pad_up(N, 128) * _pad_up(k_scales, 4), dtype=torch.uint8, device=dev
+    )
     out = torch.zeros(M, N, dtype=torch.bfloat16, device=dev)
     ws = torch.zeros(8 * 1024 * 1024, dtype=torch.uint8, device=dev)
 
