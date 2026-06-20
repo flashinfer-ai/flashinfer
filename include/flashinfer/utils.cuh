@@ -122,6 +122,11 @@
       __VA_ARGS__                                          \
       break;                                               \
     }                                                      \
+    case 32: {                                             \
+      constexpr uint32_t CTA_TILE_Q = 32;                  \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
     case 16: {                                             \
       constexpr uint32_t CTA_TILE_Q = 16;                  \
       __VA_ARGS__                                          \
@@ -382,6 +387,12 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
 }
 
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+  if (head_dim >= 512) {
+    if (avg_packed_qo_len <= 32) {
+      return 16;  // decode / short-q (incl. speculative decode): lean CTA16
+    }
+    return 32;  // Long-q prefill use CTA_TILE_Q=32
+  }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;
   } else {
