@@ -137,6 +137,52 @@ __global__ void interleave_int4_weights_for_sm90_mixed_gemm_kernel(uint8_t* int4
   }
 }
 
+__device__ __forceinline__ uint32_t preprocess_fp4x8_signs_for_fp8(uint32_t fp4x8) {
+  uint32_t const em = fp4x8 & 0x77777777U;
+  uint32_t const signs =
+      ((fp4x8 & 0x00000008U) << 4U) | ((fp4x8 & 0x00000080U) << 8U) |
+      ((fp4x8 & 0x00000800U) << 12U) | ((fp4x8 & 0x00008000U) << 16U) |
+      ((fp4x8 & 0x00080000U) >> 16U) | ((fp4x8 & 0x00800000U) >> 12U) |
+      ((fp4x8 & 0x08000000U) >> 8U) | ((fp4x8 & 0x80000000U) >> 4U);
+  return em | signs;
+}
+
+__global__ void interleave_fp4_fp8_weights_for_sm90_mixed_gemm_kernel(
+    uint8_t* fp4_weight, uint8_t* fp4_weight_interleaved, int const rows, int const cols) {
+  uint16_t* uint16_ptr = reinterpret_cast<uint16_t*>(fp4_weight);
+  uint16_t* uint16_interleaved_ptr = reinterpret_cast<uint16_t*>(fp4_weight_interleaved);
+
+  for (int block_id = blockIdx.x; block_id < rows / 2; block_id += gridDim.x) {
+    for (int partition_id = threadIdx.y; partition_id < cols / 64; partition_id += blockDim.y) {
+      int lane_id = threadIdx.x;
+
+      int row_id = block_id / 8 * 16 + block_id % 8;
+      int dst_row_id = row_id + (lane_id % 8) / 4 * 8;
+
+      int mma_id = lane_id / 8;
+      int interleaved_lane_id = mma_id * 8 + lane_id % 4 * 2;
+
+      int col_id = partition_id * 16 + lane_id;
+      int dst_col_id = partition_id * 16 + interleaved_lane_id;
+
+      int src_id_a = row_id * cols / 4 + col_id;
+      int src_id_b = (row_id + 8) * cols / 4 + col_id;
+
+      uint16_t packed_4b_a = uint16_ptr[src_id_a];
+      uint16_t packed_4b_b = uint16_ptr[src_id_b];
+
+      uint32_t fp4x8 = uint32_t(packed_4b_a) | (uint32_t(packed_4b_b) << 16U);
+      fp4x8 = preprocess_fp4x8_signs_for_fp8(fp4x8);
+      packed_4b_a = uint16_t(fp4x8);
+      packed_4b_b = uint16_t(fp4x8 >> 16U);
+
+      int dst_id = dst_row_id * cols / 4 + dst_col_id;
+      uint16_interleaved_ptr[dst_id] = packed_4b_a;
+      uint16_interleaved_ptr[dst_id + 1] = packed_4b_b;
+    }
+  }
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void interleave_fp4_weights_for_sm90_mixed_gemm(uint8_t* fp4_weight,
@@ -144,6 +190,14 @@ void interleave_fp4_weights_for_sm90_mixed_gemm(uint8_t* fp4_weight,
                                                 int const cols, cudaStream_t stream) {
   dim3 block(16, 32);
   interleave_fp4_weights_for_sm90_mixed_gemm_kernel<<<1024, block, 0, stream>>>(
+      fp4_weight, fp4_weight_interleaved, rows, cols);
+}
+
+void interleave_fp4_fp8_weights_for_sm90_mixed_gemm(uint8_t* fp4_weight,
+                                                    uint8_t* fp4_weight_interleaved, int const rows,
+                                                    int const cols, cudaStream_t stream) {
+  dim3 block(16, 32);
+  interleave_fp4_fp8_weights_for_sm90_mixed_gemm_kernel<<<1024, block, 0, stream>>>(
       fp4_weight, fp4_weight_interleaved, rows, cols);
 }
 

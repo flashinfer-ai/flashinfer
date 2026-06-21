@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include <cuda_runtime_api.h>
 
 #include "../../include/moe_gemm_kernels.h"
 #include "cutlass_extensions/gemm_configs.h"
+#include "cutlass_extensions/gemm/collective/collective_mma_array_mixed_input.hpp"
 #include "cutlass_extensions/weight_only_quant_op.h"
 
 namespace tensorrt_llm {
@@ -27,7 +30,9 @@ using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
           typename CTAShape, typename ClusterShape, typename MainloopScheduleType,
-          typename EpilogueScheduleType, cutlass::WeightOnlyQuantOp QuantOp>
+          typename EpilogueScheduleType, cutlass::WeightOnlyQuantOp QuantOp,
+          cutlass::gemm::collective::MixedInputScaleMode ScaleMode =
+              cutlass::gemm::collective::MixedInputScaleMode::kPostMma>
 void sm90_generic_mixed_moe_gemm_kernelLauncher(
     tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput<T, WeightType, GemmOutputType,
                                                              GemmOutputType>
