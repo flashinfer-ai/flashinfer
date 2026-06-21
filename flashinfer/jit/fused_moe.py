@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 from typing import List
 
 from . import env as jit_env
@@ -158,9 +159,58 @@ def gen_cutlass_fused_moe_module(
     except Exception as e:
         raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
-    return gen_jit_spec(
-        f"fused_moe_{device_arch}",
-        [
+    # PHASE3_SINGLE_CONFIG_TEMP: limit Phase 3 Humming-style bring-up to a
+    # fixed SM90 mixed-input tactic and compile only the sources needed for that
+    # path. Remove this once full Humming runtime-scale semantics are integrated.
+    phase3_single_config = (
+        device_arch == "90"
+        and os.environ.get("FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG") is not None
+    )
+    if phase3_single_config:
+        phase3_config = os.environ["FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG"]
+        phase3_config_macros = {
+            "fp8_mxfp4_prescale_m64n16k128": "-DFLASHINFER_CUTLASS_PHASE3_M64N16K128_C1X1=1",
+            "fp8_mxfp4_prescale_m64n32k512_c2x1": "-DFLASHINFER_CUTLASS_PHASE3_M64N32K512_C2X1=1",
+            "fp8_mxfp4_prescale_m64n64k512_c1x2": "-DFLASHINFER_CUTLASS_PHASE3_M64N64K512_C1X2=1",
+        }
+        if phase3_config not in phase3_config_macros:
+            raise ValueError(
+                "Unsupported FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG="
+                f"{phase3_config!r}"
+            )
+        nvcc_flags = nvcc_flags + [
+            "-DFLASHINFER_CUTLASS_PHASE3_SINGLE_CONFIG=1",
+            phase3_config_macros[phase3_config],
+            "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
+        ]
+
+    if phase3_single_config:
+        # PHASE3_SINGLE_CONFIG_TEMP: source narrowing to avoid full CUTLASS MoE
+        # JIT rebuilds during the temporary fixed-tactic debug loop.
+        sources = [
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
+            *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
+        ]
+    else:
+        sources = [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
             jit_env.FLASHINFER_CSRC_DIR
@@ -201,7 +251,6 @@ def gen_cutlass_fused_moe_module(
             / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
-            # Add all generated kernels
             *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
@@ -214,7 +263,11 @@ def gen_cutlass_fused_moe_module(
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
-        ],
+        ]
+
+    return gen_jit_spec(
+        f"fused_moe_{device_arch}",
+        sources,
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
         extra_ldflags=["-lnvrtc"],

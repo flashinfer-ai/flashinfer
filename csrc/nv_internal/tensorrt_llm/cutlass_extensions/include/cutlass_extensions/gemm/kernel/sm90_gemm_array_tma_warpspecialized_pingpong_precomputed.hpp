@@ -715,18 +715,21 @@ public:
         bool did_batch_change = true;
         constexpr bool IsEpiLoad = true;
 
-        collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
-          shared_storage.tensormaps.epilogue,
-          params.epilogue,
-          epi_load_tensormap,
-          problem_shape_MNKL,
-          work_tile_info.L_idx,
-          0
-        );
+        if (work_tile_info.is_valid()) {
+          collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
+            shared_storage.tensormaps.epilogue,
+            params.epilogue,
+            epi_load_tensormap,
+            problem_shape_MNKL,
+            work_tile_info.L_idx,
+            0
+          );
 
-        // Converge before issuing tensormap fence release since fence is aligned
-        __syncwarp();
-        collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(shared_storage.tensormaps.epilogue, epi_load_tensormap, 0);
+          // Converge before issuing tensormap fence release since fence is aligned
+          __syncwarp();
+          collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(
+            shared_storage.tensormaps.epilogue, epi_load_tensormap, 0);
+        }
 
         load_order_barrier.wait();
 
@@ -816,21 +819,24 @@ public:
       bool did_batch_change = true;
       constexpr bool IsEpiLoad = false;
 
-      if (warp_idx_in_warp_group == 0) {
-        collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
-          shared_storage.tensormaps.epilogue,
-          params.epilogue,
-          epi_store_tensormap,
-          problem_shape_MNKL,
-          work_tile_info.L_idx,
-          consumer_warp_group_idx
-        );
+      if (work_tile_info.is_valid()) {
+        if (warp_idx_in_warp_group == 0) {
+          collective_epilogue.template tensormaps_perform_update<IsEpiLoad>(
+            shared_storage.tensormaps.epilogue,
+            params.epilogue,
+            epi_store_tensormap,
+            problem_shape_MNKL,
+            work_tile_info.L_idx,
+            consumer_warp_group_idx
+          );
 
-        // Converge before issuing tensormap fence release since fence is aligned
-        __syncwarp();
-        collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(shared_storage.tensormaps.epilogue,
-                                                                    epi_store_tensormap,
-                                                                    consumer_warp_group_idx);
+          // Converge before issuing tensormap fence release since fence is aligned
+          __syncwarp();
+          collective_epilogue.template tensormaps_cp_fence_release<IsEpiLoad>(
+            shared_storage.tensormaps.epilogue,
+            epi_store_tensormap,
+            consumer_warp_group_idx);
+        }
       }
 
       while (work_tile_info.is_valid()) {
@@ -885,7 +891,7 @@ public:
         TileScheduler::fixup(
           params.scheduler, work_tile_info, accumulators, NumMmaWarpGroups, consumer_warp_group_idx);
 
-        if (did_batch_change) {
+        if (did_batch_change && warp_idx_in_warp_group == 0) {
           collective_epilogue.template tensormaps_fence_acquire<IsEpiLoad>(epi_store_tensormap);
         }
 

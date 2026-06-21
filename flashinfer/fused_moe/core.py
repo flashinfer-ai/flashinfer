@@ -568,11 +568,13 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
+        # PHASE3_SINGLE_CONFIG_TEMP: fixed-tactic override for Phase 3 debug
+        # builds. Remove once the full runtime-scale path no longer needs
+        # single-config JIT narrowing.
+        profile_ids: Optional[List[int]] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
-        tuner = AutoTuner.get()
-        MoERunner.refine_tuning_config(tune_max_num_tokens)
 
         # allocate workspace for profiling
         moe_runner = MoERunner(
@@ -597,37 +599,47 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_fused_finalize=use_fused_finalize,
         )
 
-        # Limit tactics to GEMM1 during tuning
-        moe_runner.gemm_idx_for_tuning = 1
-        _, gemm_tactic_1 = tuner.choose_one(
-            "trtllm::fused_moe::gemm1",
-            [moe_runner],
-            MoERunner.tuning_config,
-            [
-                input,
-                fc1_expert_weights,
-                fc1_expert_biases,
-                fc2_expert_weights,
-                fc2_expert_biases,
-            ],
-            gemm_idx=1,
-        )
+        if profile_ids is None:
+            tuner = AutoTuner.get()
+            MoERunner.refine_tuning_config(tune_max_num_tokens)
 
-        # Limit tactics to GEMM2 during tuning
-        moe_runner.gemm_idx_for_tuning = 2
-        _, gemm_tactic_2 = tuner.choose_one(
-            "trtllm::fused_moe::gemm2",
-            [moe_runner],
-            MoERunner.tuning_config,
-            [
-                input,
-                fc1_expert_weights,
-                fc1_expert_biases,
-                fc2_expert_weights,
-                fc2_expert_biases,
-            ],
-            gemm_idx=2,
-        )
+            # Limit tactics to GEMM1 during tuning
+            moe_runner.gemm_idx_for_tuning = 1
+            _, gemm_tactic_1 = tuner.choose_one(
+                "trtllm::fused_moe::gemm1",
+                [moe_runner],
+                MoERunner.tuning_config,
+                [
+                    input,
+                    fc1_expert_weights,
+                    fc1_expert_biases,
+                    fc2_expert_weights,
+                    fc2_expert_biases,
+                ],
+                gemm_idx=1,
+            )
+
+            # Limit tactics to GEMM2 during tuning
+            moe_runner.gemm_idx_for_tuning = 2
+            _, gemm_tactic_2 = tuner.choose_one(
+                "trtllm::fused_moe::gemm2",
+                [moe_runner],
+                MoERunner.tuning_config,
+                [
+                    input,
+                    fc1_expert_weights,
+                    fc1_expert_biases,
+                    fc2_expert_weights,
+                    fc2_expert_biases,
+                ],
+                gemm_idx=2,
+            )
+        else:
+            # PHASE3_SINGLE_CONFIG_TEMP: bypass autotune and force the selected
+            # GEMM1/GEMM2 tactics for the fixed-config smoke path.
+            if len(profile_ids) != 2:
+                raise ValueError("profile_ids must contain [gemm1_profile, gemm2_profile]")
+            gemm_tactic_1, gemm_tactic_2 = profile_ids
 
         run_moe = (
             moe_runner.fused_moe_runner.run_moe_min_latency
@@ -729,6 +741,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
+        # PHASE3_SINGLE_CONFIG_TEMP: workspace shape follows the same fixed
+        # tactic override as the temporary Phase 3 smoke path.
+        profile_ids: Optional[List[int]] = None,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -854,8 +869,9 @@ def interleave_moe_weights_for_sm90_mixed_gemm(
         ``[num_experts, n, k // 2]`` uint8 CUDA tensor (4-bit values packed
         two-per-byte).
     quant_type : str
-        ``"fp4"`` for MXFP4 (the W4A16 path) or ``"int4"`` for INT4 (the
-        W4A8 path).
+        ``"fp4"`` for MXFP4 (the W4A16 path), ``"fp4_fp8"`` for MXFP4 consumed
+        by the FP8/Humming-style pre-MMA-scale path, or ``"int4"`` for INT4
+        (the W4A8 path).
 
     Returns
     -------
@@ -873,7 +889,7 @@ def interleave_moe_weights_for_sm90_mixed_gemm(
     if not weight.is_cuda:
         raise ValueError("weight must live on CUDA")
 
-    qtype_map = {"fp4": 1, "int4": 0}
+    qtype_map = {"fp4": 1, "fp4_fp8": 2, "int4": 0}
     if quant_type not in qtype_map:
         raise ValueError(
             f"quant_type must be one of {list(qtype_map)}; got {quant_type!r}"
@@ -925,6 +941,9 @@ def cutlass_fused_moe(
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
     use_fused_finalize: bool = True,
+    # PHASE3_SINGLE_CONFIG_TEMP: public Python hook used only to force the
+    # fixed Phase 3 tactic while Humming runtime-scale semantics are incomplete.
+    profile_ids: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1136,6 +1155,7 @@ def cutlass_fused_moe(
         enable_pdl=enable_pdl,
         activation_type=activation_type,
         use_fused_finalize=use_fused_finalize,
+        profile_ids=profile_ids,
     )
 
 

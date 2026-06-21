@@ -18,9 +18,19 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 #ifdef ENABLE_FP4
-template class MoeGemmRunner<__nv_fp8_e4m3, Fp4Type, half>;
+template class MoeGemmRunner<__nv_fp8_e4m3, Fp4Type, half, half, false,
+                             Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
+template class MoeGemmRunner<__nv_fp8_e4m3, Fp4Type, half, half, false,
+                             Wfp4Afp8ScaleMode::kPostMmaFp8Act>;
+template class MoeGemmRunner<__nv_fp8_e4m3, Fp4Type, half, half, false,
+                             Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>;
 #ifdef ENABLE_BF16
-template class MoeGemmRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16>;
+template class MoeGemmRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_bfloat16, false,
+                             Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
+template class MoeGemmRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_bfloat16, false,
+                             Wfp4Afp8ScaleMode::kPostMmaFp8Act>;
+template class MoeGemmRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_bfloat16, false,
+                             Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>;
 #endif
 #endif
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

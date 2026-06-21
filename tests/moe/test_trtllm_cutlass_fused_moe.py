@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from contextlib import nullcontext
+import os
 
 import pytest
 from flashinfer.fused_moe.core import ActivationType
@@ -2676,6 +2677,29 @@ def _dequant_mxfp4_on_device(
     return (values * scale).to(torch.bfloat16)
 
 
+def _dequant_mxfp4_humming_prescale_on_device(
+    w_fp4: torch.Tensor, exp_offset: torch.Tensor
+) -> torch.Tensor:
+    """Reference for the Humming-style MXFP4 fast path.
+
+    ``exp_offset`` is not the original e8m0 scale. It is the preprocessed
+    offset byte consumed by the pre-MMA FP4->E4M3 conversion.
+    """
+    lo = w_fp4 & 0x0F
+    hi = (w_fp4 >> 4) & 0x0F
+    fp4_code = torch.stack([lo, hi], dim=-1).reshape(*w_fp4.shape[:-1], -1)
+    offset = exp_offset.repeat_interleave(32, dim=-1).to(torch.int32)
+    em_code = (fp4_code & 0x07).to(torch.int32)
+    em = torch.zeros_like(em_code)
+    em = torch.where(em_code == 1, offset * 8, em)
+    em = torch.where(em_code == 2, offset * 8 + 0x08, em)
+    em = torch.where(em_code == 3, offset * 8 + 0x0C, em)
+    em = torch.where(em_code >= 4, offset * 8 + 0x10 + (em_code - 4) * 4, em)
+    sign = (fp4_code.to(torch.int32) & 0x08) << 4
+    fp8_raw = (sign | em).to(torch.uint8).contiguous()
+    return fp8_raw.view(torch.float8_e4m3fn).to(torch.float32)
+
+
 def _compute_with_active_experts(
     active_experts,
     x,
@@ -2881,6 +2905,110 @@ def test_moe_bf16_mxfp4_hopper_activations(
         alpha,
         beta,
         limit,
+    )
+
+
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="FP8xMXFP4 pre-MMA scale MoE (Hopper mixed-input) requires SM90",
+)
+def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness():
+    # PHASE3_SINGLE_CONFIG_TEMP: keep this smoke on one fixed tactic until the
+    # full Humming runtime per-token quantization path is implemented.
+    os.environ.setdefault(
+        "FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG",
+        "fp8_mxfp4_prescale_m64n16k128",
+    )
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    e, m, n, k, top_k = 2, 4, 512, 512, 2
+    output_dtype = torch.bfloat16
+
+    x_fp32 = torch.randn(m, k, dtype=torch.float32, device=device) * 0.05
+    x = x_fp32.to(torch.float8_e4m3fn)
+    w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
+
+    # Humming-style preprocessing constrains the original e8m0 scale range and
+    # stores only an exponent offset for the pre-MMA FP4->E4M3 conversion. The
+    # activation dequant scale is applied by the GEMM epilogue per routed token.
+    w1_exp_offset = torch.randint(1, 5, (e, 2 * n, k // 32), device=device, dtype=torch.uint8)
+    w2_exp_offset = torch.randint(1, 5, (e, k, n // 32), device=device, dtype=torch.uint8)
+    fc2_act_global = torch.ones((), device=device, dtype=torch.float32)
+
+    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w1, "fp4_fp8")
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w2, "fp4_fp8")
+    w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_exp_offset)
+    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_exp_offset)
+
+    router_logits = torch.randn(m, e, dtype=output_dtype, device=device)
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    # Humming keeps the FP4->FP8 exponent-bias compensation in the epilogue for
+    # this FP8 x MXFP4 path. Fold the synthetic residual and the known 2^6 factor
+    # into the offline token scales for both GEMMs.
+    humming_synthetic_residual = 2.0 ** -10
+    humming_epilogue_compensation = 64.0
+    fc1_route_scale = (
+        torch.rand(m, top_k, dtype=torch.float32, device=device) * 0.25 + 0.875
+    ) * humming_synthetic_residual
+    fc1_route_scale = fc1_route_scale * humming_epilogue_compensation
+    fc2_route_scale = (
+        torch.rand(m, top_k, dtype=torch.float32, device=device) * 0.25 + 0.875
+    ) * humming_synthetic_residual
+    fc2_route_scale = fc2_route_scale * humming_epilogue_compensation
+
+    def make_expert_contiguous_token_scale(route_scale):
+        return torch.cat(
+            [route_scale[selected_experts == expert_id] for expert_id in range(e)]
+        ).contiguous()
+
+    fc1_token_scale = make_expert_contiguous_token_scale(fc1_route_scale)
+    fc2_token_scale = make_expert_contiguous_token_scale(fc2_route_scale)
+
+    flash_output = torch.zeros(m, k, device=device, dtype=output_dtype)
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w1_il,
+        w2_il,
+        output_dtype,
+        quant_scales=[
+            w1_scale_il.view(torch.int32),
+            fc1_token_scale,
+            fc2_act_global,
+            w2_scale_il.view(torch.int32),
+            fc2_token_scale,
+        ],
+        use_w4_group_scaling=True,
+        output=flash_output,
+        # PHASE3_SINGLE_CONFIG_TEMP: bypass autotune in the fixed-tactic smoke.
+        profile_ids=[0, 0],
+    )
+
+    w1_ref = _dequant_mxfp4_humming_prescale_on_device(w1, w1_exp_offset)
+    w2_ref = _dequant_mxfp4_humming_prescale_on_device(w2, w2_exp_offset)
+    x_ref = x.to(torch.float32)
+    ref_output = torch.zeros(m, k, dtype=torch.float32, device=device)
+    for expert_id in range(e):
+        mask = selected_experts == expert_id
+        if not mask.any():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+        w3_expert, w1_expert = torch.chunk(w1_ref[expert_id], 2, dim=0)
+        route_fc1_scale = fc1_route_scale[batch_idx, nth_expert]
+        # FC1 token scale is applied in the GEMM epilogue before activation, so
+        # both gated branches must be scaled before the SiLU/product.
+        fc1_w1 = (x_ref[batch_idx] @ w1_expert.t()) * route_fc1_scale[:, None]
+        fc1_w3 = (x_ref[batch_idx] @ w3_expert.t()) * route_fc1_scale[:, None]
+        fc1 = F.silu(fc1_w1) * fc1_w3
+        fc1_fp8 = (fc1 * fc2_act_global).to(torch.float8_e4m3fn).to(torch.float32)
+        route_fc2_scale = fc2_route_scale[batch_idx, nth_expert]
+        fc2 = (fc1_fp8 @ w2_ref[expert_id].t()) * route_fc2_scale[:, None]
+        ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
+
+    torch.testing.assert_close(
+        ref_output.to(output_dtype), flash_output, rtol=2e-1, atol=5e-1
     )
 
 

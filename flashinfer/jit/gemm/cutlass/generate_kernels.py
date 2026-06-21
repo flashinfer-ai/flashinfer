@@ -120,6 +120,11 @@ CudaTypeName = {
     DataType.u4: "cutlass::uint4b_t",
 }
 
+MixedInputScaleModeTag = {
+    "post_mma": "cutlass::gemm::collective::MixedInputScaleMode::kPostMma",
+    "pre_mma_e8m0": "cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0",
+}
+
 
 ################################################################################
 # A data structure holding all info to instantiate gemm launchers in TRT LLM.
@@ -143,6 +148,7 @@ class TrtLlm_GemmLauncher:
         epi_schedule,
         epi_fusion=None,
         is_mx_fpx=False,
+        mixed_input_scale_mode="post_mma",
         dynamic_cga=False,
         swap_ab=False,
     ):
@@ -164,6 +170,7 @@ class TrtLlm_GemmLauncher:
         self.epi_schedule = epi_schedule
         self.epi_fusion = epi_fusion
         self.is_mx_fpx = is_mx_fpx
+        self.mixed_input_scale_mode = mixed_input_scale_mode
         self.swap_ab = swap_ab
 
     def __repr__(self):
@@ -196,6 +203,8 @@ class TrtLlm_GemmLauncher:
             "_mxfpx_" if self.is_mx_fpx else "",
             "_swap_ab" if self.swap_ab else "",
         )
+        if self.mixed_input_scale_mode != "post_mma":
+            hopper_suffix += f"_{self.mixed_input_scale_mode}"
 
         if self.arch >= 90:
             return kernel_prefix + hopper_suffix
@@ -237,14 +246,17 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
 {out_tag}*, int, int, int, const int, tensorrt_llm::cutlass_extensions::CutlassGemmConfig, char*, size_t, cudaStream_t, int*
 );"""
     elif operation.gemm_kind == GemmKind.Grouped:
-        if operation.act_type != operation.weight_type and (
-            operation.act_type != DataType.e4m3 or operation.weight_type != e2m1
-        ):
+        if operation.arch == 90 and operation.act_type != operation.weight_type:
             # Mixed MoE GEMM
             weight_tag = CudaTypeName[operation.weight_type]
+            mixed_input_scale_mode_arg = ""
+            if operation.mixed_input_scale_mode != "post_mma":
+                mixed_input_scale_mode_arg = MixedInputScaleModeTag[
+                    operation.mixed_input_scale_mode
+                ]
             instantiation = f"""
 template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
-{epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
+{epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}{", " + mixed_input_scale_mode_arg if mixed_input_scale_mode_arg else ""}> (
 GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size);
 """
         else:
@@ -365,6 +377,46 @@ def write_file(launcher_inl_files, operations, output_file):
         pass
     with open(output_file, mode="w") as f:
         f.write(content)
+
+
+def maybe_filter_single_sm90_mixed_operation(operations):
+    # PHASE3_SINGLE_CONFIG_TEMP: keep only the selected Humming-style SM90
+    # mixed-input tactic while bringing up runtime per-token scale semantics.
+    single_config = os.environ.get("FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG")
+    if not single_config:
+        return operations
+    single_configs = {
+        "fp8_mxfp4_prescale_m64n16k128": ((64, 16, 128), (1, 1, 1)),
+        "fp8_mxfp4_prescale_m64n32k512_c2x1": ((64, 32, 512), (2, 1, 1)),
+        "fp8_mxfp4_prescale_m64n64k512_c1x2": ((64, 64, 512), (1, 2, 1)),
+    }
+    if single_config not in single_configs:
+        raise ValueError(
+            "Unsupported FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG="
+            f"{single_config!r}"
+        )
+    cta_shape, cga_shape = single_configs[single_config]
+
+    filtered = [
+        op
+        for op in operations
+        if not isinstance(op, GemmSm80LauncherConfig)
+        and op.arch == 90
+        and op.gemm_kind == GemmKind.Grouped
+        and op.act_type == DataType.e4m3
+        and op.weight_type == e2m1
+        and op.scalezero_type == DataType.ue8m0
+        and op.output_type == DataType.bf16
+        and op.cta_shape == cta_shape
+        and op.cga_shape == cga_shape
+        and op.mainloop_schedule == KernelScheduleType.TmaWarpSpecializedPingpong
+    ]
+    if not filtered:
+        raise ValueError(
+            "No operation matched FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG="
+            f"{single_config!r}"
+        )
+    return filtered
 
 
 def is_gemm_op_valid_sm100(op):
@@ -665,27 +717,41 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
             DataType.bf16,
             DataType.bf16,
         ),
+        (
+            DataType.e4m3,
+            e2m1,
+            DataType.ue8m0,
+            DataType.f16,
+            DataType.f16,
+        ),
+        (
+            DataType.e4m3,
+            e2m1,
+            DataType.ue8m0,
+            DataType.bf16,
+            DataType.bf16,
+        ),
     ]
 
     quant_ops = [TrtLlm_QuantOp.finegrained_scale_only]
 
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
 
-    cta_shapes_mnk_cmx_profiler = list(
+    cta_shapes_mnk_mixed_input = list(
         product([64], [16, 32, 64, 128], [128, 256, 512])
     )
-    cta_shapes_mnk_cmx_profiler.extend(
+    cta_shapes_mnk_mixed_input.extend(
         product([128], [16, 32, 64, 128], [128, 256, 512])
     )
-    cta_shapes_mnk_cmx_profiler.extend(
+    cta_shapes_mnk_mixed_input.extend(
         [(128, 256, k_tile) for k_tile in [128, 256]]
     )
-    cta_shapes_mnk_cmx_profiler.extend(
+    cta_shapes_mnk_mixed_input.extend(
         [(256, 128, k_tile) for k_tile in [128, 256]]
     )
-    cta_shapes_mnk_cmx_profiler.append((256, 256, 128))
-    cta_shapes_mnk_int4 = list(cta_shapes_mnk_cmx_profiler)
-    cta_shapes_mnk_fp4 = list(cta_shapes_mnk_cmx_profiler)
+    cta_shapes_mnk_mixed_input.append((256, 256, 128))
+    cta_shapes_mnk_int4 = list(cta_shapes_mnk_mixed_input)
+    cta_shapes_mnk_fp4 = list(cta_shapes_mnk_mixed_input)
 
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
@@ -702,6 +768,15 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
     operations = list()
     for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in partial_args:
+        is_fp8_mxfp4 = dtype_combo[0] == DataType.e4m3 and dtype_combo[1] == e2m1
+        mixed_input_scale_mode = "post_mma"
+        # PHASE3_SINGLE_CONFIG_TEMP: compile the selected FP8 x MXFP4 operation
+        # as the pre-MMA E8M0 mode only for the fixed-tactic debug build.
+        if is_fp8_mxfp4 and os.environ.get(
+            "FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG", ""
+        ).startswith("fp8_mxfp4_prescale"):
+            mixed_input_scale_mode = "pre_mma_e8m0"
+
         use_coop = cta_shape_mnk[0] >= 128
         mainloop_schedules = (
             [
@@ -725,9 +800,10 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                 cga_shape,
                 mainloop_schedule,
                 epi_schedule,
+                mixed_input_scale_mode=mixed_input_scale_mode,
             )
             operations.append(moe_gemm_operation)
-    return operations
+    return maybe_filter_single_sm90_mixed_operation(operations)
 
 
 def generate_sm90_operations(is_arch_enabled):
@@ -1042,25 +1118,29 @@ def generate_gemm_operations(output_dir, architectures):
 
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
-    operations = []
-    operations += generate_sm120_operations(has_arch(120) or has_arch(121))
-    operations += generate_sm103_operations(has_arch(103))
-    operations += generate_sm100_operations(has_arch(100) or has_arch(103))
-    operations += generate_sm90_operations(has_arch(90))
-    operations += generate_sm80_operations(has_arch(80) or has_arch(89))
+    # PHASE3_SINGLE_CONFIG_TEMP: skip unrelated architecture generators in the
+    # fixed-tactic debug build to avoid repeated full JIT compiles.
+    if os.environ.get("FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG"):
+        operations = generate_sm90_mixed_type_grouped_gemm_operations(has_arch(90))
+    else:
+        operations = []
+        operations += generate_sm120_operations(has_arch(120) or has_arch(121))
+        operations += generate_sm103_operations(has_arch(103))
+        operations += generate_sm100_operations(has_arch(100) or has_arch(103))
+        operations += generate_sm90_operations(has_arch(90))
+        operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 
     def should_skip(op):
         return False  # All kernels have a public implementation
 
-    # The mixed dtype grouped gemm for w4afp8 has a different launcher
+    # SM90 mixed-input grouped GEMMs have a dedicated launcher.
     def is_mixed_dtype_grouped(op):
         if isinstance(op, GemmSm80LauncherConfig):
             return False
-        # Only w4a8fp8 and not wfp4afp8
         return (
-            (op.act_type != op.weight_type)
+            (op.arch == 90)
+            and (op.act_type != op.weight_type)
             and (op.gemm_kind == GemmKind.Grouped)
-            and (op.act_type != DataType.e4m3 or op.weight_type != e2m1)
         )
 
     # Fix OOM error in CI. If len(operations) is more than GROUP_SIZE, it will be split into multiple sub groups.

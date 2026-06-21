@@ -89,11 +89,12 @@ constexpr int compute_stage_count_or_override_folded_weight_scale(
 // GMMA_TMA_WS_RS
 template <class ElementA_, class GmemLayoutATag_, int AlignmentA, class ElementB_,
           class GmemLayoutBTag_, int AlignmentB, class ElementAccumulator, class TileShape_MNK,
-          class ClusterShape_MNK, class StageCountType, class KernelScheduleType>
+          class ClusterShape_MNK, class StageCountType, class KernelScheduleType,
+          MixedInputScaleMode ScaleMode>
 struct CollectiveBuilderMixedInput<
     arch::Sm90, arch::OpClassTensorOp, ElementA_, GmemLayoutATag_, AlignmentA, ElementB_,
     GmemLayoutBTag_, AlignmentB, ElementAccumulator, TileShape_MNK, ClusterShape_MNK,
-    StageCountType, KernelScheduleType,
+    StageCountType, KernelScheduleType, ScaleMode,
     cute::enable_if_t<
         (cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecialized> ||
          cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedPingpong> ||
@@ -247,11 +248,26 @@ struct CollectiveBuilderMixedInput<
                                                     ElementBMma, TileShape_MNK, SmemAlignment>(
                 StageCountType{});
 
+  static constexpr bool UseFusedE8M0PreMmaScale =
+      ScaleMode == MixedInputScaleMode::kPreMmaE8M0;
+  static_assert(
+      !UseFusedE8M0PreMmaScale ||
+          (IsArrayOfPointersGemm && IsATransformed &&
+           cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+           cute::is_same_v<ElementB, cutlass::float_e4m3_t>),
+      "Pre-MMA E8M0 scale mode is only implemented for grouped MXFP4 weight x FP8 activation.");
+
+  using ArrayMixedInputDispatchPolicy = cute::conditional_t<
+      UseFusedE8M0PreMmaScale,
+      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<
+          PipelineStages, ClusterShape_MNK, KernelScheduleType>,
+      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<
+          PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
+
   using DispatchPolicy = cute::conditional_t<
       IsMixedInput,
       cute::conditional_t<IsArrayOfPointersGemm,
-                          MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<
-                              PipelineStages, ClusterShape_MNK, KernelScheduleType>,
+                          ArrayMixedInputDispatchPolicy,
                           MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput<
                               PipelineStages, ClusterShape_MNK, KernelScheduleType>>,
       MainloopSm90TmaGmmaRmemAWarpSpecialized<PipelineStages, ClusterShape_MNK,
