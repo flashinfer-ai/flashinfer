@@ -395,11 +395,19 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
   // nonzero) lets asymmetric (QK != VO) configurations report the dim that
   // actually drives shared-memory cost.
   const uint32_t qk = head_dim_qk ? head_dim_qk : head_dim;
-  if (qk >= 512) {
+  if (head_dim >= 512) {
+    // True VO-split (VO >= 512): the split halves o_frag register pressure, so
+    // CTA_TILE_Q=32 is feasible for long-q; CTA16 for decode / short-q.
     if (avg_packed_qo_len <= 32) {
       return 16;  // decode / short-q (incl. speculative decode): lean CTA16
     }
     return 32;  // Long-q prefill use CTA_TILE_Q=32
+  }
+  if (qk >= 512) {
+    // Asymmetric large-QK but VO <= 256: VO-split does NOT engage (NUM_MMA_D_VO
+    // == 16), so o_frag is sized by the full NUM_MMA_D_VO_TILE=16. CTA_TILE_Q>16
+    // (NUM_MMA_Q>=2) overflows the 256-register o_frag wall -> only CTA16 is valid.
+    return 16;
   }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;
