@@ -18,10 +18,11 @@ class TestKernelRequiresWeights:
         assert kernel_requires_weights(IdentityConfig()) is False
         assert kernel_requires_weights(IdentityConfig(kernel_name="identity")) is False
 
-    def test_fused_moe_requires_weights(self) -> None:
-        from flashinfer.moe_ep_v2 import FusedMoeKernelConfig, kernel_requires_weights
+    def test_fused_moe_requires_moe_config(self) -> None:
+        from flashinfer.moe_ep_v2 import FusedMoeKernelConfig
 
-        assert kernel_requires_weights(FusedMoeKernelConfig()) is True
+        with pytest.raises(TypeError):
+            FusedMoeKernelConfig()  # type: ignore[call-arg]
 
 
 class TestIdentitySplitKernel:
@@ -53,32 +54,7 @@ class TestIdentitySplitKernel:
 
 
 class TestSplitKernelRegistry:
-    def test_fused_moe_kernel_raises_not_implemented(self) -> None:
-        import torch
-
-        from flashinfer.moe_ep_v2 import (
-            FleetParams,
-            FusedMoeKernelConfig,
-            MoEWeightPack,
-            SplitKernelContext,
-            run_split_kernel,
-        )
-
-        ctx = SplitKernelContext(
-            expert_tensors=torch.zeros(4, 8),
-            num_tokens=4,
-            fleet_params=FleetParams(
-                num_experts=2, max_tokens_per_rank=4, token_hidden_size=8
-            ),
-            weights=MoEWeightPack(
-                w13=torch.zeros(1, 4, 8),
-                w2=torch.zeros(1, 8, 4),
-            ),
-        )
-        with pytest.raises(NotImplementedError, match="FusedMoeKernelConfig"):
-            run_split_kernel(FusedMoeKernelConfig(), ctx)
-
-    def test_unknown_kernel_raises_not_implemented(self) -> None:
+    def test_unknown_kernel_raises(self) -> None:
         import torch
 
         from flashinfer.moe_ep_v2 import FleetParams, SplitKernelContext, run_split_kernel

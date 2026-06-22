@@ -42,6 +42,7 @@ from .config import (
     DispatchInputParams,
     DispatchOutput,
     EpAlgorithm,
+    EpLayout,
     FleetParams,
     HandleParams,
     QuantType,
@@ -86,6 +87,7 @@ __all__ = [
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",
+    "EpLayout",
     "Fleet",
     "FleetAlgoKnobNumChannelsPerRank",
     "FleetAlgoKnobNumQpsPerRank",
@@ -171,8 +173,12 @@ def _nixl_libs_dir() -> Path:
 
 
 def _probe_nccl_ep() -> bool:
-    libs = _nccl_libs_dir()
-    return (libs / "libnccl_ep.so").exists()
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("nccl.ep") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
 
 
 def _probe_nixl_ep() -> bool:

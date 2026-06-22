@@ -36,21 +36,30 @@ from .api import (
     MoEConfig,
     MoEWeightPack,
     QuantVariant,
+    TrtllmBf16Config,
     TrtllmFp4Config,
 )
-from .runners import CuteDslNvfp4Runner, TrtllmFp4RoutedRunner
+from .runners import CuteDslNvfp4Runner, TrtllmBf16RoutedRunner, TrtllmFp4RoutedRunner
 from .utils import map_to_hybrid_bucket
 
 
 # Union of the concrete runners the layer dispatches to.  All share
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
-_RunnerT = Union[CuteDslNvfp4Runner, TrtllmFp4RoutedRunner]
+_RunnerT = Union[CuteDslNvfp4Runner, TrtllmFp4RoutedRunner, TrtllmBf16RoutedRunner]
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
+    TrtllmBf16Config: TrtllmBf16RoutedRunner,
+}
+
+# Quant variants each runner can execute.
+_RUNNER_QUANTS: Dict[type, Tuple[QuantVariant, ...]] = {
+    CuteDslConfig: (QuantVariant.NVFP4,),
+    TrtllmFp4Config: (QuantVariant.NVFP4,),
+    TrtllmBf16Config: (QuantVariant.BF16,),
 }
 
 
@@ -87,7 +96,7 @@ class MoELayer:
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
-                f"arch sm{arch}. The MVP supports only NVFP4 via [{mvp}]."
+                f"arch sm{arch}. Supported backends: [{mvp}]."
             )
 
         # Cross-backend winner cache, keyed by the num_tokens tuning bucket.
@@ -99,18 +108,17 @@ class MoELayer:
 
     @staticmethod
     def _validate_mvp_scope(config: MoEConfig) -> None:
-        """Fail fast on configs the MVP cannot execute (CR6).
-
-        The MVP is NVFP4 + Swiglu + pre-routed packs only.  Surfacing this at
-        construction time turns a deep C++ crash or silent backend skip into a
-        clear, actionable Python error.
-        """
+        """Fail fast on configs no configured backend can execute."""
         variant = config.quant.variant
-        if variant is not QuantVariant.NVFP4:
+        supported = {
+            q for cfg in config.backend for q in _RUNNER_QUANTS.get(type(cfg), ())
+        }
+        if variant not in supported:
             raise NotImplementedError(
-                f"MoELayer MVP supports only QuantVariant.NVFP4; got {variant!r}. "
-                "FP8 / MXFP4 / MxInt4 / BF16 paths are tracked as post-MVP "
-                "follow-ups."
+                f"MoELayer: QuantVariant.{variant.name} is not executable by any "
+                f"configured backend (supported here: "
+                f"{sorted(q.name for q in supported) or 'none'}). "
+                "FP8 / MXFP4 / MxInt4 paths are tracked as post-MVP follow-ups."
             )
         act = config.activation.type
         if act is not ActivationType.Swiglu:

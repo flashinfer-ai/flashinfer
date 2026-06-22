@@ -21,7 +21,8 @@ class SplitKernelContext:
     expert_tensors: "torch.Tensor"
     num_tokens: int
     fleet_params: "FleetParams"
-    weights: Optional["MoEWeightPack"] = None
+    recv_topk_idx: Optional["torch.Tensor"] = None
+    recv_topk_weights: Optional["torch.Tensor"] = None
 
 
 class SplitKernelBackend(ABC):

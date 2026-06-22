@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ...config import BootstrapConfig, FleetParams, QuantType
+from ...config import BootstrapConfig, EpAlgorithm, EpLayout, FleetParams, QuantType
 
 if TYPE_CHECKING:
     import torch
@@ -181,6 +181,15 @@ def validate_fleet_params(
         raise MoEEpConfigError(
             f"num_experts ({params.num_experts}) must be divisible by "
             f"world_size ({world_size})"
+        )
+
+    if (
+        params.layout is EpLayout.RANK_MAJOR
+        and params.algorithm is not EpAlgorithm.LOW_LATENCY
+    ):
+        raise MoEEpConfigError(
+            "FleetParams.layout=RANK_MAJOR is only valid with "
+            "algorithm=LOW_LATENCY (HT uses the FLAT layout)."
         )
 
     if backend == "nixl_ep":

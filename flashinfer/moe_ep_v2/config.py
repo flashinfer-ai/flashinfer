@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     import torch
@@ -28,6 +28,25 @@ if TYPE_CHECKING:
 class EpAlgorithm(enum.Enum):
     LOW_LATENCY = 0
     HIGH_THROUGHPUT = 1
+
+
+class EpLayout(enum.Enum):
+    """LL receive-buffer layout, mirroring ``nccl.ep.Layout`` for the LL paths.
+
+    * ``EXPERT_MAJOR`` — recv buffer ``[num_local_experts, max_tokens_per_rank *
+      world, hidden]``; each padded row is pre-assigned to one local expert and
+      combine reweights per-token on receive.
+    * ``RANK_MAJOR`` — recv buffer ``[world, max_tokens_per_rank, hidden]``;
+      tokens grouped by source rank (received once each, carrying their
+      ``topk_idx`` / ``topk_weights``). The caller pre-reduces across local
+      experts before combine; combine then just sums across ranks.
+
+    HT always uses the library's ``FLAT`` layout regardless of this field; it is
+    only consulted on the LL path.
+    """
+
+    EXPERT_MAJOR = 1
+    RANK_MAJOR = 2
 
 
 class QuantType(enum.Enum):
@@ -72,7 +91,8 @@ class FleetParams:
     fields, since they're backend-specific tuning rather than contract-level
     sizing.
 
-    ``weights`` holds per-rank expert weights (required for mega kernels).
+    ``weights`` holds per-rank expert weights in canonical :class:`MoEWeightPack`
+    layout (required for compute kernels and mega paths).
     """
 
     num_experts: int
@@ -80,6 +100,7 @@ class FleetParams:
     token_hidden_size: int
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
+    layout: EpLayout = EpLayout.EXPERT_MAJOR
     weights: Optional["MoEWeightPack"] = None
 
     def __post_init__(self) -> None:
@@ -92,6 +113,14 @@ class FleetParams:
             v = getattr(self, name)
             if v <= 0:
                 raise ValueError(f"FleetParams.{name} must be positive, got {v}")
+        if (
+            self.layout is EpLayout.RANK_MAJOR
+            and self.algorithm is not EpAlgorithm.LOW_LATENCY
+        ):
+            raise ValueError(
+                "FleetParams.layout=RANK_MAJOR is only valid with "
+                "algorithm=LOW_LATENCY (HT uses the FLAT layout)."
+            )
 
 
 @dataclass(frozen=True)
@@ -119,14 +148,25 @@ class DispatchInputParams:
 class DispatchOutput:
     """Outputs from :meth:`Handle.dispatch`.
 
-    ``expert_tensors`` is the dispatched token tensor on the local rank
-    (shape: ``[num_recv_tokens, hidden]``). ``num_tokens`` is the actual
-    receive count (= ``max_tokens_per_rank`` in fixed-size LL mode; queried
-    via ``ncclEpHandleGetNumRecvTokens`` otherwise).
+    ``expert_tensors`` is the dispatched token tensor on the local rank.
+    ``num_tokens`` is the actual receive count (= ``max_tokens_per_rank`` in
+    fixed-size LL mode; queried via ``ncclEpHandleGetNumRecvTokens`` otherwise).
+
+    ``recv_topk_idx`` / ``recv_topk_weights`` are the per-received-token routing
+    returned by the LL RANK_MAJOR (and HT) layouts — ``[num_recv_tokens, top_k]``
+    int64 / fp32. They are ``None`` for the LL EXPERT_MAJOR layout (whose rows are
+    pre-assigned to experts by position, so no per-token routing is returned).
     """
 
     expert_tensors: "torch.Tensor"
-    num_tokens: int
+    num_tokens: Union[int, Callable[[], int]]
+    recv_topk_idx: Optional["torch.Tensor"] = None
+    recv_topk_weights: Optional["torch.Tensor"] = None
+
+    def get_num_tokens(self) -> int:
+        """Resolve ``num_tokens`` to an int, evaluating a deferred thunk if present."""
+        nt = self.num_tokens
+        return nt() if callable(nt) else nt
 
 
 @dataclass(frozen=True)

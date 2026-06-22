@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,7 @@ from ..config import (
     BootstrapConfig,
     CombineInputParams,
     DispatchInputParams,
+    DispatchOutput,
     FleetParams,
     HandleParams,
 )
@@ -32,7 +33,6 @@ from ..core.validation.common import (
     validate_fleet_params,
     validate_split_forward_inputs,
 )
-from ..weights import MoEWeightPack
 from .config import SplitConfig
 from ..backends.split.kernel.identity.config import IdentityConfig
 
@@ -72,9 +72,8 @@ class MoEEpSplitLayer(nn.Module):
         self._validate_at_init()
         self._kernel.validate_init(bootstrap, fleet_params)
 
-        self._weights: Optional[MoEWeightPack] = fleet_params.weights
-        if self._kernel.requires_weights() and self._weights is not None:
-            self._kernel.preprocess_weights(self._weights, fleet_params)
+        if self._kernel.requires_weights() and fleet_params.weights is not None:
+            self._kernel.preprocess_weights(fleet_params.weights, fleet_params)
 
         self._fleet: Fleet | None = None
 
@@ -116,14 +115,13 @@ class MoEEpSplitLayer(nn.Module):
             )
         return self._fleet
 
-    def _inner_compute(
-        self, expert_tensors: torch.Tensor, num_tokens: int
-    ) -> torch.Tensor:
+    def _inner_compute(self, dispatch: DispatchOutput) -> torch.Tensor:
         ctx = SplitKernelContext(
-            expert_tensors=expert_tensors,
-            num_tokens=num_tokens,
+            expert_tensors=dispatch.expert_tensors,
+            num_tokens=dispatch.get_num_tokens(),
             fleet_params=self._fleet_params,
-            weights=self._weights if self._kernel.requires_weights() else None,
+            recv_topk_idx=dispatch.recv_topk_idx,
+            recv_topk_weights=dispatch.recv_topk_weights,
         )
         return self._kernel.compute(ctx)
 
@@ -144,16 +142,16 @@ class MoEEpSplitLayer(nn.Module):
             algo_knobs=handle_knobs,
         )
         try:
-            d = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
-            expert_out = self._inner_compute(d.expert_tensors, d.num_tokens)
-            c = handle.combine(
+            dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
+            expert_out = self._inner_compute(dispatch)
+            combine = handle.combine(
                 CombineInputParams(
                     x=[expert_out],
                     out=torch.empty_like(t.hidden_states),
                 )
             )
             handle.complete()
-            return c.x
+            return combine.x
         finally:
             handle.destroy()
 
