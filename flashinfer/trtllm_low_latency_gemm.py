@@ -46,17 +46,8 @@ from flashinfer.utils import _get_cache_buf
 _LLGEMM_A_IDX = 0
 _LLGEMM_OUT_IDX = 3
 
-# Module-level singleton — must NOT be constructed inside trtllm_low_latency_gemm().
-#
-# AutoTuner._find_nearest_profile is decorated with @lru_cache(maxsize=None).  It
-# uses the TuningConfig object as part of the cache key.  DynamicTensorSpec and
-# ConstraintSpec hash their callable fields by object identity (id()), so a freshly
-# constructed TuningConfig — even with identical arguments — produces a new hash on
-# every call.  The result is one new lru_cache entry per inference call regardless of
-# whether the shape changed, causing unbounded memory growth in long-running servers.
-#
-# Keeping a single instance here ensures the same object identity is reused across
-# calls, so the cache key is stable and the cache stays bounded.
+# Module-level as the tuning config is independent of the inputs in this case.
+# Avoids re-instantiating on each call.
 _LLGEMM_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(

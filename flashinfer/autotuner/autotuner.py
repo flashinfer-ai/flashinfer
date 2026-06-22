@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import functools
 import importlib
 import inspect
 import itertools
@@ -12,7 +13,6 @@ import weakref
 import tqdm
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import (
     Any,
     Callable,
@@ -325,8 +325,7 @@ class DynamicTensorSpec:
         # Set default tensor_initializers if not provided
         if self.tensor_initializers is None:
             self.tensor_initializers = [
-                autotuner_initializer_rand_scaled
-                for _ in range(len(self.input_idx))
+                autotuner_initializer_rand_scaled for _ in range(len(self.input_idx))
             ]
 
     def __hash__(self) -> int:
@@ -850,10 +849,10 @@ class AutoTunerStatistics:
     cache_misses: int = 0
     cache_miss_config_collection: dict[str, set[tuple]] = field(default_factory=dict)
     failed_profiling_count: dict[str, set[ProfilingCacheKey]] = field(
-        default_factory=dict
+        default_factory=dict[str, set[ProfilingCacheKey]]
     )
-    tuned_op_total_configs: dict[str, int] = field(default_factory=dict)
-    tuned_op_successful_configs: dict[str, int] = field(default_factory=dict)
+    tuned_op_total_configs: dict[str, int] = field(default_factory=dict[str, int])
+    tuned_op_successful_configs: dict[str, int] = field(default_factory=dict[str, int])
 
     def __str__(self) -> str:
         """Return a string representation of collected statistics."""
@@ -886,7 +885,7 @@ class AutoTunerStatistics:
         return stats_str
 
 
-@lru_cache(maxsize=None)
+@functools.cache
 def load_from_file(key: ProfilingCacheKey) -> tuple[bool, int, int, None]:
     module_name = get_config_path(is_module=True)
     try:
@@ -1734,7 +1733,7 @@ class AutoTuner:
         return generated_profiles
 
     @classmethod
-    @lru_cache(maxsize=None)
+    @functools.cache
     def _find_nearest_profile(
         cls, shapes: tuple[tuple[int, ...], ...], tuning_config: TuningConfig
     ) -> tuple[tuple[int, ...], ...]:

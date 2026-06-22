@@ -259,7 +259,7 @@ def map_to_hybrid_bucket(x: int, max_num_tokens: int) -> int:
     return min(next_positive_power_of_2(x), max_num_tokens)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def make_hybrid_bucket_mapper(max_num_tokens: int) -> Callable[[int], int]:
     """Return a stable callable that maps token counts to hybrid buckets.
 
