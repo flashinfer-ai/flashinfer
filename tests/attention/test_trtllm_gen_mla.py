@@ -1034,7 +1034,7 @@ def test_trtllm_batch_decode_mla_cum_seq_lens_q(
         dynamic_scale=False,
         enable_pdl=False,
         backend="trtllm-gen",
-        max_seq_len=1024,
+        MAX_SEQ_LEN=1024,
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         use_cum_seq_lens_q=True,
