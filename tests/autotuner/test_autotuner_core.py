@@ -1029,6 +1029,8 @@ def test_find_nearest_profile_lru_cache_memory_leak():
     """
     import tracemalloc
 
+    AutoTuner._find_nearest_profile.cache_clear()
+
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
@@ -1069,6 +1071,7 @@ def test_find_nearest_profile_lru_cache_memory_leak():
     )
     # Sanity-check that Python-level memory grew from caching the entries.
     assert allocated_bytes > 0, "Expected Python allocation growth from unbounded cache"
+    AutoTuner._find_nearest_profile.cache_clear()
 
     print(
         f"\nCache grew by {cache_growth} entries. "

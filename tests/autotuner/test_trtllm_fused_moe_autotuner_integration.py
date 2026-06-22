@@ -18,7 +18,7 @@ TUNE_MAX = 8192
 
 
 def _prepare_bf16_moe_weights(
-    num_experts: int, intermediate_size: int, hidden_size: int, device: torch.Device
+    num_experts: int, intermediate_size: int, hidden_size: int, device: torch.device
 ):
     """Prepare shuffled BF16 weights in BlockMajorK layout."""
     from flashinfer import shuffle_matrix_a
@@ -107,7 +107,7 @@ def _tune_bf16_moe_once(
 
 def _run_bf16_moe_infer(
     *,
-    device: torch.Device,
+    device: torch.device,
     infer_num_tokens: int,
     num_experts: int,
     top_k: int,
