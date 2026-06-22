@@ -3718,16 +3718,23 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // affine in NUM_MMA_KV once the q/k/v arrays dominate the storage union, so two
   // large sample points recover the exact bytes-per-tile and fixed base.
   // max_smem_per_threadblock is already clamped to the per-block opt-in limit above.
-  // Note: kVOSplitDispatch is false for HEAD_DIM_VO < 512; the VO-split fixed
-  // overhead is zero for that regime and is captured by the SharedStorageQKVO samples.
+  // Sample the SAME struct the paged kernel instantiates: SharedStoragePaged sets
+  // kEnableVOSplitOpt=true. For HEAD_DIM_VO >= 512 the VO-split p_smem buffer
+  // (DTypeQ[CTA_TILE_Q * CTA_TILE_KV]) is active and SCALES with the tile, so it
+  // must be in the per-tile slope; sampling it with the default (false) under-counts
+  // smem_per_mma_kv, overshoots max_num_mma_kv_smem, and the final size check below
+  // hard-fails instead of selecting a smaller valid tile. No-op for HEAD_DIM_VO < 512
+  // (kVOSplit stays false there regardless of kEnableVOSplitOpt).
   constexpr uint32_t smem_sample_lo_mma = 128;
   constexpr uint32_t smem_sample_hi_mma = 256;
   constexpr size_t smem_sample_lo = sizeof(
       SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, smem_sample_lo_mma * NUM_WARPS_KV * 16,
-                        HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>);
+                        HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO,
+                        /*kEnableVOSplitOpt=*/true>);
   constexpr size_t smem_sample_hi = sizeof(
       SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, smem_sample_hi_mma * NUM_WARPS_KV * 16,
-                        HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>);
+                        HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO,
+                        /*kEnableVOSplitOpt=*/true>);
   constexpr size_t smem_per_mma_kv =
       (smem_sample_hi - smem_sample_lo) / (smem_sample_hi_mma - smem_sample_lo_mma);
   constexpr size_t smem_mma_kv_base = smem_sample_lo - smem_sample_lo_mma * smem_per_mma_kv;
