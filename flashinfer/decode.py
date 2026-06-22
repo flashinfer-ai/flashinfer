@@ -2558,6 +2558,15 @@ def _pack_trtllm_gen_spec_dec_mask(
         # The mask region covers the whole presented KV range (offset 0).
         if max_seq_len is None:
             raise ValueError("window_left >= 0 requires max_seq_len for mask sizing")
+        if seq_lens.numel() != batch_size:
+            raise ValueError(
+                f"seq_lens must have shape [{batch_size}] when packing spec-dec masks"
+            )
+        if int(seq_lens.max().item()) > max_seq_len:
+            raise ValueError(
+                "seq_lens contains values larger than max_seq_len; trim the "
+                "presented KV/page table and pass the trimmed bound."
+            )
         max_mask_tiles_kv = ceil_div(max_seq_len, tile_size_kv_per_cta)
     else:
         # Worst case over prefix tile alignment: ceil((tile - 1 + q_len) / tile).
@@ -2582,7 +2591,7 @@ def _pack_trtllm_gen_spec_dec_mask(
         packed_custom_mask,
         first_sparse_mask_offsets_kv,
         mask.contiguous(),
-        seq_lens.to(torch.int32),
+        seq_lens.to(device=mask.device, dtype=torch.int32),
         num_heads_q_per_kv,
         num_insts_kv,
         window_left,
