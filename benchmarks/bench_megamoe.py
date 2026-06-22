@@ -5,24 +5,25 @@ shape (E=256, N=512, K=2048).  Timing is end-to-end via CUDA graph replay
 (`use_cuda_graph=True`), which amortizes launch overhead and reflects the
 serving regime where the MoE is replayed from a captured graph.
 
-For a fair comparison both paths include the SAME phases — routing + the two
-block-FP8 GEMMs (with internal bf16->fp8 activation quant) + SiLU:
+Both paths run the same block-FP8 MoE math (two GEMMs with internal bf16->fp8
+activation quant + SiLU).  The one deliberate asymmetry is routing:
 
   * mono_moe          — routing (top-K + renormalize) is FUSED inside the
-                        single kernel, from `router_logits`.
-  * cutlass_fused_moe — takes pre-computed routing, so the timed region runs a
-                        FUSED routing kernel (`fused_topk_deepseek`, ~3us) then
-                        `cutlass_fused_moe`.  We deliberately do NOT use a torch
-                        softmax+topk for routing here: that multi-kernel
-                        sequence costs ~21us in-graph (more than the whole mono
-                        kernel) and would unfairly penalize cutlass — it
-                        measures torch, not the MoE.
+                        single kernel, from `router_logits`, so it is part of
+                        the timed region (it cannot be separated out).
+  * cutlass_fused_moe — routing is computed ONCE outside the timed region (the
+                        softmax top-K selection mono uses) and fed in as
+                        pre-computed `topk_ids` / `topk_w`.  The timed region is
+                        therefore JUST `cutlass_fused_moe` — the two GEMMs.  We
+                        no longer run `fused_topk_deepseek` in the loop: its
+                        sigmoid+grouped scoring picks DIFFERENT experts than the
+                        softmax routing mono uses, so timing it conflated an
+                        inaccurate routing kernel with the GEMM work.
 
-Note the routing kernels differ in scoring (mono = softmax, fused_topk_deepseek
-= sigmoid+grouped), so they pick different experts.  That is fine for TIMING
-(both are one fast fused routing kernel).  The CORRECTNESS cross-check is done
-separately: cutlass is fed the SAME softmax top-K selection mono uses (computed
-once, outside the timed region) and compared by cosine similarity.
+Both kernels are thus fed the SAME expert selection, so the cosine-similarity
+correctness check compares the actual timed cutlass output against mono.  Block-
+wise WEIGHT quant is one-time prep outside the loop for both paths; activation
+bf16->fp8 quant is internal to both kernels (inside the timed region for both).
 
 Run:  python benchmarks/bench_megamoe.py
 """
@@ -33,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import fused_moe
-from flashinfer.fused_moe import mono_moe, has_megamoe, fused_topk_deepseek
+from flashinfer.fused_moe import mono_moe, has_megamoe
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import is_sm90a_supported
 
@@ -80,7 +81,7 @@ def summarize(times_ms):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tokens", type=int, nargs="+", default=[1, 8])
+    ap.add_argument("--tokens", type=int, nargs="+", default=[1, 2, 4, 8])
     ap.add_argument("--top-k", type=int, nargs="+", default=[8])
     ap.add_argument("--cupti", action="store_true", help="use CUPTI timing if available")
     args = ap.parse_args()
@@ -103,12 +104,12 @@ def main():
     timing = "CUPTI" if args.cupti else "CUDA-graph"
     print(
         f"End-to-end MoE, block-FP8, SM90 — {timing} timing.\n"
-        f"Both paths = fused routing + 2 block-FP8 GEMMs + SiLU.\n"
-        f"  mono_moe         : routing fused in-kernel (softmax)\n"
-        f"  cutlass+routing  : fused_topk_deepseek (sigmoid) + cutlass_fused_moe\n"
-        f"cos = correctness check with MATCHED softmax routing fed to cutlass.\n"
+        f"Both paths = 2 block-FP8 GEMMs + SiLU (activation quant internal).\n"
+        f"  mono_moe         : routing fused in-kernel (softmax), timed\n"
+        f"  cutlass          : pre-computed softmax routing (NOT timed) + cutlass_fused_moe\n"
+        f"cos = correctness check; both fed the SAME softmax top-K selection.\n"
     )
-    print(f"{'shape':>16} | {'mono_moe':>22} | {'cutlass + routing':>22} | {'speedup':>8} | {'cos':>6}")
+    print(f"{'shape':>16} | {'mono_moe':>22} | {'cutlass (no routing)':>22} | {'speedup':>8} | {'cos':>6}")
     print("-" * 92)
 
     for m in args.tokens:
@@ -145,24 +146,18 @@ def main():
             s13_c = s13_swapped.contiguous()
             s2_c = s2.contiguous()
 
-            # Pre-allocated routing outputs (graph-capture-safe: same buffers
-            # every call).  Filled by fused_topk_deepseek inside the timed
-            # region so cutlass pays a routing cost comparable to mono's
-            # in-kernel routing — without the ~21us torch-softmax tax.
-            route_bias = torch.zeros(E, device=dev, dtype=torch.bfloat16)
-            route_vals = torch.empty(m, top_k, device=dev, dtype=torch.bfloat16)
-            route_ids = torch.empty(m, top_k, device=dev, dtype=torch.int32)
-            n_group, topk_group = 8, 4  # 256 experts / 8 groups, DeepSeek-V3 style
+            # Routing is computed ONCE here, OUTSIDE the timed region, using the
+            # same softmax top-K selection mono uses (topk_ids / topk_w from
+            # above).  These fixed buffers are graph-capture-safe, and the timed
+            # region below is JUST the two block-FP8 GEMMs — no routing kernel.
+            route_ids = topk_ids.contiguous()
+            route_vals = topk_w.float().contiguous()
 
             def run_cutlass():
-                fused_topk_deepseek(
-                    logits, route_bias, n_group, topk_group, top_k,
-                    1.0, route_vals, route_ids,
-                )
                 fused_moe.cutlass_fused_moe(
                     x,
                     route_ids,
-                    route_vals.float(),
+                    route_vals,
                     w13_c,
                     w2_c,
                     torch.bfloat16,
@@ -180,19 +175,14 @@ def main():
                 have_cutlass = False
                 cutlass_err = str(e).splitlines()[0][:60]
 
-            # Correctness cross-check: feed cutlass the SAME softmax top-K
-            # selection mono uses (outside any timed region) and compare.
+            # Correctness cross-check: run_cutlass already uses the SAME softmax
+            # top-K selection mono uses, so its warm-up output (out_cutlass) is
+            # directly comparable to out_mono.
             cos = float("nan")
             if have_cutlass:
-                out_cut_ref = torch.zeros(m, K, dtype=torch.bfloat16, device=dev)
-                fused_moe.cutlass_fused_moe(
-                    x, topk_ids, topk_w, w13_c, w2_c, torch.bfloat16,
-                    use_deepseek_fp8_block_scale=True,
-                    quant_scales=[s13_c, s2_c], output=out_cut_ref,
-                )
                 torch.cuda.synchronize()
                 cos = F.cosine_similarity(
-                    out_mono.float().reshape(-1), out_cut_ref.float().reshape(-1), dim=0
+                    out_mono.float().reshape(-1), out_cutlass.float().reshape(-1), dim=0
                 ).item()
 
             mono_med, mono_std = summarize(

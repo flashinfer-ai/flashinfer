@@ -33,6 +33,7 @@ from typing import Optional, Tuple
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.moe import mono_moe_trace
 
 # Hard-coded geometry of the only compiled variant
 # (Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA in
@@ -63,6 +64,7 @@ def _get_megamoe_module():
 
 
 @functools.cache
+@flashinfer_api
 def has_megamoe() -> bool:
     """Return True if the megamoe CUDA extension can be built and loaded."""
     try:
@@ -73,6 +75,7 @@ def has_megamoe() -> bool:
 
 
 @functools.cache
+@flashinfer_api
 def get_scratchpad_size_bytes() -> int:
     """Return the global scratchpad size (bytes) required by the kernel.
 
@@ -85,6 +88,7 @@ def get_scratchpad_size_bytes() -> int:
     return int(mod.moe_monokernel_scratchpad_size())
 
 
+@flashinfer_api
 def alloc_scratchpad(device: torch.device) -> torch.Tensor:
     """Allocate a zero-initialized scratchpad on ``device`` for the kernel.
 
@@ -98,6 +102,7 @@ def alloc_scratchpad(device: torch.device) -> torch.Tensor:
     return torch.zeros(nbytes, dtype=torch.uint8, device=device)
 
 
+@flashinfer_api
 def interleave_for_tma_wgmma_up(w_fp8: torch.Tensor) -> torch.Tensor:
     """Repack fp8 up-projection weights so one ``boxDim=(128, 128)``
     SWIZZLE_128B TMA issue fetches a full 128-row x 128-K WGMMA A-tile.
@@ -126,9 +131,11 @@ def interleave_for_tma_wgmma_up(w_fp8: torch.Tensor) -> torch.Tensor:
         return cached
 
     E, rows, K = w_fp8.shape
-    assert rows % 2 == 0, f"expected rows = 2*N, got rows={rows}"
+    if rows % 2 != 0:
+        raise ValueError(f"expected rows = 2*N, got rows={rows}")
     n_half = rows // 2
-    assert n_half % 64 == 0, f"N (half of rows) must be a multiple of 64; got N={n_half}"
+    if n_half % 64 != 0:
+        raise ValueError(f"N (half of rows) must be a multiple of 64; got N={n_half}")
 
     gate = w_fp8[:, :n_half, :]
     up = w_fp8[:, n_half:, :]
@@ -163,32 +170,44 @@ def _check_shapes(
     """Validate the fixed-shape contract and return the active token count."""
     E, N, K, BS = _MEGAMOE_E, _MEGAMOE_N, _MEGAMOE_K, _MEGAMOE_BS
 
-    assert activations_in.dim() == 2, "activations_in must be [M, K]"
+    # Explicit raises (not assert): these validate user-provided tensor
+    # shapes that, if wrong, let the fixed-shape CUDA kernel read/write out
+    # of bounds.  `assert` would be stripped under `python -O`, so the
+    # checks must always run.
+    if activations_in.dim() != 2:
+        raise ValueError(f"activations_in must be [M, K], got {activations_in.dim()}D")
     m = activations_in.size(0)
-    assert m <= BS, f"this kernel caps tokens at BS={BS}; got M={m}"
-    assert activations_in.size(1) == K, f"activations K must be {K}, got {activations_in.size(1)}"
-    assert router_logits.shape == (m, E), f"router_logits must be [{m}, {E}], got {tuple(router_logits.shape)}"
+    if m > BS:
+        raise ValueError(f"this kernel caps tokens at BS={BS}; got M={m}")
+    if activations_in.size(1) != K:
+        raise ValueError(f"activations K must be {K}, got {activations_in.size(1)}")
+    if tuple(router_logits.shape) != (m, E):
+        raise ValueError(f"router_logits must be [{m}, {E}], got {tuple(router_logits.shape)}")
 
     # Up weights: interleaved [E, 2*N, K]; up scales block-wise [E, 2N/128, K/128].
-    assert expert_weights_up.shape == (E, 2 * N, K), (
-        f"expert_weights_up must be [{E}, {2 * N}, {K}], got {tuple(expert_weights_up.shape)}"
-    )
-    assert expert_scales_up.shape == (E, (2 * N) // _BLOCK, K // _BLOCK), (
-        f"expert_scales_up must be [{E}, {(2 * N) // _BLOCK}, {K // _BLOCK}], "
-        f"got {tuple(expert_scales_up.shape)}"
-    )
+    if tuple(expert_weights_up.shape) != (E, 2 * N, K):
+        raise ValueError(
+            f"expert_weights_up must be [{E}, {2 * N}, {K}], got {tuple(expert_weights_up.shape)}"
+        )
+    if tuple(expert_scales_up.shape) != (E, (2 * N) // _BLOCK, K // _BLOCK):
+        raise ValueError(
+            f"expert_scales_up must be [{E}, {(2 * N) // _BLOCK}, {K // _BLOCK}], "
+            f"got {tuple(expert_scales_up.shape)}"
+        )
     # Down weights: raw [E, K, N]; down scales block-wise [E, K/128, N/128].
-    assert expert_weights_down.shape == (E, K, N), (
-        f"expert_weights_down must be [{E}, {K}, {N}], got {tuple(expert_weights_down.shape)}"
-    )
-    assert expert_scales_down.shape == (E, K // _BLOCK, N // _BLOCK), (
-        f"expert_scales_down must be [{E}, {K // _BLOCK}, {N // _BLOCK}], "
-        f"got {tuple(expert_scales_down.shape)}"
-    )
+    if tuple(expert_weights_down.shape) != (E, K, N):
+        raise ValueError(
+            f"expert_weights_down must be [{E}, {K}, {N}], got {tuple(expert_weights_down.shape)}"
+        )
+    if tuple(expert_scales_down.shape) != (E, K // _BLOCK, N // _BLOCK):
+        raise ValueError(
+            f"expert_scales_down must be [{E}, {K // _BLOCK}, {N // _BLOCK}], "
+            f"got {tuple(expert_scales_down.shape)}"
+        )
     return m
 
 
-@flashinfer_api
+@flashinfer_api(trace=mono_moe_trace)
 def mono_moe(
     activations_in: torch.Tensor,
     router_logits: torch.Tensor,
@@ -228,7 +247,8 @@ def mono_moe(
     Returns:
         bf16 MoE output ``[M, K]``.
     """
-    assert 1 <= top_k <= 8, "top_k must be in [1, 8]"
+    if not (1 <= top_k <= 8):
+        raise ValueError(f"top_k must be in [1, 8], got {top_k}")
     sf_map = {"sigmoid": _SCORING_SIGMOID, "softmax": _SCORING_SOFTMAX}
     if scoring_func not in sf_map:
         raise ValueError(f"scoring_func must be 'sigmoid' or 'softmax', got {scoring_func!r}")

@@ -20,7 +20,7 @@ import shutil
 from pathlib import Path
 
 from . import env as jit_env
-from .core import gen_jit_spec, logger, current_compilation_context
+from .core import gen_jit_spec, logger, sm90a_nvcc_flags
 
 
 def _get_megamoe_csrc_dir() -> Path:
@@ -120,15 +120,19 @@ def gen_megamoe_module():
     for fname in _INCLUDE_FILES:
         _copy(fname)
 
-    # Hopper (SM90a) only: the kernel uses wgmma.mma_async + TMA.
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9]
-    )
-
+    # Hopper (SM90a) ONLY: the kernel uses wgmma.mma_async + TMA and is
+    # hard-specialized to a single SM90a shape — it cannot target any
+    # other architecture.  Use the `sm90a_nvcc_flags` constant directly
+    # (matching gen_cutlass_fused_moe_sm90_module / gen_gemm_sm90_module)
+    # rather than the multi-arch `get_nvcc_flags_list` path: both resolve
+    # to `compute_90a,sm_90a` today, but the constant is the honest,
+    # robust choice for a kernel that is SM90a-only by construction (it
+    # always emits the `a` suffix and never depends on the detected /
+    # FLASHINFER_CUDA_ARCH_LIST arch set).
     spec = gen_jit_spec(
         name=uri,
         sources=sources,
-        extra_cuda_cflags=nvcc_flags
+        extra_cuda_cflags=sm90a_nvcc_flags
         + [
             "-DFLASHINFER_ENABLE_BF16",
             "-DFLASHINFER_ENABLE_FP8_E4M3",

@@ -354,8 +354,8 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   // Cooperative zero of expert_routed_count[NUM_EXPERTS].  Each lane owns
   // BLK = 8 contiguous u8 entries; issue as one STS.64 per lane (32 lanes
   // × 8 B = 256 B → 2 SHM transactions) instead of eight STS.U8 (8
-  // transactions).  `expert_routed_count` follows `alignas(16) bar_a[2]`
-  // so the per-lane base `tid * BLK` is always 8-byte aligned for BLK=8.
+  // transactions).  `expert_routed_count` is declared `alignas(16)` so
+  // the per-lane base `tid * BLK` is always 8-byte aligned for BLK=8.
   static_assert(BLK == 8u,
                 "Vectorized zero assumes BLK = 8 (one uint64 per lane). "
                 "Update the cast width if NUM_EXPERTS / 32 ever changes.");

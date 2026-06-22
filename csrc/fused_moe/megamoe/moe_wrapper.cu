@@ -176,13 +176,9 @@ static_assert(
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);                      \
         int smem_opt_in = 0;                                                                       \
         cudaDeviceGetAttribute(&smem_opt_in, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);          \
-        fprintf(stderr,                                                                            \
-                "[monokernel] %s: grid=%u block=%u shmem=%zu bytes "                               \
-                "regs/thread=%d static_shmem=%zu max_blocks_per_sm=%d "                            \
-                "sms=%d coop_max=%d opt-in_shmem=%d\n",                                            \
-                #name, dims::KernelConfig::GRID_SIZE, dims::KernelConfig::BLOCK_SIZE, shmem_size,  \
-                fa.numRegs, fa.sharedSizeBytes, max_blocks_per_sm, sm_count,                       \
-                max_blocks_per_sm* sm_count, smem_opt_in);                                         \
+        (void)smem_opt_in;                                                                          \
+        (void)max_blocks_per_sm;                                                                    \
+        (void)fa;                                                                                   \
         /* Hard co-residency assertions for the software grid barrier                              \
            (spec R4.1, R4.2, R4.3 / Design Component C "Co-residency                               \
            assertions").  The seed-atomicAdd-spin-on-high-bit protocol                             \
@@ -224,10 +220,26 @@ static_assert(
        the cost is a few hundred microseconds one-time on H200 — trivial                         \
        next to per-decode kernel launches. */                                                      \
     {                                                                                              \
-      static bool _zeroed = false;                                                                 \
-      if (!_zeroed) {                                                                              \
+      /* Caller-provided scratchpad: key the guard on buffer identity                              \
+         (ptr, size, device) and re-zero whenever it changes, so each                              \
+         distinct allocation is initialized exactly once.  A process-wide                          \
+         one-shot flag would be WRONG here — it zeroes only the first                             \
+         buffer ever seen and launches every subsequent DISTINCT scratchpad                        \
+         (other stream/device or a freshly-malloc'd buffer) with                                   \
+         uninitialized barrier counters, deadlocking the seed/spin protocol                        \
+         or silently corrupting results.  A reused buffer still pays the                           \
+         zero-init only on its first launch (self-maintaining ping-pong                            \
+         reset thereafter). */                                                                     \
+      static const void* _zeroed_ptr = nullptr;                                                    \
+      static size_t _zeroed_size = 0;                                                              \
+      static int _zeroed_dev = -1;                                                                 \
+      const int _cur_dev = activations_in.device().device_id;                                      \
+      if (_zeroed_ptr != static_cast<const void*>(scratchpad_ptr) ||                               \
+          _zeroed_size != scratchpad_size || _zeroed_dev != _cur_dev) {                            \
         CUDA_CHECK(cudaMemsetAsync(scratchpad_ptr, 0, scratchpad_size, stream));                   \
-        _zeroed = true;                                                                            \
+        _zeroed_ptr = scratchpad_ptr;                                                              \
+        _zeroed_size = scratchpad_size;                                                            \
+        _zeroed_dev = _cur_dev;                                                                    \
       }                                                                                            \
     }                                                                                              \
     /* Standard (non-cooperative) launch.  The kernel reaches grid-wide                            \

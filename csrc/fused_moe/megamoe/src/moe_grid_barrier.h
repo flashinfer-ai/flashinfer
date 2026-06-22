@@ -160,14 +160,31 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
   }
 
   // Step 4 (fence discipline, step 4 — spin with acquire-like
-  // semantics): every thread polls the slot until bit 31 flips.
+  // semantics): thread 0 alone polls the slot until bit 31 flips.
   // Using `atomicAdd(c, 0u)` forces an uncached device-scope read;
   // it compiles to the same ld.acquire.gpu pattern as an inline-PTX
   // acquire load on SM90 and is portable across CUDA versions.
-  while ((atomicAdd(c, 0u) & 0x80000000u) == 0u) {
-    // Empty spin body.  The memory subsystem coalesces repeated
-    // reads of the same address from the same SM, so the spin's
-    // L2 bandwidth cost is negligible.
+  //
+  // Only thread 0 spins: the Step-6 `__syncthreads()` re-gathers the
+  // block, so the other threads simply wait there until thread 0
+  // exits the spin.  This avoids all 384 threads issuing redundant
+  // device-scope atomics (the reads coalesce, but they still occupy
+  // warp scheduler slots).  Correctness is unchanged — the
+  // happens-before chain is `producer __threadfence() (release) →
+  // producer arrive → thread-0 acquire-spin → thread-0
+  // __syncthreads() (cta-release) → other-thread __syncthreads()
+  // (cta-acquire) → other-thread post-barrier read`, the same chain
+  // CUDA's canonical `threadFenceReduction` relies on (thread 0
+  // observes the cross-block flag; `__syncthreads()` publishes its
+  // acquired GPU-scope view to the rest of the block).  Step 5's
+  // `__threadfence()` and Step 6's `__syncthreads()` below still run
+  // on every thread.
+  if (threadIdx.x == 0) {
+    while ((atomicAdd(c, 0u) & 0x80000000u) == 0u) {
+      // Empty spin body.  The memory subsystem coalesces repeated
+      // reads of the same address from the same SM, so the spin's
+      // L2 bandwidth cost is negligible.
+    }
   }
 
   // Step 5 (fence discipline, step 5): pair with the arrival-side
@@ -177,6 +194,8 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
 
   // Step 6 (fence discipline, step 6): re-gather the block so every
   // thread proceeds together with a consistent post-barrier view.
+  // This is also what releases the non-spinning threads, which were
+  // waiting here while thread 0 spun on the counter.
   __syncthreads();
 
   // Step 7 : advance the phase so the next call targets
@@ -375,14 +394,25 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
   }
 
   // Step 4 (fence discipline, step 4 — spin with acquire-like
-  // semantics): every thread polls the slot until bit 31 flips.
+  // semantics): thread 0 alone polls the slot until bit 31 flips.
   // Using `atomicAdd(c, 0u)` forces an uncached device-scope read;
   // it compiles to the same ld.acquire.gpu pattern as an inline-PTX
   // acquire load on SM90 and is portable across CUDA versions.
-  while ((atomicAdd(c, 0u) & 0x80000000u) == 0u) {
-    // Empty spin body.  Repeated reads of the same address from
-    // the same SM are coalesced in the memory subsystem so the
-    // spin's L2 bandwidth cost is negligible.
+  //
+  // Only thread 0 spins: the Step-6 `__syncthreads()` re-gathers the
+  // block, so the other threads simply wait there until thread 0
+  // exits the spin.  This avoids every thread issuing redundant
+  // device-scope atomics (the reads coalesce, but they still occupy
+  // warp scheduler slots).  Correctness is unchanged — see the
+  // detailed happens-before argument on the identical spin in
+  // `grid_barrier` above.  Step 5's `__threadfence()` and Step 6's
+  // `__syncthreads()` below still run on every thread.
+  if (threadIdx.x == 0) {
+    while ((atomicAdd(c, 0u) & 0x80000000u) == 0u) {
+      // Empty spin body.  Repeated reads of the same address from
+      // the same SM are coalesced in the memory subsystem so the
+      // spin's L2 bandwidth cost is negligible.
+    }
   }
 
   // Step 5 (fence discipline, step 5): pair with the arrival-side
@@ -392,6 +422,8 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
 
   // Step 6 (fence discipline, step 6): re-gather the block so every
   // thread proceeds together with a consistent post-barrier view.
+  // This is also what releases the non-spinning threads, which were
+  // waiting here while thread 0 spun on the counter.
   __syncthreads();
 
   // Step 7: advance the phase so the next call targets

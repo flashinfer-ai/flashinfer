@@ -182,20 +182,10 @@ struct MoEGemmSpec {
   // 8 now also uses BS * SPEC_MAX_TOPK rows because the split-phase design
   // writes one row per (token, expert) pair into spec->temp_bf16.
   static constexpr uint32_t TEMP_ROWS = Dims::BS * SPEC_MAX_TOPK + 8;
-
-  // TMA path uses a tighter outer-axis extent that excludes the 8-row
-  // padding above.  The padding exists only to guard against off-by-one
-  // writes in the scalar/BS64 paths; the BS8 WGMMA up-proj epilogue only
-  // ever writes to rows `[0, BS * SPEC_MAX_TOPK) = [0, 64)` via
-  // `sorted_slot`.  `TEMP_ROWS_TMA = BS * SPEC_MAX_TOPK` (= 64 for
-  // Qwen3.5-35B) is the value passed to `create_down_activation_tma_desc`
-  // as the outer-axis `globalDim`.
   static constexpr uint32_t TEMP_ROWS_TMA = Dims::BS * SPEC_MAX_TOPK;
 
   AQ_element activations[Dims::BS][Dims::HIDDEN_STATES];  //< Quantized activations
 
-  // Up-projection SiLU output (legacy, previously used by BS64 path).
-  //
   // Kept for struct layout stability — removing it would shift
   // TEMP_FP8_OFFSET and break the down-activation TMA descriptor.
   A_element temp_bf16[TEMP_ROWS * Dims::N];
@@ -242,7 +232,6 @@ struct MoEGemmSpec {
   //   Dims::BS <= 8), `DOWN_COL_TILE = 256`; otherwise 128.  Grids:
   //
   //   BS8 TMA+WGMMA: DOWN_COL_TILE=256, DOWN_GRID=8, DOWN_GROUPS=16
-  //   BS64 / non-TMA: DOWN_COL_TILE=128, DOWN_GRID=16, DOWN_GROUPS=8
   //
   //   The `DOWN_GROUPS == UP_GROUPS` alignment in the BS8 TMA path is
   //   the prerequisite for the Phase-2b Expert_Barrier at site #2.
@@ -540,11 +529,6 @@ struct MoECoreDims {
   // Phase 5 reads each cell once and casts to bf16 (no cross-group
   // reduction).
   //
-  // Default (BS64, non-TMA): DOWN_COL_TILE = 128.
-  //   For Qwen3.5-35B (HIDDEN_STATES=2048, GRID_SIZE=128):
-  //     DOWN_GRID   = 2048 / 128 = 16 blocks per expert
-  //     DOWN_GROUPS = 128  / 16  = 8 expert groups running in parallel
-  //
   // BS8 TMA+WGMMA (Phase 2a layout alignment): DOWN_COL_TILE = 256.
   //   DOWN_GRID   = 2048 / 256 = 8 blocks per expert
   //   DOWN_GROUPS = 128  / 8   = 16 expert groups (== UP_GROUPS)
@@ -686,13 +670,7 @@ struct MoE_SHM {
       // consumed only by the BS8 TMA+WGMMA path.
       // The `tiny_wgmma_tma` variant of `union U` is, however, present
       // in `MoE_SHM<Dims>` for every Dims, and `sizeof(MoE_SHM<Dims>)`
-      // takes the max across all union members.  To keep the BS64
-      // path's `MoE_SHM<Dims>` size byte-identical to the
-      // pre-optimization baseline, we collapse the BS-
-      // dependent extents of the new fields to 1 when `Dims::BS > 8`
-      // and to their natural value otherwise.  The runtime BS8
-      // dispatch never reads the BS64-instantiated views; the
-      // `tiny_wgmma_tma` union member is the only active path.
+      // takes the max across all union members.
       //
       // Tile-major shape: the BF16 input SHM buffer is shaped as
       // `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` rather than the natural-
@@ -787,18 +765,13 @@ struct MoE_SHM {
       //   * Old: 16 × 8 × 8 × 16 = 16 KB.
       //   * New: 16 × 8 × 9 × 16 = 18 KB (+2 KB).
       //
-      // The BS-dependent extent (`FP8_ACT_FULL_K_BLOCKS`) collapses
-      // to 1 for `Dims::BS > 8` so the BS64 path's `MoE_SHM<Dims>`
-      // size stays byte-identical to the pre-optimization baseline.
-      // See the BF16_IN_FULL_BS / BF16_IN_FULL_K
-      // comment above K_BLOCKS_TOTAL for the rationale.
       static constexpr uint32_t FP8_ACT_T_TILE_PADDED = CoreDims::T_TILE + 1u;
       alignas(1024) AQ_element fp8_act_full[FP8_ACT_FULL_K_BLOCKS][FP8_ACT_NUM_CHUNKS]
                                            [FP8_ACT_T_TILE_PADDED][FP8_ACT_K_CHUNK];
 
       static constexpr uint32_t W_WGMMA_M = 128;  // M dim of weight tile (up-proj)
       // Down-proj tile M dim tracks DOWN_COL_TILE (Phase 2a): 128 for the
-      // BS64 / non-TMA path, 256 for the BS8 TMA+WGMMA variant after the
+      // non-TMA path, 256 for the BS8 TMA+WGMMA variant after the
       // Phase-2a layout alignment (DOWN_COL_TILE = 256).  Must stay a
       // multiple of 128 so the SWIZZLE_128B core-matrix atoms still tile
       // the outer M axis cleanly.
@@ -859,13 +832,6 @@ struct MoE_SHM {
         // unioned weight buffers (the bf16 activation TMA descriptor
         // itself uses SWIZZLE_NONE so 16 B alignment would suffice).
         //
-        // Sizing is BS-clamped (`BF16_IN_FULL_K_BLOCKS` /
-        // `BF16_IN_FULL_BS` / `BF16_IN_FULL_K`) so the field
-        // collapses to a 1×1×1 placeholder for `Dims::BS > 8`,
-        // keeping the BS64 path's `MoE_SHM<Dims>` size byte-
-        // identical to the pre-optimization baseline.
-        // See the BF16_IN_FULL_K_BLOCKS / BF16_IN_FULL_BS /
-        // BF16_IN_FULL_K comment above for the rationale.
         //
         // Sizing (per slot):
         //   w_wgmma[2][W_WGMMA_M_TOTAL][K_STEP_WGMMA=128]
@@ -1078,7 +1044,7 @@ struct MoE_SHM {
       //   * Phase 4 launcher reads `expert_slot_start[id]` and
       //     `expert_routed_count[id]` once per expert to parameterize
       //     the bulk activation TMA.
-      //   * Phase 4 epilogue (Task 9.6) walks the (tok, k_in_topk) grid
+      //   * Phase 4 epilogue walks the (tok, k_in_topk) grid
       //     in `topk_ids_flat`, filters by the current expert id, then
       //     derives the intra-expert rank as
       //     `sorted_slot[pair] - expert_slot_start[id]` to index the
@@ -1104,7 +1070,19 @@ struct MoE_SHM {
       // the contract explicit on the declaration side so future SHM
       // layout changes cannot silently break it.
       alignas(16) uint16_t expert_slot_start[Dims::NUM_EXPERTS];
-      uint8_t expert_routed_count[Dims::NUM_EXPERTS];
+      // `alignas(16)` is required (NOT cosmetic): `prepare_moe_topk_BS8`
+      // (in `moe_routing.cu`) zero-inits this array with a per-lane
+      // STS.64 (`*reinterpret_cast<uint64_t*>(&expert_routed_count[tid *
+      // BLK]) = 0ull`, BLK = 8) and later reads it back with the matching
+      // 64-bit `reinterpret_cast` load.  Both require the array base to be
+      // ≥8-byte aligned (per-lane base `tid * BLK` is 8-aligned only when
+      // the base itself is).  It currently lands 16-aligned by virtue of
+      // the preceding `alignas(16) uint16_t expert_slot_start[256]` (= 512
+      // B, a multiple of 16), but that is incidental — making the
+      // alignment explicit here means a future SHM-layout change to the
+      // preceding field cannot silently shift this to an unaligned offset
+      // and trigger `cudaErrorMisalignedAddress` at the STS.64 / LD.64.
+      alignas(16) uint8_t expert_routed_count[Dims::NUM_EXPERTS];
       uint8_t sorted_slot[MAX_PAIRS];
       // Per-expert per-token cached rank used by the down-proj
       // accumulate loop (Phase 4 epilogue).  Rebuilt at the top of each
@@ -1161,14 +1139,6 @@ struct MoE_SHM {
     // type).  Still inside `union U` of the enclosing
     // `MoE_SHM<Dims>` so `Dims` is in scope.
     //
-    // These asserts hold for ALL Dims (including BS64) because the
-    // three fields are members of the same anonymous union and thus
-    // all start at offset 0 of that union.  On BS64 the BS-clamped
-    // extents `BF16_IN_FULL_K_BLOCKS=1` / `BF16_IN_FULL_BS=1` /
-    // `BF16_IN_FULL_K=1` collapse the bf16 view to a 2-byte
-    // placeholder but the union offset invariant is unchanged — the
-    // asserts pass and the BS64 SHM footprint stays byte-identical to
-    // the pre-optimization baseline.
     static_assert(offsetof(typename U::TinyDataWGMMA_TMA, bf16_in_full) ==
                       offsetof(typename U::TinyDataWGMMA_TMA, w_wgmma),
                   "bf16_in_full must alias w_wgmma exactly.");
@@ -1179,8 +1149,6 @@ struct MoE_SHM {
 
   static_assert(Dims::NUM_EXPERTS <= 65535,
                 "Number of experts too high, cannot store as uint16 anymore.");
-
-  // ── Common fields (both BS8 and BS64) ────────────────────────────────────
 
   // act_scale[blk][tok] = max(|x_tok[blk*128..(blk+1)*128-1]|)/448
   //
@@ -1196,11 +1164,7 @@ struct MoE_SHM {
   // legacy `[Dims::BS][ACT_SCALE_BLOCKS]` layout had a 64-B row stride
   // (= 16 banks); for BS=8 the four toks read from the same warp lane
   // mapped to the same bank, producing a 4-way conflict per LDS that
-  // NCU flagged as the dominant excessive-wavefront source.  The
-  // transposed layout costs the same 512 B and updates only the SHM
-  // index pattern — `MoEGemmSpec<Dims>::act_scale` (GM staging) keeps
-  // its `[BS][BLK]` layout because the BS64 path uses GM coalesced
-  // writes and there's no bank-conflict concern in DRAM.
+  // NCU flagged as the dominant excessive-wavefront source.  
   static constexpr uint32_t ACT_BLOCK_SIZE = 128;
   static constexpr uint32_t ACT_SCALE_BLOCKS =
       (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
