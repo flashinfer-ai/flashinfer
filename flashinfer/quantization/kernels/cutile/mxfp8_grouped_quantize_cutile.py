@@ -43,9 +43,6 @@ class _PrefixSchedule:
     total_tiles: int
 
 
-_FUSED_PREFIX_GRAPH_TILE_OFFSETS: dict[tuple[str, int], torch.Tensor] = {}
-
-
 def mxfp8_grouped_quantize_cutile(
     input: torch.Tensor,
     problem_sizes: torch.Tensor,
@@ -104,23 +101,14 @@ def build_mxfp8_grouped_quant_prefix_schedule(
             total_tiles=-1,
         )
 
-    if input.device.index is None:
-        device_index = torch.cuda.current_device()
-    else:
-        device_index = input.device.index
-    cache_key = (input.device.type, device_index)
-    tile_offsets = _FUSED_PREFIX_GRAPH_TILE_OFFSETS.get(cache_key)
-    if tile_offsets is None or tile_offsets.device != input.device:
-        is_capturing = getattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-        if is_capturing():
-            raise RuntimeError(
-                "Grouped MXFP8 quantization requires a preallocated prefix buffer "
-                "before CUDA Graph capture. Run one eager warmup call first."
-            )
-        tile_offsets = torch.empty(
-            MAX_GROUPS_FUSED + 1, dtype=torch.int32, device=input.device
-        )
-        _FUSED_PREFIX_GRAPH_TILE_OFFSETS[cache_key] = tile_offsets
+    # Allocate the prefix scratch per call. The build kernel fully overwrites it
+    # before the persistent kernel reads it on the same stream, so it needs no
+    # zero-init and its lifetime is one call; it is only MAX_GROUPS_FUSED + 1
+    # int32 entries (8 KB when MAX_GROUPS_FUSED is 2048), so caching would save
+    # a negligible allocation.
+    tile_offsets = torch.empty(
+        MAX_GROUPS_FUSED + 1, dtype=torch.int32, device=input.device
+    )
 
     _launch_prefix_offsets_into(input, problem_sizes, tile_offsets)
     return _PrefixSchedule(tile_offsets, total_tiles=-1)

@@ -29,6 +29,16 @@ def is_cutile_available():
         return False
 
 
+def _is_mxfp8_supported(device: torch.device) -> bool:
+    """Check if MXFP8 quantization is supported on this device.
+
+    The public ``mxfp8_quantize`` and ``mxfp8_grouped_quantize`` APIs gate on
+    "SM100 or newer" (the grouped wrapper raises for ``major < 10``), so use a
+    forward-compatible minimum-compute-capability check.
+    """
+    return get_compute_capability(device)[0] >= 10
+
+
 def _unswizzle_mxfp8_scales_128x4(
     sf: torch.Tensor,
     row: int,
@@ -51,12 +61,8 @@ def _unswizzle_mxfp8_scales_128x4(
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backend):
-    if device == "cuda":
-        major, _ = get_compute_capability(torch.device(device))
-        if major < 10:
-            pytest.skip(
-                "mxfp8 quantization is not supported on compute capability < 10"
-            )
+    if device == "cuda" and not _is_mxfp8_supported(torch.device(device)):
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     # Skip cute-dsl backend for CPU or if not available
     if backend == "cute-dsl":
@@ -89,8 +95,7 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
 def test_mxfp8_grouped_quantize(batch_shape, dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
     if not is_cutile_available():
         pytest.skip("cuda.tile is not available")
@@ -144,8 +149,7 @@ def test_mxfp8_grouped_quantize_empty_group(dtype):
     """A zero-token group (mask=0) must not corrupt its non-empty neighbors."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
     if not is_cutile_available():
         pytest.skip("cuda.tile is not available")
@@ -200,8 +204,7 @@ def test_mxfp8_grouped_quantize_cuda_graph(batch_shape):
     """Grouped MXFP8 quantize must be CUDA-graph capturable and replay correctly."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
     if not is_cutile_available():
         pytest.skip("cuda.tile is not available")
@@ -211,25 +214,169 @@ def test_mxfp8_grouped_quantize_cuda_graph(batch_shape):
     x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
-    # Eager warmup: populates the persistent-prefix buffer cache (allocating it
-    # mid-capture is rejected) and triggers the cuTile JIT compile.
+    # Eager warmup: triggers the cuTile JIT compile so the first launch does not
+    # happen mid-capture. The prefix scratch buffer is allocated per call from
+    # the stream-ordered caching allocator, so there is no buffer to prepopulate.
     out_eager, sf_eager = mxfp8_grouped_quantize(x, mask)
     torch.cuda.synchronize()
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        out_g, sf_g = mxfp8_grouped_quantize(x, mask)
+        out_graph, sf_graph = mxfp8_grouped_quantize(x, mask)
 
     g.replay()
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
-        out_g.contiguous().view(torch.uint8),
+        out_graph.contiguous().view(torch.uint8),
         out_eager.contiguous().view(torch.uint8),
         rtol=0,
         atol=0,
     )
-    torch.testing.assert_close(sf_g, sf_eager, rtol=0, atol=0)
+    torch.testing.assert_close(sf_graph, sf_eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch_shape", [(2, 128, 256), (3, 256, 128)])
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_cuda_graph_pool_reuse(batch_shape):
+    """Replay a captured graph many times with interleaved allocator churn.
+
+    The per-call ``tile_offsets`` scratch is allocated and freed inside the
+    capture region, so it returns to the graph private pool during capture.
+    This stresses graph-pool isolation: the recorded prefix table must stay
+    reserved across replays even when unrelated allocations and frees happen in
+    between.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+
+    from flashinfer.quantization.kernels.cutile.mxfp8_grouped_quantize_cutile import (
+        MAX_GROUPS_FUSED,
+    )
+
+    torch.manual_seed(0)
+    b, m, k = batch_shape
+    x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
+    mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
+
+    # Eager reference. Also triggers the cuTile JIT compile before capture.
+    out_eager, sf_eager = mxfp8_grouped_quantize(x, mask)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out_graph, sf_graph = mxfp8_grouped_quantize(x, mask)
+
+    scratch_numel = MAX_GROUPS_FUSED + 1
+    for _ in range(8):
+        # Churn the caching allocator with same-sized blocks as the prefix
+        # scratch (the most likely candidates to grab a non-isolated address)
+        # plus a large block, writing a sentinel so any reuse would corrupt the
+        # next replay rather than silently match.
+        churn = [
+            torch.full((scratch_numel,), -1, dtype=torch.int32, device="cuda")
+            for _ in range(32)
+        ]
+        churn.append(torch.full((1 << 22,), -1, dtype=torch.int32, device="cuda"))
+        del churn
+
+        g.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            out_graph.contiguous().view(torch.uint8),
+            out_eager.contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(sf_graph, sf_eager, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_concurrent_streams():
+    """Two streams on one device must not share prefix-schedule scratch.
+
+    The op allocates its ``tile_offsets`` prefix table per call. This test
+    guards against regressing to a per-device cached buffer, which would be
+    shared across streams and race: one launch prefix table could overwrite the
+    other between the build kernel and the persistent read (see
+    flashinfer-ai/flashinfer#3618).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+
+    # Distinct group counts, shapes, and masks so a prefix table built by one
+    # stream would mis-tile the other stream output.
+    shape_a, mask_vals_a = (3, 256, 256), [256, 128, 200]
+    shape_b, mask_vals_b = (5, 128, 512), [128, 64, 96, 32, 100]
+    x_a = torch.randn(shape_a, dtype=dtype, device="cuda")
+    x_b = torch.randn(shape_b, dtype=dtype, device="cuda")
+    mask_a = torch.tensor(mask_vals_a, dtype=torch.int32, device="cuda")
+    mask_b = torch.tensor(mask_vals_b, dtype=torch.int32, device="cuda")
+
+    def valid_views(q, sf, masks, m, k):
+        padded_k = (k + 127) // 128 * 128
+        q_groups = q.permute(2, 0, 1)
+        sf_groups = sf.permute(5, 2, 4, 0, 1, 3)
+        q_valid = []
+        sf_valid = []
+        for i, mask_i in enumerate(masks):
+            q_valid.append(q_groups[i, :mask_i].contiguous().view(torch.uint8))
+            sf_un = _unswizzle_mxfp8_scales_128x4(sf_groups[i], m, padded_k)
+            sf_valid.append(sf_un[:mask_i].contiguous())
+        return q_valid, sf_valid
+
+    # Per-stream eager references. Also triggers the cuTile JIT compile so the
+    # concurrent loop does not compile on a side stream.
+    ref_qa, ref_sa = mxfp8_grouped_quantize(x_a, mask_a)
+    ref_qb, ref_sb = mxfp8_grouped_quantize(x_b, mask_b)
+    torch.cuda.synchronize()
+    ref_qa_v, ref_sa_v = valid_views(
+        ref_qa, ref_sa, mask_vals_a, shape_a[1], shape_a[2]
+    )
+    ref_qb_v, ref_sb_v = valid_views(
+        ref_qb, ref_sb, mask_vals_b, shape_b[1], shape_b[2]
+    )
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+
+    # Interleave launches on both streams without syncing inside the loop so
+    # the two launch sequences actually overlap on the device.
+    outs_a = []
+    outs_b = []
+    for _ in range(32):
+        with torch.cuda.stream(stream_a):
+            outs_a.append(mxfp8_grouped_quantize(x_a, mask_a))
+        with torch.cuda.stream(stream_b):
+            outs_b.append(mxfp8_grouped_quantize(x_b, mask_b))
+    torch.cuda.synchronize()
+
+    def assert_stream_matches(outs, ref_q_v, ref_s_v, masks, m, k):
+        for q, sf in outs:
+            q_v, s_v = valid_views(q, sf, masks, m, k)
+            for got, ref in zip(q_v, ref_q_v, strict=True):
+                torch.testing.assert_close(got, ref, rtol=0, atol=0)
+            for got, ref in zip(s_v, ref_s_v, strict=True):
+                torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    assert_stream_matches(
+        outs_a, ref_qa_v, ref_sa_v, mask_vals_a, shape_a[1], shape_a[2]
+    )
+    assert_stream_matches(
+        outs_b, ref_qb_v, ref_sb_v, mask_vals_b, shape_b[1], shape_b[2]
+    )
 
 
 @pytest.mark.parametrize("batch_shape", [(2, 256, 512), (3, 200, 160), (4, 128, 2048)])
@@ -249,8 +396,7 @@ def test_mxfp8_grouped_quantize_matches_gemm_sfa_layout(batch_shape):
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
     if not is_cutile_available():
         pytest.skip("cuda.tile is not available")
@@ -331,8 +477,7 @@ def test_mxfp8_grouped_quantize_fake_op_matches_real(batch_shape):
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
     if not is_cutile_available():
         pytest.skip("cuda.tile is not available")
@@ -379,8 +524,7 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend):
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
@@ -406,8 +550,7 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend
 def test_mxfp8_quantize_alignment_torch_device(
     m, k, dtype, is_sf_swizzled_layout, alignment, backend
 ):
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
@@ -446,8 +589,7 @@ def test_mxfp8_quantize_denormal_inputs(m, k, dtype, is_sf_swizzled_layout, back
     This test covers a bug where inputs small enough to cause E8M0 scale factor
     underflow would result in NaN outputs due to 0 * infinity computations.
     """
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
@@ -479,8 +621,7 @@ def test_mxfp8_quantize_denormal_inputs(m, k, dtype, is_sf_swizzled_layout, back
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_all_zeros(dtype, is_sf_swizzled_layout, backend):
     """Test that all-zero inputs produce all-zero outputs without NaN."""
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
@@ -511,8 +652,7 @@ def test_mxfp8_quantize_mixed_magnitude(dtype, is_sf_swizzled_layout, backend):
     This mimics real-world scenarios where different regions of a tensor
     may have vastly different magnitudes.
     """
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
@@ -561,8 +701,7 @@ def test_mxfp8_quantize_single_denormal_in_block(dtype, is_sf_swizzled_layout, b
     a single float32 denormal value in a block would become NaN due to
     0 * infinity when FTZ mode flushes it to zero.
     """
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
@@ -595,8 +734,7 @@ def test_mxfp8_quantize_single_denormal_in_block(dtype, is_sf_swizzled_layout, b
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_extreme_scale_inputs(dtype, is_sf_swizzled_layout, backend):
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
@@ -627,8 +765,7 @@ def test_cute_dsl_compilation_cache_m_agnostic(is_sf_swizzled_layout):
     Different M values with the same K should reuse the cached kernel,
     meaning no recompilation occurs when only M changes.
     """
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if not is_cute_dsl_available():
@@ -693,8 +830,7 @@ def test_cute_dsl_compilation_cache_k_specific(is_sf_swizzled_layout):
     Different K values should create separate cached kernels,
     meaning recompilation occurs when K changes.
     """
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if not is_cute_dsl_available():
@@ -763,8 +899,7 @@ MXFP8_SF_LAYOUTS = [
 @pytest.mark.parametrize("sf_layout", MXFP8_SF_LAYOUTS)
 def test_mxfp8_quantize_layout_backend_parity(m, k, dtype, sf_layout):
     """CUDA and CuTe-DSL backends must exactly match element-wise."""
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
     if not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
@@ -823,8 +958,7 @@ def test_cute_dsl_compilation_cache_dtype_specific(is_sf_swizzled_layout):
 
     Different dtypes (fp16 vs bf16) should create separate cached kernels.
     """
-    major, _ = get_compute_capability(torch.device("cuda:0"))
-    if major < 10:
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
     if not is_cute_dsl_available():
