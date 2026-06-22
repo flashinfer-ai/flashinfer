@@ -28,6 +28,7 @@ class _A2AState:
     phase: str = "idle"  # idle | dispatched
     local_num_tokens: Optional[int] = None
     combine_payload_offset: Optional[int] = None
+    eplb_gathered_stats: Optional[torch.Tensor] = None
 
 
 @functools.cache
@@ -44,8 +45,11 @@ def get_moe_alltoall_module():
         ep_rank: int,
         ep_size: int,
         max_num_tokens: int,
+        eplb_stats_num_experts: int = 0,
     ):
-        return module.moe_a2a_initialize(workspace, ep_rank, ep_size, max_num_tokens)
+        return module.moe_a2a_initialize(
+            workspace, ep_rank, ep_size, max_num_tokens, eplb_stats_num_experts
+        )
 
     @register_custom_op(
         "flashinfer::moe_a2a_dispatch",
@@ -62,6 +66,7 @@ def get_moe_alltoall_module():
         top_k: int,
         num_experts: int,
         enable_pdl: bool,
+        eplb_local_stats: Optional[torch.Tensor] = None,
     ):
         """
         Dispatch tokens and payloads to expert ranks.
@@ -77,11 +82,17 @@ def get_moe_alltoall_module():
             top_k: Number of experts per token
             num_experts: Total number of experts
             enable_pdl: Whether to use programmatic dependent launch
+            eplb_local_stats: Optional [eplb_stats_num_experts] int32 tensor of
+                this rank's local EPLB statistics to all-gather during dispatch
 
         Returns:
             recv_offsets: List of offsets for each payload in the workspace
             recv_sizes: List of sizes for each payload in the workspace
             combine_payload_offset: Offset for combine payload region
+            eplb_gathered_stats_offset: Offset for the gathered EPLB stats
+                region, or -1 when EPLB is disabled
+            eplb_stats_num_experts: Number of experts in the EPLB stats, or 0
+                when EPLB is disabled
         """
         return module.moe_a2a_dispatch(
             token_selected_experts,
@@ -94,6 +105,7 @@ def get_moe_alltoall_module():
             top_k,
             num_experts,
             enable_pdl,
+            eplb_local_stats,
         )
 
     @register_custom_op(
@@ -196,6 +208,7 @@ def get_moe_alltoall_module():
     def moe_a2a_get_aux_data_size(
         ep_size: int,
         max_num_tokens: int,
+        eplb_stats_num_experts: int = 0,
     ):
         """
         Get the auxilary datasize per rank for the MoeAlltoAll operation.
@@ -203,11 +216,15 @@ def get_moe_alltoall_module():
         Args:
             ep_size: Total expert parallel size
             max_num_tokens: Maximum number of tokens across all ranks
+            eplb_stats_num_experts: Number of experts reserved for EPLB stats
+                (0 disables the EPLB region)
 
         Returns:
             aux_data_size: Size of the auxilary data per rank in bytes
         """
-        return module.moe_a2a_get_aux_data_size(ep_size, max_num_tokens)
+        return module.moe_a2a_get_aux_data_size(
+            ep_size, max_num_tokens, eplb_stats_num_experts
+        )
 
     return SimpleNamespace(
         moe_a2a_initialize=moe_a2a_initialize,
@@ -225,6 +242,7 @@ def moe_a2a_initialize(
     ep_rank: int,
     ep_size: int,
     max_num_tokens: int,
+    eplb_stats_num_experts: int = 0,
 ):
     r"""Initialize the MoE all-to-all workspace and return a metainfo tensor.
 
@@ -245,6 +263,11 @@ def moe_a2a_initialize(
     max_num_tokens : int
         Maximum number of tokens any rank may dispatch in a single call;
         used to size the metainfo allocation.
+    eplb_stats_num_experts : int
+        Number of experts to reserve space for in the EPLB gathered-stats
+        region.  ``0`` (default) disables the EPLB region; when non-zero it
+        must match the ``eplb_local_stats`` length passed to
+        :func:`moe_a2a_dispatch`.
 
     Returns
     -------
@@ -253,7 +276,7 @@ def moe_a2a_initialize(
         ``moe_a2a_*`` calls.
     """
     return get_moe_alltoall_module().moe_a2a_initialize(
-        workspace, ep_rank, ep_size, max_num_tokens
+        workspace, ep_rank, ep_size, max_num_tokens, eplb_stats_num_experts
     )
 
 
@@ -322,6 +345,7 @@ def moe_a2a_dispatch(
     top_k: int,
     num_experts: int,
     enable_pdl: Optional[bool] = None,
+    eplb_local_stats: Optional[torch.Tensor] = None,
 ):
     r"""Dispatch tokens and payloads to their target expert ranks.
 
@@ -349,31 +373,45 @@ def moe_a2a_dispatch(
     enable_pdl : Optional[bool]
         Whether to use programmatic dependent launch.  ``None`` auto-detects
         from the device.
+    eplb_local_stats : Optional[torch.Tensor]
+        Optional ``[eplb_stats_num_experts]`` ``int32`` tensor of this rank's
+        local EPLB statistics.  When provided, the dispatch all-gathers it
+        across ranks and returns the result as ``eplb_gathered_stats``.  The
+        length must match the ``eplb_stats_num_experts`` passed to
+        :func:`moe_a2a_initialize`.
 
     Returns
     -------
-    Tuple[list[torch.Tensor], int]
-        ``(output_payloads, combine_payload_offset)``.  ``output_payloads``
-        is a list of workspace-backed views, one per ``input_payloads``
-        entry, that contains the data routed to this rank.  ``combine_payload_offset``
-        is the workspace offset reserved for the matching
-        :func:`moe_a2a_combine` call.
+    Tuple[list[torch.Tensor], int, Optional[torch.Tensor]]
+        ``(output_payloads, combine_payload_offset, eplb_gathered_stats)``.
+        ``output_payloads`` is a list of workspace-backed views, one per
+        ``input_payloads`` entry, that contains the data routed to this rank.
+        ``combine_payload_offset`` is the workspace offset reserved for the
+        matching :func:`moe_a2a_combine` call.  ``eplb_gathered_stats`` is a
+        workspace-backed ``[ep_size, eplb_stats_num_experts]`` ``int32`` view
+        (row ``r`` holds rank ``r``'s ``eplb_local_stats``) when
+        ``eplb_local_stats`` was provided, else ``None``.
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(token_selected_experts.device)
-    recv_offsets, recv_sizes, combine_payload_offset = (
-        get_moe_alltoall_module().moe_a2a_dispatch(
-            token_selected_experts,
-            input_payloads,
-            workspace,
-            metainfo,
-            runtime_max_tokens_per_rank,
-            ep_rank,
-            ep_size,
-            top_k,
-            num_experts,
-            enable_pdl,
-        )
+    (
+        recv_offsets,
+        recv_sizes,
+        combine_payload_offset,
+        eplb_gathered_stats_offset,
+        eplb_stats_num_experts,
+    ) = get_moe_alltoall_module().moe_a2a_dispatch(
+        token_selected_experts,
+        input_payloads,
+        workspace,
+        metainfo,
+        runtime_max_tokens_per_rank,
+        ep_rank,
+        ep_size,
+        top_k,
+        num_experts,
+        enable_pdl,
+        eplb_local_stats,
     )
 
     output_payloads = []
@@ -391,7 +429,17 @@ def moe_a2a_dispatch(
             )
         )
 
-    return output_payloads, combine_payload_offset
+    eplb_gathered_stats = None
+    if eplb_gathered_stats_offset >= 0:
+        eplb_gathered_stats = moe_a2a_wrap_payload_tensor_in_workspace(
+            workspace,
+            [ep_size],
+            eplb_gathered_stats_offset,
+            eplb_gathered_stats_offset + ep_size * eplb_stats_num_experts * 4,
+            torch.int32,
+        )
+
+    return output_payloads, combine_payload_offset, eplb_gathered_stats
 
 
 @flashinfer_api
@@ -527,6 +575,7 @@ def moe_a2a_get_workspace_size_per_rank(
     max_num_tokens: int,
     total_dispatch_payload_size_per_token: int,
     combine_payload_size_per_token: int,
+    eplb_stats_num_experts: int = 0,
 ):
     r"""Compute the per-rank workspace size for the MoE all-to-all primitive.
 
@@ -542,6 +591,9 @@ def moe_a2a_get_workspace_size_per_rank(
     combine_payload_size_per_token : int
         Per-token payload size (in bytes) sent back during the combine
         phase.
+    eplb_stats_num_experts : int
+        Number of experts reserved for the EPLB gathered-stats region
+        (``0`` disables it).
 
     Returns
     -------
@@ -551,6 +603,7 @@ def moe_a2a_get_workspace_size_per_rank(
     aux_data_size = get_moe_alltoall_module().moe_a2a_get_aux_data_size(
         ep_size,
         max_num_tokens,
+        eplb_stats_num_experts,
     )
 
     def pad_up(x, y):
@@ -579,7 +632,7 @@ class MoeAlltoAll:
 
     # Single shared workspace across the process
     # _WORKSPACE: Optional[dict] = None
-    _WORKSPACE_CACHE: dict[tuple[int, int, int, int], dict] = {}
+    _WORKSPACE_CACHE: dict[tuple[int, int, int, int, int], dict] = {}
 
     @classmethod
     def get_workspace(
@@ -589,8 +642,15 @@ class MoeAlltoAll:
         ep_size: int,
         max_num_tokens: int,
         mapping: Mapping,
+        eplb_stats_num_experts: int = 0,
     ) -> dict:
-        key = (workspace_size_per_rank, ep_rank, ep_size, max_num_tokens)
+        key = (
+            workspace_size_per_rank,
+            ep_rank,
+            ep_size,
+            max_num_tokens,
+            eplb_stats_num_experts,
+        )
         if key in cls._WORKSPACE_CACHE:
             return cls._WORKSPACE_CACHE[key]
         else:
@@ -601,12 +661,14 @@ class MoeAlltoAll:
                 ep_rank,
                 ep_size,
                 max_num_tokens,
+                eplb_stats_num_experts,
             )
             cls._WORKSPACE_CACHE[key] = {
                 "workspace_size_per_rank": workspace_size_per_rank,
                 "max_num_tokens": max_num_tokens,
                 "ep_rank": ep_rank,
                 "ep_size": ep_size,
+                "eplb_stats_num_experts": eplb_stats_num_experts,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
@@ -621,6 +683,7 @@ class MoeAlltoAll:
         max_num_tokens: int,
         hidden_size: int,
         extra_payload_bytes_per_token: int = 0,
+        eplb_stats_num_experts: int = 0,
     ) -> int:
         r"""Compute the per-rank workspace size for the MoE all-to-all primitive.
 
@@ -643,6 +706,9 @@ class MoeAlltoAll:
         extra_payload_bytes_per_token : int
             Extra payload bytes per token to reserve (e.g. for quantization
             scales).  Defaults to ``0``.
+        eplb_stats_num_experts : int
+            Number of experts reserved for the EPLB gathered-stats region
+            (``0`` disables it).
 
         Returns
         -------
@@ -668,6 +734,7 @@ class MoeAlltoAll:
             max_num_tokens,
             total_dispatch_payload_size_per_token,
             combine_payload_size_per_token,
+            eplb_stats_num_experts,
         )
 
     # Metainfo index constants (loaded dynamically from C++)
@@ -702,6 +769,7 @@ class MoeAlltoAll:
         workspace_size_per_rank: int = None,
         hidden_size: int = None,
         mnnvl_config: Optional[MnnvlConfig] = None,
+        eplb_stats_num_experts: int = 0,
     ):
         r"""Initialize :class:`MoeAlltoAll` and allocate the shared workspace.
 
@@ -727,16 +795,27 @@ class MoeAlltoAll:
         mnnvl_config : MnnvlConfig, optional
             Optional configuration for the underlying MNNVL communication
             backend.
+        eplb_stats_num_experts : int
+            Number of experts to reserve for the EPLB gathered-stats region.
+            ``0`` (default) disables EPLB; when non-zero, pass an
+            ``eplb_local_stats`` tensor of this length to :meth:`dispatch`.
         """
         # Initialize constants from C++
         self._init_constants()
+
+        self.eplb_stats_num_experts = eplb_stats_num_experts
+        self.enable_eplb = eplb_stats_num_experts > 0
 
         if workspace_size_per_rank is None:
             assert hidden_size is not None, (
                 "hidden_size must be provided if workspace_size_per_rank is not provided"
             )
             workspace_size_per_rank = self.get_moe_workspace_size_per_rank(
-                mapping.moe_ep_size, top_k, max_num_tokens, hidden_size
+                mapping.moe_ep_size,
+                top_k,
+                max_num_tokens,
+                hidden_size,
+                eplb_stats_num_experts=eplb_stats_num_experts,
             )
 
         # Initialize MNNVL memory system
@@ -763,6 +842,7 @@ class MoeAlltoAll:
             self.ep_size,
             self.max_num_tokens,
             mapping,
+            eplb_stats_num_experts=self.eplb_stats_num_experts,
         )
         # Validate workspace compatibility
         assert self._WORKSPACE["workspace_size_per_rank"] == workspace_size_per_rank, (
@@ -779,6 +859,17 @@ class MoeAlltoAll:
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
 
+    @property
+    def eplb_gathered_stats(self) -> Optional[torch.Tensor]:
+        r"""Gathered EPLB stats from the most recent :meth:`dispatch`.
+
+        Workspace-backed ``[ep_size, eplb_stats_num_experts]`` ``int32`` view
+        (row ``r`` holds rank ``r``'s ``eplb_local_stats``), or ``None`` when
+        EPLB is disabled or no ``eplb_local_stats`` was passed.  Valid only
+        between :meth:`dispatch` and :meth:`combine` (combine resets state).
+        """
+        return self._state.eplb_gathered_stats
+
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
         torch.cuda.synchronize()
@@ -789,6 +880,7 @@ class MoeAlltoAll:
                 self.ep_rank,
                 self.ep_size,
                 self.max_num_tokens,
+                self.eplb_stats_num_experts,
             )
         ]
         self._state.phase = "deleted"
@@ -801,6 +893,7 @@ class MoeAlltoAll:
         runtime_max_tokens_per_rank: int,
         invalid_token_expert_id: Optional[int] = None,
         expert_id_payload_index: Optional[int] = None,
+        eplb_local_stats: Optional[torch.Tensor] = None,
     ) -> list[torch.Tensor]:
         r"""Run the MoE all-to-all dispatch phase.
 
@@ -820,6 +913,12 @@ class MoeAlltoAll:
         expert_id_payload_index : int, optional
             Index into ``input_payloads`` that holds the expert IDs to
             sanitize.  Required when ``invalid_token_expert_id`` is set.
+        eplb_local_stats : torch.Tensor, optional
+            ``[eplb_stats_num_experts]`` ``int32`` tensor of this rank's local
+            EPLB statistics to all-gather during dispatch.  Requires the
+            instance to have been constructed with ``eplb_stats_num_experts``
+            set.  The gathered result is available afterwards via
+            :attr:`eplb_gathered_stats`.
 
         Returns
         -------
@@ -831,8 +930,17 @@ class MoeAlltoAll:
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
         )
+        if eplb_local_stats is not None:
+            assert self.enable_eplb, (
+                "eplb_local_stats provided but instance was constructed with "
+                "eplb_stats_num_experts=0"
+            )
+            assert eplb_local_stats.dim() == 1, "eplb_local_stats must be a 1D tensor"
+            assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
+                "eplb_local_stats size must match eplb_stats_num_experts"
+            )
 
-        recv_tensors, combine_payload_offset = moe_a2a_dispatch(
+        recv_tensors, combine_payload_offset, eplb_gathered_stats = moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             self.workspace,
@@ -842,11 +950,13 @@ class MoeAlltoAll:
             self.ep_size,
             self.top_k,
             self.num_experts,
+            eplb_local_stats=eplb_local_stats,
         )
 
         # Update state
         self._state.local_num_tokens = token_selected_experts.size(0)
         self._state.combine_payload_offset = combine_payload_offset
+        self._state.eplb_gathered_stats = eplb_gathered_stats
         self._state.phase = "dispatched"
 
         # Sanitize invalid tokens if requested

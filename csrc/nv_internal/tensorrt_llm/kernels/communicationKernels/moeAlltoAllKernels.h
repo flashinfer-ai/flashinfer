@@ -55,6 +55,10 @@ struct DispatchKernelPointers {
   // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
   int* topk_target_ranks;  // target rank per k, -1 for duplicates
   int* topk_send_indices;  // dst index per k, -1 for duplicates
+
+  // Optional: statistics for EPLB
+  int const* eplb_local_stats;          // [eplb_stats_num_experts]
+  int* eplb_gathered_stats[kMaxRanks];  // [ep_size, eplb_stats_num_experts] per rank
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -113,6 +117,12 @@ struct MoeA2ADispatchParams {
       completion_flags[kMaxRanks];  // If completion_flags[target_rank][source_rank] == *flag_val,
                                     // then source rank has signaled the target rank
   void* recv_buffers[kMaxRanks][kMaxPayloads];  // Per-rank receive buffers for each payload
+
+  // Optional: statistics for EPLB
+  bool enable_eplb;                     // Whether to enable EPLB
+  int eplb_stats_num_experts;           // Number of experts for EPLB stats
+  int const* eplb_local_stats;          // [eplb_stats_num_experts]
+  int* eplb_gathered_stats[kMaxRanks];  // [ep_size, eplb_stats_num_experts] per rank
 
   // CUDA stream
   cudaStream_t stream;

@@ -412,7 +412,7 @@ def dispatch_from_single_rank(
             rank_token_selected_experts = token_selected_experts[
                 rank * num_tokens : (rank + 1) * num_tokens
             ]
-            output, offset = trtllm_moe_alltoall.moe_a2a_dispatch(
+            output, offset, _ = trtllm_moe_alltoall.moe_a2a_dispatch(
                 rank_token_selected_experts,
                 rank_payloads,
                 all_workspaces,
@@ -552,6 +552,101 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+
+
+EPLB_PARAMS = [
+    (2, 5, 8, 32),  # 2 ranks
+    (4, 16, 16, 32),  # 4 ranks
+    (8, 8, 8, 64),  # 8 ranks
+]
+
+
+@pytest.mark.parametrize("world_size,num_tokens,vector_dim,num_experts", EPLB_PARAMS)
+def test_moe_alltoall_eplb_stats_single_gpu(
+    world_size, num_tokens, vector_dim, num_experts
+):
+    """EPLB stats are all-gathered during dispatch: each rank's gathered_stats[r]
+    must equal rank r's local stats."""
+    torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
+
+    # Reserve EPLB stats for half of the experts (matches the upstream test).
+    eplb_stats_num_experts = num_experts // 2
+
+    payload = make_payload(num_tokens * world_size, vector_dim, torch.bfloat16)
+    token_selected_experts = make_random_topk_ids(
+        num_experts=num_experts,
+        num_tokens=world_size * num_tokens,
+        top_k=2,
+        device=torch.device("cuda"),
+    )
+
+    # Per-rank local stats: rank-distinct so the all-gather is unambiguous.
+    eplb_local_stats = [
+        torch.arange(eplb_stats_num_experts, dtype=torch.int32, device="cuda")
+        + rank * 1000
+        for rank in range(world_size)
+    ]
+
+    total_payload_size_per_element = payload[0].numel() * payload.itemsize
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        world_size,
+        num_tokens * world_size,
+        total_payload_size_per_element,
+        0,
+        eplb_stats_num_experts=eplb_stats_num_experts,
+    )
+    all_workspaces = torch.zeros(
+        world_size, workspace_size, dtype=torch.uint8, device=torch.device("cuda")
+    )
+
+    metainfo = []
+    for rank in range(world_size):
+        metainfo.append(
+            trtllm_moe_alltoall.moe_a2a_initialize(
+                all_workspaces,
+                rank,
+                world_size,
+                num_tokens * world_size,
+                eplb_stats_num_experts,
+            )
+        )
+    torch.cuda.synchronize()
+
+    cuda_streams = [torch.cuda.Stream() for _ in range(world_size)]
+    gathered_stats = [None] * world_size
+    for rank in range(world_size):
+        with torch.cuda.stream(cuda_streams[rank]):
+            rank_payload = payload[rank * num_tokens : (rank + 1) * num_tokens]
+            rank_experts = token_selected_experts[
+                rank * num_tokens : (rank + 1) * num_tokens
+            ]
+            _, _, eplb_gathered = trtllm_moe_alltoall.moe_a2a_dispatch(
+                rank_experts,
+                [rank_payload],
+                all_workspaces,
+                metainfo[rank],
+                num_tokens,
+                ep_rank=rank,
+                ep_size=world_size,
+                top_k=rank_experts.shape[-1],
+                num_experts=num_experts,
+                eplb_local_stats=eplb_local_stats[rank],
+            )
+            # Clone out of the shared workspace before the next round reuses it.
+            gathered_stats[rank] = eplb_gathered.clone()
+
+    for rank in range(world_size):
+        cuda_streams[rank].synchronize()
+    torch.cuda.synchronize()
+
+    expected = torch.stack(
+        eplb_local_stats, dim=0
+    )  # [world_size, eplb_stats_num_experts]
+    for rank in range(world_size):
+        assert gathered_stats[rank] is not None
+        assert gathered_stats[rank].shape == (world_size, eplb_stats_num_experts)
+        torch.testing.assert_close(gathered_stats[rank], expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
