@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -92,14 +94,22 @@ __device__ static __forceinline__ std::uint64_t make_wgmma_desc(const void* addr
  * accumulators.
  */
 __device__ static __forceinline__ void wgmma_fence() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
 }
 
 /**
  * @brief Close the currently-outstanding WGMMA group and start a new one.
  */
 __device__ static __forceinline__ void wgmma_commit_group() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
 }
 
 /**
@@ -115,15 +125,27 @@ __device__ __forceinline__ void wgmma_wait_group();
 
 template <>
 __device__ __forceinline__ void wgmma_wait_group<0>() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
 }
 template <>
 __device__ __forceinline__ void wgmma_wait_group<1>() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
 }
 template <>
 __device__ __forceinline__ void wgmma_wait_group<2>() {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   asm volatile("wgmma.wait_group.sync.aligned 2;\n" ::: "memory");
+#else
+  asm volatile("trap;");
+#endif
 }
 
 /**
@@ -160,6 +182,7 @@ __device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(std::uint64_
                                                                     std::uint64_t desc_b, float& d0,
                                                                     float& d1, float& d2,
                                                                     float& d3) {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
   // scale_D = 1 → accumulate into d0..d3.
   constexpr std::uint32_t scale_D = 1;
   asm volatile(
@@ -171,6 +194,15 @@ __device__ static __forceinline__ void wgmma_m64n8k32_e4m3_e4m3_f32(std::uint64_
       "}\n"
       : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
       : "l"(desc_a), "l"(desc_b), "r"(scale_D), "n"(1), "n"(1));
+#else
+  (void)desc_a;
+  (void)desc_b;
+  (void)d0;
+  (void)d1;
+  (void)d2;
+  (void)d3;
+  asm volatile("trap;");
+#endif
 }
 
 __device__ inline std::uint32_t rotate_col_32(std::uint32_t col, std::uint32_t row) {
