@@ -236,10 +236,14 @@ hidden × dtype / stage time, decimal GB); single-node so the RDMA columns are 0
 Compute dominates e2e at these large per-rank sizes, but dispatch/combine are timed
 independently so the bandwidth is a clean comm figure.
 
-> **HT cross-node (16+ GPU) is currently blocked by a library bug.** Multi-node HT
+> **HT cross-node (16+ GPU) is blocked by a `nccl.ep` library bug.** Multi-node HT
 > (MNNVL) aborts with `CUDA error nccl_ep.cc:2884 'an illegal memory access was
-> encountered'`. It is **size-independent** (reproduces at 128 *and* 4096/8192
-> tokens/rank) and our recv-buffer sizing matches `ep_test.py`, so it is a
-> cross-node `nccl.ep` HT issue, not a FlashInfer-side bug (cf. the earlier
-> `nccl_ep.cc:3269` HT multi-rank failure). Single-node (8 GPU, intra-tray NVLink)
-> HT works. Multi-node HT tables are pending the library fix.
+> encountered'`. **Confirmed library-side**, not FlashInfer: a minimal pure-`nccl.ep`
+> repro with **no FlashInfer and no expert FFN** (just `Group.create` → FLAT
+> `create_handle` → `dispatch` → `combine`, mirroring `contrib/nccl_ep/ep_test.py`'s
+> HT path) reproduces the exact same abort at 16 GPU —
+> `tests/moe_ep/repro_ht_crossnode.py`. It is **size-independent** (128 *and*
+> 4096/8192 tokens/rank) and routing-independent (distinct top-k), and our recv-buffer
+> sizing matches `ep_test.py` (cf. the earlier `nccl_ep.cc:3269` HT multi-rank
+> failure). Single-node (8 GPU, intra-tray NVLink) HT works. Multi-node HT tables are
+> pending the library fix.

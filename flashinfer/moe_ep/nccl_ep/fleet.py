@@ -123,8 +123,11 @@ class NcclEpFleet(Fleet):
         # >= max_dispatch_tokens_per_rank); LL auto-derives it from 0. Match
         # contrib/nccl_ep/ep_test.py (max_recv_tokens_per_rank = num_tokens *
         # n_ranks): the per-rank recv-slot budget is max_dispatch_tokens_per_rank
-        # * world_size. (Distinct from the dispatch output buffer, which the
-        # handle sizes as max_tokens_per_rank * num_local_experts.)
+        # * world_size. The library sizes its internal HT staging buffers to this
+        # value, so NcclEpHandle._dispatch_ht MUST size the dispatch output buffer
+        # to exactly the same row count (max_tokens_per_rank * world_size) — see
+        # the note there. (This is an upper bound on the uniform recv estimate
+        # max_tokens_per_rank * top_k for top_k <= world.)
         if p.algorithm == EpAlgorithm.HIGH_THROUGHPUT:
             world = self._bootstrap.world_size
             kwargs["max_recv_tokens_per_rank"] = p.max_tokens_per_rank * world

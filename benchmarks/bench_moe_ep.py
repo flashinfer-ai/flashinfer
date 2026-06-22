@@ -287,14 +287,12 @@ def main() -> int:
     x = torch.randn(
         per_rank, args.hidden, dtype=torch.bfloat16, device=device, generator=g
     )
-    topk_ids = torch.randint(
-        0,
-        args.num_experts,
-        (per_rank, args.top_k),
-        device=device,
-        dtype=torch.int64,
-        generator=g,
-    )
+    # DISTINCT top-k experts per token (via topk over random scores), matching
+    # contrib/nccl_ep/ep_test.py. Plain randint draws WITH replacement, so a token
+    # can pick the same expert twice — which the HT cross-node path mishandles
+    # (illegal access at nccl_ep.cc:2884); distinct picks avoid it and are realistic.
+    _scores = torch.randn(per_rank, args.num_experts, device=device, generator=g)
+    topk_ids = _scores.topk(args.top_k, dim=-1).indices.to(torch.int64)
     topk_weights = torch.softmax(
         torch.randn(per_rank, args.top_k, device=device, generator=g), dim=-1
     )

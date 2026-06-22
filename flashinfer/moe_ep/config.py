@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     import torch
@@ -156,9 +156,19 @@ class DispatchOutput:
     """
 
     expert_tensors: "torch.Tensor"
-    num_tokens: int
+    # int, or a 0-arg thunk that lazily computes the count. A backend may defer the
+    # device->host recv-count readback (a per-dispatch reduce + sync) by passing a
+    # thunk; consumers MUST read the count via :meth:`get_num_tokens` so the sync is
+    # paid at most once, and only if the count is actually needed (the comm-only
+    # path never reads it). Direct ``.num_tokens`` access stays valid for int values.
+    num_tokens: Union[int, Callable[[], int]]
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
+
+    def get_num_tokens(self) -> int:
+        """Resolve ``num_tokens`` to an int, evaluating a deferred thunk if present."""
+        nt = self.num_tokens
+        return nt() if callable(nt) else nt
 
 
 @dataclass(frozen=True)

@@ -54,6 +54,64 @@ from ..handle import Handle
 
 # from ...api_logging import flashinfer_api  # disabled per PR #3453 review
 
+# --- EP_PROFILE_HOST: per-step host-wall burn-down of the dispatch/combine host
+# path (zero overhead when unset). Accumulates host µs per labelled step and prints
+# a grouped breakdown on rank 0 at exit. Used to attribute the FI host-call gap.
+import os as _os
+from time import perf_counter as _pc
+
+_HP = _os.environ.get("EP_PROFILE_HOST") == "1"
+# Drop the first N (cold/warmup) samples per step before summarizing.
+_HP_SKIP = int(_os.environ.get("EP_PROFILE_SKIP", "15"))
+_hprof: "dict[str, list]" = {}
+
+# EP_FAST_PATH=1 enables the Python-side host-call optimizations (measured against
+# the EP_PROFILE_HOST burn-down):
+#   (1) defer the LL recv-count .sum().item() readback + its stream sync — return a
+#       lazy num_tokens (resolved on demand) so the comm path pays nothing;
+#   (2) cache the per-call FFI wrapper objects built over STABLE tensors (recv
+#       buffer / counters / weights / configs); only the per-call input-token wrap
+#       is rebuilt (it may alias a new tensor each call);
+#   (3) cache the LL recv buffer instead of torch.empty() every dispatch.
+_FAST = _os.environ.get("EP_FAST_PATH") == "1"
+
+
+def _hp(name, t0):
+    if not _HP:
+        return None
+    now = _pc()
+    _hprof.setdefault(name, []).append((now - t0) * 1e6)
+    return now
+
+
+if _HP:
+    import atexit
+    from statistics import median
+
+    @atexit.register
+    def _dump_hprof():
+        if _os.environ.get("RANK", "0") != "0" or not _hprof:
+            return
+        groups: "dict[str, list]" = {}
+        for k, samples in _hprof.items():
+            groups.setdefault(k.split(".")[0], []).append((k, samples[_HP_SKIP:]))
+        print(
+            f"\n=== EP_PROFILE_HOST (median host wall µs/call, rank 0, "
+            f"skip first {_HP_SKIP}) ===",
+            flush=True,
+        )
+        for grp, items in groups.items():
+            n0 = len(items[0][1])
+            gtot = sum(median(s) for _, s in items if s)
+            print(f"  [{grp}] {gtot:8.1f} us/call total ({n0} samples)", flush=True)
+            for k, s in items:
+                if s:
+                    print(
+                        f"      {k.split('.', 1)[1]:18s} {median(s):8.2f} us",
+                        flush=True,
+                    )
+
+
 if TYPE_CHECKING:
     from .fleet import NcclEpFleet
 
@@ -148,24 +206,43 @@ class NcclEpHandle(Handle):
     def _dispatch_ll(self, x) -> DispatchOutput:
         import torch
 
+        _t = _pc() if _HP else None
         world_size = self._fleet.bootstrap.world_size
         max_per_rank = self._fleet.params.max_tokens_per_rank
         hidden = self._fleet.params.token_hidden_size
 
-        out_t = torch.empty(
-            self._num_local_experts,
-            max_per_rank * world_size,
-            hidden,
-            dtype=x.dtype,
-            device=x.device,
-        )
+        # (3) cache the recv buffer instead of torch.empty() every dispatch.
+        out_t = getattr(self, "_ll_recv_buf", None) if _FAST else None
+        if out_t is None:
+            out_t = torch.empty(
+                self._num_local_experts,
+                max_per_rank * world_size,
+                hidden,
+                dtype=x.dtype,
+                device=x.device,
+            )
+            if _FAST:
+                self._ll_recv_buf = out_t
+        _t = _hp("ll_disp.alloc", _t)
 
+        # (2) cache the FFI wrapper objects over STABLE tensors (out_t / recv_count /
+        # config). Only the input-token wrap is rebuilt each call (x may alias a new
+        # tensor). On the slow path everything is rebuilt as before.
+        cache = getattr(self, "_ll_disp_cache", None) if _FAST else None
+        if cache is None:
+            outputs = self._ep.DispatchOutputs(tokens=self._ep.Tensor(out_t))
+            layout_info = self._ep.LayoutInfo(
+                expert_counters=self._ep.Tensor(self._recv_count_t)
+            )
+            config = self._ep.DispatchConfig(
+                send_only=int(self._staged), round_scales=0
+            )
+            if _FAST:
+                self._ll_disp_cache = (outputs, layout_info, config)
+        else:
+            outputs, layout_info, config = cache
         inputs = self._ep.DispatchInputs(tokens=self._ep.Tensor(x))
-        outputs = self._ep.DispatchOutputs(tokens=self._ep.Tensor(out_t))
-        layout_info = self._ep.LayoutInfo(
-            expert_counters=self._ep.Tensor(self._recv_count_t)
-        )
-        config = self._ep.DispatchConfig(send_only=int(self._staged), round_scales=0)
+        _t = _hp("ll_disp.build_ffi_objs", _t)
 
         self._handle.dispatch(
             inputs,
@@ -174,6 +251,7 @@ class NcclEpHandle(Handle):
             config=config,
             stream=self._stream,
         )
+        _t = _hp("ll_disp.ffi_dispatch", _t)
         # Finish the dispatch (incl. the cross-rank RECEIVE) before the inner
         # compute reads the recv buffer. Required even in non-staged mode — the LL
         # dispatch is async, so without complete() the remote slots are still empty
@@ -181,6 +259,7 @@ class NcclEpHandle(Handle):
         # Mirrors contrib/nccl_ep/ep_test.py, which calls complete() after dispatch
         # unconditionally.
         self._handle.complete(stream=self._stream)
+        _t = _hp("ll_disp.ffi_complete", _t)
 
         # Keepalives for combine() / async safety.
         self._dispatch_inputs = inputs
@@ -188,9 +267,24 @@ class NcclEpHandle(Handle):
         self._dispatch_layout = layout_info
         self._dispatch_output_t = out_t
 
-        # recv_count is written on self._stream; sync it before the host read.
+        # (1) defer the recv-count readback. The eager path syncs self._stream and
+        # reduces recv_count to host (a per-dispatch reduce + D2H + sync); instead
+        # return a thunk that does it on demand (resolved at most once by the compute
+        # bridge, never on the comm-only path). nccl.ep itself completed the receive
+        # in complete() above, so the recv buffer is already valid for combine.
+        if _FAST:
+
+            def _num_tokens():
+                torch.cuda.ExternalStream(self._stream).synchronize()
+                return int(self._recv_count_t.sum().item())
+
+            _t = _hp("ll_disp.defer_count", _t)
+            return DispatchOutput(expert_tensors=out_t, num_tokens=_num_tokens)
+
         torch.cuda.ExternalStream(self._stream).synchronize()
+        _t = _hp("ll_disp.synchronize", _t)
         num_tokens = int(self._recv_count_t.sum().item())
+        _t = _hp("ll_disp.recvcount_sum_item", _t)
         return DispatchOutput(expert_tensors=out_t, num_tokens=num_tokens)
 
     def _dispatch_ll_rank_major(self, x) -> DispatchOutput:
@@ -287,7 +381,21 @@ class NcclEpHandle(Handle):
 
         max_per_rank = self._fleet.params.max_tokens_per_rank
         hidden = self._fleet.params.token_hidden_size
-        num_recv = max_per_rank * self._num_local_experts
+        # HT recv-buffer rows MUST equal the fleet's max_recv_tokens_per_rank (the
+        # per-rank recv-slot budget the library sizes its internal HT staging
+        # buffers to). Fleet sets that to max_tokens_per_rank * world_size; sizing
+        # the dispatch output by max_tokens_per_rank * num_local_experts instead
+        # overflows the library staging buffer whenever num_local_experts > world
+        # (i.e. num_experts > world^2, e.g. 256 experts / 8 GPU → local_n=32),
+        # surfacing as nccl_ep.cc:3269 'invalid argument' at combine (masked as a
+        # 2nd-dispatch hang on the default stream). They coincide only when
+        # num_local_experts == world (the rank-derived ep_test geometry), which is
+        # why the 8-GPU/64-expert correctness test passed but the 256-expert
+        # matrix did not. The uniform recv estimate is max_tokens_per_rank * top_k
+        # (<= this budget for top_k <= world); we use the budget to stay byte-for-
+        # byte consistent with the GroupConfig the library was created with.
+        world = self._fleet.params.num_experts // self._num_local_experts
+        num_recv = max_per_rank * world
 
         tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
         if tw is None:
@@ -303,26 +411,57 @@ class NcclEpHandle(Handle):
         # received LOCAL topk_idx (-1 = non-local) in out_idx. The compute bridge
         # masks non-local picks (and padding rows, whose topk_idx is -1) to weight 0,
         # so the recv buffer can be uninitialized (matches the RANK_MAJOR path).
-        out_t = torch.empty(num_recv, hidden, dtype=x.dtype, device=x.device)
-        out_w = torch.empty(num_recv, self._top_k, dtype=torch.float32, device=x.device)
-        out_idx = torch.empty(num_recv, self._top_k, dtype=torch.int64, device=x.device)
+        #
+        # Allocate the recv buffers ONCE and reuse them across dispatches: HT
+        # switches to "cached" mode on the 2nd+ dispatch (handle state is reused,
+        # cf. ep_bench.cu), which assumes the SAME output buffer pointers as the
+        # first dispatch. Fresh torch.empty buffers each call gave the cached
+        # dispatch new addresses and deadlocked the next collective.
+        _t = _pc() if _HP else None
+        cached = getattr(self, "_ht_recv_bufs", None)
+        if cached is None or cached[0].shape[0] != num_recv:
+            out_t = torch.empty(num_recv, hidden, dtype=x.dtype, device=x.device)
+            out_w = torch.empty(
+                num_recv, self._top_k, dtype=torch.float32, device=x.device
+            )
+            out_idx = torch.empty(
+                num_recv, self._top_k, dtype=torch.int64, device=x.device
+            )
+            self._ht_recv_bufs = (out_t, out_w, out_idx)
+        else:
+            out_t, out_w, out_idx = cached
+        _t = _hp("ht_disp.alloc_cached", _t)
 
+        # (2) cache the output wraps (over cached recv bufs) + weights wrap + config;
+        # rebuild only the per-call input-token wrap.
+        cache = getattr(self, "_ht_disp_cache", None) if _FAST else None
+        if cache is None:
+            outputs = self._ep.DispatchOutputs(
+                tokens=self._ep.Tensor(out_t),
+                topk_weights=self._ep.Tensor(out_w),
+                topk_idx=self._ep.Tensor(out_idx),
+            )
+            config = self._ep.DispatchConfig(
+                send_only=int(self._staged), round_scales=0
+            )
+            weights_t = self._ep.Tensor(weights)
+            if _FAST:
+                self._ht_disp_cache = (outputs, config, weights_t)
+        else:
+            outputs, config, weights_t = cache
         inputs = self._ep.DispatchInputs(
-            tokens=self._ep.Tensor(x), topk_weights=self._ep.Tensor(weights)
+            tokens=self._ep.Tensor(x), topk_weights=weights_t
         )
-        outputs = self._ep.DispatchOutputs(
-            tokens=self._ep.Tensor(out_t),
-            topk_weights=self._ep.Tensor(out_w),
-            topk_idx=self._ep.Tensor(out_idx),
-        )
-        config = self._ep.DispatchConfig(send_only=int(self._staged), round_scales=0)
+        _t = _hp("ht_disp.build_ffi_objs", _t)
 
         self._handle.dispatch(
             inputs, outputs, layout_info=None, config=config, stream=self._stream
         )
+        _t = _hp("ht_disp.ffi_dispatch", _t)
         # Finish the dispatch (incl. cross-rank RECEIVE) before compute reads the
         # recv buffer — unconditional, matching the LL paths and ep_test.py.
         self._handle.complete(stream=self._stream)
+        _t = _hp("ht_disp.ffi_complete", _t)
 
         # Keepalives.
         self._dispatch_inputs = inputs
@@ -331,7 +470,12 @@ class NcclEpHandle(Handle):
         self._dispatch_out_w = out_w
         self._dispatch_out_idx = out_idx
 
-        out_3d = out_t.view(self._num_local_experts, max_per_rank, hidden)
+        # HT FLAT recv is token-major (num_recv = max_per_rank * world rows); view
+        # it as [world, max_per_rank, hidden] — the same layout the RANK_MAJOR
+        # compute bridge consumes (HT routes through build_activation_pack_rank_major).
+        # Equals the old [num_local_experts, max_per_rank, hidden] only when
+        # num_local_experts == world; combine flattens it back to 2D regardless.
+        out_3d = out_t.view(world, max_per_rank, hidden)
         return DispatchOutput(
             expert_tensors=out_3d,
             num_tokens=num_recv,
@@ -356,17 +500,34 @@ class NcclEpHandle(Handle):
             )
         )
 
+        _t = _pc() if _HP else None
         if self._is_ht:
             # HT FLAT combine: input is the 2D [num_recv, hidden] expert output;
             # FWD combine takes NO topk_weights (routing weights were captured at
             # dispatch). Flatten the bridge's 3D [L, cap, H] view back to 2D.
             x2d = x.reshape(-1, hidden)
+            # (2) cache output wrap + config (guarded by out_t identity); rebuild
+            # only the per-call input wrap (x2d is a fresh view each call).
+            cache = getattr(self, "_ht_comb_cache", None) if _FAST else None
+            if cache is None or cache[2] is not out_t:
+                outputs = self._ep.CombineOutputs(tokens=self._ep.Tensor(out_t))
+                config = self._ep.CombineConfig(send_only=int(self._staged))
+                if _FAST:
+                    self._ht_comb_cache = (outputs, config, out_t)
+            else:
+                outputs, config, _ = cache
             inputs = self._ep.CombineInputs(tokens=self._ep.Tensor(x2d))
-            outputs = self._ep.CombineOutputs(tokens=self._ep.Tensor(out_t))
-            config = self._ep.CombineConfig(send_only=int(self._staged))
+            _t = _hp("ht_comb.build_ffi_objs", _t)
             self._handle.combine(inputs, outputs, config=config, stream=self._stream)
-            if self._staged:
-                self._handle.complete(stream=self._stream)
+            _t = _hp("ht_comb.ffi_combine", _t)
+            # HT requires complete() after EVERY combine (unconditional, matching
+            # ep_test.py's cached-mode pairing dispatch->complete->combine->complete).
+            # The HT combine leaves a pending GIN/scan op on the handle; without
+            # draining it here the next dispatch on this handle hangs (the repeated-
+            # op deadlock seen across MoEEpLayer.forward iterations and the matrix
+            # benchmark's measure loop). LL self-drains, so this is HT-specific.
+            self._handle.complete(stream=self._stream)
+            _t = _hp("ht_comb.ffi_complete", _t)
             self._combine_inputs = inputs
             self._combine_outputs = outputs
             self._combine_x2d = x2d
@@ -388,25 +549,36 @@ class NcclEpHandle(Handle):
             return CombineOutput(x=out_t)
 
         # LL EXPERT_MAJOR combine: weights applied on the receive side.
-        tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
-        if tw is None:
-            raise ValueError(
-                "NcclEpHandle.combine requires HandleAlgoKnobTopKWeights set "
-                "at handle creation; NCCL EP LL needs per-token weights to "
-                "reweight on combine."
-            )
-        weights = tw.weights  # type: ignore[attr-defined]
-        if weights.dtype != torch.float32:
-            weights = weights.to(torch.float32)
+        # (2) cache the stable weights wrap + config; rebuild only the per-call
+        # token wraps (x / out_t may alias new tensors).
+        cache = getattr(self, "_ll_comb_cache", None) if _FAST else None
+        if cache is None:
+            tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
+            if tw is None:
+                raise ValueError(
+                    "NcclEpHandle.combine requires HandleAlgoKnobTopKWeights set "
+                    "at handle creation; NCCL EP LL needs per-token weights to "
+                    "reweight on combine."
+                )
+            weights = tw.weights  # type: ignore[attr-defined]
+            if weights.dtype != torch.float32:
+                weights = weights.to(torch.float32)
+            weights_t = self._ep.Tensor(weights)
+            config = self._ep.CombineConfig(send_only=int(self._staged))
+            if _FAST:
+                self._ll_comb_cache = (weights, weights_t, config)
+        else:
+            weights, weights_t, config = cache
 
         inputs = self._ep.CombineInputs(tokens=self._ep.Tensor(x))
         outputs = self._ep.CombineOutputs(
             tokens=self._ep.Tensor(out_t),
-            topk_weights=self._ep.Tensor(weights),
+            topk_weights=weights_t,
         )
-        config = self._ep.CombineConfig(send_only=int(self._staged))
+        _t = _hp("ll_comb.build_ffi_objs", _t)
 
         self._handle.combine(inputs, outputs, config=config, stream=self._stream)
+        _t = _hp("ll_comb.ffi_combine", _t)
         if self._staged:
             self._handle.complete(stream=self._stream)
 
