@@ -62,7 +62,6 @@ def gdn_decode_kernel_small_batch_pretranspose(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -383,7 +382,6 @@ def gdn_decode_kernel_big_batch_pretranspose(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -690,7 +688,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -712,6 +709,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         v_dim = h0_source.layout.shape[1]
         k_dim = h0_source.layout.shape[2]
     # Grid size: use B*HV (actual batch) not h0_source.shape[0] (which may be pool_size*HV)
+    B = cute.size(q.shape[0])
     grid_batch = B * HV
 
     # Create cp.async copy with cache-global mode (bypass L1)
@@ -768,7 +766,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -803,7 +800,6 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -820,6 +816,7 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     else:
         v_dim = h0_source.layout.shape[1]
         k_dim = h0_source.layout.shape[2]
+    B = cute.size(q.shape[0])
     grid_batch = B * HV
 
     # Create cp.async copy with cache-global mode (bypass L1)
@@ -876,7 +873,6 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -900,7 +896,6 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
 
 @functools.cache
 def _get_compiled_decode_kernel(
-    B: int,
     T: int,
     H: int,
     HV: int,
@@ -966,7 +961,6 @@ def run_pretranspose_decode(
     else:
         pool_size = stride0 = stride1 = stride2 = stride3 = 0
     cache_key = (
-        B,
         T,
         H,
         HV,
@@ -984,39 +978,62 @@ def run_pretranspose_decode(
     )
     cache = _get_compiled_decode_kernel(*cache_key)
 
-    # Get or create h0_indices and cu_seqlens (cached per config)
-    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
-        cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
-        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    aux_map = cache.setdefault("aux", {})
+    aux_key = (B, q.device)
+    if aux_key not in aux_map:
+        aux_map[aux_key] = (
+            torch.zeros(B, dtype=torch.int32, device=q.device),
+            torch.zeros(B + 1, dtype=torch.int32, device=q.device),
+        )
+    default_h0_indices, cu_seqlens = aux_map[aux_key]
 
     if use_pool_indexing and initial_state_indices is not None:
         h0_indices = initial_state_indices.to(torch.int32)
     else:
-        h0_indices = cache["h0_indices"]
+        h0_indices = default_h0_indices
     # Resolve output indices: default to same as read indices
     if use_pool_indexing and output_state_indices is not None:
         h0_out_indices = output_state_indices.to(torch.int32)
     else:
         h0_out_indices = h0_indices
-    cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        # Convert tensors to CuTe format for compilation only
-        # Use the actual tensor view so strided pool layouts are preserved.
         h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        if not use_pool_indexing:
+            h0_source_tensor = h0_source_tensor.mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1, 2), divisibility=1
+            )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16)
+        a_tensor = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16)
-        k_tensor = from_dlpack(k, assumed_align=16)
-        v_tensor = from_dlpack(v, assumed_align=16)
-        b_tensor = from_dlpack(b, assumed_align=16)
-        o_tensor = from_dlpack(output, assumed_align=16)
-        h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
-        h0_out_indices_tensor = from_dlpack(h0_out_indices, assumed_align=16)
-        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        q_tensor = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        k_tensor = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        v_tensor = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        b_tensor = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
+        o_tensor = from_dlpack(output, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        h0_indices_tensor = from_dlpack(
+            h0_indices, assumed_align=16
+        ).mark_layout_dynamic()
+        h0_out_indices_tensor = from_dlpack(
+            h0_out_indices, assumed_align=16
+        ).mark_layout_dynamic()
+        cu_seqlens_tensor = from_dlpack(
+            cu_seqlens, assumed_align=16
+        ).mark_layout_dynamic()
 
         # Always use 8-CTA architecture (benchmarks show it's better for all batch sizes)
         run_func = run_gdn_decode_kernel_small_batch_pretranspose
@@ -1040,7 +1057,6 @@ def run_pretranspose_decode(
             softplus_threshold=20.0,
             scale=scale,
             HV=HV,
-            B=B,
             T=T,
             H=H,
             K=K,
