@@ -6,7 +6,11 @@ import torch
 
 from flashinfer import autotune, RoutingMethodType
 from flashinfer.autotuner import AutoTuner
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    get_compute_capability,
+    next_positive_power_of_2,
+    last_positive_power_of_2,
+)
 from flashinfer.fused_moe.utils import make_random_topk_ids
 from .utils import reset_autotuner
 
@@ -146,7 +150,6 @@ def _compute_selected_tile_n_base_element(
     num_tokens: int, top_k: int, num_experts: int
 ) -> int:
     """Compute the base element used by computeSelectedTileN(num_tokens) to filter tile_N candidates."""
-    from flashinfer.fused_moe.utils import next_positive_power_of_2
 
     return min(next_positive_power_of_2(int(num_tokens * top_k / num_experts)), 256)
 
@@ -194,7 +197,6 @@ def test_bf16_moe_all_supported_tile_n_inference_succeed(
     """SM100 BF16 integration: Test that MoE works when given any supported tileN value,
     including values filtered out by computeSelectedTileN for the given inference num tokens.
     """
-    from flashinfer.fused_moe.utils import last_positive_power_of_2
 
     _require_sm100()
     torch.manual_seed(42)
@@ -605,3 +607,152 @@ def test_bf16_moe_invalid_tactic_raises_runtime_error(monkeypatch, invalid_tacti
             gemm2_weights=gemm2_weights,
             tune_max=TUNE_MAX,
         )
+
+
+def test_fp8_moe_inference_loop_no_lru_cache_leak():
+    """Regression test: repeated FP8 MoE inference with varying token counts must not
+    cause unbounded AutoTuner._find_nearest_profile lru_cache growth.
+
+    Root cause of the leak: _make_tuning_config (called on every inference call)
+    constructs a fresh TuningConfig containing a new lambda closure each time.
+    DynamicTensorSpec hashes callables by object identity (id()), so each fresh
+    construction yields a new lru_cache key regardless of whether the shape changed.
+    The result is one new cache entry per inference call instead of one per unique
+    bucket mapping.
+
+    After the fix, cache growth should be bounded by the number of distinct token
+    bucket values, not by the number of inference calls.
+    """
+    import tracemalloc
+
+    _require_sm100()
+    reset_autotuner()
+    device = torch.device("cuda:0")
+
+    from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+    num_experts = 16
+    top_k = 4
+    hidden_size = 512
+    intermediate_size = 512
+    tune_max_num_tokens = 8192
+    # Use enough iterations to make unbounded growth obvious while keeping the
+    # test fast; 200 calls across ~20 distinct bucket values is sufficient.
+    N = 200
+
+    gemm1_weights = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    gemm1_weights_scale = torch.ones(
+        num_experts,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+    gemm2_weights = (
+        torch.randn(num_experts, hidden_size, intermediate_size, device=device)
+        .clamp(-1, 1)
+        .to(torch.float8_e4m3fn)
+    )
+    gemm2_weights_scale = torch.ones(
+        num_experts,
+        hidden_size // 128,
+        intermediate_size // 128,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    def _make_fp8_inputs(num_tokens: int):
+        hidden_states = (
+            torch.randn(num_tokens, hidden_size, device=device)
+            .clamp(-1, 1)
+            .to(torch.float8_e4m3fn)
+        )
+        # DeepSeekFp8 scale layout: [hidden_size // 128, num_tokens]
+        hidden_states_scale = torch.ones(
+            hidden_size // 128, num_tokens, dtype=torch.float32, device=device
+        )
+        routing_logits = torch.rand(
+            num_tokens, num_experts, dtype=torch.bfloat16, device=device
+        )
+        return hidden_states, hidden_states_scale, routing_logits
+
+    common_kwargs = dict(
+        routing_bias=None,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        do_finalize=True,
+        tune_max_num_tokens=tune_max_num_tokens,
+    )
+
+    # Tune once at a representative token count before the measurement window.
+    h, hs, r = _make_fp8_inputs(128)
+    with autotune(tune_mode=True):
+        trtllm_fp8_block_scale_moe(
+            routing_logits=r,
+            hidden_states=h,
+            hidden_states_scale=hs,
+            **common_kwargs,
+        )
+    torch.cuda.synchronize()
+
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+    tracemalloc.start()
+    snapshot_before = tracemalloc.take_snapshot()
+
+    # Inference loop: random token counts in [1, 512] to cover many distinct
+    # bucket values while keeping tensor allocation minimal.
+    torch.manual_seed(0)
+    token_counts = torch.randint(1, 513, (N,)).tolist()
+    distinct_counts = len(set(token_counts))
+
+    for num_tokens in token_counts:
+        h, hs, r = _make_fp8_inputs(num_tokens)
+        trtllm_fp8_block_scale_moe(
+            routing_logits=r,
+            hidden_states=h,
+            hidden_states_scale=hs,
+            **common_kwargs,
+        )
+
+    torch.cuda.synchronize()
+    snapshot_after = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+
+    cache_after = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_growth = cache_after - cache_before
+
+    stats = snapshot_after.compare_to(snapshot_before, "lineno")
+    allocated_kb = sum(s.size_diff for s in stats if s.size_diff > 0) / 1024
+
+    print(
+        f"\n{N} inference calls, {distinct_counts} distinct token counts. "
+        f"lru_cache grew by {cache_growth} entries ({allocated_kb:.1f} KB Python)."
+    )
+
+    # The cache must grow by at most one entry per distinct token bucket mapping —
+    # a small constant determined by the tuning bucket grid, not by call count.
+    # tune_max_num_tokens=8192 with get_hybrid_num_tokens_buckets produces ~20
+    # buckets; allow 2× headroom.
+    max_expected_cache_growth = 40
+    assert cache_growth <= max_expected_cache_growth, (
+        f"lru_cache grew by {cache_growth} entries across {N} inference calls "
+        f"({distinct_counts} distinct token counts). "
+        f"Expected growth bounded by tuning bucket count (~{max_expected_cache_growth}). "
+        f"TuningConfig is likely being reconstructed on every call — "
+        f"move it to a module-level or class-level singleton."
+    )
