@@ -332,6 +332,40 @@ def test_gqa_paged_decode_fi_trace():
     ]
 
 
+def test_gqa_paged_decode_fi_trace_combined_kv_cache():
+    # vLLM passes the paged KV cache as a single combined tensor
+    # [num_pages, 2, page_size, num_kv_heads, head_dim] instead of a
+    # (k_cache, v_cache) tuple. The trace must still recover per-cache
+    # dtype/shape from the k/v split on dim 1 (regression for #3685).
+    from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+
+    batch_size = 32
+    num_qo_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    num_pages = 512
+    page_size = 16
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.bfloat16)
+    paged_kv_cache = torch.randn(
+        num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16
+    )
+
+    defn = BatchDecodeWithPagedKVCacheWrapper.run.fi_trace(
+        q=q, paged_kv_cache=paged_kv_cache
+    )
+    _check_defn(defn, "gqa_paged", "BatchDecodeWithPagedKVCacheWrapper")
+    axes = defn["axes"]
+    # Axes that are only sourced from the KV cache must still resolve.
+    assert axes["num_kv_heads"]["value"] == num_kv_heads
+    assert axes["head_dim"]["value"] == head_dim
+    assert axes["page_size"]["value"] == page_size
+
+    # The combined tensor must not be skipped: dtype is recovered, not "unknown".
+    assert defn["inputs"]["k_cache"]["dtype"] == "bfloat16"
+    assert defn["inputs"]["v_cache"]["dtype"] == "bfloat16"
+
+
 # ---------------------------------------------------------------------------
 # GQA ragged prefill
 # ---------------------------------------------------------------------------
