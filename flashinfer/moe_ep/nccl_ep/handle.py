@@ -65,7 +65,7 @@ _HP = _os.environ.get("EP_PROFILE_HOST") == "1"
 _HP_SKIP = int(_os.environ.get("EP_PROFILE_SKIP", "15"))
 _hprof: "dict[str, list]" = {}
 
-# EP_FAST_PATH=1 enables the Python-side host-call optimizations (measured against
+# NV_FI_EP_FAST_PATH=1 enables the Python-side host-call optimizations (measured against
 # the EP_PROFILE_HOST burn-down):
 #   (1) defer the LL recv-count .sum().item() readback + its stream sync — return a
 #       lazy num_tokens (resolved on demand) so the comm path pays nothing;
@@ -73,7 +73,7 @@ _hprof: "dict[str, list]" = {}
 #       buffer / counters / weights / configs); only the per-call input-token wrap
 #       is rebuilt (it may alias a new tensor each call);
 #   (3) cache the LL recv buffer instead of torch.empty() every dispatch.
-_FAST = _os.environ.get("EP_FAST_PATH") == "1"
+_FAST = _os.environ.get("NV_FI_EP_FAST_PATH") == "1"
 
 
 def _hp(name, t0):
