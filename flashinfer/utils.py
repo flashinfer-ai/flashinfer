@@ -126,11 +126,11 @@ def last_positive_power_of_2(x: int) -> int:
 
     If *x* is itself a power of 2, returns *x*.
     """
-    next = next_positive_power_of_2(x)
-    if next == x:
-        return next
+    n = next_positive_power_of_2(x)
+    if n == x:
+        return n
 
-    return next // 2
+    return n // 2
 
 
 def calculate_tile_tokens_dim(
