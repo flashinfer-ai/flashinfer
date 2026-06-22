@@ -3137,32 +3137,29 @@ def gated_delta_rule_mtp_wide_vec(
         per_token_pool_scatter_flat,
     )
 
-    if initial_state_indices is None:
-        initial_state_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
-    if output is None:
-        output = torch.empty(
-            B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
-        )
-    # Dummy tensors for the constexpr-gated kernel-arg slots so cute.compile
-    # sees a real typed tensor of the expected shape.
-    accepted_steps_arg = (
-        accepted_steps
-        if accepted_steps is not None
-        else torch.zeros(B_val, dtype=torch.int32, device=q.device)
-    )
-    ssm_state_indices_arg = (
-        ssm_state_indices
-        if ssm_state_indices is not None
-        else torch.zeros(B_val, T_val, dtype=torch.int32, device=q.device)
-    )
-
     if cache_key not in _compiled_kernels_wide_vec:
+        # Compile the cubin ONCE per cache_key (cache_key omits B —
+        # upstream's batch-dynamic refactor: one cubin serves all B).
+        # Compile-time template tensors use a B=1 placeholder; the
+        # cubin runs at the caller's actual B via _mark_batch_dynamic.
+        _placeholder_indices = torch.arange(1, dtype=torch.int32, device=q.device)
+        _placeholder_output = torch.empty(
+            1, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
+        )
+        _placeholder_accepted_steps = torch.zeros(1, dtype=torch.int32, device=q.device)
+        _placeholder_ssm_state_indices = torch.zeros(
+            1, T_val, dtype=torch.int32, device=q.device
+        )
+
         if contiguous_pool:
             h_ = _mark_batch_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        if cache_intermediate_states:
+        # Mark the flat-3D view's slot dim dynamic so the cubin works across
+        # pool_size variations (FLA-flat aliases h0_source as a flat [pool*HV,
+        # V, K] view whose slot dim varies with pool_size).
+        if cache_intermediate_states or per_token_pool_scatter_flat:
             inter_ = _mark_batch_dynamic(intermediate_states)
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
@@ -3171,11 +3168,23 @@ def gated_delta_rule_mtp_wide_vec(
         b_ = _mark_batch_dynamic(b)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        o_ = _mark_batch_dynamic(output)
-        h0_idx_ = _mark_batch_dynamic(initial_state_indices)
-        h0_out_idx_ = _mark_batch_dynamic(initial_state_indices)
-        acc_steps_ = _mark_batch_dynamic(accepted_steps_arg)
-        ssm_idx_ = _mark_batch_dynamic(ssm_state_indices_arg)
+        o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
+        h0_idx_ = _mark_batch_dynamic(
+            initial_state_indices
+            if initial_state_indices is not None
+            else _placeholder_indices
+        )
+        h0_out_idx_ = h0_idx_
+        acc_steps_ = _mark_batch_dynamic(
+            accepted_steps
+            if accepted_steps is not None
+            else _placeholder_accepted_steps
+        )
+        ssm_idx_ = _mark_batch_dynamic(
+            ssm_state_indices
+            if ssm_state_indices is not None
+            else _placeholder_ssm_state_indices
+        )
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -3216,13 +3225,41 @@ def gated_delta_rule_mtp_wide_vec(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
+            # Per-B default tensors (B-dependent shapes; can't be shared
+            # across batch sizes — see #L bug at cache_key without B).
+            "defaults_by_B": {},
         }
 
     cache = _compiled_kernels_wide_vec[cache_key]
+    defaults_by_B = cache["defaults_by_B"]
+    if B_val not in defaults_by_B:
+        defaults_by_B[B_val] = {
+            "indices": torch.arange(B_val, dtype=torch.int32, device=q.device),
+            "output": torch.empty(
+                B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
+            ),
+            "accepted_steps": torch.zeros(B_val, dtype=torch.int32, device=q.device),
+            "ssm_state_indices": torch.zeros(
+                B_val, T_val, dtype=torch.int32, device=q.device
+            ),
+        }
+    defs = defaults_by_B[B_val]
+    if initial_state_indices is None:
+        initial_state_indices = defs["indices"]
     if output_state_indices is None:
         # Single-pool: read==write. Reuse the same indices tensor — no extra
         # allocation, kernel still produces the same address for both slots.
         output_state_indices = initial_state_indices
+    if output is None:
+        output = defs["output"]
+    accepted_steps_arg = (
+        accepted_steps if accepted_steps is not None else defs["accepted_steps"]
+    )
+    ssm_state_indices_arg = (
+        ssm_state_indices
+        if ssm_state_indices is not None
+        else defs["ssm_state_indices"]
+    )
 
     cache["compiled"](
         h0_source,
@@ -3375,14 +3412,15 @@ def gated_delta_rule_t1_wide_vec(
         same_pool,
     )
 
-    if initial_state_indices is None:
-        initial_state_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
-    if output is None:
-        output = torch.empty(
-            B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
+    if cache_key not in _compiled_kernels_wide_vec:
+        # Compile-time template tensors at B=1; cubin runs at caller's
+        # actual B via _mark_batch_dynamic. cache_key omits B by design
+        # (upstream batch-dynamic).
+        _placeholder_indices = torch.arange(1, dtype=torch.int32, device=q.device)
+        _placeholder_output = torch.empty(
+            1, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
         )
 
-    if cache_key not in _compiled_kernels_wide_vec:
         if contiguous_pool:
             h_ = _mark_batch_dynamic(h0_source)
         else:
@@ -3398,9 +3436,13 @@ def gated_delta_rule_t1_wide_vec(
         b_ = _mark_batch_dynamic(b)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        o_ = _mark_batch_dynamic(output)
-        h0_idx_ = _mark_batch_dynamic(initial_state_indices)
-        h0_out_idx_ = _mark_batch_dynamic(initial_state_indices)
+        o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
+        h0_idx_ = _mark_batch_dynamic(
+            initial_state_indices
+            if initial_state_indices is not None
+            else _placeholder_indices
+        )
+        h0_out_idx_ = h0_idx_
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -3434,13 +3476,29 @@ def gated_delta_rule_t1_wide_vec(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
+            # Per-B default tensors (B-dependent shapes — see batch-dynamic
+            # correctness note in gated_delta_rule_mtp_wide_vec).
+            "defaults_by_B": {},
         }
 
     cache = _compiled_kernels_wide_vec[cache_key]
+    defaults_by_B = cache["defaults_by_B"]
+    if B_val not in defaults_by_B:
+        defaults_by_B[B_val] = {
+            "indices": torch.arange(B_val, dtype=torch.int32, device=q.device),
+            "output": torch.empty(
+                B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
+            ),
+        }
+    defs = defaults_by_B[B_val]
+    if initial_state_indices is None:
+        initial_state_indices = defs["indices"]
     if output_state_indices is None:
         # Single-pool: read==write. Reuse the same indices tensor — no extra
         # allocation, kernel still produces the same address for both slots.
         output_state_indices = initial_state_indices
+    if output is None:
+        output = defs["output"]
 
     cache["compiled"](
         h0_source,
@@ -3721,31 +3779,26 @@ def gated_delta_rule_mtp(
         per_token_pool_scatter_flat,
     )
 
-    if initial_state_indices is None:
-        initial_state_indices = torch.arange(B, dtype=torch.int32, device=q.device)
-    if output is None:
-        output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
-    # Defaults for kernel-arg tensors that are constexpr-gated at runtime
-    # (accepted_steps/ssm_state_indices). cute.compile needs a tensor of
-    # the right shape/dtype even when the kernel never reads it.
-    accepted_steps_arg = (
-        accepted_steps
-        if accepted_steps is not None
-        else torch.zeros(B, dtype=torch.int32, device=q.device)
-    )
-    ssm_state_indices_arg = (
-        ssm_state_indices
-        if ssm_state_indices is not None
-        else torch.zeros(B, T, dtype=torch.int32, device=q.device)
-    )
-
     if cache_key not in _compiled_kernels_mtp:
+        # Compile-time template tensors at B=1; cubin runs at caller's
+        # actual B via _mark_batch_dynamic. cache_key omits B by design
+        # (upstream batch-dynamic).
+        _placeholder_indices = torch.arange(1, dtype=torch.int32, device=q.device)
+        _placeholder_output = torch.empty(1, T, HV, V, device=q.device, dtype=q.dtype)
+        _placeholder_accepted_steps = torch.zeros(1, dtype=torch.int32, device=q.device)
+        _placeholder_ssm_state_indices = torch.zeros(
+            1, T, dtype=torch.int32, device=q.device
+        )
+
         if contiguous_pool:
             h_ = _mark_batch_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        if cache_intermediate_states:
+        # Mark the flat-3D view's slot dim dynamic so the cubin works across
+        # pool_size variations (FLA-flat aliases h0_source as a flat [pool*HV,
+        # V, K] view whose slot dim varies with pool_size).
+        if cache_intermediate_states or per_token_pool_scatter_flat:
             inter_ = _mark_batch_dynamic(intermediate_states)
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
@@ -3754,11 +3807,23 @@ def gated_delta_rule_mtp(
         b_ = _mark_batch_dynamic(b)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        o_ = _mark_batch_dynamic(output)
-        h0_idx_ = _mark_batch_dynamic(initial_state_indices)
-        h0_out_idx_ = _mark_batch_dynamic(initial_state_indices)
-        acc_steps_ = _mark_batch_dynamic(accepted_steps_arg)
-        ssm_idx_ = _mark_batch_dynamic(ssm_state_indices_arg)
+        o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
+        h0_idx_ = _mark_batch_dynamic(
+            initial_state_indices
+            if initial_state_indices is not None
+            else _placeholder_indices
+        )
+        h0_out_idx_ = h0_idx_
+        acc_steps_ = _mark_batch_dynamic(
+            accepted_steps
+            if accepted_steps is not None
+            else _placeholder_accepted_steps
+        )
+        ssm_idx_ = _mark_batch_dynamic(
+            ssm_state_indices
+            if ssm_state_indices is not None
+            else _placeholder_ssm_state_indices
+        )
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
@@ -3798,12 +3863,35 @@ def gated_delta_rule_mtp(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
+            # Per-B default tensors (B-dependent shapes — see batch-dynamic
+            # correctness note in gated_delta_rule_mtp_wide_vec).
+            "defaults_by_B": {},
         }
 
     cache = _compiled_kernels_mtp[cache_key]
-
+    defaults_by_B = cache["defaults_by_B"]
+    if B not in defaults_by_B:
+        defaults_by_B[B] = {
+            "indices": torch.arange(B, dtype=torch.int32, device=q.device),
+            "output": torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype),
+            "accepted_steps": torch.zeros(B, dtype=torch.int32, device=q.device),
+            "ssm_state_indices": torch.zeros(B, T, dtype=torch.int32, device=q.device),
+        }
+    defs = defaults_by_B[B]
+    if initial_state_indices is None:
+        initial_state_indices = defs["indices"]
+    if output is None:
+        output = defs["output"]
     if output_state_indices is None:
         output_state_indices = initial_state_indices
+    accepted_steps_arg = (
+        accepted_steps if accepted_steps is not None else defs["accepted_steps"]
+    )
+    ssm_state_indices_arg = (
+        ssm_state_indices
+        if ssm_state_indices is not None
+        else defs["ssm_state_indices"]
+    )
 
     cache["compiled"](
         h0_source,
