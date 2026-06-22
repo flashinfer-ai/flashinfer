@@ -2562,7 +2562,10 @@ def _pack_trtllm_gen_spec_dec_mask(
             raise ValueError(
                 f"seq_lens must have shape [{batch_size}] when packing spec-dec masks"
             )
-        if int(seq_lens.max().item()) > max_seq_len:
+        is_cuda_graph_capturing = (
+            mask.is_cuda and torch.cuda.is_current_stream_capturing()
+        )
+        if not is_cuda_graph_capturing and int(seq_lens.max().item()) > max_seq_len:
             raise ValueError(
                 "seq_lens contains values larger than max_seq_len; trim the "
                 "presented KV/page table and pass the trimmed bound."
