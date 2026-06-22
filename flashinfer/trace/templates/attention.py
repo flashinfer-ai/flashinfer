@@ -2137,7 +2137,8 @@ def _trtllm_batch_decode_mla_sparse_init(
 def _trtllm_batch_decode_mla_ragged_init(
     *,
     batch_size: int,
-    q_len_per_request: int,
+    num_tokens: int,
+    batch_size_plus_1: int,
     num_heads: int = 128,
     head_dim_qk: int = 576,
     kv_lora_rank: int = 512,
@@ -2151,9 +2152,23 @@ def _trtllm_batch_decode_mla_ragged_init(
     device: str = "cuda",
     seed: int = 0,
 ):
+    if batch_size_plus_1 != batch_size + 1:
+        raise ValueError("batch_size_plus_1 must equal batch_size + 1")
+    if num_tokens < batch_size:
+        raise ValueError(
+            "num_tokens must be at least batch_size for non-empty init segments"
+        )
+
+    base_q_len = num_tokens // batch_size
+    extra = num_tokens % batch_size
+    q_lens = torch.full((batch_size,), base_q_len, device=device, dtype=torch.int32)
+    if extra:
+        q_lens[:extra] += 1
+    max_q_len = int(q_lens.max().item())
+
     dense = _trtllm_batch_decode_mla_init(
         batch_size=batch_size,
-        q_len_per_request=q_len_per_request,
+        q_len_per_request=max_q_len,
         num_heads=num_heads,
         head_dim_qk=head_dim_qk,
         kv_lora_rank=kv_lora_rank,
@@ -2168,12 +2183,9 @@ def _trtllm_batch_decode_mla_ragged_init(
         seed=seed,
     )
     query = dense["query"]
-    q_lens = (
-        torch.arange(batch_size, device=query.device, dtype=torch.int32)
-        % q_len_per_request
-    ) + 1
-    q_lens[-1] = q_len_per_request
-    cum_seq_lens_q = torch.empty(batch_size + 1, device=query.device, dtype=torch.int32)
+    cum_seq_lens_q = torch.empty(
+        batch_size_plus_1, device=query.device, dtype=torch.int32
+    )
     cum_seq_lens_q[0] = 0
     cum_seq_lens_q[1:] = torch.cumsum(q_lens, dim=0)
     dense["query"] = torch.cat(
@@ -2181,7 +2193,7 @@ def _trtllm_batch_decode_mla_ragged_init(
         dim=0,
     )
     dense["cum_seq_lens_q"] = cum_seq_lens_q
-    dense["max_q_len"] = int(q_len_per_request)
+    dense["max_q_len"] = max_q_len
     return dense
 
 

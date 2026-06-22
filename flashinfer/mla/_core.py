@@ -627,9 +627,11 @@ def _check_trtllm_gen_mla_shape(
     batch_size: Optional[int] = None,
     max_q_len: Optional[int] = None,
 ) -> torch.Tensor:
+    is_flattened_query = False
     if query.ndim == 4:
         num_seqs, num_tokens, _, qk_head_dim = query.shape
     elif query.ndim == 3:
+        is_flattened_query = True
         if batch_size is None or max_q_len is None:
             raise ValueError(
                 "batch_size and max_q_len are required when query.ndim == 3"
@@ -669,9 +671,15 @@ def _check_trtllm_gen_mla_shape(
 
     if sparse_mla_top_k > 0:
         page_table_shape = page_table.shape
-        if page_table_shape != (num_seqs, num_tokens, sparse_mla_top_k):
+        expected_page_table_shape = (
+            (query.size(0), sparse_mla_top_k)
+            if is_flattened_query
+            else (num_seqs, num_tokens, sparse_mla_top_k)
+        )
+        if page_table_shape != expected_page_table_shape:
             raise ValueError(
-                f"Expected page_table.shape == (num_seqs, num_tokens, sparse_mla_top_k), got {page_table_shape}"
+                "Expected page_table.shape == "
+                f"{expected_page_table_shape}" + f", got {page_table_shape}"
             )
     else:
         _check_block_tables_shape(page_table, uses_shared_paged_kv_idx)
@@ -2461,6 +2469,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_tables : torch.Tensor
         Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
         SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.
+        When ``cum_seq_lens_q`` is provided with sparse MLA, pass compact
+        sparse rows in flattened query-token order with shape
+        ``[total_q, sparse_mla_top_k]``.
         For SM120/SM121 sparse v32/GLM, it is the sparse index matrix and must
         have shape ``[batch_size, q_len_per_request, sparse_mla_top_k]`` with
         int32 physical token indices.
@@ -2476,7 +2487,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Enables sparse MLA when greater than zero. On SM100/SM103 this selects
         the TRTLLM-GEN sparse page-table path. On SM120/SM121 with
         ``backend="auto"`` or ``backend="sparse"``, this is the width of the
-        packed v32/GLM sparse index matrix.
+        packed v32/GLM sparse index matrix. The TRTLLM-GEN backend supports
+        dense query input or flattened query input plus ``cum_seq_lens_q``.
     out : Optional[torch.Tensor]
         Output tensor. If not provided, it is allocated internally.
     bmm1_scale : Union[float, torch.Tensor]
@@ -2731,11 +2743,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     if has_var_q:
         if backend == "cute-dsl":
             raise ValueError("cute-dsl MLA does not support cum_seq_lens_q")
-        if sparse_mla_top_k != 0:
-            raise ValueError(
-                "sparse MLA (sparse_mla_top_k > 0) is not supported with "
-                "variable-length queries (cum_seq_lens_q) for trtllm-gen"
-            )
         if return_lse or lse is not None:
             raise NotImplementedError(
                 "trtllm-gen MLA does not support return_lse/lse with cum_seq_lens_q"
