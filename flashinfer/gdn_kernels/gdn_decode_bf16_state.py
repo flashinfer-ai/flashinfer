@@ -1773,32 +1773,22 @@ def gated_delta_rule_mtp_wide_vec(
             # scales with B. The dummy [1,1,1] tensor (caching off) is never read
             # and cannot be marked dynamic (no unique stride-1 dim), so skip it.
             inter_ = inter_.mark_compact_shape_dynamic(mode=0)
-        q_ = from_dlpack(
-            q, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
-        k_ = from_dlpack(
-            k, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
-        v_ = from_dlpack(
-            v, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
-        a_ = from_dlpack(
-            a, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
-        b_ = from_dlpack(
-            b, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
+        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
+        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
+        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
+        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
+        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = from_dlpack(
             output, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
+        ).mark_layout_dynamic()
         h0_idx_ = from_dlpack(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
+        ).mark_layout_dynamic()
         h0_out_idx_ = from_dlpack(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
+        ).mark_layout_dynamic()
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -2047,32 +2037,22 @@ def gated_delta_rule_mtp(
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
             inter_ = inter_.mark_compact_shape_dynamic(mode=0)
-        q_ = from_dlpack(
-            q, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
-        k_ = from_dlpack(
-            k, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
-        v_ = from_dlpack(
-            v, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
-        a_ = from_dlpack(
-            a, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
-        b_ = from_dlpack(
-            b, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
+        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
+        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
+        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
+        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
+        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True).mark_layout_dynamic()
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = from_dlpack(
             output, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
+        ).mark_layout_dynamic()
         h0_idx_ = from_dlpack(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
+        ).mark_layout_dynamic()
         h0_out_idx_ = from_dlpack(
             initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        ).mark_compact_shape_dynamic(mode=0)
+        ).mark_layout_dynamic()
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
