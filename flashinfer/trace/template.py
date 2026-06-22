@@ -249,8 +249,15 @@ def _get_tensor(
     if val is None:
         return None
     if tuple_idx is not None:
-        if isinstance(val, (tuple, list)) and len(val) > tuple_idx:
-            val = val[tuple_idx]
+        if isinstance(val, (tuple, list)):
+            val = val[tuple_idx] if len(val) > tuple_idx else None
+        elif isinstance(val, torch.Tensor) and val.dim() >= 2 and val.shape[1] == 2:
+            # vLLM passes the paged KV cache as a single combined tensor
+            # [num_pages, 2, page_size, num_kv_heads, head_dim] rather than a
+            # (k_cache, v_cache) tuple; the k/v split lives on dim 1. Recover
+            # the per-cache view so dtype/shape extraction matches the
+            # template's dim_names.
+            val = val[:, tuple_idx]
         else:
             return None
     return val if isinstance(val, torch.Tensor) else None
