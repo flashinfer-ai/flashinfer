@@ -66,7 +66,7 @@ __global__ void PackSpecDecMaskKernel(uint32_t* packed_mask, int32_t* first_spar
                                       int max_words_per_seq, int window_left) {
   int const batch_idx = blockIdx.y;
   int const seq_len_kv = seq_lens_kv[batch_idx];
-  int const prefix_len = seq_len_kv - q_len;
+  int const prefix_len = seq_len_kv >= q_len ? seq_len_kv - q_len : 0;
   int const tile_size_kv_per_cta = kTileSizeKv * num_insts_kv;
   bool const has_window = window_left >= 0;
   int const first_sparse_tile_kv = has_window ? 0 : prefix_len / tile_size_kv_per_cta;

@@ -1231,6 +1231,24 @@ def build_tree_window_custom_mask_flat(
     return torch.cat(parts)
 
 
+def test_pack_trtllm_gen_spec_dec_mask_rejects_untrimmed_window_seq_lens():
+    mask = torch.ones(2, 4, 4, dtype=torch.bool)
+    seq_lens = torch.tensor([16, 24], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="seq_lens contains values larger"):
+        flashinfer.decode._pack_trtllm_gen_spec_dec_mask(
+            mask,
+            seq_lens,
+            batch_size=2,
+            q_len_per_req=4,
+            num_heads_q_per_kv=1,
+            q_dtype=torch.float16,
+            kv_dtype=torch.float16,
+            window_left=8,
+            max_seq_len=16,
+        )
+
+
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [

@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+import shutil
 from typing import List, Optional
 
 import jinja2
@@ -1804,6 +1805,10 @@ def gen_fmha_cutlass_sm100a_module(
 def gen_trtllm_gen_fmha_module():
     from ...artifacts import ArtifactPath, CheckSumHash
 
+    uri = "fmha_gen"
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory.mkdir(parents=True, exist_ok=True)
+
     include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
     header_name = "flashInferMetaInfo"
 
@@ -1822,13 +1827,20 @@ def gen_trtllm_gen_fmha_module():
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
+    source_paths = []
+    for filename in [
+        "trtllm_fmha_kernel_launcher.cu",
+        "trtllm_fmha_spec_dec_mask.cu",
+        "fmhaReduction.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        shutil.copy(src_path, dest_path)
+        source_paths.append(dest_path)
+
     return gen_jit_spec(
-        "fmha_gen",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_spec_dec_mask.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
-        ],
+        uri,
+        source_paths,
         # link "include" sub-directory in cache
         extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
         extra_cuda_cflags=[
