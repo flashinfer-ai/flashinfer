@@ -1,0 +1,20 @@
+# Run from: cd /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/flashinfer
+
+# Steady-state capture (recommended for kernel breakdown)
+bash benchmarks/moe_ep/trace/bench_deepseek_v4_mega_moe_nsys.sh nvtx both
+
+# Full timeline (setup + cold start + warmup + repeats)
+bash benchmarks/moe_ep/trace/bench_deepseek_v4_mega_moe_nsys.sh full both
+
+# Full without cold start
+COLD_START=off bash benchmarks/moe_ep/trace/bench_deepseek_v4_mega_moe_nsys.sh full both
+
+# Stats on steady-state captures
+bash benchmarks/moe_ep/trace/bench_deepseek_v4_mega_moe_nsys.sh stats nvtx both
+
+# Stats on full captures (writes CSVs + tables; redirect to trace.txt)
+bash benchmarks/moe_ep/trace/bench_deepseek_v4_mega_moe_nsys.sh stats full both \
+  > benchmarks/moe_ep/trace/trace.txt 2>&1
+
+# Capture + stats in one go
+bash benchmarks/moe_ep/trace/bench_deepseek_v4_mega_moe_nsys.sh all both

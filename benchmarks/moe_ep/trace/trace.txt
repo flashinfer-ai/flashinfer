@@ -1,0 +1,365 @@
+=== nsys stats: flashinfer (full) ===
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_gpu_kern_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_cuda_gpu_kern_sum.csv]... SKIPPED: output file /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_cuda_gpu_kern_sum.csv exists.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_gpu_mem_time_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_cuda_gpu_mem_time_sum.csv]... SKIPPED: output file /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_cuda_gpu_mem_time_sum.csv exists.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_api_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_cuda_api_sum.csv]... SKIPPED: output file /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_cuda_api_sum.csv exists.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/osrt_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_osrt_sum.csv]... SKIPPED: output file /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_osrt_sum.csv exists.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/nvtx_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_nvtx_sum.csv]... SKIPPED: output file /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats_nvtx_sum.csv exists.
+
+    CSV prefix: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full_stats
+
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/nvtx_sum.py]... 
+
+ ** NVTX Range Summary (nvtx_sum):
+
++----------+-----------------+-----------+--------------+--------------+------------+------------+-------------+----------+-----------------------+
+| Time (%) | Total Time (ns) | Instances |   Avg (ns)   |   Med (ns)   |  Min (ns)  |  Max (ns)  | StdDev (ns) |  Style   |         Range         |
++----------+-----------------+-----------+--------------+--------------+------------+------------+-------------+----------+-----------------------+
+|     49.7 |     12684780448 |         4 | 3171195112.0 | 3163571696.0 | 3150554688 | 3207082368 |  25497525.8 | PushPop  | :setup                |
+|     18.9 |      4831165760 |         4 | 1207791440.0 | 1208122400.0 | 1204150080 | 1210770880 |   3479683.3 | PushPop  | :warmup               |
+|     18.9 |      4823288448 |       100 |   48232884.5 |     215344.0 |     185920 | 1203416256 | 236387716.0 | PushPop  | :forward              |
+|      5.9 |      1500348032 |         4 |  375087008.0 |  374960656.0 |  371117824 |  379308896 |   4538618.1 | StartEnd | NCCL:API Group        |
+|      5.9 |      1500272896 |         4 |  375068224.0 |  374942384.0 |  371099424 |  379288704 |   4538007.2 | StartEnd | NCCL:GroupLaunch      |
+|      0.7 |       167717696 |         4 |   41929424.0 |   42036848.0 |   41370432 |   42273568 |    425502.6 | PushPop  | :steady_capture       |
+|      0.1 |        16909984 |         8 |    2113748.0 |       4528.0 |       1696 |    8193024 |   3726832.1 | StartEnd | NCCL:AllReduce        |
+|      0.0 |         8976992 |         4 |    2244248.0 |    2263152.0 |    2112576 |    2338112 |     95599.0 | PushPop  | cuBLAS:cublasLtCreate |
+|      0.0 |           89696 |         4 |      22424.0 |      22640.0 |      15392 |      29024 |      5719.0 | StartEnd | NCCL:GroupRuntime     |
+|      0.0 |            6976 |         4 |       1744.0 |       1664.0 |       1568 |       2080 |       228.5 | StartEnd | NCCL:ncclCommFinalize |
++----------+-----------------+-----------+--------------+--------------+------------+------------+-------------+----------+-----------------------+
+
+
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
++----------+-----------------+-----------+-----------+-----------+----------+----------+-------------+------------------------------------------------------------------------------------------------------+
+| Time (%) | Total Time (ns) | Instances | Avg (ns)  | Med (ns)  | Min (ns) | Max (ns) | StdDev (ns) |                                                 Name                                                 |
++----------+-----------------+-----------+-----------+-----------+----------+----------+-------------+------------------------------------------------------------------------------------------------------+
+|     31.6 |       119950688 |       100 | 1199506.9 | 1193856.0 |  1185216 |  1340032 |     23389.2 | void deep_gemm::sm100_fp8_fp4_mega_moe_impl<(unsigned int)8448, (unsigned int)4096, (unsigned int)2… |
+|     10.3 |        39036896 |       512 |   76243.9 |   74784.0 |    50432 |   104928 |     24964.1 | void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapp… |
+|      6.1 |        23296032 |       512 |   45500.1 |   45424.0 |    29760 |    63328 |     14899.4 | void at::native::<unnamed>::searchsorted_cuda_kernel<float, long>(T2 *, const T1 *, const T1 *, con… |
+|      5.9 |        22377568 |       512 |   43706.2 |   43504.0 |    26656 |    62048 |     16391.4 | void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl<at::native::… |
+|      5.8 |        21938848 |      1024 |   21424.7 |   21824.0 |    13408 |    29536 |      6734.6 | void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator… |
+|      4.5 |        16913696 |         4 | 4228424.0 | 4353712.0 |     9472 |  8196800 |   4530910.1 | ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)               |
+|      3.9 |        14806304 |       772 |   19179.2 |   18720.0 |    18240 |    65952 |      3198.6 | void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat… |
+|      3.7 |        14079424 |       100 |  140794.2 |  140736.0 |   140192 |   143392 |       575.1 | _stage_mega_moe_inputs_kernel                                                                        |
+|      3.3 |        12709280 |       512 |   24822.8 |   24544.0 |    16416 |    34144 |      8022.8 | void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator… |
+|      2.6 |         9913536 |      1024 |    9681.2 |    9632.0 |     6944 |    12896 |      2325.1 | void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::n… |
+|      2.6 |         9857920 |         4 | 2464480.0 | 2432224.0 |  2420512 |  2572960 |     73075.6 | void at::native::<unnamed>::CatArrayBatchedCopy<at::native::<unnamed>::OpaqueType<(unsigned int)1>,… |
+|      2.3 |         8916736 |       512 |   17415.5 |   17600.0 |    11040 |    24480 |      6079.6 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<long, long, bool, … |
+|      1.8 |         6916160 |      1024 |    6754.1 |    4464.0 |     1728 |    17536 |      5865.3 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(a… |
+|      1.8 |         6679584 |      1024 |    6523.0 |    4480.0 |     1504 |    17888 |      5795.1 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::AbsFunctor<float>, std::array<ch… |
+|      1.5 |         5850848 |       264 |   22162.3 |    8608.0 |     8192 |   600960 |     80713.1 | void at::native::<unnamed>::CatArrayBatchedCopy_vectorized<at::native::<unnamed>::OpaqueType<(unsig… |
+|      1.5 |         5746272 |       512 |   11223.2 |   11360.0 |     8128 |    15008 |      2832.9 | void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<float… |
+|      1.1 |         4254944 |       512 |    8310.4 |    8336.0 |     5888 |    11040 |      2312.9 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<bool, bool, bool, … |
+|      1.1 |         4171584 |       512 |    8147.6 |    8208.0 |     5888 |    10560 |      2159.4 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<unsigned char, uns… |
+|      1.1 |         4102016 |       512 |    8011.8 |    8304.0 |     5728 |    10528 |      2151.2 | void at::native::vectorized_elementwise_kernel<(int)8, at::native::AbsFunctor<c10::BFloat16>, std::… |
+|      1.1 |         4061184 |       512 |    7932.0 |    7952.0 |     5664 |    10304 |      2161.8 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<unsigned char, uns… |
+|      1.1 |         3993312 |       512 |    7799.4 |    8080.0 |     5536 |    10688 |      2158.7 | void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std:… |
+|      0.7 |         2545344 |         8 |  318168.0 |  317904.0 |   316736 |   320160 |      1201.2 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<signed char>, std::a… |
+|      0.6 |         2432896 |       512 |    4751.8 |    4848.0 |     3552 |     6176 |      1124.2 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<signed char, signe… |
+|      0.6 |         2408800 |       512 |    4704.7 |    4752.0 |     3520 |     6048 |      1095.2 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<signed char, signe… |
+|      0.5 |         1872672 |       512 |    3657.6 |    3680.0 |     3360 |     4320 |       120.9 | void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator… |
+|      0.4 |         1612288 |      1024 |    1574.5 |    1568.0 |     1248 |     2272 |       161.3 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<int, int, int, at:… |
+|      0.4 |         1601376 |       512 |    3127.7 |    3136.0 |     2912 |     3424 |        99.2 | void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator… |
+|      0.3 |         1016512 |       512 |    1985.4 |    1984.0 |     1824 |     2336 |       103.7 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::reciprocal_kernel_cuda(at::Tenso… |
+|      0.3 |          953472 |       512 |    1862.3 |    1888.0 |     1728 |     2176 |        87.4 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<int>, std::array… |
+|      0.2 |          859296 |       512 |    1678.3 |    1728.0 |     1504 |     1984 |       107.0 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(a… |
+|      0.2 |          858368 |       512 |    1676.5 |    1696.0 |     1504 |     1984 |       107.3 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<float, float, floa… |
+|      0.2 |          848960 |       512 |    1658.1 |    1696.0 |     1472 |     2016 |       113.8 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, floa… |
+|      0.2 |          846496 |       512 |    1653.3 |    1696.0 |     1504 |     2016 |       112.8 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<int, int, int, at:… |
+|      0.2 |          841952 |       512 |    1644.4 |    1664.0 |     1504 |     1984 |       108.8 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<int, int, int, at:… |
+|      0.1 |          535776 |        20 |   26788.8 |   34224.0 |    11392 |    36416 |     10390.1 | void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n… |
+|      0.1 |          333888 |         4 |   83472.0 |   82544.0 |    81984 |    86816 |      2249.5 | void at::native::sbtopk::gatherTopK<float, unsigned int, (int)2, (bool)0>(at::cuda::detail::TensorI… |
+|      0.1 |          201504 |         4 |   50376.0 |   50096.0 |    49760 |    51552 |       800.8 | void deep_gemm::transpose_and_pack_fp32_into_ue8m0<(unsigned int)512, (unsigned int)48, (unsigned i… |
+|      0.0 |          175552 |         4 |   43888.0 |   43344.0 |    43104 |    45760 |      1253.2 | void at::native::<unnamed>::CatArrayBatchedCopy<at::native::<unnamed>::OpaqueType<(unsigned int)4>,… |
+|      0.0 |          109472 |         4 |   27368.0 |   27200.0 |    26976 |    28096 |       497.4 | void deep_gemm::transpose_and_pack_fp32_into_ue8m0<(unsigned int)512, (unsigned int)48, (unsigned i… |
+|      0.0 |           29568 |         4 |    7392.0 |    7280.0 |     7232 |     7776 |       257.3 | void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat… |
+|      0.0 |            5056 |         4 |    1264.0 |    1264.0 |     1216 |     1312 |        41.3 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<c… |
++----------+-----------------+-----------+-----------+-----------+----------+----------+-------------+------------------------------------------------------------------------------------------------------+
+
+
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
++----------+-----------------+-----------+-------------+-------------+-----------+-----------+-------------+-------------------------------------------+
+| Time (%) | Total Time (ns) | Num Calls |  Avg (ns)   |  Med (ns)   | Min (ns)  | Max (ns)  | StdDev (ns) |                   Name                    |
++----------+-----------------+-----------+-------------+-------------+-----------+-----------+-------------+-------------------------------------------+
+|     28.0 |      1350103200 |         8 | 168762900.0 | 168492944.0 | 102276224 | 235445088 |  71029938.4 | cuMulticastBindMem                        |
+|     16.8 |       810096768 |      1028 |    788031.9 |    212080.0 |     46848 | 124979968 |   6965917.9 | cuMemSetAccess                            |
+|     15.0 |       725305248 |       268 |   2706362.9 |   2824544.0 |       480 |   6967840 |   1308685.0 | cuMemExportToShareableHandle              |
+|      6.7 |       322036192 |      1028 |    313264.8 |     59968.0 |      2560 | 124952512 |   5504859.7 | cuMemMap                                  |
+|      5.3 |       256122016 |       760 |    337002.7 |     79504.0 |     18368 |  61043744 |   3824777.5 | cuMemCreate                               |
+|      4.6 |       219588736 |     17468 |     12570.9 |      6432.0 |      3488 |   2770176 |     95555.1 | cudaLaunchKernel                          |
+|      4.0 |       191939872 |       278 |    690431.2 |    700224.0 |     44480 |   2993728 |    548129.8 | cuMemImportFromShareableHandle            |
+|      4.0 |       191547616 |       576 |    332547.9 |    334336.0 |     97568 |   1076224 |    113458.0 | cudaMalloc                                |
+|      3.7 |       176721056 |        68 |   2598839.1 |   2613200.0 |    262400 |   5124896 |   1335051.1 | cuLibraryLoadData                         |
+|      3.1 |       150772512 |      1028 |    146665.9 |    119360.0 |     34816 |   1694176 |    120261.0 | cuMemUnmap                                |
+|      2.9 |       139251104 |       136 |   1023905.2 |   1224400.0 |      4576 |   7967968 |    995175.1 | cudaDeviceSynchronize                     |
+|      2.4 |       114996192 |      2040 |     56370.7 |     30832.0 |        96 |   1453536 |    108822.0 | cuMemRelease                              |
+|      1.0 |        49360352 |         4 |  12340088.0 |  12444512.0 |  11786688 |  12684640 |    422557.0 | cudaProfilerStop                          |
+|      0.9 |        42723328 |       512 |     83444.0 |      4752.0 |      2368 |    864864 |    146012.0 | cudaStreamCreateWithPriority              |
+|      0.6 |        30450688 |      4876 |      6245.0 |      6816.0 |      1344 |     42112 |      4609.2 | cudaMemcpyAsync                           |
+|      0.2 |        11716160 |       756 |     15497.6 |      9632.0 |      2624 |     43968 |     10148.9 | cudaStreamSynchronize                     |
+|      0.1 |         5468416 |       212 |     25794.4 |     11248.0 |      8032 |    839936 |    100879.7 | cuLaunchKernelEx                          |
+|      0.1 |         3792064 |      1028 |      3688.8 |      2848.0 |      1600 |     33088 |      2735.6 | cuMemAddressReserve                       |
+|      0.1 |         3753792 |       488 |      7692.2 |      7200.0 |      5408 |     58880 |      3677.4 | cudaMemsetAsync                           |
+|      0.1 |         3427232 |     17468 |       196.2 |       160.0 |        64 |     10048 |       123.4 | cuKernelGetName                           |
+|      0.1 |         2639872 |      1008 |      2618.9 |      2368.0 |      1056 |     12544 |      1113.6 | cuMemAddressFree                          |
+|      0.0 |         2106848 |      5106 |       412.6 |       288.0 |       128 |     16480 |       499.8 | cudaThreadExchangeStreamCaptureMode       |
+|      0.0 |         1936832 |      2888 |       670.6 |       672.0 |       160 |     10144 |       435.3 | cudaStreamIsCapturing                     |
+|      0.0 |         1624192 |        12 |    135349.3 |    119264.0 |     52544 |    238240 |     76524.5 | cuKernelGetFunction                       |
+|      0.0 |         1620544 |         8 |    202568.0 |     41872.0 |      8928 |    710784 |    311775.9 | cuMulticastAddDevice                      |
+|      0.0 |         1388416 |      1000 |      1388.4 |      1120.0 |       352 |     13792 |      1112.9 | cuMemRetainAllocationHandle               |
+|      0.0 |         1348256 |      5560 |       242.5 |       160.0 |        64 |     11552 |       372.5 | cuGetProcAddress_v2                       |
+|      0.0 |         1271840 |        12 |    105986.7 |     26832.0 |     18400 |    283616 |    122122.5 | cuLibraryUnload                           |
+|      0.0 |         1065792 |         4 |    266448.0 |    268944.0 |    228224 |    299680 |     35844.3 | cudaMemPoolDestroy                        |
+|      0.0 |          981600 |        16 |     61350.0 |     22096.0 |      1888 |    201376 |     76991.1 | cudaHostAlloc                             |
+|      0.0 |          882304 |        16 |     55144.0 |     20288.0 |      6816 |    183136 |     68307.5 | cudaFreeHost                              |
+|      0.0 |          878720 |       208 |      4224.6 |      3936.0 |      1888 |     15808 |      1654.5 | cudaEventRecordWithFlags                  |
+|      0.0 |          741120 |        12 |     61760.0 |     59264.0 |     53152 |     70368 |      6352.2 | cuLibraryLoadFromFile                     |
+|      0.0 |          706176 |        16 |     44136.0 |     23296.0 |     14912 |    120672 |     40336.9 | cudaStreamCreateWithFlags                 |
+|      0.0 |          700640 |         8 |     87580.0 |     75744.0 |     60352 |    140032 |     27491.8 | cuMulticastUnbind                         |
+|      0.0 |          657280 |       213 |      3085.8 |      2848.0 |      1728 |     20832 |      2092.7 | cudaEventQuery                            |
+|      0.0 |          472672 |       232 |      2037.4 |      1888.0 |       448 |      6944 |      1083.4 | cudaEventCreateWithFlags                  |
+|      0.0 |          424352 |       144 |      2946.9 |      1744.0 |       448 |     40800 |      5044.6 | cuLibraryGetKernel                        |
+|      0.0 |          420000 |       256 |      1640.6 |      1312.0 |       576 |     15424 |      1480.9 | cudaStreamWaitEvent                       |
+|      0.0 |          380448 |         8 |     47556.0 |     45056.0 |     36672 |     72832 |     11934.0 | cudaMemset                                |
+|      0.0 |          335040 |         4 |     83760.0 |     81856.0 |     72992 |     98336 |     10664.5 | cuModuleLoadData                          |
+|      0.0 |          323552 |      1020 |       317.2 |       288.0 |        96 |      8416 |       493.2 | cuMemGetAllocationGranularity             |
+|      0.0 |          234144 |         4 |     58536.0 |     56064.0 |     53088 |     68928 |      7342.2 | cudaMemPoolCreate                         |
+|      0.0 |          231808 |        16 |     14488.0 |     13616.0 |      8288 |     21376 |      4462.8 | cudaStreamDestroy                         |
+|      0.0 |          205408 |         8 |     25676.0 |     21552.0 |     10080 |     63296 |     18656.7 | cudaMemcpy                                |
+|      0.0 |          197472 |       228 |       866.1 |       896.0 |       320 |      3136 |       500.6 | cudaEventDestroy                          |
+|      0.0 |          183584 |       900 |       204.0 |       128.0 |        64 |      1728 |       203.1 | cuTensorMapEncodeTiled                    |
+|      0.0 |          153664 |       292 |       526.2 |       416.0 |       128 |      5248 |       539.8 | cudaGetDriverEntryPointByVersion          |
+|      0.0 |          112128 |        20 |      5606.4 |      5392.0 |      1152 |     12768 |      3250.4 | cudaEventRecord                           |
+|      0.0 |           80544 |         2 |     40272.0 |     40272.0 |     20128 |     60416 |     28487.9 | cuMulticastCreate                         |
+|      0.0 |           56192 |       120 |       468.3 |       384.0 |       320 |      3712 |       463.2 | cudaOccupancyMaxActiveClusters            |
+|      0.0 |           49216 |         8 |      6152.0 |      5824.0 |      1504 |     11328 |      4409.7 | cudaFree                                  |
+|      0.0 |           41280 |        48 |       860.0 |       640.0 |        64 |      5088 |       968.7 | cudaGetDeviceProperties                   |
+|      0.0 |           39936 |        16 |      2496.0 |      2368.0 |      1792 |      3392 |       514.1 | cuInit                                    |
+|      0.0 |           21632 |         4 |      5408.0 |      5440.0 |      4608 |      6144 |       714.1 | cudaGetFuncBySymbol                       |
+|      0.0 |           21280 |        13 |      1636.9 |        96.0 |        64 |      4896 |      2060.2 | cuModuleGetLoadingMode                    |
+|      0.0 |           16000 |         8 |      2000.0 |      1888.0 |       288 |      3872 |      1696.6 | cudaStreamGetCaptureInfo                  |
+|      0.0 |           11904 |         4 |      2976.0 |      2832.0 |      2368 |      3872 |       658.4 | cudaProfilerStart                         |
+|      0.0 |           11616 |         4 |      2904.0 |      3040.0 |      2368 |      3168 |       366.1 | cudaOccupancyAvailableDynamicSMemPerBlock |
+|      0.0 |            8864 |         4 |      2216.0 |      2128.0 |      1728 |      2880 |       489.8 | cudaMemPoolSetAttribute                   |
+|      0.0 |            7680 |        12 |       640.0 |       656.0 |       416 |       896 |       153.2 | cuLibraryGetKernelCount                   |
+|      0.0 |            5696 |        12 |       474.7 |       384.0 |       288 |       800 |       193.8 | cuLibraryEnumerateKernels                 |
+|      0.0 |            1792 |         4 |       448.0 |       496.0 |       128 |       672 |       232.2 | cuMulticastGetGranularity                 |
++----------+-----------------+-----------+-------------+-------------+-----------+-----------+-------------+-------------------------------------------+
+
+
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/flashinfer_moe_ep_ws4_t8192_full.sqlite] with [nccl_sum]... 
+
+=== nsys stats: vllm (full) ===
+Generating SQLite file /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite from /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.nsys-rep
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_gpu_kern_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full_stats_cuda_gpu_kern_sum.csv]... PROCESSED
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_gpu_mem_time_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full_stats_cuda_gpu_mem_time_sum.csv]... PROCESSED
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_api_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full_stats_cuda_api_sum.csv]... PROCESSED
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/osrt_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full_stats_osrt_sum.csv]... PROCESSED
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/nvtx_sum.py] to [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full_stats_nvtx_sum.csv]... PROCESSED
+
+    CSV prefix: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full_stats
+
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/nvtx_sum.py]... 
+
+ ** NVTX Range Summary (nvtx_sum):
+
++----------+-----------------+-----------+---------------+---------------+-------------+-------------+-------------+----------+-----------------------+
+| Time (%) | Total Time (ns) | Instances |   Avg (ns)    |   Med (ns)    |  Min (ns)   |  Max (ns)   | StdDev (ns) |  Style   |         Range         |
++----------+-----------------+-----------+---------------+---------------+-------------+-------------+-------------+----------+-----------------------+
+|     77.1 |     54391202336 |         4 | 13597800584.0 | 13593021072.0 | 13541215136 | 13663945056 |  54024374.4 | PushPop  | :setup                |
+|      6.3 |      4452876064 |        12 |   371073005.3 |   367846912.0 |   353882208 |   392459168 |  13230485.7 | StartEnd | NCCL:API Group        |
+|      6.3 |      4452680672 |        12 |   371056722.7 |   367837744.0 |   353865760 |   392448480 |  13234792.1 | StartEnd | NCCL:GroupLaunch      |
+|      4.9 |      3491431584 |         4 |   872857896.0 |   875355344.0 |   850758432 |   889962464 |  16964102.0 | PushPop  | :warmup               |
+|      4.9 |      3489500416 |       100 |    34895004.2 |      289584.0 |      251488 |   882220512 | 170347144.7 | PushPop  | :forward              |
+|      0.3 |       235841696 |         4 |    58960424.0 |    49915168.0 |    49493568 |    86517792 |  18373175.5 | PushPop  | :steady_capture       |
+|      0.1 |        61104704 |        24 |     2546029.3 |        4768.0 |        1344 |    11321344 |   4392735.1 | StartEnd | NCCL:AllReduce        |
+|      0.0 |         9917920 |         4 |     2479480.0 |     2362672.0 |     2235680 |     2956896 |    324037.6 | PushPop  | cuBLAS:cublasLtCreate |
+|      0.0 |          258784 |        12 |       21565.3 |       21968.0 |       13600 |       29536 |      4332.2 | StartEnd | NCCL:GroupRuntime     |
+|      0.0 |           89952 |        40 |        2248.8 |        2288.0 |         960 |        3072 |       408.3 | StartEnd | NCCL:ncclCommFinalize |
++----------+-----------------+-----------+---------------+---------------+-------------+-------------+-------------+----------+-----------------------+
+
+
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
++----------+-----------------+-----------+-----------+-----------+----------+----------+-------------+------------------------------------------------------------------------------------------------------+
+| Time (%) | Total Time (ns) | Instances | Avg (ns)  | Med (ns)  | Min (ns) | Max (ns) | StdDev (ns) |                                                 Name                                                 |
++----------+-----------------+-----------+-----------+-----------+----------+----------+-------------+------------------------------------------------------------------------------------------------------+
+|     27.4 |       119939489 |       100 | 1199394.9 | 1192576.0 |  1185376 |  1299520 |     20116.9 | void deep_gemm::sm100_fp8_fp4_mega_moe_impl<(unsigned int)8448, (unsigned int)4096, (unsigned int)2… |
+|     14.0 |        61117312 |        12 | 5093109.3 | 4771824.0 |     8992 | 11325312 |   5121899.8 | ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)               |
+|      9.0 |        39437792 |       768 |   51351.3 |   50848.0 |    50400 |    53376 |      1012.2 | void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapp… |
+|      5.6 |        24379616 |      2304 |   10581.4 |   13792.0 |     2112 |    16384 |      5981.5 | void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator… |
+|      5.3 |        23266304 |       768 |   30294.7 |   29984.0 |    29344 |    32416 |       700.2 | void at::native::<unnamed>::searchsorted_cuda_kernel<float, long>(T2 *, const T1 *, const T1 *, con… |
+|      4.8 |        21008096 |       768 |   27354.3 |   27168.0 |    26560 |    29056 |       555.4 | void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl<at::native::… |
+|      3.4 |        14814496 |       772 |   19189.8 |   18752.0 |    18208 |    65536 |      3202.6 | void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat… |
+|      3.2 |        14080640 |       100 |  140806.4 |  140768.0 |   140160 |   142912 |       538.7 | _deepseek_v4_stage_mega_moe_inputs_kernel                                                            |
+|      3.0 |        12955104 |       768 |   16868.6 |   16768.0 |    16480 |    17536 |       257.8 | void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator… |
+|      2.6 |        11329248 |      1536 |    7375.8 |    7424.0 |     6912 |     8096 |       271.0 | void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::n… |
+|      2.2 |         9846080 |         4 | 2461520.0 | 2428992.0 |  2416896 |  2571200 |     73592.1 | void at::native::<unnamed>::CatArrayBatchedCopy<at::native::<unnamed>::OpaqueType<(unsigned int)1>,… |
+|      2.0 |         8714400 |       768 |   11346.9 |   11296.0 |    10976 |    12320 |       206.7 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<long, long, bool, … |
+|      1.5 |         6779520 |      1536 |    4413.8 |    4672.0 |     1760 |     7936 |      2552.3 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(a… |
+|      1.5 |         6484576 |      1536 |    4221.7 |    4240.0 |     1472 |     7456 |      2670.3 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::AbsFunctor<float>, std::array<ch… |
+|      1.5 |         6482400 |       768 |    8440.6 |    8416.0 |     8192 |     9312 |       152.7 | void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<float… |
+|      1.3 |         5841888 |       264 |   22128.4 |    8640.0 |     8192 |   600320 |     80575.8 | void at::native::<unnamed>::CatArrayBatchedCopy_vectorized<at::native::<unnamed>::OpaqueType<(unsig… |
+|      1.1 |         4645984 |       768 |    6049.5 |    6048.0 |     5888 |     6336 |        63.4 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<unsigned char, uns… |
+|      1.1 |         4605056 |       768 |    5996.2 |    5984.0 |     5824 |     6304 |        62.8 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<bool, bool, bool, … |
+|      1.0 |         4491552 |       768 |    5848.4 |    5824.0 |     5760 |     6208 |        68.6 | void at::native::vectorized_elementwise_kernel<(int)8, at::native::AbsFunctor<c10::BFloat16>, std::… |
+|      1.0 |         4440640 |       768 |    5782.1 |    5776.0 |     5600 |     6144 |        81.0 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<unsigned char, uns… |
+|      1.0 |         4252480 |       768 |    5537.1 |    5504.0 |     5472 |     6272 |        75.5 | void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std:… |
+|      0.8 |         3432128 |      2304 |    1489.6 |    1504.0 |     1280 |     1920 |       111.6 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<int, int, int, at:… |
+|      0.6 |         2803392 |      1536 |    1825.1 |    1952.0 |     1376 |     2464 |       312.7 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<int, int, int, at:… |
+|      0.6 |         2789568 |       768 |    3632.3 |    3648.0 |     3520 |     3936 |        73.9 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<signed char, signe… |
+|      0.6 |         2772416 |       768 |    3609.9 |    3584.0 |     3488 |     4000 |        69.6 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<signed char, signe… |
+|      0.6 |         2742560 |       768 |    3571.0 |    3552.0 |     3392 |     3840 |        77.2 | void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator… |
+|      0.6 |         2622592 |       776 |    3379.6 |    3040.0 |     2912 |    48192 |      3501.6 | void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator… |
+|      0.6 |         2544512 |         8 |  318064.0 |  317840.0 |   316640 |   320128 |      1211.1 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<signed char>, std::a… |
+|      0.3 |         1443872 |       768 |    1880.0 |    1856.0 |     1760 |     2144 |        59.1 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::reciprocal_kernel_cuda(at::Tenso… |
+|      0.3 |         1440096 |       776 |    1855.8 |    1568.0 |     1472 |    42016 |      3049.4 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<int, int, int, at:… |
+|      0.3 |         1371872 |       768 |    1786.3 |    1760.0 |     1696 |     2752 |        96.8 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<int>, std::array… |
+|      0.3 |         1227264 |       768 |    1598.0 |    1568.0 |     1504 |     1920 |        64.6 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(a… |
+|      0.3 |         1201184 |       768 |    1564.0 |    1536.0 |     1472 |     1920 |        73.8 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<float, float, floa… |
+|      0.3 |         1189408 |       768 |    1548.7 |    1536.0 |     1472 |     1792 |        62.7 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, floa… |
+|      0.1 |          537280 |        20 |   26864.0 |   34176.0 |    11488 |    36128 |     10241.5 | void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n… |
+|      0.1 |          333600 |         4 |   83400.0 |   82560.0 |    82080 |    86400 |      2018.9 | void at::native::sbtopk::gatherTopK<float, unsigned int, (int)2, (bool)0>(at::cuda::detail::TensorI… |
+|      0.0 |          202400 |         4 |   50600.0 |   50400.0 |    49952 |    51648 |       730.4 | void deep_gemm::transpose_and_pack_fp32_into_ue8m0<(unsigned int)512, (unsigned int)48, (unsigned i… |
+|      0.0 |          175168 |         4 |   43792.0 |   43296.0 |    42432 |    46144 |      1630.3 | void at::native::<unnamed>::CatArrayBatchedCopy<at::native::<unnamed>::OpaqueType<(unsigned int)4>,… |
+|      0.0 |          104320 |         4 |   26080.0 |   25760.0 |    25696 |    27104 |       683.8 | void deep_gemm::transpose_and_pack_fp32_into_ue8m0<(unsigned int)512, (unsigned int)48, (unsigned i… |
+|      0.0 |           29760 |         4 |    7440.0 |    7344.0 |     7264 |     7808 |       251.3 | void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat… |
+|      0.0 |           21248 |        12 |    1770.7 |    1920.0 |     1440 |     2208 |       276.7 | void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<c… |
++----------+-----------------+-----------+-----------+-----------+----------+----------+-------------+------------------------------------------------------------------------------------------------------+
+
+
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-sbsa-armv8/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
++----------+-----------------+-----------+------------+------------+----------+-----------+-------------+-------------------------------------------+
+| Time (%) | Total Time (ns) | Num Calls |  Avg (ns)  |  Med (ns)  | Min (ns) | Max (ns)  | StdDev (ns) |                   Name                    |
++----------+-----------------+-----------+------------+------------+----------+-----------+-------------+-------------------------------------------+
+|     25.2 |      2609075584 |      7656 |   340788.3 |   131104.0 |    43200 | 248824736 |   5668599.7 | cuMemSetAccess                            |
+|     21.0 |      2180647168 |        32 | 68145224.0 | 79006864.0 | 23043136 |  89136416 |  23275259.4 | cuMulticastBindMem                        |
+|     20.1 |      2080702720 |       800 |  2600878.4 |  2843568.0 |      736 |   6196896 |   1262339.0 | cuMemExportToShareableHandle              |
+|      5.2 |       540983232 |      7656 |    70661.3 |    52352.0 |    26304 |   1119264 |     61462.6 | cuMemUnmap                                |
+|      4.5 |       467914560 |       820 |   570627.5 |   345408.0 |    43616 |   2639008 |    441366.8 | cuMemImportFromShareableHandle            |
+|      4.2 |       437504704 |      7656 |    57145.3 |    25856.0 |     2208 |   2005344 |     71239.8 | cuMemMap                                  |
+|      4.1 |       429614080 |      6840 |    62809.1 |    46256.0 |    12032 |   1174848 |     59197.6 | cuMemCreate                               |
+|      2.9 |       296974624 |     15236 |    19491.6 |    11776.0 |       64 |   1135360 |     46508.5 | cuMemRelease                              |
+|      2.8 |       288978048 |     27988 |    10325.1 |     6368.0 |     3456 |   2355840 |     72414.2 | cudaLaunchKernel                          |
+|      1.7 |       178384608 |        68 |  2623303.1 |  2621840.0 |   272480 |   5231968 |   1348021.4 | cuLibraryLoadData                         |
+|      1.3 |       138744032 |       156 |   889384.8 |  1209760.0 |     4896 |   8394816 |   1017299.1 | cudaDeviceSynchronize                     |
+|      1.3 |       135642528 |       588 |   230684.6 |   212112.0 |    95616 |   2189056 |    124694.5 | cudaMalloc                                |
+|      1.2 |       125849536 |     21348 |     5895.1 |     2464.0 |     1344 |   4326400 |     55003.1 | cudaMemcpyAsync                           |
+|      1.1 |       112583136 |         4 | 28145784.0 | 19097504.0 | 18683744 |  55704384 |  18373973.2 | cudaProfilerStop                          |
+|      0.7 |        72550912 |      3312 |    21905.5 |     8592.0 |     2336 |  11242528 |    367962.5 | cudaStreamSynchronize                     |
+|      0.5 |        49609984 |      6040 |     8213.6 |     7104.0 |     4064 |     58112 |      3701.7 | cudaMemsetAsync                           |
+|      0.4 |        39262816 |       512 |    76685.2 |     4448.0 |     2368 |    643040 |    132998.5 | cudaStreamCreateWithPriority              |
+|      0.4 |        38045184 |      7656 |     4969.3 |     3904.0 |     1248 |    433728 |      9633.7 | cuMemAddressReserve                       |
+|      0.2 |        18487360 |      7616 |     2427.4 |     2240.0 |      768 |     36448 |      1359.1 | cuMemAddressFree                          |
+|      0.2 |        17587776 |     44272 |      397.3 |      288.0 |      128 |     24608 |       373.5 | cudaThreadExchangeStreamCaptureMode       |
+|      0.2 |        16717888 |        24 |   696578.7 |   242304.0 |   105184 |   1902336 |    636989.8 | cudaIpcOpenMemHandle                      |
+|      0.1 |        12183168 |        40 |   304579.2 |    50992.0 |    35680 |   2764544 |    776285.1 | cudaMemPoolCreate                         |
+|      0.1 |        11806016 |        96 |   122979.3 |    18256.0 |     4160 |   5077120 |    526449.2 | cudaStreamCreateWithFlags                 |
+|      0.1 |        10357952 |      7568 |     1368.7 |     1120.0 |      256 |     20544 |      1037.0 | cuMemRetainAllocationHandle               |
+|      0.1 |         8473472 |       220 |    38515.8 |    13312.0 |     8704 |   1373152 |    180102.0 | cuLaunchKernelEx                          |
+|      0.1 |         7557920 |       160 |    47237.0 |    20304.0 |     1952 |    249344 |     66734.5 | cudaHostAlloc                             |
+|      0.1 |         7377952 |        32 |   230561.0 |    37408.0 |    12000 |    818016 |    320175.1 | cuMulticastAddDevice                      |
+|      0.1 |         5927968 |     27988 |      211.8 |      192.0 |       64 |     11008 |       148.2 | cuKernelGetName                           |
+|      0.1 |         5665248 |       160 |    35407.8 |    18080.0 |     7424 |    172896 |     44061.9 | cudaFreeHost                              |
+|      0.0 |         4130432 |      2552 |     1618.5 |     1344.0 |      480 |     15456 |       902.5 | cudaStreamWaitEvent                       |
+|      0.0 |         4102144 |        40 |   102553.6 |    38624.0 |    26944 |    901888 |    198895.1 | cudaMemPoolDestroy                        |
+|      0.0 |         2174624 |      3164 |      687.3 |      672.0 |      128 |      6208 |       464.8 | cudaStreamIsCapturing                     |
+|      0.0 |         1984096 |      7620 |      260.4 |      192.0 |       64 |      9120 |       282.9 | cuMemGetAllocationGranularity             |
+|      0.0 |         1813824 |        96 |    18894.0 |    18576.0 |     8256 |     53920 |      8580.6 | cudaStreamDestroy                         |
+|      0.0 |         1802656 |        32 |    56333.0 |    47152.0 |    35264 |    111776 |     20276.4 | cuMulticastUnbind                         |
+|      0.0 |         1650496 |        12 |   137541.3 |   111200.0 |    55904 |    250784 |     79396.3 | cuKernelGetFunction                       |
+|      0.0 |         1376736 |        12 |   114728.0 |    28288.0 |    20256 |    315712 |    131877.2 | cuLibraryUnload                           |
+|      0.0 |         1291296 |        60 |    21521.6 |     2064.0 |     1088 |    201856 |     50179.2 | cudaFree                                  |
+|      0.0 |         1230784 |        32 |    38462.0 |    36176.0 |    20832 |     76160 |     10769.5 | cudaMemset                                |
+|      0.0 |          961568 |       208 |     4622.9 |     4320.0 |     1440 |     13888 |      1656.0 | cudaEventRecordWithFlags                  |
+|      0.0 |          909248 |      3596 |      252.8 |      128.0 |       32 |     11904 |       343.9 | cuGetProcAddress_v2                       |
+|      0.0 |          794048 |        12 |    66170.7 |    65568.0 |    56224 |     86016 |      9666.0 | cuLibraryLoadFromFile                     |
+|      0.0 |          707488 |       376 |     1881.6 |     1568.0 |      288 |      7936 |      1308.0 | cudaEventCreateWithFlags                  |
+|      0.0 |          666016 |       212 |     3141.6 |     2960.0 |     1792 |     19456 |      1992.1 | cudaEventQuery                            |
+|      0.0 |          459232 |        20 |    22961.6 |    25424.0 |     7904 |     45056 |     12164.6 | cudaMemcpy                                |
+|      0.0 |          399232 |        64 |     6238.0 |     6896.0 |     1024 |     12544 |      2876.8 | cudaEventRecord                           |
+|      0.0 |          386656 |       372 |     1039.4 |      960.0 |      320 |      4320 |       608.2 | cudaEventDestroy                          |
+|      0.0 |          341696 |       144 |     2372.9 |     1872.0 |      544 |     14112 |      1877.4 | cuLibraryGetKernel                        |
+|      0.0 |          336832 |         4 |    84208.0 |    78000.0 |    74688 |    106144 |     14803.3 | cuModuleLoadData                          |
+|      0.0 |          227328 |         8 |    28416.0 |    20912.0 |    14432 |     60768 |     16828.6 | cuMulticastCreate                         |
+|      0.0 |          196032 |       900 |      217.8 |      160.0 |       64 |      1792 |       220.0 | cuTensorMapEncodeTiled                    |
+|      0.0 |          144448 |       292 |      494.7 |      400.0 |      128 |      2656 |       374.1 | cudaGetDriverEntryPointByVersion          |
+|      0.0 |          136928 |       120 |     1141.1 |      912.0 |      128 |      4704 |       780.0 | cudaGetDeviceProperties                   |
+|      0.0 |           77344 |        40 |     1933.6 |     1792.0 |      864 |      3424 |       577.5 | cudaMemPoolSetAttribute                   |
+|      0.0 |           73440 |        12 |     6120.0 |     6256.0 |     4992 |      7488 |       845.6 | cudaGetFuncBySymbol                       |
+|      0.0 |           58560 |       120 |      488.0 |      384.0 |      320 |      4032 |       534.6 | cudaOccupancyMaxActiveClusters            |
+|      0.0 |           42816 |        24 |     1784.0 |     1344.0 |      448 |      5312 |      1348.8 | cudaStreamGetCaptureInfo                  |
+|      0.0 |           29824 |        12 |     2485.3 |     2304.0 |     1856 |      3360 |       508.0 | cuInit                                    |
+|      0.0 |           26784 |        13 |     2060.3 |      192.0 |       64 |      5984 |      2570.3 | cuModuleGetLoadingMode                    |
+|      0.0 |           13600 |        24 |      566.7 |      560.0 |      128 |      1120 |       264.1 | cuMulticastGetGranularity                 |
+|      0.0 |           12224 |         4 |     3056.0 |     2928.0 |     2720 |      3648 |       406.9 | cudaOccupancyAvailableDynamicSMemPerBlock |
+|      0.0 |           11936 |         4 |     2984.0 |     2864.0 |     2464 |      3744 |       559.4 | cudaProfilerStart                         |
+|      0.0 |            7840 |        12 |      653.3 |      640.0 |      352 |      1088 |       198.9 | cuLibraryGetKernelCount                   |
+|      0.0 |            5120 |        12 |      426.7 |      384.0 |      192 |       800 |       194.6 | cuLibraryEnumerateKernels                 |
++----------+-----------------+-----------+------------+------------+----------+-----------+-------------+-------------------------------------------+
+
+
+
+NOTICE: Existing SQLite export found: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite
+        It is assumed file was previously exported from: /lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [/lustre/fsw/coreai_libraries_cudnn/mhoqueanik/profiles/vllm_moe_ep_ws4_t8192_full.sqlite] with [nccl_sum]... 
+
