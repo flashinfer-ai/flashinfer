@@ -52,11 +52,19 @@ from flashinfer.cute_dsl.utils import get_num_sm
 
 
 def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
-    # explicit stride_order: auto-deduction is ambiguous at B=1/T=1.
-    stride_order = tuple(sorted(range(torch_t.dim()), key=lambda d: -torch_t.stride(d)))
+    # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
     return from_dlpack(
         torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
-    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order)
+    ).mark_layout_dynamic()
+
+
+def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # Only the leading (mode 0) dim dynamic; inner dims stay static so launchers
+    # can derive constexpr tile counts (num_v_tiles) from the pool/cache shape.
+    stride_order = tuple(range(torch_t.dim()))
+    return from_dlpack(
+        torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
+    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
 
 
 # ==============================================================================
@@ -1764,13 +1772,13 @@ def gated_delta_rule_mtp_wide_vec(
 
     if cache_key not in _compiled_kernels_wide_vec:
         if contiguous_pool:
-            h_ = _mark_batch_dynamic(h0_source)
+            h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
             # Dummy [1,1,1] tensor (caching off) has no unique stride-1 dim.
-            inter_ = _mark_batch_dynamic(intermediate_states)
+            inter_ = _mark_slot_dynamic(intermediate_states)
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
@@ -2023,12 +2031,12 @@ def gated_delta_rule_mtp(
 
     if cache_key not in _compiled_kernels_mtp:
         if contiguous_pool:
-            h_ = _mark_batch_dynamic(h0_source)
+            h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
-            inter_ = _mark_batch_dynamic(intermediate_states)
+            inter_ = _mark_slot_dynamic(intermediate_states)
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
