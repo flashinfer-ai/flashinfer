@@ -1316,6 +1316,21 @@ def _time_kernel_eager(
     return _compute_stats(latencies_us)
 
 
+def finalize_cupti() -> None:
+    """Detach CUPTI from the process — call ONCE, after the whole sweep.
+
+    cuptiFinalize() is once-per-process teardown; _time_kernel_cupti deliberately does
+    NOT call it per timing (per-call finalize cycled attach/detach into an illegal memory
+    access after ~40 calls).  Safe to call even when CUPTI was never used / not installed.
+    """
+    try:
+        from cupti import cupti
+
+        cupti.finalize()
+    except Exception:
+        pass
+
+
 def _time_kernel_cupti(
     args,
     run_fn,
@@ -1401,7 +1416,11 @@ def _time_kernel_cupti(
     cupti.activity_disable(cupti.ActivityKind.DRIVER)
     cupti.activity_disable(cupti.ActivityKind.MEMCPY)
     cupti.activity_disable(cupti.ActivityKind.MEMSET)
-    cupti.finalize()
+    # NOTE: no cupti.finalize() here.  cuptiFinalize() is once-per-process teardown, and
+    # this runs per (kernel, batch); finalizing per call cycled attach/detach into a
+    # cudaErrorIllegalAddress after ~40 calls (a 5-kernel x 9-batch sweep died at the 43rd).
+    # activity_flush_all(0) above already drained the data — the driver calls
+    # finalize_cupti() ONCE after the whole sweep instead.
 
     # Build correlation_id → kernel list mapping
     corr_to_kernels: dict[int, list[tuple[int, int, int]]] = {}
@@ -2141,6 +2160,9 @@ if __name__ == "__main__":
 
     try:
         _run_benchmark(_args)
+        # Finalize CUPTI ONCE, after the whole sweep — never per timing call.
+        if _args.cupti:
+            finalize_cupti()
     finally:
         if _tee is not None:
             sys.stdout = _tee._stdout

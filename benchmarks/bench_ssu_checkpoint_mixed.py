@@ -506,6 +506,11 @@ def run_in_process_bench(
         "window": window,
         "K": K,
     }
+    # Finalize CUPTI ONCE, after the whole sweep — never per timing call (cuptiFinalize
+    # is once-per-process; finalizing per call corrupted CUPTI into an illegal memory
+    # access after ~40 calls).  No-op when --no-cupti / cupti not installed.
+    if cupti:
+        bench_ssu.finalize_cupti()
     return rows, meta
 
 
