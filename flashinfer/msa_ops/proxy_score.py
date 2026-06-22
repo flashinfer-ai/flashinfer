@@ -446,37 +446,18 @@ def msa_proxy_score(
     return output
 
 
-def quantize_bf16_qk_to_nvfp4(
+def _quantize_qk_to_nvfp4(
     x: torch.Tensor,
     global_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
-    """Quantize a proxy Q or K tensor to NVFP4 for :func:`msa_proxy_score_fp4`.
+    """Reshape + :func:`nvfp4_quantize` glue for tests / benchmarks / trace.
 
-    Helper for tests / benchmarks / standalone callers; a real deployment
-    quantizes the index Q/K once upstream and stores them packed. Produces the
-    cuBLAS **128x4 tiled** scale-factor layout shared by the MSA stack
-    (``msa_proxy_score_fp4`` / ``msa_sparse_attention`` / decode), so one NVFP4 cache feeds all.
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        ``(total, num_heads, 128)`` bf16/fp16 proxy Q or K.
-    global_scale : float, optional
-        Per-tensor NVFP4 global scale (the multiplier applied to ``x`` before
-        e2m1 rounding). Defaults to ``448 * 6 / amax(x)``, the standard choice
-        that maps the tensor's max magnitude to the e4m3*e2m1 range.
-
-    Returns
-    -------
-    x_fp4 : torch.Tensor
-        ``(total, num_heads, 64)`` uint8, two packed e2m1 nibbles per byte.
-    x_scale : torch.Tensor
-        Flat uint8 e4m3 block scales (one per 16 elements) in the cuBLAS 128x4
-        tiled layout, indexed by logical row ``token*num_heads + head``.
-    inv_global_scale : float
-        ``1 / global_scale``; pass as ``q_global_scale`` / ``k_global_scale`` to
-        :func:`msa_proxy_score_fp4` (the kernel multiplies the dequantized
-        logits by ``q_global_scale * k_global_scale``).
+    Quantizes a ``(total, num_heads, 128)`` bf16/fp16 proxy Q or K to packed
+    NVFP4 in the 128x4 tiled scale layout the MSA fp4 kernels expect. Returns
+    ``(x_fp4 (total, num_heads, 64) uint8, flat e4m3 block scales,
+    1 / global_scale)``. ``global_scale`` defaults to ``448 * 6 / amax(x)``.
+    Deployment quantizes the index Q/K once upstream; this is only for callers
+    that start from bf16.
     """
     from flashinfer import nvfp4_quantize
 
@@ -545,11 +526,10 @@ def msa_proxy_score_fp4(
     q_scale, k_scale : torch.Tensor
         Flat uint8 e4m3 block scales in the cuBLAS 128x4 tiled layout, indexed by
         logical row ``token*num_heads + head`` (paged K: ``(page*num_kv_heads +
-        kv_head)*128 + token_in_page``). Produced by
-        :func:`quantize_bf16_qk_to_nvfp4`; shared with the attention + decode kernels.
+        kv_head)*128 + token_in_page``). Produced by :func:`nvfp4_quantize`
+        (128x4 layout, ``sf_vec_size=16``); shared with the attention + decode kernels.
     q_global_scale, k_global_scale : float
-        Per-tensor inverse global scales (``1 / global_scale``) from
-        :func:`quantize_bf16_qk_to_nvfp4`.
+        Per-tensor inverse global scales (``1 / global_scale``).
     cu_seqlens_q, cu_seqlens_k, causal, max_seqlen_q, max_k_tiles, output,
     reduce_heads, q_offset
         As in :func:`msa_proxy_score`.

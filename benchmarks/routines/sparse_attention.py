@@ -247,10 +247,11 @@ def testMSAProxyScore(args):
     cu_q, cu_k = _cu_seqlens(bs, s_qo, device), _cu_seqlens(bs, s_kv, device)
 
     if is_fp4:
-        from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
+        from flashinfer.msa_ops import msa_proxy_score_fp4
+        from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
-        q_fp4, q_sc, q_g = quantize_bf16_qk_to_nvfp4(q)
-        k_fp4, k_sc, k_g = quantize_bf16_qk_to_nvfp4(k)
+        q_fp4, q_sc, q_g = _quantize_qk_to_nvfp4(q)
+        k_fp4, k_sc, k_g = _quantize_qk_to_nvfp4(k)
 
     def run(_b=None):
         if is_fp4:

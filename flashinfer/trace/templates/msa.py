@@ -331,19 +331,19 @@ def _msa_proxy_score_fp4_init(
 ):
     """Build inputs for ``flashinfer.msa_ops.msa_proxy_score_fp4``.
 
-    Quantizes random bf16 Q/K to NVFP4 via ``quantize_bf16_qk_to_nvfp4``
-    (requires CUDA). Sourced from ``tests/msa_ops/test_proxy_fp4.py``.
+    Quantizes random bf16 Q/K to NVFP4 (requires CUDA). Sourced from
+    ``tests/msa_ops/test_proxy_fp4.py``.
     """
     del len_indptr, max_k_tiles, q_sf_numel, k_sf_numel, head_dim_half
-    from flashinfer.msa_ops import quantize_bf16_qk_to_nvfp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
     torch.manual_seed(seed)
     cu_q = _msa_varlen_cu_seqlens(total_q, batch_size, device)
     cu_k = _msa_varlen_cu_seqlens(total_k, batch_size, device)
     q = torch.randn(total_q, num_qo_heads, 128, dtype=torch.bfloat16, device=device) * 2
     k = torch.randn(total_k, num_kv_heads, 128, dtype=torch.bfloat16, device=device) * 2
-    q_fp4, q_scale, inv_q = quantize_bf16_qk_to_nvfp4(q)
-    k_fp4, k_scale, inv_k = quantize_bf16_qk_to_nvfp4(k)
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
+    k_fp4, k_scale, inv_k = _quantize_qk_to_nvfp4(k)
     return {
         "q_fp4": q_fp4,
         "k_fp4": k_fp4,

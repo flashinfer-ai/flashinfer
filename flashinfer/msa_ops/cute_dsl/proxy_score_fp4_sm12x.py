@@ -1005,7 +1005,7 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
     ):
         """Fill the SF smem for the packed Q tile. SF logical row =
         ``(q_start + token) * num_qo_heads + head`` (the flat token*heads+head row
-        order ``quantize_bf16_qk_to_nvfp4`` produces)."""
+        order ``nvfp4_quantize`` produces from a ``(total, heads, d)`` reshape)."""
         total = self._M * self._sf_per_row
         for it in cutlass.range_constexpr(total // self._num_threads):
             e = tidx + it * self._num_threads

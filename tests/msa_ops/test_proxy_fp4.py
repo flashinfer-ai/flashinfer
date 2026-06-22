@@ -107,7 +107,8 @@ def _dequant_qk(q_fp4, q_scale, inv_q, k_fp4, k_scale, inv_k):
 @pytest.mark.parametrize("causal", [True, False])
 def test_proxy_fp4_correctness(Hq, Hkv, causal):
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
+    from flashinfer.msa_ops import msa_proxy_score_fp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
     torch.manual_seed(11)
     dev = "cuda"
@@ -118,8 +119,8 @@ def test_proxy_fp4_correctness(Hq, Hkv, causal):
 
     q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev) * 2
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
-    q_fp4, q_scale, inv_q = quantize_bf16_qk_to_nvfp4(q)
-    k_fp4, k_scale, inv_k = quantize_bf16_qk_to_nvfp4(k)
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
+    k_fp4, k_scale, inv_k = _quantize_qk_to_nvfp4(k)
 
     out = msa_proxy_score_fp4(
         q_fp4, k_fp4, q_scale, k_scale, inv_q, inv_k, cu_q, cu_k, causal=causal
@@ -147,8 +148,8 @@ def test_proxy_fp4_selection_overlap_vs_bf16():
         msa_proxy_score,
         msa_proxy_score_fp4,
         msa_topk_select,
-        quantize_bf16_qk_to_nvfp4,
     )
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
     torch.manual_seed(22)
     dev = "cuda"
@@ -161,8 +162,8 @@ def test_proxy_fp4_selection_overlap_vs_bf16():
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 2
 
     bf16_score = msa_proxy_score(q, k, cu_q, cu_k, causal=True)
-    q_fp4, q_scale, inv_q = quantize_bf16_qk_to_nvfp4(q)
-    k_fp4, k_scale, inv_k = quantize_bf16_qk_to_nvfp4(k)
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
+    k_fp4, k_scale, inv_k = _quantize_qk_to_nvfp4(k)
     fp4_score = msa_proxy_score_fp4(
         q_fp4, k_fp4, q_scale, k_scale, inv_q, inv_k, cu_q, cu_k, causal=True
     )
@@ -193,7 +194,8 @@ def test_proxy_fp4_paged():
     # oracle (group_size 4 -> the general, non-packed fp4-MMA schedule).
     _skip_if_unsupported()
     from flashinfer import nvfp4_quantize
-    from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
+    from flashinfer.msa_ops import msa_proxy_score_fp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
     torch.manual_seed(44)
     dev = "cuda"
@@ -206,7 +208,7 @@ def test_proxy_fp4_paged():
 
     q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev) * 2
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
-    q_fp4, q_scale, inv_q = quantize_bf16_qk_to_nvfp4(q)
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
 
     # scatter logical K into shuffled pages, then quantize page-major so the SF
     # lands in the (page*Hkv+head)*128+token row order the paged kernel reads.
@@ -273,7 +275,8 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
     kernel (MsaProxyScoreFp4MmaDecodePackedSm12x). Validated against the torch
     fp4-dequant reference per batch."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
+    from flashinfer.msa_ops import msa_proxy_score_fp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
     torch.manual_seed(55 + B)
     dev = "cuda"
@@ -288,8 +291,8 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
 
     q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) * 2
     k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
-    q_fp4, q_scale, inv_q = quantize_bf16_qk_to_nvfp4(q)
-    k_fp4, k_scale, inv_k = quantize_bf16_qk_to_nvfp4(k)
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
+    k_fp4, k_scale, inv_k = _quantize_qk_to_nvfp4(k)
 
     out = msa_proxy_score_fp4(
         q_fp4,
@@ -330,7 +333,8 @@ def test_proxy_fp4_paged_packed():
     dequant oracle."""
     _skip_if_unsupported()
     from flashinfer import nvfp4_quantize
-    from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
+    from flashinfer.msa_ops import msa_proxy_score_fp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
     torch.manual_seed(66)
     dev = "cuda"
@@ -343,7 +347,7 @@ def test_proxy_fp4_paged_packed():
 
     q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev) * 2
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
-    q_fp4, q_scale, inv_q = quantize_bf16_qk_to_nvfp4(q)
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
 
     # scatter logical K into shuffled pages, quantize page-major (same SF row order
     # the paged kernel reads): (page*Hkv + head)*128 + token_in_page.
@@ -428,7 +432,8 @@ def test_proxy_fp4_split_k_decode(Hq, Hkv):
     the kv-block range across CTAs. Covers the general fp4-MMA schedule (Hq=4/Hkv=1)
     and the 16-head packed decoder (Hq=32/Hkv=2) against the torch ref."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
+    from flashinfer.msa_ops import msa_proxy_score_fp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
     from flashinfer.msa_ops.proxy_score import _proxy_split_k_fp4
 
     torch.manual_seed(88 + Hq)
@@ -448,8 +453,8 @@ def test_proxy_fp4_split_k_decode(Hq, Hkv):
 
     q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev) * 2
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
-    q_fp4, q_scale, inv_q = quantize_bf16_qk_to_nvfp4(q)
-    k_fp4, k_scale, inv_k = quantize_bf16_qk_to_nvfp4(k)
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
+    k_fp4, k_scale, inv_k = _quantize_qk_to_nvfp4(k)
 
     out = msa_proxy_score_fp4(
         q_fp4,
@@ -478,7 +483,8 @@ def test_proxy_fp4_split_k_decode(Hq, Hkv):
 
 def test_proxy_fp4_reduce_heads():
     _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_proxy_score_fp4, quantize_bf16_qk_to_nvfp4
+    from flashinfer.msa_ops import msa_proxy_score_fp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
     torch.manual_seed(33)
     dev = "cuda"
@@ -489,8 +495,8 @@ def test_proxy_fp4_reduce_heads():
 
     q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev)
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev)
-    q_fp4, q_scale, inv_q = quantize_bf16_qk_to_nvfp4(q)
-    k_fp4, k_scale, inv_k = quantize_bf16_qk_to_nvfp4(k)
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
+    k_fp4, k_scale, inv_k = _quantize_qk_to_nvfp4(k)
 
     per_head = msa_proxy_score_fp4(
         q_fp4, k_fp4, q_scale, k_scale, inv_q, inv_k, cu_q, cu_k, causal=True

@@ -1192,8 +1192,10 @@ with contextlib.suppress(Exception):
         _msa.msa_proxy_score(_idx_q, _idx_k, _idx_cu_q, _idx_cu_k, causal=True)
 
     with contextlib.suppress(Exception):
-        _q_fp4, _q_sf, _inv_q = _msa.quantize_bf16_qk_to_nvfp4(_idx_q)
-        _k_fp4, _k_sf, _inv_k = _msa.quantize_bf16_qk_to_nvfp4(_idx_k)
+        from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
+
+        _q_fp4, _q_sf, _inv_q = _quantize_qk_to_nvfp4(_idx_q)
+        _k_fp4, _k_sf, _inv_k = _quantize_qk_to_nvfp4(_idx_k)
         _msa.msa_proxy_score_fp4(
             _q_fp4,
             _k_fp4,

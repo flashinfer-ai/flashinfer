@@ -7,7 +7,6 @@ Supports SM120 and SM121 (Blackwell) GPUs.
 from .proxy_score import (
     msa_proxy_score,
     msa_proxy_score_fp4,
-    quantize_bf16_qk_to_nvfp4,
 )
 from .sparse_attention import msa_sparse_attention
 from .sparse_decode import msa_sparse_decode_attention
@@ -25,5 +24,4 @@ __all__ = [
     "msa_sparse_attention",
     "msa_sparse_decode_attention",
     "msa_topk_select",
-    "quantize_bf16_qk_to_nvfp4",
 ]
