@@ -435,10 +435,29 @@ def testMSASparseDecode(args):
             use_cuda_graph=False,
             input_args=(b,),
         )
+        median = float(np.median(times))  # milliseconds
         flops = 4 * total_q * args.topk * BLK_KV * Hq * 128
-        tflops = flops / (1e9 * float(np.median(times)))
+        tflops = flops / (1e9 * median)
+        # Sparse decode is memory-bound: each query token reads its top-k K and V
+        # blocks, one kv_head wide. bf16 2 B/elem, fp8 1 B, NVFP4 0.5625 B.
+        if args.kv_dtype == "nvfp4":
+            b_per_elem = 0.5625
+        elif kv_dtype == torch.float8_e4m3fn:
+            b_per_elem = 1.0
+        else:
+            b_per_elem = 2.0
+        kv_read_bytes = 2 * total_q * Hkv * args.topk * BLK_KV * 128 * b_per_elem
+        tb_per_sec = kv_read_bytes / (1e9 * median)
         res.append(
-            _record(args, b, times, tflops=tflops, total_q=total_q, total_kv=total_kv)
+            _record(
+                args,
+                b,
+                times,
+                tflops=tflops,
+                tb_per_sec=tb_per_sec,
+                total_q=total_q,
+                total_kv=total_kv,
+            )
         )
     return res
 
