@@ -3,11 +3,14 @@
 Package layout::
 
     moe_ep_v2/
-      split/     dispatch/combine transport (NCCL-EP, NIXL-EP) + inner kernels
-      mega/      fused DeepGEMM mega-MoE (symmetric memory)
-
-Native transport libraries are reused from :mod:`flashinfer.moe_ep` until
-v2 ships its own staged ``_libs/`` trees under ``split/``.
+      core/                 shared comm + kernel abstractions and validation
+      backends/
+        split/
+          comm/             NCCL-EP, NIXL-EP transport
+          kernel/           post-dispatch inner kernels
+        mega/
+          kernel/           fused comm + local MoE kernels
+      modes/                split and mega orchestration layers
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .errors import MoEEpNotBuiltError
 from .algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobNumChannelsPerRank,
@@ -27,6 +31,10 @@ from .algo_knobs import (
     HandleAlgoKnobTopKWeights,
     HandleAlgoKnobUserStream,
 )
+from .backends.mega.kernel.deep_gemm_mega import (
+    DeepGemmMegaMoeConfig,
+    preprocess_mega_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -38,7 +46,9 @@ from .config import (
     HandleParams,
     QuantType,
 )
-from ._validators import (
+from .core.comm.fleet import Fleet, create_fleet
+from .core.comm.handle import Handle
+from .core.validation import (
     MoEEpArchError,
     MoEEpConfigError,
     validate_arch_for_backend,
@@ -49,24 +59,20 @@ from ._validators import (
     validate_mega_forward_inputs,
     validate_split_forward_inputs,
 )
-from .fleet import Fleet, create_fleet
-from .handle import Handle
 from .layer import MoEEpLayer
-from .mega import (
-    DeepGemmMegaMoeConfig,
-    MegaConfig,
-    MoEEpMegaLayer,
-    preprocess_mega_weights,
-)
-from .split import (
+from .modes import (
     FusedMoeKernelConfig,
     IdentityConfig,
+    MegaConfig,
+    MoEEpMegaLayer,
     MoEEpSplitLayer,
     NCCLEPConfig,
     NcclEpConfig,
     NvepConfig,
     SplitConfig,
     SplitKernelContext,
+    kernel_requires_weights,
+    run_split_kernel,
 )
 from .tensors import MoEEpTensors
 from .weights import MoEWeightPack
@@ -76,6 +82,7 @@ __all__ = [
     "BootstrapConfig",
     "CombineInputParams",
     "CombineOutput",
+    "DeepGemmMegaMoeConfig",
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",
@@ -86,18 +93,17 @@ __all__ = [
     "FleetAlgoKnobRdmaBufferSize",
     "FleetAlgoKnobTopologyCapacity",
     "FleetParams",
+    "FusedMoeKernelConfig",
     "Handle",
     "HandleAlgoKnobNumReceivedTokens",
     "HandleAlgoKnobSplitOperation",
     "HandleAlgoKnobTopKWeights",
     "HandleAlgoKnobUserStream",
     "HandleParams",
-    "MoEEpArchError",
-    "MoEEpConfigError",
-    "DeepGemmMegaMoeConfig",
-    "FusedMoeKernelConfig",
     "IdentityConfig",
     "MegaConfig",
+    "MoEEpArchError",
+    "MoEEpConfigError",
     "MoEEpLayer",
     "MoEEpMegaLayer",
     "MoEEpNotBuiltError",
@@ -107,16 +113,23 @@ __all__ = [
     "NCCLEPConfig",
     "NcclEpConfig",
     "NvepConfig",
+    "QuantType",
     "SplitConfig",
     "SplitKernelContext",
-    "preprocess_mega_weights",
-    "QuantType",
     "available_backends",
     "create_fleet",
     "have_nccl_ep",
     "have_nixl_ep",
+    "kernel_requires_weights",
+    "preprocess_mega_weights",
+    "run_split_kernel",
+    "validate_arch_for_backend",
+    "validate_bootstrap_world_size",
+    "validate_fleet_params",
     "validate_mega_arch",
+    "validate_mega_fleet_params",
     "validate_mega_forward_inputs",
+    "validate_split_forward_inputs",
 ]
 
 
@@ -131,54 +144,51 @@ _REBUILD_HINT = (
 
 def _nccl_libs_dir() -> Path:
     for root in (_pkg_dir, _moe_ep_libs_dir):
-        staged = root / "split" / "nccl_ep" / "_libs"
+        staged = root / "backends" / "split" / "comm" / "nccl_ep" / "_libs"
         if (staged / "libnccl_ep.so").exists():
             return staged
+        legacy = root / "split" / "nccl_ep" / "_libs"
+        if (legacy / "libnccl_ep.so").exists():
+            return legacy
         legacy = root / "nccl_ep" / "_libs"
         if (legacy / "libnccl_ep.so").exists():
             return legacy
-    return _pkg_dir / "split" / "nccl_ep" / "_libs"
+    return _pkg_dir / "backends" / "split" / "comm" / "nccl_ep" / "_libs"
 
 
 def _nixl_libs_dir() -> Path:
     for root in (_pkg_dir, _moe_ep_libs_dir):
-        staged = root / "split" / "nixl_ep" / "_libs"
+        staged = root / "backends" / "split" / "comm" / "nixl_ep" / "_libs"
         if staged.is_dir() and any(staged.glob("nixl_ep_cpp*.so")):
             return staged
+        legacy = root / "split" / "nixl_ep" / "_libs"
+        if legacy.is_dir() and any(legacy.glob("nixl_ep_cpp*.so")):
+            return legacy
         legacy = root / "nixl_ep" / "_libs"
         if legacy.is_dir() and any(legacy.glob("nixl_ep_cpp*.so")):
             return legacy
-    return _pkg_dir / "split" / "nixl_ep" / "_libs"
-
-
-class MoEEpNotBuiltError(RuntimeError):
-    """Raised when an EP backend is invoked but its native libs are missing."""
+    return _pkg_dir / "backends" / "split" / "comm" / "nixl_ep" / "_libs"
 
 
 def _probe_nccl_ep() -> bool:
-    """True if the NCCL-EP plugin .so was staged by the build."""
     libs = _nccl_libs_dir()
     return (libs / "libnccl_ep.so").exists()
 
 
 def _probe_nixl_ep() -> bool:
-    """True if the NIXL-EP plugin .so was staged by the build."""
     libs = _nixl_libs_dir()
     return libs.is_dir() and any(libs.glob("nixl_ep_cpp*.so"))
 
 
 def have_nccl_ep() -> bool:
-    """Return True if the NCCL-EP backend native libs are present."""
     return _probe_nccl_ep()
 
 
 def have_nixl_ep() -> bool:
-    """Return True if the NIXL-EP backend native libs are present."""
     return _probe_nixl_ep()
 
 
 def available_backends() -> list[str]:
-    """Names of EP backends with both native libs and python wrappers present."""
     out: list[str] = []
     if have_nccl_ep():
         out.append("nccl_ep")
@@ -188,7 +198,6 @@ def available_backends() -> list[str]:
 
 
 def _require_built(backend: str) -> None:
-    """Raise MoEEpNotBuiltError if `backend` is missing its native libs."""
     probe = {"nccl_ep": _probe_nccl_ep, "nixl_ep": _probe_nixl_ep}.get(backend)
     if probe is None:
         raise ValueError(
@@ -218,5 +227,6 @@ if _set_build_flags and not available_backends():
         stacklevel=2,
     )
 
-from .split.nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
-from .split.nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
+from . import backends as _backends  # noqa: E402,F401
+from .backends.split.comm.nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
+from .backends.split.comm.nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401

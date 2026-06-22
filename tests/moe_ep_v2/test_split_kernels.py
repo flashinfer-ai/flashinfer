@@ -13,15 +13,13 @@ import pytest
 
 class TestKernelRequiresWeights:
     def test_identity_does_not_require_weights(self) -> None:
-        from flashinfer.moe_ep_v2 import IdentityConfig
-        from flashinfer.moe_ep_v2.split.kernels import kernel_requires_weights
+        from flashinfer.moe_ep_v2 import IdentityConfig, kernel_requires_weights
 
         assert kernel_requires_weights(IdentityConfig()) is False
         assert kernel_requires_weights(IdentityConfig(kernel_name="identity")) is False
 
     def test_fused_moe_requires_weights(self) -> None:
-        from flashinfer.moe_ep_v2 import FusedMoeKernelConfig
-        from flashinfer.moe_ep_v2.split.kernels import kernel_requires_weights
+        from flashinfer.moe_ep_v2 import FusedMoeKernelConfig, kernel_requires_weights
 
         assert kernel_requires_weights(FusedMoeKernelConfig()) is True
 
@@ -30,8 +28,7 @@ class TestIdentitySplitKernel:
     def test_passes_expert_tensors_through_unchanged(self) -> None:
         import torch
 
-        from flashinfer.moe_ep_v2 import FleetParams, IdentityConfig
-        from flashinfer.moe_ep_v2.split.kernels import SplitKernelContext, run_split_kernel
+        from flashinfer.moe_ep_v2 import FleetParams, IdentityConfig, SplitKernelContext, run_split_kernel
 
         expert = torch.randn(8, 128)
         ctx = SplitKernelContext(
@@ -46,19 +43,26 @@ class TestIdentitySplitKernel:
 
     def test_resolve_returns_identity_kernel(self) -> None:
         from flashinfer.moe_ep_v2 import IdentityConfig
-        from flashinfer.moe_ep_v2.split.kernels import resolve_split_kernel
-        from flashinfer.moe_ep_v2.split.kernels.identity import IdentitySplitKernel
+        from flashinfer.moe_ep_v2.backends.split.kernel.identity.backend import (
+            IdentitySplitKernelBackend,
+        )
+        from flashinfer.moe_ep_v2.core.kernel.registry import resolve_split_kernel
 
         kernel = resolve_split_kernel(IdentityConfig())
-        assert isinstance(kernel, IdentitySplitKernel)
+        assert isinstance(kernel, IdentitySplitKernelBackend)
 
 
 class TestSplitKernelRegistry:
     def test_fused_moe_kernel_raises_not_implemented(self) -> None:
         import torch
 
-        from flashinfer.moe_ep_v2 import FleetParams, FusedMoeKernelConfig, MoEWeightPack
-        from flashinfer.moe_ep_v2.split.kernels import SplitKernelContext, run_split_kernel
+        from flashinfer.moe_ep_v2 import (
+            FleetParams,
+            FusedMoeKernelConfig,
+            MoEWeightPack,
+            SplitKernelContext,
+            run_split_kernel,
+        )
 
         ctx = SplitKernelContext(
             expert_tensors=torch.zeros(4, 8),
@@ -77,8 +81,7 @@ class TestSplitKernelRegistry:
     def test_unknown_kernel_raises_not_implemented(self) -> None:
         import torch
 
-        from flashinfer.moe_ep_v2 import FleetParams
-        from flashinfer.moe_ep_v2.split.kernels import SplitKernelContext, run_split_kernel
+        from flashinfer.moe_ep_v2 import FleetParams, SplitKernelContext, run_split_kernel
 
         class _UnknownKernel:
             kernel_name = "unknown"
@@ -90,14 +93,14 @@ class TestSplitKernelRegistry:
                 num_experts=2, max_tokens_per_rank=2, token_hidden_size=4
             ),
         )
-        with pytest.raises(NotImplementedError, match="_UnknownKernel"):
+        with pytest.raises(KeyError, match="unknown"):
             run_split_kernel(_UnknownKernel(), ctx)
 
 
 @pytest.fixture
 def capturing_stub_fleet():
     """Stub fleet that records tensors at dispatch and combine boundaries."""
-    from flashinfer.moe_ep_v2.fleet import _BACKEND_REGISTRY
+    from flashinfer.moe_ep_v2.core.comm.fleet import _BACKEND_REGISTRY
 
     captured: dict[str, object] = {}
 

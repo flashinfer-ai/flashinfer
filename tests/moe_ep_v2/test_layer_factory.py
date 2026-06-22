@@ -41,7 +41,7 @@ def _mega_config(*, preprocess_weights: bool = False):
     from flashinfer.moe_ep_v2 import DeepGemmMegaMoeConfig, MegaConfig
 
     return MegaConfig(
-        kernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+        megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
         preprocess_weights=preprocess_weights,
     )
 
@@ -73,7 +73,7 @@ def test_factory_returns_mega_for_mega_config():
 
     from flashinfer.moe_ep_v2 import BootstrapConfig, MoEEpLayer, MoEEpMegaLayer
 
-    with mock.patch("flashinfer.moe_ep_v2.mega.layer.validate_mega_arch"):
+    with mock.patch("flashinfer.moe_ep_v2.core.validation.common.validate_mega_arch"):
         layer = MoEEpLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=_mega_fleet_params(),
@@ -92,7 +92,7 @@ def test_factory_mega_ignores_fleet_knobs_warns():
         MoEEpMegaLayer,
     )
 
-    with mock.patch("flashinfer.moe_ep_v2.mega.layer.validate_mega_arch"):
+    with mock.patch("flashinfer.moe_ep_v2.core.validation.common.validate_mega_arch"):
         with pytest.warns(UserWarning, match="fleet_knobs are ignored"):
             layer = MoEEpLayer(
                 bootstrap=BootstrapConfig(world_size=1, rank=0),

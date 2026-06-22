@@ -106,7 +106,7 @@ def _build_mega_moe_layer(
             weights=MoEWeightPack(w13=weights.w13, w2=weights.w2),
         ),
         backend=MegaConfig(
-            kernel=DeepGemmMegaMoeConfig(
+            megakernel=DeepGemmMegaMoeConfig(
                 intermediate_size=intermediate,
                 top_k=topk,
                 activation_clamp=activation_clamp,

@@ -40,11 +40,11 @@ def bypass_moe_ep_build_check():
     the tests exercise that logic on whatever GPU the shard provides.
 
     Both names are bound at module scope in
-    ``flashinfer.moe_ep_v2.split.nccl_ep.fleet`` (``from .. import _require_built`` /
-    ``from .._validators import validate_arch_for_backend``), so we patch them
+    ``flashinfer.moe_ep_v2.backends.split.comm.nccl_ep.fleet`` (``from ..... import _require_built`` /
+    ``from .....core.validation.common import validate_arch_for_backend``), so we patch them
     there rather than on the parent package.
     """
-    from flashinfer.moe_ep_v2.split.nccl_ep import fleet as nccl_fleet
+    from flashinfer.moe_ep_v2.backends.split.comm.nccl_ep import fleet as nccl_fleet
 
     with (
         mock.patch.object(nccl_fleet, "_require_built", return_value=None),
@@ -148,7 +148,7 @@ def fake_nccl_lib():
 @pytest.fixture
 def patched_lib(fake_nccl_lib):
     """Patch get_nccl_lib in BOTH ndtensor and the modules that call it."""
-    from flashinfer.moe_ep_v2.split.nccl_ep import fleet, handle, ndtensor
+    from flashinfer.moe_ep_v2.backends.split.comm.nccl_ep import fleet, handle, ndtensor
 
     with (
         mock.patch.object(ndtensor, "get_nccl_lib", return_value=fake_nccl_lib),

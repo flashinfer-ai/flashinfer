@@ -21,7 +21,7 @@ sys.path[:] = [
 @pytest.fixture
 def stubbed_fleet_registry():
     """Inject a stub Fleet class that records dispatch/combine/destroy calls."""
-    from flashinfer.moe_ep_v2.fleet import _BACKEND_REGISTRY
+    from flashinfer.moe_ep_v2.core.comm.fleet import _BACKEND_REGISTRY
 
     log: list[str] = []
 

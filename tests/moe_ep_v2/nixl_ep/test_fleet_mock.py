@@ -109,7 +109,7 @@ def fake_nixl_ep_module(fake_buffer_cls):
 @pytest.fixture
 def patched_loader(fake_nixl_ep_module):
     """Bypass _load_nixl_ep so we don't need libnixl.so on the dev box."""
-    from flashinfer.moe_ep_v2.split.nixl_ep import fleet
+    from flashinfer.moe_ep_v2.backends.split.comm.nixl_ep import fleet
 
     with (
         mock.patch.object(fleet, "_load_nixl_ep", return_value=fake_nixl_ep_module),

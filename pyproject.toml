@@ -80,8 +80,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 # build_backend._build_nvep_if_enabled).
 "flashinfer.moe_ep.nixl_ep" = ["_libs/**"]
 "flashinfer.moe_ep.nccl_ep" = ["_libs/*.so*"]
-"flashinfer.moe_ep_v2.split.nixl_ep" = ["_libs/**"]
-"flashinfer.moe_ep_v2.split.nccl_ep" = ["_libs/*.so*"]
+"flashinfer.moe_ep_v2.backends.split.comm.nixl_ep" = ["_libs/**"]
+"flashinfer.moe_ep_v2.backends.split.comm.nccl_ep" = ["_libs/*.so*"]
 
 [tool.mypy]
 files = ["flashinfer"]

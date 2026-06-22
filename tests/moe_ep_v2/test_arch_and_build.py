@@ -8,7 +8,7 @@ import pytest
 
 
 def test_validate_arch_skips_when_cuda_unavailable():
-    from flashinfer.moe_ep_v2._validators import validate_arch_for_backend
+    from flashinfer.moe_ep_v2.core.validation.common import validate_arch_for_backend
 
     with mock.patch("torch.cuda.is_available", return_value=False):
         validate_arch_for_backend("nccl_ep")
@@ -17,7 +17,7 @@ def test_validate_arch_skips_when_cuda_unavailable():
 @pytest.mark.parametrize("backend", ["nccl_ep", "nixl_ep"])
 def test_validate_arch_rejects_pre_hopper(backend: str):
     from flashinfer.moe_ep_v2 import MoEEpArchError
-    from flashinfer.moe_ep_v2._validators import validate_arch_for_backend
+    from flashinfer.moe_ep_v2.core.validation.common import validate_arch_for_backend
 
     with (
         mock.patch("torch.cuda.is_available", return_value=True),
@@ -30,7 +30,7 @@ def test_validate_arch_rejects_pre_hopper(backend: str):
 
 @pytest.mark.parametrize("backend", ["nccl_ep", "nixl_ep"])
 def test_validate_arch_accepts_hopper(backend: str):
-    from flashinfer.moe_ep_v2._validators import validate_arch_for_backend
+    from flashinfer.moe_ep_v2.core.validation.common import validate_arch_for_backend
 
     with (
         mock.patch("torch.cuda.is_available", return_value=True),
@@ -42,7 +42,7 @@ def test_validate_arch_accepts_hopper(backend: str):
 
 def test_validate_mega_arch_rejects_pre_blackwell():
     from flashinfer.moe_ep_v2 import MoEEpArchError
-    from flashinfer.moe_ep_v2._validators import validate_mega_arch
+    from flashinfer.moe_ep_v2.core.validation.common import validate_mega_arch
 
     with (
         mock.patch("torch.cuda.is_available", return_value=True),
@@ -54,7 +54,7 @@ def test_validate_mega_arch_rejects_pre_blackwell():
 
 
 def test_validate_mega_arch_accepts_blackwell():
-    from flashinfer.moe_ep_v2._validators import validate_mega_arch
+    from flashinfer.moe_ep_v2.core.validation.common import validate_mega_arch
 
     with (
         mock.patch("torch.cuda.is_available", return_value=True),

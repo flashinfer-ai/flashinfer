@@ -20,7 +20,7 @@ def _mega_layer(*, stage_inputs: bool = True, preprocess_weights: bool = False):
         MoEWeightPack,
     )
 
-    with mock.patch("flashinfer.moe_ep_v2.mega.layer.validate_mega_arch"):
+    with mock.patch("flashinfer.moe_ep_v2.core.validation.common.validate_mega_arch"):
         return MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=FleetParams(
@@ -33,7 +33,7 @@ def _mega_layer(*, stage_inputs: bool = True, preprocess_weights: bool = False):
                 ),
             ),
             backend=MegaConfig(
-                kernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
                 stage_inputs=stage_inputs,
                 preprocess_weights=preprocess_weights,
             ),
@@ -60,7 +60,7 @@ def test_mega_layer_init_requires_weights():
         MoEEpMegaLayer,
     )
 
-    with mock.patch("flashinfer.moe_ep_v2.mega.layer.validate_mega_arch"):
+    with mock.patch("flashinfer.moe_ep_v2.core.validation.common.validate_mega_arch"):
         with pytest.raises(ValueError, match="FleetParams.weights"):
             MoEEpMegaLayer(
                 bootstrap=BootstrapConfig(world_size=1, rank=0),
@@ -70,7 +70,7 @@ def test_mega_layer_init_requires_weights():
                     token_hidden_size=128,
                 ),
                 backend=MegaConfig(
-                    kernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                    megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
                     preprocess_weights=False,
                 ),
             )
@@ -134,7 +134,7 @@ def test_mega_layer_forward_requires_scales_when_not_staging():
 
     layer = _mega_layer(stage_inputs=False)
     layer._transformed = ((None, None), (None, None))
-    layer.get_symm_buffer = lambda: _fake_symm_buffer()  # type: ignore[method-assign]
+    layer._workspace = _fake_symm_buffer()  # type: ignore[attr-defined]
 
     t = MoEEpTensors(
         hidden_states=torch.zeros(4, 128),
@@ -164,12 +164,12 @@ def test_mega_layer_forward_rejects_hidden_mismatch():
 
 
 @mock.patch("torch.distributed.is_initialized", return_value=False)
-def test_mega_layer_get_symm_buffer_requires_dist(mock_dist_init):
+def test_mega_layer_prepare_workspace_requires_dist(mock_dist_init):
     layer = _mega_layer()
     layer._transformed = ((None, None), (None, None))
 
     with pytest.raises(RuntimeError, match="torch.distributed"):
-        layer.get_symm_buffer()
+        layer._ensure_workspace()
 
 
 def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():

@@ -7,9 +7,8 @@ construction), `FleetParams` (durable transport sizing), `HandleParams`
 :class:`CombineInputParams` / :class:`CombineOutput` that the Handle
 interface passes around.
 
-Validation: ctors enforce non-negative ints. Backend-specific constraints
-(`max_tokens_per_rank ≤ 1024` for nixl_ep, `num_experts % world_size == 0`,
-etc.) live in :mod:`flashinfer.moe_ep_v2._validators` and run inside each
+Backend-specific constraints live in
+:mod:`flashinfer.moe_ep_v2.core.validation` and run inside each
 backend's Fleet __init__.
 """
 

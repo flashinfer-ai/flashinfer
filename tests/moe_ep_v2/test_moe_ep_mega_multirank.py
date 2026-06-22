@@ -139,8 +139,8 @@ def _reference_mega_moe_staged(group, problem: dict, *, destroy_buffer: bool = T
     """Reference with bf16 activations staged inside the symm buffer."""
     import torch
 
-    from flashinfer.moe_ep_v2.mega.staging import stage_mega_moe_inputs
-    from flashinfer.moe_ep_v2.mega.weights import MoEWeightPack, preprocess_mega_weights
+    from flashinfer.moe_ep_v2.backends.mega.kernel.deep_gemm_mega.staging import stage_mega_moe_inputs
+    from flashinfer.moe_ep_v2 import MoEWeightPack, preprocess_mega_weights
 
     symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
@@ -191,7 +191,7 @@ def _reference_mega_moe_prestaged(
     """Reference with caller-supplied fp8 activations + packed scales."""
     import torch
 
-    from flashinfer.moe_ep_v2.mega.weights import MoEWeightPack, preprocess_mega_weights
+    from flashinfer.moe_ep_v2 import MoEWeightPack, preprocess_mega_weights
 
     symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
@@ -270,7 +270,7 @@ def _run_mega_layer(dist_mod, rank, world_size, *, stage_inputs: bool):
             weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
         ),
         backend=MegaConfig(
-            kernel=DeepGemmMegaMoeConfig(
+            megakernel=DeepGemmMegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 activation_clamp=problem["activation_clamp"],

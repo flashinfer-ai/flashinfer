@@ -5,57 +5,6 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.fixture
-def stubbed_fleet_registry():
-    """Inject a stub Fleet class that records the dispatch/combine/complete
-    sequence into a list."""
-    from flashinfer.moe_ep_v2.fleet import _BACKEND_REGISTRY
-
-    log: list[str] = []
-
-    class _StubHandle:
-        def dispatch(self, params):
-            log.append("dispatch")
-            from flashinfer.moe_ep_v2 import DispatchOutput
-
-            return DispatchOutput(
-                expert_tensors=params.x[0], num_tokens=params.x[0].size(0)
-            )
-
-        def combine(self, params):
-            log.append("combine")
-            from flashinfer.moe_ep_v2 import CombineOutput
-
-            return CombineOutput(x=params.x[0] if params.out is None else params.out)
-
-        def complete(self):
-            log.append("complete")
-
-        def destroy(self):
-            pass
-
-    class _StubFleet:
-        def __init__(self, bootstrap, params, algo_knobs):
-            log.append("fleet_init")
-            self.params = params
-
-        def create_handle(self, params, algo_knobs=()):
-            log.append("create_handle")
-            return _StubHandle()
-
-        def update_topology(self, bootstrap, algo_knobs=()):
-            pass
-
-        def destroy(self):
-            log.append("destroy")
-
-    saved = _BACKEND_REGISTRY.get("nccl_ep")
-    _BACKEND_REGISTRY["nccl_ep"] = _StubFleet
-    yield log
-    if saved is not None:
-        _BACKEND_REGISTRY["nccl_ep"] = saved
-
-
 def test_forward_call_order(stubbed_fleet_registry):
     import torch
 
@@ -151,7 +100,7 @@ def test_split_layer_preprocess_requires_weights():
         SplitConfig,
     )
 
-    with pytest.raises(ValueError, match="require_weights"):
+    with pytest.raises(ValueError, match="FleetParams.weights"):
         MoEEpSplitLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=FleetParams(
@@ -163,19 +112,29 @@ def test_split_layer_preprocess_requires_weights():
         )
 
 
-def test_split_layer_rejects_fused_moe_kernel_at_init():
+def test_split_layer_rejects_fused_moe_kernel_at_forward(stubbed_fleet_registry):
+    """FusedMoe init succeeds; NotImplementedError is raised in inner compute."""
+    from unittest import mock
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
     from flashinfer.moe_ep_v2 import (
         BootstrapConfig,
         FleetParams,
         FusedMoeKernelConfig,
         MoEEpSplitLayer,
+        MoEEpTensors,
         MoEWeightPack,
         SplitConfig,
     )
-    import torch
 
-    with pytest.raises(NotImplementedError, match="FusedMoeKernelConfig"):
-        MoEEpSplitLayer(
+    with mock.patch(
+        "flashinfer.moe_ep_v2.modes.split_layer.validate_arch_for_backend"
+    ):
+        split = MoEEpSplitLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=FleetParams(
                 num_experts=2,
@@ -188,6 +147,13 @@ def test_split_layer_rejects_fused_moe_kernel_at_init():
             ),
             backend=SplitConfig(kernel=FusedMoeKernelConfig()),
         )
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(4, 8, device="cuda"),
+        topk_ids=torch.zeros(4, 2, dtype=torch.int64, device="cuda"),
+        topk_weights=torch.ones(4, 2, device="cuda") * 0.5,
+    )
+    with pytest.raises(NotImplementedError, match="FusedMoeKernelConfig"):
+        split.forward(t)
 
 
 def test_split_layer_rejects_nixl_oversized_tokens_at_init():

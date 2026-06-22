@@ -1,6 +1,6 @@
 """B3 — NDTensor unit tests (mocked NCCL library).
 
-These tests don't need GPU comms: they patch ``flashinfer.moe_ep_v2.split.nccl_ep.ndtensor.get_nccl_lib``
+These tests don't need GPU comms: they patch ``flashinfer.moe_ep_v2.backends.split.comm.nccl_ep.ndtensor.get_nccl_lib``
 to return a fake library whose ``_funcs`` dict records the call arguments. Real
 ``ncclEpTensorCreate`` behavior is exercised in the on-cluster smoke tests
 (``smoke_nccl_ep.py``) and the B4 mock-based Fleet tests.
@@ -82,7 +82,7 @@ def test_from_torch_calls_create(fake_nccl_lib, fake_nccl_ep_module):
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA for tensor.is_cuda check")
 
-    from flashinfer.moe_ep_v2.split.nccl_ep import ndtensor
+    from flashinfer.moe_ep_v2.backends.split.comm.nccl_ep import ndtensor
 
     with mock.patch.object(ndtensor, "get_nccl_lib", return_value=fake_nccl_lib):
         x = torch.zeros(32, 4096, dtype=torch.bfloat16, device="cuda")
@@ -113,7 +113,7 @@ def test_from_torch_rejects_noncontiguous(fake_nccl_lib, fake_nccl_ep_module):
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
-    from flashinfer.moe_ep_v2.split.nccl_ep import ndtensor
+    from flashinfer.moe_ep_v2.backends.split.comm.nccl_ep import ndtensor
 
     with mock.patch.object(ndtensor, "get_nccl_lib", return_value=fake_nccl_lib):
         x = torch.zeros(64, 4096, device="cuda").T  # non-contiguous transpose
@@ -124,7 +124,7 @@ def test_from_torch_rejects_noncontiguous(fake_nccl_lib, fake_nccl_ep_module):
 def test_from_torch_rejects_cpu(fake_nccl_lib, fake_nccl_ep_module):
     import torch
 
-    from flashinfer.moe_ep_v2.split.nccl_ep import ndtensor
+    from flashinfer.moe_ep_v2.backends.split.comm.nccl_ep import ndtensor
 
     with mock.patch.object(ndtensor, "get_nccl_lib", return_value=fake_nccl_lib):
         x = torch.zeros(32, 4096)  # CPU
@@ -135,7 +135,7 @@ def test_from_torch_rejects_cpu(fake_nccl_lib, fake_nccl_ep_module):
 def test_allocate_owns_handle(fake_nccl_lib, fake_nccl_ep_module):
     import torch
 
-    from flashinfer.moe_ep_v2.split.nccl_ep import ndtensor
+    from flashinfer.moe_ep_v2.backends.split.comm.nccl_ep import ndtensor
 
     with mock.patch.object(ndtensor, "get_nccl_lib", return_value=fake_nccl_lib):
         nd = ndtensor.NDTensor.allocate(
@@ -153,7 +153,7 @@ def test_allocate_owns_handle(fake_nccl_lib, fake_nccl_ep_module):
 def test_destroy_on_del(fake_nccl_lib, fake_nccl_ep_module):
     import torch
 
-    from flashinfer.moe_ep_v2.split.nccl_ep import ndtensor
+    from flashinfer.moe_ep_v2.backends.split.comm.nccl_ep import ndtensor
 
     with mock.patch.object(ndtensor, "get_nccl_lib", return_value=fake_nccl_lib):
         nd = ndtensor.NDTensor.allocate(

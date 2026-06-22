@@ -7,10 +7,9 @@ from typing import Sequence, Union
 
 from .algo_knobs import AlgoKnob
 from .config import BootstrapConfig, FleetParams
-from .mega.config import MegaConfig
-from .mega.layer import MoEEpMegaLayer
-from .split.config import SplitConfig
-from .split.layer import MoEEpSplitLayer
+from .modes.config import MegaConfig, SplitConfig
+from .modes.mega_layer import MoEEpMegaLayer
+from .modes.split_layer import MoEEpSplitLayer
 
 __all__ = ["MoEEpLayer", "MoEEpMegaLayer", "MoEEpSplitLayer"]
 
