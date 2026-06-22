@@ -113,6 +113,8 @@ def run_moe_test(args):
         return testB12xFusedMoe(args)
     elif args.routine == "bgmv_moe":
         return testBgmvMoe(args)
+    elif args.routine == "unified_nvfp4_moe":
+        return testUnifiedNvfp4Moe(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -2400,6 +2402,318 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["weight_dtype"] = weight_dtype
         cur_res["activation_type"] = args.activation_type.name
         res.append(cur_res)
+
+    return res
+
+
+# =============================================================================
+# Unified NVFP4 MoE — MoELayer-based cross-backend autotune
+# =============================================================================
+
+
+def testUnifiedNvfp4Moe(args):
+    """MoELayer cross-backend autotune for NVFP4.
+
+    Exercises the unified MoE API: per-shape, builds MoELayer over
+    {CuteDslConfig, TrtllmFp4Config}, registers both backend-native weight
+    views on a single MoEWeightPack, dispatches once, reports the winner
+    and both backends' best-tactic latencies.
+
+    Emits one result row per backend candidate so CSV output carries the
+    cross-backend comparison directly.
+    """
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.fused_moe import (
+        ActivationConfig,
+        CuteDslConfig,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEActivationPack,
+        MoEConfig,
+        MoELayer,
+        MoEWeightPack,
+        QuantConfig,
+        QuantVariant,
+        RoutingConfig,
+        TrtllmFp4Config,
+    )
+    from flashinfer.fused_moe.api import BackendOptions
+
+    if args.verbose >= 1:
+        print("[INFO] Running testUnifiedNvfp4Moe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    local_expert_offset = args.local_expert_offset
+    local_num_experts = args.local_num_experts or num_experts
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
+
+    res = []
+    backends = ["unified"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    if args.verbose >= 1:
+        print(
+            f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
+            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}, "
+            f"local_experts={local_num_experts}"
+        )
+
+    # ---- Build shared bf16 reference weights ------------------------------
+    torch.manual_seed(0)
+    w1_bf16 = (
+        torch.randn(
+            local_num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w2_bf16 = (
+        torch.randn(
+            local_num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+
+    # ---- Backend-native weight views — first-class prepare helpers (CR2) --
+    # Both views are built from the SAME canonical bf16 weights, so the two
+    # backends are directly comparable (and a shared reference is meaningful).
+    cute_dsl_view = CuteDslConfig.prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=local_num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    trtllm_view = TrtllmFp4Config.prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        num_local_experts=local_num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+
+    # ---- Activation pack --------------------------------------------------
+    # The activation (NVFP4-quantized hidden states + pre-routed indices) still
+    # comes from the canonical test data creator; only weight prep is
+    # first-class today (activation-prep promotion tracked under CR2).
+    import os
+    import sys
+
+    _repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from tests.moe.test_cute_dsl_fused_moe import (
+        check_accuracy,
+        compute_reference_moe_fp4,
+        create_moe_tensors,
+    )
+
+    # Wide-EP (MVP): model a single rank as a complete MoE over its
+    # local_num_experts experts — route the activation WITHIN the local experts
+    # (selected ids in [0, local_num_experts)) so every token is computed
+    # locally. This is the "local-only" proxy: it avoids the unfaithful
+    # global-routing-but-local-weights setup (most tokens skipped) and keeps the
+    # derived FLOP/bandwidth metrics correct (all tokens computed, active
+    # experts <= local). For EP=1 (local == global) this is unchanged.
+    routing_num_experts = local_num_experts
+    routing_top_k = min(top_k, local_num_experts)
+    cute_dsl_data = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=routing_num_experts,
+        num_local_experts=local_num_experts,
+        top_k=routing_top_k,
+        device=device,
+    )
+    # cute_dsl_data["x_sf"] is already unsqueezed to [M, H//16, 1]; strip that
+    # for the Pack (runner re-applies unsqueeze in pack_inputs).
+    x_sf = cute_dsl_data["x_sf"].squeeze(-1)
+    act_pack = MoEActivationPack(
+        hidden_states_q=cute_dsl_data["x"],
+        hidden_states_scale=x_sf,
+        selected_experts=cute_dsl_data["token_selected_experts"],
+        final_scales=cute_dsl_data["token_final_scales"],
+    )
+
+    num_active_experts = int(act_pack.selected_experts.unique().numel())
+
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)
+    weight_pack.prepare_for("trtllm_fp4_routed", trtllm_view)
+
+    # ---- MoELayer config --------------------------------------------------
+    config = MoEConfig(
+        routing=RoutingConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=args.n_group,
+            topk_group=args.topk_group,
+            routed_scaling_factor=args.routed_scaling_factor,
+        ),
+        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        experts=ExpertConfig(
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+        ),
+        activation=ActivationConfig(),
+        backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+        execution=ExecutionConfig(tune_max_num_tokens=max(num_tokens, 8192)),
+    )
+
+    # ---- Dispatch: trigger cross-backend selection ------------------------
+    with autotune(True):
+        layer = MoELayer(config, device=device)
+        _ = layer(act_pack, weight_pack)
+
+    winner_key = layer.winner_backend or "?"
+    if args.verbose >= 1:
+        print(
+            f"[INFO] MoELayer winner: {winner_key} "
+            f"(candidates: {[r.backend_key for r in layer.runners]})"
+        )
+
+    # ---- Optional shared-reference accuracy check (CR10/CR11) -------------
+    # Both backend views derive from the same bf16 weights, so a single bf16
+    # reference is valid for every candidate.  Catches shared-mode errors that
+    # cross-backend agreement would miss.
+    ref_output = None
+    if args.refcheck:
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=cute_dsl_data["x_bf16"].float().to(device),
+            gemm1_weights=w1_bf16.float().to(device),
+            gemm2_weights=w2_bf16.float().to(device),
+            token_selected_experts=act_pack.selected_experts,
+            token_final_scales=act_pack.final_scales,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=cute_dsl_data["fc2_input_scale"],
+        )
+
+    # ---- Per-backend best-tactic timing (one result row per candidate) ----
+    tuner = AutoTuner.get()
+    for runner in layer.runners:
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        with autotune(True):
+            _, tactic = tuner.choose_one(
+                custom_op=f"moe_{runner.backend_key}",
+                runners=[runner],
+                tuning_config=runner.tuning_config,
+                inputs=inputs,
+            )
+
+        def _call(r=runner, i=inputs, t=tactic):
+            return r.forward(i, tactic=t)
+
+        times = bench_gpu_time(
+            fn=_call,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=not args.no_cuda_graph,
+            cold_l2_cache=True,
+        )
+        median_time = float(np.median(times))
+        std_time = float(np.std(times))
+        # Use the actual routing geometry (local experts / clamped top_k), not
+        # the global config, so the wide-EP local-only proxy reports honest
+        # FLOP/byte counts. For EP=1 these equal num_experts/top_k.
+        tflops = calculate_moe_tflops(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            routing_num_experts,
+            routing_top_k,
+            median_time,
+        )
+        tb_per_sec = calculate_moe_kernel_bandwidth(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            routing_num_experts,
+            routing_top_k,
+            median_time,
+            input_dtype,
+            weight_dtype,
+            input_format="nvfp4",
+            weight_format="nvfp4",
+            routing_logits_dtype=None,
+            active_experts=num_active_experts,
+            verbose=args.verbose,
+        )
+
+        # Tag: "unified/<backend>" + star the winner
+        is_winner = runner.backend_key == winner_key
+        backend_label = f"unified/{runner.backend_key}" + ("*" if is_winner else "")
+        print_perf_metrics(backend_label, median_time, std_time, tflops, tb_per_sec)
+
+        # Shared-reference accuracy check for this candidate (CR10/CR11).
+        refcheck_passed = None
+        if ref_output is not None:
+            out = runner.forward(inputs, tactic=tactic)
+            refcheck_passed, pct, atol = check_accuracy(out, ref_output)
+            status = "PASS" if refcheck_passed else "FAIL"
+            print(
+                f"[REFCHECK] {backend_label}: {status} "
+                f"({pct * 100:.2f}% within atol={atol:.4f} vs bf16 reference)"
+            )
+            if not refcheck_passed and not args.allow_output_mismatch:
+                print(
+                    f"[ERROR] {backend_label} failed reference check. "
+                    f"Re-run with --allow_output_mismatch to continue past mismatches."
+                )
+
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["backend"] = backend_label
+            cur_res["refcheck_passed"] = refcheck_passed
+            cur_res["num_tokens"] = num_tokens
+            cur_res["hidden_size"] = hidden_size
+            cur_res["intermediate_size"] = intermediate_size
+            cur_res["num_experts"] = num_experts
+            cur_res["top_k"] = top_k
+            cur_res["local_expert_offset"] = local_expert_offset
+            cur_res["local_num_experts"] = local_num_experts
+            cur_res["input_dtype"] = input_dtype
+            cur_res["weight_dtype"] = weight_dtype
+            cur_res["fp4_mode"] = "nvfp4"
+            res.append(cur_res)
 
     return res
 
