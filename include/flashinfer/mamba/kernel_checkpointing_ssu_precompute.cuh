@@ -553,9 +553,10 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // ── old_B (cache, conv1d-INDEPENDENT cp.async): hoisted BEFORE gdc_wait so it
   // overlaps the conv1d wait (cliff) / the B/C cp.async (standalone) — old_B is the
   // buffered cache, NOT a conv1d output.  The cp.async stays in flight across the
-  // grid-dep sync; the single drain below completes it.  NO-WRITE + W2/3 (the C6-MMA
-  // warps); must_checkpoint is uniform per CTA. ──
-  if (!must_checkpoint && warp >= 2) {
+  // grid-dep sync; the single drain below completes it.  NO-WRITE, W2/3 ONLY (the C6-MMA
+  // warps — at NUM_WARPS>4 the extra warps W4+ never run the matmul, so they must not load
+  // old_B); must_checkpoint is uniform per CTA. ──
+  if (!must_checkpoint && warp >= 2 && warp < 4) {
     load_old_B<input_t, MAX_WINDOW, DSTATE>(smem, params, lane, cache_slot, buf_read, group_idx,
                                             prev_k);
   }
@@ -570,9 +571,13 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
     cudaGridDependencySynchronize();
   }
 
-  // ── Load this group's C (all warps) + B (W0/1 only — the new-token N-operand,
-  // read only by the C·B warps) into swizzled smem (cp.async). ──
-  load_C<input_t, NPREDICTED, DSTATE>(smem, params, lane, group_idx, outer, seq_len);
+  // ── Load this group's C (W0-3 — the matmul warps; A-operand of both C·B and
+  // C·old_B) + B (W0/1 only — the new-token N-operand) into swizzled smem (cp.async).
+  // At NUM_WARPS>4 the extra warps W4+ run no matmul and never read C/B, so they skip
+  // these loads (they earn their keep in PHASE 1 + PHASE 2 instead). ──
+  if (warp < 4) {
+    load_C<input_t, NPREDICTED, DSTATE>(smem, params, lane, group_idx, outer, seq_len);
+  }
   if (warp < 2) {
     load_B<input_t, NPREDICTED, DSTATE>(smem, params, lane, group_idx, outer, seq_len);
   }
@@ -603,12 +608,13 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
                                                               write_offset, seq_len);
   }
 
-  // ── Raw matmul-1 — ONCE per group, all 4 warps (no-write).  W0/1 → C·B (C5) →
-  // smem.CB; W2/3 → C·old_B (C6, no-write) → smem.CB_old.  Independent of PHASE 1
-  // (different smem); both land before the __syncthreads below. ──
+  // ── Raw matmul-1 — ONCE per group, by the FIRST 4 warps (no-write).  W0/1 → C·B (C5)
+  // → smem.CB; W2/3 → C·old_B (C6, no-write) → smem.CB_old.  At NUM_WARPS>4 the extra
+  // warps W4+ skip the matmul (the CB is per-group, computed once; the __syncthreads
+  // below publishes it to them for PHASE 2).  Independent of PHASE 1 (different smem). ──
   if (warp < 2) {
     compute_cb_2warp<input_t, NPREDICTED, DSTATE>(smem, warp, lane);
-  } else if (!must_checkpoint) {
+  } else if (warp < 4 && !must_checkpoint) {
     compute_cb_old_2warp<input_t, NPREDICTED, MAX_WINDOW, DSTATE>(smem, warp - 2, lane);
   }
 

@@ -118,12 +118,20 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       // below).  HEADS_PER_CTA is picked at runtime, dispatched to a template arg;
       // DT_SOFTPLUS is JIT-folded on the runtime flag.
       auto launch_precompute = [&]<int HEADS_PER_CTA, bool DT_SOFTPLUS>() {
+        // 1 head/warp: couple the precompute's warp count to its head tile, clamped to
+        // >= 4 (the C·B / C·old_B matmul is a fixed 2+2-warp job — W0/1 new, W2/3 old).
+        // At hc=8 this gives 8 resident warps (2x the latency-hiding of the main's 4),
+        // matching triton's _dynamic_precompute geometry (256 thr / 8 heads / 1 head per
+        // warp); at hc<=4 it stays 4 warps (byte-identical to before).  Decoupled from the
+        // main's NUM_WARPS so the main keeps its own register/occupancy tuning.  Tune via
+        // the existing precompute_heads_per_cta knob / FLASHINFER_SSU_HEADS_PER_CTA.
+        constexpr int PRECOMPUTE_NUM_WARPS = HEADS_PER_CTA > 4 ? HEADS_PER_CTA : 4;
         auto pfunc = checkpointing_ssu_precompute_kernel<
             input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, NPREDICTED, MAX_WINDOW, DIM,
-            DSTATE, HEADS_PER_GROUP, HEADS_PER_CTA, NUM_WARPS, DT_SOFTPLUS, VARLEN>;
+            DSTATE, HEADS_PER_GROUP, HEADS_PER_CTA, PRECOMPUTE_NUM_WARPS, DT_SOFTPLUS, VARLEN>;
         constexpr size_t psmem =
             sizeof(CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE,
-                                                     NUM_WARPS, HEADS_PER_CTA>);
+                                                     PRECOMPUTE_NUM_WARPS, HEADS_PER_CTA>);
         if constexpr (psmem > 0) {
           FLASHINFER_CUDA_CHECK(
               cudaFuncSetAttribute(pfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, psmem));
@@ -131,49 +139,27 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
         constexpr int head_tiles = (HEADS_PER_GROUP + HEADS_PER_CTA - 1) / HEADS_PER_CTA;
         cudaLaunchConfig_t pcfg;
         pcfg.gridDim = dim3(params.batch, params.ngroups, head_tiles);
-        pcfg.blockDim = dim3(warpSize, NUM_WARPS);
+        pcfg.blockDim = dim3(warpSize, PRECOMPUTE_NUM_WARPS);
         pcfg.dynamicSmemBytes = psmem;
         pcfg.stream = stream;
         pcfg.attrs = attrs;
         pcfg.numAttrs = 1;
         FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
       };
-      // ── Head-tiling heuristic: balance precompute parallelism vs MAIN co-residency ──
-      // Tiling heads across grid.z sets #precompute CTAs = batch·ngroups·ceil(HPG/hc) =
-      // batch·nheads/hc.  S (sm_count) and the main's per-SM occupancy are device/kernel
-      // constants → cache statically; the hc choice is justified at hc_ideal below.
-      static int const sm_count = [] {
-        int dev = 0, s = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&s, cudaDevAttrMultiProcessorCount, dev);
-        return s > 0 ? s : 1;
-      }();
-      // The MAIN co-launches with the precompute (internal PDL, always on) and the two
-      // compete for SMs.  occ_main = main blocks resident per SM (it owns the same big
-      // smem as the monolith, so typically 1).  Query once for the real D_SPLIT kernel.
-      static int const occ_main = [] {
-        int o = 0;
-        constexpr size_t msmem = sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED,
-                                                                    MAX_WINDOW, D_PER_CTA, DSTATE>);
-        auto mf = checkpointing_ssu_main_kernel<
-            input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NPREDICTED,
-            MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN>;
-        if constexpr (msmem > 48 * 1024) {
-          cudaFuncSetAttribute(mf, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem);
-        }
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, mf, NUM_WARPS * (int)warpSize, msmem);
-        return o > 0 ? o : 1;
-      }();
-      // The main launches main_ctas = batch·nheads·D_SPLIT.  Cliff sweeps (b∈{8,16,64},
-      // B200): hc=2 is the robust optimum (hc=1 never beat it) ONCE the main is multi-wave
-      // and pipelines over the precompute.  But when the main alone fits in ≤1 resident
-      // wave it is FRAGILE — a big precompute footprint spills it into a 2nd wave
-      // (b=8: hc=2 → main 13.4µs vs hc=4 → 9.7µs, +3µs).  So back off to hc=4 there.  The
-      // earlier "fill one precompute wave" rule ignored the main and floored to hc=1 at
-      // small batch — exactly the over-saturation that starves the main.
-      // (Provisional: only D_SPLIT==1 / ngroups==1 / b∈{8,16,64} measured.)  Snap to HPG>>k.
-      int const main_ctas = params.batch * params.nheads * D_SPLIT;
-      int const hc_ideal = (main_ctas <= sm_count * occ_main) ? 4 : 2;
+      // ── Head-tiling default: heads/CTA == warps/CTA (1 head/warp), coupled in
+      // launch_precompute (PRECOMPUTE_NUM_WARPS = max(hc, 4)).  hc=8 (→ 8 warps) measured as
+      // the robust optimum for batch >= 8 on B200, across BOTH the cliff and large batch:
+      //   • small batch: the precompute is latency-bound + under-occupied — 8 warps double
+      //     the resident warps (occ 6%→12%, matching triton's _dynamic_precompute) to hide
+      //     the load latency (no-issue 93%→88%, b=16 11.3µs→10.7µs).
+      //   • large batch: fewer head-tiles per group HALVE the redundant per-group C·B matmul
+      //     (b=1024: hc=8 136µs vs the old hc=2 143µs — now beats triton-replay-pm).
+      // Below b=8 the precompute is so under-occupied that spreading into MORE, smaller CTAs
+      // (hc=4 → 4 tiles vs hc=8 → 2) lights up more SMs and edges ahead (b≤4: hc=8 is +0.1–0.2µs),
+      // so back off there.  hc=16 regressed small batch (too few CTAs, 512 thr) without helping
+      // large — not worth a 3rd tier.  Tunable via precompute_heads_per_cta / the env below;
+      // dispatch_heads_per_cta snaps to the HEADS_PER_GROUP>>k chain (clamps to HPG).
+      int const hc_ideal = (params.batch >= 8) ? 8 : 4;
       int hc = HEADS_PER_GROUP;
       while (hc > 1 && hc > hc_ideal) hc >>= 1;
       // Overrides (both snap to the HEADS_PER_GROUP>>k chain in dispatch_heads_per_cta):
