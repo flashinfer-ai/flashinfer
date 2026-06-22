@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import warnings
 from enum import Enum
 from types import SimpleNamespace
 from typing import List, Literal, Optional, Tuple
@@ -2233,6 +2234,30 @@ def _get_cudnn_override_shape_workspace_size(
         return graph.get_workspace_size_plan_at_index(tactic)
 
 
+def _cudnn_graph_engine_knob_tactics(graph) -> List[tuple]:
+    tactics: List[tuple] = []
+    for plan_idx in range(graph.get_execution_plan_count()):
+        try:
+            engine_id, knobs = graph.get_engine_and_knobs_at_index(plan_idx)
+        except (AttributeError, RuntimeError):
+            continue
+        knob_items = tuple(
+            sorted((int(knob_type), int(value)) for knob_type, value in knobs.items())
+        )
+        tactics.append((int(engine_id), knob_items))
+    return tactics
+
+
+def _is_cudnn_engine_knob_tactic(tactic) -> bool:
+    return isinstance(tactic, (tuple, list)) and len(tactic) == 2
+
+
+def _cudnn_knob_items_to_dict(knob_items) -> dict:
+    return {
+        cudnn.knob_type(int(knob_type)): int(value) for knob_type, value in knob_items
+    }
+
+
 def clear_cudnn_graph_cache() -> None:
     """Invalidate all process-local cuDNN GEMM graph caches **and** the
     AutoTuner profiling cache.
@@ -2994,29 +3019,9 @@ def build_cudnn_gemm_fp8_graph(
     b_type,
     o_type,
     device,
-    policy=None,
+    tactic=-1,
 ):
-    """Build a cuDNN graph for GEMM with per-tensor quantization.
-
-    This function is cached to avoid rebuilding identical graphs.
-
-    Args:
-        a_shape: Shape of tensor A
-        a_stride: Stride of tensor A
-        b_shape: Shape of tensor B
-        b_stride: Stride of tensor B
-        a_type: Data type for input tensor A
-        b_type: Data type for input tensor B
-        o_type: Data type for output tensor
-        policy: cuDNN build plan policy. None defaults to HEURISTICS_CHOICE.
-                Use ALL to enumerate all execution plans for autotuning.
-
-    Returns:
-        cuDNN graph object
-    """
     _check_cudnn_availability()
-    if policy is None:
-        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
 
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
@@ -3070,9 +3075,24 @@ def build_cudnn_gemm_fp8_graph(
 
         graph.validate()
         graph.build_operation_graph()
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        if _is_cudnn_engine_knob_tactic(tactic):
+            engine_id, knob_items = tactic
+            graph.create_execution_plan(
+                int(engine_id), _cudnn_knob_items_to_dict(knob_items)
+            )
+            policy = None
+        else:
+            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            policy = (
+                cudnn.build_plan_policy.HEURISTICS_CHOICE
+                if tactic < 0
+                else cudnn.build_plan_policy.ALL
+            )
         graph.check_support()
-        graph.build_plans(policy)
+        if policy is None:
+            graph.build_plans()
+        else:
+            graph.build_plans(policy)
 
         return graph
 
@@ -3085,7 +3105,7 @@ def execute_cudnn_gemm_fp8_graph(
     b_scale,
     c_final,
     workspace,
-    tactic: int = -1,
+    tactic=-1,
 ):
     variant_pack = {
         UIDs.A_UID.value: a,
@@ -3098,22 +3118,23 @@ def execute_cudnn_gemm_fp8_graph(
     stream = torch.cuda.current_stream(a.device)
     cudnn_handle = _get_cudnn_handle(a.device, stream)
 
-    # This (non-override) graph is built at the real shape, whereas the tactic
-    # was tuned against a possibly different (bucketed) M whose plan list can
-    # differ in length. If the index is out of range, fall back to the
-    # heuristic default rather than letting execute_plan_at_index raise.
-    if tactic >= graph.get_execution_plan_count():
-        tactic = -1
+    if _is_cudnn_engine_knob_tactic(tactic):
+        plan_index = -1
+    else:
+        plan_index = tactic
 
-    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if plan_index >= graph.get_execution_plan_count():
+        plan_index = -1
+
+    workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace.numel() < workspace_size:
         workspace.resize_(workspace_size)
 
-    if tactic == -1:
+    if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
     else:
         graph.execute_plan_at_index(
-            variant_pack, workspace, tactic, handle=cudnn_handle
+            variant_pack, workspace, plan_index, handle=cudnn_handle
         )
 
 
@@ -3286,14 +3307,9 @@ def _cudnn_gemm_fp8(
     b_scale: torch.Tensor,
     out: Optional[torch.Tensor],
     torch_out_dtype: torch.dtype,
-    tactic: int = -1,
+    tactic=-1,
 ):
     _check_cudnn_availability()
-
-    if tactic == -1:
-        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
-    else:
-        policy = cudnn.build_plan_policy.ALL
 
     graph = build_cudnn_gemm_fp8_graph(
         a.shape,
@@ -3304,7 +3320,7 @@ def _cudnn_gemm_fp8(
         _torch_data_type_to_cudnn_data_type(b.dtype),
         _torch_data_type_to_cudnn_data_type(torch_out_dtype),
         a.device,
-        policy=policy,
+        tactic=tactic,
     )
 
     execute_cudnn_gemm_fp8_graph(
@@ -3358,14 +3374,11 @@ def _cudnn_gemm_fp8_runner():
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
-        ) -> List[int]:
+        ) -> List[tuple]:
             a, b, _, _, out, _ = inputs
             if self._use_override_shape:
                 graph = self._get_override_graph(a, b, out)
             else:
-                # ALL exposes every heuristic plan to the autotuner;
-                # HEURISTICS_CHOICE would collapse to a single plan. Graph
-                # is @lru_cache'd, so all plans are built once per shape.
                 graph = build_cudnn_gemm_fp8_graph(
                     a_shape=a.shape,
                     a_stride=a.stride(),
@@ -3375,34 +3388,48 @@ def _cudnn_gemm_fp8_runner():
                     b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
                     o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
                     device=a.device,
-                    policy=cudnn.build_plan_policy.ALL,
+                    tactic=0,
                 )
-
-            return list(range(graph.get_execution_plan_count()))
+            return _cudnn_graph_engine_knob_tactics(graph)
 
         def forward(
             self,
             inputs: List[torch.Tensor],
-            tactic: int = -1,
+            tactic=-1,
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
             a, b, scale_a, scale_b, out, workspace_buffer = inputs
-            if self._use_override_shape:
-                graph = self._get_override_graph(a, b, out)
-                execute_cudnn_gemm_fp8_graph_override_shape(
-                    graph,
-                    a,
-                    b,
-                    scale_a,
-                    scale_b,
-                    out,
-                    workspace_buffer,
-                    tactic=max(tactic, 0),
+            try:
+                if self._use_override_shape:
+                    graph = self._get_override_graph(a, b, out)
+                    execute_cudnn_gemm_fp8_graph_override_shape(
+                        graph,
+                        a,
+                        b,
+                        scale_a,
+                        scale_b,
+                        out,
+                        workspace_buffer,
+                        tactic=max(tactic, 0),
+                    )
+                else:
+                    _cudnn_gemm_fp8(
+                        workspace_buffer,
+                        a,
+                        b,
+                        scale_a,
+                        scale_b,
+                        out,
+                        out.dtype,
+                        tactic=tactic,
+                    )
+            except Exception as exc:
+                warnings.warn(
+                    "cuDNN fp8 GEMM tactic failed; falling back to default "
+                    f"tactic=-1. ({exc})",
+                    stacklevel=2,
                 )
-            else:
-                # Apply the tuned tactic. tactic>=0 -> specific plan
-                # (policy=ALL); tactic==-1 -> cheap HEURISTICS_CHOICE default.
                 _cudnn_gemm_fp8(
                     workspace_buffer,
                     a,
@@ -3411,7 +3438,7 @@ def _cudnn_gemm_fp8_runner():
                     scale_b,
                     out,
                     out.dtype,
-                    tactic=tactic,
+                    tactic=-1,
                 )
             return out
 
