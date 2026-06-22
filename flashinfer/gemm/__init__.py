@@ -23,6 +23,11 @@ from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
+from .gemm_bf16_fp4 import (
+    mm_bf16_fp4 as mm_bf16_fp4,
+    prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
+)
+
 from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
@@ -62,27 +67,52 @@ try:
 except ImportError:
     pass
 
-__all__ = [
-    "SegmentGEMMWrapper",
-    "bmm_bf16",
-    "bmm_fp8",
-    "bmm_mxfp8",
-    "mm_bf16",
-    "mm_fp4",
-    "mm_fp8",
-    "mm_mxfp8",
-    "tgv_gemm_sm100",
-    "group_gemm_mxfp4_nt_groupwise",
-    "group_gemm_mxfp8_mxfp4_nt_groupwise",
-    "group_gemm_nvfp4_nt_groupwise",
-    "batch_deepgemm_fp8_nt_groupwise",
-    "group_deepgemm_fp8_nt_groupwise",
-    "gemm_fp8_nt_blockscaled",
-    "gemm_fp8_nt_groupwise",
-    "group_gemm_fp8_nt_groupwise",
-    "fp8_blockscale_gemm_sm90",
-    "mm_M1_16_K6144_N256",
-    "mm_M1_16_K7168_N128",
-    "mm_M1_16_K7168_N256",
-    "tinygemm_bf16",
-] + _cute_dsl_kernels
+# is_cuda_tile_available is always importable — cutile_common.py has no
+# cuda.tile imports by design, so this never fails even when cuda-tile is
+# absent.  Mirrors how is_cute_dsl_available is exported unconditionally
+# from flashinfer.cute_dsl.
+from .kernels.cutile.cutile_common import (
+    is_cuda_tile_available as is_cuda_tile_available,
+)
+
+_cuda_tile_kernels = ["is_cuda_tile_available"]
+try:
+    if is_cuda_tile_available():
+        from .kernels.cutile.bmm_bf16_cutile import (
+            make_bmm_bf16_tune_cache as make_bmm_bf16_tune_cache,
+        )
+
+        _cuda_tile_kernels.append("make_bmm_bf16_tune_cache")
+except ImportError:
+    pass
+
+__all__ = (
+    [
+        "SegmentGEMMWrapper",
+        "bmm_bf16",
+        "bmm_fp8",
+        "bmm_mxfp8",
+        "mm_bf16",
+        "mm_fp4",
+        "mm_fp8",
+        "mm_mxfp8",
+        "tgv_gemm_sm100",
+        "group_gemm_mxfp4_nt_groupwise",
+        "group_gemm_mxfp8_mxfp4_nt_groupwise",
+        "group_gemm_nvfp4_nt_groupwise",
+        "batch_deepgemm_fp8_nt_groupwise",
+        "group_deepgemm_fp8_nt_groupwise",
+        "gemm_fp8_nt_blockscaled",
+        "gemm_fp8_nt_groupwise",
+        "group_gemm_fp8_nt_groupwise",
+        "fp8_blockscale_gemm_sm90",
+        "mm_bf16_fp4",
+        "prepare_bf16_fp4_weights",
+        "mm_M1_16_K6144_N256",
+        "mm_M1_16_K7168_N128",
+        "mm_M1_16_K7168_N256",
+        "tinygemm_bf16",
+    ]
+    + _cute_dsl_kernels
+    + _cuda_tile_kernels
+)

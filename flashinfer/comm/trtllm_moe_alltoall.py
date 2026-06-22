@@ -18,6 +18,7 @@ from .mnnvl import MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
 from ..utils import register_custom_op
+from ..tllm_enums import SfLayout
 
 
 @dataclass
@@ -107,6 +108,9 @@ def get_moe_alltoall_module():
         top_k: int,
         combine_payload_offset: int,
         payload_in_workspace: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        output_scales: Optional[torch.Tensor] = None,
+        sf_layout: SfLayout = SfLayout.layout_linear,
     ) -> torch.Tensor:
         """
         Combine expert outputs back to originating tokens.
@@ -122,7 +126,11 @@ def get_moe_alltoall_module():
             top_k: Number of experts per token
             combine_payload_offset: Offset from dispatch
             payload_in_workspace: If True, payload is workspace-backed
-
+            output_dtype: Optional output data type
+                currently supports [torch.bfloat16, torch.float8_e4m3fn]
+            output_scales: Optional output scale tensor for quantized outputs
+                currently support ue8m0 (packed in torch.uint8) with vector size of 32
+            sf_layout: Output swizzle layout
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
         """
@@ -137,6 +145,9 @@ def get_moe_alltoall_module():
             top_k,
             combine_payload_offset,
             payload_in_workspace,
+            output_dtype,
+            output_scales,
+            sf_layout.value,
         )
 
     @register_custom_op(
@@ -378,6 +389,9 @@ def moe_a2a_combine(
     top_k: int,
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
+    output_dtype: Optional[torch.dtype] = None,
+    output_scales: Optional[torch.Tensor] = None,
+    sf_layout: SfLayout = SfLayout.layout_linear,
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
 
@@ -429,6 +443,9 @@ def moe_a2a_combine(
         top_k,
         combine_payload_offset,
         payload_in_workspace,
+        output_dtype,
+        output_scales,
+        sf_layout,
     )
 
 
@@ -812,6 +829,9 @@ class MoeAlltoAll:
         payload: torch.Tensor,
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
+        output_scales: Optional[torch.Tensor] = None,
+        sf_layout: SfLayout = SfLayout.layout_linear,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
 
@@ -850,6 +870,9 @@ class MoeAlltoAll:
             self.top_k,
             self._state.combine_payload_offset,
             payload_in_workspace,
+            output_dtype,
+            output_scales,
+            sf_layout,
         )
 
         # Reset state for next round

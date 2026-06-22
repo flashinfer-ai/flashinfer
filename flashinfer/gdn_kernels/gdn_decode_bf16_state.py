@@ -47,6 +47,15 @@ import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+
+def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # explicit stride_order: auto-deduction is ambiguous at B=1/T=1.
+    stride_order = tuple(sorted(range(torch_t.dim()), key=lambda d: -torch_t.stride(d)))
+    return from_dlpack(
+        torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
+    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order)
+
+
 # ==============================================================================
 # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
 # ==============================================================================
@@ -128,7 +137,6 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -851,7 +859,6 @@ def gdn_wide_vec_kernel(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1928,7 +1935,6 @@ def gdn_wide_vec_kernel_t1(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -2417,7 +2423,6 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -2446,6 +2451,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     )
 
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
+    B = cute.size(q.shape[0])
     grid_size = B * HV * num_v_tiles
 
     smem_bytes = 128
@@ -2474,7 +2480,6 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -2521,7 +2526,6 @@ def _run_wide_vec(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -2539,6 +2543,9 @@ def _run_wide_vec(
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
+    # B derived dynamically from q (mark_compact_shape_dynamic on dim 0) so the
+    # compiled cubin works across batch sizes for the same other-shape config.
+    B = cute.size(q.shape[0])
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
     grid_size = B * HV * num_v_tiles
     smem_bytes = (
@@ -2566,7 +2573,6 @@ def _run_wide_vec(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -2614,7 +2620,6 @@ def _run_wide_vec_t1(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -2628,6 +2633,7 @@ def _run_wide_vec_t1(
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
+    B = cute.size(q.shape[0])
     grid_size = B * HV * num_v_tiles
     smem_bytes = (
         4 * T * (K + 8)  # sQ FP32
@@ -2652,7 +2658,6 @@ def _run_wide_vec_t1(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -2818,7 +2823,6 @@ def gated_delta_rule(
 # ==============================================================================
 _compiled_kernels_mtp: dict = {}
 _compiled_kernels_wide_vec: dict = {}
-_compiled_kernels_wide_vec_t1: dict = {}
 
 
 def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
@@ -3099,15 +3103,24 @@ def gated_delta_rule_mtp_wide_vec(
         )
         assert ssm_state_indices.device == q.device
 
+    # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
+    # agnostic); padded/strided pool keeps real pool_size/stride in the key.
+    contiguous_pool = initial_state_source.is_contiguous()
+    if contiguous_pool:
+        pool_size_key = -1
+        pool_slot_stride: tuple[int, ...] = (-1,)
+    else:
+        pool_size_key = pool_size
+        pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
     cache_key = (
-        "v3_mtp_bf16_tiled",
-        B_val,
+        "v3_mtp_bf16_tiled_dynB",
         T_val,
         H_val,
         HV_val,
         K_val,
         V_val,
-        pool_size,
+        pool_size_key,
+        pool_slot_stride,
         tile_v,
         effective_disable_final,
         cache_intermediate_states,
@@ -3122,57 +3135,47 @@ def gated_delta_rule_mtp_wide_vec(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
-        # h0_source strides: padded pools (vLLM-style stride[0] > HV*V*K) must
-        # compile as a separate specialization from tight pools. cute compiles
-        # for a specific layout; reusing a tight-pool kernel on a padded pool
-        # would read the wrong memory.
-        tuple(int(s) for s in initial_state_source.stride()),
     )
-    if cache_key not in _compiled_kernels_wide_vec:
-        default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
-        default_output = torch.empty(
+
+    if initial_state_indices is None:
+        initial_state_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
+    if output is None:
+        output = torch.empty(
             B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
         )
-        # Dummy accepted_steps used as a compile-time template (and at runtime
-        # when per_request_accepted_steps=False; never read by the kernel in
-        # that case since the load is constexpr-gated).
-        default_accepted_steps = torch.zeros(B_val, dtype=torch.int32, device=q.device)
-        # Dummy ssm_state_indices: B*T int32 tensor used as compile-time template
-        # and at runtime when per_token_pool_scatter=False (load constexpr-gated).
-        default_ssm_state_indices = torch.zeros(
-            B_val, T_val, dtype=torch.int32, device=q.device
-        )
+    # Dummy tensors for the constexpr-gated kernel-arg slots so cute.compile
+    # sees a real typed tensor of the expected shape.
+    accepted_steps_arg = (
+        accepted_steps
+        if accepted_steps is not None
+        else torch.zeros(B_val, dtype=torch.int32, device=q.device)
+    )
+    ssm_state_indices_arg = (
+        ssm_state_indices
+        if ssm_state_indices is not None
+        else torch.zeros(B_val, T_val, dtype=torch.int32, device=q.device)
+    )
 
-        if initial_state_indices is None:
-            initial_state_indices = default_indices
-        if output is None:
-            output = default_output
-
-        # Compile-time indices template: any [B] int32 on the right device.
-        # Both read and write index tensors share the same shape/dtype so
-        # the same dlpack handle works for both slots.
-        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+    if cache_key not in _compiled_kernels_wide_vec:
+        if contiguous_pool:
+            h_ = _mark_batch_dynamic(h0_source)
+        else:
+            h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
+        if cache_intermediate_states:
+            inter_ = _mark_batch_dynamic(intermediate_states)
+        q_ = _mark_batch_dynamic(q)
+        k_ = _mark_batch_dynamic(k)
+        v_ = _mark_batch_dynamic(v)
+        a_ = _mark_batch_dynamic(a)
+        b_ = _mark_batch_dynamic(b)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
-        h0_idx_ = from_dlpack(
-            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        )
-        h0_out_idx_ = from_dlpack(
-            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        )
-        acc_steps_ = from_dlpack(
-            default_accepted_steps, assumed_align=32, enable_tvm_ffi=True
-        )
-        ssm_idx_ = from_dlpack(
-            default_ssm_state_indices, assumed_align=32, enable_tvm_ffi=True
-        )
+        o_ = _mark_batch_dynamic(output)
+        h0_idx_ = _mark_batch_dynamic(initial_state_indices)
+        h0_out_idx_ = _mark_batch_dynamic(initial_state_indices)
+        acc_steps_ = _mark_batch_dynamic(accepted_steps_arg)
+        ssm_idx_ = _mark_batch_dynamic(ssm_state_indices_arg)
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -3195,7 +3198,6 @@ def gated_delta_rule_mtp_wide_vec(
                 softplus_threshold,
                 scale,
                 HV_val,
-                B_val,
                 T_val,
                 H_val,
                 K_val,
@@ -3214,33 +3216,13 @@ def gated_delta_rule_mtp_wide_vec(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            "default_indices": default_indices,
-            "default_accepted_steps": default_accepted_steps,
-            "default_ssm_state_indices": default_ssm_state_indices,
-            "output": default_output,
         }
 
     cache = _compiled_kernels_wide_vec[cache_key]
-    if initial_state_indices is None:
-        initial_state_indices = cache["default_indices"]
     if output_state_indices is None:
         # Single-pool: read==write. Reuse the same indices tensor — no extra
         # allocation, kernel still produces the same address for both slots.
         output_state_indices = initial_state_indices
-    if output is None:
-        output = cache["output"]
-    # If accepted_steps wasn't passed, use the cached dummy (never read by
-    # the kernel since per_request_accepted_steps=False).
-    accepted_steps_arg = (
-        accepted_steps
-        if accepted_steps is not None
-        else cache["default_accepted_steps"]
-    )
-    ssm_state_indices_arg = (
-        ssm_state_indices
-        if ssm_state_indices is not None
-        else cache["default_ssm_state_indices"]
-    )
 
     cache["compiled"](
         h0_source,
@@ -3304,7 +3286,7 @@ def gated_delta_rule_t1_wide_vec(
     (or pointing at the same tensor as `initial_state_indices`), the
     kernel reads and writes the same slot (single-pool).
     """
-    global _compiled_kernels_wide_vec_t1
+    global _compiled_kernels_wide_vec
 
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
@@ -3364,15 +3346,24 @@ def gated_delta_rule_t1_wide_vec(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
+    # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
+    # agnostic); padded/strided pool keeps real pool_size/stride in the key.
+    contiguous_pool = initial_state_source.is_contiguous()
+    if contiguous_pool:
+        pool_size_key = -1
+        pool_slot_stride: tuple[int, ...] = (-1,)
+    else:
+        pool_size_key = pool_size
+        pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
     cache_key = (
-        "v3_mtp_bf16_tiled",
-        B_val,
+        "v3_mtp_bf16_tiled_dynB",
         T_val,
         H_val,
         HV_val,
         K_val,
         V_val,
-        pool_size,
+        pool_size_key,
+        pool_slot_stride,
         tile_v,
         effective_disable_final,
         cache_intermediate_states,
@@ -3382,41 +3373,36 @@ def gated_delta_rule_t1_wide_vec(
         softplus_threshold,
         use_packed_fma,
         same_pool,
-        # See gated_delta_rule_mtp_wide_vec for rationale.
-        tuple(int(s) for s in initial_state_source.stride()),
     )
-    if cache_key not in _compiled_kernels_wide_vec_t1:
-        default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
-        default_output = torch.empty(
+
+    if initial_state_indices is None:
+        initial_state_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
+    if output is None:
+        output = torch.empty(
             B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
         )
 
-        if initial_state_indices is None:
-            initial_state_indices = default_indices
-        if output is None:
-            output = default_output
-
-        # Compile-time indices template: any [B] int32 on the right device.
-        # Both read and write index tensors share the same shape/dtype so
-        # the same dlpack handle works for both slots.
-        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+    if cache_key not in _compiled_kernels_wide_vec:
+        if contiguous_pool:
+            h_ = _mark_batch_dynamic(h0_source)
+        else:
+            h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
+        if cache_intermediate_states:
+            # Dummy [1,1,1] tensor (caching off) has no unique stride-1 dim.
+            inter_ = _mark_batch_dynamic(intermediate_states)
+        q_ = _mark_batch_dynamic(q)
+        k_ = _mark_batch_dynamic(k)
+        v_ = _mark_batch_dynamic(v)
+        a_ = _mark_batch_dynamic(a)
+        b_ = _mark_batch_dynamic(b)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
-        h0_idx_ = from_dlpack(
-            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        )
-        h0_out_idx_ = from_dlpack(
-            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        )
+        o_ = _mark_batch_dynamic(output)
+        h0_idx_ = _mark_batch_dynamic(initial_state_indices)
+        h0_out_idx_ = _mark_batch_dynamic(initial_state_indices)
 
-        _compiled_kernels_wide_vec_t1[cache_key] = {
+        _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
                 _run_wide_vec_t1,
                 h_,
@@ -3435,7 +3421,6 @@ def gated_delta_rule_t1_wide_vec(
                 softplus_threshold,
                 scale,
                 HV_val,
-                B_val,
                 T_val,
                 H_val,
                 K_val,
@@ -3449,19 +3434,13 @@ def gated_delta_rule_t1_wide_vec(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            "default_indices": default_indices,
-            "output": default_output,
         }
 
-    cache = _compiled_kernels_wide_vec_t1[cache_key]
-    if initial_state_indices is None:
-        initial_state_indices = cache["default_indices"]
+    cache = _compiled_kernels_wide_vec[cache_key]
     if output_state_indices is None:
         # Single-pool: read==write. Reuse the same indices tensor — no extra
         # allocation, kernel still produces the same address for both slots.
         output_state_indices = initial_state_indices
-    if output is None:
-        output = cache["output"]
 
     cache["compiled"](
         h0_source,
@@ -3708,15 +3687,24 @@ def gated_delta_rule_mtp(
         )
         assert accepted_steps.device == q.device
 
+    # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
+    # agnostic); padded/strided pool keeps real pool_size/stride in the key.
+    contiguous_pool = initial_state_source.is_contiguous()
+    if contiguous_pool:
+        pool_size_key = -1
+        pool_slot_stride: tuple[int, ...] = (-1,)
+    else:
+        pool_size_key = pool_size
+        pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
     cache_key = (
-        "mtp_bf16",
-        B,
+        "mtp_bf16_dynB",
         T,
         H,
         HV,
         K,
         V,
-        pool_size,
+        pool_size_key,
+        pool_slot_stride,
         tile_v,
         ilp_rows,
         disable_state_update,
@@ -3731,45 +3719,46 @@ def gated_delta_rule_mtp(
         per_request_accepted_steps,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
-        # h0_source strides: see gated_delta_rule_mtp_wide_vec for rationale.
-        tuple(int(s) for s in initial_state_source.stride()),
     )
-    if cache_key not in _compiled_kernels_mtp:
-        # First call for this shape: allocate default indices/output and do
-        # dlpack conversions once for compilation. Steady-state calls pass
-        # torch tensors straight to the compiled callable (tvm-ffi accepts
-        # either) and reuse these cached defaults when the caller doesn't
-        # provide their own.
-        default_indices = torch.arange(B, dtype=torch.int32, device=q.device)
-        default_output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
-        default_accepted_steps = torch.zeros(B, dtype=torch.int32, device=q.device)
-        # Per-token pool scatter (FLA-style) defaults: a B×T int32 tensor.
-        # When per_token_pool_scatter=False the kernel never reads it (constexpr
-        # gated); it exists so cute.compile sees a real tensor of the right shape.
-        default_ssm_state_indices = torch.zeros(
-            B, T, dtype=torch.int32, device=q.device
-        )
 
-        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+    if initial_state_indices is None:
+        initial_state_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+    if output is None:
+        output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
+    # Defaults for kernel-arg tensors that are constexpr-gated at runtime
+    # (accepted_steps/ssm_state_indices). cute.compile needs a tensor of
+    # the right shape/dtype even when the kernel never reads it.
+    accepted_steps_arg = (
+        accepted_steps
+        if accepted_steps is not None
+        else torch.zeros(B, dtype=torch.int32, device=q.device)
+    )
+    ssm_state_indices_arg = (
+        ssm_state_indices
+        if ssm_state_indices is not None
+        else torch.zeros(B, T, dtype=torch.int32, device=q.device)
+    )
+
+    if cache_key not in _compiled_kernels_mtp:
+        if contiguous_pool:
+            h_ = _mark_batch_dynamic(h0_source)
+        else:
+            h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
+        if cache_intermediate_states:
+            inter_ = _mark_batch_dynamic(intermediate_states)
+        q_ = _mark_batch_dynamic(q)
+        k_ = _mark_batch_dynamic(k)
+        v_ = _mark_batch_dynamic(v)
+        a_ = _mark_batch_dynamic(a)
+        b_ = _mark_batch_dynamic(b)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        o_ = from_dlpack(default_output, assumed_align=32, enable_tvm_ffi=True)
-        h0_idx_ = from_dlpack(default_indices, assumed_align=32, enable_tvm_ffi=True)
-        h0_out_idx_ = from_dlpack(
-            default_indices, assumed_align=32, enable_tvm_ffi=True
-        )
-        acc_steps_ = from_dlpack(
-            default_accepted_steps, assumed_align=32, enable_tvm_ffi=True
-        )
-        ssm_idx_ = from_dlpack(
-            default_ssm_state_indices, assumed_align=32, enable_tvm_ffi=True
-        )
+        o_ = _mark_batch_dynamic(output)
+        h0_idx_ = _mark_batch_dynamic(initial_state_indices)
+        h0_out_idx_ = _mark_batch_dynamic(initial_state_indices)
+        acc_steps_ = _mark_batch_dynamic(accepted_steps_arg)
+        ssm_idx_ = _mark_batch_dynamic(ssm_state_indices_arg)
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
@@ -3792,7 +3781,6 @@ def gated_delta_rule_mtp(
                 softplus_threshold,
                 scale,
                 HV,
-                B,
                 T,
                 H,
                 K,
@@ -3810,28 +3798,12 @@ def gated_delta_rule_mtp(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            "default_indices": default_indices,
-            "default_accepted_steps": default_accepted_steps,
-            "default_ssm_state_indices": default_ssm_state_indices,
-            "output": default_output,
         }
 
     cache = _compiled_kernels_mtp[cache_key]
 
     if output_state_indices is None:
         output_state_indices = initial_state_indices
-    if output is None:
-        output = cache["output"]
-    accepted_steps_arg = (
-        accepted_steps
-        if accepted_steps is not None
-        else cache["default_accepted_steps"]
-    )
-    ssm_state_indices_arg = (
-        ssm_state_indices
-        if ssm_state_indices is not None
-        else cache["default_ssm_state_indices"]
-    )
 
     cache["compiled"](
         h0_source,

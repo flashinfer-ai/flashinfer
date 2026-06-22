@@ -31,6 +31,7 @@
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Array;
+using tvm::ffi::Optional;
 using tvm::ffi::Shape;
 using tvm::ffi::String;
 using tvm::ffi::Tensor;
@@ -254,6 +255,9 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
 
 nvinfer1::DataType toNvDataType(DLDataType dtype) {
   auto code = encode_dlpack_dtype(dtype);
+  if (code == float8_e4m3fn_code) {
+    return nvinfer1::DataType::kFP8;
+  }
   if (code == float16_code) {
     return nvinfer1::DataType::kHALF;
   }
@@ -270,8 +274,11 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
 Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
                        TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
                        int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
-                       bool payloadInWorkspace) {
+                       bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
+                       Optional<TensorView> outputScales, int64_t sfLayout) {
   using tl_throughput::MoeA2ACombineParams;
+  using tl_throughput::MoeA2ACombineQuantMode;
+  using tl_throughput::MoeA2ACombineSwizzleSFMode;
   CHECK_INPUT(payload);
   TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
       << "payload must be [ep_size, runtime_max_tokens_per_rank, hidden]";
@@ -311,10 +318,10 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
         << " != " << (void*)expectedPtr;
   }
 
-  Tensor output =
-      alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
-
+  auto stream = get_current_stream();
   MoeA2ACombineParams params{};
+  Tensor output = alloc_tensor({localNumTokens, elementsPerToken},
+                               outputDtype_.value_or(payload.dtype()), payload.device());
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);
@@ -324,6 +331,25 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   params.output_data = output.data_ptr();
   params.elements_per_token = static_cast<int>(elementsPerToken);
   params.dtype = toNvDataType(payload.dtype());
+  params.swizzle_mode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
+
+  if (outputScales.has_value()) {
+    CHECK_INPUT_AND_TYPE(outputScales.value(), dl_uint8);
+    TVM_FFI_ICHECK(payload.dtype() == dl_bfloat16 || payload.dtype() == dl_float16)
+        << "Quantization only supported for fp16 or bf16 inputs";
+    if (output.dtype() == dl_float8_e4m3fn) {
+      // TODO(siyuan): currently only support MXFP8 quantization
+      params.quant_mode = MoeA2ACombineQuantMode::MXFP8;
+      params.output_scales = outputScales.value().data_ptr();
+    } else {
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "Quantization not supported for output dtype: " << output.dtype();
+    }
+  } else {
+    TVM_FFI_ICHECK(output.dtype() == payload.dtype())
+        << "output_dtype without output_scales must match payload dtype";
+    params.quant_mode = MoeA2ACombineQuantMode::NONE;
+  }
 
   params.flag_val =
       reinterpret_cast<uint32_t*>(rankWorkspacePtr + offsets[fi_throughput::FLAG_VAL_OFFSET_INDEX]);
@@ -340,7 +366,7 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
         targetWorkspacePtr + offsets[fi_throughput::COMBINE_COMPLETION_FLAGS_OFFSET_INDEX]);
     params.recv_buffers[targetRank] = targetWorkspacePtr + combinePayloadOffset;
   }
-  params.stream = get_current_stream();
+  params.stream = stream;
 
   tl_throughput::moe_a2a_prepare_combine_launch(params);
   tl_throughput::moe_a2a_combine_launch(params);
