@@ -30,7 +30,7 @@ from .gemm_base import (
     _get_cudnn_override_shape_workspace_size,
     _get_cudnn_workspace_size,
     _torch_data_type_to_cudnn_data_type,
-    is_cudnn_override_shape_available,
+    _is_cudnn_override_shape_available,
 )
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
 
@@ -365,7 +365,7 @@ def _cudnn_bf16_fp4_runner(tuning_config):
         def __init__(self):
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
-            self._use_override_shape = is_cudnn_override_shape_available()
+            self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, alpha, out_dtype, _, block_size, use_nvfp4, _ = inputs

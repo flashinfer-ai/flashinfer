@@ -2338,7 +2338,7 @@ def _check_cudnn_override_shape_availability():
         ) from e
 
 
-def is_cudnn_override_shape_available() -> bool:
+def _is_cudnn_override_shape_available() -> bool:
     """Return True if the installed cuDNN backend supports is_override_shape_enabled."""
     if not CUDNN_AVAILABLE:
         return False
@@ -3586,7 +3586,7 @@ def _cudnn_gemm_fp8_runner():
         def __init__(self):
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
-            self._use_override_shape = is_cudnn_override_shape_available()
+            self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             a, b, _, _, out, _ = inputs
@@ -4075,7 +4075,7 @@ def _cudnn_gemm_bf16_runner(
             # profile tensors use) when caller didn't specify.
             self._is_a_k_major = True if is_a_k_major is None else is_a_k_major
             self._is_b_k_major = True if is_b_k_major is None else is_b_k_major
-            self._use_override_shape = is_cudnn_override_shape_available()
+            self._use_override_shape = _is_cudnn_override_shape_available()
 
         def _get_override_graph(self, a, b, bias, out):
             a_shape, _ = _get_bf16_3d_shape_stride(a)
@@ -5122,7 +5122,7 @@ def _cudnn_mm_mxfp8_runner():
         def __init__(self):
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
-            self._use_override_shape = is_cudnn_override_shape_available()
+            self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             a, b, _, _, _, out, _ = inputs
@@ -5513,7 +5513,7 @@ def _cudnn_gemm_fp4_runner(tuning_config):
         def __init__(self):
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
-            self._use_override_shape = is_cudnn_override_shape_available()
+            self._use_override_shape = _is_cudnn_override_shape_available()
 
         def _get_override_graph(self, a, b, alpha, out_dtype, block_size, use_nvfp4):
             real_a_shape, _ = _get_real_fp4_shape_from_packed_uint8(a)
@@ -8951,7 +8951,7 @@ def _cudnn_gemm_mxfp8_runner():
         def __init__(self):
             super().__init__()
             self._m_bucket_mapper = m_bucket_mapper
-            self._use_override_shape = is_cudnn_override_shape_available()
+            self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             a, b, _, _, out, _ = inputs
