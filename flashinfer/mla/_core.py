@@ -2089,17 +2089,10 @@ def _cute_dsl_incompatibility_reason(
     Used by both the explicit ``backend="cute-dsl"`` path (raises the reason
     as a ``ValueError``) and the ``backend="auto"`` filter (silently drops
     cute-dsl from the runners list).
-
-    ``cute_dsl_impl`` mirrors the dispatcher's impl selection so the
-    eligibility check validates against the constraints of the impl that will
-    actually run (modular vs monolithic).
     """
     cc = get_compute_capability(query.device)
-    if cc[0] not in (10, 11):
-        return (
-            "cute-dsl backend (MLA decode kernel) uses tcgen05 2-SM instructions, "
-            f"supported only on SM100-SM110 (datacenter Blackwell); got SM{cc[0]}{cc[1]}"
-        )
+    if cc[0] < 10:
+        return f"cute-dsl backend (MLA decode kernel) requires SM100+, got SM{cc[0]}{cc[1]}"
     if isinstance(bmm1_scale, torch.Tensor):
         return (
             "cute-dsl backend (MLA decode kernel) does not support tensor bmm1_scale, "
