@@ -10,7 +10,11 @@ can ``from flashinfer.autotuner.initializers import autotuner_initializer_ones``
 without any ambiguity about what the symbol is for.
 """
 
+from typing import Callable
+
 import torch
+
+TensorInitializer = Callable[[tuple[int, ...], torch.dtype, torch.device], torch.Tensor]
 
 
 def _empty(

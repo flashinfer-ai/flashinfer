@@ -31,12 +31,6 @@ from flashinfer.autotuner.autotuner import (
 )
 
 __all__ = [
-    "autotuner_initializer_empty",
-    "autotuner_initializer_zeros",
-    "autotuner_initializer_ones",
-    "autotuner_initializer_randn",
-    "autotuner_initializer_rand",
-    "autotuner_initializer_rand_scaled",
     "AutoTuner",
     "AutoTunerStatistics",
     "ConstraintSpec",
@@ -55,6 +49,12 @@ __all__ = [
     "_tactic_to_json",
     "_tactic_to_json_hashable",
     "autotune",
+    "autotuner_initializer_empty",
+    "autotuner_initializer_ones",
+    "autotuner_initializer_rand",
+    "autotuner_initializer_rand_scaled",
+    "autotuner_initializer_randn",
+    "autotuner_initializer_zeros",
     "is_in_profile_measurement",
     "make_bucket_mapper",
     "round_to_nearest_bucket",
