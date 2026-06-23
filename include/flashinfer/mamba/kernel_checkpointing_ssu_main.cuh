@@ -200,17 +200,19 @@ __device__ __forceinline__ void load_main_data(SmemT& smem, CheckpointingSsuPara
 // conv1d's writes are guaranteed visible (the main co-launches ahead of conv1d's
 // completion — see load_main_data header).
 //
-// Both are loaded REDUNDANTLY by every warp (no warp guard): matmul-3 reads the
-// full C from every warp, and each warp's matmul-4 reads its own D-slice of x
-// out of the full tile.  Loading them per-warp (idempotent) means there is NO
-// cross-warp hazard — only the cross-LANE LDSM read inside each warp — so the
-// caller publishes with a cheap __syncwarp instead of a block barrier, keeping
-// the post-wait critical path free of __syncthreads.
+// Loaded ONCE, on dedicated warps — x on W0, C on W1.  They're SEPARATE tiles, so the two
+// loads run in PARALLEL with ZERO redundancy (no swizzle-split needed — each warp loads a
+// whole tile, just a different one), and the caller's __syncthreads publishes both cross-warp
+// before the output MMA (matmul-3 reads full C, each warp's matmul-4 reads its D-slice of x).
+// (The old design loaded both on EVERY warp + a cheap __syncwarp — warp-local, no barrier —
+// but that scaled the LDG traffic with NUM_WARPS; at >4 warps the redundant load + mio_throttle
+// outweighs the saved barrier, so we load 1x and pay one block barrier.)  C is per-GROUP →
+// only on IS_FIRST.
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, bool IS_FIRST,
           typename SmemT>
 __device__ __forceinline__ void load_conv_inputs(SmemT& smem, CheckpointingSsuParams const& params,
-                                                 int lane, int d_tile, int head, int group_idx,
-                                                 int64_t outer, int seq_len) {
+                                                 int lane, int warp, int d_tile, int head,
+                                                 int group_idx, int64_t outer, int seq_len) {
   int const d_tile_off = d_tile * D_PER_CTA;
   auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
   auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
@@ -218,12 +220,15 @@ __device__ __forceinline__ void load_conv_inputs(SmemT& smem, CheckpointingSsuPa
   int64_t const x_base = outer * params.x_stride_seq + (int64_t)head * DIM + d_tile_off;
   using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
   using XShape = cute::Shape<cute::Int<SmemT::NPREDICTED_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
-  // C is per-GROUP (C_base has no head term) → load ONCE for the head-tile (is_first) and
-  // reuse across the loop's heads.  x is per-HEAD → load every head.
+  // C is per-GROUP (C_base has no head term) → load ONCE for the head-tile (is_first), on W1.
   if constexpr (IS_FIRST)
-    load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane,
+    if (warp == 1)
+      load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane,
+                                          seq_len);
+  // x is per-HEAD → load every head, on W0 (parallel with C on W1).
+  if (warp == 0)
+    load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane,
                                         seq_len);
-  load_tile_async<XShape, NPREDICTED>(smem.x, x_ptr + x_base, params.x_stride_token, lane, seq_len);
   __pipeline_commit();
   __pipeline_wait_prior(0);
   __syncwarp();
@@ -280,15 +285,19 @@ __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams
   if constexpr (IS_FIRST) cudaGridDependencySynchronize();
 
   // ── POST-gdc_wait: conv1d outputs (C once per tile, x per head) + precompute cumAdt_vec ──
+  // x and C are each loaded ONCE — x on W0, C on W1 — in parallel (separate tiles).  Since
+  // every other warp will read C/x that W0/W1 loaded, the publish below must be a __syncthreads
+  // (not __syncwarp).  (Loading them on EVERY warp scaled the LDG traffic with NUM_WARPS and at
+  // 8 warps the redundant load + mio_throttle erased the occupancy gain — b=32 main 15.2->16.5us.)
   load_conv_inputs<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, IS_FIRST>(
-      smem, params, lane, d_tile, head, group_idx, outer, seq_len);
+      smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   auto const* __restrict__ cumAdt_ptr = reinterpret_cast<float const*>(params.cumAdt_vec);
   if (lane < seq_len) {
     smem.cumAdt[lane] =
         cumAdt_ptr[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane];
   }
-  __syncwarp();  // publish x (per-warp) + cumAdt for the cross-lane β broadcast
+  __syncthreads();  // publish C (W1) / x (W0) + cumAdt cross-warp before the output MMA
 
   // Precompute CB pointers (fragA-native, per (batch_slot, head)).  REGS = K/2.
   constexpr int CB_NEW_REGS = NPREDICTED_PAD_MMA_M / 2;

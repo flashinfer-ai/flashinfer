@@ -187,18 +187,17 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       // it to the HPG>>k chain and binds it to the MAIN_HEADS_PER_CTA template arg — it
       // never reaches the kernel as a runtime value.
       //
-      // MAIN_NUM_WARPS=8 (decoupled from the precompute/mono NUM_WARPS=4): the main is
-      // SRAM-feed + state-load bound and badly under-occupied at small batch (~0.2 waves/SM);
-      // 8 warps split the replay MMA (M_WARPS×4) + the output MMA (_1×NUM_WARPS) + the state
-      // load, doubling the warps feeding the tensor cores.  Per-CTA smem is NUM_WARPS-
-      // independent.  (int8/fp8 still routes to the separate 8bit kernel — see replay TODO.)
-      // The 8-warp main is fully plumbed (replay M_WARPS×4, output _1×NUM_WARPS, per-warp
-      // state load + store) and DOUBLES occupancy (b=32: occ 20%→38%, eligible 0.38→0.84,
-      // no-issue 73%→64%).  But load_conv_inputs still loads C/x redundantly per-warp, so at
-      // 8 warps that traffic goes 4×→8× — the extra long_scoreboard + mio_throttle currently
-      // outweighs the occupancy gain (b=32 main 15.2→16.5us).  Stay at 4 until the conv-input
-      // load is split per-warp; then flip to `(D_PER_CTA >= 64) ? 8 : 4` (8 needs D_PER_CTA≥64
-      // for the output's _1×NUM_WARPS tiling: N_TILE = NUM_WARPS·n8 must divide D_PER_CTA).
+      // MAIN_NUM_WARPS=4.  The main is NUM_WARPS-generic (replay MMA M_WARPS×4, output MMA
+      // _1×NUM_WARPS, per-warp state load + store, 1x conv-input load), so 8 warps is fully
+      // plumbed and selectable — and it DOES double occupancy (b=32: occ 20%→38%, eligible
+      // 0.38→0.84, no-issue 73%→64%).  But the main isn't warp-hideable: its stalls are
+      // gmem-arrival / SRAM-feed bound (long+short scoreboard), not warp-starvation, so the
+      // extra occupancy buys nothing and the finer MMA tiling + publish barrier cost net time.
+      // Measured (cuda-incr-2k, end-to-end with conv1d), 4w beats 8w at every batch but b=8:
+      //   b=16 10.45 vs 11.01 | b=32 11.81 vs 12.26 | b=64 16.48 vs 18.05 | b=1024 134.3 vs 146.4.
+      // So ship 4; keep the 8-warp infra for a future feed-bound config.  (8 would need
+      // D_PER_CTA≥64 for the output's _1×NUM_WARPS tiling: N_TILE = NUM_WARPS·n8 must divide
+      // D_PER_CTA, so D_SPLIT≥2 (D_PER_CTA=32) would fall back to 4.  int8/fp8 → 8bit kernel.)
       constexpr int MAIN_NUM_WARPS = 4;
       dispatch_heads_per_cta<HEADS_PER_GROUP>(main_heads_per_cta, [&]<int MHC>() {
         auto mfunc =
