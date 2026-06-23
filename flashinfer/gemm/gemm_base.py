@@ -2152,8 +2152,6 @@ def _cudnn_available_or_raise_for_backend(backend):
 
 def _is_cublas_fp4_available_in_cudnn():
     """Check if cuBLAS backend for FP4 GEMM is available in cuDNN."""
-
-    # Check cuDNN backend version for FP4 support (requires cudnn_version == 9.11.1 or cudnn_version >= 9.13)
     backend_version = cudnn.backend_version()
     CUDNN_VERSION_9_11_1 = 91101
     CUDNN_VERSION_9_13_0 = 91300
@@ -2167,71 +2165,49 @@ def _check_cudnn_override_shape_availability():
     """Raise if the installed cuDNN backend does not support is_override_shape_enabled."""
     _check_cudnn_availability()
     backend_version = cudnn.backend_version()
-    if backend_version < 92100:
+    if backend_version < 92301:
         raise RuntimeError(
-            f"cuDNN override-shape GEMM requires backend version >= 92100 (9.21.0), "
+            f"cuDNN override-shape GEMM requires backend version >= 92301 (9.23.1), "
             f"found {backend_version}. "
             f"Please upgrade cuDNN: pip install --upgrade nvidia-cudnn-cu12 nvidia-cudnn-frontend"
         )
-    try:
-        version_str = cudnn.__version__
-        major, minor = map(int, version_str.split(".")[:2])
-        required_frontend_version = (1, 24) if backend_version >= 92300 else (1, 20)
-        if (major, minor) < required_frontend_version:
-            raise RuntimeError(
-                f"cuDNN override-shape GEMM requires cudnn-frontend version >= "
-                f"{required_frontend_version[0]}.{required_frontend_version[1]}, found {version_str}. "
-                f"Please upgrade: pip install --upgrade nvidia-cudnn-frontend"
-            )
-    except (AttributeError, ValueError, IndexError) as e:
-        raise RuntimeError(
-            "Unable to determine cudnn-frontend version. "
-            "Override-shape GEMM requires cudnn-frontend >= 1.20, or >= 1.24 with cuDNN backend >= 9.23.0"
-        ) from e
 
 
 def _is_cudnn_override_shape_available() -> bool:
     """Return True if the installed cuDNN backend supports is_override_shape_enabled."""
     if not CUDNN_AVAILABLE:
         return False
-    try:
-        backend_version = cudnn.backend_version()
-        if backend_version < 92100:
-            return False
-        version_str = cudnn.__version__
-        major, minor = map(int, version_str.split(".")[:2])
-        required_frontend_version = (1, 24) if backend_version >= 92300 else (1, 20)
-        return (major, minor) >= required_frontend_version
-    except Exception:
+    if cudnn.backend_version() < 92301:
         return False
+    return True
 
 
-def _get_cudnn_workspace_size(graph, tactic: int) -> int:
-    if tactic < 0:
+def _get_cudnn_workspace_size(graph, plan_index: int) -> int:
+    if plan_index < 0:
         return graph.get_workspace_size()
-    return graph.get_workspace_size_plan_at_index(tactic)
+    return graph.get_workspace_size_plan_at_index(plan_index)
 
 
 def _get_cudnn_override_shape_workspace_size(
     graph,
-    tactic: int,
+    plan_index: int,
     cudnn_handle,
     override_uids,
     override_shapes,
     override_strides,
 ) -> int:
     if cudnn.backend_version() >= 92300:
-        if tactic < 0:
+        if plan_index < 0:
             return graph.get_workspace_size(
                 cudnn_handle, override_uids, override_shapes, override_strides
             )
         return graph.get_workspace_size_plan_at_index(
-            tactic, cudnn_handle, override_uids, override_shapes, override_strides
+            plan_index, cudnn_handle, override_uids, override_shapes, override_strides
         )
     else:
-        if tactic < 0:
+        if plan_index < 0:
             return graph.get_workspace_size()
-        return graph.get_workspace_size_plan_at_index(tactic)
+        return graph.get_workspace_size_plan_at_index(plan_index)
 
 
 def _cudnn_graph_engine_knob_tactics(graph) -> List[tuple]:
