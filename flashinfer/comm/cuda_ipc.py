@@ -119,24 +119,53 @@ class CudaRTLibrary:
     #  to the corresponding dictionary
     path_to_dict_mapping: Dict[str, Dict[str, Any]] = {}
 
+    @staticmethod
+    def _load_exported_functions(so_file: str) -> Dict[str, Any]:
+        """Load cudart and bind every runtime symbol required by this wrapper."""
+        lib = CudaRTLibrary.path_to_library_cache.get(so_file)
+        if lib is None:
+            lib = ctypes.CDLL(so_file)
+        _funcs = {}
+        for func in CudaRTLibrary.exported_functions:
+            f = getattr(lib, func.name)
+            f.restype = func.restype
+            f.argtypes = func.argtypes
+            _funcs[func.name] = f
+        CudaRTLibrary.path_to_library_cache[so_file] = lib
+        CudaRTLibrary.path_to_dict_mapping[so_file] = _funcs
+        return _funcs
+
+    @staticmethod
+    def _find_loadable_cudart() -> str:
+        """Return the first loaded libcudart candidate that exports required symbols."""
+        candidates = []
+        with open("/proc/self/maps") as f:
+            for line in f:
+                if "libcudart" not in line or "/" not in line:
+                    continue
+                path = line[line.index("/") :].strip()
+                filename = path.split("/")[-1]
+                if not filename.rpartition(".so")[0].startswith("libcudart"):
+                    continue
+                if path not in candidates:
+                    candidates.append(path)
+        for path in candidates:
+            try:
+                CudaRTLibrary._load_exported_functions(path)
+            except (AttributeError, OSError):
+                continue
+            return path
+        raise AssertionError("libcudart is not loaded in the current process")
+
     def __init__(self, so_file: Optional[str] = None):
         if so_file is None:
-            so_file = find_loaded_library("libcudart")
-            assert so_file is not None, "libcudart is not loaded in the current process"
-        if so_file not in CudaRTLibrary.path_to_library_cache:
-            lib = ctypes.CDLL(so_file)
-            CudaRTLibrary.path_to_library_cache[so_file] = lib
-        self.lib = CudaRTLibrary.path_to_library_cache[so_file]
+            so_file = self._find_loadable_cudart()
 
         if so_file not in CudaRTLibrary.path_to_dict_mapping:
-            _funcs = {}
-            for func in CudaRTLibrary.exported_functions:
-                f = getattr(self.lib, func.name)
-                f.restype = func.restype
-                f.argtypes = func.argtypes
-                _funcs[func.name] = f
-            CudaRTLibrary.path_to_dict_mapping[so_file] = _funcs
-        self.funcs = CudaRTLibrary.path_to_dict_mapping[so_file]
+            self.funcs = self._load_exported_functions(so_file)
+        else:
+            self.funcs = CudaRTLibrary.path_to_dict_mapping[so_file]
+        self.lib = CudaRTLibrary.path_to_library_cache[so_file]
 
     def CUDART_CHECK(self, result: cudaError_t) -> None:
         if result != 0:
