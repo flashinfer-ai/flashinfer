@@ -137,6 +137,7 @@ _FLASHINFER_ENV_OVERRIDES = {
     "online_act_quant": "FLASHINFER_ONLINE_ACT_QUANT",
     "use_skip_softmax_sparse": "FLASHINFER_USE_SKIP_SOFTMAX_SPARSE",
     "skip_softmax_threshold_scale_factor": "FLASHINFER_SKIP_SOFTMAX_THRESHOLD",
+    "attention_backend": "FLASHINFER_ATTENTION_BACKEND",
 }
 
 
@@ -193,10 +194,6 @@ def _config_to_flashinfer_config(
         for field in WanTransformer3DConfig.__dataclass_fields__
         if field != "inner_dim"
     }
-
-    attention_backend = os.getenv("FLASHINFER_ATTENTION_BACKEND")
-    if attention_backend:
-        values["attention_backend"] = attention_backend
 
     for field, env_name in _FLASHINFER_ENV_OVERRIDES.items():
         raw = os.getenv(env_name)

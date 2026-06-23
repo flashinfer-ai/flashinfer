@@ -191,18 +191,6 @@ python wan/pipeline_wan_flashinfer.py \
   --output wan_flashinfer.mp4
 ```
 
-For numeric end-to-end comparison, run latent output for original diffusers and
-FlashInfer using the same seed:
-
-```bash
-python wan/pipeline_wan_flashinfer.py \
-  --model-id Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --compare-original \
-  --num-inference-steps 3 \
-  --output-type latent \
-  --output wan_flashinfer_compare.pt
-```
-
 ### WAN Config Fields
 
 `WanTransformer3DConfig` exposes the same backend controls as constructor fields:
@@ -226,5 +214,3 @@ python wan/pipeline_wan_flashinfer.py \
 - `from_pretrained` remaps diffusers' `ffn.net.0.proj.*` / `ffn.net.2.*` keys
   to `FlashInferFeedForward`'s `proj_up.*` / `proj_down.*`; without the remap
   the FFN weights would be silently dropped.
-- `pipeline_wan_flashinfer.py --compare-original` compares latent tensors by
-  `max_abs_error`, `mean_abs_error`, and cosine similarity.
