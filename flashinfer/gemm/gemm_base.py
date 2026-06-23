@@ -2177,9 +2177,10 @@ def _is_cudnn_override_shape_available() -> bool:
     """Return True if the installed cuDNN backend supports is_override_shape_enabled."""
     if not CUDNN_AVAILABLE:
         return False
-    if cudnn.backend_version() < 92301:
+    try:
+        return cudnn.backend_version() >= 92301
+    except (AttributeError, RuntimeError, TypeError):
         return False
-    return True
 
 
 def _get_cudnn_workspace_size(graph, plan_index: int) -> int:
