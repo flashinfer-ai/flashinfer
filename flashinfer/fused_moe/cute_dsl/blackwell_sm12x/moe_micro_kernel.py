@@ -47,12 +47,8 @@ from flashinfer.fused_moe.cute_dsl.utils import (
     prefetch_global_l2,
 )
 from .moe_activations import (
-    SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     normalize_moe_activation,
-    normalize_swiglu_alpha_for_activation,
-    normalize_swiglu_beta_for_activation,
-    normalize_swiglu_limit_for_activation,
 )
 
 
@@ -347,9 +343,10 @@ class MoEMicroKernelBackend:
             raise ValueError(
                 f"unsupported micro e8m0_scale_layout {e8m0_scale_layout!r}"
             )
-        swiglu_limit = normalize_swiglu_limit_for_activation(activation, swiglu_limit)
-        swiglu_alpha = normalize_swiglu_alpha_for_activation(activation, swiglu_alpha)
-        swiglu_beta = normalize_swiglu_beta_for_activation(activation, swiglu_beta)
+        # SwiGLU-OAI is not supported; silu/relu2 use these fixed defaults.
+        swiglu_limit = None
+        swiglu_alpha = 1.0
+        swiglu_beta = 0.0
         if w13_layout not in {"w13", "w31"}:
             raise ValueError(f"unsupported micro w13_layout {w13_layout!r}")
         self.scale_format = scale_format
@@ -367,7 +364,7 @@ class MoEMicroKernelBackend:
         del fast_math
         self.activation = activation
         self.is_gated = is_gated_moe_activation(activation)
-        self.is_swigluoai = activation == SWIGLUOAI_UNINTERLEAVE
+        self.is_swigluoai = False
         self.share_input_across_experts = share_input_across_experts
         self.share_expert_scales = share_expert_scales
         self.single_token = single_token

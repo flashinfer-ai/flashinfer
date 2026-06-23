@@ -717,12 +717,7 @@ def launch_sm120_static_moe(
 ) -> torch.Tensor:
     """Launch the SM120 "static" band via the MoEMicroKernelBackend harness.
 
-    Upstream b12x folded the legacy tensor-core static backend into the
-    compact micro kernel, which now handles the whole small/medium decode
-    band (the dispatcher only routes here for routed-pair counts the micro
-    kernel reports as supported). The kernel reads the routed activations,
-    packed FP4 weights, and swizzled block scales directly and scatters the
-    weighted result into ``scatter_output``.
+    Micro kernel handles the small/medium decode band.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
@@ -772,20 +767,12 @@ def launch_sm120_static_moe(
         device=a.device,
     )
 
-    # FC1->FC2 intermediate scratch (uint32 packed FP4). Sized from the
-    # kernel's bound shape config and cached on the workspace so repeated
-    # launches (and CUDA-graph replay) reuse the same buffer.
     inter_elems = int(num_tokens) * int(kernel._cfg.inter_u32)
     inter_fp32 = getattr(workspace, "_micro_inter", None)
     if inter_fp32 is None or inter_fp32.numel() < inter_elems:
         inter_fp32 = torch.empty(inter_elems, dtype=torch.uint32, device=a.device)
         workspace._micro_inter = inter_fp32  # type: ignore[attr-defined]
 
-    # The compiled __call__ takes the operands as DataPointer params, which the
-    # tvm-ffi binding accepts as raw int addresses (matching the dynamic launch
-    # path). MoEMicroKernelBackend.launch wraps the same arguments in cute
-    # Pointer objects, which this tvm-ffi build rejects, so call the compiled
-    # function directly with .data_ptr() addresses in the launch() arg order.
     _stream = current_cuda_stream()
     compiled(
         a.data_ptr(),
@@ -1309,23 +1296,6 @@ def _get_dynamic_kernel(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
 
-    # num_experts is passed as a dynamic (SymInt) operand dim so a single
-    # compiled dynamic kernel serves any expert count — the kernel reads
-    # num_experts = Int32(row_counts.shape[0]) at runtime and loops dynamically,
-    # so E never needs to be a compile-time constant. This avoids recompiling per
-    # expert count (e.g. 256 vs 384) with no measurable kernel-perf cost
-    # (validated on GB10: min/p10 latency unchanged vs a static-E build).
-    #
-    # NOTE: k and n are deliberately left static. Marking them SymInt compiles and
-    # binds fine (smem is tile-shaped, not k/n-shaped), but the kernel rebuilds
-    # the block-scale (SF) gmem layouts via tile_atom_to_shape_SF(packed_a.shape /
-    # b_w13.shape) from pointer operands, and those freeze at the traced k/n -- so
-    # a kernel traced at one (k,n) reads scales from wrong offsets at another.
-    # Verified in isolation: same-n/different-k reuse passes at the traced k but
-    # drops to ~50% within tolerance at a different k (and k+n reuse NaNs).
-    # Genericizing k/n would require making the SF layouts SymInt-correct (kernel
-    # surgery + upstream divergence); not worth it. num_experts (E) is purely a
-    # batch/stride/loop dim with no such dependency, so it stays dynamic.
     E_sym = sym_int(32, divisibility=1, symbol="moe_E")
     Ep1_sym = sym_int(32, divisibility=1, symbol="moe_Ep1")
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
@@ -2086,7 +2056,6 @@ def launch_sm120_moe(
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
     source_format: str = "modelopt",
-    apply_router_weight_on_input: bool = False,
     _workspace=None,
     _weight_views=None,
     _prepared_weights=None,
@@ -2185,10 +2154,7 @@ def launch_sm120_moe(
             num_topk=top_k,
             activation_precision=activation_precision,
         )
-        # The "static" band is now served by the compact micro kernel, which
-        # only handles 1 <= num_tokens <= 8 (it keeps the tokens' activations
-        # resident). For shapes it cannot support, fall back to the dynamic
-        # grouped-GEMM backend.
+
         micro_cls = _resolve_micro_cls(activation)
         if backend == "static" and not micro_cls.is_supported(  # type: ignore[attr-defined]
             num_tokens, k, n, top_k, num_experts

@@ -2881,13 +2881,6 @@ b12x_fused_moe_trace = TraceTemplate(
                 "'modelopt' or 'compressed_tensors' for w4a16."
             ),
         ),
-        "apply_router_weight_on_input": Scalar(
-            "bool",
-            optional=True,
-            description=(
-                "Apply routing weights to the FC1 input instead of the FC2 output."
-            ),
-        ),
     },
     outputs={
         "output": Tensor(

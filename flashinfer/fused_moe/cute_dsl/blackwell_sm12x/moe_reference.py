@@ -5,13 +5,9 @@ from dataclasses import dataclass
 import torch
 from flashinfer.fused_moe.cute_dsl.utils import fp4_quantize_values_torch
 from .moe_activations import (
-    SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     moe_activation_w1_rows,
     normalize_moe_activation,
-    normalize_swiglu_alpha_for_activation,
-    normalize_swiglu_beta_for_activation,
-    normalize_swiglu_limit_for_activation,
 )
 
 
@@ -163,12 +159,8 @@ def _normalize_reference_swiglu_params(
     swiglu_beta: float | None,
 ) -> tuple[str, float | None, float, float]:
     activation = normalize_moe_activation(activation)
-    return (
-        activation,
-        normalize_swiglu_limit_for_activation(activation, swiglu_limit),
-        normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
-        normalize_swiglu_beta_for_activation(activation, swiglu_beta),
-    )
+    # SwiGLU-OAI is not supported; silu/relu2 use these fixed defaults.
+    return (activation, None, 1.0, 0.0)
 
 
 def _gated_row_slices(
@@ -183,8 +175,6 @@ def _gated_row_slices(
         if layout == "w31":
             return slice(0, I_tp), slice(I_tp, 2 * I_tp)
         return slice(I_tp, 2 * I_tp), slice(0, I_tp)
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        return slice(0, I_tp), slice(I_tp, 2 * I_tp)
     return slice(I_tp, 2 * I_tp), slice(0, I_tp)
 
 
@@ -197,13 +187,6 @@ def _apply_gated_activation(
     swiglu_alpha: float,
     swiglu_beta: float,
 ) -> torch.Tensor:
-    if swiglu_limit is not None:
-        gate = torch.clamp(gate, max=float(swiglu_limit))
-        up = torch.clamp(up, min=-float(swiglu_limit), max=float(swiglu_limit))
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        return (
-            gate * torch.sigmoid(float(swiglu_alpha) * gate) * (up + float(swiglu_beta))
-        )
     return gate * torch.sigmoid(gate) * up
 
 
@@ -335,10 +318,6 @@ def prepare_flashinfer_trtllm_fp4_e8m0_k32_weights(
     FlashInfer's ABI carrier for the interleaved byte storage.
     """
     activation = normalize_moe_activation(activation)
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        raise NotImplementedError(
-            "FlashInfer TRT-LLM FP4 preparation does not support swigluoai_uninterleave"
-        )
     _validate_reference_inputs(w13_fp4, I_tp, activation)
     if not w13_fp4.is_cuda or not w2_fp4.is_cuda:
         raise RuntimeError("FlashInfer TRT-LLM FP4 preparation requires CUDA tensors")
@@ -482,10 +461,6 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer(
     scale_byte_clamp: int | None = _E8M0_K32_BF16_MAX_SCALE_BYTE,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        raise NotImplementedError(
-            "FlashInfer TRT-LLM FP4 oracle does not support swigluoai_uninterleave"
-        )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if int(E) != int(w1_fp4.shape[0]) or int(E) != int(w2_fp4.shape[0]):
         raise ValueError("E must match the expert dimension of w1_fp4 and w2_fp4")
@@ -529,10 +504,6 @@ def moe_reference_w4a16_fp4_e8m0_k32_flashinfer_prepared(
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        raise NotImplementedError(
-            "FlashInfer TRT-LLM FP4 oracle does not support swigluoai_uninterleave"
-        )
     if x.dtype != torch.bfloat16:
         raise TypeError(
             f"FlashInfer W4A16 oracle expects BF16 activations, got {x.dtype}"
@@ -1490,10 +1461,6 @@ def moe_reference_w4a8_mx(
     per-expert weight global dequant scale (ones for MXFP4 sources).
     """
     activation = normalize_moe_activation(activation)
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        raise NotImplementedError(
-            "W4A8 MoE reference does not support swigluoai_uninterleave"
-        )
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     if K % 32 != 0 or I_tp % 32 != 0:
         raise ValueError("K and I_tp must be divisible by 32 for w4a8")
@@ -1569,10 +1536,6 @@ def trace_moe_reference_w4a8_route(
 ) -> MoERouteTrace:
     """Single-route stage trace for the w4a8 oracle (kernel debugging aid)."""
     activation = normalize_moe_activation(activation)
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        raise NotImplementedError(
-            "W4A8 MoE reference does not support swigluoai_uninterleave"
-        )
     del E
     _validate_reference_inputs(w1_fp4, I_tp, activation)
     is_gated = is_gated_moe_activation(activation)

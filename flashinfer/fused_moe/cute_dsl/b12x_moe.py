@@ -76,7 +76,6 @@ def b12x_fused_moe(
     activation_precision: str = "fp4",
     quant_mode: Optional[str] = None,
     source_format: str = "modelopt",
-    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     r"""Run fused MoE on SM120/SM121 using b12x CuTe-DSL kernels.
 
@@ -208,7 +207,6 @@ def b12x_fused_moe(
         activation_precision=activation_precision,
         quant_mode=quant_mode,
         source_format=source_format,
-        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
 
@@ -260,7 +258,6 @@ class B12xMoEWrapper:
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
-        apply_router_weight_on_input: bool = False,
     ):
         r"""Configure the b12x fused-MoE wrapper.
 
@@ -343,7 +340,6 @@ class B12xMoEWrapper:
             self.quant_mode
         )
         self.source_format = source_format
-        self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
@@ -589,7 +585,6 @@ class B12xMoEWrapper:
             activation_precision=self.activation_precision,
             quant_mode=self.quant_mode,
             source_format=self.source_format,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
             _workspace=workspace,
             _weight_views=self._weight_views,
         )
