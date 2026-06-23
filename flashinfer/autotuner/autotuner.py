@@ -487,8 +487,8 @@ class FakeTensor:
 class TunableRunner(ABC):
     @abstractmethod
     def get_valid_tactics(
-        self, inputs: list[torch.Tensor], profile: OptimizationProfile
-    ) -> list[int]:
+        self, inputs: List[torch.Tensor], profile: OptimizationProfile
+    ) -> List[Any]:
         """One tactic corresponding to one cuda kernel normally, but how to interpret the meaning
         of tactic is pure internal details of the runner.
 
@@ -527,8 +527,8 @@ class TunableRunner(ABC):
     @abstractmethod
     def forward(
         self,
-        inputs: list[torch.Tensor],
-        tactic: int = -1,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs,  # all others are keyword args only
     ) -> Any:
@@ -1314,7 +1314,7 @@ class AutoTuner:
         tuning_config: TuningConfig,
         inputs: list[torch.Tensor],
         **kwargs,
-    ) -> tuple[TunableRunner, int]:
+    ) -> Tuple[TunableRunner, Any]:
         """Choose the best runner and tactic combination through performance profiling.
 
         Args:
@@ -1325,9 +1325,9 @@ class AutoTuner:
             **kwargs: Arbitrary keyword arguments, will be passed to get_valid_tactics and forward method of each runner
 
         Returns:
-            Tuple[TunableRunner, int]: A tuple containing:
+            Tuple[TunableRunner, Any]: A tuple containing:
                 - The selected runner implementation
-                - The best tactic ID for that runner (-1 if using fallback)
+                - The best tactic for that runner (-1 if using fallback)
 
         Note:
             The method profiles different implementations and tactics to find the
