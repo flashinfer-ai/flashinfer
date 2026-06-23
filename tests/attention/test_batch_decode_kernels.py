@@ -23,7 +23,17 @@ from tests.test_helpers.jit_utils import (
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from functools import partial
 import flashinfer
-from flashinfer.utils import has_flashinfer_jit_cache
+from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+
+
+def head_dim_512_supported() -> bool:
+    # head_dim > 256 is only supported on SM100+.
+    return get_compute_capability(torch.device("cuda:0"))[0] >= 10
+
+
+def skip_if_head_dim_unsupported(head_dim: int):
+    if head_dim > 256 and not head_dim_512_supported():
+        pytest.skip("head_dim > 256 is only supported on SM100 or newer")
 
 
 @pytest.fixture(
@@ -65,7 +75,7 @@ def warmup_jit():
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
 @pytest.mark.parametrize("kv_layout", ["NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
@@ -88,6 +98,7 @@ def test_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
+    skip_if_head_dim_unsupported(head_dim)
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size

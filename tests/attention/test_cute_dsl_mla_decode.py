@@ -1708,3 +1708,58 @@ def test_cute_dsl_mla_decode_soft_capping_small_cap(batch_size, seq_len_k, page_
     ref_out_cast = ref_out.to(dtype)
 
     torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
+
+
+def _mla_decode_block_size_128_inputs(batch_size=4, seq_len_k=512, num_heads=128):
+    device = torch.device("cuda")
+    latent_dim = 512
+    rope_dim = 64
+    page_size = 128
+    D_qk = latent_dim + rope_dim
+    query = torch.randn(
+        batch_size, 1, num_heads, D_qk, dtype=torch.float16, device=device
+    )
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    kv_cache = torch.randn(
+        total_pages, page_size, D_qk, dtype=torch.float16, device=device
+    )
+    block_tables = torch.arange(
+        batch_size * num_pages_per_batch, dtype=torch.int32, device=device
+    ).view(batch_size, num_pages_per_batch)
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    return dict(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=latent_dim,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        bmm1_scale=1.0 / (latent_dim**0.5),
+        bmm2_scale=1.0,
+        is_var_seq=False,
+    )
+
+
+def test_mla_decode_auto_dispatches_to_cute_dsl_for_block_size_128():
+    skip_if_unsupported()
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    torch.manual_seed(42)
+    args = _mla_decode_block_size_128_inputs()
+    out = trtllm_batch_decode_with_kv_cache_mla(**args, backend="auto")
+    assert out.shape == (args["query"].size(0), 1, args["query"].size(2), 512)
+    assert torch.isfinite(out).all()
+
+
+def test_mla_decode_trtllm_gen_rejects_block_size_128():
+    skip_if_unsupported()
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    args = _mla_decode_block_size_128_inputs()
+    with pytest.raises(ValueError, match=r"trtllm-gen requires block_size"):
+        trtllm_batch_decode_with_kv_cache_mla(**args, backend="trtllm-gen")

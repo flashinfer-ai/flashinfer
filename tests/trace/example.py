@@ -39,6 +39,8 @@ merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
+mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
+mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
 moe_fp4_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
@@ -308,6 +310,32 @@ try:
     a_d4 = torch.ones(M, K // BS4, dtype=torch.float8_e4m3fn, device=device)
     b_d4 = torch.ones(K, N // BS4, dtype=torch.float8_e4m3fn, device=device)
     flashinfer.gemm.mm_fp4(a_fp4, b_fp4, a_d4, b_d4, block_size=BS4)
+except Exception:
+    pass  # Requires Blackwell (SM100+)
+
+# ── GEMM bf16 x fp4: mm_bf16_fp4 (weight-only) ──────────────────────────────
+# Blackwell SM100+: M×7168@2048×7168, block=16. b/b_descale shapes are the
+# *prepared* layouts (prepare_bf16_fp4_weights).
+try:
+    M, K, N, BSW = 128, 7168, 2048, 16
+    a_w4 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    alpha_w4 = torch.ones(1, dtype=torch.float32, device=device)
+    # cuDNN layout: canonical packed weight + linear fp8 scales.
+    b_w4 = torch.zeros(N, K // 2, dtype=torch.uint8, device=device)
+    sf_w4 = torch.ones(N, K // BSW, dtype=torch.float8_e4m3fn, device=device)
+    flashinfer.mm_bf16_fp4(a_w4, b_w4, sf_w4, alpha_w4, backend="cudnn", block_size=BSW)
+except Exception:
+    pass  # Requires Blackwell (SM100+) and cuDNN >= 9.23.1
+try:
+    M, K, N, BSW = 128, 7168, 2048, 16
+    a_w4 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
+    alpha_w4 = torch.ones(1, dtype=torch.float32, device=device)
+    # cute-DSL layout: tile-packed int32 weight + S0E5M3 uint8 scales.
+    b_w4 = torch.zeros(K // 16, N * 2, dtype=torch.int32, device=device)
+    sf_w4 = torch.ones(K // BSW, N, dtype=torch.uint8, device=device)
+    flashinfer.mm_bf16_fp4(
+        a_w4, b_w4, sf_w4, alpha_w4, backend="cute-dsl", block_size=BSW
+    )
 except Exception:
     pass  # Requires Blackwell (SM100+)
 

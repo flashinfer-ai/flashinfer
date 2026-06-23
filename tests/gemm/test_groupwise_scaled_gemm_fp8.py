@@ -27,6 +27,7 @@ from flashinfer.gemm import (
     group_deepgemm_fp8_nt_groupwise,
     group_gemm_fp8_nt_groupwise,
 )
+from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
 
@@ -80,7 +81,7 @@ def test_fp8_blockscale_gemm(
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
-@pytest.mark.parametrize("backend", ["cutlass", "trtllm"])
+@pytest.mark.parametrize("backend", ["cutlass", "trtllm", "cutile"])
 def test_fp8_groupwise_gemm(
     m,
     n,
@@ -102,6 +103,19 @@ def test_fp8_groupwise_gemm(
         pytest.skip(
             "gemm_fp8_nt_groupwise with cutlass backend is only supported on SM100/103, SM110, and SM120/121 GPUs."
         )
+    if backend == "cutile":
+        if compute_capability[0] not in [10, 11, 12]:
+            pytest.skip(
+                "gemm_fp8_nt_groupwise with cuTile backend is only supported on SM100+ GPUs."
+            )
+        if scale_major_mode != "K":
+            pytest.skip(
+                "gemm_fp8_nt_groupwise with cuTile backend currently supports scale_major_mode='K' only."
+            )
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
     torch.random.manual_seed(0)
     tile_size = 128
     out_dtype = torch.bfloat16
@@ -348,6 +362,95 @@ def test_fp8_groupwise_batch_deepgemm_masked(
     for i in range(group_size):
         torch.testing.assert_close(
             out[i][: masked_m[i]], ref[i][: masked_m[i]], atol=3e-2, rtol=3e-2
+        )
+
+
+@pytest.mark.parametrize("m", [128, 512])
+@pytest.mark.parametrize("n", [256, 4096])
+@pytest.mark.parametrize("k", [256, 2048])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_gemm_fp8_nt_groupwise_cutile_out_dtypes(m, n, k, out_dtype):
+    """cuTile FP8 groupwise GEMM correctness across supported output dtypes.
+
+    ``gemm_fp8_nt_groupwise`` (all backends) is contract-restricted to bf16 /
+    fp16 output by ``_validate_fp8_output_dtype`` in ``gemm_base.py``, so we
+    do not parametrize over fp32 here. The cuTile kernel itself supports
+    fp32 store, but matching the function-level contract avoids divergence
+    from the other backends.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10, 11, 12]:
+        pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
+
+    torch.random.manual_seed(0)
+    tile_size = 128
+    scale_major_mode = "K"
+
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
+
+    a_scale_shape = (m, k // tile_size)
+    b_scale_shape = (n // tile_size, k // tile_size)
+    a_tile_shape = (1, tile_size)
+    b_tile_shape = (tile_size, tile_size)
+
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
+
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
+
+    c = gemm_fp8_nt_groupwise(
+        a=a_fp8,
+        b=b_fp8,
+        a_scale=a_scale,
+        b_scale=b_scale,
+        scale_major_mode=scale_major_mode,
+        mma_sm=1,
+        out_dtype=out_dtype,
+        backend="cutile",
+    )
+    torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+
+
+def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
+    """The v1 cuTile fp8 path only supports K-major scales; MN-major must raise."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] not in [10, 11, 12]:
+        pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
+
+    torch.random.manual_seed(0)
+    m, n, k = 128, 1024, 2048
+    tile_size = 128
+
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda")
+
+    a_scale_shape = (k // tile_size, m)
+    b_scale_shape = (k // tile_size, n // tile_size)
+    a_tile_shape = (1, tile_size)
+    b_tile_shape = (tile_size, tile_size)
+
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, "MN")
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, "MN")
+
+    # The @backend_requirement decorator raises ValueError before reaching the
+    # cuTile module's own NotImplementedError.
+    with pytest.raises(ValueError, match="scale_major_mode='K' only"):
+        gemm_fp8_nt_groupwise(
+            a=a_fp8,
+            b=b_fp8,
+            a_scale=a_scale,
+            b_scale=b_scale,
+            scale_major_mode="MN",
+            mma_sm=1,
+            out_dtype=torch.bfloat16,
+            backend="cutile",
         )
 
 

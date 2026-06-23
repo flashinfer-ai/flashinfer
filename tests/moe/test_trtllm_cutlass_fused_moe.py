@@ -445,6 +445,93 @@ def test_moe(
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
 
 
+def compute_with_experts_gelu_tanh(
+    num_experts,
+    x,
+    w31_weight,
+    w2_weight,
+    selected_experts,
+    routing_weights,
+):
+    """Reference for gated tanh-GELU MoE.
+
+    Mirrors ``compute_with_experts`` (the SwiGLU reference) exactly, including
+    the gated weight split convention: ``w31`` is split along dim 0 into
+    ``(w3, w1)`` where ``w3`` is the first half and ``w1`` is the second half.
+    The gate branch (``w1``) is activated and multiplied by the linear branch
+    (``w3``). The only difference vs SwiGLU is the activation:
+    ``F.gelu(gate, approximate="tanh")`` instead of ``F.silu(gate)``.
+    """
+    results = torch.zeros_like(x)
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.sum():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+        w31_expert = w31_weight[expert_id]  # [2 * intermediate_size, hidden_size]
+        w2_expert = w2_weight[expert_id]  # [hidden_size, intermediate_size]
+
+        # Same split as compute_with_experts: w3 = first half, w1 = second half.
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+
+        expert_inputs = x[batch_idx]
+        gate = expert_inputs @ w1_expert.t()
+        linear = expert_inputs @ w3_expert.t()
+        inter = F.gelu(gate, approximate="tanh") * linear
+        output = inter @ w2_expert.t()
+        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+    return results.view_as(x)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+    """Gated tanh-GELU activation (ActivationType.GegluTanh) on the bf16 CUTLASS
+    MoE path. Same shapes / weight-split convention as the SwiGLU ``test_moe``,
+    but activation = GELU_tanh(gate) * linear, compared against a torch
+    ``F.gelu(..., approximate="tanh")`` gated reference.
+    """
+    # Skip invalid configurations
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=dtype).cuda()
+        / 5
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda() / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts_gelu_tanh(
+        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+    )
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        flash_output.dtype,
+        output=flash_output,
+        quant_scales=None,
+        activation_type=ActivationType.GegluTanh,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
