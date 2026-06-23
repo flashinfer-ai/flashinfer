@@ -20,7 +20,3 @@ def normalize_moe_activation(activation: str) -> str:
 
 def is_gated_moe_activation(activation: str) -> bool:
     return normalize_moe_activation(activation) in GATED_MOE_ACTIVATIONS
-
-
-def moe_activation_w1_rows(activation: str, n: int) -> int:
-    return (2 if is_gated_moe_activation(activation) else 1) * int(n)

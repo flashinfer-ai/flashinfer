@@ -2149,17 +2149,28 @@ def launch_sm120_moe(
         )
 
         micro_cls = _resolve_micro_cls(activation)
-        if backend == "static" and not micro_cls.is_supported(  # type: ignore[attr-defined]
+        micro_supported = micro_cls.is_supported(  # type: ignore[attr-defined]
             num_tokens, k, n, top_k, num_experts
-        ):
-            backend = "dynamic"
+        )
         # The dynamic kernel indexes row_counts/expert_write_rows directly with
         # topk_ids but those buffers are sized with num_local_experts. Unless
         # num_local_experts == num_experts the per-expert buffers do not line
         # up; the micro path indexes weights by physical expert id and is the
         # only backend here that tolerates num_local_experts != num_experts.
-        if backend == "dynamic" and num_local_experts != num_experts:
+        # (The public API rejects num_local_experts != num_experts outright;
+        # this keeps the dispatcher self-consistent regardless, never routing
+        # to the micro backend with a shape it does not support.)
+        if num_local_experts != num_experts:
+            if not micro_supported:
+                raise ValueError(
+                    "num_local_experts != num_experts requires the SM120 micro "
+                    "MoE backend, but it does not support this shape "
+                    f"(num_tokens={num_tokens}, k={k}, n={n}, top_k={top_k}, "
+                    f"num_experts={num_experts})."
+                )
             backend = "static"
+        elif backend == "static" and not micro_supported:
+            backend = "dynamic"
         workspace = _get_cached_workspace(
             backend=backend,
             state_E=num_local_experts,

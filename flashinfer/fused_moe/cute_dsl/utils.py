@@ -30,12 +30,6 @@ from flashinfer.cute_dsl.fp4_common import (
 )
 
 
-MX_SF_VEC_SIZE = 32  # Elements per UE8M0 scale block (MXFP8 w4a8 activations)
-
-
-_INV_FLOAT8_E4M3_MAX = 1.0 / FLOAT8_E4M3_MAX
-
-
 @cute.jit
 def quantize_block_fp4(
     values: cute.Tensor,
@@ -93,7 +87,7 @@ def relu2_quantize_block_fp4(
 
 # =============================================================================
 # Additional primitives ported from b12x (b12x/cute/fp4.py) to support the
-# rebased SM120/SM121 two-backend MoE (dynamic + micro) and the W4A8 tier.
+# rebased SM120/SM121 two-backend MoE (dynamic + micro).
 # Ported verbatim from b12x HEAD 5af873a; see flashinfer/fused_moe/cute_dsl.
 # =============================================================================
 
@@ -287,54 +281,6 @@ def red_add_global_release_i32(addr: Int64, val: Int32, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def red_add_global_bf16x2(addr: Int64, packed: Uint32, *, loc=None, ip=None):
-    """No-return global atomic add of a packed bf16x2 value (2 contiguous bf16).
-
-    Used by the W4A16 TC-decode FC2 epilogue to fold the per-route partial
-    outputs into the per-token output without a separate top-k-sum launch.
-    The address must be 4-byte aligned and cover two consecutive bf16 lanes.
-    """
-    llvm.inline_asm(
-        None,
-        [
-            Int64(addr).ir_value(loc=loc, ip=ip),
-            Uint32(packed).ir_value(loc=loc, ip=ip),
-        ],
-        "red.relaxed.gpu.global.add.noftz.bf16x2 [$0], $1;",
-        "l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def red_max_global_f32_nonnegative(addr: Int64, val: Float32, *, loc=None, ip=None):
-    """No-return global max reduction for a non-negative fp32 value.
-
-    Non-negative IEEE-754 float ordering matches unsigned integer bit ordering,
-    so this emits a no-return u32 max reduction on the value's bit pattern.
-    Callers must initialize the destination with a non-negative fp32 value.
-    """
-    llvm.inline_asm(
-        None,
-        [
-            Int64(addr).ir_value(loc=loc, ip=ip),
-            Float32(val).ir_value(loc=loc, ip=ip),
-        ],
-        "{ .reg .u32 vi; mov.b32 vi, $1; red.relaxed.gpu.global.max.u32 [$0], vi; }",
-        "l,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def atomic_add_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None) -> Int32:
     """Shared-memory int32 atomic add (CTA-scope). Returns old value.
 
@@ -445,17 +391,17 @@ def bfloat2_broadcast_lane(x: Uint32, lane: Int32, *, loc=None, ip=None) -> Uint
                 Uint32(x).ir_value(loc=loc, ip=ip),
                 Int32(lane).ir_value(loc=loc, ip=ip),
             ],
+            # Use prmt to broadcast the selected bf16 half into both lanes in a
+            # single byte-permute instead of mask/shift/select/or. ctrl selects
+            # output bytes from $1 (c0->d0=LSB): 0x1010 -> [b0,b1,b0,b1] (low
+            # bf16) when lane==0, 0x3232 -> [b2,b3,b2,b3] (high bf16) otherwise.
             """
             {
                 .reg .pred p;
-                .reg .b32 lo, hi, val, shifted;
-                and.b32 lo, $1, 0x0000ffff;
-                shr.u32 hi, $1, 16;
+                .reg .b32 ctrl;
                 setp.eq.s32 p, $2, 0;
-                @p  mov.b32 val, lo;
-                @!p mov.b32 val, hi;
-                shl.b32 shifted, val, 16;
-                or.b32 $0, val, shifted;
+                selp.b32 ctrl, 0x1010, 0x3232, p;
+                prmt.b32 $0, $1, $1, ctrl;
             }
             """,
             "=r,r,r",
@@ -658,141 +604,6 @@ def packed_dequant_e4m3x4_to_half2x2(
 
 
 @dsl_user_op
-def packed_dequant_e8m0x4_to_bfloat2x2(
-    packed: Uint32, *, loc=None, ip=None
-) -> Tuple[Uint32, Uint32]:
-    """E8M0 compute-scale dequant for one packed 4-value BF16 fragment.
-
-    The W4A16 FP4 unpack path represents E2M1 values scaled by 2^-126.  Match
-    the existing NVFP4 split by materializing E8M0 scales multiplied by 2^7 in
-    the MMA input and applying the remaining compensation in the kernel
-    epilogue.
-    """
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [Uint32(packed).ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .u32 b0, b1, b2, b3;
-            .reg .u32 h0, h1, h2, h3;
-            .reg .u32 t0, t1;
-
-            and.b32 b0, $2, 0x000000ff;
-            shr.u32 b1, $2, 8;
-            and.b32 b1, b1, 0x000000ff;
-            shr.u32 b2, $2, 16;
-            and.b32 b2, b2, 0x000000ff;
-            shr.u32 b3, $2, 24;
-
-            add.u32 h0, b0, 7;
-            add.u32 h1, b1, 7;
-            add.u32 h2, b2, 7;
-            add.u32 h3, b3, 7;
-            shl.b32 h0, h0, 7;
-            shl.b32 h1, h1, 7;
-            shl.b32 h2, h2, 7;
-            shl.b32 h3, h3, 7;
-
-            shl.b32 t0, h2, 16;
-            or.b32 $0, h0, t0;
-            shl.b32 t1, h3, 16;
-            or.b32 $1, h1, t1;
-        }
-        """,
-        "=r,=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
-    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
-    return Uint32(lo), Uint32(hi)
-
-
-@dsl_user_op
-def packed_dequant_e8m0x4_to_half2x2(
-    packed: Uint32, *, loc=None, ip=None
-) -> Tuple[Uint32, Uint32]:
-    """E8M0 compute-scale dequant for one packed 4-value FP16 fragment."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [Uint32(packed).ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .pred p0, p1, p2, p3;
-            .reg .u32 b0, b1, b2, b3;
-            .reg .s32 e0, e1, e2, e3;
-            .reg .f32 ef0, ef1, ef2, ef3;
-            .reg .f32 f0, f1, f2, f3;
-            .reg .b16 h0, h1, h2, h3;
-
-            and.b32 b0, $2, 0x000000ff;
-            shr.u32 b1, $2, 8;
-            and.b32 b1, b1, 0x000000ff;
-            shr.u32 b2, $2, 16;
-            and.b32 b2, b2, 0x000000ff;
-            shr.u32 b3, $2, 24;
-
-            setp.eq.u32 p0, b0, 0;
-            setp.eq.u32 p1, b1, 0;
-            setp.eq.u32 p2, b2, 0;
-            setp.eq.u32 p3, b3, 0;
-
-            cvt.s32.u32 e0, b0;
-            cvt.s32.u32 e1, b1;
-            cvt.s32.u32 e2, b2;
-            cvt.s32.u32 e3, b3;
-            sub.s32 e0, e0, 120;
-            sub.s32 e1, e1, 120;
-            sub.s32 e2, e2, 120;
-            sub.s32 e3, e3, 120;
-
-            cvt.rn.f32.s32 ef0, e0;
-            cvt.rn.f32.s32 ef1, e1;
-            cvt.rn.f32.s32 ef2, e2;
-            cvt.rn.f32.s32 ef3, e3;
-            ex2.approx.f32 f0, ef0;
-            ex2.approx.f32 f1, ef1;
-            ex2.approx.f32 f2, ef2;
-            ex2.approx.f32 f3, ef3;
-            selp.f32 f0, 0f00000000, f0, p0;
-            selp.f32 f1, 0f00000000, f1, p1;
-            selp.f32 f2, 0f00000000, f2, p2;
-            selp.f32 f3, 0f00000000, f3, p3;
-
-            cvt.rn.f16.f32 h0, f0;
-            cvt.rn.f16.f32 h1, f1;
-            cvt.rn.f16.f32 h2, f2;
-            cvt.rn.f16.f32 h3, f3;
-
-            setp.eq.u32 p0, b0, 255;
-            setp.eq.u32 p1, b1, 255;
-            setp.eq.u32 p2, b2, 255;
-            setp.eq.u32 p3, b3, 255;
-            selp.b16 h0, 0x7e00, h0, p0;
-            selp.b16 h1, 0x7e00, h1, p1;
-            selp.b16 h2, 0x7e00, h2, p2;
-            selp.b16 h3, 0x7e00, h3, p3;
-
-            mov.b32 $0, {h0, h2};
-            mov.b32 $1, {h1, h3};
-        }
-        """,
-        "=r,=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
-    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
-    return Uint32(lo), Uint32(hi)
-
-
-@dsl_user_op
 def bf16_mma_m16n8k16_f32(
     d0: Float32,
     d1: Float32,
@@ -825,82 +636,6 @@ def bf16_mma_m16n8k16_f32(
         ],
         """
         mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
-        {$0, $1, $2, $3},
-        {$4, $5, $6, $7},
-        {$8, $9},
-        {$10, $11, $12, $13};
-        """,
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
-    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
-    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
-    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
-    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
-
-
-@dsl_user_op
-def f32_to_tf32_bits(x: Float32, *, loc=None, ip=None) -> Uint32:
-    """Round one float32 value to TF32 format and return its 32-bit operand bits."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(x).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .b32 tmp;
-                cvt.rna.tf32.f32 tmp, $1;
-                mov.b32 $0, tmp;
-            }
-            """,
-            "=r,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def tf32_mma_m16n8k8_f32(
-    d0: Float32,
-    d1: Float32,
-    d2: Float32,
-    d3: Float32,
-    a0: Uint32,
-    a1: Uint32,
-    a2: Uint32,
-    a3: Uint32,
-    b0: Uint32,
-    b1: Uint32,
-    *,
-    loc=None,
-    ip=None,
-) -> Tuple[Float32, Float32, Float32, Float32]:
-    """Warp MMA helper for `mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32`."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
-        [
-            Uint32(a0).ir_value(loc=loc, ip=ip),
-            Uint32(a1).ir_value(loc=loc, ip=ip),
-            Uint32(a2).ir_value(loc=loc, ip=ip),
-            Uint32(a3).ir_value(loc=loc, ip=ip),
-            Uint32(b0).ir_value(loc=loc, ip=ip),
-            Uint32(b1).ir_value(loc=loc, ip=ip),
-            Float32(d0).ir_value(loc=loc, ip=ip),
-            Float32(d1).ir_value(loc=loc, ip=ip),
-            Float32(d2).ir_value(loc=loc, ip=ip),
-            Float32(d3).ir_value(loc=loc, ip=ip),
-        ],
-        """
-        mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
         {$0, $1, $2, $3},
         {$4, $5, $6, $7},
         {$8, $9},
@@ -1559,51 +1294,6 @@ def _fp4_quantize_values(x: torch.Tensor) -> torch.Tensor:
 def fp4_quantize_values_torch(x: torch.Tensor) -> torch.Tensor:
     """Pure-Torch FP4 E2M1 quantization with kernel-matching tie-breaking."""
     return _fp4_quantize_values(x)
-
-
-def pow2_ceil_ue8m0_torch(scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Bit-exact Torch replica of the ``pow2_ceil_ue8m0`` device intrinsic.
-
-    Rounds positive fp32 scales UP to a power of two by bumping the exponent
-    whenever the mantissa is nonzero.  Returns ``(rounded_fp32, ue8m0_u8)``;
-    a zero scale maps to (0.0, byte 0).
-    """
-    bits = scale.to(torch.float32).contiguous().view(torch.int32)
-    mant = bits & 0x007FFFFF
-    bumped = torch.where(mant != 0, (bits + 0x00800000) & 0x7F800000, bits)
-    rounded = bumped.view(torch.float32)
-    byte = ((bumped >> 23) & 0xFF).to(torch.uint8)
-    return rounded, byte
-
-
-def _ue8m0_output_scale_torch(byte: torch.Tensor) -> torch.Tensor:
-    """Torch replica of ``ue8m0_to_output_scale``: 2^(127-byte), 0 for byte 0."""
-    inv_bits = (254 - byte.to(torch.int32)).clamp(min=0) << 23
-    inv = inv_bits.view(torch.float32)
-    return torch.where(byte == 0, torch.zeros_like(inv), inv)
-
-
-def quant_dequant_mxfp8_torch(x: torch.Tensor) -> torch.Tensor:
-    """Per-32-block MXFP8 quantize-dequantize roundtrip (oracle helper).
-
-    Matches the in-kernel ``quantize_block_fp8_mx`` numerics bit-for-bit:
-    UE8M0 ceil block scale, E4M3 RN-saturating payload.
-    """
-    orig_shape = x.shape
-    cols = orig_shape[-1]
-    if cols % MX_SF_VEC_SIZE != 0:
-        raise ValueError(f"last dim must be divisible by {MX_SF_VEC_SIZE}, got {cols}")
-    blocked = x.to(torch.float32).reshape(-1, cols // MX_SF_VEC_SIZE, MX_SF_VEC_SIZE)
-    block_max = blocked.abs().amax(dim=-1, keepdim=True)
-    rounded, byte = pow2_ceil_ue8m0_torch(block_max * _INV_FLOAT8_E4M3_MAX)
-    inv = _ue8m0_output_scale_torch(byte)
-    payload = (
-        (blocked * inv)
-        .clamp(-FLOAT8_E4M3_MAX, FLOAT8_E4M3_MAX)
-        .to(torch.float8_e4m3fn)
-        .to(torch.float32)
-    )
-    return (payload * rounded).reshape(orig_shape)
 
 
 @dsl_user_op
