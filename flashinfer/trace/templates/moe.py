@@ -2877,8 +2877,8 @@ b12x_fused_moe_trace = TraceTemplate(
             "string",
             optional=True,
             description=(
-                "Source weight format. 'modelopt'/'modelopt_nvfp4' for nvfp4; "
-                "'modelopt' or 'compressed_tensors' for w4a16."
+                "Source weight format for quant_mode='w4a16': 'modelopt' or "
+                "'compressed_tensors'."
             ),
         ),
     },

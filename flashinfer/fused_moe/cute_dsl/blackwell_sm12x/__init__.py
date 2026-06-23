@@ -1,16 +1,14 @@
 """Blackwell SM12x (SM120/SM121) MoE kernels for CuTe DSL (ported from b12x)."""
 
-from .moe_dynamic_kernel import MoEDynamicKernelBackend
-from .moe_micro_kernel import MoEMicroKernelBackend
-from .moe_relu2 import MoEDynamicKernelRelu2, MoEMicroKernelRelu2
-from .moe_silu import MoEDynamicKernelSilu, MoEMicroKernelSilu
-from .moe_reference import (
-    MoERouteTrace,
-    OracleMetrics,
-    compare_to_reference,
-    moe_reference_f32,
-    moe_reference_nvfp4,
-    trace_moe_reference_nvfp4_route,
+from .moe_dynamic_kernel import (
+    MoEDynamicKernelBackend,
+    MoEDynamicKernelRelu2,
+    MoEDynamicKernelSilu,
+)
+from .moe_micro_kernel import (
+    MoEMicroKernelBackend,
+    MoEMicroKernelRelu2,
+    MoEMicroKernelSilu,
 )
 
 # Default (gated SiLU) aliases.
@@ -26,10 +24,4 @@ __all__ = [
     "MoEMicroKernel",
     "MoEMicroKernelRelu2",
     "MoEMicroKernelSilu",
-    "MoERouteTrace",
-    "OracleMetrics",
-    "compare_to_reference",
-    "moe_reference_f32",
-    "moe_reference_nvfp4",
-    "trace_moe_reference_nvfp4_route",
 ]

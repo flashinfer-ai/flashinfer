@@ -27,11 +27,8 @@ from .moe_activations import (
     is_gated_moe_activation,
     normalize_moe_activation,
 )
-from .moe_silu import (
-    MoEDynamicKernelSilu,
-    MoEMicroKernelSilu,
-)
-from .moe_relu2 import MoEDynamicKernelRelu2, MoEMicroKernelRelu2
+from .moe_micro_kernel import MoEMicroKernelRelu2, MoEMicroKernelSilu
+from .moe_dynamic_kernel import MoEDynamicKernelRelu2, MoEDynamicKernelSilu
 from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
@@ -1796,8 +1793,6 @@ def _launch_sm120_w4a16_moe(
     fast_math: bool = True,
     activation: str = "silu",
     source_format: str = "modelopt",
-    activation_amax: torch.Tensor | None = None,
-    layer_idx: int | None = None,
     _workspace=None,
     _prepared_weights=None,
 ) -> torch.Tensor:
@@ -1868,8 +1863,6 @@ def _launch_sm120_w4a16_moe(
         packed_route_count=workspace.packed_route_count,
         expert_offsets=workspace.expert_offsets,
         expert_map=workspace.expert_map,
-        activation_amax=activation_amax,
-        layer_idx=layer_idx,
         fast_math=fast_math,
     )
 

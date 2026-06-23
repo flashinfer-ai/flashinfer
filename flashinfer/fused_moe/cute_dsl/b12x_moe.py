@@ -541,7 +541,6 @@ class B12xMoEWrapper:
             # Cache weight views; invalidate if weight pointers change.
             weight_key = (
                 self.quant_mode,
-                self.activation,
                 w1_weight.data_ptr(),
                 w1_weight_sf.data_ptr(),
                 w1_alpha.data_ptr(),
