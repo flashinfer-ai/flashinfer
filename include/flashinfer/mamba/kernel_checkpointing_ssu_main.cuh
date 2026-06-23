@@ -267,7 +267,7 @@ __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams
         cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
     state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) + state_ptr_offset +
                                   (int64_t)d_tile * D_PER_CTA * DSTATE;
-    replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
+    replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
         smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
         /*must_checkpoint=*/true);
   }
@@ -317,8 +317,12 @@ __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams
 
   // ── Cache: the main owns old_x (it loaded x).  old_B / old_dt / old_cumAdt are the
   // precompute's.  Per-head writeback. ──
-  store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
-                                                   cache_slot, write_offset, seq_len);
+  // store_old_x uses a fixed 128-thread (16×8) cooperative copy that covers the whole tile
+  // in one pass — so only the first 4 warps participate (flat_tid < 128).  At NUM_WARPS>4 the
+  // extra warps would index outside the 128-thread tiled copy → OOB STG; gate them out.
+  if (warp < 4)
+    store_old_x<input_t, NPREDICTED, DIM, D_PER_CTA>(smem, params, warp, lane, d_tile, head,
+                                                     cache_slot, write_offset, seq_len);
 }
 
 // =============================================================================

@@ -275,7 +275,7 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
 // i32 element offset inside the chunk.  Use this instead of separately
 // holding params.state-ptr and state_gmem_off.
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS,
-          typename SmemT>
+          int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuParams const& params,
                                                  int warp, int lane, int prev_k, int d_tile,
                                                  int64_t state_ptr_offset, state_t* state_w_base,
@@ -298,14 +298,23 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
   using LdsmB = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
                                    SM75_U16x2_LDSM_T>;
 
-  // 4 warps along N=DSTATE; each warp covers full M (D_PER_CTA/16 m-atoms).
-  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<_1, _4>>{});
+  // Warp layout (M_WARPS, 4): always 4 warps along N=DSTATE; M_WARPS = NUM_WARPS/4 warps
+  // split M=D_PER_CTA (each covers D_PER_CTA/M_WARPS/16 m-atoms + its own M-slice of the
+  // A operand, cutting the redundant old_x LDSM by M_WARPS).  NUM_WARPS=4 → (1,4) = the
+  // original _1x4 (byte-identical); 8 → (2,4); 16 → (4,4).
+  // TODO(int8-8warp): the int8/fp8 amax (kernel_checkpointing_ssu_8bit.cuh) is warp-local
+  // ONLY with full-N-per-warp (_W×1); this N-split layout would need a cross-warp amax
+  // reduce.  bf16/fp16 are unaffected (deterministic state / order-free SR).
+  constexpr int M_WARPS = NUM_WARPS / 4;
+  static_assert(NUM_WARPS % 4 == 0, "replay_state_mma needs NUM_WARPS a multiple of 4");
+  auto tiled_mma =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<Int<M_WARPS>, _4>>{});
   auto thr_mma = tiled_mma.get_slice(tid);
 
-  // Per-pass output tile is (D_PER_CTA, N_PER_PASS).  N_PER_PASS = 4 warps × n8 = 32 cols.
+  // Per-pass output tile is (D_PER_CTA/M_WARPS, N_PER_PASS).  N_PER_PASS = 4 warps × n8 = 32.
   constexpr int N_PER_PASS = 4 * MMA_prop::N;
   static_assert(DSTATE % N_PER_PASS == 0,
-                "DSTATE must be divisible by 4 * MMA_prop::N for _1x4 warp layout");
+                "DSTATE must be divisible by 4 * MMA_prop::N for the (M_WARPS,4) warp layout");
   constexpr int NUM_N_PASSES = DSTATE / N_PER_PASS;
 
   float total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
@@ -398,7 +407,10 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
   // Randint amortization: rand_idx[4] refreshed every 4 pairs; each pair's
   // cvt_rs uses one of the 4 randints.  Triton bit-equality is intentionally
   // given up; unbiasedness still holds.
-  constexpr int PAIRS_PER_PASS = D_PER_CTA / 8;  // = (D_PER_CTA/16) × 2 row-pair iters
+  // Per-warp M-rows = D_PER_CTA / M_WARPS, so pairs/pass = (D_PER_CTA/M_WARPS)/8.  (NUM_WARPS=4
+  // → M_WARPS=1 → D_PER_CTA/8, the original.)  Keeps the philox my_packed buffer + STG fusion
+  // sized to this warp's actual fragment under the (M_WARPS,4) split.
+  constexpr int PAIRS_PER_PASS = (D_PER_CTA / M_WARPS) / 8;  // = (per-warp M-atoms) × 2 row-pairs
   static_assert(NUM_N_PASSES % 2 == 0, "Cross-pass STG fusion requires even NUM_N_PASSES");
 
 #pragma unroll
@@ -511,8 +523,8 @@ __device__ __forceinline__ void compute_and_store_output(
   int const tid = warp * warpSize + lane;
 
   // ── TiledMMA: 128 threads, covers [16, 32] output per step ──
-  auto tiled_mma =
-      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_1, _4>>{});
+  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{},
+                                  Layout<Shape<_1, Int<NUM_WARPS>>>{});
   auto thr_mma = tiled_mma.get_slice(tid);
 
   // ── Swizzled smem views ──
@@ -716,8 +728,8 @@ __device__ __forceinline__ void compute_no_write_output(
   int const tid = warp * warpSize + lane;
 
   // ── TiledMMA for matmul-3 + matmul-4-new (K=NPREDICTED_PAD_MMA_M=16 fits K_BIG). ──
-  auto tiled_mma =
-      make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{}, Layout<Shape<_1, _4>>{});
+  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{},
+                                  Layout<Shape<_1, Int<NUM_WARPS>>>{});
   auto thr_mma = tiled_mma.get_slice(tid);
 
   // ── TiledMMA for matmul-4-old: K = MAX_WINDOW_PAD_MMA_K ∈ {8, 16} → atom dispatch. ──
@@ -727,7 +739,8 @@ __device__ __forceinline__ void compute_no_write_output(
                                       SM75_U32x2_LDSM_N>;
   using LdsmBOld = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
                                       SM75_U16x2_LDSM_T>;
-  auto tiled_mma_old = make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomOld>>{}, Layout<Shape<_1, _4>>{});
+  auto tiled_mma_old =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomOld>>{}, Layout<Shape<_1, Int<NUM_WARPS>>>{});
   auto thr_mma_old = tiled_mma_old.get_slice(tid);
 
   // ── Swizzled smem views ──
@@ -911,7 +924,7 @@ __device__ __forceinline__ void ssu_checkpoint(SmemT& smem, CheckpointingSsuPara
   state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
                                 cache_slot * params.state_stride_seq +
                                 (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
-  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
+  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
       smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
       /*must_checkpoint=*/true);
 

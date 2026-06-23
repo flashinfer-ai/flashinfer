@@ -381,9 +381,12 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
                                                     state_t const* __restrict__ state_ptr,
                                                     int64_t state_base, int warp, int lane) {
   using namespace cute;
-  static_assert(NUM_WARPS == 4, "Expected 4 warps");
   static_assert(D_PER_CTA % NUM_WARPS == 0, "D_PER_CTA must be divisible by NUM_WARPS");
   constexpr int DIM_PER_WARP = D_PER_CTA / NUM_WARPS;
+  // Each warp loads its DIM_PER_WARP-row slice with the (4,8) thread tile (4 rows/pass), so
+  // DIM_PER_WARP must be a multiple of 4.  NUM_WARPS=4 → 16 rows/warp (4 passes); 8 → 8 (2).
+  static_assert(DIM_PER_WARP % 4 == 0,
+                "DIM_PER_WARP (D_PER_CTA/NUM_WARPS) must be a multiple of 4 for the (4,8) load");
 
   // Single-local_tile path — swizzle layout sized to this CTA's
   // D_PER_CTA slice; one local_tile splits it directly per-warp.
@@ -1521,26 +1524,35 @@ __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams 
                                             int warp, int lane, int d_tile, int head,
                                             int64_t cache_slot) {
   using namespace cute;
-  int const flat_tid = warp * warpSize + lane;
+  static_assert(D_PER_CTA % NUM_WARPS == 0, "D_PER_CTA must be divisible by NUM_WARPS");
+  constexpr int DIM_PER_WARP = D_PER_CTA / NUM_WARPS;
+  static_assert(DIM_PER_WARP % 4 == 0,
+                "DIM_PER_WARP (D_PER_CTA/NUM_WARPS) must be a multiple of 4 for the (4,8) store");
   auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
   // gmem dest = head's full state base + d_tile's row slice.
   int64_t const state_base = cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE +
                              (int64_t)d_tile * D_PER_CTA * DSTATE;
 
-  // ── Per-CTA smem swizzle layout [D_PER_CTA, DSTATE]. ──
+  // Per-warp D-slice store — the exact inverse of load_state_per_warp: each warp writes its
+  // own DIM_PER_WARP rows with a 32-thread (4,8) copy, so ALL NUM_WARPS warps participate
+  // (symmetric with the load; no 128-thread cap, no idle warps).  NUM_WARPS=4 → 16 rows/warp
+  // (byte-identical gmem result to the old cooperative copy); 8 → 8 rows/warp.
   auto layout_smem_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
-  state_t const* smem_state_base = reinterpret_cast<state_t const*>(smem.state);
-
-  Tensor sState = make_tensor(make_smem_ptr(smem_state_base), layout_smem_swz);
-  Tensor gState = make_tensor(make_gmem_ptr(state_w + state_base),
-                              make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
-                                          make_stride(Int<DSTATE>{}, Int<1>{})));
+  Tensor sState_full =
+      make_tensor(make_smem_ptr(reinterpret_cast<state_t const*>(smem.state)), layout_smem_swz);
+  Tensor gState_full = make_tensor(make_gmem_ptr(state_w + state_base),
+                                   make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
+                                               make_stride(Int<DSTATE>{}, Int<1>{})));
+  Tensor sState = local_tile(sState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
+                             make_coord(warp, _0{}));
+  Tensor gState = local_tile(gState_full, make_shape(Int<DIM_PER_WARP>{}, Int<DSTATE>{}),
+                             make_coord(warp, _0{}));
   // Each store is 16 bytes — adjust val cols to the dtype.
   constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto s2g =
       make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, state_t>{},
-                      Layout<Shape<_16, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
-  auto thr = s2g.get_slice(flat_tid);
+                      Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
+  auto thr = s2g.get_slice(lane);
   copy(s2g, thr.partition_S(sState), thr.partition_D(gState));
 }
 

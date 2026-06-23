@@ -186,11 +186,26 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       // main_heads_per_cta is a HOST knob (Python-tunable); dispatch_heads_per_cta snaps
       // it to the HPG>>k chain and binds it to the MAIN_HEADS_PER_CTA template arg — it
       // never reaches the kernel as a runtime value.
+      //
+      // MAIN_NUM_WARPS=8 (decoupled from the precompute/mono NUM_WARPS=4): the main is
+      // SRAM-feed + state-load bound and badly under-occupied at small batch (~0.2 waves/SM);
+      // 8 warps split the replay MMA (M_WARPS×4) + the output MMA (_1×NUM_WARPS) + the state
+      // load, doubling the warps feeding the tensor cores.  Per-CTA smem is NUM_WARPS-
+      // independent.  (int8/fp8 still routes to the separate 8bit kernel — see replay TODO.)
+      // The 8-warp main is fully plumbed (replay M_WARPS×4, output _1×NUM_WARPS, per-warp
+      // state load + store) and DOUBLES occupancy (b=32: occ 20%→38%, eligible 0.38→0.84,
+      // no-issue 73%→64%).  But load_conv_inputs still loads C/x redundantly per-warp, so at
+      // 8 warps that traffic goes 4×→8× — the extra long_scoreboard + mio_throttle currently
+      // outweighs the occupancy gain (b=32 main 15.2→16.5us).  Stay at 4 until the conv-input
+      // load is split per-warp; then flip to `(D_PER_CTA >= 64) ? 8 : 4` (8 needs D_PER_CTA≥64
+      // for the output's _1×NUM_WARPS tiling: N_TILE = NUM_WARPS·n8 must divide D_PER_CTA).
+      constexpr int MAIN_NUM_WARPS = 4;
       dispatch_heads_per_cta<HEADS_PER_GROUP>(main_heads_per_cta, [&]<int MHC>() {
-        auto mfunc = checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t,
-                                                   stateIndex_t, state_scale_t, NPREDICTED,
-                                                   MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP,
-                                                   PHILOX_ROUNDS, NUM_WARPS, D_SPLIT, VARLEN, MHC>;
+        auto mfunc =
+            checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                          state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                          HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT,
+                                          VARLEN, MHC>;
         constexpr size_t msmem = sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED,
                                                                     MAX_WINDOW, D_PER_CTA, DSTATE>);
         if constexpr (msmem > 0) {
@@ -208,7 +223,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
         // grid.z = ngroups·(HPG/MHC); MHC divides HPG (kernel static_assert), so the
         // integer divide is the exact ceil.  Each CTA owns MHC consecutive heads in a group.
         mcfg.gridDim = dim3(D_SPLIT, params.batch, params.ngroups * (HEADS_PER_GROUP / MHC));
-        mcfg.blockDim = dim3(warpSize, NUM_WARPS);
+        mcfg.blockDim = dim3(warpSize, MAIN_NUM_WARPS);
         mcfg.dynamicSmemBytes = msmem;
         mcfg.stream = stream;
         mcfg.attrs = main_attrs;
