@@ -1686,10 +1686,10 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
             num_sab_heads * 64 * 64,
         ),
     )
-    transfer_t = torch.zeros(
+    transfer_t = torch.empty(
         (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
     )
-    state_t = torch.zeros(
+    state_t = torch.empty(
         (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
     )
     if total_cp_chunks == 0:
@@ -2331,7 +2331,7 @@ def cp_delta_rule_fixup_dsl_sm120(
             raise RuntimeError("cu_seqlens must be contiguous")
     num_seqs = cu_seqlens.shape[0] - 1
 
-    fixed_state = torch.zeros_like(local_state)
+    fixed_state = torch.empty_like(local_state)
     if total_cp_chunks == 0:
         return fixed_state
 
@@ -2907,9 +2907,9 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         for i in cutlass.range_constexpr(cute.size(tKKrT)):
             s, t = tKKcMkk_cv[i]
             value = cutlass.Float32(0.0)
-            pred = True
+            pred = s >= t
             if cutlass.const_expr(is_final_block):
-                pred = s < B and t < B
+                pred = pred and s < B and t < B
             if pred:
                 gamma = cute.math.exp2(
                     cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
@@ -4710,7 +4710,6 @@ def cp_delta_rule_dsl_sm120(
         _skip_check=True,
     )
 
-    state.zero_()
     cp_delta_rule_prefill_dsl_sm120(
         o,
         state,
