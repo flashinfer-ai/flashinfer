@@ -49,6 +49,14 @@ from cutlass.cute.runtime import from_dlpack
 
 
 def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # PyTorch's `.contiguous()` does NOT repack a slice whose leading dim has
+    # size 1 — size-1 dims don't affect PyTorch's contiguity check, so the
+    # parent's stride[0] survives. CUTE's mark_compact_shape_dynamic is
+    # stricter: it requires stride[0] == stride[1] * shape[1] (canonical
+    # compact). Detect the mismatch and rebuild with `.clone()` (forces
+    # contiguous-format allocation with canonical strides).
+    if torch_t.dim() > 1 and torch_t.stride(0) != torch_t.stride(1) * torch_t.size(1):
+        torch_t = torch_t.clone(memory_format=torch.contiguous_format)
     # explicit stride_order: auto-deduction is ambiguous at B=1/T=1.
     stride_order = tuple(sorted(range(torch_t.dim()), key=lambda d: -torch_t.stride(d)))
     return from_dlpack(
