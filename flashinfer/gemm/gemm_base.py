@@ -2520,6 +2520,11 @@ def build_cudnn_gemm_fp4_graph(
                 else cudnn.build_plan_policy.ALL
             )
 
+        # WAR: The alpha (contains the global scale) is not supported by the cuBLAS backend (eng0)
+        # in older cuDNN versions, so we deselect it.
+        if (alpha_is_not_none) and (not _is_cublas_fp4_available_in_cudnn()):
+            graph.deselect_engines(["eng0"])
+
         graph.check_support()
         if policy is None:
             graph.build_plans()
