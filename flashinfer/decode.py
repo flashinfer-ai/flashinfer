@@ -2031,9 +2031,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # use q's head_dim for output instead
             # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
             # asymmetric QK/VO plans; q.shape[-1] assumed QK == VO).
+            # Only the NVFP4 packed path (uint8 KV) stores VO at half width;
+            # derive the doubled output width from the KV dtype, not merely from
+            # kv_cache_sf being present, so a stray scale-factor tensor on a
+            # non-uint8 cache can't silently miscompute the output shape.
             out_head_dim = (
                 v_cache.shape[-1] * 2
-                if kv_cache_sf is not None
+                if kv_cache_sf is not None and v_cache.dtype == torch.uint8
                 else v_cache.shape[-1]
             )
             out = torch.empty(
