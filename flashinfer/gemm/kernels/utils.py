@@ -30,18 +30,16 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
     (256, 256),
 ]
 
-# Tactic cache: (n, real_k, sm_count) -> dict[(m_bucket, is_8_aligned) -> tactic_tuple]
+# Tactic cache: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
 # M bucket boundaries — powers of 2 for fast bucketing via
-# last_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
-# Each bucket is precomputed for both 8-aligned and non-8-aligned M,
-# keyed as (bucket, is_8_aligned).
+# next_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
 _M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
-def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
+def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
     Selects swap_ab, tile shape, and cluster shape sequentially:
@@ -161,11 +159,8 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
     if bucket_tactics is None:
         bucket_tactics = {}
         for rep_m in _M_BUCKETS:
-            for aligned in (True, False):
-                bucket_tactics[(rep_m, aligned)] = _compute_tactic_for_m(
-                    rep_m, n, real_k, sm_count, aligned
-                )
+            bucket_tactics[rep_m] = _compute_tactic_for_m(rep_m, n, real_k, sm_count)
         _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
     bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
-    return bucket_tactics[(bucket, m % 8 == 0)]
+    return bucket_tactics[bucket]
