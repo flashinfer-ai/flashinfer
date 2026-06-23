@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass.cute.typing import sym_int
 
 from flashinfer.cute_dsl.utils import (
     convert_sf_from_mma_layout,
@@ -22,9 +23,21 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     make_ptr,
 )
-from .moe_dynamic_kernel import MoEDynamicKernel
-from .moe_micro_kernel import MoEMicroKernel
-from .moe_static_kernel import MoEStaticKernel
+from .moe_activations import (
+    SWIGLUOAI_UNINTERLEAVE,
+    is_gated_moe_activation,
+    normalize_moe_activation,
+    normalize_swiglu_alpha_for_activation,
+    normalize_swiglu_beta_for_activation,
+    normalize_swiglu_limit_for_activation,
+)
+from .moe_silu import (
+    MoEDynamicKernelSilu,
+    MoEDynamicKernelSwiGLUOAI,
+    MoEMicroKernelSilu,
+    MoEMicroKernelSwiGLUOAI,
+)
+from .moe_relu2 import MoEDynamicKernelRelu2, MoEMicroKernelRelu2
 from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
@@ -131,6 +144,24 @@ def _normalize_activation_precision(activation_precision: str) -> str:
         ) from exc
 
 
+# Quantization modes understood by the dispatch layer. Rebased onto upstream
+# b12x's explicit 4-mode set (HEAD 5af873a):
+#   nvfp4       — FP4 weights + FP4 activations (NVFP4, E4M3 K/16 block scales)
+#   w4a16       — FP4 weights + BF16 activations (weight-only)
+#   w4a8_mx     — FP4 weights + MXFP8 (E4M3) activations, UE8M0 K/32 scales
+#   w4a8_nvfp4  — FP4 weights + FP8 (E4M3) activations, NVFP4 scales decomposed
+_W4A8_QUANT_MODES = frozenset({"w4a8_mx", "w4a8_nvfp4"})
+
+# FP4-source formats for the nvfp4 / w4a8 paths. "modelopt" is the legacy
+# FlashInfer alias for upstream "modelopt_nvfp4".
+_FP4_SOURCE_FORMATS = {
+    "modelopt": "modelopt_nvfp4",
+    "modelopt_nvfp4": "modelopt_nvfp4",
+    "fp4_e8m0_k32": "fp4_e8m0_k32",
+    "compressed_tensors": "compressed_tensors",
+}
+
+
 def _normalize_quant_mode(
     quant_mode: str | None = None,
     activation_precision: str | None = None,
@@ -151,26 +182,85 @@ def _normalize_quant_mode(
         "w4a4": "nvfp4",
         "bf16": "w4a16",
         "w4a16": "w4a16",
+        "w4a8_mx": "w4a8_mx",
+        "w4a8_nvfp4": "w4a8_nvfp4",
     }
     try:
         return aliases[normalized]
     except KeyError as exc:
         raise ValueError(
-            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+            "quant_mode must be one of 'nvfp4'/'w4a4', 'w4a16', "
+            f"'w4a8_mx', or 'w4a8_nvfp4' (got {quant_mode!r})."
         ) from exc
 
 
+def _is_w4a8(quant_mode: str) -> bool:
+    """True for the FP8-activation x FP4-weight throughput tiers."""
+    return _normalize_quant_mode(quant_mode) in _W4A8_QUANT_MODES
+
+
 def _activation_precision_from_quant_mode(quant_mode: str) -> str:
-    return "bf16" if _normalize_quant_mode(quant_mode) == "w4a16" else "fp4"
+    mode = _normalize_quant_mode(quant_mode)
+    if mode == "w4a16":
+        return "bf16"
+    if mode in _W4A8_QUANT_MODES:
+        return "fp8"
+    return "fp4"
+
+
+def _normalize_fp4_source_format(source_format: str) -> str:
+    """Normalize an FP4-path source format to the upstream canonical name."""
+    lowered = str(source_format).lower()
+    if lowered == "mxfp4_native":
+        raise ValueError(
+            "source_format='mxfp4_native' has been removed; use "
+            "source_format='fp4_e8m0_k32' for byte-preserved E8M0 K/32 scales."
+        )
+    try:
+        return _FP4_SOURCE_FORMATS[lowered]
+    except KeyError as exc:
+        raise ValueError(
+            "source_format must be one of 'modelopt'/'modelopt_nvfp4', "
+            "'fp4_e8m0_k32', or 'compressed_tensors', "
+            f"got {source_format!r}"
+        ) from exc
+
+
+def _validate_fp4_source_format_for_quant_mode(
+    *, source_format: str, quant_mode: str
+) -> None:
+    """Upstream (mode, source) compatibility matrix for the FP4 paths."""
+    normalized = _normalize_fp4_source_format(source_format)
+    mode = _normalize_quant_mode(quant_mode)
+    if mode == "w4a16":
+        return
+    if normalized == "modelopt_nvfp4":
+        return
+    if normalized == "fp4_e8m0_k32" and mode == "w4a8_mx":
+        return
+    raise ValueError(
+        f"source_format={normalized!r} with quant_mode={mode!r} is "
+        "unsupported; use quant_mode='w4a16' for non-NVFP4 sources, "
+        "quant_mode='w4a8_mx' for source_format='fp4_e8m0_k32', or "
+        "source_format='modelopt_nvfp4' for NVFP4/W4A8-NVFP4 kernels"
+    )
 
 
 def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
-    normalized = _normalize_source_format(source_format)
-    if quant_mode == "nvfp4" and normalized == "compressed_tensors":
-        raise ValueError(
-            "source_format='compressed_tensors' requires quant_mode='w4a16'."
-        )
-    return normalized
+    """Validate (mode, source) and return the format name for that path.
+
+    w4a16 keeps the FlashInfer-native 'modelopt'/'compressed_tensors' names
+    (consumed by the W4A16 weight-prep). The nvfp4/w4a8 paths use the upstream
+    canonical FP4-source names.
+    """
+    mode = _normalize_quant_mode(quant_mode)
+    if mode == "w4a16":
+        return _normalize_source_format(source_format)
+    # nvfp4 / w4a8: validate against the upstream matrix.
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format, quant_mode=mode
+    )
+    return _normalize_fp4_source_format(source_format)
 
 
 def _is_w4a16(activation_precision: str) -> bool:
@@ -374,6 +464,112 @@ class _WeightViews:
 _WEIGHT_CACHE: Dict[Tuple, _WeightViews] = {}
 
 
+# ---------------------------------------------------------------------------
+# Activation -> backend class resolvers
+# ---------------------------------------------------------------------------
+def _resolve_micro_cls(activation: str) -> type:
+    """Map a normalized activation name to its micro-kernel backend class."""
+    activation = normalize_moe_activation(activation)
+    if activation == "relu2":
+        return MoEMicroKernelRelu2
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        return MoEMicroKernelSwiGLUOAI
+    return MoEMicroKernelSilu
+
+
+def _resolve_dynamic_cls(activation: str) -> type:
+    """Map a normalized activation name to its dynamic-kernel backend class."""
+    activation = normalize_moe_activation(activation)
+    if activation == "relu2":
+        return MoEDynamicKernelRelu2
+    if activation == SWIGLUOAI_UNINTERLEAVE:
+        return MoEDynamicKernelSwiGLUOAI
+    return MoEDynamicKernelSilu
+
+
+def _resolve_swiglu_params(
+    activation: str,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
+) -> Tuple[float | None, float, float]:
+    """Normalize (limit, alpha, beta) for the given activation.
+
+    Defaults: swigluoai -> (7.0, 1.702, 1.0); silu/relu2 -> (None, 1.0, 0.0).
+    """
+    activation = normalize_moe_activation(activation)
+    return (
+        normalize_swiglu_limit_for_activation(activation, swiglu_limit),
+        normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
+        normalize_swiglu_beta_for_activation(activation, swiglu_beta),
+    )
+
+
+# Storages already flipped to the kernel-native [up; gate] order, keyed by
+# (w1_fp4 data_ptr, w1_blockscale data_ptr). The gated micro/dynamic NVFP4
+# kernels consume FC1 weights as [up; gate] ("w13"); swigluoai sources arrive
+# as [gate; up] ("w31"), so flip the FP4 bytes and the swizzled block-scale
+# halves once per storage (the load-time mirror of upstream's W4A16 row
+# rotation). Mirrors b12x integration/tp_moe.py::_ensure_w13_kernel_order_inplace.
+# Values hold the tensors so the allocator cannot recycle a registered data_ptr
+# into a stale repack.
+_W13_NORMALIZED_STORAGES: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _swap_w13_fp4_halves_inplace(w1_fp4: torch.Tensor, n: int) -> None:
+    """Swap the two FC1 halves of the packed FP4 weights in place ([E, 2n, k//2])."""
+    w1_u8 = w1_fp4.view(torch.uint8)
+    if w1_u8.dim() != 3 or int(w1_u8.shape[1]) != 2 * n:
+        raise ValueError(
+            f"w31 FC1 weights must be [E, 2n, k//2]; got {tuple(w1_u8.shape)} for n={n}"
+        )
+    E = int(w1_u8.shape[0])
+    per_expert = int(w1_u8.shape[1]) * int(w1_u8.shape[2])
+    # Swap halves a few experts at a time to bound the temporary.
+    chunk = max(1, min(E, (32 << 20) // max(1, per_expert)))
+    for e0 in range(0, E, chunk):
+        sl = w1_u8[e0 : e0 + chunk]
+        tmp = sl[:, :n].clone()
+        sl[:, :n] = sl[:, n:]
+        sl[:, n:] = tmp
+
+
+def _ensure_w13_kernel_order_inplace(
+    w1_fp4: torch.Tensor,
+    w13_sf_contiguous: torch.Tensor,
+    *,
+    n: int,
+    num_experts: int,
+    rows_pad: int,
+) -> None:
+    """Flip gate-first ("w31") FC1 storage to kernel-native [up; gate] order.
+
+    Flips the packed FP4 weight bytes in place (once per storage, tracked by
+    data_ptr) and swaps the gate/up halves of the *un-swizzled contiguous*
+    block-scale buffer ``w13_sf_contiguous`` (shape [num_experts*rows_pad,
+    cols]). The scale buffer is freshly produced per call by
+    ``convert_sf_from_mma_layout(...).contiguous()`` so it is always swapped to
+    match the (idempotently) flipped FP4 storage.
+    """
+    if not w1_fp4.is_contiguous():
+        raise ValueError("w31 FC1 normalization requires contiguous w1 storage")
+
+    # Flip the FP4 weight bytes once per physical storage.
+    reg_key = (w1_fp4.data_ptr(), w13_sf_contiguous.data_ptr())
+    if reg_key not in _W13_NORMALIZED_STORAGES:
+        _swap_w13_fp4_halves_inplace(w1_fp4, n)
+        _W13_NORMALIZED_STORAGES[reg_key] = (w1_fp4, w13_sf_contiguous)
+
+    # Swap the gate/up scale halves on the un-swizzled contiguous buffer. Rows
+    # are physically [E, rows_pad] (padded to 128); within each expert block the
+    # first 2n rows hold [gate(0:n); up(n:2n)] and must become [up; gate].
+    sf2d = w13_sf_contiguous.view(num_experts, rows_pad, -1)
+    for e in range(num_experts):
+        tmp = sf2d[e, :n].clone()
+        sf2d[e, :n] = sf2d[e, n : 2 * n]
+        sf2d[e, n : 2 * n] = tmp
+
+
 def _get_weight_views(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -384,12 +580,19 @@ def _get_weight_views(
     n: int,
     k: int,
     activation_precision: str = "fp4",
+    activation: str = "silu",
 ) -> _WeightViews:
     """Create permuted weight views for the static kernel.
 
     The kernel expects concatenated w13 data with shape [2*n, k//2, E]
     via a single TMA descriptor.
+
+    For ``swigluoai_uninterleave`` the FC1 weights arrive gate-first ("w31");
+    the gated micro/dynamic NVFP4 kernels consume [up; gate] ("w13"), so the
+    FP4 bytes and block-scale halves are flipped once per storage (see
+    ``_ensure_w13_kernel_order_inplace``). silu/relu2 are already kernel-native.
     """
+    activation = normalize_moe_activation(activation)
     activation_precision = _normalize_activation_precision(activation_precision)
     tile_n = _level_tile_n(activation_precision)
     # The kernel splits w13 into gate/up halves by tile index. This only works
@@ -402,6 +605,7 @@ def _get_weight_views(
 
     key = (
         activation_precision,
+        activation,
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
         w1_alphas.data_ptr(),
@@ -412,6 +616,10 @@ def _get_weight_views(
     cached = _WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
+
+    needs_w31_flip = activation == SWIGLUOAI_UNINTERLEAVE and is_gated_moe_activation(
+        activation
+    )
 
     # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy)
     # w1_rows is 2*n for gated (SiLU) or n for non-gated (ReLU2)
@@ -438,6 +646,17 @@ def _get_weight_views(
         k=n,
         num_groups=w2_fp4.shape[0],
     ).contiguous()
+
+    if needs_w31_flip:
+        # rows_pad = ceil(w1_rows/128)*128; convert_sf_from_mma_layout pads M.
+        rows_pad = ((w1_rows + 127) // 128) * 128
+        _ensure_w13_kernel_order_inplace(
+            w1_fp4,
+            w13_sf_contiguous,
+            n=n,
+            num_experts=int(w1_fp4.shape[0]),
+            rows_pad=rows_pad,
+        )
 
     views = _WeightViews(
         w13_fp4=w13.view(torch.float4_e2m1fn_x2),
@@ -469,246 +688,8 @@ def _get_weight_views(
 
 
 # ---------------------------------------------------------------------------
-# Kernel compilation cache
+# Micro kernel compilation cache
 # ---------------------------------------------------------------------------
-_STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
-
-
-def _get_static_kernel(
-    state_E: int,
-    weight_E: int,
-    m: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    max_rows: int,
-    *,
-    topk_ids_dtype: torch.dtype = torch.int32,
-    input_scales_are_reciprocal: bool = False,
-    fast_math: bool = True,
-    mac_override: int | None = None,
-    activation: str = "silu",
-    activation_precision: str = "fp4",
-):
-    """Compile (or retrieve cached) the SM120 static MoE kernel."""
-    activation_precision = _normalize_activation_precision(activation_precision)
-    if activation_precision == "bf16":
-        raise ValueError(
-            "internal routing error: quant_mode='w4a16' reached the NVFP4 static compiler"
-        )
-    sf_vec_size = 16
-    sm_count = get_num_sm(torch.device("cuda"))
-    mac = (
-        mac_override
-        if mac_override is not None
-        else min(get_max_active_clusters(1), sm_count)
-    )
-
-    # Select tile size based on actual routed rows
-    routed_rows = m * num_topk
-    mma_tiler_mn = (128, 128)
-    if activation_precision == "fp4" and num_topk > 1:
-        mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
-
-    cache_key = (
-        "static",
-        activation_precision,
-        state_E,
-        weight_E,
-        m,
-        k,
-        n,
-        num_topk,
-        max_rows,
-        mac,
-        mma_tiler_mn,
-        topk_ids_dtype,
-        input_scales_are_reciprocal,
-        fast_math,
-        activation,
-    )
-    cached = _STATIC_KERNEL_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    ab_dtype = cutlass.Float4E2M1FN
-    weight_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
-    a_dtype = cutlass.BFloat16
-    alpha_dtype = cutlass.Float32
-
-    output_tile_count_n = max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1])
-    kernel: Any = MoEStaticKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        output_tile_count_n=output_tile_count_n,
-        fast_math=fast_math,
-        activation=activation,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
-    )
-
-    is_gated = activation == "silu"
-    w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
-
-    rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
-
-    # Build fake tensors for compilation
-    a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    topk_ids_cutlass_dtype = (
-        cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
-    )
-    topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
-    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
-        topk_ids_cutlass_dtype,
-        (m * num_topk,),
-        assumed_align=topk_ids_align,
-    )
-    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (m * num_topk,),
-        assumed_align=4,
-    )
-    packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
-        (max_rows, k, state_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * max_rows * (k // 2),),
-        assumed_align=16,
-    )
-    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * rows_pad_k * cols_pad_k,),
-        assumed_align=16,
-    )
-    barrier_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
-    )
-    barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
-    )
-    b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype,
-        (w1_rows, k, weight_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    b_down_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype,
-        (k, n, weight_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E,),
-        assumed_align=4,
-    )
-    active_expert_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
-    )
-    weight_expert_ids_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E,),
-        assumed_align=4,
-    )
-    global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (weight_E,),
-        assumed_align=4,
-    )
-    input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=4,
-    )
-    token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    compiled = cute.compile(
-        kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
-
-    result = (compiled, mac)
-    _STATIC_KERNEL_CACHE[cache_key] = result
-    return result
-
-
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 
 
@@ -719,29 +700,32 @@ def _get_micro_kernel(
     k: int,
     n: int,
     num_topk: int,
-    max_rows: int,
     *,
     topk_ids_dtype: torch.dtype = torch.int32,
-    input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     share_input_across_experts: bool = False,
     share_expert_scales: bool = False,
     single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
+    device: torch.device | None = None,
 ):
-    """Compile (or retrieve cached) the SM120 micro MoE kernel."""
-    sf_vec_size = 16
-    sm_count = get_num_sm(torch.device("cuda"))
-    mac = (
-        mac_override
-        if mac_override is not None
-        else min(get_max_active_clusters(1), sm_count)
-    )
+    """Compile (or retrieve cached) the SM120 micro MoE kernel.
 
-    # Micro always selects tile from routed rows (not just for multi-topk)
-    routed_rows = m * num_topk
-    mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
+    Uses the upstream MoEMicroKernelBackend harness: construct the
+    activation-specialized backend, run ``configure(...)`` to bind the problem
+    shape (and compute ``grid_x``), then ``cute.compile`` the pointer-taking
+    ``__call__``. Returns ``(compiled, kernel)``; the kernel instance carries
+    ``grid_x`` for the launch path.
+    """
+    sf_vec_size = 16
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _resolve_swiglu_params(
+        activation, swiglu_limit, swiglu_alpha, swiglu_beta
+    )
 
     cache_key = (
         "micro",
@@ -751,196 +735,115 @@ def _get_micro_kernel(
         k,
         n,
         num_topk,
-        max_rows,
-        mac,
-        mma_tiler_mn,
         topk_ids_dtype,
-        input_scales_are_reciprocal,
         fast_math,
         share_input_across_experts,
         share_expert_scales,
         single_token,
+        mac_override,
         activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    ab_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
-    a_dtype = cutlass.BFloat16
-    alpha_dtype = cutlass.Float32
-
-    kernel = MoEMicroKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    micro_cls = _resolve_micro_cls(activation)
+    mma_tiler_mn = (128, 128)
+    output_tile_count_n = max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1])
+    # Gated subclasses (silu/swigluoai) accept swiglu params; relu2 does not.
+    extra_kwargs = (
+        dict(
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+        if is_gated_moe_activation(activation)
+        else {}
+    )
+    kernel: Any = micro_cls(
+        sf_vec_size,
+        mma_tiler_mn,
+        output_tile_count_n,
         fast_math=fast_math,
-        activation=activation,
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
         single_token=single_token,
+        **extra_kwargs,
+    )
+    # configure() must run before cute.compile so the shape config and grid_x
+    # are bound into the kernel instance.
+    kernel.configure(
+        m,
+        k,
+        n,
+        num_topk,
+        weight_E,
+        max_active_ctas=mac_override,
+        device=device,
     )
 
-    is_gated = activation == "silu"
-    w1_rows = (2 if is_gated else 1) * n
+    a_dtype = cutlass.BFloat16
+    alpha_dtype = cutlass.Float32
 
-    rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
-
-    # Build fake tensors for compilation (identical to static kernel)
-    a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
     topk_ids_cutlass_dtype = (
         cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
     )
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
-    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
+
+    # The micro __call__ takes raw pointers for every operand plus two int32
+    # barrier tensors. Build fake pointers/tensors matching its signature.
+    x_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w1_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w1s_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w1a_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    a1_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    a2_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    inter_fake = make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w2_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w2s_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w2a_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    tid_fake = make_ptr(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        topk_ids_align,
+        cute.AddressSpace.gmem,
         assumed_align=topk_ids_align,
     )
-    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (m * num_topk,),
-        assumed_align=4,
-    )
-    packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
-        (max_rows, k, state_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * max_rows * (k // 2),),
-        assumed_align=16,
-    )
-    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * rows_pad_k * cols_pad_k,),
-        assumed_align=16,
-    )
+    tw_fake = make_ptr(alpha_dtype, 4, cute.AddressSpace.gmem, assumed_align=4)
+    out_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     barrier_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
+        cutlass.Int32, (1,), assumed_align=4
     )
     barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
+        cutlass.Int32, (1,), assumed_align=4
     )
-    b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
-        (w1_rows, k, weight_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    b_down_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
-        (k, n, weight_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E,),
-        assumed_align=4,
-    )
-    active_expert_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
-    )
-    weight_expert_ids_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E,),
-        assumed_align=4,
-    )
-    global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (weight_E,),
-        assumed_align=4,
-    )
-    input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=4,
-    )
-    token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
+
     compiled = cute.compile(
         kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
+        x_fake,
+        w1_fake,
+        w1s_fake,
+        w1a_fake,
+        a1_fake,
+        a2_fake,
+        inter_fake,
+        w2_fake,
+        w2s_fake,
+        w2a_fake,
+        tid_fake,
+        tw_fake,
+        out_fake,
         barrier_count_fake,
         barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
+        m,
+        kernel.grid_x,
         current_cuda_stream(),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
-    result = (compiled, mac)
+    result = (compiled, kernel)
     _MICRO_KERNEL_CACHE[cache_key] = result
     return result
 
@@ -973,13 +876,19 @@ def launch_sm120_static_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     activation_precision: str = "fp4",
 ) -> torch.Tensor:
-    """Launch the SM120 static or micro MoE kernel.
+    """Launch the SM120 "static" band via the MoEMicroKernelBackend harness.
 
-    Selects the micro kernel for tiny decode batches (routed_rows <= 20-40)
-    and the static kernel otherwise. The micro path runs a Triton pre-pass
-    to compact routing IDs before launching.
+    Upstream b12x folded the legacy tensor-core static backend into the
+    compact micro kernel, which now handles the whole small/medium decode
+    band (the dispatcher only routes here for routed-pair counts the micro
+    kernel reports as supported). The kernel reads the routed activations,
+    packed FP4 weights, and swizzled block scales directly and scatters the
+    weighted result into ``scatter_output``.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
@@ -987,36 +896,22 @@ def launch_sm120_static_moe(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 static launcher"
         )
 
-    # Flatten routing tensors
+    # Flatten routing tensors. The micro kernel consumes the routed expert ids
+    # and per-pair weights directly (no compaction pre-pass).
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
-    routed_rows = num_tokens * top_k
 
-    # Capture whether input_gs was a single shared scalar BEFORE expansion:
-    # the m=1 relu2 shared-input micro optimization only applies when every
-    # expert sees the same FC1-input global scale.
+    # Capture whether the FC1-input / FC2-input scales were single shared
+    # scalars BEFORE expansion: the ReLU2 single-token shared-scale micro
+    # specializations only apply when every expert sees the same scale.
     input_gs_is_shared = input_gs.numel() == 1
     down_input_scale_is_shared = down_input_scale.numel() == 1
 
-    # Broadcast scalar scales to per-expert [E] tensors
+    # Broadcast scalar scales to per-expert [E] tensors (the kernel indexes
+    # input_gs / down_input_scale by physical expert id).
     input_gs = _expand_to_experts(input_gs, num_experts)
     down_input_scale = _expand_to_experts(down_input_scale, num_experts)
 
-    # Decide micro vs static
-    micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS
-    if top_k > 1:
-        micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
-    use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
-
-    sm_count = get_num_sm(torch.device("cuda"))
-    base_mac = min(get_max_active_clusters(1), sm_count)
-    tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
-    static_mac = min(tuned_static_mac or base_mac, base_mac)
-    if activation_precision == "fp4" and not use_micro and routed_rows < 40:
-        static_mac = min(static_mac, 64)
-
-    # Shared-scale flags let compact W4A4 micro match the ReLU2 single-token
-    # specialization.
     share_input_across_experts = (
         activation == "relu2"
         and num_tokens == 1
@@ -1027,109 +922,60 @@ def launch_sm120_static_moe(
         activation == "relu2" and input_gs_is_shared and down_input_scale_is_shared
     )
 
-    if use_micro:
-        assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
-            f"compact_topk_ids buffer too small: "
-            f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
-        )
-        # Single-token ReLU2 is non-gated, so the micro kernel can launch on
-        # the routed expert ids directly. Gated SiLU still goes through the
-        # compact id buffer so the kernel can map compact launch ids back to
-        # the physical gate/up weight experts.
-        if num_tokens == 1 and activation == "relu2":
-            launch_ids = flat_ids
-        elif num_tokens == 1:
-            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            compact_ids.copy_(
-                torch.arange(
-                    flat_ids.numel(),
-                    device=flat_ids.device,
-                    dtype=torch.int32,
-                )
-            )
-            workspace.weight_expert_ids[: flat_ids.numel()].copy_(
-                flat_ids.to(torch.int32)
-            )
-            workspace.active_expert_count.fill_(flat_ids.numel())
-            launch_ids = compact_ids
-        else:
-            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            from .triton_compact import compact_topk_ids as _triton_compact_topk_ids
+    compiled, kernel = _get_micro_kernel(
+        workspace.state_E,
+        num_experts,
+        num_tokens,
+        k,
+        n,
+        top_k,
+        topk_ids_dtype=flat_ids.dtype,
+        fast_math=fast_math,
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=num_tokens == 1,
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        device=a.device,
+    )
 
-            _triton_compact_topk_ids(
-                flat_ids,
-                compact_ids,
-                workspace.weight_expert_ids,
-                workspace.active_expert_count,
-            )
-            launch_ids = compact_ids
-        # Select micro MAC: min of tuned ladder, work tiles, and hardware limit.
-        micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
-        tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
-        micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
-        compiled, mac = _get_micro_kernel(
-            workspace.state_E,
-            num_experts,
-            num_tokens,
-            k,
-            n,
-            top_k,
-            workspace.max_rows,
-            topk_ids_dtype=launch_ids.dtype,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
-            fast_math=fast_math,
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=num_tokens == 1,
-            mac_override=micro_mac,
-            activation=activation,
-        )
-    else:
-        compiled, mac = _get_static_kernel(
-            workspace.state_E,
-            num_experts,
-            num_tokens,
-            k,
-            n,
-            top_k,
-            workspace.max_rows,
-            topk_ids_dtype=torch.int32,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
-            fast_math=fast_math,
-            mac_override=static_mac,
-            activation=activation,
-            activation_precision=activation_precision,
-        )
-        launch_ids = flat_ids
+    # FC1->FC2 intermediate scratch (uint32 packed FP4). Sized from the
+    # kernel's bound shape config and cached on the workspace so repeated
+    # launches (and CUDA-graph replay) reuse the same buffer.
+    inter_elems = int(num_tokens) * int(kernel._cfg.inter_u32)
+    inter_fp32 = getattr(workspace, "_micro_inter", None)
+    if inter_fp32 is None or inter_fp32.numel() < inter_elems:
+        inter_fp32 = torch.empty(inter_elems, dtype=torch.uint32, device=a.device)
+        workspace._micro_inter = inter_fp32  # type: ignore[attr-defined]
 
-    # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
-    runtime_args: Tuple[Any, ...] = (
-        a,
-        launch_ids,
-        flat_weights,
-        workspace.packed_a_view,
-        workspace.packed_input_scale.data_ptr(),
-        workspace.packed_a_flat,
-        workspace.scale_flat,
+    # The compiled __call__ takes the operands as DataPointer params, which the
+    # tvm-ffi binding accepts as raw int addresses (matching the dynamic launch
+    # path). MoEMicroKernelBackend.launch wraps the same arguments in cute
+    # Pointer objects, which this tvm-ffi build rejects, so call the compiled
+    # function directly with .data_ptr() addresses in the launch() arg order.
+    _stream = current_cuda_stream()
+    compiled(
+        a.data_ptr(),
+        weights.w1_storage.data_ptr(),
+        weights._w13_sf_storage.data_ptr(),
+        weights.w1_alpha.data_ptr(),
+        input_gs.data_ptr(),
+        down_input_scale.data_ptr(),
+        inter_fp32.data_ptr(),
+        weights.w2_storage.data_ptr(),
+        weights._down_sf_storage.data_ptr(),
+        weights.w2_alpha.data_ptr(),
+        flat_ids.data_ptr(),
+        flat_weights.data_ptr(),
+        scatter_output.data_ptr(),
         workspace.barrier_count,
         workspace.barrier_epoch,
-        weights.w13_fp4,
-        weights._w13_sf_storage.data_ptr(),
-        weights.down_fp4,
-        weights._down_sf_storage.data_ptr(),
-        workspace.row_counts,
-        workspace.active_expert_count,
-        workspace.weight_expert_ids,
-        workspace.global_to_local_expert,
-        input_gs,
-        weights.w1_alpha,
-        weights.w2_alpha,
-        down_input_scale,
-        scatter_output,
-        workspace.token_map,
-        workspace.token_weights,
+        cutlass.Int32(int(num_tokens)),
+        cutlass.Int32(int(kernel.grid_x)),
+        _stream,
     )
-    compiled(*runtime_args, current_cuda_stream())
 
     return scatter_output
 
@@ -1497,10 +1343,17 @@ def _get_dynamic_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     activation_precision: str = "fp4",
     share_input_across_experts: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _resolve_swiglu_params(
+        activation, swiglu_limit, swiglu_alpha, swiglu_beta
+    )
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
@@ -1520,7 +1373,8 @@ def _get_dynamic_kernel(
     cache_key = (
         "dynamic",
         activation_precision,
-        E,
+        # E omitted: num_experts is a dynamic (SymInt) operand dim, so one
+        # compiled dynamic kernel serves any expert count (see note below).
         k,
         n,
         num_topk,
@@ -1530,13 +1384,16 @@ def _get_dynamic_kernel(
         input_scales_are_reciprocal,
         fast_math,
         activation,
+        swiglu_limit,
+        swiglu_alpha,
+        swiglu_beta,
         share_input_across_experts,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
     w1_rows = (2 if is_gated else 1) * n
 
     scratch_dtype = cutlass.Float4E2M1FN
@@ -1545,13 +1402,23 @@ def _get_dynamic_kernel(
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    kernel: Any = MoEDynamicKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    dynamic_cls = _resolve_dynamic_cls(activation)
+    # Gated subclasses (silu/swigluoai) accept swiglu params; relu2 does not.
+    extra_kwargs = (
+        dict(
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+        if is_gated
+        else {}
+    )
+    kernel: Any = dynamic_cls(
+        sf_vec_size,
+        mma_tiler_mn,
         fast_math=fast_math,
-        activation=activation,
         share_input_across_experts=share_input_across_experts,
+        **extra_kwargs,
     )
     launch = _DynamicMoELaunch(
         kernel,
@@ -1631,40 +1498,59 @@ def _get_dynamic_kernel(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
 
+    # num_experts is passed as a dynamic (SymInt) operand dim so a single
+    # compiled dynamic kernel serves any expert count — the kernel reads
+    # num_experts = Int32(row_counts.shape[0]) at runtime and loops dynamically,
+    # so E never needs to be a compile-time constant. This avoids recompiling per
+    # expert count (e.g. 256 vs 384) with no measurable kernel-perf cost
+    # (validated on GB10: min/p10 latency unchanged vs a static-E build).
+    #
+    # NOTE: k and n are deliberately left static. Marking them SymInt compiles and
+    # binds fine (smem is tile-shaped, not k/n-shaped), but the kernel rebuilds
+    # the block-scale (SF) gmem layouts via tile_atom_to_shape_SF(packed_a.shape /
+    # b_w13.shape) from pointer operands, and those freeze at the traced k/n -- so
+    # a kernel traced at one (k,n) reads scales from wrong offsets at another.
+    # Verified in isolation: same-n/different-k reuse passes at the traced k but
+    # drops to ~50% within tolerance at a different k (and k+n reuse NaNs).
+    # Genericizing k/n would require making the SF layouts SymInt-correct (kernel
+    # surgery + upstream divergence); not worth it. num_experts (E) is purely a
+    # batch/stride/loop dim with no such dependency, so it stays dynamic.
+    E_sym = sym_int(32, divisibility=1, symbol="moe_E")
+    Ep1_sym = sym_int(32, divisibility=1, symbol="moe_Ep1")
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (w1_rows, k, E),
+        (w1_rows, k, E_sym),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (k, n, E),
+        (k, n, E_sym),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E,), assumed_align=4
+        cutlass.Int32, (E_sym,), assumed_align=4
     )
     expert_write_rows_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E,), assumed_align=4
+        cutlass.Int32, (E_sym,), assumed_align=4
     )
     expert_tile_base_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E + 1,), assumed_align=4
+        cutlass.Int32, (Ep1_sym,), assumed_align=4
     )
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E_sym,), assumed_align=16
     )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E_sym,), assumed_align=16
     )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E_sym,), assumed_align=16
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E_sym,), assumed_align=16
     )
     scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
@@ -1745,6 +1631,9 @@ def launch_sm120_dynamic_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
     activation_precision: str = "fp4",
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
@@ -1772,6 +1661,9 @@ def launch_sm120_dynamic_moe(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         activation=activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         activation_precision=activation_precision,
         share_input_across_experts=input_gs_is_shared,
     )
@@ -2129,6 +2021,8 @@ def _launch_sm120_w4a16_moe(
     fast_math: bool = True,
     activation: str = "silu",
     source_format: str = "modelopt",
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
     _workspace=None,
     _prepared_weights=None,
 ) -> torch.Tensor:
@@ -2199,7 +2093,264 @@ def _launch_sm120_w4a16_moe(
         packed_route_count=workspace.packed_route_count,
         expert_offsets=workspace.expert_offsets,
         expert_map=workspace.expert_map,
+        activation_amax=activation_amax,
+        layer_idx=layer_idx,
         fast_math=fast_math,
+    )
+
+
+# ==========================================================================
+# W4A8 throughput tier (mx) dispatch
+# ==========================================================================
+# Routed-rows floor above which dynamic-band w4a8_mx calls dispatch to the
+# dedicated W4A8 throughput-tier pipeline (w4a8/pipeline.py). Ported from
+# b12x integration/tp_moe.py: the tier's 48-row expert-run group padding loses
+# to the dynamic kernel at few routes/expert, but wins by >5% above ~3840 and
+# by ~36-46% at 6144-12288 routed rows. Floor rounded up to 4096. The env flags
+# accept both the upstream B12X_* names and the FlashInfer FLASHINFER_B12X_*
+# alias (matching _first_env handling elsewhere in this module).
+_W4A8_TIER_MIN_ROUTED_ROWS_DEFAULT = 4096
+_W4A8_TIER_MIN_ROUTED_ROWS_ENVS = (
+    "FLASHINFER_B12X_W4A8_TIER_MIN_ROUTED_ROWS",
+    "B12X_W4A8_TIER_MIN_ROUTED_ROWS",
+)
+_W4A8_TIER_FORCE_ENVS = (
+    "FLASHINFER_B12X_MOE_FORCE_W4A8_TIER",
+    "B12X_MOE_FORCE_W4A8_TIER",
+)
+
+
+def _w4a8_tier_min_routed_rows() -> int:
+    raw = _first_env(*_W4A8_TIER_MIN_ROUTED_ROWS_ENVS)
+    if raw is None or not raw.strip():
+        return _W4A8_TIER_MIN_ROUTED_ROWS_DEFAULT
+    return int(raw)
+
+
+def _w4a8_tier_forced() -> bool:
+    raw = _first_env(*_W4A8_TIER_FORCE_ENVS)
+    if raw is None:
+        return False
+    return raw.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+# Prepared (repacked) W4A8 tier weights, keyed on source data_ptrs + shapes,
+# mirroring _W4A16_WEIGHT_CACHE / _WEIGHT_CACHE. Stores (sources, prepared)
+# where prepared is None when the tier cannot serve these weights (non-unit
+# alphas) so the refusal decision is cached without re-checking on the GPU.
+_W4A8_TIER_WEIGHT_CACHE: Dict[Tuple, Tuple[Tuple, Optional[dict]]] = {}
+# Capacity-sized pipeline workspaces, keyed on (m, k, n, weight_E, topk, device).
+_W4A8_TIER_WORKSPACE_CACHE: Dict[Tuple, dict] = {}
+
+
+def _get_w4a8_tier_prepared(
+    w13_fp4: torch.Tensor,
+    w13_mx: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_mx: torch.Tensor,
+    w2_alpha: torch.Tensor,
+) -> Optional[dict]:
+    """Repack (once) kernel-order FC1/FC2 storage for the W4A8 tier GEMM.
+
+    ``w13_fp4`` is [E, 2n, K/2] u8 (kernel order [up; gate]); ``w13_mx`` is
+    [E, 2n, K/32] u8; ``w2_fp4`` is [E, K, n/2] u8; ``w2_mx`` is [E, K, n/32]
+    u8 — the exact fp4_e8m0_k32 source layout the pipeline consumes. Returns
+    None when the tier cannot serve these weights (non-unit alphas: the tier
+    GEMM has no per-expert alpha operand in v1).
+    """
+    from .w4a8.pipeline import prepare_w4a8_tier_weights
+
+    key = (
+        w13_fp4.data_ptr(),
+        w13_mx.data_ptr(),
+        w2_fp4.data_ptr(),
+        w2_mx.data_ptr(),
+        w1_alpha.data_ptr(),
+        w2_alpha.data_ptr(),
+        tuple(w13_fp4.shape),
+        tuple(w2_fp4.shape),
+    )
+    cached = _W4A8_TIER_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached[1]
+    sources = (w13_fp4, w13_mx, w2_fp4, w2_mx, w1_alpha, w2_alpha)
+    # One-time host check (syncs): v1 consumes MXFP4 sources exactly, whose
+    # per-expert weight global dequant scales are ones by contract.
+    unit_alphas = bool(
+        torch.all(w1_alpha == 1.0).item() and torch.all(w2_alpha == 1.0).item()
+    )
+    if not unit_alphas:
+        _W4A8_TIER_WEIGHT_CACHE[key] = (sources, None)
+        return None
+    prepared = prepare_w4a8_tier_weights(
+        w13_fp4.view(torch.uint8),
+        w13_mx.view(torch.uint8),
+        w2_fp4.view(torch.uint8),
+        w2_mx.view(torch.uint8),
+    )
+    _W4A8_TIER_WEIGHT_CACHE[key] = (sources, prepared)
+    return prepared
+
+
+def _maybe_launch_w4a8_tier(
+    *,
+    a: torch.Tensor,
+    w13_fp4: torch.Tensor,
+    w13_mx: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_mx: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: Optional[torch.Tensor],
+    m: int,
+    k: int,
+    n: int,
+    weight_E: int,
+    num_topk: int,
+    routed_rows: int,
+    activation: str,
+    quant_mode: str,
+    apply_router_weight_on_input: bool,
+    device: torch.device,
+    prepared_w4a8: object | None = None,
+    swiglu_limit: float | None = None,
+) -> Optional[torch.Tensor]:
+    """Route a dynamic-band w4a8_mx call to the W4A8 throughput-tier pipeline.
+
+    Returns the output tensor when the tier handled the call, or None when the
+    call should fall through to the dynamic kernel instead. When an explicit
+    ``prepared_w4a8`` object is supplied the refusal conditions become hard
+    errors (``RuntimeError("B12X prepared W4A8 MoE cannot run: ...")``).
+
+    Ported from b12x integration/tp_moe.py ``_maybe_launch_w4a8_tier``. v1
+    refusal conditions: non-"w4a8_mx" mode; tier disabled; routed_rows below
+    the floor (unless forced or a prepared object was supplied);
+    activation != "silu"; apply_router_weight_on_input; k % 256 or n % 128;
+    non-rank-2 routing tensors; non-unit w1/w2 alphas.
+    """
+    if quant_mode != "w4a8_mx":
+        return None
+    prepared_required = prepared_w4a8 is not None
+
+    def reject_prepared_w4a8(reason: str) -> None:
+        raise RuntimeError(f"B12X prepared W4A8 MoE cannot run: {reason}")
+
+    min_routed = _w4a8_tier_min_routed_rows()
+    if min_routed == 0:
+        if prepared_required:
+            reject_prepared_w4a8(
+                "B12X_W4A8_TIER_MIN_ROUTED_ROWS=0 disables the required W4A8 tier"
+            )
+        return None
+    if routed_rows < min_routed and not prepared_required and not _w4a8_tier_forced():
+        return None
+    if activation != "silu":
+        if prepared_required:
+            reject_prepared_w4a8(
+                f"W4A8 tier supports activation='silu', got {activation!r}"
+            )
+        return None
+    if apply_router_weight_on_input:
+        if prepared_required:
+            reject_prepared_w4a8(
+                "apply_router_weight_on_input is unsupported by the W4A8 tier"
+            )
+        return None
+    if k % 256 != 0 or n % 128 != 0:
+        if prepared_required:
+            reject_prepared_w4a8(
+                f"W4A8 tier requires k % 256 == 0 and n % 128 == 0; got k={k}, n={n}"
+            )
+        return None
+    if topk_ids.dim() != 2 or topk_weights.dim() != 2:
+        if prepared_required:
+            reject_prepared_w4a8(
+                "topk_ids and topk_weights must both be rank-2 tensors"
+            )
+        return None
+
+    from .w4a8.pipeline import build_w4a8_tier_workspace, w4a8_tier_forward
+
+    capturing = _is_cuda_graph_capturing()
+    if prepared_w4a8 is not None:
+        prepared = {
+            "w13_rp": prepared_w4a8.w13_rp,  # type: ignore[attr-defined]
+            "w13_sfb": prepared_w4a8.w13_sfb,  # type: ignore[attr-defined]
+            "w2_rp": prepared_w4a8.w2_rp,  # type: ignore[attr-defined]
+            "w2_sfb": prepared_w4a8.w2_sfb,  # type: ignore[attr-defined]
+        }
+    else:
+        prepared = _get_w4a8_tier_prepared(
+            w13_fp4,
+            w13_mx,
+            w1_alpha,
+            w2_fp4,
+            w2_mx,
+            w2_alpha,
+        )
+    if prepared is None:
+        # Non-unit alphas (only reachable on the non-prepared path; the
+        # prepared path folds alphas at prepare time). Fall through.
+        return None
+
+    ws_key = (m, k, n, weight_E, num_topk, str(device))
+    ws = _W4A8_TIER_WORKSPACE_CACHE.get(ws_key)
+    if capturing and (ws is None or "fc2" not in ws["_compiled"]):
+        raise RuntimeError(
+            "CUDA graph capture requires a warmed w4a8 tier workspace; "
+            "run one eager call for this shape before capture"
+        )
+    if ws is None:
+        ws = build_w4a8_tier_workspace(
+            m=m,
+            hidden_size=k,
+            intermediate_size=n,
+            num_experts=weight_E,
+            topk=num_topk,
+            device=device,
+        )
+        _W4A8_TIER_WORKSPACE_CACHE[ws_key] = ws
+
+    if output is None:
+        if capturing:
+            raise ValueError("CUDA graph capture requires a caller-owned output buffer")
+        output = torch.empty(m, k, dtype=a.dtype, device=device)
+    if tuple(output.shape) != (m, k):
+        raise ValueError(f"output must have shape {(m, k)}, got {tuple(output.shape)}")
+    if output.dtype != a.dtype:
+        raise ValueError(f"output must have dtype {a.dtype}, got {output.dtype}")
+    if not output.is_contiguous():
+        raise ValueError("output must be contiguous")
+
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        if capturing:
+            raise ValueError(
+                "CUDA graph capture requires contiguous int32 topk_ids on the "
+                "w4a8 tier path"
+            )
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+    if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
+        if capturing:
+            raise ValueError(
+                "CUDA graph capture requires contiguous float32 topk_weights "
+                "on the w4a8 tier path"
+            )
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+
+    return w4a8_tier_forward(
+        a,
+        prepared["w13_rp"],
+        prepared["w13_sfb"],
+        prepared["w2_rp"],
+        prepared["w2_sfb"],
+        topk_ids,
+        topk_weights,
+        ws,
+        out=output,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -2385,9 +2536,12 @@ def launch_sm120_moe(
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
     source_format: str = "modelopt",
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
     _workspace=None,
     _weight_views=None,
     _prepared_weights=None,
+    _prepared_w4a8=None,
 ) -> torch.Tensor:
     """Unified SM120 MoE dispatch — selects static or dynamic by token count.
 
@@ -2400,9 +2554,18 @@ def launch_sm120_moe(
     source_format = _normalize_source_format_for_quant_mode(source_format, quant_mode)
     activation_precision = _activation_precision_from_quant_mode(quant_mode)
 
+    # Validate the activation name (unknown activations raise) and normalize
+    # the swiglu params (swigluoai defaults: limit=7.0, alpha=1.702, beta=1.0;
+    # silu/relu2: None/1.0/0.0). swiglu_alpha/beta are not exposed by this
+    # public entry point; they ride the activation defaults.
+    activation = normalize_moe_activation(activation)
+    swiglu_limit, swiglu_alpha, swiglu_beta = _resolve_swiglu_params(
+        activation, swiglu_limit
+    )
+
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
@@ -2430,6 +2593,55 @@ def launch_sm120_moe(
             _prepared_weights=_prepared_weights,
         )
 
+    if quant_mode == "w4a8_nvfp4":
+        # w4a8_nvfp4 needs residual scale grids and per-expert alphas the tier
+        # GEMM does not implement, and the non-tier w4a8_nvfp4 dynamic path is
+        # not yet wired through this dispatcher. Fail loudly rather than run a
+        # silently-wrong NVFP4 kernel.
+        raise NotImplementedError("quant_mode='w4a8_nvfp4' dispatch not yet wired")
+
+    if quant_mode == "w4a8_mx":
+        # The W4A8 throughput tier serves the large-routed ("dynamic") band.
+        # Weights arrive in the fp4_e8m0_k32 source layout: w1_weight
+        # [E, 2n, K/2] u8, w1_weight_sf [E, 2n, K/32] u8, w2_weight [E, K, n/2]
+        # u8, w2_weight_sf [E, K, n/32] u8.
+        tier_out = _maybe_launch_w4a8_tier(
+            a=a,
+            w13_fp4=w1_weight,
+            w13_mx=w1_weight_sf,
+            w1_alpha=w1_alpha,
+            w2_fp4=w2_weight,
+            w2_mx=w2_weight_sf,
+            w2_alpha=w2_alpha,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=scatter_output,
+            m=num_tokens,
+            k=k,
+            n=n,
+            weight_E=num_experts,
+            num_topk=top_k,
+            routed_rows=routed_rows,
+            activation=activation,
+            quant_mode=quant_mode,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            device=a.device,
+            prepared_w4a8=_prepared_w4a8,
+            swiglu_limit=swiglu_limit,
+        )
+        if tier_out is not None:
+            return tier_out
+        # Below the tier floor (micro-eligible / small-routed w4a8_mx) the
+        # non-tier mxfp8-activation kernel path is not yet wired through this
+        # dispatcher (owned by the broader b12x rebase). Fail loudly.
+        raise NotImplementedError(
+            "quant_mode='w4a8_mx' below the throughput-tier floor "
+            f"(routed_rows={routed_rows} < {_w4a8_tier_min_routed_rows()}); "
+            "the non-tier w4a8_mx dispatch path is not yet wired. Set "
+            "B12X_MOE_FORCE_W4A8_TIER=1 to force the tier, or raise the "
+            "routed-row count above the floor."
+        )
+
     if fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
     down_input_scale = fc2_input_scale
@@ -2447,6 +2659,7 @@ def launch_sm120_moe(
             n=n,
             k=k,
             activation_precision=activation_precision,
+            activation=activation,
         )
     )
 
@@ -2480,10 +2693,20 @@ def launch_sm120_moe(
             num_topk=top_k,
             activation_precision=activation_precision,
         )
+        # The "static" band is now served by the compact micro kernel, which
+        # only handles 1 <= num_tokens <= 8 (it keeps the tokens' activations
+        # resident). For shapes it cannot support, fall back to the dynamic
+        # grouped-GEMM backend.
+        micro_cls = _resolve_micro_cls(activation)
+        if backend == "static" and not micro_cls.is_supported(  # type: ignore[attr-defined]
+            num_tokens, k, n, top_k, num_experts
+        ):
+            backend = "dynamic"
         # The dynamic kernel indexes row_counts/expert_write_rows directly with
         # topk_ids but those buffers are sized with num_local_experts. Unless
-        # num_local_experts == num_experts, fall back to the static backend which
-        # has global-to-local expert remapping.
+        # num_local_experts == num_experts the per-expert buffers do not line
+        # up; the micro path indexes weights by physical expert id and is the
+        # only backend here that tolerates num_local_experts != num_experts.
         if backend == "dynamic" and num_local_experts != num_experts:
             backend = "static"
         workspace = _get_cached_workspace(
@@ -2518,6 +2741,9 @@ def launch_sm120_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             activation_precision=activation_precision,
         )
     else:
@@ -2538,5 +2764,8 @@ def launch_sm120_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             activation_precision=activation_precision,
         )

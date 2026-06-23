@@ -76,6 +76,8 @@ def b12x_fused_moe(
     activation_precision: str = "fp4",
     quant_mode: Optional[str] = None,
     source_format: str = "modelopt",
+    swiglu_limit: Optional[float] = None,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     r"""Run fused MoE on SM120/SM121 using b12x CuTe-DSL kernels.
 
@@ -207,6 +209,8 @@ def b12x_fused_moe(
         activation_precision=activation_precision,
         quant_mode=quant_mode,
         source_format=source_format,
+        swiglu_limit=swiglu_limit,
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
 
@@ -258,6 +262,8 @@ class B12xMoEWrapper:
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
+        swiglu_limit: Optional[float] = None,
+        apply_router_weight_on_input: bool = False,
     ):
         r"""Configure the b12x fused-MoE wrapper.
 
@@ -340,6 +346,8 @@ class B12xMoEWrapper:
             self.quant_mode
         )
         self.source_format = source_format
+        self.swiglu_limit = swiglu_limit
+        self.apply_router_weight_on_input = apply_router_weight_on_input
 
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
@@ -541,6 +549,7 @@ class B12xMoEWrapper:
             # Cache weight views; invalidate if weight pointers change.
             weight_key = (
                 self.quant_mode,
+                self.activation,
                 w1_weight.data_ptr(),
                 w1_weight_sf.data_ptr(),
                 w1_alpha.data_ptr(),
@@ -559,6 +568,7 @@ class B12xMoEWrapper:
                     n=self.intermediate_size,
                     k=self.hidden_size,
                     activation_precision=self.activation_precision,
+                    activation=self.activation,
                 )
                 self._weight_key = weight_key
         else:
@@ -584,6 +594,8 @@ class B12xMoEWrapper:
             activation_precision=self.activation_precision,
             quant_mode=self.quant_mode,
             source_format=self.source_format,
+            swiglu_limit=self.swiglu_limit,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
             _workspace=workspace,
             _weight_views=self._weight_views,
         )

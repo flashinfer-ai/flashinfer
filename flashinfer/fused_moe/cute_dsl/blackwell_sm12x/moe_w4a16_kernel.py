@@ -22,6 +22,8 @@ from .moe_w4a16_fp4_helpers import (
     broadcast_f32_to_bfloat2,
     cp_async4_shared_global,
     cp_async4_shared_global_pred,
+    fabs_f32,
+    fmax_f32,
     f16_mma_m16n8k16_f32,
     f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
     half2_to_float2_scaled,
@@ -29,6 +31,7 @@ from .moe_w4a16_fp4_helpers import (
     half2_mul,
     ld_global_acquire_i32,
     ld_global_v4_f32,
+    ld_shared_f32,
     ld_shared_i32_relaxed,
     ld_shared_u32,
     ld_shared_v2_u32,
@@ -49,11 +52,14 @@ from .moe_w4a16_fp4_helpers import (
     st_global_v4_f32,
     st_shared_bf16_from_f32,
     st_shared_f16_from_f32,
+    st_shared_f32,
     st_shared_i32,
     st_shared_u32,
     st_shared_v4_f32,
     threadfence,
+    warp_reduce,
 )
+from flashinfer.cute_dsl.fp4_common import red_max_global_f32_nonnegative
 from flashinfer.cute_dsl.utils import current_cuda_stream
 from .moe_w4a16_route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
@@ -2661,6 +2667,7 @@ class W4A16FusedMoeKernel:
         moe_block_size: int,
         max_m_blocks: int,
         element_dtype: str = "bf16",
+        collect_activation_amax: bool = False,
     ):
         is_gated = validate_activation(activation)
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
@@ -2671,10 +2678,12 @@ class W4A16FusedMoeKernel:
         self.fc1_cols = int(fc1_cols)
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
+        self.moe_block_size = int(moe_block_size)
         self.activation = activation
         self.activation_is_gated = is_gated
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self.zero_fc2_output = bool(zero_fc2_output)
+        self.collect_activation_amax = bool(collect_activation_amax)
         self.element_dtype = element_dtype
         self.is_fp16 = element_dtype == "fp16"
         self.fc1 = W4A16GemmKernel(
@@ -2737,6 +2746,7 @@ class W4A16FusedMoeKernel:
         packed_route_indices: cute.Tensor,
         block_expert_ids: cute.Tensor,
         packed_route_count: cute.Tensor,
+        activation_amax_flat: cute.Tensor,
         topk_weights_flat: cute.Tensor,
         fc1_c_tmp_f32_flat: cute.Tensor,
         fc2_c_tmp_f32_flat: cute.Tensor,
@@ -2759,6 +2769,7 @@ class W4A16FusedMoeKernel:
             packed_route_indices,
             block_expert_ids,
             packed_route_count,
+            activation_amax_flat,
             topk_weights_flat,
             fc1_c_tmp_f32_flat,
             fc2_c_tmp_f32_flat,
@@ -2785,6 +2796,7 @@ class W4A16FusedMoeKernel:
         packed_route_indices: cute.Tensor,
         block_expert_ids: cute.Tensor,
         packed_route_count: cute.Tensor,
+        activation_amax_flat: cute.Tensor,
         topk_weights_flat: cute.Tensor,
         fc1_c_tmp_f32_flat: cute.Tensor,
         fc2_c_tmp_f32_flat: cute.Tensor,
@@ -2874,6 +2886,140 @@ class W4A16FusedMoeKernel:
             cta,
             grid_x,
         )
+        if cutlass.const_expr(self.collect_activation_amax):
+            # Opt-in calibration hook. The FC1 input activations (``a_bf16_flat``)
+            # and the FC2 input activations (``activated_bf16_flat``) are still
+            # live here; the FC2 GEMM only reads ``activated_bf16_flat`` and writes
+            # ``fc2_bf16_flat``. A grid barrier guarantees every CTA finished FC2
+            # (so all routed rows of ``activated_bf16_flat`` are final) before we
+            # reuse shared memory as a reduction scratchpad. When the flag is off
+            # this whole block is const-folded away, so the default path is
+            # byte-identical to today.
+            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            self._collect_activation_amax_epilogue(
+                a_bf16_flat,
+                activated_bf16_flat,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                activation_amax_flat,
+                smem_base,
+                tid,
+                cta,
+                grid_x,
+            )
+
+    @cute.jit
+    def _reduce_and_red_activation_amax(
+        self,
+        local_max: cutlass.Float32,
+        activation_amax_flat: cute.Tensor,
+        expert_idx: Int32,
+        slot: Int32,
+        smem_base: Int32,
+        tid: Int32,
+    ):
+        # warp -> block reduction followed by a single no-return global red.max.
+        # ``smem_base`` is reused as a small fp32 scratchpad (one word per warp);
+        # the surrounding ``sync_threads`` calls keep this safe to interleave with
+        # the GEMM's shared-memory usage on either side.
+        lane = tid & Int32(31)
+        warp_idx = tid // Int32(32)
+        warp_amax = warp_reduce(local_max, fmax_f32)
+        if lane == Int32(0):
+            st_shared_f32(smem_base + warp_idx * Int32(4), warp_amax)
+        cute.arch.sync_threads()
+
+        if warp_idx == Int32(0):
+            block_amax = cutlass.Float32(0.0)
+            if lane < Int32(self.cta_threads // 32):
+                block_amax = ld_shared_f32(smem_base + lane * Int32(4))
+            block_amax = warp_reduce(block_amax, fmax_f32)
+            if lane == Int32(0) and block_amax > cutlass.Float32(0.0):
+                out_idx = expert_idx * Int32(2) + slot
+                red_max_global_f32_nonnegative(
+                    get_ptr_as_int64(activation_amax_flat, out_idx),
+                    block_amax,
+                )
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _collect_activation_amax_epilogue(
+        self,
+        a_bf16_flat: cute.Tensor,
+        activated_bf16_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        activation_amax_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+    ):
+        # One CTA per expert (strided by ``grid_x``). For each route mapped to the
+        # expert we reduce the max-abs of its FC1-input row (``a_bf16_flat``,
+        # ``hidden_size`` wide, indexed by token) into slot 0 and its FC2-input row
+        # (``activated_bf16_flat``, ``intermediate_size`` wide, indexed by route)
+        # into slot 1. Route bookkeeping mirrors ``_run_persistent_gemm``: route
+        # blocks come from ``packed_route_count`` truncated by ``moe_block_size``
+        # (so only fully-packed blocks are visited, exactly as the GEMM does) and
+        # padding routes carry an index ``>= size_m * top_k``.
+        live_routes = Int32(self.size_m * self.top_k)
+        route_count = packed_route_count[Int32(0)].to(Int32)
+        route_blocks = route_count // Int32(self.moe_block_size)
+        expert_idx = cta
+        while expert_idx < Int32(self.num_experts):
+            local_fc1 = cutlass.Float32(0.0)
+            local_fc2 = cutlass.Float32(0.0)
+            has_route_block = Int32(0)
+            block_idx = Int32(0)
+            while block_idx < route_blocks:
+                block_expert = block_expert_ids[block_idx].to(Int32)
+                if block_expert == expert_idx:
+                    has_route_block = Int32(1)
+                    route_pos = block_idx * Int32(self.moe_block_size)
+                    route_stop = route_pos + Int32(self.moe_block_size)
+                    while route_pos < route_stop:
+                        route_idx = packed_route_indices[route_pos].to(Int32)
+                        if route_idx >= Int32(0) and route_idx < live_routes:
+                            token_idx = route_idx // Int32(self.top_k)
+                            fc1_col = tid
+                            while fc1_col < Int32(self.hidden_size):
+                                v1 = a_bf16_flat[
+                                    token_idx * Int32(self.hidden_size) + fc1_col
+                                ].to(cutlass.Float32)
+                                local_fc1 = fmax_f32(local_fc1, fabs_f32(v1))
+                                fc1_col += Int32(self.cta_threads)
+
+                            fc2_col = tid
+                            while fc2_col < Int32(self.intermediate_size):
+                                v2 = activated_bf16_flat[
+                                    route_idx * Int32(self.intermediate_size) + fc2_col
+                                ].to(cutlass.Float32)
+                                local_fc2 = fmax_f32(local_fc2, fabs_f32(v2))
+                                fc2_col += Int32(self.cta_threads)
+                        route_pos += Int32(1)
+                block_idx += Int32(1)
+
+            if has_route_block != Int32(0):
+                self._reduce_and_red_activation_amax(
+                    local_fc1,
+                    activation_amax_flat,
+                    expert_idx,
+                    Int32(0),
+                    smem_base,
+                    tid,
+                )
+                self._reduce_and_red_activation_amax(
+                    local_fc2,
+                    activation_amax_flat,
+                    expert_idx,
+                    Int32(1),
+                    smem_base,
+                    tid,
+                )
+            expert_idx += grid_x
 
     @cute.jit
     def _grid_barrier(
@@ -3262,7 +3408,9 @@ def compile_w4a16_fused_moe(
     element_dtype: str = "bf16",
     sms: int,
     max_shared_mem: int,
+    collect_activation_amax: bool = False,
 ) -> W4A16FusedMoeCompileResult:
+    collect_activation_amax = bool(collect_activation_amax)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
     device = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
     is_gated = validate_activation(activation)
@@ -3333,6 +3481,7 @@ def compile_w4a16_fused_moe(
         fc2_tile_k,
         moe_block_size,
         max_m_blocks,
+        collect_activation_amax,
     )
     cached = _FUSED_CACHE.get(cache_key)
     if cached is not None:
@@ -3403,6 +3552,11 @@ def compile_w4a16_fused_moe(
         (1,),
         assumed_align=4,
     )
+    activation_amax_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (num_experts * 2,),
+        assumed_align=4,
+    )
     topk_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
         (size_m * top_k,),
@@ -3450,6 +3604,7 @@ def compile_w4a16_fused_moe(
         moe_block_size=moe_block_size,
         max_m_blocks=max_m_blocks,
         element_dtype=element_dtype,
+        collect_activation_amax=collect_activation_amax,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=kernel, cache_key=cache_key
@@ -3469,6 +3624,7 @@ def compile_w4a16_fused_moe(
         packed_routes_fake,
         block_experts_fake,
         route_count_fake,
+        activation_amax_fake,
         topk_fake,
         fc1_c_tmp_fake,
         fc2_c_tmp_fake,
@@ -3749,6 +3905,65 @@ def pack_topk_routes_by_expert(
     )
 
 
+def _validate_activation_amax(
+    activation_amax: torch.Tensor | None,
+    *,
+    layer_idx: int | None,
+    num_experts: int,
+    device: torch.device,
+) -> int | None:
+    """Validate the optional calibration tensor and resolve the layer offset.
+
+    Mirrors the upstream b12x guard set. ``activation_amax`` may be either
+    ``[num_experts, 2]`` (single layer, ``layer_idx`` omitted) or
+    ``[num_layers, num_experts, 2]`` (``layer_idx`` selects the layer slice).
+    Returns the resolved layer index (``0`` when 2D) or ``None`` when collection
+    is disabled.
+    """
+    if activation_amax is None:
+        if layer_idx is not None:
+            raise ValueError("layer_idx requires activation_amax")
+        return None
+    if activation_amax.dtype != torch.float32:
+        raise TypeError("activation_amax must be torch.float32")
+    if not activation_amax.is_cuda:
+        raise ValueError("activation_amax must be a CUDA tensor")
+    if activation_amax.device != device:
+        raise ValueError("activation_amax must be on the same device as a_input")
+    if not activation_amax.is_contiguous():
+        raise ValueError("activation_amax must be contiguous")
+    if activation_amax.ndim == 2:
+        if layer_idx is not None and int(layer_idx) != 0:
+            raise ValueError(
+                "layer_idx must be 0 (or omitted) for a 2D activation_amax tensor"
+            )
+        if int(activation_amax.shape[1]) != 2:
+            raise ValueError("activation_amax must have shape [num_experts, 2]")
+        if int(activation_amax.shape[0]) < int(num_experts):
+            raise ValueError(
+                "activation_amax expert dimension is smaller than the expert count"
+            )
+        return 0
+    if activation_amax.ndim != 3 or int(activation_amax.shape[2]) != 2:
+        raise ValueError(
+            "activation_amax must have shape [num_experts, 2] or "
+            "[num_layers, num_experts, 2]"
+        )
+    if int(activation_amax.shape[1]) < int(num_experts):
+        raise ValueError(
+            "activation_amax expert dimension is smaller than the expert count"
+        )
+    if layer_idx is None:
+        raise ValueError("layer_idx is required for a 3D activation_amax tensor")
+    layer = int(layer_idx)
+    if layer < 0 or layer >= int(activation_amax.shape[0]):
+        raise ValueError(
+            f"layer_idx {layer} is out of bounds for activation_amax with "
+            f"{int(activation_amax.shape[0])} layers"
+        )
+    return layer
+
+
 def run_w4a16_moe(
     a_input: torch.Tensor,
     prepared,
@@ -3766,6 +3981,8 @@ def run_w4a16_moe(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    activation_amax: torch.Tensor | None = None,
+    layer_idx: int | None = None,
     apply_router_weight_on_input: bool = False,
     fast_math: bool = True,
 ) -> torch.Tensor:
@@ -3801,6 +4018,20 @@ def run_w4a16_moe(
         raise ValueError(f"output must have shape {(m, hidden_size)}")
     if expert_map is not None and int(expert_map.numel()) < int(prepared.num_experts):
         raise ValueError("expert_map cannot be shorter than the local expert count")
+
+    layer_idx_int = _validate_activation_amax(
+        activation_amax,
+        layer_idx=layer_idx,
+        num_experts=int(prepared.num_experts),
+        device=a_input.device,
+    )
+    collect_activation_amax = activation_amax is not None
+    if collect_activation_amax and expert_map is not None:
+        # Upstream restricts calibration to the route-packed fused path with no
+        # expert remapping; the per-expert amax slots are keyed by local expert id.
+        raise ValueError(
+            "activation amax collection is incompatible with expert_map remapping"
+        )
 
     route_num_experts = (
         int(expert_map.numel()) if expert_map is not None else int(prepared.num_experts)
@@ -3892,6 +4123,7 @@ def run_w4a16_moe(
         element_dtype=element_dtype,
         sms=sms,
         max_shared_mem=max_shared_mem,
+        collect_activation_amax=collect_activation_amax,
     )
     fc1_scratch = _get_c_tmp(
         packed_gemm_scratch_elements(
@@ -3913,6 +4145,17 @@ def run_w4a16_moe(
         device=a_input.device,
         scratch=fc2_c_tmp,
     )
+    if collect_activation_amax:
+        assert activation_amax is not None
+        if activation_amax.ndim == 3:
+            assert layer_idx_int is not None
+            activation_amax_arg = activation_amax[layer_idx_int].reshape(-1)
+        else:
+            activation_amax_arg = activation_amax.reshape(-1)
+    else:
+        # Unused when the kernel was compiled with collection disabled; pass a
+        # live fp32 gmem tensor so the launch ABI is satisfied without overhead.
+        activation_amax_arg = prepared.w13_global_scale
     fused.compiled(
         a_input.view(-1),
         prepared.w13.view(torch.int32).view(-1),
@@ -3927,6 +4170,7 @@ def run_w4a16_moe(
         packed_route_indices,
         block_expert_ids,
         packed_route_count,
+        activation_amax_arg,
         topk_weights.view(-1),
         fc1_scratch,
         fc2_scratch,

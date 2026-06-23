@@ -2871,14 +2871,32 @@ b12x_fused_moe_trace = TraceTemplate(
         "quant_mode": Scalar(
             "string",
             optional=True,
-            description="Quantization mode: 'nvfp4'/'w4a4' or 'w4a16'.",
+            description=(
+                "Quantization mode: 'nvfp4'/'w4a4', 'w4a16', or the FP8-activation "
+                "tiers 'w4a8_mx'/'w4a8_nvfp4'."
+            ),
         ),
         "source_format": Scalar(
             "string",
             optional=True,
             description=(
-                "Source weight format for quant_mode='w4a16': 'modelopt' or "
-                "'compressed_tensors'."
+                "Source weight format. 'modelopt'/'modelopt_nvfp4' for nvfp4; "
+                "'compressed_tensors' for w4a16; 'fp4_e8m0_k32' for w4a8_mx."
+            ),
+        ),
+        "swiglu_limit": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "SwiGLU-OAI gate clamp limit (activation="
+                "'swigluoai_uninterleave'). Ignored for silu/relu2."
+            ),
+        ),
+        "apply_router_weight_on_input": Scalar(
+            "bool",
+            optional=True,
+            description=(
+                "Apply routing weights to the FC1 input instead of the FC2 output."
             ),
         ),
     },
