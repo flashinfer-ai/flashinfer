@@ -2907,15 +2907,22 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         for i in cutlass.range_constexpr(cute.size(tKKrT)):
             s, t = tKKcMkk_cv[i]
             value = cutlass.Float32(0.0)
-            pred = s >= t
+            pred = True  # for non final blocks, s >= t is enforced by value filtering
             if cutlass.const_expr(is_final_block):
-                pred = pred and s < B and t < B
+                pred = s >= t and s < B and t < B
             if pred:
                 gamma = cute.math.exp2(
                     cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
                     fastmath=True,
                 )
                 value = -gamma * cutlass.Float32(sT[t, s])
+            if cutlass.const_expr(not is_final_block):  # value filtering
+                # T is already structurally lower-triangular in this operand view.
+                # If gamma overflows on a structural-zero entry, the product becomes
+                # inf * 0 -> NaN; filter only that bad product instead of
+                # materializing the coordinates.
+                if value != value:
+                    value = cutlass.Float32(0.0)
             tKKrT[i] = self.dtype(value)
         cute.copy(tiled_store, tKKrT, tKKsKK)
 
