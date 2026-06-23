@@ -5209,6 +5209,49 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
         )
 
 
+def test_fp8_block_scale_moe_fused_shared_experts_reject_ep():
+    """Fused shared experts must reject expert-parallel (EP) configurations.
+
+    The routing kernel maps a shared expert's global id ``num_experts + k`` to a
+    weight row as ``global_id - local_expert_offset``, which only lands at the
+    intended local slot when all routed experts are local. EP configurations
+    (non-zero ``local_expert_offset`` or ``local_num_experts < num_experts``)
+    must therefore raise instead of silently producing wrong results. The guard
+    is a cheap host-side check, so this test does not require a GPU.
+    """
+    num_experts = 4
+    base_kwargs = {
+        "routing_logits": torch.empty((1, num_experts), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((1, 1), dtype=torch.bfloat16),
+        "hidden_states_scale": torch.empty((1, 1), dtype=torch.float32),
+        "gemm1_weights": torch.empty((1, 2, 1), dtype=torch.bfloat16),
+        "gemm1_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "gemm2_weights": torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        "gemm2_weights_scale": torch.empty((1, 1, 1), dtype=torch.float32),
+        "num_experts": num_experts,
+        "top_k": 1,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": 1,
+        "routed_scaling_factor": None,
+        "routing_method_type": RoutingMethodType.DeepSeekV3.value,
+        "num_fused_shared_experts": 1,
+    }
+
+    # Non-zero local_expert_offset (this rank does not own the first expert).
+    with pytest.raises(ValueError, match="expert parallelism"):
+        trtllm_fp8_block_scale_moe(
+            **base_kwargs, local_expert_offset=2, local_num_experts=num_experts
+        )
+
+    # Sharded experts: local_num_experts < num_experts.
+    with pytest.raises(ValueError, match="expert parallelism"):
+        trtllm_fp8_block_scale_moe(
+            **base_kwargs, local_expert_offset=0, local_num_experts=num_experts // 2
+        )
+
+
 def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices):
     """TRT-LLM Gen MxFp8 MoE applies raw fused FC1 SwiGLU OA params."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))

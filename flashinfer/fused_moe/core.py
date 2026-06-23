@@ -3403,6 +3403,10 @@ def trtllm_fp8_block_scale_moe(
         Number of shared experts to fuse into the MoE kernel (default
         ``None`` / ``0``).  When ``> 0``, the weight tensors must have
         ``num_experts + num_fused_shared_experts`` in the expert dimension.
+        Expert parallelism (EP) is not yet supported together with fused shared
+        experts: when this is ``> 0`` you must pass ``local_expert_offset == 0``
+        and ``local_num_experts == num_experts`` (all routed experts local),
+        otherwise a ``ValueError`` is raised.
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2 (non-gated); ``7`` Identity.
@@ -3433,6 +3437,20 @@ def trtllm_fp8_block_scale_moe(
         Final MoE output when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
+    # Fused shared experts do not yet support expert parallelism (EP). The routing
+    # kernel maps a shared expert's global id (num_experts + k) to a weight row as
+    # (global_id - local_expert_offset), which only lands at the intended local slot
+    # when local_expert_offset == 0 and local_num_experts == num_experts. Reject EP
+    # configurations explicitly instead of silently producing wrong results.
+    _nfse = num_fused_shared_experts or 0
+    if _nfse > 0 and (local_expert_offset != 0 or local_num_experts != num_experts):
+        raise ValueError(
+            "Fused shared experts (num_fused_shared_experts > 0) do not yet support "
+            "expert parallelism: require local_expert_offset == 0 and "
+            "local_num_experts == num_experts. Got "
+            f"num_fused_shared_experts={_nfse}, local_expert_offset={local_expert_offset}, "
+            f"local_num_experts={local_num_experts}, num_experts={num_experts}."
+        )
     _validate_routing_replay_out(routing_replay_out, top_k)
     _validate_fp8_block_scale_gemm1_activation_params(
         fp8_quantization_type,

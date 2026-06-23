@@ -675,6 +675,27 @@ void FusedMoeLauncher::init_common(
   auto bias_type_enum = static_cast<batchedGemm::gemm::BiasType>(gemm1_bias_type);
   args->gemm1_bias_type = bias_type_enum;
 
+  // Fused shared experts do not yet support expert parallelism (EP).
+  //
+  // The routing kernel assigns each fused shared expert the global id
+  // (num_experts + k) and the permutation pipeline maps a global expert id to a
+  // weight-tensor row as (global_id - local_expert_offset) (see
+  // include/flashinfer/trtllm/fused_moe/RoutingKernel.cuh). A shared expert
+  // therefore lands at its intended local row (local_num_experts + k) only when
+  // local_expert_offset + local_num_experts == num_experts, i.e. when every
+  // routed expert is local to this rank. Under EP (local_expert_offset > 0, or
+  // local_num_experts < num_experts) this silently produces wrong results, so
+  // reject it explicitly until the kernel learns to map the shared-expert id
+  // range independently of the routed-expert window.
+  TVM_FFI_ICHECK(args->num_fused_shared_experts == 0 ||
+                 (args->local_expert_offset == 0 && args->local_num_experts == args->num_experts))
+      << "Fused shared experts (num_fused_shared_experts > 0) are currently only supported "
+         "without expert parallelism, i.e. local_expert_offset == 0 and "
+         "local_num_experts == num_experts. Got num_fused_shared_experts="
+      << args->num_fused_shared_experts << ", local_expert_offset=" << args->local_expert_offset
+      << ", local_num_experts=" << args->local_num_experts << ", num_experts=" << args->num_experts
+      << ".";
+
   this->args = std::move(args);
   this->tile_tokens_dim = tile_tokens_dim;
   this->routing_method_type = routing_method_type;
