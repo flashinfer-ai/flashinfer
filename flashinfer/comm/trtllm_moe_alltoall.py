@@ -412,14 +412,6 @@ def moe_a2a_combine(
     payload_in_workspace : bool
         ``True`` if ``payload`` is already a workspace-backed view (skips
         the staging copy).  Defaults to ``False``.
-    output_dtype : Optional[torch.dtype]
-        Optional output data type.  Currently supports ``torch.bfloat16``
-        and ``torch.float8_e4m3fn``.
-    output_scales : Optional[torch.Tensor]
-        Optional output scale tensor for quantized outputs.  Currently
-        supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
-    sf_layout : SfLayout
-        Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
 
     Returns
     -------
@@ -834,14 +826,6 @@ class MoeAlltoAll:
         payload_in_workspace : bool
             ``True`` if ``payload`` is already a workspace-backed view (skips
             the staging copy).  Defaults to ``False``.
-        output_dtype : Optional[torch.dtype]
-            Optional output data type.  Currently supports ``torch.bfloat16``
-            and ``torch.float8_e4m3fn``.
-        output_scales : Optional[torch.Tensor]
-            Optional output scale tensor for quantized outputs.  Currently
-            supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
-        sf_layout : SfLayout
-            Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
 
         Returns
         -------
