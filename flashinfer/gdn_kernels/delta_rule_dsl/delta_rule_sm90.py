@@ -143,6 +143,25 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         self.qk_stage = 2
         self.kk_stage = 2
         self.alpha_beta_stage = 5
+        self.manual_cache_key(
+            "needs_alpha",
+            "needs_beta",
+            "needs_init_state",
+            "needs_checkpointing",
+            "dtype",
+            "acc_dtype",
+            "inverse_dtype",
+            "BLK_Q",
+            "BLK_KV",
+            "D",
+            "q_stage",
+            "k_stage",
+            "v_stage",
+            "o_stage",
+            "qk_stage",
+            "kk_stage",
+            "alpha_beta_stage",
+        )
 
     def get_next_work(
         self,
@@ -2365,7 +2384,7 @@ def delta_rule_prefill_dsl_sm90(
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
 
     workspace_size = get_device_sm_count(q.device) * 128
-    tensormaps_t = _get_cache_buf("gdn_cp_prefill_tensormaps", workspace_size, q.device)
+    tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, q.device)
 
     stream_val = torch.cuda.current_stream().cuda_stream
     stream = cuda_driver.CUstream(stream_val)
