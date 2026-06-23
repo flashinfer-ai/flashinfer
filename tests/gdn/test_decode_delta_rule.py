@@ -2654,12 +2654,11 @@ def _packed_qkv(
     q = fused[:, :, :num_q_heads, :]
     k = fused[:, :, num_q_heads : num_q_heads + num_k_heads, :]
     v = fused[:, :, num_q_heads + num_k_heads :, :]
-    # Non-compact only for B>1; at B=1 the size-1 batch dim is trivially contiguous.
-    assert batch_size == 1 or not q.is_contiguous(), "expected a packed view"
+    assert not q.is_contiguous(), "expected a non-compact (packed) view"
     return q, k, v
 
 
-def _packed_qkv_params(batch_size, seq_len, num_v_heads, head_size, device):
+def _packed_qkv_params(batch_size, seq_len, num_v_heads, device):
     a = (
         torch.randn(
             batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
@@ -2675,7 +2674,7 @@ def _packed_qkv_params(batch_size, seq_len, num_v_heads, head_size, device):
 
 
 @pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
-@pytest.mark.parametrize("batch_size", [1, 2, 8, 64])
+@pytest.mark.parametrize("batch_size", [2, 8, 64])
 def test_decode_pretranspose_packed_qkv(batch_size: int, state_dtype: str):
     """Pretranspose decode must accept packed q/k/v (bit-identical to contiguous)."""
     _skip_if_not_sm90_or_later()
@@ -2688,7 +2687,7 @@ def test_decode_pretranspose_packed_qkv(batch_size: int, state_dtype: str):
     kv_dtype = getattr(torch, state_dtype)
 
     q, k, v = _packed_qkv(batch_size, 1, Hq, Hk, HV, D, dev)
-    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, 1, HV, D, dev)
+    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, 1, HV, dev)
     state = torch.randn(batch_size, HV, D, D, dtype=kv_dtype, device=dev)
 
     kw = dict(A_log=A_log, a=a, dt_bias=dt_bias, b=b, scale=scale, use_qk_l2norm=True)
@@ -2702,7 +2701,7 @@ def test_decode_pretranspose_packed_qkv(batch_size: int, state_dtype: str):
     torch.testing.assert_close(s_p, s_c, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 8, 64])
+@pytest.mark.parametrize("batch_size", [2, 8, 64])
 def test_decode_nontranspose_packed_qkv(batch_size: int):
     """Nontranspose decode must accept packed q/k/v (bit-identical to contiguous)."""
     _skip_if_not_sm90_or_later()
@@ -2714,7 +2713,7 @@ def test_decode_nontranspose_packed_qkv(batch_size: int):
     scale = 1.0 / math.sqrt(D)
 
     q, k, v = _packed_qkv(batch_size, 1, Hq, Hk, HV, D, dev)
-    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, 1, HV, D, dev)
+    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, 1, HV, dev)
     state = torch.randn(batch_size, HV, D, D, dtype=torch.float32, device=dev)
 
     kw = dict(A_log=A_log, a=a, dt_bias=dt_bias, b=b, scale=scale, use_qk_l2norm=True)
@@ -2726,7 +2725,7 @@ def test_decode_nontranspose_packed_qkv(batch_size: int):
     torch.testing.assert_close(s_p, s_c, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 8, 64])
+@pytest.mark.parametrize("batch_size", [2, 8, 64])
 @pytest.mark.parametrize("seq_len", [2, 4])
 def test_mtp_packed_qkv(batch_size: int, seq_len: int):
     """MTP decode must accept packed q/k/v (bit-identical to contiguous)."""
@@ -2739,7 +2738,7 @@ def test_mtp_packed_qkv(batch_size: int, seq_len: int):
     scale = 1.0 / math.sqrt(D)
 
     q, k, v = _packed_qkv(batch_size, seq_len, Hq, Hk, HV, D, dev)
-    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, seq_len, HV, D, dev)
+    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, seq_len, HV, dev)
     pool = torch.randn(batch_size, HV, D, D, dtype=torch.float32, device=dev)
     idx = torch.arange(batch_size, dtype=torch.int32, device=dev)
 

@@ -1775,10 +1775,13 @@ def gated_delta_rule_mtp_wide_vec(
             h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
-            # Dummy [1,1,1] tensor (caching off) has no unique stride-1 dim.
             inter_ = _mark_slot_dynamic(intermediate_states)
+        else:
+            # Caching-off dummy ([1,1,1]) is never read; don't mark it.
+            inter_ = from_dlpack(
+                intermediate_states, assumed_align=32, enable_tvm_ffi=True
+            )
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
@@ -2034,9 +2037,12 @@ def gated_delta_rule_mtp(
             h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
             inter_ = _mark_slot_dynamic(intermediate_states)
+        else:
+            inter_ = from_dlpack(
+                intermediate_states, assumed_align=32, enable_tvm_ffi=True
+            )
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
