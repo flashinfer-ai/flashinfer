@@ -223,9 +223,28 @@ def _mnnvl_workspace_check(
     """
     Check if mnnvl backend CAN be used for workspace creation.
 
+    Hard requirements:
+    - Device must support cuMulticastCreate (SM90+ with NVLink, i.e. H100 SXM or newer).
+      This is true for both single-node NVLink (H100 SXM) and multi-node NVLink (GB200
+      NVL72), so the check correctly admits single-node NVLink setups.
     """
+    try:
+        try:
+            from cuda.bindings import driver as cuda
+        except ImportError:
+            from cuda import cuda  # type: ignore[no-reuse-def]
+        from flashinfer.cuda_utils import checkCudaErrors
 
-    return True
+        device_idx = torch.cuda.current_device()
+        multicast_supported = checkCudaErrors(
+            cuda.cuDeviceGetAttribute(
+                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED,
+                device_idx,
+            )
+        )
+        return multicast_supported != 0
+    except Exception:
+        return False
 
 
 # ============================================================================
