@@ -254,21 +254,6 @@ def _ld_shared_i32(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ld_global_u64(addr, *, loc=None, ip=None):
-    return Uint64(
-        llvm.inline_asm(
-            T.i64(),
-            [Int64(addr).ir_value(loc=loc, ip=ip)],
-            "ld.global.u64 $0, [$1];",
-            "=l,l",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def _ld_global_acquire_i32(addr, *, loc=None, ip=None):
     return Int32(
         llvm.inline_asm(

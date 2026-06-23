@@ -91,16 +91,6 @@ _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
 )
 
 
-def _lookup_mac_ladder(
-    ladder: Tuple[Tuple[int, int], ...], routed_rows: int
-) -> int | None:
-    """Look up optimal MAC from a tuning ladder. Returns None if no match."""
-    for end_rows, mac in ladder:
-        if routed_rows <= end_rows:
-            return mac
-    return None
-
-
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
@@ -266,39 +256,6 @@ def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
         cached = max(0, int(cutover))
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[activation_precision] = cached
     return cached
-
-
-def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
-    """Select optimal MoE tile shape based on routed rows and N dimension.
-
-    Uses narrower 64x128 tiles when routed_rows <= 128 and default 128x128
-    would leave SMs idle.
-    """
-    sm_count = get_num_sm(torch.device("cuda"))
-    coarse_tile = (128, 128)
-    coarse_tiles = ((routed_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
-        (n + coarse_tile[1] - 1) // coarse_tile[1]
-    )
-    # Single-token decode often lands exactly on the "half the machine"
-    # boundary. Keeping the coarse 128x128 tile there leaves the M dimension
-    # badly underfilled, so take the narrow 64x128 tile inclusive of equality.
-    if routed_rows <= 128 and coarse_tiles <= max(1, sm_count // 2):
-        return (64, 128)
-    return (128, 128)
-
-
-def _as_grouped_scale_view(
-    scale_storage: torch.Tensor,
-    rows: int,
-    cols: int,
-) -> torch.Tensor:
-    """Create 6D MMA-compatible scale factor view from swizzled storage."""
-    batch = scale_storage.shape[0]
-    rows_padded = _align_up(rows, 128)
-    cols_padded = _align_up(cols // SF_VEC_SIZE, 4)
-    sf = scale_storage.view(torch.float8_e4m3fn)
-    sf = sf.view(batch, rows_padded // 128, cols_padded // 4, 32, 4, 4)
-    return sf.permute(3, 4, 1, 5, 2, 0)
 
 
 # ---------------------------------------------------------------------------

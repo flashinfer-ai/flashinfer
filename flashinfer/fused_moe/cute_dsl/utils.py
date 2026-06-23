@@ -1,16 +1,9 @@
-"""b12x-MoE-specific FP4 CuTe-DSL primitives.
-
-Moved out of flashinfer/cute_dsl/fp4_common.py (which stays focused on the
-rmsnorm-shared helpers): these primitives and quantize_block_fp4 are used only
-by the SM120/SM121 b12x MoE kernels under flashinfer/fused_moe/cute_dsl/.
-Shared helpers are imported from fp4_common.
-"""
+"""b12x-MoE-specific FP4 CuTe-DSL primitives."""
 
 from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass import Float32, Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -18,14 +11,10 @@ from cutlass._mlir.dialects import llvm
 from flashinfer.cute_dsl.fp4_common import (
     FLOAT4_E2M1_MAX,
     FLOAT8_E4M3_MAX,
-    SF_VEC_SIZE,
     cvt_f32_to_e4m3,
     fmin_f32,
     fp8_e4m3_to_f32,
-    max_abs_16,
     quantize_and_pack_16,
-    relu2_16,
-    silu_mul_16,
     ue8m0_to_output_scale,
 )
 
@@ -55,34 +44,6 @@ def quantize_block_fp4(
         # reciprocal: global_scale_val / quantized_scale.
         packed64 = quantize_and_pack_16(values, global_scale_val / quantized_scale)
     return packed64, scale_byte
-
-
-@cute.jit
-def silu_mul_quantize_block_fp4(
-    gate: cute.Tensor,
-    up: cute.Tensor,
-    global_scale_val: Float32,
-) -> Tuple[Uint64, Uint8]:
-    """Fused SiLU(gate)*up + FP4 quantize for 16 element pairs."""
-    activated = silu_mul_16(gate, up)
-    block_max = max_abs_16(activated)
-    return quantize_block_fp4(activated, block_max, global_scale_val)
-
-
-# =============================================================================
-# ReLU2 Activation — ReLU(x)² for non-gated MoE (Nemotron-Super)
-# =============================================================================
-
-
-@cute.jit
-def relu2_quantize_block_fp4(
-    x: cute.Tensor,
-    global_scale_val: Float32,
-) -> Tuple[Uint64, Uint8]:
-    """Fused ReLU² + FP4 quantize for 16 float32 values."""
-    activated = relu2_16(x)
-    block_max = max_abs_16(activated)
-    return quantize_block_fp4(activated, block_max, global_scale_val)
 
 
 # =============================================================================
@@ -1262,40 +1223,6 @@ def quant_dequant_e4m3_2(
 # =============================================================================
 
 
-def align_up(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
-
-
-def as_grouped_scale_view(
-    scale_storage: torch.Tensor, rows: int, cols: int
-) -> torch.Tensor:
-    batch = scale_storage.shape[0]
-    rows_padded = align_up(rows, 128)
-    cols_padded = align_up(cols // SF_VEC_SIZE, 4)
-    sf = scale_storage.view(torch.float8_e4m3fn)
-    sf = sf.view(batch, rows_padded // 128, cols_padded // 4, 32, 4, 4)
-    return sf.permute(3, 4, 1, 5, 2, 0)
-
-
-def _fp4_quantize_values(x: torch.Tensor) -> torch.Tensor:
-    sign = torch.sign(x)
-    x = torch.abs(x.clone())
-    x[(x >= 0.0) & (x <= 0.25)] = 0.0
-    x[(x > 0.25) & (x < 0.75)] = 0.5
-    x[(x >= 0.75) & (x <= 1.25)] = 1.0
-    x[(x > 1.25) & (x < 1.75)] = 1.5
-    x[(x >= 1.75) & (x <= 2.5)] = 2.0
-    x[(x > 2.5) & (x < 3.5)] = 3.0
-    x[(x >= 3.5) & (x <= 5.0)] = 4.0
-    x[x > 5.0] = 6.0
-    return x * sign
-
-
-def fp4_quantize_values_torch(x: torch.Tensor) -> torch.Tensor:
-    """Pure-Torch FP4 E2M1 quantization with kernel-matching tie-breaking."""
-    return _fp4_quantize_values(x)
-
-
 @dsl_user_op
 def st_global_v4_f32(
     base_ptr: Int64,
@@ -1319,35 +1246,6 @@ def st_global_v4_f32(
         ],
         "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
         "l,f,f,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def st_shared_v4_u32(
-    smem_addr: Int32,
-    v0: Uint32,
-    v1: Uint32,
-    v2: Uint32,
-    v3: Uint32,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Store 128 bits (4 x uint32) to shared memory. smem_addr is a u32 shared-memory address."""
-    llvm.inline_asm(
-        None,
-        [
-            Int32(smem_addr).ir_value(loc=loc, ip=ip),
-            Uint32(v0).ir_value(loc=loc, ip=ip),
-            Uint32(v1).ir_value(loc=loc, ip=ip),
-            Uint32(v2).ir_value(loc=loc, ip=ip),
-            Uint32(v3).ir_value(loc=loc, ip=ip),
-        ],
-        "st.shared.v4.u32 [$0], {$1, $2, $3, $4};",
-        "r,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
