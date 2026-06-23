@@ -59,7 +59,7 @@ from .moe_w4a16_fp4_helpers import (
     threadfence,
     warp_reduce,
 )
-from flashinfer.cute_dsl.fp4_common import red_max_global_f32_nonnegative
+from flashinfer.fused_moe.cute_dsl.utils import red_max_global_f32_nonnegative
 from flashinfer.cute_dsl.utils import current_cuda_stream
 from .moe_w4a16_route_pack import (
     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,

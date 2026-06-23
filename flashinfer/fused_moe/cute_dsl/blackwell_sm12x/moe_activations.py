@@ -1,4 +1,10 @@
-"""Shared activation metadata for fused MoE paths."""
+"""Shared activation metadata for fused MoE paths.
+
+NOTE: SwiGLU-OAI (GPT-OSS) is NOT integrated in FlashInfer: it is excluded
+from SUPPORTED_MOE_ACTIVATIONS so activation='swigluoai_uninterleave' is
+rejected. The kernel bodies retain dead, const-folded swigluoai branches from
+the upstream b12x port.
+"""
 
 from __future__ import annotations
 
@@ -10,8 +16,8 @@ SWIGLUOAI_DEFAULT_LIMIT = 7.0
 SWIGLUOAI_DEFAULT_ALPHA = 1.702
 SWIGLUOAI_DEFAULT_BETA = 1.0
 
-SUPPORTED_MOE_ACTIVATIONS = frozenset({"silu", "relu2", SWIGLUOAI_UNINTERLEAVE})
-GATED_MOE_ACTIVATIONS = frozenset({"silu", SWIGLUOAI_UNINTERLEAVE})
+SUPPORTED_MOE_ACTIVATIONS = frozenset({"silu", "relu2"})
+GATED_MOE_ACTIVATIONS = frozenset({"silu"})
 
 
 def normalize_moe_activation(activation: str) -> str:

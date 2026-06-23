@@ -22,8 +22,6 @@ from flashinfer.cute_dsl.fp4_common import (
     atomic_add_global_i32,
     cvt_e4m3_to_f32_via_f16,
     cvt_e4m3x4_to_f32x4,
-    cvt_e8m0_to_f32,
-    cvt_e8m0x4_to_f32x4,
     cvt_f32_to_e4m3,
     fmax_f32,
     fp4_dot4_sum_f32acc,
@@ -32,17 +30,21 @@ from flashinfer.cute_dsl.fp4_common import (
     ld_global_acquire_i32,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
-    mx_scale_from_amax32,
     nvfp4_scale_from_amax,
-    quant_dequant_e4m3_2,
     pack_f32x2_to_f16x2,
-    prefetch_global_l2,
     quant_dequant_2,
     spin_wait_global_eq_i32,
     st_global_i32,
     st_global_release_i32,
     threadfence,
     warp_reduce,
+)
+from flashinfer.fused_moe.cute_dsl.utils import (
+    cvt_e8m0_to_f32,
+    cvt_e8m0x4_to_f32x4,
+    mx_scale_from_amax32,
+    quant_dequant_e4m3_2,
+    prefetch_global_l2,
 )
 from .moe_activations import (
     SWIGLUOAI_UNINTERLEAVE,

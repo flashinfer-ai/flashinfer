@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from flashinfer.cute_dsl.fp4_common import fp4_quantize_values_torch
+from flashinfer.fused_moe.cute_dsl.utils import fp4_quantize_values_torch
 from .moe_activations import (
     SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
@@ -1396,7 +1396,7 @@ def nvfp4_mx_residual_quality_report(scales: torch.Tensor) -> dict[str, float]:
 
 
 def _quant_dequant_mxfp8_rows(x: torch.Tensor) -> torch.Tensor:
-    from flashinfer.cute_dsl.fp4_common import quant_dequant_mxfp8_torch
+    from flashinfer.fused_moe.cute_dsl.utils import quant_dequant_mxfp8_torch
 
     return quant_dequant_mxfp8_torch(x)
 

@@ -24,18 +24,12 @@ from flashinfer.cute_dsl.utils import (
     make_ptr,
 )
 from .moe_activations import (
-    SWIGLUOAI_UNINTERLEAVE,
     is_gated_moe_activation,
     normalize_moe_activation,
-    normalize_swiglu_alpha_for_activation,
-    normalize_swiglu_beta_for_activation,
-    normalize_swiglu_limit_for_activation,
 )
 from .moe_silu import (
     MoEDynamicKernelSilu,
-    MoEDynamicKernelSwiGLUOAI,
     MoEMicroKernelSilu,
-    MoEMicroKernelSwiGLUOAI,
 )
 from .moe_relu2 import MoEDynamicKernelRelu2, MoEMicroKernelRelu2
 from .moe_w4a16_host import (
@@ -144,20 +138,16 @@ def _normalize_activation_precision(activation_precision: str) -> str:
         ) from exc
 
 
-# Quantization modes understood by the dispatch layer. Rebased onto upstream
-# b12x's explicit 4-mode set (HEAD 5af873a):
-#   nvfp4       — FP4 weights + FP4 activations (NVFP4, E4M3 K/16 block scales)
-#   w4a16       — FP4 weights + BF16 activations (weight-only)
-#   w4a8_mx     — FP4 weights + MXFP8 (E4M3) activations, UE8M0 K/32 scales
-#   w4a8_nvfp4  — FP4 weights + FP8 (E4M3) activations, NVFP4 scales decomposed
-_W4A8_QUANT_MODES = frozenset({"w4a8_mx", "w4a8_nvfp4"})
+# Quantization modes exposed by the dispatch layer:
+#   nvfp4  — FP4 weights + FP4 activations (NVFP4, E4M3 K/16 block scales)
+#   w4a16  — FP4 weights + BF16 activations (weight-only)
+# (Upstream's W4A8 FP8-activation tier is intentionally not exposed here.)
 
-# FP4-source formats for the nvfp4 / w4a8 paths. "modelopt" is the legacy
-# FlashInfer alias for upstream "modelopt_nvfp4".
+# FP4-source formats for the nvfp4 path. "modelopt" is the legacy FlashInfer
+# alias for upstream "modelopt_nvfp4".
 _FP4_SOURCE_FORMATS = {
     "modelopt": "modelopt_nvfp4",
     "modelopt_nvfp4": "modelopt_nvfp4",
-    "fp4_e8m0_k32": "fp4_e8m0_k32",
     "compressed_tensors": "compressed_tensors",
 }
 
@@ -182,67 +172,44 @@ def _normalize_quant_mode(
         "w4a4": "nvfp4",
         "bf16": "w4a16",
         "w4a16": "w4a16",
-        "w4a8_mx": "w4a8_mx",
-        "w4a8_nvfp4": "w4a8_nvfp4",
     }
     try:
         return aliases[normalized]
     except KeyError as exc:
         raise ValueError(
-            "quant_mode must be one of 'nvfp4'/'w4a4', 'w4a16', "
-            f"'w4a8_mx', or 'w4a8_nvfp4' (got {quant_mode!r})."
+            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
         ) from exc
 
 
-def _is_w4a8(quant_mode: str) -> bool:
-    """True for the FP8-activation x FP4-weight throughput tiers."""
-    return _normalize_quant_mode(quant_mode) in _W4A8_QUANT_MODES
-
-
 def _activation_precision_from_quant_mode(quant_mode: str) -> str:
-    mode = _normalize_quant_mode(quant_mode)
-    if mode == "w4a16":
-        return "bf16"
-    if mode in _W4A8_QUANT_MODES:
-        return "fp8"
-    return "fp4"
+    return "bf16" if _normalize_quant_mode(quant_mode) == "w4a16" else "fp4"
 
 
 def _normalize_fp4_source_format(source_format: str) -> str:
     """Normalize an FP4-path source format to the upstream canonical name."""
-    lowered = str(source_format).lower()
-    if lowered == "mxfp4_native":
-        raise ValueError(
-            "source_format='mxfp4_native' has been removed; use "
-            "source_format='fp4_e8m0_k32' for byte-preserved E8M0 K/32 scales."
-        )
     try:
-        return _FP4_SOURCE_FORMATS[lowered]
+        return _FP4_SOURCE_FORMATS[str(source_format).lower()]
     except KeyError as exc:
         raise ValueError(
-            "source_format must be one of 'modelopt'/'modelopt_nvfp4', "
-            "'fp4_e8m0_k32', or 'compressed_tensors', "
-            f"got {source_format!r}"
+            "source_format must be one of 'modelopt'/'modelopt_nvfp4' or "
+            f"'compressed_tensors', got {source_format!r}"
         ) from exc
 
 
 def _validate_fp4_source_format_for_quant_mode(
     *, source_format: str, quant_mode: str
 ) -> None:
-    """Upstream (mode, source) compatibility matrix for the FP4 paths."""
+    """(mode, source) compatibility matrix for the FP4 paths."""
     normalized = _normalize_fp4_source_format(source_format)
     mode = _normalize_quant_mode(quant_mode)
     if mode == "w4a16":
         return
     if normalized == "modelopt_nvfp4":
         return
-    if normalized == "fp4_e8m0_k32" and mode == "w4a8_mx":
-        return
     raise ValueError(
         f"source_format={normalized!r} with quant_mode={mode!r} is "
-        "unsupported; use quant_mode='w4a16' for non-NVFP4 sources, "
-        "quant_mode='w4a8_mx' for source_format='fp4_e8m0_k32', or "
-        "source_format='modelopt_nvfp4' for NVFP4/W4A8-NVFP4 kernels"
+        "unsupported; use quant_mode='w4a16' for non-NVFP4 sources, or "
+        "source_format='modelopt_nvfp4' for the NVFP4 kernel"
     )
 
 
@@ -250,13 +217,13 @@ def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str)
     """Validate (mode, source) and return the format name for that path.
 
     w4a16 keeps the FlashInfer-native 'modelopt'/'compressed_tensors' names
-    (consumed by the W4A16 weight-prep). The nvfp4/w4a8 paths use the upstream
+    (consumed by the W4A16 weight-prep). The nvfp4 path uses the upstream
     canonical FP4-source names.
     """
     mode = _normalize_quant_mode(quant_mode)
     if mode == "w4a16":
         return _normalize_source_format(source_format)
-    # nvfp4 / w4a8: validate against the upstream matrix.
+    # nvfp4: validate against the source matrix.
     _validate_fp4_source_format_for_quant_mode(
         source_format=source_format, quant_mode=mode
     )
@@ -472,8 +439,6 @@ def _resolve_micro_cls(activation: str) -> type:
     activation = normalize_moe_activation(activation)
     if activation == "relu2":
         return MoEMicroKernelRelu2
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        return MoEMicroKernelSwiGLUOAI
     return MoEMicroKernelSilu
 
 
@@ -482,92 +447,7 @@ def _resolve_dynamic_cls(activation: str) -> type:
     activation = normalize_moe_activation(activation)
     if activation == "relu2":
         return MoEDynamicKernelRelu2
-    if activation == SWIGLUOAI_UNINTERLEAVE:
-        return MoEDynamicKernelSwiGLUOAI
     return MoEDynamicKernelSilu
-
-
-def _resolve_swiglu_params(
-    activation: str,
-    swiglu_limit: float | None,
-    swiglu_alpha: float | None = None,
-    swiglu_beta: float | None = None,
-) -> Tuple[float | None, float, float]:
-    """Normalize (limit, alpha, beta) for the given activation.
-
-    Defaults: swigluoai -> (7.0, 1.702, 1.0); silu/relu2 -> (None, 1.0, 0.0).
-    """
-    activation = normalize_moe_activation(activation)
-    return (
-        normalize_swiglu_limit_for_activation(activation, swiglu_limit),
-        normalize_swiglu_alpha_for_activation(activation, swiglu_alpha),
-        normalize_swiglu_beta_for_activation(activation, swiglu_beta),
-    )
-
-
-# Storages already flipped to the kernel-native [up; gate] order, keyed by
-# (w1_fp4 data_ptr, w1_blockscale data_ptr). The gated micro/dynamic NVFP4
-# kernels consume FC1 weights as [up; gate] ("w13"); swigluoai sources arrive
-# as [gate; up] ("w31"), so flip the FP4 bytes and the swizzled block-scale
-# halves once per storage (the load-time mirror of upstream's W4A16 row
-# rotation). Mirrors b12x integration/tp_moe.py::_ensure_w13_kernel_order_inplace.
-# Values hold the tensors so the allocator cannot recycle a registered data_ptr
-# into a stale repack.
-_W13_NORMALIZED_STORAGES: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
-
-
-def _swap_w13_fp4_halves_inplace(w1_fp4: torch.Tensor, n: int) -> None:
-    """Swap the two FC1 halves of the packed FP4 weights in place ([E, 2n, k//2])."""
-    w1_u8 = w1_fp4.view(torch.uint8)
-    if w1_u8.dim() != 3 or int(w1_u8.shape[1]) != 2 * n:
-        raise ValueError(
-            f"w31 FC1 weights must be [E, 2n, k//2]; got {tuple(w1_u8.shape)} for n={n}"
-        )
-    E = int(w1_u8.shape[0])
-    per_expert = int(w1_u8.shape[1]) * int(w1_u8.shape[2])
-    # Swap halves a few experts at a time to bound the temporary.
-    chunk = max(1, min(E, (32 << 20) // max(1, per_expert)))
-    for e0 in range(0, E, chunk):
-        sl = w1_u8[e0 : e0 + chunk]
-        tmp = sl[:, :n].clone()
-        sl[:, :n] = sl[:, n:]
-        sl[:, n:] = tmp
-
-
-def _ensure_w13_kernel_order_inplace(
-    w1_fp4: torch.Tensor,
-    w13_sf_contiguous: torch.Tensor,
-    *,
-    n: int,
-    num_experts: int,
-    rows_pad: int,
-) -> None:
-    """Flip gate-first ("w31") FC1 storage to kernel-native [up; gate] order.
-
-    Flips the packed FP4 weight bytes in place (once per storage, tracked by
-    data_ptr) and swaps the gate/up halves of the *un-swizzled contiguous*
-    block-scale buffer ``w13_sf_contiguous`` (shape [num_experts*rows_pad,
-    cols]). The scale buffer is freshly produced per call by
-    ``convert_sf_from_mma_layout(...).contiguous()`` so it is always swapped to
-    match the (idempotently) flipped FP4 storage.
-    """
-    if not w1_fp4.is_contiguous():
-        raise ValueError("w31 FC1 normalization requires contiguous w1 storage")
-
-    # Flip the FP4 weight bytes once per physical storage.
-    reg_key = (w1_fp4.data_ptr(), w13_sf_contiguous.data_ptr())
-    if reg_key not in _W13_NORMALIZED_STORAGES:
-        _swap_w13_fp4_halves_inplace(w1_fp4, n)
-        _W13_NORMALIZED_STORAGES[reg_key] = (w1_fp4, w13_sf_contiguous)
-
-    # Swap the gate/up scale halves on the un-swizzled contiguous buffer. Rows
-    # are physically [E, rows_pad] (padded to 128); within each expert block the
-    # first 2n rows hold [gate(0:n); up(n:2n)] and must become [up; gate].
-    sf2d = w13_sf_contiguous.view(num_experts, rows_pad, -1)
-    for e in range(num_experts):
-        tmp = sf2d[e, :n].clone()
-        sf2d[e, :n] = sf2d[e, n : 2 * n]
-        sf2d[e, n : 2 * n] = tmp
 
 
 def _get_weight_views(
@@ -580,19 +460,12 @@ def _get_weight_views(
     n: int,
     k: int,
     activation_precision: str = "fp4",
-    activation: str = "silu",
 ) -> _WeightViews:
     """Create permuted weight views for the static kernel.
 
     The kernel expects concatenated w13 data with shape [2*n, k//2, E]
-    via a single TMA descriptor.
-
-    For ``swigluoai_uninterleave`` the FC1 weights arrive gate-first ("w31");
-    the gated micro/dynamic NVFP4 kernels consume [up; gate] ("w13"), so the
-    FP4 bytes and block-scale halves are flipped once per storage (see
-    ``_ensure_w13_kernel_order_inplace``). silu/relu2 are already kernel-native.
+    via a single TMA descriptor. silu/relu2 are already kernel-native.
     """
-    activation = normalize_moe_activation(activation)
     activation_precision = _normalize_activation_precision(activation_precision)
     tile_n = _level_tile_n(activation_precision)
     # The kernel splits w13 into gate/up halves by tile index. This only works
@@ -605,7 +478,6 @@ def _get_weight_views(
 
     key = (
         activation_precision,
-        activation,
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
         w1_alphas.data_ptr(),
@@ -616,10 +488,6 @@ def _get_weight_views(
     cached = _WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
-
-    needs_w31_flip = activation == SWIGLUOAI_UNINTERLEAVE and is_gated_moe_activation(
-        activation
-    )
 
     # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy)
     # w1_rows is 2*n for gated (SiLU) or n for non-gated (ReLU2)
@@ -646,17 +514,6 @@ def _get_weight_views(
         k=n,
         num_groups=w2_fp4.shape[0],
     ).contiguous()
-
-    if needs_w31_flip:
-        # rows_pad = ceil(w1_rows/128)*128; convert_sf_from_mma_layout pads M.
-        rows_pad = ((w1_rows + 127) // 128) * 128
-        _ensure_w13_kernel_order_inplace(
-            w1_fp4,
-            w13_sf_contiguous,
-            n=n,
-            num_experts=int(w1_fp4.shape[0]),
-            rows_pad=rows_pad,
-        )
 
     views = _WeightViews(
         w13_fp4=w13.view(torch.float4_e2m1fn_x2),
@@ -708,9 +565,6 @@ def _get_micro_kernel(
     single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
-    swiglu_limit: float | None = None,
-    swiglu_alpha: float | None = None,
-    swiglu_beta: float | None = None,
     device: torch.device | None = None,
 ):
     """Compile (or retrieve cached) the SM120 micro MoE kernel.
@@ -723,9 +577,6 @@ def _get_micro_kernel(
     """
     sf_vec_size = 16
     activation = normalize_moe_activation(activation)
-    swiglu_limit, swiglu_alpha, swiglu_beta = _resolve_swiglu_params(
-        activation, swiglu_limit, swiglu_alpha, swiglu_beta
-    )
 
     cache_key = (
         "micro",
@@ -742,9 +593,6 @@ def _get_micro_kernel(
         single_token,
         mac_override,
         activation,
-        swiglu_limit,
-        swiglu_alpha,
-        swiglu_beta,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -753,16 +601,6 @@ def _get_micro_kernel(
     micro_cls = _resolve_micro_cls(activation)
     mma_tiler_mn = (128, 128)
     output_tile_count_n = max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1])
-    # Gated subclasses (silu/swigluoai) accept swiglu params; relu2 does not.
-    extra_kwargs = (
-        dict(
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-        )
-        if is_gated_moe_activation(activation)
-        else {}
-    )
     kernel: Any = micro_cls(
         sf_vec_size,
         mma_tiler_mn,
@@ -771,7 +609,6 @@ def _get_micro_kernel(
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
         single_token=single_token,
-        **extra_kwargs,
     )
     # configure() must run before cute.compile so the shape config and grid_x
     # are bound into the kernel instance.
@@ -876,9 +713,6 @@ def launch_sm120_static_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
-    swiglu_limit: float | None = None,
-    swiglu_alpha: float | None = None,
-    swiglu_beta: float | None = None,
     activation_precision: str = "fp4",
 ) -> torch.Tensor:
     """Launch the SM120 "static" band via the MoEMicroKernelBackend harness.
@@ -935,9 +769,6 @@ def launch_sm120_static_moe(
         share_expert_scales=share_expert_scales,
         single_token=num_tokens == 1,
         activation=activation,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
         device=a.device,
     )
 
@@ -1343,17 +1174,11 @@ def _get_dynamic_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
-    swiglu_limit: float | None = None,
-    swiglu_alpha: float | None = None,
-    swiglu_beta: float | None = None,
     activation_precision: str = "fp4",
     share_input_across_experts: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     activation = normalize_moe_activation(activation)
-    swiglu_limit, swiglu_alpha, swiglu_beta = _resolve_swiglu_params(
-        activation, swiglu_limit, swiglu_alpha, swiglu_beta
-    )
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
@@ -1384,9 +1209,6 @@ def _get_dynamic_kernel(
         input_scales_are_reciprocal,
         fast_math,
         activation,
-        swiglu_limit,
-        swiglu_alpha,
-        swiglu_beta,
         share_input_across_experts,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
@@ -1403,22 +1225,11 @@ def _get_dynamic_kernel(
     alpha_dtype = cutlass.Float32
 
     dynamic_cls = _resolve_dynamic_cls(activation)
-    # Gated subclasses (silu/swigluoai) accept swiglu params; relu2 does not.
-    extra_kwargs = (
-        dict(
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-        )
-        if is_gated
-        else {}
-    )
     kernel: Any = dynamic_cls(
         sf_vec_size,
         mma_tiler_mn,
         fast_math=fast_math,
         share_input_across_experts=share_input_across_experts,
-        **extra_kwargs,
     )
     launch = _DynamicMoELaunch(
         kernel,
@@ -1631,9 +1442,6 @@ def launch_sm120_dynamic_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
-    swiglu_limit: float | None = None,
-    swiglu_alpha: float | None = None,
-    swiglu_beta: float | None = None,
     activation_precision: str = "fp4",
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
@@ -1661,9 +1469,6 @@ def launch_sm120_dynamic_moe(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         activation=activation,
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
         activation_precision=activation_precision,
         share_input_across_experts=input_gs_is_shared,
     )
@@ -2100,261 +1905,6 @@ def _launch_sm120_w4a16_moe(
 
 
 # ==========================================================================
-# W4A8 throughput tier (mx) dispatch
-# ==========================================================================
-# Routed-rows floor above which dynamic-band w4a8_mx calls dispatch to the
-# dedicated W4A8 throughput-tier pipeline (w4a8/pipeline.py). Ported from
-# b12x integration/tp_moe.py: the tier's 48-row expert-run group padding loses
-# to the dynamic kernel at few routes/expert, but wins by >5% above ~3840 and
-# by ~36-46% at 6144-12288 routed rows. Floor rounded up to 4096. The env flags
-# accept both the upstream B12X_* names and the FlashInfer FLASHINFER_B12X_*
-# alias (matching _first_env handling elsewhere in this module).
-_W4A8_TIER_MIN_ROUTED_ROWS_DEFAULT = 4096
-_W4A8_TIER_MIN_ROUTED_ROWS_ENVS = (
-    "FLASHINFER_B12X_W4A8_TIER_MIN_ROUTED_ROWS",
-    "B12X_W4A8_TIER_MIN_ROUTED_ROWS",
-)
-_W4A8_TIER_FORCE_ENVS = (
-    "FLASHINFER_B12X_MOE_FORCE_W4A8_TIER",
-    "B12X_MOE_FORCE_W4A8_TIER",
-)
-
-
-def _w4a8_tier_min_routed_rows() -> int:
-    raw = _first_env(*_W4A8_TIER_MIN_ROUTED_ROWS_ENVS)
-    if raw is None or not raw.strip():
-        return _W4A8_TIER_MIN_ROUTED_ROWS_DEFAULT
-    return int(raw)
-
-
-def _w4a8_tier_forced() -> bool:
-    raw = _first_env(*_W4A8_TIER_FORCE_ENVS)
-    if raw is None:
-        return False
-    return raw.strip().lower() not in ("", "0", "false", "no", "off")
-
-
-# Prepared (repacked) W4A8 tier weights, keyed on source data_ptrs + shapes,
-# mirroring _W4A16_WEIGHT_CACHE / _WEIGHT_CACHE. Stores (sources, prepared)
-# where prepared is None when the tier cannot serve these weights (non-unit
-# alphas) so the refusal decision is cached without re-checking on the GPU.
-_W4A8_TIER_WEIGHT_CACHE: Dict[Tuple, Tuple[Tuple, Optional[dict]]] = {}
-# Capacity-sized pipeline workspaces, keyed on (m, k, n, weight_E, topk, device).
-_W4A8_TIER_WORKSPACE_CACHE: Dict[Tuple, dict] = {}
-
-
-def _get_w4a8_tier_prepared(
-    w13_fp4: torch.Tensor,
-    w13_mx: torch.Tensor,
-    w1_alpha: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_mx: torch.Tensor,
-    w2_alpha: torch.Tensor,
-) -> Optional[dict]:
-    """Repack (once) kernel-order FC1/FC2 storage for the W4A8 tier GEMM.
-
-    ``w13_fp4`` is [E, 2n, K/2] u8 (kernel order [up; gate]); ``w13_mx`` is
-    [E, 2n, K/32] u8; ``w2_fp4`` is [E, K, n/2] u8; ``w2_mx`` is [E, K, n/32]
-    u8 — the exact fp4_e8m0_k32 source layout the pipeline consumes. Returns
-    None when the tier cannot serve these weights (non-unit alphas: the tier
-    GEMM has no per-expert alpha operand in v1).
-    """
-    from .w4a8.pipeline import prepare_w4a8_tier_weights
-
-    key = (
-        w13_fp4.data_ptr(),
-        w13_mx.data_ptr(),
-        w2_fp4.data_ptr(),
-        w2_mx.data_ptr(),
-        w1_alpha.data_ptr(),
-        w2_alpha.data_ptr(),
-        tuple(w13_fp4.shape),
-        tuple(w2_fp4.shape),
-    )
-    cached = _W4A8_TIER_WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached[1]
-    sources = (w13_fp4, w13_mx, w2_fp4, w2_mx, w1_alpha, w2_alpha)
-    # One-time host check (syncs): v1 consumes MXFP4 sources exactly, whose
-    # per-expert weight global dequant scales are ones by contract.
-    unit_alphas = bool(
-        torch.all(w1_alpha == 1.0).item() and torch.all(w2_alpha == 1.0).item()
-    )
-    if not unit_alphas:
-        _W4A8_TIER_WEIGHT_CACHE[key] = (sources, None)
-        return None
-    prepared = prepare_w4a8_tier_weights(
-        w13_fp4.view(torch.uint8),
-        w13_mx.view(torch.uint8),
-        w2_fp4.view(torch.uint8),
-        w2_mx.view(torch.uint8),
-    )
-    _W4A8_TIER_WEIGHT_CACHE[key] = (sources, prepared)
-    return prepared
-
-
-def _maybe_launch_w4a8_tier(
-    *,
-    a: torch.Tensor,
-    w13_fp4: torch.Tensor,
-    w13_mx: torch.Tensor,
-    w1_alpha: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_mx: torch.Tensor,
-    w2_alpha: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    output: Optional[torch.Tensor],
-    m: int,
-    k: int,
-    n: int,
-    weight_E: int,
-    num_topk: int,
-    routed_rows: int,
-    activation: str,
-    quant_mode: str,
-    apply_router_weight_on_input: bool,
-    device: torch.device,
-    prepared_w4a8: object | None = None,
-    swiglu_limit: float | None = None,
-) -> Optional[torch.Tensor]:
-    """Route a dynamic-band w4a8_mx call to the W4A8 throughput-tier pipeline.
-
-    Returns the output tensor when the tier handled the call, or None when the
-    call should fall through to the dynamic kernel instead. When an explicit
-    ``prepared_w4a8`` object is supplied the refusal conditions become hard
-    errors (``RuntimeError("B12X prepared W4A8 MoE cannot run: ...")``).
-
-    Ported from b12x integration/tp_moe.py ``_maybe_launch_w4a8_tier``. v1
-    refusal conditions: non-"w4a8_mx" mode; tier disabled; routed_rows below
-    the floor (unless forced or a prepared object was supplied);
-    activation != "silu"; apply_router_weight_on_input; k % 256 or n % 128;
-    non-rank-2 routing tensors; non-unit w1/w2 alphas.
-    """
-    if quant_mode != "w4a8_mx":
-        return None
-    prepared_required = prepared_w4a8 is not None
-
-    def reject_prepared_w4a8(reason: str) -> None:
-        raise RuntimeError(f"B12X prepared W4A8 MoE cannot run: {reason}")
-
-    min_routed = _w4a8_tier_min_routed_rows()
-    if min_routed == 0:
-        if prepared_required:
-            reject_prepared_w4a8(
-                "B12X_W4A8_TIER_MIN_ROUTED_ROWS=0 disables the required W4A8 tier"
-            )
-        return None
-    if routed_rows < min_routed and not prepared_required and not _w4a8_tier_forced():
-        return None
-    if activation != "silu":
-        if prepared_required:
-            reject_prepared_w4a8(
-                f"W4A8 tier supports activation='silu', got {activation!r}"
-            )
-        return None
-    if apply_router_weight_on_input:
-        if prepared_required:
-            reject_prepared_w4a8(
-                "apply_router_weight_on_input is unsupported by the W4A8 tier"
-            )
-        return None
-    if k % 256 != 0 or n % 128 != 0:
-        if prepared_required:
-            reject_prepared_w4a8(
-                f"W4A8 tier requires k % 256 == 0 and n % 128 == 0; got k={k}, n={n}"
-            )
-        return None
-    if topk_ids.dim() != 2 or topk_weights.dim() != 2:
-        if prepared_required:
-            reject_prepared_w4a8(
-                "topk_ids and topk_weights must both be rank-2 tensors"
-            )
-        return None
-
-    from .w4a8.pipeline import build_w4a8_tier_workspace, w4a8_tier_forward
-
-    capturing = _is_cuda_graph_capturing()
-    if prepared_w4a8 is not None:
-        prepared = {
-            "w13_rp": prepared_w4a8.w13_rp,  # type: ignore[attr-defined]
-            "w13_sfb": prepared_w4a8.w13_sfb,  # type: ignore[attr-defined]
-            "w2_rp": prepared_w4a8.w2_rp,  # type: ignore[attr-defined]
-            "w2_sfb": prepared_w4a8.w2_sfb,  # type: ignore[attr-defined]
-        }
-    else:
-        prepared = _get_w4a8_tier_prepared(
-            w13_fp4,
-            w13_mx,
-            w1_alpha,
-            w2_fp4,
-            w2_mx,
-            w2_alpha,
-        )
-    if prepared is None:
-        # Non-unit alphas (only reachable on the non-prepared path; the
-        # prepared path folds alphas at prepare time). Fall through.
-        return None
-
-    ws_key = (m, k, n, weight_E, num_topk, str(device))
-    ws = _W4A8_TIER_WORKSPACE_CACHE.get(ws_key)
-    if capturing and (ws is None or "fc2" not in ws["_compiled"]):
-        raise RuntimeError(
-            "CUDA graph capture requires a warmed w4a8 tier workspace; "
-            "run one eager call for this shape before capture"
-        )
-    if ws is None:
-        ws = build_w4a8_tier_workspace(
-            m=m,
-            hidden_size=k,
-            intermediate_size=n,
-            num_experts=weight_E,
-            topk=num_topk,
-            device=device,
-        )
-        _W4A8_TIER_WORKSPACE_CACHE[ws_key] = ws
-
-    if output is None:
-        if capturing:
-            raise ValueError("CUDA graph capture requires a caller-owned output buffer")
-        output = torch.empty(m, k, dtype=a.dtype, device=device)
-    if tuple(output.shape) != (m, k):
-        raise ValueError(f"output must have shape {(m, k)}, got {tuple(output.shape)}")
-    if output.dtype != a.dtype:
-        raise ValueError(f"output must have dtype {a.dtype}, got {output.dtype}")
-    if not output.is_contiguous():
-        raise ValueError("output must be contiguous")
-
-    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-        if capturing:
-            raise ValueError(
-                "CUDA graph capture requires contiguous int32 topk_ids on the "
-                "w4a8 tier path"
-            )
-        topk_ids = topk_ids.to(torch.int32).contiguous()
-    if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
-        if capturing:
-            raise ValueError(
-                "CUDA graph capture requires contiguous float32 topk_weights "
-                "on the w4a8 tier path"
-            )
-        topk_weights = topk_weights.to(torch.float32).contiguous()
-
-    return w4a8_tier_forward(
-        a,
-        prepared["w13_rp"],
-        prepared["w13_sfb"],
-        prepared["w2_rp"],
-        prepared["w2_sfb"],
-        topk_ids,
-        topk_weights,
-        ws,
-        out=output,
-        swiglu_limit=swiglu_limit,
-    )
-
-
-# ==========================================================================
 # Workspace cache (for functional API path)
 # ==========================================================================
 
@@ -2537,11 +2087,9 @@ def launch_sm120_moe(
     quant_mode: str | None = None,
     source_format: str = "modelopt",
     apply_router_weight_on_input: bool = False,
-    swiglu_limit: float | None = None,
     _workspace=None,
     _weight_views=None,
     _prepared_weights=None,
-    _prepared_w4a8=None,
 ) -> torch.Tensor:
     """Unified SM120 MoE dispatch — selects static or dynamic by token count.
 
@@ -2554,14 +2102,8 @@ def launch_sm120_moe(
     source_format = _normalize_source_format_for_quant_mode(source_format, quant_mode)
     activation_precision = _activation_precision_from_quant_mode(quant_mode)
 
-    # Validate the activation name (unknown activations raise) and normalize
-    # the swiglu params (swigluoai defaults: limit=7.0, alpha=1.702, beta=1.0;
-    # silu/relu2: None/1.0/0.0). swiglu_alpha/beta are not exposed by this
-    # public entry point; they ride the activation defaults.
+    # Validate the activation name (unknown activations raise).
     activation = normalize_moe_activation(activation)
-    swiglu_limit, swiglu_alpha, swiglu_beta = _resolve_swiglu_params(
-        activation, swiglu_limit
-    )
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
@@ -2593,55 +2135,6 @@ def launch_sm120_moe(
             _prepared_weights=_prepared_weights,
         )
 
-    if quant_mode == "w4a8_nvfp4":
-        # w4a8_nvfp4 needs residual scale grids and per-expert alphas the tier
-        # GEMM does not implement, and the non-tier w4a8_nvfp4 dynamic path is
-        # not yet wired through this dispatcher. Fail loudly rather than run a
-        # silently-wrong NVFP4 kernel.
-        raise NotImplementedError("quant_mode='w4a8_nvfp4' dispatch not yet wired")
-
-    if quant_mode == "w4a8_mx":
-        # The W4A8 throughput tier serves the large-routed ("dynamic") band.
-        # Weights arrive in the fp4_e8m0_k32 source layout: w1_weight
-        # [E, 2n, K/2] u8, w1_weight_sf [E, 2n, K/32] u8, w2_weight [E, K, n/2]
-        # u8, w2_weight_sf [E, K, n/32] u8.
-        tier_out = _maybe_launch_w4a8_tier(
-            a=a,
-            w13_fp4=w1_weight,
-            w13_mx=w1_weight_sf,
-            w1_alpha=w1_alpha,
-            w2_fp4=w2_weight,
-            w2_mx=w2_weight_sf,
-            w2_alpha=w2_alpha,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            output=scatter_output,
-            m=num_tokens,
-            k=k,
-            n=n,
-            weight_E=num_experts,
-            num_topk=top_k,
-            routed_rows=routed_rows,
-            activation=activation,
-            quant_mode=quant_mode,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            device=a.device,
-            prepared_w4a8=_prepared_w4a8,
-            swiglu_limit=swiglu_limit,
-        )
-        if tier_out is not None:
-            return tier_out
-        # Below the tier floor (micro-eligible / small-routed w4a8_mx) the
-        # non-tier mxfp8-activation kernel path is not yet wired through this
-        # dispatcher (owned by the broader b12x rebase). Fail loudly.
-        raise NotImplementedError(
-            "quant_mode='w4a8_mx' below the throughput-tier floor "
-            f"(routed_rows={routed_rows} < {_w4a8_tier_min_routed_rows()}); "
-            "the non-tier w4a8_mx dispatch path is not yet wired. Set "
-            "B12X_MOE_FORCE_W4A8_TIER=1 to force the tier, or raise the "
-            "routed-row count above the floor."
-        )
-
     if fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
     down_input_scale = fc2_input_scale
@@ -2659,7 +2152,6 @@ def launch_sm120_moe(
             n=n,
             k=k,
             activation_precision=activation_precision,
-            activation=activation,
         )
     )
 
@@ -2741,9 +2233,6 @@ def launch_sm120_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
             activation_precision=activation_precision,
         )
     else:
@@ -2764,8 +2253,5 @@ def launch_sm120_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
             activation_precision=activation_precision,
         )
