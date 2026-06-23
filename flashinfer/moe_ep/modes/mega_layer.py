@@ -10,6 +10,11 @@ import torch.nn as nn
 
 from ..config import BootstrapConfig, FleetParams
 from ..core.kernel.registry import create_mega_kernel
+from ..core.runtime import (
+    bootstrap_moe_ep_runtime,
+    ensure_moe_ep_cuda_device,
+    finalize_moe_ep_runtime,
+)
 from ..core.validation.common import validate_bootstrap_world_size
 from ..weights import MoEWeightPack
 from .config import MegaConfig
@@ -36,9 +41,17 @@ class MoEEpMegaLayer(nn.Module):
         if fleet_params.weights is None:
             raise ValueError("MoEEpMegaLayer requires FleetParams.weights")
 
-        validate_bootstrap_world_size(bootstrap)
+        ensure_moe_ep_cuda_device(bootstrap)
 
         self._kernel = create_mega_kernel(self._megakernel_config)
+        self._runtime = None
+        if bootstrap.auto_bootstrap:
+            self._runtime = bootstrap_moe_ep_runtime(
+                bootstrap,
+                self._kernel.runtime_requirements(bootstrap),
+            )
+
+        validate_bootstrap_world_size(bootstrap)
         self._kernel.validate_init(bootstrap, fleet_params)
 
         self._weights: MoEWeightPack = fleet_params.weights
@@ -85,7 +98,12 @@ class MoEEpMegaLayer(nn.Module):
             num_tokens=num_tokens,
         )
 
-        y = torch.empty_like(t.hidden_states, dtype=torch.bfloat16)
+        y = torch.empty(
+            num_tokens,
+            self._fleet_params.token_hidden_size,
+            dtype=torch.bfloat16,
+            device=t.hidden_states.device,
+        )
         return self._kernel.compute(
             workspace,
             self._transformed,
@@ -97,6 +115,9 @@ class MoEEpMegaLayer(nn.Module):
         if self._workspace is not None:
             self._kernel.destroy(self._workspace)
             self._workspace = None
+        if self._runtime is not None:
+            finalize_moe_ep_runtime(self._runtime)
+            self._runtime = None
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):

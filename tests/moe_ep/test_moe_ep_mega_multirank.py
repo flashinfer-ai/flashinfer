@@ -17,21 +17,17 @@ deep_gemm = pytest.importorskip("deep_gemm")
 pytest.importorskip("triton")
 
 
-def _init_dist():
+def _launcher_ranks() -> tuple[int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    return rank, world_size
+
+
+def _require_cuda():
     import torch
-    import torch.distributed as dist
 
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-
-    if not dist.is_initialized():
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend="nccl",
-            device_id=torch.device(f"cuda:{local_rank}"),
-        )
-    return dist
 
 
 def _make_inputs(
@@ -231,8 +227,9 @@ def _reference_mega_moe_prestaged(
     return y
 
 
-def _run_mega_layer(dist_mod, rank, world_size, *, stage_inputs: bool):
+def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
     import torch
+    import torch.distributed as dist
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -243,7 +240,11 @@ def _run_mega_layer(dist_mod, rank, world_size, *, stage_inputs: bool):
         MoEEpMegaLayer,
         MoEEpTensors,
         MoEWeightPack,
+        ensure_moe_ep_cuda_device,
     )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
 
     problem = _mega_problem(rank, world_size)
     if stage_inputs:
@@ -262,7 +263,7 @@ def _run_mega_layer(dist_mod, rank, world_size, *, stage_inputs: bool):
         t_scales = x_sf
 
     mega = MoEEpLayer(
-        bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
+        bootstrap=bootstrap,
         fleet_params=FleetParams(
             num_experts=problem["num_experts"],
             max_tokens_per_rank=problem["max_tokens"],
@@ -290,17 +291,17 @@ def _run_mega_layer(dist_mod, rank, world_size, *, stage_inputs: bool):
     )
     y_layer = mega.forward(t)
     torch.cuda.synchronize()
-    dist_mod.barrier()
+    dist.barrier()
 
     if stage_inputs:
         y_ref = _reference_mega_moe_staged(
-            dist_mod.group.WORLD, problem, destroy_buffer=True
+            dist.group.WORLD, problem, destroy_buffer=True
         )
     else:
         y_ref = _reference_mega_moe_prestaged(
-            dist_mod.group.WORLD, problem, t_hidden, t_scales, destroy_buffer=True
+            dist.group.WORLD, problem, t_hidden, t_scales, destroy_buffer=True
         )
-    dist_mod.barrier()
+    dist.barrier()
 
     assert y_layer.shape == (problem["num_tokens"], problem["hidden"])
     assert y_layer.dtype == torch.bfloat16
@@ -314,11 +315,11 @@ def _run_mega_layer(dist_mod, rank, world_size, *, stage_inputs: bool):
 @pytest.mark.arch_blackwell
 def test_moe_ep_mega_layer_matches_deep_gemm_reference():
     """MoEEpMegaLayer with on-the-fly bf16→fp8 staging."""
-    dist_mod = _init_dist()
-    assert dist_mod.get_world_size() >= 4
-    rank = _run_mega_layer(
-        dist_mod, dist_mod.get_rank(), dist_mod.get_world_size(), stage_inputs=True
-    )
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(rank, world_size, stage_inputs=True)
     print(f"rank {rank}: mega layer (staged inputs) matches deep_gemm reference")
 
 
@@ -326,9 +327,9 @@ def test_moe_ep_mega_layer_matches_deep_gemm_reference():
 @pytest.mark.arch_blackwell
 def test_moe_ep_mega_layer_prestaged_inputs_matches_reference():
     """MoEEpMegaLayer with pre-staged fp8 activations (stage_inputs=False)."""
-    dist_mod = _init_dist()
-    assert dist_mod.get_world_size() >= 4
-    rank = _run_mega_layer(
-        dist_mod, dist_mod.get_rank(), dist_mod.get_world_size(), stage_inputs=False
-    )
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(rank, world_size, stage_inputs=False)
     print(f"rank {rank}: mega layer (prestaged inputs) matches deep_gemm reference")

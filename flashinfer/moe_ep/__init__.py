@@ -35,6 +35,10 @@ from .backends.mega.kernel.deep_gemm_mega import (
     DeepGemmMegaMoeConfig,
     preprocess_mega_weights,
 )
+from .backends.mega.kernel.nvfp4_cutedsl import (
+    Nvfp4CutedslMegaMoeConfig,
+    preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -49,6 +53,11 @@ from .config import (
 )
 from .core.comm.fleet import Fleet, create_fleet
 from .core.comm.handle import Handle
+from .core.runtime import (
+    bootstrap_moe_ep_runtime,
+    ensure_moe_ep_cuda_device,
+    finalize_moe_ep_runtime,
+)
 from .core.validation import (
     MoEEpArchError,
     MoEEpConfigError,
@@ -89,6 +98,7 @@ __all__ = [
     "EpAlgorithm",
     "EpLayout",
     "Fleet",
+    "finalize_moe_ep_runtime",
     "FleetAlgoKnobNumChannelsPerRank",
     "FleetAlgoKnobNumQpsPerRank",
     "FleetAlgoKnobQuantization",
@@ -114,16 +124,21 @@ __all__ = [
     "MoEWeightPack",
     "NCCLEPConfig",
     "NcclEpConfig",
+    "Nvfp4CutedslMegaMoeConfig",
     "NvepConfig",
     "QuantType",
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
+    "bootstrap_moe_ep_runtime",
     "create_fleet",
+    "ensure_moe_ep_cuda_device",
+    "finalize_moe_ep_runtime",
     "have_nccl_ep",
     "have_nixl_ep",
     "kernel_requires_weights",
     "preprocess_mega_weights",
+    "preprocess_nvfp4_cutedsl_mega_weights",
     "run_split_kernel",
     "validate_arch_for_backend",
     "validate_bootstrap_world_size",

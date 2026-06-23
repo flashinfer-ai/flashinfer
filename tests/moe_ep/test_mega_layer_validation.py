@@ -22,7 +22,7 @@ def _mega_layer(*, stage_inputs: bool = True, preprocess_weights: bool = False):
 
     with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
         return MoEEpMegaLayer(
-            bootstrap=BootstrapConfig(world_size=1, rank=0),
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(
                 num_experts=8,
                 max_tokens_per_rank=64,
@@ -60,10 +60,10 @@ def test_mega_layer_init_requires_weights():
         MoEEpMegaLayer,
     )
 
-    with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
-        with pytest.raises(ValueError, match="FleetParams.weights"):
-            MoEEpMegaLayer(
-                bootstrap=BootstrapConfig(world_size=1, rank=0),
+        with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
+            with pytest.raises(ValueError, match="FleetParams.weights"):
+                MoEEpMegaLayer(
+                    bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
                 fleet_params=FleetParams(
                     num_experts=8,
                     max_tokens_per_rank=64,

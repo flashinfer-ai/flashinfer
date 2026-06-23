@@ -73,6 +73,14 @@ class MegaKernelBackend(ABC):
     def requires_weights(self) -> bool:
         return True
 
+    def runtime_requirements(
+        self, bootstrap: "BootstrapConfig"
+    ) -> frozenset[str]:
+        """Process resources this mega kernel needs (``torch_dist``, ``nvshmem``, …)."""
+        from ...core.runtime import TORCH_DIST
+
+        return frozenset({TORCH_DIST})
+
     def validate_init(
         self,
         bootstrap: "BootstrapConfig",

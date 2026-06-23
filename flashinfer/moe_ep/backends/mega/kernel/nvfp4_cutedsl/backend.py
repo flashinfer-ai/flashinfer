@@ -1,0 +1,180 @@
+"""CuTeDSL NVFP4 mega-MoE kernel backend."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import torch
+import torch.distributed as dist
+
+from .....config import BootstrapConfig, FleetParams
+from .....core.kernel.base import MegaKernelBackend
+from .....core.kernel.registry import register_mega_kernel
+from .....core.runtime import nvfp4_cutedsl_runtime_requirements
+from .....core.validation.common import (
+    validate_mega_arch,
+    validate_mega_fleet_params,
+)
+from .....weights import MoEWeightPack
+from .config import Nvfp4CutedslMegaMoeConfig
+from .staging import stage_mega_moe_inputs, validate_nvfp4_forward_inputs
+from .weights import TransformedMegaWeights, preprocess_mega_weights
+
+if TYPE_CHECKING:
+    from .....tensors import MoEEpTensors
+
+
+def _resolve_gate_up_clamp(config: Nvfp4CutedslMegaMoeConfig) -> float | None:
+    if config.gate_up_clamp is not None:
+        return config.gate_up_clamp
+    return config.activation_clamp
+
+
+@register_mega_kernel("nvfp4_cutedsl")
+class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
+    def __init__(self, config: Nvfp4CutedslMegaMoeConfig) -> None:
+        super().__init__(config)
+        self._kernel_config: Nvfp4CutedslMegaMoeConfig = config
+
+    @classmethod
+    def kernel_name(cls) -> str:
+        return "nvfp4_cutedsl"
+
+    def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
+        return nvfp4_cutedsl_runtime_requirements(bootstrap)
+
+    def validate_init(
+        self,
+        bootstrap: BootstrapConfig,
+        fleet_params: FleetParams,
+    ) -> None:
+        validate_mega_arch()
+        validate_mega_fleet_params(
+            fleet_params,
+            bootstrap.world_size,
+            intermediate_size=self._kernel_config.intermediate_size,
+            top_k=self._kernel_config.top_k,
+        )
+
+    def preprocess_weights(
+        self,
+        weights: MoEWeightPack,
+        fleet_params: FleetParams,
+    ) -> TransformedMegaWeights:
+        return preprocess_mega_weights(
+            weights,
+            intermediate_size=self._kernel_config.intermediate_size,
+            hidden_size=fleet_params.token_hidden_size,
+            gate_up_clamp=_resolve_gate_up_clamp(self._kernel_config),
+            activation_clamp=self._kernel_config.activation_clamp,
+        )
+
+    def _resolve_rank_world(self, bootstrap: BootstrapConfig) -> tuple[int, int]:
+        if dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        return bootstrap.rank, bootstrap.world_size
+
+    def prepare_workspace(
+        self,
+        bootstrap: BootstrapConfig,
+        fleet_params: FleetParams,
+    ) -> Any:
+        from cutedsl_nvfp4_mega_moe_front_end import get_symm_buffer_for_mega_moe
+
+        rank, world_size = self._resolve_rank_world(bootstrap)
+        k = self._kernel_config
+        fp = fleet_params
+        return get_symm_buffer_for_mega_moe(
+            fp.num_experts,
+            fp.max_tokens_per_rank,
+            k.top_k,
+            fp.token_hidden_size,
+            2 * k.intermediate_size,
+            rank,
+            world_size,
+            gate_up_clamp=_resolve_gate_up_clamp(k),
+            activation_clamp=k.activation_clamp,
+            apply_topk_in_fc1=k.apply_topk_in_fc1,
+        )
+
+    def validate_forward(
+        self,
+        t: "MoEEpTensors",
+        fleet_params: FleetParams,
+        *,
+        stage_inputs: bool,
+    ) -> None:
+        validate_nvfp4_forward_inputs(
+            t.hidden_states,
+            t.topk_ids,
+            t.topk_weights,
+            fleet_params,
+            top_k=self._kernel_config.top_k,
+            stage_inputs=stage_inputs,
+            scales=t.scales,
+        )
+
+    def stage_inputs(
+        self,
+        t: "MoEEpTensors",
+        workspace: Any,
+        *,
+        stage_inputs: bool,
+        num_tokens: int,
+    ) -> None:
+        if stage_inputs:
+            stage_mega_moe_inputs(
+                t.hidden_states,
+                t.topk_weights,
+                t.topk_ids,
+                workspace.x[:num_tokens],
+                workspace.x_sf[:num_tokens],
+                workspace.topk_idx[:num_tokens],
+                workspace.topk_weights[:num_tokens],
+            )
+            return
+
+        from common.megamoe_constants import Nvfp4BlockSize
+        from moe_nvfp4_swapab.runner_common import ceil_div, round_up
+
+        hidden = workspace.hidden
+        hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
+        hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
+
+        workspace.x[:num_tokens].copy_(t.hidden_states)
+        assert t.scales is not None
+        workspace.x_sf[:num_tokens].zero_()
+        workspace.x_sf[:num_tokens, :hidden_sf_cols].copy_(
+            t.scales[:num_tokens, :hidden_sf_cols]
+        )
+        if t.scales.shape[1] >= hidden_sf_cols_padded:
+            workspace.x_sf[:num_tokens, hidden_sf_cols:hidden_sf_cols_padded].zero_()
+        workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
+        workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
+
+    def compute(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+        *,
+        num_tokens: int,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        from cutedsl_nvfp4_mega_moe_front_end import nvfp4_mega_moe
+
+        kcfg = self._kernel_config
+        nvfp4_mega_moe(
+            output,
+            transformed_weights[0],
+            transformed_weights[1],
+            workspace,
+            num_tokens=num_tokens,
+            gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+            activation_clamp=kcfg.activation_clamp,
+            fast_math=kcfg.fast_math,
+        )
+        return output
+
+    def destroy(self, workspace: Any) -> None:
+        if workspace is not None:
+            workspace.destroy()

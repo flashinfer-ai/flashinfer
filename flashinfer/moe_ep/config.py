@@ -70,6 +70,7 @@ class BootstrapConfig:
     world_size: int
     rank: int
     stream: int = 0  # int representation of a cudaStream_t; 0 = default stream
+    auto_bootstrap: bool = True
     nccl_comm: Optional[int] = (
         None  # int representation of ncclComm_t; None = derive from PG
     )

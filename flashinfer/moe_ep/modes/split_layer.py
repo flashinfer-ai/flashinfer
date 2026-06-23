@@ -27,6 +27,12 @@ from ..config import (
 from ..core.comm.fleet import Fleet, create_fleet
 from ..core.kernel.base import SplitKernelBackend, SplitKernelContext
 from ..core.kernel.registry import create_split_kernel
+from ..core.runtime import (
+    bootstrap_moe_ep_runtime,
+    ensure_moe_ep_cuda_device,
+    finalize_moe_ep_runtime,
+    split_comm_runtime_requirements,
+)
 from ..core.validation.common import (
     validate_arch_for_backend,
     validate_bootstrap_world_size,
@@ -63,10 +69,19 @@ class MoEEpSplitLayer(nn.Module):
 
         self._kernel: SplitKernelBackend = create_split_kernel(self._kernel_config)
 
+        ensure_moe_ep_cuda_device(bootstrap)
+
         if self._kernel.requires_weights() and fleet_params.weights is None:
             raise ValueError(
                 "MoEEpSplitLayer requires FleetParams.weights for "
                 f"kernel {type(self._kernel_config).__name__}"
+            )
+
+        self._runtime = None
+        if bootstrap.auto_bootstrap:
+            self._runtime = bootstrap_moe_ep_runtime(
+                bootstrap,
+                split_comm_runtime_requirements(self._comm_backend_name()),
             )
 
         self._validate_at_init()
@@ -195,6 +210,9 @@ class MoEEpSplitLayer(nn.Module):
         if self._fleet is not None:
             self._fleet.destroy()
             self._fleet = None
+        if self._runtime is not None:
+            finalize_moe_ep_runtime(self._runtime)
+            self._runtime = None
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
