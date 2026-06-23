@@ -36,6 +36,7 @@ from .gemm_base import (
     _is_cudnn_engine_knob_tactic,
     _torch_data_type_to_cudnn_data_type,
     _is_cudnn_override_shape_available,
+    _check_cudnn_override_shape_availability,
 )
 from .gemm_bf16_fp4 import _unswizzle_sf_128x4
 
@@ -185,6 +186,8 @@ def build_cudnn_bf16_fp4_graph_override_shape(
 ):
     """Build a cuDNN bf16 x fp4 GEMM graph with override-shape support."""
     _check_cudnn_fp4_availability()
+
+    _check_cudnn_override_shape_availability()
 
     scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
 
