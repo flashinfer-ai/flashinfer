@@ -78,7 +78,7 @@ def _build_mega_moe_layer(
     activation_clamp: float | None,
     fast_math: bool,
 ):
-    from flashinfer.moe_ep_v2 import (
+    from flashinfer.moe_ep import (
         BootstrapConfig,
         DeepGemmMegaMoeConfig,
         FleetParams,
@@ -112,7 +112,7 @@ def _build_mega_moe_layer(
 
 
 def _to_moe_ep_tensors(inputs: BenchmarkInputs):
-    from flashinfer.moe_ep_v2 import MoEEpTensors
+    from flashinfer.moe_ep import MoEEpTensors
 
     return MoEEpTensors(
         hidden_states=inputs.hidden_states,
@@ -125,7 +125,7 @@ def main() -> int:
     args = parse_benchmark_args(
         description=(
             "NVTX trace benchmark for MoEEpMegaLayer forward "
-            "(multi-rank EP, moe_ep_v2)."
+            "(multi-rank EP, moe_ep)."
         )
     )
     require_shared_routing_benchmark(args)
@@ -207,7 +207,7 @@ def main() -> int:
         print_benchmark_header(
             title=(
                 "MoEEpMegaLayer forward trace benchmark "
-                "(flashinfer.moe_ep_v2, NVTX)"
+                "(flashinfer.moe_ep, NVTX)"
             ),
             rank=rank,
             world_size=world_size,

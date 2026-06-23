@@ -61,7 +61,7 @@ PY
 
 stage_nccl_ep_so() {
     local src="${BUILD_DIR}/lib/libnccl_ep.so"
-    local dst="${REPO_ROOT}/flashinfer/moe_ep/nccl_ep/_libs/libnccl_ep.so"
+    local dst="${REPO_ROOT}/flashinfer/moe_ep/backends/split/comm/nccl_ep/_libs/libnccl_ep.so"
     if [[ ! -f "${src}" ]]; then
         echo "ERROR: expected ${src} after nccl_ep build" >&2
         exit 1

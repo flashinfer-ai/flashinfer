@@ -37,69 +37,50 @@ Mega MoE is **not** registered in `_BACKEND_REGISTRY` — there is no
 
 ---
 
-## (1) Folder structure — current vs target
+## (1) Folder structure — flat layout vs implemented restructure
+
+> **Status:** The restructure described below is **implemented** under
+> `core/`, `backends/`, and `modes/` (not the interim `layer/` package or root
+> `fleet.py` paths in early drafts). See
+> [`flashinfer/moe_ep/design.md`](../../flashinfer/moe_ep/design.md) for the
+> authoritative tree and
+> [`moe_ep_current_design.md`](moe_ep_current_design.md) for a summary.
 
 Side-by-side view of `flashinfer/moe_ep/` before and after the restructure.
 New paths marked with **+**; moved paths marked with **→**.
 
-| Current (`main` today) | Target (end state) | Notes |
-|------------------------|-------------------|-------|
-| `layer.py` | **→** `layer/__init__.py` | Package re-export |
-| — | **+** `layer/base.py` | `MoEEpLayerBase` |
-| — | **+** `layer/split.py` | `MoEEpSplitLayer` (body of today's `layer.py`) |
-| — | **+** `layer/mega.py` | `MoEEpMegaLayer` |
-| — | **+** `layer/factory.py` | `MoEEpLayer(...)` routing |
-| `config.py` | `config.py` | **+** optional `BootstrapConfig.dist_group` |
-| `fleet.py` | `fleet.py` | Unchanged; split-only |
-| `handle.py` | `handle.py` | Unchanged; split-only |
-| `tensors.py` | `tensors.py` | Unchanged |
-| `_validators.py` | `_validators.py` | **+** mega validators |
-| `algo_knobs.py` | `algo_knobs.py` | Split-only knobs |
-| `split_backends/` | `split_backends/` | **Split only** — `NcclEpConfig`, `NvepConfig`; no mega config |
-| `split_backends/nccl_ep_comm.py` | `split_backends/nccl_ep_comm.py` | `NcclEpConfig` |
-| `split_backends/nixl_ep_comm.py` | `split_backends/nixl_ep_comm.py` | `NvepConfig` |
-| `nccl_ep/` | `nccl_ep/` | Unchanged |
-| `nixl_ep/` | `nixl_ep/` | Unchanged |
-| — | **+** `comm_resource.py` | `EpCommResource` ABC (shared `destroy()`) |
-| — | **+** `mega/` | Mega-only implementation + config |
-| — | **+** `mega/__init__.py` | Package exports |
-| — | **+** `mega/config.py` | `DeepGemmMegaMoeConfig` (not under `split_backends/`) |
-| — | **+** `mega/pool.py` | `SymmMemoryPool` wraps `get_symm_buffer_for_mega_moe` |
-| — | **+** `mega/weights.py` | Load-time FP4 cast + `transform_weights_for_mega_moe` |
-| — | **+** `mega/staging.py` | `stage_mega_moe_inputs()` |
-| — | **+** `mega/runner.py` | `run_fp8_fp4_mega_moe()` thin wrapper |
-| `__init__.py` | `__init__.py` | **+** export split/mega classes, `have_deep_gemm_mega_moe()` |
+| Flat layout (ported from) | Implemented (current) | Notes |
+|---------------------------|----------------------|-------|
+| `layer.py` (monolithic) | **→** `layer.py` (factory) + `modes/split_layer.py` + `modes/mega_layer.py` | Split vs mega orchestration |
+| `_compute_bridge.py` | **→** `backends/split/kernel/fused_moe/bridge.py` | Fused MoE dispatch layout bridge |
+| `fleet.py`, `handle.py` | **→** `core/comm/fleet.py`, `core/comm/handle.py` | Split-only transport ABCs |
+| `split_backends/` | **→** `backends/split/comm/*/config.py` | `NcclEpConfig`, `NvepConfig` |
+| `nccl_ep/`, `nixl_ep/` | **→** `backends/split/comm/nccl_ep/`, `.../nixl_ep/` | Fleet/Handle implementations |
+| — | **+** `backends/split/kernel/{identity,fused_moe}/` | Pluggable inner kernels |
+| — | **+** `backends/mega/kernel/deep_gemm_mega/` | Mega kernel plugin |
+| — | **+** `core/kernel/`, `core/validation/` | Registries + shared validators |
+| `config.py`, `tensors.py` | unchanged at package root | **+** `weights.py` (`MoEWeightPack`) |
 
-### Target tree (compact)
+### Implemented tree (compact)
 
 ```
 flashinfer/moe_ep/
-├── __init__.py
-├── comm_resource.py          # EpCommResource ABC
-├── config.py
-├── fleet.py                  # Fleet + _BACKEND_REGISTRY (split only)
-├── handle.py
-├── tensors.py
-├── _validators.py
-├── algo_knobs.py
-├── layer/
-│   ├── __init__.py           # MoEEpLayer, MoEEpSplitLayer, MoEEpMegaLayer
-│   ├── base.py
-│   ├── split.py
-│   ├── mega.py
-│   └── factory.py
-├── split_backends/             # split EP configs only
-│   ├── nccl_ep_comm.py         # NcclEpConfig
-│   └── nixl_ep_comm.py         # NvepConfig
-├── mega/
-│   ├── config.py               # DeepGemmMegaMoeConfig
-│   ├── pool.py
-│   ├── weights.py
-│   ├── staging.py
-│   └── runner.py
-├── nccl_ep/
-└── nixl_ep/
+├── layer.py                    # MoEEpLayer factory
+├── config.py, tensors.py, weights.py, algo_knobs.py, errors.py
+├── core/{comm,kernel,validation}/
+├── backends/split/{comm,kernel}/, backends/mega/kernel/deep_gemm_mega/
+└── modes/{config,split_layer,mega_layer}.py
 ```
+
+### Original planning table (superseded paths)
+
+| Current (`main` today) | Early target draft | Implemented as |
+|------------------------|-------------------|----------------|
+| `layer.py` | **→** `layer/__init__.py` | `modes/split_layer.py`, `modes/mega_layer.py` |
+| — | **+** `layer/factory.py` | `layer.py` (top-level factory) |
+| `fleet.py` | `fleet.py` | `core/comm/fleet.py` |
+| `split_backends/` | `split_backends/` | `backends/split/comm/` |
+| — | **+** `mega/` | `backends/mega/kernel/deep_gemm_mega/` |
 
 ### What does **not** move
 

@@ -17,7 +17,7 @@ Launch (example, 4 GPUs on one node):
 
 Requires:
     - vLLM with DeepSeek V4 MegaMoE support
-    - flashinfer with ``moe_ep_v2`` mega path
+    - flashinfer with ``moe_ep`` mega path
     - deep_gemm with ``fp8_fp4_mega_moe``
     - SM100+ GPU per rank
 """

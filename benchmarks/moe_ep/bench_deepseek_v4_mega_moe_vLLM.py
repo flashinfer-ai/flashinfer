@@ -14,7 +14,7 @@ Launch (example, 4 GPUs on one node):
     torchrun --nproc_per_node=4 benchmarks/moe_ep/bench_deepseek_v4_mega_moe_vLLM.py \\
         --num-tokens 4096 --num-max-tokens 4096 --warmup 10 --repeat 50
 
-    # vLLM-only gate or hash routing (not comparable to moe_ep_v2):
+    # vLLM-only gate or hash routing (not comparable to moe_ep):
     torchrun --nproc_per_node=4 benchmarks/moe_ep/bench_deepseek_v4_mega_moe_vLLM.py \\
         --no-random-routing
 

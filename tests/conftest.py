@@ -131,7 +131,7 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help="moe_ep backend to exercise (nccl_ep / nixl_ep / both); "
-        "consumed by tests/moe_ep_v2/test_moe_ep_layer_multirank.py",
+        "consumed by tests/moe_ep/test_moe_ep_layer_multirank.py",
     )
 
 
@@ -153,15 +153,12 @@ def pytest_configure(config):
 def pytest_collection_modifyitems(config, items):
     """Skip moe_ep tests on hosts that lack the requisite env / GPUs / arch."""
     nvep_built = False
-    for module in ("flashinfer.moe_ep_v2", "flashinfer.moe_ep"):
-        try:
-            from importlib import import_module
+    try:
+        from importlib import import_module
 
-            nvep_built = bool(import_module(module).available_backends())
-        except ImportError:
-            continue
-        if nvep_built:
-            break
+        nvep_built = bool(import_module("flashinfer.moe_ep").available_backends())
+    except ImportError:
+        pass
 
     ngpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     cc = (

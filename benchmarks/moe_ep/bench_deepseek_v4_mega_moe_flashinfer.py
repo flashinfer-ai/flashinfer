@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Minimal multi-rank benchmark for flashinfer MoEEpMegaLayer forward.
 
-Uses ``flashinfer.moe_ep_v2`` MegaMoE APIs end-to-end; the benchmark only
+Uses ``flashinfer.moe_ep`` MegaMoE APIs end-to-end; the benchmark only
 supplies bf16 weights and activation/routing tensors via
 ``bench_deepseek_v4_mega_moe_common``.
 
@@ -19,7 +19,7 @@ Launch (example, 4 GPUs on one node):
 Use the same CLI flags as bench_deepseek_v4_mega_moe_vLLM.py for comparable runs.
 
 Requires:
-    - flashinfer with ``moe_ep_v2`` mega path
+    - flashinfer with ``moe_ep`` mega path
     - deep_gemm with ``fp8_fp4_mega_moe``
     - SM100+ GPU per rank
 """
@@ -87,7 +87,7 @@ def _build_mega_moe_layer(
     activation_clamp: float | None,
     fast_math: bool,
 ):
-    from flashinfer.moe_ep_v2 import (
+    from flashinfer.moe_ep import (
         BootstrapConfig,
         DeepGemmMegaMoeConfig,
         FleetParams,
@@ -121,7 +121,7 @@ def _build_mega_moe_layer(
 
 
 def _to_moe_ep_tensors(inputs: BenchmarkInputs):
-    from flashinfer.moe_ep_v2 import MoEEpTensors
+    from flashinfer.moe_ep import MoEEpTensors
 
     return MoEEpTensors(
         hidden_states=inputs.hidden_states,
@@ -132,7 +132,7 @@ def _to_moe_ep_tensors(inputs: BenchmarkInputs):
 
 def main() -> int:
     args = parse_benchmark_args(
-        description="Benchmark MoEEpMegaLayer forward (multi-rank EP, moe_ep_v2)."
+        description="Benchmark MoEEpMegaLayer forward (multi-rank EP, moe_ep)."
     )
     require_shared_routing_benchmark(args)
     local_rank, world_size = require_env_rank()
@@ -210,7 +210,7 @@ def main() -> int:
         )
 
         print_benchmark_header(
-            title="MoEEpMegaLayer forward benchmark (flashinfer.moe_ep_v2)",
+            title="MoEEpMegaLayer forward benchmark (flashinfer.moe_ep)",
             rank=rank,
             world_size=world_size,
             num_local_experts=num_local_experts,

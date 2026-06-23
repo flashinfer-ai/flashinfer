@@ -5,11 +5,16 @@ from __future__ import annotations
 import pytest
 
 from flashinfer.moe_ep import (
+    BootstrapConfig,
     FleetAlgoKnobQuantization,
     FleetParams,
     MoEEpConfigError,
     QuantType,
+    validate_bootstrap_world_size,
     validate_fleet_params,
+    validate_mega_fleet_params,
+    validate_mega_forward_inputs,
+    validate_split_forward_inputs,
 )
 
 
@@ -43,6 +48,127 @@ def test_nixl_ep_supported_hidden_sizes_pass():
     for h in (2048, 4096, 7168, 8192):
         p = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=h)
         validate_fleet_params(p, backend="nixl_ep", world_size=4)
+
+
+def test_mega_fleet_params_rejects_indivisible_experts():
+    p = FleetParams(num_experts=7, max_tokens_per_rank=64, token_hidden_size=4096)
+    with pytest.raises(MoEEpConfigError, match="num_experts"):
+        validate_mega_fleet_params(
+            p, world_size=2, intermediate_size=2048, top_k=4
+        )
+
+
+def test_mega_fleet_params_requires_128_aligned_sizes():
+    p = FleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=1000)
+    with pytest.raises(MoEEpConfigError, match="token_hidden_size"):
+        validate_mega_fleet_params(
+            p, world_size=4, intermediate_size=2048, top_k=4
+        )
+    p2 = FleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=4096)
+    with pytest.raises(MoEEpConfigError, match="intermediate_size"):
+        validate_mega_fleet_params(
+            p2, world_size=4, intermediate_size=1000, top_k=4
+        )
+
+
+def test_mega_fleet_params_happy_path():
+    p = FleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=4096)
+    validate_mega_fleet_params(p, world_size=4, intermediate_size=2048, top_k=4)
+
+
+def test_bootstrap_world_size_must_match_dist_when_initialized():
+    from unittest import mock
+
+    bootstrap = BootstrapConfig(world_size=4, rank=0)
+    with mock.patch("torch.distributed.is_initialized", return_value=True):
+        with mock.patch("torch.distributed.get_world_size", return_value=8):
+            with pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"):
+                validate_bootstrap_world_size(bootstrap)
+
+
+def test_bootstrap_world_size_skipped_when_dist_not_initialized():
+    from unittest import mock
+
+    bootstrap = BootstrapConfig(world_size=4, rank=0)
+    with mock.patch("torch.distributed.is_initialized", return_value=False):
+        validate_bootstrap_world_size(bootstrap)
+
+
+def test_split_forward_inputs_rejects_token_overflow():
+    import torch
+
+    p = FleetParams(num_experts=8, max_tokens_per_rank=4, token_hidden_size=8)
+    with pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"):
+        validate_split_forward_inputs(
+            torch.zeros(5, 8),
+            torch.zeros(5, 2, dtype=torch.int64),
+            torch.zeros(5, 2),
+            p,
+        )
+
+
+def test_split_forward_inputs_rejects_hidden_mismatch():
+    import torch
+
+    p = FleetParams(num_experts=8, max_tokens_per_rank=4, token_hidden_size=8)
+    with pytest.raises(MoEEpConfigError, match="token_hidden_size"):
+        validate_split_forward_inputs(
+            torch.zeros(4, 16),
+            torch.zeros(4, 2, dtype=torch.int64),
+            torch.zeros(4, 2),
+            p,
+        )
+
+
+def test_nixl_ep_topology_capacity_requires_expert_divisibility():
+    p = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=4096)
+    with pytest.raises(MoEEpConfigError, match="topology capacity"):
+        validate_fleet_params(
+            p,
+            backend="nixl_ep",
+            world_size=2,
+            topology_capacity=3,
+        )
+    validate_fleet_params(
+        p,
+        backend="nixl_ep",
+        world_size=2,
+        topology_capacity=4,
+    )
+
+
+def test_nixl_ep_topology_capacity_defaults_to_world_size():
+    p = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=4096)
+    validate_fleet_params(p, backend="nixl_ep", world_size=4)
+
+
+def test_mega_forward_inputs_rejects_hidden_mismatch():
+    import torch
+
+    p = FleetParams(num_experts=8, max_tokens_per_rank=4, token_hidden_size=8)
+    with pytest.raises(MoEEpConfigError, match="token_hidden_size"):
+        validate_mega_forward_inputs(
+            torch.zeros(4, 16),
+            torch.zeros(4, 2, dtype=torch.int64),
+            torch.zeros(4, 2),
+            p,
+            top_k=2,
+            stage_inputs=True,
+        )
+
+
+def test_mega_forward_inputs_happy_path():
+    import torch
+
+    p = FleetParams(num_experts=8, max_tokens_per_rank=4, token_hidden_size=8)
+    validate_mega_forward_inputs(
+        torch.zeros(4, 8),
+        torch.zeros(4, 2, dtype=torch.int64),
+        torch.zeros(4, 2),
+        p,
+        top_k=2,
+        stage_inputs=True,
+    )
 
 
 def test_ue8m0_quant_rejected_on_pre_blackwell_for_nixl():

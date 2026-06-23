@@ -1,6 +1,6 @@
-# `moe_ep_v2` vs `moe_ep`
+# `moe_ep` vs `moe_ep`
 
-Comparison of `flashinfer.moe_ep_v2` (new) against `flashinfer.moe_ep` (v1).
+Comparison of `flashinfer.moe_ep` (new) against `flashinfer.moe_ep` (v1).
 For the full mega-MoE design and migration plan, see
 [`moe_ep_deep_gemm_mega_moe.md`](moe_ep_deep_gemm_mega_moe.md).
 
@@ -8,102 +8,84 @@ For the full mega-MoE design and migration plan, see
 
 ## Overview
 
-`moe_ep_v2` is a **separate package** shipped alongside `moe_ep`. It does not
-modify v1. Native NCCL/NIXL transport libraries are still staged under
-`flashinfer/moe_ep/{nccl,nixl}_ep/_libs/` until v2 grows its own trees under
-`moe_ep_v2/split/`.
+The package uses a **plugin layout** under `core/`, `backends/`, and `modes/`.
+Native NCCL/NIXL transport libraries are staged under
+`flashinfer/moe_ep/backends/split/comm/{nccl_ep,nixl_ep}/_libs/` when built with
+`BUILD_NVEP=1`.
 
-| Area | `moe_ep` (v1) | `moe_ep_v2` |
-|------|---------------|-------------|
-| **Entry point** | `MoEEpLayer` is an `nn.Module` | `MoEEpLayer(...)` **factory** → `MoEEpSplitLayer` or `MoEEpMegaLayer` |
-| **Split path** | Identity inner compute inline | `dispatch → inner kernel → combine`; `SplitConfig(comm, kernel)` |
-| **Mega path** | Not present | `MoEEpMegaLayer` + `deep_gemm.fp8_fp4_mega_moe` |
-| **Weights** | Not on `FleetParams` | `MoEWeightPack` on `FleetParams` |
-| **Tests** | `tests/moe_ep/` | `tests/moe_ep_v2/` |
+| Area | Flat layout (archived) | Current (`core/` / `backends/` / `modes/`) |
+|------|------------------------|-----------------------------------------------|
+| **Entry point** | `MoEEpLayer` monolithic `nn.Module` | `MoEEpLayer(...)` **factory** → `MoEEpSplitLayer` or `MoEEpMegaLayer` |
+| **Split path** | Inline identity / `compute_config` kwargs | `SplitConfig(comm, kernel)`; kernels in `backends/split/kernel/` |
+| **Fused MoE compute** | `_compute_bridge.py` + inline `_inner_compute` | `FusedMoeKernelConfig` → `backends/split/kernel/fused_moe/` |
+| **Mega path** | Not present | `MoEEpMegaLayer` + `backends/mega/kernel/deep_gemm_mega/` |
+| **Weights** | `compute_config` + `fused_moe.api.MoEWeightPack` kwargs | Canonical `MoEWeightPack` on `FleetParams`; kernel materializes native views |
+| **Tests** | `tests/moe_ep/` | `tests/moe_ep/` (+ `test_fused_moe_weights.py`, NVFP4 compute correctness) |
 
 ---
 
 ## Directory structure
 
-One-line role for every file under `flashinfer/moe_ep_v2/` and
-`tests/moe_ep_v2/`.
+One-line role for every file under `flashinfer/moe_ep/` and
+`tests/moe_ep/`.
 
-### `flashinfer/moe_ep_v2/`
+### `flashinfer/moe_ep/` (implemented)
+
+See also [`flashinfer/moe_ep/design.md`](../../flashinfer/moe_ep/design.md) for the
+full design, call sequences, and migration table from the flat layout.
 
 ```
-flashinfer/moe_ep_v2/
-├── __init__.py                 # Public re-exports, native-lib probes (have_nccl_ep, available_backends)
-├── layer.py                    # MoEEpLayer factory: routes MegaConfig → mega, else → split
-├── config.py                   # BootstrapConfig, FleetParams, HandleParams, dispatch/combine envelopes
-├── fleet.py                    # Fleet ABC + create_fleet() + _BACKEND_REGISTRY
-├── handle.py                   # Handle ABC (dispatch / combine / complete / destroy)
-├── tensors.py                  # MoEEpTensors per-forward input bundle
-├── weights.py                  # MoEWeightPack shared weight container (w13, w2, scales)
-├── algo_knobs.py               # Fleet- and handle-level AlgoKnob dataclasses + _index_knobs()
-├── _validators.py              # Backend/mega config and forward-input validators
-├── backend_config.py           # Backward-compat re-exports of split/mega config types
-│
-├── split/
-│   ├── __init__.py             # Re-exports MoEEpSplitLayer, SplitConfig, kernels, backend configs
-│   ├── layer.py                # MoEEpSplitLayer nn.Module: fleet + handle pipeline + inner kernel
-│   ├── config.py               # SplitConfig, IdentityConfig, FusedMoeKernelConfig
-│   ├── backends/
-│   │   ├── __init__.py         # Re-exports NcclEpConfig, NvepConfig
-│   │   ├── nccl_ep_comm.py     # NcclEpConfig adapter (backend_name="nccl_ep")
-│   │   └── nixl_ep_comm.py     # NvepConfig adapter (backend_name="nixl_ep")
-│   ├── kernels/
-│   │   ├── __init__.py         # Re-exports SplitKernelContext, run_split_kernel, registry helpers
-│   │   ├── base.py             # SplitKernelContext dataclass + SplitKernel protocol
-│   │   ├── identity.py         # IdentitySplitKernel — passes expert_tensors through unchanged
-│   │   └── registry.py         # resolve_split_kernel() / run_split_kernel() dispatch table
-│   ├── nccl_ep/
-│   │   ├── __init__.py         # libnccl + libnccl_ep preload helpers (_load_libnccl_ep)
-│   │   ├── fleet.py            # NcclEpFleet — owns ncclEpGroup_t, registers in _BACKEND_REGISTRY
-│   │   ├── handle.py           # NcclEpHandle — per-forward ncclEpHandle_t dispatch/combine
-│   │   └── ndtensor.py         # NDTensor wrapper around ncclNDTensor_t + get_nccl_lib()
-│   └── nixl_ep/
-│       ├── __init__.py         # libnixl + nixl_ep_cpp preload helpers (_load_nixl_ep_cpp)
-│       ├── fleet.py            # NixlEpFleet — owns nixl_ep.Buffer, registers in _BACKEND_REGISTRY
-│       └── handle.py           # NixlEpHandle — wraps low_latency_dispatch / low_latency_combine
-│
-└── mega/
-    ├── __init__.py             # Re-exports MegaConfig, MoEEpMegaLayer, preprocess_mega_weights
-    ├── layer.py                # MoEEpMegaLayer nn.Module: symm buffer + fp8_fp4_mega_moe forward
-    ├── config.py               # MegaConfig + DeepGemmMegaMoeConfig kernel sizing
-    ├── staging.py              # Triton stage_mega_moe_inputs() — bf16 activations → FP8 symm views
-    └── weights.py              # preprocess_mega_weights() — bf16/fp4 layout for deep_gemm
+flashinfer/moe_ep/
+├── __init__.py                 # Public re-exports, native-lib probes
+├── layer.py                    # MoEEpLayer factory
+├── config.py, tensors.py, weights.py, algo_knobs.py, errors.py
+├── design.md                   # Authoritative design doc
+├── core/
+│   ├── comm/                   # Fleet + Handle ABCs, create_fleet(), _BACKEND_REGISTRY
+│   ├── kernel/                 # Split/Mega kernel ABCs + registry
+│   └── validation/             # Shared validators
+├── backends/
+│   ├── split/
+│   │   ├── comm/
+│   │   │   ├── nccl_ep/        # NcclEpConfig, NcclEpFleet, NcclEpHandle, ndtensor.py
+│   │   │   └── nixl_ep/        # NvepConfig, NixlEpFleet, NixlEpHandle
+│   │   └── kernel/
+│   │       ├── identity/       # IdentityConfig
+│   │       └── fused_moe/      # FusedMoeKernelConfig, bridge, materialize_fused_moe_weights
+│   └── mega/
+│       └── kernel/deep_gemm_mega/
+└── modes/
+    ├── config.py               # SplitConfig, MegaConfig
+    ├── split_layer.py          # MoEEpSplitLayer (+ opt-in enable_timing)
+    └── mega_layer.py           # MoEEpMegaLayer
 ```
 
 Runtime native artifacts (not in git; built by `BUILD_NVEP=1`):
 
 ```
-flashinfer/moe_ep_v2/split/nccl_ep/_libs/   # libnccl_ep.so (target; may fall back to moe_ep/)
-flashinfer/moe_ep_v2/split/nixl_ep/_libs/   # nixl_ep_cpp*.so (target; may fall back to moe_ep/)
+flashinfer/moe_ep/backends/split/comm/nccl_ep/_libs/
+flashinfer/moe_ep/backends/split/comm/nixl_ep/_libs/
 ```
 
-### `tests/moe_ep_v2/`
+### `tests/moe_ep/`
 
 ```
-tests/moe_ep_v2/
-├── conftest.py                      # Stub fleet registry fixture; torchrun session PG teardown
-├── test_config.py                   # Dataclass + AlgoKnob unit tests
-├── test_constraints.py              # validate_fleet_params, mega/split forward validators
-├── test_arch_and_build.py           # Arch probes, MoEEpNotBuiltError, available_backends()
-├── test_fleet_create.py             # create_fleet routing and error paths
-├── test_layer_factory.py            # MoEEpLayer factory returns split vs mega
-├── test_layer_single_gpu.py         # MoEEpSplitLayer forward sequencing (stubbed fleet)
-├── test_split_kernels.py            # Inner-kernel registry + identity wiring + multirank identity
-├── test_mega_layer_validation.py    # MoEEpMegaLayer init/forward validation (no kernel launch)
-├── test_moe_ep_layer_multirank.py   # Split-path NCCL/NIXL roundtrip on 4+ GPUs
-├── test_moe_ep_mega_multirank.py    # Mega-path correctness on 4+ Blackwell GPUs
-├── smoke_nccl_ep.py                 # torchrun smoke: MoEEpLayer + nccl_ep identity roundtrip
-├── smoke_nixl_ep.py                 # torchrun smoke: MoEEpLayer + nixl_ep identity roundtrip
-├── nccl_ep/
-│   ├── test_fleet_mock.py           # NcclEpFleet/Handle marshaling with mocked NCCLLibrary
-│   └── test_ndtensor.py             # NDTensor from_torch / allocate unit tests
-└── nixl_ep/
-    └── test_fleet_mock.py           # NixlEpFleet/Handle sequencing with mocked nixl_ep.Buffer
+tests/moe_ep/
+├── test_moe_ep_compute_correctness.py       # LL bf16 fused_moe vs MoELayer reference
+├── test_moe_ep_compute_correctness_nvfp4.py # LL NVFP4 (SM100+)
+├── test_moe_ep_ht_correctness.py            # HT bf16
+├── test_fused_moe_weights.py                # materialize_fused_moe_weights unit tests
+├── test_compute_bridge.py                   # dispatch → MoEActivationPack bridge
+├── test_split_kernels.py                    # Kernel registry + identity wiring
+├── test_layer_single_gpu.py                 # Split layer sequencing (stubbed fleet)
+├── test_moe_ep_layer_multirank.py           # Identity roundtrip on 4+ GPUs
+├── test_moe_ep_mega_multirank.py            # Mega-path correctness
+├── smoke_nccl_ep.py, smoke_nixl_ep.py
+├── nccl_ep/test_fleet_mock.py, test_ndtensor.py
+└── nixl_ep/test_fleet_mock.py
 ```
+
+Benchmark: `benchmarks/bench_moe_ep.py` (split path latency; uses `enable_timing`).
 
 ---
 
@@ -272,7 +254,7 @@ sequenceDiagram
 
 ## User-facing API
 
-All symbols below are importable from `flashinfer.moe_ep_v2`.
+All symbols below are importable from `flashinfer.moe_ep`.
 
 ### Shared types
 
@@ -294,7 +276,7 @@ pluggable inner kernel between dispatch and combine. Requires **sm_90+**.
 
 ```python
 import torch
-from flashinfer.moe_ep_v2 import (
+from flashinfer.moe_ep import (
     BootstrapConfig,
     FleetParams,
     MoEEpLayer,
@@ -323,7 +305,7 @@ layer.destroy()  # optional; also called from __del__
 **Explicit comm + kernel (`SplitConfig`):**
 
 ```python
-from flashinfer.moe_ep_v2 import (
+from flashinfer.moe_ep import (
     IdentityConfig,
     NCCLEPConfig,
     SplitConfig,
@@ -344,7 +326,7 @@ layer = MoEEpSplitLayer(
 `NvepConfig()`:
 
 ```python
-from flashinfer.moe_ep_v2 import BootstrapConfig, NvepConfig
+from flashinfer.moe_ep import BootstrapConfig, NvepConfig
 
 bootstrap = BootstrapConfig(
     world_size=world_size,
@@ -354,10 +336,65 @@ bootstrap = BootstrapConfig(
 layer = MoEEpLayer(..., backend=NvepConfig())
 ```
 
+**Fused MoE inner compute** (`FusedMoeKernelConfig`):
+
+```python
+from flashinfer.fused_moe.api import (
+    BackendOptions,
+    ExecutionConfig,
+    ExpertConfig,
+    MoEConfig,
+    QuantConfig,
+    QuantVariant,
+    RoutingConfig,
+    TrtllmBf16Config,
+)
+from flashinfer.moe_ep import (
+    BootstrapConfig,
+    FleetParams,
+    FusedMoeKernelConfig,
+    MoEEpLayer,
+    MoEEpTensors,
+    MoEWeightPack,
+    NcclEpConfig,
+    SplitConfig,
+)
+
+moe_config = MoEConfig(
+    routing=RoutingConfig(num_experts=64, top_k=8),
+    quant=QuantConfig(variant=QuantVariant.BF16),
+    experts=ExpertConfig(
+        intermediate_size=2048,
+        local_expert_offset=rank * (64 // world_size),
+        local_num_experts=64 // world_size,
+    ),
+    backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
+    execution=ExecutionConfig(tune_max_num_tokens=8192),
+)
+
+layer = MoEEpLayer(
+    bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
+    fleet_params=FleetParams(
+        num_experts=64,
+        max_tokens_per_rank=128,
+        token_hidden_size=4096,
+        weights=MoEWeightPack(w13=w13_local, w2=w2_local),  # canonical bf16
+    ),
+    backend=SplitConfig(
+        comm=NcclEpConfig(),
+        kernel=FusedMoeKernelConfig(moe_config=moe_config),
+    ),
+)
+```
+
+The kernel plugin materializes `FleetParams.weights` into
+`flashinfer.fused_moe.api.MoEWeightPack` native views via
+`materialize_fused_moe_weights()` during layer init.
+
 **Fleet-level knobs** (optional, split only):
 
 ```python
-from flashinfer.moe_ep_v2 import (
+from flashinfer.moe_ep import (
     FleetAlgoKnobQuantization,
     FleetAlgoKnobTopologyCapacity,
     QuantType,
@@ -375,7 +412,7 @@ layer = MoEEpLayer(
 **Lower-level API** (no `nn.Module`):
 
 ```python
-from flashinfer.moe_ep_v2 import create_fleet, HandleParams, DispatchInputParams, ...
+from flashinfer.moe_ep import create_fleet, HandleParams, DispatchInputParams, ...
 
 fleet = create_fleet(bootstrap, fleet_params, fleet_knobs, backend="nccl_ep")
 handle = fleet.create_handle(HandleParams(topk_ids=topk_ids), algo_knobs=[...])
@@ -394,7 +431,7 @@ Requires **sm_100+**, `torch.distributed` initialized, and `FleetParams.weights`
 
 ```python
 import torch.distributed as dist
-from flashinfer.moe_ep_v2 import (
+from flashinfer.moe_ep import (
     BootstrapConfig,
     DeepGemmMegaMoeConfig,
     FleetParams,
@@ -415,7 +452,7 @@ layer = MoEEpLayer(
         weights=MoEWeightPack(w13=w13, w2=w2),  # per-rank bf16 weights
     ),
     backend=MegaConfig(
-        kernel=DeepGemmMegaMoeConfig(
+        megakernel=DeepGemmMegaMoeConfig(
             intermediate_size=2048,
             top_k=4,
         ),
@@ -440,7 +477,7 @@ and copies activations into the symm buffer layout directly.
 **Direct construction** (skip factory):
 
 ```python
-from flashinfer.moe_ep_v2 import MoEEpMegaLayer, MegaConfig, ...
+from flashinfer.moe_ep import MoEEpMegaLayer, MegaConfig, ...
 
 mega = MoEEpMegaLayer(bootstrap, fleet_params, mega_config)
 ```

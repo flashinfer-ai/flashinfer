@@ -1,4 +1,4 @@
-"""Shared fixtures for DeepSeek V4 MegaMoE vLLM vs moe_ep_v2 benchmarks.
+"""Shared fixtures for DeepSeek V4 MegaMoE vLLM vs moe_ep benchmarks.
 
 Provides CLI defaults, deterministic bf16 expert weights, routing tensors,
 and timing helpers. Each backend script loads/forwards through its own APIs.
@@ -86,7 +86,7 @@ def parse_benchmark_args(*, description: str) -> argparse.Namespace:
         default=True,
         help=(
             "Shared deterministic topk fixtures from make_benchmark_routing_inputs "
-            "(default; required for apples-to-apples vLLM vs moe_ep_v2 runs)."
+            "(default; required for apples-to-apples vLLM vs moe_ep runs)."
         ),
     )
     parser.add_argument(
@@ -198,7 +198,7 @@ def routing_mode_from_args(args: argparse.Namespace) -> str:
 
 
 def require_shared_routing_benchmark(args: argparse.Namespace) -> None:
-    """moe_ep_v2 benchmarks the expert kernel only; routing must match vLLM fixtures."""
+    """moe_ep benchmarks the expert kernel only; routing must match vLLM fixtures."""
     if args.hash_moe:
         raise SystemExit(
             "ERROR: --hash-moe is vLLM-only. Use "
@@ -207,7 +207,7 @@ def require_shared_routing_benchmark(args: argparse.Namespace) -> None:
         )
     if not args.random_routing:
         raise SystemExit(
-            "ERROR: moe_ep_v2 has no gate routing API. Use shared routing fixtures "
+            "ERROR: moe_ep has no gate routing API. Use shared routing fixtures "
             "(--random-routing, default) or run the vLLM benchmark with "
             "--no-random-routing for gate/hash routing."
         )

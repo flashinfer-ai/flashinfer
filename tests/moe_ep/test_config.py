@@ -107,3 +107,28 @@ class TestAlgoKnobs:
     def test_reject_non_knob(self) -> None:
         with pytest.raises(TypeError, match="AlgoKnob"):
             _index_knobs(["not a knob"])  # type: ignore[list-item]
+
+
+class TestSplitConfig:
+    def test_identity_require_weights_defaults_false(self) -> None:
+        from flashinfer.moe_ep import IdentityConfig, SplitConfig
+
+        assert IdentityConfig().require_weights is False
+        assert SplitConfig().kernel.require_weights is False
+
+
+def test_moe_ep_imports_without_deep_gemm():
+    """Core v2 surface should import without optional mega deps installed."""
+    import importlib
+
+    importlib.import_module("flashinfer.moe_ep")
+    from flashinfer.moe_ep import (
+        IdentityConfig,
+        MoEEpSplitLayer,
+        SplitConfig,
+        SplitKernelContext,
+    )
+
+    assert SplitConfig().kernel.kernel_name == "identity"
+    assert SplitKernelContext.__name__ == "SplitKernelContext"
+    assert MoEEpSplitLayer.__name__ == "MoEEpSplitLayer"

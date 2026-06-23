@@ -232,13 +232,13 @@ def _build_nixl_ep() -> None:
         ninja_cmd.append("install")
     subprocess.run(ninja_cmd, check=True)
 
-    dst = _moe_ep_pkg / "nixl_ep" / "_libs"
+    dst = _moe_ep_pkg / "backends" / "split" / "comm" / "nixl_ep" / "_libs"
     dst.mkdir(parents=True, exist_ok=True)
 
     # We do NOT stage the base NIXL libraries (libnixl.so, libnixl_capi.so,
     # libserdes.so, etc.) — they come from the `nixl-cu13` pip wheel installed
     # by _install_nvep_runtime_wheels(). The runtime loader in
-    # flashinfer/moe_ep/nixl_ep/__init__.py ctypes-preloads them via the wheel's
+    # flashinfer/moe_ep/backends/split/comm/nixl_ep/__init__.py ctypes-preloads them via the wheel's
     # site-packages path before loading nixl_ep_cpp.so. This keeps the
     # FlashInfer wheel small.
 
@@ -248,12 +248,12 @@ def _build_nixl_ep() -> None:
         print(f"[BUILD_NVEP] staged: {cand.name}")
 
     # Vendor the python wrapper sources so we can import from
-    # flashinfer.moe_ep.nixl_ep._vendored (Step B5).
+    # flashinfer.moe_ep.backends.split.comm.nixl_ep._vendored.
     vendored_src = src / "examples/device/ep/nixl_ep"
     if vendored_src.exists():
         shutil.copytree(
             vendored_src,
-            _moe_ep_pkg / "nixl_ep" / "_vendored",
+            _moe_ep_pkg / "backends" / "split" / "comm" / "nixl_ep" / "_vendored",
             dirs_exist_ok=True,
         )
 
@@ -406,11 +406,11 @@ def _build_nccl_ep() -> None:
         check=True,
     )
 
-    dst = _moe_ep_pkg / "nccl_ep" / "_libs"
+    dst = _moe_ep_pkg / "backends" / "split" / "comm" / "nccl_ep" / "_libs"
     dst.mkdir(parents=True, exist_ok=True)
     # We do NOT stage libnccl.so.2 — it comes from the `nvidia-nccl-cu13`
     # pip wheel installed by _install_nvep_runtime_wheels(). The runtime
-    # loader in flashinfer/moe_ep/nccl_ep/__init__.py ctypes-preloads it
+    # loader in flashinfer/moe_ep/backends/split/comm/nccl_ep/__init__.py ctypes-preloads it
     # via the wheel's site-packages path before loading libnccl_ep.so.
     # This keeps the FlashInfer wheel ~200 MB smaller.
     for soname in ("libnccl_ep.so",):
@@ -444,7 +444,7 @@ def _fix_rpaths() -> None:
     the package, the RPATH only needs to cover $ORIGIN and $ORIGIN/_libs for
     co-located plugin files. The base libs are loaded explicitly at Python
     import time via the runtime preloaders in
-    flashinfer/moe_ep/{nccl,nixl}_ep/__init__.py.
+    flashinfer/moe_ep/backends/split/comm/{nccl,nixl}_ep/__init__.py.
     """
     patchelf_ok = shutil.which("patchelf") is not None
     if not patchelf_ok:

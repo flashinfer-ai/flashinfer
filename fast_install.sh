@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Fast dev install for FlashInfer + NCCL-EP (legacy moe_ep + moe_ep_v2 split path).
+# Fast dev install for FlashInfer + NCCL-EP (moe_ep split comm via nccl.ep).
 #
 # Usage (from repo root):
 #   bash fast_install.sh
 #
 # What this builds:
-#   * libnccl_ep.so  -> flashinfer/moe_ep/nccl_ep/_libs/          (legacy moe_ep ctypes)
-#                     -> flashinfer/moe_ep_v2/.../nccl_ep/_libs/ (optional fallback)
-#   * nccl4py>=0.3.1 wheel (nccl.ep API)                          (moe_ep_v2 split comm)
-#   * nccl_ep python (import nccl_ep)                             (ctypes helpers / ndtensor)
+#   * libnccl_ep.so  -> flashinfer/moe_ep/backends/split/comm/nccl_ep/_libs/
+#   * nccl4py>=0.3.1 wheel (nccl.ep API)
+#   * nccl_ep python (import nccl_ep) — ctypes helpers / ndtensor
 #
 # Override arch for H100:
 #   NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90" bash fast_install.sh
@@ -28,6 +27,9 @@ NCCL_PYPI_VERSION="${FI_NCCL_VERSION:-2.30.7}"
 NCCL4PY_SPEC="${FI_NCCL4PY_SPEC:-nccl4py==0.3.1}"
 CUDA_CORE_VERSION="${FI_CUDA_CORE_VERSION:-1.0.1}"
 CUDA_BINDINGS_VERSION="${FI_CUDA_BINDINGS_VERSION:-13.2.0}"
+# FlashInfer 0.6.x imports CuTe DSL at package load when cutlass is present; the
+# venv often has an older nvidia-cutlass-dsl that lacks cutlass.cute.nvgpu.OperandMajorMode.
+CUTLASS_DSL_SPEC="${FI_CUTLASS_DSL_SPEC:-nvidia-cutlass-dsl[cu13]>=4.5.0}"
 
 # Ignore NVIDIA pip constraint/config files (pins like nvidia-nccl-cu13==2.28.3-1).
 pip_install() {
@@ -37,7 +39,7 @@ pip_install() {
     python -m pip install --no-cache-dir "$@"
 }
 
-# moe_ep_v2 comm uses nccl.ep from released nccl4py (>=0.3.1). Install NCCL wheels
+# moe_ep comm uses nccl.ep from released nccl4py (>=0.3.1). Install NCCL wheels
 # before FlashInfer so `pip install -e .` does not downgrade NCCL via torch deps.
 echo "Installing nvidia-nccl-cu13==${NCCL_PYPI_VERSION} (${NCCL4PY_SPEC})"
 pip_install --no-deps "nvidia-nccl-cu13==${NCCL_PYPI_VERSION}"
@@ -53,6 +55,9 @@ pip_install --no-build-isolation --no-deps -e .
 
 # flashinfer.jit.cubin_loader imports filelock; not always pulled transitively.
 pip_install filelock
+
+echo "Installing ${CUTLASS_DSL_SPEC} (import flashinfer requires CuTe DSL >= 4.5)"
+pip_install "${CUTLASS_DSL_SPEC}"
 
 python3 -c "
 from build_backend import _synthesize_nccl_builddir
@@ -72,13 +77,10 @@ make -C 3rdparty/nccl/contrib/nccl_ep \
   lib -j"$(nproc)"
 
 LIBNCCL_EP_SO="build_nvep/nccl/lib/libnccl_ep.so"
+NCCL_EP_LIBS="flashinfer/moe_ep/backends/split/comm/nccl_ep/_libs"
 
-MOE_EP_LIBS="flashinfer/moe_ep/nccl_ep/_libs"
-MOE_EP_V2_LIBS="flashinfer/moe_ep_v2/backends/split/comm/nccl_ep/_libs"
-
-mkdir -p "${MOE_EP_LIBS}" "${MOE_EP_V2_LIBS}"
-cp "${LIBNCCL_EP_SO}" "${MOE_EP_LIBS}/"
-cp "${LIBNCCL_EP_SO}" "${MOE_EP_V2_LIBS}/"
+mkdir -p "${NCCL_EP_LIBS}"
+cp "${LIBNCCL_EP_SO}" "${NCCL_EP_LIBS}/"
 
 # ctypes nccl_ep helpers (ndtensor); separate from nccl.ep API above.
 pip_install --no-deps -e 3rdparty/nccl/contrib/nccl_ep/python
@@ -96,9 +98,6 @@ import nccl.ep  # noqa: F401
 from nccl.core import Communicator  # noqa: F401
 print('nccl.ep importable:', importlib.util.find_spec('nccl.ep') is not None)
 
-from flashinfer.moe_ep import available_backends as moe_ep_backends
-print('flashinfer.moe_ep:', moe_ep_backends())
-
-from flashinfer.moe_ep_v2 import available_backends as moe_ep_v2_backends
-print('flashinfer.moe_ep_v2:', moe_ep_v2_backends())
+from flashinfer.moe_ep import available_backends
+print('flashinfer.moe_ep:', available_backends())
 "

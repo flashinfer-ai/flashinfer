@@ -1,7 +1,7 @@
 """NCCL-EP smoke entry point.
 
 Usage:
-    torchrun --nproc_per_node=8 tests/moe_ep/smoke_nccl_ep.py
+    torchrun --nproc_per_node=4 tests/moe_ep/smoke_nccl_ep.py
 
 Constructs an :class:`MoEEpLayer` with ``backend="nccl_ep"`` and runs one
 dispatch → identity → combine → complete pass. Asserts the output has the
@@ -96,6 +96,7 @@ def main() -> int:
     y_mean = float(y.float().mean().item())
     print(f"rank {rank}: nccl_ep smoke OK, y.mean={y_mean:.4f}")
 
+    layer.destroy()
     dist.barrier()
     if rank == 0:
         print("SMOKE_RESULT: nccl_ep OK")

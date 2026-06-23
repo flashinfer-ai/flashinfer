@@ -1,43 +1,162 @@
 # `flashinfer.moe_ep` — Current Design
 
-Class diagram and module map for the **current** implementation under
-`flashinfer/flashinfer/moe_ep/` (split EP path: `nccl_ep` + `nixl_ep`).
-This document reflects the code as it exists today, not the planned Mega MoE
-restructure described in
-[`moe_ep_deep_gemm_mega_moe.md`](moe_ep_deep_gemm_mega_moe.md).
+Authoritative package design (layout, split/mega paths, migration table) lives in
+[`flashinfer/moe_ep/design.md`](../../flashinfer/moe_ep/design.md). This document
+summarizes the **implemented** `core/` / `backends/` / `modes/` layout and the
+split-path fused MoE compute plugin.
 
 ---
 
-## Package layout
+## Package layout (implemented)
 
 ```
 flashinfer/moe_ep/
-├── __init__.py              # Public exports, build probes, backend import side-effects
-├── layer.py                 # MoEEpLayer (nn.Module entry point)
-├── fleet.py                 # Fleet ABC + create_fleet() + _BACKEND_REGISTRY
-├── handle.py                # Handle ABC
-├── config.py                # Enums + frozen dataclass I/O envelopes
-├── tensors.py               # MoEEpTensors input bundle
-├── algo_knobs.py            # AlgoKnob hierarchy + _index_knobs()
-├── _validators.py           # Backend-specific FleetParams / arch checks
-├── split_backends/
-│   ├── __init__.py
-│   ├── nccl_ep_comm.py      # NcclEpConfig
-│   └── nixl_ep_comm.py      # NvepConfig
-├── nccl_ep/
-│   ├── __init__.py          # libnccl / libnccl_ep lazy loaders
-│   ├── fleet.py             # NcclEpFleet
-│   ├── handle.py            # NcclEpHandle
-│   └── ndtensor.py          # NDTensor + get_nccl_lib()
-└── nixl_ep/
-    ├── __init__.py          # libnixl / nixl_ep_cpp lazy loaders
-    ├── fleet.py             # NixlEpFleet
-    └── handle.py            # NixlEpHandle
+├── __init__.py              # Public re-exports, build probes, plugin import side-effects
+├── layer.py                 # MoEEpLayer factory → MoEEpSplitLayer | MoEEpMegaLayer
+├── config.py                # BootstrapConfig, FleetParams, HandleParams, I/O envelopes
+├── tensors.py               # MoEEpTensors
+├── weights.py               # Canonical MoEWeightPack (w13, w2, optional scales)
+├── algo_knobs.py            # Fleet/Handle AlgoKnob hierarchy
+├── errors.py                # MoEEpNotBuiltError
+├── design.md                # Full design + migration from flat layout
+├── core/
+│   ├── comm/                # Fleet + Handle ABCs, create_fleet(), _BACKEND_REGISTRY
+│   ├── kernel/              # Split/Mega kernel ABCs, @register_* registry
+│   └── validation/          # validate_fleet_params, forward-input checks, mega validators
+├── backends/
+│   ├── split/
+│   │   ├── comm/
+│   │   │   ├── nccl_ep/     # NcclEpConfig, NcclEpFleet, NcclEpHandle, ndtensor.py
+│   │   │   └── nixl_ep/     # NvepConfig, NixlEpFleet, NixlEpHandle
+│   │   └── kernel/
+│   │       ├── identity/    # IdentityConfig — passthrough inner kernel
+│   │       └── fused_moe/   # FusedMoeKernelConfig + MoELayer compute bridge
+│   └── mega/
+│       └── kernel/
+│           └── deep_gemm_mega/  # DeepGemmMegaMoeConfig, staging, weights
+└── modes/
+    ├── config.py            # SplitConfig, MegaConfig
+    ├── split_layer.py       # MoEEpSplitLayer (dispatch → kernel → combine)
+    └── mega_layer.py        # MoEEpMegaLayer (fused mega kernel)
+```
+
+Native transport libs (built with `BUILD_NVEP=1`) stage under
+`backends/split/comm/{nccl_ep,nixl_ep}/_libs/`.
+
+---
+
+## Split path + fused MoE compute
+
+`SplitConfig` (`modes/config.py`) pairs **comm** (NCCL-EP / NIXL-EP) with **kernel**
+(identity or fused MoE). Defaults: `comm=NcclEpConfig()`, `kernel=IdentityConfig()`.
+
+| Kernel | Config | Weights on `FleetParams` | Role |
+|--------|--------|--------------------------|------|
+| `identity` | `IdentityConfig()` | not required | Comm-only roundtrip |
+| `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` | required (`MoEWeightPack`) | `flashinfer.fused_moe.MoELayer` over dispatched tokens |
+
+**Fused MoE example:**
+
+```python
+from flashinfer.fused_moe.api import MoEConfig, ...  # build moe_config
+from flashinfer.moe_ep import (
+    BootstrapConfig,
+    FleetParams,
+    FusedMoeKernelConfig,
+    MoEEpLayer,
+    MoEEpTensors,
+    MoEWeightPack,
+    NcclEpConfig,
+    SplitConfig,
+)
+
+layer = MoEEpLayer(
+    bootstrap=BootstrapConfig(world_size=8, rank=rank),
+    fleet_params=FleetParams(
+        num_experts=64,
+        max_tokens_per_rank=128,
+        token_hidden_size=4096,
+        weights=MoEWeightPack(w13=w13_local, w2=w2_local),  # canonical bf16
+    ),
+    backend=SplitConfig(
+        comm=NcclEpConfig(),
+        kernel=FusedMoeKernelConfig(moe_config=moe_config),
+    ),
+)
+out = layer.forward(MoEEpTensors(hidden_states=x, topk_ids=topk_ids, topk_weights=topk_weights))
+```
+
+Implementation files:
+- `backends/split/kernel/fused_moe/bridge.py` — EP dispatch layout → `MoEActivationPack`
+- `backends/split/kernel/fused_moe/backend.py` — `FusedMoeSplitKernelBackend`
+- `backends/split/kernel/fused_moe/weights.py` — `materialize_fused_moe_weights()`
+- `backends/split/kernel/fused_moe/validate.py` — EP vs `MoEConfig` consistency
+
+**Opt-in profiling:** `MoEEpSplitLayer.enable_timing = True` records dispatch/compute/combine
+GPU times in `last_timings_ms` (off by default; used by `benchmarks/bench_moe_ep.py`).
+
+---
+
+## End-to-end flow (split path)
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant MoEEpSplitLayer
+    participant create_fleet
+    participant Fleet
+    participant Handle
+    participant Kernel as SplitKernelBackend
+
+    User->>MoEEpSplitLayer: forward(MoEEpTensors)
+    MoEEpSplitLayer->>create_fleet: _ensure_fleet() [lazy, once]
+    create_fleet->>Fleet: _BACKEND_REGISTRY[comm](...)
+    MoEEpSplitLayer->>Fleet: create_handle(HandleParams, handle_knobs)
+    Fleet->>Handle: NcclEpHandle | NixlEpHandle
+    MoEEpSplitLayer->>Handle: dispatch(DispatchInputParams)
+    Handle-->>MoEEpSplitLayer: DispatchOutput
+    MoEEpSplitLayer->>Kernel: compute(SplitKernelContext)
+    Kernel-->>MoEEpSplitLayer: expert_out
+    MoEEpSplitLayer->>Handle: combine(CombineInputParams)
+    Handle-->>MoEEpSplitLayer: CombineOutput
+    MoEEpSplitLayer->>Handle: complete()
+    MoEEpSplitLayer->>Handle: destroy()
+    MoEEpSplitLayer-->>User: torch.Tensor
 ```
 
 ---
 
-## End-to-end flow
+## Legacy note
+
+Older flat-layout docs referenced `fleet.py`, `handle.py`, and `split_backends/` at
+the package root. Those responsibilities now live under `core/comm/` and
+`backends/split/comm/` respectively. Class diagrams below retain transport-backend
+detail; adjust import paths to `flashinfer.moe_ep.backends.split.comm.nccl_ep`.
+
+---
+
+## Package layout (historical flat tree — superseded)
+
+<details>
+<summary>Pre-restructure layout (for archaeology only)</summary>
+
+```
+flashinfer/moe_ep/
+├── layer.py                 # Monolithic MoEEpLayer with inline compute
+├── fleet.py, handle.py
+├── _compute_bridge.py
+├── split_backends/
+├── nccl_ep/, nixl_ep/
+```
+
+</details>
+
+---
+
+## End-to-end flow (historical)
+
+<details>
+<summary>Identity-only flow before split kernels</summary>
 
 ```mermaid
 sequenceDiagram
@@ -61,9 +180,57 @@ sequenceDiagram
     MoEEpLayer-->>User: torch.Tensor
 ```
 
+</details>
+
 ---
 
 ## Complete class diagram
+
+### Public API & layer (split)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class MoEEpLayer {
+        <<factory>>
+    }
+    class MoEEpSplitLayer
+    class MoEEpMegaLayer
+    class SplitConfig {
+        comm
+        kernel
+    }
+    class FusedMoeKernelConfig {
+        moe_config
+    }
+
+    MoEEpLayer --> MoEEpSplitLayer
+    MoEEpLayer --> MoEEpMegaLayer
+    MoEEpSplitLayer --> SplitConfig
+    SplitConfig --> FusedMoeKernelConfig : optional kernel
+```
+
+### Public API & layer (historical monolithic layer)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class nn_Module {
+        <<PyTorch>>
+    }
+
+    class MoEEpLayerLegacy {
+        <<removed>>
+    }
+
+    nn_Module <|-- MoEEpLayerLegacy
+```
+
+---
+
+## Complete class diagram (transport)
 
 ### Public API & layer
 
@@ -75,17 +242,15 @@ classDiagram
         <<PyTorch>>
     }
 
-    class MoEEpLayer {
+    class MoEEpSplitLayer {
         -BootstrapConfig _bootstrap
         -FleetParams _fleet_params
-        -list~AlgoKnob~ _fleet_knobs
-        -Union~str, object~ _backend
+        -SplitKernelBackend _kernel
         -Fleet _fleet
-        +__init__(bootstrap, fleet_params, fleet_knobs, backend)
         +forward(t: MoEEpTensors) torch.Tensor
         +destroy() void
-        -_ensure_fleet() Fleet
-        -_inner_compute_identity(expert_tensors, num_tokens) torch.Tensor
+        +enable_timing bool
+        +last_timings_ms dict
     }
 
     class MoEEpTensors {
@@ -97,12 +262,12 @@ classDiagram
         +Optional~torch.Tensor~ num_tokens_per_expert
     }
 
-    nn_Module <|-- MoEEpLayer
-    MoEEpLayer ..> MoEEpTensors : forward input
-    MoEEpLayer ..> Fleet : owns (lazy)
-    MoEEpLayer ..> BootstrapConfig : uses
-    MoEEpLayer ..> FleetParams : uses
-    MoEEpLayer ..> AlgoKnob : fleet + handle knobs
+    nn_Module <|-- MoEEpSplitLayer
+    MoEEpSplitLayer ..> MoEEpTensors : forward input
+    MoEEpSplitLayer ..> Fleet : owns (lazy)
+    MoEEpSplitLayer ..> BootstrapConfig : uses
+    MoEEpSplitLayer ..> FleetParams : uses
+    MoEEpSplitLayer ..> AlgoKnob : fleet + handle knobs
 ```
 
 ### Fleet / Handle abstraction & backends

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Nsight Systems profiling for DeepSeek V4 MegaMoE EP trace benchmarks
-# (flashinfer.moe_ep_v2 vs vLLM DeepseekV4MegaMoEExperts, NVTX-instrumented).
+# (flashinfer.moe_ep vs vLLM DeepseekV4MegaMoEExperts, NVTX-instrumented).
 #
 # Run from the flashinfer repo root, inside the nsys-capable container:
 #   ./open_docker.sh

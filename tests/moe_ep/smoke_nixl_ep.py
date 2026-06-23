@@ -1,7 +1,7 @@
 """NIXL-EP smoke entry point.
 
 Usage:
-    torchrun --nproc_per_node=8 tests/moe_ep/smoke_nixl_ep.py
+    torchrun --nproc_per_node=4 tests/moe_ep/smoke_nixl_ep.py
 
 Same shape as the NCCL-EP smoke, but constructs a torch.distributed.TCPStore
 for the NIXL Buffer rendezvous (NIXL doesn't share NCCL's communicator).
@@ -100,6 +100,7 @@ def main() -> int:
     y_mean = float(y.float().mean().item())
     print(f"rank {rank}: nixl_ep smoke OK, y.mean={y_mean:.4f}")
 
+    layer.destroy()
     dist.barrier()
     if rank == 0:
         print("SMOKE_RESULT: nixl_ep OK")
