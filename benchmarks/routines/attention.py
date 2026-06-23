@@ -2309,7 +2309,7 @@ def testBatchMLAPagedAttentionWrapper(args):
     if mla_is_var_seq_arg is None:
         resolved_is_var_seq = None
     elif mla_is_var_seq_arg == "auto":
-        resolved_is_var_seq = args.random_actual_seq_len
+        resolved_is_var_seq = getattr(args, "random_actual_seq_len", False)
     else:
         resolved_is_var_seq = mla_is_var_seq_arg == "true"
     # Only forwarded to the direct trtllm API when explicitly resolved.
