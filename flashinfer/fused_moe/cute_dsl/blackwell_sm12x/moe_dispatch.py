@@ -434,7 +434,16 @@ def _get_weight_views(
             w2_alphas.contiguous().to(torch.float32),
         )
         _WEIGHT_CACHE[key] = cached
-        _register_cache_eviction(_WEIGHT_CACHE, key, w1_fp4, w2_fp4)
+        _register_cache_eviction(
+            _WEIGHT_CACHE,
+            key,
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+        )
     w13_sf_contiguous, down_sf_contiguous, w1_alpha, w2_alpha = cached
 
     # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy).
@@ -2075,7 +2084,16 @@ def _get_w4a16_packed_weights(
         source_format=source_format,
     )
     _W4A16_WEIGHT_CACHE[key] = prepared
-    _register_cache_eviction(_W4A16_WEIGHT_CACHE, key, w1_weight, w2_weight)
+    _register_cache_eviction(
+        _W4A16_WEIGHT_CACHE,
+        key,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+    )
     return prepared
 
 
