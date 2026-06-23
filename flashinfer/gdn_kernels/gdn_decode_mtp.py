@@ -213,7 +213,6 @@ def gdn_verify_kernel_mtp(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1352,7 +1351,6 @@ def run_gdn_verify_kernel_mtp(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1378,7 +1376,7 @@ def run_gdn_verify_kernel_mtp(
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
 
     # Grid: (B * HV * num_v_tiles, 1, 1) - parallelize across V dimension
-    grid_size = B * HV * num_v_tiles
+    grid_size = q.shape[0] * HV * num_v_tiles
 
     # Shared memory for pre-computed q, k, g, beta, preloaded v data, and output
     smem_bytes = (
@@ -1411,7 +1409,6 @@ def run_gdn_verify_kernel_mtp(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -1455,7 +1452,6 @@ def gdn_verify_kernel_mtp_inline(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -2127,7 +2123,6 @@ def run_gdn_verify_kernel_mtp_inline(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -2153,7 +2148,7 @@ def run_gdn_verify_kernel_mtp_inline(
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
 
     # Grid: (B * HV * num_v_tiles, 1, 1) - parallelize across V dimension
-    grid_size = B * HV * num_v_tiles
+    grid_size = q.shape[0] * HV * num_v_tiles
 
     # v10: No sQ/sK/sG/sBeta — only sVdata + sOutput
     smem_bytes = (
@@ -2182,7 +2177,6 @@ def run_gdn_verify_kernel_mtp_inline(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -2205,13 +2199,11 @@ def run_gdn_verify_kernel_mtp_inline(
 
 @functools.cache
 def _get_compiled_mtp_kernel(
-    B: int,
     T: int,
     H: int,
     HV: int,
     K: int,
     V: int,
-    pool_size: int,
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
@@ -2229,13 +2221,11 @@ def _get_compiled_mtp_kernel(
 
 @functools.cache
 def _get_compiled_mtp_kernel_inline(
-    B: int,
     T: int,
     H: int,
     HV: int,
     K: int,
     V: int,
-    pool_size: int,
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
@@ -2312,68 +2302,74 @@ def run_mtp_decode(
     major, _ = torch.cuda.get_device_capability(q.device)
     use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
 
+    cache_key = (
+        T,
+        H,
+        HV,
+        K,
+        V,
+        cache_steps,
+        disable_state_update,
+        cache_intermediate_states,
+        scale,
+        use_qk_l2norm,
+        tile_v,
+        vec_size,
+        ilp_rows,
+        use_smem_v,
+        use_packed_fma,
+    )
     if use_inline_kernel:
-        inline_cache_key = (
-            B,
-            T,
-            H,
-            HV,
-            K,
-            V,
-            pool_size,
-            cache_steps,
-            disable_state_update,
-            cache_intermediate_states,
-            scale,
-            use_qk_l2norm,
-            tile_v,
-            vec_size,
-            ilp_rows,
-            use_smem_v,
-            use_packed_fma,
-        )
-        cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
+        cache = _get_compiled_mtp_kernel_inline(*cache_key)
     else:
-        warp_cache_key = (
-            B,
-            T,
-            H,
-            HV,
-            K,
-            V,
-            pool_size,
-            cache_steps,
-            disable_state_update,
-            cache_intermediate_states,
-            scale,
-            use_qk_l2norm,
-            tile_v,
-            vec_size,
-            ilp_rows,
-            use_smem_v,
-            use_packed_fma,
-        )
-        cache = _get_compiled_mtp_kernel(*warp_cache_key)
+        cache = _get_compiled_mtp_kernel(*cache_key)
 
-    if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
-        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    cu_seqlens = cache["cu_seqlens"]
+    cu_seqlens_map = cache.setdefault("cu_seqlens", {})
+    cu_key = (B, q.device)
+    if cu_key not in cu_seqlens_map:
+        cu_seqlens_map[cu_key] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    cu_seqlens = cu_seqlens_map[cu_key]
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        h0_source_tensor = from_dlpack(
+            h0_source, assumed_align=16
+        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
+        if cache_intermediate_states:
+            # Caching-off dummy ([1,1,1]) is never read; skip marking it.
+            intermediate_states_tensor = (
+                intermediate_states_tensor.mark_compact_shape_dynamic(
+                    mode=0, stride_order=(0, 1, 2), divisibility=1
+                )
+            )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16)
+        a_tensor = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16)
-        k_tensor = from_dlpack(k, assumed_align=16)
-        v_tensor = from_dlpack(v, assumed_align=16)
-        b_tensor = from_dlpack(b, assumed_align=16)
-        o_tensor = from_dlpack(output, assumed_align=16)
-        h0_indices_tensor = from_dlpack(initial_state_indices, assumed_align=16)
-        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        q_tensor = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        k_tensor = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        v_tensor = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        b_tensor = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
+        o_tensor = from_dlpack(output, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        h0_indices_tensor = from_dlpack(
+            initial_state_indices, assumed_align=16
+        ).mark_layout_dynamic()
+        cu_seqlens_tensor = from_dlpack(
+            cu_seqlens, assumed_align=16
+        ).mark_layout_dynamic()
 
         if use_inline_kernel:
             compiled = cute.compile(
@@ -2394,7 +2390,6 @@ def run_mtp_decode(
                 softplus_threshold=20.0,
                 scale=scale,
                 HV=HV,
-                B=B,
                 T=T,
                 H=H,
                 K=K,
@@ -2431,7 +2426,6 @@ def run_mtp_decode(
                 softplus_threshold=20.0,
                 scale=scale,
                 HV=HV,
-                B=B,
                 T=T,
                 H=H,
                 K=K,

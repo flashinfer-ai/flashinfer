@@ -192,7 +192,7 @@ class SoftmaxRole:
 
         # Wait for Si
         si_handle = mma_si_consumer.wait_and_advance()
-        tTMEM_LOADrS = cute.make_fragment(tTMEM_LOADcS.shape, self.qk_acc_dtype)
+        tTMEM_LOADrS = cute.make_rmem_tensor(tTMEM_LOADcS.shape, self.qk_acc_dtype)
         cute.copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS)
         if need_apply_mask:
             apply_mask(
@@ -243,7 +243,7 @@ class SoftmaxRole:
 
             if row_max == -cutlass.Float32.inf:
                 row_max_safe = 0.0
-            tTMEM_STORE_VECrS = cute.make_fragment(
+            tTMEM_STORE_VECrS = cute.make_rmem_tensor(
                 tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
             )
 
@@ -253,7 +253,7 @@ class SoftmaxRole:
             cute.arch.fence_view_async_tmem_store()
             vec_i_handle.commit()
 
-        tTMEM_STORErS_x4 = cute.make_fragment(tTMEM_STOREcS.shape, self.qk_acc_dtype)
+        tTMEM_STORErS_x4 = cute.make_rmem_tensor(tTMEM_STOREcS.shape, self.qk_acc_dtype)
         tTMEM_STORErS_x4_e = cute.make_tensor(
             cute.recast_ptr(tTMEM_STORErS_x4.iterator, dtype=self.q_dtype),
             tTMEM_LOADrS.layout,
@@ -371,7 +371,7 @@ class SoftmaxRole:
     def softmax_epilog(
         self,
         stage: int,
-        pv_thr_mma: cute.core.ThrMma,
+        pv_thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         scale: Float32,
         sO: cute.Tensor,
@@ -430,7 +430,7 @@ class SoftmaxRole:
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADsO_i = tTMEM_LOADsO[None, 0, 0, i]
-            tTMrO = cute.make_fragment(
+            tTMrO = cute.make_rmem_tensor(
                 tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype
             )
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
@@ -439,7 +439,7 @@ class SoftmaxRole:
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
-            tSMrO = cute.make_fragment(tTMrO.shape, self.o_dtype)
+            tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tSMrO.store(o_vec.to(self.o_dtype))
             cute.copy(tiled_smem_store, tSMrO, tTMEM_LOADsO_i)
@@ -457,8 +457,8 @@ class SoftmaxRole:
         cum_seqlen_k: cute.Tensor | None,
         scale_softmax_log2: Float32,
         scale_output: Float32,
-        qk_thr_mma: cute.core.ThrMma,
-        pv_thr_mma: cute.core.ThrMma | None,
+        qk_thr_mma: cute.ThrMma,
+        pv_thr_mma: cute.ThrMma | None,
         tStS: cute.Tensor,
         tStSi: cute.Tensor,
         tOtO: cute.Tensor | None,
@@ -691,7 +691,7 @@ class SoftmaxRole:
                     )
                 si_handle = mma_si_consumer.wait_and_advance()
                 if cutlass.const_expr(not self.has_logits_transform):
-                    tTMEM_STORE_VECrS = cute.make_fragment(
+                    tTMEM_STORE_VECrS = cute.make_rmem_tensor(
                         tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
                     )
                     tTMEM_STORE_VECrS[0] = row_sum

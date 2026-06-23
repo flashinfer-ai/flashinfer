@@ -196,6 +196,52 @@ void moe_output_memset_bf16(int64_t input_ptr, int64_t tile_idx_to_mn_limit_ptr,
 }
 #endif
 
+// ============================ moeOutputMemsetInplace (dense Path A) bindings
+// ============================
+//
+// Dense-only port of TRT-LLM's `moe_output_memset_inplace` Path A
+// (cuteDslMoeUtilsOp.cpp:moe_output_memset_inplace at the
+// `!enable_alltoall || ep_size <= top_k` branch — just cudaMemsetAsync).
+//
+// This entry point exposes only Path A. Current callers of the
+// monolithic CuteDSL MoE API handle all-to-all outside this function,
+// so TRT-LLM's internal-alltoall Path B (the sparse `moeOutputMemset`
+// kernel) is not part of this API. The existing sparse moeOutputMemset
+// bindings above remain available if a future internal-alltoall
+// integration needs them.
+//
+// The signature accepts an explicit `cuda_stream_ptr` (PyTorch's current
+// CUDA stream). `get_current_stream()` here resolves through
+// `TVMFFIEnvGetStream`, which does NOT track PyTorch's
+// `torch.cuda.stream(...)` context — so without the explicit pointer
+// the memset would queue on TVM's env stream and would not overlap
+// aux-stream memset with surrounding GEMM work. Mirrors the
+// `moe_sort`/`flashinfer_moe_sort` pattern in this file (the binding
+// resolves to `cuda_stream_ptr != 0 ? <ptr> : get_current_stream()`).
+
+void moe_output_memset_inplace_fp16(int64_t input_ptr, int64_t num_tokens, int64_t hidden_size,
+                                    // Explicit PyTorch stream; 0 falls back to TVM FFI env.
+                                    int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
+  cudaMemsetAsync(reinterpret_cast<void*>(input_ptr), 0x0,
+                  sizeof(half) * static_cast<size_t>(num_tokens) * static_cast<size_t>(hidden_size),
+                  stream);
+}
+
+#ifdef ENABLE_BF16
+void moe_output_memset_inplace_bf16(int64_t input_ptr, int64_t num_tokens, int64_t hidden_size,
+                                    // Explicit PyTorch stream; 0 falls back to TVM FFI env.
+                                    int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
+  cudaMemsetAsync(
+      reinterpret_cast<void*>(input_ptr), 0x0,
+      sizeof(__nv_bfloat16) * static_cast<size_t>(num_tokens) * static_cast<size_t>(hidden_size),
+      stream);
+}
+#endif
+
 // ============================ moeActivation bindings ============================
 
 void moe_activation_fp16(int64_t input_ptr, int64_t output_ptr, int64_t tile_idx_to_mn_limit_ptr,
@@ -251,6 +297,13 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_bf16_scale,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_output_memset_fp16, moe_output_memset_fp16);
 #ifdef ENABLE_BF16
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_output_memset_bf16, moe_output_memset_bf16);
+#endif
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_output_memset_inplace_fp16,
+                              moe_output_memset_inplace_fp16);
+#ifdef ENABLE_BF16
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_output_memset_inplace_bf16,
+                              moe_output_memset_inplace_bf16);
 #endif
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_activation_fp16, moe_activation_fp16);

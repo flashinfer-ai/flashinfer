@@ -284,6 +284,33 @@ def get_smem_ptr_as_int32(
 
 
 @dsl_user_op
+def ld_shared_v2_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+    """Load 64 bits (2 x uint32) from shared memory via ld.shared.v2.u32.
+
+    Args:
+        smem_addr: 32-bit shared memory address (from get_smem_ptr_as_int32).
+                   Caller is responsible for ensuring 8-byte alignment.
+
+    Returns:
+        2 Uint32 values (8 bytes total).
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.u32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(v0), Uint32(v1)
+
+
+@dsl_user_op
 def ld_shared_v4_u32(
     smem_addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
@@ -356,6 +383,94 @@ def rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def rcp_rn(a: Float32, *, loc=None, ip=None) -> Float32:
+    """Round-to-nearest reciprocal using PTX div.rn.f32."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, 0f3F800000, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def fadd_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 addition."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fsub_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 subtraction."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "sub.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fmul_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 multiplication."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fdiv_rn(a: Float32, b: Float32, loc=None, ip=None) -> Float32:
+    """Round-to-nearest float32 division."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -857,6 +972,52 @@ def nvfp4_compute_output_scale(
     )
 
 
+@dsl_user_op
+def nvfp4_compute_output_scale_rn(
+    fp8_val: Uint32, global_scale: Float32, block_amax: Float32, *, loc=None, ip=None
+) -> Float32:
+    """Compute TE-exact NVFP4 output scale when FP4 quant fast math is disabled."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Uint32(fp8_val).ir_value(loc=loc, ip=ip),
+                Float32(global_scale).ir_value(loc=loc, ip=ip),
+                Float32(block_amax).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .pred p_zero;
+                .reg .b16 fp8_pair;
+                .reg .b32 h2_32;
+                .reg .b16 h_lo, h_hi;
+                .reg .f32 scale_f32, rcp_gs, product, result, max_f32;
+
+                cvt.u16.u32 fp8_pair, $1;
+                cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;
+                mov.b32 {h_lo, h_hi}, h2_32;
+                cvt.f32.f16 scale_f32, h_lo;
+
+                div.rn.f32 rcp_gs, 0f3F800000, $2;
+                mul.rn.f32 product, scale_f32, rcp_gs;
+                div.rn.f32 result, 0f3F800000, product;
+                mov.b32 max_f32, 0x7F7FFFFF;
+                min.f32 result, result, max_f32;
+
+                setp.eq.f32 p_zero, $3, 0f00000000;
+                selp.f32 $0, 0f00000000, result, p_zero;
+            }
+            """,
+            "=f,r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 # =============================================================================
 # UE8M0 Intrinsics (for MXFP4)
 # =============================================================================
@@ -1306,7 +1467,7 @@ def compute_y_and_max_abs_f32(
 
 
 # =============================================================================
-# PTX Intrinsics — Global Memory Stores (ported from b12x for MoE kernels)
+# PTX intrinsics used by SM120 MoE kernels
 # =============================================================================
 
 
@@ -1744,6 +1905,38 @@ def nvfp4_scale_from_amax(
 
 
 @dsl_user_op
+def nvfp4_scale_from_amax_rn(
+    block_amax: Float32, global_scale: Float32, *, loc=None, ip=None
+) -> Float32:
+    """Compute NVFP4 block scale with round-to-nearest FP32 operations."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(block_amax).ir_value(loc=loc, ip=ip),
+                Float32(global_scale).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .pred p_zero;
+                .reg .f32 scale_mul, result;
+                setp.eq.f32 p_zero, $1, 0f00000000;
+                mul.rn.f32 scale_mul, $2, 0f3E2AAAAB;
+                mul.rn.f32 result, $1, scale_mul;
+                selp.f32 $0, 0f00000000, result, p_zero;
+            }
+            """,
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def cvt_e4m3x2_to_f16x2_pair(
     packed_u32: Uint32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:
@@ -1821,6 +2014,35 @@ def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             }
             """,
             "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_s0e5m3_to_f16x2_broadcast(fp8_val: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Convert one S0E5M3 scale byte to an f16x2 with the scale in both lanes.
+
+    S0E5M3 (sign-0, 5-exp, 3-mantissa) is a host-side reformat of the per-block
+    E4M3 scale, rebiased to fp16's bias (exp 7->15, i.e. byte += 0x40) so the
+    bits line up with fp16 directly: ``f16(byte) = byte << 7`` (exp -> bits 14-10,
+    the 3 mantissa bits -> bits 9-7, low mantissa and sign = 0).  Broadcasting to
+    both f16x2 lanes is then ``byte * 0x00800080`` = ``(byte<<7) | (byte<<23)`` --
+    a single ``mul.lo.u32`` (the two shifted copies never overlap, so the mul is
+    exactly the OR).  Replaces the 3-op E4M3 path (cvt.u16 + cvt.f16x2.e4m3x2 +
+    prmt) with 1 op, and the per-block scale stays 1 byte (memory-neutral).
+    Numerically exact for normal E4M3 scales (both formats carry 3 mantissa bits).
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
+            "mul.lo.u32 $0, $1, 0x00800080;",
+            "=r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

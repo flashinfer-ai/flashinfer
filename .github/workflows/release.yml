@@ -280,7 +280,7 @@ jobs:
           # Delete existing release and tag if they exist
           if gh release view "$TAG" &>/dev/null; then
             echo "Deleting existing release: $TAG"
-            gh release delete "$TAG" --yes --cleanup-tag
+            gh release delete "$TAG" --yes
           fi
 
           # Read release notes from file

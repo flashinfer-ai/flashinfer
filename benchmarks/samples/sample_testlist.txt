@@ -77,13 +77,28 @@
 # RMSNorm with PDL enabled
 --routine rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --enable_pdl --refcheck -vv --generate_repro_command --case_tag "rmsnorm_pdl"
 
+## Fused Add + RMSNorm
+# Fused residual add + RMSNorm (in-place); residual is updated, normalized output written back to input
+--routine fused_add_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "fused_add_rmsnorm_llama_hidden"
+--routine fused_add_rmsnorm --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "fused_add_rmsnorm_large_hidden"
+--routine fused_add_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --enable_pdl --refcheck -vv --generate_repro_command --case_tag "fused_add_rmsnorm_pdl"
+
+## Gemma RMSNorm
+# Gemma-style RMSNorm using (weight + 1)
+--routine gemma_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_rmsnorm_llama_hidden"
+--routine gemma_rmsnorm --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_rmsnorm_large_hidden"
+--routine gemma_rmsnorm --batch_size 32 --num_heads 32 --hidden_size 128 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_rmsnorm_3d_gqa"
+
+## Gemma Fused Add + RMSNorm
+# Gemma-style fused residual add + RMSNorm using (weight + 1)
+--routine gemma_fused_add_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_fused_add_rmsnorm_llama_hidden"
+--routine gemma_fused_add_rmsnorm --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "gemma_fused_add_rmsnorm_large_hidden"
+--routine gemma_fused_add_rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --enable_pdl --refcheck -vv --generate_repro_command --case_tag "gemma_fused_add_rmsnorm_pdl"
+
 ## RMSNorm with Quantized Output
 # RMSNorm with FP8 e4m3 output
 --routine rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag "rmsnorm_quant_fp8_e4m3"
 --routine rmsnorm_quant --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag "rmsnorm_quant_large"
-
-# RMSNorm with FP8 e5m2 output
---routine rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype float16 --out_dtype fp8_e5m2 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag "rmsnorm_quant_fp8_e5m2"
 
 ## Fused Add + RMSNorm with Quantized Output
 # Fused add + RMSNorm with FP8 e4m3 output
@@ -299,3 +314,25 @@
 
 # FlashInfer-only (no refcheck, perf focus)
 --routine selective_state_update --batch_size 128 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --backends flashinfer -vv --generate_repro_command --case_tag "mamba2_stp_perf"
+
+## GDN (Gated Delta Net, SM90+)
+# Decode T=1, Qwen3-Next config (q=k=16, v=32, d=128), pretranspose layout, FlashInfer vs Triton
+--routine gated_delta_rule_decode --batch_size 128 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "gdn_decode_pretrans"
+
+# Decode T=1, nontranspose layout
+--routine gated_delta_rule_decode --batch_size 128 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --state_layout nontranspose --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "gdn_decode_nontrans"
+
+# Decode T=1, BF16 state kernel
+--routine gated_delta_rule_decode --batch_size 128 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --state_dtype bfloat16 --backends flashinfer --refcheck -vv --generate_repro_command --case_tag "gdn_decode_bf16_state"
+
+# Decode T=1, BF16 state, split pool (speculative-decoding shape)
+--routine gated_delta_rule_decode --batch_size 128 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --state_dtype bfloat16 --pool_mode split --backends flashinfer -vv --generate_repro_command --case_tag "gdn_decode_bf16_split"
+
+# MTP T=4, fp32 state pool, FlashInfer vs Triton
+--routine gated_delta_rule_mtp --batch_size 128 --seq_len 4 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "gdn_mtp4_fp32"
+
+# MTP T=4, BF16 state
+--routine gated_delta_rule_mtp --batch_size 128 --seq_len 4 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --state_dtype bfloat16 --backends flashinfer --refcheck -vv --generate_repro_command --case_tag "gdn_mtp4_bf16"
+
+# Prefill, 4 x 2048 tokens, Qwen3.5-35B head config
+--routine chunk_gated_delta_rule --batch_size 4 --s_qo 2048 --num_q_heads 16 --num_k_heads 16 --num_v_heads 32 --head_size 128 --backends flashinfer --refcheck -vv --generate_repro_command --case_tag "gdn_prefill_4x2048"

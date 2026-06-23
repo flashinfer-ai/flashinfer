@@ -24,7 +24,7 @@ import functools
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32
+from cutlass import Float32, Int64
 
 from ..utils import (
     COPY_BITS,
@@ -84,7 +84,7 @@ class LayerNormKernel:
         mX: cute.Tensor,
         mGamma: cute.Tensor,
         mBeta: cute.Tensor,
-        M: Int32,
+        M: Int64,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         stream,
@@ -123,7 +123,7 @@ class LayerNormKernel:
         mX: cute.Tensor,
         mGamma: cute.Tensor,
         mBeta: cute.Tensor,
-        M: Int32,
+        M: Int64,
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
@@ -270,9 +270,11 @@ def _get_compiled_layernorm_kernel(
     gamma_dtype = get_cutlass_dtype(gamma_dtype_str)
     kernel_obj = LayerNormKernel(dtype, H)
 
-    sym_m = cute.sym_int()
-    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
-    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    # 64-bit M and row strides so the offset arithmetic does not overflow
+    # when M * H exceeds INT32_MAX.
+    sym_m = cute.sym_int(64)
+    sym_row_stride_y = cute.sym_int64(divisibility=kernel_obj.vec_size)
+    sym_row_stride_x = cute.sym_int64(divisibility=kernel_obj.vec_size)
 
     y_fake = cute.runtime.make_fake_tensor(
         dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
@@ -295,7 +297,7 @@ def _get_compiled_layernorm_kernel(
         x_fake,
         gamma_fake,
         beta_fake,
-        Int32(1),
+        Int64(1),
         Float32(1e-6),
         enable_pdl,
         stream_fake,

@@ -47,6 +47,18 @@ import cuda.bindings.driver as cuda
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from flashinfer.cute_dsl.fp4_common import get_sm_version
+from flashinfer.cute_dsl.utils import get_num_sm
+
+
+def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # explicit stride_order: auto-deduction is ambiguous at B=1/T=1.
+    stride_order = tuple(sorted(range(torch_t.dim()), key=lambda d: -torch_t.stride(d)))
+    return from_dlpack(
+        torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
+    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order)
+
+
 # ==============================================================================
 # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
 # ==============================================================================
@@ -107,7 +119,7 @@ MTP_ILP4_ROWS = 4
 
 @cute.kernel
 def gdn_decode_bf16state_mtp_ilp4_kernel(
-    h0_source: cute.Tensor,  # [pool_size * HV, V, K] as BF16
+    h0_source: cute.Tensor,  # [pool_size, HV, V, K] as BF16 (4D, supports strided pool)
     intermediate_states: cute.Tensor,  # [B * T * HV, V, K] as BF16 (or dummy)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
@@ -126,7 +138,6 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -324,11 +335,10 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
 
                 cute.arch.barrier()
 
-        flat_state_idx = cache_idx * HV + i_hv
-        if cutlass.const_expr(same_pool):
-            flat_write_state_idx = flat_state_idx
-        else:
-            flat_write_state_idx = write_cache_idx * HV + i_hv
+        # 4D pool: address by (cache_idx, i_hv, v, lane_in_group). No
+        # `flat_state_idx = cache_idx*HV + i_hv` needed because we keep the
+        # leading two dims separate so cute strides handle the (possibly
+        # non-contiguous) per-slot stride correctly.
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
 
         sum_q = cutlass.Float32(0.0)
@@ -345,19 +355,16 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             vc = vb4 + 2
             vd = vb4 + 3
 
-            # Read tiles at the source slot.
-            hta = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, va, lane_in_group)
-            )
-            htb = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, vb, lane_in_group)
-            )
-            htc = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, vc, lane_in_group)
-            )
-            htd = cute.local_tile(
-                h0_source, (1, 1, vec_size), (flat_state_idx, vd, lane_in_group)
-            )
+            # Take a 2D (V, K) sub-tensor at the read slot first. Using
+            # __getitem__ with two coords gives cute an int64 base-pointer
+            # offset (cache_idx * stride[0] + i_hv * stride[1]), which is
+            # required when pool_size * slot_stride * sizeof(elt) exceeds 2^31
+            # (e.g. vLLM padded layout at HV=64, B>=2048).
+            gSrc = h0_source[(cache_idx, i_hv, None, None)]  # (V, K)
+            hta = cute.local_tile(gSrc, (1, vec_size), (va, lane_in_group))
+            htb = cute.local_tile(gSrc, (1, vec_size), (vb, lane_in_group))
+            htc = cute.local_tile(gSrc, (1, vec_size), (vc, lane_in_group))
+            htd = cute.local_tile(gSrc, (1, vec_size), (vd, lane_in_group))
             # Write tiles. In single-pool (same_pool=True), they alias the
             # read tiles — nvcc DCEs the write-side base-pointer arithmetic.
             if cutlass.const_expr(same_pool):
@@ -366,26 +373,11 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                 htc_w = htc
                 htd_w = htd
             else:
-                hta_w = cute.local_tile(
-                    h0_source,
-                    (1, 1, vec_size),
-                    (flat_write_state_idx, va, lane_in_group),
-                )
-                htb_w = cute.local_tile(
-                    h0_source,
-                    (1, 1, vec_size),
-                    (flat_write_state_idx, vb, lane_in_group),
-                )
-                htc_w = cute.local_tile(
-                    h0_source,
-                    (1, 1, vec_size),
-                    (flat_write_state_idx, vc, lane_in_group),
-                )
-                htd_w = cute.local_tile(
-                    h0_source,
-                    (1, 1, vec_size),
-                    (flat_write_state_idx, vd, lane_in_group),
-                )
+                gDst = h0_source[(write_cache_idx, i_hv, None, None)]  # (V, K)
+                hta_w = cute.local_tile(gDst, (1, vec_size), (va, lane_in_group))
+                htb_w = cute.local_tile(gDst, (1, vec_size), (vb, lane_in_group))
+                htc_w = cute.local_tile(gDst, (1, vec_size), (vc, lane_in_group))
+                htd_w = cute.local_tile(gDst, (1, vec_size), (vd, lane_in_group))
             cute.autovec_copy(hta, r_hb4_0)
             cute.autovec_copy(htb, r_hb4_1)
             cute.autovec_copy(htc, r_hb4_2)
@@ -765,7 +757,6 @@ def gdn_wide_vec_kernel(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -873,11 +864,9 @@ def gdn_wide_vec_kernel(
             write_cache_idx = cutlass.Int64(0)
 
     if cache_idx >= 0:
-        flat_state_idx = cache_idx * HV + i_hv
-        if cutlass.const_expr(same_pool):
-            flat_write_state_idx = flat_state_idx
-        else:
-            flat_write_state_idx = write_cache_idx * HV + i_hv
+        # 4D pool: address h0_source by (cache_idx, i_hv, v, lane). No
+        # flat_state_idx; cute applies the (possibly non-contiguous) per-slot
+        # stride directly.
 
         # ==================================================================
         # Phase 0: precompute q/k/g/beta/kq into SMEM (all 4 warps)
@@ -990,19 +979,14 @@ def gdn_wide_vec_kernel(
             v2 = v_base + 2
             v3 = v_base + 3
 
-            # Load 4 V-rows of h (LDG.128 each) into r_h from the read slot.
-            ht0 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_state_idx, v0, lane_in_group)
-            )
-            ht1 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_state_idx, v1, lane_in_group)
-            )
-            ht2 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_state_idx, v2, lane_in_group)
-            )
-            ht3 = cute.local_tile(
-                h0_source, (1, 1, vec), (flat_state_idx, v3, lane_in_group)
-            )
+            # Take a 2D (V, K) sub-tensor at the read slot first. __getitem__
+            # uses int64 base-pointer arithmetic, required when pool_size *
+            # slot_stride * 2 exceeds 2^31 (vLLM padded layout, HV=64, B>=2048).
+            gSrc = h0_source[(cache_idx, i_hv, None, None)]  # (V, K)
+            ht0 = cute.local_tile(gSrc, (1, vec), (v0, lane_in_group))
+            ht1 = cute.local_tile(gSrc, (1, vec), (v1, lane_in_group))
+            ht2 = cute.local_tile(gSrc, (1, vec), (v2, lane_in_group))
+            ht3 = cute.local_tile(gSrc, (1, vec), (v3, lane_in_group))
             # Write-side tiles. In single-pool (same_pool=True), they alias
             # the read tiles — nvcc DCEs the write-side base-pointer
             # arithmetic (the source of the +5-7 % T=1 large-B regression).
@@ -1014,18 +998,11 @@ def gdn_wide_vec_kernel(
                 ht_w2 = ht2
                 ht_w3 = ht3
             else:
-                ht_w0 = cute.local_tile(
-                    h0_source, (1, 1, vec), (flat_write_state_idx, v0, lane_in_group)
-                )
-                ht_w1 = cute.local_tile(
-                    h0_source, (1, 1, vec), (flat_write_state_idx, v1, lane_in_group)
-                )
-                ht_w2 = cute.local_tile(
-                    h0_source, (1, 1, vec), (flat_write_state_idx, v2, lane_in_group)
-                )
-                ht_w3 = cute.local_tile(
-                    h0_source, (1, 1, vec), (flat_write_state_idx, v3, lane_in_group)
-                )
+                gDst = h0_source[(write_cache_idx, i_hv, None, None)]  # (V, K)
+                ht_w0 = cute.local_tile(gDst, (1, vec), (v0, lane_in_group))
+                ht_w1 = cute.local_tile(gDst, (1, vec), (v1, lane_in_group))
+                ht_w2 = cute.local_tile(gDst, (1, vec), (v2, lane_in_group))
+                ht_w3 = cute.local_tile(gDst, (1, vec), (v3, lane_in_group))
             cute.autovec_copy(ht0, r_hb0)
             cute.autovec_copy(ht1, r_hb1)
             cute.autovec_copy(ht2, r_hb2)
@@ -1262,7 +1239,7 @@ def gdn_wide_vec_kernel(
 
 @cute.jit
 def run_gdn_decode_bf16state_mtp_ilp4(
-    h0_source: cute.Tensor,  # [pool_size * HV, V, K] BF16
+    h0_source: cute.Tensor,  # [pool_size, HV, V, K] BF16 (4D, supports strided pool)
     intermediate_states: cute.Tensor,  # [B * T * HV, V, K] BF16 (or dummy)
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -1278,7 +1255,6 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1294,13 +1270,16 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     """Launch the MTP kernel (ILP=4) for BF16 state."""
     tile_v = tile_v_param
     vec_size = MTP_VEC_SIZE
-    _, v_dim, _k_dim = (
+    # 4D source: (pool_size, HV, V, K)
+    _pool_size, _hv_dim, v_dim, _k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
+        h0_source.layout.shape[3],
     )
 
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
+    B = cute.size(q.shape[0])
     grid_size = B * HV * num_v_tiles
 
     smem_bytes = 128
@@ -1327,7 +1306,6 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -1368,7 +1346,6 @@ def _run_wide_vec(
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1382,6 +1359,7 @@ def _run_wide_vec(
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
+    B = cute.size(q.shape[0])
     grid_size = B * HV * num_v_tiles
     smem_bytes = (
         4 * T * (K + 8)  # sQ FP32
@@ -1406,7 +1384,6 @@ def _run_wide_vec(
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -1429,13 +1406,6 @@ def _run_wide_vec(
 # ==============================================================================
 # PUBLIC API
 # ==============================================================================
-# Number of SMs on target GPU (detected dynamically)
-NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
-
-# GPU architecture detected once at import time — avoids per-call
-# torch.cuda.get_device_capability() in the hot path.
-_GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
-_USE_PACKED_FMA = _GPU_MAJOR >= 10
 
 
 def gated_delta_rule(
@@ -1570,7 +1540,9 @@ _compiled_kernels_mtp: dict = {}
 _compiled_kernels_wide_vec: dict = {}
 
 
-def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
+def _select_tile_v_for_mtp(
+    B: int, HV: int, V: int, T: int = 1, *, device: torch.device
+) -> int:
     """Select optimal tile_v for the MTP BF16 kernel based on batch size and T.
 
     tile_v must be a multiple of 4 * MTP_ILP4_ROWS (= 16) and divide V=128.
@@ -1582,13 +1554,13 @@ def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
         num_v_tiles = V // tv
         grid_size = B * HV * num_v_tiles
         # Want at least 4 waves for good occupancy
-        if grid_size >= 4 * NUM_SMS:
+        if grid_size >= 4 * get_num_sm(device):
             return tv
     return 32  # Minimum tile_v for maximum parallelism
 
 
 def _get_bf16_mtp_config(
-    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int
+    batch_size: int, seq_len: int, num_v_heads: int, v_dim: int, *, device: torch.device
 ) -> tuple:
     """Select ``(tile_v, ilp_rows)`` for the BF16 MTP kernel.
 
@@ -1608,7 +1580,9 @@ def _get_bf16_mtp_config(
     if work_units <= 128:
         # Tiny grid: small tile_v gives more CTAs to fill SMs.
         return min(16, v_dim), 4
-    return _select_tile_v_for_mtp(batch_size, num_v_heads, v_dim, seq_len), 4
+    return _select_tile_v_for_mtp(
+        batch_size, num_v_heads, v_dim, seq_len, device=device
+    ), 4
 
 
 # Threshold above which `gated_delta_rule_mtp` dispatches to the wide_vec
@@ -1709,7 +1683,10 @@ def gated_delta_rule_mtp_wide_vec(
     if scale is None:
         scale = 1.0 / math.sqrt(K_val)
 
-    h0_source = initial_state_source.reshape(pool_size * HV_val, V_val, K_val)
+    # Pass the 4D pool tensor directly. cute handles the per-slot stride —
+    # critical for vLLM's layout where slot stride is larger than HV*V*K
+    # because conv_state and ssm_state share an allocation page.
+    h0_source = initial_state_source
 
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
@@ -1733,11 +1710,14 @@ def gated_delta_rule_mtp_wide_vec(
         # Skip the redundant final writeback when caching is on.
         effective_disable_final = True
     else:
-        intermediate_states = h0_source[:1, :1, :1]
+        # Dummy 3D tensor; the kernel never reads it when caching is off.
+        intermediate_states = torch.empty(
+            1, 1, 1, dtype=torch.bfloat16, device=q.device
+        )
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = get_sm_version(q.device) >= 100
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -1746,15 +1726,24 @@ def gated_delta_rule_mtp_wide_vec(
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
+    # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
+    # agnostic); padded/strided pool keeps real pool_size/stride in the key.
+    contiguous_pool = initial_state_source.is_contiguous()
+    if contiguous_pool:
+        pool_size_key = -1
+        pool_slot_stride: tuple[int, ...] = (-1,)
+    else:
+        pool_size_key = pool_size
+        pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
     cache_key = (
-        "v3_mtp_bf16_tiled",
-        B_val,
+        "v3_mtp_bf16_tiled_dynB",
         T_val,
         H_val,
         HV_val,
         K_val,
         V_val,
-        pool_size,
+        pool_size_key,
+        pool_slot_stride,
         tile_v,
         effective_disable_final,
         cache_intermediate_states,
@@ -1765,36 +1754,33 @@ def gated_delta_rule_mtp_wide_vec(
         use_packed_fma,
         same_pool,
     )
-    if cache_key not in _compiled_kernels_wide_vec:
-        default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
-        default_output = torch.empty(
+
+    if initial_state_indices is None:
+        initial_state_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
+    if output is None:
+        output = torch.empty(
             B_val, T_val, HV_val, V_val, device=q.device, dtype=q.dtype
         )
 
-        if initial_state_indices is None:
-            initial_state_indices = default_indices
-        if output is None:
-            output = default_output
-
-        # Compile-time indices template: any [B] int32 on the right device.
-        # Both read and write index tensors share the same shape/dtype so
-        # the same dlpack handle works for both slots.
-        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+    if cache_key not in _compiled_kernels_wide_vec:
+        if contiguous_pool:
+            h_ = _mark_batch_dynamic(h0_source)
+        else:
+            h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
+        if cache_intermediate_states:
+            # Dummy [1,1,1] tensor (caching off) has no unique stride-1 dim.
+            inter_ = _mark_batch_dynamic(intermediate_states)
+        q_ = _mark_batch_dynamic(q)
+        k_ = _mark_batch_dynamic(k)
+        v_ = _mark_batch_dynamic(v)
+        a_ = _mark_batch_dynamic(a)
+        b_ = _mark_batch_dynamic(b)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
-        h0_idx_ = from_dlpack(
-            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        )
-        h0_out_idx_ = from_dlpack(
-            initial_state_indices, assumed_align=32, enable_tvm_ffi=True
-        )
+        o_ = _mark_batch_dynamic(output)
+        h0_idx_ = _mark_batch_dynamic(initial_state_indices)
+        h0_out_idx_ = _mark_batch_dynamic(initial_state_indices)
 
         _compiled_kernels_wide_vec[cache_key] = {
             "compiled": cute.compile(
@@ -1815,7 +1801,6 @@ def gated_delta_rule_mtp_wide_vec(
                 softplus_threshold,
                 scale,
                 HV_val,
-                B_val,
                 T_val,
                 H_val,
                 K_val,
@@ -1829,19 +1814,13 @@ def gated_delta_rule_mtp_wide_vec(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            "default_indices": default_indices,
-            "output": default_output,
         }
 
     cache = _compiled_kernels_wide_vec[cache_key]
-    if initial_state_indices is None:
-        initial_state_indices = cache["default_indices"]
     if output_state_indices is None:
         # Single-pool: read==write. Reuse the same indices tensor — no extra
         # allocation, kernel still produces the same address for both slots.
         output_state_indices = initial_state_indices
-    if output is None:
-        output = cache["output"]
 
     cache["compiled"](
         h0_source,
@@ -1931,8 +1910,10 @@ def gated_delta_rule_mtp(
     if output_state_indices is not None and output_state_indices.dtype != torch.int32:
         output_state_indices = output_state_indices.to(torch.int32)
 
-    # Reshape state to [pool_size * HV, V, K]
-    h0_source = initial_state_source.reshape(pool_size * HV, V, K)
+    # Pass the 4D pool tensor directly. cute handles the per-slot stride —
+    # critical for vLLM's layout where slot stride is larger than HV*V*K
+    # because conv_state and ssm_state share an allocation page.
+    h0_source = initial_state_source
 
     # Handle intermediate states. The cache buffer is BATCH-scoped: shape
     # [B, T, HV, V, K]. The kernel indexes it by i_n (per-call batch index),
@@ -1956,9 +1937,10 @@ def gated_delta_rule_mtp(
         if not intermediate_states.is_contiguous():
             intermediate_states = intermediate_states.contiguous()
     else:
-        intermediate_states = h0_source[
-            :1, :1, :1
-        ]  # Reuse existing allocation as dummy
+        # Dummy 3D tensor; the kernel never reads it when caching is off.
+        intermediate_states = torch.empty(
+            1, 1, 1, dtype=torch.bfloat16, device=q.device
+        )
 
     # Dispatch to the wide_vec kernel when work_units (B*HV) amortizes its
     # lower per-CTA parallelism. ``_select_wide_vec_tile_v`` picks tile_v
@@ -1994,25 +1976,34 @@ def gated_delta_rule_mtp(
     # redirected here). Falls to the ILP=4 MTP path
     # (mtp_ilp4_kernel), which natively supports both single- and
     # split-pool, so the config picker is independent of pool mode.
-    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
+    tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V, device=q.device)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = get_sm_version(q.device) >= 100
     # Set same_pool=True when reads and writes alias (single-pool); the
     # kernel then DCEs write-side base-pointer arithmetic.
     same_pool = (
         output_state_indices is None or output_state_indices is initial_state_indices
     )
 
+    # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
+    # agnostic); padded/strided pool keeps real pool_size/stride in the key.
+    contiguous_pool = initial_state_source.is_contiguous()
+    if contiguous_pool:
+        pool_size_key = -1
+        pool_slot_stride: tuple[int, ...] = (-1,)
+    else:
+        pool_size_key = pool_size
+        pool_slot_stride = tuple(int(s) for s in initial_state_source.stride())
     cache_key = (
-        "mtp_bf16",
-        B,
+        "mtp_bf16_dynB",
         T,
         H,
         HV,
         K,
         V,
-        pool_size,
+        pool_size_key,
+        pool_slot_stride,
         tile_v,
         ilp_rows,
         disable_state_update,
@@ -2024,29 +2015,30 @@ def gated_delta_rule_mtp(
         use_packed_fma,
         same_pool,
     )
-    if cache_key not in _compiled_kernels_mtp:
-        # First call for this shape: allocate default indices/output and do
-        # dlpack conversions once for compilation. Steady-state calls pass
-        # torch tensors straight to the compiled callable (tvm-ffi accepts
-        # either) and reuse these cached defaults when the caller doesn't
-        # provide their own.
-        default_indices = torch.arange(B, dtype=torch.int32, device=q.device)
-        default_output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
-        h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
+    if initial_state_indices is None:
+        initial_state_indices = torch.arange(B, dtype=torch.int32, device=q.device)
+    if output is None:
+        output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
+
+    if cache_key not in _compiled_kernels_mtp:
+        if contiguous_pool:
+            h_ = _mark_batch_dynamic(h0_source)
+        else:
+            h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-        k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-        v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-        a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-        b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
+        if cache_intermediate_states:
+            inter_ = _mark_batch_dynamic(intermediate_states)
+        q_ = _mark_batch_dynamic(q)
+        k_ = _mark_batch_dynamic(k)
+        v_ = _mark_batch_dynamic(v)
+        a_ = _mark_batch_dynamic(a)
+        b_ = _mark_batch_dynamic(b)
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-        o_ = from_dlpack(default_output, assumed_align=32, enable_tvm_ffi=True)
-        h0_idx_ = from_dlpack(default_indices, assumed_align=32, enable_tvm_ffi=True)
-        h0_out_idx_ = from_dlpack(
-            default_indices, assumed_align=32, enable_tvm_ffi=True
-        )
+        o_ = _mark_batch_dynamic(output)
+        h0_idx_ = _mark_batch_dynamic(initial_state_indices)
+        h0_out_idx_ = _mark_batch_dynamic(initial_state_indices)
 
         _compiled_kernels_mtp[cache_key] = {
             "compiled": cute.compile(
@@ -2067,7 +2059,6 @@ def gated_delta_rule_mtp(
                 softplus_threshold,
                 scale,
                 HV,
-                B,
                 T,
                 H,
                 K,
@@ -2081,16 +2072,12 @@ def gated_delta_rule_mtp(
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
-            "default_indices": default_indices,
-            "output": default_output,
         }
 
     cache = _compiled_kernels_mtp[cache_key]
 
     if output_state_indices is None:
         output_state_indices = initial_state_indices
-    if output is None:
-        output = cache["output"]
 
     cache["compiled"](
         h0_source,
