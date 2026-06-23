@@ -74,8 +74,8 @@ struct MLAParams {
   // Per-tensor symmetric quantization scales for the FP8 KV cache path.
   // Both default to 1.0 and have no effect on the BF16/FP16 KV path.
   // dequantized = ckv_scale * static_cast<float>(ckv_fp8); same for kpe.
-  float ckv_scale;
-  float kpe_scale;
+  float ckv_scale = 1.f;
+  float kpe_scale = 1.f;
   bool return_lse_base_on_e;
 };
 

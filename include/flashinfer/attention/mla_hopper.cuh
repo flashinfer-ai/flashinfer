@@ -354,12 +354,18 @@ __device__ __forceinline__ void load_kv(typename KTraits::SharedStorage* smem_st
 template <typename KTraits>
 __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedStorage* smem_storage,
                                                       const uint32_t stage_idx, float ckv_scale,
-                                                      float kpe_scale, uint32_t thread_id,
-                                                      uint32_t num_threads) {
+                                                      float kpe_scale) {
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
   static_assert(std::is_same_v<DTypeKV, __nv_fp8_e4m3>,
                 "repack_fp8_kv_to_bf16 only supports DTypeKV == __nv_fp8_e4m3");
+
+  // Only consumer warpgroup does the dequant; producer wg early-returns.
+  // The helper has no internal barriers, so this is safe — the surrounding
+  // __syncthreads() at the call sites covers cross-wg synchronization.
+  if (threadIdx.x < KTraits::NUM_COPY_THREADS) return;
+  const uint32_t thread_id = threadIdx.x - KTraits::NUM_COPY_THREADS;
+  const uint32_t num_threads = KTraits::NUM_QK_THREADS;
 
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
@@ -1063,9 +1069,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
           // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
           // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
-          repack_fp8_kv_to_bf16<KTraits>(
-              &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
-              threadIdx.x - KTraits::NUM_COPY_THREADS, KTraits::NUM_QK_THREADS);
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
+                                         variant.ckv_scale, variant.kpe_scale);
           // s2: ensures dequant is complete before any wg reads BF16 staging.
           __syncthreads();
         }
@@ -1109,9 +1114,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
           // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
           // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
-          repack_fp8_kv_to_bf16<KTraits>(
-              &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
-              threadIdx.x - KTraits::NUM_COPY_THREADS, KTraits::NUM_QK_THREADS);
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
+                                         variant.ckv_scale, variant.kpe_scale);
           // s2: ensures dequant is complete before any wg reads BF16 staging.
           __syncthreads();
         }
@@ -1152,9 +1156,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
           // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
           // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
-          repack_fp8_kv_to_bf16<KTraits>(
-              &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
-              threadIdx.x - KTraits::NUM_COPY_THREADS, KTraits::NUM_QK_THREADS);
+          repack_fp8_kv_to_bf16<KTraits>(&smem_storage, smem_pipe_read_kv.index(),
+                                         variant.ckv_scale, variant.kpe_scale);
           // s2: ensures dequant is complete before any wg reads BF16 staging.
           __syncthreads();
         }

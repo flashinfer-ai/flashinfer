@@ -1595,6 +1595,15 @@ class BatchMLAPagedAttentionWrapper:
                     "FP8 kv_data_type for MLA is only supported with the fa3 "
                     f"backend on SM90, got backend={self._backend!r}."
                 )
+            # backend=="fa3" alone does not guarantee an SM90 runtime device
+            # (the user can force fa3 on any Hopper / non-Hopper config).
+            # Fail before JIT-compiling a module the device can't actually run.
+            major, minor = get_compute_capability(self.device)
+            if major != 9:
+                raise ValueError(
+                    "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
+                    f"got SM{major}{minor}."
+                )
             # The FP8 KV path was developed and tested for BF16 Q; while
             # `vec_cast<half, __nv_fp8_e4m3>` exists in vec_dtypes.cuh, the
             # FP16 Q + FP8 KV combination has no test coverage in this PR.
@@ -1852,8 +1861,10 @@ class BatchMLAPagedAttentionWrapper:
             )
 
         # plan() already gated unsupported FP8 backend / dtype combos before
-        # JIT compilation; here we only validate the runtime scales.
-        kv_is_fp8 = self._kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+        # JIT compilation; here we only validate the runtime scales. The
+        # MLA FP8 KV path currently only supports e4m3fn (plan() rejects
+        # other FP8 dtypes), so we compare exactly rather than via a tuple.
+        kv_is_fp8 = self._kv_data_type == torch.float8_e4m3fn
         if kv_is_fp8:
             if ckv_scale is None or kpe_scale is None:
                 raise ValueError(
