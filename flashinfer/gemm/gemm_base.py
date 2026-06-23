@@ -2304,6 +2304,35 @@ def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
     return plan_index
 
 
+def _finalize_cudnn_graph_for_tactic(
+    graph, tactic, heur_modes, deselect_eng0: bool = False
+) -> None:
+    graph.validate()
+    graph.build_operation_graph()
+
+    if _is_cudnn_engine_knob_tactic(tactic):
+        engine_id, knob_items = tactic
+        graph.create_execution_plan(
+            int(engine_id), _cudnn_knob_items_to_dict(knob_items)
+        )
+        policy = None
+    else:
+        graph.create_execution_plans(heur_modes)
+        policy = (
+            cudnn.build_plan_policy.HEURISTICS_CHOICE
+            if tactic < 0
+            else cudnn.build_plan_policy.ALL
+        )
+        if deselect_eng0:
+            graph.deselect_engines(["eng0"])
+
+    graph.check_support()
+    if policy is None:
+        graph.build_plans()
+    else:
+        graph.build_plans(policy)
+
+
 def clear_cudnn_graph_cache() -> None:
     """Invalidate all process-local cuDNN GEMM graph caches **and** the
     AutoTuner profiling cache.
@@ -2504,32 +2533,12 @@ def build_cudnn_gemm_fp4_graph(
         block_descale_b_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_B_UID.value)
         c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
-        graph.validate()
-        graph.build_operation_graph()
-        if _is_cudnn_engine_knob_tactic(tactic):
-            engine_id, knob_items = tactic
-            graph.create_execution_plan(
-                int(engine_id), _cudnn_knob_items_to_dict(knob_items)
-            )
-            policy = None
-        else:
-            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-            policy = (
-                cudnn.build_plan_policy.HEURISTICS_CHOICE
-                if tactic < 0
-                else cudnn.build_plan_policy.ALL
-            )
-
-        # WAR: The alpha (contains the global scale) is not supported by the cuBLAS backend (eng0)
-        # in older cuDNN versions, so we deselect it.
-        if (alpha_is_not_none) and (not _is_cublas_fp4_available_in_cudnn()):
-            graph.deselect_engines(["eng0"])
-
-        graph.check_support()
-        if policy is None:
-            graph.build_plans()
-        else:
-            graph.build_plans(policy)
+        _finalize_cudnn_graph_for_tactic(
+            graph,
+            tactic,
+            [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK],
+            deselect_eng0=alpha_is_not_none and not _is_cublas_fp4_available_in_cudnn(),
+        )
 
         return graph
 
@@ -2708,27 +2717,9 @@ def build_cudnn_gemm_fp4_graph_override_shape(
     block_descale_b_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_B_UID.value)
     c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
-    graph.validate()
-    graph.build_operation_graph()
-    if _is_cudnn_engine_knob_tactic(tactic):
-        engine_id, knob_items = tactic
-        graph.create_execution_plan(
-            int(engine_id), _cudnn_knob_items_to_dict(knob_items)
-        )
-        policy = None
-    else:
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        policy = (
-            cudnn.build_plan_policy.HEURISTICS_CHOICE
-            if tactic < 0
-            else cudnn.build_plan_policy.ALL
-        )
-
-    graph.check_support()
-    if policy is None:
-        graph.build_plans()
-    else:
-        graph.build_plans(policy)
+    _finalize_cudnn_graph_for_tactic(
+        graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+    )
 
     return graph
 
@@ -2978,26 +2969,9 @@ def build_cudnn_gemm_mxfp8_graph_override_shape(
     block_descale_b_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_B_UID.value)
     c_tensor.set_uid(UIDs.O_UID.value)
 
-    graph.validate()
-    graph.build_operation_graph()
-    if _is_cudnn_engine_knob_tactic(tactic):
-        engine_id, knob_items = tactic
-        graph.create_execution_plan(
-            int(engine_id), _cudnn_knob_items_to_dict(knob_items)
-        )
-        policy = None
-    else:
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        policy = (
-            cudnn.build_plan_policy.HEURISTICS_CHOICE
-            if tactic < 0
-            else cudnn.build_plan_policy.ALL
-        )
-    graph.check_support()
-    if policy is None:
-        graph.build_plans()
-    else:
-        graph.build_plans(policy)
+    _finalize_cudnn_graph_for_tactic(
+        graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+    )
 
     return graph
 
@@ -3186,26 +3160,9 @@ def build_cudnn_gemm_fp8_graph(
         b_scale_cudnn_tensor.set_uid(UIDs.B_SCALE_UID.value)
         c_after_scale_b_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
-        graph.validate()
-        graph.build_operation_graph()
-        if _is_cudnn_engine_knob_tactic(tactic):
-            engine_id, knob_items = tactic
-            graph.create_execution_plan(
-                int(engine_id), _cudnn_knob_items_to_dict(knob_items)
-            )
-            policy = None
-        else:
-            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-            policy = (
-                cudnn.build_plan_policy.HEURISTICS_CHOICE
-                if tactic < 0
-                else cudnn.build_plan_policy.ALL
-            )
-        graph.check_support()
-        if policy is None:
-            graph.build_plans()
-        else:
-            graph.build_plans(policy)
+        _finalize_cudnn_graph_for_tactic(
+            graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+        )
 
         return graph
 
@@ -3323,26 +3280,9 @@ def build_cudnn_gemm_fp8_graph_override_shape(
     b_scale_cudnn_tensor.set_uid(UIDs.B_SCALE_UID.value)
     c_after_scale_b.set_uid(UIDs.O_UID.value)
 
-    graph.validate()
-    graph.build_operation_graph()
-    if _is_cudnn_engine_knob_tactic(tactic):
-        engine_id, knob_items = tactic
-        graph.create_execution_plan(
-            int(engine_id), _cudnn_knob_items_to_dict(knob_items)
-        )
-        policy = None
-    else:
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        policy = (
-            cudnn.build_plan_policy.HEURISTICS_CHOICE
-            if tactic < 0
-            else cudnn.build_plan_policy.ALL
-        )
-    graph.check_support()
-    if policy is None:
-        graph.build_plans()
-    else:
-        graph.build_plans(policy)
+    _finalize_cudnn_graph_for_tactic(
+        graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+    )
 
     return graph
 
@@ -3659,26 +3599,9 @@ def build_cudnn_gemm_bf16_graph(
         b_cudnn_tensor.set_uid(UIDs.B_UID.value)
         c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
-        graph.validate()
-        graph.build_operation_graph()
-        if _is_cudnn_engine_knob_tactic(tactic):
-            engine_id, knob_items = tactic
-            graph.create_execution_plan(
-                int(engine_id), _cudnn_knob_items_to_dict(knob_items)
-            )
-            policy = None
-        else:
-            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-            policy = (
-                cudnn.build_plan_policy.HEURISTICS_CHOICE
-                if tactic < 0
-                else cudnn.build_plan_policy.ALL
-            )
-        graph.check_support()
-        if policy is None:
-            graph.build_plans()
-        else:
-            graph.build_plans(policy)
+        _finalize_cudnn_graph_for_tactic(
+            graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+        )
 
         return graph
 
@@ -3806,26 +3729,9 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     b_cudnn_tensor.set_uid(UIDs.B_UID.value)
     c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
-    graph.validate()
-    graph.build_operation_graph()
-    if _is_cudnn_engine_knob_tactic(tactic):
-        engine_id, knob_items = tactic
-        graph.create_execution_plan(
-            int(engine_id), _cudnn_knob_items_to_dict(knob_items)
-        )
-        policy = None
-    else:
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        policy = (
-            cudnn.build_plan_policy.HEURISTICS_CHOICE
-            if tactic < 0
-            else cudnn.build_plan_policy.ALL
-        )
-    graph.check_support()
-    if policy is None:
-        graph.build_plans()
-    else:
-        graph.build_plans(policy)
+    _finalize_cudnn_graph_for_tactic(
+        graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+    )
 
     return graph
 
@@ -8768,26 +8674,9 @@ def build_cudnn_gemm_mxfp8_graph(
         block_descale_b_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_B_UID.value)
         c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
-        graph.validate()
-        graph.build_operation_graph()
-        if _is_cudnn_engine_knob_tactic(tactic):
-            engine_id, knob_items = tactic
-            graph.create_execution_plan(
-                int(engine_id), _cudnn_knob_items_to_dict(knob_items)
-            )
-            policy = None
-        else:
-            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-            policy = (
-                cudnn.build_plan_policy.HEURISTICS_CHOICE
-                if tactic < 0
-                else cudnn.build_plan_policy.ALL
-            )
-        graph.check_support()
-        if policy is None:
-            graph.build_plans()
-        else:
-            graph.build_plans(policy)
+        _finalize_cudnn_graph_for_tactic(
+            graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+        )
 
         return graph
 
