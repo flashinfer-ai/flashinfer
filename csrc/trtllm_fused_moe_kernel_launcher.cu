@@ -523,12 +523,13 @@ class FusedMoeLauncher {
         ;
     // FIXME(siyuan): currently only nvfp4 x nvfp4 uses per-token scaling in both FC1 and FC2
     bool usePerTokenScalingGemm2 = per_token_scales.has_value() && mDtypeAct == btg::Dtype::E2m1;
-    // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8, use the
-    // weights-only Runner constructor to match the original kernel path and numerics.
+    // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8 and no
+    // gemm1 bias, use the weights-only Runner constructor to match the original kernel
+    // path and numerics. DSFp8 + biasMn routes through the unified constructor below
+    // (which accepts gemm1_bias_type).
     if (this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
-        args->mUseDeepSeekFp8) {
-      TVM_FFI_ICHECK(args->gemm1_bias_type == batchedGemm::gemm::BiasType::None)
-          << "DeepSeek FP8 MoE does not support a gemm1_bias_type other than None";
+        args->mUseDeepSeekFp8 &&
+        args->gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
       moe_runner = std::make_unique<RunnerType>(this->mDtypeWeights, args->mUseDeepSeekFp8,
                                                 (int32_t)tile_tokens_dim, this->use_shuffled_weight,
                                                 this->weight_layout, usePerTokenScalingGemm1,
@@ -1398,10 +1399,6 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
                     bool use_routing_scales_on_input = false, bool use_deep_seek_fp8 = false,
                     bool return_activation_output = false) override {
-    if (return_activation_output) {
-      TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8)
-          << "return_activation_output is only supported for MxFp8 block-scale MoE";
-    }
     check_routing();
     prepare_routing();
 
@@ -1473,9 +1470,11 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     for (int32_t tile_N : selected_tile_nums) {
       std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
       // Keep getValidConfigs constructor path aligned with runtime prepare_moe_common().
-      // This branch is for DeepSeek FP8 (E4m3 activations + E4m3 weights).
+      // DSFp8 without bias uses the weights-only constructor;
+      // DSFp8 + biasMn routes through the unified constructor below.
       if (quantization_type == Fp8QuantizationType::DeepSeekFp8 && dtype_act == btg::Dtype::E4m3 &&
-          dtype_weights == btg::Dtype::E4m3) {
+          dtype_weights == btg::Dtype::E4m3 &&
+          gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
         TVM_FFI_ICHECK(static_cast<int>(activation_type) ==
                        static_cast<int>(ActivationType::Swiglu))
             << "DeepSeekFp8 only supports ActivationType::Swiglu, got "
@@ -2319,10 +2318,6 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
-  if (gemm1_lora_delta.has_value() && quantization_type != Fp8QuantizationType::MxFp8) {
-    TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "FP8 block-scale MoE only supports lora delta for MxFp8.";
-  }
   auto const dtype_act =
       quantization_type == Fp8QuantizationType::DeepSeekFp8 ? btg::Dtype::E4m3 : btg::Dtype::MxE4m3;
   auto const dtype_weights =
@@ -2654,9 +2649,6 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
 
   } else if (fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
-    if (has_gemm1_lora_delta) {
-      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "DeepSeek FP8 MoE does not support lora delta";
-    }
     if (activation_type != ActivationType::Swiglu) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "DeepSeekFp8 only supports ActivationType::Swiglu, "

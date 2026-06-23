@@ -2093,13 +2093,6 @@ def get_trtllm_moe_sm100_module():
             if fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
             else DtypeTrtllmGen.MxE4m3
         )  # FP8 weights
-        if (
-            gemm1_lora_delta is not None
-            and fp8_quantization_type != Fp8QuantizationType.MxFp8
-        ):
-            raise NotImplementedError(
-                "LoRA delta is only supported for MxFp8 block-scale MoE."
-            )
         _validate_fp8_block_scale_gemm1_activation_params(
             fp8_quantization_type,
             activation_type,
