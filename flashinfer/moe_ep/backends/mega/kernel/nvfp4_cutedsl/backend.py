@@ -1,4 +1,11 @@
-"""CuTeDSL NVFP4 mega-MoE kernel backend."""
+"""CuTeDSL NVFP4 mega-MoE kernel backend.
+
+The fused kernel consumes NVFP4 expert weights in kernel-ready layout (packed
+weights + atom-swizzled scale factors). ``MoEWeightPack`` supplies canonical
+bf16 ``w13``/``w2`` by default; ``preprocess_weights()`` quantizes and swizzles
+them. Pass pre-quantized NVFP4 weights via ``w13``/``w2`` + ``w13_scale``/``w2_scale``
+to skip re-quantization.
+"""
 
 from __future__ import annotations
 
@@ -95,6 +102,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
+            fc1_alpha=k.fc1_alpha,
+            fc2_alpha=k.fc2_alpha,
+            fc1_norm_const=k.fc1_norm_const,
         )
 
     def validate_forward(
@@ -132,25 +142,31 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx[:num_tokens],
                 workspace.topk_weights[:num_tokens],
             )
-            return
+        else:
+            from common.megamoe_constants import Nvfp4BlockSize
+            from moe_nvfp4_swapab.runner_common import ceil_div, round_up
 
-        from common.megamoe_constants import Nvfp4BlockSize
-        from moe_nvfp4_swapab.runner_common import ceil_div, round_up
+            hidden = workspace.hidden
+            hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
+            hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
 
-        hidden = workspace.hidden
-        hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
-        hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
+            workspace.x[:num_tokens].copy_(t.hidden_states)
+            assert t.scales is not None
+            workspace.x_sf[:num_tokens].zero_()
+            workspace.x_sf[:num_tokens, :hidden_sf_cols].copy_(
+                t.scales[:num_tokens, :hidden_sf_cols]
+            )
+            if t.scales.shape[1] >= hidden_sf_cols_padded:
+                workspace.x_sf[:num_tokens, hidden_sf_cols:hidden_sf_cols_padded].zero_()
+            workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
+            workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
 
-        workspace.x[:num_tokens].copy_(t.hidden_states)
-        assert t.scales is not None
-        workspace.x_sf[:num_tokens].zero_()
-        workspace.x_sf[:num_tokens, :hidden_sf_cols].copy_(
-            t.scales[:num_tokens, :hidden_sf_cols]
-        )
-        if t.scales.shape[1] >= hidden_sf_cols_padded:
-            workspace.x_sf[:num_tokens, hidden_sf_cols:hidden_sf_cols_padded].zero_()
-        workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
-        workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
+        if t.fc1_alpha is not None:
+            workspace.fc1_alpha.copy_(t.fc1_alpha)
+        if t.fc2_alpha is not None:
+            workspace.fc2_alpha.copy_(t.fc2_alpha)
+        if t.fc1_norm_const is not None:
+            workspace.fc1_norm_const.copy_(t.fc1_norm_const)
 
     def compute(
         self,

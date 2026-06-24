@@ -117,6 +117,10 @@ Mega backends declare requirements via `MegaKernelBackend.runtime_requirements()
 **Mega staging:** `stage_inputs=True` accepts bf16 activations; `False` expects caller-supplied
 quantized `hidden_states` + `scales` (NVFP4 packed shape `[T, hidden/2]`).
 
+**Mega weights (`nvfp4_cutedsl`):** kernel launch expects NVFP4 + swizzled-SF expert weights.
+`MoEWeightPack` may be bf16 (quantized at init when `preprocess_weights=True`, default) or
+pre-quantized NVFP4 with `w13_scale` / `w2_scale`.
+
 ## Usage
 
 Entry point: `flashinfer.moe_ep.MoEEpLayer`.

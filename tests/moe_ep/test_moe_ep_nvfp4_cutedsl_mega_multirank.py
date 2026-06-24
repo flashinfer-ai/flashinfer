@@ -8,6 +8,12 @@ package (``pip install -e cutedsl_megamoe/front_end``).
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
+
+Weights: the CuTeDSL kernel consumes NVFP4 expert weights in kernel-ready
+(swizzled scale-factor) layout. These tests pass canonical bf16
+:class:`~flashinfer.moe_ep.MoEWeightPack`; the layer quantizes them at init via
+``preprocess_weights=True`` (see ``preprocess_mega_weights``). To supply
+pre-quantized NVFP4 weights instead, pass ``w13``/``w2`` plus ``w13_scale``/``w2_scale``.
 """
 
 from __future__ import annotations
@@ -57,6 +63,15 @@ def _make_inputs(
         topk_weights.to(torch.float32),
         topk_ids.to(torch.int64),
     )
+
+
+def _make_epilogue_params(rank: int, num_local_experts: int):
+    import torch
+
+    from cutedsl_nvfp4_mega_moe_front_end import make_dummy_epilogue_params
+
+    g = torch.Generator(device="cuda").manual_seed(19 + rank)
+    return make_dummy_epilogue_params(num_local_experts, generator=g)
 
 
 def _make_bf16_weights(
@@ -116,6 +131,9 @@ def _mega_problem(rank: int, world_size: int):
         hidden=hidden,
         intermediate=intermediate,
     )
+    fc1_alpha, fc2_alpha, fc1_norm_const = _make_epilogue_params(
+        rank, num_local_experts
+    )
     return dict(
         hidden=hidden,
         intermediate=intermediate,
@@ -130,6 +148,9 @@ def _mega_problem(rank: int, world_size: int):
         topk_ids=topk_ids,
         w13=w13,
         w2=w2,
+        fc1_alpha=fc1_alpha,
+        fc2_alpha=fc2_alpha,
+        fc1_norm_const=fc1_norm_const,
     )
 
 
@@ -158,6 +179,9 @@ def _reference_nvfp4_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
+        fc1_alpha=problem["fc1_alpha"],
+        fc2_alpha=problem["fc2_alpha"],
+        fc1_norm_const=problem["fc1_norm_const"],
     )
     num_tokens = problem["num_tokens"]
     stage_mega_moe_inputs(
@@ -220,6 +244,9 @@ def _reference_nvfp4_mega_moe_prestaged(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
+        fc1_alpha=problem["fc1_alpha"],
+        fc2_alpha=problem["fc2_alpha"],
+        fc1_norm_const=problem["fc1_norm_const"],
     )
     num_tokens = problem["num_tokens"]
     symm_buffer.x[:num_tokens].copy_(x_nvfp4)
@@ -253,6 +280,24 @@ def _reference_nvfp4_mega_moe_prestaged(
     return y
 
 
+def _megakernel_config(problem: dict, *, epilogue_via_config: bool):
+    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+
+    kwargs = dict(
+        intermediate_size=problem["intermediate"],
+        top_k=problem["topk"],
+        gate_up_clamp=problem["gate_up_clamp"],
+        fast_math=problem["fast_math"],
+    )
+    if epilogue_via_config:
+        kwargs.update(
+            fc1_alpha=problem["fc1_alpha"],
+            fc2_alpha=problem["fc2_alpha"],
+            fc1_norm_const=problem["fc1_norm_const"],
+        )
+    return Nvfp4CutedslMegaMoeConfig(**kwargs)
+
+
 def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
     import torch
     import torch.distributed as dist
@@ -265,7 +310,6 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
         MoEEpMegaLayer,
         MoEEpTensors,
         MoEWeightPack,
-        Nvfp4CutedslMegaMoeConfig,
         bootstrap_moe_ep_runtime,
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
@@ -278,20 +322,16 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
 
-    kernel_cfg = Nvfp4CutedslMegaMoeConfig(
-        intermediate_size=1024,
-        top_k=4,
-        gate_up_clamp=10.0,
-        fast_math=True,
+    problem = _mega_problem(rank, world_size)
+    kernel = create_mega_kernel(
+        _megakernel_config(problem, epilogue_via_config=stage_inputs)
     )
-    kernel = create_mega_kernel(kernel_cfg)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
         kernel.runtime_requirements(bootstrap),
     )
 
     try:
-        problem = _mega_problem(rank, world_size)
         if stage_inputs:
             t_hidden = problem["hidden_states"]
             t_scales = None
@@ -335,11 +375,8 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
                 weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
             ),
             backend=MegaConfig(
-                megakernel=Nvfp4CutedslMegaMoeConfig(
-                    intermediate_size=problem["intermediate"],
-                    top_k=problem["topk"],
-                    gate_up_clamp=problem["gate_up_clamp"],
-                    fast_math=problem["fast_math"],
+                megakernel=_megakernel_config(
+                    problem, epilogue_via_config=stage_inputs
                 ),
                 stage_inputs=stage_inputs,
                 preprocess_weights=True,
@@ -347,11 +384,19 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
         )
         assert isinstance(mega, MoEEpMegaLayer)
 
+        tensor_kwargs = {}
+        if not stage_inputs:
+            tensor_kwargs = dict(
+                fc1_alpha=problem["fc1_alpha"],
+                fc2_alpha=problem["fc2_alpha"],
+                fc1_norm_const=problem["fc1_norm_const"],
+            )
         t = MoEEpTensors(
             hidden_states=t_hidden,
             topk_ids=problem["topk_ids"],
             topk_weights=problem["topk_weights"],
             scales=t_scales,
+            **tensor_kwargs,
         )
         y_layer = mega.forward(t)
         torch.cuda.synchronize()
@@ -378,7 +423,11 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
-    """MoEEpMegaLayer (nvfp4_cutedsl) with on-the-fly bf16→NVFP4 staging."""
+    """MoEEpMegaLayer (nvfp4_cutedsl) with on-the-fly bf16→NVFP4 staging.
+
+    Per-expert ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const`` are supplied
+    via :class:`Nvfp4CutedslMegaMoeConfig` (workspace allocation).
+    """
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
@@ -390,7 +439,11 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
-    """MoEEpMegaLayer (nvfp4_cutedsl) with pre-staged NVFP4 activations."""
+    """MoEEpMegaLayer (nvfp4_cutedsl) with pre-staged NVFP4 activations.
+
+    Per-expert epilogue scalars are supplied via :class:`MoEEpTensors` and copied
+    into the symm workspace during ``stage_inputs``.
+    """
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:

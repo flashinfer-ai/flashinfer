@@ -27,5 +27,8 @@ class MoEEpTensors:
     topk_ids: "torch.Tensor"
     topk_weights: "torch.Tensor"
     scales: Optional["torch.Tensor"] = None
+    fc1_alpha: Optional["torch.Tensor"] = None
+    fc2_alpha: Optional["torch.Tensor"] = None
+    fc1_norm_const: Optional["torch.Tensor"] = None
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
