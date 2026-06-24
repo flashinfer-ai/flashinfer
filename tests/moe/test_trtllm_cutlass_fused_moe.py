@@ -16,9 +16,10 @@ limitations under the License.
 
 from contextlib import nullcontext
 import os
+import struct
 
 import pytest
-from flashinfer.fused_moe.core import ActivationType
+from flashinfer.fused_moe.core import ActivationType, get_cutlass_fused_moe_module
 import torch
 from torch.nn import functional as F
 
@@ -2700,6 +2701,209 @@ def _dequant_mxfp4_humming_prescale_on_device(
     return fp8_raw.view(torch.float8_e4m3fn).to(torch.float32)
 
 
+def _make_humming_e8m0_weight_scale(
+    shape: tuple[int, ...],
+    device: torch.device,
+    low: int = 114,
+    high: int = 128,
+) -> torch.Tensor:
+    """Generate deterministic raw E8M0 scale bytes for Humming preprocessing."""
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    values = torch.arange(numel, device=device, dtype=torch.int32)
+    return (low + values.remainder(high - low)).to(torch.uint8).reshape(shape)
+
+
+def _reference_humming_e8m0_weight_scale(
+    raw_scale: torch.Tensor,
+    max_range: int = 11,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Self-contained reference for the Humming-style scale clamp."""
+    num_experts = raw_scale.shape[0]
+    scale_view = raw_scale.contiguous().view(num_experts, -1)
+    scale_max = scale_view.max(dim=1, keepdim=True).values
+    scale_min = scale_view.min(dim=1, keepdim=True).values
+    max_range_tensor = torch.tensor(max_range, dtype=torch.uint8, device=raw_scale.device)
+    scale_range = torch.minimum(scale_max - scale_min, max_range_tensor)
+    scale_min_new = scale_max - scale_range
+
+    clamped_scale = scale_view.maximum(scale_min_new)
+    delta_scale_offsets = (clamped_scale - scale_view).to(torch.uint8)
+    offset = torch.bitwise_and(clamped_scale - scale_min_new + 1, 0x0F).to(
+        torch.uint8
+    )
+    residual = torch.exp2(scale_min_new.squeeze(1).to(torch.float32) - 127.0) * 0.5
+    return (
+        offset.view_as(raw_scale).contiguous(),
+        residual.contiguous(),
+        delta_scale_offsets.view_as(raw_scale).contiguous(),
+    )
+
+
+def _humming_payload_rewrite_lut(device: torch.device) -> torch.Tensor:
+    def float_from_bits(bits: int) -> float:
+        return struct.unpack("f", struct.pack("I", bits & 0xFFFFFFFF))[0]
+
+    def bits_from_float(value: float) -> int:
+        return struct.unpack("I", struct.pack("f", value))[0]
+
+    def dequant_fp4_val(code: int) -> float:
+        sign = (code & 0x8) << 28
+        other = (code & 0x7) << 22
+        return float_from_bits(sign | other)
+
+    def quant_to_fp4_val(value: float) -> int:
+        value_bits = bits_from_float(value)
+        mask = 0x81C00000
+        rz_bits = value_bits & mask
+        ru_bits = (value_bits + 0x00200000) & mask
+        rz_value = float_from_bits(rz_bits)
+        ru_value = float_from_bits(ru_bits)
+        rounded_bits = (
+            ru_bits if abs(value - rz_value) >= abs(value - ru_value) else rz_bits
+        )
+        return ((rounded_bits & 0x80000000) >> 28) | (
+            (rounded_bits & 0x01C00000) >> 22
+        )
+
+    lut = torch.empty((256, 16), dtype=torch.uint8)
+    for delta in range(256):
+        scale_factor = float_from_bits(0x3F800000 - (delta << 23))
+        for code in range(16):
+            normalized_code = 0 if code == 8 else code
+            if delta:
+                normalized_code = quant_to_fp4_val(
+                    dequant_fp4_val(normalized_code) * scale_factor
+                )
+            lut[delta, code] = normalized_code
+    return lut.to(device)
+
+
+def _reference_humming_payload_rewrite(
+    weight: torch.Tensor,
+    delta_scale_offsets: torch.Tensor,
+) -> torch.Tensor:
+    lut = _humming_payload_rewrite_lut(weight.device)
+    lo = weight & 0x0F
+    hi = (weight >> 4) & 0x0F
+    fp4_codes = torch.stack([lo, hi], dim=-1).reshape(*weight.shape[:-1], -1)
+    delta = delta_scale_offsets.repeat_interleave(32, dim=-1).to(torch.long)
+    rewritten = lut[delta, fp4_codes.to(torch.long)]
+    return (rewritten[..., 0::2] | (rewritten[..., 1::2] << 4)).contiguous()
+
+
+def _assert_humming_payload_rewrite_bit_equal(
+    weight: torch.Tensor,
+    delta_scale_offsets: torch.Tensor,
+    processed_weight: torch.Tensor,
+) -> None:
+    reference_weight = _reference_humming_payload_rewrite(
+        weight, delta_scale_offsets.contiguous()
+    )
+    if not torch.equal(processed_weight, reference_weight):
+        raise AssertionError("Humming-style payload rewrite is not bit-exact")
+
+
+PHASE3_HUMMING_E2E_CASES = {
+    "small": {
+        "seed": 7,
+        "single_config": "fp8_mxfp4_prescale_m64n16k128",
+        "e": 2,
+        "m": 4,
+        "n": 512,
+        "k": 512,
+        "top_k": 2,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 0,
+        "description": "default small smoke, offset range 1..4",
+    },
+    "wide_offset": {
+        "seed": 7,
+        "single_config": "fp8_mxfp4_prescale_m64n16k128",
+        "e": 2,
+        "m": 4,
+        "n": 512,
+        "k": 512,
+        "top_k": 2,
+        "raw_scale": (114, 128),
+        "torch_ref_tolerance": (2e-1, 5e-1),
+        # The PyTorch dequant reference is not the golden for this wider dynamic
+        # range.  This small bad-count budget prevents sparse BF16/FP8
+        # accumulation differences from hiding broad correctness failures.
+        "torch_ref_max_bad": 8,
+        "description": "small smoke with full Humming offset range 1..12",
+    },
+    "e256_config": {
+        "seed": 11,
+        "single_config": "fp8_mxfp4_prescale_m64n32k512_c2x1",
+        "e": 256,
+        "m": 8,
+        "n": 256,
+        "k": 4096,
+        "top_k": 1,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 0,
+        "description": "E256-style FC1 N512/K4096 fixed best config coverage",
+    },
+    "e32_config": {
+        "seed": 13,
+        "single_config": "fp8_mxfp4_prescale_m64n64k512_c1x2",
+        "e": 32,
+        "m": 8,
+        "n": 2048,
+        "k": 4096,
+        "top_k": 1,
+        "raw_scale": (118, 122),
+        "torch_ref_tolerance": (5e-2, 1e-3),
+        "torch_ref_max_bad": 0,
+        "description": "E32-style FC1 N4096/K4096 fixed best config coverage",
+    },
+}
+
+
+def _assert_close_with_error_stats(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    label: str,
+    rtol: float,
+    atol: float,
+    max_bad: int = 0,
+    print_stats: bool = False,
+) -> None:
+    actual_f = actual.to(torch.float32)
+    expected_f = expected.to(torch.float32)
+    abs_error = (actual_f - expected_f).abs()
+    allowed = atol + rtol * expected_f.abs()
+    bad = abs_error > allowed
+    bad_count = int(bad.sum().item())
+    flat = abs_error.flatten()
+    stats = {
+        "max_abs": float(flat.max().item()) if flat.numel() else 0.0,
+        "mean_abs": float(flat.mean().item()) if flat.numel() else 0.0,
+        "p95_abs": float(torch.quantile(flat, 0.95).item()) if flat.numel() else 0.0,
+        "p99_abs": float(torch.quantile(flat, 0.99).item()) if flat.numel() else 0.0,
+        "bad_count": bad_count,
+        "total": flat.numel(),
+    }
+    if print_stats:
+        print(
+            f"{label}: max_abs={stats['max_abs']:.6g} "
+            f"mean_abs={stats['mean_abs']:.6g} p95_abs={stats['p95_abs']:.6g} "
+            f"p99_abs={stats['p99_abs']:.6g} bad={bad_count}/{flat.numel()}"
+        )
+    if bad_count > max_bad:
+        raise AssertionError(
+            f"{label} exceeded tolerance: bad={bad_count}/{flat.numel()} "
+            f"(max_bad={max_bad}), max_abs={stats['max_abs']:.6g}, "
+            f"mean_abs={stats['mean_abs']:.6g}, p95_abs={stats['p95_abs']:.6g}, "
+            f"p99_abs={stats['p99_abs']:.6g}, rtol={rtol}, atol={atol}"
+        )
+
+
 def _compute_with_active_experts(
     active_experts,
     x,
@@ -2912,58 +3116,132 @@ def test_moe_bf16_mxfp4_hopper_activations(
     not is_sm90a_supported(torch.device("cuda")),
     reason="FP8xMXFP4 pre-MMA scale MoE (Hopper mixed-input) requires SM90",
 )
-def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness():
+@pytest.mark.parametrize(
+    "case_name,case",
+    list(PHASE3_HUMMING_E2E_CASES.items()),
+    ids=list(PHASE3_HUMMING_E2E_CASES.keys()),
+)
+def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
+    case_name, case, monkeypatch
+):
     # PHASE3_SINGLE_CONFIG_TEMP: keep this smoke on one fixed tactic until the
     # full Humming runtime per-token quantization path is implemented.
-    os.environ.setdefault(
-        "FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG",
-        "fp8_mxfp4_prescale_m64n16k128",
+    monkeypatch.setenv(
+        "FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG", case["single_config"]
     )
-    torch.manual_seed(7)
+    get_cutlass_fused_moe_module.cache_clear()
+
+    torch.manual_seed(case["seed"])
     device = torch.device("cuda")
-    e, m, n, k, top_k = 2, 4, 512, 512, 2
+    e, m, n, k, top_k = (
+        case["e"],
+        case["m"],
+        case["n"],
+        case["k"],
+        case["top_k"],
+    )
     output_dtype = torch.bfloat16
 
     x_fp32 = torch.randn(m, k, dtype=torch.float32, device=device) * 0.05
-    x = x_fp32.to(torch.float8_e4m3fn)
+    x = x_fp32.to(output_dtype)
     w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device=device, dtype=torch.uint8)
     w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
 
-    # Humming-style preprocessing constrains the original e8m0 scale range and
-    # stores only an exponent offset for the pre-MMA FP4->E4M3 conversion. The
-    # activation dequant scale is applied by the GEMM epilogue per routed token.
-    w1_exp_offset = torch.randint(1, 5, (e, 2 * n, k // 32), device=device, dtype=torch.uint8)
-    w2_exp_offset = torch.randint(1, 5, (e, k, n // 32), device=device, dtype=torch.uint8)
+    # Humming-style preprocessing constrains the original E8M0 scale range and
+    # stores only a small exponent offset for the pre-MMA FP4->E4M3 conversion.
+    # The residual is supplied through the GEMM epilogue routed-token scale.
+    raw_scale_low, raw_scale_high = case["raw_scale"]
+    w1_raw_scale = _make_humming_e8m0_weight_scale(
+        (e, 2 * n, k // 32), device, low=raw_scale_low, high=raw_scale_high
+    )
+    w2_raw_scale = _make_humming_e8m0_weight_scale(
+        (e, k, n // 32), device, low=raw_scale_low, high=raw_scale_high
+    )
+    w1_processed, w1_exp_offset, w1_residual = (
+        fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+            w1, w1_raw_scale, interleave=False
+        )
+    )
+    w2_processed, w2_exp_offset, w2_residual = (
+        fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+            w2, w2_raw_scale, interleave=False
+        )
+    )
+    if case_name == "small":
+        w1_api_il, w1_api_scale_il, w1_api_residual = (
+            fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                w1, w1_raw_scale
+            )
+        )
+        w2_api_il, w2_api_scale_il, w2_api_residual = (
+            fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+                w2, w2_raw_scale
+            )
+        )
+    w1_ref_offset, w1_ref_residual, w1_delta_scale_offsets = (
+        _reference_humming_e8m0_weight_scale(w1_raw_scale)
+    )
+    w2_ref_offset, w2_ref_residual, w2_delta_scale_offsets = (
+        _reference_humming_e8m0_weight_scale(w2_raw_scale)
+    )
+    torch.testing.assert_close(w1_exp_offset, w1_ref_offset)
+    torch.testing.assert_close(w2_exp_offset, w2_ref_offset)
+    torch.testing.assert_close(w1_residual, w1_ref_residual)
+    torch.testing.assert_close(w2_residual, w2_ref_residual)
+    expected_max_offset = min(raw_scale_high - raw_scale_low, 12)
+    assert 1 <= int(w1_exp_offset.min().item()) <= expected_max_offset
+    assert 1 <= int(w2_exp_offset.min().item()) <= expected_max_offset
+    assert int(w1_exp_offset.max().item()) == expected_max_offset
+    assert int(w2_exp_offset.max().item()) == expected_max_offset
+    clamp_probe = _make_humming_e8m0_weight_scale((1, 64, 16), device)
+    clamp_offset, clamp_residual, clamp_delta = _reference_humming_e8m0_weight_scale(
+        clamp_probe
+    )
+    assert int(clamp_offset.max().item()) == 12
+    assert int(clamp_delta.max().item()) == 2
+    torch.testing.assert_close(
+        clamp_residual.cpu(), torch.tensor([2.0 ** -12], dtype=torch.float32)
+    )
+    # Humming mode currently shares the FP8MXFP4 5-slot quant_scales contract;
+    # slot 2 is reserved for the future post-MMA activation scale and is not
+    # consumed by the runtime per-token FP8 activation quantization path.
     fc2_act_global = torch.ones((), device=device, dtype=torch.float32)
 
-    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w1, "fp4_fp8")
-    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w2, "fp4_fp8")
+    _assert_humming_payload_rewrite_bit_equal(w1, w1_delta_scale_offsets, w1_processed)
+    _assert_humming_payload_rewrite_bit_equal(w2, w2_delta_scale_offsets, w2_processed)
+
+    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w1_processed, "fp4_fp8")
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w2_processed, "fp4_fp8")
     w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_exp_offset)
     w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_exp_offset)
+    if case_name == "small":
+        torch.testing.assert_close(w1_il, w1_api_il)
+        torch.testing.assert_close(w2_il, w2_api_il)
+        torch.testing.assert_close(w1_scale_il, w1_api_scale_il)
+        torch.testing.assert_close(w2_scale_il, w2_api_scale_il)
+        torch.testing.assert_close(w1_residual, w1_api_residual)
+        torch.testing.assert_close(w2_residual, w2_api_residual)
 
     router_logits = torch.randn(m, e, dtype=output_dtype, device=device)
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     # Humming keeps the FP4->FP8 exponent-bias compensation in the epilogue for
-    # this FP8 x MXFP4 path. Fold the synthetic residual and the known 2^6 factor
-    # into the offline token scales for both GEMMs.
-    humming_synthetic_residual = 2.0 ** -10
+    # this FP8 x MXFP4 path. Fold the derived residual and the known 2^6 factor
+    # into the routed-token scale inputs for both GEMMs.
     humming_epilogue_compensation = 64.0
-    fc1_route_scale = (
-        torch.rand(m, top_k, dtype=torch.float32, device=device) * 0.25 + 0.875
-    ) * humming_synthetic_residual
-    fc1_route_scale = fc1_route_scale * humming_epilogue_compensation
-    fc2_route_scale = (
-        torch.rand(m, top_k, dtype=torch.float32, device=device) * 0.25 + 0.875
-    ) * humming_synthetic_residual
-    fc2_route_scale = fc2_route_scale * humming_epilogue_compensation
+    fc1_residual_route_scale = (
+        w1_residual[selected_experts.to(torch.long)] * humming_epilogue_compensation
+    )
+    fc2_residual_route_scale = (
+        w2_residual[selected_experts.to(torch.long)] * humming_epilogue_compensation
+    )
 
     def make_expert_contiguous_token_scale(route_scale):
         return torch.cat(
             [route_scale[selected_experts == expert_id] for expert_id in range(e)]
         ).contiguous()
 
-    fc1_token_scale = make_expert_contiguous_token_scale(fc1_route_scale)
-    fc2_token_scale = make_expert_contiguous_token_scale(fc2_route_scale)
+    fc1_residual_token_scale = make_expert_contiguous_token_scale(fc1_residual_route_scale)
+    fc2_residual_token_scale = make_expert_contiguous_token_scale(fc2_residual_route_scale)
 
     flash_output = torch.zeros(m, k, device=device, dtype=output_dtype)
     fused_moe.cutlass_fused_moe(
@@ -2975,40 +3253,70 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness():
         output_dtype,
         quant_scales=[
             w1_scale_il.view(torch.int32),
-            fc1_token_scale,
+            fc1_residual_token_scale,
             fc2_act_global,
             w2_scale_il.view(torch.int32),
-            fc2_token_scale,
+            fc2_residual_token_scale,
         ],
         use_w4_group_scaling=True,
+        use_wfp4afp8_humming=True,
         output=flash_output,
         # PHASE3_SINGLE_CONFIG_TEMP: bypass autotune in the fixed-tactic smoke.
         profile_ids=[0, 0],
     )
 
-    w1_ref = _dequant_mxfp4_humming_prescale_on_device(w1, w1_exp_offset)
-    w2_ref = _dequant_mxfp4_humming_prescale_on_device(w2, w2_exp_offset)
+    w1_ref = _dequant_mxfp4_humming_prescale_on_device(w1_processed, w1_exp_offset)
+    w2_ref = _dequant_mxfp4_humming_prescale_on_device(w2_processed, w2_exp_offset)
     x_ref = x.to(torch.float32)
     ref_output = torch.zeros(m, k, dtype=torch.float32, device=device)
+    print_ref_stats = os.environ.get("FLASHINFER_PRINT_PHASE3_REF_STATS", "0") == "1"
     for expert_id in range(e):
         mask = selected_experts == expert_id
         if not mask.any():
             continue
         batch_idx, nth_expert = torch.where(mask)
         w3_expert, w1_expert = torch.chunk(w1_ref[expert_id], 2, dim=0)
-        route_fc1_scale = fc1_route_scale[batch_idx, nth_expert]
+        x_rows = x_ref[batch_idx]
+        fc1_amax = x_rows.abs().amax(dim=1)
+        fc1_quant = torch.where(
+            fc1_amax > 0,
+            torch.full_like(fc1_amax, 448.0) / fc1_amax,
+            torch.ones_like(fc1_amax),
+        )
+        x_fp8_tensor = (x_rows * fc1_quant[:, None]).to(torch.float8_e4m3fn)
+        x_fp8 = x_fp8_tensor.to(torch.float32)
+        route_fc1_scale = (
+            1.0 / fc1_quant
+        ) * fc1_residual_route_scale[batch_idx, nth_expert]
         # FC1 token scale is applied in the GEMM epilogue before activation, so
         # both gated branches must be scaled before the SiLU/product.
-        fc1_w1 = (x_ref[batch_idx] @ w1_expert.t()) * route_fc1_scale[:, None]
-        fc1_w3 = (x_ref[batch_idx] @ w3_expert.t()) * route_fc1_scale[:, None]
+        fc1_w1 = (x_fp8 @ w1_expert.t()) * route_fc1_scale[:, None]
+        fc1_w3 = (x_fp8 @ w3_expert.t()) * route_fc1_scale[:, None]
         fc1 = F.silu(fc1_w1) * fc1_w3
-        fc1_fp8 = (fc1 * fc2_act_global).to(torch.float8_e4m3fn).to(torch.float32)
-        route_fc2_scale = fc2_route_scale[batch_idx, nth_expert]
+
+        fc2_amax = fc1.abs().amax(dim=1)
+        fc2_quant = torch.where(
+            fc2_amax > 0,
+            torch.full_like(fc2_amax, 448.0) / fc2_amax,
+            torch.ones_like(fc2_amax),
+        )
+        fc1_fp8_tensor = (fc1 * fc2_quant[:, None]).to(torch.float8_e4m3fn)
+        fc1_fp8 = fc1_fp8_tensor.to(torch.float32)
+        route_fc2_scale = (
+            1.0 / fc2_quant
+        ) * fc2_residual_route_scale[batch_idx, nth_expert]
         fc2 = (fc1_fp8 @ w2_ref[expert_id].t()) * route_fc2_scale[:, None]
         ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
 
-    torch.testing.assert_close(
-        ref_output.to(output_dtype), flash_output, rtol=2e-1, atol=5e-1
+    torch_ref_rtol, torch_ref_atol = case["torch_ref_tolerance"]
+    _assert_close_with_error_stats(
+        flash_output,
+        ref_output.to(output_dtype),
+        label=f"{case_name}: FlashInfer vs PyTorch reference",
+        rtol=torch_ref_rtol,
+        atol=torch_ref_atol,
+        max_bad=case["torch_ref_max_bad"],
+        print_stats=print_ref_stats,
     )
 
 

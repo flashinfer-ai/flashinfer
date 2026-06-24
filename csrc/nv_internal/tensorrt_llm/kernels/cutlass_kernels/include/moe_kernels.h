@@ -482,6 +482,7 @@ class CutlassMoeFCRunnerInterface {
                      void const* const fc1_expert_weights, void const* const fc1_expert_biases,
                      int64_t const* const num_valid_tokens_ptr, void const* const fc1_int_scales,
                      float const* const fc1_fp8_dequant, float const* const fc2_fp8_quant,
+                     float* const act_fp8_token_scale,
                      TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
                      TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
                      QuantParams quant_params, int64_t const num_rows,
@@ -716,6 +717,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     int64_t const* const num_valid_tokens_ptr,
                     ScaleBiasType const* const fc1_int_scales, float const* const fc1_fp8_dequant,
                     float const* const fc2_fp8_quant,
+                    float* const act_fp8_token_scale,
                     TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
                     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
                     QuantParams quant_params, int64_t const num_rows,
@@ -756,6 +758,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
              void const* const fc1_expert_weights, void const* const fc1_expert_biases,
              int64_t const* const num_valid_tokens_ptr, void const* const fc1_int_scales,
              float const* const fc1_fp8_dequant, float const* const fc2_fp8_quant,
+             float* const act_fp8_token_scale,
              TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
              TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
              QuantParams quant_params, int64_t const num_rows, int64_t const expanded_num_rows,
@@ -771,7 +774,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                        tma_ws_input_template, static_cast<WeightType const*>(fc1_expert_weights),
                        static_cast<ScaleBiasType const*>(fc1_expert_biases), num_valid_tokens_ptr,
                        static_cast<ScaleBiasType const*>(fc1_int_scales), fc1_fp8_dequant,
-                       fc2_fp8_quant, fc1_fp4_act_flat, fc2_fp4_act_flat, quant_params, num_rows,
+                       fc2_fp8_quant, act_fp8_token_scale, fc1_fp4_act_flat, fc2_fp4_act_flat, quant_params, num_rows,
                        expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
                        fc1_activation_type, alpha_scale_ptr_array, bias_is_broadcast, stream,
                        config, min_latency_mode, num_active_experts_per, active_expert_global_ids,
@@ -1015,9 +1018,9 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   void* glu_inter_result_{};
   void* fc2_result_{};
   T* fc1_result_{};
-  // TODO If we fuse the quantization for GEMM2 into GEMM1 we will need two pointers
   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_fp4_act_scale_;
   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_scale_;
+  float* act_fp8_token_scale_{};
   float const** alpha_scale_ptr_array_fc1_ = nullptr;
   float const** alpha_scale_ptr_array_fc2_ = nullptr;
   ScaleBiasType* lora_input_{};
@@ -1054,7 +1057,8 @@ struct GemmProfilerBackend {
             int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias,
             bool use_lora, bool min_latency_mode, bool need_weights,
             MOEParallelismConfig parallelism_config, bool const enable_alltoall,
-            bool use_mxfp8_act_scaling = false) {
+            bool use_mxfp8_act_scaling = false,
+            Wfp4Afp8ScaleMode wfp4afp8_mode = Wfp4Afp8ScaleMode::kNone) {
     mInterface = &runner;
     mGemmToProfile = gemm_to_profile;
     mDType = dtype;
@@ -1074,6 +1078,7 @@ struct GemmProfilerBackend {
     mNeedWeights = need_weights;
     mParallelismConfig = parallelism_config;
     mEnableAlltoall = enable_alltoall;
+    mWfp4Afp8Mode = wfp4afp8_mode;
     mSM = common::getSMVersion();
 
     mScalingType = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE;
@@ -1139,10 +1144,38 @@ struct GemmProfilerBackend {
   bool mUseLora{};
   bool mMinLatencyMode{};
   bool mNeedWeights{};
+  Wfp4Afp8ScaleMode mWfp4Afp8Mode = Wfp4Afp8ScaleMode::kNone;
 
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
  private:
+  bool isWfp4Afp8Family() const {
+    return mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kUINT8 &&
+           mGroupSize == TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size;
+  }
+
+  bool isHummingPreMmaScaleMode() const {
+    return mWfp4Afp8Mode == Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
+  }
+
+  bool isSm90MixedInputFamily() const {
+    bool const is_fp8_groupwise_weight_family =
+        mDType == nvinfer1::DataType::kFP8 &&
+        (mWType == nvinfer1::DataType::kINT8 || mWType == nvinfer1::DataType::kINT4 ||
+         mWType == nvinfer1::DataType::kUINT8) &&
+        mGroupSize > 0;
+    bool const is_wfp4a16_family =
+        (mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16) &&
+        mWType == nvinfer1::DataType::kUINT8;
+    return is_fp8_groupwise_weight_family || is_wfp4a16_family;
+  }
+
+  void checkWfp4Afp8ScaleMode() const {
+    TLLM_CHECK_WITH_INFO(
+        isWfp4Afp8Family() == (mWfp4Afp8Mode != Wfp4Afp8ScaleMode::kNone),
+        "Wfp4Afp8ScaleMode must be set exactly for FP8 activation x packed MXFP4 weight.");
+  }
+
   void prepareRouting(int num_tokens, char* workspace, bool enable_pdl, cudaStream_t stream);
   void prepareQuantParams(int num_tokens, char* workspace, cudaStream_t stream);
   void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights,
