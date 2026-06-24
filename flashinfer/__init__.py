@@ -159,6 +159,9 @@ from .page import get_seq_lens as get_seq_lens
 from .page import (
     nvfp4_quantize_append_paged_kv_cache as nvfp4_quantize_append_paged_kv_cache,
 )
+from .page import (
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+)
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper
 from .prefill import (

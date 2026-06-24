@@ -192,6 +192,58 @@ def _fake_nvfp4_quantize_append_paged_kv_cache_kernel(
     pass
 
 
+@register_custom_op(
+    "flashinfer::nvfp4_quantize_append_paged_kv_cache_with_slot_mapping",
+    mutates_args=(
+        "paged_k_cache",
+        "paged_v_cache",
+        "k_scale_cache",
+        "v_scale_cache",
+    ),
+)
+def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    layout: int,
+) -> None:
+    slot_mapping = slot_mapping.contiguous()
+    get_page_module().nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        append_key,
+        append_value,
+        slot_mapping,
+        paged_k_cache,
+        paged_v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        k_scale,
+        v_scale,
+        layout,
+    )
+
+
+@register_fake_op("flashinfer::nvfp4_quantize_append_paged_kv_cache_with_slot_mapping")
+def _fake_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    layout: int,
+) -> None:
+    pass
+
+
 @flashinfer_api
 def get_batch_indices_positions(
     append_indptr: torch.Tensor,
@@ -535,5 +587,87 @@ def nvfp4_quantize_append_paged_kv_cache(
         kv_last_page_len,
         k_scale,
         v_scale,
+        TensorLayout[kv_layout].value,
+    )
+
+
+def _as_float32_scalar_tensor(
+    value: Union[float, torch.Tensor],
+    *,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f"{name} must have exactly one element, got {value.numel()}")
+        if value.dtype != torch.float32:
+            raise ValueError(f"{name} must be torch.float32, got {value.dtype}")
+        if value.device != device:
+            value = value.to(device=device)
+        return value.contiguous()
+    return torch.tensor([float(value)], dtype=torch.float32, device=device)
+
+
+@flashinfer_api
+def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_cache_sf: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    k_scale: Union[float, torch.Tensor],
+    v_scale: Union[float, torch.Tensor],
+    kv_layout: str = "NHD",
+) -> None:
+    r"""Quantize and write K/V rows into an NVFP4 paged KV cache by slot mapping.
+
+    This variant is intended for runtimes that already assign each token to a
+    flat cache slot. ``slot_mapping[i]`` is interpreted as
+    ``page_id * page_size + entry_idx``. Negative slots are padding and are
+    ignored. ``append_key`` and ``append_value`` may contain additional padded
+    rows; only ``slot_mapping.shape[0]`` rows are considered.
+    """
+    _check_kv_layout(kv_layout)
+    if append_key.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"append_key must be float16 or bfloat16, got {append_key.dtype}")
+    if append_value.dtype != append_key.dtype:
+        raise ValueError(
+            f"append_key and append_value must have the same dtype, got "
+            f"{append_key.dtype} and {append_value.dtype}"
+        )
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}")
+    if append_key.shape[0] < slot_mapping.shape[0] or append_value.shape[0] < slot_mapping.shape[0]:
+        raise ValueError(
+            "append_key and append_value must have at least slot_mapping.shape[0] rows"
+        )
+
+    paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
+    k_scale_cache, v_scale_cache = _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
+    if paged_k_cache.dtype != torch.uint8 or paged_v_cache.dtype != torch.uint8:
+        raise ValueError("NVFP4 paged K/V cache tensors must have dtype torch.uint8")
+    if (
+        k_scale_cache.dtype != torch.float8_e4m3fn
+        or v_scale_cache.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn")
+
+    k_scale_tensor = _as_float32_scalar_tensor(
+        k_scale, device=append_key.device, name="k_scale"
+    )
+    v_scale_tensor = _as_float32_scalar_tensor(
+        v_scale, device=append_key.device, name="v_scale"
+    )
+
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
+        append_key,
+        append_value,
+        slot_mapping,
+        paged_k_cache,
+        paged_v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        k_scale_tensor,
+        v_scale_tensor,
         TensorLayout[kv_layout].value,
     )

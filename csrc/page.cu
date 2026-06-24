@@ -256,6 +256,143 @@ void nvfp4_quantize_append_paged_kv_cache(
                           << append_key.dtype();
 }
 
+void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+    TensorView append_key, TensorView append_value, TensorView slot_mapping,
+    TensorView paged_k_cache, TensorView paged_v_cache, TensorView k_scale_cache,
+    TensorView v_scale_cache, TensorView k_scale, TensorView v_scale, int64_t layout) {
+  CHECK_LAST_DIM_CONTIGUOUS(append_key);
+  CHECK_LAST_DIM_CONTIGUOUS(append_value);
+  CHECK_INPUT(slot_mapping);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(paged_k_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(paged_v_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_scale_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_scale_cache);
+  CHECK_INPUT(k_scale);
+  CHECK_INPUT(v_scale);
+  CHECK_DIM(3, append_key);
+  CHECK_DIM(3, append_value);
+  CHECK_DIM(1, slot_mapping);
+  CHECK_DIM(4, paged_k_cache);
+  CHECK_DIM(4, paged_v_cache);
+  CHECK_DIM(4, k_scale_cache);
+  CHECK_DIM(4, v_scale_cache);
+  CHECK_DEVICE(append_key, append_key);
+  CHECK_DEVICE(append_value, append_key);
+  CHECK_DEVICE(slot_mapping, append_key);
+  CHECK_DEVICE(paged_k_cache, append_key);
+  CHECK_DEVICE(paged_v_cache, append_key);
+  CHECK_DEVICE(k_scale_cache, append_key);
+  CHECK_DEVICE(v_scale_cache, append_key);
+  CHECK_DEVICE(k_scale, append_key);
+  CHECK_DEVICE(v_scale, append_key);
+
+  TVM_FFI_ICHECK(append_key.dtype() == dl_float16 || append_key.dtype() == dl_bfloat16)
+      << "append_key must be float16 or bfloat16";
+  TVM_FFI_ICHECK(append_value.dtype() == append_key.dtype())
+      << "append_key and append_value must have the same dtype";
+  TVM_FFI_ICHECK(slot_mapping.dtype() == dl_int32 || slot_mapping.dtype() == dl_int64)
+      << "slot_mapping must be int32 or int64";
+  TVM_FFI_ICHECK(paged_k_cache.dtype() == dl_uint8 && paged_v_cache.dtype() == dl_uint8)
+      << "paged_k_cache and paged_v_cache must be uint8 packed NVFP4 tensors";
+  TVM_FFI_ICHECK(k_scale_cache.dtype() == dl_float8_e4m3fn &&
+                 v_scale_cache.dtype() == dl_float8_e4m3fn)
+      << "k_scale_cache and v_scale_cache must be float8_e4m3fn tensors";
+  TVM_FFI_ICHECK(k_scale.dtype() == dl_float32 && v_scale.dtype() == dl_float32)
+      << "k_scale and v_scale must be float32 tensors";
+  TVM_FFI_ICHECK_EQ(k_scale.numel(), 1) << "k_scale must be a single-element tensor";
+  TVM_FFI_ICHECK_EQ(v_scale.numel(), 1) << "v_scale must be a single-element tensor";
+
+  const unsigned int nnz = slot_mapping.size(0);
+  TVM_FFI_ICHECK_GE(append_key.size(0), nnz);
+  TVM_FFI_ICHECK_GE(append_value.size(0), nnz);
+
+  QKVLayout kv_layout = QKVLayout(layout);
+  unsigned int num_heads, page_size;
+  const unsigned int packed_head_dim = paged_k_cache.size(3);
+  const unsigned int scale_dim = k_scale_cache.size(3);
+  const unsigned int head_dim = append_key.size(2);
+  if (kv_layout == QKVLayout::kHND) {
+    num_heads = paged_k_cache.size(1);
+    page_size = paged_k_cache.size(2);
+  } else {
+    page_size = paged_k_cache.size(1);
+    num_heads = paged_k_cache.size(2);
+  }
+
+  TVM_FFI_ICHECK_EQ(append_key.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(append_value.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(append_value.size(2), head_dim);
+  TVM_FFI_ICHECK_EQ(packed_head_dim * 2, head_dim);
+  TVM_FFI_ICHECK_EQ(scale_dim * 16, head_dim);
+  TVM_FFI_ICHECK_EQ(head_dim % 16, 0);
+
+  auto require_same_shape = [](TensorView lhs, TensorView rhs, const char* name) {
+    TVM_FFI_ICHECK_EQ(lhs.ndim(), rhs.ndim()) << name << " ndim mismatch";
+    for (int i = 0; i < lhs.ndim(); ++i) {
+      TVM_FFI_ICHECK_EQ(lhs.size(i), rhs.size(i)) << name << " shape mismatch at dim " << i;
+    }
+  };
+  require_same_shape(paged_k_cache, paged_v_cache, "paged K/V cache");
+  require_same_shape(k_scale_cache, v_scale_cache, "K/V scale cache");
+  TVM_FFI_ICHECK_EQ(k_scale_cache.size(0), paged_k_cache.size(0));
+  if (kv_layout == QKVLayout::kHND) {
+    TVM_FFI_ICHECK_EQ(k_scale_cache.size(1), num_heads);
+    TVM_FFI_ICHECK_EQ(k_scale_cache.size(2), page_size);
+  } else {
+    TVM_FFI_ICHECK_EQ(k_scale_cache.size(1), page_size);
+    TVM_FFI_ICHECK_EQ(k_scale_cache.size(2), num_heads);
+  }
+
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  auto k_sf_strides = k_scale_cache.strides();
+  auto v_sf_strides = v_scale_cache.strides();
+  const size_t k_stride_page = k_strides[0];
+  const size_t k_stride_n = kv_layout == QKVLayout::kHND ? k_strides[2] : k_strides[1];
+  const size_t k_stride_h = kv_layout == QKVLayout::kHND ? k_strides[1] : k_strides[2];
+  const size_t v_stride_page = v_strides[0];
+  const size_t v_stride_n = kv_layout == QKVLayout::kHND ? v_strides[2] : v_strides[1];
+  const size_t v_stride_h = kv_layout == QKVLayout::kHND ? v_strides[1] : v_strides[2];
+  const size_t k_sf_stride_page = k_sf_strides[0];
+  const size_t k_sf_stride_n = kv_layout == QKVLayout::kHND ? k_sf_strides[2] : k_sf_strides[1];
+  const size_t k_sf_stride_h = kv_layout == QKVLayout::kHND ? k_sf_strides[1] : k_sf_strides[2];
+  const size_t v_sf_stride_page = v_sf_strides[0];
+  const size_t v_sf_stride_n = kv_layout == QKVLayout::kHND ? v_sf_strides[2] : v_sf_strides[1];
+  const size_t v_sf_stride_h = kv_layout == QKVLayout::kHND ? v_sf_strides[1] : v_sf_strides[2];
+  auto append_k_strides = append_key.strides();
+  auto append_v_strides = append_value.strides();
+  const size_t append_k_stride_n = append_k_strides[0];
+  const size_t append_k_stride_h = append_k_strides[1];
+  const size_t append_v_stride_n = append_v_strides[0];
+  const size_t append_v_stride_h = append_v_strides[1];
+
+  ffi::CUDADeviceGuard device_guard(append_key.device().device_id);
+  const cudaStream_t stream = get_stream(append_key.device());
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(append_key.dtype(), c_type, [&] {
+    return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(slot_mapping.dtype(), id_type, [&] {
+      cudaError_t status = NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
+          static_cast<c_type*>(append_key.data_ptr()), static_cast<c_type*>(append_value.data_ptr()),
+          static_cast<id_type*>(slot_mapping.data_ptr()), nnz, num_heads, page_size,
+          packed_head_dim, append_k_stride_n, append_k_stride_h, append_v_stride_n,
+          append_v_stride_h, static_cast<uint8_t*>(paged_k_cache.data_ptr()),
+          static_cast<uint8_t*>(paged_v_cache.data_ptr()),
+          static_cast<uint8_t*>(k_scale_cache.data_ptr()),
+          static_cast<uint8_t*>(v_scale_cache.data_ptr()), k_stride_page, k_stride_n, k_stride_h,
+          v_stride_page, v_stride_n, v_stride_h, k_sf_stride_page, k_sf_stride_n,
+          k_sf_stride_h, v_sf_stride_page, v_sf_stride_n, v_sf_stride_h,
+          static_cast<float*>(k_scale.data_ptr()), static_cast<float*>(v_scale.data_ptr()), stream);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "NVFP4QuantizeAppendPagedKVCacheWithSlotMapping failed with error: "
+          << cudaGetErrorString(status);
+      return true;
+    });
+  });
+
+  TVM_FFI_ICHECK(success)
+      << "NVFP4QuantizeAppendPagedKVCacheWithSlotMapping failed to dispatch with dtype "
+      << append_key.dtype();
+}
+
 void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
                                TensorView batch_indices, TensorView positions, TensorView ckv_cache,
                                TensorView kpe_cache, TensorView kv_indices, TensorView kv_indptr,
