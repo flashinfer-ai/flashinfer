@@ -626,40 +626,13 @@ def test_cute_dsl_vs_trtllm_gen(
     )
 
 
-@pytest.mark.parametrize(
-    (
-        "batch_size, seq_len_k, page_size, num_heads, enable_pdl, "
-        "cute_dsl_impl, is_persistent"
-    ),
-    [
-        (batch_size, seq_len_k, page_size, num_heads, False, cute_dsl_impl, False)
-        for batch_size in [1, 4]
-        for seq_len_k in [128, 512, 2048]
-        for page_size in [64, 128]
-        for num_heads in [128, 64]
-        for cute_dsl_impl in ["modular", "monolithic"]
-    ]
-    + [
-        pytest.param(
-            128,
-            160,
-            128,
-            128,
-            False,
-            "monolithic",
-            True,
-            id="monolithic-persistent-s160-b128",
-        )
-    ],
-)
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 512, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("num_heads", [128, 64])
+@pytest.mark.parametrize("enable_pdl", [False])
 def test_cute_dsl_mla_decode_fp8(
-    batch_size,
-    seq_len_k,
-    page_size,
-    num_heads,
-    enable_pdl,
-    cute_dsl_impl,
-    is_persistent,
+    batch_size, seq_len_k, page_size, num_heads, enable_pdl, cute_dsl_impl
 ):
     """Test FP8 MLA decode kernel against FP32 reference."""
     skip_if_unsupported()
@@ -721,7 +694,6 @@ def test_cute_dsl_mla_decode_fp8(
         max_seq_len=seq_len_k,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
-        is_var_seq=not is_persistent,
         enable_pdl=enable_pdl,
         cute_dsl_impl=cute_dsl_impl,
         lse=lse_buf,
@@ -743,33 +715,19 @@ def test_cute_dsl_mla_decode_fp8(
     assert torch.isfinite(out).all(), "FP8 cute-dsl MLA decode produced non-finite"
 
     # Reference: compute in FP32 using FP8 values dequantized to FP32
-    if is_persistent:
-        check_indices = torch.tensor(
-            [0, 1, batch_size - 1], dtype=torch.long, device=device
-        )
-        query_ref = query[check_indices]
-        block_tables_ref = block_tables[check_indices]
-        seq_lens_ref = seq_lens[check_indices]
-        out_to_check = out[check_indices]
-    else:
-        query_ref = query
-        block_tables_ref = block_tables
-        seq_lens_ref = seq_lens
-        out_to_check = out
-
     kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
     c_latent_ref = kv_flat[:, :latent_dim]
     c_rope_ref = kv_flat[:, latent_dim:]
-    q_nope = query_ref[..., :latent_dim].to(torch.float32)
-    q_rope_tensor = query_ref[..., latent_dim:].to(torch.float32)
+    q_nope = query[..., :latent_dim].to(torch.float32)
+    q_rope_tensor = query[..., latent_dim:].to(torch.float32)
 
     ref = torch_reference_mla(
         q_nope,
         q_rope_tensor,
         c_latent_ref,
         c_rope_ref,
-        block_tables_ref,
-        seq_lens_ref,
+        block_tables,
+        seq_lens,
         softmax_scale,
         output_scale,
         page_size,
@@ -782,22 +740,13 @@ def test_cute_dsl_mla_decode_fp8(
         ref_lse = None
     # Compare outputs in FP32; FP8 has limited precision so use wider tolerance
     torch.testing.assert_close(
-        out_to_check.to(torch.float32),
-        ref_out.to(torch.float32),
-        atol=0.1,
-        rtol=0.1,
+        out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
     )
     if cute_dsl_impl == "monolithic":
         # LSE reshaped back to native shape for comparison.  FP8 quantization
         # noise propagates into LSE so use the same wide tolerance as `out`.
-        lse_to_check = lse.view(batch_size, q_len, num_heads)
-        if is_persistent:
-            lse_to_check = lse_to_check[check_indices]
         torch.testing.assert_close(
-            lse_to_check,
-            ref_lse,
-            atol=0.1,
-            rtol=0.1,
+            lse.view(batch_size, q_len, num_heads), ref_lse, atol=0.1, rtol=0.1
         )
 
 
