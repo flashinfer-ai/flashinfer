@@ -24,8 +24,8 @@ FP4 GEMM
 
     mm_fp4
 
-BF16×FP4 GEMM (W4A16)
-----------------------
+BF16 x FP4 GEMM (W4A16)
+-----------------------
 
 .. autosummary::
     :toctree: ../generated
