@@ -298,7 +298,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
         runner_dict: Dict[
-            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool, bool], Any
+            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool, bool, bool], Any
         ] = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
@@ -331,6 +331,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             enable_pdl: bool,
             activation_type: ActivationType,
             use_packed_weights: bool,
+            use_wfp4afp8_humming: bool,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -346,6 +347,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
             self.use_w4_group_scaling = use_w4_group_scaling
             self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
+            self.use_wfp4afp8_humming = use_wfp4afp8_humming
             self.min_latency_mode = min_latency_mode
             self.enable_pdl = enable_pdl
             self.use_packed_weights = use_packed_weights
@@ -357,6 +359,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 use_w4_group_scaling,
                 use_mxfp8_act_scaling,
                 use_packed_weights,
+                use_wfp4afp8_humming,
             )
             self.activation_type = activation_type
             # Set by tuning flow to indicate which GEMM stage (1 or 2) to filter tactics for
@@ -371,6 +374,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                     use_w4_group_scaling,
                     use_mxfp8_act_scaling,
                     use_packed_weights,
+                    use_wfp4afp8_humming,
                 )
 
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
@@ -554,6 +558,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         enable_pdl: Optional[bool] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
+        use_wfp4afp8_humming: bool = False,
         # PHASE3_SINGLE_CONFIG_TEMP: fixed-tactic override for Phase 3 debug
         # builds. Remove once the full runtime-scale path no longer needs
         # single-config JIT narrowing.
@@ -582,7 +587,18 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             enable_pdl=enable_pdl,
             activation_type=activation_type,
             use_packed_weights=use_packed_weights,
+            use_wfp4afp8_humming=use_wfp4afp8_humming,
         )
+
+        # PHASE3_SINGLE_CONFIG_TEMP: the Humming path currently relies on fixed
+        # tactics because the autotune profiler does not yet build runtime
+        # token-scale inputs. Remove this guard together with the fixed-tactic
+        # narrowing in the next Phase 3 cleanup commit.
+        if use_wfp4afp8_humming and profile_ids is None:
+            raise NotImplementedError(
+                "Humming-style MXFP4 x FP8 currently requires fixed profile_ids; "
+                "the autotune profiler path does not yet build runtime token-scale inputs."
+            )
 
         if profile_ids is None:
             tuner = AutoTuner.get()
@@ -723,7 +739,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
+        use_wfp4afp8_humming: bool = False,
         # PHASE3_SINGLE_CONFIG_TEMP: workspace shape follows the same fixed
         # tactic override as the temporary Phase 3 smoke path.
         profile_ids: Optional[List[int]] = None,
@@ -752,142 +770,6 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             module.interleave_moe_weights_for_sm90_mixed_gemm
         ),
     )
-
-
-@flashinfer_api
-def interleave_moe_scales_for_sm90_mixed_gemm(
-    scales: torch.Tensor,
-    group_size: int = 32,
-) -> torch.Tensor:
-    """Fold weight scales for the SM90 mixed-input MoE GEMM.
-
-    Parameters
-    ----------
-    scales : torch.Tensor
-        ``[num_experts, rows, K // group_size]`` tensor of scalar weight scales.
-        MXFP4 uses uint8 E8M0 scales with ``group_size=32``; W4A8 uses bf16
-        bit-pattern scales with ``group_size=128``.
-    group_size : int
-        Weight quantization group size.
-
-    Returns
-    -------
-    torch.Tensor
-        Contiguous tensor with shape
-        ``[num_experts, rows // 64, K // 128, folded_m, physical_cols]``.
-        ``physical_cols`` is the number of scale elements in 16B and
-        ``folded_m`` is derived so each 64x128 logical scale block is stored as
-        a 16B-contiguous folded block.
-    """
-    if scales.dim() != 3:
-        raise ValueError(
-            f"scales must be 3D (num_experts, rows, K/group_size); got {tuple(scales.shape)}"
-        )
-
-    scale_groups_per_k128 = 128 // group_size
-    if scale_groups_per_k128 < 1 or 128 % group_size != 0:
-        raise ValueError(
-            f"group_size={group_size} must divide 128 (scale groups per K128 block)"
-        )
-    element_bits = scales.element_size() * 8
-    physical_cols = 128 // element_bits
-    if physical_cols < 1 or 128 % element_bits != 0:
-        raise ValueError(
-            f"scale dtype {scales.dtype} has unsupported element size {element_bits} bits"
-        )
-    if physical_cols % scale_groups_per_k128 != 0:
-        raise ValueError(
-            f"scale dtype {scales.dtype} and group_size={group_size} do not form "
-            "an integer folded M slice"
-        )
-    m_slices_per_m64 = physical_cols // scale_groups_per_k128
-    if 64 % m_slices_per_m64 != 0:
-        raise ValueError(
-            f"folded M slices {m_slices_per_m64} must divide the logical M64 block"
-        )
-    folded_m = 64 // m_slices_per_m64
-
-    e, rows, kgs = scales.shape
-    if rows % 64 != 0:
-        raise ValueError(f"scale rows={rows} must be divisible by 64")
-    if kgs % scale_groups_per_k128 != 0:
-        raise ValueError(
-            f"K/group_size={kgs} must be divisible by scale groups per K128 block "
-            f"{scale_groups_per_k128}"
-        )
-    k128_blocks = kgs // scale_groups_per_k128
-    return (
-        scales.reshape(
-            e,
-            rows // 64,
-            m_slices_per_m64,
-            folded_m,
-            k128_blocks,
-            scale_groups_per_k128,
-        )
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-        .reshape(e, rows // 64, k128_blocks, folded_m, physical_cols)
-    )
-
-
-@flashinfer_api
-def interleave_moe_weights_for_sm90_mixed_gemm(
-    weight: torch.Tensor,
-    quant_type: str = "fp4",
-) -> torch.Tensor:
-    """Interleave 4-bit packed MoE weights for the SM90 mixed-input GEMM.
-
-    The SM90 mixed-dtype MoE GEMM (used by ``cutlass_fused_moe`` with
-    ``use_w4_group_scaling=True``) expects weights in a specific interleaved
-    layout; without preprocessing, the LUT-based FP4→BF16 conversion reads
-    bytes from the wrong positions and the output diverges from a dequantized
-    reference for any K > 128. TensorRT-LLM's W4A16 MoE runs the equivalent
-    preprocessing at weight-load time (see
-    ``interleave_4bit_weights_for_Hopper_mixed_gemm`` in TRT-LLM PR #12451).
-
-    Parameters
-    ----------
-    weight : torch.Tensor
-        ``[num_experts, n, k // 2]`` uint8 CUDA tensor (4-bit values packed
-        two-per-byte).
-    quant_type : str
-        ``"fp4"`` for MXFP4 (the W4A16 path), ``"fp4_fp8"`` for MXFP4 consumed
-        by the FP8/Humming-style pre-MMA-scale path, or ``"int4"`` for INT4
-        (the W4A8 path).
-
-    Returns
-    -------
-    torch.Tensor
-        A new uint8 tensor with the same shape as ``weight`` holding the
-        interleaved layout. Feed this directly as ``fc1_expert_weights`` /
-        ``fc2_expert_weights`` to :func:`cutlass_fused_moe`.
-    """
-    if weight.dim() != 3:
-        raise ValueError(
-            f"weight must be 3D (num_experts, n, k/2); got shape {tuple(weight.shape)}"
-        )
-    if weight.dtype != torch.uint8:
-        raise ValueError(f"weight must be uint8 (packed 4-bit); got {weight.dtype}")
-    if not weight.is_cuda:
-        raise ValueError("weight must live on CUDA")
-
-    qtype_map = {"fp4": 1, "fp4_fp8": 2, "int4": 0}
-    if quant_type not in qtype_map:
-        raise ValueError(
-            f"quant_type must be one of {list(qtype_map)}; got {quant_type!r}"
-        )
-
-    weight = weight.contiguous()
-    out = torch.empty_like(weight)
-
-    major, minor = get_compute_capability(weight.device)
-    device_arch = f"{major * 10 + minor}"
-    module = get_cutlass_fused_moe_module(device_arch)
-    module.interleave_moe_weights_for_sm90_mixed_gemm(
-        weight, out, qtype_map[quant_type]
-    )
-    return out
 
 
 # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py#L121
@@ -919,6 +801,7 @@ def cutlass_fused_moe(
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     use_packed_weights: bool = False,
+    use_wfp4afp8_humming: bool = False,
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
@@ -1030,6 +913,11 @@ def cutlass_fused_moe(
     use_packed_weights : bool = False
         Whether to use packed uint4x2 weights passed as packed uint8 values. Defaults to False.
 
+    use_wfp4afp8_humming : bool = False
+        Selects the Humming-style MXFP4-weight x FP8-activation Hopper path with pre-MMA E8M0
+        scale fusion. This flag is separate from W4A16 because both paths use uint8 FP4 weight
+        storage and ``use_w4_group_scaling=True``.
+
     tune_max_num_tokens : int = 8192
         Maximum number of tokens for tuning. Defaults to 8192.
 
@@ -1130,6 +1018,7 @@ def cutlass_fused_moe(
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
+        use_wfp4afp8_humming=use_wfp4afp8_humming,
         profile_ids=profile_ids,
     )
 

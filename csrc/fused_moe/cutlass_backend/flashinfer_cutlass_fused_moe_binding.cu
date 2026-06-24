@@ -126,7 +126,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   FusedMoeRunner(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                  bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                 bool use_mxfp8_act_scaling, bool use_packed_weights) {
+                 bool use_mxfp8_act_scaling, bool use_packed_weights,
+                 bool use_wfp4afp8_humming) {
     mActivationDtype = activation_dtype;
     mWeightDtype = weight_dtype;
     mUsePackedWeights = use_packed_weights;
@@ -134,16 +135,29 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
     mUseW4GroupScaling = use_w4_group_scaling;
     mUseMxfp8ActScaling = use_mxfp8_act_scaling;
+    mUseWfp4Afp8Humming = use_wfp4afp8_humming;
+    mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kNone;
     mInnerDimMultiplier = 1;
+
+    auto make_humming_runner = [&] {
+      mInnerDimMultiplier = 2;
+      mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
+      TVM_FFI_ICHECK(mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16)
+          << "Humming-style MXFP4 x FP8 requires FP16/BF16 inputs and online FP8 activation "
+             "quantization.";
+      TVM_FFI_ICHECK(mActivationDtype == mOutputDtype)
+          << "Humming-style MXFP4 x FP8 online activation quantization currently requires "
+             "activation dtype and output dtype to match.";
+      mKernelRunner = switch_output_type<
+          __nv_fp8_e4m3, kernels::Fp4Type, true, false,
+          kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+    };
 
 #ifdef FLASHINFER_CUTLASS_PHASE3_SINGLE_CONFIG
     // PHASE3_SINGLE_CONFIG_TEMP: in the fixed-tactic debug build, construct only
-    // the Humming-style FP8 activation x MXFP4 weight runner.
+    // the Humming-style MXFP4 x FP8 runner with online FP16/BF16 input quantization.
     if (isWMxfp4AFp8HummingQuant()) {
-      mInnerDimMultiplier = 2;
-      mKernelRunner = switch_output_type<
-          __nv_fp8_e4m3, kernels::Fp4Type, false, false,
-          kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+      make_humming_runner();
     } else {
       TVM_FFI_ICHECK(false)
           << "FLASHINFER_CUTLASS_PHASE3_SINGLE_CONFIG only supports Humming-style MXFP4 x "
@@ -175,9 +189,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #ifdef ENABLE_FP4
 #if 0
     // PHASE3_POST_MMA_PLACEHOLDER: keep these post-MMA MXFP4 routes as a
-    // reminder for future CMX integration, but do not expose the old dl_int64
-    // FP4 placeholder.  The real Hopper CMX paths should use the same
-    // uint8-packed MXFP4 storage as the Humming-style path and select a
+    // reminder for future Hopper mixed-input integration, but do not expose the
+    // dl_int64 FP4 placeholder. The real Hopper mixed-input paths should use
+    // the same uint8-packed MXFP4 storage as the Humming-style path and select a
     // different Wfp4Afp8ScaleMode explicitly.
     if (isWMxfp4AFp8Quant()) {
       mInnerDimMultiplier = 16;  // 16 FP4 -> 1 LONG
@@ -195,10 +209,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
 
     if (isWMxfp4AFp8HummingQuant()) {
-      mInnerDimMultiplier = 2;
-      mKernelRunner = switch_output_type<
-          __nv_fp8_e4m3, kernels::Fp4Type, false, false,
-          kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+      make_humming_runner();
     }
 
     if (isNvfp4Quant()) {
@@ -753,14 +764,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                       hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
                       activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                       /*need_weights*/ false, parallelism_config, mUseMxfp8ActScaling,
-                      enable_alltoall);
+                      enable_alltoall, mWfp4Afp8Mode);
 #else
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
                       DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                       hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
                       activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-                      /*need_weights*/ false, parallelism_config, mUseMxfp8ActScaling);
+                      /*need_weights*/ false, parallelism_config, mUseMxfp8ActScaling,
+                      /*enable_alltoall*/ false, mWfp4Afp8Mode);
 #endif
 
       size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
@@ -884,7 +896,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool mUseDeepSeekFP8BlockScaling = false;
   bool mUseW4GroupScaling = false;
   bool mUseMxfp8ActScaling = false;
+  bool mUseWfp4Afp8Humming = false;
   bool mUsePackedWeights = false;
+  kernels::Wfp4Afp8ScaleMode mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kNone;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
@@ -1256,10 +1270,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           nullptr,
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
           static_cast<float const*>(fc1_token_scale.data_ptr()),
-          static_cast<float const*>(fc2_act_global.data_ptr()),
+          nullptr,
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
-          static_cast<float const*>(fc2_token_scale.data_ptr()), false,
-          fc2_act_global.ndim() == 1);
+          static_cast<float const*>(fc2_token_scale.data_ptr()), false, false);
     } else if (isWMxfp4AMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value())
@@ -1477,7 +1490,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   bool isWFP4A16Quant() const {
     return mUseW4GroupScaling && (mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16) &&
-           mWeightDtype == dl_uint8 && !mUsePackedWeights;
+           mWeightDtype == dl_uint8 && !mUsePackedWeights && !mUseWfp4Afp8Humming;
   }
 
   bool isInt4Quant() const { return mWeightDtype == dl_uint8 && mUsePackedWeights; }
@@ -1485,13 +1498,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool isW4AFp8Quant() const { return mActivationDtype == dl_float8_e4m3fn && isInt4Quant(); }
 
   bool isWMxfp4AFp8HummingQuant() const {
-    return mUseW4GroupScaling && mActivationDtype == dl_float8_e4m3fn &&
+    bool const supported_activation =
+        mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16;
+    return mUseWfp4Afp8Humming && mUseW4GroupScaling && supported_activation &&
            mWeightDtype == dl_uint8 && !mUsePackedWeights && !mUseMxfp8ActScaling;
   }
 
   bool isWMxfp4AFp8Quant() const {
     // PHASE3_POST_MMA_PLACEHOLDER: disabled until this path is wired to
-    // uint8-packed MXFP4 storage instead of the old dl_int64 placeholder.
+    // uint8-packed MXFP4 storage instead of the dl_int64 FP4 placeholder.
     // return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 &&
     //        !mUseMxfp8ActScaling;
     return false;
@@ -1499,7 +1514,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   bool isWMxfp4AMxfp8Quant() const {
     // PHASE3_POST_MMA_PLACEHOLDER: disabled until this path is wired to
-    // uint8-packed MXFP4 storage instead of the old dl_int64 placeholder.
+    // uint8-packed MXFP4 storage instead of the dl_int64 FP4 placeholder.
     // return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 &&
     //        mUseMxfp8ActScaling;
     return false;
@@ -1508,10 +1523,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
 tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                       bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                      bool use_mxfp8_act_scaling, bool use_packed_weights) {
+                      bool use_mxfp8_act_scaling, bool use_packed_weights,
+                      bool use_wfp4afp8_humming) {
   auto ptr = tvm::ffi::make_object<FusedMoeRunner>(
       activation_dtype, weight_dtype, output_dtype, use_deepseek_fp8_block_scale,
-      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights);
+      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights, use_wfp4afp8_humming);
   return tvm::ffi::Module(ptr);
 }
 
