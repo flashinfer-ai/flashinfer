@@ -166,8 +166,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          uint32_t* semaphores, void* scratch, bool enable_pdl,
                          uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
 #if ENABLE_4BIT_KV_CACHE
-                         uint64_t sf_stride_page, uint64_t sf_stride_token,
-                         uint64_t sf_stride_head,
+                         uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
                          cudaStream_t stream);
 

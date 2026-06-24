@@ -2911,8 +2911,7 @@ void launchMHA(
   uint32_t const stride_token_in_heads = static_cast<uint32_t>(kv_stride_token / validElemsPerHead);
   uint32_t const stride_head_in_heads = static_cast<uint32_t>(kv_stride_head / validElemsPerHead);
 #if ENABLE_4BIT_KV_CACHE
-  uint32_t const sf_elems_per_head =
-      validElemsPerHead / CacheElemConverter::QuantVectorSize;
+  uint32_t const sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
   uint32_t const sf_stride_page_in_heads =
       static_cast<uint32_t>(sf_stride_page / sf_elems_per_head);
   uint32_t const sf_stride_token_in_heads =
@@ -2945,8 +2944,7 @@ void launchMHA(
                      batchSize, kvCacheScale, kvScalePtr, stride_page_in_heads,
                      stride_token_in_heads, stride_head_in_heads,
 #if ENABLE_4BIT_KV_CACHE
-                     sf_stride_page_in_heads, sf_stride_token_in_heads,
-                     sf_stride_head_in_heads,
+                     sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
 #endif
                      semaphores, scratch);
   checkCuda(cudaPeekAtLastError());
@@ -2982,8 +2980,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          uint32_t* semaphores, void* scratch, bool enable_pdl,
                          uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
 #if ENABLE_4BIT_KV_CACHE
-                         uint64_t sf_stride_page, uint64_t sf_stride_token,
-                         uint64_t sf_stride_head,
+                         uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
                          cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
@@ -3017,8 +3014,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
   uint32_t const stride_head_in_heads =
       static_cast<uint32_t>(kv_stride_head / container_elems_per_head);
 #if ENABLE_4BIT_KV_CACHE
-  uint32_t const sf_elems_per_head =
-      validElemsPerHead / CacheElemConverter::QuantVectorSize;
+  uint32_t const sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
   uint32_t const sf_stride_page_in_heads =
       static_cast<uint32_t>(sf_stride_page / sf_elems_per_head);
   uint32_t const sf_stride_token_in_heads =
@@ -3047,8 +3043,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                      attentionSinks, cacheList, batchSize, kvCacheScale, kvScalePtr,
                      stride_page_in_heads, stride_token_in_heads, stride_head_in_heads,
 #if ENABLE_4BIT_KV_CACHE
-                     sf_stride_page_in_heads, sf_stride_token_in_heads,
-                     sf_stride_head_in_heads,
+                     sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
 #endif
                      semaphores, scratch);
   checkCuda(cudaPeekAtLastError());

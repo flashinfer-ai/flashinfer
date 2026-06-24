@@ -94,26 +94,23 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 
 #if USE_SM90_MHA
   if (run_sm90_fp8_mha) {
-    launchHopperF8MHAFlashInfer(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
-                                qScalePtr, reinterpret_cast<OutputHead*>(output.data_ptr()),
+    launchHopperF8MHAFlashInfer(
+        multiProcessorCount, nbKHeads, slidingWinSize, qScale, qScalePtr,
+        reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
-                                rcpOutScale,
+        rcpOutScale,
 #endif
-                                reinterpret_cast<InputHead const*>(q.data_ptr()),
-                                attentionSinksPtr,
-                                reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
-                                reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
-                                reinterpret_cast<KVCachePageIndex const*>(
-                                    kvCachePageList.data_ptr()),
-                                maxSeqLen,
-                                reinterpret_cast<uint32_t const*>(seqLen.data_ptr()),
-                                batchSize, kvCacheScale, kvScalePtr,
+        reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
+        reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
+        reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
+        reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
+        reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale, kvScalePtr,
 #if SPEC_DEC
-                                qSeqLen, nullptr, maskPtr,
+        qSeqLen, nullptr, maskPtr,
 #endif
-                                reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-                                reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl,
-                                kv_stride_page, kv_stride_token, kv_stride_head, stream);
+        reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
+        reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page, kv_stride_token,
+        kv_stride_head, stream);
     return;
   }
 #endif
@@ -131,8 +128,8 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                       reinterpret_cast<GMemCacheHeadSf*>(vSfCachePtr),
 #endif
                       reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
-                      maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()),
-                      batchSize, kvCacheScale, kvScalePtr,
+                      maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
+                      kvCacheScale, kvScalePtr,
 #if SPEC_DEC
                       qSeqLen, nullptr, maskPtr,
 #endif
