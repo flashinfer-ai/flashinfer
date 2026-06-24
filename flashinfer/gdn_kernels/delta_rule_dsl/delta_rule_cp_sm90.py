@@ -1694,11 +1694,10 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
             num_sab_heads * 64 * 64,
         ),
     )
-    workspace_ctor = torch.empty if num_seqs == 1 else torch.zeros
-    transfer_t = workspace_ctor(
+    transfer_t = torch.empty(
         (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
     )
-    state_t = workspace_ctor(
+    state_t = torch.empty(
         (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
     )
     if total_cp_chunks == 0:
@@ -2330,11 +2329,7 @@ def cp_delta_rule_fixup_dsl_sm90(
             raise RuntimeError("cu_seqlens must be contiguous")
     num_seqs = cu_seqlens.shape[0] - 1
 
-    fixed_state = (
-        torch.empty_like(local_state)
-        if num_seqs == 1
-        else torch.zeros_like(local_state)
-    )
+    fixed_state = torch.empty_like(local_state)
     if total_cp_chunks == 0:
         return fixed_state
 
@@ -3980,8 +3975,6 @@ def cp_delta_rule_dsl_sm90(
         _skip_check=True,
     )
 
-    if num_seqs != 1:
-        state.zero_()
     cp_delta_rule_prefill_dsl_sm90(
         o,
         state,
