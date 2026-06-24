@@ -2528,6 +2528,15 @@ def testBatchMLAPagedAttentionWrapper(args):
         block_tables,
         actual_seq_lens_kv,
     ):
+        """
+        Run a single MLA decode backend and return its output tensor.
+
+        Dispatches to the BatchMLAPagedAttentionWrapper for fa2/fa3/cutlass or
+        to the direct trtllm_batch_decode_with_kv_cache_mla API for
+        trtllm-native/auto/cute-dsl. The trtllm/auto/cute-dsl branches also
+        forward the resolved MLA overrides (is_var_seq / cute_dsl_impl) via
+        mla_api_extra_kwargs.
+        """
         if backend in ["fa2", "fa3"]:
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
             # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
