@@ -373,11 +373,11 @@ class BlackwellMultiLatentAttentionForwardFP8:
         storage = smem.allocate(SharedStorage)
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.schedule.mma_warp_id,
             is_two_cta=self.config.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         pipes = self._create_pipelines(storage, cta_layout_vmnk)
@@ -559,8 +559,8 @@ class BlackwellMultiLatentAttentionForwardFP8:
             # .set(ACCUMULATE) mutations on the same tiled_mma_qk variable.
             compute_tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
                 self.q_dtype,
-                tcgen05.OperandMajorMode.K,
-                tcgen05.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
+                cute.nvgpu.OperandMajorMode.K,
                 self.config.acc_dtype,
                 tcgen05.CtaGroup.TWO,
                 self.config.mma_qk_tiler[:2],

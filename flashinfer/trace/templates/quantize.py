@@ -104,7 +104,14 @@ def _quantize_fp4_block_scale(
         torch.ones_like(actual_scale),
     )
     # Broadcast block scale back to element granularity and quantize.
-    scaled = blocks / actual_scale.unsqueeze(-1)
+    if global_scale is not None:
+        scaled = (
+            blocks
+            * global_scale.to(torch.float32).reshape(())
+            / actual_scale.unsqueeze(-1)
+        )
+    else:
+        scaled = blocks / actual_scale.unsqueeze(-1)
     nibbles = _fp4_e2m1_quantize_block(scaled, amax)
     nibbles = nibbles.reshape(M, K)
     packed = _pack_fp4_pairs(nibbles)
@@ -230,6 +237,36 @@ _FP4_AXES: Dict[str, _AxisT] = {
     "one": Var(description="Placeholder for shape [1] scalar tensors."),
 }
 
+
+def _fp4_quantize_init(
+    *,
+    M: int,
+    K: int = 4096,
+    K_packed: int = 0,
+    num_scale_elems: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.fp4_quantize`` (generic NvFP4 path).
+
+    Sourced from ``tests/utils/test_fp4_quantize.py``: ``input`` is
+    ``randn`` (bf16); ``global_scale`` is computed as
+    ``FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / amax(input)`` per the test
+    fixture. Default ``K=4096`` matches the example call.
+    """
+    del K_packed, num_scale_elems, one  # derived
+    torch.manual_seed(seed)
+    inp = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    amax = inp.float().abs().nan_to_num().max().clamp(min=1e-12)
+    global_scale = (448.0 * 6.0 / amax).reshape(1).contiguous()
+    return {
+        "input": inp,
+        "global_scale": global_scale,
+        "sf_vec_size": 16,
+    }
+
+
 fp4_quantize_trace = TraceTemplate(
     op_type="quantization",
     name_prefix="fp4_quantize",
@@ -268,7 +305,35 @@ fp4_quantize_trace = TraceTemplate(
     constraints=["K_packed == K // 2"],
     tags=["status:verified", "quantization:fp4"],
     reference=_fp4_quantize_reference,
+    init=_fp4_quantize_init,
 )
+
+
+def _nvfp4_quantize_init(
+    *,
+    M: int,
+    K: int = 4096,
+    K_packed: int = 0,
+    num_scale_elems: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.nvfp4_quantize``.
+
+    Sourced from ``tests/utils/test_fp4_quantize.py`` /
+    ``test_mm_fp4.py``: ``a_global_sf`` is computed from the input
+    absmax as ``448 * 6 / amax(a)``.
+    """
+    del K_packed, num_scale_elems, one
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    amax = a.float().abs().nan_to_num().max().clamp(min=1e-12)
+    return {
+        "a": a,
+        "a_global_sf": (448.0 * 6.0 / amax).reshape(1).contiguous(),
+    }
+
 
 # ── NVFP4 quantization ────────────────────────────────────────────────────────
 nvfp4_quantize_trace = TraceTemplate(
@@ -304,7 +369,25 @@ nvfp4_quantize_trace = TraceTemplate(
     constraints=["K_packed == K // 2"],
     tags=["status:verified", "quantization:nvfp4"],
     reference=_nvfp4_quantize_reference,
+    init=_nvfp4_quantize_init,
 )
+
+
+def _mxfp4_quantize_init(
+    *,
+    M: int,
+    K: int = 4096,
+    K_packed: int = 0,
+    num_scale_elems: int = 0,
+    one: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mxfp4_quantize`` (no global scale)."""
+    del K_packed, num_scale_elems, one
+    torch.manual_seed(seed)
+    return {"a": torch.randn(M, K, dtype=torch.bfloat16, device=device)}
+
 
 # ── MXFP4 quantization ────────────────────────────────────────────────────────
 mxfp4_quantize_trace = TraceTemplate(
@@ -330,7 +413,23 @@ mxfp4_quantize_trace = TraceTemplate(
     constraints=["K_packed == K // 2"],
     tags=["status:verified", "quantization:mxfp4"],
     reference=_mxfp4_quantize_reference,
+    init=_mxfp4_quantize_init,
 )
+
+
+def _mxfp8_quantize_init(
+    *,
+    M: int,
+    K: int = 4096,
+    num_scale_elems: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mxfp8_quantize``."""
+    del num_scale_elems
+    torch.manual_seed(seed)
+    return {"input": torch.randn(M, K, dtype=torch.bfloat16, device=device)}
+
 
 # ── MXFP8 quantization ────────────────────────────────────────────────────────
 
@@ -366,6 +465,7 @@ mxfp8_quantize_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:mxfp8"],
     reference=_mxfp8_quantize_reference,
+    init=_mxfp8_quantize_init,
 )
 
 
@@ -387,6 +487,40 @@ def _nvfp4_kv_quantize_reference(
         sf_vec_size=16,
         sf_use_ue8m0=False,
     )
+
+
+def _nvfp4_kv_quantize_init(
+    *,
+    M: int,
+    K: int = 128,
+    K_div_2: int = 0,
+    K_div_16: int = 0,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.nvfp4_kv_quantize``.
+
+    Default ``K=128`` matches a typical KV head dim. ``global_scale`` is
+    computed from input absmax (``448 * 6 / amax``) — same principled
+    formula used by ``fp4_quantize`` / ``nvfp4_quantize``.
+
+    Note: ``tests/utils/test_fp4_kv_quantization.py`` parametrizes over
+    multiple ``global_scale`` values (0.5, 1.0) — the 1.0 case
+    specifically guards against FP8 E4M3 block-scale underflow at very
+    small KV head_dim. The amax-derived scale here matches the
+    activation/weight quantize pipeline; callers who want the underflow
+    guard can override with ``global_scale=torch.tensor([1.0])`` after
+    calling ``init``.
+    """
+    del K_div_2, K_div_16, scalar
+    torch.manual_seed(seed)
+    inp = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    amax = inp.float().abs().nan_to_num().max().clamp(min=1e-12)
+    return {
+        "input": inp,
+        "global_scale": (448.0 * 6.0 / amax).reshape(1).contiguous(),
+    }
 
 
 nvfp4_kv_quantize_trace = TraceTemplate(
@@ -414,4 +548,5 @@ nvfp4_kv_quantize_trace = TraceTemplate(
     },
     tags=["status:verified", "quantization:fp4"],
     reference=_nvfp4_kv_quantize_reference,
+    init=_nvfp4_kv_quantize_init,
 )

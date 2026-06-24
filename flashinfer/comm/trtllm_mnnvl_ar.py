@@ -7,7 +7,7 @@ import functools
 import math
 import logging
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from enum import Enum
 
 import torch
@@ -18,7 +18,9 @@ from flashinfer.comm.mnnvl import TorchDistBackend
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
+from ..fp4_quantization import _compute_swizzled_layout_sf_size
 from .mnnvl import CommBackend, MPIBackend
+from .trtllm_ar import QuantizationSFLayout
 from .workspace_base import AllReduceFusionWorkspace
 from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 
@@ -48,6 +50,12 @@ class MNNVLAllreduceFusionStrategy(Enum):
 
 # Empirical result calculated from num_tokens * hidden_dim * tp_size * elem_size
 MNNVL_ONE_SHOT_THRESHOLD = 64 * 1024 * 8 * 2
+
+
+class MNNVLQuantType:
+    NONE = 0
+    FP8 = 1
+    NVFP4 = 2
 
 
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
@@ -274,12 +282,18 @@ def get_trtllm_mnnvl_comm_module():
             "rank",
             "rmsnorm_fusion",
             "launch_with_pdl",
+            "trigger_completion_at_end",
             "use_oneshot",
             "output",
             "residual_out",
             "residual_in",
             "gamma",
             "epsilon",
+            "quant_type",
+            "quant_out",
+            "sf_out",
+            "output_scale",
+            "layout_code",
         ],
     )
     def trtllm_mnnvl_allreduce_fusion(
@@ -294,11 +308,17 @@ def get_trtllm_mnnvl_comm_module():
         launch_with_pdl: bool,
         trigger_completion_at_end: bool,
         use_oneshot: bool,
-        output: torch.Tensor,
+        output: Optional[torch.Tensor],
         residual_out: Optional[torch.Tensor],
         residual_in: Optional[torch.Tensor],
         gamma: Optional[torch.Tensor],
         epsilon: Optional[float],
+        weight_bias: Optional[float] = None,
+        quant_type: int = MNNVLQuantType.NONE,
+        quant_out: Optional[torch.Tensor] = None,
+        sf_out: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
+        layout_code: int = QuantizationSFLayout.SWIZZLED_128x4,
     ) -> None:
         """
         Perform a multi-node NVLink all-reduce operation with fusion.
@@ -341,6 +361,12 @@ def get_trtllm_mnnvl_comm_module():
             residual_in,
             gamma,
             epsilon,
+            weight_bias,
+            quant_type,
+            quant_out,
+            sf_out,
+            output_scale,
+            layout_code,
         )
 
     return SimpleNamespace(
@@ -356,18 +382,42 @@ def trtllm_mnnvl_allreduce(
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
     trigger_completion_at_end: bool = True,
 ) -> torch.Tensor:
-    """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
+    """Perform an MNNVL all-reduce sum across tensor-parallel ranks.
 
-    This function performs an all-reduce (sum) operation using NVIDIA's multi-node NVLink (MNNVL)
-    technology to efficiently combine tensors across multiple GPUs and nodes.
+    ``input`` must be a 2-D local shard with shape ``[num_tokens, hidden_dim]``.
+    The result has the same shape and is written to ``output`` when provided, or
+    to a newly allocated tensor otherwise. ``workspace`` must be an
+    :class:`MNNVLAllReduceFusionWorkspace` created for the same tensor-parallel
+    group and with enough buffer capacity for the selected strategy.
 
-    There are 2 variants: One-shot and Two-shot:
-     - One-shot: Each rank stores local shard to all other ranks. Each ranks will receive all shards at the end of the communication round and perfom local reduction. Suitable for small data size and is optimized for low latency.
-     - Two-shot: There will be 3 steps:
-        1. Scatter each GPU's input shard to other ranks. Each rank will received all shards of a slice of tokens.
-        2. Each rank perform reduction on the local tokens.
-        3. Each rank broadcast the result to all ranks.
-        Suitable for large data size and is optimized for balancing throughput and latency.
+    MNNVL supports two execution strategies:
+
+    * ``ONESHOT`` stores each rank's local shard to the peer-visible workspace
+      and each rank performs the reduction locally. This is the low-latency path
+      used for smaller payloads.
+    * ``TWOSHOT`` scatters token slices, reduces each slice on its destination
+      rank, then broadcasts the reduced result. This is the throughput-oriented
+      path for larger payloads.
+
+    With ``AUTO``, FlashInfer selects the strategy from the payload size. Both
+    ``ONESHOT`` and ``TWOSHOT`` are fully deterministic across ranks.
+
+    This allreduce-only helper does not perform quantization. Use
+    :func:`trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant`, or the unified
+    :func:`flashinfer.comm.allreduce_fusion` API with FP8/NVFP4
+    ``AllReduceFusionPattern`` values, when the post-RMSNorm quantized output is
+    needed.
+
+    Determinism:
+
+    * ``ONESHOT`` and ``TWOSHOT`` use the exact same reduction order on each
+      rank.
+    * ``ONESHOT`` keeps the local rank's value in registers; only remote ranks
+      are volatile-loaded from the Lamport buffer.
+    * ``ONESHOT`` uses a rank-specialized fast path for ``world_size <= 8``.
+      Larger world sizes use a compact deterministic fallback because the
+      runtime benefit is thin and specializing every rank significantly
+      increases JIT compile time.
 
     Args:
         input: Local Input Shard [num_tokens, hidden_dim]
@@ -444,6 +494,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     launch_with_pdl: bool = False,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
     trigger_completion_at_end: bool = True,
+    weight_bias: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Performs MNNVL Allreduce + Residual + RMSNorm.
 
@@ -468,6 +519,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
             last kernel fully finishes. False: signal completion early to
             allow the next PDL-aware kernel to overlap. Only has an effect
             when ``launch_with_pdl`` is True on SM90+.
+        weight_bias: Bias added to gamma before scaling. 0.0 (default) for standard
+            RMSNorm (gamma * x * rsqrt(...)); 1.0 for Gemma / Qwen3.5 RMSNorm
+            ((1 + gamma) * x * rsqrt(...)).
 
     Returns:
         output: Add-residual and normalized tensor [num_tokens, hidden_dim]
@@ -532,8 +586,230 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         residual_in,
         gamma,
         epsilon,
+        weight_bias,
     )
     return output, residual_out
+
+
+def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
+    input: torch.Tensor,
+    residual_in: torch.Tensor,
+    gamma: torch.Tensor,
+    workspace: MNNVLAllReduceFusionWorkspace,
+    epsilon: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+    quant_out: Optional[torch.Tensor] = None,
+    scale_out: Optional[torch.Tensor] = None,
+    output_scale: Union[torch.Tensor, float, None] = None,
+    layout_code: int = QuantizationSFLayout.SWIZZLED_128x4,
+    quant_type: int = MNNVLQuantType.NONE,
+    launch_with_pdl: bool = False,
+    strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
+    weight_bias: float = 0.0,
+    trigger_completion_at_end: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+    """Perform MNNVL AllReduce + Residual + RMSNorm + FP8/NVFP4 quantization.
+
+    Quantization is applied after RMSNorm. ``output`` is optional; pass it only
+    when the normalized non-quantized tensor is also needed. The quantized result
+    is always returned as ``quant_out``.
+
+    Args:
+        input: Input tensor with shape ``[num_tokens, hidden_dim]``.
+        residual_in: Residual tensor with the same shape as ``input``.
+        gamma: RMSNorm gamma tensor with shape ``[hidden_dim]``.
+        workspace: MNNVL workspace for the tensor-parallel group.
+        epsilon: RMSNorm epsilon. Defaults to ``torch.finfo(input.dtype).eps``.
+        output: Optional normalized output tensor with shape
+            ``[num_tokens, hidden_dim]``.
+        residual_out: Optional residual output tensor with shape
+            ``[num_tokens, hidden_dim]``.
+        quant_out: Optional quantized output. For FP8, shape must be
+            ``[num_tokens, hidden_dim]`` and dtype ``torch.float8_e4m3fn``. For
+            NVFP4, shape must be ``[num_tokens, hidden_dim // 2]`` and dtype
+            ``torch.uint8`` or ``torch.float4_e2m1fn_x2``.
+        scale_out: Optional NVFP4 scale output. For ``LINEAR`` layout, shape is
+            ``[num_tokens, hidden_dim // 16]``. For ``SWIZZLED_128x4``, provide a
+            1-D tensor large enough for the padded swizzled scale layout. FP8
+            ignores this argument.
+        output_scale: Scalar float or float32 tensor used as the quantization
+            output scale. Defaults to ``1.0``.
+        layout_code: NVFP4 scale layout. MNNVL supports ``SWIZZLED_128x4`` and
+            ``LINEAR``; ``SWIZZLED_8x4`` is not supported.
+        quant_type: ``MNNVLQuantType.FP8`` or ``MNNVLQuantType.NVFP4``.
+        launch_with_pdl: Whether to launch with PDL.
+        strategy: MNNVL execution strategy. ``AUTO`` uses internal heuristics.
+        weight_bias: Bias added to gamma before scaling. ``0.0`` for standard
+            RMSNorm; ``1.0`` for Gemma / Qwen3.5 RMSNorm.
+
+    Returns:
+        A tuple ``(quant_out, scale_out, residual_out, output)``. ``scale_out``
+        is ``None`` for FP8, and ``output`` is ``None`` unless requested.
+    """
+
+    if epsilon is None:
+        epsilon = torch.finfo(input.dtype).eps
+    if output_scale is None:
+        output_scale = 1.0
+
+    if len(input.shape) != 2:
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(input.shape)}D. The shape is {input.shape}."
+        )
+    if len(residual_in.shape) != 2:
+        raise ValueError(
+            f"The residual input tensor must be 2D, got {len(residual_in.shape)}D. The shape is {residual_in.shape}."
+        )
+    if residual_in.shape != input.shape:
+        raise ValueError(
+            f"residual_in shape must match input shape, got {residual_in.shape} and {input.shape}."
+        )
+    if gamma.numel() != input.shape[1]:
+        raise ValueError(
+            f"The gamma tensor must have the same number of elements as the hidden dimension, got {gamma.numel()} elements but expected {input.shape[1]} elements."
+        )
+
+    if layout_code == QuantizationSFLayout.SWIZZLED_8x4:
+        raise ValueError(
+            "MNNVL NVFP4 quantization supports SWIZZLED_128x4 or LINEAR scale layouts, not SWIZZLED_8x4."
+        )
+
+    if residual_out is None:
+        residual_out = torch.empty_like(input)
+    elif residual_out.shape != input.shape:
+        raise ValueError(
+            f"residual_out shape must match input shape, got {residual_out.shape} and {input.shape}."
+        )
+
+    if output is not None and output.shape != input.shape:
+        raise ValueError(
+            f"output shape must match input shape, got {output.shape} and {input.shape}."
+        )
+
+    if isinstance(output_scale, torch.Tensor):
+        if output_scale.numel() < 1:
+            raise ValueError("output_scale must contain at least one element")
+        output_scale_tensor = output_scale.to(device=input.device, dtype=torch.float32)
+    else:
+        output_scale_tensor = torch.tensor(
+            [float(output_scale)], dtype=torch.float32, device=input.device
+        )
+
+    token_num, hidden_dim = input.shape
+    if quant_type == MNNVLQuantType.FP8:
+        if quant_out is None:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        elif quant_out.shape != input.shape:
+            raise ValueError(
+                f"quant_out shape must be {tuple(input.shape)} for FP8, got {tuple(quant_out.shape)}."
+            )
+        if quant_out.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"quant_out dtype for FP8 must be float8_e4m3fn, got {quant_out.dtype}."
+            )
+        scale_out = None
+    elif quant_type == MNNVLQuantType.NVFP4:
+        if input.dtype == torch.float32:
+            raise ValueError("MNNVL NVFP4 quantization requires fp16 or bf16 input.")
+        if hidden_dim % 16 != 0:
+            raise ValueError(
+                f"MNNVL NVFP4 quantization requires hidden_dim divisible by 16, got {hidden_dim}."
+            )
+        expected_quant_shape = (token_num, hidden_dim // 2)
+        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if quant_out is None:
+            quant_out = torch.empty(
+                expected_quant_shape, dtype=torch.uint8, device=input.device
+            )
+        elif tuple(quant_out.shape) != expected_quant_shape:
+            raise ValueError(
+                f"quant_out shape must be {expected_quant_shape} for NVFP4, got {tuple(quant_out.shape)}."
+            )
+        if quant_out.dtype != torch.uint8 and not (
+            fp4_dtype is not None and quant_out.dtype == fp4_dtype
+        ):
+            raise ValueError(
+                f"quant_out dtype for NVFP4 must be uint8 or float4_e2m1fn_x2, got {quant_out.dtype}."
+            )
+
+        expected_scale_out_numel = (
+            token_num * hidden_dim // 16
+            if layout_code == QuantizationSFLayout.LINEAR
+            else _compute_swizzled_layout_sf_size(token_num, hidden_dim // 16)
+        )
+        if scale_out is None:
+            if layout_code == QuantizationSFLayout.LINEAR:
+                scale_out = torch.empty(
+                    (token_num, hidden_dim // 16),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+            else:
+                scale_out = torch.empty(
+                    _compute_swizzled_layout_sf_size(token_num, hidden_dim // 16),
+                    dtype=torch.float8_e4m3fn,
+                    device=input.device,
+                )
+        elif scale_out.numel() < expected_scale_out_numel:
+            raise ValueError(
+                f"scale_out is too small for NVFP4: got {scale_out.numel()} elements, need at least {expected_scale_out_numel}."
+            )
+        if scale_out.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"scale_out dtype for NVFP4 must be float8_e4m3fn, got {scale_out.dtype}."
+            )
+    else:
+        raise ValueError(f"Unsupported MNNVL quant_type: {quant_type}")
+
+    if strategy == MNNVLAllreduceFusionStrategy.AUTO:
+        strategy = MNNVLAllreduceFusionStrategy.select_strategy(
+            workspace.tp_size, token_num, hidden_dim, input.dtype
+        )
+    if not workspace.is_buffer_size_sufficient(
+        workspace.tp_size, token_num, hidden_dim, input.dtype, strategy
+    ):
+        raise ValueError(
+            f"The buffer size in the given workspace is insufficient for the given problem size. Buffer: {workspace.buffer_size_bytes} bytes, Required: {workspace.get_required_buffer_size_bytes(workspace.tp_size, token_num, hidden_dim, input.dtype, strategy)} bytes."
+        )
+
+    for tensor, name in (
+        (residual_in, "residual_in"),
+        (gamma, "gamma"),
+        (output, "output"),
+        (residual_out, "residual_out"),
+        (quant_out, "quant_out"),
+        (scale_out, "scale_out"),
+    ):
+        if tensor is not None and tensor.device != input.device:
+            raise ValueError(f"{name} must be on {input.device}, got {tensor.device}.")
+
+    module = get_trtllm_mnnvl_comm_module()
+    module.trtllm_mnnvl_allreduce_fusion(
+        input,
+        workspace.mc_ptr,
+        workspace.uc_ptrs_dev,
+        workspace.uc_ptr_local,
+        workspace.buffer_flags,
+        workspace.tp_size,
+        workspace.rank,
+        True,
+        launch_with_pdl,
+        trigger_completion_at_end,
+        strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
+        output,
+        residual_out,
+        residual_in,
+        gamma,
+        epsilon,
+        weight_bias,
+        quant_type,
+        quant_out,
+        scale_out,
+        output_scale_tensor,
+        layout_code,
+    )
+    return quant_out, scale_out, residual_out, output
 
 
 # Legacy API that has been deprecated; Left for backward compatibility
@@ -547,6 +823,10 @@ def get_allreduce_mnnvl_workspace(
     buffer_size_in_bytes: Optional[int] = None,
 ) -> Tuple[MNNVLAllReduceFusionWorkspace, torch.Tensor, int]:
     """Get workspace buffers needed for multi-node NVLink all-reduce operation.
+
+    Deprecated: use :class:`MNNVLAllReduceFusionWorkspace` to manage the
+    workspace instead. This legacy helper is kept for backward compatibility
+    and may be removed in a future release.
 
     Args:
         mapping: Tensor parallel mapping configuration containing rank info
@@ -603,7 +883,14 @@ def trtllm_mnnvl_all_reduce(
     launch_with_pdl: bool,
     out: Optional[torch.Tensor] = None,
 ) -> None:
-    """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
+    """Deprecated pointer-based MNNVL all-reduce API.
+
+    Deprecated:
+        Use :func:`trtllm_mnnvl_allreduce` with
+        :class:`MNNVLAllReduceFusionWorkspace` instead. This legacy function is
+        kept for compatibility and may be removed in a future release.
+
+    Perform a multi-node NVLink all-reduce operation across multiple GPUs.
 
     This function performs an all-reduce (sum) operation using NVIDIA's multi-node NVLink (MNNVL)
     technology to efficiently combine tensors across multiple GPUs and nodes.
@@ -683,6 +970,10 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
     launch_with_pdl: bool,
 ) -> None:
     """Performs MNNVL TwoShot Allreduce + RMSNorm.
+
+    Deprecated: use :func:`trtllm_mnnvl_fused_allreduce_add_rmsnorm` instead.
+    This legacy function is kept for backward compatibility and may be removed
+    in a future release.
 
     This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_all_reduce on the shard_input.
     After this, it performs RMSNorm on the all-reduced result, reading it directly from the multicast buffer.

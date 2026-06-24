@@ -1,8 +1,9 @@
 import pytest
 import torch
 
-from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
+from flashinfer import mxfp8_quantize, SfLayout
 from flashinfer.utils import get_compute_capability
+from tests.utils_fp8 import assert_mxfp8_quantize_exact as _assert_mxfp8_quantize_exact
 
 
 def is_cute_dsl_available():
@@ -43,53 +44,15 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
 
     a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
 
-    if device == "cuda":
-        a_fp8 = a_fp8.cpu()
-        a_sf = a_sf.cpu()
-
-    a_pt = mxfp8_dequantize_host(
-        a_fp8.view(torch.uint8),
-        a_sf.view(torch.uint8).reshape(-1),
-        is_sf_swizzled_layout,
+    _assert_mxfp8_quantize_exact(
+        a,
+        a_fp8,
+        a_sf,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
     )
 
     if device == "cuda":
-        a_pt = a_pt.cuda()
-
-    torch.cuda.synchronize()
-
-    def check_accuracy(a, b, atol, rtol, percent):
-        if torch.any(torch.isnan(a)):
-            raise Exception("NaN in a")
-        if torch.any(torch.isnan(b)):
-            raise Exception("NaN in b")
-        assert a.shape == b.shape
-        left = torch.abs(a - b)
-        right = atol + rtol * torch.abs(b)
-        count = torch.sum(left > right)
-        mismatch_percent = count / a.numel()
-        if mismatch_percent > 1 - percent:
-            raise Exception(
-                "Mismatch percentage is %f for rtol %f" % (mismatch_percent, rtol)
-            )
-
-    check_accuracy(a_pt, a, 8, 0, 0.999)
-
-
-def mxfp8_quantize_check_accuracy(a, b, atol, rtol, percent):
-    if torch.any(torch.isnan(a)):
-        raise Exception("NaN in a")
-    if torch.any(torch.isnan(b)):
-        raise Exception("NaN in b")
-    assert a.shape == b.shape
-    left = torch.abs(a - b)
-    right = atol + rtol * torch.abs(b)
-    count = torch.sum(left > right)
-    mismatch_percent = count / a.numel()
-    if mismatch_percent > 1 - percent:
-        raise Exception(
-            "Mismatch percentage is %f for rtol %f" % (mismatch_percent, rtol)
-        )
+        torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])
@@ -102,13 +65,9 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
 
     a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout)
 
-    a_pt = mxfp8_dequantize_host(
-        a_fp8.view(torch.uint8), a_sf.view(torch.uint8), is_sf_swizzled_layout
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
-
-    torch.cuda.synchronize()
-
-    mxfp8_quantize_check_accuracy(a_pt, a, 8, 0, 0.999)
 
 
 @pytest.mark.parametrize("m", [1, 2, 3, 16, 64, 1024])
@@ -128,16 +87,11 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
 
     a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, 32, backend=backend)
-    a_pt = mxfp8_dequantize_host(
-        a_fp8.cpu().view(torch.uint8),
-        a_sf.cpu().view(torch.uint8),
-        is_sf_swizzled_layout,
-    )
 
-    torch.cuda.synchronize()
-    mxfp8_quantize_check_accuracy(
-        a_pt.cpu().to(torch.float32), a.cpu().to(torch.float32), 8, 0, 0.999
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])
@@ -164,22 +118,18 @@ def test_mxfp8_quantize_alignment_torch_device(
     a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, alignment, backend=backend)
     assert a_fp8.shape[1] == padded_k
 
-    # Dequantize it on host.
-    a_pt = mxfp8_dequantize_host(
-        a_fp8.cpu().view(torch.uint8),
-        a_sf.cpu().view(torch.uint8),
-        is_sf_swizzled_layout,
-    )
-
     # Check if the bits of paddings are zero.
     paddings = a_fp8.view(torch.int8)[:, k:]
     assert torch.all(paddings == 0), "Paddings should be zero"
 
-    torch.cuda.synchronize()
-
-    mxfp8_quantize_check_accuracy(
-        a_pt[:, :k].cpu().to(torch.float32), a.cpu().to(torch.float32), 8, 0, 0.999
+    _assert_mxfp8_quantize_exact(
+        a,
+        a_fp8,
+        a_sf,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        alignment=alignment,
     )
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("m", [1, 3, 128, 2048])
@@ -216,6 +166,10 @@ def test_mxfp8_quantize_denormal_inputs(m, k, dtype, is_sf_swizzled_layout, back
     inf_count = torch.isinf(a_fp8.float()).sum().item()
     assert inf_count == 0, f"Found {inf_count} Inf values in output (expected 0)"
 
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+
 
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
@@ -239,6 +193,10 @@ def test_mxfp8_quantize_all_zeros(dtype, is_sf_swizzled_layout, backend):
 
     # All outputs should be zero
     assert (a_fp8.float() == 0).all(), "Non-zero output for zero input"
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
@@ -285,6 +243,10 @@ def test_mxfp8_quantize_mixed_magnitude(dtype, is_sf_swizzled_layout, backend):
             f"Found {nan_count} NaN values. First NaN at row={first_nan_row}, col={first_nan_col}"
         )
 
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+
 
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
@@ -320,6 +282,33 @@ def test_mxfp8_quantize_single_denormal_in_block(dtype, is_sf_swizzled_layout, b
     # Check that no NaN is produced
     nan_mask = torch.isnan(a_fp8.float())
     assert not nan_mask.any(), f"Found NaN at positions: {torch.where(nan_mask)}"
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_extreme_scale_inputs(dtype, is_sf_swizzled_layout, backend):
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    a = torch.zeros((2, 128), dtype=dtype, device="cuda")
+    a[:, 32:64] = float("inf")
+    a[:, 64:96] = 448.0
+    a[:, 96:128] = -448.0
+
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
+
+    _assert_mxfp8_quantize_exact(
+        a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
 
 
 # =============================================================================
@@ -452,6 +441,76 @@ def test_cute_dsl_compilation_cache_k_specific(is_sf_swizzled_layout):
 
     # Clean up
     cache_fn.cache_clear()
+
+
+# =============================================================================
+# Backend-parity tests across all SF layouts (128x4 / 8x4 / linear)
+# =============================================================================
+
+MXFP8_SF_LAYOUTS = [
+    SfLayout.layout_128x4,
+    SfLayout.layout_8x4,
+    SfLayout.layout_linear,
+]
+
+
+@pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
+@pytest.mark.parametrize("k", [128, 1024, 8192])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sf_layout", MXFP8_SF_LAYOUTS)
+def test_mxfp8_quantize_layout_backend_parity(m, k, dtype, sf_layout):
+    """CUDA and CuTe-DSL backends must exactly match element-wise."""
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    torch.random.manual_seed(0)
+    a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
+
+    a_fp8_cuda, a_sf_cuda = mxfp8_quantize(
+        a, sf_swizzle_layout=sf_layout, backend="cuda"
+    )
+    a_fp8_cute, a_sf_cute = mxfp8_quantize(
+        a, sf_swizzle_layout=sf_layout, backend="cute-dsl"
+    )
+
+    assert a_fp8_cuda.shape == a_fp8_cute.shape, (
+        f"Quantized output shape mismatch for {sf_layout.name}: "
+        f"cuda={a_fp8_cuda.shape}, cute={a_fp8_cute.shape}"
+    )
+    if not torch.equal(a_fp8_cuda, a_fp8_cute):
+        mismatch = a_fp8_cuda != a_fp8_cute
+        mismatch_count = int(mismatch.sum().item())
+        first_index = tuple(
+            int(x) for x in torch.nonzero(mismatch, as_tuple=False)[0].cpu()
+        )
+        raise AssertionError(
+            f"Quantized output element mismatch for {sf_layout.name}: "
+            f"{mismatch_count}/{a_fp8_cuda.numel()} elements differ; "
+            f"first mismatch at index {first_index}: "
+            f"cuda={a_fp8_cuda[first_index].float().item()}, "
+            f"cute={a_fp8_cute[first_index].float().item()}"
+        )
+
+    assert a_sf_cuda.shape == a_sf_cute.shape, (
+        f"Scale factor shape mismatch for {sf_layout.name}: "
+        f"cuda={a_sf_cuda.shape}, cute={a_sf_cute.shape}"
+    )
+    if not torch.equal(a_sf_cuda, a_sf_cute):
+        mismatch = a_sf_cuda != a_sf_cute
+        mismatch_count = int(mismatch.sum().item())
+        first_index = tuple(
+            int(x) for x in torch.nonzero(mismatch, as_tuple=False)[0].cpu()
+        )
+        raise AssertionError(
+            f"Scale factor element mismatch for {sf_layout.name}: "
+            f"{mismatch_count}/{a_sf_cuda.numel()} elements differ; "
+            f"first mismatch at index {first_index}: "
+            f"cuda={int(a_sf_cuda[first_index].item())}, "
+            f"cute={int(a_sf_cute[first_index].item())}"
+        )
 
 
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
