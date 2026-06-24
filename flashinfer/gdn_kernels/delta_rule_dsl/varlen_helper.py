@@ -60,12 +60,6 @@ def should_use_cp_host(num_parallel_work: int, num_sms: int, device_name: str) -
     output/state heads. CP is selected only when that parallelism is strictly
     below the card-specific threshold.
     """
-    if num_parallel_work <= 0:
-        raise RuntimeError(
-            f"num_parallel_work must be positive, got {num_parallel_work}"
-        )
-    if num_sms <= 0:
-        raise RuntimeError(f"num_sms must be positive, got {num_sms}")
     threshold_num, threshold_den = cp_parallelism_threshold_host(device_name)
     return num_parallel_work * threshold_den < num_sms * threshold_num
 
