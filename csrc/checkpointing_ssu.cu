@@ -457,14 +457,15 @@ void checkpointing_ssu(
                    " < 32 (output MMA m16n8 atom floor with _1×4 warp layout)");
 
   // ── Validate main_heads_per_cta (two-kernel MAIN head-tiling, host knob) ──
-  // Consecutive heads each main CTA processes; must be >= 1 and divide HEADS_PER_GROUP
-  // (= nheads/ngroups).  The launcher snaps it to the HPG>>k chain and binds it to the
-  // MAIN_HEADS_PER_CTA template arg (it never reaches the kernel as a runtime value).
+  // 0 = auto-heuristic (resolved in launchCheckpointingSsuImpl); >0 must divide HPG.
+  // The launcher snaps it to the HPG>>k chain and binds it to the MAIN_HEADS_PER_CTA
+  // template arg (it never reaches the kernel as a runtime value).
   {
     int64_t const hpg = nheads / ngroups;
-    FLASHINFER_CHECK(main_heads_per_cta >= 1 && hpg % main_heads_per_cta == 0,
-                     "main_heads_per_cta=", main_heads_per_cta,
-                     " must be >= 1 and divide HEADS_PER_GROUP (nheads/ngroups=", hpg, ")");
+    FLASHINFER_CHECK(
+        main_heads_per_cta == 0 || (main_heads_per_cta >= 1 && hpg % main_heads_per_cta == 0),
+        "main_heads_per_cta=", main_heads_per_cta,
+        " must be 0 (auto) or a positive divisor of HEADS_PER_GROUP (nheads/ngroups=", hpg, ")");
   }
 
   // ── Validate precompute_heads_per_cta (two-kernel PRECOMPUTE head-tiling, host knob) ──

@@ -851,17 +851,18 @@ def _make_run_closure(
         _ca = inputs.cumAdt_vec if _two else None
         _cbo = inputs.cb_old if _two else None
         # MAIN head-tiling knob (two-kernel only): heads-per-CTA the main loops over.
-        # Swept via env, mirroring the precompute's FLASHINFER_SSU_HEADS_PER_CTA.  1 =
-        # today's per-head main; monolith ("cuda-incr") always uses 1.
+        # 0 = launcher heuristic (batch>=512 → 4, else 1); >0 overrides.
+        # Swept via env, mirroring the precompute's FLASHINFER_SSU_HEADS_PER_CTA.
         _mhc = (
-            int(os.environ.get("FLASHINFER_SSU_MAIN_HEADS_PER_CTA", "1")) if _two else 1
+            int(os.environ.get("FLASHINFER_SSU_MAIN_HEADS_PER_CTA", "0")) if _two else 1
         )
         # PRECOMPUTE head-tiling knob (two-kernel only): 0 = launcher co-residency heuristic;
         # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
         _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
         # D-split knob (two-kernel only): splits each head's DIM across D_SPLIT CTAs.
-        # FLASHINFER_SSU_D_SPLIT=2 doubles CTA count for better occupancy at small batch.
-        _ds = int(os.environ.get("FLASHINFER_SSU_D_SPLIT", "1")) if _two else 1
+        # DS=2 default: doubles main CTA count (256→512), keeps D_PER_CTA=64 (≥32 required).
+        # Joint sweep (batch=16, B300, 2026-06-24): DS=2 saves 2.04µs vs DS=1 at HPC=8,NW=8,MHC=1.
+        _ds = int(os.environ.get("FLASHINFER_SSU_D_SPLIT", "2")) if _two else 1
         if with_conv1d:
 
             def _run():

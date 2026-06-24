@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 by FlashInfer team.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -95,7 +95,7 @@ struct CheckpointingSsuMainStorage {
   alignas(16) input_t old_x[STATE_PIPE * OLD_X_ELEMS];
   float old_dt[STATE_PIPE * MAX_WINDOW];
   float old_cumAdt[STATE_PIPE * MAX_WINDOW];
-  float cumAdt[STATE_PIPE * NPREDICTED];
+  float cumAdt[STATE_PIPE * NPREDICTED_PAD_MMA_M];
   alignas(16) input_t x[STATE_PIPE * X_ELEMS];
   alignas(16) state_t state[STATE_PIPE * STATE_ELEMS];
 };
@@ -338,7 +338,7 @@ __device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams co
   // gdc_wait has fired; precompute output (cumAdt_vec, cb_scaled) is now globally visible.
   // Load cumAdt from one warp only — all warps would write the same values (same lane/head/seq).
   if (warp == 0 && lane < seq_len) {
-    (smem.cumAdt + 0 * NPREDICTED)[lane] =
+    (smem.cumAdt + 0 * NPREDICTED_PAD_MMA_M)[lane] =
         cumAdt_ptr[(int64_t)(seq * params.nheads + first_head) * NPREDICTED_PAD_MMA_M + lane];
   }
 
@@ -404,7 +404,7 @@ __device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams co
                   NUM_WARPS, MUST_CHECKPOINT, /*IS_FIRST=*/false>(
           smem, params, lane, warp, d_tile, head, cache_slot, prev_k, rand_seed, /*tile_buf=*/0);
       // my_cumAdt is in a register (loaded before replay); write it to smem now.
-      if (warp == 0 && lane < seq_len) (smem.cumAdt + 0 * NPREDICTED)[lane] = my_cumAdt;
+      if (warp == 0 && lane < seq_len) (smem.cumAdt + 0 * NPREDICTED_PAD_MMA_M)[lane] = my_cumAdt;
       __pipeline_wait_prior(0);  // drain G_x → x_h ready for output_head
       __syncthreads();           // fence warp-0 cumAdt write + x_h pipeline data across all warps
     } else {
@@ -417,8 +417,8 @@ __device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams co
                   /*IS_FIRST=*/false>(smem, params, lane, warp, d_tile, head + 1, group_idx,
                                       cache_slot, buf_read, outer, seq_len, MUST_CHECKPOINT, prev_k,
                                       next_buf);
+        __pipeline_commit();  // G_tiles: state_{h+1} + old_tiles_{h+1}
       }
-      __pipeline_commit();  // G_tiles: [state_{h+1} + old_tiles_{h+1}] if has_next, else empty
 
       // Issue x_{h+1} in its own group so it stays in flight across replay + output of head h.
       if (has_next) {
@@ -427,23 +427,25 @@ __device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams co
         __pipeline_commit();  // G_xnext: x_{h+1}
       }
 
-      // Always drain only the oldest outstanding group, keeping the 2 most recent in flight:
-      //   has_next:  in-flight = G_xprev(x_h), G_tiles(state_{h+1}+tiles_{h+1}), G_xnext(x_{h+1})
-      //              → wait_prior(2) drains G_xprev(x_h); x_h lands in smem; G_tiles+G_xnext
-      //              stay in flight across replay_head(h) which doesn't need either.
-      //   !has_next: in-flight = G_tiles(state_h+tiles_h), G_xnext(x_h), G_empty
-      //              → wait_prior(2) drains G_tiles(state_h+tiles_h); replay_head(h) proceeds
-      //              while x_h (G_xnext) still loads in the background.
-      __pipeline_wait_prior(2);
+      // ── DRAIN TILES FOR REPLAY ──
+      // has_next:  3 in-flight = [x_h(prev), G_tiles(h+1), G_xnext(h+1)].
+      //            wait_prior(3) keeps all 3 in flight — replay_head does NOT need x_h,
+      //            so its HBM latency is hidden behind replay MMA.
+      // !has_next: 1 in-flight = [x_h].
+      //            wait_prior(1) = no stall (already ≤1). x_h loads during replay_head.
+      __pipeline_wait_prior(has_next ? 3 : 1);
       __syncwarp();
       replay_head<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS,
                   NUM_WARPS, MUST_CHECKPOINT, /*IS_FIRST=*/false>(
           smem, params, lane, warp, d_tile, head, cache_slot, prev_k, rand_seed, cur_buf);
       // my_cumAdt is in a register (loaded before replay); write it to smem now.
-      if (warp == 0 && lane < seq_len) (smem.cumAdt + cur_buf * NPREDICTED)[lane] = my_cumAdt;
-      // !has_next: x_h (G_xnext) is still in flight — drain it now before the sync.
-      //  has_next: x_h was already drained by wait_prior(2) above; this is a no-op.
-      if (!has_next) __pipeline_wait_prior(0);
+      if (warp == 0 && lane < seq_len)
+        (smem.cumAdt + cur_buf * NPREDICTED_PAD_MMA_M)[lane] = my_cumAdt;
+      // ── DRAIN X FOR OUTPUT ──
+      // has_next:  x_h still in flight; wait_prior(2) drains it (drops G_xprev(x_h),
+      //            leaving G_tiles(h+1)+G_xnext(h+1) in flight for next iteration).
+      // !has_next: x_h still in flight; wait_prior(0) drains it.
+      __pipeline_wait_prior(has_next ? 2 : 0);
       __syncthreads();  // fence warp-0 cumAdt write + x_h across all warps
     }
 

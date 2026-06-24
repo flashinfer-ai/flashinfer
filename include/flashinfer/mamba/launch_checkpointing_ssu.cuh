@@ -41,6 +41,19 @@ void dispatch_heads_per_cta(int hc, Fn&& fn) {
   }
 }
 
+// Map a runtime precompute warp count to a compile-time template arg.
+// Valid values: 4, 8, 16 (minimum 4 — the CB matmul uses 4 warps).
+template <typename Fn>
+void dispatch_precompute_num_warps(int nw, Fn&& fn) {
+  if (nw >= 16) {
+    fn.template operator()<16>();
+  } else if (nw >= 8) {
+    fn.template operator()<8>();
+  } else {
+    fn.template operator()<4>();
+  }
+}
+
 // ── Dispatcher ─────────────────────────────────────────────────────────────
 // `D_SPLIT` splits each head's DIM axis across `D_SPLIT` CTAs.
 // `VARLEN` selects the packed-token gmem layout (cu_seqlens-driven).
@@ -117,35 +130,30 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       // Heads are tiled across grid.z to fill the GPU at small batch (heuristic
       // below).  HEADS_PER_CTA is picked at runtime, dispatched to a template arg;
       // DT_SOFTPLUS is JIT-folded on the runtime flag.
-      auto launch_precompute = [&]<int HEADS_PER_CTA, bool DT_SOFTPLUS>() {
-        // 1 head/warp: couple the precompute's warp count to its head tile, clamped to
-        // >= 4 (the C·B / C·old_B matmul is a fixed 2+2-warp job — W0/1 new, W2/3 old).
-        // At hc=8 this gives 8 resident warps (2x the latency-hiding of the main's 4),
-        // matching triton's _dynamic_precompute geometry (256 thr / 8 heads / 1 head per
-        // warp); at hc<=4 it stays 4 warps (byte-identical to before).  Decoupled from the
-        // main's NUM_WARPS so the main keeps its own register/occupancy tuning.  Tune via
-        // the existing precompute_heads_per_cta knob / FLASHINFER_SSU_HEADS_PER_CTA.
-        constexpr int PRECOMPUTE_NUM_WARPS = HEADS_PER_CTA > 4 ? HEADS_PER_CTA : 4;
-        auto pfunc = checkpointing_ssu_precompute_kernel<
-            input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, NPREDICTED, MAX_WINDOW, DIM,
-            DSTATE, HEADS_PER_GROUP, HEADS_PER_CTA, PRECOMPUTE_NUM_WARPS, DT_SOFTPLUS, VARLEN>;
-        constexpr size_t psmem =
-            sizeof(CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE,
-                                                     PRECOMPUTE_NUM_WARPS, HEADS_PER_CTA>);
-        if constexpr (psmem > 0) {
-          FLASHINFER_CUDA_CHECK(
-              cudaFuncSetAttribute(pfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, psmem));
-        }
-        constexpr int head_tiles = (HEADS_PER_GROUP + HEADS_PER_CTA - 1) / HEADS_PER_CTA;
-        cudaLaunchConfig_t pcfg;
-        pcfg.gridDim = dim3(params.batch, params.ngroups, head_tiles);
-        pcfg.blockDim = dim3(warpSize, PRECOMPUTE_NUM_WARPS);
-        pcfg.dynamicSmemBytes = psmem;
-        pcfg.stream = stream;
-        pcfg.attrs = attrs;
-        pcfg.numAttrs = 1;
-        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
-      };
+      auto launch_precompute =
+          [&]<int HEADS_PER_CTA, int PRECOMPUTE_NUM_WARPS, bool DT_SOFTPLUS>() {
+            auto pfunc =
+                checkpointing_ssu_precompute_kernel<input_t, dt_t, weight_t, matrixA_t, state_t,
+                                                    stateIndex_t, NPREDICTED, MAX_WINDOW, DIM,
+                                                    DSTATE, HEADS_PER_GROUP, HEADS_PER_CTA,
+                                                    PRECOMPUTE_NUM_WARPS, DT_SOFTPLUS, VARLEN>;
+            constexpr size_t psmem =
+                sizeof(CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE,
+                                                         PRECOMPUTE_NUM_WARPS, HEADS_PER_CTA>);
+            if constexpr (psmem > 0) {
+              FLASHINFER_CUDA_CHECK(
+                  cudaFuncSetAttribute(pfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, psmem));
+            }
+            constexpr int head_tiles = (HEADS_PER_GROUP + HEADS_PER_CTA - 1) / HEADS_PER_CTA;
+            cudaLaunchConfig_t pcfg;
+            pcfg.gridDim = dim3(params.batch, params.ngroups, head_tiles);
+            pcfg.blockDim = dim3(warpSize, PRECOMPUTE_NUM_WARPS);
+            pcfg.dynamicSmemBytes = psmem;
+            pcfg.stream = stream;
+            pcfg.attrs = attrs;
+            pcfg.numAttrs = 1;
+            FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&pcfg, pfunc, params));
+          };
       // ── Head-tiling default: heads/CTA == warps/CTA (1 head/warp), coupled in
       // launch_precompute (PRECOMPUTE_NUM_WARPS = max(hc, 4)).  hc=8 (→ 8 warps) measured as
       // the robust optimum for batch >= 8 on B200, across BOTH the cliff and large batch:
@@ -172,20 +180,55 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       }();
       if (hc_env > 0) hc = hc_env;
       if (precompute_heads_per_cta > 0) hc = precompute_heads_per_cta;
+      static int const pnw_env = [] {
+        char const* e = std::getenv("FLASHINFER_SSU_PRECOMPUTE_NUM_WARPS");
+        return e ? std::atoi(e) : 0;
+      }();
       dispatch_heads_per_cta<HEADS_PER_GROUP>(hc, [&]<int HEADS_PER_CTA>() {
-        if (params.dt_softplus) {
-          launch_precompute.template operator()<HEADS_PER_CTA, true>();
-        } else {
-          launch_precompute.template operator()<HEADS_PER_CTA, false>();
-        }
+        int pnw = (HEADS_PER_CTA > 4) ? HEADS_PER_CTA : 4;  // default: 1 head/warp, min 4
+        if (pnw_env > 0) pnw = pnw_env;
+        dispatch_precompute_num_warps(pnw, [&]<int PNW>() {
+          if (params.dt_softplus) {
+            launch_precompute.template operator()<HEADS_PER_CTA, PNW, true>();
+          } else {
+            launch_precompute.template operator()<HEADS_PER_CTA, PNW, false>();
+          }
+        });
       });
 
       // Main: grid (D_SPLIT, batch, ngroups·ceil(HPG/MHC)).  Per-CTA smem is UNCHANGED
       // from the monolithic — head-tiling reuses the same single buffers across the
       // MHC heads, so occupancy is identical and only the CTA count drops (fewer waves).
-      // main_heads_per_cta is a HOST knob (Python-tunable); dispatch_heads_per_cta snaps
-      // it to the HPG>>k chain and binds it to the MAIN_HEADS_PER_CTA template arg — it
-      // never reaches the kernel as a runtime value.
+      // main_heads_per_cta — HOST knob (Python-tunable); 0 = auto-heuristic.
+      // dispatch_heads_per_cta snaps the resolved value to the HPG>>k chain and binds it to
+      // the MAIN_HEADS_PER_CTA template arg — it never reaches the kernel as a runtime value.
+      //
+      // Heuristic (B300, 2026-06-25, DS=2, mixed batch, with conv1d):
+      //   batch < 512 → MHC=1: fewer main CTAs → each CTA does more work per wave; at small
+      //                         batch the GPU isn't full and adding heads just increases the
+      //                         CTA serial chain.
+      //   batch ≥ 512 → MHC=4: amortizes per-group C/old_B loads across 4 heads per CTA,
+      //                         cuts CTA count in half, reduces L2 pressure.
+      //                b=512: 75.55(MHC=1)→72.48(MHC=4)µs; b=1024: 145.3→130.9µs.
+      // Override precedence: explicit handle (>0) > env FLASHINFER_SSU_MAIN_HEADS_PER_CTA >
+      // heuristic.
+      {
+        int const mhc_env = [] {
+          char const* e = std::getenv("FLASHINFER_SSU_MAIN_HEADS_PER_CTA");
+          return e ? std::atoi(e) : 0;
+        }();
+        if (mhc_env > 0)
+          main_heads_per_cta = mhc_env;
+        else if (main_heads_per_cta == 0)
+          main_heads_per_cta = (params.batch >= 512) ? 4 : 1;
+      }
+      //
+      // D_SPLIT=2 knob: comes from params.d_split (Python-controlled).  Joint sweep
+      // (batch=16, B300, 2026-06-24) shows DS=2 saves 2.04µs vs DS=1 at HPC=8,NW=8,MHC=1
+      // (10.30 vs 12.34µs) by doubling main CTA count (256→512); D_PER_CTA shrinks from
+      // 128 to 64 (still ≥32, the output-MMA minimum).  MHC=2+ is always worse than MHC=1
+      // (fewer CTAs hurts bandwidth more than C-reuse helps at small batch); best config at
+      // small batch = MHC=1, DS=2; at large batch = MHC=4, DS=2.
       //
       // MAIN_NUM_WARPS=4.  The main is NUM_WARPS-generic (replay MMA M_WARPS×4, output MMA
       // _1×NUM_WARPS, per-warp state load + store, 1x conv-input load), so 8 warps is fully
@@ -203,7 +246,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       // Each extra stage adds a per-CTA state buffer (16 KB bf16) → fewer resident blocks/SM, so
       // it's only worth it at small batch (launch-bound, not occupancy-bound) AND MHC>1 (needs
       // ≥2 heads to pipeline).  Gated below so STAGES=2 is never instantiated at MHC=1.
-      static int const main_pipeline_stages = [] {
+      int const main_pipeline_stages = [] {
         char const* e = std::getenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES");
         return e ? std::atoi(e) : 1;
       }();

@@ -485,13 +485,6 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           int HEADS_PER_GROUP, int HEADS_PER_CTA, int NUM_WARPS, bool DT_SOFTPLUS,
           bool VARLEN = false>
 __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams params) {
-  // HEADS_PER_CTA <= HEADS_PER_GROUP: the group's heads are tiled across
-  // ceil(HEADS_PER_GROUP / HEADS_PER_CTA) CTAs (grid.z) so small batches fill the
-  // GPU.  It sizes the per-head coeff smem, so a small HEADS_PER_CTA shrinks smem
-  // too.  The per-group C / B load + C·B (and C·old_B) matmul are recomputed by
-  // every head-tile — cheap (Tensor-core-light) and L2-hot, hidden under the load
-  // latency on the latency-bound small-batch path.  The launcher picks
-  // HEADS_PER_CTA from the heuristic hc ~= (batch·nheads)/(SMs·occ).
   using SmemT = CheckpointingSsuPrecomputeStorage<input_t, NPREDICTED, MAX_WINDOW, DSTATE,
                                                   NUM_WARPS, HEADS_PER_CTA>;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
@@ -501,15 +494,6 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
   // ── INTERNAL PDL (precompute → main): UNCONDITIONAL — the split's mechanism,
-  // not gated by ENABLE_PDL.  Fired FIRST (Triton fires gdc_launch_dependents at
-  // the top of its precompute, replay_selective_state_update.py:971).
-  // launch_dependents is a launch-eligibility hint, NOT a memory release: the
-  // main's own gdc_wait blocks until THIS grid fully completes + its stores are
-  // visible, so cb_scaled / cumAdt_vec / cb_old are always seen regardless of
-  // where we fire this.  Firing it early lets the main's (precompute-independent)
-  // state replay run concurrently with our conv1d wait + CB matmul — the whole
-  // point of the split.  The main is launched with the programmatic attr
-  // unconditionally (launch_checkpointing_ssu.cuh), so this always pairs.
   cudaTriggerProgrammaticLaunchCompletion();  // main may co-launch now
 
   // ── Grid (batch, ngroups, head_tiles) ──
@@ -524,6 +508,7 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
   if (cache_slot == params.pad_slot_id) return;
+
   // prev_k is on the critical path — must_checkpoint (and load_old_B's row extent) consume it
   // first, and there's no executed work before that consume to hide the load.  Issue it FIRST,
   // via __ldg (read-only path), so its latency overlaps the buf_read load instead of fully
@@ -550,12 +535,6 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   int const buf_write = must_checkpoint ? (1 - buf_read) : buf_read;
   int const write_offset = must_checkpoint ? 0 : prev_k;
 
-  // ── old_B (cache, conv1d-INDEPENDENT cp.async): hoisted BEFORE gdc_wait so it
-  // overlaps the conv1d wait (cliff) / the B/C cp.async (standalone) — old_B is the
-  // buffered cache, NOT a conv1d output.  The cp.async stays in flight across the
-  // grid-dep sync; the single drain below completes it.  NO-WRITE, W2/3 ONLY (the C6-MMA
-  // warps — at NUM_WARPS>4 the extra warps W4+ never run the matmul, so they must not load
-  // old_B); must_checkpoint is uniform per CTA. ──
   if (!must_checkpoint && warp >= 2 && warp < 4) {
     load_old_B<input_t, MAX_WINDOW, DSTATE>(smem, params, lane, cache_slot, buf_read, group_idx,
                                             prev_k);
@@ -648,9 +627,10 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   }
 
   constexpr int NUM_ITER = (HEADS_PER_CTA + NUM_WARPS - 1) / NUM_WARPS;  // ceil, uniform
+  int const h_base = warp * NUM_ITER;  // first head for this warp (contiguous block)
 #pragma unroll
   for (int iter = 0; iter < NUM_ITER; ++iter) {
-    int const h = warp + iter * NUM_WARPS;
+    int const h = h_base + iter;
     bool const has_head = (h < HEADS_PER_CTA);
     int const head = first_head + h;
 
@@ -663,31 +643,9 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       }
       // C2: cumsum scan (own-lane read + register shfl) → smem.cumAdt[h].
       compute_cumAdt_pw<NPREDICTED>(smem, h, lane, smem.A[h]);
-      // Publish dt[h] (softplus) + cumAdt[h] cross-lane for the cross-lane reads
-      // (C7 tail + scale_store_cb) below.
+      // Publish dt[h] (softplus) + cumAdt[h] cross-lane for scale_store_cb below.
       __syncwarp();
 
-      // cumAdt_vec[batch, head, t] = raw cumAdt[t] (the main exp's it for β).
-      if (lane < seq_len)
-        cumAdt_gmem[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + lane] =
-            smem.cumAdt[h][lane];
-      // C7: persist this head's new dt / cumAdt into the cache tape at write_offset.
-      // cumAdt continuity: no-write steps add the previous buffer's tail
-      // (old_cumAdt[h][prev_k-1]) so the cache stays a monotone cumsum.
-      if (lane < seq_len) {
-        auto* __restrict__ old_dt_w = reinterpret_cast<float*>(params.old_dt);
-        auto* __restrict__ old_ca_w = reinterpret_cast<float*>(params.old_cumAdt);
-        int64_t const dt_w_base = cache_slot * params.old_dt_stride_seq +
-                                  (int64_t)buf_write * params.old_dt_stride_dbuf +
-                                  (int64_t)head * params.old_dt_stride_head;
-        int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
-                                  (int64_t)buf_write * params.old_cumAdt_stride_dbuf +
-                                  (int64_t)head * params.old_cumAdt_stride_head;
-        float const cumAdt_prefix =
-            (!must_checkpoint && prev_k > 0) ? smem.old_cumAdt[h][prev_k - 1] : 0.f;
-        old_dt_w[dt_w_base + write_offset + lane] = smem.dt[h][lane];
-        old_ca_w[ca_w_base + write_offset + lane] = smem.cumAdt[h][lane] + cumAdt_prefix;
-      }
       // C5: scale the register-resident raw C·B by this head + STG → cb_scaled.
       auto* cb_gmem_head = cb_gmem + (int64_t)(seq * params.nheads + head) * warpSize * CB_NEW_REGS;
       scale_store_cb</*IS_OLD=*/false, CB_NEW_REGS, input_t>(smem, h, lane, seq_len, prev_k, raw_cb,
@@ -700,6 +658,33 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
                                                               raw_cb_old, cb_old_head);
       }
     }
+  }
+
+  // Store pass: each warp stores its contiguous heads (h_base..h_base+NUM_ITER-1).
+  // No __syncthreads needed: each warp reads only its own smem writes from the loop above.
+  // Lane i covers element [i/NPREDICTED, i%NPREDICTED] within this warp's head block.
+  auto* __restrict__ old_dt_w = reinterpret_cast<float*>(params.old_dt);
+  auto* __restrict__ old_ca_w = reinterpret_cast<float*>(params.old_cumAdt);
+  constexpr int STORE_ELEMS = NUM_ITER * NPREDICTED;
+#pragma unroll
+  for (int i = lane; i < STORE_ELEMS; i += warpSize) {
+    int const h_local = i / NPREDICTED;
+    int const t = i % NPREDICTED;
+    int const h = h_base + h_local;
+    if (h >= HEADS_PER_CTA || t >= seq_len) continue;
+    int const head = first_head + h;
+
+    cumAdt_gmem[(int64_t)(seq * params.nheads + head) * NPREDICTED_PAD_MMA_M + t] =
+        smem.cumAdt[h][t];
+    int64_t const dt_w_base = cache_slot * params.old_dt_stride_seq +
+                              (int64_t)buf_write * params.old_dt_stride_dbuf +
+                              (int64_t)head * params.old_dt_stride_head;
+    int64_t const ca_w_base = cache_slot * params.old_cumAdt_stride_seq +
+                              (int64_t)buf_write * params.old_cumAdt_stride_dbuf +
+                              (int64_t)head * params.old_cumAdt_stride_head;
+    float const prefix = (!must_checkpoint && prev_k > 0) ? smem.old_cumAdt[h][prev_k - 1] : 0.f;
+    old_dt_w[dt_w_base + write_offset + t] = smem.dt[h][t];
+    old_ca_w[ca_w_base + write_offset + t] = smem.cumAdt[h][t] + prefix;
   }
 }
 

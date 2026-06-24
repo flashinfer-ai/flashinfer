@@ -246,7 +246,7 @@ def checkpointing_ssu(
     cb_scaled: Optional[torch.Tensor] = None,
     cumAdt_vec: Optional[torch.Tensor] = None,
     cb_old: Optional[torch.Tensor] = None,
-    main_heads_per_cta: int = 1,
+    main_heads_per_cta: int = 0,
     precompute_heads_per_cta: int = 0,
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
@@ -305,8 +305,8 @@ def checkpointing_ssu(
         Two-kernel MAIN head-tiling: number of consecutive heads (within one group)
         each main CTA processes in a loop, amortizing the per-group C / old_B loads and
         cutting the main's CTA count (fewer waves).  Must divide nheads/ngroups; the
-        launcher snaps it to the HEADS_PER_GROUP>>k chain.  Default 1 (today's per-head
-        behavior).  Tuning knob — two-kernel path only.
+        launcher snaps it to the HEADS_PER_GROUP>>k chain.  0 (default) = launcher
+        auto-heuristic (batch≥512 → 4, else 1).  Tuning knob — two-kernel path only.
     precompute_heads_per_cta : int
         Two-kernel PRECOMPUTE head-tiling: heads per precompute CTA.  0 (default) uses the
         launcher's co-residency heuristic; >0 overrides it (must divide nheads/ngroups,
