@@ -318,7 +318,7 @@ class TuningConfig:
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
     use_cold_l2_cache: bool = False
-    use_cuda_graph: bool = False
+    use_cuda_graph: bool = True
     # Optional callback invoked once per profile bucket, after dynamic
     # tensors are synthesized but before the per-tactic profile loop.
     # Receives the full list of tensors and returns a (possibly modified)
