@@ -28,12 +28,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 from routines.mamba import parse_mamba_args, run_mamba_test
 
 # ---------------------------------------------------------------------------
-# Nemotron Ultra TP=8 slice
+# Nemotron Ultra full-model config
 # ---------------------------------------------------------------------------
-NHEADS = 32
+NHEADS_FULL = 256
+NGROUPS_FULL = 8
 HEADDIM = 64
 DSTATE = 128
-NGROUPS = 1
 
 BATCH_SIZES = [1, 8, 16, 32, 64, 128, 256, 512]
 
@@ -45,6 +45,8 @@ def make_args(
     no_cuda_graph,
     num_iters,
     dry_run_iters,
+    nheads,
+    ngroups,
     state_dtype="float32",
     philox_rounds=0,
 ):
@@ -61,13 +63,13 @@ def make_args(
         "--batch_size",
         str(batch_size),
         "--nheads",
-        str(NHEADS),
+        str(nheads),
         "--dim",
         str(HEADDIM),
         "--dstate",
         str(DSTATE),
         "--ngroups",
-        str(NGROUPS),
+        str(ngroups),
         "--cache_steps",
         str(mtp_len),
         "--input_dtype",
@@ -93,7 +95,9 @@ def make_args(
     args.allow_output_mismatch = False
     args.random_seed = 42
     args.verbose = 0
-    args.output_path = None
+    args.output_path = (
+        "_collect"  # non-None triggers result collection in run_mamba_test
+    )
     args.num_iters = num_iters
     args.dry_run_iters = dry_run_iters
     args.autotune_cache = None
@@ -102,6 +106,45 @@ def make_args(
     args.repro_command = ""
 
     return args
+
+
+def _print_table(results, backends):
+    """Print a summary table: rows = batch sizes, columns = backends."""
+    # Gather: {batch -> {backend -> median_us}}
+    from collections import defaultdict
+
+    data = defaultdict(dict)
+    for r in results:
+        data[r["batch_size"]][r["backend"]] = r["median_time"] * 1e3  # ms → µs
+
+    has_both = "flashinfer" in backends and "triton" in backends
+
+    # Header
+    print("=" * 70)
+    print("Summary")
+    print("=" * 70)
+    header = f"  {'batch':>6}"
+    for b in backends:
+        header += f"  {b + ' (µs)':>16}"
+    if has_both:
+        header += f"  {'speedup':>8}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    for batch in BATCH_SIZES:
+        if batch not in data:
+            continue
+        row = f"  {batch:>6}"
+        for b in backends:
+            us = data[batch].get(b, float("nan"))
+            row += f"  {us:>16.1f}"
+        if has_both:
+            fi = data[batch].get("flashinfer", float("nan"))
+            tr = data[batch].get("triton", float("nan"))
+            speedup = tr / fi if fi > 0 else float("nan")
+            row += f"  {speedup:>7.2f}x"
+        print(row)
+    print()
 
 
 def main():
@@ -113,6 +156,12 @@ def main():
         nargs="+",
         default=["flashinfer", "triton"],
         choices=["flashinfer", "triton"],
+    )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=8,
+        help="Tensor parallel size (divides nheads and ngroups). Default: 8",
     )
     parser.add_argument(
         "--mtp-len",
@@ -142,12 +191,16 @@ def main():
     parser.add_argument("-d", "--dry-run-iters", type=int, default=5)
     args = parser.parse_args()
 
+    nheads = NHEADS_FULL // args.tp
+    ngroups = max(1, NGROUPS_FULL // args.tp)
+
     print("=" * 70)
-    print("Mamba selective_state_update — Nemotron Ultra TP=8 slice")
+    print("Mamba selective_state_update — Nemotron Ultra")
     print("=" * 70)
     print(f"  Device  : {torch.cuda.get_device_name()}")
+    print(f"  TP      : {args.tp}")
     print(
-        f"  nheads  : {NHEADS}  headdim: {HEADDIM}  dstate: {DSTATE}  ngroups: {NGROUPS}"
+        f"  nheads  : {nheads}  headdim: {HEADDIM}  dstate: {DSTATE}  ngroups: {ngroups}"
     )
     print(f"  mtp_len : {args.mtp_len}  (tokens/seq)")
     philox_str = f" + philox-{args.philox_rounds}" if args.philox_rounds > 0 else ""
@@ -155,6 +208,7 @@ def main():
     print(f"  backends: {args.backends}")
     print()
 
+    all_results = []
     for batch in BATCH_SIZES:
         bench_args = make_args(
             batch_size=batch,
@@ -163,12 +217,16 @@ def main():
             no_cuda_graph=not args.cuda_graph,
             num_iters=args.num_iters,
             dry_run_iters=args.dry_run_iters,
+            nheads=nheads,
+            ngroups=ngroups,
             state_dtype=args.state_dtype,
             philox_rounds=args.philox_rounds,
         )
         print(f"batch={batch}")
-        run_mamba_test(bench_args)
+        all_results.extend(run_mamba_test(bench_args))
         print()
+
+    _print_table(all_results, args.backends)
 
 
 if __name__ == "__main__":

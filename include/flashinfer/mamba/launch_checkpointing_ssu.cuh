@@ -199,35 +199,54 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       // D_PER_CTA≥64 for the output's _1×NUM_WARPS tiling: N_TILE = NUM_WARPS·n8 must divide
       // D_PER_CTA, so D_SPLIT≥2 (D_PER_CTA=32) would fall back to 4.  int8/fp8 → 8bit kernel.)
       constexpr int MAIN_NUM_WARPS = 4;
+      // PIPELINE_STAGES: cross-head STATE double-buffer (env knob; default 1 = no prefetch).
+      // Each extra stage adds a per-CTA state buffer (16 KB bf16) → fewer resident blocks/SM, so
+      // it's only worth it at small batch (launch-bound, not occupancy-bound) AND MHC>1 (needs
+      // ≥2 heads to pipeline).  Gated below so STAGES=2 is never instantiated at MHC=1.
+      static int const main_pipeline_stages = [] {
+        char const* e = std::getenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES");
+        return e ? std::atoi(e) : 1;
+      }();
       dispatch_heads_per_cta<HEADS_PER_GROUP>(main_heads_per_cta, [&]<int MHC>() {
-        auto mfunc =
-            checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                          state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                          HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT,
-                                          VARLEN, MHC>;
-        constexpr size_t msmem = sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED,
-                                                                    MAX_WINDOW, D_PER_CTA, DSTATE>);
-        if constexpr (msmem > 0) {
-          FLASHINFER_CUDA_CHECK(
-              cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
+        auto launch_main = [&]<int PIPELINE_STAGES>() {
+          auto mfunc =
+              checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t,
+                                            stateIndex_t, state_scale_t, NPREDICTED, MAX_WINDOW,
+                                            DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS,
+                                            MAIN_NUM_WARPS, D_SPLIT, VARLEN, MHC, PIPELINE_STAGES>;
+          constexpr size_t msmem =
+              sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW,
+                                                 D_PER_CTA, DSTATE, PIPELINE_STAGES>);
+          if constexpr (msmem > 0) {
+            FLASHINFER_CUDA_CHECK(
+                cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
+          }
+          // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr hard-wired to 1,
+          // independent of ENABLE_PDL) — the split's mechanism, not a user knob.  Its gdc_wait
+          // (unconditional in the kernel body) blocks for the precompute before reading cb_scaled.
+          cudaLaunchAttribute main_attrs[1];
+          main_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+          main_attrs[0].val.programmaticStreamSerializationAllowed = 1;
+          cudaLaunchConfig_t mcfg;
+          // grid.z = ngroups·(HPG/MHC); MHC divides HPG (kernel static_assert), so the integer
+          // divide is the exact ceil.  Each CTA owns MHC consecutive heads in a group.
+          mcfg.gridDim = dim3(D_SPLIT, params.batch, params.ngroups * (HEADS_PER_GROUP / MHC));
+          mcfg.blockDim = dim3(warpSize, MAIN_NUM_WARPS);
+          mcfg.dynamicSmemBytes = msmem;
+          mcfg.stream = stream;
+          mcfg.attrs = main_attrs;
+          mcfg.numAttrs = 1;
+          FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
+        };
+        // STAGES=2 only when there are ≥2 heads/CTA to pipeline; never instantiated at MHC=1.
+        if constexpr (MHC > 1) {
+          if (main_pipeline_stages >= 2)
+            launch_main.template operator()<2>();
+          else
+            launch_main.template operator()<1>();
+        } else {
+          launch_main.template operator()<1>();
         }
-        // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr
-        // hard-wired to 1, independent of ENABLE_PDL) — the split's mechanism, not
-        // a user knob.  Its gdc_wait (unconditional in the kernel body) blocks for
-        // the precompute before reading cb_scaled, so this is always correct.
-        cudaLaunchAttribute main_attrs[1];
-        main_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        main_attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t mcfg;
-        // grid.z = ngroups·(HPG/MHC); MHC divides HPG (kernel static_assert), so the
-        // integer divide is the exact ceil.  Each CTA owns MHC consecutive heads in a group.
-        mcfg.gridDim = dim3(D_SPLIT, params.batch, params.ngroups * (HEADS_PER_GROUP / MHC));
-        mcfg.blockDim = dim3(warpSize, MAIN_NUM_WARPS);
-        mcfg.dynamicSmemBytes = msmem;
-        mcfg.stream = stream;
-        mcfg.attrs = main_attrs;
-        mcfg.numAttrs = 1;
-        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
       });
       return;
     } else {

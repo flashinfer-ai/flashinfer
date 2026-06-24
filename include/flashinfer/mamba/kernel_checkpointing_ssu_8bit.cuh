@@ -341,7 +341,8 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
   // ── Bake dB coefficients into frag_A once (8 scale ops), replacing 16×
   // per-N-pass compute_dB_scaling on frag_B (64 scale ops).
   // dB coefficients c[k] baked into frag_A once, replacing per-N-pass B scaling.
-  apply_dA_coeff<MAX_WINDOW_PAD_MMA_K>(frag_A_replay, smem, total_cumAdt, prev_k, lane);
+  apply_dA_coeff<MAX_WINDOW_PAD_MMA_K>(frag_A_replay, smem.old_cumAdt, smem.old_dt, total_cumAdt,
+                                       prev_k, lane);
 
   // ── B operand (replay): old_B per-pass.
   auto layout_B_replay = make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
@@ -602,7 +603,8 @@ __device__ __forceinline__ void encode_state_replay_8bit(
   cute::copy(s2r_A, smem_A_s2r, frag_A_replay_view);
 
   // dB coefficients baked into frag_A (same identity as PASS 1).
-  apply_dA_coeff<MAX_WINDOW_PAD_MMA_K>(frag_A_replay, smem, total_cumAdt, prev_k, lane);
+  apply_dA_coeff<MAX_WINDOW_PAD_MMA_K>(frag_A_replay, smem.old_cumAdt, smem.old_dt, total_cumAdt,
+                                       prev_k, lane);
 
   auto layout_B_replay = make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
   Tensor smem_B_full = make_tensor(

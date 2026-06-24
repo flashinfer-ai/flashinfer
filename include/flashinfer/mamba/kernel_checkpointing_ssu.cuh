@@ -279,7 +279,8 @@ template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE
 __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuParams const& params,
                                                  int warp, int lane, int prev_k, int d_tile,
                                                  int64_t state_ptr_offset, state_t* state_w_base,
-                                                 int64_t rand_seed, bool must_checkpoint) {
+                                                 int64_t rand_seed, bool must_checkpoint,
+                                                 int tile_buf = 0) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
   static_assert(D_PER_CTA % 16 == 0, "D_PER_CTA must be divisible by 16 (m16n8 atom)");
@@ -317,7 +318,11 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
                 "DSTATE must be divisible by 4 * MMA_prop::N for the (M_WARPS,4) warp layout");
   constexpr int NUM_N_PASSES = DSTATE / N_PER_PASS;
 
-  float total_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
+  // tile_buf selects the pipeline slot for all per-head smem arrays (old_cumAdt, old_dt, old_x).
+  constexpr int MAX_WINDOW = SmemT::MAX_WINDOW;
+  float const* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
+  float const* old_dt_slot = smem.old_dt + tile_buf * MAX_WINDOW;
+  float total_cumAdt = (prev_k > 0) ? old_cumAdt_slot[prev_k - 1] : 0.f;
   float total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
 
   // ── A operand: old_x [MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS] Swizzle<3,3,3>, transposed
@@ -328,8 +333,9 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
   auto layout_A_full =
       make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS>();
+  auto const* old_x_slot = smem.old_x + tile_buf * MAX_WINDOW_PAD_MMA_K * D_SMEM_COLS;
   Tensor smem_A_full = make_tensor(
-      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.old_x)), layout_A_full);
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(old_x_slot)), layout_A_full);
   Tensor smem_A = local_tile(smem_A_full, make_shape(Int<D_PER_CTA>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
                              make_coord(_0{}, _0{}));
 
@@ -353,9 +359,10 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
   auto s2r_B = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
 
-  // ── State: per-CTA swizzle layout [D_PER_CTA, DSTATE]. ──
+  // ── State: per-CTA swizzle layout [D_PER_CTA, DSTATE].  tile_buf selects the
+  // double-buffered slot (cross-head prefetch); 0 ⇒ the single original buffer. ──
   auto layout_state_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
-  state_t* state_base = reinterpret_cast<state_t*>(smem.state);
+  state_t* state_base = reinterpret_cast<state_t*>(smem.state) + tile_buf * D_PER_CTA * DSTATE;
 
   // ── Per-pass identity for (row, col) coords ──
   // partition_C of an identity tensor of the per-pass output shape gives this
@@ -374,7 +381,8 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
   constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;  // = 4 for m16n8k_
   constexpr int DB_COEFFS_PER_LANE = MAX_WINDOW_PAD_MMA_K / LANES_PER_N_COL;
   float dB_coeff[DB_COEFFS_PER_LANE];
-  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, smem, total_cumAdt, prev_k, lane);
+  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, old_cumAdt_slot, old_dt_slot, total_cumAdt,
+                                          prev_k, lane);
 
   using pair_t = Pair<state_t>;
 
@@ -515,7 +523,7 @@ template <typename input_t, typename state_t, int NPREDICTED, int DIM, int D_PER
 __device__ __forceinline__ void compute_and_store_output(
     SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int d_tile,
     int64_t out_seq_base, int head, int64_t cache_slot, float D_val, bool must_checkpoint,
-    int seq_len, input_t const* cb_gmem_head = nullptr) {
+    int seq_len, input_t const* cb_gmem_head = nullptr, int tile_buf = 0) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_and_store_output requires 2-byte input type");
 
@@ -535,21 +543,24 @@ __device__ __forceinline__ void compute_and_store_output(
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
 
   // x: swizzled [NPREDICTED_PAD_MMA_M, D_SMEM_COLS]
+  // tile_buf selects the pipeline slot for all per-head smem arrays.
+  auto const* x_base = smem.x + tile_buf * NPREDICTED_PAD_MMA_M * D_SMEM_COLS;
   auto layout_x_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
-  Tensor smem_x = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.x)),
+  Tensor smem_x = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(x_base)),
                               layout_x_swz);
   auto layout_x_trans_swz =
       make_swizzled_layout_rc_transpose<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
   Tensor smem_x_trans = make_tensor(
-      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.x)), layout_x_trans_swz);
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(x_base)), layout_x_trans_swz);
 
   // z: aliased swizzled [NPREDICTED_PAD_MMA_M, D_SMEM_COLS] — physical buffer
   // is only next_multiple_of<ATOM_ROWS>(NPREDICTED) rows tall; second m-tile
   // aliases first.  Ghost rows feed predicated-out output rows.
   auto layout_z_swz =
       make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS, NPREDICTED>();
+  auto const* z_base = smem.z + tile_buf * SmemT::NPREDICTED_SWIZZLE_R * D_SMEM_COLS;
   Tensor smem_z =
-      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.z)), layout_z_swz);
+      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(z_base)), layout_z_swz);
 
   // ── S2R copies ──
   auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MMA_prop::operand_t>{}, tiled_mma);
@@ -585,8 +596,9 @@ __device__ __forceinline__ void compute_and_store_output(
 
   // Decay broadcast: cumAdt[t] → [NPREDICTED_PAD_MMA_M, N_TILE] with stride-0 on N.
   constexpr int N_TILE = cute::tile_size<1>(decltype(tiled_mma){});
+  float const* cumAdt_slot = smem.cumAdt + tile_buf * NPREDICTED_PAD_MMA_M;
   Tensor decay_bcast = make_tensor(
-      make_smem_ptr(smem.cumAdt),
+      make_smem_ptr(cumAdt_slot),
       make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}), make_stride(_1{}, _0{})));
   Tensor decay_part = thr_mma.partition_C(decay_bcast);
 
@@ -660,8 +672,8 @@ __device__ __forceinline__ void compute_and_store_output(
   if constexpr (NUM_N_TILES == 2) {
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
     Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0,
-                                                      frag_y_1);
+    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
+                                                      frag_y_0, frag_y_1);
     // State writeback hoisted here — after matmul 3 has finished consuming
     // smem.state, before matmul 4 which reads only smem.x / smem.CB_scaled
     // / smem.z.  STGs fire-and-forget alongside the epilogue (matmul 4 +
@@ -671,14 +683,15 @@ __device__ __forceinline__ void compute_and_store_output(
     if constexpr (!kSkipSmemToGmemState) {
       if (must_checkpoint) {
         store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
-                                                                head, cache_slot);
+                                                                head, cache_slot, tile_buf);
       }
     }
     epilogue(frag_y_0, 0);
     epilogue(frag_y_1, 1);
   } else {  // NUM_N_TILES == 1 (D_SPLIT = 2 path)
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
-    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0);
+    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
+                                                      frag_y_0);
     // No sync needed before store_state: the post-replay __syncthreads()
     // in the kernel already established cross-warp visibility of replay's
     // writes to smem.state, and nothing after that point writes to it
@@ -686,7 +699,7 @@ __device__ __forceinline__ void compute_and_store_output(
     if constexpr (!kSkipSmemToGmemState) {
       if (must_checkpoint) {
         store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
-                                                                head, cache_slot);
+                                                                head, cache_slot, tile_buf);
       }
     }
     epilogue(frag_y_0, 0);
@@ -718,7 +731,8 @@ template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, in
 __device__ __forceinline__ void compute_no_write_output(
     SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t out_seq_base, int head, int64_t cache_slot, float D_val, int seq_len,
-    input_t const* cb_gmem_head = nullptr, input_t const* cb_old_gmem_head = nullptr) {
+    input_t const* cb_gmem_head = nullptr, input_t const* cb_old_gmem_head = nullptr,
+    int tile_buf = 0) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "compute_no_write_output requires 2-byte input type");
 
@@ -743,25 +757,28 @@ __device__ __forceinline__ void compute_no_write_output(
       make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomOld>>{}, Layout<Shape<_1, Int<NUM_WARPS>>>{});
   auto thr_mma_old = tiled_mma_old.get_slice(tid);
 
-  // ── Swizzled smem views ──
+  // ── Swizzled smem views — tile_buf selects the pipeline slot for all per-head arrays. ──
+  auto const* x_base = smem.x + tile_buf * NPREDICTED_PAD_MMA_M * D_SMEM_COLS;
   auto layout_x_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
-  Tensor smem_x = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.x)),
+  Tensor smem_x = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(x_base)),
                               layout_x_swz);
   auto layout_x_trans_swz =
       make_swizzled_layout_rc_transpose<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
   Tensor smem_x_trans = make_tensor(
-      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.x)), layout_x_trans_swz);
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(x_base)), layout_x_trans_swz);
 
   auto layout_old_x_trans_swz =
       make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS>();
+  auto const* old_x_base = smem.old_x + tile_buf * MAX_WINDOW_PAD_MMA_K * D_SMEM_COLS;
   Tensor smem_old_x_trans =
-      make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.old_x)),
+      make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(old_x_base)),
                   layout_old_x_trans_swz);
 
   auto layout_z_swz =
       make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS, NPREDICTED>();
+  auto const* z_base = smem.z + tile_buf * SmemT::NPREDICTED_SWIZZLE_R * D_SMEM_COLS;
   Tensor smem_z =
-      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.z)), layout_z_swz);
+      make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(z_base)), layout_z_swz);
 
   // ── S2R copies (matmul-4-new) ──
   auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MMA_prop::operand_t>{}, tiled_mma);
@@ -825,13 +842,15 @@ __device__ __forceinline__ void compute_no_write_output(
 
   // ── Decay broadcast: cumAdt[t] (per-T scalar) with stride-0 on N. ──
   constexpr int N_TILE = cute::tile_size<1>(decltype(tiled_mma){});
+  float const* cumAdt_slot = smem.cumAdt + tile_buf * NPREDICTED_PAD_MMA_M;
   Tensor decay_bcast = make_tensor(
-      make_smem_ptr(smem.cumAdt),
+      make_smem_ptr(cumAdt_slot),
       make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}), make_stride(_1{}, _0{})));
   Tensor decay_part = thr_mma.partition_C(decay_bcast);
 
   // ── β extra factor: exp(total_old_cumAdt) — uniform constant across (t, d) ──
-  float const total_old_cumAdt = (prev_k > 0) ? smem.old_cumAdt[prev_k - 1] : 0.f;
+  float const* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
+  float const total_old_cumAdt = (prev_k > 0) ? old_cumAdt_slot[prev_k - 1] : 0.f;
   float const beta_extra = __expf(total_old_cumAdt);
 
   // ── Gmem output base ──
@@ -892,13 +911,14 @@ __device__ __forceinline__ void compute_no_write_output(
   if constexpr (NUM_N_TILES == 2) {
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
     Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0,
-                                                      frag_y_1);
+    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
+                                                      frag_y_0, frag_y_1);
     epilogue(frag_y_0, 0);
     epilogue(frag_y_1, 1);
   } else {  // NUM_N_TILES == 1 (D_SPLIT = 2 path)
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
-    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, frag_y_0);
+    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
+                                                      frag_y_0);
     epilogue(frag_y_0, 0);
   }
 }

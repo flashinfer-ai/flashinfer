@@ -859,6 +859,9 @@ def _make_run_closure(
         # PRECOMPUTE head-tiling knob (two-kernel only): 0 = launcher co-residency heuristic;
         # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
         _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
+        # D-split knob (two-kernel only): splits each head's DIM across D_SPLIT CTAs.
+        # FLASHINFER_SSU_D_SPLIT=2 doubles CTA count for better occupancy at small batch.
+        _ds = int(os.environ.get("FLASHINFER_SSU_D_SPLIT", "1")) if _two else 1
         if with_conv1d:
 
             def _run():
@@ -890,6 +893,7 @@ def _make_run_closure(
                     enable_pdl=external_pdl,
                     main_heads_per_cta=_mhc,
                     precompute_heads_per_cta=_phc,
+                    d_split=_ds,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,
@@ -924,6 +928,7 @@ def _make_run_closure(
                     enable_pdl=False,
                     main_heads_per_cta=_mhc,
                     precompute_heads_per_cta=_phc,
+                    d_split=_ds,
                     cb_scaled=_cb,
                     cumAdt_vec=_ca,
                     cb_old=_cbo,

@@ -379,7 +379,8 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
 template <typename state_t, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
                                                     state_t const* __restrict__ state_ptr,
-                                                    int64_t state_base, int warp, int lane) {
+                                                    int64_t state_base, int warp, int lane,
+                                                    int state_buf = 0) {
   using namespace cute;
   static_assert(D_PER_CTA % NUM_WARPS == 0, "D_PER_CTA must be divisible by NUM_WARPS");
   constexpr int DIM_PER_WARP = D_PER_CTA / NUM_WARPS;
@@ -388,10 +389,12 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
   static_assert(DIM_PER_WARP % 4 == 0,
                 "DIM_PER_WARP (D_PER_CTA/NUM_WARPS) must be a multiple of 4 for the (4,8) load");
 
-  // Single-local_tile path — swizzle layout sized to this CTA's
-  // D_PER_CTA slice; one local_tile splits it directly per-warp.
-  Tensor sState_full = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(smem.state)),
-                                   make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
+  // Single-local_tile path — swizzle layout sized to this CTA's D_PER_CTA slice; one local_tile
+  // splits it directly per-warp.  state_buf selects the double-buffered state slot (cross-head
+  // prefetch); state_buf=0 ⇒ the single original buffer.
+  Tensor sState_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<state_t*>(smem.state) + state_buf * D_PER_CTA * DSTATE),
+      make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
   Tensor gState_full = make_tensor(make_gmem_ptr(state_ptr + state_base),
                                    make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
                                                make_stride(Int<DSTATE>{}, Int<1>{})));
@@ -411,12 +414,13 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
 
 template <typename state_t, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __restrict__ state_ptr,
-                                               int64_t state_base, int tid) {
+                                               int64_t state_base, int tid, int state_buf = 0) {
   using namespace cute;
   static_assert(NUM_WARPS == 4, "Expected 4 warps");
 
-  Tensor sState = make_tensor(make_smem_ptr(reinterpret_cast<state_t*>(smem.state)),
-                              make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
+  Tensor sState = make_tensor(
+      make_smem_ptr(reinterpret_cast<state_t*>(smem.state) + state_buf * D_PER_CTA * DSTATE),
+      make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>());
   Tensor gState = make_tensor(make_gmem_ptr(state_ptr + state_base),
                               make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
                                           make_stride(Int<DSTATE>{}, Int<1>{})));
@@ -1078,10 +1082,10 @@ __device__ __forceinline__ void compute_CB_old_2warp(SmemT& smem, int warp, int 
 //   m16n8k16 B frag (4 elts): 0→K_base, 1→K_base+1, 2→K_base+8, 3→K_base+9
 //   m16n8k8  B frag (2 elts): 0→K_base, 1→K_base+1
 // =============================================================================
-template <int DB_COEFFS_PER_LANE, typename SmemT>
+template <int DB_COEFFS_PER_LANE>
 __device__ __forceinline__ void precompute_dB_coeff(float coeff[DB_COEFFS_PER_LANE],
-                                                    SmemT const& smem, float total_cumAdt,
-                                                    int prev_k, int lane) {
+                                                    float const* old_cumAdt, float const* old_dt,
+                                                    float total_cumAdt, int prev_k, int lane) {
   static_assert(DB_COEFFS_PER_LANE == 2 || DB_COEFFS_PER_LANE == 4,
                 "DB_COEFFS_PER_LANE must be 2 (k8) or 4 (k16)");
   int const K_base = (lane % 4) * 2;
@@ -1090,7 +1094,7 @@ __device__ __forceinline__ void precompute_dB_coeff(float coeff[DB_COEFFS_PER_LA
     // m16n8k_ V-index → K-offset: (V & 1) is the col-pair offset; (V & 2) ? 8 : 0
     // covers the second K-tile inside the K_BIG (k16) atom.
     int const k = K_base + (i & 1) + ((i & 2) << 2);
-    coeff[i] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt[k] : 0.f;
+    coeff[i] = (k < prev_k) ? __expf(total_cumAdt - old_cumAdt[k]) * old_dt[k] : 0.f;
   }
 }
 
@@ -1127,9 +1131,10 @@ __device__ __forceinline__ void compute_dB_scaling(FragB& frag_B,
 //            frag (8 elts): {0,2}→K_base, {1,3}→K_base+1,
 //                           {4,6}→K_base+8, {5,7}→K_base+9  (4 unique K)
 // =============================================================================
-template <int MAX_WINDOW_PAD_MMA_K, typename FragA, typename SmemT>
-__device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, SmemT const& smem, float total_cumAdt,
-                                               int prev_k, int lane) {
+template <int MAX_WINDOW_PAD_MMA_K, typename FragA>
+__device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, float const* old_cumAdt,
+                                               float const* old_dt, float total_cumAdt, int prev_k,
+                                               int lane) {
   using namespace cute;
   constexpr int FRAG_A_SIZE = size(FragA{});
   static_assert((MAX_WINDOW_PAD_MMA_K == 16 && FRAG_A_SIZE == 8) ||
@@ -1140,12 +1145,11 @@ __device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, SmemT const& smem,
   int const K_base = (lane % 4) * 2;
 
   if constexpr (MAX_WINDOW_PAD_MMA_K == 8) {
-    float const c0 = (K_base < prev_k)
-                         ? __expf(total_cumAdt - smem.old_cumAdt[K_base]) * smem.old_dt[K_base]
+    float const c0 =
+        (K_base < prev_k) ? __expf(total_cumAdt - old_cumAdt[K_base]) * old_dt[K_base] : 0.f;
+    float const c1 = (K_base + 1 < prev_k)
+                         ? __expf(total_cumAdt - old_cumAdt[K_base + 1]) * old_dt[K_base + 1]
                          : 0.f;
-    float const c1 = (K_base + 1 < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[K_base + 1]) *
-                                                 smem.old_dt[K_base + 1]
-                                           : 0.f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       frag_A(i) = frag_t(toFloat(frag_A(i)) * ((i & 1) ? c1 : c0));
@@ -1155,7 +1159,7 @@ __device__ __forceinline__ void apply_dA_coeff(FragA& frag_A, SmemT const& smem,
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       int const k = K_base + (j & 1) + ((j & 2) ? 8 : 0);
-      c[j] = (k < prev_k) ? __expf(total_cumAdt - smem.old_cumAdt[k]) * smem.old_dt[k] : 0.f;
+      c[j] = (k < prev_k) ? __expf(total_cumAdt - old_cumAdt[k]) * old_dt[k] : 0.f;
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -1481,7 +1485,8 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
 template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& tiled_mma,
-                                             ThrMma const& thr_mma, int tid, FragY&... frag_y) {
+                                             ThrMma const& thr_mma, int tid, int state_buf,
+                                             FragY&... frag_y) {
   using namespace cute;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
@@ -1506,7 +1511,9 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 
   // Swizzle layout matches the dtype of the buffer being viewed.
   auto const layout_state_swz = make_swizzled_layout_rc<BTypeIn, D_PER_CTA, DSTATE>();
-  state_view_t const* smem_state_ptr = reinterpret_cast<state_view_t const*>(smem.state);
+  // state_buf selects the double-buffered slot; offset in state_t units before the view cast.
+  state_view_t const* smem_state_ptr = reinterpret_cast<state_view_t const*>(
+      reinterpret_cast<state_t const*>(smem.state) + state_buf * D_PER_CTA * DSTATE);
   Tensor smem_state = make_tensor(make_smem_ptr(smem_state_ptr), layout_state_swz);
 
   pipelined_kloop_gemm<3, NUM_K_TILES, input_t, BTypeIn, MMA_prop::operand_t>(
@@ -1522,7 +1529,7 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
 __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int d_tile, int head,
-                                            int64_t cache_slot) {
+                                            int64_t cache_slot, int state_buf = 0) {
   using namespace cute;
   static_assert(D_PER_CTA % NUM_WARPS == 0, "D_PER_CTA must be divisible by NUM_WARPS");
   constexpr int DIM_PER_WARP = D_PER_CTA / NUM_WARPS;
@@ -1538,8 +1545,9 @@ __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams 
   // (symmetric with the load; no 128-thread cap, no idle warps).  NUM_WARPS=4 → 16 rows/warp
   // (byte-identical gmem result to the old cooperative copy); 8 → 8 rows/warp.
   auto layout_smem_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
-  Tensor sState_full =
-      make_tensor(make_smem_ptr(reinterpret_cast<state_t const*>(smem.state)), layout_smem_swz);
+  Tensor sState_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<state_t const*>(smem.state) + state_buf * D_PER_CTA * DSTATE),
+      layout_smem_swz);
   Tensor gState_full = make_tensor(make_gmem_ptr(state_w + state_base),
                                    make_layout(make_shape(Int<D_PER_CTA>{}, Int<DSTATE>{}),
                                                make_stride(Int<DSTATE>{}, Int<1>{})));
@@ -1563,7 +1571,8 @@ __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams 
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, typename SmemT>
 __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams const& params,
                                             int warp, int lane, int d_tile, int head,
-                                            int64_t cache_slot, int write_offset, int seq_len) {
+                                            int64_t cache_slot, int write_offset, int seq_len,
+                                            int tile_buf = 0) {
   using namespace cute;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   int const flat_tid = warp * warpSize + lane;
@@ -1586,7 +1595,8 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
   // next d_tile / next head's gmem region.
   constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
   auto layout_x_swz = make_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, D_SMEM_COLS>();
-  Tensor sX = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(smem.x)), layout_x_swz);
+  auto const* x_base = smem.x + tile_buf * NPREDICTED_PAD_MMA_M * D_SMEM_COLS;
+  Tensor sX = make_tensor(make_smem_ptr(reinterpret_cast<input_t const*>(x_base)), layout_x_swz);
   Tensor gX = make_tensor(make_gmem_ptr(old_x_w + ox_w_base),
                           make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}),
                                       make_stride(params.old_x_stride_token, Int<1>{})));
