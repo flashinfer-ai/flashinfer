@@ -104,14 +104,7 @@ def test_sinqle_prefill_with_paged_kv_cache(
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("kv_len", [128, 256])
-@pytest.mark.parametrize("qo_len", [64, 128])
-@pytest.mark.parametrize("num_kv_heads", [1])
-@pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
-def test_single_prefill_with_kv_cache_nvfp4(
+def _run_single_prefill_with_kv_cache_nvfp4(
     kv_len,
     qo_len,
     num_kv_heads,
@@ -119,6 +112,7 @@ def test_single_prefill_with_kv_cache_nvfp4(
     head_dim,
     causal,
     q_dtype,
+    pos_encoding_mode="NONE",
 ):
     """Test single_prefill_with_kv_cache with NVFP4 KV cache (contiguous layout).
 
@@ -147,16 +141,74 @@ def test_single_prefill_with_kv_cache_nvfp4(
         k_packed,
         v_packed,
         causal=causal,
-        pos_encoding_mode="NONE",
+        pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=0.0,
         k_scale=k_global_scale.item(),
         v_scale=v_global_scale.item(),
         kv_cache_sf=(k_sf, v_sf),
+        backend="fa2",
     )
 
     o_ref = flashinfer.prefill.single_prefill_with_kv_cache(
-        q, k_dq, v_dq, causal=causal, pos_encoding_mode="NONE", logits_soft_cap=0.0
+        q,
+        k_dq,
+        v_dq,
+        causal=causal,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=0.0,
     )
 
     # NVFP4 is 4-bit; use relaxed tolerance
     torch.testing.assert_close(o, o_ref, rtol=1e-1, atol=1e-1)
+
+
+@pytest.mark.parametrize("kv_len", [128, 256])
+@pytest.mark.parametrize("qo_len", [64, 128])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("num_qo_heads", [1])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_single_prefill_with_kv_cache_nvfp4(
+    kv_len,
+    qo_len,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    q_dtype,
+):
+    _run_single_prefill_with_kv_cache_nvfp4(
+        kv_len,
+        qo_len,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        causal,
+        q_dtype,
+    )
+
+
+def test_single_prefill_with_kv_cache_nvfp4_large_head():
+    _run_single_prefill_with_kv_cache_nvfp4(
+        kv_len=256,
+        qo_len=64,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.float16,
+    )
+
+
+def test_single_prefill_with_kv_cache_nvfp4_rope_large_head():
+    _run_single_prefill_with_kv_cache_nvfp4(
+        kv_len=128,
+        qo_len=64,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        causal=False,
+        q_dtype=torch.float16,
+        pos_encoding_mode="ROPE_LLAMA",
+    )

@@ -831,6 +831,18 @@ def test_batch_decode_with_paged_kv_cache_nvfp4(
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-1, atol=1e-1)
 
 
+def test_batch_decode_with_paged_kv_cache_nvfp4_large_head():
+    test_batch_decode_with_paged_kv_cache_nvfp4(
+        batch_size=4,
+        kv_len=128,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        q_dtype=torch.float16,
+    )
+
+
 if __name__ == "__main__":
     test_batch_decode_with_paged_kv_cache(
         256,

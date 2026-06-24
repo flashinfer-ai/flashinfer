@@ -42,6 +42,12 @@ from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
 
 
+def _is_nvfp4_kv_dtype(dtype: torch.dtype) -> bool:
+    return dtype == torch.uint8 or (
+        hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2
+    )
+
+
 def get_single_decode_uri(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -1085,6 +1091,7 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        allow_nvfp4_sm8_large_head=(backend == "fa2"),
     )
 
 
@@ -1187,23 +1194,53 @@ def gen_batch_attention_module(
 
 
 def _fa2_head_dim_nvcc_flags(
-    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
+    head_dim_qk: int,
+    head_dim_vo: int,
+    dtype_kv: torch.dtype,
+    *,
+    allow_nvfp4_sm8_large_head: bool = False,
 ) -> Optional[List[str]]:
     """Return arch flags for FA2 large-head modules.
 
-    For 16-bit KV, head_dim > 256 uses the Ampere+ VO-split/KV-shared-memory
-    path. FP8 large-head modules remain restricted to SM100+ until that variant
-    is validated separately.
+    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. NVFP4 KV
+    can opt into the same arch set only for validated FA2 prefill read paths.
+    Other one-byte large-head modules remain restricted to SM100+ until those
+    variants are validated separately.
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
         if dtype_kv.itemsize == 1:
-            return current_compilation_context.get_nvcc_flags_list(
-                supported_major_versions=[10, 11, 12]
-            )
+            if not (
+                allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)
+            ):
+                return current_compilation_context.get_nvcc_flags_list(
+                    supported_major_versions=[10, 11, 12]
+                )
         return current_compilation_context.get_nvcc_flags_list(
             supported_major_versions=[8, 9, 10, 11, 12]
         )
     return None
+
+
+def _fa2_batch_prefill_head_dim_nvcc_flags(
+    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
+) -> Optional[List[str]]:
+    return _fa2_head_dim_nvcc_flags(
+        head_dim_qk,
+        head_dim_vo,
+        dtype_kv,
+        allow_nvfp4_sm8_large_head=True,
+    )
+
+
+def _fa2_single_prefill_head_dim_nvcc_flags(
+    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
+) -> Optional[List[str]]:
+    return _fa2_head_dim_nvcc_flags(
+        head_dim_qk,
+        head_dim_vo,
+        dtype_kv,
+        allow_nvfp4_sm8_large_head=True,
+    )
 
 
 def gen_customize_single_decode_module(
@@ -1391,7 +1428,7 @@ def gen_customize_single_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(
+            extra_cuda_cflags=_fa2_single_prefill_head_dim_nvcc_flags(
                 head_dim_qk, head_dim_vo, dtype_kv
             ),
         )
@@ -1570,6 +1607,7 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    allow_nvfp4_sm8_large_head: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1662,8 +1700,12 @@ def gen_customize_batch_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(
-                head_dim_qk, head_dim_vo, dtype_kv
+            extra_cuda_cflags=(
+                _fa2_batch_prefill_head_dim_nvcc_flags(
+                    head_dim_qk, head_dim_vo, dtype_kv
+                )
+                if allow_nvfp4_sm8_large_head
+                else _fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv)
             ),
         )
     elif backend == "fa3":
