@@ -37,7 +37,7 @@ def is_gddr_device_host(device_name: str) -> bool:
     names default to the GDDR threshold.
     """
     lowered = device_name.lower()
-    gddr_markers = ("geforce", "rtx", "workstation", "l4", "l40", "l20", "a10", "a40")
+    gddr_markers = ("geforce", "rtx", "workstation")
     return any(marker in lowered for marker in gddr_markers)
 
 
