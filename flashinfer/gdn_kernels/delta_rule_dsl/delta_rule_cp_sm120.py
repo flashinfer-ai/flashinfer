@@ -2854,94 +2854,61 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             )
 
     @cute.jit
-    def cp_qk_epi_converted(
+    def cp_qk_t_epi_converted(
         self,
         tQKrQK: cute.Tensor,
         tQKcMqk: cute.Tensor,
-        sAlpha: cute.Tensor,
-        alpha_stage: cutlass.Int32,
-        is_final_block: bool,
-        B: cutlass.Int32,
-        scale: cutlass.Float32,
-    ):
-        alpha_log = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
-        for i in cutlass.range_constexpr(cute.size(tQKrQK)):
-            s, t = tQKcMqk[i]
-            alpha = cute.math.exp2(
-                cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
-                fastmath=True,
-            )
-            pred = s >= t
-            if cutlass.const_expr(is_final_block):
-                pred = pred and (s < B and t < B)
-            tQKrQK[i] = tQKrQK[i] * alpha * scale if pred else cutlass.Float32(0.0)
-
-        tQKrQK_cvt = cute.make_fragment_like(tQKrQK, self.dtype)
-        for i in cutlass.range_constexpr(cute.size(tQKrQK)):
-            tQKrQK_cvt[i] = self.dtype(tQKrQK[i])
-        return tQKrQK_cvt
-
-    @cute.jit
-    def materialize_t_opd(
-        self,
         sT: cute.Tensor,
+        sQK: cute.Tensor,
         sKK_opd: cute.Tensor,
         sAlpha: cute.Tensor,
         alpha_stage: cutlass.Int32,
         is_final_block: bool,
         B: cutlass.Int32,
+        scale: cutlass.Float32,
+        qk_tiled_mma,
         kk_tiled_mma,
-        tKKcMkk: cute.Tensor,
         aux_tidx: cutlass.Int32,
     ):
         alpha_log = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
         stsm_atom = cute.make_copy_atom(
             warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
         )
-        tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
-        thr_store = tiled_store.get_slice(aux_tidx)
-        tKKsKK = thr_store.partition_D(sKK_opd)
-        tKKcMkk_cv = thr_store.retile(tKKcMkk)
+        qk_tiled_store = cute.make_tiled_copy_C(stsm_atom, qk_tiled_mma)
+        kk_tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
+        qk_thr_store = qk_tiled_store.get_slice(aux_tidx)
+        kk_thr_store = kk_tiled_store.get_slice(aux_tidx)
+        tQKsQK = qk_thr_store.partition_D(sQK)
+        tKKsKK = kk_thr_store.partition_D(sKK_opd)
+        tQKcMqk_cv = kk_thr_store.retile(tQKcMqk)
+        tQKrQK_cv = kk_thr_store.retile(tQKrQK)
+        tQKrQK_cvt = cute.make_fragment_like(tQKrQK, self.dtype)
+        tQKrQK_cvt_cv = kk_thr_store.retile(tQKrQK_cvt)
         tKKrT = cute.make_fragment_like(tKKsKK, self.dtype)
 
         for i in cutlass.range_constexpr(cute.size(tKKrT)):
-            s, t = tKKcMkk_cv[i]
-            value = cutlass.Float32(0.0)
-            pred = True  # for non final blocks, s >= t is enforced by value filtering
+            s, t = tQKcMqk_cv[i]
+            gamma = cutlass.Float32(0.0)
+            qk_value = cutlass.Float32(0.0)
+            t_value = cutlass.Float32(0.0)
+            pred = s >= t
             if cutlass.const_expr(is_final_block):
-                pred = s >= t and s < B and t < B
+                pred = pred and s < B and t < B
             if pred:
                 gamma = cute.math.exp2(
                     cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
                     fastmath=True,
                 )
-                value = -gamma * cutlass.Float32(sT[t, s])
-            if cutlass.const_expr(not is_final_block):  # value filtering
-                # T is already structurally lower-triangular in this operand view.
-                # If gamma overflows on a structural-zero entry, the product becomes
-                # inf * 0 -> NaN; filter only that bad product instead of
-                # materializing the coordinates.
-                if value != value:
-                    value = cutlass.Float32(0.0)
-            tKKrT[i] = self.dtype(value)
-        cute.copy(tiled_store, tKKrT, tKKsKK)
+            qk_value = tQKrQK_cv[i] * gamma * scale
+            t_value = -gamma * cutlass.Float32(sT[t, s])
+            if cutlass.const_expr(is_final_block):
+                qk_value = qk_value if pred else cutlass.Float32(0.0)
+                t_value = t_value if pred else cutlass.Float32(0.0)
 
-    @cute.jit
-    def qk_store_converted(
-        self,
-        tQKrQK_cvt: cute.Tensor,
-        sQK: cute.Tensor,
-        qk_tiled_mma,
-        qk_thread_idx: cutlass.Int32,
-    ):
-        stsm_atom = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
-        )
-        qk_tiled_copy = cute.make_tiled_copy_C(stsm_atom, qk_tiled_mma)
-        qk_thr_copy = qk_tiled_copy.get_slice(qk_thread_idx)
-        tQKsQK = qk_thr_copy.partition_D(sQK)
-        tQKrQK_cv = qk_thr_copy.retile(tQKrQK_cvt)
-        cute.copy(qk_tiled_copy, tQKrQK_cv, tQKsQK)
+            tQKrQK_cvt_cv[i] = self.dtype(qk_value)
+            tKKrT[i] = self.dtype(t_value)
+        cute.copy(qk_tiled_store, qk_thr_store.retile(tQKrQK_cvt), tQKsQK)
+        cute.copy(kk_tiled_store, tKKrT, tKKsKK)
 
     @cute.jit
     def run_aux_loop_body(
@@ -3003,40 +2970,28 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         t_pipeline.consumer_wait(t_consumer_state)
         cute.arch.fence_view_async_shared()
 
-        tQKrQK_cvt = self.cp_qk_epi_converted(
+        kk_pipeline.producer_acquire(kk_producer_state)
+        qk_pipeline.producer_acquire(qk_producer_state)
+        self.cp_qk_t_epi_converted(
             tQKrQK,
             tQKcMqk,
-            sAlpha,
-            alpha_consumer_state.index,
-            is_final_block,
-            B,
-            scale,
-        )
-        kk_pipeline.producer_acquire(kk_producer_state)
-        self.materialize_t_opd(
             sT[None, None, t_consumer_state.index],
+            sQK[None, None, qk_producer_state.index],
             sKK_opd[None, None, kk_producer_state.index],
             sAlpha,
             alpha_consumer_state.index,
             is_final_block,
             B,
+            scale,
+            qk_tiled_mma,
             kk_tiled_mma,
-            tKKcMkk,
             aux_tidx,
         )
         t_pipeline.consumer_release(t_consumer_state)
         t_consumer_state.advance()
+        cute.arch.fence_view_async_shared()
         kk_pipeline.producer_commit(kk_producer_state)
         kk_producer_state.advance()
-
-        qk_pipeline.producer_acquire(qk_producer_state)
-        self.qk_store_converted(
-            tQKrQK_cvt,
-            sQK[None, None, qk_producer_state.index],
-            qk_tiled_mma,
-            aux_tidx,
-        )
-        cute.arch.fence_view_async_shared()
         qk_pipeline.producer_commit(qk_producer_state)
         qk_producer_state.advance()
 
