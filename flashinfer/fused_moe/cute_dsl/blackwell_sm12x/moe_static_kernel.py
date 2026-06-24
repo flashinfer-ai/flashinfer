@@ -985,9 +985,15 @@ class MoEStaticKernel:
             active_expert_count[Int32(0)] = Int32(0)
         scatter_total = num_tokens * cols
         j = flat_tid
+        row = flat_tid // cols
+        col = flat_tid - row * cols
         while j < scatter_total:
-            scatter_output[j // cols, j % cols] = cutlass.BFloat16(0.0)
+            scatter_output[row, col] = cutlass.BFloat16(0.0)
             j += flat_stride
+            col += flat_stride
+            while col >= cols:
+                col -= cols
+                row += Int32(1)
         cute.arch.sync_threads()
         self._resident_grid_barrier(
             barrier_count,
@@ -1553,20 +1559,14 @@ class MoEStaticKernel:
                             csB_p[None, None, k_next],
                             crB[None, None, k_next],
                         )
-                        fz_csSFA_cur = cute.filter_zeros(
-                            csSFA_tile[None, None, None, cons_state.index]
-                        )
-                        fz_csSFB_cur = cute.filter_zeros(
-                            csSFB_tile[None, None, None, cons_state.index]
-                        )
                         cute.copy(
                             smem_copy_SFA,
-                            fz_csSFA_cur[None, None, k_next],
+                            fz_csSFA_p[None, None, k_next],
                             fz_crSFA[None, None, k_next],
                         )
                         cute.copy(
                             smem_copy_SFB,
-                            fz_csSFB_cur[None, None, k_next],
+                            fz_csSFB_p[None, None, k_next],
                             fz_crSFB[None, None, k_next],
                         )
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -1951,9 +1951,9 @@ class MoEStaticKernel:
                     cute.copy(
                         smem_copy_B, csB_phase2[None, None, 0], crB[None, None, 0]
                     )
-                    f2 = cute.filter_zeros(csSFB_phase2)
-                    f4 = cute.filter_zeros(crSFB_phase2)
-                    cute.copy(smem_copy_SFB, f2[None, None, 0], f4[None, None, 0])
+                    f2_hoist = cute.filter_zeros(csSFB_phase2)
+                    f4_hoist = cute.filter_zeros(crSFB_phase2)
+                    cute.copy(smem_copy_SFB, f2_hoist[None, None, 0], f4_hoist[None, None, 0])
 
                     down_acc.fill(0.0)
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -1970,12 +1970,10 @@ class MoEStaticKernel:
                                 csB_phase2[None, None, k_next],
                                 crB[None, None, k_next],
                             )
-                            f2 = cute.filter_zeros(csSFB_phase2)
-                            f4 = cute.filter_zeros(crSFB_phase2)
                             cute.copy(
                                 smem_copy_SFB,
-                                f2[None, None, k_next],
-                                f4[None, None, k_next],
+                                f2_hoist[None, None, k_next],
+                                f4_hoist[None, None, k_next],
                             )
                         for _mt in range(self.num_m_tiles):
                             for _nt in range(self.num_n_tiles):
