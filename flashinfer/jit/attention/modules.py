@@ -1186,16 +1186,22 @@ def gen_batch_attention_module(
     )
 
 
-def _fa2_head_dim_nvcc_flags(head_dim_qk: int, head_dim_vo: int) -> Optional[List[str]]:
-    """head_dim > 256 is only supported on SM100+.
+def _fa2_head_dim_nvcc_flags(
+    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
+) -> Optional[List[str]]:
+    """Return arch flags for FA2 large-head modules.
 
-    Restrict compilation of those modules to SM100/110/120 so pre-SM100
-    builds neither compile nor expose them; requesting such a module on an
-    older GPU raises "No supported CUDA architectures found".
+    For 16-bit KV, head_dim > 256 uses the Ampere+ VO-split/KV-shared-memory
+    path. FP8 large-head modules remain restricted to SM100+ until that variant
+    is validated separately.
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
+        if dtype_kv.itemsize == 1:
+            return current_compilation_context.get_nvcc_flags_list(
+                supported_major_versions=[10, 11, 12]
+            )
         return current_compilation_context.get_nvcc_flags_list(
-            supported_major_versions=[10, 11, 12]
+            supported_major_versions=[8, 9, 10, 11, 12]
         )
     return None
 
@@ -1286,7 +1292,7 @@ def gen_customize_single_decode_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
     )
 
 
@@ -1385,7 +1391,9 @@ def gen_customize_single_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(
+                head_dim_qk, head_dim_vo, dtype_kv
+            ),
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -1538,7 +1546,7 @@ def gen_customize_batch_decode_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
     )
 
 
@@ -1654,7 +1662,9 @@ def gen_customize_batch_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(
+                head_dim_qk, head_dim_vo, dtype_kv
+            ),
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri

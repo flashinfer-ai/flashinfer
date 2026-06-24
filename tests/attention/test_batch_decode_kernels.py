@@ -27,13 +27,23 @@ from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
 def head_dim_512_supported() -> bool:
-    # head_dim > 256 is only supported on SM100+.
-    return get_compute_capability(torch.device("cuda:0"))[0] >= 10
+    # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
+    return get_compute_capability(torch.device("cuda:0"))[0] >= 8
 
 
 def skip_if_head_dim_unsupported(head_dim: int):
     if head_dim > 256 and not head_dim_512_supported():
-        pytest.skip("head_dim > 256 is only supported on SM100 or newer")
+        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
+
+
+def skip_if_head_dim_dtype_unsupported(head_dim: int, kv_dtype: torch.dtype):
+    skip_if_head_dim_unsupported(head_dim)
+    if (
+        head_dim > 256
+        and kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and get_compute_capability(torch.device("cuda:0"))[0] < 10
+    ):
+        pytest.skip("head_dim > 256 with FP8 KV is only validated on SM100 or newer")
 
 
 @pytest.fixture(
@@ -98,7 +108,7 @@ def test_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
-    skip_if_head_dim_unsupported(head_dim)
+    skip_if_head_dim_dtype_unsupported(head_dim, kv_dtype)
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size

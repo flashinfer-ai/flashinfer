@@ -226,12 +226,13 @@ def gen_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
 
-    # head_dim > 256 FA2 modules are SM100+-only; skip them entirely when no
-    # SM100+ architecture is being targeted.
+    # For 16-bit KV, head_dim > 256 FA2 modules use the Ampere+
+    # large-head path. FP8 large-head modules stay SM100+-only until that
+    # variant is validated separately.
     from .jit.core import current_compilation_context
 
-    has_sm100_or_newer = any(
-        major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    has_sm8_or_newer = any(
+        major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
     )
 
     # FA2 MHA / MQA / GQA
@@ -248,8 +249,12 @@ def gen_attention(
         use_sliding_window_,
         use_logits_soft_cap_,
     ):
-        if (head_dim_qk > 256 or head_dim_vo > 256) and not has_sm100_or_newer:
-            continue
+        if head_dim_qk > 256 or head_dim_vo > 256:
+            if dtype_kv.itemsize == 1:
+                if not has_sm100:
+                    continue
+            elif not has_sm8_or_newer:
+                continue
         yield from gen_fa2(
             dtype_qo=dtype_qo,
             dtype_kv=dtype_kv,
