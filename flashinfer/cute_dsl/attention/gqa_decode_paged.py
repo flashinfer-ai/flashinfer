@@ -1444,6 +1444,14 @@ class GroupedQueryAttentionDecodePaged:
                         masked_start_s = 0
                         masked_iters_s = 1
                         masked_coord_s = tiles_s - 1
+            else:
+                # Non-causal boundary mask.
+                is_last_split = kv_split_idx == (tiles_s - 1) % kv_splits
+                is_last_phase = softmax_phase == (iters_s - 1) % softmax_warpgroups
+                if seqlen % blk_tile_s != 0 and is_last_split and is_last_phase:
+                    masked_start_s = 0
+                    masked_iters_s = 1
+                    masked_coord_s = tiles_s - 1
 
             if cutlass.const_expr(enable_blasst):
                 # Tile skip tracking
@@ -1454,8 +1462,8 @@ class GroupedQueryAttentionDecodePaged:
                     Float32(seqlen)
                 )
 
-            # Sequence loop
-            num_loops = 2 if not tma_mask else 1
+            # Loop 1 applies the boundary mask.
+            num_loops = 2
             for loop in cutlass.range_constexpr(num_loops):
                 is_masked_loop = loop == 1
                 for s in cutlass.range(
@@ -1483,7 +1491,11 @@ class GroupedQueryAttentionDecodePaged:
                         for sm in cutlass.range_constexpr(tiles_sm):
                             for p in cutlass.range_constexpr(blk_tile_p):
                                 masked_p = masked[None, p, sm]
-                                is_oob = offset_s + sm * mma_tile_m > offset_p + p
+                                key_pos = offset_s + sm * mma_tile_m
+                                if cutlass.const_expr(not tma_mask):
+                                    is_oob = key_pos > offset_p + p
+                                else:
+                                    is_oob = key_pos >= seqlen
                                 mask = -Float32.inf if is_oob else Float32(0)
                                 masked_p.store(masked_p.load() + mask)
                         scores = masked.load().reshape((blk_tile_n, tiles_sm))

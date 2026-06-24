@@ -92,6 +92,30 @@ def _decode_reference_paged(
     return out.to(q.dtype)
 
 
+def _decode_reference_paged_non_causal(
+    q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+):
+    """Non-causal multi-query GQA paged reference; q is [b, q_len, h_q, d]."""
+    batch_size = kv_indptr.numel() - 1
+    page_size = k_cache.shape[1]
+    num_kv_heads = k_cache.shape[2]
+    head_dim = k_cache.shape[3]
+    group = q.shape[2] // num_kv_heads
+    out = torch.empty_like(q, dtype=torch.float32)
+    for b in range(batch_size):
+        pages_b = kv_indices[kv_indptr[b] : kv_indptr[b + 1]]
+        valid_len = (pages_b.numel() - 1) * page_size + int(kv_last_page_len[b].item())
+        keys = k_cache[pages_b].float().reshape(-1, num_kv_heads, head_dim)[:valid_len]
+        values = (
+            v_cache[pages_b].float().reshape(-1, num_kv_heads, head_dim)[:valid_len]
+        )
+        keys = keys.repeat_interleave(group, dim=1)
+        values = values.repeat_interleave(group, dim=1)
+        logits = torch.einsum("qhd,nhd->hqn", q[b].float(), keys) * sm_scale
+        out[b] = torch.einsum("hqn,nhd->qhd", torch.softmax(logits, dim=-1), values)
+    return out.to(q.dtype)
+
+
 def _decode_reference_contiguous(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -226,6 +250,55 @@ def test_cute_dsl_decode_paged_wrapper(batch_size, kv_len, page_size, dtype):
     )
     torch.testing.assert_close(
         out.reshape(batch_size, NUM_QO_HEADS, HEAD_DIM),
+        ref,
+        rtol=5e-3,
+        atol=5e-3,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 17])
+@pytest.mark.parametrize("kv_len", [129, 1024])
+@pytest.mark.parametrize("page_size", [16, 32])
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cute_dsl_decode_paged_non_causal(
+    batch_size, kv_len, page_size, q_len_per_req, dtype
+):
+    """Non-causal paged decode (regression: seqlen-boundary masking)."""
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, q_len_per_req, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        page_size=page_size,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        q_len_per_req=q_len_per_req,
+        is_causal=False,
+    )
+    out = wrapper.run(
+        q.reshape(batch_size * q_len_per_req, NUM_QO_HEADS, HEAD_DIM), k_cache, v_cache
+    )
+    ref = _decode_reference_paged_non_causal(
+        q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+    )
+    torch.testing.assert_close(
+        out.reshape(batch_size, q_len_per_req, NUM_QO_HEADS, HEAD_DIM),
         ref,
         rtol=5e-3,
         atol=5e-3,
