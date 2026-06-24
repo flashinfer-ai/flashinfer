@@ -53,6 +53,7 @@ def _decode_reference_paged(
     kv_last_page_len: torch.Tensor,
     sm_scale: float,
     o_scale: float = 1.0,
+    sinks: torch.Tensor | None = None,
 ):
     """Single-token GQA decode reference using a paged KV cache (NHD layout)."""
     batch_size = kv_indptr.numel() - 1
@@ -86,7 +87,11 @@ def _decode_reference_paged(
         values = values.repeat_interleave(group, dim=1)
         # logits: [num_qo_heads, valid_len]
         logits = torch.einsum("hd,nhd->hn", q_f32[b], keys) * sm_scale
+        if sinks is not None:
+            logits = torch.cat([logits, sinks.float().unsqueeze(-1)], dim=-1)
         probs = torch.softmax(logits, dim=-1)
+        if sinks is not None:
+            probs = probs[:, :-1]
         out[b] = torch.einsum("hn,nhd->hd", probs, values)
     out *= o_scale
     return out.to(q.dtype)
@@ -245,7 +250,7 @@ def test_batch_decode_wrapper_cute_dsl_backend(batch_size, kv_len, page_size, dt
     """Integration test via the standard BatchDecodeWithPagedKVCacheWrapper API."""
     torch.manual_seed(0)
     q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
-    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
+    kv, kv_indptr, kv_indices, kv_last_page_len, _seq_lens = _make_paged_kv(
         batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
 
@@ -352,6 +357,48 @@ def test_batch_decode_wrapper_cute_dsl_hnd(batch_size, kv_len, page_size, dtype)
     )
     ref = ref_wrapper.run(q, kv_nhd)
     torch.testing.assert_close(out_hnd, ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_attention_sinks(dtype):
+    """Public cute-dsl decode path should pass attention sinks to the paged kernel."""
+    batch_size, page_size, kv_len = 4, 16, 1024
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, kv_last_page_len, _seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    sinks = torch.randn(NUM_QO_HEADS, device=DEVICE, dtype=torch.float32)
+
+    workspace = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="cute-dsl"
+    )
+    cd.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    out = cd.run(q, kv, sinks=sinks)
+
+    k_cache, v_cache = kv.unbind(dim=1)
+    ref = _decode_reference_paged(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        1.0 / math.sqrt(HEAD_DIM),
+        sinks=sinks,
+    )
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.parametrize("batch_size", [4])

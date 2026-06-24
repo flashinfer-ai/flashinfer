@@ -1417,8 +1417,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             provided, ``sinks[head_idx]`` is appended to each row of the
             softmax denominator (Streaming-LLM / Attention-Sinks). The dtype
             requirement is backend-specific and validated by the underlying
-            kernel; pass ``None`` to disable. Not supported by the
-            ``cute-dsl`` backend.
+            kernel; pass ``None`` to disable.
         q_len_per_req : Optional[int]
             DEPRECATED — pass to :meth:`plan` instead. When provided here, emits
             a :class:`DeprecationWarning` and is used to validate the run-time value
@@ -1561,10 +1560,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             check_shape_dtype_device(out, q.shape, out_dtype, q.device, "out")
 
         if self._backend == "cute-dsl":
-            if sinks is not None:
-                raise NotImplementedError(
-                    "cute-dsl decode backend does not support attention sinks"
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support NVFP4 KV cache"
@@ -1587,6 +1582,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 out=out,
                 sm_scale=sm_scale,
                 o_scale=o_scale,
+                sinks=sinks,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 lse=lse if return_lse else None,
                 enable_pdl=enable_pdl,

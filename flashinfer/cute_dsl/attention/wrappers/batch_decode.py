@@ -321,6 +321,7 @@ def _get_compiled_paged_decode_kernel(
     tma_mask: bool,
     use_threshold: bool,
     use_lse: bool,
+    use_sink: bool,
 ):
     """Compile and cache the paged GQA decode kernel."""
     grouped_head_tile, prediction_tile = _pick_tile_shape(
@@ -444,6 +445,12 @@ def _get_compiled_paged_decode_kernel(
             assumed_align=16,
         )
 
+    sink_fake = None
+    if use_sink:
+        sink_fake = cute.runtime.make_fake_compact_tensor(
+            acc_dtype, (num_qo_heads,), assumed_align=16
+        )
+
     threshold_p_fake = Float32(0.0) if use_threshold else None
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -462,7 +469,7 @@ def _get_compiled_paged_decode_kernel(
         o_partial_fake,
         l_partial_fake,
         m_partial_fake,
-        None,  # sink_h
+        sink_fake,
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         threshold_p_fake,
@@ -1047,12 +1054,12 @@ class BatchDecodePagedCuteDSLWrapper:
         # Standard (no-BLASST, no-LSE) variant — always compiled at plan().
         # BLASST and LSE variants compile lazily on first use via the cache.
         self._compiled_fmha_std = _get_compiled_paged_decode_kernel(
-            *self._compile_args, False, False
+            *self._compile_args, False, False, False
         )
         if precompile_skip_softmax_kernel:
             # Warm the cache so the BLASST variant is ready for the first
             # run() that uses skip_softmax_threshold.
-            _get_compiled_paged_decode_kernel(*self._compile_args, True, False)
+            _get_compiled_paged_decode_kernel(*self._compile_args, True, False, False)
         self._planned = True
 
     @flashinfer_api
@@ -1064,6 +1071,7 @@ class BatchDecodePagedCuteDSLWrapper:
         out: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
         o_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         lse: Optional[torch.Tensor] = None,
         enable_pdl: bool = True,
@@ -1092,6 +1100,11 @@ class BatchDecodePagedCuteDSLWrapper:
             Output scale applied to the final O before it is written. The
             cute-dsl kernel folds this in for free in the reduction
             epilogue (no separate post-kernel multiply). Defaults to 1.0.
+        sinks : Optional[torch.Tensor]
+            Contiguous float32 per-head attention sink logits on the query
+            device, shape ``(num_qo_heads,)``. When provided, the sink logit
+            is included in the softmax denominator and receives no output
+            value contribution.
         skip_softmax_threshold_scale_factor : Optional[float]
             BLASST skip-softmax scale factor. The kernel divides this by
             each batch's KV seqlen to obtain the per-request effective
@@ -1224,6 +1237,7 @@ class BatchDecodePagedCuteDSLWrapper:
         scale_s = self._sm_scale if sm_scale is None else sm_scale
         use_threshold = skip_softmax_threshold_scale_factor is not None
         use_lse = lse is not None
+        use_sink = sinks is not None
         if use_threshold:
             if not skip_softmax_threshold_scale_factor > 0:
                 raise ValueError(
@@ -1255,11 +1269,30 @@ class BatchDecodePagedCuteDSLWrapper:
         else:
             l_view = None
 
-        # Pick the variant matching this (use_threshold, use_lse) — std is
-        # always already compiled; the other three are lazy.
-        if use_threshold or use_lse:
+        if use_sink:
+            if sinks.ndim != 1 or sinks.shape[0] != self._num_qo_heads:
+                raise ValueError(
+                    f"sinks tensor must have shape (num_qo_heads,) = "
+                    f"({self._num_qo_heads},), got shape {tuple(sinks.shape)}"
+                )
+            if sinks.dtype != torch.float32:
+                raise ValueError(f"sinks must be float32, got {sinks.dtype}")
+            if sinks.device != device:
+                raise ValueError(
+                    f"sinks must be on device {device}, got {sinks.device}"
+                )
+            if not sinks.is_contiguous():
+                raise ValueError(
+                    f"sinks tensor must be contiguous, got strides {sinks.stride()} "
+                    f"for shape {sinks.shape}"
+                )
+
+        # Pick the variant matching this optional-feature set. The standard
+        # no-threshold/no-LSE/no-sink path is always already compiled; the
+        # other combinations are lazy.
+        if use_threshold or use_lse or use_sink:
             fmha = _get_compiled_paged_decode_kernel(
-                *self._compile_args, use_threshold, use_lse
+                *self._compile_args, use_threshold, use_lse, use_sink
             )
         else:
             fmha = self._compiled_fmha_std
@@ -1281,7 +1314,7 @@ class BatchDecodePagedCuteDSLWrapper:
             o_partial,
             l_partial,
             m_partial,
-            None,  # sink_h
+            sinks,
             Float32(scale_s),
             Float32(o_scale_val),
             threshold_arg,
