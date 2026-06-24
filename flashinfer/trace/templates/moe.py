@@ -1817,8 +1817,12 @@ def _moe_bf16_run_experts(
     topk_idx,
     local_expert_offset,
     E_global,
+    activation="swiglu",
+    swiglu_alpha=1.702,
+    swiglu_beta=1.0,
+    swiglu_limit=7.0,
 ):
-    """Un-quantized (bf16) MoE expert computation with SwiGLU."""
+    """Un-quantized (bf16) MoE expert computation with gated activation."""
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
     I = gemm1_out // 2
@@ -1839,8 +1843,17 @@ def _moe_bf16_run_experts(
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
         X1, X2 = G1[:, :I], G1[:, I:]
-        silu_X2 = X2 / (1.0 + torch.exp(-X2))
-        O = (silu_X2 * X1).matmul(W2[le].t())
+        if activation == "swiglu_oai":
+            gate = X2.clamp(max=float(swiglu_limit))
+            up = X1.clamp(min=-float(swiglu_limit), max=float(swiglu_limit))
+            activated = gate * torch.sigmoid(float(swiglu_alpha) * gate)
+            activated = activated * (up + float(swiglu_beta))
+        elif activation == "swiglu":
+            silu_X2 = X2 / (1.0 + torch.exp(-X2))
+            activated = silu_X2 * X1
+        else:
+            raise ValueError(f"Unsupported activation {activation!r}")
+        O = activated.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
         w_e = (w_tok * match).sum(dim=1)
@@ -2549,6 +2562,26 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "local_expert_offset": Scalar(
             "int32", optional=True, description="Offset of local experts."
         ),
+        "activation": Scalar(
+            "string",
+            optional=True,
+            description="GEMM1 activation: 'swiglu' or 'swiglu_oai'.",
+        ),
+        "swiglu_alpha": Scalar(
+            "float32",
+            optional=True,
+            description="OAI SwiGLU sigmoid multiplier.",
+        ),
+        "swiglu_beta": Scalar(
+            "float32",
+            optional=True,
+            description="OAI SwiGLU up-projection bias.",
+        ),
+        "swiglu_limit": Scalar(
+            "float32",
+            optional=True,
+            description="OAI SwiGLU clamp limit.",
+        ),
     },
     outputs={
         "output": Tensor(
@@ -2756,6 +2789,10 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     w2_alpha,
     num_experts,
     top_k,
+    activation="swiglu",
+    swiglu_alpha=1.702,
+    swiglu_beta=1.0,
+    swiglu_limit=7.0,
     **_unused,
 ):
     """Reference for CuteDSL NvFP4 fused MoE — bridges to the FP4
@@ -2776,6 +2813,10 @@ def _cute_dsl_fused_moe_nvfp4_reference(
         token_selected_experts.to(torch.int64),
         local_expert_offset=0,
         E_global=int(num_experts),
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
 
 

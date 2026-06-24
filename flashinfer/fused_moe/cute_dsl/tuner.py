@@ -271,7 +271,15 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         use_fused_finalize: bool = True,
         output_dtype: torch.dtype = torch.bfloat16,
         enable_pdl: bool = True,
+        activation: str = "swiglu",
+        swiglu_alpha: float = 1.702,
+        swiglu_beta: float = 1.0,
+        swiglu_limit: float = 7.0,
     ):
+        if activation not in ("swiglu", "swiglu_oai"):
+            raise ValueError(
+                f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+            )
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -280,6 +288,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.output_dtype = output_dtype
         self.enable_pdl = enable_pdl
+        self.activation = activation
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -371,6 +383,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.local_expert_offset,
                 self.use_fused_finalize,
                 self.output_dtype,
+                self.activation,
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.swiglu_limit,
             )
         )
 
@@ -556,6 +572,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             use_fused_finalize=self.use_fused_finalize,
             moe_output=moe_output,
             enable_pdl=self.enable_pdl,
+            activation=self.activation,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
             **kwargs,
         )
 

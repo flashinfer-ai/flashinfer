@@ -146,6 +146,10 @@ def _moe_core_impl(
     output_dtype: torch.dtype = torch.bfloat16,
     use_async_memset: bool = True,
     enable_pdl: bool = True,
+    activation: str = "swiglu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float = 7.0,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -185,10 +189,20 @@ def _moe_core_impl(
         memset_event: CUDA event for memset completion.
         output_dtype: Output data type.
         use_async_memset: Use async memset on aux stream.
+        activation: Activation to apply after GEMM1. Supported values are
+            "swiglu" and "swiglu_oai".
+        swiglu_alpha: OAI SwiGLU sigmoid multiplier.
+        swiglu_beta: OAI SwiGLU up-projection bias.
+        swiglu_limit: OAI SwiGLU clamp limit.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
+    if activation not in ("swiglu", "swiglu_oai"):
+        raise ValueError(
+            f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+        )
+
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
@@ -260,6 +274,10 @@ def _moe_core_impl(
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
             enable_pdl=enable_pdl,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
         )
     )
 
@@ -369,6 +387,10 @@ class CuteDslMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         enable_pdl: bool = True,
+        activation: str = "swiglu",
+        swiglu_alpha: float = 1.702,
+        swiglu_beta: float = 1.0,
+        swiglu_limit: float = 7.0,
     ):
         """Initialize the MoE wrapper.
 
@@ -386,7 +408,17 @@ class CuteDslMoEWrapper:
             output_dtype: Output data type. Default: torch.bfloat16.
             device: Device for buffer allocation. Default: "cuda".
             enable_pdl: Enable Programmatic Dependent Launch. Default: True.
+            activation: Activation to apply after GEMM1. Supported values are
+                "swiglu" and "swiglu_oai".
+            swiglu_alpha: OAI SwiGLU sigmoid multiplier.
+            swiglu_beta: OAI SwiGLU up-projection bias.
+            swiglu_limit: OAI SwiGLU clamp limit.
         """
+        if activation not in ("swiglu", "swiglu_oai"):
+            raise ValueError(
+                f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+            )
+
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -400,6 +432,10 @@ class CuteDslMoEWrapper:
         self.output_dtype = output_dtype
         self.device = device
         self.enable_pdl = enable_pdl
+        self.activation = activation
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
 
         # Pre-allocated buffers
         self._moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None
@@ -432,6 +468,10 @@ class CuteDslMoEWrapper:
             use_fused_finalize=True,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
         )
 
         if use_cuda_graph:
@@ -602,6 +642,10 @@ class CuteDslMoEWrapper:
             output_dtype=output_dtype,
             use_async_memset=True,
             enable_pdl=enable_pdl,
+            activation=self.activation,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -684,7 +728,7 @@ class CuteDslMoEWrapper:
 
         # Let tuner choose tactic
         _, best_tactic = tuner.choose_one(
-            "CuteDslMoEWrapper::run",
+            f"CuteDslMoEWrapper::run::{self.activation}",
             [self._runner],
             self._runner.tuning_config,
             inputs,
@@ -728,6 +772,10 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
+    activation: str = "swiglu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float = 7.0,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -756,6 +804,10 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         output_dtype=output_dtype,
         use_async_memset=True,
         enable_pdl=enable_pdl,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -782,6 +834,10 @@ def cute_dsl_fused_moe_nvfp4(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
+    activation: str = "swiglu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float = 7.0,
 ) -> torch.Tensor:
     """Run fused MoE computation using CuteDSL NVFP4 kernels.
 
@@ -815,10 +871,20 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize: Use fused finalize. Default: True.
         moe_output: Pre-allocated output buffer.
         aux_stream: Auxiliary CUDA stream.
+        activation: Activation to apply after GEMM1. Supported values are
+            "swiglu" and "swiglu_oai".
+        swiglu_alpha: OAI SwiGLU sigmoid multiplier.
+        swiglu_beta: OAI SwiGLU up-projection bias.
+        swiglu_limit: OAI SwiGLU clamp limit.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
+    if activation not in ("swiglu", "swiglu_oai"):
+        raise ValueError(
+            f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+        )
+
     if num_local_experts is None:
         num_local_experts = num_experts
 
@@ -843,6 +909,10 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize=use_fused_finalize,
         output_dtype=output_dtype,
         enable_pdl=enable_pdl,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
 
     inputs = [
@@ -861,7 +931,7 @@ def cute_dsl_fused_moe_nvfp4(
     ]
 
     _, best_tactic = tuner.choose_one(
-        "CuteDslFusedMoE::run_moe_nvfp4",
+        f"CuteDslFusedMoE::run_moe_nvfp4::{activation}",
         [runner],
         runner.tuning_config,
         inputs,

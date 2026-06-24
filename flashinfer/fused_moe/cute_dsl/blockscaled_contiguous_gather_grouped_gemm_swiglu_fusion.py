@@ -221,6 +221,10 @@ def _get_compiled_gather_kernel(
     vectorized_f32: bool,
     raster_along_m: bool,
     enable_pdl: bool = True,
+    activation: str = "swiglu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float = 7.0,
 ):
     """Get or compile the gather grouped GEMM with SwiGLU kernel.
 
@@ -250,6 +254,10 @@ def _get_compiled_gather_kernel(
         vectorized_f32,
         raster_along_m,
         enable_pdl,
+        activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -262,6 +270,10 @@ def _get_compiled_gather_kernel(
             topk=topk,
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -325,6 +337,10 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
+    activation: str = "swiglu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float = 7.0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled Contiguous Gather Grouped GEMM with SwiGLU Fusion for MoE workloads.
 
@@ -367,6 +383,14 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         vectorized_f32: Use vectorized f32x2 operations. Default: True
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        activation: Activation to apply in the epilogue. Supported values:
+            "swiglu" and "swiglu_oai".
+        swiglu_alpha: OAI SwiGLU sigmoid multiplier. Used only when
+            activation="swiglu_oai".
+        swiglu_beta: OAI SwiGLU up-projection bias. Used only when
+            activation="swiglu_oai".
+        swiglu_limit: OAI SwiGLU clamp limit. Used only when
+            activation="swiglu_oai".
 
     Returns:
         Tuple of:
@@ -409,6 +433,10 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
+    if activation not in ("swiglu", "swiglu_oai"):
+        raise ValueError(
+            f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+        )
 
     # Get dimensions
     seq_len = a.shape[0]
@@ -585,6 +613,10 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         vectorized_f32=vectorized_f32,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
 
     # Execute kernel with runtime parameters
