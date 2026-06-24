@@ -1578,11 +1578,9 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
-        # Fail fast on unsupported KV configs BEFORE we JIT-compile a module
-        # the kernel can't actually run. The MLA path supports BF16/FP16 KV
-        # natively, and FP8 e4m3 via the in-kernel dequant path on fa3/SM90;
-        # other 1-byte dtypes (uint8 / fp4) would JIT-map to non-FP8 element
-        # types and silently take an unsupported code path inside the kernel.
+        # Other 1-byte dtypes (uint8, fp4, e5m2) would JIT-map to non-FP8
+        # element types and silently take an unsupported code path inside
+        # the kernel, so allowlist exactly the dtypes the kernel can handle.
         _SUPPORTED_MLA_KV_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         if kv_data_type not in _SUPPORTED_MLA_KV_DTYPES:
             raise ValueError(
@@ -1595,27 +1593,22 @@ class BatchMLAPagedAttentionWrapper:
                     "FP8 kv_data_type for MLA is only supported with the fa3 "
                     f"backend on SM90, got backend={self._backend!r}."
                 )
-            # backend=="fa3" alone does not guarantee an SM90 runtime device
-            # (the user can force fa3 on any Hopper / non-Hopper config).
-            # Fail before JIT-compiling a module the device can't actually run.
+            # Backend selection is independent of the runtime device; FP8 MLA
+            # requires SM90 specifically.
             major, minor = get_compute_capability(self.device)
             if major != 9:
                 raise ValueError(
                     "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
                     f"got SM{major}{minor}."
                 )
-            # The FP8 KV path was developed and tested for BF16 Q; while
-            # `vec_cast<half, __nv_fp8_e4m3>` exists in vec_dtypes.cuh, the
-            # FP16 Q + FP8 KV combination has no test coverage in this PR.
-            # Lock the supported Q dtype here so the path can be extended in
-            # a follow-up with appropriate validation.
+            # Removing this guard exposes vec_cast<half, fp8_e4m3>, which
+            # exists but is untested for MLA — silent wrong output.
             if q_data_type != torch.bfloat16:
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
                     f"q_data_type=torch.bfloat16, got {q_data_type}."
                 )
-            # The FP8 KV path's shared-memory layout and dequant helpers
-            # currently only cover the DeepSeek MLA head dims.
+            # Also enforced by static_assert in mla_hopper.cuh.
             if head_dim_ckv != 512 or head_dim_kpe != 64:
                 raise ValueError(
                     "FP8 kv_data_type for MLA currently only supports "
@@ -1650,9 +1643,9 @@ class BatchMLAPagedAttentionWrapper:
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
-        # Cache both planned dtypes so run() can reject mismatched tensors
-        # before the C++ launcher reinterprets the storage by JIT-template
-        # type (which would silently produce wrong output).
+        # Used by run() to reject dtype mismatches; the C++ launcher
+        # reinterprets storage by the JIT-template type chosen at plan(),
+        # so a mismatch produces silent wrong output.
         self._q_data_type = q_data_type
         self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
@@ -1835,10 +1828,9 @@ class BatchMLAPagedAttentionWrapper:
                 "o_scale is only supported with the cutlass backend for now."
             )
 
-        # Validate actual tensor dtypes against the planned dtypes before the
-        # C++ launcher reinterprets storage by JIT-template type. Without this,
-        # a caller can plan(BF16-Q, FP8-KV) and accidentally pass FP16 Q (or
-        # BF16 KV) at run() and get silent wrong output.
+        # The C++ launcher reinterprets tensor storage by the JIT-template
+        # type chosen at plan(); a dtype mismatch here silently produces
+        # wrong output.
         if q_nope.dtype != self._q_data_type:
             raise ValueError(
                 f"q_nope.dtype={q_nope.dtype} does not match the planned "
@@ -1860,10 +1852,7 @@ class BatchMLAPagedAttentionWrapper:
                 f"kv_data_type={self._kv_data_type}."
             )
 
-        # plan() already gated unsupported FP8 backend / dtype combos before
-        # JIT compilation; here we only validate the runtime scales. The
-        # MLA FP8 KV path currently only supports e4m3fn (plan() rejects
-        # other FP8 dtypes), so we compare exactly rather than via a tuple.
+        # e4m3fn is the only FP8 dtype reachable here (plan() rejects others).
         kv_is_fp8 = self._kv_data_type == torch.float8_e4m3fn
         if kv_is_fp8:
             if ckv_scale is None or kpe_scale is None:

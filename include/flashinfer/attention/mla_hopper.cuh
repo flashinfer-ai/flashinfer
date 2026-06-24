@@ -72,10 +72,8 @@ struct HopperSharedStorageQKVO {
   // FP8 KV path: store KV as FP8 (e4m3) in shmem, dequantize to BF16 in
   // dedicated staging buffers right before each WGMMA. WGMMA itself stays
   // BF16xBF16 because Hopper does not have a mixed BF16xFP8 wgmma instruction.
-  // Match HopperKernelTraits::USE_KV_REPACK's exact-type predicate so the
-  // shared-storage layout decision and the kernel-side code path can never
-  // disagree (which would either oversize the staging buffers or skip the
-  // dequant on an unsupported 1-byte KV dtype).
+  // Must match HopperKernelTraits::USE_KV_REPACK exactly — same predicate
+  // keeps the smem layout in sync with the kernel-side dequant.
   static constexpr bool USE_KV_REPACK = std::is_same_v<DTypeKV, __nv_fp8_e4m3>;
   // Per-stage KV data tile. `p` (softmax output) is always DTypeQ-typed so the
   // PV WGMMA can run as BF16xBF16 on both the BF16 KV and FP8 KV paths. On the
@@ -133,16 +131,12 @@ struct HopperKernelTraits
   static constexpr uint32_t NUM_REGS_S_FRAG = CTA_TILE_KV_ / 2;
   static constexpr uint32_t NUM_REGS_O_FRAG = HEAD_DIM_CKV_ / 4;
   static constexpr uint32_t NUM_REGS_P_FRAG = CTA_TILE_KV_ / 4;
-  // FP8 KV path indicator: KV is stored as FP8 (e4m3) in shmem and
-  // dequantized to BF16/FP16 (= DTypeQ) before WGMMA. We key on the exact
-  // type (not byte size) so other 1-byte KV dtypes that flashinfer's JIT
-  // can also synthesize (e.g. __nv_fp4x2_e2m1) cannot silently enter the
-  // FP8 repack path with an unsupported vec_cast specialization.
+  // FP8 KV path: KV stored as FP8 e4m3 in shmem, dequantized to DTypeQ
+  // before WGMMA. Match on the exact type (not sizeof==1) — other 1-byte
+  // JIT dtypes (e.g. __nv_fp4x2_e2m1) have no compatible vec_cast.
   static constexpr bool USE_KV_REPACK = std::is_same_v<DTypeKV_, __nv_fp8_e4m3>;
-  // Defense in depth: the FP8 KV layout / dequant routine is currently only
-  // verified for the DeepSeek MLA dimensions. Python plan() guards this too;
-  // keep the C++ assertion so future AOT/JIT instantiations cannot quietly
-  // produce an unsafe swizzle configuration.
+  // FP8 KV swizzle / dequant layout is only correct for the DeepSeek MLA
+  // dims; AOT/JIT must not instantiate other sizes.
   static_assert(!USE_KV_REPACK || HEAD_DIM_CKV_ == 512,
                 "FP8 KV MLA path currently only supports HEAD_DIM_CKV=512");
   static_assert(!USE_KV_REPACK || HEAD_DIM_KPE_ == 64,
@@ -349,8 +343,8 @@ __device__ __forceinline__ void load_kv(typename KTraits::SharedStorage* smem_st
 // the same k128B swizzle as the BF16 path, so existing WGMMA descriptors work
 // unchanged after pointing them at the staging buffers.
 //
-// Per the prefill.cuh:849 idiom: each thread reads a 16-byte (b128) chunk of 16
-// FP8 elements and writes two 16-byte chunks of 8 BF16 elements each.
+// Each thread reads one 16-byte chunk (16 FP8 elems) and writes two
+// 16-byte chunks (8 BF16 elems each); see the FP8 dequant idiom in prefill.cuh.
 template <typename KTraits>
 __device__ __forceinline__ void repack_fp8_kv_to_bf16(typename KTraits::SharedStorage* smem_storage,
                                                       const uint32_t stage_idx, float ckv_scale,
@@ -644,9 +638,8 @@ __device__ __forceinline__ void write_o(
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
-  // o lives at the top level of SharedStorage (not per-stage) so write_o no
-  // longer takes a stage_idx argument. Both warpgroups write disjoint halves
-  // of the same buffer (warp_group_idx * NUM_MMA_D_CKV column offset).
+  // o is a top-level (not per-stage) shmem region. Both warpgroups write
+  // disjoint halves of the same buffer, offset by warp_group_idx * NUM_MMA_D_CKV.
   smem_t<KTraits::SWIZZLE_MODE_O> o_smem;
   o_smem = smem_storage->o;
 
