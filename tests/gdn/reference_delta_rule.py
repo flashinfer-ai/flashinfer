@@ -332,6 +332,506 @@ def delta_rule(
     return torch.stack(o), torch.stack(kv)
 
 
+def _expand_delta_rule_heads(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor | None,
+    beta: torch.Tensor | None,
+):
+    total_seqlen = q.size(0)
+    num_q_heads = q.size(1)
+    num_k_heads = k.size(1)
+    num_v_heads = v.size(1)
+    num_sab_heads = max(num_q_heads, num_v_heads)
+
+    if alpha is None:
+        alpha = torch.ones(
+            total_seqlen, num_sab_heads, dtype=torch.float32, device=q.device
+        )
+    if beta is None:
+        beta = torch.ones(
+            total_seqlen, num_sab_heads, dtype=torch.float32, device=q.device
+        )
+
+    if num_q_heads > num_v_heads:  # GQA
+        k = k.repeat_interleave(num_q_heads // num_k_heads, dim=1)
+        v = v.repeat_interleave(num_q_heads // num_v_heads, dim=1)
+    else:  # GVA
+        q = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)
+        k = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)
+
+    return q, k, v, alpha, beta
+
+
+@torch.inference_mode
+def cp_delta_rule_pre(
+    k: torch.Tensor,  # [chunk_len, num_heads, head_size]
+    v: torch.Tensor,  # [chunk_len, num_heads, head_size]
+    alpha: torch.Tensor,  # [chunk_len, num_heads]
+    beta: torch.Tensor,  # [chunk_len, num_heads]
+    *,
+    kv_dtype: torch.dtype = torch.float32,
+):
+    """CP chunk core: compute only this chunk's affine transfer.
+
+    The returned `(M, B)` satisfies `S_out = M @ S_in + B` for this chunk.
+    This function intentionally receives no data outside the CP chunk.
+    """
+    assert k.size(0) == v.size(0) == alpha.size(0) == beta.size(0)
+    num_heads = k.size(1)
+    head_size = k.size(2)
+    eye_HKK = torch.eye(head_size, dtype=kv_dtype, device=k.device).expand(
+        num_heads, head_size, head_size
+    )
+    transfer_HKK = eye_HKK.clone()
+    state_HKV = torch.zeros(
+        (num_heads, head_size, head_size), dtype=kv_dtype, device=k.device
+    )
+
+    for token_idx in range(k.size(0)):
+        k_HK = k[token_idx].to(kv_dtype)
+        v_HV = v[token_idx].to(kv_dtype)
+        alpha_H11 = alpha[token_idx].to(kv_dtype).reshape(num_heads, 1, 1)
+        beta_H11 = beta[token_idx].to(kv_dtype).reshape(num_heads, 1, 1)
+
+        kk_HKK = torch.einsum("hk,hl->hkl", k_HK, k_HK)
+        kv_HKV = torch.einsum("hk,hv->hkv", k_HK, v_HV)
+        token_transfer_HKK = alpha_H11 * (eye_HKK - beta_H11 * kk_HKK)
+        token_update_HKV = beta_H11 * kv_HKV
+
+        transfer_HKK = torch.bmm(token_transfer_HKK, transfer_HKK)
+        state_HKV = torch.bmm(token_transfer_HKK, state_HKV) + token_update_HKV
+
+    return transfer_HKK, state_HKV
+
+
+@torch.inference_mode
+def blockwise_cp_delta_rule_pre(
+    k: torch.Tensor,  # [chunk_len, num_heads, head_size]
+    v: torch.Tensor,  # [chunk_len, num_heads, head_size]
+    alpha: torch.Tensor,  # [chunk_len, num_heads]
+    beta: torch.Tensor,  # [chunk_len, num_heads]
+    *,
+    block_size: int = 64,
+    kv_dtype: torch.dtype = torch.float32,
+):
+    """CP preprocessing using matrix-form delta-rule blocks.
+
+    Tokens inside each `block_size` block are processed with the same matrix
+    formulation as `blockwise_delta_rule`; recurrence is only across blocks.
+    Returns `(M, B)` such that `S_out = M @ S_in + B` for the whole CP chunk.
+    """
+    assert block_size > 0
+    assert k.size(0) == v.size(0) == alpha.size(0) == beta.size(0)
+
+    chunk_len = k.size(0)
+    num_heads = k.size(1)
+    head_size = k.size(2)
+    eye_HKK = torch.eye(head_size, dtype=kv_dtype, device=k.device).expand(
+        num_heads, head_size, head_size
+    )
+    transfer_HKK = eye_HKK.clone()
+    state_HKV = torch.zeros(
+        (num_heads, head_size, head_size), dtype=kv_dtype, device=k.device
+    )
+
+    for blk_offset in range(0, chunk_len, block_size):
+        valid_len = min(block_size, chunk_len - blk_offset)
+        if valid_len == block_size:
+            k_SHK = k[blk_offset : blk_offset + block_size]
+            v_SHV = v[blk_offset : blk_offset + block_size]
+            alpha_SH = alpha[blk_offset : blk_offset + block_size]
+            beta_SH = beta[blk_offset : blk_offset + block_size]
+        else:
+            k_SHK = torch.zeros(
+                (block_size, num_heads, head_size), dtype=k.dtype, device=k.device
+            )
+            v_SHV = torch.zeros(
+                (block_size, num_heads, head_size), dtype=v.dtype, device=v.device
+            )
+            alpha_SH = torch.ones(
+                (block_size, num_heads), dtype=alpha.dtype, device=alpha.device
+            )
+            beta_SH = torch.zeros(
+                (block_size, num_heads), dtype=beta.dtype, device=beta.device
+            )
+            k_SHK[:valid_len] = k[blk_offset:]
+            v_SHV[:valid_len] = v[blk_offset:]
+            alpha_SH[:valid_len] = alpha[blk_offset:]
+            beta_SH[:valid_len] = beta[blk_offset:]
+
+        alpha_HS = alpha_SH.transpose(0, 1)
+        beta_HS1 = beta_SH.transpose(0, 1).unsqueeze(2)
+        Gamma_HSS, gamma_HS1 = to_logspace_Gamma_and_gamma(alpha_HS)
+        block_gamma_H11 = gamma_HS1[:, [valid_len - 1], :]
+
+        k_HSK = k_SHK.transpose(0, 1)
+        v_HSV = v_SHV.transpose(0, 1)
+
+        IKK = identity_add_strict_lower_diagonal(
+            beta_HS1 * torch.exp(Gamma_HSS) * matmul(k_HSK, k_HSK.transpose(-2, -1))
+        )
+        T = torch.inverse(IKK) * beta_HS1.transpose(1, 2)
+        T = T.to(k.dtype)
+        u_HSV = matmul(T, v_HSV)
+        w_HSK = matmul(T, torch.exp(gamma_HS1) * k_HSK)
+
+        k_decay_HSK = torch.exp(block_gamma_H11 - gamma_HS1) * k_HSK
+        block_transfer_HKK = torch.exp(block_gamma_H11) * eye_HKK - matmul(
+            k_decay_HSK.transpose(-2, -1).to(kv_dtype),
+            w_HSK.to(kv_dtype),
+        )
+        block_state_HKV = matmul(
+            k_decay_HSK.transpose(-2, -1).to(kv_dtype),
+            u_HSV.to(kv_dtype),
+        )
+
+        transfer_HKK = torch.bmm(block_transfer_HKK, transfer_HKK)
+        state_HKV = torch.bmm(block_transfer_HKK, state_HKV) + block_state_HKV
+
+    return transfer_HKK, state_HKV
+
+
+@torch.inference_mode
+def precompute_blockwise_cp_delta_rule_t(
+    k: torch.Tensor,  # [chunk_len, num_heads, head_size]
+    beta: torch.Tensor,  # [chunk_len, num_heads]
+    *,
+    block_size: int = 64,
+    kv_dtype: torch.dtype = torch.float32,
+    t_dtype: torch.dtype | None = None,
+):
+    """Precompute the signed, beta-folded triangular solve matrix.
+
+    Returns `T := -(T_clean beta)^T` with shape
+    `[num_blocks, num_heads, block_size, block_size]`, in the orientation used
+    directly by the CP preprocess WGMMA. Tail blocks are padded with `K = 0`,
+    and `beta = 0`, so the returned tail tile is projected as `P T P`.
+    """
+    assert block_size > 0
+    assert k.size(0) == beta.size(0)
+    if t_dtype is None:
+        t_dtype = k.dtype
+
+    chunk_len = k.size(0)
+    num_heads = k.size(1)
+    head_size = k.size(2)
+    num_blocks = (chunk_len + block_size - 1) // block_size
+    t_HSS = torch.empty(
+        (num_blocks, num_heads, block_size, block_size), dtype=t_dtype, device=k.device
+    )
+
+    for blk_idx, blk_offset in enumerate(range(0, chunk_len, block_size)):
+        valid_len = min(block_size, chunk_len - blk_offset)
+        if valid_len == block_size:
+            k_SHK = k[blk_offset : blk_offset + block_size]
+            beta_SH = beta[blk_offset : blk_offset + block_size]
+        else:
+            k_SHK = torch.zeros(
+                (block_size, num_heads, head_size), dtype=k.dtype, device=k.device
+            )
+            beta_SH = torch.zeros(
+                (block_size, num_heads), dtype=beta.dtype, device=beta.device
+            )
+            k_SHK[:valid_len] = k[blk_offset:]
+            beta_SH[:valid_len] = beta[blk_offset:]
+
+        beta_HS1 = beta_SH.transpose(0, 1).unsqueeze(2)
+        k_HSK = k_SHK.transpose(0, 1)
+
+        IKK = identity_add_strict_lower_diagonal(
+            beta_HS1.to(kv_dtype)
+            * matmul(k_HSK.to(kv_dtype), k_HSK.to(kv_dtype).transpose(-2, -1))
+        )
+        t_clean_HSS = torch.inverse(IKK) * beta_HS1.transpose(1, 2).to(kv_dtype)
+        t_HSS[blk_idx] = (-t_clean_HSS.transpose(-2, -1)).to(t_dtype)
+
+    return t_HSS
+
+
+@torch.inference_mode
+def blockwise_cp_delta_rule_pre_transposed(
+    k: torch.Tensor,  # [chunk_len, num_heads, head_size]
+    v: torch.Tensor,  # [chunk_len, num_heads, head_size]
+    alpha: torch.Tensor,  # [chunk_len, num_heads]
+    t: torch.Tensor,  # [num_blocks, num_heads, block_size, block_size], signed gamma-sandwiched
+    *,
+    block_size: int = 64,
+    kv_dtype: torch.dtype = torch.float32,
+):
+    """CP preprocessing in the same orientation as `CPDeltaRuleMNPrecomputeSm90`.
+
+    This path consumes raw `K`, raw `V`, `alpha`, and externally precomputed
+    signed gamma-sandwiched `T`. It keeps the running transfer/state transposed internally:
+    `Mt_next = Mt @ M_block_t` and `Bt_next = Bt @ M_block_t + B_block_t`.
+    The returned tensors use the normal `(M, B)` orientation.
+    """
+    assert block_size > 0
+    assert k.size(0) == v.size(0) == alpha.size(0)
+
+    chunk_len = k.size(0)
+    num_heads = k.size(1)
+    head_size = k.size(2)
+    num_blocks = (chunk_len + block_size - 1) // block_size
+    assert t.shape == (num_blocks, num_heads, block_size, block_size)
+
+    eye_HKK = torch.eye(head_size, dtype=kv_dtype, device=k.device).expand(
+        num_heads, head_size, head_size
+    )
+    transfer_t_HKK = eye_HKK.clone()
+    state_t_HKV = torch.zeros(
+        (num_heads, head_size, head_size), dtype=kv_dtype, device=k.device
+    )
+
+    for blk_idx, blk_offset in enumerate(range(0, chunk_len, block_size)):
+        valid_len = min(block_size, chunk_len - blk_offset)
+        if valid_len == block_size:
+            k_SHK = k[blk_offset : blk_offset + block_size]
+            v_SHV = v[blk_offset : blk_offset + block_size]
+            alpha_SH = alpha[blk_offset : blk_offset + block_size]
+        else:
+            k_SHK = torch.zeros(
+                (block_size, num_heads, head_size), dtype=k.dtype, device=k.device
+            )
+            v_SHV = torch.zeros(
+                (block_size, num_heads, head_size), dtype=v.dtype, device=v.device
+            )
+            alpha_SH = torch.ones(
+                (block_size, num_heads), dtype=alpha.dtype, device=alpha.device
+            )
+            k_SHK[:valid_len] = k[blk_offset:]
+            v_SHV[:valid_len] = v[blk_offset:]
+            alpha_SH[:valid_len] = alpha[blk_offset:]
+
+        alpha_HS = alpha_SH.transpose(0, 1)
+        _, gamma_HS1 = to_logspace_Gamma_and_gamma(alpha_HS)
+        gamma_HS1 = torch.exp(gamma_HS1).to(kv_dtype)
+        inv_gamma_H1S = torch.reciprocal(gamma_HS1.transpose(1, 2))
+        block_gamma_H11 = gamma_HS1[:, [valid_len - 1], :]
+
+        k_HSK = k_SHK.transpose(0, 1)
+        v_HSV = v_SHV.transpose(0, 1)
+        k_HSD = k_HSK.to(kv_dtype)
+        t_HSS = t[blk_idx].to(kv_dtype)
+        v_inv_HDS = v_HSV.transpose(-2, -1).to(kv_dtype) * inv_gamma_H1S
+        kt_HDS = k_HSD.transpose(-2, -1)
+
+        block_state_t_HKV = -block_gamma_H11 * matmul(matmul(v_inv_HDS, t_HSS), k_HSD)
+        block_transfer_t_HKK = block_gamma_H11 * eye_HKK + block_gamma_H11 * matmul(
+            matmul(kt_HDS, t_HSS), k_HSD
+        )
+
+        state_t_HKV = matmul(state_t_HKV, block_transfer_t_HKK) + block_state_t_HKV
+        transfer_t_HKK = matmul(transfer_t_HKK, block_transfer_t_HKK)
+
+    return transfer_t_HKK.transpose(-2, -1), state_t_HKV.transpose(-2, -1)
+
+
+@torch.inference_mode
+def compose_delta_rule_chunk_range(
+    local_transfers: torch.Tensor,  # [num_chunks, num_heads, head_size, head_size]
+    local_states: torch.Tensor,  # [num_chunks, num_heads, head_size, head_size]
+    start_chunk: int = 0,
+    end_chunk: int | None = None,
+):
+    """Compose chunk-local affine maps over `[start_chunk, end_chunk)`.
+
+    Returns `(M, B)` such that `S_end = M @ S_start + B`.
+    """
+    if end_chunk is None:
+        end_chunk = local_transfers.size(0)
+    assert 0 <= start_chunk <= end_chunk <= local_transfers.size(0)
+
+    num_heads = local_transfers.size(1)
+    head_size = local_transfers.size(2)
+    transfer_HKK = (
+        torch.eye(head_size, dtype=local_transfers.dtype, device=local_transfers.device)
+        .expand(num_heads, head_size, head_size)
+        .clone()
+    )
+    state_HKV = torch.zeros(
+        (local_states.size(1), local_states.size(2), local_states.size(3)),
+        dtype=local_states.dtype,
+        device=local_states.device,
+    )
+
+    for chunk_idx in range(start_chunk, end_chunk):
+        chunk_transfer_HKK = local_transfers[chunk_idx]
+        chunk_state_HKV = local_states[chunk_idx]
+        transfer_HKK = torch.bmm(chunk_transfer_HKK, transfer_HKK)
+        state_HKV = torch.bmm(chunk_transfer_HKK, state_HKV) + chunk_state_HKV
+
+    return transfer_HKK, state_HKV
+
+
+@torch.inference_mode
+def cp_delta_rule_fixup(
+    local_transfers_by_seq: list[torch.Tensor],
+    local_states_by_seq: list[torch.Tensor],
+):
+    """Fix CP chunk artifacts into global chunk-boundary states.
+
+    This stage consumes only outputs from `blockwise_cp_delta_rule_pre`.
+    """
+    assert len(local_transfers_by_seq) == len(local_states_by_seq)
+    fixed_states_by_seq = []
+    final_states = []
+
+    for local_transfers, local_states in zip(  # noqa: B905
+        local_transfers_by_seq, local_states_by_seq
+    ):
+        assert local_transfers.size(0) == local_states.size(0)
+        seq_fixed_states = []
+        if local_transfers.size(0) == 0:
+            fixed_states_by_seq.append(local_states)
+            final_states.append(local_states)
+            continue
+
+        state_HKV = torch.zeros_like(local_states[0])
+        for chunk_idx in range(local_transfers.size(0)):
+            state_HKV = (
+                torch.bmm(local_transfers[chunk_idx], state_HKV)
+                + local_states[chunk_idx]
+            )
+            seq_fixed_states.append(state_HKV)
+
+        fixed_states = torch.stack(seq_fixed_states)
+        fixed_states_by_seq.append(fixed_states)
+        final_states.append(state_HKV)
+
+    return torch.stack(final_states), fixed_states_by_seq
+
+
+@torch.inference_mode
+def cp_delta_rule_fixup_transposed(
+    local_transfers_by_seq: list[torch.Tensor],
+    local_states_by_seq: list[torch.Tensor],
+    initial_states_by_seq: list[torch.Tensor] | None = None,
+):
+    """Fix CP chunk artifacts in CPDeltaRuleFixupSm90 workspace orientation.
+
+    `CPDeltaRuleFixupSm90` consumes transfer/state tensors in transposed
+    workspace layout and applies `S_i = S_{i-1} @ M_i + N_i`.
+    """
+    assert len(local_transfers_by_seq) == len(local_states_by_seq)
+    if initial_states_by_seq is not None:
+        assert len(initial_states_by_seq) == len(local_transfers_by_seq)
+    fixed_states_by_seq = []
+    final_states = []
+
+    for seq_idx, (local_transfers, local_states) in enumerate(
+        zip(local_transfers_by_seq, local_states_by_seq)  # noqa: B905
+    ):
+        assert local_transfers.size(0) == local_states.size(0)
+        seq_fixed_states = []
+        initial_state = (
+            initial_states_by_seq[seq_idx]
+            if initial_states_by_seq is not None
+            else None
+        )
+        if local_transfers.size(0) == 0:
+            fixed_states_by_seq.append(local_states)
+            final_states.append(
+                local_states if initial_state is None else initial_state
+            )
+            continue
+
+        state_HKV = (
+            torch.zeros_like(local_states[0])
+            if initial_state is None
+            else initial_state.clone()
+        )
+        for chunk_idx in range(local_transfers.size(0)):
+            state_HKV = (
+                torch.bmm(state_HKV, local_transfers[chunk_idx])
+                + local_states[chunk_idx]
+            )
+            seq_fixed_states.append(state_HKV)
+
+        fixed_states = torch.stack(seq_fixed_states)
+        fixed_states_by_seq.append(fixed_states)
+        final_states.append(state_HKV)
+
+    return torch.stack(final_states), fixed_states_by_seq
+
+
+@torch.inference_mode
+def context_parallel_delta_rule_states(
+    q: torch.Tensor,  # [total_seq_len, num_qo_heads, head_size]
+    k: torch.Tensor,  # [total_seq_len, num_kv_heads, head_size]
+    v: torch.Tensor,  # [total_seq_len, num_kv_heads, head_size]
+    seq_lens: list[int],  # sequence length for each sequence
+    *,
+    alpha: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
+    beta: torch.Tensor | None = None,  # [total_seq_len, num_qo_heads]
+    chunk_size: int = 256,
+    pre_block_size: int = 64,
+    kv_dtype: torch.dtype = torch.float32,
+    return_debug: bool = False,
+):
+    """Torch reference for context-parallel delta-rule chunk-state fixup.
+
+    Each chunk independently computes an affine transfer `S_out = M S_in + B`.
+    The fixup pass applies those chunk transfers to recover true global
+    chunk-boundary states. The final fixed state should match `delta_rule`.
+    """
+    assert chunk_size > 0
+    assert pre_block_size > 0
+
+    q, k, v, alpha, beta = _expand_delta_rule_heads(q, k, v, alpha, beta)
+    del q  # State fixup only needs K/V and gates.
+
+    local_transfers = []
+    local_states = []
+    local_transfers_by_seq = []
+    local_states_by_seq = []
+
+    seq_offset = exclusive_cumsum(seq_lens)
+    for seq_idx, seq_start in enumerate(seq_offset[:-1]):
+        seq_end = seq_offset[seq_idx + 1]
+        seq_local_transfers = []
+        seq_local_states = []
+
+        for chunk_start in range(seq_start, seq_end, chunk_size):
+            chunk_end = min(seq_end, chunk_start + chunk_size)
+            transfer_HKK, local_state_HKV = blockwise_cp_delta_rule_pre(
+                k[chunk_start:chunk_end],
+                v[chunk_start:chunk_end],
+                alpha[chunk_start:chunk_end],
+                beta[chunk_start:chunk_end],
+                block_size=pre_block_size,
+                kv_dtype=kv_dtype,
+            )
+            seq_local_transfers.append(transfer_HKK)
+            seq_local_states.append(local_state_HKV)
+            local_transfers.append(transfer_HKK)
+            local_states.append(local_state_HKV)
+
+        local_transfers_by_seq.append(torch.stack(seq_local_transfers))
+        local_states_by_seq.append(torch.stack(seq_local_states))
+
+    final_states, fixed_states_by_seq = cp_delta_rule_fixup(
+        local_transfers_by_seq, local_states_by_seq
+    )
+
+    if not return_debug:
+        return final_states, fixed_states_by_seq
+
+    debug = {
+        "local_transfers": torch.stack(local_transfers)
+        if local_transfers
+        else final_states.new_empty(0),
+        "local_states": torch.stack(local_states)
+        if local_states
+        else final_states.new_empty(0),
+        "local_transfers_by_seq": local_transfers_by_seq,
+        "local_states_by_seq": local_states_by_seq,
+        "fixed_states_by_seq": fixed_states_by_seq,
+    }
+    return final_states, debug
+
+
 def identity_add_strict_lower_diagonal(m: torch.Tensor):
     SIZE = m.size(-1)
     assert m.size(-2) == SIZE
