@@ -299,6 +299,7 @@ def _get_compiled_decode_kernel(
         o_partial_fake,
         l_partial_fake,
         m_partial_fake,
+        None,  # sink_h
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         stream_fake,
@@ -461,6 +462,7 @@ def _get_compiled_paged_decode_kernel(
         o_partial_fake,
         l_partial_fake,
         m_partial_fake,
+        None,  # sink_h
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         threshold_p_fake,
@@ -807,6 +809,7 @@ class BatchDecodeCuteDSLWrapper:
             o_partial,
             l_partial,
             m_partial,
+            None,  # sink_h
             Float32(scale_s),
             Float32(scale_o),
             enable_pdl,
@@ -1278,6 +1281,7 @@ class BatchDecodePagedCuteDSLWrapper:
             o_partial,
             l_partial,
             m_partial,
+            None,  # sink_h
             Float32(scale_s),
             Float32(o_scale_val),
             threshold_arg,

@@ -143,6 +143,7 @@ class GroupedQueryAttentionDecodePaged:
         o_partial_bshd: Optional[cute.Tensor],
         l_partial_bsh: Optional[cute.Tensor],
         m_partial_bsh: Optional[cute.Tensor],
+        sink_h: Optional[cute.Tensor],
         scale_s: Float32,
         scale_o: Float32,
         threshold_scale_factor: Optional[Float32],
@@ -177,6 +178,8 @@ class GroupedQueryAttentionDecodePaged:
             Partial ``colsum_p`` per kv split (kernel-red workspace).
         m_partial_bsh
             Partial ``colmax_s`` per kv split (kernel-red workspace).
+        sink_h
+            Pre-scaled attention sink logits per head
         scale_s
             Softmax scale.
         scale_o
@@ -411,6 +414,17 @@ class GroupedQueryAttentionDecodePaged:
             mM_partial_nl = GqaDecode.gemm_view_bsh(m_partial_bsh, h_k)
             mL_partial_nl = GqaDecode.gemm_view_bsh(l_partial_bsh, h_k)
 
+        if cutlass.const_expr(sink_h is not None):
+            assert sink_h.dtype == acc_dtype
+
+            h_g = sink_h.shape[0] // h_k
+            mSink = cute.make_tensor(
+                sink_h.iterator,
+                cute.make_layout((h_g, h_k), stride=(1, h_g)),
+            )
+        else:
+            mSink = None
+
         ##############################
         # Launch kernel(s)
         ##############################
@@ -466,6 +480,7 @@ class GroupedQueryAttentionDecodePaged:
             mM_nl,
             mL_partial_nl,
             mM_partial_nl,
+            mSink,
             scale_s_log2_e,
             scale_o,
             log2_threshold_scale_factor,
@@ -487,6 +502,7 @@ class GroupedQueryAttentionDecodePaged:
                 o_partial_bshd,
                 l_partial_bsh,
                 m_partial_bsh,
+                sink_h,
                 scale_o,
                 stream,
                 enable_pdl,
@@ -529,6 +545,7 @@ class GroupedQueryAttentionDecodePaged:
         mM: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
         mM_partial: Optional[cute.Tensor],
+        mSink: Optional[cute.Tensor],  # (h_g, h_k)
         scale_s_log2_e: Float32,
         scale_o: Float32,
         log2_threshold_scale_factor: Optional[Float32],
@@ -572,6 +589,7 @@ class GroupedQueryAttentionDecodePaged:
         tma_mask = self.tma_mask
         is_varlen = isinstance(seqlens_iter, cute.Pointer)
         enable_blasst = log2_threshold_scale_factor is not None
+        use_sink = mSink is not None
 
         ##############################
         # Warp specialization
@@ -886,6 +904,19 @@ class GroupedQueryAttentionDecodePaged:
                 if i + lane_idx < cute.size(sL):
                     sL[i + lane_idx] = Float32(0)
         init_warp += 1
+
+        # Sink
+        if cutlass.const_expr(use_sink and not do_kernel_red):
+            sSink_layout = cute.make_layout(blk_tile_hp, stride=(1, 0))
+            sSink = smem.allocate_tensor(acc_dtype, sSink_layout, svector_align)
+            gSink = cute.local_tile(mSink, (blk_tile_h,), (coord_hg, coord_hk))
+            sSink_lane = cute.local_tile(sSink, (1,), (lane_idx, 0))
+            gSink_lane = cute.local_tile(gSink, (1,), (lane_idx,))
+            if warp_idx == reduction_warp_id and lane_idx < blk_tile_h:
+                cute.copy(cpasync_atom, gSink_lane, sSink_lane)
+            init_warp += 1
+        else:
+            sSink = None
 
         # per-thread colsum
         # (MMA_MN, #MMA_M=1, #MMA_N=1, o_stages)
@@ -1807,6 +1838,11 @@ class GroupedQueryAttentionDecodePaged:
         # Reduction Dispatch
         ##############################
         if warp_idx == reduction_warp_id:
+            if cutlass.const_expr(sSink is not None):
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_warp()
+
             if cutlass.const_expr(do_kernel_red):
                 GqaDecode.reduction_epilogue(
                     blk_tile_hp,
@@ -1838,6 +1874,7 @@ class GroupedQueryAttentionDecodePaged:
                     sL,
                     sR,
                     gL,
+                    sSink,
                     scale_o,
                 )
             elif cutlass.const_expr(do_none_red):
@@ -1852,6 +1889,7 @@ class GroupedQueryAttentionDecodePaged:
                     sM,
                     sL,
                     gL,
+                    sSink,
                     scale_o,
                 )
             cute.arch.griddepcontrol_launch_dependents()
@@ -2113,6 +2151,9 @@ def run(
         _, m_partial_cute, m_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
         _, l_partial_cute, l_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
 
+    # No sink refcheck for now, just test exec path
+    _, sink_cute, sink_torch = create_tensor((heads_q,), acc_dtype, init=-math.inf)
+
     # Initialize reference KV tensors
     max_pages_per_batch = math.ceil(max_seqlen / page_size)
     ref_seqlen = max_pages_per_batch * page_size
@@ -2222,6 +2263,7 @@ def run(
         o_partial_cute,
         l_partial_cute,
         m_partial_cute,
+        sink_cute,
         scale_s,
         1.0,  # scale_o
         threshold_scale_factor,
@@ -2278,6 +2320,7 @@ def run(
             o_partial_cute,
             l_partial_cute,
             m_partial_cute,
+            sink_cute,
             scale_s,
             1.0,  # scale_o
             threshold_scale_factor,
@@ -2340,6 +2383,7 @@ def run(
             _, o_partial_cute, _ = create_tensor(qo_shape, acc_dtype)
             _, m_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
             _, l_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
+        _, sink_cute, _ = create_tensor((heads_q,), acc_dtype, init=-math.inf)
 
         return testing.JitArguments(
             kv_splits,
@@ -2355,6 +2399,7 @@ def run(
             o_partial_cute,
             l_partial_cute,
             m_partial_cute,
+            sink_cute,
             scale_s,
             1.0,  # scale_o
             threshold_scale_factor,
