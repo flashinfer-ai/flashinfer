@@ -740,10 +740,10 @@ void trtllm_ragged_attention(
   int head_dim_v = value.size(2);
   int k_stride_keys_values = key.stride(0);
   int k_stride_heads = key.stride(1);
-  int k_stride_batch = key.numel();
+  int k_stride_batch = 0;
   int v_stride_keys_values = value.stride(0);
   int v_stride_heads = value.stride(1);
-  int v_stride_batch = value.numel();
+  int v_stride_batch = 0;
 
   // SageAttention scaling factor pointers.
   const float* sage_attn_sfs_q_ptr =
