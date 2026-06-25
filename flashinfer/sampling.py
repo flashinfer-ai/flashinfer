@@ -37,7 +37,6 @@ from .trace.templates.sampling import (
 )
 from .utils import (
     _get_cache_buf,
-    _get_cache_buf_ring,
     device_support_pdl,
     get_default_generators,
     register_custom_op,
@@ -1888,14 +1887,14 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU).
-    # Ring-buffered so that concurrent launches from different streams do not
-    # share the kernel's synchronization state (see issue #3618).
+    # Allocate the row_states scratch per call from the stream-ordered caching
+    # allocator (1MB is enough for any GPU). Concurrent launches on different
+    # streams thus get disjoint buffers and never share the multi-CTA kernel's
+    # synchronization state (#3618). zero-init is required: the kernel reads the
+    # arrival counters before any CTA writes them.
     buffer_bytes = 1024 * 1024  # 1MB
-    row_states_buffer = _get_cache_buf_ring(
-        "top_k_renorm_probs_row_states",
-        buffer_bytes,
-        probs.device,
+    row_states_buffer = torch.zeros(
+        buffer_bytes, dtype=torch.uint8, device=probs.device
     )
 
     return get_sampling_module().top_k_renorm_probs(
@@ -1961,19 +1960,15 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU).
-    # Ring-buffered so that concurrent launches from different streams do not
-    # share the kernel's synchronization state (see issue #3618).
+    # Allocate the row_states scratch per call from the stream-ordered caching
+    # allocator (1MB is enough for any GPU). Concurrent launches on different
+    # streams thus get disjoint buffers and never share the multi-CTA kernel's
+    # synchronization state (#3618). zero-init is required: the kernel reads the
+    # arrival counters before any CTA writes them.
     buffer_bytes = 1024 * 1024  # 1MB
-    row_states_buffer = _get_cache_buf_ring(
-        "top_k_mask_logits_row_states",
-        buffer_bytes,
-        logits.device,
+    row_states_buffer = torch.zeros(
+        buffer_bytes, dtype=torch.uint8, device=logits.device
     )
-
-    # Note: row_states_buffer is zero-initialized on first allocation by
-    # _get_cache_buf_ring. Kernel will reset arrival_counter to 0 at the end
-    # of each launch.
 
     return get_sampling_module().top_k_mask_logits(
         logits, *_to_tensor_scalar_tuple(top_k), row_states_buffer
