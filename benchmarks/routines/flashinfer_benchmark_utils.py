@@ -27,6 +27,8 @@ output_column_dict = {
         "kv_dtype",
         "avg_actual_seq_len",
         "random_actual_seq_len",
+        "is_var_seq",
+        "cute_dsl_impl",
     ],
     "gemm": [
         "n",

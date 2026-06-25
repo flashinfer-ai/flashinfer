@@ -59,8 +59,7 @@ from flashinfer.cute_dsl.utils import (
     make_ptr,
 )
 
-# Import the TRT-LLM kernel implementation
-from .blackwell.blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
+from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     BlockScaledContiguousGatherGroupedGemmKernel,
 )
 
@@ -221,8 +220,9 @@ def _get_compiled_gather_kernel(
     vectorized_f32: bool,
     raster_along_m: bool,
     enable_pdl: bool = True,
+    gated: bool = True,
 ):
-    """Get or compile the gather grouped GEMM with SwiGLU kernel.
+    """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
     This function caches compiled kernels by tactic and dtype parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
@@ -250,6 +250,7 @@ def _get_compiled_gather_kernel(
         vectorized_f32,
         raster_along_m,
         enable_pdl,
+        gated,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -262,6 +263,7 @@ def _get_compiled_gather_kernel(
             topk=topk,
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
+            gated=gated,
         )
 
         # Compile with runtime parameters - they can vary across calls
@@ -300,7 +302,7 @@ def _get_compiled_gather_kernel(
     return _gather_kernel_cache[cache_key]
 
 
-def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
+def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -325,6 +327,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
+    gated: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled Contiguous Gather Grouped GEMM with SwiGLU Fusion for MoE workloads.
 
@@ -393,7 +396,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         ... )
         >>>
         >>> # Run gathered GEMM with SwiGLU fusion - NO moe_permute needed!
-        >>> out, _ = blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
+        >>> out, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         ...     a=original_input_fp4,            # (seq_len, hidden_dim//2) - UNPERMUTED!
         ...     b=expert_gate_up_weights_fp4,    # (num_experts, 2*intermediate_dim, hidden_dim//2)
         ...     a_scale=input_scale,
@@ -413,13 +416,16 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     # Get dimensions
     seq_len = a.shape[0]
     num_experts = b.shape[0]
-    n = b.shape[1]  # This is 2*intermediate_size
+    n = b.shape[1]
     k = a.shape[1]
     if ab_dtype == "float4_e2m1fn":
         k = k * 2  # FP4 is packed 2 elements per byte
 
-    intermediate_size = n // 2  # Output dimension after SwiGLU
+    intermediate_size = n // (2 if gated else 1)
     permuted_m = token_id_mapping.shape[0]
+
+    if n % 128 != 0:
+        raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
@@ -585,6 +591,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         vectorized_f32=vectorized_f32,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        gated=gated,
     )
 
     # Execute kernel with runtime parameters
