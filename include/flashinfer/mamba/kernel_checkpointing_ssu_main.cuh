@@ -151,9 +151,16 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
   float* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
   auto* z_slot = smem.z + tile_buf * SmemT::Z_ELEMS;
 
-  if (warp == 0)
-    load_tile_async<OxShape, MAX_WINDOW>(old_x_slot, old_x_ptr + ox_base, params.old_x_stride_token,
-                                         lane);
+  int const tid = warp * warpSize + lane;
+  // Warp-balanced per-head loads (both load on BOTH paths).  old_x is loaded CTA-wide and
+  // self-limits to its row count (load_tile_async_cta guards tid ≥ ROWS·8): 8 rows → W0-1,
+  // 16 rows → all warps.  z then rides the warps old_x leaves idle: when BOTH old_x (8 rows)
+  // and z (8 rows) fit 64 threads, put z on W2-3 so the two loads issue in parallel (1 pass
+  // each, all 4 warps busy) instead of the old W0-only old_x / W3-only z (32 lanes, 2 passes).
+  // If either tensor needs >64 threads (max_window=16 or NPREDICTED>8), z shares W0-1 (W-base 0,
+  // self-limited) — still correct, just less parallel.  Bank-conflict-free contract unchanged.
+  load_tile_async_cta<OxShape, MAX_WINDOW>(old_x_slot, old_x_ptr + ox_base,
+                                           params.old_x_stride_token, /*tid=*/tid);
   if (must_checkpoint) {
     if constexpr (IS_FIRST)
       if (warp == 1)
@@ -169,10 +176,15 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
                             (int64_t)head * params.old_cumAdt_stride_head;
     old_cumAdt_slot[prev_k - 1] = oca_ptr[ca_base + prev_k - 1];  // tail for β only
   }
-  if (warp == 3 && z_ptr) {
+  if (z_ptr) {
     int64_t const z_base = outer * params.z_stride_seq + (int64_t)head * DIM + d_tile_off;
-    load_tile_async<ZShape, NPREDICTED>(z_slot, z_ptr + z_base, params.z_stride_token, lane,
-                                        seq_len);
+    // z on W2-3 only when old_x and z each fit a warp pair (≤8 rows = 64 threads); else W0-3.
+    constexpr int kZWarpBase =
+        (SmemT::MAX_WINDOW_PAD_MMA_K <= 8 && SmemT::NPREDICTED_SWIZZLE_R <= 8) ? 2 : 0;
+    if (warp >= kZWarpBase)
+      load_tile_async_cta<ZShape, NPREDICTED>(z_slot, z_ptr + z_base, params.z_stride_token,
+                                              /*tid=*/(warp - kZWarpBase) * warpSize + lane,
+                                              seq_len);
   }
   // NO commit/wait/syncwarp — head_loop drains (see header).
 }
