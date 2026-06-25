@@ -1,12 +1,100 @@
+from dataclasses import dataclass
+
 import cutlass
 import cutlass.cute as cute
+import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
+from cutlass.cute import core as cute_core
+from cutlass.cute.atom import Trait, make_atom
 from cutlass.cute.nvgpu import warp, warpgroup
+from cutlass.cute.typing import Shape
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects import llvm
 
 
 def round_down(a: int, b: int) -> int:
     return (a // b) * b
+
+
+@dataclass(frozen=True)
+class WarpMmaTF32Op(warp.WarpMmaOp):
+    shape_mnk: Shape
+
+    def __post_init__(self) -> None:
+        if self.shape_mnk != (16, 8, 8):
+            raise ValueError(
+                f"WarpMmaTF32Op only supports (16, 8, 8), got {self.shape_mnk}"
+            )
+
+    def _make_trait(self, *, loc=None, ip=None, **kwargs):
+        shape_mnk = cute_core._pack_shape(self.shape_mnk, loc=loc, ip=ip)
+        ty = _cute_nvgpu_ir.MmaAtomSM80Type.get(
+            shape_mnk.type.attribute,
+            cutlass.TFloat32.mlir_type,
+            cutlass.TFloat32.mlir_type,
+            cutlass.Float32.mlir_type,
+        )
+        return WarpMmaTF32Trait(make_atom(ty, loc=loc, ip=ip))
+
+    def _verify_fragment_A(self, input, *, loc=None, ip=None):
+        return True
+
+    def _verify_fragment_B(self, input, *, loc=None, ip=None):
+        return True
+
+
+class WarpMmaTF32Trait(Trait):
+    pass
+
+
+class TF32:
+    @staticmethod
+    @cute.jit
+    def round_to_tf32_f32(value: cutlass.Float32) -> cutlass.Float32:
+        bits = llvm.inline_asm(
+            T.i32(),
+            [value.ir_value()],
+            "cvt.rz.tf32.f32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+        return cutlass.Float32(llvm.bitcast(T.f32(), bits))
+
+    @staticmethod
+    @cute.jit
+    def convert_fp32_to_tf32_residual(tensor: cute.Tensor):
+        residual = cute.make_rmem_tensor_like(tensor, cutlass.Float32)
+        for i in cutlass.range_constexpr(cute.size(residual)):
+            value = tensor[i]
+            residual[i] = value - TF32.round_to_tf32_f32(value)
+        return cute.recast_tensor(residual, cutlass.TFloat32)
+
+    @staticmethod
+    @cute.jit
+    def convert_tf32_c_to_kpermuted_a(tCrC: cute.Tensor, tCrA: cute.Tensor):
+        for i in cutlass.range(cute.size(tCrA), unroll_full=True):
+            tCrA[i] = tCrC[i]
+        for m in cutlass.range_constexpr(cute.size(tCrA, mode=[1])):
+            for k in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
+                tmp = tCrA[(1, 0), m, k]
+                tCrA[(1, 0), m, k] = tCrA[(0, 1), m, k]
+                tCrA[(0, 1), m, k] = tmp
+
+    @staticmethod
+    @cute.jit
+    def load_tf32_kpermuted_b(
+        tCrB: cute.Tensor,
+        sB_NK: cute.Tensor,
+        lane_idx: cutlass.Int32,
+    ):
+        sB_8x8 = cute.flat_divide(sB_NK, (8, 8))
+        n = lane_idx // 4
+        k = lane_idx - n * 4
+        for iter_n in cutlass.range_constexpr(cute.size(tCrB, mode=[1])):
+            for iter_k in cutlass.range_constexpr(cute.size(tCrB, mode=[2])):
+                tCrB[0, iter_n, iter_k] = sB_8x8[n, k * 2, iter_n, iter_k]
+                tCrB[1, iter_n, iter_k] = sB_8x8[n, k * 2 + 1, iter_n, iter_k]
 
 
 @cute.jit
