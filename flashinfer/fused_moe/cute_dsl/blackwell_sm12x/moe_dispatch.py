@@ -18,6 +18,7 @@ import torch
 
 from flashinfer.cute_dsl.utils import (
     convert_sf_from_mma_layout,
+    convert_sf_to_mma_layout,
     current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
@@ -26,10 +27,12 @@ from flashinfer.cute_dsl.utils import (
 from .moe_dynamic_kernel import MoEDynamicKernel
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
+from .moe_w4a16_fp4_helpers import swizzle_block_scale
 from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
+    unswizzle_block_scale,
     validate_activation,
 )
 from .moe_w4a16_kernel import run_w4a16_moe
@@ -555,7 +558,7 @@ def _get_static_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
     )
 
-    is_gated = activation == "silu"
+    is_gated = activation in ("silu", "gelu_tanh")
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -791,7 +794,7 @@ def _get_micro_kernel(
         single_token=single_token,
     )
 
-    is_gated = activation == "silu"
+    is_gated = activation in ("silu", "gelu_tanh")
     w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -1544,7 +1547,7 @@ def _get_dynamic_kernel(
     if cached is not None:
         return cached
 
-    is_gated = activation == "silu"
+    is_gated = activation in ("silu", "gelu_tanh")
     w1_rows = (2 if is_gated else 1) * n
 
     scratch_dtype = cutlass.Float4E2M1FN
@@ -2381,6 +2384,134 @@ def _get_cached_workspace(
 # ==========================================================================
 # Unified dispatch
 # ==========================================================================
+def _pad_intermediate_to_tile(
+    w1_weight,
+    w1_weight_sf,
+    w2_weight,
+    w2_weight_sf,
+    fc2_input_scale,
+    n,
+    tile,
+    h,
+    num_experts,
+    is_gated,
+):
+    """Zero-pad NVFP4 weights + scale factors so the intermediate size is a
+    multiple of ``tile`` (gate/up tile-split requirement); padded channels are
+    zero, so the result is numerically identical. Interim support for non-128
+    sizes (e.g. Gemma-4's 704). Scale factors are padded in the logical
+    (pre-swizzle) domain since the gate/up boundary is not tile-aligned.
+    """
+    n_pad = ((n + tile - 1) // tile) * tile
+    if n_pad == n:
+        return w1_weight, w1_weight_sf, w2_weight, w2_weight_sf, fc2_input_scale, n
+    E = int(num_experts)
+
+    def mma_to_logical(sf, m, k):
+        sw = convert_sf_from_mma_layout(sf, m=m, k=k, num_groups=E)
+        m_pad = ((m + 127) // 128) * 128
+        sw = sw.reshape(E, m_pad, -1)
+        cb = (k + SF_VEC_SIZE - 1) // SF_VEC_SIZE
+        return torch.stack(
+            [unswizzle_block_scale(sw[e], rows=m, cols_blocks=cb) for e in range(E)], 0
+        )
+
+    def logical_to_mma(log, m, k):
+        sw = torch.stack([swizzle_block_scale(log[e]) for e in range(E)], 0)
+        sw2d = sw.reshape(E * sw.shape[1], sw.shape[2]).to(torch.float8_e4m3fn)
+        return convert_sf_to_mma_layout(sw2d, m=m, k=k, num_groups=E)
+
+    def pad_dim(t, dim, old, new):
+        if new == old:
+            return t
+        shp = list(t.shape)
+        shp[dim] = new - old
+        return torch.cat([t, t.new_zeros(shp)], dim=dim)
+
+    if is_gated:
+        # w1 packs [up(0:n), gate(n:2n)] rows; pad each half so the split stays
+        # tile-aligned, then re-concat.
+        up, gate = w1_weight[:, :n, :], w1_weight[:, n : 2 * n, :]
+        w1p = torch.cat([pad_dim(up, 1, n, n_pad), pad_dim(gate, 1, n, n_pad)], dim=1)
+        log1 = mma_to_logical(w1_weight_sf, m=2 * n, k=h)
+        up_sf, gate_sf = log1[:, :n, :], log1[:, n : 2 * n, :]
+        log1p = torch.cat(
+            [pad_dim(up_sf, 1, n, n_pad), pad_dim(gate_sf, 1, n, n_pad)], dim=1
+        )
+        w1_sf_p = logical_to_mma(log1p, m=2 * n_pad, k=h)
+    else:
+        w1p = pad_dim(w1_weight, 1, n, n_pad)
+        log1 = mma_to_logical(w1_weight_sf, m=n, k=h)
+        w1_sf_p = logical_to_mma(pad_dim(log1, 1, n, n_pad), m=n_pad, k=h)
+
+    # w2 reduces over the intermediate dim: pad its packed columns + SF columns.
+    w2p = pad_dim(w2_weight, 2, n // 2, n_pad // 2)
+    log2 = mma_to_logical(w2_weight_sf, m=h, k=n)
+    cb_n = (n + SF_VEC_SIZE - 1) // SF_VEC_SIZE
+    cb_np = (n_pad + SF_VEC_SIZE - 1) // SF_VEC_SIZE
+    w2_sf_p = logical_to_mma(pad_dim(log2, 2, cb_n, cb_np), m=h, k=n_pad)
+
+    if fc2_input_scale is not None and fc2_input_scale.numel() == n:
+        fc2_input_scale = pad_dim(fc2_input_scale, 0, n, n_pad)
+    return w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad
+
+
+# Padding rebuilds scale factors via a per-expert swizzle roundtrip — too costly
+# to repeat every call, so cache the result keyed on the source weights and evict
+# it when they are freed (same lifetime model as _WEIGHT_CACHE).
+_PADDED_WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
+
+
+def _get_padded_intermediate(
+    w1_weight,
+    w1_weight_sf,
+    w2_weight,
+    w2_weight_sf,
+    fc2_input_scale,
+    n,
+    tile,
+    h,
+    num_experts,
+    is_gated,
+):
+    key = (
+        n,
+        tile,
+        h,
+        int(num_experts),
+        bool(is_gated),
+        w1_weight.data_ptr(),
+        w1_weight_sf.data_ptr(),
+        w2_weight.data_ptr(),
+        w2_weight_sf.data_ptr(),
+        fc2_input_scale.data_ptr() if fc2_input_scale is not None else 0,
+    )
+    cached = _PADDED_WEIGHT_CACHE.get(key)
+    if cached is None:
+        cached = _pad_intermediate_to_tile(
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+            fc2_input_scale,
+            n,
+            tile,
+            h,
+            num_experts,
+            is_gated,
+        )
+        _PADDED_WEIGHT_CACHE[key] = cached
+        _register_cache_eviction(
+            _PADDED_WEIGHT_CACHE,
+            key,
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+        )
+    return cached
+
+
 def launch_sm120_moe(
     *,
     a: torch.Tensor,
@@ -2420,10 +2551,35 @@ def launch_sm120_moe(
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    is_gated = activation == "silu"
+    is_gated = activation in ("silu", "gelu_tanh")
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
+
+    # NVFP4 kernels need the intermediate size to be a multiple of the gate/up
+    # tile width; zero-pad non-aligned sizes (e.g. Gemma-4's 704). W4A16 has its
+    # own handling, and a caller-supplied _weight_views is already padded.
+    if quant_mode != "w4a16" and n % _LEVEL_TILE_N != 0 and _weight_views is None:
+        (
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+            fc2_input_scale,
+            n,
+        ) = _get_padded_intermediate(
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+            fc2_input_scale,
+            n,
+            _LEVEL_TILE_N,
+            k,
+            w1_weight.size(0),
+            is_gated,
+        )
+
     routed_rows = num_tokens * top_k
 
     if quant_mode == "w4a16":

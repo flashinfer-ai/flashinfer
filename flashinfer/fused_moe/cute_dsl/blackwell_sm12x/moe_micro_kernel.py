@@ -370,7 +370,7 @@ class MoEMicroKernel:
         share_expert_scales: bool = False,
         single_token: bool = False,
     ):
-        if activation not in {"silu", "relu2"}:
+        if activation not in {"silu", "relu2", "gelu_tanh"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
@@ -378,7 +378,7 @@ class MoEMicroKernel:
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = activation in ("silu", "gelu_tanh")
         # For m=1 with a shared input scale, the quantized activation is
         # identical across all K top-k experts. When set, only pair_idx==0
         # does the quantize and all pairs read from a single shared slot
@@ -1866,10 +1866,24 @@ class MoEMicroKernel:
                                     ):
                                         g = alpha_value * gate_slice[elem_idx]
                                         u = alpha_value * up_slice[elem_idx]
+                                        # silu: g*sigmoid(g); gelu_tanh: g*sigmoid(2z)
+                                        # == 0.5*g*(1+tanh(z)), the tanh-approx GELU,
+                                        # z = 0.7978845608*(g + 0.044715*g^3)
+                                        if cutlass.const_expr(
+                                            self.activation == "gelu_tanh"
+                                        ):
+                                            sig_arg = cutlass.Float32(
+                                                2.0 * 0.7978845608028654
+                                            ) * (
+                                                g
+                                                + cutlass.Float32(0.044715) * g * g * g
+                                            )
+                                        else:
+                                            sig_arg = g
                                         sigmoid_g = cute.arch.rcp_approx(
                                             cutlass.Float32(1.0)
                                             + cute.math.exp(
-                                                -g, fastmath=self.fast_math
+                                                -sig_arg, fastmath=self.fast_math
                                             ),
                                         )
                                         tRS_rD_slice[elem_idx] = g * sigmoid_g * u

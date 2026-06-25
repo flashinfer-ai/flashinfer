@@ -37,7 +37,7 @@ Example (Wrapper API with CUDA Graph):
     >>> output = moe.run(x=hidden_states_bf16, ...)
 """
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -122,8 +122,9 @@ def b12x_fused_moe(
     output_dtype : torch.dtype
         Output data type.  Only ``torch.bfloat16`` is currently supported.
     activation : str
-        Activation function — ``"silu"`` (gated SwiGLU) or ``"relu2"``
-        (non-gated Nemotron-Super).  Defaults to ``"silu"``.
+        Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"`` (gated
+        GeGLU, tanh-approx GELU) or ``"relu2"`` (non-gated Nemotron-Super).
+        Defaults to ``"silu"``.
     activation_precision : str
         Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
@@ -227,7 +228,7 @@ class B12xMoEWrapper:
         output_dtype: Output data type. Only torch.bfloat16 is currently
             supported. Default: torch.bfloat16.
         device: Device for buffer allocation. Default: "cuda".
-        activation: Activation function — "silu" or "relu2". Default: "silu".
+        activation: Activation function — "silu", "gelu_tanh", or "relu2". Default: "silu".
         activation_precision: Backward-compatible alias for quant_mode.
             "fp4" selects quant_mode="nvfp4"; "bf16" selects quant_mode="w4a16".
         quant_mode: Quantization mode, "nvfp4"/"w4a4" or "w4a16". When set,
@@ -287,8 +288,9 @@ class B12xMoEWrapper:
             Device on which to allocate workspace buffers.  Defaults to
             ``"cuda"``.
         activation : str
-            Activation function — ``"silu"`` (gated SwiGLU) or ``"relu2"``
-            (non-gated).  Defaults to ``"silu"``.
+            Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"``
+            (gated GeGLU, tanh-approx GELU) or ``"relu2"`` (non-gated).
+            Defaults to ``"silu"``.
         activation_precision : str
             Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
             ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
@@ -348,6 +350,7 @@ class B12xMoEWrapper:
         self._dynamic_workspace: object = None
         self._weight_views: object = None
         self._weight_key: Optional[Tuple] = None
+        self._padded_weights: Any = None
         self._moe_output: Optional[torch.Tensor] = None
 
         if use_cuda_graph:
@@ -515,6 +518,8 @@ class B12xMoEWrapper:
             launch_sm120_moe,
             select_sm120_moe_backend,
             _get_weight_views as _get_sm120_weight_views,
+            _pad_intermediate_to_tile,
+            _LEVEL_TILE_N,
         )
 
         # Pick the right pre-allocated workspace for this call's token
@@ -548,6 +553,33 @@ class B12xMoEWrapper:
                 w2_weight_sf.data_ptr(),
                 w2_alpha.data_ptr(),
             )
+            n_eff = self.intermediate_size
+            # Pad non-128-aligned intermediate sizes (e.g. Gemma-4's 704) once
+            # and cache, so addresses stay stable across CUDA-graph replays.
+            if self.intermediate_size % _LEVEL_TILE_N != 0:
+                if self._padded_weights is None or self._weight_key != weight_key:
+                    is_gated = self.activation in ("silu", "gelu_tanh")
+                    self._padded_weights = _pad_intermediate_to_tile(
+                        w1_weight,
+                        w1_weight_sf,
+                        w2_weight,
+                        w2_weight_sf,
+                        fc2_input_scale,
+                        self.intermediate_size,
+                        _LEVEL_TILE_N,
+                        self.hidden_size,
+                        w1_weight.size(0),
+                        is_gated,
+                    )
+                (
+                    w1_weight,
+                    w1_weight_sf,
+                    w2_weight,
+                    w2_weight_sf,
+                    fc2_input_scale,
+                    n_eff,
+                ) = self._padded_weights
+
             if self._weight_views is None or self._weight_key != weight_key:
                 self._weight_views = _get_sm120_weight_views(
                     w1_fp4=w1_weight,
@@ -556,7 +588,7 @@ class B12xMoEWrapper:
                     w2_blockscale=w2_weight_sf,
                     w1_alphas=w1_alpha,
                     w2_alphas=w2_alpha,
-                    n=self.intermediate_size,
+                    n=n_eff,
                     k=self.hidden_size,
                     activation_precision=self.activation_precision,
                 )
