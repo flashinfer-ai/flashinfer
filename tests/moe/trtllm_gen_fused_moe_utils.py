@@ -2962,7 +2962,6 @@ RENORMALIZE_ROUTING_CONFIGS = [
     # NOTE: dropped synthetic "Renorm" (256e/top-8) — no production model at this size
     # (real Renormalize models are Qwen3 128e/top-8 and Qwen3-Next 512e/top-10, both kept).
     # CI-budget pruning; broad routing×quant spread is being relocated to the MoE fuzzer.
-    # See var/moe-routing-test-audit.md.
     pytest.param(
         {
             "num_experts": 512,
@@ -3074,7 +3073,7 @@ RENORMALIZE_ROUTING_CONFIGS = [
     ),
     # NOTE: dropped "MiniMax2_256e_top6_scale3" — the no-scale variant above already covers
     # the MiniMax2 routing method; this entry only varied routed_scaling=3.0. CI-budget pruning;
-    # the routed_scaling axis is covered in the fuzzer. See var/moe-routing-test-audit.md.
+    # the routed_scaling axis is covered in the fuzzer.
 ]
 
 RENORMALIZE_WEIGHT_PROCESSING = [
@@ -3118,8 +3117,7 @@ RENORMALIZE_ACTIVATION_TYPES = [
 # NOTE: fp32 logits removed from the renormalize family to fit the CI budget. bf16 is kept
 # because it is the only logits dtype that exercises MxFP4xMxFp8 / MxFP4xBf16 / MXINT4 (skip_checks
 # gates fp32 off those quant modes). The fp32-logits code path stays covered by
-# test_deepseekv3_routing (fp32-only) and test_topk_routing (fp32+bf16). See
-# var/moe-routing-test-audit.md (cuts the over-budget fp8 shard 1020->375, total 1398->570).
+# test_deepseekv3_routing (fp32-only) and test_topk_routing (fp32+bf16).
 RENORMALIZE_ROUTING_LOGITS_DTYPES = [
     pytest.param(torch.bfloat16, id="BF16_logits"),
 ]
