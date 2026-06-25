@@ -582,6 +582,9 @@ class FusedMoeLauncher {
   // | false | false | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]               |
   // | false | true  | [gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_output] |
   //
+  // The `gemm1_output` slot carries the post-activation FC1 output with shape
+  // [num_padded_tokens, intermediate_size].
+  //
   // `expanded_idx_to_permuted_idx` is appended whenever a permuted-layout
   // tensor (`gemm2_output` or `gemm1_output`) is returned, so the caller can
   // always unpermute back to (token, slot) order.
@@ -1450,7 +1453,12 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       result.push_back(expanded_idx_to_permuted_idx);
     }
     if (return_activation_output) {
-      result.push_back(gemm1_output);
+      // For DSFp8, gemm1_output is the pre-activation FC1 output (shape [M, 2*I])
+      // and the post-activation tensor lives in activation_output (shape [M, I]).
+      // MxFp8 fuses SwiGLU into FC1 so gemm1_output IS already post-activation.
+      result.push_back(quantization_type == Fp8QuantizationType::DeepSeekFp8
+                           ? activation_output
+                           : gemm1_output);
     }
     return result;
   }
