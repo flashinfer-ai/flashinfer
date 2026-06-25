@@ -61,6 +61,7 @@ from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fusemoe_blackwell import gen_fusemoe_blackwell_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -537,6 +538,7 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
+            jit_specs.append(gen_fusemoe_blackwell_module())
         if has_sm100f:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
