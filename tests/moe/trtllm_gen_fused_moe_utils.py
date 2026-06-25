@@ -2959,28 +2959,10 @@ RENORMALIZE_ROUTING_CONFIGS = [
         },
         id="Qwen3_MOE",
     ),
-    pytest.param(
-        {
-            "num_experts": 256,
-            "top_k": 8,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.Renormalize,
-            "compatible_moe_impls": [
-                FP8PerTensorMoe,
-                FP8BlockScaleMoe,
-                FP4Moe,
-                BF16Moe,
-                MxInt4BlockScaleMoe,
-            ],
-            "compatible_intermediate_size": [384, 1024],
-            "enable_autotune": False,
-        },
-        id="Renorm",
-    ),
+    # NOTE: dropped synthetic "Renorm" (256e/top-8) — no production model at this size
+    # (real Renormalize models are Qwen3 128e/top-8 and Qwen3-Next 512e/top-10, both kept).
+    # CI-budget pruning; broad routing×quant spread is being relocated to the MoE fuzzer.
+    # See var/moe-routing-test-audit.md.
     pytest.param(
         {
             "num_experts": 512,
@@ -3090,28 +3072,9 @@ RENORMALIZE_ROUTING_CONFIGS = [
         },
         id="MiniMax2_256e_top6_no_scale",
     ),
-    pytest.param(
-        {
-            "num_experts": 256,
-            "top_k": 6,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": 3.0,
-            "has_routing_bias": True,
-            "routing_method_type": RoutingMethodType.MiniMax2,
-            "compatible_moe_impls": [
-                FP8PerTensorMoe,
-                FP8BlockScaleMoe,
-                FP4Moe,
-                BF16Moe,
-                MxInt4BlockScaleMoe,
-            ],
-            "compatible_intermediate_size": [384, 768, 1024],
-            "enable_autotune": False,
-        },
-        id="MiniMax2_256e_top6_scale3",
-    ),
+    # NOTE: dropped "MiniMax2_256e_top6_scale3" — the no-scale variant above already covers
+    # the MiniMax2 routing method; this entry only varied routed_scaling=3.0. CI-budget pruning;
+    # the routed_scaling axis is covered in the fuzzer. See var/moe-routing-test-audit.md.
 ]
 
 RENORMALIZE_WEIGHT_PROCESSING = [
@@ -3147,11 +3110,17 @@ RENORMALIZE_WEIGHT_PROCESSING = [
 
 RENORMALIZE_ACTIVATION_TYPES = [
     pytest.param(ActivationType.Swiglu, id="Swiglu"),
-    pytest.param(ActivationType.Geglu, id="Geglu"),
+    # NOTE: Geglu removed — skip_checks only admits Geglu with FP4-NVFP4 + TopK routing + <=128
+    # tokens, none of which occur in the renormalize configs, so it produced 0 passing tests
+    # (pure collection overhead). Geglu is covered by test_sigmoid/deepseekv3/topk routing.
 ]
 
+# NOTE: fp32 logits removed from the renormalize family to fit the CI budget. bf16 is kept
+# because it is the only logits dtype that exercises MxFP4xMxFp8 / MxFP4xBf16 / MXINT4 (skip_checks
+# gates fp32 off those quant modes). The fp32-logits code path stays covered by
+# test_deepseekv3_routing (fp32-only) and test_topk_routing (fp32+bf16). See
+# var/moe-routing-test-audit.md (cuts the over-budget fp8 shard 1020->375, total 1398->570).
 RENORMALIZE_ROUTING_LOGITS_DTYPES = [
-    pytest.param(torch.float32, id="FP32_logits"),
     pytest.param(torch.bfloat16, id="BF16_logits"),
 ]
 
