@@ -27,6 +27,8 @@ output_column_dict = {
         "kv_dtype",
         "avg_actual_seq_len",
         "random_actual_seq_len",
+        "is_var_seq",
+        "cute_dsl_impl",
     ],
     "gemm": [
         "n",
@@ -199,6 +201,7 @@ benchmark_apis = {
         "bmm_fp8",
         "bmm_mxfp8",
         "mm_fp4",
+        "mm_bf16_fp4",
         "mm_mxfp8",
         "mm_bf16",
         "bmm_bf16",

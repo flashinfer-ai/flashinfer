@@ -44,6 +44,8 @@ def run_gemm_test(args):
         return testBmmMxfp8(args)
     elif args.routine == "mm_fp4":
         return testMmFp4(args)
+    elif args.routine == "mm_bf16_fp4":
+        return testMmBf16Fp4(args)
     elif args.routine == "mm_mxfp8":
         return testMmMxfp8(args)
     elif args.routine == "mm_bf16":
@@ -200,6 +202,11 @@ def parse_gemm_args(line, parser):
             args.input_dtype = "bfloat16"
         if not has_mat2_dtype_arg:
             args.mat2_dtype = "bfloat16"
+    if args.routine == "mm_bf16_fp4":
+        if not has_backends_arg:
+            args.backends = ["cute-dsl"]
+        if not has_input_dtype_arg:
+            args.input_dtype = "bfloat16"
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -1323,6 +1330,233 @@ def testMmFp4(args):
                 cur_res["use_nvfp4"] = use_nvfp4
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
+    return res
+
+
+# E2M1 (FP4) value table, signed (codes 0-7 positive, 8-15 negative), matching
+# ``flashinfer.nvfp4_quantize``.
+_E2M1_VALUES_FP32 = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)  # fmt: skip
+
+
+def _dequantize_bf16_fp4_ref(b, b_descale, alpha, n, k, block_size):
+    """PyTorch implementation of swizzled nvfp4 dequantization to fp32."""
+    import torch
+    from flashinfer.gemm.gemm_bf16_fp4 import _unswizzle_sf_128x4
+
+    device = b.device
+    k_sf = k // block_size
+    lut = torch.tensor(_E2M1_VALUES_FP32, dtype=torch.float32, device=device)
+    b_int = b.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
+    values = lut[codes]
+    sf = _unswizzle_sf_128x4(b_descale, n, k_sf).view(torch.float8_e4m3fn)
+    sf_expanded = sf.to(torch.float32).repeat_interleave(block_size, dim=1)
+    weight = values * sf_expanded
+    if alpha is not None:
+        weight = weight * alpha.to(torch.float32)
+    return weight
+
+
+def testMmBf16Fp4(args):
+    """Benchmark mm_bf16_fp4 (bf16 activation x FP4 weight, bf16 x fp4).
+
+    Weights are produced by ``flashinfer.nvfp4_quantize(sfLayout=layout_128x4)``
+    -- the same format the new API expects.
+
+    Constraints:
+      * N must be divisible by 64 (the weight-prepack / kernel N tile).
+        The 128x4 SF swizzle only pads N to 128; prepare_bf16_fp4_weights
+        unswizzles the padded tail, so any N % 64 == 0 works.
+      * K must be divisible by 16 (FP4 block size).
+      * input_dtype must be bfloat16 (the only A dtype currently
+        supported; fp16 deferred).
+
+    Refcheck uses an fp32 dequant + matmul.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testMmBf16Fp4")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    m, n, k = args.m, args.n, args.k
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    backends = args.backends
+    run_refcheck = args.refcheck
+    is_cuda_graph_compatible = not args.no_cuda_graph
+
+    if input_dtype != torch.bfloat16:
+        raise ValueError(
+            f"mm_bf16_fp4 benchmark requires input_dtype=bfloat16, got {args.input_dtype}"
+        )
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"mm_bf16_fp4 benchmark requires out_dtype in (bfloat16, float16), got {args.out_dtype}"
+        )
+    if n % 64 != 0:
+        # N must be a multiple of the 64-wide N tile used by the weight
+        # prepack and the cute-dsl kernel.  The 128x4 SF swizzle only *pads*
+        # N to 128, and prepare_bf16_fp4_weights unswizzles the padded
+        # tail, so any n % 64 == 0 works.
+        raise ValueError("mm_bf16_fp4 benchmark requires n % 64 == 0")
+    if k % 16 != 0:
+        raise ValueError("mm_bf16_fp4 benchmark requires k % 16 == 0 (FP4 block size)")
+
+    torch.manual_seed(args.random_seed)
+    a = torch.randn((m, k), device=device, dtype=input_dtype) * 0.5
+    w = torch.randn((n, k), device=device, dtype=input_dtype) * 0.1
+    g_b = (448 * 6) / w.float().abs().nan_to_num().max()
+    b_fp4, b_sf = flashinfer.nvfp4_quantize(
+        w,
+        g_b,
+        sfLayout=flashinfer.SfLayout.layout_128x4,
+        do_shuffle=False,
+        backend="cute-dsl",
+    )
+    alpha = torch.tensor([1.0 / g_b.item()], device=device, dtype=torch.float32)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {a.shape = } {a.dtype = }")
+        print(f"[VVERBOSE] {b_fp4.shape = } {b_fp4.dtype = }")
+        print(f"[VVERBOSE] {b_sf.shape = } {b_sf.dtype = }")
+
+    # Per-backend prep + runner closures.  Prep is one-shot and not timed.
+    backend_runners = {}
+
+    def make_runner(b_p, sf_p, alpha_p, backend):
+        def run(a):
+            # mm_bf16_fp4: bf16 activation a against the prepared FP4
+            # weight; b_p/sf_p are prepare_bf16_fp4_weights outputs.
+            return flashinfer.mm_bf16_fp4(
+                a,
+                b_p,
+                sf_p,
+                alpha_p,
+                backend=backend,
+                out_dtype=out_dtype,
+                block_size=16,
+                enable_pdl=args.enable_pdl,
+            )
+
+        return run
+
+    backends_to_remove = []
+    for backend in backends:
+        try:
+            b_p, sf_p, alpha_p = flashinfer.prepare_bf16_fp4_weights(
+                b_fp4, b_sf, alpha, backend=backend
+            )
+            runner = make_runner(b_p, sf_p, alpha_p, backend)
+            runner(a)
+            backend_runners[backend] = runner
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+
+    for backend in backends_to_remove:
+        backends.remove(backend)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return
+
+    autotune_supported_backends = ["cudnn", "cute-dsl"]
+    cache_path = getattr(args, "autotune_cache", None)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        for cur_backend in backends:
+            if cur_backend in autotune_supported_backends:
+                if args.verbose >= 1:
+                    print(
+                        f"[INFO] Autotune warmup for mm_bf16_fp4 {cur_backend}: "
+                        f"{warmup_iters} iters"
+                    )
+                with autotune(True, cache=cache_path):
+                    for _ in range(warmup_iters):
+                        backend_runners[cur_backend](a)
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
+
+    ref = None
+    if run_refcheck:
+        weight_fp32 = _dequantize_bf16_fp4_ref(b_fp4, b_sf, alpha, n, k, 16)
+        ref = (a.float() @ weight_fp32.T).to(out_dtype)
+
+    res = []
+    flops = 2 * m * n * k
+    bytes_accessed = (
+        m * k * input_dtype.itemsize
+        + (k // 2) * n  # FP4 weight (uint8, 2 codes / byte)
+        + (k // 16) * n  # FP8-E4M3 per-block SF
+        + m * n * out_dtype.itemsize
+    )
+
+    refcheck_tol = dict(rtol=1.5e-2, atol=1.5e-2)
+    for backend in backends:
+        runner = backend_runners[backend]
+        if run_refcheck:
+            out = runner(a)
+            try:
+                torch.testing.assert_close(out, ref, **refcheck_tol)
+            except AssertionError as e:
+                if args.allow_output_mismatch:
+                    print(f"[WARNING] {backend} output mismatch vs fp32 ref: {e}")
+                else:
+                    raise
+
+        timing = bench_gpu_time(
+            fn=runner,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=(a,),
+        )
+        median_time = float(np.median(timing))
+        std_time = float(np.std(timing))
+        tflops = flops / median_time / 1e9
+        tb_per_sec = bytes_accessed / median_time / 1e9
+        backend_name = backend + (
+            "_autotune"
+            if (
+                getattr(args, "autotune", False)
+                and backend in autotune_supported_backends
+            )
+            else ""
+        )
+        print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+        res.append(
+            {
+                "routine": args.routine,
+                "median_time": median_time,
+                "std_time": std_time,
+                "tflops": tflops,
+                "tb_per_sec": tb_per_sec,
+                "backend": backend_name,
+                "resolved_backend": backend,
+                "m": m,
+                "n": n,
+                "k": k,
+                "input_dtype": str(input_dtype).split(".")[-1],
+                "out_dtype": str(out_dtype).split(".")[-1],
+                "case_tag": args.case_tag,
+            }
+        )
     return res
 
 
