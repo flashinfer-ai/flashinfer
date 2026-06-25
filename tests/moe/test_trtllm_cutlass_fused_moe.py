@@ -2645,7 +2645,6 @@ def _assert_humming_payload_rewrite_bit_equal(
 PHASE3_HUMMING_E2E_CASES = {
     "small": {
         "seed": 7,
-        "single_config": "fp8_mxfp4_prescale_m64n16k128",
         "e": 2,
         "m": 4,
         "n": 512,
@@ -2658,7 +2657,6 @@ PHASE3_HUMMING_E2E_CASES = {
     },
     "wide_offset": {
         "seed": 7,
-        "single_config": "fp8_mxfp4_prescale_m64n16k128",
         "e": 2,
         "m": 4,
         "n": 512,
@@ -2674,7 +2672,6 @@ PHASE3_HUMMING_E2E_CASES = {
     },
     "e256_config": {
         "seed": 11,
-        "single_config": "fp8_mxfp4_prescale_m64n32k512_c2x1",
         "e": 256,
         "m": 8,
         "n": 256,
@@ -2683,11 +2680,10 @@ PHASE3_HUMMING_E2E_CASES = {
         "raw_scale": (118, 122),
         "torch_ref_tolerance": (5e-2, 1e-3),
         "torch_ref_max_bad": 0,
-        "description": "E256-style FC1 N512/K4096 fixed best config coverage",
+        "description": "E256-style FC1 N512/K4096 full-tactic coverage",
     },
     "e32_config": {
         "seed": 13,
-        "single_config": "fp8_mxfp4_prescale_m64n64k512_c1x2",
         "e": 32,
         "m": 8,
         "n": 2048,
@@ -2696,7 +2692,7 @@ PHASE3_HUMMING_E2E_CASES = {
         "raw_scale": (118, 122),
         "torch_ref_tolerance": (5e-2, 1e-3),
         "torch_ref_max_bad": 0,
-        "description": "E32-style FC1 N4096/K4096 fixed best config coverage",
+        "description": "E32-style FC1 N4096/K4096 full-tactic coverage",
     },
 }
 
@@ -2958,16 +2954,10 @@ def test_moe_bf16_mxfp4_hopper_activations(
     list(PHASE3_HUMMING_E2E_CASES.items()),
     ids=list(PHASE3_HUMMING_E2E_CASES.keys()),
 )
+@pytest.mark.parametrize("use_autotune", [False, True])
 def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
-    case_name, case, monkeypatch
+    case_name, case, use_autotune
 ):
-    # PHASE3_SINGLE_CONFIG_TEMP: keep this smoke on one fixed tactic until the
-    # full Humming runtime per-token quantization path is implemented.
-    monkeypatch.setenv(
-        "FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG", case["single_config"]
-    )
-    get_cutlass_fused_moe_module.cache_clear()
-
     torch.manual_seed(case["seed"])
     device = torch.device("cuda")
     e, m, n, k, top_k = (
@@ -3079,28 +3069,30 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
 
     fc1_residual_token_scale = make_expert_contiguous_token_scale(fc1_residual_route_scale)
     fc2_residual_token_scale = make_expert_contiguous_token_scale(fc2_residual_route_scale)
+    quant_scales = [
+        w1_scale_il.view(torch.int32),
+        fc1_residual_token_scale,
+        fc2_act_global,
+        w2_scale_il.view(torch.int32),
+        fc2_residual_token_scale,
+    ]
 
-    flash_output = torch.zeros(m, k, device=device, dtype=output_dtype)
-    fused_moe.cutlass_fused_moe(
-        x,
-        selected_experts.to(torch.int),
-        routing_weights,
-        w1_il,
-        w2_il,
-        output_dtype,
-        quant_scales=[
-            w1_scale_il.view(torch.int32),
-            fc1_residual_token_scale,
-            fc2_act_global,
-            w2_scale_il.view(torch.int32),
-            fc2_residual_token_scale,
-        ],
-        use_w4_group_scaling=True,
-        use_wfp4afp8_humming=True,
-        output=flash_output,
-        # PHASE3_SINGLE_CONFIG_TEMP: bypass autotune in the fixed-tactic smoke.
-        profile_ids=[0, 0],
-    )
+    def run_flash(profile_ids=None):
+        flash_output = torch.zeros(m, k, device=device, dtype=output_dtype)
+        fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts.to(torch.int32),
+            routing_weights,
+            w1_il,
+            w2_il,
+            output_dtype,
+            quant_scales=quant_scales,
+            use_w4_group_scaling=True,
+            use_wfp4afp8_humming=True,
+            output=flash_output,
+            profile_ids=profile_ids,
+        )
+        return flash_output
 
     w1_ref = _dequant_mxfp4_humming_prescale_on_device(w1_processed, w1_exp_offset)
     w2_ref = _dequant_mxfp4_humming_prescale_on_device(w2_processed, w2_exp_offset)
@@ -3146,15 +3138,22 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
 
     torch_ref_rtol, torch_ref_atol = case["torch_ref_tolerance"]
-    _assert_close_with_error_stats(
-        flash_output,
-        ref_output.to(output_dtype),
-        label=f"{case_name}: FlashInfer vs PyTorch reference",
-        rtol=torch_ref_rtol,
-        atol=torch_ref_atol,
-        max_bad=case["torch_ref_max_bad"],
-        print_stats=print_ref_stats,
-    )
+    ref_output = ref_output.to(output_dtype)
+
+    def assert_flash_output(profile_label, flash_output):
+        _assert_close_with_error_stats(
+            flash_output,
+            ref_output,
+            label=f"{case_name}/{profile_label}: FlashInfer vs PyTorch reference",
+            rtol=torch_ref_rtol,
+            atol=torch_ref_atol,
+            max_bad=case["torch_ref_max_bad"],
+            print_stats=print_ref_stats,
+        )
+
+    profile_label = "autotune" if use_autotune else "default"
+    with autotune(True) if use_autotune else nullcontext():
+        assert_flash_output(profile_label, run_flash())
 
 
 # W4A8 Hopper interleaved path.

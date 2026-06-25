@@ -153,17 +153,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
     };
 
-#ifdef FLASHINFER_CUTLASS_PHASE3_SINGLE_CONFIG
-    // PHASE3_SINGLE_CONFIG_TEMP: in the fixed-tactic debug build, construct only
-    // the Humming-style MXFP4 x FP8 runner with online FP16/BF16 input quantization.
-    if (isWMxfp4AFp8HummingQuant()) {
-      make_humming_runner();
-    } else {
-      TVM_FFI_ICHECK(false)
-          << "FLASHINFER_CUTLASS_PHASE3_SINGLE_CONFIG only supports Humming-style MXFP4 x "
-             "FP8 pre-MMA scaling.";
-    }
-#else
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
     if (mActivationDtype == dl_float16 && mWeightDtype == dl_float16) {
       mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, half>>();
@@ -272,7 +261,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       }
 #endif
     }
-#endif
     if (!mKernelRunner) {
       TVM_FFI_ICHECK(false)
           << "Could not construct fused moe op with the requested input combination Activation: "
@@ -285,34 +273,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // Get tactics for both GEMM1 and GEMM2, combine them
     auto gemm1_tactics = mKernelRunner->getTactics(kernels::MoeGemmId::GEMM_1);
     auto gemm2_tactics = mKernelRunner->getTactics(kernels::MoeGemmId::GEMM_2);
-#ifdef FLASHINFER_CUTLASS_PHASE3_SINGLE_CONFIG
-    // PHASE3_SINGLE_CONFIG_TEMP: replace autotuned tactic lists with one
-    // selected tactic to keep Phase 3 JIT/debug iteration small.
-#if defined(FLASHINFER_CUTLASS_PHASE3_M64N16K128_C1X1)
-    auto phase3_config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig(
-        tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::CtaShape64x16x128B,
-        tensorrt_llm::cutlass_extensions::MainloopScheduleType::PINGPONG,
-        tensorrt_llm::cutlass_extensions::EpilogueScheduleType::AUTO,
-        tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
-#elif defined(FLASHINFER_CUTLASS_PHASE3_M64N32K512_C2X1)
-    auto phase3_config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig(
-        tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::CtaShape64x32x512B,
-        tensorrt_llm::cutlass_extensions::MainloopScheduleType::PINGPONG,
-        tensorrt_llm::cutlass_extensions::EpilogueScheduleType::AUTO,
-        tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_2x1x1);
-#elif defined(FLASHINFER_CUTLASS_PHASE3_M64N64K512_C1X2)
-    auto phase3_config = tensorrt_llm::cutlass_extensions::CutlassGemmConfig(
-        tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::CtaShape64x64x512B,
-        tensorrt_llm::cutlass_extensions::MainloopScheduleType::PINGPONG,
-        tensorrt_llm::cutlass_extensions::EpilogueScheduleType::AUTO,
-        tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_1x2x1);
-#else
-#error "Unknown FLASHINFER_CUTLASS_PHASE3_SINGLE_CONFIG selection"
-#endif
-    phase3_config.swap_ab = true;
-    gemm1_tactics = {phase3_config};
-    gemm2_tactics = {phase3_config};
-#endif
     mGemm1TacticCount = static_cast<int64_t>(gemm1_tactics.size());
     mGemm2TacticCount = static_cast<int64_t>(gemm2_tactics.size());
     mAllProfiles = gemm1_tactics;

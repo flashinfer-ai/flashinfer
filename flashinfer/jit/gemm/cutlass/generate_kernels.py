@@ -379,46 +379,6 @@ def write_file(launcher_inl_files, operations, output_file):
         f.write(content)
 
 
-def maybe_filter_single_sm90_mixed_operation(operations):
-    # PHASE3_SINGLE_CONFIG_TEMP: keep only the selected Humming-style SM90
-    # mixed-input tactic while bringing up runtime per-token scale semantics.
-    single_config = os.environ.get("FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG")
-    if not single_config:
-        return operations
-    single_configs = {
-        "fp8_mxfp4_prescale_m64n16k128": ((64, 16, 128), (1, 1, 1)),
-        "fp8_mxfp4_prescale_m64n32k512_c2x1": ((64, 32, 512), (2, 1, 1)),
-        "fp8_mxfp4_prescale_m64n64k512_c1x2": ((64, 64, 512), (1, 2, 1)),
-    }
-    if single_config not in single_configs:
-        raise ValueError(
-            "Unsupported FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG="
-            f"{single_config!r}"
-        )
-    cta_shape, cga_shape = single_configs[single_config]
-
-    filtered = [
-        op
-        for op in operations
-        if not isinstance(op, GemmSm80LauncherConfig)
-        and op.arch == 90
-        and op.gemm_kind == GemmKind.Grouped
-        and op.act_type == DataType.e4m3
-        and op.weight_type == e2m1
-        and op.scalezero_type == DataType.ue8m0
-        and op.output_type == DataType.bf16
-        and op.cta_shape == cta_shape
-        and op.cga_shape == cga_shape
-        and op.mainloop_schedule == KernelScheduleType.TmaWarpSpecializedPingpong
-    ]
-    if not filtered:
-        raise ValueError(
-            "No operation matched FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG="
-            f"{single_config!r}"
-        )
-    return filtered
-
-
 def is_gemm_op_valid_sm100(op):
     # TODO These are much more restricted than theory dictates, investigate if more can be enabled in future
     tile_m, tile_n, _ = op.cta_shape
@@ -769,13 +729,7 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     operations = list()
     for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in partial_args:
         is_fp8_mxfp4 = dtype_combo[0] == DataType.e4m3 and dtype_combo[1] == e2m1
-        mixed_input_scale_mode = "post_mma"
-        # PHASE3_SINGLE_CONFIG_TEMP: compile the selected FP8 x MXFP4 operation
-        # as the pre-MMA E8M0 mode only for the fixed-tactic debug build.
-        if is_fp8_mxfp4 and os.environ.get(
-            "FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG", ""
-        ).startswith("fp8_mxfp4_prescale"):
-            mixed_input_scale_mode = "pre_mma_e8m0"
+        mixed_input_scale_mode = "pre_mma_e8m0" if is_fp8_mxfp4 else "post_mma"
 
         use_coop = cta_shape_mnk[0] >= 128
         mainloop_schedules = (
@@ -803,7 +757,7 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                 mixed_input_scale_mode=mixed_input_scale_mode,
             )
             operations.append(moe_gemm_operation)
-    return maybe_filter_single_sm90_mixed_operation(operations)
+    return operations
 
 
 def generate_sm90_operations(is_arch_enabled):
@@ -1118,17 +1072,12 @@ def generate_gemm_operations(output_dir, architectures):
 
     # The goal here is to group kernels with common instantiations together in order to reduce template instantiation overheads.
     # Template instantiation dominates the time in a compilation unit, so it is the most important factor to improve.
-    # PHASE3_SINGLE_CONFIG_TEMP: skip unrelated architecture generators in the
-    # fixed-tactic debug build to avoid repeated full JIT compiles.
-    if os.environ.get("FLASHINFER_CUTLASS_SM90_MIXED_SINGLE_CONFIG"):
-        operations = generate_sm90_mixed_type_grouped_gemm_operations(has_arch(90))
-    else:
-        operations = []
-        operations += generate_sm120_operations(has_arch(120) or has_arch(121))
-        operations += generate_sm103_operations(has_arch(103))
-        operations += generate_sm100_operations(has_arch(100) or has_arch(103))
-        operations += generate_sm90_operations(has_arch(90))
-        operations += generate_sm80_operations(has_arch(80) or has_arch(89))
+    operations = []
+    operations += generate_sm120_operations(has_arch(120) or has_arch(121))
+    operations += generate_sm103_operations(has_arch(103))
+    operations += generate_sm100_operations(has_arch(100) or has_arch(103))
+    operations += generate_sm90_operations(has_arch(90))
+    operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 
     def should_skip(op):
         return False  # All kernels have a public implementation

@@ -18,17 +18,6 @@
 #include "moe_kernels.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
-// PHASE3_SINGLE_CONFIG_TEMP: instantiate only the Humming-style MXFP4 x FP8
-// runner with FP16/BF16 external activation input. The full instantiation set
-// must be restored before this path becomes PR-ready.
-#ifdef FLASHINFER_CUTLASS_PHASE3_SINGLE_CONFIG
-#if defined(ENABLE_FP4) && defined(ENABLE_FP8) && defined(ENABLE_BF16)
-template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_bfloat16,
-                                  __nv_bfloat16, false,
-                                  Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
-INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
-#endif
-#else
 template class CutlassMoeFCRunner<float, float>;
 
 #ifdef ENABLE_BF16
@@ -79,6 +68,5 @@ INSTANTIATE_FINALIZE_MOE_ROUTING(half, half, half);
 INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
 #ifdef ENABLE_BF16
 INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
-#endif
 #endif
 }  // namespace tensorrt_llm::kernels::cutlass_kernels
