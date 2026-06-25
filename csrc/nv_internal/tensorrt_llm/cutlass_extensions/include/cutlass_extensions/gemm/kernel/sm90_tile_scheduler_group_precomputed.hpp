@@ -99,8 +99,9 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   //
 
 private:
-  uint64_t current_work_linear_idx_ = 0;
-  uint64_t total_grid_size_ = 0;
+  using WorkLinearIdx = uint32_t;
+  WorkLinearIdx current_work_linear_idx_ = 0;
+  WorkLinearIdx total_grid_size_ = 0;
 
 public:
   struct WorkTileInfo {
@@ -322,11 +323,11 @@ public:
 #if defined(__CUDA_ARCH__)
     CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
     current_work_linear_idx_ =
-        uint64_t(blockIdx.x) * uint64_t(gridDim.y) +
-        uint64_t(blockIdx.y) +
-        uint64_t(blockIdx.z) * uint64_t(gridDim.x) * uint64_t(gridDim.y);
+        WorkLinearIdx(blockIdx.x) * WorkLinearIdx(gridDim.y) +
+        WorkLinearIdx(blockIdx.y) +
+        WorkLinearIdx(blockIdx.z) * WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y);
 
-    total_grid_size_ = uint64_t(gridDim.x) * uint64_t(gridDim.y) * uint64_t(gridDim.z);
+    total_grid_size_ = WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
 
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
@@ -339,11 +340,11 @@ public:
 #if defined(__CUDA_ARCH__)
     CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
     current_work_linear_idx_ =
-        uint64_t(blockIdx.x) * uint64_t(gridDim.y) +
-        uint64_t(blockIdx.y) +
-        uint64_t(blockIdx.z) * uint64_t(gridDim.x) * uint64_t(gridDim.y);
+        WorkLinearIdx(blockIdx.x) * WorkLinearIdx(gridDim.y) +
+        WorkLinearIdx(blockIdx.y) +
+        WorkLinearIdx(blockIdx.z) * WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y);
 
-    total_grid_size_ = uint64_t(gridDim.x) * uint64_t(gridDim.y) * uint64_t(gridDim.z);
+    total_grid_size_ = WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
 
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
@@ -358,7 +359,7 @@ public:
 
   CUTLASS_DEVICE
   WorkTileInfo
-  get_current_work_for_linear_idx(uint64_t linear_idx) {
+  get_current_work_for_linear_idx(WorkLinearIdx linear_idx) {
     return get_precomputed_work_tile(linear_idx, scheduler_params.precomputed_work_tiles_);
   }
 
@@ -386,7 +387,7 @@ public:
     uint32_t advance_count = 1,
     CallbackBeforeCommit callback_before_commit = [] (WorkTileInfo info) { return info;}) {
 
-    current_work_linear_idx_ += total_grid_size_ * uint64_t(advance_count);
+    current_work_linear_idx_ += total_grid_size_ * WorkLinearIdx(advance_count);
     auto work_tile = get_current_work_for_linear_idx(current_work_linear_idx_);
     using WorkTileWithCallbackInfo = decltype(callback_before_commit(work_tile));
     WorkTileWithCallbackInfo work_tile_with_callback_info = work_tile;
@@ -412,7 +413,7 @@ public:
   CUTLASS_DEVICE
   void
   advance_to_next_work(uint32_t advance_count) {
-    current_work_linear_idx_ += total_grid_size_ * uint64_t(advance_count);
+    current_work_linear_idx_ += total_grid_size_ * WorkLinearIdx(advance_count);
   }
 
   // Returns whether the block assigned this work should compute the epilogue for the corresponding
