@@ -2112,9 +2112,11 @@ def delta_rule_prefill_dsl(
         num_seqs * num_sab_heads,
         stream,
     )
+    _, sm_minor = torch.cuda.get_device_capability()
+    gpu_arch = cute.GPUArch("sm_121a") if sm_minor == 1 else cute.GPUArch("sm_120a")
     compiled_delta_rule_kernel = cached_compile(
         delta_rule_kernel,
         *kernel_args,
-        compile_options=(cute.GPUArch("sm_120a"),),
+        compile_options=(gpu_arch,),
     )
     compiled_delta_rule_kernel(*kernel_args)
