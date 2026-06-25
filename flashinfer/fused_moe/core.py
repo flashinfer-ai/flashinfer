@@ -572,9 +572,6 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
         use_wfp4afp8_humming: bool = False,
-        # PHASE3_SINGLE_CONFIG_TEMP: fixed-tactic override for Phase 3 debug
-        # builds. Remove once the full runtime-scale path no longer needs
-        # single-config JIT narrowing.
         profile_ids: Optional[List[int]] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
@@ -603,16 +600,6 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_fused_finalize=use_fused_finalize,
             use_wfp4afp8_humming=use_wfp4afp8_humming,
         )
-
-        # PHASE3_SINGLE_CONFIG_TEMP: the Humming path currently relies on fixed
-        # tactics because the autotune profiler does not yet build runtime
-        # token-scale inputs. Remove this guard together with the fixed-tactic
-        # narrowing in the next Phase 3 cleanup commit.
-        if use_wfp4afp8_humming and profile_ids is None:
-            raise NotImplementedError(
-                "Humming-style MXFP4 x FP8 currently requires fixed profile_ids; "
-                "the autotune profiler path does not yet build runtime token-scale inputs."
-            )
 
         if profile_ids is None:
             tuner = AutoTuner.get()
@@ -650,8 +637,6 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 gemm_idx=2,
             )
         else:
-            # PHASE3_SINGLE_CONFIG_TEMP: bypass autotune and force the selected
-            # GEMM1/GEMM2 tactics for the fixed-config smoke path.
             if len(profile_ids) != 2:
                 raise ValueError("profile_ids must contain [gemm1_profile, gemm2_profile]")
             gemm_tactic_1, gemm_tactic_2 = profile_ids
@@ -757,8 +742,6 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_packed_weights: bool = False,
         use_fused_finalize: bool = True,
         use_wfp4afp8_humming: bool = False,
-        # PHASE3_SINGLE_CONFIG_TEMP: workspace shape follows the same fixed
-        # tactic override as the temporary Phase 3 smoke path.
         profile_ids: Optional[List[int]] = None,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
@@ -822,8 +805,6 @@ def cutlass_fused_moe(
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
     use_fused_finalize: bool = True,
-    # PHASE3_SINGLE_CONFIG_TEMP: public Python hook used only to force the
-    # fixed Phase 3 tactic while Humming runtime-scale semantics are incomplete.
     profile_ids: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.

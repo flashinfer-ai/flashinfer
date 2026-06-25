@@ -607,11 +607,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX, Wfp4Afp8Mode>::
           ? CutlassGemmConfig::FP4_ONLY
           : CutlassGemmConfig::NONE;
   static constexpr auto fp8fp4_mixed_flag =
-      (use_wfp4afp8 &&
-       (Wfp4Afp8Mode == Wfp4Afp8ScaleMode::kPostMmaFp8Act ||
-        Wfp4Afp8Mode == Wfp4Afp8ScaleMode::kPostMmaMxfp8Act))
-          ? CutlassGemmConfig::FP8FP4_MIXED
-          : CutlassGemmConfig::NONE;
+      use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(
       weight_only_flag | simt_only_flag | grouped_gemm_flag | enable_blackwell | enable_hopper |
       fp8_only_flag | fp4_only_flag | fp8fp4_mixed_flag);
