@@ -284,6 +284,10 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             )
         detach(synchronize=synchronize, barrier=barrier)
 
+    def pause(self, *, synchronize: bool = True, barrier: bool = True) -> None:
+        """Pause graph-visible peer mappings before process checkpoint."""
+        self.detach_physical_keep_va(synchronize=synchronize, barrier=barrier)
+
     def remap_physical_same_va(
         self,
         *,
@@ -320,6 +324,22 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             if barrier:
                 self.comm_backend.barrier()
         self.validate_graph_visible_addresses()
+
+    def resume(
+        self,
+        *,
+        comm_backend: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        reset: bool = True,
+    ) -> None:
+        """Resume graph-visible peer mappings after process restore."""
+        self.remap_physical_same_va(
+            comm_backend=comm_backend,
+            synchronize=synchronize,
+            barrier=barrier,
+            reset=reset,
+        )
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""

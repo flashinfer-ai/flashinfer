@@ -218,6 +218,10 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 )
             detach(synchronize=synchronize, barrier=barrier)
 
+    def pause(self, *, synchronize: bool = True, barrier: bool = True) -> None:
+        """Pause graph-visible peer mappings before process checkpoint."""
+        self.detach_physical_keep_va(synchronize=synchronize, barrier=barrier)
+
     def _reset_after_remap(self, *, barrier: bool = True) -> None:
         """Reinitialize Lamport buffers and flags after physical remap."""
         lamport_dtype = (
@@ -265,6 +269,22 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         if reset:
             self._reset_after_remap(barrier=barrier)
         self.validate_graph_visible_addresses()
+
+    def resume(
+        self,
+        *,
+        comm_backend: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        reset: bool = True,
+    ) -> None:
+        """Resume graph-visible peer mappings after process restore."""
+        self.remap_physical_same_va(
+            comm_backend=comm_backend,
+            synchronize=synchronize,
+            barrier=barrier,
+            reset=reset,
+        )
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
