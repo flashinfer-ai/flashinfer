@@ -38,6 +38,7 @@ and is dispatched via the public run_mtp_decode() function.
 """
 
 import functools
+from typing import Optional
 
 import torch
 import cutlass
@@ -217,11 +218,11 @@ def gdn_verify_kernel_mtp(
     o: cute.Tensor,  # [B, T, HV, V] - output
     h0_indices: cute.Tensor,  # [B] - initial state indices
     cu_seqlens: cute.Tensor,  # [B+1] - cumulative sequence lengths (for varlen)
+    ssm_state_indices: cute.Tensor,  # [B, T] int32 - per-token pool slots (FLA-style); dummy when per_token_pool_scatter=False
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -238,6 +239,7 @@ def gdn_verify_kernel_mtp(
         bool
     ],  # True: preload v into SMEM (large BS), False: GMEM reads
     use_packed_fma: cutlass.Constexpr[bool],
+    per_token_pool_scatter: cutlass.Constexpr[bool],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -700,6 +702,69 @@ def gdn_verify_kernel_mtp(
                             )
                             cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
 
+                        # FLA-style per-token scatter: write h_{i_t+1} directly
+                        # to pool[ssm_state_indices[i_n, i_t]] (a different slot
+                        # per iteration). h0_source is [pool_size * HV, V, K] so
+                        # the slot-flat index is pool_slot * HV + i_hv.
+                        if cutlass.const_expr(per_token_pool_scatter):
+                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                            # (65,536 bytes). Element multiply overflows Int32 at
+                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                            # T=8 the max is 73,727 — well over. Matches the
+                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                            # used by reads (PR #3230). Zero reg cost: compiler
+                            # emits mad.wide.u32.
+                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                            fla_t0 = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v0, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t0)
+                            fla_t1 = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v1, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t1)
+                            fla_t2 = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v2, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t2)
+                            fla_t3 = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v3, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t3)
+                            fla_t4 = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v4, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (4, None)), fla_t4)
+                            fla_t5 = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v5, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (5, None)), fla_t5)
+                            fla_t6 = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v6, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (6, None)), fla_t6)
+                            fla_t7 = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v7, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (7, None)), fla_t7)
+
                         # Step 5: Output dot products h@q for all 8 rows
                         o0 = 0.0
                         o1 = 0.0
@@ -766,8 +831,13 @@ def gdn_verify_kernel_mtp(
                                 o[(i_n, i_t, i_hv, v6)] = cutlass.BFloat16(o6)
                                 o[(i_n, i_t, i_hv, v7)] = cutlass.BFloat16(o7)
 
-                    # Write final state back for all 8 rows
-                    if cutlass.const_expr(not disable_state_update):
+                    # Write final state back for all 8 rows. Skipped under FLA
+                    # mode (same_pool only): per-token scatter at i_t=T-1 already
+                    # wrote h_T to ssm_state_indices[i, T-1]; writing to
+                    # flat_state_idx (the read slot) would clobber h_0.
+                    if cutlass.const_expr(
+                        not disable_state_update and not per_token_pool_scatter
+                    ):
                         ht_o0 = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
@@ -1225,8 +1295,49 @@ def gdn_verify_kernel_mtp(
                             )
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
-                    # Write final state back for ALL 4 rows (if not disabled)
-                    if cutlass.const_expr(not disable_state_update):
+                        # FLA-style per-token pool scatter (parallel to cache).
+                        if cutlass.const_expr(per_token_pool_scatter):
+                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                            # (65,536 bytes). Element multiply overflows Int32 at
+                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                            # T=8 the max is 73,727 — well over. Matches the
+                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                            # used by reads (PR #3230). Zero reg cost: compiler
+                            # emits mad.wide.u32.
+                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                            fla_t_a = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
+                            fla_t_b = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
+                            fla_t_c = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_c, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
+                            fla_t_d = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_d, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
+
+                    # Write final state back for ALL 4 rows (if not disabled).
+                    # Skipped under FLA mode (same_pool only): per-token scatter
+                    # at i_t=T-1 already wrote h_T to ssm_state_indices[i, T-1];
+                    # writing to flat_state_idx (the read slot) would clobber h_0.
+                    if cutlass.const_expr(
+                        not disable_state_update and not per_token_pool_scatter
+                    ):
                         h_tile_out_a = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
@@ -1388,6 +1499,30 @@ def gdn_verify_kernel_mtp(
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
+                        # FLA-style per-token pool scatter (parallel to cache).
+                        if cutlass.const_expr(per_token_pool_scatter):
+                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                            # (65,536 bytes). Element multiply overflows Int32 at
+                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                            # T=8 the max is 73,727 — well over. Matches the
+                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                            # used by reads (PR #3230). Zero reg cost: compiler
+                            # emits mad.wide.u32.
+                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                            fla_t_a = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
+                            fla_t_b = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
+
                         # Step 5: Compute output for BOTH rows (ILP)
                         sum_hq_a = 0.0
                         sum_hq_b = 0.0
@@ -1418,8 +1553,12 @@ def gdn_verify_kernel_mtp(
                                     sum_hq_b
                                 )
 
-                    # Write final state back for BOTH rows (if not disabled)
-                    if cutlass.const_expr(not disable_state_update):
+                    # Write final state back for BOTH rows (if not disabled).
+                    # Skipped under FLA mode (same_pool only): per-token scatter
+                    # at i_t=T-1 already wrote h_T to ssm_state_indices[i, T-1].
+                    if cutlass.const_expr(
+                        not disable_state_update and not per_token_pool_scatter
+                    ):
                         h_tile_out_a = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
@@ -1466,11 +1605,11 @@ def run_gdn_verify_kernel_mtp(
     o: cute.Tensor,
     h0_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
+    ssm_state_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1485,6 +1624,7 @@ def run_gdn_verify_kernel_mtp(
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
+    per_token_pool_scatter: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     _, v_dim, k_dim = (
@@ -1496,7 +1636,7 @@ def run_gdn_verify_kernel_mtp(
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
 
     # Grid: (B * HV * num_v_tiles, 1, 1) - parallelize across V dimension
-    grid_size = B * HV * num_v_tiles
+    grid_size = q.shape[0] * HV * num_v_tiles
 
     # Shared memory for pre-computed q, k, g, beta, preloaded v data, and output
     smem_bytes = (
@@ -1525,11 +1665,11 @@ def run_gdn_verify_kernel_mtp(
         o,
         h0_indices,
         cu_seqlens,
+        ssm_state_indices,
         softplus_beta,
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -1542,6 +1682,7 @@ def run_gdn_verify_kernel_mtp(
         ilp_rows,
         use_smem_v,
         use_packed_fma,
+        per_token_pool_scatter,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -1569,11 +1710,11 @@ def gdn_verify_kernel_mtp_inline(
     o: cute.Tensor,  # [B, T, HV, V] - output
     h0_indices: cute.Tensor,  # [B] - initial state indices
     cu_seqlens: cute.Tensor,  # [B+1] - cumulative sequence lengths (for varlen)
+    ssm_state_indices: cute.Tensor,  # [B, T] int32 - per-token pool slots (FLA-style); dummy when per_token_pool_scatter=False
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1590,6 +1731,7 @@ def gdn_verify_kernel_mtp_inline(
         bool
     ],  # True: preload v into SMEM (large BS), False: GMEM reads
     use_packed_fma: cutlass.Constexpr[bool],
+    per_token_pool_scatter: cutlass.Constexpr[bool],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -1891,6 +2033,42 @@ def gdn_verify_kernel_mtp_inline(
                             )
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
+                        # FLA-style per-token pool scatter (inline ilp_rows=4).
+                        if cutlass.const_expr(per_token_pool_scatter):
+                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                            # (65,536 bytes). Element multiply overflows Int32 at
+                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                            # T=8 the max is 73,727 — well over. Matches the
+                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                            # used by reads (PR #3230). Zero reg cost: compiler
+                            # emits mad.wide.u32.
+                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                            fla_t_a = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
+                            fla_t_b = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
+                            fla_t_c = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_c, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
+                            fla_t_d = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_d, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
+
                         # Step 5: h@q with deferred L2 norm
                         sum_hq_a = 0.0
                         sum_hq_b = 0.0
@@ -1992,8 +2170,12 @@ def gdn_verify_kernel_mtp_inline(
                             r_g = r_g_arr[i_t + 1]
                             r_beta = r_beta_arr[i_t + 1]
 
-                    # Write final state back for ALL 4 rows (if not disabled)
-                    if cutlass.const_expr(not disable_state_update):
+                    # Write final state back for ALL 4 rows (if not disabled).
+                    # Skipped under FLA mode (same_pool only): per-token scatter
+                    # at i_t=T-1 already wrote h_T to ssm_state_indices[i, T-1].
+                    if cutlass.const_expr(
+                        not disable_state_update and not per_token_pool_scatter
+                    ):
                         h_tile_out_a = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
@@ -2173,6 +2355,30 @@ def gdn_verify_kernel_mtp_inline(
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
+                        # FLA-style per-token pool scatter (inline ilp_rows=2).
+                        if cutlass.const_expr(per_token_pool_scatter):
+                            pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
+                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
+                            # (65,536 bytes). Element multiply overflows Int32 at
+                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
+                            # T=8 the max is 73,727 — well over. Matches the
+                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
+                            # used by reads (PR #3230). Zero reg cost: compiler
+                            # emits mad.wide.u32.
+                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
+                            fla_t_a = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
+                            fla_t_b = cute.local_tile(
+                                h0_source,
+                                (1, 1, vec_size),
+                                (fla_idx, v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
+
                         # h@q reduction
                         for offset in [16, 8, 4, 2, 1]:
                             sum_hq_a += cute.arch.shuffle_sync_bfly(
@@ -2200,8 +2406,12 @@ def gdn_verify_kernel_mtp_inline(
                                     sum_hq_b
                                 )
 
-                    # Write final state back
-                    if cutlass.const_expr(not disable_state_update):
+                    # Write final state back. Skipped under FLA mode
+                    # (same_pool only): per-token scatter at i_t=T-1 already
+                    # wrote h_T to ssm_state_indices[i, T-1].
+                    if cutlass.const_expr(
+                        not disable_state_update and not per_token_pool_scatter
+                    ):
                         h_tile_out_a = cute.local_tile(
                             h0_source,
                             (1, 1, vec_size),
@@ -2241,11 +2451,11 @@ def run_gdn_verify_kernel_mtp_inline(
     o: cute.Tensor,
     h0_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
+    ssm_state_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -2260,6 +2470,7 @@ def run_gdn_verify_kernel_mtp_inline(
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
+    per_token_pool_scatter: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     _, v_dim, _ = (
@@ -2271,7 +2482,7 @@ def run_gdn_verify_kernel_mtp_inline(
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
 
     # Grid: (B * HV * num_v_tiles, 1, 1) - parallelize across V dimension
-    grid_size = B * HV * num_v_tiles
+    grid_size = q.shape[0] * HV * num_v_tiles
 
     # v10: No sQ/sK/sG/sBeta — only sVdata + sOutput
     smem_bytes = (
@@ -2296,11 +2507,11 @@ def run_gdn_verify_kernel_mtp_inline(
         o,
         h0_indices,
         cu_seqlens,
+        ssm_state_indices,
         softplus_beta,
         softplus_threshold,
         scale,
         HV,
-        B,
         T,
         H,
         K,
@@ -2313,6 +2524,7 @@ def run_gdn_verify_kernel_mtp_inline(
         ilp_rows,
         use_smem_v,
         use_packed_fma,
+        per_token_pool_scatter,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -2323,13 +2535,11 @@ def run_gdn_verify_kernel_mtp_inline(
 
 @functools.cache
 def _get_compiled_mtp_kernel(
-    B: int,
     T: int,
     H: int,
     HV: int,
     K: int,
     V: int,
-    pool_size: int,
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
@@ -2340,6 +2550,7 @@ def _get_compiled_mtp_kernel(
     ilp_rows: int = 4,
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
+    per_token_pool_scatter: bool = False,
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2347,13 +2558,11 @@ def _get_compiled_mtp_kernel(
 
 @functools.cache
 def _get_compiled_mtp_kernel_inline(
-    B: int,
     T: int,
     H: int,
     HV: int,
     K: int,
     V: int,
-    pool_size: int,
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
@@ -2364,6 +2573,7 @@ def _get_compiled_mtp_kernel_inline(
     ilp_rows: int = 4,
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
+    per_token_pool_scatter: bool = False,
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -2395,6 +2605,7 @@ def run_mtp_decode(
     use_qk_l2norm: bool,
     disable_state_update: bool,
     cache_intermediate_states: bool,
+    ssm_state_indices: Optional[torch.Tensor] = None,
 ):
     """Execute the appropriate MTP kernel based on batch size.
 
@@ -2430,68 +2641,92 @@ def run_mtp_decode(
     major, _ = torch.cuda.get_device_capability(q.device)
     use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
 
+    per_token_pool_scatter = ssm_state_indices is not None
+    cache_key = (
+        T,
+        H,
+        HV,
+        K,
+        V,
+        cache_steps,
+        disable_state_update,
+        cache_intermediate_states,
+        scale,
+        use_qk_l2norm,
+        tile_v,
+        vec_size,
+        ilp_rows,
+        use_smem_v,
+        use_packed_fma,
+        per_token_pool_scatter,
+    )
     if use_inline_kernel:
-        inline_cache_key = (
-            B,
-            T,
-            H,
-            HV,
-            K,
-            V,
-            pool_size,
-            cache_steps,
-            disable_state_update,
-            cache_intermediate_states,
-            scale,
-            use_qk_l2norm,
-            tile_v,
-            vec_size,
-            ilp_rows,
-            use_smem_v,
-            use_packed_fma,
-        )
-        cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
+        cache = _get_compiled_mtp_kernel_inline(*cache_key)
     else:
-        warp_cache_key = (
-            B,
-            T,
-            H,
-            HV,
-            K,
-            V,
-            pool_size,
-            cache_steps,
-            disable_state_update,
-            cache_intermediate_states,
-            scale,
-            use_qk_l2norm,
-            tile_v,
-            vec_size,
-            ilp_rows,
-            use_smem_v,
-            use_packed_fma,
-        )
-        cache = _get_compiled_mtp_kernel(*warp_cache_key)
+        cache = _get_compiled_mtp_kernel(*cache_key)
 
-    if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
-        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    cu_seqlens = cache["cu_seqlens"]
+    cu_seqlens_map = cache.setdefault("cu_seqlens", {})
+    cu_key = (B, q.device)
+    if cu_key not in cu_seqlens_map:
+        cu_seqlens_map[cu_key] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    cu_seqlens = cu_seqlens_map[cu_key]
+
+    # FLA-style per-token scatter destinations. The kernel never reads this when
+    # per_token_pool_scatter=False (constexpr-gated); the dummy exists so
+    # cute.compile sees a typed tensor of the right shape.
+    if "default_ssm_state_indices" not in cache:
+        cache["default_ssm_state_indices"] = torch.zeros(
+            B, T, dtype=torch.int32, device=q.device
+        )
+    ssm_state_indices_arg = (
+        ssm_state_indices
+        if ssm_state_indices is not None
+        else cache["default_ssm_state_indices"]
+    )
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        h0_source_tensor = from_dlpack(
+            h0_source, assumed_align=16
+        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
+        if cache_intermediate_states:
+            # Caching-off dummy ([1,1,1]) is never read; skip marking it.
+            intermediate_states_tensor = (
+                intermediate_states_tensor.mark_compact_shape_dynamic(
+                    mode=0, stride_order=(0, 1, 2), divisibility=1
+                )
+            )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16)
+        a_tensor = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16)
-        k_tensor = from_dlpack(k, assumed_align=16)
-        v_tensor = from_dlpack(v, assumed_align=16)
-        b_tensor = from_dlpack(b, assumed_align=16)
-        o_tensor = from_dlpack(output, assumed_align=16)
-        h0_indices_tensor = from_dlpack(initial_state_indices, assumed_align=16)
-        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        q_tensor = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        k_tensor = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        v_tensor = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        b_tensor = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2), divisibility=1
+        )
+        o_tensor = from_dlpack(output, assumed_align=16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
+        )
+        h0_indices_tensor = from_dlpack(
+            initial_state_indices, assumed_align=16
+        ).mark_layout_dynamic()
+        cu_seqlens_tensor = from_dlpack(
+            cu_seqlens, assumed_align=16
+        ).mark_layout_dynamic()
+        ssm_idx_tensor = from_dlpack(
+            ssm_state_indices_arg, assumed_align=16
+        ).mark_layout_dynamic()
 
         if use_inline_kernel:
             compiled = cute.compile(
@@ -2508,11 +2743,11 @@ def run_mtp_decode(
                 o_tensor,
                 h0_indices_tensor,
                 cu_seqlens_tensor,
+                ssm_idx_tensor,
                 softplus_beta=1.0,
                 softplus_threshold=20.0,
                 scale=scale,
                 HV=HV,
-                B=B,
                 T=T,
                 H=H,
                 K=K,
@@ -2527,6 +2762,7 @@ def run_mtp_decode(
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
                 use_packed_fma=use_packed_fma,
+                per_token_pool_scatter=per_token_pool_scatter,
                 stream=stream,
                 options="--enable-tvm-ffi --generate-line-info",
             )
@@ -2545,11 +2781,11 @@ def run_mtp_decode(
                 o_tensor,
                 h0_indices_tensor,
                 cu_seqlens_tensor,
+                ssm_idx_tensor,
                 softplus_beta=1.0,
                 softplus_threshold=20.0,
                 scale=scale,
                 HV=HV,
-                B=B,
                 T=T,
                 H=H,
                 K=K,
@@ -2564,6 +2800,7 @@ def run_mtp_decode(
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
                 use_packed_fma=use_packed_fma,
+                per_token_pool_scatter=per_token_pool_scatter,
                 stream=stream,
                 options="--enable-tvm-ffi --generate-line-info",
             )
@@ -2585,5 +2822,6 @@ def run_mtp_decode(
         output,
         initial_state_indices,
         cu_seqlens,
+        ssm_state_indices_arg,
         stream,
     )

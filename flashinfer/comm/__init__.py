@@ -75,5 +75,10 @@ from .dcp_alltoall import decode_cp_a2a_workspace_size as decode_cp_a2a_workspac
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 
-# AllGatherMatmul
-from .all_gather_matmul import all_gather_matmul as all_gather_matmul
+
+def __getattr__(name: str):
+    if name == "all_gather_matmul":
+        from .all_gather_matmul import all_gather_matmul
+
+        return all_gather_matmul
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
