@@ -151,16 +151,25 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
   float* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
   auto* z_slot = smem.z + tile_buf * SmemT::Z_ELEMS;
 
-  int const tid = warp * warpSize + lane;
-  // Warp-balanced per-head loads (both load on BOTH paths).  old_x is loaded CTA-wide and
-  // self-limits to its row count (load_tile_async_cta guards tid ≥ ROWS·8): 8 rows → W0-1,
-  // 16 rows → all warps.  z then rides the warps old_x leaves idle: when BOTH old_x (8 rows)
-  // and z (8 rows) fit 64 threads, put z on W2-3 so the two loads issue in parallel (1 pass
-  // each, all 4 warps busy) instead of the old W0-only old_x / W3-only z (32 lanes, 2 passes).
-  // If either tensor needs >64 threads (max_window=16 or NPREDICTED>8), z shares W0-1 (W-base 0,
-  // self-limited) — still correct, just less parallel.  Bank-conflict-free contract unchanged.
-  load_tile_async_cta<OxShape, MAX_WINDOW>(old_x_slot, old_x_ptr + ox_base,
-                                           params.old_x_stride_token, /*tid=*/tid);
+  // Per-head load distribution: one tensor per warp, each a single-warp (conflict-free)
+  // load_tile_async.  old_x is the variable / largest small tensor (up to max_window rows), so
+  // it gets two warps; x and z (each seq_len valid rows) get one each:
+  //   W0 → old_x[0:8]   W1 → old_x[8:16]   W2 → x (load_x)   W3 → z
+  // old_x is PREDICATED to prev_k (PNAT): prev_k=0 loads nothing, high PNAT fills both halves —
+  // its DRAM scales with the window occupancy instead of always reading max_window rows.  The
+  // split is at row 8 = the Swizzle<3,3,3> period, so the upper sub-tile's addresses match
+  // rows 8-15 of the full layout exactly.  W1's half ZFILLs when prev_k≤8 (cheap), and at
+  // max_window=8 (no upper half) W1 is idle — accepted, not generalized per combination.
+  using OxHalfShape = cute::Shape<cute::Int<8>, cute::Int<D_PER_CTA>>;
+  if (warp == 0)
+    load_tile_async<OxHalfShape, /*VALID_ROWS=*/8>(old_x_slot, old_x_ptr + ox_base,
+                                                   params.old_x_stride_token, lane,
+                                                   /*valid_rows_rt=*/prev_k);
+  if constexpr (MAX_WINDOW_PAD_MMA_K > 8)
+    if (warp == 1)
+      load_tile_async<OxHalfShape, /*VALID_ROWS=*/8>(
+          old_x_slot + 8 * SmemT::D_SMEM_COLS, old_x_ptr + ox_base + 8 * params.old_x_stride_token,
+          params.old_x_stride_token, lane, /*valid_rows_rt=*/prev_k - 8);
   if (must_checkpoint) {
     if constexpr (IS_FIRST)
       if (warp == 1)
@@ -176,15 +185,10 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
                             (int64_t)head * params.old_cumAdt_stride_head;
     old_cumAdt_slot[prev_k - 1] = oca_ptr[ca_base + prev_k - 1];  // tail for β only
   }
-  if (z_ptr) {
+  if (warp == 3 && z_ptr) {
     int64_t const z_base = outer * params.z_stride_seq + (int64_t)head * DIM + d_tile_off;
-    // z on W2-3 only when old_x and z each fit a warp pair (≤8 rows = 64 threads); else W0-3.
-    constexpr int kZWarpBase =
-        (SmemT::MAX_WINDOW_PAD_MMA_K <= 8 && SmemT::NPREDICTED_SWIZZLE_R <= 8) ? 2 : 0;
-    if (warp >= kZWarpBase)
-      load_tile_async_cta<ZShape, NPREDICTED>(z_slot, z_ptr + z_base, params.z_stride_token,
-                                              /*tid=*/(warp - kZWarpBase) * warpSize + lane,
-                                              seq_len);
+    load_tile_async<ZShape, NPREDICTED>(z_slot, z_ptr + z_base, params.z_stride_token, lane,
+                                        seq_len);
   }
   // NO commit/wait/syncwarp — head_loop drains (see header).
 }
@@ -212,10 +216,9 @@ __device__ __forceinline__ void prefetch_state(SmemT& smem, CheckpointingSsuPara
 
 // load_x: loads x (and C for IS_FIRST) from gmem → smem slot tile_buf.  ISSUE ONLY —
 // no __pipeline_commit / wait / syncwarp.  head_loop owns the whole cp.async pipeline.
-// C is per-GROUP (W1, IS_FIRST only); x is per-HEAD and loaded CTA-WIDE (all 128 threads).
-// x was previously warp-0-only, which left warps 1-3 idle at the next barrier waiting on
-// warp 0's 4-pass load; the CTA-wide load balances it (16 rows = 4 warps × 4 rows, ONE pass)
-// so all warps reach the x-fence together — cuts the barrier stall, no extra smem.
+// Per-head load distribution (see load_head): C per-GROUP on W1 (IS_FIRST only); x per-HEAD on
+// W2, single-warp (conflict-free).  old_x (W0-1) and z (W3) load in parallel — all 4 warps busy
+// without the CTA-wide multi-warp writes that caused the d_split=2 LDGSTS bank conflict.
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, bool IS_FIRST,
           typename SmemT>
 __device__ __forceinline__ void load_x(SmemT& smem, CheckpointingSsuParams const& params, int lane,
@@ -233,11 +236,11 @@ __device__ __forceinline__ void load_x(SmemT& smem, CheckpointingSsuParams const
     if (warp == 1)
       load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane,
                                           seq_len);
-  // x is per-HEAD → every head, CTA-wide across all 128 threads (tid-based).
+  // x is per-HEAD → every head, single-warp on W2 (W0-1 carry old_x, W3 carries z).
   auto* x_slot = smem.x + tile_buf * SmemT::X_ELEMS;
-  int const tid = warp * warpSize + lane;
-  load_tile_async_cta<XShape, NPREDICTED>(x_slot, x_ptr + x_base, params.x_stride_token, tid,
-                                          seq_len);
+  if (warp == 2)
+    load_tile_async<XShape, NPREDICTED>(x_slot, x_ptr + x_base, params.x_stride_token, lane,
+                                        seq_len);
   // NOTE: NO commit/wait — head_loop owns the pipeline.
 }
 
