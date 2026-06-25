@@ -1492,7 +1492,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
       } else {
         // Under current trtllm_get_valid_moe_configs() dispatch rules, this else-path is
-        // reached only by FP8 block-scale MXFP8 (dtype_act=dtype_weights=MxE4m3).
+        // reached by FP8 block-scale MXFP8 (dtype_act=dtype_weights=MxE4m3) and by
+        // DeepSeek FP8 with a gemm1 bias (BiasType::Mn).
         moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
             dtype_act,                                              // dtypeAct
             dtype_weights,                                          // dtypeWeights
