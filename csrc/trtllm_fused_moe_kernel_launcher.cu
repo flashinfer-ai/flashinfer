@@ -528,8 +528,7 @@ class FusedMoeLauncher {
     // path and numerics. DSFp8 + biasMn routes through the unified constructor below
     // (which accepts gemm1_bias_type).
     if (this->mDtypeAct == btg::Dtype::E4m3 && this->mDtypeWeights == btg::Dtype::E4m3 &&
-        args->mUseDeepSeekFp8 &&
-        args->gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
+        args->mUseDeepSeekFp8 && args->gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
       moe_runner = std::make_unique<RunnerType>(this->mDtypeWeights, args->mUseDeepSeekFp8,
                                                 (int32_t)tile_tokens_dim, this->use_shuffled_weight,
                                                 this->weight_layout, usePerTokenScalingGemm1,
@@ -1456,9 +1455,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       // For DSFp8, gemm1_output is the pre-activation FC1 output (shape [M, 2*I])
       // and the post-activation tensor lives in activation_output (shape [M, I]).
       // MxFp8 fuses SwiGLU into FC1 so gemm1_output IS already post-activation.
-      result.push_back(quantization_type == Fp8QuantizationType::DeepSeekFp8
-                           ? activation_output
-                           : gemm1_output);
+      result.push_back(quantization_type == Fp8QuantizationType::DeepSeekFp8 ? activation_output
+                                                                             : gemm1_output);
     }
     return result;
   }
