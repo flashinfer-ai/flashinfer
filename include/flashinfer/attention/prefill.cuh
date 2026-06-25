@@ -577,7 +577,13 @@ __device__ __forceinline__ void page_produce_kv_sf(
               sf_ptr[page_head_base + static_cast<size_t>(swz_entry) * sf_stride_n + swz_sd];
         }
       }
-      *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
+      // NUM_SF_ITERS is rounded up, so the last iter has lanes with
+      // flat_byte >= SF_TOTAL_BYTES. Unlike the predicated cp_async store below,
+      // this write is unconditional, so guard it on the buffer bound (not in_bounds,
+      // which would also skip the intended zero-fill of in-buffer padding rows).
+      if (flat_byte < SF_TOTAL_BYTES) {
+        *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
+      }
     } else {
       const size_t sf_gmem_offset = page_head_base + entry_idx * sf_stride_n + sf_smem_col;
       constexpr auto fill_mode =
@@ -661,7 +667,10 @@ __device__ __forceinline__ void init_rope_freq(float (*rope_freq)[4], const floa
   constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
   const uint32_t lane_idx = tid_x;
 #pragma unroll
-  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO / 2; ++mma_d) {
+  // rope_freq is sized [NUM_MMA_D_QK/2][4] and the rotary appliers index it up to
+  // NUM_MMA_D_QK/2; for asymmetric QK/VO (e.g. qk=512, vo=256) NUM_MMA_D_VO/2 would
+  // leave the upper half of the table uninitialized, so bound on QK.
+  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_QK / 2; ++mma_d) {
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
       rope_freq[mma_d][j] =
@@ -2101,7 +2110,11 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                    : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
         (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                        sizeof(DTypeQ))
-                    : 0u);
+                    : 0u) +
+        // NVFP4 K/V scale-factor smem (k_sf_smem + v_sf_smem) also scales with
+        // CTA_TILE_KV (= NUM_MMA_KV*16); count it so the occupancy budget doesn't
+        // over-select a tile whose SharedStorage then exceeds the smem limit.
+        (is_fp4_type_v<DTypeKV> ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 / NVFP4_SF_VEC_SIZE) : 0u);
     // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
     // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0); size the
     // occupancy budget against the minimum *valid* tile so the staging buffer
@@ -3518,7 +3531,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                  : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
-                  : 0u);
+                  : 0u) +
+      // NVFP4 K/V scale-factor smem (k_sf_smem + v_sf_smem) also scales with
+      // CTA_TILE_KV (= NUM_MMA_KV*16); count it so the occupancy budget doesn't
+      // over-select a tile whose SharedStorage then exceeds the smem limit.
+      (is_fp4_type_v<DTypeKV> ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 / NVFP4_SF_VEC_SIZE) : 0u);
   // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
   // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0). When the
   // staging buffer shrinks the tile on tight-smem parts (e.g. SM120), we must
@@ -3707,7 +3724,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u) +
-      (kVOSplitDispatch ? (CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ)) : 0u);
+      (kVOSplitDispatch ? (CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ)) : 0u) +
+      // NVFP4 K/V scale-factor smem (k_sf_smem + v_sf_smem) also scales with
+      // CTA_TILE_KV (= NUM_MMA_KV*16); count it so the occupancy budget doesn't
+      // over-select a tile whose SharedStorage then exceeds the smem limit.
+      (is_fp4_type_v<DTypeKV> ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 / NVFP4_SF_VEC_SIZE) : 0u);
   // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
   // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0). When the
   // staging buffer shrinks the tile on tight-smem parts (e.g. SM120), we must
