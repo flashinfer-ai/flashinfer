@@ -37,6 +37,7 @@ from .utils import (
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    get_compute_capability,
     is_float8,
 )
 
@@ -63,6 +64,14 @@ def _bsr_to_vsa_index(
     """
     indptr_cpu = indptr.cpu()
     indices_cpu = indices.cpu().to(torch.int32)
+
+    if indices_cpu.numel() and (
+        int(indices_cpu.min()) < 0 or int(indices_cpu.max()) >= NB
+    ):
+        raise ValueError(
+            f"BSR indices out of range [0, {NB}): "
+            f"got min={int(indices_cpu.min())}, max={int(indices_cpu.max())}"
+        )
 
     q2k_index_flat = torch.full((MB, NB), -1, dtype=torch.int32)
     q2k_num_flat = (indptr_cpu[1:] - indptr_cpu[:-1]).to(torch.int32)
@@ -412,6 +421,12 @@ class BlockSparseAttentionWrapper:
         
         # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
         if self._backend == "vsa_blackwell":
+            cc = get_compute_capability(self.device)
+            if cc[0] < 10:
+                raise RuntimeError(
+                    f"vsa_blackwell backend requires SM100+ (Blackwell), "
+                    f"current device is SM{cc[0] * 10 + cc[1]}"
+                )
             # BSA blk128 kernel uses 128-token compute tiles; block index granularity = R = C = 128.
             if R != 128 or C != 128:
                 raise ValueError(
@@ -461,8 +476,12 @@ class BlockSparseAttentionWrapper:
 
             if block_mask is not None:
                 # Per-head block_mask: accept both (num_qo_heads, MB, NB) and (num_kv_heads, MB, NB).
-                # For GQA, reduce to num_kv_heads by taking the first QO head per KV-head group
-                # (sparsity must be uniform within each group when using pack_gqa).
+                # For GQA, reduce to num_kv_heads by taking the first QO head per KV-head group.
+                # WARNING: sparsity must be identical for all QO heads within the same KV-head group.
+                # Non-uniform masks across the group are silently ignored — only the first QO head's
+                # mask is used. This is a kernel limitation of pack_gqa (blk128 schedules one block
+                # index list per KV head); in true GQA VSA the compress stage produces per-QO-head
+                # scores that may differ within a group.
                 if block_mask.shape == (num_qo_heads, MB, NB) and num_qo_heads != num_kv_heads:
                     block_mask = block_mask[::qhead_per_kvhead]  # [num_kv_heads, MB, NB]
                 if block_mask.shape != (H_idx, MB, NB):
@@ -495,6 +514,12 @@ class BlockSparseAttentionWrapper:
 
         # ---- VSA Blackwell blk64 backend (BSA blk64 C++ kernel) ------------------
         if self._backend == "vsa_blackwell_blk64":
+            cc = get_compute_capability(self.device)
+            if cc[0] < 10:
+                raise RuntimeError(
+                    f"vsa_blackwell_blk64 backend requires SM100+ (Blackwell), "
+                    f"current device is SM{cc[0] * 10 + cc[1]}"
+                )
             # blk64 kernel uses 64-token compute tiles; block index granularity = R = C = 64.
             if R != 64 or C != 64:
                 raise ValueError(

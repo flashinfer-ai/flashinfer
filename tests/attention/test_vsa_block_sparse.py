@@ -425,6 +425,10 @@ _SWEEP_CONFIGS = [
 ]
 
 
+@pytest.mark.skipif(
+    not os.environ.get("FLASHINFER_TEST_PERF"),
+    reason="performance sweep, set FLASHINFER_TEST_PERF=1 to run",
+)
 @pytest.mark.parametrize("seqlen,topk_frac", _SWEEP_CONFIGS)
 def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
     """Accuracy: full fastvideo VSA (compress + select) vs full dense attention.
