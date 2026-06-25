@@ -102,7 +102,13 @@ def _sm12x_jit_target(options):
     import cuda.bindings.driver as cuda_driver
 
     if _has_option_value(options, cute.GPUArch, "sm_121a"):
-        return cuda_driver.CUjit_target.CU_TARGET_COMPUTE_121A
+        target = getattr(cuda_driver.CUjit_target, "CU_TARGET_COMPUTE_121A", None)
+        if target is None:
+            raise AttributeError(
+                "CU_TARGET_COMPUTE_121A is not defined in cuda.bindings.driver.CUjit_target. "
+                "Please upgrade your cuda-python package to a version that supports SM121 (CUDA 12.8+)."
+            )
+        return target
     return cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A
 
 
