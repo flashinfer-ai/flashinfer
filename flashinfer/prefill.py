@@ -1465,6 +1465,26 @@ def _compute_page_mask_indptr(
     return mask_indptr
 
 
+def _nvfp4_kv_requires_disabled_split_kv(kv_data_type: torch.dtype) -> bool:
+    """Whether split-KV must be disabled because the KV cache is NVFP4.
+
+    NVFP4 paged KV is stored as packed ``uint8`` (two E2M1 values per byte) with a
+    per-16-element FP8 block scale. Split-KV (flash-decoding) partitions the KV
+    range into chunks sized by ``kv_chunk_size``, which is *not* aligned to the
+    16-element scale blocks: a chunk boundary that lands mid-block — together with
+    the small per-split chunk tripping the 1-byte-KV ``NUM_MMA_KV`` tile floor —
+    corrupts the dequantized reads. The corruption only surfaces when a short query
+    attends a long KV (``qo_len << kv_len``), i.e. decode and prefix-cache *extend*,
+    so dense full-prefill tests miss it while prefix caching breaks. Until the FP4
+    split path is made scale-block-aware, disable split-KV for NVFP4 KV. FP8 KV has
+    no block scales and is unaffected.
+    """
+    if kv_data_type == torch.uint8:  # packed NVFP4 (the run path's convention)
+        return True
+    native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    return native_fp4 is not None and kv_data_type == native_fp4
+
+
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
     requests.
@@ -2157,6 +2177,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
+                if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
+                    kv_data_type
+                ):
+                    # NVFP4 split-KV corrupts prefix-cached / decode reads; force
+                    # it off. See _nvfp4_kv_requires_disabled_split_kv for why.
+                    disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
@@ -3281,6 +3307,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
+                if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
+                    kv_data_type
+                ):
+                    # NVFP4 split-KV corrupts prefix-cached / decode reads; force
+                    # it off. See _nvfp4_kv_requires_disabled_split_kv for why.
+                    disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
