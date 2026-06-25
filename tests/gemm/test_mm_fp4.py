@@ -114,7 +114,10 @@ def _test_mm_fp4(
 
 
 # TODO: Consdier splitting this function up for the various backends
-@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 48, 64, 128, 256, 512])
+@pytest.mark.parametrize(
+    "m",
+    [1, 2, 3, 4, 5, 7, 8, 9, 12, 13, 15, 16, 17, 20, 24, 31, 32, 48, 64, 128, 256, 512],
+)
 @pytest.mark.parametrize("n", [128, 256, 512])
 @pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
@@ -194,6 +197,39 @@ def test_mm_fp4_b12x_misaligned_k_raises():
             block_size=16,
             use_8x4_sf_layout=False,
             backend="b12x",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+
+def test_mm_fp4_cute_dsl_misaligned_n_raises():
+    device = torch.device("cuda")
+    if get_compute_capability(device)[0] != 10:
+        pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
+    m, n, k = 16, 130, 128  # n % 8 == 2
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    g_in = (448 * 6) / a.float().abs().nan_to_num().max()
+    g_w = (448 * 6) / b.float().abs().nan_to_num().max()
+    a_fp4, a_s = nvfp4_quantize(
+        a, g_in, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    b_fp4, b_s = nvfp4_quantize(
+        b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="N % 8 == 0"):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            1.0 / (g_in * g_w),
+            torch.bfloat16,
+            res,
+            block_size=16,
+            use_8x4_sf_layout=False,
+            backend="cute-dsl",
             use_nvfp4=True,
             skip_check=False,
         )
