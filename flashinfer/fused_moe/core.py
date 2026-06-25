@@ -3438,12 +3438,6 @@ def trtllm_fp8_block_scale_moe(
         gemm1_beta,
         gemm1_clamp_limit,
     )
-    output = _alloc_trtllm_moe_output(
-        hidden_states.shape[0],
-        hidden_states.shape[1],
-        do_finalize,
-        hidden_states.device,
-    )
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         routing_logits,
         None,  # topk_ids - will be computed from routing_logits
@@ -3459,7 +3453,7 @@ def trtllm_fp8_block_scale_moe(
         gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
-        output,
+        None,  # output, allocated inside op
         num_experts,
         top_k,
         n_group,
