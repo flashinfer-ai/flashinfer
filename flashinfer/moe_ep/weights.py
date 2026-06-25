@@ -18,9 +18,14 @@ import torch
 class MoEWeightPack:
     """Per-rank expert weights in canonical logical layout.
 
-    ``w13`` — gate+up projection ``[local_experts, 2*intermediate, hidden]``.
-    ``w2``  — down projection ``[local_experts, hidden, intermediate]``.
-    Optional scale tensors support quantized mega kernels.
+    ``w13`` — gate+up projection ``[local_experts, 2*intermediate, hidden]`` in
+    bf16, or ``[..., hidden // 2]`` fp4 (``torch.int8`` / ``torch.uint8``) when
+    ``w13_scale`` is supplied for mega kernels.
+    ``w2``  — down projection ``[local_experts, hidden, intermediate]`` in bf16,
+    or ``[..., intermediate // 2]`` fp4 when ``w2_scale`` is supplied.
+    ``w13_scale`` / ``w2_scale`` — optional block scale factors. Mega DeepGEMM
+    kernels expect ue8m0-packed ``torch.uint8`` scales with trailing dims
+    ``hidden // 32`` and ``intermediate // 32`` respectively.
     """
 
     w13: torch.Tensor

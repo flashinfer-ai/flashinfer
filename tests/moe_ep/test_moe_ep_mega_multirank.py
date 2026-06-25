@@ -5,6 +5,10 @@ Launched via torchrun:
 
 Requires Blackwell (sm_100+), >=4 GPUs, and the ``deep_gemm`` package with
 ``fp8_fp4_mega_moe`` support.
+
+Weights: loaded fp4 ``int8`` weights plus raw fp32 block-32 scales are wrapped
+in ``MoEWeightPack`` with no external ``transform_sf_into_required_layout``;
+FlashInfer preprocesses them when ``preprocess_weights=True``.
 """
 
 from __future__ import annotations
@@ -57,17 +61,21 @@ def _make_inputs(
     )
 
 
-def _make_bf16_weights(
+def _make_moe_weight_pack(
     rank: int,
     *,
     num_local_experts: int,
     hidden: int,
     intermediate: int,
 ):
+    """Loaded fp4 weights + fp32 block scales (no SF layout transform)."""
     import torch
+    from deep_gemm.utils import per_token_cast_to_fp4
+
+    from flashinfer.moe_ep import MoEWeightPack
 
     g = torch.Generator(device="cuda").manual_seed(13 + rank)
-    w13 = torch.randn(
+    w13_bf16 = torch.randn(
         num_local_experts,
         2 * intermediate,
         hidden,
@@ -75,7 +83,7 @@ def _make_bf16_weights(
         device="cuda",
         generator=g,
     )
-    w2 = torch.randn(
+    w2_bf16 = torch.randn(
         num_local_experts,
         hidden,
         intermediate,
@@ -83,7 +91,55 @@ def _make_bf16_weights(
         device="cuda",
         generator=g,
     )
-    return w13, w2
+
+    # Loaded checkpoint layout: fp4-packed int8 weights [E, N, K//2].
+    w13 = torch.empty(
+        num_local_experts,
+        2 * intermediate,
+        hidden // 2,
+        dtype=torch.int8,
+        device="cuda",
+    )
+    w2 = torch.empty(
+        num_local_experts,
+        hidden,
+        intermediate // 2,
+        dtype=torch.int8,
+        device="cuda",
+    )
+    # Raw fp32 block-32 scales — same role as w13_weight_scale_inv / w2_weight_scale_inv.
+    w13_sf_fp32 = torch.empty(
+        num_local_experts,
+        2 * intermediate,
+        hidden // 32,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    w2_sf_fp32 = torch.empty(
+        num_local_experts,
+        hidden,
+        intermediate // 32,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    for expert in range(num_local_experts):
+        w13_q, w13_sf = per_token_cast_to_fp4(
+            w13_bf16[expert], use_ue8m0=True, gran_k=32
+        )
+        w2_q, w2_sf = per_token_cast_to_fp4(
+            w2_bf16[expert], use_ue8m0=True, gran_k=32
+        )
+        w13[expert].copy_(w13_q)
+        w2[expert].copy_(w2_q)
+        w13_sf_fp32[expert].copy_(w13_sf)
+        w2_sf_fp32[expert].copy_(w2_sf)
+
+    return MoEWeightPack(
+        w13=w13,
+        w2=w2,
+        w13_scale=w13_sf_fp32,
+        w2_scale=w2_sf_fp32,
+    )
 
 
 def _mega_problem(rank: int, world_size: int):
@@ -108,7 +164,7 @@ def _mega_problem(rank: int, world_size: int):
         num_experts=num_experts,
         topk=topk,
     )
-    w13, w2 = _make_bf16_weights(
+    weights = _make_moe_weight_pack(
         rank,
         num_local_experts=num_local_experts,
         hidden=hidden,
@@ -126,17 +182,18 @@ def _mega_problem(rank: int, world_size: int):
         hidden_states=hidden_states,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        w13=w13,
-        w2=w2,
+        weights=weights,
     )
 
 
-def _reference_mega_moe_staged(group, problem: dict, *, destroy_buffer: bool = True):
-    """Reference with bf16 activations staged inside the symm buffer."""
+def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
+    """Reference deep_gemm mega-MoE path for correctness checks."""
     import torch
 
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import stage_mega_moe_inputs
-    from flashinfer.moe_ep import MoEWeightPack, preprocess_mega_weights
+    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep import preprocess_mega_weights
 
     symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
@@ -157,9 +214,8 @@ def _reference_mega_moe_staged(group, problem: dict, *, destroy_buffer: bool = T
         symm_buffer.topk_weights[:num_tokens],
     )
 
-    pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     transformed_l1, transformed_l2 = preprocess_mega_weights(
-        pack,
+        problem["weights"],
         intermediate_size=problem["intermediate"],
         hidden_size=problem["hidden"],
     )
@@ -181,53 +237,7 @@ def _reference_mega_moe_staged(group, problem: dict, *, destroy_buffer: bool = T
     return y
 
 
-def _reference_mega_moe_prestaged(
-    group, problem: dict, x_fp8, x_sf, *, destroy_buffer: bool = True
-):
-    """Reference with caller-supplied fp8 activations + packed scales."""
-    import torch
-
-    from flashinfer.moe_ep import MoEWeightPack, preprocess_mega_weights
-
-    symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-        group,
-        problem["num_experts"],
-        problem["max_tokens"],
-        problem["topk"],
-        problem["hidden"],
-        problem["intermediate"],
-    )
-    num_tokens = problem["num_tokens"]
-    symm_buffer.x[:num_tokens].copy_(x_fp8)
-    symm_buffer.x_sf[:num_tokens].copy_(x_sf)
-    symm_buffer.topk_idx[:num_tokens].copy_(problem["topk_ids"])
-    symm_buffer.topk_weights[:num_tokens].copy_(problem["topk_weights"])
-
-    pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
-    transformed_l1, transformed_l2 = preprocess_mega_weights(
-        pack,
-        intermediate_size=problem["intermediate"],
-        hidden_size=problem["hidden"],
-    )
-
-    y = torch.empty(
-        num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-    )
-    deep_gemm.fp8_fp4_mega_moe(
-        y,
-        transformed_l1,
-        transformed_l2,
-        symm_buffer,
-        activation_clamp=problem["activation_clamp"],
-        fast_math=problem["fast_math"],
-    )
-    torch.cuda.synchronize()
-    if destroy_buffer:
-        symm_buffer.destroy()
-    return y
-
-
-def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
+def _run_mega_layer(rank, world_size):
     import torch
     import torch.distributed as dist
 
@@ -239,7 +249,6 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
         MoEEpLayer,
         MoEEpMegaLayer,
         MoEEpTensors,
-        MoEWeightPack,
         ensure_moe_ep_cuda_device,
     )
 
@@ -247,28 +256,16 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
     ensure_moe_ep_cuda_device(bootstrap)
 
     problem = _mega_problem(rank, world_size)
-    if stage_inputs:
-        t_hidden = problem["hidden_states"]
-        t_scales = None
-    else:
-        from deep_gemm.utils import per_token_cast_to_fp8
+    weights = problem["weights"]
 
-        x_fp8, x_sf = per_token_cast_to_fp8(
-            problem["hidden_states"],
-            use_ue8m0=True,
-            gran_k=32,
-            use_packed_ue8m0=True,
-        )
-        t_hidden = x_fp8
-        t_scales = x_sf
-
+    # Pass loaded fp4 + fp32 scales directly; transform_sf runs in preprocess.
     mega = MoEEpLayer(
         bootstrap=bootstrap,
         fleet_params=FleetParams(
             num_experts=problem["num_experts"],
             max_tokens_per_rank=problem["max_tokens"],
             token_hidden_size=problem["hidden"],
-            weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+            weights=weights,
         ),
         backend=MegaConfig(
             megakernel=DeepGemmMegaMoeConfig(
@@ -277,30 +274,22 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
                 activation_clamp=problem["activation_clamp"],
                 fast_math=problem["fast_math"],
             ),
-            stage_inputs=stage_inputs,
+            stage_inputs=True,
             preprocess_weights=True,
         ),
     )
     assert isinstance(mega, MoEEpMegaLayer)
 
     t = MoEEpTensors(
-        hidden_states=t_hidden,
+        hidden_states=problem["hidden_states"],
         topk_ids=problem["topk_ids"],
         topk_weights=problem["topk_weights"],
-        scales=t_scales,
     )
     y_layer = mega.forward(t)
     torch.cuda.synchronize()
     dist.barrier()
 
-    if stage_inputs:
-        y_ref = _reference_mega_moe_staged(
-            dist.group.WORLD, problem, destroy_buffer=True
-        )
-    else:
-        y_ref = _reference_mega_moe_prestaged(
-            dist.group.WORLD, problem, t_hidden, t_scales, destroy_buffer=True
-        )
+    y_ref = _reference_mega_moe(dist.group.WORLD, problem, destroy_buffer=True)
     dist.barrier()
 
     assert y_layer.shape == (problem["num_tokens"], problem["hidden"])
@@ -314,22 +303,10 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_mega_layer_matches_deep_gemm_reference():
-    """MoEEpMegaLayer with on-the-fly bf16→fp8 staging."""
+    """MoEEpMegaLayer matches the deep_gemm mega-MoE reference."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
-    rank = _run_mega_layer(rank, world_size, stage_inputs=True)
-    print(f"rank {rank}: mega layer (staged inputs) matches deep_gemm reference")
-
-
-@pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
-def test_moe_ep_mega_layer_prestaged_inputs_matches_reference():
-    """MoEEpMegaLayer with pre-staged fp8 activations (stage_inputs=False)."""
-    _require_cuda()
-    rank, world_size = _launcher_ranks()
-    if world_size < 4:
-        pytest.skip("needs >=4 ranks")
-    rank = _run_mega_layer(rank, world_size, stage_inputs=False)
-    print(f"rank {rank}: mega layer (prestaged inputs) matches deep_gemm reference")
+    rank = _run_mega_layer(rank, world_size)
+    print(f"rank {rank}: mega layer matches deep_gemm reference")
