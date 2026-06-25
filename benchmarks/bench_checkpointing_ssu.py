@@ -1899,10 +1899,14 @@ def _run_benchmark(args) -> None:
 
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
-            # Resolve prev_k fractions → clamped integers in [0, mtp_len]
+            # Resolve prev_k fractions → clamped integers in [0, max_window].
+            # prev_k is window OCCUPANCY (∈ [0, max_window]), not last-step acceptance, so the
+            # bound is max_window — this lets frac>1 reach the write path (prev_k+mtp_len>max_window)
+            # at the production window (e.g. mw=16 needs prev_k>10).  The kernel asserts the same
+            # [0, max_window] range; the mixed sweep already drives prev_k up to max_window.
             prev_ks = sorted(
                 set(
-                    min(mtp_len, max(0, round(f * mtp_len)))
+                    min(max_window, max(0, round(f * mtp_len)))
                     for f in args.prev_tokens_fracs
                 )
             )
