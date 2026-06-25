@@ -473,7 +473,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
 
 template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
           int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS,
-          bool MUST_CHECKPOINT, int MAIN_HEADS_PER_CTA, int PIPELINE_STAGES, typename SmemT>
+          bool MUST_CHECKPOINT, int MAIN_HEADS_PER_CTA, int PIPELINE_STAGES,
+          bool DO_GDC_WAIT = true, typename SmemT>
 __device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams const& params,
                                           int lane, int warp, int d_tile, int first_head,
                                           int group_idx, int seq, int64_t cache_slot, int buf_read,
@@ -545,13 +546,15 @@ __device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams co
         smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
         /*must_checkpoint=*/true, /*tile_buf=*/0);
   }
-  // Unconditional CTA barrier before gdc_wait: this is the fence for gdc visibility (all warps
-  // converge before the collective wait) and, on the write path, also publishes the replayed
-  // state.  Must run on BOTH paths — formerly the post-replay __syncthreads inside replay_head.
+  // Unconditional CTA barrier: publishes the prefetch-loaded (+ replayed, write path) state
+  // cross-warp before the output MMA reads it.  Must run on every work-unit (BOTH paths).
+  // (Also serves as the warp-convergence fence for the gdc_wait below, when it fires.)
   __syncthreads();
-  // ONE-SHOT PDL gdc_wait.  Once head 0 has waited, precompute is visible to the whole CTA;
-  // subsequent heads read cb_scaled / cumAdt_vec without re-waiting.
-  cudaGridDependencySynchronize();
+  // ONE-SHOT PDL gdc_wait — fires only on a CTA's FIRST work-unit (DO_GDC_WAIT).  Once any
+  // work-unit has waited, the precompute is done + globally visible, so subsequent grid-stride
+  // iterations read cb_scaled / cumAdt_vec without re-waiting.  gdc_wait is a no-op without a
+  // programmatic predecessor (non-PDL / T0).
+  if constexpr (DO_GDC_WAIT) cudaGridDependencySynchronize();
   // precompute output (cumAdt_vec, cb_scaled) is now globally visible.
   // Batch-load ALL MAIN_HEADS_PER_CTA heads' cumAdt at once.  MAX_WINDOW ≤ 16 floats/head;
   // we cover 2 heads per pass by using all 32 warp-0 lanes: lanes 0..15 → head hh,
@@ -773,75 +776,106 @@ __global__ __maxnreg__(64) void checkpointing_ssu_main_kernel(CheckpointingSsuPa
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
-  // ── Grid (D_SPLIT, batch, ngroups·ceil(HPG/MAIN_HEADS_PER_CTA)) ──
-  // grid.z packs (group, head-tile): each CTA owns MAIN_HEADS_PER_CTA CONSECUTIVE heads
-  // within ONE group, looped below so the per-group C / old_B load once and reuse across
-  // them.  At MAIN_HEADS_PER_CTA==1, HEAD_TILES==HPG and first_head==blockIdx.z (one head
-  // per CTA) — bit-identical to the old (D_SPLIT, batch, nheads) per-head grid.
+  // ── 1D grid-stride persistent loop over work-units ──
+  // Work-unit = (d_tile, seq, group, head_tile); a CTA processes MAIN_HEADS_PER_CTA heads per
+  // work-unit (head_tile).  The launcher sizes the grid to min(cta_per_sm·NUM_SMS, total_work):
+  // at the default (grid==total_work) each CTA runs exactly one work-unit → bit-identical to the
+  // old 3D per-work-unit launch; with fewer CTAs each grid-strides over several, leaving SM room
+  // to co-reside with conv1d (the precompute) and keeping per-group C/old_B L2-hot.
+  // Flatten head_tile-fastest, then group, seq, d_tile → consecutive work-units are consecutive
+  // head-tiles of one (d_tile, seq, group) (same C/old_B).
   static_assert(HEADS_PER_GROUP % MAIN_HEADS_PER_CTA == 0,
                 "MAIN_HEADS_PER_CTA must divide HEADS_PER_GROUP");
   constexpr int HEAD_TILES = HEADS_PER_GROUP / MAIN_HEADS_PER_CTA;
-  int const d_tile = blockIdx.x;
-  int const seq = blockIdx.y;
-  int group_idx, first_head;
-  if constexpr (MAIN_HEADS_PER_CTA == 1) {
-    // Degenerate head-tile (one head per CTA): first_head == blockIdx.z, exactly the old
-    // per-head grid.  Skip the div/mod/mul so the compiler addresses straight off %ctaid.z
-    // instead of materializing first_head/head_tile in registers.
-    first_head = blockIdx.z;
-    group_idx = blockIdx.z / HEADS_PER_GROUP;
-  } else {
-    group_idx = blockIdx.z / HEAD_TILES;
-    int const head_tile = blockIdx.z % HEAD_TILES;
-    first_head = group_idx * HEADS_PER_GROUP + head_tile * MAIN_HEADS_PER_CTA;
-  }
   int const lane = threadIdx.x;
   int const warp = threadIdx.y;
+  int const ngroups = (int)params.ngroups;
+  int const batch = (int)params.batch;
+  int const tiles_per_dseq = ngroups * HEAD_TILES;  // work-units per (d_tile, seq)
+  int const total_work = D_SPLIT * batch * tiles_per_dseq;
 
-  // ── Per-slot setup ──
-  auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
-  if (cache_slot == params.pad_slot_id) return;
-  auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
-  int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
-  auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
-  int const prev_k = prev_ptr[cache_slot];
+  // gdc_wait fires only on a CTA's FIRST work-unit that actually runs (skips pad slots); once any
+  // CTA work-unit has waited, the precompute is done + globally visible for the rest of the loop.
+  bool did_gdc = false;
 
-  int seq_len;
-  int64_t outer;
-  if constexpr (VARLEN) {
-    auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
-    int const bos = __ldg(&cu[seq]);
-    int const eos = __ldg(&cu[seq + 1]);
-    seq_len = eos - bos;
-    if (seq_len <= 0) return;
-    outer = (int64_t)bos;
-  } else {
-    seq_len = NPREDICTED;
-    outer = (int64_t)seq;
-  }
-  int64_t const out_seq_base = outer * params.out_stride_seq;
+  for (int tile = blockIdx.x; tile < total_work; tile += gridDim.x) {
+    // Unflatten head_tile-fastest.
+    int const head_tile = tile % HEAD_TILES;
+    int t1 = tile / HEAD_TILES;
+    int const group_idx = t1 % ngroups;
+    int t2 = t1 / ngroups;
+    int const seq = t2 % batch;
+    int const d_tile = t2 / batch;
+    int const first_head = group_idx * HEADS_PER_GROUP + head_tile * MAIN_HEADS_PER_CTA;
 
-  bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
-  int const write_offset = must_checkpoint ? 0 : prev_k;
+    // ── Per-slot setup ──
+    auto const* __restrict__ sbi =
+        reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
+    int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
+    if (cache_slot == params.pad_slot_id) continue;  // padded slot: skip (uniform across CTA)
+    auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
+    int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
+    auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
+    int const prev_k = prev_ptr[cache_slot];
 
-  if (must_checkpoint) {
-    head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-              PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, MAIN_HEADS_PER_CTA,
-              PIPELINE_STAGES>(smem, params, lane, warp, d_tile, first_head, group_idx, seq,
-                               cache_slot, buf_read, prev_k, outer, seq_len, out_seq_base,
-                               write_offset);
-  } else {
-    head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-              PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, MAIN_HEADS_PER_CTA,
-              PIPELINE_STAGES>(smem, params, lane, warp, d_tile, first_head, group_idx, seq,
-                               cache_slot, buf_read, prev_k, outer, seq_len, out_seq_base,
-                               write_offset);
+    int seq_len;
+    int64_t outer;
+    if constexpr (VARLEN) {
+      auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
+      int const bos = __ldg(&cu[seq]);
+      int const eos = __ldg(&cu[seq + 1]);
+      seq_len = eos - bos;
+      if (seq_len <= 0) continue;
+      outer = (int64_t)bos;
+    } else {
+      seq_len = NPREDICTED;
+      outer = (int64_t)seq;
+    }
+    int64_t const out_seq_base = outer * params.out_stride_seq;
+
+    bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
+    int const write_offset = must_checkpoint ? 0 : prev_k;
+    bool const do_gdc = !did_gdc;  // uniform across the CTA
+    did_gdc = true;
+
+    // Runtime do_gdc → compile-time DO_GDC_WAIT (gates the one-shot gdc_wait inside head_loop).
+    if (must_checkpoint) {
+      if (do_gdc)
+        head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, MAIN_HEADS_PER_CTA,
+                  PIPELINE_STAGES, /*DO_GDC_WAIT=*/true>(
+            smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read,
+            prev_k, outer, seq_len, out_seq_base, write_offset);
+      else
+        head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, MAIN_HEADS_PER_CTA,
+                  PIPELINE_STAGES, /*DO_GDC_WAIT=*/false>(
+            smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read,
+            prev_k, outer, seq_len, out_seq_base, write_offset);
+    } else {
+      if (do_gdc)
+        head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, MAIN_HEADS_PER_CTA,
+                  PIPELINE_STAGES, /*DO_GDC_WAIT=*/true>(
+            smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read,
+            prev_k, outer, seq_len, out_seq_base, write_offset);
+      else
+        head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, MAIN_HEADS_PER_CTA,
+                  PIPELINE_STAGES, /*DO_GDC_WAIT=*/false>(
+            smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read,
+            prev_k, outer, seq_len, out_seq_base, write_offset);
+    }
+
+    // Loop-boundary fence: this work-unit's output_head_2k / store_old_x reads of smem must finish
+    // before the next work-unit's prefetch_state / load_head / load_x overwrite the same buffers
+    // (single-buffered across work-units).  Only when a next iteration exists (uniform condition).
+    if (tile + (int)gridDim.x < total_work) __syncthreads();
   }
 
   // ── EXTERNAL PDL: signal a programmatic DOWNSTREAM kernel that `output` is fully written
-  // (ALL heads done; the per-head cache writes are next-step-only).  Gated by ENABLE_PDL.
-  // (The internal precompute→main chain uses the one-shot gdc_wait after head-0 replay.) ──
+  // (ALL work-units done; the per-head cache writes are next-step-only).  Gated by ENABLE_PDL.
+  // (The internal precompute→main chain uses the one-shot gdc_wait on the first work-unit.) ──
   if constexpr (ENABLE_PDL) {
     cudaTriggerProgrammaticLaunchCompletion();
   }

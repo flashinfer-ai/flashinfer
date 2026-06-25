@@ -196,101 +196,61 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
         });
       });
 
-      // Main: grid (D_SPLIT, batch, ngroups·ceil(HPG/MHC)).  Per-CTA smem is UNCHANGED
-      // from the monolithic — head-tiling reuses the same single buffers across the
-      // MHC heads, so occupancy is identical and only the CTA count drops (fewer waves).
-      // main_heads_per_cta — HOST knob (Python-tunable); 0 = auto-heuristic.
-      // dispatch_heads_per_cta snaps the resolved value to the HPG>>k chain and binds it to
-      // the MAIN_HEADS_PER_CTA template arg — it never reaches the kernel as a runtime value.
+      // ── Persistent main: 1D grid-stride loop over single-head work-units (MHC=1) ──
+      // The grid-stride loop SUBSUMES the old MAIN_HEADS_PER_CTA head-tiling (knob ditched).
+      // Launch min(cta_per_sm·NUM_SMS, total_work) CTAs; each grid-strides over work-units.
+      // Fewer CTAs leave SM room to co-reside with conv1d (closing the no-write gap to
+      // triton-replay-pm), and consecutive work-units (head_tile-fastest, see kernel) keep
+      // per-group C/old_B L2-hot.  Default cta_per_sm huge ⇒ grid == total_work ⇒ one
+      // work-unit/CTA ⇒ bit-identical to the old (D_SPLIT, batch, nheads) launch.
       //
-      // Heuristic (B300, 2026-06-25, DS=2, mixed batch, with conv1d):
-      //   batch < 512 → MHC=1: fewer main CTAs → each CTA does more work per wave; at small
-      //                         batch the GPU isn't full and adding heads just increases the
-      //                         CTA serial chain.
-      //   batch ≥ 512 → MHC=4: amortizes per-group C/old_B loads across 4 heads per CTA,
-      //                         cuts CTA count in half, reduces L2 pressure.
-      //                b=512: 75.55(MHC=1)→72.48(MHC=4)µs; b=1024: 145.3→130.9µs.
-      // Override precedence: explicit handle (>0) > env FLASHINFER_SSU_MAIN_HEADS_PER_CTA >
-      // heuristic.
-      {
-        int const mhc_env = [] {
-          char const* e = std::getenv("FLASHINFER_SSU_MAIN_HEADS_PER_CTA");
-          return e ? std::atoi(e) : 0;
-        }();
-        if (mhc_env > 0)
-          main_heads_per_cta = mhc_env;
-        else if (main_heads_per_cta == 0)
-          main_heads_per_cta = (params.batch >= 512) ? 4 : 1;
-      }
-      //
-      // D_SPLIT=2 knob: comes from params.d_split (Python-controlled).  Joint sweep
-      // (batch=16, B300, 2026-06-24) shows DS=2 saves 2.04µs vs DS=1 at HPC=8,NW=8,MHC=1
-      // (10.30 vs 12.34µs) by doubling main CTA count (256→512); D_PER_CTA shrinks from
-      // 128 to 64 (still ≥32, the output-MMA minimum).  MHC=2+ is always worse than MHC=1
-      // (fewer CTAs hurts bandwidth more than C-reuse helps at small batch); best config at
-      // small batch = MHC=1, DS=2; at large batch = MHC=4, DS=2.
-      //
-      // MAIN_NUM_WARPS=4.  The main is NUM_WARPS-generic (replay MMA M_WARPS×4, output MMA
-      // _1×NUM_WARPS, per-warp state load + store, 1x conv-input load), so 8 warps is fully
-      // plumbed and selectable — and it DOES double occupancy (b=32: occ 20%→38%, eligible
-      // 0.38→0.84, no-issue 73%→64%).  But the main isn't warp-hideable: its stalls are
-      // gmem-arrival / SRAM-feed bound (long+short scoreboard), not warp-starvation, so the
-      // extra occupancy buys nothing and the finer MMA tiling + publish barrier cost net time.
-      // Measured (cuda-incr-2k, end-to-end with conv1d), 4w beats 8w at every batch but b=8:
-      //   b=16 10.45 vs 11.01 | b=32 11.81 vs 12.26 | b=64 16.48 vs 18.05 | b=1024 134.3 vs 146.4.
-      // So ship 4; keep the 8-warp infra for a future feed-bound config.  (8 would need
-      // D_PER_CTA≥64 for the output's _1×NUM_WARPS tiling: N_TILE = NUM_WARPS·n8 must divide
-      // D_PER_CTA, so D_SPLIT≥2 (D_PER_CTA=32) would fall back to 4.  int8/fp8 → 8bit kernel.)
+      // MAIN_NUM_WARPS=4: the main is NUM_WARPS-generic but feed-bound (long/short scoreboard),
+      // not warp-hideable, so 8 warps buys nothing and costs finer MMA tiling + publish barriers.
+      (void)
+          main_heads_per_cta;  // MHC knob ditched — the main runs MHC=1 (kernel template default).
       constexpr int MAIN_NUM_WARPS = 4;
-      // PIPELINE_STAGES: cross-head STATE double-buffer (env knob; default 1 = no prefetch).
-      // Each extra stage adds a per-CTA state buffer (16 KB bf16) → fewer resident blocks/SM, so
-      // it's only worth it at small batch (launch-bound, not occupancy-bound) AND MHC>1 (needs
-      // ≥2 heads to pipeline).  Gated below so STAGES=2 is never instantiated at MHC=1.
-      int const main_pipeline_stages = [] {
-        char const* e = std::getenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES");
-        return e ? std::atoi(e) : 1;
+
+      static int const main_num_sms = [] {
+        int dev = 0, n = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n;
       }();
-      dispatch_heads_per_cta<HEADS_PER_GROUP>(main_heads_per_cta, [&]<int MHC>() {
-        auto launch_main = [&]<int PIPELINE_STAGES>() {
-          auto mfunc =
-              checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t,
-                                            stateIndex_t, state_scale_t, NPREDICTED, MAX_WINDOW,
-                                            DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS,
-                                            MAIN_NUM_WARPS, D_SPLIT, VARLEN, MHC, PIPELINE_STAGES>;
-          constexpr size_t msmem =
-              sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW,
-                                                 D_PER_CTA, DSTATE, PIPELINE_STAGES, MHC>);
-          if constexpr (msmem > 0) {
-            FLASHINFER_CUDA_CHECK(
-                cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
-          }
-          // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr hard-wired to 1,
-          // independent of ENABLE_PDL) — the split's mechanism, not a user knob.  Its gdc_wait
-          // (unconditional in the kernel body) blocks for the precompute before reading cb_scaled.
-          cudaLaunchAttribute main_attrs[1];
-          main_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-          main_attrs[0].val.programmaticStreamSerializationAllowed = 1;
-          cudaLaunchConfig_t mcfg;
-          // grid.z = ngroups·(HPG/MHC); MHC divides HPG (kernel static_assert), so the integer
-          // divide is the exact ceil.  Each CTA owns MHC consecutive heads in a group.
-          mcfg.gridDim = dim3(D_SPLIT, params.batch, params.ngroups * (HEADS_PER_GROUP / MHC));
-          mcfg.blockDim = dim3(warpSize, MAIN_NUM_WARPS);
-          mcfg.dynamicSmemBytes = msmem;
-          mcfg.stream = stream;
-          mcfg.attrs = main_attrs;
-          mcfg.numAttrs = 1;
-          FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
-        };
-        // STAGES=2 only when there are ≥2 heads/CTA to pipeline; never instantiated at MHC=1.
-        if constexpr (MHC > 1) {
-          if (main_pipeline_stages >= 2)
-            launch_main.template operator()<2>();
-          else
-            launch_main.template operator()<1>();
-        } else {
-          launch_main.template operator()<1>();
-        }
-      });
+      int const main_cta_per_sm = [] {
+        char const* e = std::getenv("FLASHINFER_SSU_MAIN_CTA_PER_SM");
+        // Default huge ⇒ grid == total_work (non-persistent, bit-identical).  Heuristic later.
+        return e ? std::atoi(e) : (1 << 20);
+      }();
+      int const main_total_work =
+          D_SPLIT * static_cast<int>(params.batch) * static_cast<int>(params.nheads);
+      int64_t const main_grid_ll = static_cast<int64_t>(main_cta_per_sm) * main_num_sms;
+      int const main_grid =
+          static_cast<int>(main_grid_ll < main_total_work ? main_grid_ll : main_total_work);
+
+      // MAIN_HEADS_PER_CTA=1 and PIPELINE_STAGES=1 are the kernel-template defaults.
+      auto mfunc = checkpointing_ssu_main_kernel<
+          input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NPREDICTED,
+          MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT, VARLEN>;
+      constexpr size_t msmem = sizeof(
+          CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
+      if constexpr (msmem > 0) {
+        FLASHINFER_CUDA_CHECK(
+            cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
+      }
+      // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr hard-wired to 1,
+      // independent of ENABLE_PDL).  The one-shot gdc_wait on a CTA's first work-unit blocks for
+      // the precompute before reading cb_scaled / cumAdt_vec.
+      cudaLaunchAttribute main_attrs[1];
+      main_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      main_attrs[0].val.programmaticStreamSerializationAllowed = 1;
+      cudaLaunchConfig_t mcfg;
+      mcfg.gridDim = dim3(main_grid);
+      mcfg.blockDim = dim3(warpSize, MAIN_NUM_WARPS);
+      mcfg.dynamicSmemBytes = msmem;
+      mcfg.stream = stream;
+      mcfg.attrs = main_attrs;
+      mcfg.numAttrs = 1;
+      FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
       return;
     } else {
       FLASHINFER_CHECK(false,
