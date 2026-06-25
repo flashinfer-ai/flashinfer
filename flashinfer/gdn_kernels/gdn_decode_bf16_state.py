@@ -64,6 +64,15 @@ def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
     ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
 
 
+def _mark_index_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # Batch-dynamic compact marking for contiguous index/step tensors; explicit
+    # stride_order disambiguates size-1 dims that mark_layout_dynamic cannot.
+    stride_order = tuple(sorted(range(torch_t.dim()), key=lambda d: -torch_t.stride(d)))
+    return from_dlpack(
+        torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
+    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
+
+
 # ==============================================================================
 # FMA WRAPPER FUNCTIONS (SM90 Compatibility)
 # ==============================================================================
@@ -3176,18 +3185,18 @@ def gated_delta_rule_mtp_wide_vec(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
         )
         h0_out_idx_ = h0_idx_
-        acc_steps_ = _mark_batch_dynamic(
+        acc_steps_ = _mark_index_dynamic(
             accepted_steps
             if accepted_steps is not None
             else _placeholder_accepted_steps
         )
-        ssm_idx_ = _mark_batch_dynamic(
+        ssm_idx_ = _mark_index_dynamic(
             ssm_state_indices
             if ssm_state_indices is not None
             else _placeholder_ssm_state_indices
@@ -3447,7 +3456,7 @@ def gated_delta_rule_t1_wide_vec(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
@@ -3820,18 +3829,18 @@ def gated_delta_rule_mtp(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
         )
         h0_out_idx_ = h0_idx_
-        acc_steps_ = _mark_batch_dynamic(
+        acc_steps_ = _mark_index_dynamic(
             accepted_steps
             if accepted_steps is not None
             else _placeholder_accepted_steps
         )
-        ssm_idx_ = _mark_batch_dynamic(
+        ssm_idx_ = _mark_index_dynamic(
             ssm_state_indices
             if ssm_state_indices is not None
             else _placeholder_ssm_state_indices
