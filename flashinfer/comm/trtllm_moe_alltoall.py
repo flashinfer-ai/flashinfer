@@ -761,6 +761,10 @@ class MoeAlltoAll:
             synchronize=synchronize, barrier=barrier
         )
 
+    def pause(self, *, synchronize: bool = True, barrier: bool = True) -> None:
+        """Pause graph-visible peer mappings before process checkpoint."""
+        self.detach_physical_keep_va(synchronize=synchronize, barrier=barrier)
+
     def remap_physical_same_va(
         self,
         *,
@@ -793,6 +797,22 @@ class MoeAlltoAll:
                 MnnvlMemory.allocated_map[self.mnnvl_mem.ptr].comm.barrier()
         self.validate_graph_visible_addresses()
         self._state = _A2AState()
+
+    def resume(
+        self,
+        *,
+        config: Optional[MnnvlConfig] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        reinitialize: bool = True,
+    ) -> None:
+        """Resume graph-visible peer mappings after process restore."""
+        self.remap_physical_same_va(
+            config=config,
+            synchronize=synchronize,
+            barrier=barrier,
+            reinitialize=reinitialize,
+        )
 
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""

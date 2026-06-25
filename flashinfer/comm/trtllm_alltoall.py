@@ -517,6 +517,13 @@ class MnnvlMoe:
             )
 
     @staticmethod
+    def pause(*, synchronize: bool = True, barrier: bool = True) -> None:
+        """Pause graph-visible peer mappings before process checkpoint."""
+        MnnvlMoe.detach_physical_keep_va(
+            synchronize=synchronize, barrier=barrier
+        )
+
+    @staticmethod
     def remap_physical_same_va(
         *,
         config: Optional[MnnvlConfig] = None,
@@ -540,6 +547,22 @@ class MnnvlMoe:
                 zero_local=zero_local,
             )
         MnnvlMoe.validate_graph_visible_addresses()
+
+    @staticmethod
+    def resume(
+        *,
+        config: Optional[MnnvlConfig] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+        zero_local: bool = True,
+    ) -> None:
+        """Resume graph-visible peer mappings after process restore."""
+        MnnvlMoe.remap_physical_same_va(
+            config=config,
+            synchronize=synchronize,
+            barrier=barrier,
+            zero_local=zero_local,
+        )
 
     @staticmethod
     def compute_target_rank_id(
