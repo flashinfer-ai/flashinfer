@@ -424,6 +424,14 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         gemm1_c_dtype = cutlass.Float4E2M1FN
         gemm2_out_dtype = cutlass.BFloat16
 
+        token_final_scales = inputs[3]
+        if token_final_scales.dtype == torch.float32:
+            final_scale_dtype = cutlass.Float32
+        elif token_final_scales.dtype == torch.bfloat16:
+            final_scale_dtype = cutlass.BFloat16
+        else:
+            final_scale_dtype = cutlass.Float16
+
         valid_tactics = []
         for tactic in ALL_MOE_TACTICS:
             tile_size, gemm1_tactic, gemm2_tactic = tactic
@@ -458,6 +466,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
                     out_dtype=gemm2_out_dtype,
+                    final_scale_dtype=final_scale_dtype,
                     mma_tiler_mn=gemm2_mma_tiler_mn,
                     cluster_shape_mn=gemm2_cluster_shape_mn,
                     m=permuted_m,

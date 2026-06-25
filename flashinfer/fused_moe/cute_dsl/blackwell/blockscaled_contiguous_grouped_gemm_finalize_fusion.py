@@ -2610,6 +2610,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         out_dtype: Type[cutlass.Numeric],
+        final_scale_dtype: Type[cutlass.Numeric],
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         m: cutlass.Int64,
@@ -2631,6 +2632,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type sf_vec_size: int
         :param out_dtype: The data type of the output tensor
         :type out_dtype: Type[cutlass.Numeric]
+        :param final_scale_dtype: The data type of the router scales (token_final_scales)
+        :type final_scale_dtype: Type[cutlass.Numeric]
         :param mma_tiler_mn: The (M, N) shape of the MMA instruction tiler
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
@@ -2674,6 +2677,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             can_implement = False
         # Skip unsupported A/B layout
         if not (a_major == "k" and b_major == "k"):
+            can_implement = False
+
+        # Skip unsupported final scale dtype, only Float32 is supported
+        if final_scale_dtype != cutlass.Float32:
             can_implement = False
         return can_implement
 
