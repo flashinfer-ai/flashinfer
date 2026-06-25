@@ -1601,6 +1601,12 @@ __device__ __forceinline__ void store_old_x(SmemT& smem, CheckpointingSsuParams 
                           make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<D_SMEM_COLS>{}),
                                       make_stride(params.old_x_stride_token, Int<1>{})));
 
+  // Wide layout (16×8 threads): uses all 128 threads for maximum STG.128 bandwidth.
+  // UniversalCopy<uint128_t> has no .with(bool) → copy_if falls back to software predication
+  // at copy_atom.hpp:149, which produces 4-way LDS.128 bank conflicts (Swizzle<3,3,3> is
+  // designed for ldmatrix, not plain LDS.128, and 4 rows-per-warp always hit the same 8 bank
+  // groups).  The conflicts are intentional: switching to ldmatrix would require a full
+  // MMA-layout writeback and lose the wide STG.128 path.  NCU will show excess wavefronts here.
   using ThrLayoutX = Layout<Shape<_16, _8>, Stride<_8, _1>>;
   auto s2g = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, input_t>{}, ThrLayoutX{},
                              Layout<Shape<_1, _8>>{});
