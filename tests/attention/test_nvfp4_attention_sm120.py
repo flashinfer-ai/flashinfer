@@ -371,3 +371,30 @@ def test_nvfp4_attention_sm120_causal_mask_column_order():
 
     assert suffix_max <= 1e-5
     assert cos_sim >= 0.98
+
+
+def test_nvfp4_split_kv_gate_dtype_logic():
+    """The split-KV gate must fire for NVFP4 KV and only for NVFP4 KV.
+
+    NVFP4 split-KV corrupts prefix-cached / decode reads (a split boundary can land
+    mid 16-element scale block; the small per-split chunk also trips the 1-byte-KV
+    NUM_MMA_KV tile floor), so plan() force-disables split-KV when the KV cache is
+    NVFP4. FP8 / 16-bit KV have no block scales and must keep split-KV. This is a
+    pure dtype-classification check (no GPU required) guarding that contract.
+    """
+    from flashinfer.prefill import _nvfp4_kv_requires_disabled_split_kv
+
+    # packed NVFP4 (uint8 is the run-path convention) and native fp4 -> gated
+    assert _nvfp4_kv_requires_disabled_split_kv(torch.uint8)
+    native_fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    if native_fp4 is not None:
+        assert _nvfp4_kv_requires_disabled_split_kv(native_fp4)
+
+    # 16-bit and FP8 KV split-KV is fine -> not gated
+    for dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        assert not _nvfp4_kv_requires_disabled_split_kv(dtype)
