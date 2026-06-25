@@ -23,6 +23,11 @@ from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
+from .gemm_bf16_fp4 import (
+    mm_bf16_fp4 as mm_bf16_fp4,
+    prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
+)
+
 from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
@@ -101,6 +106,8 @@ __all__ = (
         "gemm_fp8_nt_groupwise",
         "group_gemm_fp8_nt_groupwise",
         "fp8_blockscale_gemm_sm90",
+        "mm_bf16_fp4",
+        "prepare_bf16_fp4_weights",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",

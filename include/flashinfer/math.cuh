@@ -19,6 +19,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 
 namespace flashinfer {
@@ -43,6 +44,121 @@ __forceinline__ __device__ float ptx_exp2(float x) {
   float y;
   asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
+}
+
+template <typename T>
+struct MaxOp {
+  __device__ __forceinline__ T operator()(T const& x, T const& y) { return x > y ? x : y; }
+};
+
+template <>
+struct MaxOp<float> {
+  __device__ __forceinline__ float operator()(float const& x, float const& y) {
+    return fmaxf(x, y);
+  }
+};
+
+template <typename T>
+struct SumOp {
+  __device__ __forceinline__ T operator()(T const& x, T const& y) { return x + y; }
+};
+
+__forceinline__ __device__ void add(float2& c, float2 const& a, float2 const& b) {
+  c.x = a.x + b.x;
+  c.y = a.y + b.y;
+}
+
+__forceinline__ __device__ void mul(float2& c, float2 const& a, float2 const& b) {
+  c.x = a.x * b.x;
+  c.y = a.y * b.y;
+}
+
+__forceinline__ __device__ void fma(float2& d, float2 const& a, float2 const& b, float2 const& c) {
+  d.x = fmaf(a.x, b.x, c.x);
+  d.y = fmaf(a.y, b.y, c.y);
+}
+
+__forceinline__ __device__ float exp2_fma_poly(float x) {
+  float n = rintf(x);
+  float f = x - n;
+
+  float poly = ((0.0771f * f + 0.2276f) * f + 0.6951f) * f + 1.0f;
+
+  int n_int = __float2int_rn(n);
+  uint32_t poly_bits = __float_as_uint(poly);
+  poly_bits += static_cast<uint32_t>(n_int) << 23;
+  return __uint_as_float(poly_bits);
+}
+
+__forceinline__ __device__ uint32_t fp32_vec_to_e4m3(float const& f0, float const& f1,
+                                                     float const& f2, float const& f3) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b16 lo;\n"
+      ".reg .b16 hi;\n"
+      "cvt.rn.satfinite.e4m3x2.f32   lo, %2, %1;\n"
+      "cvt.rn.satfinite.e4m3x2.f32   hi, %4, %3;\n"
+      "mov.b32 %0, {lo, hi};\n"
+      "}"
+      : "=r"(val)
+      : "f"(f0), "f"(f1), "f"(f2), "f"(f3));
+  return val;
+#elif defined(__CUDA_ARCH__)
+  asm volatile("trap;");
+  return 0;
+#else
+  return 0;
+#endif
+}
+
+__forceinline__ __device__ uint32_t fp32_vec_to_e4m3(float const (&array)[4]) {
+  return fp32_vec_to_e4m3(array[0], array[1], array[2], array[3]);
+}
+
+__forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float const& f0, float const& f1,
+                                                     float const& f2, float const& f3,
+                                                     float const& f4, float const& f5,
+                                                     float const& f6, float const& f7) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(val)
+      : "f"(f0), "f"(f1), "f"(f2), "f"(f3), "f"(f4), "f"(f5), "f"(f6), "f"(f7));
+  return val;
+#elif defined(__CUDA_ARCH__)
+  asm volatile("trap;");
+  return 0;
+#else
+  return 0;
+#endif
+}
+
+__forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float const (&array)[8]) {
+  return fp32_vec_to_e2m1(array[0], array[1], array[2], array[3], array[4], array[5], array[6],
+                          array[7]);
+}
+
+__forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float2 const (&array)[4]) {
+  return fp32_vec_to_e2m1(array[0].x, array[0].y, array[1].x, array[1].y, array[2].x, array[2].y,
+                          array[3].x, array[3].y);
+}
+
+__forceinline__ __device__ uint32_t fp32_vec_to_e2m1(float2 const* array) {
+  return fp32_vec_to_e2m1(array[0].x, array[0].y, array[1].x, array[1].y, array[2].x, array[2].y,
+                          array[3].x, array[3].y);
 }
 
 /*!

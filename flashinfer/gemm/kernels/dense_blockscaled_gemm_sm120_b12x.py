@@ -2413,9 +2413,9 @@ class DenseGemmKernel:
         # A must be K-major, B must be K-major
         if a_major != "k" or b_major != "k":
             return False
-        # Alignment: K must be divisible by tile_k
-        tile_k = sf_vec_size * 8
-        if k % tile_k != 0:
+        # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not tile_k: the
+        # mainloop predicates the partial tile, so ragged K works. Mirror gemm_base.py.
+        if k % 32 != 0:
             return False
         return True
 
