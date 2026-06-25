@@ -1371,8 +1371,14 @@ def single_prefill_with_kv_cache(
 
     # For NVFP4 KV (uint8 packed), last dim is head_dim//2 packed bytes: the
     # unpacked VO width is v.shape[-1] * 2, which equals head_dim_vo even for
-    # asymmetric (QK, VO) plans; q.shape[-1] assumed QK == VO.
-    out_head_dim = v.shape[-1] * 2 if kv_cache_sf is not None else v.shape[-1]
+    # asymmetric (QK, VO) plans; q.shape[-1] assumed QK == VO. Gate on the packed
+    # (uint8) storage, not just kv_cache_sf, so a stray scale-factor tensor on a
+    # non-uint8 cache cannot silently double the output width.
+    out_head_dim = (
+        v.shape[-1] * 2
+        if kv_cache_sf is not None and v.dtype == torch.uint8
+        else v.shape[-1]
+    )
 
     if backend == "auto":
         backend = determine_attention_backend(
@@ -2776,7 +2782,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # the kernel (which writes head_dim_vo-wide rows) garble a too-wide
         # output buffer whenever VO < QK.
         out_head_dim = (
-            v_cache.shape[-1] * 2 if kv_cache_sf is not None else v_cache.shape[-1]
+            v_cache.shape[-1] * 2
+            if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+            else v_cache.shape[-1]
         )
         if out is None:
             # Use cached output data type if available (for FP8 attention with FP16 output)
@@ -3438,9 +3446,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             mask_indptr = _compute_mask_indptr(qo_indptr, kv_indptr)
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
+            # NOTE(spark-hijinks): segment_packbits requires mask_indptr on the
+            # same device as custom_mask, but mask_indptr inherits qo_indptr's
+            # device (often CPU) while custom_mask is on GPU. Mirror the paged
+            # path's .to(device) so the ragged custom-mask flow doesn't crash.
             packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
-                mask_indptr,
+                mask_indptr.to(custom_mask.device),
                 bitorder="little",
             )
 
@@ -3857,8 +3869,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 k_sf, v_sf = kv_cache_sf.unbind(dim=1)
 
         # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
-        # asymmetric QK/VO; q.shape[-1] assumed QK == VO).
-        out_head_dim = v.shape[-1] * 2 if kv_cache_sf is not None else v.shape[-1]
+        # asymmetric QK/VO; q.shape[-1] assumed QK == VO). Gate on the packed
+        # (uint8) storage so a stray scale-factor tensor on a non-uint8 cache
+        # can't silently double the output width (matches the decode-side guard).
+        out_head_dim = (
+            v.shape[-1] * 2
+            if kv_cache_sf is not None and v.dtype == torch.uint8
+            else v.shape[-1]
+        )
         if out is None:
             # when input dtype is fp8, we need to use bf16 output
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype

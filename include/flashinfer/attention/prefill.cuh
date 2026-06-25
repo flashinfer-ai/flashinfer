@@ -687,7 +687,13 @@ __device__ __forceinline__ void page_produce_kv_sf(
               sf_ptr[page_head_base + static_cast<size_t>(swz_entry) * sf_stride_n + swz_sd];
         }
       }
-      *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
+      // NUM_SF_ITERS is rounded up, so the last iter has lanes with
+      // flat_byte >= SF_TOTAL_BYTES. Unlike the predicated cp_async store below,
+      // this write is unconditional, so guard it on the buffer bound (not in_bounds,
+      // which would also skip the intended zero-fill of in-buffer padding rows).
+      if (flat_byte < SF_TOTAL_BYTES) {
+        *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
+      }
     } else {
       const size_t sf_gmem_offset = page_head_base + entry_idx * sf_stride_n + sf_smem_col;
       constexpr auto fill_mode =
@@ -786,7 +792,10 @@ __device__ __forceinline__ void init_rope_freq(float (*rope_freq)[4], const floa
                                                const uint32_t tid_x = threadIdx.x) {
   const uint32_t lane_idx = tid_x;
 #pragma unroll
-  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO / 2; ++mma_d) {
+  // rope_freq is sized [NUM_MMA_D_QK/2][4] and the rotary appliers index it up to
+  // NUM_MMA_D_QK/2; for asymmetric QK/VO (e.g. qk=512, vo=256) NUM_MMA_D_VO/2 would
+  // leave the upper half of the table uninitialized, so bound on QK.
+  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_QK / 2; ++mma_d) {
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
       rope_freq[mma_d][j] =
