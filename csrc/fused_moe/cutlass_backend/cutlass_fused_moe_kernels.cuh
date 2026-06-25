@@ -1203,6 +1203,34 @@ float const** computeFP8DequantScale(float const** alpha_scale_ptr_array,
   return alpha_scale_ptr_array;
 }
 
+__global__ void prepareProfilerFP8TokenScalePtrArrayKernel(
+    float const** alpha_scale_ptr_array, float const* fp8_token_scale,
+    int64_t const* expert_first_token_offset, int const num_experts_per_node,
+    int const expert_first_token_offset_stride) {
+  int const expert = blockIdx.x * blockDim.x + threadIdx.x;
+  int const sample = blockIdx.y;
+  if (expert >= num_experts_per_node) {
+    return;
+  }
+
+  auto const* sample_offsets =
+      expert_first_token_offset + sample * expert_first_token_offset_stride;
+  alpha_scale_ptr_array[sample * num_experts_per_node + expert] =
+      fp8_token_scale + sample_offsets[expert];
+}
+
+float const** prepareProfilerFP8TokenScalePtrArray(
+    float const** alpha_scale_ptr_array, float const* fp8_token_scale,
+    int64_t const* expert_first_token_offset, int const num_experts_per_node,
+    int const num_samples, cudaStream_t stream) {
+  int const threads = std::min(128, num_experts_per_node);
+  int const blocks = (num_experts_per_node + threads - 1) / threads;
+  prepareProfilerFP8TokenScalePtrArrayKernel<<<dim3(blocks, num_samples), threads, 0, stream>>>(
+      alpha_scale_ptr_array, fp8_token_scale, expert_first_token_offset, num_experts_per_node,
+      num_experts_per_node + 1);
+  return alpha_scale_ptr_array;
+}
+
 template <class BSConfig>
 __device__ void setupFP4BlockScalingFactors(
     TmaWarpSpecializedGroupedGemmInput& layout_info, int expert, int gemm_m, int gemm_n, int gemm_k,
@@ -4659,6 +4687,8 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   }
 
   // FP4 sizes
+  bool const use_humming_pre_mma = isHummingPreMmaScaleMode();
+  size_t const fp8_mxfp4_token_scale_size = num_expanded_tokens * sizeof(float);
   quant_1_size = is_wfp4afp8_family ? sizeof(float) : quant_1_size;
   quant_2_size = is_wfp4afp8_family ? getOffsetWeightSF(num_experts_per_node, fc1_out_size,
                                                        hidden_size,
@@ -4666,7 +4696,10 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
                                                            FpXBlockScalingType::MXFPX) *
                                          sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF)
                                    : quant_2_size;
-  quant_3_size = is_wfp4afp8_family ? num_experts_per_node * sizeof(float) : quant_3_size;
+  quant_3_size = is_wfp4afp8_family
+                     ? (use_humming_pre_mma ? fp8_mxfp4_token_scale_size
+                                            : num_experts_per_node * sizeof(float))
+                     : quant_3_size;
   quant_4_size = is_wfp4afp8_family ? sizeof(float) : quant_4_size;
   size_t quant_5_size = is_wfp4afp8_family
                             ? getOffsetWeightSF(num_experts_per_node, hidden_size, inter_size,
@@ -4674,7 +4707,10 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
                                                     FpXBlockScalingType::MXFPX) *
                                   sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF)
                             : 0;
-  size_t quant_6_size = is_wfp4afp8_family ? num_experts_per_node * sizeof(float) : 0;
+  size_t quant_6_size = is_wfp4afp8_family
+                            ? (use_humming_pre_mma ? fp8_mxfp4_token_scale_size
+                                                   : num_experts_per_node * sizeof(float))
+                            : 0;
 
   size_t tma_ws_input_workspace_size = 0;
   if (is_tma_ws_input) {
@@ -4703,6 +4739,9 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
   size_t w4a8_alpha_size =
       (is_w4afp8_quant || is_wfp4a16_quant) ? num_experts_per_node * sizeof(float) : 0;
   size_t alpha_scale_ptr_array_size = num_experts_per_node * sizeof(float**);
+  if (use_humming_pre_mma) {
+    alpha_scale_ptr_array_size *= NUM_ROUTING_SAMPLES;
+  }
   size_t gemm_workspace_size = mInterface->getGemmWorkspaceSize(num_experts_per_node);
   size_t precomputed_scheduler_workspace_size =
       (is_tma_ws_input && isSm90MixedInputFamily())
@@ -5068,6 +5107,20 @@ void GemmProfilerBackend::prepare(int num_tokens, char* workspace_ptr_char,
 
   prepareRouting(num_tokens, workspace_ptr_char, enable_pdl, stream);
   prepareQuantParams(num_tokens, workspace_ptr_char, stream);
+  if (isHummingPreMmaScaleMode()) {
+    auto workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
+    auto* expert_first_token_offset =
+        reinterpret_cast<int64_t*>(workspace_ptr_char +
+                                   workspaces.at("expert_first_token_offset").second);
+    auto* act_fp8_token_scale =
+        reinterpret_cast<float*>(workspace_ptr_char + workspaces.at("act_fp8_token_scale").second);
+    auto* alpha_scale_ptr_array = reinterpret_cast<float const**>(
+        workspace_ptr_char + workspaces.at("alpha_scale_ptr_array").second);
+    prepareProfilerFP8TokenScalePtrArray(alpha_scale_ptr_array, act_fp8_token_scale,
+                                         expert_first_token_offset, mNumExpertsPerNode,
+                                         NUM_ROUTING_SAMPLES, stream);
+    sync_check_cuda_error(stream);
+  }
   for (auto fusion : {TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
                       TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE}) {
     for (auto swap_ab : {false, true}) {
@@ -5129,7 +5182,8 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
   void const* weights_sel = mNeedWeights ? weights : expert_weights;
   GET_WS_PTR(void const*, bias);
 
-  GET_WS_PTR(float const**, alpha_scale_ptr_array);
+  GET_WS_PTR_OFFSET(float const**, alpha_scale_ptr_array,
+                    (isHummingPreMmaScaleMode() ? mSampleIndex * mNumExpertsPerNode : 0));
   GET_WS_PTR(TmaWarpSpecializedGroupedGemmInput::ElementSF*, fp4_act_scale_flat);
   GET_WS_PTR(void*, gemm_workspace);
 

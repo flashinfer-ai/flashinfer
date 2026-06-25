@@ -901,6 +901,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (mUseW4GroupScaling && gemm_n % tile_m != 0) {
       return false;
     }
+    if (isWFP4A16Quant()) {
+      if (tile_k == 256 && ((tile_m == 128 && tile_n == 256) ||
+                            (tile_m == 256 && tile_n == 128))) {
+        return false;
+      }
+      if (tile_k == 512 && tile_n >= 128) {
+        return false;
+      }
+    }
     return true;
   }
 
