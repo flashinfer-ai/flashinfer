@@ -550,3 +550,85 @@ nvfp4_kv_quantize_trace = TraceTemplate(
     reference=_nvfp4_kv_quantize_reference,
     init=_nvfp4_kv_quantize_init,
 )
+
+
+# ── Grouped MXFP8 quantization (cuTile, SM100+) ──────────────────────────────
+
+
+def _mxfp8_grouped_quantize_init(
+    *,
+    B,
+    M,
+    K=4096,
+    padded_K=0,
+    rm=0,
+    rk=0,
+    m32=32,
+    m4=4,
+    k4=4,
+    device="cuda",
+    seed=0,
+):
+    """Build inputs for ``flashinfer.mxfp8_grouped_quantize``.
+
+    Every group uses the full ``M`` valid rows (``mask = M``) so the trace
+    exercises the dense path with no uninitialized output rows; callers may
+    shrink ``mask`` afterwards.
+    """
+    del padded_K, rm, rk, m32, m4, k4  # output-only / derived axes
+    torch.manual_seed(seed)
+    a = torch.randn(B, M, K, dtype=torch.bfloat16, device=device)
+    mask = torch.full((B,), M, dtype=torch.int32, device=device)
+    return {"a": a, "mask": mask}
+
+
+mxfp8_grouped_quantize_trace = TraceTemplate(
+    op_type="quantization",
+    name_prefix="mxfp8_grouped_quantize",
+    description=(
+        "Grouped MXFP8 quantization (cuTile, SM100+): [B, M, K] bf16/fp16 -> "
+        "fp8_e4m3fn activations + UE8M0 block scales, laid out for the masked "
+        "grouped GEMM. K is padded up to a multiple of 128 for the kernel."
+    ),
+    axes={
+        "B": Var(description="Number of groups."),
+        "M": Var(description="Rows per group."),
+        "K": Const(abbrev="k", description="Input columns (divisible by 32)."),
+        "padded_K": Var(description="K rounded up to a multiple of 128."),
+        "rm": Var(description="padded_M // 128 (row scale tiles)."),
+        "rk": Var(description="padded_K // 128 (column scale tiles)."),
+        "m32": Var(description="MXFP8 scale swizzle dim (32)."),
+        "m4": Var(description="MXFP8 scale swizzle dim (4)."),
+        "k4": Var(description="MXFP8 scale swizzle dim (4)."),
+    },
+    inputs={
+        "a": Tensor(["B", "M", "K"], description="Input tensor, fp16/bf16."),
+        "mask": Tensor(
+            ["B"],
+            dtype="int32",
+            description="Valid rows per group (int32).",
+        ),
+    },
+    outputs={
+        "x_q": Tensor(
+            ["M", "padded_K", "B"],
+            dtype="float8_e4m3fn",
+            description="Quantized activations, permuted for the grouped GEMM.",
+        ),
+        "sf": Tensor(
+            ["m32", "m4", "rm", "k4", "rk", "B"],
+            dtype="uint8",
+            description="UE8M0 swizzled block scales (1 byte per 32-element block).",
+        ),
+    },
+    constraints=[
+        "padded_K == ((K + 127) // 128) * 128",
+        "rm == (M + 127) // 128",
+        "rk == padded_K // 128",
+        "m32 == 32",
+        "m4 == 4",
+        "k4 == 4",
+    ],
+    tags=["status:verified", "quantization:mxfp8"],
+    init=_mxfp8_grouped_quantize_init,
+)

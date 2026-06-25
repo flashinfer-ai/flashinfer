@@ -53,6 +53,7 @@ moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
+mxfp8_grouped_quantize_k4096.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -222,7 +223,10 @@ from flashinfer.quantization.fp4_quantization import (
     mxfp4_quantize,
     nvfp4_quantize,
 )
-from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+from flashinfer.quantization.fp8_quantization import (
+    mxfp8_grouped_quantize,
+    mxfp8_quantize,
+)
 
 quant_M, quant_K = 128, 4096
 quant_input_bf16 = torch.randn(quant_M, quant_K, dtype=torch.bfloat16, device=device)
@@ -236,6 +240,12 @@ with contextlib.suppress(Exception):
     mxfp4_quantize(quant_input_bf16)
 with contextlib.suppress(Exception):
     mxfp8_quantize(quant_input_bf16)
+
+# Grouped MXFP8 (cuTile, SM100+): [B, M, K] -> masked grouped GEMM layout.
+with contextlib.suppress(Exception):
+    grouped_a = torch.randn(2, 256, quant_K, dtype=torch.bfloat16, device=device)
+    grouped_mask = torch.full((2,), 256, dtype=torch.int32, device=device)
+    mxfp8_grouped_quantize(grouped_a, grouped_mask)
 
 # ── Single-request attention (non-batched) ───────────────────────────────────
 sa_Hq, sa_Hk, sa_D, sa_KV = 32, 8, 128, 256
