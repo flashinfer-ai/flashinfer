@@ -2402,8 +2402,11 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     launchers_map[curr_tile_N] = std::move(launcher);
   }
 
-  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, supported_tile_nums,
-                                                        num_tokens, top_k, local_num_experts);
+  // Use the fused totals (routed + shared experts) so the fallback tile/config
+  // selection matches prepare_moe(), which validates the chosen tactic against
+  // effectiveTopK / effectiveLocalExperts.
+  auto const [tile_N, config] = resolveMoeTileAndConfig(
+      config_index, supported_tile_nums, num_tokens, totalExpertsPerToken, totalLocalExperts);
 
   // Get the launcher for the selected tile_N
   auto launcher_it = launchers_map.find(static_cast<int32_t>(tile_N));

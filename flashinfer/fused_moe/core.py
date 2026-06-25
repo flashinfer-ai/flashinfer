@@ -1172,9 +1172,15 @@ def get_trtllm_moe_sm100_module():
             use_packed_weights: bool = False,
             use_per_token_scaling: bool = False,
             num_experts: Optional[int] = None,
+            num_fused_shared_experts: int = 0,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
+            # Fused shared experts widen the per-token expert count and the local
+            # expert count seen by the kernel. Keep top_k / num_local_experts raw
+            # (forward() adds the shared experts via the C++ op), but record the
+            # fused count so valid-tactic enumeration matches prepare_moe().
+            self.num_fused_shared_experts = num_fused_shared_experts or 0
             self.dtype_act = dtype_act
             self.dtype_weights = dtype_weights
             self.fp8_quantization_type = fp8_quantization_type
@@ -1299,14 +1305,20 @@ def get_trtllm_moe_sm100_module():
 
             has_gemm1_lora_delta = moe_inputs.gemm1_lora_delta is not None
 
+            # Enumerate valid tactics for the fused (routed + shared) expert
+            # dimensions so they match what prepare_moe() validates against at
+            # runtime (effectiveTopK / effectiveLocalExperts). nfse defaults to 0,
+            # so non-shared-expert paths are unaffected. Including nfse in the key
+            # also prevents cache collisions across different shared-expert counts.
+            nfse = self.num_fused_shared_experts
             instance_key = (
                 self.dtype_act,
                 self.dtype_weights,
                 self.fp8_quantization_type,
-                self.top_k,
+                self.top_k + nfse,
                 self.hidden_size,
                 self.intermediate_size,
-                self.num_local_experts,
+                self.num_local_experts + nfse,
                 self.activation_type,
                 self.use_shuffled_weight,
                 self.weight_layout,
@@ -2097,6 +2109,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
             num_experts=num_experts,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
 
         moe_inputs = MoeRunnerInputs(
@@ -3697,6 +3710,7 @@ def trtllm_fp8_block_scale_routed_moe(
         enable_pdl,
         tune_max_num_tokens,
         fp8_quantization_type,
+        0,  # num_fused_shared_experts: not supported on the pre-routed path
         activation_type,
         True,  # norm_topk_prob: not used for pre-computed routing
     )

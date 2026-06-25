@@ -105,10 +105,10 @@ struct DataBase {
   int32_t mNumLocalExperts;
 
   /// For fused shared expert
-  int32_t mNumFusedSharedExperts;
-  int32_t mSharedExpertTokenOffset;
-  int32_t mSharedExpertNumTokens;
-  int32_t mTotalExpertsPerToken;
+  int32_t mNumFusedSharedExperts{0};
+  int32_t mSharedExpertTokenOffset{0};
+  int32_t mSharedExpertNumTokens{0};
+  int32_t mTotalExpertsPerToken{0};
 
   // optional: if nullptr, no routing replay recording occurs
   // dim: [mNumTokens, mTopK]

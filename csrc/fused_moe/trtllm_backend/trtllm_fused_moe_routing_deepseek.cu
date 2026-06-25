@@ -162,10 +162,14 @@ __global__ void routingMainKernel(KernelParams params) {
                      : (expertSelected ? OutputT{0} : invalidScore);
 
   // initialize the mPtrExpertCounts
+  // Include the fused shared experts so the histogram/offset slots for the
+  // appended shared-expert ids (>= mNumExperts) are zeroed too. The permutation
+  // pipeline runs after run() bumps mNumExperts by mNumFusedSharedExperts, so it
+  // indexes counts over the full (routed + shared) expert range.
   if (params.mPtrExpertCounts) {
     int32_t globalThreadIdx = blockIdx.x * blockDim.x + threadIdx.x;
     int32_t globalThreadStride = gridDim.x * blockDim.x;
-    int32_t expertCountsNum = 2 * params.mNumExperts;
+    int32_t expertCountsNum = 2 * (params.mNumExperts + params.mNumFusedSharedExperts);
     initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
   }
 
@@ -544,6 +548,13 @@ void run(Data& data, void* stream) {
   }
 
   int const numExperts = data.mNumExperts + data.mNumFusedSharedExperts;
+  // Bound the fused expert total so getMaxNumExperts() below cannot return 0
+  // (which would launch the histogram kernels with 0 threads). NumNemotronExperts
+  // is the largest tier getMaxNumExperts() supports.
+  FLASHINFER_CHECK(numExperts <= NumNemotronExperts,
+                   "Routing kernel expects total experts (routed + fused shared) <= %d, got %d "
+                   "(num_experts=%d, num_fused_shared_experts=%d)",
+                   NumNemotronExperts, numExperts, data.mNumExperts, data.mNumFusedSharedExperts);
   int const topK = data.mTopK + data.mNumFusedSharedExperts;
   int const numThreadsHist = getMaxNumExperts(numExperts);
 
