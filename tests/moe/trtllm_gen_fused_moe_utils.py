@@ -3071,9 +3071,27 @@ RENORMALIZE_ROUTING_CONFIGS = [
         },
         id="MiniMax2_256e_top6_no_scale",
     ),
-    # NOTE: dropped "MiniMax2_256e_top6_scale3" — the no-scale variant above already covers
-    # the MiniMax2 routing method; this entry only varied routed_scaling=3.0. CI-budget pruning;
-    # the routed_scaling axis is covered in the fuzzer.
+    # MiniMax2 with routed_scaling != None. The no_scale variant above uses routed_scaling=None
+    # (the kernel's scale multiply is a no-op there), so this is the only case exercising
+    # routing_reference_minimax2's `raw_weights * routed_scaling_factor` branch. routed_scaling is
+    # routing-math only and quant-independent, so it's pinned to a single quant + intermediate size
+    # (3 tests instead of the full quant x layout x shape sweep) — a routing-only smoke.
+    pytest.param(
+        {
+            "num_experts": 256,
+            "top_k": 6,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": 3.0,
+            "has_routing_bias": True,
+            "routing_method_type": RoutingMethodType.MiniMax2,
+            "compatible_moe_impls": [BF16Moe],
+            "compatible_intermediate_size": [1024],
+            "enable_autotune": False,
+        },
+        id="MiniMax2_256e_top6_scale3",
+    ),
 ]
 
 RENORMALIZE_WEIGHT_PROCESSING = [
