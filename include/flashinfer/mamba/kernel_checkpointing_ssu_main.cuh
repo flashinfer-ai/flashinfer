@@ -200,7 +200,10 @@ __device__ __forceinline__ void prefetch_state(SmemT& smem, CheckpointingSsuPara
 
 // load_x: loads x (and C for IS_FIRST) from gmem → smem slot tile_buf.  ISSUE ONLY —
 // no __pipeline_commit / wait / syncwarp.  head_loop owns the whole cp.async pipeline.
-// C is per-GROUP (W1); x is per-HEAD (W0).  Both loads run in parallel across warps.
+// C is per-GROUP (W1, IS_FIRST only); x is per-HEAD and loaded CTA-WIDE (all 128 threads).
+// x was previously warp-0-only, which left warps 1-3 idle at the next barrier waiting on
+// warp 0's 4-pass load; the CTA-wide load balances it (16 rows = 4 warps × 4 rows, ONE pass)
+// so all warps reach the x-fence together — cuts the barrier stall, no extra smem.
 template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, bool IS_FIRST,
           typename SmemT>
 __device__ __forceinline__ void load_x(SmemT& smem, CheckpointingSsuParams const& params, int lane,
@@ -218,11 +221,11 @@ __device__ __forceinline__ void load_x(SmemT& smem, CheckpointingSsuParams const
     if (warp == 1)
       load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane,
                                           seq_len);
-  // x is per-HEAD → every head, on W0 (parallel with C on W1).
+  // x is per-HEAD → every head, CTA-wide across all 128 threads (tid-based).
   auto* x_slot = smem.x + tile_buf * SmemT::X_ELEMS;
-  if (warp == 0)
-    load_tile_async<XShape, NPREDICTED>(x_slot, x_ptr + x_base, params.x_stride_token, lane,
-                                        seq_len);
+  int const tid = warp * warpSize + lane;
+  load_tile_async_cta<XShape, NPREDICTED>(x_slot, x_ptr + x_base, params.x_stride_token, tid,
+                                          seq_len);
   // NOTE: NO commit/wait — head_loop owns the pipeline.
 }
 

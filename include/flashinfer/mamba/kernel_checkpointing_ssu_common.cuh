@@ -359,6 +359,54 @@ __device__ __forceinline__ void load_tile_async(input_t* __restrict__ smem_dst,
   copy_if(g2s, pred, thr.partition_S(g_full), thr.partition_D(s_full));
 }
 
+// CTA-wide variant of load_tile_async: spreads the tile across ALL threads (tid-based,
+// ROWS_PAD thread-rows × 8 thread-cols) instead of a single warp's 32 lanes.  Each
+// thread-row still covers one full swizzle-atom width (8 thread-cols × 8 vals = 64 cols),
+// so the bank-conflict-free contract is unchanged — but now every warp issues an equal
+// share of the cp.async instead of one warp carrying the whole tile while the others idle
+// at the next barrier.  Use for per-head tensors that today pin to a single warp (e.g. x):
+// at ROWS_PAD=16 this fills exactly 128 threads (4 warps × 4 rows) in ONE pass vs the
+// per-warp version's 4 passes.  Threads with tid ≥ ROWS_PAD·8 don't participate (guarded),
+// so it is safe to call from the full CTA even when the tile has fewer rows than 16.
+template <typename SmemShape, int VALID_ROWS, typename input_t>
+__device__ __forceinline__ void load_tile_async_cta(input_t* __restrict__ smem_dst,
+                                                    input_t const* __restrict__ gmem_src,
+                                                    int gmem_row_stride, int tid,
+                                                    int valid_rows_rt = VALID_ROWS) {
+  using namespace cute;
+  constexpr int ROWS_PAD = size<0>(SmemShape{});
+  constexpr int VALID_COLS = size<1>(SmemShape{});
+  constexpr int SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(VALID_COLS);
+  constexpr int VAL_COLS_PER_THREAD = Copy_prop::vec_bytes / sizeof(input_t);
+  static_assert(SMEM_COLS % VAL_COLS_PER_THREAD == 0,
+                "SMEM_COLS must be divisible by VAL_COLS_PER_THREAD");
+  // One thread-row per data row → ROWS_PAD·8 threads.  Must fit the CTA (≤128 here).
+  static_assert(ROWS_PAD * 8 <= 128, "load_tile_async_cta: ROWS_PAD·8 must fit the CTA");
+  if (tid >= ROWS_PAD * 8) return;
+
+  Tensor s_full =
+      make_tensor(make_smem_ptr(smem_dst), make_swizzled_layout_rc<input_t, ROWS_PAD, SMEM_COLS>());
+  Tensor g_full = make_tensor(make_gmem_ptr(gmem_src),
+                              make_layout(make_shape(Int<ROWS_PAD>{}, Int<SMEM_COLS>{}),
+                                          make_stride(gmem_row_stride, Int<1>{})));
+
+  using ThrLayout = Layout<Shape<Int<ROWS_PAD>, _8>, Stride<_8, _1>>;
+  static_assert(size<1>(ThrLayout{}) * VAL_COLS_PER_THREAD == SmemSwizzle<input_t>::ATOM_COLS,
+                "wide thread layout must cover one full swizzle atom width per row");
+  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomZFill, input_t>{}, ThrLayout{},
+                             Layout<Shape<_1, Int<VAL_COLS_PER_THREAD>>>{});
+  auto thr = g2s.get_slice(tid);
+
+  auto id = make_identity_tensor(make_shape(Int<ROWS_PAD>{}, Int<SMEM_COLS>{}));
+  auto thr_id = thr.partition_S(id);
+  auto pred = make_tensor<bool>(shape(thr_id));
+  CUTE_UNROLL
+  for (int i = 0; i < size(pred); ++i) {
+    pred(i) = (get<0>(thr_id(i)) < valid_rows_rt) && (get<1>(thr_id(i)) < VALID_COLS);
+  }
+  copy_if(g2s, pred, thr.partition_S(g_full), thr.partition_D(s_full));
+}
+
 // State load — D_SPLIT-conditional dispatch:
 //
 //   D_SPLIT == 1: per-warp partition (warp W loads rows
