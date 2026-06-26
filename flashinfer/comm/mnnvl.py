@@ -19,12 +19,14 @@ import os
 import socket
 import array
 import random
+import tempfile
+import threading
+import time
 
 import contextlib
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import platform
 import sys
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import pynvml
@@ -429,6 +431,68 @@ class MnnvlMemory:  # type: ignore[no-redef]
         MnnvlMemory.comm = comm
         return comm
 
+    _fabric_supported: Optional[bool] = None
+
+    @staticmethod
+    def _probe_fabric_supported(dev_id: int) -> bool:
+        """Locally probe whether FABRIC handles are usable on this rank.
+
+        Delegates to is_mnnvl_fabric_supported(), which checks both the device
+        capability (CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED) and that
+        the GPU has actually joined a fabric cluster (NVML fabric state
+        COMPLETED with a valid clusterUuid).  The latter matters because a GPU
+        can be capable of *creating* a FABRIC handle while not being part of a
+        common fabric with its peers (e.g. a single-node NVLink box) -- in that
+        case the FABRIC path would only fail later at import, so we must report
+        it as unsupported here and fall back to the POSIX-fd path.
+
+        This is a read-only capability query (no allocation), so it does not
+        depend on transient memory pressure and yields a stable answer across a
+        homogeneous cluster -- avoiding the flakiness that a cuMemCreate-based
+        probe would introduce on otherwise fabric-capable systems (e.g. GB200).
+
+        NOTE: this is still a *per-rank* answer and may differ across ranks on a
+        heterogeneous/partially-provisioned setup.  Callers that drive
+        collective operations MUST reconcile it across the whole communicator
+        via _resolve_fabric_support() before using it; otherwise ranks can take
+        divergent allgather/fd-exchange paths and deadlock.
+        """
+        try:
+            return is_mnnvl_fabric_supported(dev_id)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _resolve_fabric_support(comm, dev_id: int) -> bool:
+        """Establish a *communicator-wide* FABRIC support decision.
+
+        The handle type selected here decides which collective path every rank
+        takes in open_mnnvl_memory (FABRIC -> allgather of handle bytes, POSIX
+        -> SCM_RIGHTS fd exchange).  Those paths are mutually incompatible, so
+        all ranks MUST agree.  We therefore take the logical AND of every
+        rank's local probe: FABRIC is used only if it works everywhere, and any
+        rank that cannot use it forces the whole group onto the POSIX-fd path.
+
+        The agreed value is cached in _fabric_supported and reused thereafter.
+        """
+        if MnnvlMemory._fabric_supported is not None:
+            return MnnvlMemory._fabric_supported
+
+        local_supported = MnnvlMemory._probe_fabric_supported(dev_id)
+        all_supported = comm.allgather(local_supported)
+        agreed = all(all_supported)
+
+        if agreed != local_supported:
+            logger.warning(
+                "[MnnvlMemory] FABRIC support probe disagrees across ranks "
+                f"(local={local_supported}, per-rank={all_supported}); "
+                f"falling back to {'FABRIC' if agreed else 'POSIX fd'} on all "
+                "ranks to keep the handle-exchange path consistent."
+            )
+
+        MnnvlMemory._fabric_supported = agreed
+        return agreed
+
     @staticmethod
     def get_allocation_prop(dev_id: int):
         location = cuda.CUmemLocation()
@@ -436,11 +500,16 @@ class MnnvlMemory:  # type: ignore[no-redef]
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        # TODO: We differentiate FABRIC for GB200 (aarch64) and POSIX_FILE_DESCRIPTOR for B200 (x86_64).
-        # May need to find a better way to handle this.
-        arch = platform.machine().lower()
-        is_on_aarch64 = "aarch64" in arch
-        if is_on_aarch64:
+        allocation_prop.location = location
+
+        if MnnvlMemory._fabric_supported is None:
+            # No communicator-wide decision has been reached yet (e.g. a
+            # standalone call outside open_mnnvl_memory).  Fall back to the
+            # local probe; collective callers reconcile via
+            # _resolve_fabric_support() before reaching this point.
+            MnnvlMemory._fabric_supported = MnnvlMemory._probe_fabric_supported(dev_id)
+
+        if MnnvlMemory._fabric_supported:
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
             )
@@ -448,7 +517,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
             )
-        allocation_prop.location = location
         return allocation_prop
 
     @staticmethod
@@ -485,6 +553,113 @@ class MnnvlMemory:  # type: ignore[no-redef]
         MnnvlMemory.current_mem_offset = 0
 
     @staticmethod
+    def _exchange_fds_via_scm_rights(comm, local_fd: int) -> list:
+        """Exchange file descriptors among all ranks using SCM_RIGHTS.
+
+        Unlike pidfd_getfd, SCM_RIGHTS does not require CAP_SYS_PTRACE and
+        works in restricted containers.  Returns a list of length comm_size
+        where entry[rank] is the local file descriptor received from that rank.
+        """
+        comm_rank = comm.Get_rank()
+        comm_size = comm.Get_size()
+
+        sock_path = os.path.join(
+            tempfile.gettempdir(),
+            f"cuda_fd_xchg_{os.getpid()}_{comm_rank}.sock",
+        )
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+
+        all_sock_paths = comm.allgather(sock_path)
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(sock_path)
+        server.listen(comm_size)
+        server.settimeout(30.0)
+
+        received_fds = [None] * comm_size
+        received_fds[comm_rank] = local_fd
+        accept_errors = []
+
+        def accept_loop():
+            for _ in range(comm_size - 1):
+                try:
+                    conn, _ = server.accept()
+                    rank_bytes = b""
+                    while len(rank_bytes) < 4:
+                        chunk = conn.recv(4 - len(rank_bytes))
+                        if not chunk:
+                            break
+                        rank_bytes += chunk
+                    sender_rank = int.from_bytes(rank_bytes, "little")
+                    fds_arr = array.array("i")
+                    _, ancdata, _, _ = conn.recvmsg(
+                        1, socket.CMSG_SPACE(fds_arr.itemsize)
+                    )
+                    for cmsg_level, cmsg_type, cmsg_data in ancdata:
+                        if (
+                            cmsg_level == socket.SOL_SOCKET
+                            and cmsg_type == socket.SCM_RIGHTS
+                        ):
+                            trim = len(cmsg_data) - (
+                                len(cmsg_data) % fds_arr.itemsize
+                            )
+                            fds_arr.frombytes(cmsg_data[:trim])
+                    if fds_arr:
+                        received_fds[sender_rank] = fds_arr[0]
+                    conn.close()
+                except Exception as exc:
+                    accept_errors.append(exc)
+
+        t = threading.Thread(target=accept_loop, daemon=True)
+        t.start()
+
+        for target_rank in range(comm_size):
+            if target_rank == comm_rank:
+                continue
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            target_path = all_sock_paths[target_rank]
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    sock.connect(target_path)
+                    break
+                except (ConnectionRefusedError, FileNotFoundError):
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(
+                            f"[MnnvlMemory] timed out connecting to rank "
+                            f"{target_rank} at {target_path}"
+                        )
+                    time.sleep(0.01)
+            sock.sendall(comm_rank.to_bytes(4, "little"))
+            fds_arr = array.array("i", [local_fd])
+            sock.sendmsg(
+                [b"\x00"],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds_arr)],
+            )
+            sock.close()
+
+        t.join(timeout=30.0)
+        server.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+
+        if accept_errors:
+            raise RuntimeError(
+                f"[MnnvlMemory] SCM_RIGHTS accept errors: {accept_errors}"
+            )
+        missing = [i for i, fd in enumerate(received_fds) if fd is None]
+        if missing:
+            raise RuntimeError(
+                f"[MnnvlMemory] did not receive file descriptors from ranks: {missing}"
+            )
+        return received_fds
+
+    @staticmethod
     def open_mnnvl_memory(mapping: Mapping, size: int):
         dev = checkCudaErrors(cuda.cuCtxGetDevice())
         dev_id = int(dev)
@@ -501,6 +676,11 @@ class MnnvlMemory:  # type: ignore[no-redef]
         assert all(x == size for x in all_rank_allocate_sizes), (
             "Not all rank allocating same size."
         )
+        # Reach a communicator-wide decision on the handle type BEFORE any rank
+        # selects its allocation prop.  This guarantees every rank takes the
+        # same handle-exchange path below (FABRIC allgather vs SCM_RIGHTS fd
+        # exchange); a divergent decision would deadlock the collective.
+        MnnvlMemory._resolve_fabric_support(comm, dev_id)
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
@@ -530,41 +710,12 @@ class MnnvlMemory:  # type: ignore[no-redef]
         ):
             all_handles_data = comm.allgather(exported_fabric_handle.data)
         else:
-            all_handles_data = comm.allgather(exported_fabric_handle)
-            all_pids = comm.allgather(os.getpid())
-            libc = ctypes.CDLL(None, use_errno=True)
-            syscall = libc.syscall
-            SYS_pidfd_open = 434
-            SYS_pidfd_getfd = 438
-            pidfds = []
-            for pid in all_pids:
-                pidfd = syscall(SYS_pidfd_open, pid, 0)
-                if pidfd < 0:
-                    err = ctypes.get_errno()
-                    raise RuntimeError(
-                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                    )
-                pidfds.append(pidfd)
-
-            remote_fds = []
-            for pidfd, fd in zip(pidfds, all_handles_data, strict=True):
-                remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                if remote_fd < 0:
-                    err = ctypes.get_errno()
-                    error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                    if err == 1:  # EPERM
-                        error_msg += (
-                            " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                            "to your docker run command."
-                        )
-                    else:
-                        error_msg += (
-                            " This may be due to kernel version (requires Linux 5.6+)."
-                        )
-                    raise RuntimeError(error_msg)
-                remote_fds.append(remote_fd)
-
-            all_handles_data = remote_fds
+            # Use SCM_RIGHTS (UNIX socket fd passing) to exchange POSIX file
+            # descriptors across ranks.  This avoids pidfd_getfd which requires
+            # CAP_SYS_PTRACE and is blocked in many container environments.
+            all_handles_data = MnnvlMemory._exchange_fds_via_scm_rights(
+                comm, exported_fabric_handle
+            )
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
