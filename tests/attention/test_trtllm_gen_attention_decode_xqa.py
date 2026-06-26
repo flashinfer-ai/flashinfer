@@ -19,6 +19,7 @@ live in the decode file and are imported here.
 """
 
 import pytest
+import torch
 
 from tests.attention.test_trtllm_gen_attention_decode import (
     _test_trtllm_batch_decode,
@@ -96,7 +97,8 @@ def test_trtllm_batch_decode(
     # xqa backend does not support non-contiguous query yet
     if backend == "xqa" and non_contiguous_query:
         pytest.skip("xqa backend does not support non-contiguous query")
-
+    if backend == "xqa" and torch.device(device="cuda")[0] not in [9, 10, 12]:
+        pytest.skip("xqa backend requires SM90, SM100, SM120/SM121 GPUs")
     # General set of tests for xqa decode
     _test_trtllm_batch_decode(
         backend,
