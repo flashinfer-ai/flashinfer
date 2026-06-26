@@ -92,6 +92,16 @@ Unified AllReduce Fusion API
     TRTLLMAllReduceFusionWorkspace
     MNNVLAllReduceFusionWorkspace
 
+FP8 Quantized AllReduce
+-----------------------
+
+.. currentmodule:: flashinfer.comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    quantized_all_reduce
+
 vLLM AllReduce
 --------------
 
