@@ -831,26 +831,19 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
             : mAllProfiles.front();
     if (profile_ids.has_value()) {
       TVM_FFI_ICHECK_EQ(profile_ids.value().size(), 2) << "Expecting 2 profile ids";
-      // GEMM1 index: accept absolute index; otherwise if clearly out of combined range, keep
-      // default
+      // GEMM1 index: accept absolute index and raise error if out of GEMM1 range
       auto id1 = profile_ids.value()[0];
       if (id1 != -1) {
         TVM_FFI_ICHECK(id1 >= 0 && id1 < mGemm1TacticCount) << "Invalid gemm1 profile id: " << id1;
         best_gemm1_profile = mAllProfiles.at(id1);
       }
 
-      // GEMM2 index: support both absolute (combined) and relative (within GEMM2 subrange) ids
+      // GEMM2 index: accept absolute index and raise error if out of GEMM2 range
       auto id2 = profile_ids.value()[1];
       if (id2 != -1) {
-        int64_t absolute_id2 = id2;
-        // If id2 appears relative to GEMM2 subrange, offset it
-        if (id2 >= 0 && id2 < mGemm2TacticCount) {
-          absolute_id2 = mGemm1TacticCount + id2;
-        }
-        TVM_FFI_ICHECK(absolute_id2 >= 0 &&
-                       absolute_id2 < static_cast<int64_t>(mAllProfiles.size()))
+        TVM_FFI_ICHECK(id2 >= mGemm1TacticCount && id2 < mGemm1TacticCount + mGemm2TacticCount)
             << "Invalid gemm2 profile id: " << id2;
-        best_gemm2_profile = mAllProfiles.at(absolute_id2);
+        best_gemm2_profile = mAllProfiles.at(id2);
       }
     }
     mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
