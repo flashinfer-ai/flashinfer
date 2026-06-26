@@ -112,11 +112,13 @@ void append_paged_kv_cache(TensorView append_key, TensorView append_value, Tenso
                           << paged_k_cache.dtype();
 }
 
-void nvfp4_quantize_append_paged_kv_cache(
-    TensorView append_key, TensorView append_value, TensorView batch_indices, TensorView positions,
-    TensorView paged_k_cache, TensorView paged_v_cache, TensorView k_scale_cache,
-    TensorView v_scale_cache, TensorView kv_indices, TensorView kv_indptr,
-    TensorView kv_last_page_len, double k_scale, double v_scale, int64_t layout) {
+void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView append_value,
+                                          TensorView batch_indices, TensorView positions,
+                                          TensorView paged_k_cache, TensorView paged_v_cache,
+                                          TensorView k_scale_cache, TensorView v_scale_cache,
+                                          TensorView kv_indices, TensorView kv_indptr,
+                                          TensorView kv_last_page_len, double k_scale,
+                                          double v_scale, int64_t layout) {
   CHECK_LAST_DIM_CONTIGUOUS(append_key);
   CHECK_LAST_DIM_CONTIGUOUS(append_value);
   CHECK_INPUT(batch_indices);
@@ -241,7 +243,8 @@ void nvfp4_quantize_append_paged_kv_cache(
         static_cast<int32_t*>(kv_last_page_len.data_ptr()));
     cudaError_t status = NVFP4QuantizeAppendPagedKVCache(
         paged_kv, static_cast<c_type*>(append_key.data_ptr()),
-        static_cast<c_type*>(append_value.data_ptr()), static_cast<int32_t*>(batch_indices.data_ptr()),
+        static_cast<c_type*>(append_value.data_ptr()),
+        static_cast<int32_t*>(batch_indices.data_ptr()),
         static_cast<int32_t*>(positions.data_ptr()), nnz, append_k_stride_n, append_k_stride_h,
         append_v_stride_n, append_v_stride_h, static_cast<uint8_t*>(k_scale_cache.data_ptr()),
         static_cast<uint8_t*>(v_scale_cache.data_ptr()), k_sf_stride_page, k_sf_stride_n,
@@ -371,16 +374,17 @@ void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(append_key.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(slot_mapping.dtype(), id_type, [&] {
       cudaError_t status = NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
-          static_cast<c_type*>(append_key.data_ptr()), static_cast<c_type*>(append_value.data_ptr()),
+          static_cast<c_type*>(append_key.data_ptr()),
+          static_cast<c_type*>(append_value.data_ptr()),
           static_cast<id_type*>(slot_mapping.data_ptr()), nnz, num_heads, page_size,
           packed_head_dim, append_k_stride_n, append_k_stride_h, append_v_stride_n,
           append_v_stride_h, static_cast<uint8_t*>(paged_k_cache.data_ptr()),
           static_cast<uint8_t*>(paged_v_cache.data_ptr()),
           static_cast<uint8_t*>(k_scale_cache.data_ptr()),
           static_cast<uint8_t*>(v_scale_cache.data_ptr()), k_stride_page, k_stride_n, k_stride_h,
-          v_stride_page, v_stride_n, v_stride_h, k_sf_stride_page, k_sf_stride_n,
-          k_sf_stride_h, v_sf_stride_page, v_sf_stride_n, v_sf_stride_h,
-          static_cast<float*>(k_scale.data_ptr()), static_cast<float*>(v_scale.data_ptr()), stream);
+          v_stride_page, v_stride_n, v_stride_h, k_sf_stride_page, k_sf_stride_n, k_sf_stride_h,
+          v_sf_stride_page, v_sf_stride_n, v_sf_stride_h, static_cast<float*>(k_scale.data_ptr()),
+          static_cast<float*>(v_scale.data_ptr()), stream);
       TVM_FFI_ICHECK(status == cudaSuccess)
           << "NVFP4QuantizeAppendPagedKVCacheWithSlotMapping failed with error: "
           << cudaGetErrorString(status);

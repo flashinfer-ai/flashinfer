@@ -22,11 +22,13 @@ void append_paged_kv_cache(TensorView append_key, TensorView append_value, Tenso
                            TensorView kv_indices, TensorView kv_indptr, TensorView kv_last_page_len,
                            int64_t layout);
 
-void nvfp4_quantize_append_paged_kv_cache(
-    TensorView append_key, TensorView append_value, TensorView batch_indices, TensorView positions,
-    TensorView paged_k_cache, TensorView paged_v_cache, TensorView k_scale_cache,
-    TensorView v_scale_cache, TensorView kv_indices, TensorView kv_indptr,
-    TensorView kv_last_page_len, double k_scale, double v_scale, int64_t layout);
+void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView append_value,
+                                          TensorView batch_indices, TensorView positions,
+                                          TensorView paged_k_cache, TensorView paged_v_cache,
+                                          TensorView k_scale_cache, TensorView v_scale_cache,
+                                          TensorView kv_indices, TensorView kv_indptr,
+                                          TensorView kv_last_page_len, double k_scale,
+                                          double v_scale, int64_t layout);
 
 void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     TensorView append_key, TensorView append_value, TensorView slot_mapping,

@@ -555,7 +555,9 @@ def nvfp4_quantize_append_paged_kv_cache(
     """
     _check_kv_layout(kv_layout)
     if append_key.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"append_key must be float16 or bfloat16, got {append_key.dtype}")
+        raise ValueError(
+            f"append_key must be float16 or bfloat16, got {append_key.dtype}"
+        )
     if append_value.dtype != append_key.dtype:
         raise ValueError(
             f"append_key and append_value must have the same dtype, got "
@@ -569,7 +571,9 @@ def nvfp4_quantize_append_paged_kv_cache(
         k_scale_cache.dtype != torch.float8_e4m3fn
         or v_scale_cache.dtype != torch.float8_e4m3fn
     ):
-        raise ValueError("NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn")
+        raise ValueError(
+            "NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn"
+        )
     if k_scale <= 0.0 or v_scale <= 0.0:
         raise ValueError("k_scale and v_scale must be positive global decode scales")
 
@@ -599,7 +603,9 @@ def _as_float32_scalar_tensor(
 ) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
-            raise ValueError(f"{name} must have exactly one element, got {value.numel()}")
+            raise ValueError(
+                f"{name} must have exactly one element, got {value.numel()}"
+            )
         if value.dtype != torch.float32:
             raise ValueError(f"{name} must be torch.float32, got {value.dtype}")
         if value.device != device:
@@ -629,15 +635,22 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     """
     _check_kv_layout(kv_layout)
     if append_key.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"append_key must be float16 or bfloat16, got {append_key.dtype}")
+        raise ValueError(
+            f"append_key must be float16 or bfloat16, got {append_key.dtype}"
+        )
     if append_value.dtype != append_key.dtype:
         raise ValueError(
             f"append_key and append_value must have the same dtype, got "
             f"{append_key.dtype} and {append_value.dtype}"
         )
     if slot_mapping.dtype not in (torch.int32, torch.int64):
-        raise ValueError(f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}")
-    if append_key.shape[0] < slot_mapping.shape[0] or append_value.shape[0] < slot_mapping.shape[0]:
+        raise ValueError(
+            f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}"
+        )
+    if (
+        append_key.shape[0] < slot_mapping.shape[0]
+        or append_value.shape[0] < slot_mapping.shape[0]
+    ):
         raise ValueError(
             "append_key and append_value must have at least slot_mapping.shape[0] rows"
         )
@@ -650,7 +663,9 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         k_scale_cache.dtype != torch.float8_e4m3fn
         or v_scale_cache.dtype != torch.float8_e4m3fn
     ):
-        raise ValueError("NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn")
+        raise ValueError(
+            "NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn"
+        )
 
     k_scale_tensor = _as_float32_scalar_tensor(
         k_scale, device=append_key.device, name="k_scale"

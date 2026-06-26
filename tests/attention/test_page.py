@@ -8,7 +8,9 @@ from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
 def _nvfp4_dequant_linear(packed, scales, global_scale):
     packed_flat = packed.reshape(-1, packed.shape[-1])
     scales_flat = scales.reshape(-1, scales.shape[-1]).view(torch.uint8)
-    global_scale_tensor = torch.tensor([global_scale], dtype=torch.float32, device=packed.device)
+    global_scale_tensor = torch.tensor(
+        [global_scale], dtype=torch.float32, device=packed.device
+    )
     dequant = e2m1_and_ufp8sf_scale_to_float(
         packed_flat,
         scales_flat,
@@ -90,7 +92,10 @@ def test_append_paged_kv_cache(contiguous):
 @pytest.mark.parametrize("head_dim", [128, 512])
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_nvfp4_quantize_append_paged_kv_cache(kv_layout, dtype, head_dim, contiguous):
-    cc = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
+    cc = (
+        torch.cuda.get_device_capability()[0] * 10
+        + torch.cuda.get_device_capability()[1]
+    )
     if cc < 80:
         pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
 
@@ -126,11 +131,17 @@ def test_nvfp4_quantize_append_paged_kv_cache(kv_layout, dtype, head_dim, contig
 
     kv_append_length = torch.tensor([45, 8, 25, 22], dtype=torch.int32, device="cuda:0")
     kv_append_indptr = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device="cuda:0"), torch.cumsum(kv_append_length, dim=0)]
+        [
+            torch.zeros(1, dtype=torch.int32, device="cuda:0"),
+            torch.cumsum(kv_append_length, dim=0),
+        ]
     )
     num_pages_per_req = torch.tensor([3, 1, 2, 2], dtype=torch.int32, device="cuda:0")
     kv_page_indptr = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device="cuda:0"), torch.cumsum(num_pages_per_req, dim=0)]
+        [
+            torch.zeros(1, dtype=torch.int32, device="cuda:0"),
+            torch.cumsum(num_pages_per_req, dim=0),
+        ]
     )
     kv_page_indices = torch.arange(8, dtype=torch.int32, device="cuda:0")
     kv_last_page_len = torch.tensor([13, 8, 9, 6], dtype=torch.int32, device="cuda:0")
@@ -169,7 +180,9 @@ def test_nvfp4_quantize_append_paged_kv_cache(kv_layout, dtype, head_dim, contig
         pos = int(positions_cpu[i].item())
         page_offset = pos // page_size
         entry_idx = pos % page_size
-        page_id = int(kv_page_indices_cpu[int(kv_page_indptr_cpu[batch_idx]) + page_offset].item())
+        page_id = int(
+            kv_page_indices_cpu[int(kv_page_indptr_cpu[batch_idx]) + page_offset].item()
+        )
         if kv_layout == "NHD":
             k_actual = k_dequant[page_id, entry_idx]
             v_actual = v_dequant[page_id, entry_idx]
@@ -188,7 +201,10 @@ def test_nvfp4_quantize_append_paged_kv_cache(kv_layout, dtype, head_dim, contig
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     kv_layout, dtype, head_dim, contiguous, slot_dtype
 ):
-    cc = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
+    cc = (
+        torch.cuda.get_device_capability()[0] * 10
+        + torch.cuda.get_device_capability()[1]
+    )
     if cc < 80:
         pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
 
