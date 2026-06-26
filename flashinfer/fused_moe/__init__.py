@@ -78,6 +78,10 @@ from .bgmv_moe import (  # noqa: F401
     fill_w_ptr as fill_w_ptr,
     has_bgmv_moe as has_bgmv_moe,
 )
+from .moe_lora_delta import (  # noqa: F401
+    bgmv_moe_gemm1_lora_delta as bgmv_moe_gemm1_lora_delta,
+    bgmv_moe_gemm2_lora_delta as bgmv_moe_gemm2_lora_delta,
+)
 
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
@@ -142,6 +146,8 @@ __all__ = [
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
+    "bgmv_moe_gemm1_lora_delta",
+    "bgmv_moe_gemm2_lora_delta",
     "fill_w_ptr",
     "has_bgmv_moe",
 ]
