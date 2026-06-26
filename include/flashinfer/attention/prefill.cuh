@@ -180,16 +180,14 @@ struct KernelTraits {
   static constexpr bool USE_KV_SHARED_SMEM = USE_VO_SPLIT && !is_fp4_type_v<DTypeKV_> &&
                                              (HEAD_DIM_QK == HEAD_DIM_VO) &&
                                              (sizeof(DTypeKV_) == 2 || CTA_TILE_Q_ > 16);
-  static constexpr bool USE_SOFTMAX_VO_SPLIT =
-      USE_VO_SPLIT && AttentionVariant_::use_softmax &&
-      ((sizeof(DTypeKV_) == 2) || is_fp4_type_v<DTypeKV_>);
+  static constexpr bool USE_SOFTMAX_VO_SPLIT = USE_VO_SPLIT && AttentionVariant_::use_softmax &&
+                                               ((sizeof(DTypeKV_) == 2) || is_fp4_type_v<DTypeKV_>);
   static constexpr bool USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT =
       USE_SOFTMAX_VO_SPLIT && is_fp4_type_v<DTypeKV_>;
   static constexpr bool USE_16B_VO_SPLIT =
       USE_VO_SPLIT && (sizeof(DTypeKV_) == 2) && AttentionVariant_::use_softmax;
-  static constexpr bool USE_SHARED_ROPE_FREQ =
-      POS_ENCODING_MODE_ == PosEncodingMode::kRoPELlama && HEAD_DIM_QK > 256 &&
-      HEAD_DIM_QK == HEAD_DIM_VO;
+  static constexpr bool USE_SHARED_ROPE_FREQ = POS_ENCODING_MODE_ == PosEncodingMode::kRoPELlama &&
+                                               HEAD_DIM_QK > 256 && HEAD_DIM_QK == HEAD_DIM_VO;
   static constexpr uint32_t SHARED_ROPE_FREQ_BYTES =
       USE_SHARED_ROPE_FREQ ? (4 * (NUM_MMA_D_QK / 2) * 4 * sizeof(float)) : 0;
   static constexpr uint32_t UPCAST_STRIDE_Q = HEAD_DIM_QK / upcast_size<DTypeQ_>();
@@ -552,10 +550,9 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
     for (uint32_t i = 0; i < NUM_MMA_KV * ROWS_PER_ITER / NUM_WARPS_Q; ++i) {
       const uint32_t logical_row =
           warp_idx * ROWS_PER_ITER + lane_idx / 8 + NUM_WARPS * ROWS_PER_ITER * i;
-      DType* gptr =
-          kv_ptr + get_paged_kv_offset_for_logical_row<KTraits>(
-                       paged_kv, packed_page_iter_base, last_indptr, kv_head_idx, logical_row,
-                       lane_idx);
+      DType* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<KTraits>(
+                                 paged_kv, packed_page_iter_base, last_indptr, kv_head_idx,
+                                 logical_row, lane_idx);
 #pragma unroll
       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DType)); ++j) {
         if constexpr (IS_FP4) {
@@ -567,10 +564,9 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
         gptr += (IS_FP4 ? 4 : 8) * upcast_size<DType>();
       }
       kv_idx += NUM_WARPS * ROWS_PER_ITER;
-      *smem_offset =
-          smem.template advance_offset_by_row<NUM_WARPS * ROWS_PER_ITER, UPCAST_STRIDE>(
-              *smem_offset) -
-          sizeof(DType) * NUM_MMA_D;
+      *smem_offset = smem.template advance_offset_by_row<NUM_WARPS * ROWS_PER_ITER, UPCAST_STRIDE>(
+                         *smem_offset) -
+                     sizeof(DType) * NUM_MMA_D;
     }
     *smem_offset -= KTraits::CTA_TILE_KV * UPCAST_STRIDE;
   } else {
@@ -581,19 +577,17 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
     for (uint32_t i = 0; i < NUM_MMA_KV * (ROWS_PER_ITER / 4) / NUM_WARPS_Q; ++i) {
       const uint32_t logical_row =
           warp_idx * ROWS_PER_ITER + lane_idx / 4 + NUM_WARPS * ROWS_PER_ITER * i;
-      DType* gptr =
-          kv_ptr + get_paged_kv_offset_for_logical_row<KTraits>(
-                       paged_kv, packed_page_iter_base, last_indptr, kv_head_idx, logical_row,
-                       lane_idx);
+      DType* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<KTraits>(
+                                 paged_kv, packed_page_iter_base, last_indptr, kv_head_idx,
+                                 logical_row, lane_idx);
       if constexpr (IS_FP4) {
         smem.template load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
       } else {
         smem.template load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
       }
       kv_idx += NUM_WARPS * ROWS_PER_ITER;
-      *smem_offset =
-          smem.template advance_offset_by_row<NUM_WARPS * ROWS_PER_ITER, UPCAST_STRIDE>(
-              *smem_offset);
+      *smem_offset = smem.template advance_offset_by_row<NUM_WARPS * ROWS_PER_ITER, UPCAST_STRIDE>(
+          *smem_offset);
     }
     *smem_offset -= KTraits::CTA_TILE_KV * UPCAST_STRIDE;
   }
@@ -764,8 +758,7 @@ __device__ __forceinline__ float compute_rope_freq(const uint32_t mma_d, const u
   constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
   return rope_rcp_scale *
          __powf(rope_rcp_theta,
-                float(2 * ((mma_d * 16 + (j / 2) * 8 + lane_mod * 2 + (j % 2)) %
-                           (HEAD_DIM / 2))) /
+                float(2 * ((mma_d * 16 + (j / 2) * 8 + lane_mod * 2 + (j % 2)) % (HEAD_DIM / 2))) /
                     float(HEAD_DIM));
 }
 
@@ -1157,10 +1150,11 @@ __device__ __forceinline__ void compute_qk(
 }
 
 template <typename KTraits>
-__device__ __forceinline__ void load_fp4_k_frag_scaled(
-    smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, const uint32_t k_smem_offset_r,
-    uint8_t* k_sf_smem, const uint32_t lane_idx, const uint32_t mma_kv,
-    const uint32_t mma_d, uint32_t* b_frag) {
+__device__ __forceinline__ void load_fp4_k_frag_scaled(smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem,
+                                                       const uint32_t k_smem_offset_r,
+                                                       uint8_t* k_sf_smem, const uint32_t lane_idx,
+                                                       const uint32_t mma_kv, const uint32_t mma_d,
+                                                       uint32_t* b_frag) {
   using DTypeQ = typename KTraits::DTypeQ;
   using DTypeKV = typename KTraits::DTypeKV;
   static_assert(is_fp4_type_v<DTypeKV>);
@@ -1242,11 +1236,10 @@ __device__ __forceinline__ void compute_qk_fp4_rope(
       uint32_t b_frag_first[4], b_frag_second[4];
       load_fp4_k_frag_scaled<KTraits>(k_smem, k_smem_offset_first_mma, k_sf_smem, lane_idx, mma_kv,
                                       mma_di, b_frag_first);
-      load_fp4_k_frag_scaled<KTraits>(k_smem, k_smem_offset_second_mma, k_sf_smem, lane_idx,
-                                      mma_kv, mma_di + NUM_MMA_D_HALF, b_frag_second);
+      load_fp4_k_frag_scaled<KTraits>(k_smem, k_smem_offset_second_mma, k_sf_smem, lane_idx, mma_kv,
+                                      mma_di + NUM_MMA_D_HALF, b_frag_second);
       k_frag_apply_llama_rope<DTypeQ>((DTypeQ*)b_frag_first, (DTypeQ*)b_frag_second,
-                                      rope_freq[mma_di],
-                                      kv_rope_base + mma_kv * 16 + lane_idx / 4);
+                                      rope_freq[mma_di], kv_rope_base + mma_kv * 16 + lane_idx / 4);
 
       k_smem_offset_first_mma =
           k_smem->template advance_offset_by_row<16, UPCAST_STRIDE_K>(k_smem_offset_first_mma);
@@ -1260,11 +1253,11 @@ __device__ __forceinline__ void compute_qk_fp4_rope(
             mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ, MMAMode::kInit>(
                 s_frag[mma_q][mma_kv], a_frag_first[mma_q], b_frag_first);
           } else {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(
-                s_frag[mma_q][mma_kv], a_frag_first[mma_q], b_frag_first);
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(s_frag[mma_q][mma_kv],
+                                                              a_frag_first[mma_q], b_frag_first);
           }
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(
-              s_frag[mma_q][mma_kv], a_frag_second[mma_q], b_frag_second);
+          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(s_frag[mma_q][mma_kv],
+                                                            a_frag_second[mma_q], b_frag_second);
         } else if (std::is_same_v<typename KTraits::DTypeQKAccum, half>) {
           if (mma_di == 0) {
             mma::mma_sync_m16n16k16_row_col_f16f16f16<MMAMode::kInit>(
@@ -1279,8 +1272,7 @@ __device__ __forceinline__ void compute_qk_fp4_rope(
       }
     }
 
-    q_smem_offset_first =
-        q_smem->template advance_offset_by_column<2>(q_smem_offset_first, mma_di);
+    q_smem_offset_first = q_smem->template advance_offset_by_column<2>(q_smem_offset_first, mma_di);
     if (mma_di % 2 == 1) {
       k_smem_offset_first =
           k_smem->template advance_offset_by_column<2>(k_smem_offset_first, mma_di / 2);
@@ -2081,7 +2073,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
             ? (NUM_MMA_D_QK / 2)
             : 1;
     alignas(16) float local_rope_freq[LOCAL_ROPE_FREQ_ROWS][4];
-    float (*rope_freq)[4] = local_rope_freq;
+    float(*rope_freq)[4] = local_rope_freq;
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
       const float rope_rcp_theta = params.rope_rcp_theta;
@@ -2106,8 +2098,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
 #pragma unroll 1
     for (uint32_t d_tile = 0;
-         d_tile < (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT ? 1u
-                                                                 : KTraits::NUM_D_VO_TILES);
+         d_tile < (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT ? 1u : KTraits::NUM_D_VO_TILES);
          ++d_tile) {
       [[maybe_unused]] const uint32_t d_base = d_tile * KTraits::NUM_MMA_D_VO_TILE;
       if constexpr (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT) {
@@ -2231,11 +2222,11 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         // compute attention score
         if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
                       is_fp4_type_v<DTypeKV>) {
-          compute_qk_fp4_rope<KTraits>(
-              &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-              smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                           KTraits::NUM_MMA_KV * 16 * KTraits::NUM_MMA_D_QK,
-              lane_idx, kv_idx_base, rope_freq, s_frag);
+          compute_qk_fp4_rope<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
+                                       smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
+                                                                    KTraits::NUM_MMA_KV * 16 *
+                                                                    KTraits::NUM_MMA_D_QK,
+                                       lane_idx, kv_idx_base, rope_freq, s_frag);
         } else {
           compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
                               smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
@@ -2317,11 +2308,10 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       finalize_m<KTraits>(variant, m);
 
       if constexpr (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT) {
-        vosplit_write_o<KTraits>(
-            o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
-            partition_kv ? num_chunks * o_stride_n : o_stride_n, o_stride_h,
-            get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP, group_size,
-            lane_idx);
+        vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
+                                 partition_kv ? num_chunks * o_stride_n : o_stride_n, o_stride_h,
+                                 get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
+                                 group_size, lane_idx);
       } else {
         // threadblock synchronization
         threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
@@ -2376,9 +2366,9 @@ template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCacheKernel(
     const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
-  using SmemStorage = std::conditional_t<KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT,
-                                         typename KTraits::SharedStoragePaged,
-                                         typename KTraits::SharedStorage>;
+  using SmemStorage =
+      std::conditional_t<KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT,
+                         typename KTraits::SharedStoragePaged, typename KTraits::SharedStorage>;
   auto& smem_storage = reinterpret_cast<SmemStorage&>(smem);
   SinglePrefillWithKVCacheDevice<KTraits>(params, smem_storage);
 }
@@ -2413,9 +2403,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. FP4 large-head
     // single-prefill additionally uses VO-split output so it avoids the
     // cta_sync_o_smem traffic that exceeds SM86 shared memory.
-    constexpr bool kLargeHeadWarpSplit =
-        ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) && (HEAD_DIM_VO >= 512) &&
-        (CTA_TILE_Q == 32);
+    constexpr bool kLargeHeadWarpSplit = ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) &&
+                                         (HEAD_DIM_VO >= 512) && (CTA_TILE_Q == 32);
     constexpr uint32_t NUM_WARPS_Q = kLargeHeadWarpSplit ? 2 : get_num_warps_q(CTA_TILE_Q);
     constexpr uint32_t NUM_WARPS_KV = kLargeHeadWarpSplit ? 2 : get_num_warps_kv(CTA_TILE_Q);
     constexpr uint32_t NUM_MMA_Q = kLargeHeadWarpSplit ? 1 : get_num_mma_q(CTA_TILE_Q);
@@ -2453,30 +2442,26 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
         (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                        sizeof(DTypeQ))
                     : 0u) +
-        (is_fp4_type_v<DTypeKV> ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV /
-                                   NVFP4_SF_VEC_SIZE)
-                                : 0u) +
+        (is_fp4_type_v<DTypeKV>
+             ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV / NVFP4_SF_VEC_SIZE)
+             : 0u) +
         (kSinglePrefillVOSplitDispatch ? CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ) : 0u);
-    constexpr uint32_t kSharedRopeFreqSmem =
-        (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && HEAD_DIM_QK > 256 &&
-         HEAD_DIM_QK == HEAD_DIM_VO)
-            ? (4u * (NUM_MMA_D_QK / 2) * 4u * sizeof(float))
-            : 0u;
+    constexpr uint32_t kSharedRopeFreqSmem = (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
+                                              HEAD_DIM_QK > 256 && HEAD_DIM_QK == HEAD_DIM_VO)
+                                                 ? (4u * (NUM_MMA_D_QK / 2) * 4u * sizeof(float))
+                                                 : 0u;
     constexpr uint32_t kSinglePrefillVOSplitFixedSmem =
         kSinglePrefillVOSplitDispatch ? (NUM_WARPS_KV * CTA_TILE_Q * 8u + 2048u) : 0u;
-    constexpr uint32_t kFixedSmem =
-        CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kSinglePrefillVOSplitFixedSmem +
-        kSharedRopeFreqSmem;
+    constexpr uint32_t kFixedSmem = CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+                                    kSinglePrefillVOSplitFixedSmem + kSharedRopeFreqSmem;
     // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
     // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0); size the
     // occupancy budget against the minimum *valid* tile so the staging buffer
     // can't shrink NUM_MMA_KV onto an invalid value on tight-smem parts (SM120).
     constexpr uint32_t kMinValidMmaKV =
         (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
-    const int num_ctas_per_sm = max_smem_per_sm >=
-                                        2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV)
-                                    ? 2
-                                    : 1;
+    const int num_ctas_per_sm =
+        max_smem_per_sm >= 2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV) ? 2 : 1;
     const int max_smem_per_threadblock =
         min(max_smem_per_sm / num_ctas_per_sm, max_smem_per_block_optin);
 
@@ -2485,9 +2470,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
          !USE_FP16_QK_REDUCTION)
             ? 2
             : (8 / NUM_MMA_Q);
-    const int max_num_mma_kv_smem =
-        (max_smem_per_threadblock - static_cast<int>(kFixedSmem)) /
-        static_cast<int>(kKVSmemPerMmaKV);
+    const int max_num_mma_kv_smem = (max_smem_per_threadblock - static_cast<int>(kFixedSmem)) /
+                                    static_cast<int>(kKVSmemPerMmaKV);
     if (max_num_mma_kv_smem < 1) {
       std::ostringstream err_msg;
       err_msg << "Even the smallest KV tile for head_dim_qk=" << HEAD_DIM_QK
@@ -2499,88 +2483,89 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     }
 
     // control NUM_MMA_KV for maximum warp occupancy
-    DISPATCH_NUM_MMA_KV(min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg),
-                        NUM_MMA_KV, {
-      using KTraits =
-          KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                       NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                       DTypeQKAccum, typename Params::IdType, AttentionVariant>;
-      if constexpr (KTraits::IsInvalid()) {
-        // Invalid configuration, skip
-        std::ostringstream err_msg;
-        err_msg << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q
+    DISPATCH_NUM_MMA_KV(
+        min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg), NUM_MMA_KV, {
+          using KTraits =
+              KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                           NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                           DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+          if constexpr (KTraits::IsInvalid()) {
+            // Invalid configuration, skip
+            std::ostringstream err_msg;
+            err_msg
+                << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q
                 << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
                 << " NUM_MMA_KV=" << NUM_MMA_KV << " NUM_WARPS_Q=" << NUM_WARPS_Q
                 << " NUM_WARPS_KV=" << NUM_WARPS_KV
                 << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
                    " and report the issue to the developers.";
-        FLASHINFER_ERROR(err_msg.str());
-      } else {
-        constexpr uint32_t num_threads = (NUM_WARPS_Q * NUM_WARPS_KV) * WARP_SIZE;
-        auto kernel = SinglePrefillWithKVCacheKernel<KTraits, Params>;
-        using SmemStorage = std::conditional_t<KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT,
-                                               typename KTraits::SharedStoragePaged,
-                                               typename KTraits::SharedStorage>;
-        size_t smem_size = sizeof(SmemStorage);
-        if (smem_size > (size_t)max_smem_per_block_optin) {
-          std::ostringstream err_msg;
-          err_msg << "Required shared memory (" << smem_size
-                  << " bytes) for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO
-                  << ", cta_tile_q=" << CTA_TILE_Q << " exceeds this GPU's per-block limit ("
-                  << max_smem_per_block_optin
-                  << " bytes); this configuration is not supported on this architecture.";
-          FLASHINFER_ERROR(err_msg.str());
-        }
-        FLASHINFER_CUDA_CALL(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        int num_blocks_per_sm = 0;
-        int num_sm = 0;
-        FLASHINFER_CUDA_CALL(
-            cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-        FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &num_blocks_per_sm, kernel, num_threads, smem_size));
-        uint32_t max_num_kv_chunks = (num_blocks_per_sm * num_sm) /
-                                     (num_kv_heads * ceil_div(qo_len * group_size, CTA_TILE_Q));
-        uint32_t num_chunks;
-        if (max_num_kv_chunks > 0) {
-          uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
-          num_chunks = ceil_div(kv_len, chunk_size);
-        } else {
-          num_chunks = 0;
-        }
-
-        if (num_chunks <= 1 || tmp == nullptr) {
-          // Enough parallelism, do not split-kv
-          params.partition_kv = false;
-          void* args[] = {(void*)&params};
-          dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), 1, num_kv_heads);
-          dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        } else {
-          // Use cooperative groups to increase occupancy
-          params.partition_kv = true;
-          float* tmp_lse = (float*)(tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM_VO);
-          auto o = params.o;
-          auto lse = params.lse;
-          params.o = tmp;
-          params.lse = tmp_lse;
-          void* args[] = {(void*)&params};
-          dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), num_chunks, num_kv_heads);
-          dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
-
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-          if constexpr (AttentionVariant::use_softmax) {
-            FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
-                                             HEAD_DIM_VO, stream));
+            FLASHINFER_ERROR(err_msg.str());
           } else {
+            constexpr uint32_t num_threads = (NUM_WARPS_Q * NUM_WARPS_KV) * WARP_SIZE;
+            auto kernel = SinglePrefillWithKVCacheKernel<KTraits, Params>;
+            using SmemStorage = std::conditional_t<KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT,
+                                                   typename KTraits::SharedStoragePaged,
+                                                   typename KTraits::SharedStorage>;
+            size_t smem_size = sizeof(SmemStorage);
+            if (smem_size > (size_t)max_smem_per_block_optin) {
+              std::ostringstream err_msg;
+              err_msg << "Required shared memory (" << smem_size
+                      << " bytes) for head_dim_qk=" << HEAD_DIM_QK
+                      << ", head_dim_vo=" << HEAD_DIM_VO << ", cta_tile_q=" << CTA_TILE_Q
+                      << " exceeds this GPU's per-block limit (" << max_smem_per_block_optin
+                      << " bytes); this configuration is not supported on this architecture.";
+              FLASHINFER_ERROR(err_msg.str());
+            }
+            FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            int num_blocks_per_sm = 0;
+            int num_sm = 0;
             FLASHINFER_CUDA_CALL(
-                AttentionSum(tmp, o, num_chunks, qo_len, num_qo_heads, HEAD_DIM_VO, stream));
+                cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+            FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &num_blocks_per_sm, kernel, num_threads, smem_size));
+            uint32_t max_num_kv_chunks = (num_blocks_per_sm * num_sm) /
+                                         (num_kv_heads * ceil_div(qo_len * group_size, CTA_TILE_Q));
+            uint32_t num_chunks;
+            if (max_num_kv_chunks > 0) {
+              uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
+              num_chunks = ceil_div(kv_len, chunk_size);
+            } else {
+              num_chunks = 0;
+            }
+
+            if (num_chunks <= 1 || tmp == nullptr) {
+              // Enough parallelism, do not split-kv
+              params.partition_kv = false;
+              void* args[] = {(void*)&params};
+              dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), 1, num_kv_heads);
+              dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+            } else {
+              // Use cooperative groups to increase occupancy
+              params.partition_kv = true;
+              float* tmp_lse = (float*)(tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM_VO);
+              auto o = params.o;
+              auto lse = params.lse;
+              params.o = tmp;
+              params.lse = tmp_lse;
+              void* args[] = {(void*)&params};
+              dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), num_chunks, num_kv_heads);
+              dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
+
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+              if constexpr (AttentionVariant::use_softmax) {
+                FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len,
+                                                 num_qo_heads, HEAD_DIM_VO, stream));
+              } else {
+                FLASHINFER_CUDA_CALL(
+                    AttentionSum(tmp, o, num_chunks, qo_len, num_qo_heads, HEAD_DIM_VO, stream));
+              }
+            }
           }
-        }
-      }
-    })
+        })
   });
   return cudaSuccess;
 }
@@ -2686,9 +2671,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
     extern __shared__ uint8_t smem[];
-    using SmemStorage = std::conditional_t<KTraits::USE_SOFTMAX_VO_SPLIT,
-                                           typename KTraits::SharedStoragePaged,
-                                           typename KTraits::SharedStorage>;
+    using SmemStorage =
+        std::conditional_t<KTraits::USE_SOFTMAX_VO_SPLIT, typename KTraits::SharedStoragePaged,
+                           typename KTraits::SharedStorage>;
     auto& smem_storage = reinterpret_cast<SmemStorage&>(smem);
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
@@ -2711,8 +2696,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     constexpr uint32_t O_FRAG_D =
-        KTraits::USE_SOFTMAX_VO_SPLIT ? KTraits::NUM_MMA_D_VO_PER_WARP
-                                       : KTraits::NUM_MMA_D_VO_TILE;
+        KTraits::USE_SOFTMAX_VO_SPLIT ? KTraits::NUM_MMA_D_VO_PER_WARP : KTraits::NUM_MMA_D_VO_TILE;
     alignas(16) float o_frag[NUM_MMA_Q][O_FRAG_D][8];
     [[maybe_unused]] float o_scale[NUM_MMA_Q][2];
     DTypeQKAccum m[NUM_MMA_Q][2];
@@ -2723,7 +2707,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
             ? (NUM_MMA_D_QK / 2)
             : 1;
     alignas(16) float local_rope_freq[LOCAL_ROPE_FREQ_ROWS][4];
-    float (*rope_freq)[4] = local_rope_freq;
+    float(*rope_freq)[4] = local_rope_freq;
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
@@ -2756,8 +2740,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
 #pragma unroll 1
     for (uint32_t d_tile = 0;
-         d_tile < (KTraits::USE_SOFTMAX_VO_SPLIT ? 1u : KTraits::NUM_D_VO_TILES);
-         ++d_tile) {
+         d_tile < (KTraits::USE_SOFTMAX_VO_SPLIT ? 1u : KTraits::NUM_D_VO_TILES); ++d_tile) {
       [[maybe_unused]] const uint32_t d_base = d_tile * KTraits::NUM_MMA_D_VO_TILE;
       if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
 #pragma unroll
@@ -2918,11 +2901,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         // compute attention score
         if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
                       is_fp4_type_v<DTypeKV>) {
-          compute_qk_fp4_rope<KTraits>(
-              &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-              smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                           KTraits::NUM_MMA_KV * 16 * KTraits::NUM_MMA_D_QK,
-              lane_idx, kv_rope_base, rope_freq, s_frag);
+          compute_qk_fp4_rope<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
+                                       smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
+                                                                    KTraits::NUM_MMA_KV * 16 *
+                                                                    KTraits::NUM_MMA_D_QK,
+                                       lane_idx, kv_rope_base, rope_freq, s_frag);
         } else if constexpr (KTraits::USE_KV_REPACK) {
           // Dequantize FP8 K -> BF16 staging smem (shuffle-free), then read native 16-bit.
           repack_fp8_tile_to_bf16<KTraits, KTraits::HEAD_DIM_QK>(
@@ -3262,8 +3245,7 @@ __device__ __forceinline__ void vosplit_compute_pv(
         if constexpr (IS_FP4) {
           using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
           constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;
-          const uint32_t sf_base =
-              (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + global_d;
+          const uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + global_d;
           __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
           sf0_fp8.__x = smem_storage->v_sf_smem[sf_base];
           sf1_fp8.__x = smem_storage->v_sf_smem[sf_base + SF_COLS_V];
@@ -3456,7 +3438,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             ? (NUM_MMA_D_QK / 2)
             : 1;
     alignas(16) float local_rope_freq[LOCAL_ROPE_FREQ_ROWS][4];
-    float (*rope_freq)[4] = local_rope_freq;
+    float(*rope_freq)[4] = local_rope_freq;
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
@@ -3540,8 +3522,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
           v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage.k_smem : smem_storage.v_smem);
-      constexpr uint32_t NUM_PAGED_KV_OFFSETS =
-          NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q;
+      constexpr uint32_t NUM_PAGED_KV_OFFSETS = NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q;
       [[maybe_unused]] size_t
           thr_local_kv_offset[KTraits::USE_KV_SHARED_SMEM ? 1 : NUM_PAGED_KV_OFFSETS];
 
@@ -3581,9 +3562,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       uint32_t packed_page_iter_base =
           paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
       if constexpr (KTraits::USE_KV_SHARED_SMEM) {
-        page_produce_kv_on_the_fly<false, KTraits>(
-            &smem_storage, &k_smem_offset_w, paged_kv.k_data, paged_kv, packed_page_iter_base,
-            last_indptr, kv_head_idx, 0, chunk_size, warp_idx, lane_idx);
+        page_produce_kv_on_the_fly<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
+                                                   paged_kv, packed_page_iter_base, last_indptr,
+                                                   kv_head_idx, 0, chunk_size, warp_idx, lane_idx);
       } else {
 #pragma unroll
         for (uint32_t i = 0;
@@ -3692,7 +3673,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           packed_page_iter_base = next_packed_page_iter_base;
 #pragma unroll
           for (uint32_t i = 0;
-               i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q; ++i) {
+               i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q;
+               ++i) {
             uint32_t page_iter, entry_idx;
             paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * KV_THR_LAYOUT_ROW +
                                           lane_idx / KV_THR_LAYOUT_COL +
@@ -3733,11 +3715,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         // compute attention score
         if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
                       is_fp4_type_v<DTypeKV>) {
-          compute_qk_fp4_rope<KTraits>(
-              &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-              smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                           KTraits::NUM_MMA_KV * 16 * KTraits::NUM_MMA_D_QK,
-              lane_idx, kv_rope_base, rope_freq, s_frag);
+          compute_qk_fp4_rope<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
+                                       smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
+                                                                    KTraits::NUM_MMA_KV * 16 *
+                                                                    KTraits::NUM_MMA_D_QK,
+                                       lane_idx, kv_rope_base, rope_freq, s_frag);
         } else if constexpr (KTraits::USE_KV_REPACK) {
           // Dequantize FP8 K -> BF16 staging smem (shuffle-free), then read native 16-bit.
           repack_fp8_tile_to_bf16<KTraits, KTraits::HEAD_DIM_QK>(
@@ -3848,8 +3830,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         block.sync();
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
           page_produce_kv_on_the_fly<false, KTraits>(
-              &smem_storage, &k_smem_offset_w, paged_kv.k_data, paged_kv, next_packed_page_iter_base,
-              last_indptr, kv_head_idx, (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+              &smem_storage, &k_smem_offset_w, paged_kv.k_data, paged_kv,
+              next_packed_page_iter_base, last_indptr, kv_head_idx, (iter + 1) * CTA_TILE_KV,
+              chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
           packed_page_iter_base = next_packed_page_iter_base;
         } else {
@@ -3999,9 +3982,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                              ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
                              (HEAD_DIM_QK == HEAD_DIM_VO) &&
                              (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
-  constexpr bool kVOSplitDispatch =
-      ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) && AttentionVariant::use_softmax &&
-      (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
+  constexpr bool kVOSplitDispatch = ((sizeof(DTypeKV) == 2) || is_fp4_type_v<DTypeKV>) &&
+                                    AttentionVariant::use_softmax && (HEAD_DIM_VO / 16 > 16) &&
+                                    ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
   constexpr uint32_t kKVSmemPerMmaKV =
       (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
                  : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
@@ -4011,11 +3994,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
       (kVOSplitDispatch ? (CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ)) : 0u);
   constexpr uint32_t kVOSplitFixedSmem =
       kVOSplitDispatch ? (NUM_WARPS_KV * CTA_TILE_Q * 8u + 2048u) : 0u;
-  constexpr uint32_t kSharedRopeFreqSmem =
-      (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && HEAD_DIM_QK > 256 &&
-       HEAD_DIM_QK == HEAD_DIM_VO)
-          ? (4u * (NUM_MMA_D_QK / 2) * 4u * sizeof(float))
-          : 0u;
+  constexpr uint32_t kSharedRopeFreqSmem = (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
+                                            HEAD_DIM_QK > 256 && HEAD_DIM_QK == HEAD_DIM_VO)
+                                               ? (4u * (NUM_MMA_D_QK / 2) * 4u * sizeof(float))
+                                               : 0u;
   constexpr uint32_t kFixedSmem =
       CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kVOSplitFixedSmem + kSharedRopeFreqSmem;
   // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
@@ -4025,10 +4007,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   // minimum *valid* tile rather than NUM_MMA_KV=1.
   constexpr uint32_t kMinValidMmaKV =
       (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
-  const int num_ctas_per_sm = max_smem_per_sm >=
-                                      2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV)
-                                  ? 2
-                                  : 1;
+  const int num_ctas_per_sm =
+      max_smem_per_sm >= 2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV) ? 2 : 1;
   // The occupancy budget (max_smem_per_sm / num_ctas_per_sm) can exceed the
   // hard per-block opt-in limit when only one CTA fits per SM (the two
   // attributes differ by 1KB on most arches), which would make
@@ -4044,8 +4024,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
           ? 2
           : (8 / NUM_MMA_Q);
   const int max_num_mma_kv_smem =
-      (max_smem_per_threadblock - static_cast<int>(kFixedSmem)) /
-      static_cast<int>(kKVSmemPerMmaKV);
+      (max_smem_per_threadblock - static_cast<int>(kFixedSmem)) / static_cast<int>(kKVSmemPerMmaKV);
   if (max_num_mma_kv_smem < 1) {
     std::ostringstream err_msg;
     err_msg << "Even the smallest KV tile for head_dim_qk=" << HEAD_DIM_QK
@@ -4056,92 +4035,92 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  DISPATCH_NUM_MMA_KV(min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg),
-                      NUM_MMA_KV, {
-    using KTraits =
-        KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                     NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
-    if constexpr (KTraits::IsInvalid()) {
-      // Invalid configuration, skip
-      std::ostringstream err_msg;
-      err_msg << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q
-              << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
-              << " NUM_MMA_KV=" << NUM_MMA_KV << " NUM_WARPS_Q=" << NUM_WARPS_Q
-              << " NUM_WARPS_KV=" << NUM_WARPS_KV
-              << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
-                 " and report the issue to the developers.";
-      FLASHINFER_ERROR(err_msg.str());
-    } else {
-      using SmemStorage = std::conditional_t<KTraits::USE_SOFTMAX_VO_SPLIT,
-                                             typename KTraits::SharedStoragePaged,
-                                             typename KTraits::SharedStorage>;
-      size_t smem_size = sizeof(SmemStorage);
-      auto kernel = BatchPrefillWithRaggedKVCacheKernel<KTraits, Params>;
-      // Exact final check: the analytic NUM_MMA_KV budget can slightly
-      // under-count the real struct (cross-warp merge buffers, padding);
-      // fail with a clear error instead of a launch-time cudaErrorInvalidValue.
-      if (smem_size > (size_t)max_smem_per_block_optin) {
-        std::ostringstream err_msg;
-        err_msg << "Required shared memory (" << smem_size
-                << " bytes) for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO
-                << ", cta_tile_q=" << CTA_TILE_Q << " exceeds this GPU's per-block limit ("
-                << max_smem_per_block_optin
-                << " bytes); this configuration is not supported on this architecture.";
-        FLASHINFER_ERROR(err_msg.str());
-      }
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      // PDL launch config
-      cudaLaunchAttribute attribute[1];
-      cudaLaunchConfig_t config;
-      if (enable_pdl) {
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        config.attrs = attribute;
-        config.numAttrs = 1;
-        config.gridDim = nblks;
-        config.blockDim = nthrs;
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-      }
+  DISPATCH_NUM_MMA_KV(
+      min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg), NUM_MMA_KV, {
+        using KTraits =
+            KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                         NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                         DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+        if constexpr (KTraits::IsInvalid()) {
+          // Invalid configuration, skip
+          std::ostringstream err_msg;
+          err_msg << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q
+                  << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
+                  << " NUM_MMA_KV=" << NUM_MMA_KV << " NUM_WARPS_Q=" << NUM_WARPS_Q
+                  << " NUM_WARPS_KV=" << NUM_WARPS_KV
+                  << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
+                     " and report the issue to the developers.";
+          FLASHINFER_ERROR(err_msg.str());
+        } else {
+          using SmemStorage = std::conditional_t<KTraits::USE_SOFTMAX_VO_SPLIT,
+                                                 typename KTraits::SharedStoragePaged,
+                                                 typename KTraits::SharedStorage>;
+          size_t smem_size = sizeof(SmemStorage);
+          auto kernel = BatchPrefillWithRaggedKVCacheKernel<KTraits, Params>;
+          // Exact final check: the analytic NUM_MMA_KV budget can slightly
+          // under-count the real struct (cross-warp merge buffers, padding);
+          // fail with a clear error instead of a launch-time cudaErrorInvalidValue.
+          if (smem_size > (size_t)max_smem_per_block_optin) {
+            std::ostringstream err_msg;
+            err_msg << "Required shared memory (" << smem_size
+                    << " bytes) for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO
+                    << ", cta_tile_q=" << CTA_TILE_Q << " exceeds this GPU's per-block limit ("
+                    << max_smem_per_block_optin
+                    << " bytes); this configuration is not supported on this architecture.";
+            FLASHINFER_ERROR(err_msg.str());
+          }
+          FLASHINFER_CUDA_CALL(
+              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          // PDL launch config
+          cudaLaunchAttribute attribute[1];
+          cudaLaunchConfig_t config;
+          if (enable_pdl) {
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            config.attrs = attribute;
+            config.numAttrs = 1;
+            config.gridDim = nblks;
+            config.blockDim = nthrs;
+            config.dynamicSmemBytes = smem_size;
+            config.stream = stream;
+          }
 
-      if (tmp_v == nullptr) {
-        // do not partition kv
-        params.partition_kv = false;
-        void* args[] = {(void*)&params};
-        if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
-        } else {
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+          if (tmp_v == nullptr) {
+            // do not partition kv
+            params.partition_kv = false;
+            void* args[] = {(void*)&params};
+            if (enable_pdl) {
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+            } else {
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+            }
+          } else {
+            // partition kv
+            params.partition_kv = true;
+            auto o = params.o;
+            auto lse = params.lse;
+            params.o = tmp_v;
+            params.lse = tmp_s;
+            void* args[] = {(void*)&params};
+            if (enable_pdl) {
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+            } else {
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+            }
+            if constexpr (AttentionVariant::use_softmax) {
+              FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+                  tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
+                  params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+            } else {
+              FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+                  tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
+                  num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+            }
+          }
         }
-      } else {
-        // partition kv
-        params.partition_kv = true;
-        auto o = params.o;
-        auto lse = params.lse;
-        params.o = tmp_v;
-        params.lse = tmp_s;
-        void* args[] = {(void*)&params};
-        if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
-        } else {
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        }
-        if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
-              tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
-        } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
-              tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
-              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
-        }
-      }
-    }
-  });
+      });
   return cudaSuccess;
 }
 
@@ -4214,11 +4193,10 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       (kVOSplitDispatch ? (CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ)) : 0u);
   constexpr uint32_t kVOSplitFixedSmem =
       kVOSplitDispatch ? (NUM_WARPS_KV * CTA_TILE_Q * 8u + 2048u) : 0u;
-  constexpr uint32_t kSharedRopeFreqSmem =
-      (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && HEAD_DIM_QK > 256 &&
-       HEAD_DIM_QK == HEAD_DIM_VO)
-          ? (4u * (NUM_MMA_D_QK / 2) * 4u * sizeof(float))
-          : 0u;
+  constexpr uint32_t kSharedRopeFreqSmem = (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
+                                            HEAD_DIM_QK > 256 && HEAD_DIM_QK == HEAD_DIM_VO)
+                                               ? (4u * (NUM_MMA_D_QK / 2) * 4u * sizeof(float))
+                                               : 0u;
   constexpr uint32_t kFixedSmem =
       CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kVOSplitFixedSmem + kSharedRopeFreqSmem;
   // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
@@ -4228,10 +4206,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // minimum *valid* tile rather than NUM_MMA_KV=1.
   constexpr uint32_t kMinValidMmaKV =
       (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
-  const int num_ctas_per_sm = max_smem_per_sm >=
-                                      2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV)
-                                  ? 2
-                                  : 1;
+  const int num_ctas_per_sm =
+      max_smem_per_sm >= 2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV) ? 2 : 1;
   const int max_smem_per_threadblock =
       min(max_smem_per_sm / num_ctas_per_sm, max_smem_per_block_optin);
 
@@ -4241,8 +4217,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
           ? 2
           : (8 / NUM_MMA_Q);
   const int max_num_mma_kv_smem =
-      (max_smem_per_threadblock - static_cast<int>(kFixedSmem)) /
-      static_cast<int>(kKVSmemPerMmaKV);
+      (max_smem_per_threadblock - static_cast<int>(kFixedSmem)) / static_cast<int>(kKVSmemPerMmaKV);
   if (max_num_mma_kv_smem < 1) {
     std::ostringstream err_msg;
     err_msg << "Even the smallest KV tile for head_dim_qk=" << HEAD_DIM_QK
@@ -4253,88 +4228,88 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  DISPATCH_NUM_MMA_KV(min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg),
-                      NUM_MMA_KV, {
-    using KTraits =
-        KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                     NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
-    if constexpr (KTraits::IsInvalid()) {
-      // Invalid configuration, skip
-      std::ostringstream err_msg;
-      err_msg << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q
-              << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
-              << " NUM_MMA_KV=" << NUM_MMA_KV << " NUM_WARPS_Q=" << NUM_WARPS_Q
-              << " NUM_WARPS_KV=" << NUM_WARPS_KV
-              << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
-                 " and report the issue to the developers.";
-      FLASHINFER_ERROR(err_msg.str());
-    } else {
-      size_t smem_size = sizeof(typename KTraits::SharedStoragePaged);
-      auto kernel = BatchPrefillWithPagedKVCacheKernel<KTraits, Params>;
-      // Exact final check: the analytic NUM_MMA_KV budget can slightly
-      // under-count the real struct (cross-warp merge buffers, padding);
-      // fail with a clear error instead of a launch-time cudaErrorInvalidValue.
-      if (smem_size > (size_t)max_smem_per_block_optin) {
-        std::ostringstream err_msg;
-        err_msg << "Required shared memory (" << smem_size
-                << " bytes) for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO
-                << ", cta_tile_q=" << CTA_TILE_Q << " exceeds this GPU's per-block limit ("
-                << max_smem_per_block_optin
-                << " bytes); this configuration is not supported on this architecture.";
-        FLASHINFER_ERROR(err_msg.str());
-      }
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      // PDL launch config
-      cudaLaunchAttribute attribute[1];
-      cudaLaunchConfig_t config;
-      if (enable_pdl) {
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        config.attrs = attribute;
-        config.numAttrs = 1;
-        config.gridDim = nblks;
-        config.blockDim = nthrs;
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-      }
+  DISPATCH_NUM_MMA_KV(
+      min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg), NUM_MMA_KV, {
+        using KTraits =
+            KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                         NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                         DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+        if constexpr (KTraits::IsInvalid()) {
+          // Invalid configuration, skip
+          std::ostringstream err_msg;
+          err_msg << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q
+                  << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
+                  << " NUM_MMA_KV=" << NUM_MMA_KV << " NUM_WARPS_Q=" << NUM_WARPS_Q
+                  << " NUM_WARPS_KV=" << NUM_WARPS_KV
+                  << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
+                     " and report the issue to the developers.";
+          FLASHINFER_ERROR(err_msg.str());
+        } else {
+          size_t smem_size = sizeof(typename KTraits::SharedStoragePaged);
+          auto kernel = BatchPrefillWithPagedKVCacheKernel<KTraits, Params>;
+          // Exact final check: the analytic NUM_MMA_KV budget can slightly
+          // under-count the real struct (cross-warp merge buffers, padding);
+          // fail with a clear error instead of a launch-time cudaErrorInvalidValue.
+          if (smem_size > (size_t)max_smem_per_block_optin) {
+            std::ostringstream err_msg;
+            err_msg << "Required shared memory (" << smem_size
+                    << " bytes) for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO
+                    << ", cta_tile_q=" << CTA_TILE_Q << " exceeds this GPU's per-block limit ("
+                    << max_smem_per_block_optin
+                    << " bytes); this configuration is not supported on this architecture.";
+            FLASHINFER_ERROR(err_msg.str());
+          }
+          FLASHINFER_CUDA_CALL(
+              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          // PDL launch config
+          cudaLaunchAttribute attribute[1];
+          cudaLaunchConfig_t config;
+          if (enable_pdl) {
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            config.attrs = attribute;
+            config.numAttrs = 1;
+            config.gridDim = nblks;
+            config.blockDim = nthrs;
+            config.dynamicSmemBytes = smem_size;
+            config.stream = stream;
+          }
 
-      if (tmp_v == nullptr) {
-        // do not partition kv
-        params.partition_kv = false;
-        if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
-        } else {
-          void* args[] = {(void*)&params};
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+          if (tmp_v == nullptr) {
+            // do not partition kv
+            params.partition_kv = false;
+            if (enable_pdl) {
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+            } else {
+              void* args[] = {(void*)&params};
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+            }
+          } else {
+            params.partition_kv = true;
+            auto o = params.o;
+            auto lse = params.lse;
+            params.o = tmp_v;
+            params.lse = tmp_s;
+            if (enable_pdl) {
+              FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+            } else {
+              void* args[] = {(void*)&params};
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+            }
+            if constexpr (AttentionVariant::use_softmax) {
+              FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+                  tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
+                  params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+            } else {
+              FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+                  tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
+                  num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+            }
+          }
         }
-      } else {
-        params.partition_kv = true;
-        auto o = params.o;
-        auto lse = params.lse;
-        params.o = tmp_v;
-        params.lse = tmp_s;
-        if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
-        } else {
-          void* args[] = {(void*)&params};
-          FLASHINFER_CUDA_CALL(
-              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        }
-        if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
-              tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
-        } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
-              tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
-              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
-        }
-      }
-    }
-  });
+      });
   return cudaSuccess;
 }
 

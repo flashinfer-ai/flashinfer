@@ -1209,9 +1209,7 @@ def _fa2_head_dim_nvcc_flags(
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
         if dtype_kv.itemsize == 1:
-            if not (
-                allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)
-            ):
+            if not (allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)):
                 return current_compilation_context.get_nvcc_flags_list(
                     supported_major_versions=[10, 11, 12]
                 )
