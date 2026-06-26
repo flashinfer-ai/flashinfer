@@ -315,9 +315,7 @@ if not hasattr(cutlass, "__version__"):
     cutlass.utils.PersistentTileSchedulerParams.__init__ = (
         hooked_PersistentTileSchedulerParams_init
     )
-    cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = (
-        hooked_get_cluster_work_idx_with_fastdivmod
-    )
+    cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
 
 
 class BlockScaledContiguousGatherGroupedGemmKernel:
@@ -562,7 +560,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 f"gated={gated} is inconsistent with activation_type {activation_type!r}"
             )
         self.vectorized_f32 = vectorized_f32
-        self.activation_type = activation_type.value
+        self.activation_type = int(activation_type)
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
@@ -1950,9 +1948,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     # Peek (try_wait) a sync transform buffer empty
                     a_sync_transform_producer_state.reset_count()
 
-                    for k_tile in cutlass.range(
-                        0, k_tile_cnt, 1, unroll=1
-                    ):  # noqa: B007
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         # Conditionally wait for A buffer full
                         a_pipeline.consumer_wait(a_consumer_state, peek_a_full_status)
 
@@ -2692,7 +2688,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         # gate * sigmoid(swiglu_alpha * gate)
                         # * (up + swiglu_beta).
                         #
-                        tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
+                        tCompute = cute.make_rmem_tensor(
+                            acc_vec_gate.shape, self.acc_dtype
+                        )
                         swiglu_alpha = cutlass.Float32(self.swiglu_alpha)
                         swiglu_beta = cutlass.Float32(self.swiglu_beta)
                         swiglu_limit = cutlass.Float32(self.swiglu_limit)

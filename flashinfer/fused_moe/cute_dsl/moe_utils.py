@@ -47,9 +47,7 @@ def normalize_cute_dsl_moe_activation_type(
 ) -> Tuple[ActivationType, bool]:
     activation_type = normalize_activation_type(activation_type)
     if activation_type not in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES:
-        expected = " or ".join(
-            repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES
-        )
+        expected = " or ".join(repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES)
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; expected {expected}"
         )

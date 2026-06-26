@@ -1668,8 +1668,7 @@ class TestCuteDslMoEWrapper:
             # are (custom_op, runner_class, hash(runner), profile, extras)
             # tuples; see AutoTuner._get_cache_key in flashinfer/autotuner.py.
             assert any(
-                isinstance(k, tuple)
-                and k[:1] == ("CuteDslMoEWrapper::run::Swiglu",)
+                isinstance(k, tuple) and k[:1] == ("CuteDslMoEWrapper::run::Swiglu",)
                 for k in autotuner.profiling_cache
             ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
             return ref, finalized
