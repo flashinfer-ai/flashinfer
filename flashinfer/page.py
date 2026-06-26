@@ -608,10 +608,15 @@ def _as_float32_scalar_tensor(
             )
         if value.dtype != torch.float32:
             raise ValueError(f"{name} must be torch.float32, got {value.dtype}")
+        if value.device.type == "cpu" and value.item() <= 0.0:
+            raise ValueError(f"{name} must be a positive global decode scale")
         if value.device != device:
             value = value.to(device=device)
         return value.contiguous()
-    return torch.tensor([float(value)], dtype=torch.float32, device=device)
+    scalar = float(value)
+    if scalar <= 0.0:
+        raise ValueError(f"{name} must be a positive global decode scale")
+    return torch.tensor([scalar], dtype=torch.float32, device=device)
 
 
 @flashinfer_api

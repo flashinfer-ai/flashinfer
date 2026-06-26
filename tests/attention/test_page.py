@@ -336,6 +336,184 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_page_size_one(
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_out_of_range(
+    kv_layout, slot_dtype
+):
+    cc = (
+        torch.cuda.get_device_capability()[0] * 10
+        + torch.cuda.get_device_capability()[1]
+    )
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+
+    nnz_kv = 4
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 2
+    max_num_pages = 2
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+
+    if kv_layout == "NHD":
+        packed_shape = (max_num_pages, page_size, num_kv_heads, head_dim // 2)
+        scale_shape = (max_num_pages, page_size, num_kv_heads, head_dim // 16)
+    else:
+        packed_shape = (max_num_pages, num_kv_heads, page_size, head_dim // 2)
+        scale_shape = (max_num_pages, num_kv_heads, page_size, head_dim // 16)
+
+    k_cache = torch.full(packed_shape, 123, dtype=torch.uint8, device="cuda:0")
+    v_cache = torch.full(packed_shape, 45, dtype=torch.uint8, device="cuda:0")
+    k_scales = torch.zeros(scale_shape, dtype=torch.float8_e4m3fn, device="cuda:0")
+    v_scales = torch.zeros_like(k_scales)
+    k_cache_before = k_cache.clone()
+    v_cache_before = v_cache.clone()
+    k_scales_before = k_scales.clone()
+    v_scales_before = v_scales.clone()
+    capacity = max_num_pages * page_size
+    slot_mapping = torch.tensor(
+        [capacity, capacity + 1, -1, capacity + 8],
+        dtype=slot_dtype,
+        device="cuda:0",
+    )
+
+    flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        1.0,
+        torch.ones(1, dtype=torch.float32),
+        kv_layout=kv_layout,
+    )
+
+    assert torch.equal(k_cache, k_cache_before)
+    assert torch.equal(v_cache, v_cache_before)
+    assert torch.equal(k_scales, k_scales_before)
+    assert torch.equal(v_scales, v_scales_before)
+
+
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_scale():
+    cc = (
+        torch.cuda.get_device_capability()[0] * 10
+        + torch.cuda.get_device_capability()[1]
+    )
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+
+    nnz_kv = 1
+    num_kv_heads = 1
+    head_dim = 64
+    page_size = 1
+    max_num_pages = 1
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+    k_cache = torch.zeros(
+        max_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim // 2,
+        dtype=torch.uint8,
+        device="cuda:0",
+    )
+    v_cache = torch.zeros_like(k_cache)
+    k_scales = torch.zeros(
+        max_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim // 16,
+        dtype=torch.float8_e4m3fn,
+        device="cuda:0",
+    )
+    v_scales = torch.zeros_like(k_scales)
+    slot_mapping = torch.zeros(nnz_kv, dtype=torch.int32, device="cuda:0")
+
+    with pytest.raises(ValueError, match="positive global decode scale"):
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append,
+            v_append,
+            slot_mapping,
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            0.0,
+            1.0,
+        )
+
+    with pytest.raises(ValueError, match="positive global decode scale"):
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append,
+            v_append,
+            slot_mapping,
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            1.0,
+            torch.tensor([-1.0], dtype=torch.float32),
+        )
+
+
+def test_nvfp4_quantize_append_paged_kv_cache_empty_append_noop():
+    cc = (
+        torch.cuda.get_device_capability()[0] * 10
+        + torch.cuda.get_device_capability()[1]
+    )
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+
+    num_kv_heads = 1
+    head_dim = 64
+    page_size = 1
+    max_num_pages = 1
+    k_append = torch.empty(
+        0, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    v_append = torch.empty_like(k_append)
+    k_cache = torch.full(
+        (max_num_pages, page_size, num_kv_heads, head_dim // 2),
+        123,
+        dtype=torch.uint8,
+        device="cuda:0",
+    )
+    v_cache = torch.full_like(k_cache, 45)
+    k_scales = torch.zeros(
+        max_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim // 16,
+        dtype=torch.float8_e4m3fn,
+        device="cuda:0",
+    )
+    v_scales = torch.zeros_like(k_scales)
+    k_cache_before = k_cache.clone()
+    v_cache_before = v_cache.clone()
+    k_scales_before = k_scales.clone()
+    v_scales_before = v_scales.clone()
+
+    flashinfer.nvfp4_quantize_append_paged_kv_cache(
+        k_append,
+        v_append,
+        torch.empty(0, dtype=torch.int32, device="cuda:0"),
+        torch.empty(0, dtype=torch.int32, device="cuda:0"),
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        torch.empty(0, dtype=torch.int32, device="cuda:0"),
+        torch.zeros(1, dtype=torch.int32, device="cuda:0"),
+        torch.empty(0, dtype=torch.int32, device="cuda:0"),
+        1.0,
+        1.0,
+    )
+
+    assert torch.equal(k_cache, k_cache_before)
+    assert torch.equal(v_cache, v_cache_before)
+    assert torch.equal(k_scales, k_scales_before)
+    assert torch.equal(v_scales, v_scales_before)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_all_negative(
     kv_layout, slot_dtype
 ):

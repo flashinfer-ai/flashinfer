@@ -160,6 +160,11 @@ void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView appe
   TVM_FFI_ICHECK(k_scale_cache.dtype() == dl_float8_e4m3fn &&
                  v_scale_cache.dtype() == dl_float8_e4m3fn)
       << "k_scale_cache and v_scale_cache must be float8_e4m3fn tensors";
+  TVM_FFI_ICHECK(batch_indices.dtype() == dl_int32) << "batch_indices must be int32";
+  TVM_FFI_ICHECK(positions.dtype() == dl_int32) << "positions must be int32";
+  TVM_FFI_ICHECK(kv_indices.dtype() == dl_int32) << "kv_indices must be int32";
+  TVM_FFI_ICHECK(kv_indptr.dtype() == dl_int32) << "kv_indptr must be int32";
+  TVM_FFI_ICHECK(kv_last_page_len.dtype() == dl_int32) << "kv_last_page_len must be int32";
   TVM_FFI_ICHECK(k_scale > 0.0 && v_scale > 0.0)
       << "k_scale and v_scale must be positive global decode scales";
 
@@ -377,8 +382,9 @@ void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
           static_cast<c_type*>(append_key.data_ptr()),
           static_cast<c_type*>(append_value.data_ptr()),
           static_cast<id_type*>(slot_mapping.data_ptr()), nnz, num_heads, page_size,
-          packed_head_dim, append_k_stride_n, append_k_stride_h, append_v_stride_n,
-          append_v_stride_h, static_cast<uint8_t*>(paged_k_cache.data_ptr()),
+          static_cast<uint32_t>(paged_k_cache.size(0)), packed_head_dim, append_k_stride_n,
+          append_k_stride_h, append_v_stride_n, append_v_stride_h,
+          static_cast<uint8_t*>(paged_k_cache.data_ptr()),
           static_cast<uint8_t*>(paged_v_cache.data_ptr()),
           static_cast<uint8_t*>(k_scale_cache.data_ptr()),
           static_cast<uint8_t*>(v_scale_cache.data_ptr()), k_stride_page, k_stride_n, k_stride_h,
