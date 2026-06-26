@@ -26,6 +26,8 @@ PY="${PYTHON:-python}"
 TORCHRUN="${TORCHRUN:-torchrun}"
 NPROC_MULTIRANK="${NPROC_MULTIRANK:-4}"
 NPROC_SMOKE="${NPROC_SMOKE:-4}"
+# Avoid loading tests/conftest.py (full flashinfer.jit); moe_ep hooks live locally.
+MOE_EP_PYTEST_FLAGS=(--confcutdir=tests/moe_ep)
 
 declare -a SECTION_NAMES=()
 declare -a SECTION_STATUS=()
@@ -50,9 +52,12 @@ run_section() {
 
 run_unit() {
   "${PY}" -m pytest tests/moe_ep/ -v \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     --ignore=tests/moe_ep/test_moe_ep_ht_correctness.py \
@@ -61,10 +66,12 @@ run_unit() {
 
 run_multirank() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_layer_multirank.py -v \
     -m "nvep and gpu_4" --backend=nccl_ep
 
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_split_kernels.py -v \
     -m "nvep and gpu_4" --backend=nccl_ep
 
@@ -81,6 +88,7 @@ run_multirank() {
 run_correctness() {
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_compute_correctness.py \
     tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
     tests/moe_ep/test_moe_ep_ht_correctness.py -v \
@@ -89,9 +97,16 @@ run_correctness() {
 
 run_mega() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_mega_multirank.py \
-    tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py -v \
+    tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
+    tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v \
     -m "gpu_4 and arch_blackwell"
+
+  MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py -v \
+    -m arch_blackwell
 }
 
 run_smoke() {

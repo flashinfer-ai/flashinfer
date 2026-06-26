@@ -35,6 +35,10 @@ from .backends.mega.kernel.deep_gemm_mega import (
     DeepGemmMegaMoeConfig,
     preprocess_mega_weights,
 )
+from .backends.mega.kernel.mxfp8_cutedsl import (
+    Mxfp8CutedslMegaMoeConfig,
+    preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
+)
 from .backends.mega.kernel.nvfp4_cutedsl import (
     Nvfp4CutedslMegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
@@ -122,6 +126,7 @@ __all__ = [
     "MoEEpSplitLayer",
     "MoEEpTensors",
     "MoEWeightPack",
+    "Mxfp8CutedslMegaMoeConfig",
     "NCCLEPConfig",
     "NcclEpConfig",
     "Nvfp4CutedslMegaMoeConfig",
@@ -138,6 +143,7 @@ __all__ = [
     "have_nixl_ep",
     "kernel_requires_weights",
     "preprocess_mega_weights",
+    "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
     "run_split_kernel",
     "validate_arch_for_backend",

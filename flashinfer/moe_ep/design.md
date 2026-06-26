@@ -18,7 +18,7 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/{deep_gemm_mega,nvfp4_cutedsl}
+  backends/mega/kernel/{deep_gemm_mega,mxfp8_cutedsl,nvfp4_cutedsl}
   modes/{split_layer,mega_layer,config}.py
 ```
 
@@ -64,6 +64,7 @@ classDiagram
     SplitKernelBackend <|-- IdentitySplitKernelBackend
     MegaKernelBackend <|-- DeepGemmMegaKernelBackend
     MegaKernelBackend <|-- Nvfp4CutedslMegaKernelBackend
+    MegaKernelBackend <|-- Mxfp8CutedslMegaKernelBackend
 ```
 
 ## Forward flow
@@ -77,7 +78,7 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | Runtime need | Used by |
 |--------------|---------|
 | `torch_dist` | split comm, all mega kernels |
-| `nvshmem` | `nvfp4_cutedsl` only (skip with `MEGA_NO_DIST=1`) |
+| `nvshmem` | `nvfp4_cutedsl`, `mxfp8_cutedsl` only (skip with `MEGA_NO_DIST=1`) |
 
 ## Built-in plugins
 
@@ -89,10 +90,13 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe.MoELayer`; needs weights |
 | Mega kernel | `deep_gemm_mega` | `DeepGemmMegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `nvfp4_cutedsl` | `Nvfp4CutedslMegaMoeConfig` — NVFP4, sm_100+ |
-
-**Mega input staging:** `stage_inputs=True` accepts bf16 activations; `False` expects caller-supplied quantized `hidden_states` + `scales` (NVFP4 packed shape `[T, hidden/2]`).
+| Mega kernel | `mxfp8_cutedsl` | `Mxfp8CutedslMegaMoeConfig` — MXFP8, sm_100+ |
 
 **Mega weights (`nvfp4_cutedsl`):** kernel expects NVFP4 + swizzled-SF expert weights. Supply bf16 `MoEWeightPack` with `preprocess_weights=True` (default), or pre-quantized NVFP4 with `w13_scale` / `w2_scale`.
+
+**Mega weights (`mxfp8_cutedsl`):** kernel expects MXFP8 + swizzled E8M0-SF expert weights. Supply bf16 `MoEWeightPack` with `preprocess_weights=True` (default), or pre-quantized kernel-layout fp8 weights with plain `w13_scale` / `w2_scale`.
+
+**Mega input staging:** `stage_inputs=True` accepts bf16 activations; `False` expects caller-supplied quantized `hidden_states` + `scales` (NVFP4 packed shape `[T, hidden/2]`; MXFP8 fp8 shape `[T, hidden]` + E8M0 scales).
 
 ## Usage
 
@@ -130,7 +134,7 @@ layer.destroy()
 
 Under torchrun, dist/NVSHMEM init is automatic. Set `auto_bootstrap=False` when tests manage runtime themselves.
 
-Useful exports: `bootstrap_moe_ep_runtime`, `finalize_moe_ep_runtime`, `ensure_moe_ep_cuda_device`, `preprocess_mega_weights`, `preprocess_nvfp4_cutedsl_mega_weights`.
+Useful exports: `bootstrap_moe_ep_runtime`, `finalize_moe_ep_runtime`, `ensure_moe_ep_cuda_device`, `preprocess_mega_weights`, `preprocess_nvfp4_cutedsl_mega_weights`, `preprocess_mxfp8_cutedsl_mega_weights`.
 
 ## Lifetimes
 

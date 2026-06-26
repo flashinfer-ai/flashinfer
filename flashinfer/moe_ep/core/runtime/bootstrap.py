@@ -242,6 +242,11 @@ def nvfp4_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[
     return frozenset({TORCH_DIST, NVSHMEM})
 
 
+def mxfp8_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL MXFP8 mega kernel."""
+    return nvfp4_cutedsl_runtime_requirements(bootstrap)
+
+
 __all__ = [
     "MoEEpRuntimeHandle",
     "NVSHMEM",
@@ -249,6 +254,7 @@ __all__ = [
     "bootstrap_moe_ep_runtime",
     "ensure_moe_ep_cuda_device",
     "finalize_moe_ep_runtime",
+    "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
     "split_comm_runtime_requirements",
 ]

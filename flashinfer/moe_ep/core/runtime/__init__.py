@@ -7,6 +7,7 @@ from .bootstrap import (
     bootstrap_moe_ep_runtime,
     ensure_moe_ep_cuda_device,
     finalize_moe_ep_runtime,
+    mxfp8_cutedsl_runtime_requirements,
     nvfp4_cutedsl_runtime_requirements,
     split_comm_runtime_requirements,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "bootstrap_moe_ep_runtime",
     "ensure_moe_ep_cuda_device",
     "finalize_moe_ep_runtime",
+    "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
     "split_comm_runtime_requirements",
 ]
