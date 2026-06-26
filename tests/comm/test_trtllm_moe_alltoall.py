@@ -15,13 +15,17 @@ limitations under the License.
 """
 
 from enum import IntEnum
+import itertools
 import pytest
-import torch
 import pynvml
+import torch
+
 from flashinfer.comm.mapping import Mapping
 from flashinfer.fused_moe.utils import make_random_topk_ids
 from flashinfer.tllm_enums import SfLayout
 from flashinfer.utils import get_compute_capability
+from flashinfer import mxfp4_quantize, nvfp4_quantize
+from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
 from tests.utils_fp8 import mxfp8_quantize_reference
 
 import flashinfer.comm.trtllm_moe_alltoall as trtllm_moe_alltoall
@@ -66,187 +70,62 @@ LARGER_PAYLOADS_PARAMS = [
 class CombineQuantMode(IntEnum):
     NONE = 0
     MXFP8 = 1
+    MXFP4 = 2
+    NVFP4 = 3
 
 
-# (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace, quant_mode)
+# (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace)
 COMBINE_PARAMS = [
     # Coverage for popular model specifications
-    (
-        4,
-        16,
-        4096,
-        2,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Mixtral-8x7B
-    (
-        4,
-        16,
-        2880,
-        4,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # GPT-OSS-120B
-    (
-        8,
-        16,
-        5120,
-        6,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # DeepSeek-V2
-    (
-        8,
-        16,
-        7168,
-        8,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # DeepSeek-V3
-    (
-        8,
-        16,
-        4096,
-        8,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Qwen3-235B-A22B
-    (
-        8,
-        16,
-        4096,
-        10,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Qwen3.5-397B-A17B
-    (
-        8,
-        16,
-        4096,
-        16,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Fake, no known model with top_k=16
-    (
-        8,
-        16,
-        4096,
-        22,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),  # Nemotron-3-Super-120B-A12B
-    # Coverage for num_tokens
-    (
-        8,
-        1,
-        4096,
-        8,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),
-    # Coverage for dtype
-    (
-        8,
-        16,
-        4096,
-        8,
-        torch.float16,
-        True,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),
-    # Coverage for payload_in_workspace
-    (
-        8,
-        16,
-        4096,
-        8,
-        torch.bfloat16,
-        False,
-        CombineQuantMode.NONE,
-        SfLayout.layout_linear,
-    ),
-    # MXFP8 quantized combine output
-    (
-        4,
-        16,
-        4096,
-        2,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.MXFP8,
-        SfLayout.layout_linear,
-    ),
-    (
-        8,
-        16,
-        4096,
-        8,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.MXFP8,
-        SfLayout.layout_linear,
-    ),
-    (
-        4,
-        16,
-        4096,
-        2,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.MXFP8,
-        SfLayout.layout_128x4,
-    ),
-    (
-        8,
-        16,
-        4096,
-        8,
-        torch.bfloat16,
-        True,
-        CombineQuantMode.MXFP8,
-        SfLayout.layout_128x4,
-    ),
-    (4, 16, 4096, 2, torch.bfloat16, True, CombineQuantMode.MXFP8, SfLayout.layout_8x4),
-    (8, 16, 4096, 8, torch.bfloat16, True, CombineQuantMode.MXFP8, SfLayout.layout_8x4),
+    (4, 16, 4096, 2, torch.bfloat16, True),  # Mixtral-8x7B
+    (4, 16, 2880, 4, torch.bfloat16, True),  # GPT-OSS-120B
+    (8, 16, 5120, 6, torch.bfloat16, True),  # DeepSeek-V2
+    (8, 16, 7168, 8, torch.bfloat16, True),  # DeepSeek-V3
+    (8, 16, 4096, 8, torch.bfloat16, True),  # Qwen3-235B-A22B
+    (8, 16, 4096, 10, torch.bfloat16, True),  # Qwen3.5-397B-A17B
+    (8, 16, 4096, 16, torch.bfloat16, True),  # Fake, no known model with top_k=16
+    (8, 16, 4096, 22, torch.bfloat16, True),  # Nemotron-3-Super-120B-A12B
 ]
 
 
-def _compute_mxfp8_sf_size(num_rows, hidden_size, sf_layout):
-    """Number of uint8 scale-factor bytes needed for an [num_rows, hidden_size] MXFP8 tensor."""
-    assert hidden_size % 32 == 0, (
-        "hidden_size must be a multiple of 32 for MXFP8 (sf_vec_size=32)"
-    )
-    cols = hidden_size // 32
+# (quant_mode, sf_layout)
+QUANT_PARAMS = [
+    (CombineQuantMode.NONE, SfLayout.layout_linear),
+    (CombineQuantMode.MXFP8, SfLayout.layout_linear),
+    (CombineQuantMode.MXFP8, SfLayout.layout_128x4),
+    (CombineQuantMode.MXFP8, SfLayout.layout_8x4),
+    (CombineQuantMode.MXFP4, SfLayout.layout_128x4),
+    (CombineQuantMode.NVFP4, SfLayout.layout_128x4),
+]
+
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _compute_sf_size(
+    combine_quant_mode: CombineQuantMode,
+    num_rows: int,
+    hidden_size: int,
+    sf_layout: SfLayout,
+):
+    """Number of scale-factor bytes needed for an [num_rows, hidden_size] tensor."""
+    assert combine_quant_mode != CombineQuantMode.NONE
+    sf_vec_size = 16 if combine_quant_mode == CombineQuantMode.NVFP4 else 32
+    cols = ceil_div(hidden_size, sf_vec_size)
+
     if sf_layout == SfLayout.layout_linear:
         return num_rows * cols
-    if sf_layout == SfLayout.layout_128x4:
+    elif sf_layout == SfLayout.layout_128x4:
         padded_row = (num_rows + 127) // 128 * 128
         padded_col = (cols + 3) // 4 * 4
         return padded_row * padded_col
-    if sf_layout == SfLayout.layout_8x4:
+    elif sf_layout == SfLayout.layout_8x4:
         padded_row = (num_rows + 7) // 8 * 8
         padded_col = (cols + 3) // 4 * 4
         return padded_row * padded_col
-    raise ValueError(f"Unsupported sf_layout: {sf_layout}")
+    else:
+        raise ValueError(f"Unsupported sf_layout: {sf_layout}")
 
 
 # This is a hack to ensure we get forward progress when running multiple kernels on a single GPU
@@ -463,6 +342,7 @@ def combine_from_single_rank(
     payload_in_workspace,
     output_dtype=None,
     output_scales_list=None,
+    output_scalar_scale=1.0,
     sf_layout=SfLayout.layout_linear,
 ):
     combine_results = []
@@ -490,6 +370,7 @@ def combine_from_single_rank(
                         if output_scales_list is not None
                         else None
                     ),
+                    output_scalar_scale=output_scalar_scale,
                     sf_layout=sf_layout,
                 )
             )
@@ -704,7 +585,7 @@ def fake_moe(
 
 @pytest.mark.parametrize(
     "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace,quant_mode,sf_layout",
-    COMBINE_PARAMS,
+    [(*x, *y) for x, y in itertools.product(COMBINE_PARAMS, QUANT_PARAMS)],
 )
 def test_moe_combine_multi_rank_single_gpu(
     world_size,
@@ -719,9 +600,9 @@ def test_moe_combine_multi_rank_single_gpu(
     torch.cuda.set_device(0)
     compute_capability = get_compute_capability(torch.device("cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-    if quant_mode == CombineQuantMode.MXFP8 and compute_capability_number < 100:
+    if quant_mode != CombineQuantMode.NONE and compute_capability_number < 100:
         pytest.skip(
-            f"MXFP8 quantized combine requires CUDA platform >= 100, got {compute_capability_number}."
+            f"Combine-quantization fusion requires CUDA platform >= 100, got {compute_capability_number}."
         )
 
     check_sufficient_sm_count(num_tokens, world_size)
@@ -813,7 +694,13 @@ def test_moe_combine_multi_rank_single_gpu(
             )
         )
 
-    if quant_mode == CombineQuantMode.MXFP8:
+    output_scalar_scale = 1.0
+    if quant_mode != CombineQuantMode.NONE:
+        output_scalar_scale = (
+            2.5  # arbitrary non-one scalar to test scaling path in the kernel
+        )
+        # High-precision (bf16) combine output. The quantized kernel output is
+        # validated by dequantizing it and comparing against this reference.
         reference_result = combine_from_single_rank(
             inplace_combine_tensors,
             num_tokens,
@@ -824,10 +711,22 @@ def test_moe_combine_multi_rank_single_gpu(
             combine_payload_offsets,
             payload_in_workspace=payload_in_workspace,
         )
-        output_dtype = torch.float8_e4m3fn
-        sf_size = _compute_mxfp8_sf_size(num_tokens, vector_dim, sf_layout)
+        sf_size = _compute_sf_size(quant_mode, num_tokens, vector_dim, sf_layout)
+        if quant_mode == CombineQuantMode.MXFP8:
+            output_dtype = torch.float8_e4m3fn
+            sf_dtype = torch.uint8  # UE8M0 scale factors, packed as bytes
+        else:
+            # MXFP4 / NVFP4: two FP4 (e2m1) values packed per uint8 byte. The scale
+            # dtype is how the binding distinguishes the two: uint8 (UE8M0) -> MXFP4,
+            # float8_e4m3fn (UE4M3) -> NVFP4.
+            output_dtype = torch.uint8
+            sf_dtype = (
+                torch.uint8
+                if quant_mode == CombineQuantMode.MXFP4
+                else torch.float8_e4m3fn
+            )
         output_scales_list = [
-            torch.zeros(sf_size, dtype=torch.uint8, device=torch.device("cuda"))
+            torch.zeros(sf_size, dtype=sf_dtype, device=torch.device("cuda"))
             for _ in range(world_size)
         ]
     else:
@@ -846,6 +745,7 @@ def test_moe_combine_multi_rank_single_gpu(
         output_dtype=output_dtype,
         output_scales_list=output_scales_list,
         sf_layout=sf_layout,
+        output_scalar_scale=output_scalar_scale,
     )
 
     if quant_mode == CombineQuantMode.NONE:
@@ -878,6 +778,47 @@ def test_moe_combine_multi_rank_single_gpu(
                 atol=0,
                 rtol=0,
             )
+    elif quant_mode in (CombineQuantMode.MXFP4, CombineQuantMode.NVFP4):
+        is_nvfp4 = quant_mode == CombineQuantMode.NVFP4
+        sf_vec_size = 16 if is_nvfp4 else 32
+        # e2m1_and_ufp8sf_scale_to_float: ufp8_type 1 = UE4M3 (NVFP4), 0 = UE8M0 (MXFP4).
+        ufp8_type = 1 if is_nvfp4 else 0
+        is_swizzled = sf_layout != SfLayout.layout_linear
+        global_sf = torch.tensor(
+            [output_scalar_scale], dtype=torch.float32, device="cuda"
+        )
+        for rank in range(world_size):
+            if is_nvfp4:
+                ref_fp4, ref_sf = nvfp4_quantize(
+                    reference_result[rank],
+                    global_sf,
+                    sfLayout=sf_layout,
+                    sf_vec_size=16,
+                    do_shuffle=False,
+                )
+            else:
+                ref_fp4, ref_sf = mxfp4_quantize(reference_result[rank])
+            # Packed FP4 bytes can't be compared directly (two e2m1 codes share a byte),
+            # so dequantize both the kernel output and the reference identically and
+            # compare in float space. Both paths share the cvt_warp_fp16_to_fp4 routine,
+            # so the dequantized values should match within FP4 granularity.
+            actual = e2m1_and_ufp8sf_scale_to_float(
+                combine_results[rank].view(torch.uint8),
+                output_scales_list[rank].view(torch.uint8).reshape(-1),
+                global_sf,
+                sf_vec_size,
+                ufp8_type,
+                is_swizzled,
+            )
+            expected = e2m1_and_ufp8sf_scale_to_float(
+                ref_fp4.view(torch.uint8),
+                ref_sf.view(torch.uint8).reshape(-1),
+                global_sf,
+                sf_vec_size,
+                ufp8_type,
+                is_swizzled,
+            )
+            torch.testing.assert_close(actual, expected, atol=1.5e-2, rtol=1.5e-2)
     else:
         raise ValueError(f"Unsupported quant_mode: {quant_mode}")
 
