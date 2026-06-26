@@ -121,6 +121,7 @@ def compute_reference_moe_fp4(
     fc2_input_scale: torch.Tensor = None,
     num_local_experts: int = None,
     local_expert_offset: int = 0,
+    gated: bool = True,
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations on GPU.
 
@@ -173,17 +174,20 @@ def compute_reference_moe_fp4(
             w1 = gemm1_weights[local_idx]
             gemm1_out = token_input @ w1.T
 
-            linear = gemm1_out[:, :intermediate_size]
-            gate = gemm1_out[:, intermediate_size:]
-            swiglu_out = silu(gate) * linear
+            if gated:
+                linear = gemm1_out[:, :intermediate_size]
+                gate = gemm1_out[:, intermediate_size:]
+                act_out = silu(gate) * linear
+            else:
+                act_out = torch.relu(gemm1_out) ** 2
 
             if fc2_input_scale is not None:
-                swiglu_out = quant_dequant_fp4_reference(
-                    swiglu_out, fc2_input_scale, sf_vec_size=16
+                act_out = quant_dequant_fp4_reference(
+                    act_out, fc2_input_scale, sf_vec_size=16
                 )
 
             w2 = gemm2_weights[local_idx]
-            gemm2_out = swiglu_out @ w2.T
+            gemm2_out = act_out @ w2.T
 
             output[token_idx] += scale * gemm2_out.squeeze(0)
 
@@ -199,6 +203,7 @@ def create_moe_tensors(
     top_k: int,
     device: str = "cuda",
     seed: int = 42,
+    gated: bool = True,
 ):
     """Create properly quantized MoE tensors for testing."""
     from flashinfer.fp4_quantization import fp4_quantize
@@ -226,11 +231,13 @@ def create_moe_tensors(
     routing_weights = routing_weights.float()
     selected_experts = selected_experts.to(torch.int32)
 
-    # GEMM1 weights
+    # GEMM1 weights: gated SwiGLU has 2*intermediate rows (interleaved
+    # linear+gate); non-gated ReLU^2 has a single intermediate-row projection.
+    fc1_rows = 2 * intermediate_size if gated else intermediate_size
     w1_bf16 = (
         torch.randn(
             num_local_experts,
-            2 * intermediate_size,
+            fc1_rows,
             hidden_size,
             dtype=torch.bfloat16,
             device=device,
@@ -238,19 +245,18 @@ def create_moe_tensors(
         / 10
     )
 
-    w1_bf16_interleaved = interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-
-    w1_flat = w1_bf16_interleaved.view(
-        num_local_experts * 2 * intermediate_size, hidden_size
+    w1_for_quant = (
+        interleave_linear_and_gate(w1_bf16, group_size=64, dim=1) if gated else w1_bf16
     )
+    w1_flat = w1_for_quant.reshape(num_local_experts * fc1_rows, hidden_size)
     w1_q_flat, w1_sf_flat = fp4_quantize(
         w1_flat, global_scale=w1_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
     )
-    w1_q = w1_q_flat.view(num_local_experts, 2 * intermediate_size, hidden_size // 2)
+    w1_q = w1_q_flat.view(num_local_experts, fc1_rows, hidden_size // 2)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
-        m=2 * intermediate_size,
+        m=fc1_rows,
         k=hidden_size,
         num_groups=num_local_experts,
         sf_vec_size=sf_vec_size,
@@ -1000,8 +1006,10 @@ class TestCuteDslFusedMoeFunctional:
     @pytest.mark.parametrize("top_k", [1, 2, 8])
     @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
     @pytest.mark.parametrize("num_experts", [256, 384])
+    @pytest.mark.parametrize("activation", ["silu", "relu2"])
     def test_numerical_accuracy(
         self,
+        activation: str,
         num_tokens: int,
         top_k: int,
         hidden_size: int,
@@ -1011,6 +1019,7 @@ class TestCuteDslFusedMoeFunctional:
         """Accuracy test for functional API across configurations."""
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
+        gated = activation == "silu"
         num_local_experts = num_experts
 
         tensors = create_moe_tensors(
@@ -1020,6 +1029,7 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             top_k=top_k,
+            gated=gated,
         )
 
         result = cute_dsl_fused_moe_nvfp4(
@@ -1037,6 +1047,7 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
+            activation=activation,
         )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1056,6 +1067,7 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
+            gated=gated,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -1283,11 +1295,13 @@ class TestCuteDslMoEWrapper:
             f"CUDA graph accuracy: {percent_within * 100:.2f}% (atol={atol:.4f})"
         )
 
-    def test_wrapper_with_autotune(self):
+    @pytest.mark.parametrize("activation", ["silu", "relu2"])
+    def test_wrapper_with_autotune(self, activation: str):
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
 
+        gated = activation == "silu"
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
         num_experts, top_k = 256, 2
 
@@ -1298,6 +1312,7 @@ class TestCuteDslMoEWrapper:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            gated=gated,
         )
 
         moe = CuteDslMoEWrapper(
@@ -1306,6 +1321,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
+            activation=activation,
         )
 
         with autotune(True):
@@ -1338,6 +1354,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
+            gated=gated,
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)

@@ -6,7 +6,6 @@ import sys
 from routines.flashinfer_benchmark_utils import (
     benchmark_apis,
     full_output_columns,
-    output_column_dict,
 )
 
 
@@ -75,9 +74,11 @@ def run_test(args):
     if args.output_path is not None:
         with open(args.output_path, "a") as fout:
             for cur_res in res:
-                for key in output_column_dict["general"]:
-                    # Only set from args if the routine hasn't already set a value
-                    # This preserves routine-specific formatting while providing defaults
+                for key in full_output_columns:
+                    # Backfill every output column the routine didn't set: from
+                    # args when available, else "".  Covers columns belonging to
+                    # other routines (e.g. attention's s_qo) that would otherwise
+                    # KeyError below.  Routine-set values are preserved.
                     if key not in cur_res or cur_res[key] == "":
                         cur_res[key] = getattr(args, key, "")
 
