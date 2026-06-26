@@ -27,11 +27,11 @@ def _assert_nvfp4_quantized_close(actual, expected):
     mask = expected_f.abs() > 1e-6
     if mask.any():
         rel_error = (actual_f[mask] - expected_f[mask]).abs() / expected_f[mask].abs()
-        assert rel_error.mean() < 0.5
+        assert rel_error.mean() < 0.3
     cos_sim = torch.nn.functional.cosine_similarity(
         actual_f.unsqueeze(0), expected_f.unsqueeze(0)
     )
-    assert cos_sim > 0.8
+    assert cos_sim > 0.9
 
 
 @pytest.mark.parametrize("contiguous", [True, False])
@@ -270,3 +270,123 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     valid_slots = slot_mapping[valid].long()
     _assert_nvfp4_quantized_close(k_dequant[valid_slots], k_append[:nnz_kv][valid])
     _assert_nvfp4_quantized_close(v_dequant[valid_slots], v_append[:nnz_kv][valid])
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_page_size_one(
+    kv_layout,
+):
+    cc = (
+        torch.cuda.get_device_capability()[0] * 10
+        + torch.cuda.get_device_capability()[1]
+    )
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+
+    torch.manual_seed(42)
+    nnz_kv = 4
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 1
+    max_num_pages = 8
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+
+    if kv_layout == "NHD":
+        packed_shape = (max_num_pages, page_size, num_kv_heads, head_dim // 2)
+        scale_shape = (max_num_pages, page_size, num_kv_heads, head_dim // 16)
+    else:
+        packed_shape = (max_num_pages, num_kv_heads, page_size, head_dim // 2)
+        scale_shape = (max_num_pages, num_kv_heads, page_size, head_dim // 16)
+
+    k_cache = torch.zeros(packed_shape, dtype=torch.uint8, device="cuda:0")
+    v_cache = torch.zeros_like(k_cache)
+    k_scales = torch.zeros(scale_shape, dtype=torch.float8_e4m3fn, device="cuda:0")
+    v_scales = torch.zeros_like(k_scales)
+    slot_mapping = torch.tensor([0, 3, 5, -1], dtype=torch.int32, device="cuda:0")
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
+    v_scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
+
+    flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        k_scale,
+        v_scale,
+        kv_layout=kv_layout,
+    )
+
+    k_dequant = _nvfp4_dequant_linear(k_cache, k_scales, float(k_scale.item()))
+    v_dequant = _nvfp4_dequant_linear(v_cache, v_scales, float(v_scale.item()))
+    if kv_layout == "HND":
+        k_dequant = k_dequant.transpose(1, 2).contiguous()
+        v_dequant = v_dequant.transpose(1, 2).contiguous()
+    k_dequant = k_dequant.reshape(max_num_pages * page_size, num_kv_heads, head_dim)
+    v_dequant = v_dequant.reshape(max_num_pages * page_size, num_kv_heads, head_dim)
+
+    valid = slot_mapping >= 0
+    valid_slots = slot_mapping[valid].long()
+    _assert_nvfp4_quantized_close(k_dequant[valid_slots], k_append[valid])
+    _assert_nvfp4_quantized_close(v_dequant[valid_slots], v_append[valid])
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_all_negative(
+    kv_layout, slot_dtype
+):
+    cc = (
+        torch.cuda.get_device_capability()[0] * 10
+        + torch.cuda.get_device_capability()[1]
+    )
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+
+    nnz_kv = 4
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 1
+    max_num_pages = 4
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+
+    if kv_layout == "NHD":
+        packed_shape = (max_num_pages, page_size, num_kv_heads, head_dim // 2)
+        scale_shape = (max_num_pages, page_size, num_kv_heads, head_dim // 16)
+    else:
+        packed_shape = (max_num_pages, num_kv_heads, page_size, head_dim // 2)
+        scale_shape = (max_num_pages, num_kv_heads, page_size, head_dim // 16)
+
+    k_cache = torch.full(packed_shape, 123, dtype=torch.uint8, device="cuda:0")
+    v_cache = torch.full(packed_shape, 45, dtype=torch.uint8, device="cuda:0")
+    k_scales = torch.zeros(scale_shape, dtype=torch.float8_e4m3fn, device="cuda:0")
+    v_scales = torch.zeros_like(k_scales)
+    k_cache_before = k_cache.clone()
+    v_cache_before = v_cache.clone()
+    k_scales_before = k_scales.clone()
+    v_scales_before = v_scales.clone()
+    slot_mapping = torch.full((nnz_kv,), -1, dtype=slot_dtype, device="cuda:0")
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
+    v_scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
+
+    flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        k_scale,
+        v_scale,
+        kv_layout=kv_layout,
+    )
+
+    assert torch.equal(k_cache, k_cache_before)
+    assert torch.equal(v_cache, v_cache_before)
+    assert torch.equal(k_scales, k_scales_before)
+    assert torch.equal(v_scales, v_scales_before)
