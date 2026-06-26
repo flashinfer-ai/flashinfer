@@ -3,6 +3,7 @@ import torch
 
 import flashinfer
 from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
+from flashinfer.utils import get_compute_capability
 
 
 def _nvfp4_dequant_linear(packed, scales, global_scale):
@@ -32,6 +33,12 @@ def _assert_nvfp4_quantized_close(actual, expected):
         actual_f.unsqueeze(0), expected_f.unsqueeze(0)
     )
     assert cos_sim > 0.9
+
+
+def _skip_if_fp8_e4m3_scale_unsupported():
+    major, minor = get_compute_capability(torch.device("cuda:0"))
+    if major < 8:
+        pytest.skip(f"SM{major}{minor} does not support FP8 E4M3 scale tensors")
 
 
 @pytest.mark.parametrize("contiguous", [True, False])
@@ -92,12 +99,7 @@ def test_append_paged_kv_cache(contiguous):
 @pytest.mark.parametrize("head_dim", [128, 512])
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_nvfp4_quantize_append_paged_kv_cache(kv_layout, dtype, head_dim, contiguous):
-    cc = (
-        torch.cuda.get_device_capability()[0] * 10
-        + torch.cuda.get_device_capability()[1]
-    )
-    if cc < 80:
-        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+    _skip_if_fp8_e4m3_scale_unsupported()
 
     torch.manual_seed(42)
     nnz_kv = 100
@@ -201,12 +203,7 @@ def test_nvfp4_quantize_append_paged_kv_cache(kv_layout, dtype, head_dim, contig
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     kv_layout, dtype, head_dim, contiguous, slot_dtype
 ):
-    cc = (
-        torch.cuda.get_device_capability()[0] * 10
-        + torch.cuda.get_device_capability()[1]
-    )
-    if cc < 80:
-        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+    _skip_if_fp8_e4m3_scale_unsupported()
 
     torch.manual_seed(42)
     nnz_kv = 100
@@ -276,12 +273,7 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_page_size_one(
     kv_layout,
 ):
-    cc = (
-        torch.cuda.get_device_capability()[0] * 10
-        + torch.cuda.get_device_capability()[1]
-    )
-    if cc < 80:
-        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+    _skip_if_fp8_e4m3_scale_unsupported()
 
     torch.manual_seed(42)
     nnz_kv = 4
@@ -339,12 +331,7 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_page_size_one(
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_out_of_range(
     kv_layout, slot_dtype
 ):
-    cc = (
-        torch.cuda.get_device_capability()[0] * 10
-        + torch.cuda.get_device_capability()[1]
-    )
-    if cc < 80:
-        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+    _skip_if_fp8_e4m3_scale_unsupported()
 
     nnz_kv = 4
     num_kv_heads = 2
@@ -396,12 +383,7 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_out_of_range(
 
 
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_scale():
-    cc = (
-        torch.cuda.get_device_capability()[0] * 10
-        + torch.cuda.get_device_capability()[1]
-    )
-    if cc < 80:
-        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+    _skip_if_fp8_e4m3_scale_unsupported()
 
     nnz_kv = 1
     num_kv_heads = 1
@@ -456,12 +438,7 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_scal
 
 
 def test_nvfp4_quantize_append_paged_kv_cache_empty_append_noop():
-    cc = (
-        torch.cuda.get_device_capability()[0] * 10
-        + torch.cuda.get_device_capability()[1]
-    )
-    if cc < 80:
-        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+    _skip_if_fp8_e4m3_scale_unsupported()
 
     num_kv_heads = 1
     head_dim = 64
@@ -517,12 +494,7 @@ def test_nvfp4_quantize_append_paged_kv_cache_empty_append_noop():
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_all_negative(
     kv_layout, slot_dtype
 ):
-    cc = (
-        torch.cuda.get_device_capability()[0] * 10
-        + torch.cuda.get_device_capability()[1]
-    )
-    if cc < 80:
-        pytest.skip(f"SM{cc} does not support FP8 E4M3 scale tensors")
+    _skip_if_fp8_e4m3_scale_unsupported()
 
     nnz_kv = 4
     num_kv_heads = 2
