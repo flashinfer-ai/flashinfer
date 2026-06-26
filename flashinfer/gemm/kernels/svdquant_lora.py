@@ -1,0 +1,293 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Host glue for the fused NVFP4 SVDQuant kernel (Sm100BlockScaledLoRADenseGemmKernel).
+
+Framework-agnostic (no framework imports): the caller supplies the already-swizzled weight
+scale-factor blob and the externally-quantized NVFP4 activation (ext_xq/ext_sf), both consumed
+by the CuTe-DSL kernel as a raw data_ptr() reinterpreted via the block-scaled scale-factor
+layout. The bf16 down-projection D = X_hat @ L2^T is computed here with torch.matmul.
+
+Public API:
+    state = prepare_svdquant_state(M, Rq, w_sf_swizzled, L1, L2, gscale_x, gscale_w, r, ...)
+    y = mm_fp4_svdquant(x, state, ext_xq=..., ext_sf=...)   # y is [M, O] bf16
+"""
+import torch
+import torch.nn.functional as F
+
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import make_ptr
+
+from .dense_blockscaled_gemm_lora_sm100 import Sm100BlockScaledLoRADenseGemmKernel
+
+_V2_KERNEL_CACHE = {}
+
+
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _build_compiled(N, K, M, r, out_dtype=torch.bfloat16, force_tactic=None):
+    """cute.compile the kernel's fused residual + LoRA-up wrapper for a fixed shape.
+
+    Returns (compiled_callable, sf_m, sf_n, sf_k, lora_k). Cached per
+    (N,K,M,r,out_dtype,force_tactic).
+
+    force_tactic: optional (mma_tiler_mn, cluster_shape_mn, use_prefetch) to bypass tactic
+    selection (used by the prepare-time autotuner and tests).
+    """
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    # The compiled kernel is symbolic in M (sf_m/sf_n/sf_k + grid are runtime args), so a fixed
+    # (force_)tactic compiles once and is reused across all M -- critical to avoid recompiling per
+    # batch during e2e warmup. Only the None path (analytical heuristic, capture fallback) is
+    # M-dependent, so it keeps M in the key.
+    key = (N, K, r, out_dtype, force_tactic, M if force_tactic is None else None)
+    if key in _V2_KERNEL_CACHE:
+        return _V2_KERNEL_CACHE[key]
+
+    sf_dtype = cutlass.Float8E4M3FN
+    c_dtype = cutlass.BFloat16 if out_dtype == torch.bfloat16 else cutlass.Float16
+    lora_k = _ceil_div(r, 16) * 16
+    sf_m = _ceil_div(M, 128)
+    sf_n = _ceil_div(N, 128)
+    sf_k = _ceil_div(_ceil_div(K, 16), 4)
+
+    # Tile/cluster: explicit force_tactic > analytical heuristic, falling back to 128x128 (1,1).
+    # The fused-LoRA path now supports 2-CTA (256-wide) tiles + multicast D/L1, so any non-swap
+    # sm100 tactic is allowed (2-CTA 256-tiles are 1.3-1.6x faster at large M = high batch). swap_ab
+    # is still unsupported (D is M-indexed / L1 N-indexed; swap would transpose those roles).
+    mma_tiler_mn, cluster_shape_mn, use_prefetch = (128, 128), (1, 1), False
+    if force_tactic is not None:
+        mma_tiler_mn, cluster_shape_mn, use_prefetch = force_tactic
+    else:
+        try:
+            from flashinfer.gemm.kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
+
+            sm_count = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            tac = _select_sm100_mm_fp4_cute_dsl_tactic(M, N, K, sm_count)
+            t_mma, t_cluster, t_swap, t_prefetch, t_kernel, _ = tac
+            if (not t_swap) and t_kernel == "sm100":
+                mma_tiler_mn, cluster_shape_mn, use_prefetch = t_mma, t_cluster, t_prefetch
+        except Exception:
+            pass
+
+    gemm = Sm100BlockScaledLoRADenseGemmKernel(
+        16, mma_tiler_mn, cluster_shape_mn, use_prefetch, True, lora_rank=r,
+    )
+    sym_m = cute.sym_int(); sym_k = cute.sym_int(); sym_n = cute.sym_int()
+    a_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_m, sym_k), stride_order=(1, 0), assumed_align=32
+    )
+    b_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_n, sym_k), stride_order=(1, 0), assumed_align=32
+    )
+    c_fake = cute.runtime.make_fake_compact_tensor(
+        c_dtype, (sym_m, sym_n), stride_order=(1, 0), assumed_align=16
+    )
+    a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+    b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+    alpha_fake = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
+    mac = get_max_active_clusters(1)
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    opts = "--opt-level 2 --enable-tvm-ffi"
+
+    d_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (sym_m, cute.sym_int()), stride_order=(1, 0), assumed_align=16
+    )
+    l1_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (sym_n, cute.sym_int()), stride_order=(1, 0), assumed_align=16
+    )
+    compiled = cute.compile(
+        gemm.wrapper_lora, a_fake, b_fake, c_fake, d_fake, l1_fake,
+        sf_m, sf_n, sf_k, 1, a_sf_ptr, b_sf_ptr, alpha_fake, mac, stream_fake, options=opts,
+    )
+    res = (compiled, sf_m, sf_n, sf_k, lora_k)
+    _V2_KERNEL_CACHE[key] = res
+    return res
+
+
+# Candidate tactics for the prepare-time autotuner. Non-swap sm100 only (the LoRA path supports
+# 1-CTA and 2-CTA 256-wide tiles, not swap_ab). 2-CTA 256-tiles are 1.3-1.6x faster at large M;
+# the analytical heuristic under-selects them, so we time-select at prepare (warmup) like the
+# production TunableRunner. (tile, cluster, use_prefetch).
+_AUTOTUNE_CANDIDATES = [
+    # 1-CTA (win at small M, where trtllm is overhead-bound and a single CTA suffices)
+    ((128, 128), (1, 1), False),
+    ((128, 256), (1, 1), False),
+    ((128, 128), (1, 2), False),
+    ((128, 192), (1, 2), False),
+    # 2-CTA 256-wide (win at large M = high batch; 1.3-1.6x faster residual). Unsupported combos
+    # (e.g. tile_n the shape can't tile) are skipped by the try/except in _autotune_tactic.
+    ((256, 128), (2, 1), False),
+    ((256, 256), (2, 1), False),
+    ((256, 192), (2, 1), False),
+    ((256, 256), (2, 2), False),
+    ((256, 192), (2, 2), False),
+    ((256, 256), (4, 1), False),
+]
+_TACTIC_CHOICE_CACHE = {}
+
+
+def _time_call(call, iters=10, warmup=3):
+    for _ in range(warmup):
+        call()
+    torch.cuda.synchronize()
+    e0 = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    e1 = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        e0[i].record(); call(); e1[i].record()
+    torch.cuda.synchronize()
+    return sorted(e0[i].elapsed_time(e1[i]) for i in range(iters))[iters // 2] * 1000.0
+
+
+def _autotune_tactic(N, K, M, r):
+    """Time-select the fastest tactic for (N,K,M-bucket,r). Returns a (tile,cluster,prefetch) tuple,
+    or None if timing is unavailable (CUDA-graph capture) -> caller falls back to the heuristic.
+    Random correctly-sized operands (timing is shape-, not value-, dependent). Cached per M-bucket."""
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+    except Exception:
+        return None
+    bucket = 1 << max(0, (M - 1).bit_length())  # next power of 2 >= M
+    key = (N, K, bucket, r)
+    if key in _TACTIC_CHOICE_CACHE:
+        return _TACTIC_CHOICE_CACHE[key]
+
+    dev = "cuda"
+    Kp = K // 2
+    lora_k = _ceil_div(r, 16) * 16
+    # Cap the timing-M to avoid huge autotune allocations (out[M,N] is ~3.6GB at M=147k/b16 ->
+    # OOM). The best tactic is ~M-bucket-invariant in the large-M (compute-bound) regime, and the
+    # compiled kernel is symbolic in M, so timing at a capped M picks the same tactic.
+    M = min(M, 32768)
+    sf_m = _ceil_div(M, 128); sf_n = _ceil_div(N, 128); sf_k = _ceil_div(_ceil_div(K, 16), 4)
+    a = torch.randint(0, 256, (M, Kp), dtype=torch.uint8, device=dev)
+    wq = torch.randint(0, 256, (N, Kp), dtype=torch.uint8, device=dev)
+    a_sf = torch.randint(0, 256, (sf_m * sf_k * 512,), dtype=torch.uint8, device=dev).view(torch.float8_e4m3fn)
+    w_sf = torch.randint(0, 256, (sf_n * sf_k * 512,), dtype=torch.uint8, device=dev).view(torch.float8_e4m3fn)
+    alpha = torch.tensor([0.5], dtype=torch.float32, device=dev)
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=dev)
+    d = torch.randn(M, lora_k, dtype=torch.bfloat16, device=dev)
+    l1 = torch.randn(N, lora_k, dtype=torch.bfloat16, device=dev)
+
+    best_t, best_us = None, None
+    for tac in _AUTOTUNE_CANDIDATES:
+        try:
+            compiled, sfm, sfn, sfk, _ = _build_compiled(N, K, M, r, force_tactic=tac)
+            call = lambda c=compiled: c(a, wq, out, d, l1, sfm, sfn, sfk, a_sf.data_ptr(), w_sf.data_ptr(), alpha)
+            us = _time_call(call)
+            if best_us is None or us < best_us:
+                best_us, best_t = us, tac
+        except Exception:
+            # A candidate tile/cluster the kernel can't codegen for this shape (e.g. a tile_n the N
+            # can't tile): skip it. best_t only ever holds a tactic that built+ran successfully.
+            continue
+    # Defensive default: if every candidate failed to build (should not happen), fall back to the
+    # universally-supported 128x128 1-CTA tile rather than None (which would route prepare() to the
+    # analytical heuristic, whose mm_fp4-oriented pick is not guaranteed LoRA-codegen-safe).
+    if best_t is None:
+        best_t = ((128, 128), (1, 1), False)
+    _TACTIC_CHOICE_CACHE[key] = best_t
+    return best_t
+
+
+@torch.compiler.disable
+def prepare_svdquant_state(
+    M, Rq, w_sf_swizzled, L1, L2, gscale_x, gscale_w, r,
+    pre_quant_scale=None, external_quant=True, force_tactic=None,
+):
+    """Build a reusable dispatch state for one (M, I, O, r) shape (injection path).
+
+      Rq: prepacked NVFP4 weight [O, I//2] uint8 (E2M1, K-major).
+      w_sf_swizzled: weight block-scales already in the NVFP4 MMA swizzle (uint8/e4m3 blob, the layout
+                     trtllm fp4_quantize / swizzle_sf produce -- passed to the kernel as raw data_ptr).
+      L1: up-proj [O, r] bf16; L2: down-proj [r, I] bf16.
+      gscale_x, gscale_w: static global scales; the kernel applies alpha = gscale_x * gscale_w.
+      pre_quant_scale: optional [I] smoothing scale (applied to x before the down-proj).
+    external_quant must be True (injection path); the kernel has no internal quantizer here.
+    """
+    assert external_quant, "this host glue only supports the ext_xq/ext_sf injection path"
+    O = int(Rq.shape[0]); I = int(Rq.shape[1]) * 2
+    lora_k = _ceil_div(r, 16) * 16
+    dev = "cuda"
+
+    # Pick the tile/cluster: caller override > prepare-time autotune (time-select 1-CTA vs 2-CTA) >
+    # analytical heuristic (inside _build_compiled). Autotune runs once per (shape, M-bucket) during
+    # warmup; it returns None under CUDA-graph capture, where _build_compiled's heuristic is used.
+    if force_tactic is None:
+        force_tactic = _autotune_tactic(O, I, M, r)
+    compiled, sf_m, sf_n, sf_k, _ = _build_compiled(O, I, M, r, force_tactic=force_tactic)
+
+    wq = Rq.to(device=dev).view(torch.uint8).contiguous()
+    w_sf = w_sf_swizzled.to(device=dev).contiguous().view(torch.float8_e4m3fn)
+
+    # Fold 1/alpha into L1 so the LoRA-up D@L1^T accumulates into the MAIN block-scaled accumulator:
+    # the (unchanged) epilogue computes out = alpha*acc = alpha*(residual + D@(L1/alpha)^T)
+    # = alpha*residual + D@L1^T. This avoids a 2nd TMEM accumulator => keeps the base num_acc_stage
+    # MMA/epilogue overlap (the perf). alpha~3e-4 => L1/alpha~O(1e2), fine in bf16 + the f32 acc.
+    alpha_f = float(gscale_x) * float(gscale_w)
+    L1d = (L1.to(device=dev, dtype=torch.float32) / alpha_f).to(torch.bfloat16)
+    if L1d.shape[0] != O:
+        L1d = F.pad(L1d, (0, 0, 0, O - L1d.shape[0]))
+    if L1d.shape[1] != lora_k:
+        L1d = F.pad(L1d, (0, lora_k - L1d.shape[1]))   # [O, lora_k]
+    L1d = L1d.contiguous()
+
+    L2d = L2.to(device=dev, dtype=torch.bfloat16)
+    if L2d.shape[1] != I:
+        L2d = F.pad(L2d, (0, I - L2d.shape[1]))         # [r, I]
+    # Fold pre_quant_scale into L2: the down-proj D = x_hat @ L2^T = x @ (pqs*L2)^T, so the kernel
+    # can use the RAW activation x -- avoids recomputing x_hat (the caller already formed it for the
+    # fp4_quantize injection) plus an [M,I] alloc. Store L2 transposed-contiguous [I, r] for a fast
+    # NN matmul (vs the slow NT path of L2.t() on a [r,I] tensor).
+    if pre_quant_scale is not None:
+        pqs = pre_quant_scale.detach().to(device=dev, dtype=torch.bfloat16).reshape(1, -1)
+        if pqs.shape[1] != I:
+            pqs = F.pad(pqs, (0, I - pqs.shape[1]), value=1.0)
+        L2d = L2d * pqs                                  # scale L2's I columns by pqs
+    L2_t = L2d.t().contiguous()                          # [I, r]
+
+    # Preallocated LoRA-down output (graph-safe: no per-call alloc). D_buf is padded to lora_k with
+    # zero columns; D_active is the contiguous [M, r] write target.
+    D_buf = torch.zeros((M, lora_k), dtype=torch.bfloat16, device=dev)
+    D_active = D_buf if lora_k == r else torch.empty((M, r), dtype=torch.bfloat16, device=dev)
+
+    return {
+        "M": M, "I": I, "O": O, "r": r, "lora_k": lora_k,
+        "compiled": compiled, "sf_m": sf_m, "sf_n": sf_n, "sf_k": sf_k,
+        "wq": wq, "w_sf": w_sf, "L1": L1d, "L2_t": L2_t, "D_buf": D_buf, "D_active": D_active,
+        "alpha": torch.tensor([alpha_f], dtype=torch.float32, device=dev),
+        # `out` is allocated per call (not cached): under CUDA-graph capture it comes from the
+        # graph's private pool, and caching a [Mpad, O] buffer per shape is prohibitive at large M.
+    }
+
+
+@torch.compiler.disable
+def mm_fp4_svdquant(x, state, ext_xq=None, ext_sf=None):
+    """Run the fused NVFP4 SVDQuant linear. x: [M, I] (M padded to 128). Returns [M, O] bf16.
+
+    Wrapped in @torch.compiler.disable because Dynamo cannot trace the CuTe-DSL JIT objects; this
+    is kept as an opaque eager region (tracing into it otherwise causes graph breaks).
+
+    ext_xq: NVFP4 activation [M, I//2] uint8 (E2M1); ext_sf: its swizzled block-scale blob. The
+    bf16 down-proj D = (x*pqs) @ L2^T is computed here (pre_quant_scale folded into L2 at prepare).
+    """
+    assert ext_xq is not None and ext_sf is not None, "the injection path requires ext_xq/ext_sf"
+    c = state
+    out = torch.empty((x.shape[0], c["O"]), dtype=torch.bfloat16, device=x.device)
+    # down-proj into the preallocated buffer: D = x @ (pqs*L2)^T  (pqs folded into L2_t at prepare,
+    # so we use the RAW activation x -- no x_hat recompute, no [M,I] alloc; graph-safe out= target).
+    xb = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+    torch.mm(xb, c["L2_t"], out=c["D_active"])               # [M, r]
+    if c["D_active"] is not c["D_buf"]:
+        c["D_buf"][:, : c["r"]].copy_(c["D_active"])
+    c["compiled"](
+        ext_xq.view(torch.uint8), c["wq"], out, c["D_buf"], c["L1"],
+        c["sf_m"], c["sf_n"], c["sf_k"],
+        ext_sf.data_ptr(), c["w_sf"].data_ptr(), c["alpha"],
+    )
+    return out

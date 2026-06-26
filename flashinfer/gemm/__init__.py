@@ -62,6 +62,23 @@ try:
 except ImportError:
     pass
 
+# SVDQuant: NVFP4 block-scaled residual + fused bf16 LoRA up-projection
+# (kernels/dense_blockscaled_gemm_lora_sm100.py :: Sm100BlockScaledLoRADenseGemmKernel).
+# Gated on the CuTe-DSL stack like the other CuTe-DSL kernels above.
+try:
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if is_cute_dsl_available():
+        from .kernels.svdquant_lora import (
+            prepare_svdquant_state as prepare_svdquant_state,
+            mm_fp4_svdquant as mm_fp4_svdquant,
+        )
+
+        _cute_dsl_kernels.append("prepare_svdquant_state")
+        _cute_dsl_kernels.append("mm_fp4_svdquant")
+except ImportError:
+    pass
+
 __all__ = [
     "SegmentGEMMWrapper",
     "bmm_bf16",
