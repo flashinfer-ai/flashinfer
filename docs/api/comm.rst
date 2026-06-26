@@ -130,7 +130,15 @@ reservations and Python workspace tensors alive.  Use
 ``detach_handles`` only after all kernels using the workspace have
 quiesced.  After restore, use ``reattach_handles`` to recreate/export/
 import handles and map them at the original virtual addresses before replaying
-captured CUDA graphs.  The reattach path refreshes communicator/transport state
+captured CUDA graphs.  CUDA synchronization needed for safe unmap/remap is
+performed internally:
+
+.. code-block:: python
+
+    workspace.detach_handles()
+    workspace.reattach_handles()
+
+The reattach path refreshes communicator/transport state
 from the current ``MnnvlConfig`` when provided; it does not reuse stale
 cross-process handles from the checkpoint.  ``reattach_handles`` maps fresh
 physical handles back into the preserved graph-visible virtual addresses and

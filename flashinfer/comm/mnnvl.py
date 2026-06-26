@@ -414,28 +414,26 @@ class MnnvlMemory:  # type: ignore[no-redef]
             MnnvlMemory.dev_id,
         )
 
-    def detach_handles(
-        self, *, synchronize: bool = True, barrier: bool = True
-    ) -> None:
-        """Release mapped MNNVL handles while keeping graph-visible VAs alive."""
-        MnnvlMemory._detach_mnnvl_handles(
-            self.ptr, synchronize=synchronize, barrier=barrier
-        )
+    def detach_handles(self) -> None:
+        """Release mapped MNNVL handles while keeping graph-visible VAs alive.
+
+        CUDA synchronization is performed internally before unmapping.
+        """
+        MnnvlMemory._detach_mnnvl_handles(self.ptr)
 
     def reattach_handles(
         self,
         *,
         comm: Optional[CommBackend] = None,
-        synchronize: bool = True,
-        barrier: bool = True,
         zero_local: bool = True,
     ) -> None:
-        """Recreate MNNVL handles and map them at the original virtual addresses."""
+        """Map fresh MNNVL handles at the preserved virtual addresses.
+
+        CUDA synchronization is performed internally before remapping.
+        """
         MnnvlMemory._reattach_mnnvl_handles(
             self.ptr,
             comm=comm,
-            synchronize=synchronize,
-            barrier=barrier,
             zero_local=zero_local,
         )
 
@@ -812,31 +810,19 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 MnnvlMemory.current_mem_offset = 0
 
     @staticmethod
-    def _detach_mnnvl_handles(
-        ptr: int, *, synchronize: bool = True, barrier: bool = True
-    ) -> None:
+    def _detach_mnnvl_handles(ptr: int) -> None:
         record = MnnvlMemory.allocated_map[ptr]
         comm = record.comm
         mapped_states = comm.allgather(record.mapped)
         if any(mapped_states) and not all(mapped_states):
             raise RuntimeError("Inconsistent MNNVL mapped state across ranks")
         if not any(mapped_states):
-            if barrier:
-                comm.barrier()
-                comm.barrier()
             return
 
-        if synchronize:
-            checkCudaErrors(cuda.cuCtxSynchronize())
-        if barrier:
-            comm.barrier()
-
+        checkCudaErrors(cuda.cuCtxSynchronize())
         MnnvlMemory._unmap_and_release_mnnvl_handles(record)
         record.mem_handles = [None] * record.comm_size
         record.mapped = False
-
-        if barrier:
-            comm.barrier()
 
     @staticmethod
     def _reattach_mnnvl_handles(
@@ -844,8 +830,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         *,
         comm: Optional[CommBackend] = None,
         config: Optional[MnnvlConfig] = None,
-        synchronize: bool = True,
-        barrier: bool = True,
         zero_local: bool = True,
     ) -> None:
         record = MnnvlMemory.allocated_map[ptr]
@@ -886,16 +870,9 @@ class MnnvlMemory:  # type: ignore[no-redef]
         if any(mapped_states) and not all(mapped_states):
             raise RuntimeError("Inconsistent MNNVL mapped state across ranks")
         if all(mapped_states):
-            if barrier:
-                comm.barrier()
-                comm.barrier()
             return
 
-        if synchronize:
-            checkCudaErrors(cuda.cuCtxSynchronize())
-        if barrier:
-            comm.barrier()
-
+        checkCudaErrors(cuda.cuCtxSynchronize())
         record.mem_handles = MnnvlMemory._create_and_map_mnnvl_handles(
             record.mapping,
             record.aligned_size,
@@ -906,9 +883,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
             zero_local=zero_local,
         )
         record.mapped = True
-
-        if barrier:
-            comm.barrier()
 
     @staticmethod
     def support_nvlink(need_all_up: bool = True):

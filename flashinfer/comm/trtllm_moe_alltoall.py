@@ -770,29 +770,23 @@ class MoeAlltoAll:
             self._WORKSPACE["graph_visible_addresses"], self.workspace
         )
 
-    def detach_handles(
-        self, *, synchronize: bool = True, barrier: bool = True
-    ) -> None:
+    def detach_handles(self) -> None:
         """Release MNNVL mappings while preserving workspace tensor pointers."""
         if self._state.phase != "idle":
             raise RuntimeError("Cannot detach MNNVL workspace during an active A2A phase")
         self.validate_graph_visible_addresses()
-        self.mnnvl_mem.detach_handles(synchronize=synchronize, barrier=barrier)
+        self.mnnvl_mem.detach_handles()
 
     def reattach_handles(
         self,
         *,
         comm: Optional[CommBackend] = None,
-        synchronize: bool = True,
-        barrier: bool = True,
     ) -> None:
         """Reattach MNNVL workspace at the original VA and refresh local state."""
         MnnvlMemory._reattach_mnnvl_handles(
             self.mnnvl_mem.ptr,
             comm=comm,
             config=None if comm is not None else self.mnnvl_config,
-            synchronize=synchronize,
-            barrier=barrier,
             zero_local=False,
         )
         refreshed_metainfo = moe_a2a_initialize(
@@ -806,8 +800,6 @@ class MoeAlltoAll:
                 "MoeAlltoAll metainfo changed during MNNVL reattach; "
                 "existing CUDA graphs are not safe to replay"
             )
-        if barrier:
-            MnnvlMemory.allocated_map[self.mnnvl_mem.ptr].comm.barrier()
         self.validate_graph_visible_addresses()
         self._state = _A2AState()
 
