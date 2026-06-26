@@ -231,7 +231,9 @@ def _patch_sm120a_tma(compiled_fn, options):
     patched_ptx = _patch_sm120a_tma_ptx(ptx)
     if patched_ptx == ptx:
         return compiled_fn
-    _install_patched_ptx_loader(compiled_fn, patched_ptx, jit_target=_sm12x_jit_target(options))
+    _install_patched_ptx_loader(
+        compiled_fn, patched_ptx, jit_target=_sm12x_jit_target(options)
+    )
     return compiled_fn
 
 
