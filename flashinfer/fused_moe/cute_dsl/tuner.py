@@ -41,6 +41,13 @@ from ...autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ...tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    normalize_activation_type,
+)
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
@@ -271,14 +278,16 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         use_fused_finalize: bool = True,
         output_dtype: torch.dtype = torch.bfloat16,
         enable_pdl: bool = True,
-        activation: str = "swiglu",
-        swiglu_alpha: float = 1.702,
-        swiglu_beta: float = 1.0,
-        swiglu_limit: float = 7.0,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ):
-        if activation not in ("swiglu", "swiglu_oai"):
+        activation_type = normalize_activation_type(activation_type)
+        if activation_type != ActivationType.Swiglu:
             raise ValueError(
-                f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+                f"Unsupported activation_type {activation_type!r}; "
+                f"expected {ActivationType.Swiglu!r}"
             )
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -288,7 +297,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.output_dtype = output_dtype
         self.enable_pdl = enable_pdl
-        self.activation = activation
+        self.activation_type = activation_type
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
@@ -383,7 +392,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.local_expert_offset,
                 self.use_fused_finalize,
                 self.output_dtype,
-                self.activation,
+                self.activation_type.value,
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
@@ -572,7 +581,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             use_fused_finalize=self.use_fused_finalize,
             moe_output=moe_output,
             enable_pdl=self.enable_pdl,
-            activation=self.activation,
+            activation_type=self.activation_type.value,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,

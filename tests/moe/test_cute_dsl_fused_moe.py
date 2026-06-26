@@ -35,6 +35,13 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    normalize_activation_type,
+)
 from flashinfer.cute_dsl import is_cute_dsl_available
 
 
@@ -57,11 +64,6 @@ sm100_required = pytest.mark.skipif(
     not is_sm100_family(),
     reason="Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)",
 )
-
-
-def silu(x: torch.Tensor) -> torch.Tensor:
-    """SiLU activation: x * sigmoid(x)"""
-    return x * torch.sigmoid(x)
 
 
 def interleave_linear_and_gate(
@@ -121,10 +123,10 @@ def compute_reference_moe_fp4(
     fc2_input_scale: torch.Tensor = None,
     num_local_experts: int = None,
     local_expert_offset: int = 0,
-    activation: str = "swiglu",
-    swiglu_alpha: float = 1.702,
-    swiglu_beta: float = 1.0,
-    swiglu_limit: float = 7.0,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations on GPU.
 
@@ -142,17 +144,21 @@ def compute_reference_moe_fp4(
         fc2_input_scale: Optional scale for FC2 input quantization
         num_local_experts: Number of local experts (for EP). Defaults to num_experts.
         local_expert_offset: Starting expert ID for this EP rank. Defaults to 0.
-        activation: GEMM1 activation, "swiglu" or "swiglu_oai".
-        swiglu_alpha: OAI SwiGLU sigmoid multiplier.
-        swiglu_beta: OAI SwiGLU up-projection bias.
-        swiglu_limit: OAI SwiGLU clamp limit.
+        activation_type: GEMM1 activation type. Currently only
+            ActivationType.Swiglu is supported; swiglu_oai is represented as
+            Swiglu with non-default swiglu_alpha/beta/limit.
+        swiglu_alpha: SwiGLU sigmoid multiplier.
+        swiglu_beta: SwiGLU up-projection bias.
+        swiglu_limit: SwiGLU clamp limit.
 
     Returns:
         Output tensor [num_tokens, hidden_size]
     """
-    if activation not in ("swiglu", "swiglu_oai"):
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type != ActivationType.Swiglu:
         raise ValueError(
-            f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+            f"Unsupported activation_type {activation_type!r}; "
+            f"expected {ActivationType.Swiglu!r}"
         )
 
     if num_local_experts is None:
@@ -188,16 +194,13 @@ def compute_reference_moe_fp4(
 
             linear = gemm1_out[:, :intermediate_size]
             gate = gemm1_out[:, intermediate_size:]
-            if activation == "swiglu_oai":
-                gate_clamped = gate.clamp(max=swiglu_limit)
-                linear_clamped = linear.clamp(min=-swiglu_limit, max=swiglu_limit)
-                swiglu_out = (
-                    gate_clamped
-                    * torch.sigmoid(swiglu_alpha * gate_clamped)
-                    * (linear_clamped + swiglu_beta)
-                )
-            else:
-                swiglu_out = silu(gate) * linear
+            gate_clamped = gate.clamp(max=swiglu_limit)
+            linear_clamped = linear.clamp(min=-swiglu_limit, max=swiglu_limit)
+            swiglu_out = (
+                gate_clamped
+                * torch.sigmoid(swiglu_alpha * gate_clamped)
+                * (linear_clamped + swiglu_beta)
+            )
 
             if fc2_input_scale is not None:
                 swiglu_out = quant_dequant_fp4_reference(
@@ -1117,7 +1120,10 @@ class TestCuteDslFusedMoeFunctional:
                 w2_alpha=tensors["w2_alpha"],
                 num_experts=num_experts,
                 top_k=top_k,
-                activation="swiglu_oai",
+                activation_type=ActivationType.Swiglu,
+                swiglu_alpha=1.702,
+                swiglu_beta=1.0,
+                swiglu_limit=7.0,
             )
 
         assert result.shape == (num_tokens, hidden_size)
@@ -1153,7 +1159,7 @@ class TestCuteDslFusedMoeFunctional:
             w2_alpha=tensors["w2_alpha"],
             num_experts=num_experts,
             top_k=top_k,
-            activation="swiglu_oai",
+            activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -1171,7 +1177,7 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
-            activation="swiglu_oai",
+            activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -1279,7 +1285,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
-            activation="swiglu_oai",
+            activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -1311,7 +1317,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
-            activation="swiglu_oai",
+            activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -1348,7 +1354,7 @@ class TestCuteDslMoEWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=True,
             max_num_tokens=num_tokens,
-            activation="swiglu_oai",
+            activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -1427,7 +1433,7 @@ class TestCuteDslMoEWrapper:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
-            activation="swiglu_oai",
+            activation_type=ActivationType.Swiglu,
             swiglu_alpha=1.702,
             swiglu_beta=1.0,
             swiglu_limit=7.0,
@@ -1647,7 +1653,7 @@ class TestCuteDslMoEWrapper:
             # tuples; see AutoTuner._get_cache_key in flashinfer/autotuner.py.
             assert any(
                 isinstance(k, tuple)
-                and k[:1] == ("CuteDslMoEWrapper::run::swiglu",)
+                and k[:1] == ("CuteDslMoEWrapper::run::Swiglu",)
                 for k in autotuner.profiling_cache
             ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
             return ref, finalized

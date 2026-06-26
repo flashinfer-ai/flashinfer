@@ -1,6 +1,6 @@
 from enum import IntEnum
 import torch
-from typing import Optional
+from typing import Optional, Union
 
 
 # The type of method in top-K routing, for use in torch custom op
@@ -40,6 +40,30 @@ class ActivationType(IntEnum):
     SwigluStep = 7
     Identity = 8
     InvalidType = 9
+
+
+DEFAULT_SWIGLU_ALPHA = 1.0
+DEFAULT_SWIGLU_BETA = 0.0
+DEFAULT_SWIGLU_LIMIT = torch.finfo(torch.float32).max
+
+
+def normalize_activation_type(
+    activation_type: Union[int, ActivationType],
+) -> ActivationType:
+    try:
+        return ActivationType(activation_type)
+    except ValueError as err:
+        raise ValueError(f"Unsupported activation_type {activation_type!r}") from err
+
+
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    # Keep this in sync with isGatedActivation() in include/flashinfer/trtllm/fused_moe/runner.h.
+    return activation_type in [
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.SwigluBias,
+        ActivationType.SwigluStep,
+    ]
 
 
 class DtypeTrtllmGen(IntEnum):

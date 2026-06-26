@@ -50,6 +50,13 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    normalize_activation_type,
+)
 from flashinfer.utils import get_compute_capability
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -221,10 +228,10 @@ def _get_compiled_gather_kernel(
     vectorized_f32: bool,
     raster_along_m: bool,
     enable_pdl: bool = True,
-    activation: str = "swiglu",
-    swiglu_alpha: float = 1.702,
-    swiglu_beta: float = 1.0,
-    swiglu_limit: float = 7.0,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
 ):
     """Get or compile the gather grouped GEMM with SwiGLU kernel.
 
@@ -240,6 +247,7 @@ def _get_compiled_gather_kernel(
     overhead during autotuning.
     """
     global _gather_kernel_cache
+    activation_type = normalize_activation_type(activation_type)
 
     # Cache key includes dtype and tactic parameters, NOT problem dimensions
     cache_key = (
@@ -254,7 +262,7 @@ def _get_compiled_gather_kernel(
         vectorized_f32,
         raster_along_m,
         enable_pdl,
-        activation,
+        activation_type.value,
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
@@ -270,7 +278,7 @@ def _get_compiled_gather_kernel(
             topk=topk,
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
-            activation=activation,
+            activation_type=activation_type.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -337,10 +345,10 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
-    activation: str = "swiglu",
-    swiglu_alpha: float = 1.702,
-    swiglu_beta: float = 1.0,
-    swiglu_limit: float = 7.0,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled Contiguous Gather Grouped GEMM with SwiGLU Fusion for MoE workloads.
 
@@ -383,14 +391,12 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         vectorized_f32: Use vectorized f32x2 operations. Default: True
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
-        activation: Activation to apply in the epilogue. Supported values:
-            "swiglu" and "swiglu_oai".
-        swiglu_alpha: OAI SwiGLU sigmoid multiplier. Used only when
-            activation="swiglu_oai".
-        swiglu_beta: OAI SwiGLU up-projection bias. Used only when
-            activation="swiglu_oai".
-        swiglu_limit: OAI SwiGLU clamp limit. Used only when
-            activation="swiglu_oai".
+        activation_type: Activation type for the epilogue. Currently only
+            ActivationType.Swiglu is supported; swiglu_oai is represented as
+            Swiglu with non-default swiglu_alpha/beta/limit.
+        swiglu_alpha: SwiGLU sigmoid multiplier.
+        swiglu_beta: SwiGLU up-projection bias.
+        swiglu_limit: SwiGLU clamp limit.
 
     Returns:
         Tuple of:
@@ -433,9 +439,11 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
-    if activation not in ("swiglu", "swiglu_oai"):
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type != ActivationType.Swiglu:
         raise ValueError(
-            f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+            f"Unsupported activation_type {activation_type!r}; "
+            f"expected {ActivationType.Swiglu!r}"
         )
 
     # Get dimensions
@@ -613,7 +621,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         vectorized_f32=vectorized_f32,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
-        activation=activation,
+        activation_type=activation_type.value,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,

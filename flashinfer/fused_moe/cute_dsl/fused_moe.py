@@ -60,6 +60,13 @@ from ...trace.templates.moe import (
     cute_dsl_fused_moe_nvfp4_trace,
     cute_dsl_moe_wrapper_run_trace,
 )
+from ...tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    normalize_activation_type,
+)
 from ...autotuner import AutoTuner, is_in_profile_measurement
 from ...utils import supported_compute_capability
 from .moe_utils import (
@@ -146,10 +153,10 @@ def _moe_core_impl(
     output_dtype: torch.dtype = torch.bfloat16,
     use_async_memset: bool = True,
     enable_pdl: bool = True,
-    activation: str = "swiglu",
-    swiglu_alpha: float = 1.702,
-    swiglu_beta: float = 1.0,
-    swiglu_limit: float = 7.0,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -189,18 +196,21 @@ def _moe_core_impl(
         memset_event: CUDA event for memset completion.
         output_dtype: Output data type.
         use_async_memset: Use async memset on aux stream.
-        activation: Activation to apply after GEMM1. Supported values are
-            "swiglu" and "swiglu_oai".
-        swiglu_alpha: OAI SwiGLU sigmoid multiplier.
-        swiglu_beta: OAI SwiGLU up-projection bias.
-        swiglu_limit: OAI SwiGLU clamp limit.
+        activation_type: Activation type to apply after GEMM1. Currently only
+            ActivationType.Swiglu is supported; swiglu_oai is represented as
+            Swiglu with non-default swiglu_alpha/beta/limit.
+        swiglu_alpha: SwiGLU sigmoid multiplier.
+        swiglu_beta: SwiGLU up-projection bias.
+        swiglu_limit: SwiGLU clamp limit.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    if activation not in ("swiglu", "swiglu_oai"):
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type != ActivationType.Swiglu:
         raise ValueError(
-            f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+            f"Unsupported activation_type {activation_type!r}; "
+            f"expected {ActivationType.Swiglu!r}"
         )
 
     num_tokens = token_selected_experts.size(0)
@@ -274,7 +284,7 @@ def _moe_core_impl(
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
             enable_pdl=enable_pdl,
-            activation=activation,
+            activation_type=activation_type.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -387,10 +397,10 @@ class CuteDslMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         enable_pdl: bool = True,
-        activation: str = "swiglu",
-        swiglu_alpha: float = 1.702,
-        swiglu_beta: float = 1.0,
-        swiglu_limit: float = 7.0,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ):
         """Initialize the MoE wrapper.
 
@@ -408,15 +418,18 @@ class CuteDslMoEWrapper:
             output_dtype: Output data type. Default: torch.bfloat16.
             device: Device for buffer allocation. Default: "cuda".
             enable_pdl: Enable Programmatic Dependent Launch. Default: True.
-            activation: Activation to apply after GEMM1. Supported values are
-                "swiglu" and "swiglu_oai".
-            swiglu_alpha: OAI SwiGLU sigmoid multiplier.
-            swiglu_beta: OAI SwiGLU up-projection bias.
-            swiglu_limit: OAI SwiGLU clamp limit.
+            activation_type: Activation type to apply after GEMM1. Currently
+                only ActivationType.Swiglu is supported; swiglu_oai is
+                represented as Swiglu with non-default swiglu_alpha/beta/limit.
+            swiglu_alpha: SwiGLU sigmoid multiplier.
+            swiglu_beta: SwiGLU up-projection bias.
+            swiglu_limit: SwiGLU clamp limit.
         """
-        if activation not in ("swiglu", "swiglu_oai"):
+        activation_type = normalize_activation_type(activation_type)
+        if activation_type != ActivationType.Swiglu:
             raise ValueError(
-                f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+                f"Unsupported activation_type {activation_type!r}; "
+                f"expected {ActivationType.Swiglu!r}"
             )
 
         self.num_experts = num_experts
@@ -432,7 +445,7 @@ class CuteDslMoEWrapper:
         self.output_dtype = output_dtype
         self.device = device
         self.enable_pdl = enable_pdl
-        self.activation = activation
+        self.activation_type = activation_type
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
@@ -468,7 +481,7 @@ class CuteDslMoEWrapper:
             use_fused_finalize=True,
             output_dtype=output_dtype,
             enable_pdl=enable_pdl,
-            activation=activation,
+            activation_type=activation_type.value,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -642,7 +655,7 @@ class CuteDslMoEWrapper:
             output_dtype=output_dtype,
             use_async_memset=True,
             enable_pdl=enable_pdl,
-            activation=self.activation,
+            activation_type=self.activation_type.value,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
@@ -728,7 +741,7 @@ class CuteDslMoEWrapper:
 
         # Let tuner choose tactic
         _, best_tactic = tuner.choose_one(
-            f"CuteDslMoEWrapper::run::{self.activation}",
+            f"CuteDslMoEWrapper::run::{self.activation_type.name}",
             [self._runner],
             self._runner.tuning_config,
             inputs,
@@ -772,10 +785,10 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
-    activation: str = "swiglu",
-    swiglu_alpha: float = 1.702,
-    swiglu_beta: float = 1.0,
-    swiglu_limit: float = 7.0,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -804,7 +817,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         output_dtype=output_dtype,
         use_async_memset=True,
         enable_pdl=enable_pdl,
-        activation=activation,
+        activation_type=activation_type,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
@@ -834,10 +847,10 @@ def cute_dsl_fused_moe_nvfp4(
     moe_output: Optional[torch.Tensor] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
     enable_pdl: bool = True,
-    activation: str = "swiglu",
-    swiglu_alpha: float = 1.702,
-    swiglu_beta: float = 1.0,
-    swiglu_limit: float = 7.0,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
 ) -> torch.Tensor:
     """Run fused MoE computation using CuteDSL NVFP4 kernels.
 
@@ -871,18 +884,21 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize: Use fused finalize. Default: True.
         moe_output: Pre-allocated output buffer.
         aux_stream: Auxiliary CUDA stream.
-        activation: Activation to apply after GEMM1. Supported values are
-            "swiglu" and "swiglu_oai".
-        swiglu_alpha: OAI SwiGLU sigmoid multiplier.
-        swiglu_beta: OAI SwiGLU up-projection bias.
-        swiglu_limit: OAI SwiGLU clamp limit.
+        activation_type: Activation type to apply after GEMM1. Currently only
+            ActivationType.Swiglu is supported; swiglu_oai is represented as
+            Swiglu with non-default swiglu_alpha/beta/limit.
+        swiglu_alpha: SwiGLU sigmoid multiplier.
+        swiglu_beta: SwiGLU up-projection bias.
+        swiglu_limit: SwiGLU clamp limit.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
     """
-    if activation not in ("swiglu", "swiglu_oai"):
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type != ActivationType.Swiglu:
         raise ValueError(
-            f"Unsupported activation {activation!r}; expected 'swiglu' or 'swiglu_oai'"
+            f"Unsupported activation_type {activation_type!r}; "
+            f"expected {ActivationType.Swiglu!r}"
         )
 
     if num_local_experts is None:
@@ -909,7 +925,7 @@ def cute_dsl_fused_moe_nvfp4(
         use_fused_finalize=use_fused_finalize,
         output_dtype=output_dtype,
         enable_pdl=enable_pdl,
-        activation=activation,
+        activation_type=activation_type.value,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
@@ -931,7 +947,7 @@ def cute_dsl_fused_moe_nvfp4(
     ]
 
     _, best_tactic = tuner.choose_one(
-        f"CuteDslFusedMoE::run_moe_nvfp4::{activation}",
+        f"CuteDslFusedMoE::run_moe_nvfp4::{activation_type.name}",
         [runner],
         runner.tuning_config,
         inputs,
