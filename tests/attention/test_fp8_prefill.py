@@ -18,6 +18,17 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
+
+
+def head_dim_512_supported() -> bool:
+    # head_dim > 256 is only supported on SM100+.
+    return get_compute_capability(torch.device("cuda:0"))[0] >= 10
+
+
+def skip_if_head_dim_unsupported(head_dim: int):
+    if head_dim > 256 and not head_dim_512_supported():
+        pytest.skip("head_dim > 256 is only supported on SM100 or newer")
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -26,7 +37,7 @@ import flashinfer
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
@@ -40,6 +51,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     kv_layout,
     dtype,
 ):
+    skip_if_head_dim_unsupported(head_dim)
     torch.manual_seed(42)
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
@@ -119,7 +131,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
 @pytest.mark.parametrize("kv_len", [54, 97])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_batch_prefill_with_ragged_kv_cache_fp8(
@@ -132,6 +144,7 @@ def test_batch_prefill_with_ragged_kv_cache_fp8(
     causal,
     dtype,
 ):
+    skip_if_head_dim_unsupported(head_dim)
     # Validates the ragged FP8 KV dequant kernel path (BF16 repack for hd128/256,
     # in-loop dequant for the k64B hd64 case) against the equivalent 16-bit kernel
     # run on the *same* dequantized values -- so no dependence on k/v scale

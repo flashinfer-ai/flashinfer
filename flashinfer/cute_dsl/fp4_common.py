@@ -284,6 +284,33 @@ def get_smem_ptr_as_int32(
 
 
 @dsl_user_op
+def ld_shared_v2_u32(smem_addr: Int32, *, loc=None, ip=None) -> Tuple[Uint32, Uint32]:
+    """Load 64 bits (2 x uint32) from shared memory via ld.shared.v2.u32.
+
+    Args:
+        smem_addr: 32-bit shared memory address (from get_smem_ptr_as_int32).
+                   Caller is responsible for ensuring 8-byte alignment.
+
+    Returns:
+        2 Uint32 values (8 bytes total).
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.u32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(v0), Uint32(v1)
+
+
+@dsl_user_op
 def ld_shared_v4_u32(
     smem_addr: Int32, *, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
@@ -1987,6 +2014,35 @@ def cvt_e4m3_to_f32_via_f16(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
             }
             """,
             "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_s0e5m3_to_f16x2_broadcast(fp8_val: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Convert one S0E5M3 scale byte to an f16x2 with the scale in both lanes.
+
+    S0E5M3 (sign-0, 5-exp, 3-mantissa) is a host-side reformat of the per-block
+    E4M3 scale, rebiased to fp16's bias (exp 7->15, i.e. byte += 0x40) so the
+    bits line up with fp16 directly: ``f16(byte) = byte << 7`` (exp -> bits 14-10,
+    the 3 mantissa bits -> bits 9-7, low mantissa and sign = 0).  Broadcasting to
+    both f16x2 lanes is then ``byte * 0x00800080`` = ``(byte<<7) | (byte<<23)`` --
+    a single ``mul.lo.u32`` (the two shifted copies never overlap, so the mul is
+    exactly the OR).  Replaces the 3-op E4M3 path (cvt.u16 + cvt.f16x2.e4m3x2 +
+    prmt) with 1 op, and the per-block scale stays 1 byte (memory-neutral).
+    Numerically exact for normal E4M3 scales (both formats carry 3 mantissa bits).
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
+            "mul.lo.u32 $0, $1, 0x00800080;",
+            "=r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

@@ -6,7 +6,7 @@
 #   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
 
 # ── Catch-all: core maintainers review everything not covered below ──
-* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv
+* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc
 
 # ── Attention ──
 csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
@@ -41,14 +41,14 @@ flashinfer/norm.py             @kahyunnam @yzh119 @bkryu @yongwww
 tests/norm/                    @kahyunnam @yzh119 @bkryu @yongwww
 
 # ── GDN ──
-benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww
-csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww
-csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww
-flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww
-flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww
-flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww
-flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww
-tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww
+benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
 
 # ── MAMBA ──
 csrc/checkpointing_ssu*         @kahyunnam @yzh119 @jimmyzho @ishovkun

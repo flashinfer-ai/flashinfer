@@ -25,12 +25,16 @@ import pytest
 
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
-from flashinfer.utils import is_sm90a_supported, is_sm100a_supported
+from flashinfer.utils import (
+    is_sm90a_supported,
+    is_sm100a_supported,
+    is_sm120a_supported,
+)
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
 def _skip_if_unsupported():
-    """Skip test if not SM90 or SM100 (with CUDA 13+) architecture."""
+    """Skip test if not SM90, SM100, or SM120 (with CUDA 13+) architecture."""
     device = torch.device("cuda")
     if is_sm100a_supported(device):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
@@ -38,8 +42,10 @@ def _skip_if_unsupported():
             pytest.skip(
                 f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
-    elif not is_sm90a_supported(device):
-        pytest.skip("GDN prefill requires SM90 or SM100")
+    elif is_sm120a_supported(device) or is_sm90a_supported(device):
+        pass  # No additional CUDA version requirement
+    else:
+        pytest.skip("GDN prefill requires SM90, SM100, or SM120")
 
 
 def _skip_if_not_sm100():
@@ -257,6 +263,77 @@ def test_prefill_kernel_nonfull(
         beta,
         seed,
     )
+
+
+@pytest.mark.parametrize(
+    "num_q_heads,num_k_heads,num_v_heads", [(1, 1, 1), (16, 16, 64)]
+)
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prefill_kernel_zero_length_sequence(
+    qkv_factory,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int = 128,
+    seq_len: int = 64,
+    scale: float = 0.1,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _skip_if_unsupported()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_o_heads = max(num_q_heads, num_v_heads)
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    dtype = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q, k, v = qkv_factory(
+            [seq_len], num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        alpha = torch.rand(seq_len, num_sab_heads)
+        beta = torch.rand(seq_len, num_sab_heads)
+        cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int64)
+        cu_seq_lens_with_empty = torch.tensor([0, seq_len, seq_len], dtype=torch.int64)
+
+    ref_o = torch.empty(
+        [seq_len, num_o_heads, head_size], dtype=q.dtype, device=q.device
+    )
+    our_o = torch.empty_like(ref_o)
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        False,
+        cu_seq_lens,
+        True,
+        output=ref_o,
+    )
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        False,
+        cu_seq_lens_with_empty,
+        True,
+        output=our_o,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(our_o, ref_o, atol=2e-2, rtol=2e-2)
 
 
 def _test_chunked_prefill(
