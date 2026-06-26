@@ -158,6 +158,73 @@ _SUPPORTED_C = [64, 128, 160, 256, 320, 512, 640, 1024]
 _SUPPORTED_TOKENS = [1560, 6240, 24960, 99840, 399360]
 
 
+# Range-based knob LUT for SM90 (H100), tuned on video VAE shapes.
+# Key format : (C, token_lo, token_hi, dtype)
+# Match rule : token_lo <= num_tokens < token_hi
+# Value      : (warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg)
+# Ranges are non-overlapping per (C, dtype); the last range uses 2**31 as an
+# "unbounded upper" sentinel.
+_KNOB_RANGE_LUT_SM90 = {
+    # C=48
+    (48, 0, 2**31, "bf16"): (32, 0, 0, 2, 4),
+    # C=96
+    (96, 0, 322194, "bf16"): (4, 0, 1, 16, 2),
+    (96, 322194, 822692, "bf16"): (8, 0, 1, 8, 2),
+    (96, 822692, 2**31, "bf16"): (32, 0, 1, 6, 2),
+    # C=192
+    (192, 0, 2489, "bf16"): (32, 0, 0, 1, 2),
+    (192, 2489, 5359, "bf16"): (32, 0, 2, 3, 2),
+    (192, 5359, 9993, "bf16"): (32, 0, 0, 3, 4),
+    (192, 9993, 18565, "bf16"): (8, 0, 1, 8, 4),
+    (192, 18565, 86719, "bf16"): (8, 0, 1, 16, 4),
+    (192, 86719, 193910, "bf16"): (8, 0, 2, 10, 4),
+    (192, 193910, 2**31, "bf16"): (8, 0, 2, 16, 4),
+    # C=384
+    (384, 0, 3789, "bf16"): (32, 0, 1, 8, 4),
+    (384, 3789, 10718, "bf16"): (32, 0, 2, 2, 4),
+    (384, 10718, 26255, "bf16"): (8, 0, 1, 16, 4),
+    (384, 26255, 2**31, "bf16"): (32, 0, 1, 8, 8),
+}
+
+
+# Range-based knob LUT for SM100+ (Blackwell family), originally tuned on
+# video VAE shapes. Applied to any SM100+ card as a
+# secondary lookup when `_KNOB_LUT` does not have an exact entry.
+# Same key/value/match semantics as `_KNOB_RANGE_LUT_SM90` above;
+_KNOB_RANGE_LUT_SM100PLUS = {
+    # C=48
+    (48, 0, 2**31, "bf16"): (4, 0, 0, 16, 4),
+    # C=96
+    (96, 0, 2**31, "bf16"): (32, 0, 1, 2, 2),
+    # C=192
+    (192, 0, 2489, "bf16"): (32, 0, 0, 1, 2),
+    (192, 2489, 5359, "bf16"): (1, 0, 0, 10, 2),
+    (192, 5359, 9993, "bf16"): (8, 0, 2, 1, 2),
+    (192, 9993, 18565, "bf16"): (32, 0, 0, 8, 4),
+    (192, 18565, 42875, "bf16"): (8, 0, 0, 16, 4),
+    (192, 42875, 86719, "bf16"): (32, 0, 0, 2, 4),
+    (192, 86719, 193910, "bf16"): (32, 0, 0, 4, 4),
+    (192, 193910, 2**31, "bf16"): (32, 0, 1, 2, 4),
+    # C=384
+    (384, 0, 3789, "bf16"): (32, 0, 0, 5, 2),
+    (384, 3789, 10718, "bf16"): (8, 0, 0, 5, 4),
+    (384, 10718, 2**31, "bf16"): (32, 0, 0, 1, 4),
+}
+
+
+def _lookup_range_lut(C: int, num_tokens: int, dtype: str, range_lut: dict):
+    """Linear scan for an entry where token_lo <= num_tokens < token_hi.
+
+    Range LUTs are small (~20 entries) so a linear scan is fine; keeping the
+    key format identical to the printout from the sweep script makes it
+    trivial to paste new tuning results in.
+    """
+    for (key_C, lo, hi, key_dtype), knobs in range_lut.items():
+        if key_C == C and key_dtype == dtype and lo <= num_tokens < hi:
+            return knobs
+    return None
+
+
 def _compute_default_knobs(C: int, dtype: str):
     """Conservative fallback knobs for non-LUT sizes."""
     input_size = 2  # bf16
@@ -165,15 +232,22 @@ def _compute_default_knobs(C: int, dtype: str):
     warps_n = 1
     cpr = 1
 
+    if dtype == "nvfp4" and C % 32 != 0:
+        return None
+
     for bpl in [4, 8, 16, 2]:
         num_elts = bpl // input_size
         if num_elts <= 0 or C % num_elts != 0:
             continue
         vec_cols = C // num_elts
         vec_cols_per_ldg = cpr * warps_n * 32
-        if vec_cols_per_ldg <= 0 or vec_cols % vec_cols_per_ldg != 0:
+        if vec_cols_per_ldg <= 0:
             continue
-        ldgs = vec_cols // vec_cols_per_ldg
+        # nvfp4 BlockScale path can't tolerate a partial tail LDG; bf16/fp8
+        # can (kernel predicates per-lane).
+        if dtype == "nvfp4" and vec_cols % vec_cols_per_ldg != 0:
+            continue
+        ldgs = (vec_cols + vec_cols_per_ldg - 1) // vec_cols_per_ldg
         if ldgs > 1024:
             continue
         return (warps_m, 0, 0, 1, bpl)
@@ -184,13 +258,23 @@ def _compute_default_knobs(C: int, dtype: str):
 def select_knobs(C: int, num_tokens: int, dtype: str, sm_version: int = 100):
     """Select knobs from LUT or fallback heuristic.
 
-    For parity with the original integration:
-    - SM100+: use sweep-tuned LUT for known shapes.
-    - non-SM100 or non-LUT shapes: use conservative fallback heuristic.
+    Lookup priority:
+    - SM100+: exact ``_KNOB_LUT`` first; on miss, the
+      ``_KNOB_RANGE_LUT_SM100PLUS`` token-bucket LUT.
+    - SM90  : ``_KNOB_RANGE_LUT_SM90`` token-bucket LUT.
+    - other / still-unmatched : conservative fallback heuristic.
     """
-    key = (C, num_tokens, dtype)
-    if sm_version >= 100 and key in _KNOB_LUT:
-        return _KNOB_LUT[key]
+    if sm_version >= 100:
+        key = (C, num_tokens, dtype)
+        if key in _KNOB_LUT:
+            return _KNOB_LUT[key]
+        knobs = _lookup_range_lut(C, num_tokens, dtype, _KNOB_RANGE_LUT_SM100PLUS)
+        if knobs is not None:
+            return knobs
+    elif sm_version == 90:
+        knobs = _lookup_range_lut(C, num_tokens, dtype, _KNOB_RANGE_LUT_SM90)
+        if knobs is not None:
+            return knobs
     return _compute_default_knobs(C, dtype)
 
 
