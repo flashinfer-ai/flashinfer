@@ -16,8 +16,8 @@
 #ifndef FLASHINFER_ALLOCATOR_H_
 #define FLASHINFER_ALLOCATOR_H_
 
-#include <memory>
 #include <limits>
+#include <memory>
 #include <sstream>
 
 #include "exception.h"

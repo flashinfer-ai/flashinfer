@@ -495,10 +495,9 @@ template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename Attenti
           typename Params, typename WorkEstimationFunc>
 inline cudaError_t DecodePlanWorkspaceSize(size_t& float_workspace_size_in_bytes,
                                            size_t& int_workspace_size_in_bytes,
-                                           typename Params::IdType* indptr_h,
-                                           uint32_t batch_size, uint32_t num_qo_heads,
-                                           uint32_t page_size, bool enable_cuda_graph,
-                                           cudaStream_t stream,
+                                           typename Params::IdType* indptr_h, uint32_t batch_size,
+                                           uint32_t num_qo_heads, uint32_t page_size,
+                                           bool enable_cuda_graph, cudaStream_t stream,
                                            WorkEstimationFunc work_estimation_func) {
   using IdType = typename Params::IdType;
   bool split_kv;
@@ -522,8 +521,8 @@ inline cudaError_t DecodePlanWorkspaceSize(size_t& float_workspace_size_in_bytes
 
   AlignedAllocator float_allocator;
   if (split_kv) {
-    float_allocator.aligned_alloc_offset(num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(float),
-                                         16, "batch_decode_tmp_v");
+    float_allocator.aligned_alloc_offset(
+        num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(float), 16, "batch_decode_tmp_v");
     float_allocator.aligned_alloc_offset(num_qo_heads * padded_batch_size * sizeof(float), 16,
                                          "batch_decode_tmp_s");
     int_allocator.aligned_alloc_offset(padded_batch_size * sizeof(bool), 16,
@@ -841,16 +840,12 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
 }
 
 template <typename IdType>
-inline cudaError_t PrefillPlanWorkspaceSize(size_t& float_workspace_size_in_bytes,
-                                            size_t& int_workspace_size_in_bytes,
-                                            IdType* qo_indptr_h, IdType* kv_indptr_h,
-                                            uint32_t total_num_rows, uint32_t batch_size,
-                                            uint32_t num_qo_heads, uint32_t num_kv_heads,
-                                            uint32_t head_dim_qk, uint32_t head_dim_vo,
-                                            uint32_t page_size, bool enable_cuda_graph,
-                                            uint32_t sizeof_dtype_o, int32_t window_left,
-                                            int32_t fixed_split_size, bool disable_split_kv,
-                                            int64_t num_colocated_ctas, cudaStream_t stream) {
+inline cudaError_t PrefillPlanWorkspaceSize(
+    size_t& float_workspace_size_in_bytes, size_t& int_workspace_size_in_bytes, IdType* qo_indptr_h,
+    IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
+    bool disable_split_kv, int64_t num_colocated_ctas, cudaStream_t stream) {
   (void)head_dim_qk;
   (void)sizeof_dtype_o;
   (void)stream;
@@ -903,9 +898,8 @@ inline cudaError_t PrefillPlanWorkspaceSize(size_t& float_workspace_size_in_byte
     float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
         "batch_prefill_tmp_v");
-    float_allocator.aligned_alloc_offset(num_qo_heads * padded_batch_size * cta_tile_q *
-                                             sizeof(float),
-                                         16, "batch_prefill_tmp_s");
+    float_allocator.aligned_alloc_offset(
+        num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");
     int_allocator.aligned_alloc_offset(sizeof(IdType) * (total_num_rows + 1), 16,
                                        "batch_prefill_merge_indptr");
     int_allocator.aligned_alloc_offset(sizeof(bool) * padded_batch_size, 16,
