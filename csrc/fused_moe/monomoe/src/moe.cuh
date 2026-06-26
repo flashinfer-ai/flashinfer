@@ -1,5 +1,5 @@
 /**
- * This is the main file of the MoE monokernel for Qwen3-Coder (top-K path).
+ * This is the main file of the MonoMoe kernel for Qwen3-Coder (top-K path).
  * It is designed so that you just need to build this file. It includes all
  * relevant implementations. For documentation of the main entry function
  * moe_kernel_topk, see moe_interface.h
@@ -9,44 +9,25 @@
 
 #include "moe_interface.h"
 
-#define INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
-#include "moe_down_projection.cu"
+#define INSIDE_MONOMOE_IMPLEMENTATION
+#include "moe_down_projection.cuh"
 #include "moe_grid_barrier.h"
 #include "moe_internal.h"
-#include "moe_prepare.cu"
-#include "moe_routing.cu"
-#include "moe_scale_inputs.cu"
+#include "moe_routing.cuh"
+#include "moe_scale_inputs.cuh"
 #include "moe_tma.h"
-#include "moe_up_projection.cu"
-#undef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#include "moe_up_projection.cuh"
+#undef INSIDE_MONOMOE_IMPLEMENTATION
 
-namespace moe_monokernel {
+namespace monomoe {
 
 /**
  * @brief Top-K MoE kernel — split-phase WGMMA path for BS <= 8.
  *
- * Uses the v1 dual-warpgroup K=128 streaming WGMMA pipeline for both
- * up- and down-projections.
- *
- * Pipeline:
- *   Phase 1: routing + topK (running in parallel with the routing-window
- *            TMA: a single 16-issue load that fetches the full per-block
- *            BF16 input tile into `bf16_in_full`, completion signalled
- *            on `bar_rwin`)
- *   Phase 2: warp 0 runs `prepare_moe_topk_BS8`; warps 1..11 wait on
- *            `bar_rwin` and quantize the full bf16 tile into
- *            `fp8_act_full` + `act_scale`.
- *   Phase 3: up-proj — streaming WGMMA reads FP8 directly from
- *            `fp8_act_full` (no per-K-step bf16 TMA, no `bar_a`,
- *            no QUANT half) → SiLU → fp8 writeback to spec->temp_fp8.
- *   grid.sync()
- *   Phase 4: down-proj — streaming WGMMA; each block atomicAdds
- *            its fp32 partial sum into the single-buffer
- *            spec->down_partial_out[tok][col]
- *   grid.sync()
- *   Phase 5: cast fp32 → bf16, write activations_out.
- *
- * 2 grid syncs total.
+ * The five-phase pipeline (routing+prefetch / quantize / up-proj / down-proj /
+ * writeback) and the two grid syncs between them are described in DESIGN.md §1;
+ * the barriers are DESIGN.md §2.  Phase markers below tie each block of code to
+ * that table.
  */
 template <typename Dims>
 __device__ void moe_kernel_topk_BS8(
@@ -63,21 +44,14 @@ __device__ void moe_kernel_topk_BS8(
     uint32_t* __restrict__ expert_counters, uint32_t& expert_phase,
     uint32_t* __restrict__ colstripe_counters, uint32_t& colstripe_phase) {
   static_assert(Dims::BS <= 8);
-  static_assert(use_wgmma<Dims>::value, "BS8 path requires the WGMMA configuration (use_wgmma).");
-  static_assert(use_tma<Dims>::value, "BS8 path requires USE_TMA");
+  static_assert(use_wgmma_v<Dims>, "BS8 path requires the WGMMA configuration (use_wgmma).");
+  static_assert(use_tma_v<Dims>, "BS8 path requires USE_TMA");
   using CoreDims = MoECoreDims<Dims>;
 
 
-  // ── Zero-init the single-buffer `down_partial_out[BS][HIDDEN]` ─────
-  //
-  // Phase 4 atomicAdds into this buffer (one cell summed across 16
-  // blocks).  All 128 blocks zero a chunk in parallel; the up-proj
-  // expert_barrier (#2) acts as the cross-block visibility fence
-  // before any Phase-4 atomicAdd fires.
-  //
-  // The buffer was allocated with the legacy [DOWN_GROUPS][BS][HIDDEN]
-  // shape; we zero only the first `[BS][HIDDEN]` portion (= 64 KB)
-  // since that's all atomicAdd ever touches.
+  // Zero-init `down_partial_out[BS][HIDDEN]` that Phase 4 atomicAdds into.
+  // All blocks zero a chunk in parallel; the Site-#2 expert_barrier is the
+  // cross-block visibility fence before any Phase-4 atomicAdd fires.
   {
     const uint32_t partial_n = Dims::BS * Dims::HIDDEN_STATES;
     for (uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; i < partial_n;
@@ -92,12 +66,12 @@ __device__ void moe_kernel_topk_BS8(
   //
   // In parallel with routing, the prefetch warps issue the routing-
   // window TMA: a single 16-issue load that pulls the full per-block
-  // BF16 input tile (`BS × HIDDEN_STATES`) into `bf16_in_full` (Req 1.4,
-  // 1.5).  Completion is signalled on the single mbarrier `bar_rwin`
+  // BF16 input tile (`BS × HIDDEN_STATES`) into `bf16_in_full`.
+  // Completion is signalled on the single mbarrier `bar_rwin`
   // (`arrival_count = 1`, `tx_bytes = BS * K_BLOCKS_TOTAL *
   // K_STEP_WGMMA * sizeof(A_element)`).  Phase 2 then quantizes the
   // full tile into `fp8_act_full`, which the up-projection K-loop
-  // reads directly — no per-K-step bf16 TMA, no `bar_a` (Req 3.1, 3.7).
+  // reads directly — no per-K-step bf16 TMA, no `bar_a`.
   //
   // Correctness requirements:
   //   * mbarriers must be initialized before any `arrive_expect_tx`.
@@ -107,7 +81,7 @@ __device__ void moe_kernel_topk_BS8(
   //     block-wide `__syncthreads()` at the end of Phase 2) publishes
   //     the init to every consumer warp before it waits on
   //     `bar_rwin` / `bar_w[*]`.
-  auto* u_tma = &shmem->u.tiny_wgmma_tma;
+  auto* u_tma = &shmem->tiny_wgmma_tma;
   if (is_tma_launcher_thread<Dims>()) {
     // mbarrier inits are kept regardless of the profile flags: they are
     // cheap SHM writes and make the SHM state well-defined even when
@@ -127,7 +101,7 @@ __device__ void moe_kernel_topk_BS8(
     mbarrier_init(&u_tma->bar_w[2], 1u);
     mbarrier_init(&u_tma->bar_w[3], 1u);
 #endif
-    // Phase-1 routing-window mbarrier (Req 1.6). Single mbarrier with
+    // Phase-1 routing-window mbarrier. Single mbarrier with
     // arrival_count = 1 and tx_bytes = BS * K_BLOCKS_TOTAL *
     // K_STEP_WGMMA * sizeof(A_element) (= 32 KB for Qwen3.5). Armed by
     // the TMA launcher thread at the start of Phase 1; waited on by
@@ -157,8 +131,7 @@ __device__ void moe_kernel_topk_BS8(
   // is what publishes the launcher-thread-only init writes to all
   // warps.
   __syncthreads();
-  // ── Phase 1 — Routing-window concurrent dispatch (Req 1.1, 1.2,
-  // 1.3, 1.7, 1.8).
+  // ── Phase 1 — Routing-window concurrent dispatch.
   //
   // Re-organized as an if-elif-else over warp identity:
   //   * warp ∈ [8, 12) (prefetch warps):
@@ -167,9 +140,8 @@ __device__ void moe_kernel_topk_BS8(
   //         sizeof(A_element)` (= 32 KB for Qwen3.5) and issues
   //         K_BLOCKS_TOTAL `cp.async.bulk.tensor.2d` instructions
   //         covering the full per-block BF16 input tile via
-  //         `moe_load_full_bf16_input` (Option B, design
-  //         "TMA-granularity decision").  The matching wait lives in
-  //         the Phase-2 dispatch (added in task 4.2).
+  //         `moe_load_full_bf16_input`.  The matching wait
+  //         lives in the Phase-2 dispatch.
   //       - Other prefetch lanes do nothing in Phase 1.
   //   * warp ∈ [0, 8) (calc warps): unchanged `topK_BS8` +
   //     `sync_calc_threads<>()` (256-thread `bar.sync 15`).
@@ -183,14 +155,14 @@ __device__ void moe_kernel_topk_BS8(
       // The helper itself does not arm — see the doc comment on
       // `moe_load_full_bf16_input` for the caller contract.
       constexpr std::uint32_t RWIN_TX_BYTES =
-          Dims::BS * MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::K_BLOCKS_TOTAL * CoreDims::K_STEP_WGMMA *
+          Dims::BS * MoE_SHM<Dims>::TinyDataWGMMA_TMA::K_BLOCKS_TOTAL * CoreDims::K_STEP_WGMMA *
           static_cast<std::uint32_t>(sizeof(A_element));
       mbarrier_arrive_expect_tx(&u_tma->bar_rwin,
                                 /*tx_bytes=*/RWIN_TX_BYTES);
       moe_load_full_bf16_input<Dims>(activations_desc, u_tma->bf16_in_full, &u_tma->bar_rwin);
     }
     // Other prefetch lanes (warp 8 lanes 1..31, warps 9..11) do
-    // nothing in Phase 1.  Phase 2 (task 4.2) re-engages them as
+    // nothing in Phase 1.  Phase 2 re-engages them as
     // BF16→FP8 quantization workers.
   } else {
     // Calc warps (warp ∈ [0, 8)).  `topK_BS8` and `prepare_moe_topk_BS8`
@@ -200,13 +172,10 @@ __device__ void moe_kernel_topk_BS8(
     sync_calc_threads<Dims>();
     // `prepare_moe_topk_BS8` is no longer called from the calc-warp
     // branch — it now runs in the Phase-2 dispatch below on warp 0
-    // only, alongside `routing_phase_quantize` on warps 1..11
-    // (Req 2.1, 2.2; design "Phase 2 — Prepare (concurrent across 12
-    // warps)").
+    // only, alongside `routing_phase_quantize` on warps 1..11.
   }
 
-  // ── Phase 2 — Prepare-phase concurrent dispatch (Req 2.1, 2.2,
-  // 2.5, 2.9, 2.10).
+  // ── Phase 2 — Prepare-phase concurrent dispatch.
   //
   // Warp dispatch over the 12 warps in the block:
   //   * warp 0: runs `prepare_moe_topk_BS8` (builds expert ids,
@@ -217,10 +186,10 @@ __device__ void moe_kernel_topk_BS8(
   //     16-issue TMA load armed in 4.1) and then run
   //     `routing_phase_quantize`, which calls
   //     `moe_streaming_quantize_k128` once per (token, k_block) pair
-  //     across the 11 warps in stride-11 partition (Req 2.4).
+  //     across the 11 warps in stride-11 partition.
   //
   // The trailing `__syncthreads()` is the SINGLE block-wide sync
-  // that ends Phase 2 (Req 2.10): it publishes BOTH warp 0's routing
+  // that ends Phase 2: it publishes BOTH warp 0's routing
   // metadata writes AND warps 1..11's `fp8_act_full` / `act_scale`
   // writes to all warps before Phase 3 begins.  No additional
   // intra-Phase-2 sync between warp 0 and warps 1..11 is required —
@@ -239,57 +208,30 @@ __device__ void moe_kernel_topk_BS8(
   __syncthreads();
 
 
-  // ── Phase 2: setup up-projection group mapping ──────────────────────────
-  // GRID=128 design, expert-group parallelism (WGMMA path):
-  //   UP_GRID = 2*N / W_UP_TILE_EFFECTIVE blocks cover the full 2*N weight
-  //   rows for one expert.  With GRID_SIZE=128, we run
-  //   UP_GROUPS = GRID_SIZE / UP_GRID groups processing DIFFERENT experts
-  //   in parallel, with each group's blocks indexed by
-  //   blockIdx.x % UP_GRID.
-  //
-  //   WGMMA v1 path (W_UP_TILE_EFFECTIVE=128): UP_GRID = 2*N/128,
-  //   UP_GROUPS = 128 / UP_GRID.  For N=512: UP_GRID=8, UP_GROUPS=16
-  //   (sixteen experts processed in parallel per grid).
+  // ── Up-projection group mapping (DESIGN.md §6) ──────────────────────────
+  // UP_GRID blocks cover one expert's 2*N rows; UP_GROUPS expert groups run
+  // in parallel.  For this shape: UP_GRID=8, UP_GROUPS=16.
   constexpr std::uint32_t UP_GRID = 2 * Dims::N / CoreDims::W_UP_TILE_EFFECTIVE;
   constexpr std::uint32_t UP_GROUPS = Dims::KernelConfig::GRID_SIZE / UP_GRID;
   static_assert(Dims::KernelConfig::GRID_SIZE % UP_GRID == 0,
                 "GRID_SIZE must be a multiple of UP_GRID.");
-  // UP_GROUPS = number of expert groups processed in parallel per grid.
-  // Each token contributes at most `top_k` virtual_row slots in
-  // spec->temp_bf16, so at most `top_k` blocks write to any given token
-  // (one per expert in the token's top-K list).  Blocks processing
-  // experts NOT in a token's top-K silently skip the write.  Therefore
-  // UP_GROUPS has no upper bound from a correctness standpoint — only
-  // a wasted-work concern (higher UP_GROUPS ⇒ more WGMMAs whose
-  // experts aren't in any active token's top-K list).
-  //
-  // We cap at UP_GROUPS <= NUM_EXPERTS (trivially always true) and
-  // leave perf tuning to the caller's choice of GRID_SIZE / UP_GRID.
+  // UP_GROUPS has no correctness upper bound (blocks whose expert isn't in a
+  // token's top-K just skip the write) — higher only means wasted WGMMAs.
   static_assert(UP_GROUPS <= Dims::NUM_EXPERTS,
                 "UP_GROUPS cannot exceed the total number of experts.");
   const std::uint32_t up_group = blockIdx.x / UP_GRID;
   const std::uint32_t up_block_idx = blockIdx.x % UP_GRID;
   const bool in_up = (up_group < UP_GROUPS);
 
-  // Phase 3 (`moe_up_projection_BS8_allexperts_wgmma_tma`) reads FP8
-  // activations directly from `fp8_act_full`, which Phase 2 produced
-  // and the trailing `__syncthreads()` above published.  The up-proj
-  // helper does its own weight-tile priming via the pre-loop
-  // `bar_w[0]` arm + first-expert weight TMA.  No __syncthreads()
-  // here: the Phase-2 trailing sync already published both the
-  // barrier init and shmem->expert_count, and computing up_group /
-  // up_block_idx / in_up is pure register work.
+  // No __syncthreads() before Phase 3: the Phase-2 trailing sync already
+  // published `fp8_act_full` / barrier init / `expert_count`, and the
+  // up_group/up_block_idx math is pure register work.  The up-proj helper
+  // primes its own weight tile (pre-loop `bar_w[0]` arm + first TMA).
 
-  // ── Phase 3: Up-projection — expert groups in parallel ────────────────
-  // Group `g` (blocks [g*UP_GRID, (g+1)*UP_GRID)) iterates experts starting
-  // at index `g`, stepping by UP_GROUPS. Each group writes to DIFFERENT
-  // virtual_row slots of spec->temp_bf16 (because each expert has its own
-  // k index within a token's top-K list), so the groups never have a
-  // write conflict.
-  //
-  // The BS8 path is TMA+WGMMA only; the kernel asserts
-  // `use_wgmma<Dims>::value` and `use_tma<Dims>::value` at the top of
-  // this function, so dispatch is unconditional.
+  // ── Phase 3: Up-projection — expert groups in parallel (DESIGN.md §1) ──
+  // Group `g` iterates experts from index `g` stepping by UP_GROUPS, writing
+  // disjoint `temp_fp8` slabs (no write conflict).  TMA+WGMMA dispatch is
+  // unconditional (asserted at function top).
   if (in_up && up_group < shmem->expert_count) {
     moe_up_projection_BS8_allexperts_wgmma_tma<Dims>(
         activations_in, expert_weights_up, expert_scales_up, top_k, batch_size, spec, shmem,
@@ -299,92 +241,49 @@ __device__ void moe_kernel_topk_BS8(
   }
 
 
-  // ── Site #2 — Expert-local barrier (Phase 2b) ────────────────────────
-  //
-  // Phase 2a aligned `DOWN_GROUPS == UP_GROUPS` so the producer-set
-  // (8 blocks with `up_group == g` writing `spec->temp_fp8` rows for
-  // expert group `g`) is identical to the consumer-set (same 8 blocks,
-  // now reading those rows in Phase 4 as `down_group == g`).  An
-  // `expert_barrier` with `arrival_count = UP_GRID = 8` and `id = up_group`
-  // is therefore sufficient: the 8 blocks rendezvous on one of
-  // `UP_GROUPS = 16` independent expert-keyed Counter_Pairs, reducing
-  // per-barrier atomic contention from 128 → 8 and allowing 16 expert
-  // groups to sync concurrently (Design "Site #2 Phase 2b change
-  // summary", Requirements 9.6, 9.8).
-  //
-  // `in_up` is always true in the GRID_SIZE=128, UP_GRID=8, UP_GROUPS=16
-  // configuration (every block maps to a valid up_group), but the gate
-  // is kept defensively so a future config with UP_GROUPS < GRID_SIZE /
-  // UP_GRID won't silently deadlock.
+  // ── Site #2 — Expert-local barrier, Phase 3→4 (DESIGN.md §2) ─────────
+  // DOWN_GROUPS == UP_GROUPS aligns the producer set (8 blocks that wrote
+  // expert group `g`'s temp_fp8 rows) with the consumer set, so an
+  // expert_barrier keyed on `up_group` is sufficient (vs a full grid sync).
+  // `in_up` is always true here but gated defensively for future configs.
   if (in_up) {
-    moe_monokernel::expert_barrier(expert_counters,
+    monomoe::expert_barrier(expert_counters,
                                    /*expert_id=*/up_group,
                                    /*arrival_count=*/UP_GRID,
                                    /*seed_blockidx=*/up_group * UP_GRID, expert_phase);
   }
 
 
-  // ── Phase 4 (WGMMA): dual-WG streaming down-projection ────────────────
-  // Each block owns DOWN_COL_TILE output cols; blocks partition into
-  // DOWN_GROUPS expert groups × DOWN_GRID col-blocks.  Every
-  // contributing block atomicAdds its partial sum into the SAME
-  // single-buffer `spec->down_partial_out[BS][HIDDEN_STATES]`; Phase 5
-  // reads each cell ONCE and casts to bf16 (no cross-group
-  // reduction).  The single-buffer is zero-initialized at kernel entry.
-  //
-  // The WGMMA down-projection function zeroes its own per-block
-  // out_accum in SHM internally, so no pre-zero is needed here.
-  //
-  // The BS8 path is TMA+WGMMA only; the kernel asserts
-  // `use_wgmma<Dims>::value` and `use_tma<Dims>::value` at the top of
-  // this function, so dispatch is unconditional.
+  // ── Phase 4 (WGMMA): dual-WG streaming down-projection (DESIGN.md §1,§6) ─
+  // Blocks partition into DOWN_GROUPS expert groups × DOWN_GRID col-blocks,
+  // each owning DOWN_COL_TILE output cols.  Every contributing block
+  // atomicAdds its partial into the single-buffer `down_partial_out` (zeroed
+  // at kernel entry); Phase 5 reads each cell once.  Dispatch unconditional.
   moe_down_projection_BS8_allexperts_wgmma_tma<Dims>(expert_weights_down, expert_scales_down, top_k,
                                                      batch_size, spec, shmem, down_weights_desc,
                                                      down_activations_desc);
 
 
-  // ── Site #3 — Col-stripe-local barrier (Phase 2b) ────────────────────
-  //
-  // Phase 4 atomicAdded into `spec->down_partial_out[tok][col_stripe *
-  // DOWN_COL_TILE .. +DOWN_COL_TILE-1]`.  Phase 5 on block `b` reads
-  // those cells at its own col stripe `b`, so its producer-set is
-  // exactly the `DOWN_GROUPS` blocks with
-  // `blockIdx.x % DOWN_GRID == b`.  That sub-grid is also the arrival
-  // set of `colstripe_barrier(col_stripe = b, arrival_count =
-  // DOWN_GROUPS)`.  Every block (including those with
-  // `down_group_r > 0` that don't enter Phase 5) calls the barrier to
-  // publish its Phase-4 atomicAdd; the block with `blockIdx.x = b` is
-  // the Phase-5 reader and also the seed block (its ID == its col
-  // stripe).
-  //
-  // Per-barrier atomic contention drops from 128 → 16; DOWN_GRID = 8
-  // independent col-stripe barriers run concurrently.
+  // ── Site #3 — Col-stripe-local barrier, Phase 4→5 (DESIGN.md §2) ─────
+  // Phase 5 reader for col stripe `b` is `blockIdx.x == b`; its producer set
+  // is the DOWN_GROUPS blocks with `blockIdx.x % DOWN_GRID == b`, which is
+  // exactly the colstripe_barrier arrival set (and `b` is its own seed).
+  // Every block calls it to publish its Phase-4 atomicAdd.
   {
     const uint32_t col_stripe_id = blockIdx.x % MoECoreDims<Dims>::DOWN_GRID;
-    moe_monokernel::colstripe_barrier(colstripe_counters,
+    monomoe::colstripe_barrier(colstripe_counters,
                                       /*col_stripe=*/col_stripe_id,
                                       /*arrival_count=*/MoECoreDims<Dims>::DOWN_GROUPS,
                                       /*seed_blockidx=*/col_stripe_id, colstripe_phase);
   }
 
 
-  // ── Phase 5 (WGMMA): bf16 cast + writeback ─────────────────────────
-  // Each Phase-5 block reads its own DOWN_COL_TILE output cols ×
-  // Dims::BS tokens of fp32 sums (already accumulated by Phase 4
-  // atomicAdds across all DOWN_GROUPS contributing blocks) and casts
-  // them to bf16 in `activations_out`.  No cross-group reduction —
-  // the work is just a streaming load + cast + store.
-  //
-  // Block-to-col mapping mirrors Phase 4a: only blocks with
-  // `blockIdx.x < DOWN_GRID` are responsible for writing (the first
-  // DOWN_GRID blocks cover the full HIDDEN_STATES output).  Blocks
-  // beyond DOWN_GRID would map to duplicate cols via
-  // `blockIdx.x % DOWN_GRID`, so we gate on the primary group
-  // (down_group == 0) to avoid redundant writes.
-  //
-  // For the BS8 TMA+WGMMA path: DOWN_COL_TILE=256, DOWN_GRID=8,
-  // DOWN_GROUPS=16.  Bounds expressed via `CoreDims` so
-  // both variants share this code.
+  // ── Phase 5 (WGMMA): bf16 cast + writeback (DESIGN.md §1) ──────────────
+  // Each Phase-5 block reads its own DOWN_COL_TILE cols × BS tokens of fp32
+  // sums (already reduced by the Phase-4 atomicAdds) and casts to bf16 — a
+  // streaming load+cast+store, no cross-group reduction.  Only the first
+  // DOWN_GRID blocks write (gate on `down_group == 0`); the rest would map to
+  // duplicate cols via `blockIdx.x % DOWN_GRID`.
   constexpr std::uint32_t DOWN_GRID_LOCAL = CoreDims::DOWN_GRID;
   constexpr std::uint32_t DOWN_COL_TILE_LOCAL = CoreDims::DOWN_COL_TILE;
   const std::uint32_t down_group_r = blockIdx.x / DOWN_GRID_LOCAL;
@@ -426,19 +325,15 @@ __device__ void moe_kernel_topk_BS8(
  *
  * `up_weights_desc` and `activations_desc` are the host-built TMA
  * descriptors consumed by `moe_up_projection_BS8_allexperts_wgmma_tma` when
- * `use_tma<Dims>::value` is true.  For non-TMA variants the torch-binding
+ * `use_tma_v<Dims>` is true.  For non-TMA variants the torch-binding
  * wrapper passes zero-initialized `CUtensorMap` values and the descriptors
- * are never read (spec R6.1, R6.3).  The `__grid_constant__` qualifier
+ * are never read.  The `__grid_constant__` qualifier
  * places them in constant memory coherent with all threads without SMEM
  * cost.
  */
-// Requirement 4.4: pin the kernel to 1 block per SM at compile time.
-// The software grid / partial barriers rely on the co-residency invariant
-// (GRID_SIZE <= SM_count and max_active_blocks_per_SM == 1) so every
-// launched block is guaranteed to be running when any other block spins
-// on its arrival counter. `__launch_bounds__(BLOCK_SIZE, 1)` is the
-// compile-time half of that invariant; the launcher enforces the runtime
-// half via `cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags`.
+// `__launch_bounds__(BLOCK_SIZE, 1)` pins one block per SM — the compile-time
+// half of the co-residency invariant the barrier spin depends on (DESIGN.md §3);
+// the launcher enforces `GRID_SIZE <= SM_count` at runtime.
 template <typename Dims>
 __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
     const A_element* __restrict__ activations_in, std::uint32_t token_count,
@@ -451,47 +346,22 @@ __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
     __grid_constant__ CUtensorMap const down_activations_desc) {
-  // ── Compile-time preconditions on `Dims` (spec R7.3, R11.3) ─────────────
-  // These fire at the first point where `Dims` is instantiated, so any
-  // misconfigured variant is caught at compile time before any TMA /
-  // WGMMA code is instantiated below.
-  //
-  //  * R7.3: `USE_TMA` requires `USE_WGMMA`. There is no TMA support for
-  //    the scalar up-projection path.
-  //  * R11.3: For every TMA-enabled variant, `MoE_SHM<Dims>` must fit in
-  //    the H100 opt-in 228 KB per-block SHM budget. The existing 224 KB
-  //    check inside `get_moe_shmem_size<Dims>()` is tighter, but this
-  //    assertion documents the per-variant TMA budget and catches future
-  //    SHM-layout regressions that loosen the opt-in cap.
-  static_assert(!use_tma<Dims>::value || use_wgmma<Dims>::value,
+  // Compile-time preconditions on `Dims` (fire at first instantiation):
+  // TMA requires WGMMA (no scalar TMA path), and the SHM footprint must fit
+  // the H100 opt-in 228 KB per-block budget.  The third assert is the same
+  // budget specialized to BS8 TMA+WGMMA, where DOWN_COL_TILE=256 doubles the
+  // per-slot down-proj weight tile — kept pointed so a layout regression
+  // names that cause.
+  static_assert(!use_tma_v<Dims> || use_wgmma_v<Dims>,
                 "USE_TMA requires USE_WGMMA; no TMA support for the scalar "
                 "path.");
-  static_assert(!use_tma<Dims>::value || sizeof(MoE_SHM<Dims>) <= 228 * 1024,
+  static_assert(!use_tma_v<Dims> || sizeof(MoE_SHM<Dims>) <= 228 * 1024,
                 "MoE_SHM<Dims> exceeds the 228 KB per-block SHM budget "
                 "for TMA variants.");
-  // Phase-2a layout alignment (software-grid-sync spec, Req 9.4):
-  // For the BS8 TMA+WGMMA variant, `DOWN_COL_TILE` is bumped to 256,
-  // which doubles the down-proj weight tile in SHM from 16 KB to 32 KB
-  // per double-buffer slot (the `w_wgmma` / `w_down_wgmma` union grows
-  // from 32 KB to 64 KB total).  The re-assertion below makes this
-  // explicit at the BS8 TMA+WGMMA instantiation site so that any
-  // future layout regression that overflows the 228 KB opt-in budget
-  // after the Phase-2a alignment is flagged with a pointed error.
-  //
-  // Also enforces Req 4.6 of the topk-bs8-tma-prefetch-quant-fusion
-  // spec ("`sizeof(MoE_SHM<Dims>)` <= 233472 for every BS8 TMA+WGMMA
-  // Dims variant"): `228 * 1024 == 233472`, and the predicate
-  // `use_tma<Dims>::value && Dims::BS <= 8` matches every BS8
-  // TMA+WGMMA Dims variant.  No second per-Dims-variant assert is
-  // required because this one is per-Dims-variant by construction —
-  // the kernel is instantiated once per Dims, so the static_assert
-  // fires once per BS8 TMA+WGMMA variant and once per non-BS8
-  // TMA variant (the latter via the broader assert above).
-  static_assert(!(use_tma<Dims>::value && Dims::BS <= 8) || sizeof(MoE_SHM<Dims>) <= 228 * 1024,
+  static_assert(!(use_tma_v<Dims> && Dims::BS <= 8) || sizeof(MoE_SHM<Dims>) <= 228 * 1024,
                 "Exceeds 228 KB opt-in SHM budget for BS8 TMA+WGMMA after "
                 "Phase 2a layout alignment (DOWN_COL_TILE = 256 doubles "
-                "the per-block down-proj weight tile).  Also enforces "
-                "the topk-bs8-tma-prefetch-quant-fusion Req 4.6 budget.");
+                "the per-block down-proj weight tile).");
 
   assert(MoECoreDims<Dims>::THREADS_PER_WARP == 32);
   assert(blockDim.x == Dims::KernelConfig::BLOCK_SIZE);
@@ -510,35 +380,9 @@ __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_
   extern __shared__ char shmem_buffer[];
   MoE_SHM<Dims>* shmem = reinterpret_cast<MoE_SHM<Dims>*>(shmem_buffer);
 
-  // ── Software barrier pointers and per-region phase state ─────────────
-  //
-  // Design Component A ("Device-side function signature") + Component B
-  // ("Per-sub-grid phase state").  The barrier primitives
-  // (`grid_barrier`, `expert_barrier`, `colstripe_barrier`) are pure
-  // device functions that take a counter-region pointer + an in/out
-  // register-resident phase counter; we materialize the pointers once in
-  // the kernel prologue from the scratchpad base and keep the phase
-  // counters in the block-local register file.
-  //
-  //   * `grid_counters` — used by every site that stays at
-  //     `Grid_Barrier` (BS64 sites #1, #4, #5 in Phase 1 and BS8 sites
-  //     #2, #3 in Phase 1 before Phase-2b downgrades them to
-  //     Expert_Barrier / ColStripe_Barrier).
-  //   * `expert_counters` — reserved for site #2 in Phase 2b
-  //     (task 12.1).  Threaded into `moe_kernel_topk_BS8` so the BS8
-  //     Phase-2b migration can wire it into the Expert_Barrier call
-  //     without re-plumbing the call chain.
-  //   * `colstripe_counters` — reserved for site #3 in Phase 2b
-  //     (task 12.2).  Same plumbing treatment as `expert_counters`.
-  //   * `grid_phase` / `expert_phase` / `colstripe_phase` — per-region
-  //     block-local phase counters; initialized to 0 at kernel entry,
-  //     bumped by each barrier call on that region.
-  //   * `GRID_SIZE_STATIC` — template non-type arg to
-  //     `grid_barrier<>`; the compile-time `Dims::KernelConfig::GRID_SIZE`
-  //     value lets the primitive fold its seed value and degenerate-case
-  //     gate.
-  //
-  // Validates: Requirements 2.8, 3.1.
+  // Barrier counter-region pointers (into the scratchpad tail, DESIGN.md §4)
+  // and per-region phase counters (block-local registers, init 0, bumped by
+  // each barrier call; see DESIGN.md §2).
   uint32_t* grid_counters = spec->grid_barrier.slot;
   uint32_t* expert_counters = &spec->partial_barrier.expert_slot[0][0];
   uint32_t* colstripe_counters = &spec->partial_barrier.colstripe_slot[0][0];
@@ -547,15 +391,11 @@ __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_
   uint32_t colstripe_phase = 0;
   constexpr uint32_t GRID_SIZE_STATIC = Dims::KernelConfig::GRID_SIZE;
 
-  // Site #1 — top-of-kernel output zero-out + sync.
-  //
-  // ELIMINATED. The Phase 5 reduction in moe_kernel_topk_BS8 `=`-writes
-  // every element of activations_out (assigns reduced sum for tokens
-  // [0, batch_size) and explicitly zeros [batch_size, Dims::BS) per block
-  // col stripe), so the pre-zero + sync is dead work.
-  // See Requirements 3.4, 3.5 and Design Migration Plan Site #1.
+  // No top-of-kernel output zero-out: Phase 5 `=`-writes every element of
+  // activations_out (reduced sum for [0, batch_size), zeros for the rest), so
+  // a pre-zero would be dead work.
 
-  static_assert(Dims::BS <= 8, "Only BS <= 8 is supported (BS64 path removed).");
+  static_assert(Dims::BS <= 8, "Only BS <= 8 is supported.");
   moe_kernel_topk_BS8<Dims>(activations_in, token_count, router_logits, expert_weights_up,
                             expert_scales_up, expert_weights_down, expert_scales_down,
                             activations_out, top_k, scoring_func, renormalize, spec, shmem,
@@ -564,4 +404,4 @@ __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_
                             expert_phase, colstripe_counters, colstripe_phase);
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe

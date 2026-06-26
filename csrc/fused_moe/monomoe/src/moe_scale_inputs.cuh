@@ -3,7 +3,7 @@
 #ifndef MOE_SCALE_INPUTS_CU
 #define MOE_SCALE_INPUTS_CU
 
-#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#ifndef INSIDE_MONOMOE_IMPLEMENTATION
 #error Do not include this file directly.
 #endif
 
@@ -17,7 +17,7 @@
 #include "moe_internal.h"
 #include "ptx_utils.h"
 
-namespace moe_monokernel {
+namespace monomoe {
 
 /**
  * @brief Sets NaNs (positive or negative, any payload) to 0.0 (bit-pattern all
@@ -148,7 +148,7 @@ struct BF16x8 {
  * where col = t * 4 and i in 0..3.  With 4 consecutive K-values per
  * thread and a 16-wide chunk, all 4 values fall in the same kc.
  *
- * Refactor note (topk-bs8-tma-prefetch-quant-fusion task 3.1):
+ * Refactor note:
  * The BF16 view was narrowed from a `[T_TILE=8][128]` 2 KB atom to a
  * `[128]` single-row view.  This unblocks calling the helper from the
  * routing-phase fusion path, where the BF16 source is the full
@@ -267,7 +267,7 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
  *      `prepare_moe_topk_BS8` concurrently and is also gated out of
  *      the `bar_rwin` wait described below.
  *   2. The caller MUST wait on the routing-window mbarrier
- *      (`u.tiny_wgmma_tma.bar_rwin`) on every warp 1..11 thread before
+ *      (`tiny_wgmma_tma.bar_rwin`) on every warp 1..11 thread before
  *      invoking this helper.  Reading `bf16_in_full` before the wait
  *      succeeds is a data race against the in-flight Phase-1 TMA load.
  *   3. The caller MUST emit a block-wide `__syncthreads()` AFTER this
@@ -275,13 +275,13 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
  *      warps before the Phase-3 up-projection K-loop reads them.
  *   4. Ragged batches (`token >= batch_size`) are handled inside this
  *      helper via the existing zero-fill + scale = 1.0f path of
- *      `moe_streaming_quantize_k128` (Req 2.7).
+ *      `moe_streaming_quantize_k128`.
  *
- * Scope (Req 7.1, 7.2, 7.3, 7.6): this helper is only valid when
+ * Scope: this helper is only valid when
  * `Dims::BS <= 8` AND the call site is on the BS8 TMA+WGMMA path.
  * The static_assert below makes miss-instantiation a build error.
  *
- * Work distribution (Req 2.4): warp `w ∈ [1, 12)` owns pair indices
+ * Work distribution: warp `w ∈ [1, 12)` owns pair indices
  *   { i ∈ [0, BS * K_BLOCKS_TOTAL) : (i % 11) == (w - 1) }.
  * With `BS = 8`, `K_BLOCKS_TOTAL = 16`, `PAIRS_TOTAL = 128`, and 11
  * warps, every pair is owned by exactly one warp.  Warp 0 owns no
@@ -290,15 +290,11 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
  *
  * @tparam Dims          MoE dims.
  * @tparam KBlocks       Outer extent of `bf16_in_full`
- *                       (= K_BLOCKS_TOTAL for BS8; the field is
- *                       BS-clamped to 1 for BS64, see
- *                       TinyDataWGMMA_TMA::BF16_IN_FULL_K_BLOCKS).
- * @tparam Bs            Middle extent of `bf16_in_full` (= Dims::BS
- *                       for BS8, BS-clamped to 1 for BS64).
+ *                       (= K_BLOCKS_TOTAL).
+ * @tparam Bs            Middle extent of `bf16_in_full` (= Dims::BS).
  * @tparam KStep         Inner extent of `bf16_in_full` (= K_STEP_WGMMA
- *                       = 128 for BS8, BS-clamped to 1 for BS64).
- * @tparam Fp8KBlocks    Outer extent of `fp8_act_full` (= K_BLOCKS_TOTAL
- *                       for BS8, BS-clamped to 1 for BS64).
+ *                       = 128).
+ * @tparam Fp8KBlocks    Outer extent of `fp8_act_full` (= K_BLOCKS_TOTAL).
  * @tparam Fp8NumChunks  Must be 8 (= K_STEP_WGMMA / FP8_ACT_K_CHUNK).
  * @tparam Fp8Tok        Must be 8 (= T_TILE).
  * @tparam Fp8KInner     Must be 16 (= FP8_ACT_K_CHUNK).
@@ -316,10 +312,6 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
  *                       routing scratchpad).
  * @param batch_size     Real token count (≤ Dims::BS); ragged tokens
  *                       get the helper's zero-fill + scale = 1.0f path.
- *
- * Implements R2.3, R2.4, R2.6, R2.7, R2.8.
- * Design: "New helper: routing_phase_quantize",
- *         "Phase 2 — Prepare (concurrent across 12 warps)".
  */
 template <typename Dims, std::size_t KBlocks, std::size_t Bs, std::size_t KStep,
           std::size_t Fp8KBlocks, std::size_t Fp8NumChunks, std::size_t Fp8Tok,
@@ -330,8 +322,8 @@ __device__ inline void routing_phase_quantize(
     float (&act_scale)[ScaleKBlocks][ScaleBs], std::uint32_t batch_size) {
   using CoreDims = MoECoreDims<Dims>;
 
-  // Scope guard — BS8 TMA+WGMMA only (Req 7.1, 7.2, 7.3, 7.6).
-  static_assert(Dims::BS <= 8, "routing_phase_quantize is BS8-only (Req 7.1, 7.2, 7.3, 7.6)");
+  // Scope guard — BS8 TMA+WGMMA only.
+  static_assert(Dims::BS <= 8, "routing_phase_quantize is BS8-only");
   // 128-K SWZ128 atoms per token along K (= HIDDEN_STATES / 128).  16
   // for Qwen3.5.  This is the same constant declared as
   // TinyDataWGMMA_TMA::K_BLOCKS_TOTAL; we recompute it locally so the
@@ -347,7 +339,7 @@ __device__ inline void routing_phase_quantize(
                 "fp8_act_full token dim must be T_TILE (legacy) or "
                 "T_TILE+1 (padded layout that breaks the 128-byte kc "
                 "stride to avoid bank conflicts on the routing-quantize "
-                "STS — see comment on `MoE_SHM::U::TinyDataWGMMA_TMA::"
+                "STS — see comment on `MoE_SHM::TinyDataWGMMA_TMA::"
                 "fp8_act_full` for the design)");
   static_assert(Fp8KInner == 16, "fp8_act_full inner dim must be 16");
   static_assert(ScaleBs == Dims::BS, "act_scale inner extent must be Dims::BS");
@@ -364,7 +356,7 @@ __device__ inline void routing_phase_quantize(
   // this assert at runtime would mean warp 0 also wrote some pair —
   // since `w_idx = warp - 1u` would underflow, we'd partition the work
   // wrong.  This is checked in the caller's `if (warp == 0) { ... }
-  // else { routing_phase_quantize(...) }` dispatch (Req 2.1).
+  // else { routing_phase_quantize(...) }` dispatch.
   assert(warp >= 1u && warp < 12u);
   const std::uint32_t w_idx = warp - 1u;  // ∈ [0, 11)
 
@@ -395,6 +387,6 @@ __device__ inline void routing_phase_quantize(
   }
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
 #endif

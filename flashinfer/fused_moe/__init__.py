@@ -78,9 +78,9 @@ from .bgmv_moe import (  # noqa: F401
     fill_w_ptr as fill_w_ptr,
     has_bgmv_moe as has_bgmv_moe,
 )
-from .megamoe import (  # noqa: F401
+from .monomoe import (  # noqa: F401
     mono_moe as mono_moe,
-    has_megamoe as has_megamoe,
+    has_monomoe as has_monomoe,
     alloc_scratchpad as alloc_scratchpad,
     get_scratchpad_size_bytes as get_scratchpad_size_bytes,
     interleave_for_tma_wgmma_up as interleave_for_tma_wgmma_up,
@@ -152,7 +152,7 @@ __all__ = [
     "fill_w_ptr",
     "has_bgmv_moe",
     "mono_moe",
-    "has_megamoe",
+    "has_monomoe",
     "alloc_scratchpad",
     "get_scratchpad_size_bytes",
     "interleave_for_tma_wgmma_up",

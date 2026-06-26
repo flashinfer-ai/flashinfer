@@ -3,7 +3,7 @@
 #ifndef MOE_DOWN_PROJECTION_CU
 #define MOE_DOWN_PROJECTION_CU
 
-#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#ifndef INSIDE_MONOMOE_IMPLEMENTATION
 #error Do not include this file directly.
 #endif
 
@@ -15,37 +15,14 @@
 #include "moe_tma.h"
 #include "ptx_utils.h"
 
-///////////////////////////////////////////////////////////////////////////////
-//
-// * moe_down_projection_BS8_allexperts_wgmma_tma
-//                                          (BS <= 8, WGMMA + TMA + SWZ128)
-//
-// * Each block owns DOWN_COL_TILE = 256 output cols of one expert.  WG0
-//   covers M-rows [0..63] and WG1 covers [64..127] of each 128-row
-//   M-half via m64n8k32 WGMMAs.
-//
-// * Weight + activation tiles are loaded via cp.async.bulk.tensor.2d
-//   (TMA) into a double-buffered SHM slot and signalled through
-//   mbarriers. The K-loop runs K_TILES_DOWN outer iterations of
-//   K_STEP_DOWN K-bytes each (= 4 inner 128-K substeps with separate
-//   scale-apply at every K=128 boundary for block-wise FP8).
-//
-// * Expert transitions overlap via inter-expert lookahead (the last
-//   K-step of expert e issues TMAs for expert e+DOWN_GROUPS into the
-//   slot that's about to be freed).
-//
-// * Weight + activation scales are tiny (≤ 256 B per expert) and
-//   loaded once per expert from prefetch warps 8 / 9 in parallel —
-//   no per-K-step scale fetch.
-//
-// * Phase-4 epilogue atomicAdds the per-block fp32 partial sum into
-//   a single-buffer `spec->down_partial_out[BS][HIDDEN_STATES]`;
-//   Phase 5 reads each cell once and casts to bf16.  No cross-group
-//   reduction.
-//
-///////////////////////////////////////////////////////////////////////////////
+// Phase 4 down-projection (DESIGN.md §1/§6): `moe_down_projection_BS8_..._tma`
+// streams fp8 weight/activation tiles via TMA into double-buffered SHM, runs the
+// dual-warpgroup WGMMA K-loop with per-128-K block-FP8 scale-apply, overlaps
+// expert transitions via inter-expert lookahead, then atomicAdds each block's
+// fp32 partial into `spec->down_partial_out` for Phase 5 to cast.  Per-function
+// and per-line specifics are documented inline below.
 
-namespace moe_monokernel {
+namespace monomoe {
 
 /**
  * @brief Per-expert activation-scale loader (down-projection, TMA path).
@@ -112,7 +89,7 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
   if (pw != RunPw) return;
 
   // Cache routed_count / expert_start once per thread (cheap broadcast).
-  const auto* tma_shm = &shmem->u.tiny_wgmma_tma;
+  const auto* tma_shm = &shmem->tiny_wgmma_tma;
   const uint32_t routed_count = static_cast<uint32_t>(tma_shm->expert_routed_count[id]);
   const uint32_t expert_start = static_cast<uint32_t>(tma_shm->expert_slot_start[id]);
 
@@ -122,7 +99,7 @@ __device__ inline void moe_load_down_wgmma_act_scale_per_expert(
   // (row-major, written by the up-proj epilogue) but SHM
   // `a_down_scale` is `[half][row]` (chosen for bank-conflict-free
   // reads in the down-proj WGMMA scale-apply, see comment on the SHM
-  // declaration in `MoE_SHM::U::TinyDataWGMMA_TMA`).  This loop
+  // declaration in `MoE_SHM::TinyDataWGMMA_TMA`).  This loop
   // transposes on the fly.
   constexpr unsigned TOTAL = (unsigned)(ScaleTok * ScaleHalves);
   for (unsigned i = thread; i < TOTAL; i += 32u) {
@@ -221,9 +198,9 @@ __device__ inline void moe_load_down_wgmma_weight_scale_tile(
   }
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
-namespace moe_monokernel {
+namespace monomoe {
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -303,7 +280,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   // `K_SUBSTEPS_DOWN` such atoms back-to-back along the K axis.
   constexpr std::uint32_t DOWN_A_TX_BYTES_TOTAL = 1024u * K_SUBSTEPS_DOWN;
   constexpr std::uint32_t W_DOWN_SCALE_COLS =
-      MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
+      MoE_SHM<Dims>::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
 
   static_assert(Dims::N % K_STEP_DOWN == 0, "Dims::N must be a multiple of K_STEP_DOWN");
   static_assert(K_STEP_DOWN % K_STEP_WGMMA == 0,
@@ -347,7 +324,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
 
   // TMA path uses the `tiny_wgmma_tma` union variant (byte-identical to
   // `tiny_wgmma` plus 32 B of mbarriers + the reorg tables at the tail).
-  auto* shm = &shmem->u.tiny_wgmma_tma;
+  auto* shm = &shmem->tiny_wgmma_tma;
 
   // ── Grid-to-(expert-group, output-col-tile) mapping ───────────────────
   const std::uint32_t down_group = blockIdx.x / DOWN_GRID;
@@ -380,7 +357,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   //       follows several additional `__syncthreads()` (priming drain +
   //       per-K-iter syncs).  A single trailing sync here is sufficient.
   //
-  //   (2) Re-initialize the 4 TMA mbarriers (R4.1, R4.9).  The Phase-3→4
+  //   (2) Re-initialize the 4 TMA mbarriers.  The Phase-3→4
   //       `grid.sync()` guarantees the barriers are idle at entry; we
   //       reset them to `arrival_count = 1` on the launcher thread and
   //       publish with `fence.mbarrier_init.release.cluster`.  They are
@@ -431,7 +408,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   for (std::uint32_t e = down_group; e < expert_count; e += DOWN_GROUPS) {
     const std::uint32_t id = shmem->experts[e].id;
 
-    // Per-expert (expert, token) reorganization state (R11).  These
+    // Per-expert (expert, token) reorganization state.  These
     // values are populated by `prepare_moe_topk_BS8` in Phase 1/2 and
     // drive the bulk activation TMA's outer coordinate and row count.
     const std::uint32_t routed_count = static_cast<std::uint32_t>(shm->expert_routed_count[id]);
@@ -1000,6 +977,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   }
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
 #endif

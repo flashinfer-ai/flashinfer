@@ -16,7 +16,7 @@ limitations under the License.
 Single-kernel ("mono") top-K Mixture-of-Experts for the Qwen3.5-35B
 block-FP8 shape on Hopper (SM90a).  The full pipeline — routing,
 up-projection, SiLU, down-projection and reduction — runs inside one
-`__global__` launch.  See csrc/fused_moe/megamoe/README.md for the design.
+`__global__` launch.  See csrc/fused_moe/monomoe/README.md for the design.
 
 This path is hard-specialized to a single shape:
   E (experts)  = 256
@@ -37,11 +37,11 @@ from ..trace.templates.moe import mono_moe_trace
 
 # Hard-coded geometry of the only compiled variant
 # (Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA in
-# csrc/fused_moe/megamoe/src/moe_interface.h).
-_MEGAMOE_E = 256
-_MEGAMOE_N = 512  # N_half: gate and up each have N rows
-_MEGAMOE_K = 2048
-_MEGAMOE_BS = 8
+# csrc/fused_moe/monomoe/src/moe_interface.h).
+_MONOMOE_E = 256
+_MONOMOE_N = 512  # N_half: gate and up each have N rows
+_MONOMOE_K = 2048
+_MONOMOE_BS = 8
 _BLOCK = 128  # block-wise FP8 quantization tile (128 x 128)
 
 _SCORING_SIGMOID = 0
@@ -49,26 +49,26 @@ _SCORING_SOFTMAX = 1
 
 
 @functools.cache
-def _get_megamoe_module():
-    """Lazily build and load the megamoe CUDA extension via FlashInfer's JIT."""
+def _get_monomoe_module():
+    """Lazily build and load the monomoe CUDA extension via FlashInfer's JIT."""
     try:
-        from ..jit.megamoe import load_megamoe_module
+        from ..jit.monomoe import load_monomoe_module
 
-        return load_megamoe_module()
+        return load_monomoe_module()
     except (ImportError, FileNotFoundError, RuntimeError) as e:
         raise ImportError(
-            f"Failed to load the MoE monokernel (megamoe) CUDA extension via JIT. "
+            f"Failed to load the MonoMoe kernel CUDA extension via JIT. "
             f"Ensure a Hopper (SM90a) GPU and the CUDA toolkit are available and "
-            f"that csrc/fused_moe/megamoe/ sources exist.\nError: {e}"
+            f"that csrc/fused_moe/monomoe/ sources exist.\nError: {e}"
         ) from e
 
 
 @functools.cache
 @flashinfer_api
-def has_megamoe() -> bool:
-    """Return True if the megamoe CUDA extension can be built and loaded."""
+def has_monomoe() -> bool:
+    """Return True if the monomoe CUDA extension can be built and loaded."""
     try:
-        _get_megamoe_module()
+        _get_monomoe_module()
         return True
     except ImportError:
         return False
@@ -80,12 +80,12 @@ def get_scratchpad_size_bytes() -> int:
     """Return the global scratchpad size (bytes) required by the kernel.
 
     Sourced from the C++ `sizeof(MoEGemmSpec<Dims>)` (exported as
-    `moe_monokernel_scratchpad_size`) so the buffer can never desync from the
+    `monomoe_scratchpad_size`) so the buffer can never desync from the
     kernel's struct layout — the software-grid-barrier counters live at the
     tail of that struct and must be backed by allocated memory.
     """
-    mod = _get_megamoe_module()
-    return int(mod.moe_monokernel_scratchpad_size())
+    mod = _get_monomoe_module()
+    return int(mod.monomoe_scratchpad_size())
 
 
 @flashinfer_api
@@ -168,7 +168,7 @@ def _check_shapes(
     expert_scales_down: torch.Tensor,
 ) -> int:
     """Validate the fixed-shape contract and return the active token count."""
-    E, N, K, BS = _MEGAMOE_E, _MEGAMOE_N, _MEGAMOE_K, _MEGAMOE_BS
+    E, N, K, BS = _MONOMOE_E, _MONOMOE_N, _MONOMOE_K, _MONOMOE_BS
 
     # Explicit raises (not assert): these validate user-provided tensor
     # shapes that, if wrong, let the fixed-shape CUDA kernel read/write out
@@ -267,13 +267,13 @@ def mono_moe(
 
     if out is None:
         out = torch.empty(
-            m, _MEGAMOE_K, dtype=torch.bfloat16, device=activations_in.device
+            m, _MONOMOE_K, dtype=torch.bfloat16, device=activations_in.device
         )
     if scratchpad is None:
         scratchpad = alloc_scratchpad(activations_in.device)
 
-    mod = _get_megamoe_module()
-    mod.moe_monokernel_topk(
+    mod = _get_monomoe_module()
+    mod.monomoe_topk(
         activations_in,
         router_logits,
         expert_weights_up,

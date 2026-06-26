@@ -5,11 +5,12 @@
 
 #include <cstdint>
 
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
+#include <cuda.h>  // CUtensorMap (Driver API) for the tma_load_2d signature
 
-namespace moe_monokernel {
+#include <cute/arch/copy_sm90_desc.hpp>
+#include <cute/arch/mma_sm90.hpp>
+
+namespace monomoe {
 
 // ── Hopper WGMMA (sm_90a) helpers ─────────────────────────────────────────
 //
@@ -93,59 +94,20 @@ __device__ static __forceinline__ std::uint64_t make_wgmma_desc(const void* addr
  * WGMMA in a group.  Not needed between back-to-back WGMMAs that chain
  * accumulators.
  */
-__device__ static __forceinline__ void wgmma_fence() {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-#else
-  asm volatile("trap;");
-#endif
-}
+__device__ static __forceinline__ void wgmma_fence() { cute::warpgroup_arrive(); }
 
 /**
  * @brief Close the currently-outstanding WGMMA group and start a new one.
  */
-__device__ static __forceinline__ void wgmma_commit_group() {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-#else
-  asm volatile("trap;");
-#endif
-}
+__device__ static __forceinline__ void wgmma_commit_group() { cute::warpgroup_commit_batch(); }
 
 /**
  * @brief Wait until at most N WGMMA groups are still outstanding.
- *
- * `wgmma_wait_group<0>()` waits for all pending groups.
- *
- * The count N must be a PTX integer literal, so this is implemented as
- * explicit specializations (no primary template that takes an operand).
+ *        `wgmma_wait_group<0>()` waits for all pending groups.
  */
 template <std::uint32_t N>
-__device__ __forceinline__ void wgmma_wait_group();
-
-template <>
-__device__ __forceinline__ void wgmma_wait_group<0>() {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-  asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-#else
-  asm volatile("trap;");
-#endif
-}
-template <>
-__device__ __forceinline__ void wgmma_wait_group<1>() {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-  asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
-#else
-  asm volatile("trap;");
-#endif
-}
-template <>
-__device__ __forceinline__ void wgmma_wait_group<2>() {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-  asm volatile("wgmma.wait_group.sync.aligned 2;\n" ::: "memory");
-#else
-  asm volatile("trap;");
-#endif
+__device__ __forceinline__ void wgmma_wait_group() {
+  cute::warpgroup_wait<static_cast<int>(N)>();
 }
 
 /**
@@ -257,8 +219,6 @@ __device__ static __forceinline__ std::uint32_t cvta_to_shared_u32(const void* p
 /**
  * @brief Initialize an mbarrier in SHM.
  *
- * Emits: `mbarrier.init.shared::cta.b64 [bar], arrival_count;`
- *
  * Sets the arrival counter to `arrival_count` and the transaction-bytes
  * counter to 0. Must be called exactly once per barrier before any
  * arrive / wait, and must be followed by a release fence
@@ -271,14 +231,7 @@ __device__ static __forceinline__ std::uint32_t cvta_to_shared_u32(const void* p
  */
 __device__ static __forceinline__ void mbarrier_init(std::uint64_t* bar,
                                                      std::uint32_t arrival_count) {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-  std::uint32_t bar_addr = cvta_to_shared_u32(bar);
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_addr), "r"(arrival_count));
-#else
-  (void)bar;
-  (void)arrival_count;
-  asm volatile("trap;");
-#endif
+  cute::initialize_barrier(*bar, static_cast<int>(arrival_count));
 }
 
 /**
@@ -302,36 +255,21 @@ __device__ static __forceinline__ void fence_mbarrier_init_release_cluster() {
 /**
  * @brief Arrive on an mbarrier and set its transaction-bytes counter.
  *
- * Emits: `mbarrier.arrive.expect_tx.shared::cta.b64 state, [bar], tx_bytes;`
- *
  * Combined arrive + expect_tx operation:
  *   - Decrements the arrival counter by 1.
  *   - Adds `tx_bytes` to the transaction-bytes counter.
  *
- * The returned state token is discarded — consumers synchronize via
- * `mbarrier_try_wait_parity` rather than by `mbarrier.test_wait`.
- *
- * Callers must issue the TMA (`cp.async.bulk.tensor.*`) targeting this
- * same barrier *after* this call so that the hardware-emitted
- * `complete_tx` decrements the counter we just primed.
+ * Consumers synchronize via `mbarrier_try_wait_parity`.  Callers must issue
+ * the TMA (`cp.async.bulk.tensor.*`) targeting this same barrier *after* this
+ * call so the hardware-emitted `complete_tx` decrements the counter we just
+ * primed.
  *
  * @param bar       16-B aligned pointer to the barrier in SHM.
  * @param tx_bytes  Expected total bytes the TMA engine will deliver.
  */
 __device__ static __forceinline__ void mbarrier_arrive_expect_tx(std::uint64_t* bar,
                                                                  std::uint32_t tx_bytes) {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-  std::uint32_t bar_addr = cvta_to_shared_u32(bar);
-  [[maybe_unused]] std::uint64_t state;
-  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 %0, [%1], %2;\n"
-               : "=l"(state)
-               : "r"(bar_addr), "r"(tx_bytes)
-               : "memory");
-#else
-  (void)bar;
-  (void)tx_bytes;
-  asm volatile("trap;");
-#endif
+  cute::set_barrier_transaction_bytes(*bar, tx_bytes);
 }
 
 /**
@@ -462,6 +400,6 @@ __device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc, std:
 #endif
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
 #endif

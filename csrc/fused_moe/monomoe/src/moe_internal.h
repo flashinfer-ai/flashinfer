@@ -3,14 +3,14 @@
 #ifndef MOE_INTERNAL_H
 #define MOE_INTERNAL_H
 
-#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#ifndef INSIDE_MONOMOE_IMPLEMENTATION
 #error Do not include this file directly.
 #endif
 
 #include "moe_interface.h"
 
 // Full 32-lane warp mask for the `*_sync` warp intrinsics.  Previously
-// supplied by the vLLM tree's `cuda_utils.h`; defined here so the megamoe
+// supplied by the vLLM tree's `cuda_utils.h`; defined here so the monomoe
 // sources are self-contained under FlashInfer's JIT build.
 #ifndef FULL_MASK
 #define FULL_MASK 0xffffffffu
@@ -43,7 +43,7 @@
 #endif
 
 
-namespace moe_monokernel {
+namespace monomoe {
 
 using T_element = float;              //< Type of fp32 accumulators (partial results, out_accum)
 using OpaqueElement = std::uint32_t;  //< Auxiliary 32-bit type used to generate
@@ -64,112 +64,26 @@ struct ExpertRef {
   std::uint32_t id;
 };
 
-// ── WGMMA / TMA opt-in detection (forward declarations) ────────────────────
-// These SFINAE helpers let `MoEGemmSpec<Dims>` pick the variant-dependent
-// `DOWN_COL_TILE` below (128 normally, 256 for the BS8 TMA+WGMMA variant
-// after Phase 2a layout alignment).  Full definitions (with detailed
-// comments) live further down the file; the forward declarations here only
-// need to expose `::value` so compile-time expressions can use them.
-template <typename Dims>
-struct use_wgmma {
-  template <typename D>
-  static constexpr auto test(int) -> decltype(D::KernelConfig::USE_WGMMA, bool()) {
-    return D::KernelConfig::USE_WGMMA;
-  }
-  template <typename>
-  static constexpr bool test(...) {
-    return false;
-  }
-  static constexpr bool value = test<Dims>(0);
-};
-
-template <typename Dims>
-struct use_tma {
-  template <typename D>
-  static constexpr auto test(int) -> decltype(D::KernelConfig::USE_TMA, bool()) {
-    return D::KernelConfig::USE_TMA;
-  }
-  template <typename>
-  static constexpr bool test(...) {
-    return false;
-  }
-  static constexpr bool value = test<Dims>(0);
-};
-
-// ── Down-proj K-step size opt-in detection ──────────────────────────────
-// `Dims::KernelConfig::K_STEP_DOWN` is optional; default to 128 (= the
-// up-proj K_STEP_WGMMA, which also matches the SWZ128 atom width).  Set
-// to 256 in a Dims variant to halve the number of outer K-iterations of
-// the down-proj K-loop, doubling the work per iteration so the launcher
-// + barrier-wait overhead is amortized over more compute.
+// ── KernelConfig accessors ───────────────────────────────────────────────
+// `KernelConfig` always carries USE_WGMMA / USE_TMA / K_STEP_DOWN / K_STEP_UP:
+// the generic `MoEDimensions` provides defaults (false / false / 128 / 128)
+// and concrete shape variants override them, so these are plain reads.
 //
-// Must be a multiple of 128 (the SWZ128 atom K-width) and a divisor of
-// `Dims::N`.
-//
-// Costs of K_STEP_DOWN > 128:
-//   * `w_down_wgmma` slot grows to `DOWN_COL_TILE * K_STEP_DOWN` bytes.
-//   * `a_down_wgmma` slot grows to `T_TILE * K_STEP_DOWN` bytes.
-//   * `a_down_scale` is fixed at `T_TILE * (Dims::N / 64)` floats per
-//     expert (full reduction-dim scale set, hoisted out of the K-loop).
-//   * One `bar_w` arm covers
-//     `DOWN_W_TX_BYTES_PER_HALF * DOWN_COL_HALVES * K_SUBSTEPS_DOWN`
-//     bytes (single mbarrier wait still drains all atoms).
-//   * The WGMMA loop runs `K_SUBSTEPS_DOWN` inner 128-K sub-blocks per
-//     outer K-step; scales are still applied at every 128-K boundary.
+// K_STEP_{UP,DOWN} must be a multiple of 128 (the SWZ128 atom K-width) and a
+// divisor of the reduction dim (HIDDEN_STATES / N respectively).  Bumping a
+// K-step to 256 halves the outer K-iteration count (amortizing launch / bar /
+// sync overhead over more compute) at the cost of a larger per-slot SHM tile.
 template <typename Dims>
-struct down_k_step {
- private:
-  template <typename D>
-  static constexpr auto test(int) -> decltype((std::uint32_t)D::KernelConfig::K_STEP_DOWN) {
-    return (std::uint32_t)D::KernelConfig::K_STEP_DOWN;
-  }
-  template <typename>
-  static constexpr std::uint32_t test(...) {
-    return 128u;
-  }
-
- public:
-  static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// ── Up-proj K-step size opt-in detection ────────────────────────────────
-// `Dims::KernelConfig::K_STEP_UP` is optional; default to 128 (= the
-// up-proj's existing K_STEP_WGMMA, which matches the SWZ128 atom
-// K-width and the per-K-step block-wise FP8 scale boundary).  Set to
-// 256 in a Dims variant to halve the number of outer K-iterations of
-// the up-proj K-loop, doubling per-iter work so the launcher + bar
-// arms + sync overhead is amortized over more compute.
-//
-// Must be a multiple of 128 (the SWZ128 atom K-width) and a divisor of
-// `Dims::HIDDEN_STATES` (the up-proj reduction dim).
-//
-// Costs of K_STEP_UP > 128:
-//   * `w_wgmma` slot grows to `W_UP_TILE_WGMMA * K_STEP_UP` bytes.
-//   * One `bar_w` arm covers `K_STEP_UP / K_STEP_WGMMA` ×
-//     the per-128-K payload; a single mbarrier wait drains all
-//     substeps.
-//   * The WGMMA loop runs `K_SUBSTEPS_UP = K_STEP_UP / 128`
-//     inner 128-K sub-blocks per outer K-step; scales are applied at
-//     every 128-K boundary (matching the block-wise FP8 quantization
-//     granularity).
+inline constexpr bool use_wgmma_v = Dims::KernelConfig::USE_WGMMA;
 template <typename Dims>
-struct up_k_step {
- private:
-  template <typename D>
-  static constexpr auto test(int) -> decltype((std::uint32_t)D::KernelConfig::K_STEP_UP) {
-    return (std::uint32_t)D::KernelConfig::K_STEP_UP;
-  }
-  template <typename>
-  static constexpr std::uint32_t test(...) {
-    return 128u;
-  }
-
- public:
-  static constexpr std::uint32_t value = test<Dims>(0);
-};
+inline constexpr bool use_tma_v = Dims::KernelConfig::USE_TMA;
+template <typename Dims>
+inline constexpr std::uint32_t down_k_step_v = Dims::KernelConfig::K_STEP_DOWN;
+template <typename Dims>
+inline constexpr std::uint32_t up_k_step_v = Dims::KernelConfig::K_STEP_UP;
 
 /**
- * @brief Scratchpad memory for use within the monokernel.
+ * @brief Scratchpad memory for use within the MonoMoe kernel.
  *
  * Place in global memory.
  *
@@ -191,7 +105,7 @@ struct MoEGemmSpec {
   A_element temp_bf16[TEMP_ROWS * Dims::N];
 
   // ── WGMMA-path-only up-proj → down-proj scratchpad ───────────────────
-  // Used when `use_wgmma<Dims>::value == true`.  The up-projection
+  // Used when `use_wgmma_v<Dims> == true`.  The up-projection
   // epilogue fuses per-64-col fp8 quantization into the SiLU writeback
   // and stores the fp8 activations plus per-(virtual-row, up-block)
   // fp32 scales into these buffers; the WGMMA down-projection consumes
@@ -219,52 +133,22 @@ struct MoEGemmSpec {
   AQ_element temp_fp8[TEMP_ROWS * Dims::N];
   float temp_act_scale[TEMP_ROWS * TEMP_ACT_SCALE_COLS];
 
-  // Byte offset of `temp_fp8` inside `MoEGemmSpec<Dims>`, exposed as a
-  // compile-time constant so the host-side TMA wrapper can compute the
-  // device pointer to `spec->temp_fp8` from the scratchpad base without
-  // reading the struct layout at runtime (spec R9.2).  Consumed by
-  // `create_down_activation_tma_desc` when building the down-projection
-  // activation descriptor.
+  // Byte offset of `temp_fp8`, so the host can address it from the
+  // scratchpad base without reading the layout at runtime (DESIGN.md §4).
   static constexpr size_t TEMP_FP8_OFFSET = offsetof(MoEGemmSpec<Dims>, temp_fp8);
 
-  // Down-projection block / group layout:
-  //   For the BS8 TMA+WGMMA variant (`use_tma<Dims>::value == true` and
-  //   Dims::BS <= 8), `DOWN_COL_TILE = 256`; otherwise 128.  Grids:
-  //
-  //   BS8 TMA+WGMMA: DOWN_COL_TILE=256, DOWN_GRID=8, DOWN_GROUPS=16
-  //
-  //   The `DOWN_GROUPS == UP_GROUPS` alignment in the BS8 TMA path is
-  //   the prerequisite for the Phase-2b Expert_Barrier at site #2.
-  //   `DOWN_GROUPS` is mirrored in MoECoreDims (defined later in this
-  //   file); the two MUST match — MoECoreDims contains a
-  //   static_assert that cross-checks.
-  //
-  // The down-projection writes its result via fp32 atomicAdd into a
-  // single-buffer `down_partial_out[BS][HIDDEN_STATES]` (no per-group
-  // dimension); Phase 5 reads each cell once and casts to bf16.
-  static constexpr uint32_t DOWN_COL_TILE = (use_tma<Dims>::value && Dims::BS <= 8) ? 256u : 128u;
+  // Down-projection group layout (DESIGN.md §6): DOWN_COL_TILE=256,
+  // DOWN_GRID=8, DOWN_GROUPS=16 for the BS8 TMA path.  `DOWN_GROUPS ==
+  // UP_GROUPS` is the prerequisite for the Site-#2 Expert_Barrier; the value
+  // is mirrored in MoECoreDims with a cross-checking static_assert.
+  static constexpr uint32_t DOWN_COL_TILE = (use_tma_v<Dims> && Dims::BS <= 8) ? 256u : 128u;
   static constexpr uint32_t DOWN_GRID = Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr uint32_t DOWN_GROUPS =
       DOWN_GRID == 0 ? 1 : Dims::KernelConfig::GRID_SIZE / DOWN_GRID;
-  // Per-(BS, HIDDEN_STATES) GM accumulator buffer for the WGMMA
-  // down-projection.  Each contributing block atomicAdds its
-  // `out_accum[tok][col]` slice into this single buffer at the end of
-  // Phase 4; Phase 5 reads each cell ONCE and casts to bf16 (no
-  // cross-group reduction).
-  //
-  // Shape: [BS][HIDDEN_STATES] fp32.
-  // For Qwen3.5-35B (BS=8, HIDDEN_STATES=2048):
-  //   8 × 2048 × 4 B = 64 KB.
-  //
-  // Stored fp32 (not bf16) so the 16-way atomicAdd preserves
-  // precision; the bf16 cast happens once in Phase 5.
-  //
-  // The buffer is zero-initialized at the top of moe_kernel_topk_BS8;
-  // the up-proj-completion barrier (#2) publishes that zero across
-  // all blocks before any Phase-4 atomicAdd fires.  No per-group
-  // dimension exists — the colstripe barrier (#3) ensures all 16
-  // contributing blocks finish their atomicAdds before Phase 5
-  // reads.
+  // Single-buffer fp32 accumulator for the down-projection (DESIGN.md §1).
+  // [BS][HIDDEN_STATES] = 64 KB for Qwen3.5.  fp32 (not bf16) so the 16-way
+  // Phase-4 atomicAdd keeps precision; Phase 5 casts each cell once.  Zeroed
+  // at kernel entry, fenced by the Site-#2/#3 barriers.
   float down_partial_out[Dims::BS * Dims::HIDDEN_STATES];
 
   // Per-token block-wise activation quantization scales.
@@ -275,59 +159,14 @@ struct MoEGemmSpec {
       (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
   float act_scale[Dims::BS][ACT_SCALE_BLOCKS];
 
-  // ── Software barrier counters ────────────────────
-  //
-  // Placed at the TAIL of `MoEGemmSpec<Dims>`, AFTER `act_scale`, so
-  // `TEMP_FP8_OFFSET = offsetof(MoEGemmSpec<Dims>, temp_fp8)` stays
-  // byte-identical to its pre-migration value.  The host-side TMA
-  // descriptor factory in `moe_wrapper.cu` derives the device pointer
-  // to `spec->temp_fp8` from that compile-time constant, 
-  // so inserting any new field BEFORE
-  // `temp_fp8` would silently break the down-activation TMA path.
-  //
-  // Lifetime / initialization:
-  //   * Host zero-initializes the whole scratchpad (including these
-  //     counters) once per process via `cudaMemsetAsync` on the first
-  //     launch.
-  //   * Subsequent launches inherit the counter state from the
-  //     previous kernel's exit: the ping-pong discipline is
-  //     self-maintaining — each barrier call's seed `atomicExch`
-  //     overwrites the prior-call `0x80000000` on the same slot in its
-  //     atomic step, and any arrivals that landed on the slot between
-  //     calls are folded back in by the seed-thread's follow-up
-  //     `atomicAdd(c, prior)`.  No host re-zero is required
-  //     across kernel invocations.
-  //
-  // Call-site mapping:
-  //   * `grid_barrier.slot[2]` — the Phase-1 full-grid ping-pong pair.
-  //     Used by:
-  //       - Sites #2, #3 (BS8) — Phase 3→4 and Phase 4→5. These are
-  //         Grid_Barrier in Phase 1 and get downgraded to
-  //         Expert_Barrier / ColStripe_Barrier (below) in Phase 2b.
-  //
-  //   * `partial_barrier.expert_slot[NUM_EXPERTS][2]` — Phase-2b
-  //     Expert_Barrier counter region, one Counter_Pair per expert
-  //     group id (== up_group).  Used at site #2 only, BS8 only.
-  //     Arrival count = UP_GRID (8 blocks per expert group after
-  //     Phase-2a layout alignment, `DOWN_COL_TILE = 256`).
-  //
-  //   * `partial_barrier.colstripe_slot[DOWN_GRID][2]` — Phase-2b
-  //     ColStripe_Barrier counter region, one Counter_Pair per
-  //     output col stripe id (== `blockIdx.x % DOWN_GRID`).  Used at
-  //     site #3 only, BS8 only.  Arrival count = DOWN_GROUPS
-  //     (16 blocks per col stripe after Phase-2a alignment).
-  //
-  // Uses the local `DOWN_GRID` (declared above on this struct) rather
-  // than `MoECoreDims<Dims>::DOWN_GRID` because `MoECoreDims` is
-  // defined LATER in this file than `MoEGemmSpec`, making the
-  // qualified name an incomplete-type forward reference here.  The
-  // two must match, and `MoECoreDims` carries a `static_assert` that
-  // cross-checks (see the DOWN_GROUPS cross-check further down).
-  //
-  // Sizing (Design "Sizing"): for NUM_EXPERTS=256, DOWN_GRID=16
-  // (Phase-1) or 8 (post Phase-2a), the barrier counters total
-  // 2 × 4 + 256 × 2 × 4 + DOWN_GRID × 2 × 4 B ≤ 2120 B — negligible
-  // vs. the MB-scale scratchpad.
+  // Software barrier counters (DESIGN.md §2), at the TAIL of the struct so
+  // TEMP_FP8_OFFSET is unaffected (DESIGN.md §4).  Counter_Pairs are
+  // ping-pong slots: `grid_barrier.slot[2]` (all blocks),
+  // `expert_slot[id][2]` (one per expert group, arrival UP_GRID),
+  // `colstripe_slot[id][2]` (one per col stripe, arrival DOWN_GROUPS).
+  // ~2 KB total — negligible.  Uses the local `DOWN_GRID` (not
+  // `MoECoreDims<Dims>::DOWN_GRID`, which is an incomplete forward ref here);
+  // the two match via a MoECoreDims static_assert.
   struct {
     uint32_t slot[2];
   } grid_barrier;
@@ -337,14 +176,9 @@ struct MoEGemmSpec {
   } partial_barrier;
 };
 
-// Maximum supported dimensions for shared memory and scratchpad allocation
-// sizes
-#if USE_SMALL_SETUP
-// SHM limits batch size to ~2k
-using Dims_Max = MoEDimensions<1024, 256, 1024, 256>;
-#else
+// Upper bound on the supported dimensions, used by the `static_assert`
+// bounds-checks in `get_moe_shmem_size<Dims>()`.
 using Dims_Max = MoEDimensions<1024, 1024, 5120, 256>;
-#endif
 
 // ── Block-wise quantization detection (forward declaration) ──────────────
 // These helpers are used in the MoE_SHM layout below and defined with full
@@ -394,7 +228,7 @@ struct shm_down_scale_cols<Dims, true> {
 // Only the new Dims_BS8_..._WGMMA variant sets USE_WGMMA=true.
 //
 // NOTE: The primary definition lives near the top of this file (before
-// `MoEGemmSpec<Dims>`) so `MoEGemmSpec` can use `use_wgmma<Dims>::value`
+// `MoEGemmSpec<Dims>`) so `MoEGemmSpec` can use `use_wgmma_v<Dims>`
 // to select the variant-dependent `DOWN_COL_TILE` for Phase 2a.  The
 // block comment below documents the same detection scheme for readers
 // who land on the later usage sites first.
@@ -408,7 +242,7 @@ struct shm_down_scale_cols<Dims, true> {
 // `MoEGemmSpec<Dims>`) — see the comment on `use_wgmma` above.
 
 /**
- * @brief contains various constants used within the MoE monokernel.
+ * @brief contains various constants used within the MonoMoe kernel.
  */
 template <typename Dims>
 struct MoECoreDims {
@@ -461,10 +295,10 @@ struct MoECoreDims {
 
   static_assert(K_STEP_WGMMA % K_TILE_WGMMA == 0,
                 "K_STEP_WGMMA must be a multiple of K_TILE_WGMMA");
-  static_assert(!use_wgmma<Dims>::value || Dims::HIDDEN_STATES % K_STEP_WGMMA == 0,
+  static_assert(!use_wgmma_v<Dims> || Dims::HIDDEN_STATES % K_STEP_WGMMA == 0,
                 "HIDDEN_STATES must be a multiple of 128 for the WGMMA path "
                 "(one K-step consumes K=128)");
-  static_assert(!use_wgmma<Dims>::value || (2 * Dims::N) % W_UP_TILE_WGMMA == 0,
+  static_assert(!use_wgmma_v<Dims> || (2 * Dims::N) % W_UP_TILE_WGMMA == 0,
                 "2*N must be a multiple of 128 for the WGMMA path "
                 "(one block produces 128 output rows per K-step)");
 
@@ -478,12 +312,12 @@ struct MoECoreDims {
   // Each outer K-step runs `K_SUBSTEPS_DOWN = K_STEP_DOWN / K_STEP_WGMMA`
   // inner 128-K sub-blocks; scales are applied at every 128-K boundary
   // (matching the block-wise quantization granularity).
-  static constexpr std::uint32_t K_STEP_DOWN = down_k_step<Dims>::value;
+  static constexpr std::uint32_t K_STEP_DOWN = down_k_step_v<Dims>;
   static constexpr std::uint32_t K_SUBSTEPS_DOWN = K_STEP_DOWN / K_STEP_WGMMA;
   static_assert(K_STEP_DOWN >= K_STEP_WGMMA && K_STEP_DOWN % K_STEP_WGMMA == 0,
                 "K_STEP_DOWN must be a positive multiple of K_STEP_WGMMA "
                 "(=128, the SWZ128 atom K-width).");
-  static_assert(!use_wgmma<Dims>::value || Dims::N % K_STEP_DOWN == 0,
+  static_assert(!use_wgmma_v<Dims> || Dims::N % K_STEP_DOWN == 0,
                 "Dims::N must be a multiple of K_STEP_DOWN for the WGMMA "
                 "down-projection (one outer K-step consumes K_STEP_DOWN "
                 "K-elements).");
@@ -500,12 +334,12 @@ struct MoECoreDims {
   // inner 128-K sub-blocks; the QUANT half quantizes one 128-K bf16
   // input chunk per substep, and the COMPUTE half runs 4 chained
   // m64n8k32 WGMMAs + scale-apply per substep.
-  static constexpr std::uint32_t K_STEP_UP = up_k_step<Dims>::value;
+  static constexpr std::uint32_t K_STEP_UP = up_k_step_v<Dims>;
   static constexpr std::uint32_t K_SUBSTEPS_UP = K_STEP_UP / K_STEP_WGMMA;
   static_assert(K_STEP_UP >= K_STEP_WGMMA && K_STEP_UP % K_STEP_WGMMA == 0,
                 "K_STEP_UP must be a positive multiple of K_STEP_WGMMA "
                 "(=128, the SWZ128 atom K-width).");
-  static_assert(!use_wgmma<Dims>::value || Dims::HIDDEN_STATES % K_STEP_UP == 0,
+  static_assert(!use_wgmma_v<Dims> || Dims::HIDDEN_STATES % K_STEP_UP == 0,
                 "Dims::HIDDEN_STATES must be a multiple of K_STEP_UP for "
                 "the WGMMA up-projection (one outer K-step consumes "
                 "K_STEP_UP K-elements of the reduction dim).");
@@ -516,7 +350,7 @@ struct MoECoreDims {
   // Effective M (row-tile) size of one block's up-proj work — 64 for the
   // WGMMA path, 16 for the scalar path.  Used to compute UP_GRID = 2*N/M.
   static constexpr std::uint32_t W_UP_TILE_EFFECTIVE =
-      use_wgmma<Dims>::value ? W_UP_TILE_WGMMA : W_UP_TILE;
+      use_wgmma_v<Dims> ? W_UP_TILE_WGMMA : W_UP_TILE;
 
   // ── WGMMA down-projection grid layout ────────────────────────────────
   // Each down-block owns DOWN_COL_TILE output cols within
@@ -541,19 +375,19 @@ struct MoECoreDims {
   // `MoEGemmSpec<Dims>::DOWN_COL_TILE`; the static_assert further down
   // cross-checks their derived DOWN_GROUPS.
   static constexpr std::uint32_t DOWN_COL_TILE =
-      (use_tma<Dims>::value && Dims::BS <= 8) ? 256u : 128u;
+      (use_tma_v<Dims> && Dims::BS <= 8) ? 256u : 128u;
   static constexpr std::uint32_t DOWN_GRID = Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr std::uint32_t DOWN_GROUPS =
       DOWN_GRID == 0 ? 1 : Dims::KernelConfig::GRID_SIZE / DOWN_GRID;
 
-  static_assert(!use_wgmma<Dims>::value || Dims::HIDDEN_STATES % DOWN_COL_TILE == 0,
+  static_assert(!use_wgmma_v<Dims> || Dims::HIDDEN_STATES % DOWN_COL_TILE == 0,
                 "HIDDEN_STATES must be a multiple of DOWN_COL_TILE for the "
                 "WGMMA down-projection (one down-block owns DOWN_COL_TILE "
                 "output cols)");
-  static_assert(!use_wgmma<Dims>::value || Dims::KernelConfig::GRID_SIZE % DOWN_GRID == 0,
+  static_assert(!use_wgmma_v<Dims> || Dims::KernelConfig::GRID_SIZE % DOWN_GRID == 0,
                 "GRID_SIZE must be a multiple of DOWN_GRID for the WGMMA "
                 "down-projection (expert groups partition the grid)");
-  static_assert(!use_wgmma<Dims>::value || DOWN_GROUPS <= Dims::NUM_EXPERTS,
+  static_assert(!use_wgmma_v<Dims> || DOWN_GROUPS <= Dims::NUM_EXPERTS,
                 "DOWN_GROUPS cannot exceed NUM_EXPERTS (each expert group "
                 "must process at least one expert)");
 
@@ -604,10 +438,17 @@ struct MoECoreDims {
 template <typename Dims>
 struct MoE_SHM {
   using CoreDims = MoECoreDims<Dims>;
-  union U {
+  // NOTE: `TinyDataWGMMA_TMA` (and its trailing static_asserts) are
+  // over-indented by one level — they were once wrapped in a
+  // `union U { ... } u;` that held multiple SHM variants.  Only this one
+  // variant remains, so the single-member (byte-identical) union wrapper was
+  // removed and the struct is now a direct member `tiny_wgmma_tma`; the body
+  // indentation is left as-is to keep the diff small.  The real SHM
+  // byte-sharing is done by the inner anonymous unions below.
+
     // ── TinyDataWGMMA_TMA: SHM layout for the TMA+WGMMA up-proj path ──
     //
-    // Used when `use_wgmma<Dims>::value && use_tma<Dims>::value` are both
+    // Used when `use_wgmma_v<Dims> && use_tma_v<Dims>` are both
     // true — the TMA-based activation & weight loading path for the BS8
     // WGMMA up- and down-projections.
     //
@@ -665,44 +506,15 @@ struct MoE_SHM {
       // direct FP8 reads.
       static constexpr uint32_t K_BLOCKS_TOTAL = Dims::HIDDEN_STATES / CoreDims::K_STEP_WGMMA;
 
-      // ── BS-dependent sizing clamp for the BS8-path-only fields ─────
-      // The new `bf16_in_full` and `fp8_act_full` fields below are
-      // consumed only by the BS8 TMA+WGMMA path.
-      // The `tiny_wgmma_tma` variant of `union U` is, however, present
-      // in `MoE_SHM<Dims>` for every Dims, and `sizeof(MoE_SHM<Dims>)`
-      // takes the max across all union members.
-      //
-      // Tile-major shape: the BF16 input SHM buffer is shaped as
-      // `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` rather than the natural-
-      // looking `[BS][HIDDEN_STATES]` because the activation TMA
-      // descriptor (`create_activations_tma_desc`) is configured with
-      // `boxDim = (128, 8)` (innermost = K, outer = tokens) and
-      // SWIZZLE_NONE.  Each `cp.async.bulk.tensor.2d` issued by
-      // `moe_load_full_bf16_input` writes a COMPACT 8 × 128 BF16 box
-      // (= 2 KB) to SHM with the box's outer-row stride equal to the
-      // INNER box dim (256 B), NOT to the destination's logical row
-      // stride.  With a `[BS][HIDDEN_STATES]` SHM layout (row stride
-      // = HIDDEN_STATES * 2 = 4096 B for Qwen3.5), consecutive
-      // K-substep TMA writes would overlap by ~1.75 KB and corrupt
-      // each other (the TMA byte layout would not match the
-      // consumer's row-strided indexing).
-      //
-      // The tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` layout
-      // gives every K-substep its own self-contained 2 KB slab whose
-      // bytes are exactly the bytes the TMA writes for that
-      // `(coord0 = k_start, coord1 = 0)` issue.  Consumers
-      // (`routing_phase_quantize`) read `bf16_in_full[kblk][token]`
-      // as a natural `[K_STEP_WGMMA]` row — no row-stride
-      // reinterpretation needed.
-      //
-      // Total size is identical to the prior `[BS][HIDDEN_STATES]`
-      // shape: 16 × 8 × 128 × 2 = 32 KB for Qwen3.5, so the union
-      // with `w_wgmma` / `w_down_wgmma` and the per-Dims SHM-budget
-      // static_assert (≤ 228 KB) are unaffected.
-      static constexpr uint32_t BF16_IN_FULL_K_BLOCKS = (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
-      static constexpr uint32_t BF16_IN_FULL_BS = (Dims::BS <= 8) ? Dims::BS : 1;
-      static constexpr uint32_t BF16_IN_FULL_K = (Dims::BS <= 8) ? CoreDims::K_STEP_WGMMA : 1;
-      static constexpr uint32_t FP8_ACT_FULL_K_BLOCKS = (Dims::BS <= 8) ? K_BLOCKS_TOTAL : 1;
+      // BF16 input buffer in tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]`
+      // (not `[BS][HIDDEN_STATES]`) so each `boxDim=(128,8)` TMA write lands
+      // in its own 2 KB slab without overlapping the next K-substep; full
+      // rationale in DESIGN.md §5.  Total 32 KB, unchanged from the natural
+      // shape, so the union and SHM budget are unaffected.
+      static constexpr uint32_t BF16_IN_FULL_K_BLOCKS = K_BLOCKS_TOTAL;
+      static constexpr uint32_t BF16_IN_FULL_BS = Dims::BS;
+      static constexpr uint32_t BF16_IN_FULL_K = CoreDims::K_STEP_WGMMA;
+      static constexpr uint32_t FP8_ACT_FULL_K_BLOCKS = K_BLOCKS_TOTAL;
 
       static constexpr uint32_t FP8_ACT_K_CHUNK = 16;
       // Number of 16-K fp8 chunks per ONE 128-K SWZ128 atom (the unit
@@ -812,21 +624,11 @@ struct MoE_SHM {
         // up-proj weight TMA / Phase 4 down-proj weight TMA), so the
         // union is byte-disjoint at any instant in time.
         //
-        // Tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` layout (vs.
-        // the apparently-natural `[BS][HIDDEN_STATES]`): the
-        // activation TMA descriptor uses `boxDim = (128, 8)` and
-        // SWIZZLE_NONE, so each
-        // `cp.async.bulk.tensor.2d` writes a COMPACT 8 × 128 BF16
-        // box to SHM whose outer (token) stride equals the inner
-        // box dim (256 B), NOT the destination's logical row stride.
-        // With a `[BS][HIDDEN_STATES]` layout (row stride 4 KB on
-        // Qwen3.5), consecutive K-substep TMA writes would overlap
-        // by ~1.75 KB and corrupt each other.  The tile-major
-        // layout gives every K-substep its own self-contained 2 KB
-        // slot at offset `kblk * (BS * K_STEP_WGMMA * 2)`, matching
-        // the TMA's natural compact write order, and lets
-        // `routing_phase_quantize` read `bf16_in_full[kblk][token]`
-        // as a natural `[K_STEP_WGMMA]` row.
+        // Tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` (not
+        // `[BS][HIDDEN_STATES]`) so each `boxDim=(128,8)` TMA write gets its
+        // own 2 KB slot in the TMA's compact write order, and
+        // `routing_phase_quantize` reads `bf16_in_full[kblk][token]` as a
+        // natural row — rationale in DESIGN.md §5.
         //
         // Aligned to 1024 B to inherit the SWZ128 alignment of the
         // unioned weight buffers (the bf16 activation TMA descriptor
@@ -948,7 +750,7 @@ struct MoE_SHM {
       // Weight-tile mbarriers (one per double-buffer slot).  The launcher
       // arms `bar_w[slot]` with `mbarrier.arrive.expect_tx tx_bytes=16384`
       // before the 4 sub-tile TMAs that populate `w_wgmma[slot]`; WGMMA
-      // consumers poll via `mbarrier.try_wait.parity` (R3.1, R3.3, R3.5).
+      // consumers poll via `mbarrier.try_wait.parity`.
       //
       // ── Sized for the deepest lookahead the up-proj K-loop uses ──
       //
@@ -974,12 +776,12 @@ struct MoE_SHM {
       // each per-expert bulk activation TMA into `a_down_wgmma[slot]`,
       // and the down-proj WGMMA K-loop waits via
       // `mbarrier.try_wait.parity`.  Re-initialized in the down-proj
-      // prologue (`moe_down_projection.cu`) so the up-side init in
-      // `moe.cu`'s prologue is no longer required.  No up-projection
+      // prologue (`moe_down_projection.cuh`) so the up-side init in
+      // `moe.cuh`'s prologue is no longer required.  No up-projection
       // consumer remains — Phase 3 sources its activation operand
       // from `fp8_act_full`.
       //
-      // `alignas(16)` satisfies R11.4 and the 16-byte alignment that the
+      // `alignas(16)` satisfies the 16-byte alignment that the
       // SM90 `mbarrier.*.shared::cta.b64` instructions require.
 #ifdef MONO_PROFILE_BARW_4DEEP
       alignas(16) uint64_t bar_w[4];  // 32 B (2-deep lookahead)
@@ -1008,11 +810,11 @@ struct MoE_SHM {
       // ── Phase 3 → Phase 4 (expert, token) reorganization tables ─────
       //
       // Added by the `tma-wgmma-down-projection` spec for the Phase-4
-      // TMA activation-load path (R11).  Only populated when
-      // `use_tma<Dims>::value` is true — on the cp.async reference path
+      // TMA activation-load path.  Only populated when
+      // `use_tma_v<Dims>` is true — on the cp.async reference path
       // these fields are allocated inside the `tiny_wgmma_tma` union
       // variant but never read or written, so non-TMA SHM layouts stay
-      // byte-identical (R13.1, R13.2).  These fields live in the
+      // byte-identical.  These fields live in the
       // `tiny_wgmma_tma` variant only (not in `TinyDataWGMMA`) so the
       // non-TMA WGMMA variant's SHM layout is also unchanged.
       //
@@ -1035,10 +837,9 @@ struct MoE_SHM {
       //   expert_slot_start   : uint16 × 256 = 512 B  (max value < 64)
       //   expert_routed_count : uint8  × 256 = 256 B  (max value ≤ 64)
       //   sorted_slot         : uint8  ×  64 =  64 B  (max value < 64)
-      //   Total ≤ 832 B, comfortably inside the 228 KB SHM budget
-      //   (R14.1, R14.2, R14.3).
+      //   Total ≤ 832 B, comfortably inside the 228 KB SHM budget.
       //
-      // Access pattern (R11.1, R11.2, R11.7):
+      // Access pattern:
       //   * Phase 3 epilogue reads `sorted_slot[pair]` once per routed
       //     pair to pick the fp8 writeback row.
       //   * Phase 4 launcher reads `expert_slot_start[id]` and
@@ -1052,7 +853,7 @@ struct MoE_SHM {
       static constexpr uint32_t MAX_TOPK = 8;
       static constexpr uint32_t MAX_PAIRS = Dims::BS * MAX_TOPK;
       // `alignas(16)` is required (NOT cosmetic): Phase B of
-      // `prepare_moe_topk_BS8` (in `moe_routing.cu`) emits a packed
+      // `prepare_moe_topk_BS8` (in `moe_routing.cuh`) emits a packed
       // 16-byte STS.128 store per warp lane via
       //   `*reinterpret_cast<uint4*>(&expert_slot_start[tid * BLK]) =
       //    packed_starts;`
@@ -1065,13 +866,13 @@ struct MoE_SHM {
       // padding consumed by the next field) shifts
       // `expert_slot_start[]` to an 8-B-aligned-but-not-16-B-aligned
       // offset, which causes a `cudaErrorMisalignedAddress` at the
-      // STS.128 issue.  The writer comment in `moe_routing.cu`
+      // STS.128 issue.  The writer comment in `moe_routing.cuh`
       // already documents this expectation; this `alignas(16)` makes
       // the contract explicit on the declaration side so future SHM
       // layout changes cannot silently break it.
       alignas(16) uint16_t expert_slot_start[Dims::NUM_EXPERTS];
       // `alignas(16)` is required (NOT cosmetic): `prepare_moe_topk_BS8`
-      // (in `moe_routing.cu`) zero-inits this array with a per-lane
+      // (in `moe_routing.cuh`) zero-inits this array with a per-lane
       // STS.64 (`*reinterpret_cast<uint64_t*>(&expert_routed_count[tid *
       // BLK]) = 0ull`, BLK = 8) and later reads it back with the matching
       // 64-bit `reinterpret_cast` load.  Both require the array base to be
@@ -1121,31 +922,22 @@ struct MoE_SHM {
 #endif
     } tiny_wgmma_tma;
 
-    // ── Aliasing safety static_asserts ─────────────────
-    // The new `bf16_in_full` field of `TinyDataWGMMA_TMA` is unioned
-    // with `w_wgmma` and `w_down_wgmma` so the BS8 TMA+WGMMA Phase-1/2
-    // BF16 input tile shares bytes with the up- and down-projection
-    // weight tiles (lifetimes are strictly disjoint.
-    // Verify at compile time that the three views start at the same 
-    // offset within `TinyDataWGMMA_TMA`
-    // so a future layout change that accidentally moves `bf16_in_full`
-    // out of the anonymous union (and therefore breaks aliasing) is
-    // caught at the build step rather than producing silent SHM
-    // corruption at runtime.
-    //
-    // Placed immediately after the `TinyDataWGMMA_TMA` struct
-    // definition (the struct is now complete here; the asserts cannot
-    // live inside the struct because `offsetof` requires a complete
-    // type).  Still inside `union U` of the enclosing
-    // `MoE_SHM<Dims>` so `Dims` is in scope.
-    //
-    static_assert(offsetof(typename U::TinyDataWGMMA_TMA, bf16_in_full) ==
-                      offsetof(typename U::TinyDataWGMMA_TMA, w_wgmma),
-                  "bf16_in_full must alias w_wgmma exactly.");
-    static_assert(offsetof(typename U::TinyDataWGMMA_TMA, bf16_in_full) ==
-                      offsetof(typename U::TinyDataWGMMA_TMA, w_down_wgmma),
-                  "bf16_in_full must alias w_down_wgmma exactly.");
-  } u;
+  // ── Aliasing safety static_asserts ─────────────────
+  // `bf16_in_full` is unioned with `w_wgmma` and `w_down_wgmma` so the BS8
+  // TMA+WGMMA Phase-1/2 BF16 input tile shares bytes with the up- and
+  // down-projection weight tiles (lifetimes are strictly disjoint).  Verify at
+  // compile time that the three views start at the same offset within
+  // `TinyDataWGMMA_TMA`, so a future layout change that accidentally moves
+  // `bf16_in_full` out of the inner anonymous union (and therefore breaks
+  // aliasing) is caught at the build step rather than producing silent SHM
+  // corruption at runtime.  Placed after the struct definition because
+  // `offsetof` requires a complete type.
+  static_assert(offsetof(TinyDataWGMMA_TMA, bf16_in_full) ==
+                    offsetof(TinyDataWGMMA_TMA, w_wgmma),
+                "bf16_in_full must alias w_wgmma exactly.");
+  static_assert(offsetof(TinyDataWGMMA_TMA, bf16_in_full) ==
+                    offsetof(TinyDataWGMMA_TMA, w_down_wgmma),
+                "bf16_in_full must alias w_down_wgmma exactly.");
 
   static_assert(Dims::NUM_EXPERTS <= 65535,
                 "Number of experts too high, cannot store as uint16 anymore.");
@@ -1200,10 +992,6 @@ __device__ __host__ constexpr size_t get_moe_shmem_size() {
                 "MoE_SHM layout exceeds the 224 KB per-block SHM budget.");
   return sizeof(MoE_SHM<Dims>);
 }
-
-constexpr size_t get_moe_max_shmem_size() { return sizeof(MoE_SHM<Dims_Max>); }
-
-constexpr size_t get_moe_max_scratchpad_size() { return sizeof(MoEGemmSpec<Dims_Max>); }
 
 template <typename Dims>
 inline __device__ bool is_calc_warp() {
@@ -1299,6 +1087,6 @@ __device__ static __forceinline__ To type_pun(From x) {
   return y;
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
 #endif

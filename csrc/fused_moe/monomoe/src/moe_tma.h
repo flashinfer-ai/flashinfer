@@ -14,7 +14,7 @@
 //
 // The definitions live in `moe_tma.cu` / `moe_tma.cpp` (host-side translation
 // unit) and call `cuTensorMapEncodeTiled` from the CUDA Driver API, which
-// requires CUDA 12.0 or later.  See the spec requirements R5.x and R12.x.
+// requires CUDA 12.0 or later.
 
 #include <cstdint>
 
@@ -34,20 +34,20 @@
 // `moe_load_full_bf16_input` template signature below.  `moe_interface.h`
 // is the canonical declaration site for the kernel's element-type
 // aliases and is a lightweight header (no
-// `INSIDE_MOE_MONOKERNEL_IMPLEMENTATION` guard), so including it here is safe
+// `INSIDE_MONOMOE_IMPLEMENTATION` guard), so including it here is safe
 // for every existing consumer of `moe_tma.h` (the host-only `moe_tma.cu`, the
 // device-side `.cu` files in the kernel's whole-program-inlined chain, and the
 // standalone `tma_descriptor_factory_test.cu`).
 #include "moe_interface.h"
 
-// Build-time guard: TMA descriptor encoding requires CUDA toolkit 12.0+
-// (see requirement R12.1).  The CUDA Driver API exposes `CUtensorMap` only
-// on 12.0+, so fail fast with a clear message on older toolchains.
+// Build-time guard: TMA descriptor encoding requires CUDA toolkit 12.0+.
+// The CUDA Driver API exposes `CUtensorMap` only on 12.0+, so fail fast
+// with a clear message on older toolchains.
 #if defined(CUDA_VERSION) && (CUDA_VERSION < 12000)
 #error "moe_tma.h requires CUDA 12.0 or later for CUtensorMap / cuTensorMapEncodeTiled"
 #endif
 
-namespace moe_monokernel {
+namespace monomoe {
 
 /**
  * @brief Build a `CUtensorMap` describing the fp8 up-projection weight
@@ -182,18 +182,17 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr, uint32_t num_ex
  * `rank = 2`, `globalDim = [N, temp_rows]`, `boxDim = [128, 8]`,
  * `elementStrides = [1, 1]`, `CU_TENSOR_MAP_INTERLEAVE_NONE`,
  * `CU_TENSOR_MAP_SWIZZLE_NONE`, `CU_TENSOR_MAP_L2_PROMOTION_L2_128B`, and
- * `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`.  See requirements R2.4, R2.8, R6.3,
- * R6.4.
+ * `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`.
  *
  * Axis ordering: innermost = `N` (128 fp8 K-values per token row),
  * outer = `sorted_slot` row index into `spec->temp_fp8`.  `boxDim[1] = 8`
  * sets the maximum rows per bulk TMA issue; the actual per-issue row
  * count is controlled at runtime by the instruction's dynamic row-count
  * operand and equals `routed_token_count ∈ [1, 8]` for the current
- * expert (R2.2, R2.5).
+ * expert.
  *
  * The `temp_fp8` tensor is written by the Phase-3 up-projection epilogue
- * into a reorganized `[expert, token]` layout (R11.x), so each expert's
+ * into a reorganized `[expert, token]` layout, so each expert's
  * routed tokens occupy a contiguous slab of rows
  * `[expert_slot_start[id], expert_slot_start[id] + routed_token_count[id])`
  * that this descriptor can fetch in a single bulk TMA.
@@ -207,7 +206,7 @@ CUtensorMap create_down_weight_tma_desc(const void* weights_ptr, uint32_t num_ex
  *         `__grid_constant__ CUtensorMap const` kernel parameter.
  *
  * On `cuTensorMapEncodeTiled` failure, raises `TORCH_CHECK` identifying
- * "down-projection activations" as the failing tensor (R6.5).
+ * "down-projection activations" as the failing tensor.
  */
 CUtensorMap create_down_activation_tma_desc(const void* activations_ptr, uint32_t temp_rows,
                                             uint32_t N);
@@ -228,7 +227,7 @@ CUtensorMap create_down_activation_tma_desc(const void* activations_ptr, uint32_
 // issue duplicate `cp.async.bulk.tensor.2d` instructions and corrupt the
 // barrier's transaction-bytes accounting.  The caller is also responsible
 // for pre-arming the target mbarrier exactly once with the total expected
-// byte count before issuing the TMA(s) that target it — see R3.3, R3.4.
+// byte count before issuing the TMA(s) that target it.
 
 /**
  * @brief Single-issue 128×128 up-projection weight TMA loader.
@@ -286,20 +285,20 @@ __device__ __forceinline__ void tma_load_up_wgmma_tile(
  * rectangular box from the full `[batch_size_cap, K_hidden]` activation
  * tensor into a 16-B aligned SHM
  * region (2048 B total: 8 tokens × 128 K × 2 B per bf16) using exactly
- * one `cp.async.bulk.tensor.2d` instruction (R2.1, R2.2).
+ * one `cp.async.bulk.tensor.2d` instruction.
  *
  * Coordinate convention for the activation descriptor (built by
  * `create_activations_tma_desc`): the innermost axis is K and the outer
- * axis is the token index.  Per spec R2.5, every K-step `s` fetches all
+ * axis is the token index.  Every K-step `s` fetches all
  * 8 tokens starting at token 0, so the tile coordinates are
  * `(k_start, 0) = (s * K_STEP, 0)`.  Per `cuTensorMapEncodeTiled`, the
  * coordinate operand order matches that of `globalDim`, so this wrapper
  * passes `coord0 = k_start` and `coord1 = 0` at the PTX boundary.
  *
- * Activations are expert-invariant (R15.2): the coordinates depend only
+ * Activations are expert-invariant: the coordinates depend only
  * on `k_start` and are the same across the outer expert loop.
  *
- * Caller contract (critical — R2.1, R2.3, R3.4, R4.2):
+ * Caller contract (critical):
  *   - Must be called by exactly ONE thread per block (the TMA launcher,
  *     typically warp 8 lane 0).  This function does NOT gate on
  *     `threadIdx`; calling from multiple threads issues duplicate TMAs
@@ -315,7 +314,7 @@ __device__ __forceinline__ void tma_load_up_wgmma_tile(
  *   - `desc` MUST be the descriptor produced by
  *     `create_activations_tma_desc`, typically passed to the kernel as
  *     a `__grid_constant__ CUtensorMap const` parameter.
- *   - Valid inputs (R15.2): `0 ≤ k_start` with `k_start + 128 ≤ K_hidden`.
+ *   - Valid inputs: `0 ≤ k_start` with `k_start + 128 ≤ K_hidden`.
  *
  * @param desc          Host-built activation TMA descriptor
  *                      (`__grid_constant__`).
@@ -330,15 +329,14 @@ __device__ __forceinline__ void tma_load_bf16_input_tile(CUtensorMap const& desc
                                                          std::uint32_t k_start, void* dest_smem_ptr,
                                                          std::uint64_t* bar_smem_ptr) {
   // Descriptor axis order (innermost first): coord0 = K, coord1 = token.
-  // We always fetch all 8 tokens starting at token 0 (R2.5, R15.2).
+  // We always fetch all 8 tokens starting at token 0.
   tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/0u, dest_smem_ptr, bar_smem_ptr);
 }
 
 /**
  * @brief Issue a full per-block BF16 input tile TMA load via
  *        `K_BLOCKS_TOTAL` back-to-back 128-K-wide bulk TMA issues
- *        (Phase-1 routing-window prefetch — Option B in the design's
- *        "TMA-granularity decision").
+ *        (Phase-1 routing-window prefetch).
  *
  * Covers the entire `[Dims::BS, Dims::HIDDEN_STATES]` BF16 activation
  * tile — `K_BLOCKS_TOTAL = Dims::HIDDEN_STATES / 128` issues of the
@@ -359,8 +357,7 @@ __device__ __forceinline__ void tma_load_bf16_input_tile(CUtensorMap const& desc
  * Why Option B (16 × 2 KB issues) instead of one 32 KB issue:
  * `cuTensorMapEncodeTiled` caps per-axis `boxDim` at 256 elements
  * regardless of swizzle mode, so a single-issue load with innermost
- * axis = `HIDDEN_STATES = 2048` is rejected by the Driver API.  See the
- * design's "TMA-granularity decision" section.
+ * axis = `HIDDEN_STATES = 2048` is rejected by the Driver API.
  *
  * This helper consumes only a `CUtensorMap` and a typed SHM reference;
  * it deliberately does NOT depend on `MoE_SHM` or `MoECoreDims` so that
@@ -370,7 +367,7 @@ __device__ __forceinline__ void tma_load_bf16_input_tile(CUtensorMap const& desc
  * in `moe_tma.cu`); a `static_assert` guards the descriptor invariant
  * (`Dims::HIDDEN_STATES % 128 == 0`).
  *
- * Caller contract (CRITICAL — Req 1.4, 1.5):
+ * Caller contract (CRITICAL):
  *   - Must be called by exactly ONE thread per block (the TMA launcher,
  *     warp 8 lane 0 in the BS8 TMA+WGMMA path, selected via
  *     `is_tma_launcher_thread<Dims>()`).  Does NOT gate on `threadIdx`;
@@ -396,7 +393,7 @@ __device__ __forceinline__ void tma_load_bf16_input_tile(CUtensorMap const& desc
  *     `TinyDataWGMMA_TMA::bf16_in_full`).  Aligned to at least 1024 B
  *     by the union's `alignas(1024)`.
  *   - This helper is consumed only by the BS8 TMA+WGMMA path; do NOT
- *     instantiate it from any other variant (Req 7.1, 7.2, 7.3, 7.6).
+ *     instantiate it from any other variant.
  *
  * @tparam Dims          The MoE Dims tag (provides `BS` and
  *                       `HIDDEN_STATES`).
@@ -406,9 +403,9 @@ __device__ __forceinline__ void tma_load_bf16_input_tile(CUtensorMap const& desc
  * @param  dest          Reference to the tile-major BF16 SHM
  *                       destination tile shaped
  *                       `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` (typically
- *                       `shmem->u.tiny_wgmma_tma.bf16_in_full`).
+ *                       `shmem->tiny_wgmma_tma.bf16_in_full`).
  * @param  bar_smem_ptr  Pointer to the routing-window mbarrier in SHM
- *                       (`shmem->u.tiny_wgmma_tma.bar_rwin`), pre-armed
+ *                       (`shmem->tiny_wgmma_tma.bar_rwin`), pre-armed
  *                       by the caller with the cumulative `tx_bytes`.
  */
 template <typename Dims>
@@ -428,16 +425,9 @@ __device__ __forceinline__ void moe_load_full_bf16_input(
 #pragma unroll
   for (std::uint32_t kk = 0u; kk < K_BLOCKS_TOTAL; ++kk) {
     const std::uint32_t k_start = kk * K_STEP_WGMMA;
-    // Tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]` SHM placement:
-    // each TMA issue writes a self-contained 2 KB box (BS × 128 BF16)
-    // into slot `kk`.  The destination `&dest[kk][0][0]` matches what
-    // the descriptor's `boxDim = (128, 8)` produces: 8 contiguous
-    // token rows × 128 K-elements per row, advancing by
-    // `K_STEP_WGMMA * sizeof(A_element) = 256` bytes per row.  This
-    // is the SAME byte stride the TMA hardware uses, so the box
-    // lands compactly in the slot.  See the doc comment on
-    // `TinyDataWGMMA_TMA::bf16_in_full` in `moe_internal.h` for why
-    // the destination is tile-major rather than `[BS][HIDDEN_STATES]`.
+    // Each issue writes a self-contained 2 KB box (BS × 128 BF16) into
+    // tile-major slot `kk` (`&dest[kk][0][0]`), matching the
+    // `boxDim=(128,8)` byte layout exactly (DESIGN.md §5).
     tma_load_bf16_input_tile(activations_desc, /*k_start=*/k_start,
                              /*dest_smem_ptr=*/&dest[kk][0][0],
                              /*bar_smem_ptr=*/bar_smem_ptr);
@@ -462,7 +452,7 @@ __device__ __forceinline__ void moe_load_full_bf16_input(
 //     (16 384 B = `boxDim = (128, 128)`).
 //   * The activation descriptor uses `boxDim = (128, 8)`; each issue
 //     fetches up to 8 contiguous rows starting at `expert_slot_start[id]`
-//     in the Phase-3-reorganized `temp_fp8` layout (R11.x).
+//     in the Phase-3-reorganized `temp_fp8` layout.
 //
 // Caller contract (same as up-proj helpers): every helper MUST be invoked
 // by exactly ONE thread per block — the TMA launcher thread (warp 8,
@@ -486,7 +476,7 @@ __device__ __forceinline__ void moe_load_full_bf16_input(
  *
  * Coordinate convention for the down-weight descriptor: innermost axis
  * is N and outer axis is the flattened row index
- * `expert_id * K + output_row` (R1.5).  Per `cuTensorMapEncodeTiled` the
+ * `expert_id * K + output_row`.  Per `cuTensorMapEncodeTiled` the
  * coordinate operand order matches `globalDim`, so this wrapper emits
  * `coord0 = k_start` (innermost, the starting N column of the tile) and
  * `coord1 = expert_id * K + base_col` (outer, the starting output row).
@@ -536,8 +526,7 @@ __device__ __forceinline__ void tma_load_down_wgmma_tile(CUtensorMap const& desc
                                                          std::uint32_t k_start, void* dest_smem_ptr,
                                                          std::uint64_t* bar_smem_ptr) {
   // Descriptor axis order (innermost first): coord0 = N, coord1 = row.
-  // Flattened outer-axis row for this expert: `expert_id * K + base_col`
-  // (R1.5).
+  // Flattened outer-axis row for this expert: `expert_id * K + base_col`.
   const std::uint32_t global_row = expert_id * K + base_col;
   tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/global_row, dest_smem_ptr, bar_smem_ptr);
 }
@@ -556,7 +545,7 @@ __device__ __forceinline__ void tma_load_down_wgmma_tile(CUtensorMap const& desc
  * `B_LBO=16`, `B_SBO=128`.
  *
  * The fetched rows start at `expert_slot_start` in the
- * Phase-3-reorganized `spec->temp_fp8` layout (R11.x), where each
+ * Phase-3-reorganized `spec->temp_fp8` layout, where each
  * expert's routed tokens occupy a contiguous slab
  * `[expert_slot_start[id], expert_slot_start[id] + routed_token_count[id])`.
  *
@@ -626,6 +615,6 @@ __device__ __forceinline__ void tma_load_down_wgmma_activation_bulk(CUtensorMap 
   tma_load_2d(desc, /*coord0=*/k_start, /*coord1=*/expert_slot_start, dest_smem_ptr, bar_smem_ptr);
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
 #endif  // MOE_TMA_H

@@ -1,4 +1,4 @@
-"""Accuracy test for the single-kernel block-FP8 MoE (megamoe / monokernel).
+"""Accuracy test for the single-kernel block-FP8 MoE (monomoe).
 
 The kernel is hard-specialized to the Qwen3.5-35B shape on Hopper (SM90a):
 E=256 experts, N=512, K=2048, up to BS=8 tokens, block-wise (128x128) FP8
@@ -12,7 +12,7 @@ GEMM) so the comparison is apples-to-apples in fp8.
 import pytest
 import torch
 
-from flashinfer.fused_moe import has_megamoe, mono_moe
+from flashinfer.fused_moe import has_monomoe, mono_moe
 from flashinfer.utils import is_sm90a_supported
 
 # Fixed geometry of the only compiled variant.
@@ -106,12 +106,12 @@ def _python_reference(x, w13_fp8, s13, w2_fp8, s2, topk_w, topk_ids):
 
 @pytest.mark.parametrize("m", [1, 8])
 @pytest.mark.parametrize("top_k", [1, 8])
-def test_megamoe_accuracy(m, top_k):
+def test_monomoe_accuracy(m, top_k):
     dev = torch.device("cuda")
     if not is_sm90a_supported(dev):
-        pytest.skip("megamoe requires SM90a (Hopper)")
-    if not has_megamoe():
-        pytest.skip("megamoe extension unavailable (failed to build/load)")
+        pytest.skip("monomoe requires SM90a (Hopper)")
+    if not has_monomoe():
+        pytest.skip("monomoe extension unavailable (failed to build/load)")
 
     torch.manual_seed(42)
     # Up weights are stored [E, 2*N, K] = [gate(N rows) || up(N rows)].
@@ -146,5 +146,5 @@ def test_megamoe_accuracy(m, top_k):
         out.float().reshape(-1), ref.float().reshape(-1), dim=0
     ).item()
     max_abs = (out.float() - ref.float()).abs().max().item()
-    print(f"\n[megamoe] m={m} top_k={top_k}: cos_sim={cos:.5f} max_abs={max_abs:.4f}")
+    print(f"\n[monomoe] m={m} top_k={top_k}: cos_sim={cos:.5f} max_abs={max_abs:.4f}")
     assert cos > 0.98, f"cosine similarity too low: {cos:.5f}"

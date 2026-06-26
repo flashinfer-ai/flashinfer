@@ -1,12 +1,23 @@
-"""End-to-end benchmark: megamoe (mono_moe) vs cutlass_fused_moe (block-FP8).
+"""End-to-end benchmark: monomoe (mono_moe) vs cutlass_fused_moe (block-FP8).
 
 Both run the same block-wise-FP8 MoE math on Hopper (SM90a) at the Qwen3.5-35B
 shape (E=256, N=512, K=2048).  Timing is end-to-end via CUDA graph replay
 (`use_cuda_graph=True`), which amortizes launch overhead and reflects the
 serving regime where the MoE is replayed from a captured graph.
 
-Both paths run the same block-FP8 MoE math (two GEMMs with internal bf16->fp8
-activation quant + SiLU).  The one deliberate asymmetry is routing:
+Accuracy and speed are measured against different baselines, on purpose:
+
+  * Accuracy  — both kernels are compared (cosine similarity) against an
+                fp32 reference computed from the UNQUANTIZED weights and the
+                same expert selection.  The fp32 reference is the ground
+                truth; each kernel's `cos` is its own accuracy, independent of
+                the other.  (Comparing the two kernels to each other is
+                misleading: cutlass is inaccurate at small token counts, which
+                would wrongly drag mono's number down.)
+  * Speed     — cutlass_fused_moe is the speedup baseline (`speedup` =
+                cutlass_time / mono_time).
+
+The one deliberate asymmetry is routing:
 
   * mono_moe          — routing (top-K + renormalize) is FUSED inside the
                         single kernel, from `router_logits`, so it is part of
@@ -14,18 +25,13 @@ activation quant + SiLU).  The one deliberate asymmetry is routing:
   * cutlass_fused_moe — routing is computed ONCE outside the timed region (the
                         softmax top-K selection mono uses) and fed in as
                         pre-computed `topk_ids` / `topk_w`.  The timed region is
-                        therefore JUST `cutlass_fused_moe` — the two GEMMs.  We
-                        no longer run `fused_topk_deepseek` in the loop: its
-                        sigmoid+grouped scoring picks DIFFERENT experts than the
-                        softmax routing mono uses, so timing it conflated an
-                        inaccurate routing kernel with the GEMM work.
+                        therefore JUST `cutlass_fused_moe` — the two GEMMs.
 
-Both kernels are thus fed the SAME expert selection, so the cosine-similarity
-correctness check compares the actual timed cutlass output against mono.  Block-
-wise WEIGHT quant is one-time prep outside the loop for both paths; activation
-bf16->fp8 quant is internal to both kernels (inside the timed region for both).
+Both kernels are fed the SAME expert selection.  Block-wise WEIGHT quant is
+one-time prep outside the loop for both paths; activation bf16->fp8 quant is
+internal to both kernels (inside the timed region for both).
 
-Run:  python benchmarks/bench_megamoe.py
+Run:  python benchmarks/bench_monomoe.py
 """
 
 import argparse
@@ -34,11 +40,11 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import fused_moe
-from flashinfer.fused_moe import mono_moe, has_megamoe
+from flashinfer.fused_moe import mono_moe, has_monomoe
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import is_sm90a_supported
 
-# Fixed geometry of the compiled megamoe variant.
+# Fixed geometry of the compiled monomoe variant.
 E = 256
 N = 512  # N_half; up-projection emits 2*N rows (gate || up)
 K = 2048
@@ -74,6 +80,31 @@ def routing_softmax_topk(logits, top_k):
     return wts.float(), ids.to(torch.int32)
 
 
+def moe_reference_fp32(x, w13, w2, topk_w, topk_ids):
+    """Ground-truth MoE in fp32 from the UNQUANTIZED weights.
+
+    Uses mono_moe's `[gate || up]` fc1 half-ordering and the given (already
+    renormalized) top-K selection.  No FP8 quantization anywhere — this is the
+    accuracy reference both kernels are scored against.
+    """
+    m = x.shape[0]
+    out = torch.zeros(m, K, device=x.device, dtype=torch.float32)
+    xf, w13f, w2f = x.float(), w13.float(), w2.float()
+    for t in range(m):
+        for j in range(topk_ids.shape[1]):
+            e = int(topk_ids[t, j])
+            wgt = float(topk_w[t, j])
+            gate = xf[t] @ w13f[e, :N, :].T
+            up = xf[t] @ w13f[e, N:, :].T
+            h = F.silu(gate) * up
+            out[t] += wgt * (h @ w2f[e].T)
+    return out
+
+
+def cosine(a, b):
+    return F.cosine_similarity(a.float().reshape(-1), b.float().reshape(-1), dim=0).item()
+
+
 def summarize(times_ms):
     t = torch.tensor(times_ms)
     return t.median().item(), t.std().item()
@@ -88,10 +119,10 @@ def main():
 
     dev = torch.device("cuda")
     if not is_sm90a_supported(dev):
-        print("megamoe requires SM90a (Hopper) — skipping.")
+        print("monomoe requires SM90a (Hopper) — skipping.")
         return
-    if not has_megamoe():
-        print("megamoe extension unavailable (failed to build/load) — skipping.")
+    if not has_monomoe():
+        print("monomoe extension unavailable (failed to build/load) — skipping.")
         return
 
     torch.manual_seed(0)
@@ -107,10 +138,14 @@ def main():
         f"Both paths = 2 block-FP8 GEMMs + SiLU (activation quant internal).\n"
         f"  mono_moe         : routing fused in-kernel (softmax), timed\n"
         f"  cutlass          : pre-computed softmax routing (NOT timed) + cutlass_fused_moe\n"
-        f"cos = correctness check; both fed the SAME softmax top-K selection.\n"
+        f"Accuracy: cos vs an fp32 reference (ground truth, unquantized weights).\n"
+        f"Speed:    speedup = cutlass_time / mono_time.\n"
     )
-    print(f"{'shape':>16} | {'mono_moe':>22} | {'cutlass (no routing)':>22} | {'speedup':>8} | {'cos':>6}")
-    print("-" * 92)
+    print(
+        f"{'shape':>12} | {'mono_moe':>22} | {'cutlass':>22} | {'speedup':>8} | "
+        f"{'mono cos':>8} | {'cutlass cos':>11}"
+    )
+    print("-" * 100)
 
     for m in args.tokens:
         for top_k in args.top_k:
@@ -133,7 +168,7 @@ def main():
             out_cutlass = torch.zeros(m, K, dtype=torch.bfloat16, device=dev)
 
             # cutlass_fused_moe uses the opposite SwiGLU half ordering from
-            # mono_moe: it reads fc1 weights as [up || gate] whereas megamoe
+            # mono_moe: it reads fc1 weights as [up || gate] whereas monomoe
             # uses [gate || up].  Swap the two N-row halves (and their scale
             # rows) so both kernels compute the SAME math from the SAME
             # logical weights — verified to bring both to cos≈0.999 vs the
@@ -175,15 +210,14 @@ def main():
                 have_cutlass = False
                 cutlass_err = str(e).splitlines()[0][:60]
 
-            # Correctness cross-check: run_cutlass already uses the SAME softmax
-            # top-K selection mono uses, so its warm-up output (out_cutlass) is
-            # directly comparable to out_mono.
-            cos = float("nan")
-            if have_cutlass:
-                torch.cuda.synchronize()
-                cos = F.cosine_similarity(
-                    out_mono.float().reshape(-1), out_cutlass.float().reshape(-1), dim=0
-                ).item()
+            # Accuracy vs the fp32 ground truth (warm-up outputs are valid).
+            # Each kernel is scored independently against the reference, NOT
+            # against each other, so cutlass's small-m inaccuracy can't drag
+            # mono's number down.
+            torch.cuda.synchronize()
+            ref = moe_reference_fp32(x, w13, w2, route_vals, route_ids)
+            mono_cos = cosine(out_mono, ref)
+            cutlass_cos = cosine(out_cutlass, ref) if have_cutlass else float("nan")
 
             mono_med, mono_std = summarize(
                 bench_gpu_time(run_mono, use_cuda_graph=True, enable_cupti=args.cupti)
@@ -194,13 +228,18 @@ def main():
                 )
                 cut_str = f"{cut_med:7.4f} ± {cut_std:6.4f} ms"
                 speedup = f"{cut_med / mono_med:6.2f}x"
+                cutlass_cos_str = f"{cutlass_cos:11.3f}"
             else:
                 cut_str = f"unavailable ({cutlass_err})"
                 speedup = "    n/a"
+                cutlass_cos_str = f"{'n/a':>11}"
 
             shape = f"m={m},k={top_k}"
             mono_str = f"{mono_med:7.4f} ± {mono_std:6.4f} ms"
-            print(f"{shape:>16} | {mono_str:>22} | {cut_str:>22} | {speedup:>8} | {cos:6.3f}")
+            print(
+                f"{shape:>12} | {mono_str:>22} | {cut_str:>22} | {speedup:>8} | "
+                f"{mono_cos:8.3f} | {cutlass_cos_str}"
+            )
 
 
 if __name__ == "__main__":

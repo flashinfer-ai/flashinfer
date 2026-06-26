@@ -2324,9 +2324,9 @@ cutlass_fused_moe_trace.axes["gemm1_out_size"] = Const(
 
 
 # ---------------------------------------------------------------------------
-# mono_moe (megamoe) — single-kernel block-FP8 top-K MoE, Qwen3.5-35B shape
+# mono_moe (monomoe) — single-kernel block-FP8 top-K MoE, Qwen3.5-35B shape
 # ---------------------------------------------------------------------------
-# Fixed-shape Hopper (SM90a) monokernel: routing is FUSED in-kernel from
+# Fixed-shape Hopper (SM90a) MonoMoe kernel: routing is FUSED in-kernel from
 # router_logits, so unlike cutlass_fused_moe this template takes the logits
 # (not precomputed selections).  Weights are block-FP8 (128x128):
 #   activations_in     : [seq_len, hidden_size]                 bf16
@@ -2352,10 +2352,10 @@ def _mono_moe_reference(
 ):
     """Reference for mono_moe: in-kernel softmax/sigmoid routing + block-FP8 SwiGLU.
 
-    Mirrors the megamoe math: score router_logits (softmax or sigmoid),
+    Mirrors the monomoe math: score router_logits (softmax or sigmoid),
     take top-k, optionally renormalize the selected weights to sum to 1,
     then run the shared block-FP8 dequant + SwiGLU + GEMM helper.  The
-    up-projection weights use the [gate || up] half ordering (megamoe's
+    up-projection weights use the [gate || up] half ordering (monomoe's
     convention), which `_fp8_moe_run_experts` already assumes (X1=gate,
     X2=up with silu on X2).
     """
@@ -2374,7 +2374,7 @@ def _mono_moe_reference(
     else:
         weights = topk_vals
     # hidden_states_scale: the helper expects [H/128, T] (block-wise act
-    # scale).  megamoe quantizes activations internally, so for the
+    # scale).  monomoe quantizes activations internally, so for the
     # reference we treat the bf16 input as already-dequantized by passing a
     # unit scale of the right shape and an fp8 round-trip of the input.
     T, H = activations_in.shape
@@ -2413,7 +2413,7 @@ def _mono_moe_init(
 ):
     """Build inputs for ``mono_moe`` (fixed Qwen3.5-35B block-FP8 shape).
 
-    The megamoe kernel is hard-specialized to E=256, N=512, K=2048, BS<=8,
+    The monomoe kernel is hard-specialized to E=256, N=512, K=2048, BS<=8,
     so the defaults match that shape (``seq_len`` is the only Var, capped at
     8 by the kernel).  Weights are block-FP8 (128×128) quantized via the
     shared ``fp8_block_quant_2d`` helper; activations / router_logits are
@@ -2456,7 +2456,7 @@ mono_moe_trace = TraceTemplate(
     op_type="moe",
     name_prefix="mono_moe",
     description=(
-        "Single-kernel (megamoe) block-FP8 top-K MoE for the Qwen3.5-35B shape "
+        "Single-kernel (monomoe) block-FP8 top-K MoE for the Qwen3.5-35B shape "
         "on Hopper (SM90a). Routing (softmax/sigmoid top-K + renormalize) is "
         "fused in-kernel from router_logits; weights are block-FP8 (128x128)."
     ),

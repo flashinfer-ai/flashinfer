@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace moe_monokernel {
+namespace monomoe {
 
 // Weight quantization granularity
 enum class QuantGranularity : uint32_t {
@@ -34,43 +34,21 @@ struct MoEDimensions {
   struct KernelConfig {
     static constexpr std::uint32_t GRID_SIZE = (2 * N) / 16;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
+    // Defaults for the generic (non-WGMMA) path.  Concrete shape variants
+    // (e.g. Dims_BS8_..._WGMMA_TMA) override these.  K_STEP_* default to 128
+    // (the SWZ128 atom K-width).
+    static constexpr bool USE_WGMMA = false;
+    static constexpr bool USE_TMA = false;
+    static constexpr std::uint32_t K_STEP_DOWN = 128;
+    static constexpr std::uint32_t K_STEP_UP = 128;
   };
 };
 
-// ── WGMMA variant of the BS8 block-wise kernel (v1 dual-WG K=128) ────────
-// Opts into the Hopper wgmma.mma_async fp8 path for Phase 3 (up-proj)
-// only.  All other phases (routing, input-quant-setup, down-proj,
-// writeback) use the existing mma.sync code.
-//
-// Layout implications when USE_WGMMA=true:
-//   - W_UP_TILE_WGMMA = 128 (each block owns 128 weight rows per K-step:
-//     64 for WG0 + 64 for WG1, with WG0 = gate[base..base+31] + up,
-//     WG1 = gate[base+32..base+63] + up).
-//   - UP_GRID = 2*N / 128 = 8 row-tiles per expert.
-//   - With GRID_SIZE = 128, UP_GROUPS = 128 / 8 = 16 experts in parallel
-//     (expert_stride = 16).
-//   - K_STEP_WGMMA = 128: each K-step consumes K=128 via 4 chained
-//     wgmma.mma_async.m64n8k32 instructions per WG.
-//   - K_TILES_WGMMA = 2048 / 128 = 16 K-steps per expert per block.
-//   - Streaming activation pipeline: bf16 input and fp8 activation tiles
-//     are K=128 and double-buffered; weight tile is K=128×128 and
-//     single-buffered.  Phase 2's upfront full-K quantization is removed.
-//   - SHM layout for `w_wgmma` and `a.fp8_act` uses canonical K-major
-//     (8×16-byte core matrices) without `rotate_col_32` swizzling, so
-//     WGMMA descriptors reference them directly.
-//
-// The rest of the kernel (BS8 down-proj) is unchanged.
-// ── BS8 WGMMA kernel (TMA + SWIZZLE_128B) ───────────────────────────────
-// Single BS8 variant: TMA + WGMMA with SWIZZLE_128B on both weight sides.
-// Callers MUST NOT pre-interleave the weights for canonical Major::K
-// byte order — the TMA hardware applies the 8-row × 128-byte core-matrix
-// XOR swizzle at write time.
-//
-// Up-projection weights MUST be repacked via
-// `interleave_for_tma_wgmma_up` (gate/up row interleave) so a single
-// 128×128 TMA fetches one full WGMMA A-tile.  Down-projection weights
-// are passed RAW row-major `[E, K, N]`.  Activation B operands always
-// use SWIZZLE_NONE.
+// The single BS8 shape variant: TMA + WGMMA, SWIZZLE_128B on both weight
+// sides.  Phase 3 (up-proj) uses the Hopper wgmma.mma_async fp8 path with a
+// v1 dual-warpgroup K=128 streaming pipeline.  Group geometry (UP_GRID,
+// UP_GROUPS, DOWN_GRID, DOWN_GROUPS) and the TMA caller contracts live in
+// DESIGN.md §5/§6; per-tensor specifics are in the moe_tma.h factory docs.
 struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
@@ -96,16 +74,15 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
     // Default 128 matches the SWZ128 atom K-width and reproduces the
     // legacy single-substep behaviour.  Set to 256 to halve the number
     // of outer K-iterations (Dims::N / K_STEP_DOWN), at the cost of
-    // doubling the per-slot weight tile in SHM.  See `down_k_step` in
-    // moe_internal.h for the cost breakdown.
+    // doubling the per-slot weight tile in SHM (see the K-step note in
+    // moe_internal.h).
     static constexpr std::uint32_t K_STEP_DOWN = 256;
     // Up-projection outer K-step width (must be a multiple of 128).
     // Default 128 matches the SWZ128 atom K-width and reproduces the
     // legacy single-substep behaviour.  Set to 256 to halve the number
     // of outer K-iterations (Dims::HIDDEN_STATES / K_STEP_UP), at the
     // cost of doubling the per-slot bf16/fp8 activation tile and the
-    // per-slot weight tile in SHM.  See `up_k_step` in moe_internal.h
-    // for the cost breakdown.
+    // per-slot weight tile in SHM (see the K-step note in moe_internal.h).
     static constexpr std::uint32_t K_STEP_UP = 256;
   };
 };
@@ -121,18 +98,6 @@ using A_element = __nv_bfloat16;   // activations as they go into the GEMM
 using AQ_element = __nv_fp8_e4m3;  // activations after quantization
 using S_element = float;           // scaling factors
 using R_element = __nv_bfloat16;   // MoE output
-
-/**
- * @brief Returns the maximum amount of shared memory necessary to run
- * moe_kernel_topk()
- */
-constexpr size_t get_moe_max_shmem_size();
-
-/**
- * @brief Returns the maximum amount of global scratchpad memory to run
- * moe_kernel_topk()
- */
-constexpr size_t get_moe_max_scratchpad_size();
 
 /**
  * @brief W8A8 MoE kernel with configurable top-K routing, scoring function,
@@ -172,6 +137,6 @@ __global__ extern void moe_kernel_topk(
     __grid_constant__ CUtensorMap const down_weights_desc,
     __grid_constant__ CUtensorMap const down_activations_desc);
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
 #endif

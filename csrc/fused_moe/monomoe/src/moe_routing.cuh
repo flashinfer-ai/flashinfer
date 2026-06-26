@@ -3,7 +3,7 @@
 #ifndef MOE_GATING_CU
 #define MOE_GATING_CU
 
-#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#ifndef INSIDE_MONOMOE_IMPLEMENTATION
 #error Do not include this file directly.
 #endif
 
@@ -14,15 +14,26 @@
 
 #include "moe_internal.h"
 
-namespace moe_monokernel {
+namespace monomoe {
 
 /**
- * @brief Determines the thread with the lowest index that has a specific value.
+ * @brief Lowest-index expert tie-break for top-k selection.
+ *
+ * Given each lane's local-argmax (`my_score`, `my_expert`) and the
+ * warp-wide max score, return the SMALLEST `my_expert` among the lanes
+ * whose `my_score` equals `warp_max`.  This matches the reference
+ * convention (and CUTLASS): when several experts tie on score, the one
+ * with the lower index wins.  Selecting by lowest *lane* would be wrong
+ * because lane L owns experts {L, L+32, ...}, so the lowest tied lane can
+ * hold a higher expert index than a higher tied lane.
  */
-__device__ static inline uint32_t warp_who_has(float haystack, float needle) {
-  uint32_t mask = __ballot_sync(0xFFFFFFFFU, haystack == needle);
-  assert(mask > 0);
-  return __ffs(mask) - 1;
+__device__ static inline uint32_t warp_lowest_tied_expert(float my_score, uint32_t my_expert,
+                                                          float warp_max) {
+  uint32_t cand = (my_score == warp_max) ? my_expert : 0xFFFFFFFFU;
+  for (int off = 16; off >= 1; off /= 2) {
+    cand = min(cand, __shfl_xor_sync(0xFFFFFFFFU, cand, off, 32));
+  }
+  return cand;
 }
 
 /**
@@ -144,12 +155,11 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func, bool renormal
         }
       }
       float warp_max = warp_reduce_max_float(max_val);
-      uint32_t winner = warp_who_has(max_val, warp_max);
-      uint32_t winning_expert = __shfl_sync(0xFFFFFFFFU, max_expert, winner);
-      float winning_weight = __shfl_sync(0xFFFFFFFFU, max_val, winner);
-      if (tid == winner) {
-        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)max_expert;
-        shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = winning_weight;
+      // Tie-break to the lowest expert index (not the lowest lane).
+      uint32_t winning_expert = warp_lowest_tied_expert(max_val, max_expert, warp_max);
+      if (tid == 0) {
+        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] = (uint16_t)winning_expert;
+        shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = warp_max;
       }
 #pragma unroll
       for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
@@ -189,10 +199,9 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func, bool renormal
       }
     }
     float warp_max = warp_reduce_max_float(max_val);
-    uint32_t winner = warp_who_has(max_val, warp_max);
-    uint32_t winning_expert = __shfl_sync(0xFFFFFFFFU, max_expert, winner);
-    float winning_score = __shfl_sync(0xFFFFFFFFU, max_val, winner);
-    topk_scores[k] = winning_score;
+    // Tie-break to the lowest expert index (not the lowest lane).
+    uint32_t winning_expert = warp_lowest_tied_expert(max_val, max_expert, warp_max);
+    topk_scores[k] = warp_max;
     topk_experts[k] = winning_expert;
 #pragma unroll
     for (uint32_t i = 0; i < MAX_PER_THREAD; i++) {
@@ -256,7 +265,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
                                      MoE_SHM<Dims>* __restrict__ shm,
                                      MoEGemmSpec<Dims>* __restrict__ spec) {
   static_assert(Dims::BS <= 8, "Dispatch to incorrect implementation");
-  static_assert(use_tma<Dims>::value,
+  static_assert(use_tma_v<Dims>,
                 "BS8 prepare path is TMA-only after the 3-phase rewrite. "
                 "All instantiated BS8 variants set USE_TMA=true and the "
                 "kernel asserts use_tma in moe_kernel_topk_BS8 — the "
@@ -334,7 +343,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
 
   const uint32_t tid = threadIdx.x;
   const uint32_t n_pairs = batch_size * top_k;
-  auto* tma_shm = &shm->u.tiny_wgmma_tma;
+  auto* tma_shm = &shm->tiny_wgmma_tma;
 
   // ───────────────── Phase A — Tally + cache eids ─────────────────────────
 
@@ -439,7 +448,7 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   // active eid.  Since lanes process in ascending tid and within a lane
   // entries are in ascending eid, the global experts[] enumeration is
   // monotonically increasing in eid — same invariant as the old bitset
-  // path (R11.2).
+  // path.
   //
   // The 8 expert_slot_start writes are packed into one STS.128 per lane:
   // `expert_slot_start` is u16, BLK = 8, so each lane's slice is exactly
@@ -522,6 +531,6 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
 
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
 #endif

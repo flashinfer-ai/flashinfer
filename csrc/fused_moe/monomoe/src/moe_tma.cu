@@ -6,17 +6,13 @@
  * through the Driver API (`cuTensorMapEncodeTiled`), which runs on the CPU
  * to populate a 128-byte POD descriptor.  The returned descriptors are later
  * passed to the device as `__grid_constant__ CUtensorMap const` kernel
- * parameters (see spec R5 / R6).
+ * parameters.
  *
- * Implements the factories declared in `moe_tma.h`.  See the spec
- * requirements:
- *   - R5.1, R5.2, R5.5, R5.6, R1.4 (weight descriptor)
- *   - R5.3, R5.4, R5.5, R5.6, R2.4, R12.4 (activation descriptor)
- *   - R12.1, R12.3 (CUDA 12.0+ / Driver API header)
+ * Implements the factories declared in `moe_tma.h`.
  *
  * Unlike the other `.cu` files in this directory (which are `#include`d into
  * `moe.cu` for whole-program inlining), this file is a standalone host-side
- * translation unit: it is compiled directly by `moe_wrapper.cu` via the
+ * translation unit: it is compiled directly by `monomoe_wrapper.cu` via the
  * build system.  Hence no `#pragma once` / include guards — this file is
  * never `#include`d by other TUs.
  */
@@ -30,7 +26,7 @@
 #include "moe_tma.h"
 #include "tvm_ffi_utils.h"
 
-namespace moe_monokernel {
+namespace monomoe {
 
 CUtensorMap create_up_weight_tma_desc(const void* weights_ptr, uint32_t num_experts, uint32_t N,
                                       uint32_t K) {
@@ -112,7 +108,7 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr, uint32_t ba
   //
   // For `rank = 2`, `globalStrides` is a length-1 array giving the byte
   // stride between successive rows along the outer axis; for bf16 (2 B/elem)
-  // the row stride is `K_hidden * 2` bytes (R5.4, R12.4).
+  // the row stride is `K_hidden * 2` bytes.
   constexpr uint32_t kRank = 2;
   uint64_t global_dim[kRank] = {
       static_cast<uint64_t>(K_hidden),
@@ -135,7 +131,7 @@ CUtensorMap create_activations_tma_desc(const void* activations_ptr, uint32_t ba
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
-  // R5.5: on failure, raise a TVM_FFI_ICHECK naming the failing tensor so the
+  // On failure, raise a TVM_FFI_ICHECK naming the failing tensor so the
   // Python stack trace points directly at "activations".
   TVM_FFI_ICHECK(res == CUDA_SUCCESS)
       << "cuTensorMapEncodeTiled failed for activations: CUresult=" << static_cast<int>(res)
@@ -265,4 +261,4 @@ CUtensorMap create_down_activation_tma_desc(const void* activations_ptr, uint32_
   return desc;
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe

@@ -3,35 +3,26 @@
 #ifndef MOE_UP_PROJECTION_CU
 #define MOE_UP_PROJECTION_CU
 
-#ifndef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
+#ifndef INSIDE_MONOMOE_IMPLEMENTATION
 #error Do not include this file directly.
 #endif
 
 #include <cuda.h>
 #include <cuda_fp8.h>
 
-#include "moe_down_projection.cu"
+#include "moe_down_projection.cuh"
 #include "moe_interface.h"
 #include "moe_internal.h"
 #include "moe_tma.h"
 #include "ptx_utils.h"
 
-///////////////////////////////////////////////////////////////////////////////
-//
-// Design Considerations
-//
-// The remaining up-projection path is the BS8 TMA + WGMMA streaming
-// pipeline: a single TMA launcher thread (warp 8, lane 0) issues
-// `cp.async.bulk.tensor.2d` loads for the fp8 weight tiles into a
-// double-buffered SHM slot, and the calc warps consume them via
-// chained `wgmma.mma_async` instructions.  See
-// `moe_up_projection_BS8_allexperts_wgmma_tma` below and the design
-// notes in `moe_internal.h` (TinyDataWGMMA_TMA SHM layout) for
-// details.
-//
-///////////////////////////////////////////////////////////////////////////////
+// Phase 3 up-projection (DESIGN.md §1/§5/§6): `moe_up_projection_BS8_..._tma`
+// streams fp8 weight tiles via a single TMA launcher (warp 8 lane 0) into
+// double-buffered SHM (TinyDataWGMMA_TMA layout, see moe_internal.h) and the
+// calc warps consume them via chained `wgmma.mma_async`.  Per-function and
+// per-line specifics are documented inline below.
 
-namespace moe_monokernel {
+namespace monomoe {
 
 /**
  * @brief Load this block's slice of block-wise up-projection scales into SHM.
@@ -85,10 +76,6 @@ __device__ inline void moe_request_up_scale_for_row(const S_element* __restrict_
 // they appear as `CUtensorMap const&` — the `__grid_constant__` qualifier
 // only applies at the kernel-function boundary.
 //
-// See `.kiro/specs/tma-wgmma-weight-load/design.md` for the full dataflow
-// (SHM layout, barrier arming, warp-role allocation) and requirements
-// R1.1, R2.1, R6.1.
-//
 
 // ── Per-(token, lane) SiLU + fp8 quantization + writeback body ─────────
 //
@@ -122,7 +109,7 @@ __device__ inline void moe_request_up_scale_for_row(const S_element* __restrict_
 template <typename Dims>
 __device__ __forceinline__ void up_silu_quant_writeback_one_token(
     MoE_SHM<Dims>* __restrict__ shmem, MoEGemmSpec<Dims>* __restrict__ spec,
-    typename MoE_SHM<Dims>::U::TinyDataWGMMA_TMA* __restrict__ shm, std::uint32_t id,
+    typename MoE_SHM<Dims>::TinyDataWGMMA_TMA* __restrict__ shm, std::uint32_t id,
     std::uint32_t tok, std::uint32_t col_in_half, std::uint32_t lane, std::uint32_t base_row_up,
     std::uint32_t effective_bid, std::uint32_t top_k, std::uint32_t batch_size) {
   constexpr std::uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
@@ -224,8 +211,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   (void)activations_in;
   (void)expert_weights_up;
 
-  // Caller contract (post topk-bs8-tma-prefetch-quant-fusion):
-  //   * The Phase-1 routing-window TMA (in `moe.cu`) has already
+  // Caller contract:
+  //   * The Phase-1 routing-window TMA (in `moe.cuh`) has already
   //     fetched the full BF16 input tile into `bf16_in_full`.
   //   * Phase 2 has run `routing_phase_quantize` and a block-wide
   //     `__syncthreads()`, so `fp8_act_full[k_block]` and
@@ -241,8 +228,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   //             (intra-expert s+1 or next expert's k=0 stitch).
   //   * No bar_a, no bf16 TMAs, no QUANT half, no QUANT/COMPUTE
   //     __syncthreads() — the activation operand is already in
-  //     `fp8_act_full` for the entire K range (Req 3.1, 3.2, 3.3,
-  //     3.6, 3.7, 3.12).
+  //     `fp8_act_full` for the entire K range.
 
   // ── Compile-time constants (v1) ─────────────────────────────────────
   // Byte-for-byte mirror of the `cp.async` reference variant's constants
@@ -285,8 +271,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   // atom, and `B_LBO = 144` steps over the unused 9th row to land on
   // the next kc atom's core matrix.
   constexpr uint64_t B_LBO =
-      static_cast<uint64_t>(MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_T_TILE_PADDED) *
-      static_cast<uint64_t>(MoE_SHM<Dims>::U::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK);  // 9 × 16 =
+      static_cast<uint64_t>(MoE_SHM<Dims>::TinyDataWGMMA_TMA::FP8_ACT_T_TILE_PADDED) *
+      static_cast<uint64_t>(MoE_SHM<Dims>::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK);  // 9 × 16 =
                                                                                     // 144 B
   constexpr uint64_t B_SBO = B_LBO;  // unused (only 1 N-block for N=8)
 
@@ -305,7 +291,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
   // TMA path uses the `tiny_wgmma_tma` union variant (byte-identical to
   // `tiny_wgmma` plus 32 B of mbarriers at the tail).
-  auto* shm = &shmem->u.tiny_wgmma_tma;
+  auto* shm = &shmem->tiny_wgmma_tma;
 
   const unsigned effective_bid = (up_block_idx == 0xffffffffu) ? blockIdx.x : up_block_idx;
   // Each block owns 128 M rows = 2 WG stripes × 64 rows.  WG0's gate
@@ -323,18 +309,18 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   //
   // Entry contract (post-fusion):
   //   * `bar_w[0..1]` are initialized (arrival_count=1) and
-  //     release-fenced by the kernel prologue in `moe.cu`.
+  //     release-fenced by the kernel prologue in `moe.cuh`.
   //   * Phase 1 + Phase 2 have populated `bf16_in_full` and then
   //     `fp8_act_full` + `act_scale[token][k_block]` for every
   //     `k_block ∈ [0, K_BLOCKS_TOTAL)`; the Phase-2 trailing
   //     `__syncthreads()` published those writes to all warps.
-  //   * `bar_a[0..1]` are NOT initialized by `moe.cu`'s prologue —
+  //   * `bar_a[0..1]` are NOT initialized by `moe.cuh`'s prologue —
   //     they are reused by the down-projection in Phase 4 and
   //     re-initialized in the down-proj prologue.
   //
   // This helper never re-initializes barriers and never issues
   // bf16-input TMAs; the K-loop reads FP8 activations directly from
-  // `fp8_act_full` (Req 3.4).
+  // `fp8_act_full`.
 
   // Stage A requires an even K_TILES so the end-of-K-loop launcher arm
   // lands on `next_slot = K_TILES % 2 = 0`.  That slot-0 stitch is what
@@ -358,10 +344,10 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   constexpr uint32_t UP_W_TX_BYTES_PER_SUBSTEP = 16384u;  // 128×128 fp8 atom
   constexpr uint32_t UP_W_TX_BYTES_TOTAL = UP_W_TX_BYTES_PER_SUBSTEP * K_SUBSTEPS;  // 16 KB / 32 KB
   // The bf16-input TMA + `bar_a` arm have been removed from this
-  // helper (Req 3.7).  Phase-1 + Phase-2 in `moe.cu` populate
+  // helper.  Phase-1 + Phase-2 in `moe.cuh` populate
   // `fp8_act_full` once per kernel invocation; the K-loop reads it
   // directly.  The legacy `UP_A_TX_BYTES_*` constants live in the
-  // kernel prologue for now (until task 12 removes the legacy
+  // kernel prologue for now (until a later cleanup removes the legacy
   // hoisted Step A entirely).
   if (is_tma_launcher_thread<Dims>() && expert_start < expert_count) {
     const uint32_t first_id = shmem->experts[expert_start].id;
@@ -465,9 +451,9 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     // Publish the per-expert `up_scale` write from the prefetch
     // warp (above) to the calc warps that consume it inside the
     // K-loop scale-apply.  The legacy QUANT/COMPUTE sync used to
-    // serve this purpose; it is removed by Req 3.6 / 3.12.  This
-    // sync sits OUTSIDE the K-loop, so R3.12 ("at most one
-    // __syncthreads() per outer K-step iteration") is preserved.
+    // serve this purpose; it has been removed.  This sync sits OUTSIDE
+    // the K-loop, so the "at most one __syncthreads() per outer K-step
+    // iteration" invariant is preserved.
     __syncthreads();
 
     // ── Main K-loop (FP8-direct: COMPUTE-only, mbarrier-only sync) ─────
@@ -479,19 +465,18 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
     //                — single-buffer FP8 produced once per kernel
     //                invocation by Phase 2's `routing_phase_quantize`
     //                and published by the Phase-2 trailing
-    //                `__syncthreads()` in `moe.cu` (Req 3.4, 3.5).
+    //                `__syncthreads()` in `moe.cuh`.
     //     launcher:  arm + TMA the NEXT slot's K_SUBSTEPS weight atoms
     //                (UP_W_TX_BYTES_TOTAL bytes total).  No bar_a arm
-    //                and no bf16-input TMA (Req 3.7).
+    //                and no bf16-input TMA.
     //                target = (s+1, current expert) for intra-expert
     //                         steps, or (0, next expert) on the last
     //                         step when a next expert is scheduled.
     //                When no next step and no next expert, skip — the
     //                trailing barriers are left idle; Phase 4 reinits.
-    //   No QUANT half, no QUANT/COMPUTE __syncthreads() (Req 3.1, 3.2,
-    //   3.3, 3.6, 3.12).  The next iter's COMPUTE wait on
-    //   bar_w[next_slot] re-establishes acquire ordering for the
-    //   weight TMA's async writes.
+    //   No QUANT half, no QUANT/COMPUTE __syncthreads().  The next
+    //   iter's COMPUTE wait on bar_w[next_slot] re-establishes acquire
+    //   ordering for the weight TMA's async writes.
     for (uint32_t s = 0; s < K_TILES; ++s) {
 #ifdef MONO_PROFILE_BARW_4DEEP
       // 2-deep lookahead: launcher arms `bar_w[(s+2) & 3]` and
@@ -559,8 +544,8 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
           // Single-buffer activation atom for this (s, kk):
           //   fp8_act_full[s * K_SUBSTEPS + kk][...]
-          // Replaces the legacy `fp8_act[cur_slot][kk]` indexing
-          // (Req 3.4).  `cur_slot` is unused for the activation
+          // Replaces the legacy `fp8_act[cur_slot][kk]` indexing.
+          // `cur_slot` is unused for the activation
           // operand and remains in scope only for the weight tile.
           const uint32_t kblk = s * K_SUBSTEPS + kk;
 
@@ -581,7 +566,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
           // Scale indices for outer step `s`, substep `kk`:
           //   * activation: `act_scale[tok][s * K_SUBSTEPS + kk]`
           //   * weight:     `up_scale[0][s * K_SUBSTEPS + kk + ws_off]`
-          // Indexing matches the legacy form (Req 3.5); the values
+          // Indexing matches the legacy form; the values
           // are now produced by `routing_phase_quantize` instead of
           // by the per-K-step `moe_streaming_quantize_k128` call.
           const uint32_t ws_off = is_gate_half ? 0u : UP_SCALE_COLS;
@@ -611,7 +596,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 
       // Launcher runs IN PARALLEL with the WGMMA above.  Only the
       // weight TMA + bar_w arm remain; the bf16-input TMA + bar_a
-      // arm have been removed (Req 3.7).  The activation operand is
+      // arm have been removed.  The activation operand is
       // sourced from `fp8_act_full`, which is produced once per
       // kernel invocation by Phase 2 — there is nothing to fetch
       // per K-step on the activation side.
@@ -826,7 +811,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       // sync, so the launcher cannot arm the next-slot mbarrier until
       // the calc warps' wait on the same slot has completed.
       //
-      // R3.12 allows one __syncthreads() per outer K-step iteration;
+      // At most one __syncthreads() per outer K-step iteration;
       // this sync publishes the launcher's `mbarrier_arrive_expect_tx`
       // (a producer-side state mutation on bar_w) to the calc warps
       // that will issue `try_wait_parity` against it next iter.
@@ -948,6 +933,6 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 #endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
 }
 
-}  // namespace moe_monokernel
+}  // namespace monomoe
 
 #endif

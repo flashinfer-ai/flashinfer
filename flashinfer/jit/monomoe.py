@@ -23,13 +23,13 @@ from . import env as jit_env
 from .core import gen_jit_spec, logger, sm90a_nvcc_flags
 
 
-def _get_megamoe_csrc_dir() -> Path:
-    """Get the path to the MoE monokernel (megamoe) CUDA source directory.
+def _get_monomoe_csrc_dir() -> Path:
+    """Get the path to the MonoMoe kernel CUDA source directory.
 
-    Handles both the installed package (data/csrc/fused_moe/megamoe) and a
-    development checkout (../../csrc/fused_moe/megamoe relative to this file).
+    Handles both the installed package (data/csrc/fused_moe/monomoe) and a
+    development checkout (../../csrc/fused_moe/monomoe relative to this file).
     """
-    standard_path = jit_env.FLASHINFER_CSRC_DIR / "fused_moe" / "megamoe"
+    standard_path = jit_env.FLASHINFER_CSRC_DIR / "fused_moe" / "monomoe"
     if standard_path.exists():
         return standard_path
 
@@ -37,47 +37,46 @@ def _get_megamoe_csrc_dir() -> Path:
         Path(__file__).parent.parent.parent
         / "csrc"
         / "fused_moe"
-        / "megamoe"
+        / "monomoe"
     )
     if dev_path.exists():
         return dev_path
 
     raise FileNotFoundError(
-        f"MoE monokernel (megamoe) CUDA sources not found. Checked:\n"
+        f"MonoMoe kernel CUDA sources not found. Checked:\n"
         f"  - {standard_path}\n"
         f"  - {dev_path}\n"
-        f"Please ensure the csrc/fused_moe/megamoe/ directory exists."
+        f"Please ensure the csrc/fused_moe/monomoe/ directory exists."
     )
 
 
-def get_megamoe_uri() -> str:
-    """Generate the unique identifier for the megamoe module."""
-    return "megamoe"
+def get_monomoe_uri() -> str:
+    """Generate the unique identifier for the monomoe module."""
+    return "monomoe"
 
 
 # Files actually fed to nvcc as compilation units.  Everything else in the
-# megamoe tree is `#include`d into one of these two TUs (whole-program unity
+# monomoe tree is `#include`d into one of these two TUs (whole-program unity
 # build), so listing it here would cause duplicate-symbol link errors.
 #
-#   - megamoe_binding.cu   #includes moe_wrapper.cu -> src/moe.cu (which in turn
-#                          #includes the up/down/routing/prepare/scale .cu files)
+#   - monomoe_binding.cu   #includes monomoe_wrapper.cuh -> src/moe.cuh (which in
+#                          turn #includes the up/down/routing/scale .cuh files)
 #   - src/moe_tma.cu       standalone host TU: definitions of the create_*_tma_desc
 #                          factories (declared in src/moe_tma.h, never #included)
 _SOURCE_FILES = [
-    "megamoe_binding.cu",
+    "monomoe_binding.cu",
     "src/moe_tma.cu",
 ]
 
 # Header / include-only sources copied alongside the compiled TUs so the
 # `#include` graph resolves inside the gen directory.  These are NOT compiled.
 _INCLUDE_FILES = [
-    "moe_wrapper.cu",
-    "src/moe.cu",
-    "src/moe_up_projection.cu",
-    "src/moe_down_projection.cu",
-    "src/moe_routing.cu",
-    "src/moe_prepare.cu",
-    "src/moe_scale_inputs.cu",
+    "monomoe_wrapper.cuh",
+    "src/moe.cuh",
+    "src/moe_up_projection.cuh",
+    "src/moe_down_projection.cuh",
+    "src/moe_routing.cuh",
+    "src/moe_scale_inputs.cuh",
     "src/moe_interface.h",
     "src/moe_internal.h",
     "src/moe_grid_barrier.h",
@@ -87,9 +86,9 @@ _INCLUDE_FILES = [
 
 
 @functools.cache
-def gen_megamoe_module():
+def gen_monomoe_module():
     """
-    Generate the JIT compilation spec for the MoE monokernel (megamoe).
+    Generate the JIT compilation spec for the MonoMoe kernel.
 
     Compiles the single-kernel top-K MoE pipeline (routing, up-projection,
     SiLU, down-projection, reduction) for the Qwen3.5-35B block-FP8
@@ -99,18 +98,18 @@ def gen_megamoe_module():
     Returns:
         JitSpec that can be built and loaded.
     """
-    csrc_dir = _get_megamoe_csrc_dir()
-    uri = get_megamoe_uri()
+    csrc_dir = _get_monomoe_csrc_dir()
+    uri = get_monomoe_uri()
 
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     # `src/` must exist so the `#include "src/..."` paths resolve and so the
-    # `src/*.cu` include-only files land where moe.cu expects them.
+    # `src/*.cuh` include-only files land where moe.cuh expects them.
     os.makedirs(gen_directory / "src", exist_ok=True)
 
     def _copy(rel_name: str) -> Path:
         src_path = csrc_dir / rel_name
         if not src_path.exists():
-            raise FileNotFoundError(f"megamoe source file not found: {src_path}")
+            raise FileNotFoundError(f"monomoe source file not found: {src_path}")
         dest_path = gen_directory / rel_name
         os.makedirs(dest_path.parent, exist_ok=True)
         shutil.copy(src_path, dest_path)
@@ -142,22 +141,25 @@ def gen_megamoe_module():
             str(gen_directory / "src"),
             str(jit_env.FLASHINFER_INCLUDE_DIR),
             str(jit_env.FLASHINFER_CSRC_DIR),
+            # CuTe SM90 arch headers: ptx_utils.h delegates the WGMMA control
+            # ops (fence/commit/wait) to cute::warpgroup_* primitives.
+            *(str(p) for p in jit_env.CUTLASS_INCLUDE_DIRS),
         ],
     )
 
-    logger.info(f"Generated megamoe JIT spec: {spec.name}")
+    logger.info(f"Generated monomoe JIT spec: {spec.name}")
     return spec
 
 
 @functools.cache
-def load_megamoe_module():
+def load_monomoe_module():
     """
-    Build and load the MoE monokernel (megamoe) CUDA extension via
+    Build and load the MonoMoe kernel CUDA extension via
     FlashInfer's JIT system.
 
-    Returns the loaded module exposing `moe_monokernel_topk`.
+    Returns the loaded module exposing `monomoe_topk`.
     """
-    spec = gen_megamoe_module()
+    spec = gen_monomoe_module()
     module = spec.build_and_load()
-    logger.info("megamoe module loaded successfully")
+    logger.info("monomoe module loaded successfully")
     return module
