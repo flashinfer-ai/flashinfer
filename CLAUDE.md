@@ -522,6 +522,8 @@ Used by `flashinfer.trace` / `fi_trace`.
 |----------|---------|---------|--------|
 | `FLASHINFER_TRACE_DUMP` | unset | `flashinfer/fi_trace.py` | If set, decorated APIs auto-dump benchmark-definition JSON for each call (the "fi_trace" feature). |
 | `FLASHINFER_TRACE_DUMP_DIR` | cwd | `flashinfer/fi_trace.py` | Directory where the trace JSON files are written. |
+| `FLASHINFER_TRACE_APPLY` | `0` | `flashinfer/__init__.py`, `flashinfer/trace_apply/config.py` | Set to `1` to enable Trace Apply (runtime kernel substitution) when FlashInfer is imported. |
+| `FLASHINFER_TRACE_APPLY_PATH` | unset | `flashinfer/trace_apply/config.py` | Directory from which deployment-configured solutions are loaded for Trace Apply. |
 
 ##### Validation / Autotuning / Routing / Kernel Selection
 

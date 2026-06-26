@@ -46,13 +46,13 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
-    normalize_activation_type,
 )
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
+from .moe_utils import normalize_cute_dsl_moe_activation_type
 
 logger = logging.getLogger(__name__)
 
@@ -161,11 +161,7 @@ def get_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
 
 
 # Canonical list of tile_sizes the autotuner is allowed to pick.  Used by
-# ``get_moe_valid_tactics`` for tactic enumeration AND by
-# ``CuteDslMoEWrapper`` to size its preallocated kernel-output buffers so
-# every tactic in this list can reuse the prealloc, regardless of which
-# tile_size the autotuner picks at runtime.  Adding a new tile_size here
-# automatically widens the prealloc.
+# ``get_moe_valid_tactics`` for tactic enumeration.
 VALID_TILE_SIZES: Tuple[int, ...] = (128, 256)
 
 
@@ -283,12 +279,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ):
-        activation_type = normalize_activation_type(activation_type)
-        if activation_type != ActivationType.Swiglu:
-            raise ValueError(
-                f"Unsupported activation_type {activation_type!r}; "
-                f"expected {ActivationType.Swiglu!r}"
-            )
+        activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -298,6 +289,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.output_dtype = output_dtype
         self.enable_pdl = enable_pdl
         self.activation_type = activation_type
+        self.gated = gated
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
@@ -433,10 +425,14 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         x = inputs[0]
         w1_weight = inputs[4]
 
+        gated = self.gated
         num_tokens = x.shape[0]
         hidden_size = x.shape[1] * 2  # FP4 packed
         num_local_experts = w1_weight.shape[0]
-        intermediate_size = w1_weight.shape[1] // 2  # gate+up fused
+        # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
+        # has a single intermediate-row projection.
+        gemm1_n = w1_weight.shape[1]
+        intermediate_size = gemm1_n // 2 if gated else gemm1_n
 
         # Fixed dtypes/layouts for NVFP4 MoE
         ab_dtype = cutlass.Float4E2M1FN
@@ -445,6 +441,14 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
         gemm1_c_dtype = cutlass.Float4E2M1FN
         gemm2_out_dtype = cutlass.BFloat16
+
+        token_final_scales = inputs[3]
+        if token_final_scales.dtype == torch.float32:
+            final_scale_dtype = cutlass.Float32
+        elif token_final_scales.dtype == torch.bfloat16:
+            final_scale_dtype = cutlass.BFloat16
+        else:
+            final_scale_dtype = cutlass.Float16
 
         valid_tactics = []
         for tactic in ALL_MOE_TACTICS:
@@ -466,7 +470,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 mma_tiler_mn=gemm1_mma_tiler_mn,
                 cluster_shape_mn=gemm1_cluster_shape_mn,
                 m=permuted_m,
-                n=2 * intermediate_size,
+                n=gemm1_n,
                 k=hidden_size,
                 l=num_local_experts,
                 a_major="k",
@@ -480,6 +484,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
                     out_dtype=gemm2_out_dtype,
+                    final_scale_dtype=final_scale_dtype,
                     mma_tiler_mn=gemm2_mma_tiler_mn,
                     cluster_shape_mn=gemm2_cluster_shape_mn,
                     m=permuted_m,

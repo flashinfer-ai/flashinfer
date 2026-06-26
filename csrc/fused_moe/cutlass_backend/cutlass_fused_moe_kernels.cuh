@@ -2122,6 +2122,9 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
              : activation_type == ActivationType::Geglu
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType,
                                             GLUAdaptor<cutlass::epilogue::thread::GELU>>
+             : activation_type == ActivationType::GegluTanh
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType,
+                                            GLUAdaptor<cutlass::epilogue::thread::GELU_taylor>>
              : activation_type == ActivationType::SwigluBias
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
              : activation_type == ActivationType::SwigluStep
@@ -2363,6 +2366,10 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
                               decltype(nvfp4_4over6_config_tag)>,  // SwigluStep
+          &doActivationKernel<
+              T, GemmOutputType, ScaleBiasType, GLUAdaptor<cutlass::epilogue::thread::GELU_taylor>,
+              decltype(block_scaling_type)::value, decltype(disableFP4QuantFastMathTag)::value,
+              decltype(nvfp4_4over6_config_tag)>,  // GegluTanh
           &doActivationKernel<T, GemmOutputType, ScaleBiasType,
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,

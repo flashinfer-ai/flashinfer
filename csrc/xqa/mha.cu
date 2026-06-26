@@ -1558,6 +1558,9 @@ CUBIN_EXPORT __global__
         uint32_t const batchSize, float kvCacheScale,
         float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
         uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
+#if ENABLE_4BIT_KV_CACHE
+        uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
+#endif
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 
   float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
@@ -1818,7 +1821,7 @@ CUBIN_EXPORT __global__
 #if ENABLE_4BIT_KV_CACHE
       HeadPtr<GMemCacheHeadSf const, tokensPerPage, nbPagesPerWarpTile> const srcSf{
           cacheList.kSfCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
-          kv_stride_page,         kv_stride_token, kv_stride_head};
+          sf_stride_page,         sf_stride_token, sf_stride_head};
 #endif
 
 #else
@@ -2160,7 +2163,7 @@ CUBIN_EXPORT __global__
 #if ENABLE_4BIT_KV_CACHE
       HeadPtr<GMemCacheHeadSf const, tokensPerPage, nbPagesPerVTile> const srcSf{
           cacheList.vSfCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
-          kv_stride_page,         kv_stride_token, kv_stride_head};
+          sf_stride_page,         sf_stride_token, sf_stride_head};
 #endif
 #else
       IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
@@ -2779,6 +2782,9 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     uint32_t const batchSize, float kvCacheScale,
     float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
+#if ENABLE_4BIT_KV_CACHE
+    uint32_t sf_stride_page, uint32_t sf_stride_token, uint32_t sf_stride_head,
+#endif
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 #if SPEC_DEC
   kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
@@ -2801,7 +2807,11 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
                   beamSearchParams,
 #endif
                   batchSize, kvCacheScale, kvScalePtr, kv_stride_page, kv_stride_token,
-                  kv_stride_head, semaphores, scratch);
+                  kv_stride_head,
+#if ENABLE_4BIT_KV_CACHE
+                  sf_stride_page, sf_stride_token, sf_stride_head,
+#endif
+                  semaphores, scratch);
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;
@@ -2843,7 +2853,11 @@ void launchMHA(
     SpecDecParams const& specDecParams,
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
+    uint64_t kv_stride_token, uint64_t kv_stride_head,
+#if ENABLE_4BIT_KV_CACHE
+    uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
+#endif
+    cudaStream_t stream) {
 #if SPEC_DEC
   auto const qSeqLen = specDecParams.qSeqLen;
   auto const qCuSeqLens = specDecParams.qCuSeqLens;
@@ -2896,6 +2910,15 @@ void launchMHA(
   uint32_t const stride_page_in_heads = static_cast<uint32_t>(kv_stride_page / validElemsPerHead);
   uint32_t const stride_token_in_heads = static_cast<uint32_t>(kv_stride_token / validElemsPerHead);
   uint32_t const stride_head_in_heads = static_cast<uint32_t>(kv_stride_head / validElemsPerHead);
+#if ENABLE_4BIT_KV_CACHE
+  uint32_t const sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
+  uint32_t const sf_stride_page_in_heads =
+      static_cast<uint32_t>(sf_stride_page / sf_elems_per_head);
+  uint32_t const sf_stride_token_in_heads =
+      static_cast<uint32_t>(sf_stride_token / sf_elems_per_head);
+  uint32_t const sf_stride_head_in_heads =
+      static_cast<uint32_t>(sf_stride_head / sf_elems_per_head);
+#endif
 
   cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
@@ -2919,7 +2942,11 @@ void launchMHA(
                      beamSearchParams,
 #endif
                      batchSize, kvCacheScale, kvScalePtr, stride_page_in_heads,
-                     stride_token_in_heads, stride_head_in_heads, semaphores, scratch);
+                     stride_token_in_heads, stride_head_in_heads,
+#if ENABLE_4BIT_KV_CACHE
+                     sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
+#endif
+                     semaphores, scratch);
   checkCuda(cudaPeekAtLastError());
 #endif  // USE_INPUT_KV
 }
@@ -2952,6 +2979,9 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #endif
                          uint32_t* semaphores, void* scratch, bool enable_pdl,
                          uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
+#if ENABLE_4BIT_KV_CACHE
+                         uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
+#endif
                          cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
@@ -2983,6 +3013,15 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
       static_cast<uint32_t>(kv_stride_token / container_elems_per_head);
   uint32_t const stride_head_in_heads =
       static_cast<uint32_t>(kv_stride_head / container_elems_per_head);
+#if ENABLE_4BIT_KV_CACHE
+  uint32_t const sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
+  uint32_t const sf_stride_page_in_heads =
+      static_cast<uint32_t>(sf_stride_page / sf_elems_per_head);
+  uint32_t const sf_stride_token_in_heads =
+      static_cast<uint32_t>(sf_stride_token / sf_elems_per_head);
+  uint32_t const sf_stride_head_in_heads =
+      static_cast<uint32_t>(sf_stride_head / sf_elems_per_head);
+#endif
 
   cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
@@ -3002,8 +3041,11 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                      mask,
 #endif
                      attentionSinks, cacheList, batchSize, kvCacheScale, kvScalePtr,
-                     stride_page_in_heads, stride_token_in_heads, stride_head_in_heads, semaphores,
-                     scratch);
+                     stride_page_in_heads, stride_token_in_heads, stride_head_in_heads,
+#if ENABLE_4BIT_KV_CACHE
+                     sf_stride_page_in_heads, sf_stride_token_in_heads, sf_stride_head_in_heads,
+#endif
+                     semaphores, scratch);
   checkCuda(cudaPeekAtLastError());
 }
 #endif

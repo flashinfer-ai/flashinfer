@@ -342,6 +342,46 @@ def single_decode_with_kv_cache_with_jit_module(
     window_left: int = -1,
     return_lse: bool = False,
 ):
+    r"""Single-request decode using a pre-compiled JIT module.
+
+    This is the low-level entry point used by :func:`single_decode_with_kv_cache` after
+    backend dispatch; user code should normally call ``single_decode_with_kv_cache``
+    directly.  This function is exposed for advanced users who already hold a compiled
+    JIT module (for example to customize the attention variant via extra kernel
+    arguments).
+
+    Parameters
+    ----------
+    jit_module : Any
+        Compiled JIT module returned by one of the ``gen_*_module`` factories.
+    q : torch.Tensor
+        Query tensor, shape ``[num_qo_heads, head_dim]``.
+    k : torch.Tensor
+        Key tensor, shape ``[kv_len, num_kv_heads, head_dim]`` (``NHD``) or
+        ``[num_kv_heads, kv_len, head_dim]`` (``HND``).
+    v : torch.Tensor
+        Value tensor, layout matches ``k``.
+    *args
+        Extra positional arguments forwarded to the JIT module's ``run`` symbol
+        (e.g. soft-cap or sliding-window parameters required by the chosen variant).
+    kv_layout : str
+        Layout of ``k`` and ``v``, either ``"NHD"`` or ``"HND"``.  Defaults to ``"NHD"``.
+    window_left : int
+        Left window size for sliding-window attention; ``-1`` disables it.
+    return_lse : bool
+        If ``True``, allocate an LSE buffer (shape ``(num_qo_heads,)``,
+        ``float32``) for the kernel to write into.  Defaults to ``False``.
+        **Note: the buffer is allocated and filled by the kernel but is not
+        currently returned to the caller** -- this function always returns
+        just ``o``.  Callers who need the LSE should use
+        :func:`single_decode_with_kv_cache` instead.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor with shape matching ``q``.  The LSE buffer (when
+        ``return_lse=True``) is discarded; see the parameter note.
+    """
     device = q.device
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=device)
     o = torch.empty_like(q)
@@ -927,6 +967,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
+        sm_scale : Optional[float]
+            Softmax scale.  If ``None``, defaults to ``1 / sqrt(head_dim)``.  Cached on
+            the wrapper and reused at :meth:`run` time.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation.  Only consulted when
+            ``pos_encoding_mode != "NONE"``.  Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies.  Only consulted when
+            ``pos_encoding_mode != "NONE"``.  Defaults to ``1e4`` when ``None``.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         seq_lens: Optional[torch.Tensor]
@@ -1358,6 +1407,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        window_left : Optional[int]
+            Per-call sliding-window bound. Must either be ``None`` (default,
+            inherit the value from :meth:`plan`) or equal the value passed to
+            :meth:`plan` (the kernel asserts this). Passing ``-1`` to
+            :meth:`plan` disables the sliding window for the entire batch.
+        sinks : Optional[torch.Tensor]
+            Per-head attention sink logits, shape ``[num_qo_heads]``. When
+            provided, ``sinks[head_idx]`` is appended to each row of the
+            softmax denominator (Streaming-LLM / Attention-Sinks). The dtype
+            requirement is backend-specific and validated by the underlying
+            kernel; pass ``None`` to disable. Not supported by the
+            ``cute-dsl`` backend.
         q_len_per_req : Optional[int]
             DEPRECATED — pass to :meth:`plan` instead. When provided here, emits
             a :class:`DeprecationWarning` and is used to validate the run-time value
@@ -1971,6 +2032,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor. If None, will be set to
             ``data_type``. Defaults to ``None``.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation for the rope-portion of
+            the MLA query.  Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies of the rope-portion of the MLA
+            query.  Defaults to ``1e4`` when ``None``.
 
         Note
         ----
@@ -2418,6 +2485,20 @@ def get_trtllm_gen_decode_module(*args):
     )
 
 
+def _check_xqa_nvfp4_page_size(page_size: int) -> None:
+    """Validate page_size for the XQA backend with an NVFP4 KV cache.
+
+    XQA's NVFP4 path only supports page_size 64 or 128; page_size 16/32 reach
+    the kernel but silently produce wrong results, so reject them early.
+    """
+    if page_size in (16, 32):
+        raise ValueError(
+            "NVFP4 KV cache page_size 16 and 32 are not supported by "
+            "FlashInfer XQA. Use page_size 64 or 128 instead. "
+            f"Got page_size={page_size}."
+        )
+
+
 @flashinfer_api(trace=trtllm_batch_decode_trace)
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
@@ -2528,6 +2609,12 @@ def trtllm_batch_decode_with_kv_cache(
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_90 (hopper architecture) and sm_120/sm_121 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
 
+    q_len_per_req : Optional[int] = 1
+        Number of query tokens per request (i.e. speculative-decoding / MTP depth).
+        ``query`` is expected to have ``batch_size * q_len_per_req`` rows along its
+        leading dimension when ``cum_seq_lens_q`` / ``max_q_len`` are ``None``.
+        Defaults to ``1``.
+
     o_scale : Optional[float] = 1.0
         output scale factor for xqa fp8 output.
 
@@ -2555,6 +2642,8 @@ def trtllm_batch_decode_with_kv_cache(
         Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
         Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
         in HND layout, with dtype ``torch.float8_e4m3fn``.
+        NVFP4 KV cache does not support page sizes 16 or 32 in the XQA backend;
+        use page size 64 or 128 instead.
 
         **Contiguity requirements (trtllm-gen backend):**
 
@@ -2638,6 +2727,12 @@ def trtllm_batch_decode_with_kv_cache(
         )
 
     if backend == "xqa":
+        if is_nvfp4_kvcache:
+            nvfp4_page_size = (
+                k_cache.shape[-2] if kv_layout == "HND" else k_cache.shape[-3]
+            )
+            _check_xqa_nvfp4_page_size(nvfp4_page_size)
+
         # xqa backend doesn't support nvfp4 output
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
             raise ValueError("xqa backend does not support nvfp4 output")
@@ -2917,6 +3012,11 @@ def xqa_batch_decode_with_kv_cache(
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
         Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
 
+    q_len_per_req : Optional[int] = 1
+        Number of query tokens per request (i.e. speculative-decoding / MTP depth).
+        ``query`` is expected to have ``batch_size * q_len_per_req`` rows along its
+        leading dimension.  Defaults to ``1``.
+
     o_scale : Optional[float] = 1.0
         output scale factor for fp8 output.
 
@@ -2963,15 +3063,28 @@ def xqa_batch_decode_with_kv_cache(
 
     # Extract shape parameters based on layout
     if kv_layout == "NHD":
-        # NHD: [num_pages, page_size, num_kv_heads, head_dim]
+        # NHD: [num_pages, page_size, num_kv_heads, head_dim] for ordinary KV cache
+        # or [num_pages, page_size, num_kv_heads, head_dim// 2] for NVFP4 KV cache with packed head dim
         page_size = k_cache.shape[1]
         num_kv_heads = k_cache.shape[2]
-        head_dim = k_cache.shape[3]
     else:  # HND
-        # HND: [num_pages, num_kv_heads, page_size, head_dim]
+        # HND: [num_pages, num_kv_heads, page_size, head_dim] for ordinary KV cache
+        # or [num_pages, num_kv_heads, page_size, head_dim// 2] for NVFP4 KV cache with packed head dim
         num_kv_heads = k_cache.shape[1]
         page_size = k_cache.shape[2]
-        head_dim = k_cache.shape[3]
+
+    # NVFP4 KV cache (uint8 storage + scale factors) only supports page_size
+    # 64/128 on XQA; reject 16/32 early to avoid silently wrong results.
+    is_nvfp4_kvcache = (
+        k_cache.dtype == torch.uint8
+        and v_cache.dtype == torch.uint8
+        and k_cache_sf is not None
+    )
+    if is_nvfp4_kvcache:
+        _check_xqa_nvfp4_page_size(page_size)
+
+    # query shape: [num_tokens, num_heads, head_dim]
+    head_dim = query.shape[-1]
 
     workspace_u8 = workspace_buffer.view(torch.uint8)
     semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
