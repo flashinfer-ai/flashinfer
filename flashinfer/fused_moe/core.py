@@ -1658,7 +1658,7 @@ def get_trtllm_moe_sm100_module():
             output = _alloc_trtllm_moe_output(
                 num_tokens, hidden_size, do_finalize, hidden_states.device
             )
-        elif not do_finalize:
+        elif do_finalize:
             check_shape_dtype_device(
                 output,
                 (num_tokens, hidden_size),
@@ -1860,7 +1860,7 @@ def get_trtllm_moe_sm100_module():
             output = _alloc_trtllm_moe_output(
                 num_tokens, hidden_size, do_finalize, hidden_states.device
             )
-        elif not do_finalize:
+        elif do_finalize:
             check_shape_dtype_device(
                 output,
                 (num_tokens, hidden_size),
@@ -2065,7 +2065,7 @@ def get_trtllm_moe_sm100_module():
             output = _alloc_trtllm_moe_output(
                 num_tokens, hidden_size, do_finalize, hidden_states.device
             )
-        elif not do_finalize:
+        elif do_finalize:
             check_shape_dtype_device(
                 output,
                 (num_tokens, hidden_size),
@@ -2337,7 +2337,7 @@ def get_trtllm_moe_sm100_module():
             output = _alloc_trtllm_moe_output(
                 num_tokens, hidden_size, do_finalize, hidden_states.device
             )
-        elif not do_finalize:
+        elif do_finalize:
             check_shape_dtype_device(
                 output, None, torch.bfloat16, hidden_states.device, "output"
             )
