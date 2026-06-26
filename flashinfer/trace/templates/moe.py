@@ -2807,6 +2807,21 @@ _cute_dsl_wrapper_inputs["activation_type"] = Scalar(
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
+_cute_dsl_wrapper_inputs["swiglu_alpha"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["swiglu_beta"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
 
 _cute_dsl_wrapper_axes = dict(cute_dsl_fused_moe_nvfp4_trace.axes)
 # num_experts / top_k are set at __init__ time — no tensor on run() has a

@@ -2,6 +2,8 @@ from enum import IntEnum
 import torch
 from typing import Optional, Union
 
+from .api_logging import flashinfer_api
+
 
 # The type of method in top-K routing, for use in torch custom op
 # Please keep this in sync with the counterpart defined in include/flashinfer/trtllm/fused_moe/runner.h
@@ -80,6 +82,7 @@ def normalize_activation_type(
         raise ValueError(f"Unsupported activation_type {activation_type!r}") from err
 
 
+@flashinfer_api
 def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
     # Keep this in sync with isGatedActivation() in include/flashinfer/trtllm/fused_moe/runner.h.
     return normalize_activation_type(activation_type) in _GATED_ACTIVATION_TYPES

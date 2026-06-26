@@ -384,11 +384,19 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.local_expert_offset,
                 self.use_fused_finalize,
                 self.output_dtype,
-                self.activation_type.value,
+                int(self.activation_type),
                 self.swiglu_alpha,
                 self.swiglu_beta,
                 self.swiglu_limit,
             )
+        )
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return (
+            int(self.activation_type),
+            self.swiglu_alpha,
+            self.swiglu_beta,
+            self.swiglu_limit,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -586,7 +594,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             use_fused_finalize=self.use_fused_finalize,
             moe_output=moe_output,
             enable_pdl=self.enable_pdl,
-            activation_type=self.activation_type.value,
+            activation_type=int(self.activation_type),
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
