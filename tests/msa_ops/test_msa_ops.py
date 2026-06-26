@@ -501,6 +501,66 @@ def test_sparse_decode(B, sq, Hq, Hkv, topk, kv_dtype, paged):
     assert err < 2.5e-2, f"decode max abs error {err}"
 
 
+@pytest.mark.parametrize(
+    "B,sq,Hq,Hkv,topk,kv_dtype,paged",
+    [
+        (8, 1, 8, 2, 16, torch.bfloat16, False),
+        (4, 2, 16, 2, 16, torch.bfloat16, True),
+        (8, 1, 4, 4, 8, torch.float8_e4m3fn, False),
+        (6, 1, 16, 1, 16, torch.float8_e4m3fn, True),
+    ],
+)
+def test_sparse_decode_fused(B, sq, Hq, Hkv, topk, kv_dtype, paged):
+    # E12: the fused decode (force_fused=True -> one CTA per token loops all its
+    # blocks, no combine) must match the per-block split+combine path (output and
+    # LSE) and the torch oracle. force_fused exercises it regardless of batch.
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    q, k_flat, v_flat, idx, seqused, cu_k, pg, ptab = _make_decode_case(
+        B, sq, Hq, Hkv, topk, kv_dtype, paged, seed=70 + B + sq
+    )
+    scale = 1.0 / math.sqrt(128)
+
+    def run(force_fused):
+        kw = dict(
+            seqlen_q=sq,
+            causal=True,
+            softmax_scale=scale,
+            return_softmax_lse=True,
+            force_fused=force_fused,
+        )
+        if paged:
+            return msa_sparse_decode_attention(
+                q,
+                pg[0].contiguous(),
+                pg[1].contiguous(),
+                idx,
+                page_table=ptab,
+                seqused_k=seqused,
+                **kw,
+            )
+        return msa_sparse_decode_attention(
+            q, k_flat, v_flat, idx, cu_seqlens_k=cu_k, **kw
+        )
+
+    out_split, lse_split = run(False)
+    out_fused, lse_fused = run(True)
+    torch.cuda.synchronize()
+
+    cu_q = torch.arange(0, B * sq + 1, sq, dtype=torch.int32)
+    k_ref = k_flat.to(torch.bfloat16) if kv_dtype == torch.float8_e4m3fn else k_flat
+    v_ref = v_flat.to(torch.bfloat16) if kv_dtype == torch.float8_e4m3fn else v_flat
+    ref = _ref_sparse_attention(
+        q.cpu(), k_ref.cpu(), v_ref.cpu(), idx.cpu(), cu_q, cu_k.cpu(), True, scale
+    )
+    assert (out_fused.float().cpu() - ref).abs().max().item() < 2.5e-2
+    # fused must agree with the proven split path to ~bf16 precision
+    assert (out_fused.float() - out_split.float()).abs().max().item() < 5e-3
+    finite = torch.isfinite(lse_split) & torch.isfinite(lse_fused)
+    assert (lse_fused[finite] - lse_split[finite]).abs().max().item() < 5e-3
+
+
 def test_sparse_decode_cuda_graph():
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_decode_attention

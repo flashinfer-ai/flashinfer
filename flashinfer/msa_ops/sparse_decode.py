@@ -55,6 +55,7 @@ def msa_sparse_decode_attention(
     v_global_scale: Optional[float] = None,
     q_offset=None,
     partial_dtype: Optional[torch.dtype] = None,
+    force_fused: Optional[bool] = None,
 ):
     """Sparse decode attention for SM120/SM121.
 
@@ -80,6 +81,15 @@ def msa_sparse_decode_attention(
         decoding).
     causal : bool
         Right-aligned causal masking (default True for decode).
+    force_fused : bool, optional
+        Override the E12 adaptive-split decision. The default per-block split
+        writes ``topk`` partials per token and reduces them with the combine
+        kernel; the fused path instead has one CTA per (token, kv-head) loop
+        over all selected blocks with an in-kernel online softmax and write the
+        final output directly (no GMEM partials, no combine), which wins once
+        the ``total_q * num_kv_heads`` grid already fills the SMs (high batch).
+        ``None`` (default) picks fused automatically when the grid is full;
+        ``True``/``False`` force it on/off. Fused is unavailable for NVFP4 KV.
 
     Returns
     -------
@@ -90,7 +100,7 @@ def msa_sparse_decode_attention(
     import cutlass
     import cutlass.cute as cute
 
-    from ..utils import is_sm12x_supported
+    from ..utils import get_device_sm_count, is_sm12x_supported
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
     from .sparse_attention import (
         _combine_partials,
@@ -208,13 +218,44 @@ def msa_sparse_decode_attention(
         torch.float8_e4m3fn,
     ):
         raise ValueError(f"unsupported partial_dtype {partial_dtype}")
-    o_partial = torch.empty(
-        (topk, total_q, num_qo_heads, head_dim), dtype=partial_dtype, device=dev
-    )
-    lse_partial = torch.empty(
-        (topk, total_q, num_qo_heads), dtype=torch.float32, device=dev
-    )
-    split_counts = torch.empty((total_q, num_kv_heads), dtype=torch.int32, device=dev)
+
+    # E12 adaptive-split: fuse when the (token x kv-head) grid already fills the
+    # SMs, so a single CTA per token can loop all its blocks and write the final
+    # output directly -- dropping the topk partials + the combine pass. The split
+    # path's combine is only worth its extra-pass cost when the grid underfills
+    # (low batch) and the topk-wide fan-out is needed for parallelism. NVFP4 KV
+    # is not supported by the fused kernel, so it always splits.
+    if force_fused and kv_nvfp4:
+        raise ValueError("force_fused is not supported with NVFP4 KV")
+    if force_fused is None:
+        fused = (not kv_nvfp4) and (total_q * num_kv_heads >= get_device_sm_count(dev))
+    else:
+        fused = bool(force_fused) and (not kv_nvfp4)
+
+    if fused:
+        # one CTA per (token, kv-head) writes the final output + LSE directly;
+        # the split-path partial buffers collapse to dummies.
+        out_buf = torch.empty(
+            (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=dev
+        )
+        lse_buf = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
+        # topk (shape[0]) and head_dim (shape[3]) are static in the signature
+        o_partial = torch.empty((topk, 1, 1, head_dim), dtype=partial_dtype, device=dev)
+        lse_partial = torch.empty((topk, 1, 1), dtype=torch.float32, device=dev)
+        split_counts = torch.empty((1, 1), dtype=torch.int32, device=dev)
+    else:
+        o_partial = torch.empty(
+            (topk, total_q, num_qo_heads, head_dim), dtype=partial_dtype, device=dev
+        )
+        lse_partial = torch.empty(
+            (topk, total_q, num_qo_heads), dtype=torch.float32, device=dev
+        )
+        split_counts = torch.empty(
+            (total_q, num_kv_heads), dtype=torch.int32, device=dev
+        )
+        # last dim must match the kernel's static head_dim in the signature
+        out_buf = torch.empty((1, 1, head_dim), dtype=compute_dtype, device=dev)
+        lse_buf = torch.empty((1, 1), dtype=torch.float32, device=dev)
 
     if kv_nvfp4:
         k_pass = k.view(torch.int32)
@@ -237,6 +278,7 @@ def msa_sparse_decode_attention(
         kv_fp8,
         kv_nvfp4,
         str(partial_dtype),
+        fused,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
@@ -247,6 +289,13 @@ def msa_sparse_decode_attention(
         kv_word = k_pass.shape[-1]  # 128 (or 16 int32 words for nvfp4)
         s_tq, s_hq, s_tk, s_hkv, s_b1, s_b0 = (cute.sym_int() for _ in range(6))
         s_pb, s_pm, s_ksf, s_vsf = (cute.sym_int() for _ in range(4))
+        # The fused and split paths each pass dummies for the other's output
+        # tensors, so those tensors get their own symbols (not tied to mQ's
+        # total_q/Hq) -- mirroring the combine kernel. Only the always-real inputs
+        # (mQ/mK/mQ2K/...) keep shared symbols. topk and head_dim stay static.
+        s_ptq, s_phq = cute.sym_int(), cute.sym_int()  # mOp/mLse (split partials)
+        s_sc0, s_sc1 = cute.sym_int(), cute.sym_int()  # mSplitCounts
+        s_otq, s_ohq = cute.sym_int(), cute.sym_int()  # mOut/mLseOut (fused)
         kv_shape = (s_tk, s_hkv, 128, kv_word) if paged else (s_tk, s_hkv, kv_word)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel_obj = SparseDecodeForwardSm12x(
@@ -259,6 +308,7 @@ def msa_sparse_decode_attention(
             kv_fp8=kv_fp8,
             kv_nvfp4=kv_nvfp4,
             q_fp8=q_fp8,
+            fused=fused,
         )
         compiled = cute.compile(
             kernel_obj,
@@ -269,12 +319,15 @@ def msa_sparse_decode_attention(
             _fake(u8, (s_ksf,), align=4),
             _fake(u8, (s_vsf,), align=4),
             _fake(i32, (s_hkv, s_tq, topk), align=4),
-            _fake(_cutlass_dtype(partial_dtype), (topk, s_tq, s_hq, head_dim)),
-            _fake(_cutlass_dtype(torch.float32), (topk, s_tq, s_hq), align=4),
-            _fake(i32, (s_tq, s_hkv), align=4),
+            _fake(_cutlass_dtype(partial_dtype), (topk, s_ptq, s_phq, head_dim)),
+            _fake(_cutlass_dtype(torch.float32), (topk, s_ptq, s_phq), align=4),
+            _fake(i32, (s_sc0, s_sc1), align=4),
+            _fake(_cutlass_dtype(compute_dtype), (s_otq, s_ohq, head_dim)),  # mOut
+            _fake(_cutlass_dtype(torch.float32), (s_otq, s_ohq), align=4),  # mLseOut
             _fake(i32, (s_b1,), align=4),
             _fake(i32, (s_b0,), align=4),
             cutlass.Float32(1.0),
+            cutlass.Float32(1.0),  # out_scale
             cutlass.Int32(1),
             cutlass.Int32(1),
             cutlass.Int32(1),
@@ -294,13 +347,22 @@ def msa_sparse_decode_attention(
         o_partial,
         lse_partial,
         split_counts,
+        out_buf,
+        lse_buf,
         cu_k,
         qoff_dev,
         float(softmax_scale),
+        float(v_global_scale) if v_global_scale is not None else 1.0,
         int(seqlen_q),
         int(total_q),
         int(num_kv_heads),
     )
+
+    if fused:
+        # the kernel already wrote the final, scaled output + natural-log LSE.
+        if return_softmax_lse:
+            return out_buf, lse_buf
+        return out_buf
 
     lse_out = None
     if return_softmax_lse:
