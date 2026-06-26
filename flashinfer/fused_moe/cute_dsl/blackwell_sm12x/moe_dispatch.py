@@ -2427,9 +2427,6 @@ def _get_cached_workspace(
 # ==========================================================================
 # Unified dispatch
 # ==========================================================================
-# Padding rebuilds scale factors via a per-expert swizzle roundtrip — too costly
-# to repeat every call, so the result is cached (keyed on the source weights) and
-# evicted when they are freed (same lifetime model as _WEIGHT_CACHE).
 _PADDED_WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
 
 
@@ -2448,10 +2445,6 @@ def _pad_intermediate_to_tile(
     """Zero-pad NVFP4 weights + scale factors so the intermediate size is a
     multiple of ``tile`` (gate/up tile-split requirement); padded channels are
     zero, so the result is numerically identical.
-
-    Enables interim support for non-128 aligned intermediate sizes. Scale factors
-    are padded in the logical (pre-swizzle) domain since the gate/up boundary is
-    not tile-aligned. Cached and evicted with the source weights.
     """
     n_pad = ((n + tile - 1) // tile) * tile
     if n_pad == n:

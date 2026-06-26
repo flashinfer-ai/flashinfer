@@ -1146,8 +1146,9 @@ class TestB12xFunctional:
 
         hidden_size, intermediate_size = 512, 256
         num_experts, top_k = 8, 2
-        # SwiGLU-OAI uses M3's clamp limit; ignored for the other activations.
-        swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
+        swiglu_limit = (
+            7.0 if activation == "swigluoai_uninterleave" else None
+        )  # Minimax-M3 clamp limit
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
