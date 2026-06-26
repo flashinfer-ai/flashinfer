@@ -2574,9 +2574,7 @@ def launch_sm120_moe(
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
 
-    # NVFP4 kernels need the intermediate size to be a multiple of the gate/up
-    # tile width; zero-pad non-aligned sizes (e.g. Gemma-4's 704). W4A16 has its
-    # own handling, and a caller-supplied _weight_views is already padded.
+    # NVFP4 kernels need padded intermediate size.
     if quant_mode != "w4a16" and n % _LEVEL_TILE_N != 0 and _weight_views is None:
         (
             w1_weight,

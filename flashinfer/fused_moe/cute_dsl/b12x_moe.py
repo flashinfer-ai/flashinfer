@@ -126,9 +126,8 @@ def b12x_fused_moe(
         Output data type.  Only ``torch.bfloat16`` is currently supported.
     activation : str
         Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"`` (gated
-        GeGLU, tanh-approx GELU), ``"swigluoai_uninterleave"`` (gated SwiGLU-OAI variant,
-        MiniMax-M3) or ``"relu2"`` (non-gated Nemotron-Super). Defaults to
-        ``"silu"``.
+        GeGLU, tanh-approx GELU), ``"swigluoai_uninterleave"`` (gated SwiGLU-OAI variant)
+        or ``"relu2"`. Defaults to ``"silu"``.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU-OAI parameters used only when
         ``activation="swigluoai_uninterleave"``: ``gate*sigmoid(alpha*gate)*

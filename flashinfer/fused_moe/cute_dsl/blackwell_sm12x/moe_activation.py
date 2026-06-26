@@ -1,7 +1,4 @@
-"""Gated activation epilogue for the b12x NVFP4 fused-MoE kernels.
-
-Shared by the b12x MoE kernel variants.
-"""
+"""Activation helper functions for the b12x fused-MoE kernels."""
 
 import cutlass
 import cutlass.cute as cute
@@ -9,7 +6,6 @@ from cutlass import Float32
 
 from flashinfer.cute_dsl.fp4_common import fmax_f32, fmin_f32
 
-# Activations that consume separate gate + up halves from FC1 (w13 has 2*n rows).
 GATED_ACTIVATIONS = ("silu", "gelu_tanh", "swigluoai_uninterleave")
 
 
