@@ -7,13 +7,8 @@ from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
 
-_TEST_MS = [1, 48, 128]
-# Share one tuning bucket to save autotuning time
-_TUNING_BUCKETS = (max(_TEST_MS),)
-
-
 @pytest.mark.parametrize("b", [1, 16])
-@pytest.mark.parametrize("m", _TEST_MS)
+@pytest.mark.parametrize("m", [1, 48, 128])
 @pytest.mark.parametrize("n", [64, 80, 10304])
 @pytest.mark.parametrize("k", [64, 256, 2688])
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -52,7 +47,7 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
 
     res = torch.empty([b, m, n], device="cuda", dtype=res_dtype)
 
-    with autotune(auto_tuning, tuning_buckets=_TUNING_BUCKETS, round_up=True):
+    with autotune(auto_tuning):
         bmm_fp8(
             input_fp8,
             mat2_fp8,
