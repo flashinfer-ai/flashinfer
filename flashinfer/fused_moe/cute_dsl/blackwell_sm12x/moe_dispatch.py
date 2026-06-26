@@ -499,6 +499,9 @@ def _get_static_kernel(
     fast_math: bool = True,
     mac_override: int | None = None,
     activation: str = "silu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
@@ -537,6 +540,9 @@ def _get_static_kernel(
         input_scales_are_reciprocal,
         fast_math,
         activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
     )
     cached = _STATIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -555,10 +561,13 @@ def _get_static_kernel(
         output_tile_count_n=output_tile_count_n,
         fast_math=fast_math,
         activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
     )
 
-    is_gated = activation in ("silu", "gelu_tanh")
+    is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -740,6 +749,9 @@ def _get_micro_kernel(
     single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float | None = None,
 ):
     """Compile (or retrieve cached) the SM120 micro MoE kernel."""
     sf_vec_size = 16
@@ -772,6 +784,9 @@ def _get_micro_kernel(
         share_expert_scales,
         single_token,
         activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -789,12 +804,15 @@ def _get_micro_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
         single_token=single_token,
     )
 
-    is_gated = activation in ("silu", "gelu_tanh")
+    is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
     w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -984,6 +1002,9 @@ def launch_sm120_static_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
 ) -> torch.Tensor:
     """Launch the SM120 static or micro MoE kernel.
@@ -1094,6 +1115,9 @@ def launch_sm120_static_moe(
             single_token=num_tokens == 1,
             mac_override=micro_mac,
             activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
         )
     else:
         compiled, mac = _get_static_kernel(
@@ -1109,6 +1133,9 @@ def launch_sm120_static_moe(
             fast_math=fast_math,
             mac_override=static_mac,
             activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             activation_precision=activation_precision,
         )
         launch_ids = flat_ids
@@ -1508,6 +1535,9 @@ def _get_dynamic_kernel(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
     share_input_across_experts: bool = False,
 ):
@@ -1541,13 +1571,16 @@ def _get_dynamic_kernel(
         input_scales_are_reciprocal,
         fast_math,
         activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         share_input_across_experts,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    is_gated = activation in ("silu", "gelu_tanh")
+    is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
     w1_rows = (2 if is_gated else 1) * n
 
     scratch_dtype = cutlass.Float4E2M1FN
@@ -1562,6 +1595,9 @@ def _get_dynamic_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
         share_input_across_experts=share_input_across_experts,
     )
     launch = _DynamicMoELaunch(
@@ -1756,6 +1792,9 @@ def launch_sm120_dynamic_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
@@ -1783,6 +1822,9 @@ def launch_sm120_dynamic_moe(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
         fast_math=fast_math,
         activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
         activation_precision=activation_precision,
         share_input_across_experts=input_gs_is_shared,
     )
@@ -2531,6 +2573,9 @@ def launch_sm120_moe(
     input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     activation: str = "silu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
     source_format: str = "modelopt",
@@ -2551,7 +2596,7 @@ def launch_sm120_moe(
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    is_gated = activation in ("silu", "gelu_tanh")
+    is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
@@ -2692,6 +2737,9 @@ def launch_sm120_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             activation_precision=activation_precision,
         )
     else:
@@ -2712,5 +2760,8 @@ def launch_sm120_moe(
             input_scales_are_reciprocal=input_scales_are_reciprocal,
             fast_math=fast_math,
             activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             activation_precision=activation_precision,
         )

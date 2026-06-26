@@ -73,6 +73,9 @@ def b12x_fused_moe(
     output: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
     activation: str = "silu",
+    swiglu_alpha: float = 1.702,
+    swiglu_beta: float = 1.0,
+    swiglu_limit: Optional[float] = None,
     activation_precision: str = "fp4",
     quant_mode: Optional[str] = None,
     source_format: str = "modelopt",
@@ -123,8 +126,14 @@ def b12x_fused_moe(
         Output data type.  Only ``torch.bfloat16`` is currently supported.
     activation : str
         Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"`` (gated
-        GeGLU, tanh-approx GELU) or ``"relu2"`` (non-gated Nemotron-Super).
-        Defaults to ``"silu"``.
+        GeGLU, tanh-approx GELU), ``"swigluoai_uninterleave"`` (gated SwiGLU-OAI,
+        MiniMax-M3) or ``"relu2"`` (non-gated Nemotron-Super). Defaults to
+        ``"silu"``.
+    swiglu_alpha, swiglu_beta, swiglu_limit : float
+        SwiGLU-OAI parameters used only when
+        ``activation="swigluoai_uninterleave"``: ``gate*sigmoid(alpha*gate)*
+        (up+beta)`` with optional clamp to ``swiglu_limit`` (``None`` disables).
+        Defaults 1.702 / 1.0 / None for approximating GELU.
     activation_precision : str
         Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
@@ -205,6 +214,9 @@ def b12x_fused_moe(
         num_local_experts=num_local_experts,
         scatter_output=output,
         activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
         activation_precision=activation_precision,
         quant_mode=quant_mode,
         source_format=source_format,
@@ -228,7 +240,8 @@ class B12xMoEWrapper:
         output_dtype: Output data type. Only torch.bfloat16 is currently
             supported. Default: torch.bfloat16.
         device: Device for buffer allocation. Default: "cuda".
-        activation: Activation function — "silu", "gelu_tanh", or "relu2". Default: "silu".
+        activation: Activation — "silu", "gelu_tanh", "swigluoai_uninterleave", or
+            "relu2". Default: "silu". swiglu_alpha/beta/limit apply to swigluoai.
         activation_precision: Backward-compatible alias for quant_mode.
             "fp4" selects quant_mode="nvfp4"; "bf16" selects quant_mode="w4a16".
         quant_mode: Quantization mode, "nvfp4"/"w4a4" or "w4a16". When set,
@@ -256,6 +269,9 @@ class B12xMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         activation: str = "silu",
+        swiglu_alpha: float = 1.702,
+        swiglu_beta: float = 1.0,
+        swiglu_limit: Optional[float] = None,
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
@@ -289,8 +305,13 @@ class B12xMoEWrapper:
             ``"cuda"``.
         activation : str
             Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"``
-            (gated GeGLU, tanh-approx GELU) or ``"relu2"`` (non-gated).
-            Defaults to ``"silu"``.
+            (gated GeGLU, tanh-approx GELU), ``"swigluoai_uninterleave"`` (gated
+            SwiGLU-OAI, MiniMax-M3) or ``"relu2"`` (non-gated). Defaults to
+            ``"silu"``.
+        swiglu_alpha, swiglu_beta, swiglu_limit : float
+            SwiGLU-OAI parameters (only for ``"swigluoai_uninterleave"``):
+            ``gate*sigmoid(alpha*gate)*(up+beta)`` with optional clamp to
+            ``swiglu_limit`` (``None`` disables). Defaults 1.702 / 1.0 / None.
         activation_precision : str
             Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
             ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
@@ -337,6 +358,9 @@ class B12xMoEWrapper:
         self.output_dtype = output_dtype
         self.device = device
         self.activation = activation
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
         self.quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
         self.activation_precision = _activation_precision_from_quant_mode(
             self.quant_mode
@@ -554,8 +578,7 @@ class B12xMoEWrapper:
                 w2_alpha.data_ptr(),
             )
             n_eff = self.intermediate_size
-            # Pad non-128-aligned intermediate sizes (e.g. Gemma-4's 704) once
-            # and cache, so addresses stay stable across CUDA-graph replays.
+            # Pad non-128-aligned intermediate sizes once and cache.
             if self.intermediate_size % _LEVEL_TILE_N != 0:
                 if self._padded_weights is None or self._weight_key != weight_key:
                     is_gated = self.activation in ("silu", "gelu_tanh")
@@ -613,6 +636,9 @@ class B12xMoEWrapper:
             num_local_experts=self.num_local_experts,
             scatter_output=moe_output,
             activation=self.activation,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
             activation_precision=self.activation_precision,
             quant_mode=self.quant_mode,
             source_format=self.source_format,
