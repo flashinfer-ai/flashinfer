@@ -2485,6 +2485,20 @@ def get_trtllm_gen_decode_module(*args):
     )
 
 
+def _check_xqa_nvfp4_page_size(page_size: int) -> None:
+    """Validate page_size for the XQA backend with an NVFP4 KV cache.
+
+    XQA's NVFP4 path only supports page_size 64 or 128; page_size 16/32 reach
+    the kernel but silently produce wrong results, so reject them early.
+    """
+    if page_size in (16, 32):
+        raise ValueError(
+            "NVFP4 KV cache page_size 16 and 32 are not supported by "
+            "FlashInfer XQA. Use page_size 64 or 128 instead. "
+            f"Got page_size={page_size}."
+        )
+
+
 @flashinfer_api(trace=trtllm_batch_decode_trace)
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
@@ -2628,6 +2642,8 @@ def trtllm_batch_decode_with_kv_cache(
         Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
         Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
         in HND layout, with dtype ``torch.float8_e4m3fn``.
+        NVFP4 KV cache does not support page sizes 16 or 32 in the XQA backend;
+        use page size 64 or 128 instead.
 
         **Contiguity requirements (trtllm-gen backend):**
 
@@ -2711,6 +2727,12 @@ def trtllm_batch_decode_with_kv_cache(
         )
 
     if backend == "xqa":
+        if is_nvfp4_kvcache:
+            nvfp4_page_size = (
+                k_cache.shape[-2] if kv_layout == "HND" else k_cache.shape[-3]
+            )
+            _check_xqa_nvfp4_page_size(nvfp4_page_size)
+
         # xqa backend doesn't support nvfp4 output
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
             raise ValueError("xqa backend does not support nvfp4 output")
@@ -3050,6 +3072,16 @@ def xqa_batch_decode_with_kv_cache(
         # or [num_pages, num_kv_heads, page_size, head_dim// 2] for NVFP4 KV cache with packed head dim
         num_kv_heads = k_cache.shape[1]
         page_size = k_cache.shape[2]
+
+    # NVFP4 KV cache (uint8 storage + scale factors) only supports page_size
+    # 64/128 on XQA; reject 16/32 early to avoid silently wrong results.
+    is_nvfp4_kvcache = (
+        k_cache.dtype == torch.uint8
+        and v_cache.dtype == torch.uint8
+        and k_cache_sf is not None
+    )
+    if is_nvfp4_kvcache:
+        _check_xqa_nvfp4_page_size(page_size)
 
     # query shape: [num_tokens, num_heads, head_dim]
     head_dim = query.shape[-1]

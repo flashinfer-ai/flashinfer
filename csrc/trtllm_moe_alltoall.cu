@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "flashinfer/utils.cuh"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tvm_ffi_utils.h"
@@ -275,7 +277,8 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
                        TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
                        int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
                        bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
-                       Optional<TensorView> outputScales, int64_t sfLayout) {
+                       Optional<TensorView> outputScales, double outputScalarScale,
+                       int64_t sfLayout) {
   using tl_throughput::MoeA2ACombineParams;
   using tl_throughput::MoeA2ACombineQuantMode;
   using tl_throughput::MoeA2ACombineSwizzleSFMode;
@@ -320,8 +323,11 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
 
   auto stream = get_current_stream();
   MoeA2ACombineParams params{};
-  Tensor output = alloc_tensor({localNumTokens, elementsPerToken},
-                               outputDtype_.value_or(payload.dtype()), payload.device());
+  auto const output_shape = outputDtype_.has_value() && outputDtype_.value() == dl_uint8
+                                ? tvm::ffi::Shape{localNumTokens, elementsPerToken / 2}
+                                : tvm::ffi::Shape{localNumTokens, elementsPerToken};
+  Tensor output =
+      alloc_tensor(output_shape, outputDtype_.value_or(payload.dtype()), payload.device());
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);
@@ -332,15 +338,26 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   params.elements_per_token = static_cast<int>(elementsPerToken);
   params.dtype = toNvDataType(payload.dtype());
   params.swizzle_mode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
+  params.output_scalar_scale = static_cast<float>(outputScalarScale);
 
+  // Handle quantization parameters if output scales are provided
   if (outputScales.has_value()) {
-    CHECK_INPUT_AND_TYPE(outputScales.value(), dl_uint8);
+    // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
+    auto const sm_version = tensorrt_llm::common::getSMVersion();
+    TVM_FFI_ICHECK(sm_version >= 100)
+        << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
     TVM_FFI_ICHECK(payload.dtype() == dl_bfloat16 || payload.dtype() == dl_float16)
-        << "Quantization only supported for fp16 or bf16 inputs";
+        << "Quantization only supports for fp16 or bf16 inputs";
+    params.output_scales = outputScales.value().data_ptr();
+
     if (output.dtype() == dl_float8_e4m3fn) {
       // TODO(siyuan): currently only support MXFP8 quantization
+      CHECK_INPUT_AND_TYPE(outputScales.value(), dl_uint8);
       params.quant_mode = MoeA2ACombineQuantMode::MXFP8;
-      params.output_scales = outputScales.value().data_ptr();
+    } else if (output.dtype() == dl_uint8) {
+      // packed fp4
+      params.quant_mode = outputScales.value().dtype() == dl_uint8 ? MoeA2ACombineQuantMode::MXFP4
+                                                                   : MoeA2ACombineQuantMode::NVFP4;
     } else {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "Quantization not supported for output dtype: " << output.dtype();
@@ -349,6 +366,12 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
     TVM_FFI_ICHECK(output.dtype() == payload.dtype())
         << "output_dtype without output_scales must match payload dtype";
     params.quant_mode = MoeA2ACombineQuantMode::NONE;
+  }
+
+  if (params.quant_mode != MoeA2ACombineQuantMode::NVFP4 && outputScalarScale != 1.0) {
+    TLLM_LOG_WARNING(
+        "moe_a2a_combine: output_scalar_scale=%f is ignored unless output quantization is NVFP4",
+        outputScalarScale);
   }
 
   params.flag_val =
