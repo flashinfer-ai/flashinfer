@@ -2450,6 +2450,7 @@ def _pad_intermediate_to_tile(
     if n_pad == n:
         return w1_weight, w1_weight_sf, w2_weight, w2_weight_sf, fc2_input_scale, n
     E = int(num_experts)
+    fc2_input_scale_src = fc2_input_scale
     key = (
         n,
         tile,
@@ -2460,7 +2461,7 @@ def _pad_intermediate_to_tile(
         w1_weight_sf.data_ptr(),
         w2_weight.data_ptr(),
         w2_weight_sf.data_ptr(),
-        fc2_input_scale.data_ptr() if fc2_input_scale is not None else 0,
+        fc2_input_scale_src.data_ptr() if fc2_input_scale_src is not None else 0,
     )
     cached = _PADDED_WEIGHT_CACHE.get(key)
     if cached is not None:
@@ -2510,12 +2511,18 @@ def _pad_intermediate_to_tile(
     cb_np = (n_pad + SF_VEC_SIZE - 1) // SF_VEC_SIZE
     w2_sf_p = logical_to_mma(pad_dim(log2, 2, cb_n, cb_np), m=h, k=n_pad)
 
-    if fc2_input_scale is not None and fc2_input_scale.numel() == n:
-        fc2_input_scale = pad_dim(fc2_input_scale, 0, n, n_pad)
+    if fc2_input_scale_src is not None and fc2_input_scale_src.numel() == n:
+        fc2_input_scale = pad_dim(fc2_input_scale_src, 0, n, n_pad)
     result = (w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad)
     _PADDED_WEIGHT_CACHE[key] = result
     _register_cache_eviction(
-        _PADDED_WEIGHT_CACHE, key, w1_weight, w1_weight_sf, w2_weight, w2_weight_sf
+        _PADDED_WEIGHT_CACHE,
+        key,
+        w1_weight,
+        w1_weight_sf,
+        w2_weight,
+        w2_weight_sf,
+        fc2_input_scale_src,
     )
     return result
 

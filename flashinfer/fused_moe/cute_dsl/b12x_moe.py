@@ -373,6 +373,7 @@ class B12xMoEWrapper:
         self._weight_views: object = None
         self._weight_key: Optional[Tuple] = None
         self._padded_weights: Any = None
+        self._padded_weight_key: Optional[Tuple] = None
         self._moe_output: Optional[torch.Tensor] = None
 
         if use_cuda_graph:
@@ -542,6 +543,7 @@ class B12xMoEWrapper:
             _get_weight_views as _get_sm120_weight_views,
             _pad_intermediate_to_tile,
             _LEVEL_TILE_N,
+            GATED_ACTIVATIONS,
         )
 
         # Pick the right pre-allocated workspace for this call's token
@@ -578,8 +580,15 @@ class B12xMoEWrapper:
             n_eff = self.intermediate_size
             # Pad non-128-aligned intermediate sizes once and cache.
             if self.intermediate_size % _LEVEL_TILE_N != 0:
-                if self._padded_weights is None or self._weight_key != weight_key:
-                    is_gated = self.activation in ("silu", "gelu_tanh")
+                padded_weight_key = (
+                    *weight_key,
+                    fc2_input_scale.data_ptr() if fc2_input_scale is not None else 0,
+                )
+                if (
+                    self._padded_weights is None
+                    or self._padded_weight_key != padded_weight_key
+                ):
+                    is_gated = self.activation in GATED_ACTIVATIONS
                     self._padded_weights = _pad_intermediate_to_tile(
                         w1_weight,
                         w1_weight_sf,
@@ -592,6 +601,7 @@ class B12xMoEWrapper:
                         w1_weight.size(0),
                         is_gated,
                     )
+                    self._padded_weight_key = padded_weight_key
                 (
                     w1_weight,
                     w1_weight_sf,

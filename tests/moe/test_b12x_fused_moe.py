@@ -1193,7 +1193,9 @@ class TestB12xFunctional:
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
 
-    @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+    @pytest.mark.parametrize(
+        "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
+    )
     @pytest.mark.parametrize("num_tokens", [8, 128])
     def test_intermediate_not_128_aligned(self, activation: str, num_tokens: int):
         """NVFP4 transparently pads non-128-aligned intermediate sizes (e.g.
@@ -1202,6 +1204,7 @@ class TestB12xFunctional:
 
         hidden_size, intermediate_size = 512, 704  # 704 = 128 * 5.5
         num_experts, top_k = 8, 2
+        swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -1225,6 +1228,7 @@ class TestB12xFunctional:
             top_k=top_k,
             num_local_experts=num_experts,
             activation=activation,
+            swiglu_limit=swiglu_limit,
         )
         assert result.shape == (num_tokens, hidden_size)
         assert not torch.isnan(result).any() and not torch.isinf(result).any()
@@ -1241,6 +1245,7 @@ class TestB12xFunctional:
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
             activation=activation,
+            swiglu_limit=swiglu_limit,
         )
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
@@ -1523,7 +1528,9 @@ class TestB12xFunctional:
 class TestB12xWrapper:
     """Tests for the wrapper API: B12xMoEWrapper."""
 
-    @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+    @pytest.mark.parametrize(
+        "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
+    )
     def test_wrapper_intermediate_not_128_aligned(self, activation: str):
         """Wrapper transparently pads a non-128-aligned intermediate size
         (Gemma-4's 704), caching the padded weights across calls."""
@@ -1531,6 +1538,7 @@ class TestB12xWrapper:
 
         num_tokens, hidden_size, intermediate_size = 128, 512, 704
         num_experts, top_k = 8, 2
+        swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -1546,6 +1554,7 @@ class TestB12xWrapper:
             intermediate_size=intermediate_size,
             use_cuda_graph=False,
             activation=activation,
+            swiglu_limit=swiglu_limit,
         )
         result = moe.run(
             x=tensors["x_bf16"],
@@ -1574,6 +1583,7 @@ class TestB12xWrapper:
             intermediate_size=intermediate_size,
             fc2_input_scale=tensors["fc2_input_scale"],
             activation=activation,
+            swiglu_limit=swiglu_limit,
         )
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"

@@ -1,5 +1,7 @@
 """Activation helper functions for the b12x fused-MoE kernels."""
 
+from __future__ import annotations
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
