@@ -103,6 +103,51 @@ def _make_bf16_weights(
     return w13, w2
 
 
+def _make_packed_weights(
+    rank: int,
+    *,
+    num_local_experts: int,
+    hidden: int,
+    intermediate: int,
+):
+    import torch
+
+    g = torch.Generator(device="cuda").manual_seed(31 + rank)
+    w13 = torch.randint(
+        0,
+        256,
+        (num_local_experts, 2 * intermediate, hidden // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    w2 = torch.randint(
+        0,
+        256,
+        (num_local_experts, hidden, intermediate // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    w13_scale = torch.randn(
+        num_local_experts,
+        2 * intermediate,
+        hidden // 16,
+        dtype=torch.float32,
+        device="cuda",
+        generator=g,
+    ).to(torch.float8_e4m3fn)
+    w2_scale = torch.randn(
+        num_local_experts,
+        hidden,
+        intermediate // 16,
+        dtype=torch.float32,
+        device="cuda",
+        generator=g,
+    ).to(torch.float8_e4m3fn)
+    return w13, w2, w13_scale, w2_scale
+
+
 def _mega_problem(rank: int, world_size: int):
     hidden = 2048
     intermediate = 1024
@@ -452,6 +497,104 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     print(
         f"rank {rank}: nvfp4_cutedsl mega layer (prestaged inputs) matches reference"
     )
+
+
+@pytest.mark.arch_blackwell
+def test_nvfp4_cutedsl_preprocess_accepts_sglang_packed_weights():
+    _require_cuda()
+
+    import torch
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+
+    rank, world_size = _launcher_ranks()
+    problem = _mega_problem(rank, world_size)
+    num_local_experts = problem["num_experts"] // world_size
+    w13, w2, w13_scale, w2_scale = _make_packed_weights(
+        rank,
+        num_local_experts=num_local_experts,
+        hidden=problem["hidden"],
+        intermediate=problem["intermediate"],
+    )
+
+    transformed_l1, transformed_l2 = preprocess_mega_weights(
+        MoEWeightPack(w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale),
+        intermediate_size=problem["intermediate"],
+        hidden_size=problem["hidden"],
+        gate_up_clamp=problem["gate_up_clamp"],
+    )
+
+    fc1_weight, fc1_sf = transformed_l1
+    fc2_weight, fc2_sf = transformed_l2
+    assert fc1_weight.shape == (
+        num_local_experts,
+        problem["hidden"] // 2,
+        2 * problem["intermediate"],
+    )
+    assert fc2_weight.shape == (
+        num_local_experts,
+        problem["intermediate"] // 2,
+        problem["hidden"],
+    )
+    assert fc1_weight.dtype == torch.float4_e2m1fn_x2
+    assert fc2_weight.dtype == torch.float4_e2m1fn_x2
+    assert fc1_sf.shape[0] == num_local_experts
+    assert fc2_sf.shape[0] == num_local_experts
+
+
+@pytest.mark.arch_blackwell
+def test_nvfp4_cutedsl_staging_uses_input_norm_const():
+    _require_cuda()
+
+    import torch
+
+    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+
+    rank, world_size = _launcher_ranks()
+    problem = _mega_problem(rank, world_size)
+    num_tokens = problem["num_tokens"]
+    hidden = problem["hidden"]
+    topk = problem["topk"]
+    sf_cols = hidden // 16
+
+    x_nvfp4_a = torch.empty(num_tokens, hidden // 2, dtype=torch.uint8, device="cuda")
+    x_nvfp4_b = torch.empty_like(x_nvfp4_a)
+    x_sf_a = torch.empty(num_tokens, sf_cols, dtype=torch.float8_e4m3fn, device="cuda")
+    x_sf_b = torch.empty_like(x_sf_a)
+    topk_idx_a = torch.empty(num_tokens, topk, dtype=torch.int64, device="cuda")
+    topk_idx_b = torch.empty_like(topk_idx_a)
+    topk_weights_a = torch.empty(num_tokens, topk, dtype=torch.float32, device="cuda")
+    topk_weights_b = torch.empty_like(topk_weights_a)
+
+    stage_mega_moe_inputs(
+        problem["hidden_states"],
+        problem["topk_weights"],
+        problem["topk_ids"],
+        x_nvfp4_a,
+        x_sf_a,
+        topk_idx_a,
+        topk_weights_a,
+        norm_const=1.0,
+    )
+    stage_mega_moe_inputs(
+        problem["hidden_states"],
+        problem["topk_weights"],
+        problem["topk_ids"],
+        x_nvfp4_b,
+        x_sf_b,
+        topk_idx_b,
+        topk_weights_b,
+        norm_const=2.0,
+    )
+
+    assert not torch.equal(x_sf_a.view(torch.uint8), x_sf_b.view(torch.uint8))
+    torch.testing.assert_close(topk_idx_a, topk_idx_b, atol=0, rtol=0)
+    torch.testing.assert_close(topk_weights_a, topk_weights_b, atol=0, rtol=0)
 
 
 def test_nvfp4_cutedsl_mega_kernel_is_registered():

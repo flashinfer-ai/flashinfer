@@ -25,6 +25,7 @@ class Nvfp4CutedslMegaMoeConfig:
     activation_clamp: float | None = None
     fast_math: bool = True
     apply_topk_in_fc1: bool = True
+    input_norm_const: float = 1.0
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None

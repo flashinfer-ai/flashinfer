@@ -58,6 +58,52 @@ def _swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
     return to_blocked(raw_sf)
 
 
+def _is_packed_nvfp4_weight(weight: "torch.Tensor") -> bool:
+    import torch
+
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    return weight.dtype == torch.uint8 or (
+        fp4_dtype is not None and weight.dtype == fp4_dtype
+    )
+
+
+def _as_fp4_weight(weight: "torch.Tensor") -> "torch.Tensor":
+    import torch
+
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is None:
+        raise RuntimeError("torch.float4_e2m1fn_x2 is required for NVFP4 MegaMOE")
+    if weight.dtype == fp4_dtype:
+        return weight
+    return weight.view(fp4_dtype)
+
+
+def _interleave_gate_up_16(
+    tensor: "torch.Tensor", *, intermediate_size: int
+) -> "torch.Tensor":
+    if intermediate_size % 16 != 0:
+        raise ValueError(
+            "NVFP4 MegaMOE requires intermediate_size to be divisible by 16, "
+            f"got {intermediate_size}."
+        )
+    if tensor.shape[1] != 2 * intermediate_size:
+        raise ValueError(
+            "expected concatenated FC1 tensor with shape "
+            f"(local_experts, {2 * intermediate_size}, ...), got {tuple(tensor.shape)}"
+        )
+
+    gate = tensor[:, :intermediate_size, :].contiguous()
+    up = tensor[:, intermediate_size:, :].contiguous()
+    num_pairs = intermediate_size // 16
+    out = tensor.new_empty(tensor.shape)
+    out_view = out.view(tensor.shape[0], num_pairs, 2, 16, tensor.shape[2])
+    gate_view = gate.view(tensor.shape[0], num_pairs, 16, tensor.shape[2])
+    up_view = up.view(tensor.shape[0], num_pairs, 16, tensor.shape[2])
+    out_view[:, :, 0].copy_(gate_view)
+    out_view[:, :, 1].copy_(up_view)
+    return out.contiguous()
+
+
 def preprocess_mega_weights(
     weights: "MoEWeightPack",
     *,
@@ -79,22 +125,65 @@ def preprocess_mega_weights(
     fc1_out = 2 * intermediate_size
     num_experts = weights.w13.shape[0]
 
-    if weights.w13.shape != (num_experts, fc1_out, hidden_size):
-        raise ValueError(
-            f"w13 must have shape ({num_experts}, {fc1_out}, {hidden_size}), "
-            f"got {tuple(weights.w13.shape)}"
-        )
-    if weights.w2.shape != (num_experts, hidden_size, intermediate_size):
-        raise ValueError(
-            f"w2 must have shape ({num_experts}, {hidden_size}, {intermediate_size}), "
-            f"got {tuple(weights.w2.shape)}"
-        )
+    logical_w13_shape = (num_experts, fc1_out, hidden_size)
+    logical_w2_shape = (num_experts, hidden_size, intermediate_size)
+    packed_w13_shape = (num_experts, fc1_out, hidden_size // 2)
+    packed_w2_shape = (num_experts, hidden_size, intermediate_size // 2)
 
     if weights.w13_scale is not None and weights.w2_scale is not None:
-        fc1_weight = weights.w13.transpose(1, 2).contiguous()
-        fc2_weight = weights.w2.transpose(1, 2).contiguous()
+        if (
+            weights.w13.shape == packed_w13_shape
+            and weights.w2.shape == packed_w2_shape
+        ):
+            if not _is_packed_nvfp4_weight(weights.w13) or not _is_packed_nvfp4_weight(
+                weights.w2
+            ):
+                raise ValueError(
+                    "packed NVFP4 weights must be torch.uint8 or "
+                    "torch.float4_e2m1fn_x2"
+                )
+        elif (
+            weights.w13.shape != logical_w13_shape
+            or weights.w2.shape != logical_w2_shape
+        ):
+            raise ValueError(
+                "pre-quantized w13/w2 must have packed shapes "
+                f"{packed_w13_shape} / {packed_w2_shape} or legacy logical "
+                f"shapes {logical_w13_shape} / {logical_w2_shape}; got "
+                f"{tuple(weights.w13.shape)} / {tuple(weights.w2.shape)}"
+            )
+        expected_w13_scale_shape = (
+            num_experts,
+            fc1_out,
+            hidden_size // 16,
+        )
+        expected_w2_scale_shape = (
+            num_experts,
+            hidden_size,
+            intermediate_size // 16,
+        )
+        if weights.w13_scale.shape != expected_w13_scale_shape:
+            raise ValueError(
+                f"w13_scale must have shape {expected_w13_scale_shape}, "
+                f"got {tuple(weights.w13_scale.shape)}"
+            )
+        if weights.w2_scale.shape != expected_w2_scale_shape:
+            raise ValueError(
+                f"w2_scale must have shape {expected_w2_scale_shape}, "
+                f"got {tuple(weights.w2_scale.shape)}"
+            )
+        w13 = _interleave_gate_up_16(
+            weights.w13, intermediate_size=intermediate_size
+        )
+        w13_scale = _interleave_gate_up_16(
+            weights.w13_scale, intermediate_size=intermediate_size
+        )
+        # Keep the transpose as a view so the kernel's K axis remains stride-1.
+        # Materializing the logical (E, K, N) view would make N stride-1.
+        fc1_weight = _as_fp4_weight(w13.transpose(1, 2))
+        fc2_weight = _as_fp4_weight(weights.w2.transpose(1, 2))
         fc1_sf_swizzled = [
-            _swizzle_expert_scales(weights.w13_scale[e]) for e in range(num_experts)
+            _swizzle_expert_scales(w13_scale[e]) for e in range(num_experts)
         ]
         fc2_sf_swizzled = [
             _swizzle_expert_scales(weights.w2_scale[e]) for e in range(num_experts)
@@ -104,9 +193,22 @@ def preprocess_mega_weights(
         fc1_sf_parts = []
         fc2_q_parts = []
         fc2_sf_parts = []
+        if weights.w13.shape != logical_w13_shape:
+            raise ValueError(
+                f"w13 must have shape {logical_w13_shape}, "
+                f"got {tuple(weights.w13.shape)}"
+            )
+        if weights.w2.shape != logical_w2_shape:
+            raise ValueError(
+                f"w2 must have shape {logical_w2_shape}, "
+                f"got {tuple(weights.w2.shape)}"
+            )
+        w13 = _interleave_gate_up_16(
+            weights.w13, intermediate_size=intermediate_size
+        )
         for expert in range(num_experts):
             fc1_q, fc1_sf = _quantize_expert_weights(
-                weights.w13[expert],
+                w13[expert],
                 norm_const=norm_const,
             )
             fc2_q, fc2_sf = _quantize_expert_weights(

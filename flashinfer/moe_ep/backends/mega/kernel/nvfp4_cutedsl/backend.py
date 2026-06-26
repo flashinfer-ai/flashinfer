@@ -137,10 +137,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 t.hidden_states,
                 t.topk_weights,
                 t.topk_ids,
-                workspace.x[:num_tokens],
-                workspace.x_sf[:num_tokens],
-                workspace.topk_idx[:num_tokens],
-                workspace.topk_weights[:num_tokens],
+                workspace.x,
+                workspace.x_sf,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                norm_const=self._kernel_config.input_norm_const,
             )
         else:
             from common.megamoe_constants import Nvfp4BlockSize
@@ -160,6 +161,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace.x_sf[:num_tokens, hidden_sf_cols:hidden_sf_cols_padded].zero_()
             workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
             workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
+            capacity = workspace.x.shape[0]
+            if num_tokens < capacity:
+                workspace.topk_idx[num_tokens:capacity].fill_(-1)
 
         if t.fc1_alpha is not None:
             workspace.fc1_alpha.copy_(t.fc1_alpha)

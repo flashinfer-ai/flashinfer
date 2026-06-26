@@ -57,6 +57,10 @@ def stage_mega_moe_inputs(
     topk_idx_out[:num_tokens].copy_(topk_ids)
     topk_weights_out[:num_tokens].copy_(topk_weights)
 
+    capacity = x_nvfp4.shape[0]
+    if num_tokens < capacity:
+        topk_idx_out[num_tokens:capacity].fill_(-1)
+
 
 def validate_nvfp4_forward_inputs(
     hidden_states: torch.Tensor,

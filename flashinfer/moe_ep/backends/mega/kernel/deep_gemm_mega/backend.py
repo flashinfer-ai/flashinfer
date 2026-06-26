@@ -110,11 +110,18 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         num_tokens: int,
     ) -> None:
         if stage_inputs:
+            # sgl-deep-gemm 0.1.3 slices the fp8 dispatch slot as int8 storage;
+            # the staging kernel writes float8_e4m3fn. Reinterpret (same 1-byte
+            # layout) so the triton store type-checks; the kernel reads the same
+            # bytes back as int8.
+            x_slot = workspace.x[:num_tokens]
+            if x_slot.dtype != torch.float8_e4m3fn:
+                x_slot = x_slot.view(torch.float8_e4m3fn)
             stage_mega_moe_inputs(
                 t.hidden_states,
                 t.topk_weights,
                 t.topk_ids,
-                workspace.x[:num_tokens],
+                x_slot,
                 workspace.x_sf[:num_tokens],
                 workspace.topk_idx[:num_tokens],
                 workspace.topk_weights[:num_tokens],
