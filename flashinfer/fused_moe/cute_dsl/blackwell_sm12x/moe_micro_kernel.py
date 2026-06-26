@@ -125,7 +125,7 @@ from flashinfer.cute_dsl.fp4_common import (
 from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm120_b12x import (
     Sm120B12xBlockScaledDenseGemmKernel as DenseGemmKernel,
 )
-from .moe_activation import gated_activation_f32
+from .moe_activation import GATED_ACTIVATIONS, gated_activation_f32
 
 
 _SF_VEC_SIZE = 16
@@ -382,11 +382,10 @@ class MoEMicroKernel:
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
+        self.is_gated = activation in GATED_ACTIVATIONS
         self.swiglu_alpha = float(swiglu_alpha)
         self.swiglu_beta = float(swiglu_beta)
-        self.has_swiglu_limit = swiglu_limit is not None
-        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else 0.0
+        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
         # For m=1 with a shared input scale, the quantized activation is
         # identical across all K top-k experts. When set, only pair_idx==0
         # does the quantize and all pairs read from a single shared slot
@@ -1878,7 +1877,6 @@ class MoEMicroKernel:
                                             g,
                                             u,
                                             activation=self.activation,
-                                            has_limit=self.has_swiglu_limit,
                                             limit=self.swiglu_limit,
                                             alpha=self.swiglu_alpha,
                                             beta=self.swiglu_beta,

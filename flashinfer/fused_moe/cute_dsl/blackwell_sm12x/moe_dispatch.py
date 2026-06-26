@@ -24,6 +24,7 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     make_ptr,
 )
+from .moe_activation import GATED_ACTIVATIONS
 from .moe_dynamic_kernel import MoEDynamicKernel
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
@@ -567,7 +568,7 @@ def _get_static_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
     )
 
-    is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
+    is_gated = activation in GATED_ACTIVATIONS
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -812,7 +813,7 @@ def _get_micro_kernel(
         single_token=single_token,
     )
 
-    is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
+    is_gated = activation in GATED_ACTIVATIONS
     w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -1580,7 +1581,7 @@ def _get_dynamic_kernel(
     if cached is not None:
         return cached
 
-    is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
+    is_gated = activation in GATED_ACTIVATIONS
     w1_rows = (2 if is_gated else 1) * n
 
     scratch_dtype = cutlass.Float4E2M1FN
@@ -2426,6 +2427,12 @@ def _get_cached_workspace(
 # ==========================================================================
 # Unified dispatch
 # ==========================================================================
+# Padding rebuilds scale factors via a per-expert swizzle roundtrip — too costly
+# to repeat every call, so the result is cached (keyed on the source weights) and
+# evicted when they are freed (same lifetime model as _WEIGHT_CACHE).
+_PADDED_WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
+
+
 def _pad_intermediate_to_tile(
     w1_weight,
     w1_weight_sf,
@@ -2440,14 +2447,31 @@ def _pad_intermediate_to_tile(
 ):
     """Zero-pad NVFP4 weights + scale factors so the intermediate size is a
     multiple of ``tile`` (gate/up tile-split requirement); padded channels are
-    zero, so the result is numerically identical. Interim support for non-128
-    sizes (e.g. Gemma-4's 704). Scale factors are padded in the logical
-    (pre-swizzle) domain since the gate/up boundary is not tile-aligned.
+    zero, so the result is numerically identical.
+
+    Enables interim support for non-128 aligned intermediate sizes. Scale factors
+    are padded in the logical (pre-swizzle) domain since the gate/up boundary is
+    not tile-aligned. Cached and evicted with the source weights.
     """
     n_pad = ((n + tile - 1) // tile) * tile
     if n_pad == n:
         return w1_weight, w1_weight_sf, w2_weight, w2_weight_sf, fc2_input_scale, n
     E = int(num_experts)
+    key = (
+        n,
+        tile,
+        h,
+        E,
+        bool(is_gated),
+        w1_weight.data_ptr(),
+        w1_weight_sf.data_ptr(),
+        w2_weight.data_ptr(),
+        w2_weight_sf.data_ptr(),
+        fc2_input_scale.data_ptr() if fc2_input_scale is not None else 0,
+    )
+    cached = _PADDED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     def mma_to_logical(sf, m, k):
         sw = convert_sf_from_mma_layout(sf, m=m, k=k, num_groups=E)
@@ -2495,63 +2519,12 @@ def _pad_intermediate_to_tile(
 
     if fc2_input_scale is not None and fc2_input_scale.numel() == n:
         fc2_input_scale = pad_dim(fc2_input_scale, 0, n, n_pad)
-    return w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad
-
-
-# Padding rebuilds scale factors via a per-expert swizzle roundtrip — too costly
-# to repeat every call, so cache the result keyed on the source weights and evict
-# it when they are freed (same lifetime model as _WEIGHT_CACHE).
-_PADDED_WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
-
-
-def _get_padded_intermediate(
-    w1_weight,
-    w1_weight_sf,
-    w2_weight,
-    w2_weight_sf,
-    fc2_input_scale,
-    n,
-    tile,
-    h,
-    num_experts,
-    is_gated,
-):
-    key = (
-        n,
-        tile,
-        h,
-        int(num_experts),
-        bool(is_gated),
-        w1_weight.data_ptr(),
-        w1_weight_sf.data_ptr(),
-        w2_weight.data_ptr(),
-        w2_weight_sf.data_ptr(),
-        fc2_input_scale.data_ptr() if fc2_input_scale is not None else 0,
+    result = (w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad)
+    _PADDED_WEIGHT_CACHE[key] = result
+    _register_cache_eviction(
+        _PADDED_WEIGHT_CACHE, key, w1_weight, w1_weight_sf, w2_weight, w2_weight_sf
     )
-    cached = _PADDED_WEIGHT_CACHE.get(key)
-    if cached is None:
-        cached = _pad_intermediate_to_tile(
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-            tile,
-            h,
-            num_experts,
-            is_gated,
-        )
-        _PADDED_WEIGHT_CACHE[key] = cached
-        _register_cache_eviction(
-            _PADDED_WEIGHT_CACHE,
-            key,
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-        )
-    return cached
+    return result
 
 
 def launch_sm120_moe(
@@ -2596,7 +2569,7 @@ def launch_sm120_moe(
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    is_gated = activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
+    is_gated = activation in GATED_ACTIVATIONS
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
@@ -2612,7 +2585,7 @@ def launch_sm120_moe(
             w2_weight_sf,
             fc2_input_scale,
             n,
-        ) = _get_padded_intermediate(
+        ) = _pad_intermediate_to_tile(
             w1_weight,
             w1_weight_sf,
             w2_weight,

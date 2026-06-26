@@ -126,14 +126,14 @@ def b12x_fused_moe(
         Output data type.  Only ``torch.bfloat16`` is currently supported.
     activation : str
         Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"`` (gated
-        GeGLU, tanh-approx GELU), ``"swigluoai_uninterleave"`` (gated SwiGLU-OAI,
+        GeGLU, tanh-approx GELU), ``"swigluoai_uninterleave"`` (gated SwiGLU-OAI variant,
         MiniMax-M3) or ``"relu2"`` (non-gated Nemotron-Super). Defaults to
         ``"silu"``.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU-OAI parameters used only when
         ``activation="swigluoai_uninterleave"``: ``gate*sigmoid(alpha*gate)*
         (up+beta)`` with optional clamp to ``swiglu_limit`` (``None`` disables).
-        Defaults 1.702 / 1.0 / None for approximating GELU.
+        Defaults to 1.702 / 1.0 / None as standard parameters for approximating GELU.
     activation_precision : str
         Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
@@ -306,8 +306,7 @@ class B12xMoEWrapper:
         activation : str
             Activation function — ``"silu"`` (gated SwiGLU), ``"gelu_tanh"``
             (gated GeGLU, tanh-approx GELU), ``"swigluoai_uninterleave"`` (gated
-            SwiGLU-OAI, MiniMax-M3) or ``"relu2"`` (non-gated). Defaults to
-            ``"silu"``.
+            SwiGLU-OAI) or ``"relu2"`` (non-gated). Defaults to ``"silu"``.
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU-OAI parameters (only for ``"swigluoai_uninterleave"``):
             ``gate*sigmoid(alpha*gate)*(up+beta)`` with optional clamp to

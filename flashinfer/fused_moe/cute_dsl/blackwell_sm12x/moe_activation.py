@@ -1,8 +1,6 @@
 """Gated activation epilogue for the b12x NVFP4 fused-MoE kernels.
 
-Shared by the micro / static / dynamic kernels so the activation math lives in
-one place. ``activation`` and the swiglu params are compile-time constants, so
-each kernel instantiation specializes to a single activation form.
+Shared by the b12x MoE kernel variants.
 """
 
 import cutlass
@@ -11,14 +9,16 @@ from cutlass import Float32
 
 from flashinfer.cute_dsl.fp4_common import fmax_f32, fmin_f32
 
+# Activations that consume separate gate + up halves from FC1 (w13 has 2*n rows).
+GATED_ACTIVATIONS = ("silu", "gelu_tanh", "swigluoai_uninterleave")
+
 
 def gated_activation_f32(
     g,
     u,
     *,
     activation: str,
-    has_limit: bool,
-    limit: float,
+    limit: float | None,
     alpha: float,
     beta: float,
     fast_math: bool,
@@ -28,10 +28,10 @@ def gated_activation_f32(
     - silu: ``g*sigmoid(g)*u``
     - gelu_tanh: ``g*sigmoid(2z)*u`` (tanh-approx GELU, sigmoid(2z) == 0.5*(1+tanh(z)),
       z = 0.7978845608*(g + 0.044715*g^3))
-    - swigluoai: optional clamp then ``g*sigmoid(alpha*g)*(u+beta)``
+    - swigluoai: ``g*sigmoid(alpha*g)*(u+beta)``, clamped when ``limit`` is set
     """
     if cutlass.const_expr(activation == "swigluoai_uninterleave"):
-        if cutlass.const_expr(has_limit):
+        if cutlass.const_expr(limit is not None):
             lim = Float32(limit)
             g = fmin_f32(g, lim)
             u = fmax_f32(fmin_f32(u, lim), Float32(-limit))
