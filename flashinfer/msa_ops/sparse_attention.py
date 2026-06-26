@@ -251,6 +251,7 @@ def msa_sparse_attention(
     page_table: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     return_softmax_lse: bool = False,
+    union: bool = False,
     m_block_size: int = 64,
     num_threads: int = 128,
     k_scale: Optional[torch.Tensor] = None,
@@ -291,6 +292,14 @@ def msa_sparse_attention(
     return_softmax_lse : bool
         Also return the natural-log LSE, shape ``(total_q, num_qo_heads)``
         float32 (``-inf`` for queries with no valid selected blocks).
+    union : bool
+        Use the query-tile **union** kernel instead of the default KV-major
+        split-KV + combine. A CTA owns a tile of query tokens and runs an
+        in-kernel online softmax over the *union* of the blocks they selected,
+        writing the final output directly (no GMEM partials, no combine) -- the
+        memory-bound KV-major path's prefill headroom on SM12x. Currently
+        bf16/fp16, flat K/V, no ``return_temperature_lse``; ``schedule`` is
+        ignored. The metadata is built internally from ``q2k_indices``.
 
     Returns
     -------
@@ -401,6 +410,36 @@ def msa_sparse_attention(
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+
+    if union:
+        # query-tile + block-union + in-kernel online softmax: no GMEM partials and
+        # no combine kernel (the memory-bound KV-major path's ~6x prefill headroom on
+        # SM12x). bf16/fp16 flat K/V only for now.
+        if paged:
+            raise ValueError("union=True does not support paged KV yet")
+        if q_fp8 or kv_fp8 or kv_nvfp4 or qk_fp8_mma or pv_fp8_mma:
+            raise ValueError("union=True supports bf16/fp16 only (no fp8/NVFP4) yet")
+        if return_temperature_lse:
+            raise ValueError("union=True does not support return_temperature_lse yet")
+        dev = q.device
+        cu_q_dev = cu_seqlens_q.to(dev, non_blocking=True)
+        cu_k_dev = cu_seqlens_k.to(dev, non_blocking=True)
+        qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k_dev, dev)
+        return _msa_sparse_attention_union(
+            q,
+            k,
+            v,
+            q2k_indices,
+            cu_q_dev,
+            cu_k_dev,
+            qoff_dev,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            group_size=group_size,
+            topk=topk,
+            compute_dtype=compute_dtype,
+            return_softmax_lse=return_softmax_lse,
+        )
 
     if schedule is None:
         schedule = msa_build_k2q_csr(
@@ -577,5 +616,130 @@ def msa_sparse_attention(
     if return_temperature_lse:
         return out, lse_out, lse_t_out
     if return_softmax_lse:
+        return out, lse_out
+    return out
+
+
+# int32 union membership mask -> at most 32 query tokens may share one tile.
+_UNION_MAX_TOKENS_PER_TILE = 32
+_LN2 = 0.6931471805599453
+
+
+def _union_tile_config(group_size: int):
+    """Pick (m_block, num_threads) for the union path: an 8-row-per-warp MMA tile
+    (m_block=128, 256 threads) when group_size divides it and the resulting
+    tokens_per_tile (= m_block // group_size) fits the 32-bit membership mask, else
+    the 64-row tile. M3 attention (group_size 16) -> 128 / 256 / tpt 8."""
+    for m_block in (128, 64):
+        if m_block % group_size == 0 and m_block // group_size <= (
+            _UNION_MAX_TOKENS_PER_TILE
+        ):
+            return m_block, m_block * 2
+    raise ValueError(
+        f"union path needs group_size dividing 64 or 128 with "
+        f"<= {_UNION_MAX_TOKENS_PER_TILE} tokens/tile, got group_size {group_size}"
+    )
+
+
+def _msa_sparse_attention_union(
+    q,
+    k,
+    v,
+    q2k_indices,
+    cu_q_dev,
+    cu_k_dev,
+    qoff_dev,
+    *,
+    causal,
+    softmax_scale,
+    group_size,
+    topk,
+    compute_dtype,
+    return_softmax_lse,
+):
+    """Union-tile prefill path (query-tile + block-union + in-kernel online softmax,
+    no GMEM partials / no combine). bf16/fp16, flat K/V. See
+    :class:`...cute_dsl.sparse_fwd_union_sm12x.SparseAttentionUnionFwdSm12x`."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.sparse_fwd_union_sm12x import SparseAttentionUnionFwdSm12x
+    from ._union_metadata import build_msa_union_metadata
+
+    total_q, num_qo_heads, head_dim = q.shape
+    dev = q.device
+    m_block, num_threads = _union_tile_config(group_size)
+    tokens_per_tile = m_block // group_size
+
+    ub, um, uc, wm, n = build_msa_union_metadata(
+        q2k_indices, cu_q_dev, tokens_per_tile, topk
+    )
+    # outputs default to 0 / -inf so query tiles that emit no work item (or rows a
+    # tile masks out entirely) read back as a zero output with -inf LSE.
+    out = torch.zeros((total_q, num_qo_heads, head_dim), dtype=q.dtype, device=dev)
+    lse2 = torch.full(
+        (num_qo_heads, total_q), -float("inf"), dtype=torch.float32, device=dev
+    )
+
+    key = ("sparse_attn_union", str(q.dtype), group_size, causal, m_block, num_threads)
+    compiled = _compile_cache.get(key)
+    if compiled is None:
+        cdt = _cutlass_dtype(q.dtype)
+        i32 = _cutlass_dtype(torch.int32)
+        f32 = _cutlass_dtype(torch.float32)
+        s = [cute.sym_int() for _ in range(9)]
+        kernel_obj = SparseAttentionUnionFwdSm12x(
+            head_dim=head_dim,
+            m_block_size=m_block,
+            n_block_size=_BLK_KV,
+            group_size=group_size,
+            num_threads=num_threads,
+            is_causal=causal,
+            return_softmax_lse=True,
+        )
+        compiled = cute.compile(
+            kernel_obj,
+            _fake(cdt, (s[0], s[1], head_dim)),
+            _fake(cdt, (s[2], s[3], head_dim)),
+            _fake(cdt, (s[2], s[3], head_dim)),
+            _fake(cdt, (s[0], s[1], head_dim)),
+            _fake(f32, (s[1], s[0]), align=4),
+            _fake(i32, (s[6], s[7]), align=4),
+            _fake(i32, (s[6], s[7]), align=4),
+            _fake(i32, (s[6],), align=4),
+            _fake(i32, (s[6], 3), align=4),
+            _fake(i32, (s[8],), align=4),
+            _fake(i32, (s[4],), align=4),
+            _fake(i32, (s[4],), align=4),
+            _fake(i32, (s[5],), align=4),
+            cutlass.Float32(1.0),
+            cutlass.Int32(1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+        _compile_cache[key] = compiled
+
+    wc = torch.tensor([n], dtype=torch.int32, device=dev)
+    compiled(
+        q,
+        k,
+        v,
+        out,
+        lse2,
+        ub,
+        um,
+        uc,
+        wm,
+        wc,
+        cu_q_dev,
+        cu_k_dev,
+        qoff_dev,
+        float(softmax_scale),
+        int(n),
+    )
+    if return_softmax_lse:
+        # kernel writes log2-domain LSE as (Hq, total_q); the public contract is
+        # natural-log (total_q, num_qo_heads).
+        lse_out = (lse2 * _LN2).t().contiguous()
         return out, lse_out
     return out

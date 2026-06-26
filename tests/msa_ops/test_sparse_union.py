@@ -169,3 +169,43 @@ def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):
     # to bf16 precision.
     assert mae_oracle <= mae_kv_oracle * 1.5 + 1e-6, (mae_oracle, mae_kv_oracle)
     assert mae_vs_kv < 5e-4, mae_vs_kv
+
+
+@pytest.mark.parametrize("B,S", [(1, 1024), (3, 384)])
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_union_public_api(B, S, return_lse):
+    """msa_sparse_attention(union=True) matches the default KV-major path (output
+    and LSE) end to end through the public wrapper."""
+    _skip()
+    from flashinfer.msa_ops import msa_sparse_attention
+
+    dev = "cuda"
+    Hq, Hkv, topk, hd = 64, 4, 16, 128
+    G = Hq // Hkv
+    scale = 1.0 / math.sqrt(hd)
+    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    torch.manual_seed(11)
+    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=5)
+    oracle = _torch_oracle(q, k, v, q2k, cu, cu, BLK, G, scale)
+
+    kw = dict(causal=True, softmax_scale=scale, return_softmax_lse=return_lse)
+    ref = msa_sparse_attention(q, k, v, q2k, cu, cu, **kw)
+    got = msa_sparse_attention(q, k, v, q2k, cu, cu, union=True, **kw)
+    if return_lse:
+        ref, ref_lse = ref
+        got, got_lse = got
+        assert got_lse.shape == (B * S, Hq)
+        # compare LSE only where the KV-major path produced a finite value
+        finite = torch.isfinite(ref_lse)
+        dl = (got_lse[finite] - ref_lse[finite]).abs().max().item()
+        assert dl < 5e-2, dl
+    torch.cuda.synchronize()
+
+    assert got.shape == (B * S, Hq, hd)
+    mae_o = (got.float() - oracle).abs().mean().item()
+    mae_kv = (ref.float() - oracle).abs().mean().item()
+    assert mae_o <= mae_kv * 1.5 + 1e-6, (mae_o, mae_kv)
+    assert (got.float() - ref.float()).abs().mean().item() < 5e-4
