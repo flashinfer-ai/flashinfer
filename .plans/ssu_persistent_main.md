@@ -139,6 +139,72 @@ per-warp form removes it.
 **Target**: close the no-write gap to triton-replay-pm via persistence
 (b=1024: 90.5 vs 75.4 = **15µs**; b=512: 50.5 vs 42.1 = **8µs**).
 
+## Persistent main results @ b=1024 (mixed PNAT + conv1d, 2026-06-25)
+
+The persistent main (v1.0, MHC=1 single-head work-units) **regresses b=1024**.
+`cta_per_sm` sweep (grid = min(cta_per_sm·NUM_SMS≈148, total_work=32768)):
+
+| cta_per_sm | grid | median µs (pre-pipeline) | + setup-prefetch |
+|---:|---:|---:|---:|
+| 1 | 148 | 908 💀 | — |
+| 2 | 296 | 477 | — |
+| 4 | 592 | 258 | — |
+| 8 | 1184 | 149.9 | 149.3 |
+| 16 | 2368 | 144.4 | 144.4 |
+| 32 | 4736 | — | 143.4 |
+| default (huge) | 32768 | 146.6 | 145.6 |
+
+Bars: old MHC=4 (non-persistent) **124.6**, triton-replay-pm **120.4**.
+
+Findings:
+- **cta_per_sm < occupancy (8) is pointless** — at b=1024 the GPU is saturated
+  (total_work ≫ occupancy·NUM_SMS), so cutting CTAs just under-occupies (cps=1 →
+  1 CTA/SM → 6× slower). Co-residency room is a *small-batch (cliff)* lever, not b=1024.
+- **Setup-prefetch (software-pipeline the per-work-unit scalar metadata loads): no
+  measured effect** (≤1µs, within noise). The dependent scalar loads were not the
+  bottleneck — the compiler already overlapped them.
+- **The ~20µs regression is MHC=1 vs MHC=4.** Single-head work-units reload per-group
+  `C`/`old_B` *every head* (16384 CTAs) vs MHC=4's load-once-reuse-4-heads (4096 CTAs)
+  — 4× the C/old_B traffic + per-CTA barrier/setup overhead. The grid-stride "head-fastest"
+  flatten only gives **L2** reuse across concurrent CTAs (the stride = gridDim.x jumps over
+  the same-group block, so a CTA's consecutive iterations are different groups → no *smem*
+  reuse, and step-7 skip-reload is moot).
+
+## NGROUPS template + division-free unflatten (2026-06-25)
+
+NCU on the MHC=1 persistent main showed the new `wait` stall (14% no-write) was the
+**unflatten's runtime integer divisions** (`tile % ngroups`, `/ ngroups`, `% batch`,
+`/ batch` — `ngroups`/`batch` runtime → `MUFU`/slow division).  The old 3D grid read
+`blockIdx.{x,y,z}` directly (zero divisions).
+
+Fix: **expose `num_groups` as a jinja template param** (`NGROUPS`, URI key `_ng_`) so
+`NHEADS = NGROUPS·HEADS_PER_GROUP` is compile-time, and **reorder the flatten** so the
+unflatten divides only by compile-time constants (NHEADS, D_SPLIT, HEADS_PER_GROUP);
+`seq` is the top quotient so `batch` is never a divisor.  Also ripped `MAIN_HEADS_PER_CTA`
+(MHC=1) + `PIPELINE_STAGES` from the kernel template (replaced by `NGROUPS`); `head_loop`'s
+dead MHC>1 inner loop left for a follow-up cleanup.
+
+Result (b=1024, mixed+conv1d) — **~10µs across the board**, far more than the stall %
+implied (the divisions gate the state-load issue + dispatch on the critical path):
+
+| cta_per_sm | pre-NGROUPS | division-free | Δ |
+|---:|---:|---:|---:|
+| 8  | 149.3 | 139.6 | −9.7 |
+| 16 | 144.4 | **133.6** | −10.8 |
+| 32 | 143.4 | 134.1 | −9.3 |
+| grid==total_work | 145.6 | 137.0 | −8.6 |
+
+- Persistence helps ~3µs (cps=16 133.6 < grid==total_work 137.0); **default set to cps=16**
+  (slightly oversubscribed beats exactly-resident cps=8 = 139.6).
+- Regression vs MHC=4 (124.6) cut from +20 → **+9µs**; gap to triton-pm (120.4) now +13µs.
+
+**Remaining +9µs vs MHC=4 = the per-work-unit C/old_B load** (single head/work-unit reloads
+C; MHC=4 amortized over 4 heads).  The grid-stride's stride jumps over same-group blocks → a
+CTA never gets consecutive same-group work-units → no smem C-reuse.  Next lever (both keep
+MHC=1): **block-cyclic work assignment** (contiguous head-fastest run per CTA → enable
+skip-reload of C/old_B) OR bring back head-tiling as the work-unit size.  **Decide after the
+no-write ncu diff.**
+
 ## Tests
 
 ```bash

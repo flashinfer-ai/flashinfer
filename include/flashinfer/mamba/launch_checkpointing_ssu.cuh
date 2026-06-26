@@ -218,8 +218,11 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       }();
       int const main_cta_per_sm = [] {
         char const* e = std::getenv("FLASHINFER_SSU_MAIN_CTA_PER_SM");
-        // Default huge ⇒ grid == total_work (non-persistent, bit-identical).  Heuristic later.
-        return e ? std::atoi(e) : (1 << 20);
+        // Default 16 ⇒ grid = 16·NUM_SMS (≈2× the 8-block/SM resident set, so each CTA grid-strides
+        // and there are ~2 launch-waves).  Measured best at b=1024 (133.6µs) — slightly
+        // oversubscribed schedules better than exactly-resident (cps=8: 139.6).  Below occupancy
+        // (8) under-occupies and is catastrophic.  Heuristic refined later.
+        return e ? std::atoi(e) : 16;
       }();
       int const main_total_work =
           D_SPLIT * static_cast<int>(params.batch) * static_cast<int>(params.nheads);
@@ -227,10 +230,13 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       int const main_grid =
           static_cast<int>(main_grid_ll < main_total_work ? main_grid_ll : main_total_work);
 
-      // MAIN_HEADS_PER_CTA=1 and PIPELINE_STAGES=1 are the kernel-template defaults.
-      auto mfunc = checkpointing_ssu_main_kernel<
-          input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NPREDICTED,
-          MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT, VARLEN>;
+      // NGROUPS is the jinja-stamped compile-time group count → the kernel's unflatten divides only
+      // by compile-time constants (no runtime div/mod).
+      auto mfunc =
+          checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                        state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                        HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT,
+                                        VARLEN, NGROUPS>;
       constexpr size_t msmem = sizeof(
           CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>);
       if constexpr (msmem > 0) {

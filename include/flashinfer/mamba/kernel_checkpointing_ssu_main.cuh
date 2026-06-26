@@ -760,7 +760,7 @@ __device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams co
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1,
-          bool VARLEN = false, int MAIN_HEADS_PER_CTA = 1, int PIPELINE_STAGES = 1>
+          bool VARLEN = false, int NGROUPS = 1>
 // __maxnreg__(64): 65536/(64·128)=8 blocks/SM at 50% occupancy.  Spills ~4 scalar regs
 // (from tile_buf address arithmetic), but fewer blocks/SM from a higher cap hurts more.
 __global__ __maxnreg__(64) void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
@@ -771,70 +771,90 @@ __global__ __maxnreg__(64) void checkpointing_ssu_main_kernel(CheckpointingSsuPa
   static_assert(MAX_WINDOW <= MMA_prop::K_BIG, "MAX_WINDOW must be <= MMA::K_BIG=16");
   assert(params.d_split == D_SPLIT);
 
-  using SmemT = CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
-                                            DSTATE, PIPELINE_STAGES, MAIN_HEADS_PER_CTA>;
+  using SmemT =
+      CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
-  // ── 1D grid-stride persistent loop over work-units ──
-  // Work-unit = (d_tile, seq, group, head_tile); a CTA processes MAIN_HEADS_PER_CTA heads per
-  // work-unit (head_tile).  The launcher sizes the grid to min(cta_per_sm·NUM_SMS, total_work):
-  // at the default (grid==total_work) each CTA runs exactly one work-unit → bit-identical to the
-  // old 3D per-work-unit launch; with fewer CTAs each grid-strides over several, leaving SM room
-  // to co-reside with conv1d (the precompute) and keeping per-group C/old_B L2-hot.
-  // Flatten head_tile-fastest, then group, seq, d_tile → consecutive work-units are consecutive
-  // head-tiles of one (d_tile, seq, group) (same C/old_B).
-  static_assert(HEADS_PER_GROUP % MAIN_HEADS_PER_CTA == 0,
-                "MAIN_HEADS_PER_CTA must divide HEADS_PER_GROUP");
-  constexpr int HEAD_TILES = HEADS_PER_GROUP / MAIN_HEADS_PER_CTA;
+  // ── 1D grid-stride persistent loop over single-head work-units ──
+  // Work-unit = (d_tile, seq, head); the launcher sizes the grid to
+  // min(cta_per_sm·NUM_SMS, total_work) and each CTA grid-strides over work-units.  Default
+  // cta_per_sm = occupancy ⇒ grid = the resident set, each CTA strides; bigger ⇒ grid==total_work.
+  // Flatten head-fastest (head innermost) so consecutive work-units are consecutive heads of one
+  // (d_tile, seq) → per-group C/old_B stay L2-hot.
+  //
+  // NHEADS = NGROUPS·HEADS_PER_GROUP is COMPILE-TIME, so the unflatten divides only by compile-time
+  // constants (NHEADS, D_SPLIT, HEADS_PER_GROUP) — no runtime div/mod.  seq is the top quotient, so
+  // `batch` is never a divisor; gridDim.x is the loop stride, never a divisor.
+  constexpr int NHEADS = NGROUPS * HEADS_PER_GROUP;
   int const lane = threadIdx.x;
   int const warp = threadIdx.y;
-  int const ngroups = (int)params.ngroups;
   int const batch = (int)params.batch;
-  int const tiles_per_dseq = ngroups * HEAD_TILES;  // work-units per (d_tile, seq)
-  int const total_work = D_SPLIT * batch * tiles_per_dseq;
+  int const total_work = D_SPLIT * batch * NHEADS;
+  int const stride = (int)gridDim.x;
 
-  // gdc_wait fires only on a CTA's FIRST work-unit that actually runs (skips pad slots); once any
-  // CTA work-unit has waited, the precompute is done + globally visible for the rest of the loop.
-  bool did_gdc = false;
+  auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
+  auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
+  auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
+  auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
 
-  for (int tile = blockIdx.x; tile < total_work; tile += gridDim.x) {
-    // Unflatten head_tile-fastest.
-    int const head_tile = tile % HEAD_TILES;
-    int t1 = tile / HEAD_TILES;
-    int const group_idx = t1 % ngroups;
-    int t2 = t1 / ngroups;
-    int const seq = t2 % batch;
-    int const d_tile = t2 / batch;
-    int const first_head = group_idx * HEADS_PER_GROUP + head_tile * MAIN_HEADS_PER_CTA;
-
-    // ── Per-slot setup ──
-    auto const* __restrict__ sbi =
-        reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-    int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
-    if (cache_slot == params.pad_slot_id) continue;  // padded slot: skip (uniform across CTA)
-    auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
-    int const buf_read = __ldg(&buf_idx_ptr[cache_slot]);
-    auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
-    int const prev_k = prev_ptr[cache_slot];
-
-    int seq_len;
-    int64_t outer;
-    if constexpr (VARLEN) {
-      auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
-      int const bos = __ldg(&cu[seq]);
-      int const eos = __ldg(&cu[seq + 1]);
-      seq_len = eos - bos;
-      if (seq_len <= 0) continue;
-      outer = (int64_t)bos;
-    } else {
-      seq_len = NPREDICTED;
-      outer = (int64_t)seq;
+  // Per-work-unit scalar setup, SOFTWARE-PIPELINED.  The metadata loads (cache_buf_idx,
+  // prev_num_accepted, cu_seqlens) are DEPENDENT on cache_slot and gate head_loop's 16 KB state
+  // load + the write/no-write dispatch (must_checkpoint = prev_k+seq_len > MAX_WINDOW).  Issuing
+  // them at the top of every iteration exposes that dependent-load stall on the critical path —
+  // the regression vs the old grid where one CTA amortized the setup across its heads.  Instead we
+  // prefetch the NEXT work-unit's setup before head_loop (its loads overlap head_loop + the fence),
+  // so each iteration consumes already-arrived metadata.  next_tile = tile + gridDim.x is exact
+  // (grid-stride is a fixed progression — no data-dependent next).
+  struct Setup {
+    int d_tile, seq, group_idx, first_head, buf_read, prev_k, seq_len;
+    int64_t cache_slot, outer;
+    bool valid;  // false ⇒ pad slot / empty varlen row (skip, but still pipelines the next)
+  };
+  auto fetch = [&](int tile) -> Setup {
+    int const head = tile % NHEADS;  // compile-time NHEADS divisor
+    int const t = tile / NHEADS;
+    Setup s;
+    s.d_tile = t % D_SPLIT;                // compile-time D_SPLIT divisor
+    s.seq = t / D_SPLIT;                   // batch is the range, never a divisor
+    s.group_idx = head / HEADS_PER_GROUP;  // compile-time HEADS_PER_GROUP divisor
+    s.first_head = head;
+    s.cache_slot = sbi ? static_cast<int64_t>(sbi[s.seq]) : s.seq;
+    if (s.cache_slot == params.pad_slot_id) {
+      s.valid = false;
+      return s;
     }
-    int64_t const out_seq_base = outer * params.out_stride_seq;
+    s.buf_read = __ldg(&buf_idx_ptr[s.cache_slot]);
+    s.prev_k = prev_ptr[s.cache_slot];
+    if constexpr (VARLEN) {
+      int const bos = __ldg(&cu[s.seq]);
+      int const eos = __ldg(&cu[s.seq + 1]);
+      s.seq_len = eos - bos;
+      s.outer = (int64_t)bos;
+      s.valid = (s.seq_len > 0);
+    } else {
+      s.seq_len = NPREDICTED;
+      s.outer = (int64_t)s.seq;
+      s.valid = true;
+    }
+    return s;
+  };
 
-    bool const must_checkpoint = (prev_k + seq_len > MAX_WINDOW);
-    int const write_offset = must_checkpoint ? 0 : prev_k;
+  // gdc_wait fires only on a CTA's FIRST work-unit that actually runs; once any work-unit has
+  // waited, the precompute is done + globally visible for the rest of the loop.
+  bool did_gdc = false;
+  Setup pending = fetch(blockIdx.x);  // prologue: prefetch the first work-unit's setup
+
+  for (int tile = blockIdx.x; tile < total_work; tile += stride) {
+    Setup const cur = pending;
+    bool const has_next = (tile + stride < total_work);
+    if (has_next) pending = fetch(tile + stride);  // prefetch next BEFORE head_loop + fence
+    if (!cur.valid)
+      continue;  // pad / empty varlen: skip (next already prefetched, no smem touched)
+
+    int64_t const out_seq_base = cur.outer * params.out_stride_seq;
+    bool const must_checkpoint = (cur.prev_k + cur.seq_len > MAX_WINDOW);
+    int const write_offset = must_checkpoint ? 0 : cur.prev_k;
     bool const do_gdc = !did_gdc;  // uniform across the CTA
     did_gdc = true;
 
@@ -842,35 +862,39 @@ __global__ __maxnreg__(64) void checkpointing_ssu_main_kernel(CheckpointingSsuPa
     if (must_checkpoint) {
       if (do_gdc)
         head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, MAIN_HEADS_PER_CTA,
-                  PIPELINE_STAGES, /*DO_GDC_WAIT=*/true>(
-            smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read,
-            prev_k, outer, seq_len, out_seq_base, write_offset);
+                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, /*MAIN_HEADS_PER_CTA=*/1,
+                  /*PIPELINE_STAGES=*/1, /*DO_GDC_WAIT=*/true>(
+            smem, params, lane, warp, cur.d_tile, cur.first_head, cur.group_idx, cur.seq,
+            cur.cache_slot, cur.buf_read, cur.prev_k, cur.outer, cur.seq_len, out_seq_base,
+            write_offset);
       else
         head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, MAIN_HEADS_PER_CTA,
-                  PIPELINE_STAGES, /*DO_GDC_WAIT=*/false>(
-            smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read,
-            prev_k, outer, seq_len, out_seq_base, write_offset);
+                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, /*MAIN_HEADS_PER_CTA=*/1,
+                  /*PIPELINE_STAGES=*/1, /*DO_GDC_WAIT=*/false>(
+            smem, params, lane, warp, cur.d_tile, cur.first_head, cur.group_idx, cur.seq,
+            cur.cache_slot, cur.buf_read, cur.prev_k, cur.outer, cur.seq_len, out_seq_base,
+            write_offset);
     } else {
       if (do_gdc)
         head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, MAIN_HEADS_PER_CTA,
-                  PIPELINE_STAGES, /*DO_GDC_WAIT=*/true>(
-            smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read,
-            prev_k, outer, seq_len, out_seq_base, write_offset);
+                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, /*MAIN_HEADS_PER_CTA=*/1,
+                  /*PIPELINE_STAGES=*/1, /*DO_GDC_WAIT=*/true>(
+            smem, params, lane, warp, cur.d_tile, cur.first_head, cur.group_idx, cur.seq,
+            cur.cache_slot, cur.buf_read, cur.prev_k, cur.outer, cur.seq_len, out_seq_base,
+            write_offset);
       else
         head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, MAIN_HEADS_PER_CTA,
-                  PIPELINE_STAGES, /*DO_GDC_WAIT=*/false>(
-            smem, params, lane, warp, d_tile, first_head, group_idx, seq, cache_slot, buf_read,
-            prev_k, outer, seq_len, out_seq_base, write_offset);
+                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, /*MAIN_HEADS_PER_CTA=*/1,
+                  /*PIPELINE_STAGES=*/1, /*DO_GDC_WAIT=*/false>(
+            smem, params, lane, warp, cur.d_tile, cur.first_head, cur.group_idx, cur.seq,
+            cur.cache_slot, cur.buf_read, cur.prev_k, cur.outer, cur.seq_len, out_seq_base,
+            write_offset);
     }
 
     // Loop-boundary fence: this work-unit's output_head_2k / store_old_x reads of smem must finish
     // before the next work-unit's prefetch_state / load_head / load_x overwrite the same buffers
     // (single-buffered across work-units).  Only when a next iteration exists (uniform condition).
-    if (tile + (int)gridDim.x < total_work) __syncthreads();
+    if (has_next) __syncthreads();
   }
 
   // ── EXTERNAL PDL: signal a programmatic DOWNSTREAM kernel that `output` is fully written

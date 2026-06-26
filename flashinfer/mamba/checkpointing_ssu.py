@@ -38,6 +38,7 @@ def _get_module(
     npredicted: int,
     max_window: int,
     heads_per_group: int,
+    num_groups: int,
     philox_rounds: int = 0,
     enable_pdl: bool = False,
 ):
@@ -54,6 +55,7 @@ def _get_module(
         npredicted,
         max_window,
         heads_per_group,
+        num_groups,
         philox_rounds,
         enable_pdl,
     ).build_and_load()
@@ -117,6 +119,7 @@ def _checkpointing_ssu(
     npredicted: int,
     max_window: int,
     heads_per_group: int,
+    num_groups: int,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
     module = _get_module(
@@ -132,6 +135,7 @@ def _checkpointing_ssu(
         npredicted,
         max_window,
         heads_per_group,
+        num_groups,
         philox_rounds,
         enable_pdl,
     )
@@ -210,6 +214,7 @@ def _checkpointing_ssu_fake(
     npredicted: int,
     max_window: int,
     heads_per_group: int,
+    num_groups: int,
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass
@@ -529,5 +534,6 @@ def checkpointing_ssu(
         npredicted=npredicted,
         max_window=max_window,
         heads_per_group=heads_per_group,
+        num_groups=ngroups,
     )
     return out
