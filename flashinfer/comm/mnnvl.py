@@ -502,14 +502,19 @@ class MnnvlMemory:  # type: ignore[no-redef]
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         allocation_prop.location = location
 
-        if MnnvlMemory._fabric_supported is None:
-            # No communicator-wide decision has been reached yet (e.g. a
-            # standalone call outside open_mnnvl_memory).  Fall back to the
-            # local probe; collective callers reconcile via
-            # _resolve_fabric_support() before reaching this point.
-            MnnvlMemory._fabric_supported = MnnvlMemory._probe_fabric_supported(dev_id)
+        # Use the communicator-wide decision if it has been established via
+        # _resolve_fabric_support(); otherwise fall back to a local probe for
+        # this one-off call.  Do NOT write the local result into
+        # _fabric_supported: that field is reserved for the allgather-agreed
+        # value so that _resolve_fabric_support() is never short-circuited by a
+        # stale per-rank answer.
+        use_fabric = (
+            MnnvlMemory._fabric_supported
+            if MnnvlMemory._fabric_supported is not None
+            else MnnvlMemory._probe_fabric_supported(dev_id)
+        )
 
-        if MnnvlMemory._fabric_supported:
+        if use_fabric:
             allocation_prop.requestedHandleTypes = (
                 cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
             )
@@ -563,101 +568,110 @@ class MnnvlMemory:  # type: ignore[no-redef]
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
 
-        sock_path = os.path.join(
-            tempfile.gettempdir(),
-            f"cuda_fd_xchg_{os.getpid()}_{comm_rank}.sock",
-        )
+        # Place the rendezvous socket inside a private, per-exchange directory
+        # created with 0700 permissions (mkdtemp also gives it an unpredictable
+        # name).  This prevents another local process from pre-binding the path
+        # or connecting to our listener to inject a bogus handle fd: only the
+        # owning user can traverse the directory, and the peer ranks of the same
+        # job share that uid.  A predictable name under the world-writable temp
+        # dir would otherwise be open to squatting/impersonation.
+        xchg_dir = tempfile.mkdtemp(prefix=f"cuda_fd_xchg_{os.getpid()}_{comm_rank}_")
+        sock_path = os.path.join(xchg_dir, "fd.sock")
+
+        # try/finally guarantees the private dir + socket are removed on every
+        # exit path (including the connect-timeout RuntimeError below); a unique
+        # mkdtemp name is not self-healing across runs the way the old fixed
+        # name was, so a leak here would accumulate stale 0700 dirs under /tmp.
+        server = None
         try:
-            os.unlink(sock_path)
-        except FileNotFoundError:
-            pass
+            all_sock_paths = comm.allgather(sock_path)
 
-        all_sock_paths = comm.allgather(sock_path)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(sock_path)
+            server.listen(comm_size)
+            server.settimeout(30.0)
 
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(sock_path)
-        server.listen(comm_size)
-        server.settimeout(30.0)
+            received_fds: List[Optional[int]] = [None] * comm_size
+            received_fds[comm_rank] = local_fd
+            accept_errors = []
 
-        received_fds = [None] * comm_size
-        received_fds[comm_rank] = local_fd
-        accept_errors = []
-
-        def accept_loop():
-            for _ in range(comm_size - 1):
-                try:
-                    conn, _ = server.accept()
-                    rank_bytes = b""
-                    while len(rank_bytes) < 4:
-                        chunk = conn.recv(4 - len(rank_bytes))
-                        if not chunk:
-                            break
-                        rank_bytes += chunk
-                    sender_rank = int.from_bytes(rank_bytes, "little")
-                    fds_arr = array.array("i")
-                    _, ancdata, _, _ = conn.recvmsg(
-                        1, socket.CMSG_SPACE(fds_arr.itemsize)
-                    )
-                    for cmsg_level, cmsg_type, cmsg_data in ancdata:
-                        if (
-                            cmsg_level == socket.SOL_SOCKET
-                            and cmsg_type == socket.SCM_RIGHTS
-                        ):
-                            trim = len(cmsg_data) - (
-                                len(cmsg_data) % fds_arr.itemsize
-                            )
-                            fds_arr.frombytes(cmsg_data[:trim])
-                    if fds_arr:
-                        received_fds[sender_rank] = fds_arr[0]
-                    conn.close()
-                except Exception as exc:
-                    accept_errors.append(exc)
-
-        t = threading.Thread(target=accept_loop, daemon=True)
-        t.start()
-
-        for target_rank in range(comm_size):
-            if target_rank == comm_rank:
-                continue
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            target_path = all_sock_paths[target_rank]
-            deadline = time.monotonic() + 30.0
-            while True:
-                try:
-                    sock.connect(target_path)
-                    break
-                except (ConnectionRefusedError, FileNotFoundError):
-                    if time.monotonic() > deadline:
-                        raise RuntimeError(
-                            f"[MnnvlMemory] timed out connecting to rank "
-                            f"{target_rank} at {target_path}"
+            def accept_loop():
+                for _ in range(comm_size - 1):
+                    try:
+                        conn, _ = server.accept()
+                        rank_bytes = b""
+                        while len(rank_bytes) < 4:
+                            chunk = conn.recv(4 - len(rank_bytes))
+                            if not chunk:
+                                break
+                            rank_bytes += chunk
+                        sender_rank = int.from_bytes(rank_bytes, "little")
+                        fds_arr = array.array("i")
+                        _, ancdata, _, _ = conn.recvmsg(
+                            1, socket.CMSG_SPACE(fds_arr.itemsize)
                         )
-                    time.sleep(0.01)
-            sock.sendall(comm_rank.to_bytes(4, "little"))
-            fds_arr = array.array("i", [local_fd])
-            sock.sendmsg(
-                [b"\x00"],
-                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds_arr)],
-            )
-            sock.close()
+                        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+                            if (
+                                cmsg_level == socket.SOL_SOCKET
+                                and cmsg_type == socket.SCM_RIGHTS
+                            ):
+                                trim = len(cmsg_data) - (
+                                    len(cmsg_data) % fds_arr.itemsize
+                                )
+                                fds_arr.frombytes(cmsg_data[:trim])
+                        if fds_arr:
+                            received_fds[sender_rank] = fds_arr[0]
+                        conn.close()
+                    except Exception as exc:
+                        accept_errors.append(exc)
 
-        t.join(timeout=30.0)
-        server.close()
-        try:
-            os.unlink(sock_path)
-        except FileNotFoundError:
-            pass
+            t = threading.Thread(target=accept_loop, daemon=True)
+            t.start()
 
-        if accept_errors:
-            raise RuntimeError(
-                f"[MnnvlMemory] SCM_RIGHTS accept errors: {accept_errors}"
-            )
-        missing = [i for i, fd in enumerate(received_fds) if fd is None]
-        if missing:
-            raise RuntimeError(
-                f"[MnnvlMemory] did not receive file descriptors from ranks: {missing}"
-            )
-        return received_fds
+            for target_rank in range(comm_size):
+                if target_rank == comm_rank:
+                    continue
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                target_path = all_sock_paths[target_rank]
+                deadline = time.monotonic() + 30.0
+                while True:
+                    try:
+                        sock.connect(target_path)
+                        break
+                    except (ConnectionRefusedError, FileNotFoundError):
+                        if time.monotonic() > deadline:
+                            raise RuntimeError(
+                                f"[MnnvlMemory] timed out connecting to rank "
+                                f"{target_rank} at {target_path}"
+                            ) from None
+                        time.sleep(0.01)
+                sock.sendall(comm_rank.to_bytes(4, "little"))
+                fds_arr = array.array("i", [local_fd])
+                sock.sendmsg(
+                    [b"\x00"],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds_arr)],
+                )
+                sock.close()
+
+            t.join(timeout=30.0)
+
+            if accept_errors:
+                raise RuntimeError(
+                    f"[MnnvlMemory] SCM_RIGHTS accept errors: {accept_errors}"
+                )
+            missing = [i for i, fd in enumerate(received_fds) if fd is None]
+            if missing:
+                raise RuntimeError(
+                    f"[MnnvlMemory] did not receive file descriptors from ranks: {missing}"
+                )
+            return received_fds
+        finally:
+            if server is not None:
+                server.close()
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(sock_path)
+            with contextlib.suppress(OSError):
+                os.rmdir(xchg_dir)
 
     @staticmethod
     def open_mnnvl_memory(mapping: Mapping, size: int):
@@ -710,6 +724,18 @@ class MnnvlMemory:  # type: ignore[no-redef]
         ):
             all_handles_data = comm.allgather(exported_fabric_handle.data)
         else:
+            # SCM_RIGHTS fd passing uses AF_UNIX sockets, which are host-local.
+            # Verify all ranks are on the same host before entering the exchange;
+            # a cross-node communicator would otherwise hang for 30 s per rank.
+            local_host = socket.gethostname()
+            all_hosts = comm.allgather(local_host)
+            if len(set(all_hosts)) != 1:
+                raise RuntimeError(
+                    "[MnnvlMemory] POSIX fd exchange via SCM_RIGHTS requires all "
+                    "ranks to share the same host, but got differing hostnames: "
+                    f"{all_hosts}. Multi-node MNNVL requires a fabric-capable GPU "
+                    "setup (CU_MEM_HANDLE_TYPE_FABRIC)."
+                )
             # Use SCM_RIGHTS (UNIX socket fd passing) to exchange POSIX file
             # descriptors across ranks.  This avoids pidfd_getfd which requires
             # CAP_SYS_PTRACE and is blocked in many container environments.

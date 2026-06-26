@@ -198,6 +198,12 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
         self.mc_ptr = self.handle.multicast_ptr
         if not self.mc_ptr:
+            # Release the symmetric buffer, flag tensor, and handle through the
+            # normal teardown path before bailing out. Otherwise the
+            # partially-constructed workspace is only reclaimed by the base
+            # __del__ safety net at non-deterministic GC time (which also emits
+            # a misleading "not explicitly destroyed" ResourceWarning).
+            self.destroy()
             raise RuntimeError(
                 "[MNNVLAllReduceFusionWorkspace] Multicast pointer is null after rendezvous. "
                 "This kernel requires NVLink multicast support (SM90+ with NVLink, e.g. H100 SXM). "
