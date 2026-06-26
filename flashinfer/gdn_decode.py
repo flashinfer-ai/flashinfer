@@ -596,6 +596,7 @@ def gated_delta_rule_mtp(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
+    ssm_state_indices: Optional[torch.Tensor] = None,
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -738,6 +739,33 @@ def gated_delta_rule_mtp(
         cache_steps = T
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=q.device)
 
+    # FLA-style per-token pool scatter. When provided, the kernel writes each
+    # h_{t+1} directly to initial_state[ssm_state_indices[i, t]] instead of
+    # to a dense intermediate_states_buffer. same_pool semantics only — the
+    # final-state writeback to initial_state_indices[i] is skipped to avoid
+    # clobbering h_0 (the per-token scatter at t=T-1 already wrote h_T to
+    # its assigned pool slot). Caller pre-allocates B*T fresh slots from
+    # the free-list and sizes the pool for at least B*(T+1) slots.
+    per_token_pool_scatter = ssm_state_indices is not None
+    if per_token_pool_scatter:
+        assert intermediate_states_buffer is None, (
+            "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
+        )
+        assert not disable_state_update, (
+            "ssm_state_indices requires state writes; disable_state_update must be False"
+        )
+        assert T >= 2, f"ssm_state_indices requires T >= 2 (got T={T})"
+        assert ssm_state_indices.shape == (B, T), (
+            f"ssm_state_indices must have shape [B={B}, T={T}], "
+            f"got {tuple(ssm_state_indices.shape)}"
+        )
+        assert ssm_state_indices.dtype == torch.int32, (
+            f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
+        )
+        assert ssm_state_indices.device == q.device, (
+            f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
+        )
+
     # Execute kernel
     run_mtp_decode(
         h0_source,
@@ -765,6 +793,7 @@ def gated_delta_rule_mtp(
         use_qk_l2norm,
         disable_state_update,
         cache_intermediate_states,
+        ssm_state_indices=ssm_state_indices,
     )
 
     # Copy state back if needed (no sync needed - PyTorch handles stream ordering)
