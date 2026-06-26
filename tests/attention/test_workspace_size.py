@@ -29,8 +29,7 @@ def _paged_kv_inputs(batch_size: int, kv_len: int, page_size: int):
     pages_per_seq = (kv_len + page_size - 1) // page_size
     total_pages = batch_size * pages_per_seq
     indptr = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
-        * pages_per_seq
+        torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * pages_per_seq
     )
     indices = torch.arange(total_pages, dtype=torch.int32, device="cuda")
     last_page_len = torch.full(
@@ -57,9 +56,7 @@ def test_batch_decode_workspace_size_plans_with_exact_buffers():
     logits_soft_cap = 0.0
     window_left = -1
 
-    indptr, indices, last_page_len = _paged_kv_inputs(
-        batch_size, kv_len, page_size
-    )
+    indptr, indices, last_page_len = _paged_kv_inputs(batch_size, kv_len, page_size)
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         _byte_workspace(32 * 1024 * 1024)
     )
@@ -128,9 +125,7 @@ def test_batch_prefill_workspace_size_plans_with_exact_buffers():
     head_dim = 128
     fixed_split_size = -1
 
-    qo_indptr = (
-        torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * qo_len
-    )
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * qo_len
     paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = _paged_kv_inputs(
         batch_size, kv_len, page_size
     )
