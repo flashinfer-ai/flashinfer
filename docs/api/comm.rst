@@ -119,6 +119,16 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+FP8 Quantized AllReduce
+-----------------------
+
+.. currentmodule:: flashinfer.comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    quantized_all_reduce
+
 vLLM AllReduce
 --------------
 
