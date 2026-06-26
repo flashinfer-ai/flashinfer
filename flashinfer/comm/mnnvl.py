@@ -425,7 +425,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         self,
         *,
         comm: Optional[CommBackend] = None,
-        zero_local: bool = True,
     ) -> None:
         """Map fresh MNNVL handles at the preserved virtual addresses.
 
@@ -434,7 +433,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         MnnvlMemory._reattach_mnnvl_handles(
             self.ptr,
             comm=comm,
-            zero_local=zero_local,
         )
 
     def get_graph_visible_addresses(self) -> Dict[str, Any]:
@@ -654,7 +652,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         address_offset: int,
         *,
         comm: Optional[CommBackend] = None,
-        zero_local: bool = False,
     ) -> List[Any]:
         dev = checkCudaErrors(cuda.cuCtxGetDevice())
         dev_id = int(dev)
@@ -694,10 +691,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handles[i], 0)
             )
             checkCudaErrors(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
-
-        if zero_local:
-            local_ptr = start_address + rank_stride * comm_rank + address_offset
-            checkCudaErrors(cuda.cuMemsetD8(local_ptr, 0, aligned_size))
 
         return mem_handles
 
@@ -830,7 +823,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         *,
         comm: Optional[CommBackend] = None,
         config: Optional[MnnvlConfig] = None,
-        zero_local: bool = True,
     ) -> None:
         record = MnnvlMemory.allocated_map[ptr]
         if config is not None and comm is not None:
@@ -880,7 +872,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
             record.rank_stride,
             record.address_offset,
             comm=comm,
-            zero_local=zero_local,
         )
         record.mapped = True
 
