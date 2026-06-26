@@ -233,7 +233,7 @@ def get_batch_decode_module(*args):
     uri = get_batch_decode_uri(*args)
     mod = gen_batch_decode_module(*args).build_and_load()
     plan_func = mod.plan
-    workspace_size_func = mod.workspace_size
+    workspace_size_func = getattr(mod, "workspace_size", None)
     run_func = mod.run
 
     # torch library for batch_decode_with_paged_kv_cache_run
@@ -735,7 +735,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
-            buffer should be the same as the device of the input tensors.
+            buffer should be the same as the device of the input tensors. The buffer must be
+            16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
@@ -1888,7 +1889,8 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
-            buffer should be the same as the device of the input tensors.
+            buffer should be the same as the device of the input tensors. The buffer must be
+            16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         use_cuda_graph : bool
             Whether to enable CUDAGraph for batch decode attention, if enabled, the

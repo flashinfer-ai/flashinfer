@@ -447,7 +447,7 @@ def get_batch_prefill_module(backend, *args):
         uri = get_batch_prefill_uri(backend, *args)
         module = gen_batch_prefill_module(backend, *args).build_and_load()
         plan_func = module.plan
-        workspace_size_func = module.workspace_size
+        workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
 
@@ -1593,7 +1593,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor
             The user reserved workspace buffer used to store intermediate attention results in
             split-k algorithm. The recommended size is 128MB, the device of the workspace buffer
-            should be the same as the device of the input tensors.
+            should be the same as the device of the input tensors. The buffer must be 16-byte
+            aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
@@ -2736,7 +2737,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
-            buffer should be the same as the device of the input tensors.
+            buffer should be the same as the device of the input tensors. The buffer must be
+            16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
