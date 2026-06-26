@@ -556,19 +556,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         return comm
 
     @staticmethod
-    def refresh_comm_from_config(mapping: Mapping, config: MnnvlConfig) -> CommBackend:
-        if config.comm_backend is None:
-            raise RuntimeError(
-                "MNNVL reattach config must provide a communication backend"
-            )
-        MnnvlMemory.config = config
-        comm = config.comm_backend.Split(
-            mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
-        )
-        MnnvlMemory.comm = comm
-        return comm
-
-    @staticmethod
     def get_allocation_prop(dev_id: int):
         location = cuda.CUmemLocation()
         location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
@@ -795,20 +782,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         return ptr, stride
 
     @staticmethod
-    def _validate_remap_comm(
-        record: _MnnvlAllocationRecord, comm: CommBackend
-    ) -> None:
-        comm_size = comm.Get_size()
-        comm_rank = comm.Get_rank()
-        if comm_size != record.comm_size or comm_rank != record.comm_rank:
-            raise RuntimeError(
-                "Restored MNNVL communicator does not match the graph-visible "
-                "allocation layout: "
-                f"rank/size {comm_rank}/{comm_size} != "
-                f"{record.comm_rank}/{record.comm_size}"
-            )
-
-    @staticmethod
     def _unmap_and_release_mnnvl_handles(record: _MnnvlAllocationRecord) -> None:
         for i in range(record.comm_size):
             rank_ptr = (
@@ -886,10 +859,28 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 "call detach_handles before checkpoint reattach"
             )
         if config is not None:
-            comm = MnnvlMemory.refresh_comm_from_config(record.mapping, config)
+            if config.comm_backend is None:
+                raise RuntimeError(
+                    "MNNVL reattach config must provide a communication backend"
+                )
+            MnnvlMemory.config = config
+            comm = config.comm_backend.Split(
+                record.mapping.pp_rank * record.mapping.cp_size
+                + record.mapping.cp_rank,
+                record.mapping.tp_rank,
+            )
+            MnnvlMemory.comm = comm
         else:
             comm = comm or record.comm
-        MnnvlMemory._validate_remap_comm(record, comm)
+        comm_size = comm.Get_size()
+        comm_rank = comm.Get_rank()
+        if comm_size != record.comm_size or comm_rank != record.comm_rank:
+            raise RuntimeError(
+                "Restored MNNVL communicator does not match the graph-visible "
+                "allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
+            )
         record.comm = comm
         mapped_states = comm.allgather(record.mapped)
         if any(mapped_states) and not all(mapped_states):
