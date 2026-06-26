@@ -42,6 +42,8 @@ struct AlignedAllocator {
         remaining_space(space),
         allocated_space(0),
         count_only(false) {}
+  // Counting mode starts from offset 0 and assumes caller-owned workspace
+  // buffers are aligned to every allocation alignment requested below.
   explicit AlignedAllocator(size_t space = std::numeric_limits<size_t>::max())
       : base_ptr(nullptr),
         cur_ptr(nullptr),

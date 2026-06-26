@@ -429,6 +429,7 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
                               typename Params::IdType* indptr_h, uint32_t batch_size,
                               uint32_t num_qo_heads, uint32_t page_size, bool enable_cuda_graph,
                               cudaStream_t stream, WorkEstimationFunc work_estimation_func) {
+  // IMPORTANT: keep workspace allocations in sync with DecodePlanWorkspaceSize.
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
   bool split_kv;
@@ -499,6 +500,7 @@ inline cudaError_t DecodePlanWorkspaceSize(size_t& float_workspace_size_in_bytes
                                            uint32_t num_qo_heads, uint32_t page_size,
                                            bool enable_cuda_graph, cudaStream_t stream,
                                            WorkEstimationFunc work_estimation_func) {
+  // IMPORTANT: keep workspace size accounting in sync with DecodePlan.
   using IdType = typename Params::IdType;
   bool split_kv;
   uint32_t max_grid_size, kv_chunk_size_in_pages, new_batch_size, gdy;
@@ -745,6 +747,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
                                cudaStream_t stream) {
+  // IMPORTANT: keep workspace allocations in sync with PrefillPlanWorkspaceSize.
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -846,6 +849,7 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
     bool disable_split_kv, int64_t num_colocated_ctas, cudaStream_t stream) {
+  // IMPORTANT: keep workspace size accounting in sync with PrefillPlan.
   (void)head_dim_qk;
   (void)sizeof_dtype_o;
   (void)stream;
