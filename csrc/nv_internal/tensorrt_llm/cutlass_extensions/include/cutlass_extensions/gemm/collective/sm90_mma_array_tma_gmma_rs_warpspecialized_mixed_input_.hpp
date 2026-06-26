@@ -92,8 +92,7 @@ struct CollectiveMmaArrayMixedInput<
   // the scale / zero is void.
   using NonVoidElementScale =
       cute::conditional_t<cute::is_void_v<ElementScale>, float, ElementScale>;
-  using NonVoidElementZero =
-      cute::conditional_t<cute::is_void_v<ElementZero>, float, ElementZero>;
+  using NonVoidElementZero = cute::conditional_t<cute::is_void_v<ElementZero>, float, ElementZero>;
   static constexpr bool HasActivationScale = false;
   using ElementActivationScale = void;
   using NonVoidElementActivationScale = cutlass::float_ue8m0_t;
@@ -212,8 +211,9 @@ struct CollectiveMmaArrayMixedInput<
   using SmemCopyAtomScale = Copy_Atom<cute::AutoVectorizingCopy, NonVoidElementScale>;
 
   using WeightScaleRawElement = NonVoidElementScale;
-  static_assert(!cutlass::detail::is_Array_v<NonVoidElementScale>,
-                "Folded weight scale uses scalar scale storage; packed scale arrays are not supported.");
+  static_assert(
+      !cutlass::detail::is_Array_v<NonVoidElementScale>,
+      "Folded weight scale uses scalar scale storage; packed scale arrays are not supported.");
   static_assert(cute::is_void_v<ElementZero>,
                 "Folded weight scale storage does not support zero-point.");
   static constexpr int WeightScaleLogicalMPerFoldBlock = 64;
@@ -247,77 +247,66 @@ struct CollectiveMmaArrayMixedInput<
       WeightScaleLogicalMPerFoldBlock * WeightScaleLogicalKPerFoldBlock / ScalingGroupSize;
   static constexpr int WeightScaleRawElementsPerStage =
       WeightScaleRawElementsPerFoldBlock * WeightScaleMBlocksPerTile * WeightScaleKBlocksPerTile;
-  static constexpr uint32_t WeightScaleFoldBlockBytes =
-      cutlass::bits_to_bytes(WeightScaleRawElementsPerFoldBlock *
-                             cutlass::sizeof_bits<WeightScaleRawElement>::value);
+  static constexpr uint32_t WeightScaleFoldBlockBytes = cutlass::bits_to_bytes(
+      WeightScaleRawElementsPerFoldBlock * cutlass::sizeof_bits<WeightScaleRawElement>::value);
   static constexpr uint32_t WeightScaleBulkCopyBytes =
       WeightScaleFoldBlockBytes * WeightScaleKBlocksPerTile;
-  static constexpr uint32_t WeightScaleTransactionBytes =
-      cutlass::bits_to_bytes(WeightScaleRawElementsPerStage *
-                             cutlass::sizeof_bits<WeightScaleRawElement>::value);
+  static constexpr uint32_t WeightScaleTransactionBytes = cutlass::bits_to_bytes(
+      WeightScaleRawElementsPerStage * cutlass::sizeof_bits<WeightScaleRawElement>::value);
   static_assert(WeightScaleBulkCopyBytes % 16 == 0,
                 "Folded weight-scale bulk copy size must be 16B aligned.");
 
-  static constexpr bool IsInt4Fp8Path =
-      cute::is_same_v<ElementA, cutlass::int4b_t> &&
-      cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
-  static constexpr bool IsMxfp4Bf16Path =
-      IsMXFP4 && cute::is_same_v<ElementB, cutlass::bfloat16_t>;
+  static constexpr bool IsInt4Fp8Path = cute::is_same_v<ElementA, cutlass::int4b_t> &&
+                                        cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
+  static constexpr bool IsMxfp4Bf16Path = IsMXFP4 && cute::is_same_v<ElementB, cutlass::bfloat16_t>;
   static constexpr bool IsMxfp4Fp8Path =
       IsMXFP4 && cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
 
   static constexpr bool UseDirectSmemWeightScale =
-      (
-        (IsMxfp4Fp8Path &&
-         ((size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 64 &&
-           size<0>(ClusterShape{}) == 1 && size<1>(ClusterShape{}) == 1) ||
-          (size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 128 &&
-           size<2>(TileShape{}) == 256 && size<0>(ClusterShape{}) == 1 &&
-           size<1>(ClusterShape{}) == 1) ||
-          (size<0>(TileShape{}) == 128 && size<1>(TileShape{}) == 256 &&
-           size<2>(TileShape{}) == 256) ||
-          (size<0>(TileShape{}) == 256 && size<1>(TileShape{}) == 128 &&
-           size<2>(TileShape{}) == 256) ||
-          (size<0>(TileShape{}) == 128 && size<1>(TileShape{}) == 64 &&
-           size<2>(TileShape{}) == 512 &&
-           (size<0>(ClusterShape{}) != 1 || size<1>(ClusterShape{}) != 1)))) ||
-        (IsMxfp4Bf16Path &&
-         ((size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 64 &&
-           size<0>(ClusterShape{}) == 1 && size<1>(ClusterShape{}) == 1) ||
-          (size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 128 &&
-           size<2>(TileShape{}) == 256 && size<0>(ClusterShape{}) == 1 &&
-           size<1>(ClusterShape{}) == 1))) ||
-        (IsInt4Fp8Path &&
-         ((size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 64 &&
-           size<2>(TileShape{}) == 256 && size<0>(ClusterShape{}) == 1 &&
-           size<1>(ClusterShape{}) == 1) ||
-          (size<0>(TileShape{}) == 128 && size<1>(TileShape{}) == 64 &&
-           size<2>(TileShape{}) == 512 && size<0>(ClusterShape{}) == 1 &&
-           size<1>(ClusterShape{}) == 2)))
-      );
-  using SmemLayoutWeightScaleRaw = Layout<
-      Shape<Int<WeightScalePhysicalColsPerFoldBlock>, Int<WeightScaleFoldedMPerFoldBlock>,
-            Int<WeightScaleMBlocksPerTile>, Int<WeightScaleKBlocksPerTile>, Int<Stages>>,
-      Stride<_1, Int<WeightScalePhysicalColsPerFoldBlock>,
-             Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock *
-                 WeightScaleKBlocksPerTile>,
-             Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock>,
-             Int<WeightScaleRawElementsPerStage>>>;
+      ((IsMxfp4Fp8Path && ((size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 64 &&
+                            size<0>(ClusterShape{}) == 1 && size<1>(ClusterShape{}) == 1) ||
+                           (size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 128 &&
+                            size<2>(TileShape{}) == 256 && size<0>(ClusterShape{}) == 1 &&
+                            size<1>(ClusterShape{}) == 1) ||
+                           (size<0>(TileShape{}) == 128 && size<1>(TileShape{}) == 256 &&
+                            size<2>(TileShape{}) == 256) ||
+                           (size<0>(TileShape{}) == 256 && size<1>(TileShape{}) == 128 &&
+                            size<2>(TileShape{}) == 256) ||
+                           (size<0>(TileShape{}) == 128 && size<1>(TileShape{}) == 64 &&
+                            size<2>(TileShape{}) == 512 &&
+                            (size<0>(ClusterShape{}) != 1 || size<1>(ClusterShape{}) != 1)))) ||
+       (IsMxfp4Bf16Path && ((size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 64 &&
+                             size<0>(ClusterShape{}) == 1 && size<1>(ClusterShape{}) == 1) ||
+                            (size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 128 &&
+                             size<2>(TileShape{}) == 256 && size<0>(ClusterShape{}) == 1 &&
+                             size<1>(ClusterShape{}) == 1))) ||
+       (IsInt4Fp8Path &&
+        ((size<0>(TileShape{}) == 64 && size<1>(TileShape{}) == 64 && size<2>(TileShape{}) == 256 &&
+          size<0>(ClusterShape{}) == 1 && size<1>(ClusterShape{}) == 1) ||
+         (size<0>(TileShape{}) == 128 && size<1>(TileShape{}) == 64 &&
+          size<2>(TileShape{}) == 512 && size<0>(ClusterShape{}) == 1 &&
+          size<1>(ClusterShape{}) == 2))));
+  using SmemLayoutWeightScaleRaw =
+      Layout<Shape<Int<WeightScalePhysicalColsPerFoldBlock>, Int<WeightScaleFoldedMPerFoldBlock>,
+                   Int<WeightScaleMBlocksPerTile>, Int<WeightScaleKBlocksPerTile>, Int<Stages>>,
+             Stride<_1, Int<WeightScalePhysicalColsPerFoldBlock>,
+                    Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock *
+                        WeightScaleKBlocksPerTile>,
+                    Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock>,
+                    Int<WeightScaleRawElementsPerStage>>>;
   using SmemLayoutWeightScaleExpanded = Layout<
       Shape<Shape<Int<WeightScaleFoldedMPerFoldBlock>, Int<WeightScaleMSlicesPerFoldBlock>,
                   Int<WeightScaleMBlocksPerTile>>,
             Shape<Int<ScalingGroupSize>,
-                  Shape<Int<WeightScaleScaleGroupsPerFoldBlock>,
-                        Int<WeightScaleKBlocksPerTile>>>,
+                  Shape<Int<WeightScaleScaleGroupsPerFoldBlock>, Int<WeightScaleKBlocksPerTile>>>,
             Int<Stages>>,
-      Stride<Stride<Int<WeightScalePhysicalColsPerFoldBlock>,
-                    Int<WeightScaleScaleGroupsPerFoldBlock>,
-                    Int<WeightScaleFoldedMPerFoldBlock *
-                        WeightScalePhysicalColsPerFoldBlock * WeightScaleKBlocksPerTile>>,
-             Stride<_0, Stride<_1,
-                                Int<WeightScaleFoldedMPerFoldBlock *
+      Stride<
+          Stride<Int<WeightScalePhysicalColsPerFoldBlock>, Int<WeightScaleScaleGroupsPerFoldBlock>,
+                 Int<WeightScaleFoldedMPerFoldBlock * WeightScalePhysicalColsPerFoldBlock *
+                     WeightScaleKBlocksPerTile>>,
+          Stride<_0, Stride<_1, Int<WeightScaleFoldedMPerFoldBlock *
                                     WeightScalePhysicalColsPerFoldBlock>>>,
-             Int<WeightScaleRawElementsPerStage>>>;
+          Int<WeightScaleRawElementsPerStage>>>;
 
   static_assert(DispatchPolicy::Stages >= 2,
                 "Specialization requires Stages set to value 2 or more.");
@@ -346,8 +335,7 @@ struct CollectiveMmaArrayMixedInput<
 
  public:
   static constexpr ConversionMode KernelConversionMode = get_conversion_mode();
-  static constexpr bool ModeHasScales =
-      KernelConversionMode == ConversionMode::ConvertAndScale;
+  static constexpr bool ModeHasScales = KernelConversionMode == ConversionMode::ConvertAndScale;
   static constexpr bool UseScaleLookupTable =
       KernelConversionMode == ConversionMode::ConvertAndScale &&
       cutlass::detail::is_Array_v<ElementScale>;
@@ -414,14 +402,14 @@ struct CollectiveMmaArrayMixedInput<
     // a static non-zero value so the A/weight TMA descriptor is created as 3D
     // and can select the expert through the L coordinate. Int<32> is the
     // minimum static value that becomes 16 bytes after FP4 subbyte upcast.
-    using TmaStrideA = cute::conditional_t<
-        IsGroupedGemmKernel && !cute::is_layout<InternalSwappedStrideA>::value,
-        decltype(cute::make_stride(cute::get<0>(InternalSwappedStrideA{}),
-                                   cute::get<1>(InternalSwappedStrideA{}),
-                                   cute::Int<32>{})),
-        InternalSwappedStrideA>;
-    using LayoutA = decltype(detail::get_gmem_layout(
-        repeat_like(TmaStrideA{}, int32_t(0)), TmaStrideA{}));
+    using TmaStrideA =
+        cute::conditional_t<IsGroupedGemmKernel && !cute::is_layout<InternalSwappedStrideA>::value,
+                            decltype(cute::make_stride(cute::get<0>(InternalSwappedStrideA{}),
+                                                       cute::get<1>(InternalSwappedStrideA{}),
+                                                       cute::Int<32>{})),
+                            InternalSwappedStrideA>;
+    using LayoutA =
+        decltype(detail::get_gmem_layout(repeat_like(TmaStrideA{}, int32_t(0)), TmaStrideA{}));
     using LayoutB = decltype(detail::get_gmem_layout(
         repeat_like(InternalSwappedStrideB{}, int32_t(0)), InternalSwappedStrideB{}));
 
@@ -798,8 +786,8 @@ struct CollectiveMmaArrayMixedInput<
 
       int write_stage = smem_pipe_write.index();
       if (cute::elect_one_sync()) {
-        copy(mainloop_params.tma_load_a.with(mainloop_params.ptr_A_prebuilt_tma_desc,
-                                             *tma_barrier, mcast_mask_a),
+        copy(mainloop_params.tma_load_a.with(mainloop_params.ptr_A_prebuilt_tma_desc, *tma_barrier,
+                                             mcast_mask_a),
              tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, write_stage));
         copy(mainloop_params.tma_load_b.with(current_tma_desc_b_, *tma_barrier, mcast_mask_b),
              tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, write_stage));
@@ -823,16 +811,15 @@ struct CollectiveMmaArrayMixedInput<
                ++local_m64_block) {
             int const m64_block = scale_m64_offset + local_m64_block;
             int64_t const scale_gmem_fold_block =
-                int64_t(m64_block) * int64_t(scale_total_k128_blocks) +
-                int64_t(scale_k128_offset);
+                int64_t(m64_block) * int64_t(scale_total_k128_blocks) + int64_t(scale_k128_offset);
             int64_t const scale_gmem_offset =
                 scale_gmem_fold_block * int64_t(WeightScaleRawElementsPerFoldBlock);
             auto* scale_gmem_addr = reinterpret_cast<void const*>(scale_base + scale_gmem_offset);
             auto* scale_smem_addr =
                 static_cast<void*>(&sSRaw(0, 0, local_m64_block, 0, write_stage));
-            cute::SM90_BULK_COPY_G2S::copy(
-                scale_gmem_addr, reinterpret_cast<uint64_t*>(tma_barrier), scale_smem_addr,
-                WeightScaleBulkCopyBytes);
+            cute::SM90_BULK_COPY_G2S::copy(scale_gmem_addr,
+                                           reinterpret_cast<uint64_t*>(tma_barrier),
+                                           scale_smem_addr, WeightScaleBulkCopyBytes);
           }
         }
       } else {
@@ -876,8 +863,7 @@ struct CollectiveMmaArrayMixedInput<
   }
 
   template <class ScaleTensor>
-  CUTLASS_DEVICE float load_weight_scale(ScaleTensor const& tCrS, int scale_idx, int mma_m,
-                                         int m) {
+  CUTLASS_DEVICE float load_weight_scale(ScaleTensor const& tCrS, int scale_idx, int mma_m, int m) {
     return scale_convertor(tCrS(make_coord(make_tuple(0, m, 0), mma_m, scale_idx)));
   }
 
@@ -1024,11 +1010,11 @@ struct CollectiveMmaArrayMixedInput<
     constexpr int KBlockMaxForScale = size<2>(TileShape{}) / MmaKPerKBlock;
     constexpr int NumChunksPerTileK = cute::size<1>(sA.shape())() / ScalingGroupSize;
 
-    Tensor sS =
-        make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()), SmemLayoutWeightScaleExpanded{});
+    Tensor sS = make_tensor(make_smem_ptr(shared_tensors.smem_scale.begin()),
+                            SmemLayoutWeightScaleExpanded{});
     Tensor tCsS = mma_thread_slice.partition_A(sS);
-    Tensor tCrS =
-        make_tensor<WeightScaleRawElement>(mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).layout());
+    Tensor tCrS = make_tensor<WeightScaleRawElement>(
+        mma_thread_slice.partition_fragment_A(sS(_, _, Int<0>{})).layout());
 
     using SmemCopyAtomScaleRaw = Copy_Atom<cute::AutoVectorizingCopy, WeightScaleRawElement>;
     auto smem_tiled_copy_S = make_tiled_copy_A(SmemCopyAtomScaleRaw{}, tiled_mma);
@@ -1068,8 +1054,7 @@ struct CollectiveMmaArrayMixedInput<
                    make_shape(ABBitWidthRatio{}, size<2>(old_shape))),
         make_stride(Int<1>{}, size<0>(old_shape) * ABBitWidthRatio{},
                     make_stride(size<0>(old_shape),
-                                size<0>(old_shape) * ABBitWidthRatio{} *
-                                    size<1>(old_shape))));
+                                size<0>(old_shape) * ABBitWidthRatio{} * size<1>(old_shape))));
     Tensor tCrA_load_4b_packed = make_tensor(ptr, tCrA_load_4b_layout);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1154,8 +1139,7 @@ struct CollectiveMmaArrayMixedInput<
 
           // (V,M) x (V,N) => (V,M,N)
           cute::gemm(tiled_mma, tCrA_mma(_, _, cute::Int<k_block>{}),
-                     tCrB(_, _, cute::Int<k_block>{}, read_stage),
-                     intermediate_array[chunk_id]);
+                     tCrB(_, _, cute::Int<k_block>{}, read_stage), intermediate_array[chunk_id]);
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
           if constexpr (k_block == 0) {
@@ -1167,8 +1151,7 @@ struct CollectiveMmaArrayMixedInput<
                                   k_block + 2, read_stage);
           }
           if constexpr (k_block < K_BLOCK_MAX - 1) {
-            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma,
-                                    cute::Int<k_block + 1>{});
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<k_block + 1>{});
           }
         });
 
@@ -1180,8 +1163,7 @@ struct CollectiveMmaArrayMixedInput<
           constexpr int chunk_id_ = chunk_id - 1;
           warpgroup_fence_operand(intermediate_array[chunk_id_]);
 
-          scale_intermediate(intermediate_array[chunk_id_], chunk_id_, read_stage,
-                             chunk_id_ == 0);
+          scale_intermediate(intermediate_array[chunk_id_], chunk_id_, read_stage, chunk_id_ == 0);
         }
       });
 
@@ -1234,8 +1216,7 @@ struct CollectiveMmaArrayMixedInput<
           warpgroup_arrive();
           // (V,M) x (V,N) => (V,M,N)
           cute::gemm(tiled_mma, tCrA_mma(_, _, cute::Int<k_block>{}),
-                     tCrB(_, _, cute::Int<k_block>{}, read_stage),
-                     intermediate_array[chunk_id]);
+                     tCrB(_, _, cute::Int<k_block>{}, read_stage), intermediate_array[chunk_id]);
           tiled_mma.accumulate_ = GMMA::ScaleOut::One;
 
           if constexpr (k_block == K_BLOCK_MAX - 1) {
@@ -1271,8 +1252,7 @@ struct CollectiveMmaArrayMixedInput<
               Utils::copy_tensors_A(smem_tiled_copy_A_LDSM, tCsA_LDSM, tCrA_copy_view_LDSM,
                                     k_block + 2, read_stage);
             }
-            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma,
-                                    cute::Int<k_block + 1>{});
+            Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<k_block + 1>{});
           }
         });
 
@@ -1325,8 +1305,7 @@ struct CollectiveMmaArrayMixedInput<
                                 read_stage);
         }
         if constexpr (k_block < K_BLOCK_MAX - 1) {
-          Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma,
-                                  cute::Int<k_block + 1>{});
+          Utils::convert_A_kblock(tCrA_load_4b_packed, tCrA_mma, cute::Int<k_block + 1>{});
         }
 
         if constexpr ((k_block + 1) % NumMMAsPerChunk == 0) {
@@ -1366,8 +1345,7 @@ struct CollectiveMmaArrayMixedInput<
   //
   CUTLASS_DEVICE auto tensormaps_init(Params const& mainloop_params,
                                       [[maybe_unused]] TensorMapStorage& shared_tensormaps,
-                                      [[maybe_unused]] int32_t sm_count,
-                                      int32_t sm_idx) {
+                                      [[maybe_unused]] int32_t sm_count, int32_t sm_idx) {
     (void)sm_idx;
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return cute::make_tuple(mainloop_params.ptr_A_prebuilt_tma_desc,

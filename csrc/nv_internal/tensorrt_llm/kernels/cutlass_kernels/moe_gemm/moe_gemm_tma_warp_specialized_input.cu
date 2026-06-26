@@ -78,12 +78,10 @@ size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts,
   return tensorrt_llm::common::calculateTotalWorkspaceSize(buffers.data(), buffers.size());
 }
 
-void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, int num_experts,
-                                                            void* gemm_workspace,
-                                                            size_t gemm_workspace_size,
-                                                            void* precomputed_scheduler_workspace,
-                                                            size_t precomputed_scheduler_workspace_size,
-                                                            FpXBlockScalingType scaling_type) {
+void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(
+    int8_t* start_ptr, int num_experts, void* gemm_workspace, size_t gemm_workspace_size,
+    void* precomputed_scheduler_workspace, size_t precomputed_scheduler_workspace_size,
+    FpXBlockScalingType scaling_type) {
   auto buffers = workspaceBuffers(num_experts, scaling_type);
   std::array<int8_t*, 20> pointers{};
   TLLM_CHECK_WITH_INFO(pointers.size() == buffers.size(),

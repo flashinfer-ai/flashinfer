@@ -298,7 +298,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
         runner_dict: Dict[
-            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool, bool, bool], Any
+            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool, bool, bool],
+            Any,
         ] = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
@@ -453,9 +454,14 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                     gemm_k = int(fc2_expert_weights.shape[2])
 
             try:
-                get_valid_tactics_for_shape = self.fused_moe_runner.get_valid_tactics_for_shape
+                get_valid_tactics_for_shape = (
+                    self.fused_moe_runner.get_valid_tactics_for_shape
+                )
                 shape_valid_tactics = set(
-                    int(t) for t in get_valid_tactics_for_shape(int(stage), int(gemm_n), int(gemm_k))
+                    int(t)
+                    for t in get_valid_tactics_for_shape(
+                        int(stage), int(gemm_n), int(gemm_k)
+                    )
                 )
             except AttributeError:
                 return valid_tactics
@@ -624,7 +630,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             )
         else:
             if len(profile_ids) != 2:
-                raise ValueError("profile_ids must contain [gemm1_profile, gemm2_profile]")
+                raise ValueError(
+                    "profile_ids must contain [gemm1_profile, gemm2_profile]"
+                )
             gemm_tactic_1, gemm_tactic_2 = profile_ids
 
         run_moe = (

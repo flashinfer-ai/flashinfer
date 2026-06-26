@@ -85,7 +85,7 @@ constexpr bool isValidHopperMOESpecialisation() {
 #ifdef ENABLE_FP4
           || cutlass::platform::is_same<Fp4Type, WeightType>::value
 #endif
-              )
+          )
 #ifdef ENABLE_FP4
          && !cutlass::platform::is_same<T, Fp4Type>::value
 #endif

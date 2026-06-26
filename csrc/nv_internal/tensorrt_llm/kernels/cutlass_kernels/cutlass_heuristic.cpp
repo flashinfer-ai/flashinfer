@@ -203,34 +203,20 @@ std::vector<CutlassTileConfigSM90> get_candidate_tiles_sm90(
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
     if (config & CutlassGemmConfig::WEIGHT_ONLY) {
       return {
-          CutlassTileConfigSM90::CtaShape64x16x128B,
-          CutlassTileConfigSM90::CtaShape64x16x256B,
-          CutlassTileConfigSM90::CtaShape64x16x512B,
-          CutlassTileConfigSM90::CtaShape64x32x128B,
-          CutlassTileConfigSM90::CtaShape64x32x256B,
-          CutlassTileConfigSM90::CtaShape64x32x512B,
-          CutlassTileConfigSM90::CtaShape64x64x128B,
-          CutlassTileConfigSM90::CtaShape64x64x256B,
-          CutlassTileConfigSM90::CtaShape64x64x512B,
-          CutlassTileConfigSM90::CtaShape64x128x128B,
-          CutlassTileConfigSM90::CtaShape64x128x256B,
-          CutlassTileConfigSM90::CtaShape64x128x512B,
-          CutlassTileConfigSM90::CtaShape128x16x128B,
-          CutlassTileConfigSM90::CtaShape128x16x256B,
-          CutlassTileConfigSM90::CtaShape128x16x512B,
-          CutlassTileConfigSM90::CtaShape128x32x128B,
-          CutlassTileConfigSM90::CtaShape128x32x256B,
-          CutlassTileConfigSM90::CtaShape128x32x512B,
-          CutlassTileConfigSM90::CtaShape128x64x128B,
-          CutlassTileConfigSM90::CtaShape128x64x256B,
-          CutlassTileConfigSM90::CtaShape128x64x512B,
-          CutlassTileConfigSM90::CtaShape128x128x128B,
-          CutlassTileConfigSM90::CtaShape128x128x256B,
-          CutlassTileConfigSM90::CtaShape128x128x512B,
-          CutlassTileConfigSM90::CtaShape128x256x128B,
-          CutlassTileConfigSM90::CtaShape128x256x256B,
-          CutlassTileConfigSM90::CtaShape256x128x128B,
-          CutlassTileConfigSM90::CtaShape256x128x256B,
+          CutlassTileConfigSM90::CtaShape64x16x128B,   CutlassTileConfigSM90::CtaShape64x16x256B,
+          CutlassTileConfigSM90::CtaShape64x16x512B,   CutlassTileConfigSM90::CtaShape64x32x128B,
+          CutlassTileConfigSM90::CtaShape64x32x256B,   CutlassTileConfigSM90::CtaShape64x32x512B,
+          CutlassTileConfigSM90::CtaShape64x64x128B,   CutlassTileConfigSM90::CtaShape64x64x256B,
+          CutlassTileConfigSM90::CtaShape64x64x512B,   CutlassTileConfigSM90::CtaShape64x128x128B,
+          CutlassTileConfigSM90::CtaShape64x128x256B,  CutlassTileConfigSM90::CtaShape64x128x512B,
+          CutlassTileConfigSM90::CtaShape128x16x128B,  CutlassTileConfigSM90::CtaShape128x16x256B,
+          CutlassTileConfigSM90::CtaShape128x16x512B,  CutlassTileConfigSM90::CtaShape128x32x128B,
+          CutlassTileConfigSM90::CtaShape128x32x256B,  CutlassTileConfigSM90::CtaShape128x32x512B,
+          CutlassTileConfigSM90::CtaShape128x64x128B,  CutlassTileConfigSM90::CtaShape128x64x256B,
+          CutlassTileConfigSM90::CtaShape128x64x512B,  CutlassTileConfigSM90::CtaShape128x128x128B,
+          CutlassTileConfigSM90::CtaShape128x128x256B, CutlassTileConfigSM90::CtaShape128x128x512B,
+          CutlassTileConfigSM90::CtaShape128x256x128B, CutlassTileConfigSM90::CtaShape128x256x256B,
+          CutlassTileConfigSM90::CtaShape256x128x128B, CutlassTileConfigSM90::CtaShape256x128x256B,
           CutlassTileConfigSM90::CtaShape256x256x128B};
     } else {
       return {
@@ -278,10 +264,9 @@ bool sm90_supports_mcast_along_m(CutlassTileConfigSM90 const tile) {
 #else
   auto const [tile_m, tile_n, tile_k] = enum_to_shape_tuple(tile);
   bool const supported_k = tile_k == 128 || tile_k == 256 || tile_k == 512;
-  bool const supported_mn =
-      (tile_m == 128 && (tile_n == 16 || tile_n == 32 || tile_n == 64 || tile_n == 128 ||
-                         tile_n == 256)) ||
-      (tile_m == 256 && tile_n == 128);
+  bool const supported_mn = (tile_m == 128 && (tile_n == 16 || tile_n == 32 || tile_n == 64 ||
+                                               tile_n == 128 || tile_n == 256)) ||
+                            (tile_m == 256 && tile_n == 128);
   return supported_mn && supported_k;
 #endif
 }
@@ -294,9 +279,8 @@ bool sm90_supports_mcast_along_n(CutlassTileConfigSM90 const tile) {
 #else
   auto const [tile_m, tile_n, tile_k] = enum_to_shape_tuple(tile);
   bool const supported_k = tile_k == 128 || tile_k == 256 || tile_k == 512;
-  bool const supported_mn =
-      ((tile_m == 64 || tile_m == 128) && (tile_n == 128 || tile_n == 256)) ||
-      (tile_m == 256 && tile_n == 128);
+  bool const supported_mn = ((tile_m == 64 || tile_m == 128) && (tile_n == 128 || tile_n == 256)) ||
+                            (tile_m == 256 && tile_n == 128);
   return supported_mn && supported_k;
 #endif
 }

@@ -19,8 +19,8 @@
 #include <cuda_runtime_api.h>
 
 #include "../../include/moe_gemm_kernels.h"
-#include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/gemm/collective/collective_mma_array_mixed_input.hpp"
+#include "cutlass_extensions/gemm_configs.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
 
 namespace tensorrt_llm {

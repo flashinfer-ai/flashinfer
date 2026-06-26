@@ -36,14 +36,14 @@ namespace cutlass::gemm::collective {
 
 namespace detail {
 
-template <int capacity_bytes, class ElementA, class ElementB, class ElementScale,
-          class ElementZero, class TileShapeMNK, int alignment = 128, int stages>
+template <int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero,
+          class TileShapeMNK, int alignment = 128, int stages>
 constexpr int compute_stage_count_or_override_folded_weight_scale(cute::Int<stages> stage_count) {
   return stages;
 }
 
-template <int capacity_bytes, class ElementA, class ElementB, class ElementScale,
-          class ElementZero, class TileShapeMNK, int alignment = 128, int stages>
+template <int capacity_bytes, class ElementA, class ElementB, class ElementScale, class ElementZero,
+          class TileShapeMNK, int alignment = 128, int stages>
 constexpr int compute_stage_count_or_override_folded_weight_scale(StageCount<stages> stage_count) {
   return stages;
 }
@@ -52,7 +52,8 @@ template <int capacity_bytes_, class ElementA, class ElementB, class ElementScal
           class ElementZero, class TileShapeMNK, int alignment = 128, int carveout_bytes_>
 constexpr int compute_stage_count_or_override_folded_weight_scale(
     StageCountAutoCarveout<carveout_bytes_> stage_count) {
-  constexpr auto mainloop_pipeline_bytes = sizeof(typename cutlass::PipelineTmaAsync<1>::SharedStorage);
+  constexpr auto mainloop_pipeline_bytes =
+      sizeof(typename cutlass::PipelineTmaAsync<1>::SharedStorage);
   constexpr auto a_bits = cute::sizeof_bits_v<ElementA>;
   constexpr auto b_bits = cute::sizeof_bits_v<ElementB>;
   constexpr auto s_bits = cute::sizeof_bits_v<ElementScale>;
@@ -62,10 +63,11 @@ constexpr int compute_stage_count_or_override_folded_weight_scale(
   static_assert((size<2>(TileShapeMNK{}) % scale_group_size) == 0,
                 "Folded weight-scale storage requires TileK to cover complete scale groups.");
 
-  constexpr auto scale_bytes =
-      cutlass::bits_to_bytes(s_bits * size<0>(TileShapeMNK{}) * size<2>(TileShapeMNK{}) / scale_group_size);
+  constexpr auto scale_bytes = cutlass::bits_to_bytes(s_bits * size<0>(TileShapeMNK{}) *
+                                                      size<2>(TileShapeMNK{}) / scale_group_size);
   constexpr auto zero_bytes = cutlass::bits_to_bytes(z_bits * size<0>(TileShapeMNK{}));
-  static_assert(scale_bytes % 16 == 0, "Folded weight-scale bulk copy must be at least 16B aligned.");
+  static_assert(scale_bytes % 16 == 0,
+                "Folded weight-scale bulk copy must be at least 16B aligned.");
   static_assert(zero_bytes % 128 == 0, "Zero bytes must be a multiple of 128");
 
   constexpr int stage_bytes_ =
@@ -248,26 +250,23 @@ struct CollectiveBuilderMixedInput<
                                                     ElementBMma, TileShape_MNK, SmemAlignment>(
                 StageCountType{});
 
-  static constexpr bool UseFusedE8M0PreMmaScale =
-      ScaleMode == MixedInputScaleMode::kPreMmaE8M0;
+  static constexpr bool UseFusedE8M0PreMmaScale = ScaleMode == MixedInputScaleMode::kPreMmaE8M0;
   static_assert(
-      !UseFusedE8M0PreMmaScale ||
-          (IsArrayOfPointersGemm && IsATransformed &&
-           cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
-           cute::is_same_v<ElementB, cutlass::float_e4m3_t>),
+      !UseFusedE8M0PreMmaScale || (IsArrayOfPointersGemm && IsATransformed &&
+                                   cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+                                   cute::is_same_v<ElementB, cutlass::float_e4m3_t>),
       "Pre-MMA E8M0 scale mode is only implemented for grouped MXFP4 weight x FP8 activation.");
 
-  using ArrayMixedInputDispatchPolicy = cute::conditional_t<
-      UseFusedE8M0PreMmaScale,
-      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<
-          PipelineStages, ClusterShape_MNK, KernelScheduleType>,
-      MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<
-          PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
+  using ArrayMixedInputDispatchPolicy =
+      cute::conditional_t<UseFusedE8M0PreMmaScale,
+                          MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<
+                              PipelineStages, ClusterShape_MNK, KernelScheduleType>,
+                          MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput<
+                              PipelineStages, ClusterShape_MNK, KernelScheduleType>>;
 
   using DispatchPolicy = cute::conditional_t<
       IsMixedInput,
-      cute::conditional_t<IsArrayOfPointersGemm,
-                          ArrayMixedInputDispatchPolicy,
+      cute::conditional_t<IsArrayOfPointersGemm, ArrayMixedInputDispatchPolicy,
                           MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput<
                               PipelineStages, ClusterShape_MNK, KernelScheduleType>>,
       MainloopSm90TmaGmmaRmemAWarpSpecialized<PipelineStages, ClusterShape_MNK,
