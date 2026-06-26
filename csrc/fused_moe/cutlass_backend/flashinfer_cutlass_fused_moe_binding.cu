@@ -96,24 +96,21 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         // return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
       case float16_code:
         if constexpr (NeedQuant) {
-          return std::make_unique<
-              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half, half, IsMXFPX,
-                                           Wfp4Afp8Mode>>();
+          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half, half,
+                                                              IsMXFPX, Wfp4Afp8Mode>>();
         } else {
-          return std::make_unique<
-              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct, half, IsMXFPX,
-                                           Wfp4Afp8Mode>>();
+          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct,
+                                                              half, IsMXFPX, Wfp4Afp8Mode>>();
         }
 #ifdef ENABLE_BF16
       case bfloat16_code:
         if constexpr (NeedQuant) {
-          return std::make_unique<kernels::CutlassMoeFCRunner<
-              TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, IsMXFPX,
-              Wfp4Afp8Mode>>();
+          return std::make_unique<
+              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16,
+                                          __nv_bfloat16, IsMXFPX, Wfp4Afp8Mode>>();
         } else {
-          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16,
-                                                              TypeAct, __nv_bfloat16, IsMXFPX,
-                                                              Wfp4Afp8Mode>>();
+          return std::make_unique<kernels::CutlassMoeFCRunner<
+              TypeAct, TypeWeight, __nv_bfloat16, TypeAct, __nv_bfloat16, IsMXFPX, Wfp4Afp8Mode>>();
         }
 #endif
       default:
@@ -149,9 +146,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(mActivationDtype == mOutputDtype)
           << "Humming-style MXFP4 x FP8 online activation quantization currently requires "
              "activation dtype and output dtype to match.";
-      mKernelRunner = switch_output_type<
-          __nv_fp8_e4m3, kernels::Fp4Type, true, false,
-          kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+      mKernelRunner =
+          switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, true, false,
+                             kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
     };
 
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
@@ -209,10 +206,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #ifdef ENABLE_BF16
         case bfloat16_code:
 #endif
-          mKernelRunner = switch_output_type<kernels::Fp4Type, kernels::Fp4Type, true>(mOutputDtype);
+          mKernelRunner =
+              switch_output_type<kernels::Fp4Type, kernels::Fp4Type, true>(mOutputDtype);
           break;
         default:
-          mKernelRunner = switch_output_type<kernels::Fp4Type, kernels::Fp4Type, false>(mOutputDtype);
+          mKernelRunner =
+              switch_output_type<kernels::Fp4Type, kernels::Fp4Type, false>(mOutputDtype);
       }
     }
 
@@ -791,10 +790,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
             mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
       });
     } else if (name == "get_valid_tactics_for_shape") {
-      return Function::FromTyped([this](int64_t stage, int64_t gemm_n, int64_t gemm_k) -> Array<int64_t> {
-        std::lock_guard<std::mutex> lock(mMutex);
-        return getValidTacticsForShape(stage, gemm_n, gemm_k);
-      });
+      return Function::FromTyped(
+          [this](int64_t stage, int64_t gemm_n, int64_t gemm_k) -> Array<int64_t> {
+            std::lock_guard<std::mutex> lock(mMutex);
+            return getValidTacticsForShape(stage, gemm_n, gemm_k);
+          });
     } else if (name == "run_moe") {
       return Function::FromTyped(
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
@@ -908,8 +908,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       return false;
     }
     if (isWFP4A16Quant()) {
-      if (tile_k == 256 && ((tile_m == 128 && tile_n == 256) ||
-                            (tile_m == 256 && tile_n == 128))) {
+      if (tile_k == 256 && ((tile_m == 128 && tile_n == 256) || (tile_m == 256 && tile_n == 128))) {
         return false;
       }
       if (tile_k == 512 && tile_n >= 128) {
@@ -1017,8 +1016,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   kernels::QuantParams getQuantParams(
-      int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size,
-      int64_t routed_tokens, Optional<Array<Tensor>> quant_scales,
+      int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size, int64_t routed_tokens,
+      Optional<Array<Tensor>> quant_scales,
       ActivationType base_activation_type = ActivationType::Swiglu) const {
     if (isWMxfp8AMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
@@ -1212,11 +1211,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_DIM(5, fc2_weight_block);
       CHECK_DIM(1, fc2_token_scale);
       int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
-      TVM_FFI_ICHECK(
-          fc1_weight_block.size(0) == num_experts_on_rank &&
-          fc1_weight_block.size(1) * 64 == inter_size * fc1_n_mult &&
-          fc1_weight_block.size(2) * 128 == hidden_size && fc1_weight_block.size(3) == 16 &&
-          fc1_weight_block.size(4) == 4)
+      TVM_FFI_ICHECK(fc1_weight_block.size(0) == num_experts_on_rank &&
+                     fc1_weight_block.size(1) * 64 == inter_size * fc1_n_mult &&
+                     fc1_weight_block.size(2) * 128 == hidden_size &&
+                     fc1_weight_block.size(3) == 16 && fc1_weight_block.size(4) == 4)
           << "fc1 Humming-style folded weight scale must be "
              "(num_experts_on_rank, inter_size"
           << (fc1_n_mult == 2 ? " * 2" : "") << " / 64, hidden_size / 128, 16, 4)";
@@ -1224,11 +1222,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "fc1 token scale must have one element per routed token";
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
           << "fc2 act global must be scalar or (num_experts_on_rank,)";
-      TVM_FFI_ICHECK(
-          fc2_weight_block.size(0) == num_experts_on_rank &&
-          fc2_weight_block.size(1) * 64 == hidden_size &&
-          fc2_weight_block.size(2) * 128 == inter_size && fc2_weight_block.size(3) == 16 &&
-          fc2_weight_block.size(4) == 4)
+      TVM_FFI_ICHECK(fc2_weight_block.size(0) == num_experts_on_rank &&
+                     fc2_weight_block.size(1) * 64 == hidden_size &&
+                     fc2_weight_block.size(2) * 128 == inter_size &&
+                     fc2_weight_block.size(3) == 16 && fc2_weight_block.size(4) == 4)
           << "fc2 Humming-style folded weight scale must be "
              "(num_experts_on_rank, hidden_size / 64, inter_size / 128, 16, 4)";
       TVM_FFI_ICHECK_EQ(fc2_token_scale.size(0), routed_tokens)
@@ -1237,8 +1234,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       return kernels::QuantParams::FP8MXFP4(
           nullptr,
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
-          static_cast<float const*>(fc1_token_scale.data_ptr()),
-          nullptr,
+          static_cast<float const*>(fc1_token_scale.data_ptr()), nullptr,
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
           static_cast<float const*>(fc2_token_scale.data_ptr()), false, false);
     } else if (isWMxfp4AMxfp8Quant()) {
@@ -1457,7 +1453,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   bool isWFP4A16Quant() const {
-    return mUseW4GroupScaling && (mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16) &&
+    return mUseW4GroupScaling &&
+           (mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16) &&
            mWeightDtype == dl_uint8 && !mUsePackedWeights && !mUseWfp4Afp8Humming;
   }
 

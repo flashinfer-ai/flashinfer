@@ -19,7 +19,7 @@ import os
 import struct
 
 import pytest
-from flashinfer.fused_moe.core import ActivationType, get_cutlass_fused_moe_module
+from flashinfer.fused_moe.core import ActivationType
 import torch
 from torch.nn import functional as F
 
@@ -2724,15 +2724,15 @@ def _reference_humming_e8m0_weight_scale(
     scale_view = raw_scale.contiguous().view(num_experts, -1)
     scale_max = scale_view.max(dim=1, keepdim=True).values
     scale_min = scale_view.min(dim=1, keepdim=True).values
-    max_range_tensor = torch.tensor(max_range, dtype=torch.uint8, device=raw_scale.device)
+    max_range_tensor = torch.tensor(
+        max_range, dtype=torch.uint8, device=raw_scale.device
+    )
     scale_range = torch.minimum(scale_max - scale_min, max_range_tensor)
     scale_min_new = scale_max - scale_range
 
     clamped_scale = scale_view.maximum(scale_min_new)
     delta_scale_offsets = (clamped_scale - scale_view).to(torch.uint8)
-    offset = torch.bitwise_and(clamped_scale - scale_min_new + 1, 0x0F).to(
-        torch.uint8
-    )
+    offset = torch.bitwise_and(clamped_scale - scale_min_new + 1, 0x0F).to(torch.uint8)
     residual = torch.exp2(scale_min_new.squeeze(1).to(torch.float32) - 127.0) * 0.5
     return (
         offset.view_as(raw_scale).contiguous(),
@@ -2763,9 +2763,7 @@ def _humming_payload_rewrite_lut(device: torch.device) -> torch.Tensor:
         rounded_bits = (
             ru_bits if abs(value - rz_value) >= abs(value - ru_value) else rz_bits
         )
-        return ((rounded_bits & 0x80000000) >> 28) | (
-            (rounded_bits & 0x01C00000) >> 22
-        )
+        return ((rounded_bits & 0x80000000) >> 28) | ((rounded_bits & 0x01C00000) >> 22)
 
     lut = torch.empty((256, 16), dtype=torch.uint8)
     for delta in range(256):
@@ -3190,7 +3188,7 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     assert int(clamp_offset.max().item()) == 12
     assert int(clamp_delta.max().item()) == 2
     torch.testing.assert_close(
-        clamp_residual.cpu(), torch.tensor([2.0 ** -12], dtype=torch.float32)
+        clamp_residual.cpu(), torch.tensor([2.0**-12], dtype=torch.float32)
     )
     # Humming mode currently shares the FP8MXFP4 5-slot quant_scales contract;
     # slot 2 is reserved for the future post-MMA activation scale and is not
@@ -3200,8 +3198,12 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     _assert_humming_payload_rewrite_bit_equal(w1, w1_delta_scale_offsets, w1_processed)
     _assert_humming_payload_rewrite_bit_equal(w2, w2_delta_scale_offsets, w2_processed)
 
-    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w1_processed, "fp4_fp8")
-    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(w2_processed, "fp4_fp8")
+    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w1_processed, "fp4_fp8"
+    )
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w2_processed, "fp4_fp8"
+    )
     w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_exp_offset)
     w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_exp_offset)
     if case_name == "small":
@@ -3230,8 +3232,12 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
             [route_scale[selected_experts == expert_id] for expert_id in range(e)]
         ).contiguous()
 
-    fc1_residual_token_scale = make_expert_contiguous_token_scale(fc1_residual_route_scale)
-    fc2_residual_token_scale = make_expert_contiguous_token_scale(fc2_residual_route_scale)
+    fc1_residual_token_scale = make_expert_contiguous_token_scale(
+        fc1_residual_route_scale
+    )
+    fc2_residual_token_scale = make_expert_contiguous_token_scale(
+        fc2_residual_route_scale
+    )
     quant_scales = [
         w1_scale_il.view(torch.int32),
         fc1_residual_token_scale,
@@ -3277,9 +3283,9 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         )
         x_fp8_tensor = (x_rows * fc1_quant[:, None]).to(torch.float8_e4m3fn)
         x_fp8 = x_fp8_tensor.to(torch.float32)
-        route_fc1_scale = (
-            1.0 / fc1_quant
-        ) * fc1_residual_route_scale[batch_idx, nth_expert]
+        route_fc1_scale = (1.0 / fc1_quant) * fc1_residual_route_scale[
+            batch_idx, nth_expert
+        ]
         # FC1 token scale is applied in the GEMM epilogue before activation, so
         # both gated branches must be scaled before the SiLU/product.
         fc1_w1 = (x_fp8 @ w1_expert.t()) * route_fc1_scale[:, None]
@@ -3294,9 +3300,9 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         )
         fc1_fp8_tensor = (fc1 * fc2_quant[:, None]).to(torch.float8_e4m3fn)
         fc1_fp8 = fc1_fp8_tensor.to(torch.float32)
-        route_fc2_scale = (
-            1.0 / fc2_quant
-        ) * fc2_residual_route_scale[batch_idx, nth_expert]
+        route_fc2_scale = (1.0 / fc2_quant) * fc2_residual_route_scale[
+            batch_idx, nth_expert
+        ]
         fc2 = (fc1_fp8 @ w2_ref[expert_id].t()) * route_fc2_scale[:, None]
         ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
 

@@ -697,18 +697,12 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
 
-    cta_shapes_mnk_mixed_input = list(
-        product([64], [16, 32, 64, 128], [128, 256, 512])
-    )
+    cta_shapes_mnk_mixed_input = list(product([64], [16, 32, 64, 128], [128, 256, 512]))
     cta_shapes_mnk_mixed_input.extend(
         product([128], [16, 32, 64, 128], [128, 256, 512])
     )
-    cta_shapes_mnk_mixed_input.extend(
-        [(128, 256, k_tile) for k_tile in [128, 256]]
-    )
-    cta_shapes_mnk_mixed_input.extend(
-        [(256, 128, k_tile) for k_tile in [128, 256]]
-    )
+    cta_shapes_mnk_mixed_input.extend([(128, 256, k_tile) for k_tile in [128, 256]])
+    cta_shapes_mnk_mixed_input.extend([(256, 128, k_tile) for k_tile in [128, 256]])
     cta_shapes_mnk_mixed_input.append((256, 256, 128))
     cta_shapes_mnk_int4 = list(cta_shapes_mnk_mixed_input)
     cta_shapes_mnk_fp4 = list(cta_shapes_mnk_mixed_input)

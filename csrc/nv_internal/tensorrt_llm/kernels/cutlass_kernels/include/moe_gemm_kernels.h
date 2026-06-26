@@ -258,8 +258,7 @@ template <typename T,                          /*The type used for activations/s
           typename WeightType,                 /* The type for the MoE weights */
           typename OutputType,                 /* The output type for the GEMM */
           typename ScaleBiasType = OutputType, /* The type for the scales/bias */
-          bool IsMXFPX = false,
-          Wfp4Afp8ScaleMode Wfp4Afp8Mode = Wfp4Afp8ScaleMode::kNone>
+          bool IsMXFPX = false, Wfp4Afp8ScaleMode Wfp4Afp8Mode = Wfp4Afp8ScaleMode::kNone>
 class MoeGemmRunner {
  public:
   MoeGemmRunner();

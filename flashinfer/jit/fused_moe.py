@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import os
 from typing import List
 
 from . import env as jit_env
@@ -197,8 +196,7 @@ def gen_cutlass_fused_moe_module(
         / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu",
         jit_env.FLASHINFER_CSRC_DIR
         / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
-        jit_env.FLASHINFER_CSRC_DIR
-        / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
         jit_env.FLASHINFER_CSRC_DIR
         / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
         *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),

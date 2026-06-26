@@ -258,8 +258,7 @@ constexpr bool are_tile_shapes_supported_sm100() {
   }
 
 #ifdef ENABLE_FP4
-  if constexpr (std::is_same_v<DataType, Fp4Type> ||
-                std::is_same_v<WeightType, Fp4Type>) {
+  if constexpr (std::is_same_v<DataType, Fp4Type> || std::is_same_v<WeightType, Fp4Type>) {
     // if (TileN % 64 != 0 || TileN < 128)
     // {
     //     return false;

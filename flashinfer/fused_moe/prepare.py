@@ -77,9 +77,7 @@ def _preprocess_humming_e8m0_weight_scale(
 
     clamped_scale = scale_view.maximum(scale_min_new)
     delta_scale_offsets = (clamped_scale - scale_view).to(torch.uint8)
-    offset = torch.bitwise_and(clamped_scale - scale_min_new + 1, 0x0F).to(
-        torch.uint8
-    )
+    offset = torch.bitwise_and(clamped_scale - scale_min_new + 1, 0x0F).to(torch.uint8)
     residual = torch.exp2(scale_min_new.squeeze(1).to(torch.float32) - 127.0) * 0.5
     return (
         offset.view_as(raw_scale).contiguous(),
@@ -111,9 +109,7 @@ def _humming_mxfp4_w4a8_rewrite_lut_cpu() -> torch.Tensor:
         rounded_bits = (
             ru_bits if abs(value - rz_value) >= abs(value - ru_value) else rz_bits
         )
-        return ((rounded_bits & 0x80000000) >> 28) | (
-            (rounded_bits & 0x01C00000) >> 22
-        )
+        return ((rounded_bits & 0x80000000) >> 28) | ((rounded_bits & 0x01C00000) >> 22)
 
     lut = torch.empty((256, 16), dtype=torch.uint8)
     for delta in range(256):
@@ -158,8 +154,7 @@ def _process_humming_mxfp4_w4a8_payload(
         )
     if delta_scale_offsets.dtype != torch.uint8:
         raise ValueError(
-            "delta_scale_offsets must be uint8; "
-            f"got {delta_scale_offsets.dtype}"
+            f"delta_scale_offsets must be uint8; got {delta_scale_offsets.dtype}"
         )
 
     lut = _humming_mxfp4_w4a8_rewrite_lut_cpu().to(weight.device)

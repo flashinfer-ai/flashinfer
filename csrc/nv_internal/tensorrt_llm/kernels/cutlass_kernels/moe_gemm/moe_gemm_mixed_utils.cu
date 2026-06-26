@@ -139,11 +139,10 @@ __global__ void interleave_int4_weights_for_sm90_mixed_gemm_kernel(uint8_t* int4
 
 __device__ __forceinline__ uint32_t preprocess_fp4x8_signs_for_fp8(uint32_t fp4x8) {
   uint32_t const em = fp4x8 & 0x77777777U;
-  uint32_t const signs =
-      ((fp4x8 & 0x00000008U) << 4U) | ((fp4x8 & 0x00000080U) << 8U) |
-      ((fp4x8 & 0x00000800U) << 12U) | ((fp4x8 & 0x00008000U) << 16U) |
-      ((fp4x8 & 0x00080000U) >> 16U) | ((fp4x8 & 0x00800000U) >> 12U) |
-      ((fp4x8 & 0x08000000U) >> 8U) | ((fp4x8 & 0x80000000U) >> 4U);
+  uint32_t const signs = ((fp4x8 & 0x00000008U) << 4U) | ((fp4x8 & 0x00000080U) << 8U) |
+                         ((fp4x8 & 0x00000800U) << 12U) | ((fp4x8 & 0x00008000U) << 16U) |
+                         ((fp4x8 & 0x00080000U) >> 16U) | ((fp4x8 & 0x00800000U) >> 12U) |
+                         ((fp4x8 & 0x08000000U) >> 8U) | ((fp4x8 & 0x80000000U) >> 4U);
   return em | signs;
 }
 

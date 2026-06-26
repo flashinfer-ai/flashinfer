@@ -56,8 +56,7 @@ template class CutlassMoeFCRunner<half, Fp4Type>;
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, __nv_bfloat16>;
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, __nv_bfloat16, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_bfloat16,
-                                  __nv_bfloat16, false,
-                                  Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
+                                  __nv_bfloat16, false, Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
 template class CutlassMoeFCRunner<__nv_bfloat16, Fp4Type>;
 #endif
 #endif

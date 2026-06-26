@@ -19,13 +19,13 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "../../include/moe_gemm_kernels.h"
+#include "cute/tensor.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_tile_scheduler_group_precomputed.hpp"
-#include "cute/tensor.hpp"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "../../include/moe_gemm_kernels.h"
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -56,9 +56,8 @@ inline size_t align_bytes(size_t value, size_t alignment) {
 
 inline int log_swizzle_size(uint64_t problem_blocks_m, uint64_t problem_blocks_n,
                             int max_swizzle_size) {
-  int const min_cta_dim = static_cast<int>(problem_blocks_m < problem_blocks_n
-                                               ? problem_blocks_m
-                                               : problem_blocks_n);
+  int const min_cta_dim =
+      static_cast<int>(problem_blocks_m < problem_blocks_n ? problem_blocks_m : problem_blocks_n);
   if (max_swizzle_size >= 8 && min_cta_dim >= 6) {
     return 3;
   }
@@ -86,12 +85,10 @@ inline uint64_t max_work_tiles_from_total_tokens(int num_experts, int64_t total_
   uint64_t const tokens_per_padded_group = uint64_t(TileShapeN) * token_tile_group;
   uint64_t const channel_tiles =
       div_round_up(static_cast<uint64_t>(channels), uint64_t(TileShapeM));
-  uint64_t const padded_channel_tiles =
-      round_up_to_multiple(channel_tiles, channel_multiple);
+  uint64_t const padded_channel_tiles = round_up_to_multiple(channel_tiles, channel_multiple);
   uint64_t const total_tokens = static_cast<uint64_t>(total_routed_tokens);
-  uint64_t const nonempty_experts = total_tokens < uint64_t(num_experts)
-                                        ? total_tokens
-                                        : uint64_t(num_experts);
+  uint64_t const nonempty_experts =
+      total_tokens < uint64_t(num_experts) ? total_tokens : uint64_t(num_experts);
   uint64_t const extra_tokens = total_tokens - nonempty_experts;
   uint64_t const max_token_tile_rows =
       token_tile_group * (nonempty_experts + extra_tokens / tokens_per_padded_group);
@@ -101,16 +98,15 @@ inline uint64_t max_work_tiles_from_total_tokens(int num_experts, int64_t total_
 
 inline size_t precomputed_scheduler_workspace_size(int num_experts, int64_t total_routed_tokens,
                                                    int64_t max_channels) {
-  uint64_t const max_work_tiles =
-      max_work_tiles_from_total_tokens<64, 16, 2, 2>(
-          num_experts, total_routed_tokens, max_channels, kPrecomputedSchedulerMaxSwizzle);
+  uint64_t const max_work_tiles = max_work_tiles_from_total_tokens<64, 16, 2, 2>(
+      num_experts, total_routed_tokens, max_channels, kPrecomputedSchedulerMaxSwizzle);
   uint64_t const work_tile_capacity = max_work_tiles + kPrecomputedSchedulerSentinelTiles;
 
   size_t bytes = 0;
   bytes += align_bytes(size_t(work_tile_capacity) * sizeof(uint64_t), 128);
   bytes += align_bytes(sizeof(cute::TmaDescriptor), 128);
-  bytes += align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor),
-                       128);
+  bytes +=
+      align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
   return bytes;
 }
 
@@ -137,16 +133,15 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
   cutlass::gemm::GemmCoord cluster_shape(ClusterShapeM, ClusterShapeN, 1);
   dim3 const problem_blocks =
       SchedulerParams::get_tiled_cta_shape_mnl(cluster_shape, static_cast<uint32_t>(sm_count), 1);
-  dim3 const gemm_grid_shape =
-      SchedulerParams::get_grid_shape(problem_blocks, cluster_shape, hw_info,
-                                      kPrecomputedSchedulerMaxSwizzle,
-                                      SchedulerParams::RasterOrderOptions::AlongM, true);
+  dim3 const gemm_grid_shape = SchedulerParams::get_grid_shape(
+      problem_blocks, cluster_shape, hw_info, kPrecomputedSchedulerMaxSwizzle,
+      SchedulerParams::RasterOrderOptions::AlongM, true);
 
   uint64_t const max_work_tiles =
       max_work_tiles_from_total_tokens<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN>(
           num_experts, total_routed_tokens, channels, kPrecomputedSchedulerMaxSwizzle);
-  uint64_t const sentinel_count = uint64_t(gemm_grid_shape.x) * uint64_t(gemm_grid_shape.y) *
-                                  uint64_t(gemm_grid_shape.z);
+  uint64_t const sentinel_count =
+      uint64_t(gemm_grid_shape.x) * uint64_t(gemm_grid_shape.y) * uint64_t(gemm_grid_shape.z);
   uint64_t const work_tile_capacity = max_work_tiles + sentinel_count;
 
   size_t const work_tiles_bytes = align_bytes(size_t(work_tile_capacity) * sizeof(uint64_t), 128);
@@ -167,8 +162,7 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
   auto* base = hopper_inputs.precomputed_scheduler_workspace;
   PrecomputedSchedulerWorkspace workspace;
   workspace.work_tiles = reinterpret_cast<uint64_t*>(base);
-  workspace.prebuilt_tma_desc_A =
-      reinterpret_cast<cute::TmaDescriptor*>(base + work_tiles_bytes);
+  workspace.prebuilt_tma_desc_A = reinterpret_cast<cute::TmaDescriptor*>(base + work_tiles_bytes);
   workspace.prebuilt_tma_desc_B =
       reinterpret_cast<cute::TmaDescriptor*>(base + work_tiles_bytes + prebuilt_a_bytes);
   workspace.required_bytes = required_bytes;
@@ -178,8 +172,7 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
 
 template <int ClusterShapeM, int ClusterShapeN>
 __device__ __forceinline__ uint64_t make_work_tile_static(uint64_t global_linear_idx,
-                                                          uint64_t local_linear_idx,
-                                                          int group_idx,
+                                                          uint64_t local_linear_idx, int group_idx,
                                                           uint64_t problem_blocks_m,
                                                           int swizzle_log, int gemm_grid_x,
                                                           int gemm_grid_y) {
@@ -275,15 +268,15 @@ __device__ __forceinline__ void build_prebuilt_tma_descriptors(
       int64_t const term_m = static_cast<int64_t>(M) * static_cast<int64_t>(stride_m);
       int64_t const term_k = static_cast<int64_t>(K) * static_cast<int64_t>(stride_k);
       int64_t const stride_l = term_m > term_k ? term_m : term_k;
-      auto full_layout = make_layout(
-          make_shape(M, K, static_cast<uint32_t>(mainloop_params.num_groups)),
-          cute::make_stride(stride_m, stride_k, stride_l));
+      auto full_layout =
+          make_layout(make_shape(M, K, static_cast<uint32_t>(mainloop_params.num_groups)),
+                      cute::make_stride(stride_m, stride_k, stride_l));
       Tensor tensor_a = make_tensor(ptr_A, full_layout);
 
       smem_desc = *mainloop_params.tma_load_a.get_tma_descriptor();
       cute::tma_descriptor_replace_addr_in_shared_mem(smem_desc, mainloop_params.ptr_A[0]);
-      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a,
-                                               prob_shape_A, prob_stride_A);
+      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_a, tensor_a, prob_shape_A,
+                                               prob_stride_A);
 
       using ElementA = std::remove_cv_t<std::remove_pointer_t<PtrA>>;
       for (uint64_t& stride : prob_stride_A) {
@@ -319,8 +312,8 @@ __device__ __forceinline__ void build_prebuilt_tma_descriptors(
 
       smem_desc = *mainloop_params.tma_load_b.get_tma_descriptor();
       cute::tma_descriptor_replace_addr_in_shared_mem(smem_desc, mainloop_params.ptr_B[group]);
-      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b,
-                                               prob_shape_B, prob_stride_B);
+      cute::detail::fill_tma_gmem_shape_stride(mainloop_params.tma_load_b, tensor_b, prob_shape_B,
+                                               prob_stride_B);
 
       using ElementB = std::remove_cv_t<std::remove_pointer_t<PtrB>>;
       for (uint64_t& stride : prob_stride_B) {
@@ -334,8 +327,8 @@ __device__ __forceinline__ void build_prebuilt_tma_descriptors(
   }
 }
 
-template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
-          class Problem, class MainloopParams>
+template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN, class Problem,
+          class MainloopParams>
 __global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_shapes, int groups,
                                                        int swizzle_log, int gemm_grid_x,
                                                        int gemm_grid_y, uint64_t* work_tiles,
@@ -360,8 +353,7 @@ __global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_sh
   }
 
   extern __shared__ __align__(64) unsigned char shared_storage[];
-  cute::TmaDescriptor* smem_tma_desc =
-      reinterpret_cast<cute::TmaDescriptor*>(shared_storage);
+  cute::TmaDescriptor* smem_tma_desc = reinterpret_cast<cute::TmaDescriptor*>(shared_storage);
   unsigned long long* prefix_partials =
       reinterpret_cast<unsigned long long*>(shared_storage + kPrebuiltTmaDescriptorScratchBytes);
   unsigned long long* group_info_storage = prefix_partials + blockDim.x;
@@ -402,10 +394,8 @@ __global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_sh
   for (uint64_t local_tile = uint64_t(tid); local_tile < group_tiles;
        local_tile += uint64_t(blockDim.x)) {
     uint64_t const global_tile = group_start + local_tile;
-    work_tiles[global_tile] =
-        make_work_tile_static<ClusterShapeM, ClusterShapeN>(
-            global_tile, local_tile, group, problem_blocks_m, swizzle_log, gemm_grid_x,
-            gemm_grid_y);
+    work_tiles[global_tile] = make_work_tile_static<ClusterShapeM, ClusterShapeN>(
+        global_tile, local_tile, group, problem_blocks_m, swizzle_log, gemm_grid_x, gemm_grid_y);
   }
 
   if (group == groups - 1) {
@@ -416,12 +406,13 @@ __global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_sh
   }
 }
 
-template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
-          class Problem, class MainloopParams>
-inline void build_precomputed_work_tile_map(
-    PrecomputedSchedulerWorkspace const& workspace, Problem const* problem_shapes, int groups,
-    int64_t total_routed_tokens, int64_t channels, MainloopParams const& mainloop_params,
-    cudaStream_t stream) {
+template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN, class Problem,
+          class MainloopParams>
+inline void build_precomputed_work_tile_map(PrecomputedSchedulerWorkspace const& workspace,
+                                            Problem const* problem_shapes, int groups,
+                                            int64_t total_routed_tokens, int64_t channels,
+                                            MainloopParams const& mainloop_params,
+                                            cudaStream_t stream) {
   uint64_t const max_work_tiles =
       max_work_tiles_from_total_tokens<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN>(
           groups, total_routed_tokens, channels, kPrecomputedSchedulerMaxSwizzle);

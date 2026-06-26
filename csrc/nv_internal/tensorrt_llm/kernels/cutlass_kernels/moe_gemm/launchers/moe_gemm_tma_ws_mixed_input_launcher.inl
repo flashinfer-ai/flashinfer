@@ -114,9 +114,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
 
   // Scale configuration
   constexpr bool use_mxfp4_weight = std::is_same_v<ElementB, cutlass::float_e2m1_t>;
-  constexpr int group_size = use_mxfp4_weight
-                                 ? cutlass::gemm::collective::detail::mxfp4_group_size
-                                 : cutlass::gemm::collective::detail::int4_group_size;
+  constexpr int group_size = use_mxfp4_weight ? cutlass::gemm::collective::detail::mxfp4_group_size
+                                              : cutlass::gemm::collective::detail::int4_group_size;
   using ElementScale =
       std::conditional_t<use_mxfp4_weight, cutlass::float_ue8m0_t,
                          TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA>;
@@ -152,29 +151,28 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
       cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>;  // Epilogue to launch
   constexpr bool use_fused_e8m0_scale =
       ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0;
-  using FusionOperation = std::conditional_t<
-      use_fused_e8m0_scale,
-      cutlass::epilogue::fusion::PtrArrayPerTokenScaledAcc<ElementD, ElementAccumulator,
-                                                           ElementAccumulator>,
-      cutlass::epilogue::fusion::LinearCombination<ElementD, ElementAccumulator, ElementC,
-                                                   ElementAccumulator>>;
+  using FusionOperation =
+      std::conditional_t<use_fused_e8m0_scale,
+                         cutlass::epilogue::fusion::PtrArrayPerTokenScaledAcc<
+                             ElementD, ElementAccumulator, ElementAccumulator>,
+                         cutlass::epilogue::fusion::LinearCombination<
+                             ElementD, ElementAccumulator, ElementC, ElementAccumulator>>;
 
-  using CollectiveEpilogue =
-      typename tensorrt_llm::cutlass_extensions::epilogue::collective::MixedInputSm90TmaEpilogueBuilder<
-      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
-      ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC, ElementD,
-      typename cutlass::layout::LayoutTranspose<LayoutD>::type*, AlignmentD,
-      EpilogueSchedule, FusionOperation>::CollectiveOp;
+  using CollectiveEpilogue = typename tensorrt_llm::cutlass_extensions::epilogue::collective::
+      MixedInputSm90TmaEpilogueBuilder<
+          cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
+          ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC, ElementD,
+          typename cutlass::layout::LayoutTranspose<LayoutD>::type*, AlignmentD, EpilogueSchedule,
+          FusionOperation>::CollectiveOp;
 
   // =========================================================== MIXED INPUT WITH SCALES
   // =========================================================================== The Scale
   // information must get paired with the operand that will be scaled. In this example, B is scaled
   // so we make a tuple of B's information and the scale information.
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<
-      ArchTag, OperatorClass, cute::tuple<ElementB, ElementScale>, LayoutB_Transpose*,
-      AlignmentB, ElementA, LayoutA_Transpose*, AlignmentA, ElementAccumulator, TileShape,
-      ClusterShape,
+      ArchTag, OperatorClass, cute::tuple<ElementB, ElementScale>, LayoutB_Transpose*, AlignmentB,
+      ElementA, LayoutA_Transpose*, AlignmentA, ElementAccumulator, TileShape, ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       KernelSchedule, ScaleMode>::CollectiveOp;
@@ -212,20 +210,20 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   hw_info.device_id = 0;
   hw_info.sm_count = sm_count_;
 
-  arguments = Args{
-      cutlass::gemm::GemmUniversalMode::kGrouped,
-      {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
-      {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),
-       reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
-       reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
-       reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
-       reinterpret_cast<ElementScale const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-       reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
-      {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
-       reinterpret_cast<StrideC*>(hopper_inputs.stride_c),
-       reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
-       reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
-      hw_info};
+  arguments =
+      Args{cutlass::gemm::GemmUniversalMode::kGrouped,
+           {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
+           {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),
+            reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
+            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
+            reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
+            reinterpret_cast<ElementScale const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+            reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
+           {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
+            reinterpret_cast<StrideC*>(hopper_inputs.stride_c),
+            reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
+            reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
+           hw_info};
 
   // Optimize tile scheduling for better L2 locality
   using RasterOrderOptions =
@@ -248,8 +246,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
                        "Precomputed scheduler requires total routed token count.");
   auto precomputed_workspace =
       detail::partition_precomputed_scheduler_workspace<CurrentTileShapeM, CurrentTileShapeN,
-                                                        CurrentClusterShapeM,
-                                                        CurrentClusterShapeN>(
+                                                        CurrentClusterShapeM, CurrentClusterShapeN>(
           hopper_inputs, inputs.num_experts, total_routed_tokens, inputs.n, sm_count_);
   arguments.scheduler.precomputed_work_tiles = precomputed_workspace.work_tiles;
   arguments.mainloop.ptr_A_prebuilt_tma_desc = precomputed_workspace.prebuilt_tma_desc_A;
