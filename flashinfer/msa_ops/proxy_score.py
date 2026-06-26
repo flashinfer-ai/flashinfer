@@ -511,9 +511,11 @@ def msa_proxy_score_fp4(
     (``MmaMXF4NVF4Op``), so numerics equal a torch dequant of the same packed
     inputs (not the bf16 reference, which differs by fp4 rounding). The two global
     scales are folded into the logits as ``q_global_scale * k_global_scale`` before
-    the block-max. The 16-head ``q_len<=8`` decode uses a packed schedule that scores
-    all 16 heads of a kv_head from one shared index-K read. Both flat and paged K are
-    supported.
+    the block-max. Short-q decode (any ``group_size`` dividing the 128-row tile with
+    ``q_len <= 128 // group_size`` -- e.g. MiniMax-M3's group_size 4 at ``q_len<=32``,
+    or the 16-head deployment at ``q_len<=8``) uses a head-fused packed schedule that
+    scores all ``group_size`` heads of a kv_head from one shared index-K read. Both
+    flat and paged K are supported.
 
     Parameters
     ----------
@@ -617,15 +619,22 @@ def msa_proxy_score_fp4(
     else:
         per_head = output
 
-    # The 16-head decode path (q_len<=8) packs 16 heads x 8 q into one 128-row
-    # tile so the shared index-K is read once per (batch, kv_head) instead of once
-    # per query head (16x less K traffic); outside that regime use the per-(q-tile,
-    # head) schedule.
+    # Head-fused decode path: pack all group_size heads of a kv_head x pack_q_len
+    # q-tokens into one 128-row MMA tile so the shared index-K is read once per
+    # (batch, kv_head) instead of once per query head (group_size x less K traffic).
+    # Valid for any group_size that divides the 128-row tile when the q-len fits the
+    # resulting per-head slot (pack_q_len = 128 // group_size). The MiniMax-M3 indexer
+    # (group_size 4) decodes at 4 x 32; the 16-head deployment at 16 x 8. Outside this
+    # regime (prefill, or group_size not dividing 128) use the per-(q-tile, head)
+    # general schedule.
+    _PACK_ROWS = MsaProxyScoreFp4MmaSm12x._M  # 128-row fp4-MMA tile
     group_size = num_qo_heads // num_kv_heads
     use_packed = (
-        group_size == MsaProxyScoreFp4MmaDecodePackedSm12x._QHEAD_PER_KV
-        and max_seqlen_q <= MsaProxyScoreFp4MmaDecodePackedSm12x._PACK_Q_LEN
+        group_size >= 2
+        and _PACK_ROWS % group_size == 0
+        and max_seqlen_q <= _PACK_ROWS // group_size
     )
+    pack_q_len = _PACK_ROWS // group_size if use_packed else 0
 
     # base grid CTAs (feeds split-K, see _proxy_split_k): the packed path is one
     # CTA per (batch, kv_head); the general path one per (q-tile, batch, head) with
@@ -635,7 +644,9 @@ def msa_proxy_score_fp4(
     else:
         base_ctas = ((max_seqlen_q + 127) // 128) * batch_size * num_qo_heads
 
-    key = ("proxy_fp4", causal, paged, use_packed)
+    # group_size keys the packed schedule: pack_q_len = 128 // group_size is
+    # constexpr-baked into the gather/epilogue, so each factorization is its own kernel.
+    key = ("proxy_fp4", causal, paged, use_packed, pack_q_len)
     compiled = _compile_cache.get(key)
     if compiled is None:
         u8 = _cutlass_dtype(torch.uint8)
@@ -665,6 +676,8 @@ def msa_proxy_score_fp4(
                 head_dim=_BLK_KV,
                 is_causal=causal,
                 paged=paged,
+                qhead_per_kv=group_size,
+                pack_q_len=pack_q_len,
             )
         else:
             kernel_obj = MsaProxyScoreFp4MmaSm12x(

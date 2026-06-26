@@ -664,23 +664,46 @@ class MsaProxyScoreFp4MmaSm12x:
 
 
 class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
-    """The 16-head packed-decode schedule on the fp4 tensor cores.
+    """The head-fused packed-decode schedule on the fp4 tensor cores.
 
-    The fp4-MMA tile is already 128 rows, exactly ``qhead_per_kv (16) x q_len (8)``,
-    so the packed schedule is a pure relabel of the parent fp4-MMA kernel: pack 16
-    heads x 8 q-tokens into the 128 MMA rows so a single CTA scores all 16 heads of
-    one ``(batch, kv_head)`` against each KV block, reading the shared index-K
-    **once** (16x less K traffic than the per-query-head general schedule). Only the
-    Q gather, the grid, and the per-row output mapping differ from the parent; the
-    fp4 mainloop, SF plumbing, and warp block-max epilogue are inherited verbatim.
+    The fp4-MMA tile is already 128 rows, exactly ``qhead_per_kv x pack_q_len``, so
+    the packed schedule is a pure relabel of the parent fp4-MMA kernel: pack all
+    ``qhead_per_kv`` query heads of one kv_head x ``pack_q_len`` q-tokens into the 128
+    MMA rows so a single CTA scores every head of one ``(batch, kv_head)`` against
+    each KV block, reading the shared index-K **once** (``qhead_per_kv``x less K
+    traffic than the per-query-head general schedule). Only the Q gather, the grid,
+    and the per-row output mapping differ from the parent; the fp4 mainloop, SF
+    plumbing, and warp block-max epilogue are inherited verbatim.
 
-    Packing: row ``r = local_head * 8 + token``, ``head = kv_head * 16 +
-    local_head``, ``q = q_start + token``. Grid is one CTA per ``(split, batch,
-    kv_head)``; split-K applies as in the parent.
+    ``(qhead_per_kv, pack_q_len)`` is any factorization of the 128-row tile with
+    ``qhead_per_kv == group_size`` (defaults to the 16-head ``q_len<=8`` deployment
+    shape, ``16 x 8``; the MiniMax-M3 indexer is ``4 x 32`` -- group_size 4,
+    ``q_len<=32``). Packing: row ``r = local_head * pack_q_len + token``, ``head =
+    kv_head * qhead_per_kv + local_head``, ``q = q_start + token``. Grid is one CTA
+    per ``(split, batch, kv_head)``; split-K applies as in the parent.
     """
 
     _PACK_Q_LEN = 8
     _QHEAD_PER_KV = 16
+
+    def __init__(
+        self,
+        head_dim: int = 128,
+        is_causal: bool = True,
+        paged: bool = False,
+        qhead_per_kv: int = _QHEAD_PER_KV,
+        pack_q_len: int = _PACK_Q_LEN,
+    ):
+        super().__init__(head_dim=head_dim, is_causal=is_causal, paged=paged)
+        if qhead_per_kv * pack_q_len != self._M:
+            raise ValueError(
+                f"qhead_per_kv * pack_q_len must equal the {self._M}-row MMA tile, "
+                f"got {qhead_per_kv} x {pack_q_len}"
+            )
+        # instance attrs shadow the class defaults; they are constexpr-baked into the
+        # gather/epilogue, so each factorization compiles to its own kernel.
+        self._QHEAD_PER_KV = qhead_per_kv
+        self._PACK_Q_LEN = pack_q_len
 
     @cute.jit
     def __call__(
@@ -703,8 +726,9 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         num_splits: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        # one CTA per (split, batch, kv_head): the 16 heads of a kv_head are packed
-        # into the single 128-row tile, so the index-K is read once per kv_head.
+        # one CTA per (split, batch, kv_head): all qhead_per_kv heads of a kv_head
+        # are packed into the single 128-row tile, so the index-K is read once per
+        # kv_head (qhead_per_kv x less K traffic than the per-head general schedule).
         self.kernel(
             mQ,
             mK,
@@ -798,7 +822,7 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         sA_u32 = cute.recast_tensor(sA, Uint32)
         sB_u32 = cute.recast_tensor(sB, Uint32)
 
-        # ----- gather the 16-head x 8-q packed Q tile once into smem -----
+        # ----- gather the qhead_per_kv-head x pack_q_len-q packed Q tile into smem -
         self._load_packed_q(mQ_u32, sA_u32, q_start, kv_head, seqlen_q, tidx)
         self._load_packed_q_sf(
             mQsf, sSFA_u8, q_start, kv_head, num_qo_heads, seqlen_q, tidx
@@ -982,10 +1006,10 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
 
     @cute.jit
     def _load_packed_q(self, mQ_u32, sX_u32, q_start, kv_head, seqlen_q, tidx):
-        """Gather 16 heads x 8 q-tokens of packed fp4 into the 128-row tile.
-        Packed row ``r = local_head * 8 + token``; ``head = kv_head * 16 +
-        local_head``; ``gi = q_start + token``. Rows with ``token >= seqlen_q`` are
-        zero-filled (masked out in the epilogue anyway)."""
+        """Gather qhead_per_kv heads x pack_q_len q-tokens of packed fp4 into the
+        128-row tile. Packed row ``r = local_head * pack_q_len + token``; ``head =
+        kv_head * qhead_per_kv + local_head``; ``gi = q_start + token``. Rows with
+        ``token >= seqlen_q`` are zero-filled (masked out in the epilogue anyway)."""
         total = self._M * self._chunks_u32
         for it in cutlass.range_constexpr(total // self._num_threads):
             e = tidx + it * self._num_threads

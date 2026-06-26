@@ -326,6 +326,55 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
         assert rel < 5e-2, f"packed b={b} max rel err {rel}"
 
 
+@pytest.mark.parametrize("B,seqlen_q", [(1, 1), (4, 1), (2, 8), (1, 32)])
+def test_proxy_fp4_decode_packed_group4(B, seqlen_q):
+    """MiniMax-M3 indexer shape (group_size 4): q_len<=32 decode now dispatches the
+    head-fused packed fp4 kernel (4 heads x 32 q-slots packed into the 128-row tile,
+    index-K read once per kv_head instead of once per head). Validated per batch
+    against the torch fp4-dequant reference -- same numerics as the general path."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_proxy_score_fp4
+    from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
+
+    torch.manual_seed(77 + B + seqlen_q)
+    dev = "cuda"
+    Hkv = 1
+    Hq = Hkv * 4  # group_size == 4 (M3): q_len<=32 -> packed (4 x 32 tile)
+    seqlen_k = 1024
+    nb = seqlen_k // BLK_KV
+    total_q = B * seqlen_q
+    total_k = B * seqlen_k
+    cu_q = torch.arange(0, (B + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=dev)
+    cu_k = torch.arange(0, (B + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=dev)
+
+    q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) * 2
+    k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
+    q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
+    k_fp4, k_scale, inv_k = _quantize_qk_to_nvfp4(k)
+
+    out = msa_proxy_score_fp4(
+        q_fp4, k_fp4, q_scale, k_scale, inv_q, inv_k, cu_q, cu_k, causal=True
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (Hq, nb, total_q)
+
+    got = out.float().cpu()
+    q_deq, k_deq = _dequant_qk(
+        q_fp4.cpu(), q_scale.cpu(), inv_q, k_fp4.cpu(), k_scale.cpu(), inv_k
+    )
+    for b in range(B):
+        qsl = slice(b * seqlen_q, (b + 1) * seqlen_q)
+        ksl = slice(b * seqlen_k, (b + 1) * seqlen_k)
+        ref = _ref_proxy_fp4(q_deq[qsl], k_deq[ksl], seqlen_q, seqlen_k, 4, True)
+        sub = got[:, :, qsl]
+        finite = torch.isfinite(ref)
+        assert (torch.isfinite(sub) == finite).all(), f"mask mismatch b={b}"
+        rel = (
+            (sub[finite] - ref[finite]).abs() / ref[finite].abs().clamp_min(1.0)
+        ).max()
+        assert rel < 5e-2, f"packed-group4 b={b} max rel err {rel}"
+
+
 def test_proxy_fp4_paged_packed():
     """16-head q_len<=8 decode with a paged K cache: the packed schedule plus the
     page_table indirection (the real vLLM-style decode shape for a 16-index-head
