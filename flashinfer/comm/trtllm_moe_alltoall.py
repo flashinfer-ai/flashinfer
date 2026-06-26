@@ -14,7 +14,7 @@ import functools
 
 from ..api_logging import flashinfer_api
 
-from .mnnvl import MnnvlMemory, MnnvlConfig
+from .mnnvl import CommBackend, MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
 from ..utils import register_custom_op
@@ -589,6 +589,7 @@ class MoeAlltoAll:
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
+                "graph_visible_addresses": mnnvl_mem.get_graph_visible_addresses(),
             }
             return cls._WORKSPACE_CACHE[key]
 
@@ -729,6 +730,7 @@ class MoeAlltoAll:
         self.ep_rank = mapping.moe_ep_rank
         self.top_k = top_k
         self.num_experts = num_experts
+        self.mnnvl_config = mnnvl_config
 
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError("top_k must be a positive int")
@@ -756,6 +758,57 @@ class MoeAlltoAll:
         self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
+        self._state = _A2AState()
+
+    def get_graph_visible_addresses(self) -> dict:
+        """Return CUDA graph-visible MNNVL workspace VA/layout metadata."""
+        return dict(self._WORKSPACE["graph_visible_addresses"])
+
+    def validate_graph_visible_addresses(self) -> None:
+        """Validate that the cached workspace tensor still uses its original VA."""
+        self.mnnvl_mem.validate_graph_visible_addresses(
+            self._WORKSPACE["graph_visible_addresses"], self.workspace
+        )
+
+    def detach_handles(
+        self, *, synchronize: bool = True, barrier: bool = True
+    ) -> None:
+        """Release MNNVL mappings while preserving workspace tensor pointers."""
+        if self._state.phase != "idle":
+            raise RuntimeError("Cannot detach MNNVL workspace during an active A2A phase")
+        self.validate_graph_visible_addresses()
+        self.mnnvl_mem.detach_handles(synchronize=synchronize, barrier=barrier)
+
+    def reattach_handles(
+        self,
+        *,
+        comm: Optional[CommBackend] = None,
+        synchronize: bool = True,
+        barrier: bool = True,
+    ) -> None:
+        """Reattach MNNVL workspace at the original VA and refresh local state."""
+        MnnvlMemory._reattach_mnnvl_handles(
+            self.mnnvl_mem.ptr,
+            comm=comm,
+            config=None if comm is not None else self.mnnvl_config,
+            synchronize=synchronize,
+            barrier=barrier,
+            zero_local=False,
+        )
+        refreshed_metainfo = moe_a2a_initialize(
+            self.workspace,
+            self.ep_rank,
+            self.ep_size,
+            self.max_num_tokens,
+        )
+        if not torch.equal(refreshed_metainfo, self.metainfo):
+            raise RuntimeError(
+                "MoeAlltoAll metainfo changed during MNNVL reattach; "
+                "existing CUDA graphs are not safe to replay"
+            )
+        if barrier:
+            MnnvlMemory.allocated_map[self.mnnvl_mem.ptr].comm.barrier()
+        self.validate_graph_visible_addresses()
         self._state = _A2AState()
 
     def _reset_workspace(self):
