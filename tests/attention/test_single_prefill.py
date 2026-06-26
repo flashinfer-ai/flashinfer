@@ -7,6 +7,16 @@ import flashinfer
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 
 
+def head_dim_512_supported() -> bool:
+    # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
+    return torch.cuda.get_device_capability()[0] >= 8
+
+
+def skip_if_head_dim_unsupported(head_dim: int):
+    if head_dim > 256 and not head_dim_512_supported():
+        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
+
+
 def build_causal_mask(qo_len, kv_len):
     i = torch.arange(qo_len).unsqueeze(1).to("cuda:0")
     j = torch.arange(kv_len).unsqueeze(0).to("cuda:0")
@@ -190,6 +200,7 @@ def test_single_prefill_with_kv_cache_nvfp4(
 
 
 def test_single_prefill_with_kv_cache_nvfp4_large_head():
+    skip_if_head_dim_unsupported(512)
     _run_single_prefill_with_kv_cache_nvfp4(
         kv_len=256,
         qo_len=64,
@@ -202,6 +213,7 @@ def test_single_prefill_with_kv_cache_nvfp4_large_head():
 
 
 def test_single_prefill_with_kv_cache_nvfp4_rope_large_head():
+    skip_if_head_dim_unsupported(512)
     _run_single_prefill_with_kv_cache_nvfp4(
         kv_len=128,
         qo_len=64,

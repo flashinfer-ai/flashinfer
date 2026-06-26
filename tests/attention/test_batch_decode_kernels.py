@@ -46,6 +46,13 @@ def skip_if_head_dim_dtype_unsupported(head_dim: int, kv_dtype: torch.dtype):
         pytest.skip("head_dim > 256 with FP8 KV is only validated on SM100 or newer")
 
 
+def skip_if_nvfp4_large_head_decode_unsupported(head_dim: int):
+    if head_dim > 256 and get_compute_capability(torch.device("cuda:0"))[0] < 10:
+        pytest.skip(
+            "head_dim > 256 with NVFP4 KV decode is only validated on SM100 or newer"
+        )
+
+
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
@@ -832,6 +839,7 @@ def test_batch_decode_with_paged_kv_cache_nvfp4(
 
 
 def test_batch_decode_with_paged_kv_cache_nvfp4_large_head():
+    skip_if_nvfp4_large_head_decode_unsupported(512)
     test_batch_decode_with_paged_kv_cache_nvfp4(
         batch_size=4,
         kv_len=128,

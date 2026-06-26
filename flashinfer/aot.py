@@ -237,6 +237,9 @@ def gen_attention(
     has_sm8_or_newer = any(
         major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
     )
+    has_sm10_or_newer = any(
+        major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    )
 
     # FA2 MHA / MQA / GQA
     for (
@@ -256,7 +259,7 @@ def gen_attention(
         nvfp4_large_head = large_head and _is_nvfp4_kv_dtype(dtype_kv)
         if large_head:
             if dtype_kv.itemsize == 1 and not nvfp4_large_head:
-                if not has_sm100:
+                if not has_sm10_or_newer:
                     continue
             elif not has_sm8_or_newer:
                 continue
@@ -267,7 +270,7 @@ def gen_attention(
             head_dim_vo=head_dim_vo,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
-            prefill_only=nvfp4_large_head and not has_sm100,
+            prefill_only=nvfp4_large_head and not has_sm10_or_newer,
         )
         # The holistic (persistent) batch-attention kernel
         # does not support head_dim=512.
