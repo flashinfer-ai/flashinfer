@@ -20,6 +20,7 @@
 #include <math.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -35,6 +36,7 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 #include "cute/tensor.hpp"
+#include "cutlass/arch/memory.h"
 #include "cutlass/conv/convolution.h"
 // Order matters here, packed_stride.hpp is missing cute and convolution includes
 #include "cutlass/array.h"
@@ -73,6 +75,7 @@ using namespace tensorrt_llm::common;
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
+constexpr int WARP_SIZE = 32;
 constexpr int CVT_ELTS_PER_THREAD = 8;
 
 template <typename Fn>
@@ -1513,6 +1516,8 @@ __global__ void expandInputRowsKernel(
     // Cast first to handle when this is FP4
     auto* dest_row_ptr = reinterpret_cast<OutputElem*>(permuted_output) +
                          permuted_row * hidden_size / ELEM_PER_THREAD;
+    assert(reinterpret_cast<std::uintptr_t>(source_row_ptr) % sizeof(DataElem) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(dest_row_ptr) % sizeof(OutputElem) == 0);
 
     int64_t const start_offset = threadIdx.x;
     int64_t const stride = EXPAND_THREADS_PER_BLOCK;
@@ -1532,7 +1537,9 @@ __global__ void expandInputRowsKernel(
       int64_t num_tokens_before_expert = expert_first_token_offset[expert];
 
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-        auto in_vec = source_row_ptr[elem_index];
+        DataElem in_vec;
+        cutlass::arch::global_load<DataElem, sizeof(DataElem)>(in_vec, source_row_ptr + elem_index,
+                                                               true);
         if constexpr (need_nvfp4_quant || need_mxfp8_quant) {
           auto res =
               quantizePackedFPXValue<InputActivationsType, ExpandedActivationsType, DataElem,
@@ -1543,14 +1550,18 @@ __global__ void expandInputRowsKernel(
                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
           static_assert(sizeof(res) == sizeof(*dest_row_ptr),
                         "Quantized value must be the same size as the output");
-          dest_row_ptr[elem_index] = res;
+          auto out_vec = cutlass::platform::bit_cast<OutputElem>(res);
+          cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
+              out_vec, dest_row_ptr + elem_index, true);
         } else {
           assert(act_scale_idx == 0 &&
                  "Cannot use per-expert act scale for pre-quantized activations");
           writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
                                             permuted_row, elem_index, padded_hidden_size,
                                             fc1_act_sf_flat, input_sf, swizzled_input_sf);
-          dest_row_ptr[elem_index] = in_vec;
+          auto out_vec = cutlass::platform::bit_cast<OutputElem>(in_vec);
+          cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
+              out_vec, dest_row_ptr + elem_index, true);
         }
       }
 
@@ -1570,18 +1581,27 @@ __global__ void expandInputRowsKernel(
       static_assert(!std::is_same_v<InputActivationsType, ExpandedActivationsType>,
                     "Input and output types must be different for AWQ");
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-        auto frag_elems = source_row_ptr[elem_index];
+        DataElem frag_elems;
+        cutlass::arch::global_load<DataElem, sizeof(DataElem)>(frag_elems,
+                                                               source_row_ptr + elem_index, true);
 
         CUTLASS_PRAGMA_UNROLL
         for (int e = 0; e < ELEM_PER_THREAD; e++) {
           frag_elems[e] = frag_elems[e] * prequant_scales[elem_index * ELEM_PER_THREAD + e];
         }
 
-        dest_row_ptr[elem_index] = arrayConvert<DataElem, OutputElem>(frag_elems);
+        auto out_vec = arrayConvert<DataElem, OutputElem>(frag_elems);
+        cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
+            out_vec, dest_row_ptr + elem_index, true);
       }
     } else {
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-        dest_row_ptr[elem_index] = source_row_ptr[elem_index];
+        DataElem in_vec;
+        cutlass::arch::global_load<DataElem, sizeof(DataElem)>(in_vec, source_row_ptr + elem_index,
+                                                               true);
+        auto out_vec = cutlass::platform::bit_cast<OutputElem>(in_vec);
+        cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
+            out_vec, dest_row_ptr + elem_index, true);
       }
     }
 
@@ -2231,6 +2251,10 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
         reinterpret_cast<GemmResultElem const*>(gemm_result + gemm_result_offset);
     auto output_vec = reinterpret_cast<OutputElem*>(safe_inc_ptr(output, output_offset));
     auto bias_ptr_vec = reinterpret_cast<BiasElem const*>(bias_ptr + bias_offset);
+    assert(reinterpret_cast<std::uintptr_t>(gemm_result_vec) % sizeof(GemmResultElem) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(output_vec) % sizeof(OutputElem) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(bias_ptr_vec) % sizeof(BiasElem) == 0);
+
     int64_t const start_offset = tid;
     int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
@@ -2247,20 +2271,28 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
       fn.limit = gate_limit;
     }
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-      auto fc1_value =
-          arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
+      GemmResultElem fc1_gemm_value;
+      cutlass::arch::global_load<GemmResultElem, sizeof(GemmResultElem)>(
+          fc1_gemm_value, gemm_result_vec + elem_index + gated_off_vec, true);
+      auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(fc1_gemm_value);
       if (bias_ptr) {
-        fc1_value = fc1_value +
-                    arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index + gated_off_vec]);
+        BiasElem fc1_bias_value;
+        cutlass::arch::global_load<BiasElem, sizeof(BiasElem)>(
+            fc1_bias_value, bias_ptr_vec + elem_index + gated_off_vec, true);
+        fc1_value = fc1_value + arrayConvert<BiasElem, ComputeElem>(fc1_bias_value);
       }
 
       auto gate_act = [&]() {
         if constexpr (IsGated) {
-          auto linear_value =
-              arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
-          if (bias_ptr_vec) {
-            linear_value =
-                linear_value + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index]);
+          GemmResultElem linear_gemm_value;
+          cutlass::arch::global_load<GemmResultElem, sizeof(GemmResultElem)>(
+              linear_gemm_value, gemm_result_vec + elem_index, true);
+          auto linear_value = arrayConvert<GemmResultElem, ComputeElem>(linear_gemm_value);
+          if (bias_ptr) {
+            BiasElem linear_bias_value;
+            cutlass::arch::global_load<BiasElem, sizeof(BiasElem)>(linear_bias_value,
+                                                                   bias_ptr_vec + elem_index, true);
+            linear_value = linear_value + arrayConvert<BiasElem, ComputeElem>(linear_bias_value);
           }
           return fn(fc1_value, linear_value);
         } else {
@@ -2281,9 +2313,13 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
                     : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
         static_assert(sizeof(res) == sizeof(*output_vec),
                       "Quantized value must be the same size as the output");
-        output_vec[elem_index] = res;
+        auto out_vec = cutlass::platform::bit_cast<OutputElem>(res);
+        cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(out_vec,
+                                                                    output_vec + elem_index, true);
       } else {
-        output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(post_act_val);
+        auto out_vec = arrayConvert<ComputeElem, OutputElem>(post_act_val);
+        cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(out_vec,
+                                                                    output_vec + elem_index, true);
       }
     }
 
