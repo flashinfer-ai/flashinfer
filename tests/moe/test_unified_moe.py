@@ -99,6 +99,7 @@ class TestActivation:
         assert ActivationType.Swiglu.is_gated
         assert ActivationType.Geglu.is_gated
         assert ActivationType.SwigluBias.is_gated
+        assert ActivationType.SwigluStep.is_gated
         assert not ActivationType.Identity.is_gated
         assert not ActivationType.Relu2.is_gated
         assert not ActivationType.Gelu.is_gated

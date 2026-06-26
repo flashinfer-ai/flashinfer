@@ -55,11 +55,15 @@ class ActivationType(IntEnum):
     @property
     def is_gated(self) -> bool:
         """True for activations that consume a gate branch (SwiGLU family)."""
-        return self in (
-            ActivationType.Swiglu,
-            ActivationType.Geglu,
-            ActivationType.SwigluBias,
-        )
+        return self in _GATED_ACTIVATION_TYPES
+
+
+_GATED_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.Geglu,
+    ActivationType.SwigluBias,
+    ActivationType.SwigluStep,
+)
 
 
 DEFAULT_SWIGLU_ALPHA = 1.0
@@ -76,14 +80,9 @@ def normalize_activation_type(
         raise ValueError(f"Unsupported activation_type {activation_type!r}") from err
 
 
-def is_gated_activation(activation_type: ActivationType) -> bool:
+def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
     # Keep this in sync with isGatedActivation() in include/flashinfer/trtllm/fused_moe/runner.h.
-    return activation_type in [
-        ActivationType.Swiglu,
-        ActivationType.Geglu,
-        ActivationType.SwigluBias,
-        ActivationType.SwigluStep,
-    ]
+    return normalize_activation_type(activation_type) in _GATED_ACTIVATION_TYPES
 
 
 class DtypeTrtllmGen(IntEnum):
