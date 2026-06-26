@@ -37,15 +37,9 @@ from ..utils import (
     pos_encoding_mode_literal,
     write_if_different,
 )
-from .utils import generate_additional_params
+from .utils import _is_nvfp4_kv_dtype, generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
-
-
-def _is_nvfp4_kv_dtype(dtype: torch.dtype) -> bool:
-    return dtype == torch.uint8 or (
-        hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2
-    )
 
 
 def get_single_decode_uri(

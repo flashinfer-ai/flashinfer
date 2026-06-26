@@ -46,6 +46,7 @@ from .jit.attention import (
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
+from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
@@ -111,12 +112,6 @@ from .jit.moe_utils import gen_moe_utils_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
-
-
-def _is_nvfp4_kv_dtype(dtype: torch.dtype) -> bool:
-    return dtype == torch.uint8 or (
-        hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2
-    )
 
 
 def gen_fa2(
