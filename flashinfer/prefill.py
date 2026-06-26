@@ -440,12 +440,14 @@ def get_batch_prefill_module(backend, *args):
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
+        workspace_size_func = None
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
         uri = get_batch_prefill_uri(backend, *args)
         module = gen_batch_prefill_module(backend, *args).build_and_load()
         plan_func = module.plan
+        workspace_size_func = module.workspace_size
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
 
@@ -864,6 +866,7 @@ def get_batch_prefill_module(backend, *args):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
+        workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )
@@ -872,6 +875,7 @@ def get_batch_prefill_module(backend, *args):
 @functools.cache
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
+    workspace_size_func = getattr(jit_module, "workspace_size", None)
     ragged_run_func = jit_module.ragged_run
     paged_run_func = jit_module.paged_run
 
@@ -1013,6 +1017,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
+        workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )
