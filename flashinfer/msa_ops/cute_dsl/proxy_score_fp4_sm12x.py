@@ -346,10 +346,26 @@ class MsaProxyScoreFp4MmaSm12x:
             # min_blocks_per_mp=2 the kernel is register-bound (128 regs/thread), so a
             # 2nd K stage just spills to local memory with no occupancy gain, and the
             # CTAs already hide the K-load latency. Sync load + high occupancy wins.
+            # E11 causal tiling: a q-tile attends only kv-blocks up to its causal
+            # limit; blocks entirely in the causal future are all-masked, so
+            # computing their MMA only to write -inf is pure waste (~half the
+            # blocks for the diagonal tile -> the ~1.9x masked-MMA overhead). Skip
+            # the K-load + MMA for those and write -inf directly. The bottom query
+            # row of this tile (m_block*M + M-1, global pos +mQOffset) sees kv up
+            # to (.. )//N; clamp to the last valid block. Non-causal keeps the full
+            # range (last_block == num_kv_blocks-1), so behavior is unchanged there.
+            if cutlass.const_expr(self._is_causal):
+                causal_last = (
+                    m_block * self._M + (self._M - 1) + mQOffset[batch_idx]
+                ) // self._N
+                last_block = cutlass.min(causal_last, num_kv_blocks - 1)
+            else:
+                last_block = num_kv_blocks - 1
+
             n_iter = cute.ceil_div(max_k_tiles, num_splits)
             for it in cutlass.range(n_iter):
                 kv_block = split_idx + it * num_splits
-                if kv_block < num_kv_blocks:
+                if kv_block <= last_block:
                     self.cta_sync_barrier.arrive_and_wait()
                     k_pos0 = kv_block * self._N
                     if cutlass.const_expr(self._paged):

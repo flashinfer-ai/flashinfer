@@ -296,10 +296,26 @@ class MsaProxyScoreSm12x:
             # ... < max_k_tiles (disjoint across splits, union covers every column
             # once, no reduction). num_splits==1 -> the original [0, max_k_tiles).
             # ///////////////////////////////////////////////////////////////
+            # E11 causal tiling: skip the K-load + MMA for kv-blocks entirely above
+            # this q-tile's causal limit (they would be fully masked to -inf
+            # anyway -- the ~1.9x masked-MMA waste) and write their -inf directly.
+            # The tile's bottom query row m_block*M + (M-1) at global position
+            # +mQOffset sees kv up to (..)//N; clamp to the last valid block.
+            # Non-causal keeps last_block == num_kv_blocks-1 (unchanged behavior).
+            if cutlass.const_expr(self._is_causal):
+                causal_last = (
+                    m_block * self._m_block_size
+                    + (self._m_block_size - 1)
+                    + mQOffset[batch_idx]
+                ) // self._n_block_size
+                last_block = cutlass.min(causal_last, num_kv_blocks - 1)
+            else:
+                last_block = num_kv_blocks - 1
+
             n_iter = cute.ceil_div(max_k_tiles, num_splits)
             for it in cutlass.range(n_iter):
                 kv_block = split_idx + it * num_splits
-                if kv_block < num_kv_blocks:
+                if kv_block <= last_block:
                     # previous iteration's K fragment reads must be complete
                     self.cta_sync_barrier.arrive_and_wait()
                     if cutlass.const_expr(self._kv_fp8):
