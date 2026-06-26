@@ -1810,7 +1810,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
     } else {
       high = min(pivot_0, max_le_high);
     }
-  } while (min_gt_low != max_le_high);
+  } while (min_gt_low < max_le_high && nextafterf(min_gt_low, max_le_high) < max_le_high);
 
   float normalizer = math::ptx_rcp(max(sum_low, 1e-8));
 

@@ -40,7 +40,7 @@ from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.tllm_enums import DtypeTrtllmGen
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
-from .test_trtllm_gen_fused_moe import (
+from .trtllm_gen_fused_moe_utils import (
     FP8BlockScaleMoe,
     QuantMode,
     routing_reference_renormalize,
