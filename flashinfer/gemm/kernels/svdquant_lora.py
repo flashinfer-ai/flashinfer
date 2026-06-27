@@ -271,7 +271,7 @@ def _autotune_tactic(N, K, M, r, device=None):
     # cluster at several image sizes.
     calls = []
     for tac in _AUTOTUNE_CANDIDATES:
-        if K == 12288 and M >= 55112 and tac[2]:
+        if N == 3072 and K == 12288 and M >= 55112 and tac[2]:
             # Long steady-state graph runs show prefetch consistently slows the
             # deep-K 2x2 kernel at 55K/65K/73K rows (about 6%), even
             # when short tuning samples occasionally rank it first.
