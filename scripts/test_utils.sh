@@ -1512,7 +1512,10 @@ SOLO_TEST_PATTERNS=(
 # Historically long-running tests. Keep these parallel, but put them at the
 # front of the queue so they start on separate GPUs before shorter tests.
 LONG_RUNNING_TEST_PATTERNS=(
-    "test_trtllm_gen_fused_moe.py"
+    "test_trtllm_gen_fused_moe_routing_renormalize_fp4.py"
+    "test_trtllm_gen_fused_moe_routing_renormalize_fp8.py"
+    "test_trtllm_gen_fused_moe_routing_renormalize_bf16.py"
+    "test_trtllm_gen_fused_moe_other.py"
     "test_trtllm_gen_attention_decode.py"
     "test_trtllm_gen_attention_decode_xqa.py"
     "test_decode_delta_rule.py"

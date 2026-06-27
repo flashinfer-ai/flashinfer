@@ -195,7 +195,7 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
 # Optimized MTP kernel with ILP rows and SMEM v caching - used for BS >= 8
 @cute.kernel
 def gdn_verify_kernel_mtp(
-    h0_source: cute.Tensor,  # [pool_size * HV, V, K] - initial state pool (K-last)
+    h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
     intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
@@ -208,7 +208,8 @@ def gdn_verify_kernel_mtp(
     v: cute.Tensor,  # [B, T, HV, V]
     b: cute.Tensor,  # [B, T, HV]
     o: cute.Tensor,  # [B, T, HV, V] - output
-    h0_indices: cute.Tensor,  # [B] - initial state indices
+    h0_indices: cute.Tensor,  # [B] - initial state indices (read)
+    h0_out_indices: cute.Tensor,  # [B] - output state indices (write)
     cu_seqlens: cute.Tensor,  # [B+1] - cumulative sequence lengths (for varlen)
     ssm_state_indices: cute.Tensor,  # [B, T] int32 - per-token pool slots (FLA-style); dummy when per_token_pool_scatter=False
     softplus_beta: cutlass.Constexpr[float],
@@ -224,6 +225,9 @@ def gdn_verify_kernel_mtp(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    use_pool_indexing: cutlass.Constexpr[
+        bool
+    ],  # True: h0_source is 4D [pool, HV, V, K]; False: 3D [pool*HV, V, K]
     ilp_rows: cutlass.Constexpr[
         int
     ],  # 1, 2, 4, or 8: number of V-rows processed simultaneously
@@ -322,6 +326,37 @@ def gdn_verify_kernel_mtp(
         # Pre-compute these before Phase 1 (needed for h-state prefetch)
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         flat_state_idx = cache_idx * HV + i_hv
+        # Separate write index supports output_state_indices != initial_state_indices.
+        # Negative write indices skip the writeback (preserves the read-side
+        # "padding skip" semantics for the legacy fp32 path) — but the view we
+        # construct below must still be a valid in-bounds index, so we clamp
+        # the negative case to the read slot. The outer `if write_cache_idx >= 0`
+        # guard at each writeback site ensures we never actually store through
+        # the clamped view when the caller asked us to skip the slot.
+        # CuTe DSL: pre-declare flat_write_idx so it lives outside the `if`.
+        # Also keep the "is this slot skipped?" signal separately from the
+        # clamped write_cache_idx that the 4D view construction uses.
+        write_cache_idx_raw = h0_out_indices[i_n]
+        write_cache_idx = write_cache_idx_raw
+        if write_cache_idx_raw < 0:
+            write_cache_idx = cache_idx
+        flat_write_idx = write_cache_idx * HV + i_hv
+        # 2D (V, K) views onto the read/write slots. The branch on
+        # `use_pool_indexing` is the only place that knows the actual
+        # h0_source layout:
+        #   - True : h0_source is 4D [pool, HV, V, K]; slice with
+        #            (cache_idx, i_hv) — works for non-contiguous strided
+        #            pools (e.g., vLLM's page-strided SSM pool).
+        #   - False: h0_source is 3D [pool*HV, V, K] (free reshape view of
+        #            a contiguous 4D pool); slice with flat_*_idx.
+        # All subsequent kernel sites use these views uniformly via
+        # `cute.local_tile(h_*_view, (1, vec_size), (v, lane))`.
+        if cutlass.const_expr(use_pool_indexing):
+            h_read_view = h0_source[(cache_idx, i_hv, None, None)]
+            h_write_view = h0_source[(write_cache_idx, i_hv, None, None)]
+        else:
+            h_read_view = h0_source[(flat_state_idx, None, None)]
+            h_write_view = h0_source[(flat_write_idx, None, None)]
 
         # === WARP SPECIALIZATION: Phase 1 ===
         # Warp 0: compute q/k/g/beta for all T timesteps, write to SMEM
@@ -421,24 +456,24 @@ def gdn_verify_kernel_mtp(
                 v_pf_d = v_base_prefetch + 3
                 if v_pf_d < V:
                     pf_a = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_base_prefetch, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_base_prefetch, lane_in_group),
                     )
                     pf_b = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_base_prefetch + 1, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_base_prefetch + 1, lane_in_group),
                     )
                     pf_c = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_base_prefetch + 2, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_base_prefetch + 2, lane_in_group),
                     )
                     pf_d = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_base_prefetch + 3, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_base_prefetch + 3, lane_in_group),
                     )
                     cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
                     cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
@@ -449,14 +484,14 @@ def gdn_verify_kernel_mtp(
                 v_pf_b = v_base_prefetch + 1
                 if v_pf_b < V:
                     pf_a = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_base_prefetch, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_base_prefetch, lane_in_group),
                     )
                     pf_b = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_base_prefetch + 1, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_base_prefetch + 1, lane_in_group),
                     )
                     cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
                     cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
@@ -464,9 +499,9 @@ def gdn_verify_kernel_mtp(
                 # Prefetch 1 h-state row
                 if v_base_prefetch < V:
                     pf_a = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_base_prefetch, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_base_prefetch, lane_in_group),
                     )
                     cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
 
@@ -501,28 +536,28 @@ def gdn_verify_kernel_mtp(
                 if v7 < V:
                     # Load h for ALL 8 V-rows (8 independent load streams)
                     ht0 = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v0, lane_in_group)
+                        h_read_view, (1, vec_size), (v0, lane_in_group)
                     )
                     ht1 = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v1, lane_in_group)
+                        h_read_view, (1, vec_size), (v1, lane_in_group)
                     )
                     ht2 = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v2, lane_in_group)
+                        h_read_view, (1, vec_size), (v2, lane_in_group)
                     )
                     ht3 = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v3, lane_in_group)
+                        h_read_view, (1, vec_size), (v3, lane_in_group)
                     )
                     ht4 = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v4, lane_in_group)
+                        h_read_view, (1, vec_size), (v4, lane_in_group)
                     )
                     ht5 = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v5, lane_in_group)
+                        h_read_view, (1, vec_size), (v5, lane_in_group)
                     )
                     ht6 = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v6, lane_in_group)
+                        h_read_view, (1, vec_size), (v6, lane_in_group)
                     )
                     ht7 = cute.local_tile(
-                        h0_source, (1, 1, vec_size), (flat_state_idx, v7, lane_in_group)
+                        h_read_view, (1, vec_size), (v7, lane_in_group)
                     )
                     cute.autovec_copy(ht0, cute.slice_(r_h, (0, None)))
                     cute.autovec_copy(ht1, cute.slice_(r_h, (1, None)))
@@ -823,61 +858,60 @@ def gdn_verify_kernel_mtp(
                                 o[(i_n, i_t, i_hv, v6)] = cutlass.BFloat16(o6)
                                 o[(i_n, i_t, i_hv, v7)] = cutlass.BFloat16(o7)
 
-                    # Write final state back for all 8 rows. Skipped under FLA
-                    # mode (same_pool only): per-token scatter at i_t=T-1 already
-                    # wrote h_T to ssm_state_indices[i, T-1]; writing to
-                    # flat_state_idx (the read slot) would clobber h_0.
+                    # Write final state back for all 8 rows. Negative write
+                    # indices (output_state_indices == -1) skip the writeback.
                     if cutlass.const_expr(
                         not disable_state_update and not per_token_pool_scatter
                     ):
-                        ht_o0 = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v0, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (0, None)), ht_o0)
-                        ht_o1 = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v1, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (1, None)), ht_o1)
-                        ht_o2 = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v2, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (2, None)), ht_o2)
-                        ht_o3 = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v3, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (3, None)), ht_o3)
-                        ht_o4 = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v4, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (4, None)), ht_o4)
-                        ht_o5 = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v5, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (5, None)), ht_o5)
-                        ht_o6 = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v6, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (6, None)), ht_o6)
-                        ht_o7 = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v7, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (7, None)), ht_o7)
+                        if write_cache_idx_raw >= 0:
+                            ht_o0 = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v0, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), ht_o0)
+                            ht_o1 = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v1, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), ht_o1)
+                            ht_o2 = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v2, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), ht_o2)
+                            ht_o3 = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v3, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), ht_o3)
+                            ht_o4 = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v4, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (4, None)), ht_o4)
+                            ht_o5 = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v5, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (5, None)), ht_o5)
+                            ht_o6 = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v6, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (6, None)), ht_o6)
+                            ht_o7 = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v7, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (7, None)), ht_o7)
         elif cutlass.const_expr(ilp_rows == 4):
             # === 4-ROW ILP PATH: Process 4 V-rows simultaneously ===
             quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
@@ -892,24 +926,24 @@ def gdn_verify_kernel_mtp(
                     # Load h for 4 V-rows. Warps 1-3 skip first quad (prefetched in Phase 1).
                     if warp_idx == 0 or row_quad > 0:
                         h_tile_a = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_a, lane_in_group),
+                            h_read_view,
+                            (1, vec_size),
+                            (v_idx_a, lane_in_group),
                         )
                         h_tile_b = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_b, lane_in_group),
+                            h_read_view,
+                            (1, vec_size),
+                            (v_idx_b, lane_in_group),
                         )
                         h_tile_c = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_c, lane_in_group),
+                            h_read_view,
+                            (1, vec_size),
+                            (v_idx_c, lane_in_group),
                         )
                         h_tile_d = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_d, lane_in_group),
+                            h_read_view,
+                            (1, vec_size),
+                            (v_idx_d, lane_in_group),
                         )
                         cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
                         cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
@@ -1266,36 +1300,35 @@ def gdn_verify_kernel_mtp(
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
 
                     # Write final state back for ALL 4 rows (if not disabled).
-                    # Skipped under FLA mode (same_pool only): per-token scatter
-                    # at i_t=T-1 already wrote h_T to ssm_state_indices[i, T-1];
-                    # writing to flat_state_idx (the read slot) would clobber h_0.
+                    # Negative write indices skip the writeback.
                     if cutlass.const_expr(
                         not disable_state_update and not per_token_pool_scatter
                     ):
-                        h_tile_out_a = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_a, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
-                        h_tile_out_b = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_b, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
-                        h_tile_out_c = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_c, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (2, None)), h_tile_out_c)
-                        h_tile_out_d = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_d, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
+                        if write_cache_idx_raw >= 0:
+                            h_tile_out_a = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
+                            h_tile_out_b = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
+                            h_tile_out_c = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_c, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), h_tile_out_c)
+                            h_tile_out_d = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_d, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
         elif cutlass.const_expr(ilp_rows == 2):
             # === 2-ROW ILP PATH: Process 2 V-rows simultaneously ===
             half_rows: cutlass.Constexpr[int] = rows_per_group // 2
@@ -1308,14 +1341,14 @@ def gdn_verify_kernel_mtp(
                     # Load h for BOTH rows. Warps 1-3 skip first pair (prefetched).
                     if warp_idx == 0 or row_pair > 0:
                         h_tile_a = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_a, lane_in_group),
+                            h_read_view,
+                            (1, vec_size),
+                            (v_idx_a, lane_in_group),
                         )
                         h_tile_b = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_b, lane_in_group),
+                            h_read_view,
+                            (1, vec_size),
+                            (v_idx_b, lane_in_group),
                         )
                         cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
                         cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
@@ -1444,23 +1477,23 @@ def gdn_verify_kernel_mtp(
                                 )
 
                     # Write final state back for BOTH rows (if not disabled).
-                    # Skipped under FLA mode (same_pool only): per-token scatter
-                    # at i_t=T-1 already wrote h_T to ssm_state_indices[i, T-1].
+                    # Negative write indices skip the writeback.
                     if cutlass.const_expr(
                         not disable_state_update and not per_token_pool_scatter
                     ):
-                        h_tile_out_a = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_a, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
-                        h_tile_out_b = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_b, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
+                        if write_cache_idx_raw >= 0:
+                            h_tile_out_a = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
+                            h_tile_out_b = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
         # === Cooperative output writeback from SMEM to GMEM (only if use_smem_v) ===
         if cutlass.const_expr(use_smem_v):
             cute.arch.barrier()  # Ensure all groups finished writing to sOutput
@@ -1486,6 +1519,7 @@ def run_gdn_verify_kernel_mtp(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     ssm_state_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
@@ -1503,17 +1537,22 @@ def run_gdn_verify_kernel_mtp(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    use_pool_indexing: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    _, v_dim, k_dim = (
-        h0_source.layout.shape[0],
-        h0_source.layout.shape[1],
-        h0_source.layout.shape[2],
-    )
+    # h0_source has two possible layouts:
+    #   - 3D [pool*HV, V, K]  (use_pool_indexing=False) → V at dim 1, K at dim 2
+    #   - 4D [pool, HV, V, K] (use_pool_indexing=True)  → V at dim 2, K at dim 3
+    if cutlass.const_expr(use_pool_indexing):
+        v_dim = h0_source.layout.shape[2]
+        k_dim = h0_source.layout.shape[3]
+    else:
+        v_dim = h0_source.layout.shape[1]
+        k_dim = h0_source.layout.shape[2]
 
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
 
@@ -1546,6 +1585,7 @@ def run_gdn_verify_kernel_mtp(
         b,
         o,
         h0_indices,
+        h0_out_indices,
         cu_seqlens,
         ssm_state_indices,
         softplus_beta,
@@ -1561,6 +1601,7 @@ def run_gdn_verify_kernel_mtp(
         is_varlen,
         disable_state_update,
         cache_intermediate_states,
+        use_pool_indexing,
         ilp_rows,
         use_smem_v,
         use_packed_fma,
@@ -1577,7 +1618,7 @@ def run_gdn_verify_kernel_mtp(
 # Best for BS <= 2 (up to +10pp SOL vs v9 SMEM precompute variant)
 @cute.kernel
 def gdn_verify_kernel_mtp_inline(
-    h0_source: cute.Tensor,  # [pool_size * HV, V, K] - initial state pool (K-last)
+    h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
     intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
@@ -1590,7 +1631,8 @@ def gdn_verify_kernel_mtp_inline(
     v: cute.Tensor,  # [B, T, HV, V]
     b: cute.Tensor,  # [B, T, HV]
     o: cute.Tensor,  # [B, T, HV, V] - output
-    h0_indices: cute.Tensor,  # [B] - initial state indices
+    h0_indices: cute.Tensor,  # [B] - initial state indices (read)
+    h0_out_indices: cute.Tensor,  # [B] - output state indices (write)
     cu_seqlens: cute.Tensor,  # [B+1] - cumulative sequence lengths (for varlen)
     ssm_state_indices: cute.Tensor,  # [B, T] int32 - per-token pool slots (FLA-style); dummy when per_token_pool_scatter=False
     softplus_beta: cutlass.Constexpr[float],
@@ -1606,6 +1648,9 @@ def gdn_verify_kernel_mtp_inline(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    use_pool_indexing: cutlass.Constexpr[
+        bool
+    ],  # True: h0_source is 4D [pool, HV, V, K]; False: 3D [pool*HV, V, K]
     ilp_rows: cutlass.Constexpr[
         int
     ],  # 1, 2, 4, or 8: number of V-rows processed simultaneously
@@ -1703,6 +1748,35 @@ def gdn_verify_kernel_mtp_inline(
         # Each group handles tile_v/num_groups V rows
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         flat_state_idx = cache_idx * HV + i_hv
+        # Separate write index supports output_state_indices != initial_state_indices.
+        # Negative write indices skip the writeback (preserves the read-side
+        # "padding skip" semantics for the legacy fp32 path).
+        # Clamp the write-side index so the view construction below is always
+        # in-bounds (use the read slot as fallback). The outer
+        # `if write_cache_idx_raw >= 0` guard at each writeback site ensures
+        # we never actually write through the clamped view when the caller
+        # asked us to skip the slot.
+        write_cache_idx_raw = h0_out_indices[i_n]
+        write_cache_idx = write_cache_idx_raw
+        if write_cache_idx_raw < 0:
+            write_cache_idx = cache_idx
+        flat_write_idx = write_cache_idx * HV + i_hv
+        # 2D (V, K) views onto the read/write slots. The branch on
+        # `use_pool_indexing` is the only place that knows the actual
+        # h0_source layout:
+        #   - True : h0_source is 4D [pool, HV, V, K]; slice with
+        #            (cache_idx, i_hv) — works for non-contiguous strided
+        #            pools (e.g., vLLM's page-strided SSM pool).
+        #   - False: h0_source is 3D [pool*HV, V, K] (free reshape view of
+        #            a contiguous 4D pool); slice with flat_*_idx.
+        # All subsequent kernel sites use these views uniformly via
+        # `cute.local_tile(h_*_view, (1, vec_size), (v, lane))`.
+        if cutlass.const_expr(use_pool_indexing):
+            h_read_view = h0_source[(cache_idx, i_hv, None, None)]
+            h_write_view = h0_source[(write_cache_idx, i_hv, None, None)]
+        else:
+            h_read_view = h0_source[(flat_state_idx, None, None)]
+            h_write_view = h0_source[(flat_write_idx, None, None)]
 
         # v10: Pre-compute g/β for ALL timesteps into register arrays (shared across V-rows)
         # This avoids redundant softplus/sigmoid computation in each V-row iteration.
@@ -1744,26 +1818,26 @@ def gdn_verify_kernel_mtp_inline(
                 v_idx_d = v_idx_a + 3
 
                 if v_idx_d < V:
-                    # Issue h loads FIRST
+                    # Issue h loads FIRST (POC: using h_read_view 2D slice)
                     h_tile_a = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_idx_a, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_idx_a, lane_in_group),
                     )
                     h_tile_b = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_idx_b, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_idx_b, lane_in_group),
                     )
                     h_tile_c = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_idx_c, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_idx_c, lane_in_group),
                     )
                     h_tile_d = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_idx_d, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_idx_d, lane_in_group),
                     )
                     cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
                     cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
@@ -2053,35 +2127,35 @@ def gdn_verify_kernel_mtp_inline(
                             r_beta = r_beta_arr[i_t + 1]
 
                     # Write final state back for ALL 4 rows (if not disabled).
-                    # Skipped under FLA mode (same_pool only): per-token scatter
-                    # at i_t=T-1 already wrote h_T to ssm_state_indices[i, T-1].
+                    # Negative write indices skip the writeback.
                     if cutlass.const_expr(
                         not disable_state_update and not per_token_pool_scatter
                     ):
-                        h_tile_out_a = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_a, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
-                        h_tile_out_b = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_b, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
-                        h_tile_out_c = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_c, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (2, None)), h_tile_out_c)
-                        h_tile_out_d = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_d, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
+                        if write_cache_idx_raw >= 0:
+                            h_tile_out_a = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
+                            h_tile_out_b = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
+                            h_tile_out_c = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_c, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), h_tile_out_c)
+                            h_tile_out_d = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_d, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
         elif cutlass.const_expr(ilp_rows == 2):
             # === 2-ROW ILP PATH (v10: batched q/k + pre-computed L2 norms + fused loops) ===
             half_rows: cutlass.Constexpr[int] = rows_per_group // 2
@@ -2106,14 +2180,14 @@ def gdn_verify_kernel_mtp_inline(
                 if v_idx_b < V:
                     # Issue h loads FIRST
                     h_tile_a = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_idx_a, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_idx_a, lane_in_group),
                     )
                     h_tile_b = cute.local_tile(
-                        h0_source,
-                        (1, 1, vec_size),
-                        (flat_state_idx, v_idx_b, lane_in_group),
+                        h_read_view,
+                        (1, vec_size),
+                        (v_idx_b, lane_in_group),
                     )
                     cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
                     cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
@@ -2288,24 +2362,23 @@ def gdn_verify_kernel_mtp_inline(
                                     sum_hq_b
                                 )
 
-                    # Write final state back. Skipped under FLA mode
-                    # (same_pool only): per-token scatter at i_t=T-1 already
-                    # wrote h_T to ssm_state_indices[i, T-1].
+                    # Write final state back. Negative write indices skip the writeback.
                     if cutlass.const_expr(
                         not disable_state_update and not per_token_pool_scatter
                     ):
-                        h_tile_out_a = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_a, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
-                        h_tile_out_b = cute.local_tile(
-                            h0_source,
-                            (1, 1, vec_size),
-                            (flat_state_idx, v_idx_b, lane_in_group),
-                        )
-                        cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
+                        if write_cache_idx_raw >= 0:
+                            h_tile_out_a = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
+                            h_tile_out_b = cute.local_tile(
+                                h_write_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
 
         # === Cooperative output writeback from SMEM to GMEM (only if use_smem_v) ===
         if cutlass.const_expr(use_smem_v):
@@ -2332,6 +2405,7 @@ def run_gdn_verify_kernel_mtp_inline(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
+    h0_out_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     ssm_state_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
@@ -2349,17 +2423,20 @@ def run_gdn_verify_kernel_mtp_inline(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    use_pool_indexing: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    _, v_dim, _ = (
-        h0_source.layout.shape[0],
-        h0_source.layout.shape[1],
-        h0_source.layout.shape[2],
-    )
+    # h0_source has two possible layouts:
+    #   - 3D [pool*HV, V, K]  (use_pool_indexing=False) → V at dim 1
+    #   - 4D [pool, HV, V, K] (use_pool_indexing=True)  → V at dim 2
+    if cutlass.const_expr(use_pool_indexing):
+        v_dim = h0_source.layout.shape[2]
+    else:
+        v_dim = h0_source.layout.shape[1]
 
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
 
@@ -2388,6 +2465,7 @@ def run_gdn_verify_kernel_mtp_inline(
         b,
         o,
         h0_indices,
+        h0_out_indices,
         cu_seqlens,
         ssm_state_indices,
         softplus_beta,
@@ -2403,6 +2481,7 @@ def run_gdn_verify_kernel_mtp_inline(
         is_varlen,
         disable_state_update,
         cache_intermediate_states,
+        use_pool_indexing,
         ilp_rows,
         use_smem_v,
         use_packed_fma,
@@ -2425,6 +2504,8 @@ def _get_compiled_mtp_kernel(
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
+    use_pool_indexing: bool,
+    pool_strides_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2448,6 +2529,8 @@ def _get_compiled_mtp_kernel_inline(
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
+    use_pool_indexing: bool,
+    pool_strides_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2488,6 +2571,8 @@ def run_mtp_decode(
     disable_state_update: bool,
     cache_intermediate_states: bool,
     ssm_state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
+    use_pool_indexing: bool = False,
 ):
     """Execute the appropriate MTP kernel based on batch size.
 
@@ -2506,7 +2591,7 @@ def run_mtp_decode(
         v: Value tensor [B, T, HV, V].
         b: Update gate input [B, T, HV].
         output: Output tensor [B, T, HV, V].
-        initial_state_indices: Batch-to-state mapping [B].
+        initial_state_indices: Batch-to-state mapping [B] (read indices).
         B, T, H, HV, K, V: Dimension sizes.
         pool_size: Number of states in the pool.
         cache_steps: Number of intermediate state cache slots.
@@ -2516,6 +2601,9 @@ def run_mtp_decode(
         use_qk_l2norm: Whether to apply L2 normalization to q and k.
         disable_state_update: If True, do not write back updated state.
         cache_intermediate_states: If True, cache intermediate states.
+        output_state_indices: Optional [B] write indices. Defaults to
+            initial_state_indices. Negative entries skip the writeback for
+            that batch slot (matching the read-side padding skip semantics).
     """
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
@@ -2524,28 +2612,61 @@ def run_mtp_decode(
     use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
 
     per_token_pool_scatter = ssm_state_indices is not None
-    cache_key = (
-        T,
-        H,
-        HV,
-        K,
-        V,
-        cache_steps,
-        disable_state_update,
-        cache_intermediate_states,
-        scale,
-        use_qk_l2norm,
-        tile_v,
-        vec_size,
-        ilp_rows,
-        use_smem_v,
-        use_packed_fma,
-        per_token_pool_scatter,
-    )
-    if use_inline_kernel:
-        cache = _get_compiled_mtp_kernel_inline(*cache_key)
+
+    # `cute.compile` bakes h0_source strides into the produced binary. When
+    # `use_pool_indexing=True` callers can legitimately pass 4D pools with
+    # different stride patterns (e.g., differently-paged pools), so we must
+    # include the strides in the cache key. For the flat path strides are
+    # always (V*K, K, 1) and don't need to be keyed.
+    if use_pool_indexing:
+        pool_strides_key = tuple(h0_source.stride())
     else:
-        cache = _get_compiled_mtp_kernel(*cache_key)
+        pool_strides_key = None
+
+    if use_inline_kernel:
+        inline_cache_key = (
+            T,
+            H,
+            HV,
+            K,
+            V,
+            cache_steps,
+            disable_state_update,
+            cache_intermediate_states,
+            use_pool_indexing,
+            pool_strides_key,
+            scale,
+            use_qk_l2norm,
+            tile_v,
+            vec_size,
+            ilp_rows,
+            use_smem_v,
+            use_packed_fma,
+            per_token_pool_scatter,
+        )
+        cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
+    else:
+        warp_cache_key = (
+            T,
+            H,
+            HV,
+            K,
+            V,
+            cache_steps,
+            disable_state_update,
+            cache_intermediate_states,
+            use_pool_indexing,
+            pool_strides_key,
+            scale,
+            use_qk_l2norm,
+            tile_v,
+            vec_size,
+            ilp_rows,
+            use_smem_v,
+            use_packed_fma,
+            per_token_pool_scatter,
+        )
+        cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
     cu_seqlens_map = cache.setdefault("cu_seqlens", {})
     cu_key = (B, q.device)
@@ -2566,12 +2687,36 @@ def run_mtp_decode(
         else cache["default_ssm_state_indices"]
     )
 
+    # Resolve write indices: default to read indices when output_state_indices is None.
+    # `.to(initial_state_indices)` (passing the tensor, not just the dtype) realigns
+    # both device and dtype in one call and is a no-op if they already match — this
+    # protects against a CPU/GPU mismatch when the caller built output_state_indices
+    # on a different device than initial_state_indices.
+    if output_state_indices is not None:
+        h0_out_indices = output_state_indices.to(initial_state_indices)
+    else:
+        h0_out_indices = initial_state_indices
+
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        h0_source_tensor = from_dlpack(
-            h0_source, assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        if use_pool_indexing:
+            # 4D pool [pool, HV, V, K], possibly non-contiguous (e.g. a strided
+            # slice of an oversized backing tensor). main's mark_compact_shape_dynamic
+            # assumes a compact 3D flat pool (wrong rank + compactness here), and
+            # mark_layout_dynamic would make V/K dynamic (the kernel needs them as
+            # compile-time constants, e.g. num_v_tiles). So pass the layout through
+            # statically: the exact strides are baked in and keyed via
+            # pool_strides_key. The pool-dim (mode 0) stride is independent of the
+            # pool size, so one compiled kernel is reused across batch sizes and
+            # indexes correctly by cache_idx * stride — pool_size is not needed in
+            # the cache key or as a compile-time shape.
+            h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        else:
+            # 3D flat pool [pool*HV, V, K], compact.
+            h0_source_tensor = from_dlpack(
+                h0_source, assumed_align=16
+            ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
         if cache_intermediate_states:
             # Caching-off dummy ([1,1,1]) is never read; skip marking it.
@@ -2581,27 +2726,19 @@ def run_mtp_decode(
                 )
             )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2), divisibility=1
-        )
+        # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
+        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-        )
-        k_tensor = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-        )
-        v_tensor = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-        )
-        b_tensor = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2), divisibility=1
-        )
-        o_tensor = from_dlpack(output, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-        )
+        q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
+        k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
+        v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
         h0_indices_tensor = from_dlpack(
             initial_state_indices, assumed_align=16
+        ).mark_layout_dynamic()
+        h0_out_indices_tensor = from_dlpack(
+            h0_out_indices, assumed_align=16
         ).mark_layout_dynamic()
         cu_seqlens_tensor = from_dlpack(
             cu_seqlens, assumed_align=16
@@ -2624,6 +2761,7 @@ def run_mtp_decode(
                 b_tensor,
                 o_tensor,
                 h0_indices_tensor,
+                h0_out_indices_tensor,
                 cu_seqlens_tensor,
                 ssm_idx_tensor,
                 softplus_beta=1.0,
@@ -2641,6 +2779,7 @@ def run_mtp_decode(
                 is_varlen=False,
                 disable_state_update=disable_state_update,
                 cache_intermediate_states=cache_intermediate_states,
+                use_pool_indexing=use_pool_indexing,
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
                 use_packed_fma=use_packed_fma,
@@ -2662,6 +2801,7 @@ def run_mtp_decode(
                 b_tensor,
                 o_tensor,
                 h0_indices_tensor,
+                h0_out_indices_tensor,
                 cu_seqlens_tensor,
                 ssm_idx_tensor,
                 softplus_beta=1.0,
@@ -2679,6 +2819,7 @@ def run_mtp_decode(
                 is_varlen=False,
                 disable_state_update=disable_state_update,
                 cache_intermediate_states=cache_intermediate_states,
+                use_pool_indexing=use_pool_indexing,
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
                 use_packed_fma=use_packed_fma,
@@ -2703,6 +2844,7 @@ def run_mtp_decode(
         b,
         output,
         initial_state_indices,
+        h0_out_indices,
         cu_seqlens,
         ssm_state_indices_arg,
         stream,
