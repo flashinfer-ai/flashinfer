@@ -132,7 +132,7 @@ def round_to_nearest_bucket(
         return buckets[0]
 
 
-@functools.cache
+@functools.lru_cache(maxsize=16384)
 def make_bucket_mapper(
     buckets: tuple[int, ...], round_map: bool = False
 ) -> Callable[[int], int]:
@@ -913,7 +913,7 @@ class AutoTunerStatistics:
         return stats_str
 
 
-@functools.cache
+@functools.lru_cache(maxsize=16384)
 def load_from_file(file_key: str) -> tuple[bool, int, int, None]:
     module_name = get_config_path(is_module=True)
     try:
@@ -1782,7 +1782,7 @@ class AutoTuner:
         return generated_profiles
 
     @classmethod
-    @functools.cache
+    @functools.lru_cache(maxsize=16384)
     def _find_nearest_profile(
         cls, shapes: tuple[tuple[int, ...], ...], tuning_config: TuningConfig
     ) -> tuple[tuple[int, ...], ...]:
