@@ -31,6 +31,37 @@ _BLK_KV = 128
 _SF_VEC_SIZE = 16
 
 
+def _resolve_proxy_dims(cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output):
+    """Resolve the host-side grid dims ``(max_seqlen_q, max_k_tiles)``.
+
+    These size the launch grid and the score buffer, so they must be Python ints.
+    Passing them -- or a pre-allocated ``output`` whose ``shape[1]`` is
+    ``max_k_tiles`` -- resolves them with no stream sync, keeping the proxy
+    **CUDA-graph-capturable** (the prerequisite for using the MSA indexer inside a
+    captured decode graph). Otherwise they are read from ``cu_seqlens`` on the host
+    (``.cpu()``/``.item()``), which is *illegal during graph capture*; rather than
+    emit the cryptic "copy between CPU and CUDA during capture" error we raise an
+    actionable one. Outside capture the host read is kept for eager convenience."""
+    if max_k_tiles is None and output is not None:
+        max_k_tiles = int(output.shape[1])
+    if max_seqlen_q is not None and max_k_tiles is not None:
+        return max_seqlen_q, max_k_tiles
+    if torch.cuda.is_current_stream_capturing():
+        raise ValueError(
+            "msa_proxy_score[_fp4] needs max_seqlen_q and max_k_tiles during CUDA "
+            "graph capture (deriving them from cu_seqlens would sync the stream). "
+            "Pass both -- computed once at plan time -- or pre-allocate `output`."
+        )
+    if max_seqlen_q is None:
+        cu_q_cpu = cu_seqlens_q.cpu()
+        max_seqlen_q = int((cu_q_cpu[1:] - cu_q_cpu[:-1]).max().item())
+    if max_k_tiles is None:
+        cu_k_cpu = cu_k.cpu()
+        seqlens_k = cu_k_cpu[1:] - cu_k_cpu[:-1]
+        max_k_tiles = int((seqlens_k.max().item() + _BLK_KV - 1) // _BLK_KV)
+    return max_seqlen_q, max_k_tiles
+
+
 def _proxy_split_k(
     base_ctas: int,
     max_k_tiles: int,
@@ -338,13 +369,9 @@ def msa_proxy_score(
 
     cu_q_dev = cu_seqlens_q.to(dev)
     qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev)
-    if max_seqlen_q is None:
-        cu_q_cpu = cu_seqlens_q.cpu()
-        max_seqlen_q = int((cu_q_cpu[1:] - cu_q_cpu[:-1]).max().item())
-    if max_k_tiles is None:
-        cu_k_cpu = cu_k.cpu()
-        seqlens_k = cu_k_cpu[1:] - cu_k_cpu[:-1]
-        max_k_tiles = int((seqlens_k.max().item() + _BLK_KV - 1) // _BLK_KV)
+    max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
+        cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output
+    )
 
     per_head_shape = (num_qo_heads, max_k_tiles, total_q)
     final_shape = (1, max_k_tiles, total_q) if reduce_heads else per_head_shape
@@ -599,13 +626,9 @@ def msa_proxy_score_fp4(
 
     cu_q_dev = cu_seqlens_q.to(dev)
     qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k, dev)
-    if max_seqlen_q is None:
-        cu_q_cpu = cu_seqlens_q.cpu()
-        max_seqlen_q = int((cu_q_cpu[1:] - cu_q_cpu[:-1]).max().item())
-    if max_k_tiles is None:
-        cu_k_cpu = cu_k.cpu()
-        seqlens_k = cu_k_cpu[1:] - cu_k_cpu[:-1]
-        max_k_tiles = int((seqlens_k.max().item() + _BLK_KV - 1) // _BLK_KV)
+    max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
+        cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output
+    )
 
     per_head_shape = (num_qo_heads, max_k_tiles, total_q)
     final_shape = (1, max_k_tiles, total_q) if reduce_heads else per_head_shape
