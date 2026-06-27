@@ -361,15 +361,17 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
   bool isGatedAct = isGatedActivation(activationType);
   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
-  auto fusedBiasShuffleMode = useBiasMn ? batchedGemm::gemm::FusedBiasShuffleMode::ReorderAndShuffle
-                                        : batchedGemm::gemm::FusedBiasShuffleMode::None;
+  // ReorderAndShuffle is only supported on fused-act (gated) paths in trtllm-gen.
+  // DSFp8 uses non-fused activation, so it must use Shuffle mode for biasMn.
+  auto fusedBiasShuffleMode =
+      useBiasMn ? (useDeepSeekFp8 ? batchedGemm::gemm::FusedBiasShuffleMode::Shuffle
+                                  : batchedGemm::gemm::FusedBiasShuffleMode::ReorderAndShuffle)
+                : batchedGemm::gemm::FusedBiasShuffleMode::None;
   auto const biasDtype = batchedGemm::trtllm::gen::Dtype::Bfloat16;
   if (useBiasMn) {
     // These checks are because trtllm-gen only exports a subset of the bias types and modes
     FLASHINFER_CHECK(isGatedAct,
                      "PermuteGemm1 BiasType::Mn requires a gated activation (SwiGlu/GeGlu)");
-    FLASHINFER_CHECK(!useDeepSeekFp8,
-                     "PermuteGemm1 BiasType::Mn requires fusedAct=true (not DeepSeek FP8)");
     FLASHINFER_CHECK(useShuffledMatrix,
                      "PermuteGemm1 BiasType::Mn requires useShuffledMatrix=true");
   }

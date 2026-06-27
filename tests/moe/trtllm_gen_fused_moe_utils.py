@@ -308,6 +308,30 @@ class Moe(ABC):
         """Unified actual computation that delegates to implementation-specific methods."""
         return _compute_moe_actual_unified(self, args_dequant, args, **kwargs)
 
+    def check_intermediate_output(self, raw_kernel_output, reference_args):
+        """Validate the kernel's exposed post-activation FC1 output.
+
+        This base implementation checks only the shape. Quant-specific subclasses may override
+        to add a numerical comparison in their own block-scale format.
+
+        ``reference_args`` is the dequantized-reference args object that carries ``intermediate_size``,
+        the reference ``activation_output``, and ``permute_info``).
+        """
+        assert isinstance(raw_kernel_output, list) and len(raw_kernel_output) >= 3, (
+            f"Expected the kernel to return [output, "
+            f"expanded_idx_to_permuted_idx, gemm1_output]; got "
+            f"{type(raw_kernel_output).__name__} of length "
+            f"{len(raw_kernel_output) if isinstance(raw_kernel_output, list) else 'n/a'}"
+        )
+        intermediate = raw_kernel_output[2]
+        assert intermediate.shape[-1] == reference_args.intermediate_size, (
+            f"Expected the post-activation FC1 output to have last-dim "
+            f"{reference_args.intermediate_size}; got shape "
+            f"{tuple(intermediate.shape)}. The kernel may have returned the "
+            f"pre-activation gemm1_output buffer (shape [M, 2*intermediate_size]) "
+            f"instead of the post-activation activation_output buffer."
+        )
+
     @abstractmethod
     def get_tolerances(self):
         """Get accuracy tolerances for this quantization mode."""
@@ -916,7 +940,11 @@ class MxInt4BlockScaleMoe(Moe):
                     tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
                     norm_topk_prob=norm_topk_prob,
                 )
-        return output[0].to(torch.float)
+        if isinstance(output, list):
+            if kwargs.get("return_full_output", False):
+                return output
+            return output[0].to(torch.float)
+        return output.to(torch.float)
 
     def compute_reference(self, args):
         return run_moe_reference_mxint4(args)
@@ -1207,7 +1235,7 @@ class FP8BlockScaleMoe(Moe):
     ):
         """Call MoE with runtime block scale generation + kernel execution.
 
-        When a ``gemm1_lora_delta`` is set for MXFP8, routing has to happen
+        When a ``gemm1_lora_delta`` is set, routing has to happen
         outside the MoE kernel so the caller's LoRA backbone and the MoE share
         the same top-k routing. We therefore switch to the routed entry point
         and reuse ``permute_info["topKIndices"]`` / ``permute_info["topKLogits"]``
@@ -1252,10 +1280,6 @@ class FP8BlockScaleMoe(Moe):
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
             if gemm1_lora_delta is not None:
-                if self.fp8_quantization_type != QuantMode.FP8_BLOCK_SCALE_MXFP8:
-                    raise NotImplementedError(
-                        "LoRA delta is only supported for MXFP8 in FP8BlockScaleMoe tests."
-                    )
                 packed_topk_ids = pack_topk_for_routed_moe(
                     permute_info["topKIndices"], permute_info["topKLogits"]
                 )
@@ -1319,6 +1343,8 @@ class FP8BlockScaleMoe(Moe):
                     gemm1_clamp_limit=gemm1_clamp_limit,
                 )
         if isinstance(output, list):
+            if kwargs.get("return_full_output", False):
+                return output
             return output[0].to(torch.float)
         return output.to(torch.float)
 
@@ -1336,6 +1362,67 @@ class FP8BlockScaleMoe(Moe):
     def get_tolerances(self):
         """Get FP8 block-scale accuracy tolerances."""
         return {"atol": 0.1, "rtol": 0.85, "percent": 0.79}
+
+    def check_intermediate_output(self, raw_kernel_output, reference_args):
+        """Shape check (base) plus a value comparison of the post-activation
+        FC1 output against the reference fp32.
+        """
+        super().check_intermediate_output(raw_kernel_output, reference_args)
+
+        # Gather both sides into canonical expanded-index order.
+        # We index each by its own expanded->permuted map (each exactly
+        # [num_tokens * top_k] long).
+        kernel_codes = raw_kernel_output[2]
+        kernel_expanded_to_permuted = raw_kernel_output[1].to(torch.int64).cpu()
+        ref_expanded_to_permuted = (
+            reference_args.permute_info["expandedTokenIdxToPermutedIdx"]
+            .to(torch.int64)
+            .cpu()
+        )
+        kernel_routed = kernel_codes[kernel_expanded_to_permuted]
+        ref_routed = reference_args.activation_output[ref_expanded_to_permuted].to(
+            torch.float32
+        )
+        n_rows, intermediate_size = ref_routed.shape
+
+        if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
+            # Per-(1, 128) linear block scale derived from the reference.
+            finfo = torch.finfo(torch.float8_e4m3fn)
+            n_blocks = intermediate_size // 128
+            scale = (
+                ref_routed.view(n_rows, n_blocks, 128)
+                .abs()
+                .amax(dim=-1, keepdim=True)
+                .clamp(min=1e-12)
+                / finfo.max
+            )
+            kernel_dequant = (
+                kernel_routed.view(torch.float8_e4m3fn)
+                .to(torch.float32)
+                .view(n_rows, n_blocks, 128)
+                * scale
+            ).view(n_rows, intermediate_size)
+        else:  # FP8_BLOCK_SCALE_MXFP8
+            # mx-format scale via the mx quantizer;
+            # keep only the scale to decode the kernel's codes.
+            _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
+            ref_scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
+            kernel_dequant = (
+                mxfp8_dequantize_host(
+                    kernel_routed.cpu().view(torch.uint8), ref_scale_bytes
+                )
+                .to(ref_routed.device)
+                .to(torch.float32)
+            )
+
+        tolerances = self.get_tolerances()
+        check_accuracy(
+            ref_routed,
+            kernel_dequant,
+            atol=tolerances["atol"],
+            rtol=tolerances["rtol"],
+            percent=tolerances["percent"],
+        )
 
 
 # ====================================================================================
@@ -1724,6 +1811,8 @@ class BF16Moe(Moe):
                     gemm1_clamp_limit=gemm1_clamp_limit,
                 )
         if isinstance(output, list):
+            if kwargs.get("return_full_output", False):
+                return output
             return output[0].to(torch.float)
         return output.to(torch.float)
 
@@ -2482,6 +2571,10 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
+    # Stash the fp32 post-activation FC1 output so callers can compare against
+    # the kernel's return_activation_output slot.
+    args.activation_output = activation_output.clone()
+
     if quant_mode == QuantMode.FP4_NVFP4_NVFP4:
         # Use centralized function for activation quantization
         activation_output, c_global_sf = quant_dequant_fp4(
@@ -2727,6 +2820,7 @@ def run_moe_reference_dsfp8(args):
         gemm1_alpha=args.gemm1_alpha,
         gemm1_beta=args.gemm1_beta,
         gemm1_clamp_limit=args.gemm1_clamp_limit,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(
@@ -2910,6 +3004,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "gemm1_clamp_limit": args.gemm1_clamp_limit,
         "permute_info": args.permute_info,
         "norm_topk_prob": kwargs.get("norm_topk_prob", True),
+        "return_full_output": kwargs.get("return_full_output", False),
     }
 
     return moe_impl.call_moe(
@@ -3161,8 +3256,12 @@ def run_moe_test(
     routing_bias_dtype=None,
     norm_topk_prob=True,
     check_reference=True,
+    check_intermediate_output=False,
 ):
     """Common test logic for all routing methods."""
+    if gemm1_lora_delta is not None:
+        check_intermediate_output = True
+
     skip_checks(
         moe_impl,
         routing_config,
@@ -3360,7 +3459,14 @@ def run_moe_test(
         hidden_states_quant=inputs_data["hidden_states"],
         enable_autotune=enable_autotune,
         norm_topk_prob=norm_topk_prob,
+        return_full_output=check_intermediate_output,
     )
+
+    # When a lora delta is set, the kernel returns the post-activation FC1 output
+    # exposed as the third element. Validate it.
+    if check_intermediate_output:
+        moe_impl.check_intermediate_output(output_dequant_actual, args_dequant)
+        output_dequant_actual = output_dequant_actual[0].to(torch.float)
 
     # Compare outputs
     if check_reference:
