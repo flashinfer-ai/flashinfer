@@ -617,7 +617,7 @@ class FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr);
+        norm_topk_prob, replay_ptr, enable_pdl);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1433,7 +1433,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr);
+        norm_topk_prob, replay_ptr, enable_pdl);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -2005,7 +2005,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
                        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
                        static_cast<RoutingMethodType>(routing_method_type), routing_stream,
-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr);
+                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
 
     check_moe();
     prepare_moe(moe_tactic);
