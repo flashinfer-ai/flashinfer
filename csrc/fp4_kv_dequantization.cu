@@ -132,7 +132,9 @@ __global__ void nvfp4_paged_dequant_kernel(
     const IdType* __restrict__ block_tables, const int32_t* __restrict__ seq_lens,
     const float* __restrict__ global_scale_ptr, OutType* __restrict__ output, const int batch_size,
     const int max_seq_len, const int block_table_stride, const int num_pages, const int page_size,
-    const int num_heads, const int head_dim, const int layout) {
+    const int num_heads, const int head_dim, const int64_t cache_stride_page,
+    const int64_t cache_stride_n, const int64_t cache_stride_h, const int64_t scale_stride_page,
+    const int64_t scale_stride_n, const int64_t scale_stride_h) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
 
@@ -150,21 +152,12 @@ __global__ void nvfp4_paged_dequant_kernel(
   const int packed_dim = head_dim / 2;
   const int scale_dim = head_dim / NVFP4_BLOCK_SIZE;
 
-  int64_t cache_base;
-  int64_t scale_base;
-  if (layout == 0) {
-    // NHD: [num_pages, page_size, num_heads, dim]
-    cache_base =
-        ((static_cast<int64_t>(page) * page_size + entry_idx) * num_heads + head) * packed_dim;
-    scale_base =
-        ((static_cast<int64_t>(page) * page_size + entry_idx) * num_heads + head) * scale_dim;
-  } else {
-    // HND: [num_pages, num_heads, page_size, dim]
-    cache_base =
-        ((static_cast<int64_t>(page) * num_heads + head) * page_size + entry_idx) * packed_dim;
-    scale_base =
-        ((static_cast<int64_t>(page) * num_heads + head) * page_size + entry_idx) * scale_dim;
-  }
+  const int64_t cache_base = static_cast<int64_t>(page) * cache_stride_page +
+                             static_cast<int64_t>(entry_idx) * cache_stride_n +
+                             static_cast<int64_t>(head) * cache_stride_h;
+  const int64_t scale_base = static_cast<int64_t>(page) * scale_stride_page +
+                             static_cast<int64_t>(entry_idx) * scale_stride_n +
+                             static_cast<int64_t>(head) * scale_stride_h;
 
   const uint8_t* row_fp4 = paged_cache + cache_base;
   const uint8_t* row_scales = paged_scales + scale_base;
@@ -244,10 +237,10 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
                             TensorView v_scales, TensorView block_tables, TensorView seq_lens,
                             TensorView k_global_scale, TensorView v_global_scale,
                             TensorView output_k, TensorView output_v, int64_t kv_layout) {
-  CHECK_INPUT(paged_k_cache);
-  CHECK_INPUT(paged_v_cache);
-  CHECK_INPUT(k_scales);
-  CHECK_INPUT(v_scales);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(paged_k_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(paged_v_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_scales);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_scales);
   CHECK_INPUT(block_tables);
   CHECK_INPUT(seq_lens);
   CHECK_CUDA(k_global_scale);
@@ -350,6 +343,23 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
   CHECK_DEVICE(paged_k_cache, output_k);
   CHECK_DEVICE(paged_k_cache, output_v);
 
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  auto k_scale_strides = k_scales.strides();
+  auto v_scale_strides = v_scales.strides();
+  const int64_t k_stride_page = k_strides[0];
+  const int64_t k_stride_n = kv_layout == 1 ? k_strides[2] : k_strides[1];
+  const int64_t k_stride_h = kv_layout == 1 ? k_strides[1] : k_strides[2];
+  const int64_t v_stride_page = v_strides[0];
+  const int64_t v_stride_n = kv_layout == 1 ? v_strides[2] : v_strides[1];
+  const int64_t v_stride_h = kv_layout == 1 ? v_strides[1] : v_strides[2];
+  const int64_t k_scale_stride_page = k_scale_strides[0];
+  const int64_t k_scale_stride_n = kv_layout == 1 ? k_scale_strides[2] : k_scale_strides[1];
+  const int64_t k_scale_stride_h = kv_layout == 1 ? k_scale_strides[1] : k_scale_strides[2];
+  const int64_t v_scale_stride_page = v_scale_strides[0];
+  const int64_t v_scale_stride_n = kv_layout == 1 ? v_scale_strides[2] : v_scale_strides[1];
+  const int64_t v_scale_stride_h = kv_layout == 1 ? v_scale_strides[1] : v_scale_strides[2];
+
   ffi::CUDADeviceGuard device_guard(paged_k_cache.device().device_id);
   cudaStream_t stream = get_stream(paged_k_cache.device());
 
@@ -366,7 +376,8 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
           static_cast<const int32_t*>(seq_lens.data_ptr()),
           static_cast<const float*>(k_global_scale.data_ptr()),
           static_cast<out_type*>(output_k.data_ptr()), batch_size, max_seq_len,
-          block_tables.size(1), num_pages, page_size, num_heads, k_head_dim, kv_layout);
+          block_tables.size(1), num_pages, page_size, num_heads, k_head_dim, k_stride_page,
+          k_stride_n, k_stride_h, k_scale_stride_page, k_scale_stride_n, k_scale_stride_h);
       nvfp4_paged_dequant_kernel<out_type, id_type, BLOCK_SIZE><<<grid, block, 0, stream>>>(
           static_cast<const uint8_t*>(paged_v_cache.data_ptr()),
           static_cast<const uint8_t*>(v_scales.data_ptr()),
@@ -374,7 +385,8 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
           static_cast<const int32_t*>(seq_lens.data_ptr()),
           static_cast<const float*>(v_global_scale.data_ptr()),
           static_cast<out_type*>(output_v.data_ptr()), batch_size, max_seq_len,
-          block_tables.size(1), num_pages, page_size, num_heads, v_head_dim, kv_layout);
+          block_tables.size(1), num_pages, page_size, num_heads, v_head_dim, v_stride_page,
+          v_stride_n, v_stride_h, v_scale_stride_page, v_scale_stride_n, v_scale_stride_h);
       return true;
     });
     return true;

@@ -76,6 +76,17 @@ SHAPES = [(128, 64), (256, 128), (1, 32), (2048, 2048)]
 DTYPES = [torch.bfloat16, torch.float16]
 
 
+def make_non_contiguous_last_dim_view(x):
+    padded_shape = (x.size(0) + 1, x.size(1) + 1, x.size(2) + 1, x.size(3) + 2)
+    padded = torch.empty(padded_shape, dtype=x.dtype, device=x.device)
+    view = padded[1:, 1:, 1:, 1 : 1 + x.size(3)]
+    view.copy_(x)
+    assert not view.is_contiguous()
+    assert view.stride(-1) == 1
+    assert view.storage_offset() > 0
+    return view
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_nvfp4_kv_dequant(shape, dtype):
@@ -111,7 +122,8 @@ def test_nvfp4_kv_dequant(shape, dtype):
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("block_table_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype):
+@pytest.mark.parametrize("non_contiguous", [False, True])
+def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype, non_contiguous):
     """Test paged NVFP4 KV dequantization against PyTorch reference."""
     cc = get_compute_capability()
     if cc < 80:
@@ -168,6 +180,11 @@ def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype):
         v_cache = v_cache_nhd.permute(0, 2, 1, 3).contiguous()
         k_scales = k_scales_nhd.permute(0, 2, 1, 3).contiguous()
         v_scales = v_scales_nhd.permute(0, 2, 1, 3).contiguous()
+    if non_contiguous:
+        k_cache = make_non_contiguous_last_dim_view(k_cache)
+        v_cache = make_non_contiguous_last_dim_view(v_cache)
+        k_scales = make_non_contiguous_last_dim_view(k_scales)
+        v_scales = make_non_contiguous_last_dim_view(v_scales)
 
     block_tables = torch.tensor(
         [[2, 5, 1], [6, 3, 0]], dtype=block_table_dtype, device="cuda"
