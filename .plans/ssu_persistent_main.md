@@ -205,6 +205,130 @@ MHC=1): **block-cyclic work assignment** (contiguous head-fastest run per CTA �
 skip-reload of C/old_B) OR bring back head-tiling as the work-unit size.  **Decide after the
 no-write ncu diff.**
 
+## No-write ncu diff — division-free unflatten landed (b=512, mw=16, 2026-06-25)
+
+NCU `--set full`, no-write (prev_k=0), `checkpointing_ssu_main_kernel`.  "grid==tw" =
+`FLASHINFER_SSU_MAIN_CTA_PER_SM=1<<20` (one work-unit/CTA, apples-to-apples vs the old
+profile); "cps=16" = the new production default.
+
+| metric | prev (grid==tw, **with** div) | div-free (grid==tw) | div-free (**cps=16**) |
+|--------|-----:|-----:|-----:|
+| duration | 52.35 µs | 49.50 µs | **48.93 µs** |
+| grid | 16384 | 16384 | 2368 (2 waves) |
+| achieved occ | 44.9% | 43.9% | 46.9% |
+| compute (SM) | 55.0% | 48.7% | 43.0% |
+| memory | 60.9% | 63.2% | 64.4% |
+| DRAM total | 160.2 MB | 151.2 MB | 151.7 MB |
+| long_scoreboard | 31.3% | 35.0% | 35.7% |
+| **wait** | **14.1%** | 12.1% | **11.3%** |
+| barrier | 12.7% | 11.7% | 14.6% |
+
+- **−3.4µs (−6.5%)** on no-write b=512 (52.35 → 48.93).  Pure division removal = −2.85µs
+  (same grid); persistent loop adds −0.57µs.
+- **The `wait` divisions are gone.** Old top-`wait` PCs `:818`/`:821` were `UIMAD`/`MUFU`/
+  `UISETP`/`UIADD3` (the `%ngroups` / `/batch` ops) — they no longer appear; the new top
+  `wait` is genuine `HMMA` latency (`mma_sm80.hpp:238`).  DRAM also −9MB (division codegen
+  freed registers → less spill).
+- **Now cleanly state-load-bound.** `long_scoreboard` 35.7%, of which **62% at `:534`**
+  (`__syncwarp` draining the `state + old_x` cp.async prefetch) and **23% at `:598`**
+  (the `cb_scaled`/C LDG).  No-write has too little compute to hide the per-work-unit
+  state reload + C/old_B re-fetch.
+
+## Decision: head-tiling fused to the group (next lever)
+
+The two LSB hotspots are exactly what MHC=4 amortized: C/old_B reload (`:598`) is *per-group*
+(shared across `HEADS_PER_GROUP` heads), and the state-load hide (`:534`) needs more in-flight
+MMA per work-unit.  **Chosen lever: make the work-unit a tile of contiguous same-group heads**
+(recovers both MHC=4 benefits inside the persistent, division-free grid), tied to the group
+structure rather than a free knob:
+
+- `total_work = D_SPLIT · batch · NGROUPS` (was `· NHEADS`); work-unit = one group.
+- Inner loop over `HEADS_PER_GROUP` heads reusing the resident C/old_B (loaded once per
+  work-unit) and pipelining `HEADS_PER_GROUP` state loads.
+- If a full group is too coarse for occupancy at small batch, the tile is a compile-time
+  divisor of `HEADS_PER_GROUP` (a TILE constant, still no runtime division).
+- Rejected alternative: block-cyclic single-head assignment (CTA gets a contiguous head-run
+  but work-unit stays single-head) — recovers smem C-reuse but not the state-load hiding, and
+  needs a per-CTA run-length the grid-stride doesn't naturally give.
+
+## State-pipeline (STATE_PIPE=2) + register-resident meta ring (B200, 2026-06-26)
+
+Path actually taken (instead of the group head-tiling decided above): pipeline the **full
+per-work-unit bundle** across `MAIN_STATE_PIPE = 2` smem slots — a cross-iteration cp.async
+ring — to hide the per-work-unit state reload the no-write path can't cover with compute.
+Depth-2 makes the bundle (C/old_B/z/old_x/x/state, STATE_PIPE-strided) ~38.4 KB/CTA →
+**smem-bound at 5 blocks/SM** (independent of registers).
+
+`HeadMetaSSU` trimmed to **`{tile, cache_slot}`** only; everything else derived on the fly
+(`derive_head`: `d_tile`/`seq`/`head`/`group` via constexpr divides, `buf_read`/`prev_k` one
+load each off the resolved `cache_slot`, `seq_len = NPREDICTED` constexpr). The ring
+prefetches `cache_slot` STAGES ahead (the chain head `sbi[seq]`) so the consumer never pays
+the `sbi[seq]→prev/buf` chain.
+
+### Bug found + fixed: the meta ring lived in LOCAL memory
+
+The prefetched ring `meta[STAGES]` was indexed by the **runtime** `slot = j % STAGES`, so the
+compiler put the whole array in **local memory**. "Prefetched cache_slot" was then read back
+from local at ~the same latency as the global load it replaced. NCU (lineinfo, `--set full`,
+no-write b1024): it was the **#1 `long_scoreboard` site** (`:1043`, `is_valid` reading
+`cache_slot`, 34.3% of long_scoreboard) plus **3.3 MB local-memory traffic** (1.46M ld /
+1.80M st sectors).
+
+**Fix:** convert the ring to a register-resident **shift-register** (`head_meta[]`) indexed
+ONLY by compile-time constants (`head_meta[0]`, `head_meta[k]` in `#pragma unroll`,
+`head_meta[STAGES-1]`) so SROA keeps it in registers; the runtime `slot` is kept SEPARATE and
+only addresses the smem ring (a runtime offset into shared memory is not local memory). The
+physical smem layout (unit `u` in buffer `u % STAGES`) and cp.async FIFO depth are unchanged →
+bit-identical.
+
+### Results (no-write prev_k=0, bf16, mtp=6, mw=16, `bench_checkpointing_ssu.py` CUPTI)
+
+| variant | b512 | b1024 |
+|---|---:|---:|
+| trimmed ring, `meta[]` in LOCAL mem | 74.2 | 142.2 |
+| **register-resident shift-register** | **68.4** | **130.8** |
+| Δ | **−7.8%** | **−8.0%** |
+| triton-replay-pm (bar) | 41.9 | 75.3 |
+
+NCU diff (lineinfo `--set full`, no-write b1024, `checkpointing_ssu_main_kernel`):
+
+| metric | `meta[]` LOCAL | shift-register |
+|---|---:|---:|
+| duration | 131.8 µs | 121.3 µs |
+| registers / smem / blocks | 87 / 38.4 KB / 5 | 87 / 38.4 KB / 5 |
+| long_scoreboard | 37.0% | 27.7% |
+| local spill traffic (ld/st sectors) | 1.46M / 1.80M | 0 / 0 |
+| INT compute (PC samples) | 49.7% | 44.2% |
+| tensor core | 4.9% | 9.4% |
+
+- Occupancy unchanged (5 blocks, smem-bound) — this was a **latency** fix, not occupancy.
+- Bit-exact across the full suite (persistent, two_kernel mhc1/2/4, d_split2, pipeline_stages2).
+- New #1 `long_scoreboard` = `:1067`, `mc_of`'s `prev_ptr[cache_slot]` reload (the
+  recompute-vs-store follow-up). Other top sites are now genuine compute (HMMA
+  `common.cuh:1279` 24.9%, cumAdt STS `main.cuh:267` 16.9%).
+
+### Next levers
+
+- **1b:** carry `prev_k`/`mc` in the now-register-resident `head_meta` entry (resolved once at
+  prefetch) → kills `:1067`'s `prev_ptr[cache_slot]` reloads (loaded 3–5×/unit today). Cheap
+  now that the entry is register-resident.
+- **2 (Plan B):** state-only pipelining — ring holds only `state`, C/old_B/x/cumAdt
+  single-buffered → smem ~38→~23 KB → **8 blocks**, to hide the residual long_scoreboard via
+  occupancy.
+
+## TODO
+
+- [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
+  `state_batch_indices=None` (no pads), and no test injects `pad_slot_id`, so the
+  mid-loop skip path (`cache_slot == pad_slot_id` → `process_head` skipped between valid
+  tiles, empty `__pipeline_commit()` holding the FIFO slot) is **untested**.  The
+  out-of-range form of the skip *is* exercised (CTAs grid-stride past their work-units →
+  epilogue empty commits) and passes, so the empty-commit + `wait_prior(STAGES-1)`
+  accounting is validated; the gap is specifically a pad *between* valid work-units.
+  Add a variant to `test_persistent_main_matches_monolithic` with some
+  `state_batch_indices` entries = `pad_slot_id` (reference monolith skips them too) to
+  cover it.  Believed-correct (skip is CTA-uniform → barriers stay matched), just unproven.
+
 ## Tests
 
 ```bash

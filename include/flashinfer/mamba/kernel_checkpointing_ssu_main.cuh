@@ -64,12 +64,13 @@ namespace flashinfer::mamba::checkpointing {
 // regs), adding a wave of warps to hide its DRAM-latency stalls (long_scoreboard ~39%,
 // eligible-warps 0.71).  The static constexpr layout constants mirror CheckpointingSsuStorage
 // exactly so the shared load/compute helpers (templated on SmemT) bind unchanged.
-// STATE_PIPE = PIPELINE_STAGES.  >1 double-buffers ALL per-head buffers (z, old_x, old_dt,
-// old_cumAdt, cumAdt, x, state) so head h+1's loads overlap head h's replay/output.
-// Per-GROUP buffers (C, old_B) stay single-slot — they are shared across all heads in the CTA.
-// STATE_PIPE=1 ⇒ single slot == the original layout, bit-identical.
+// STATE_PIPE = ring depth (STAGES).  >1 makes EVERY per-tile buffer (C, old_B, z, old_x, old_dt,
+// old_cumAdt, cumAdt, x, state) STATE_PIPE-slotted so the persistent all-async ring can prefetch a
+// whole work-unit's bundle (incl per-GROUP C / old_B) into one slot — a grid-stride CTA's
+// consecutive work-units are different groups, so there's no same-group C/old_B reuse to preserve.
+// STATE_PIPE=1 ⇒ single slot == the original layout, bit-identical (the monolith's use).
 template <typename input_t, typename state_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
-          int DSTATE, int STATE_PIPE = 1, int MHC = STATE_PIPE>
+          int DSTATE, int STATE_PIPE = 1>
 struct CheckpointingSsuMainStorage {
   static constexpr int NPREDICTED = NPREDICTED_;
   static constexpr int MAX_WINDOW = MAX_WINDOW_;
@@ -81,24 +82,29 @@ struct CheckpointingSsuMainStorage {
       next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
   static constexpr int CB_ROW_STRIDE = SmemSwizzle<input_t>::ATOM_COLS;
 
-  // C (matmul-3 A-operand) — per-group conv1d output.  Single slot (per-GROUP, not per-head).
-  alignas(16) input_t C[NPREDICTED_SWIZZLE_R * DSTATE];
-  // old_B — replay B-operand; per-group cache.  Single slot (per-GROUP).
-  alignas(16) input_t old_B[MAX_WINDOW_PAD_MMA_K * DSTATE];
-  // All per-HEAD buffers — STATE_PIPE slots each.  Slot b at offset b × <per-slot size>.
-  // STATE_PIPE=1 → single slot, bit-identical to the original single-buffer layout.
+  static constexpr int C_ELEMS = NPREDICTED_SWIZZLE_R * DSTATE;
+  static constexpr int OLD_B_ELEMS = MAX_WINDOW_PAD_MMA_K * DSTATE;
   static constexpr int Z_ELEMS = NPREDICTED_SWIZZLE_R * D_SMEM_COLS;
   static constexpr int OLD_X_ELEMS = MAX_WINDOW_PAD_MMA_K * D_SMEM_COLS;
   static constexpr int X_ELEMS = NPREDICTED_PAD_MMA_M * D_SMEM_COLS;
   static constexpr int STATE_ELEMS = D_PER_CTA * DSTATE;
+  static constexpr int CUMADT_ELEMS = NPREDICTED_PAD_MMA_M;
+  alignas(16) input_t C[STATE_PIPE * C_ELEMS];          // matmul-3 A-operand (conv1d output)
+  alignas(16) input_t old_B[STATE_PIPE * OLD_B_ELEMS];  // replay B-operand (per-group cache)
   alignas(16) input_t z[STATE_PIPE * Z_ELEMS];
   alignas(16) input_t old_x[STATE_PIPE * OLD_X_ELEMS];
   float old_dt[STATE_PIPE * MAX_WINDOW];
   float old_cumAdt[STATE_PIPE * MAX_WINDOW];
-  float cumAdt[MHC * NPREDICTED_PAD_MMA_M];  // one slot per CTA head (not per pipeline stage)
+  float cumAdt[STATE_PIPE * CUMADT_ELEMS];
   alignas(16) input_t x[STATE_PIPE * X_ELEMS];
   alignas(16) state_t state[STATE_PIPE * STATE_ELEMS];
 };
+
+// Ring depth (STAGES) for the PERSISTENT main's cross-iteration prefetch pipeline.  Each of the
+// STAGES smem slots holds one work-unit's full bundle; the grid loop prefetches STAGES work-units
+// ahead so the 16 KB state load (the long_scoreboard pole) issues well before it's consumed.
+// Higher = deeper overlap but more smem (lower occupancy); 2 is the sweet spot at this footprint.
+constexpr int MAIN_STATE_PIPE = 2;
 
 // -----------------------------------------------------------------------------
 // Main-kernel load — the conv1d-INDEPENDENT (pre-gdc_wait) set: state, old_x, z
@@ -118,9 +124,10 @@ struct CheckpointingSsuMainStorage {
 // (cb_scaled is precomputed) and dt + cumAdt scan.  Single async group, drained
 // by one commit + wait + syncwarp (like load_data).
 // load_head: the per-head PRE-gdc_wait cached loads (old_x / z / old_B / old_dt).  ISSUE ONLY —
-// no __pipeline_commit / wait / syncwarp; head_loop owns the cp.async pipeline so these loads and
-// the state prefetch can be committed + drained together at the right depth.  State is NOT loaded
-// here — its sole loader is prefetch_state (the one tile the cross-head pipeline double-buffers).
+// no __pipeline_commit / wait / syncwarp; process_head owns the cp.async pipeline so these loads
+// and the state prefetch can be committed + drained together at the right depth.  State is NOT
+// loaded here — its sole loader is prefetch_state (the one tile the cross-head pipeline
+// double-buffers).
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int NUM_WARPS, bool IS_FIRST, typename SmemT>
 __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams const& params,
@@ -145,11 +152,12 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
   using OldBShape = cute::Shape<cute::Int<MAX_WINDOW_PAD_MMA_K>, cute::Int<DSTATE>>;
   using OxShape = cute::Shape<cute::Int<MAX_WINDOW_PAD_MMA_K>, cute::Int<D_PER_CTA>>;
 
-  // Per-head smem slots: offset by tile_buf into the STATE_PIPE-strided arrays.
+  // Per-tile smem slots: offset by tile_buf into the STATE_PIPE-strided ring arrays.
   auto* old_x_slot = smem.old_x + tile_buf * SmemT::OLD_X_ELEMS;
   float* old_dt_slot = smem.old_dt + tile_buf * MAX_WINDOW;
   float* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
   auto* z_slot = smem.z + tile_buf * SmemT::Z_ELEMS;
+  auto* old_B_slot = smem.old_B + tile_buf * SmemT::OLD_B_ELEMS;
 
   // Per-head load distribution: one tensor per warp, each a single-warp (conflict-free)
   // load_tile_async.  old_x is the variable / largest small tensor (up to max_window rows), so
@@ -173,7 +181,7 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
   if (must_checkpoint) {
     if constexpr (IS_FIRST)
       if (warp == 1)
-        load_tile_async<OldBShape, MAX_WINDOW>(smem.old_B, old_B_ptr + oB_base,
+        load_tile_async<OldBShape, MAX_WINDOW>(old_B_slot, old_B_ptr + oB_base,
                                                params.old_B_stride_token, lane);
     if (warp == 2)
       load_old_dt_cumAdt(params, lane, cache_slot, buf_read, head, MAX_WINDOW, old_dt_slot,
@@ -190,7 +198,7 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
     load_tile_async<ZShape, NPREDICTED>(z_slot, z_ptr + z_base, params.z_stride_token, lane,
                                         seq_len);
   }
-  // NO commit/wait/syncwarp — head_loop drains (see header).
+  // NO commit/wait/syncwarp — process_head drains (see header).
 }
 
 template <typename state_t, int DIM, int D_PER_CTA, int DSTATE, int NUM_WARPS, typename SmemT>
@@ -209,13 +217,13 @@ __device__ __forceinline__ void prefetch_state(SmemT& smem, CheckpointingSsuPara
     load_state_cta<state_t, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, tid,
                                                           state_buf);
   }
-  // NOTE: issue ONLY — no __pipeline_commit / wait here.  head_loop owns the whole cp.async
+  // NOTE: issue ONLY — no __pipeline_commit / wait here.  process_head owns the whole cp.async
   // pipeline (commit + wait_prior) so the prefetched states can stay in flight across the
   // gdc_wait / replay; committing here would let an internal drain complete them too early.
 }
 
 // load_x: loads x (and C for IS_FIRST) from gmem → smem slot tile_buf.  ISSUE ONLY —
-// no __pipeline_commit / wait / syncwarp.  head_loop owns the whole cp.async pipeline.
+// no __pipeline_commit / wait / syncwarp.  process_head owns the whole cp.async pipeline.
 // Per-head load distribution (see load_head): C per-GROUP on W1 (IS_FIRST only); x per-HEAD on
 // W2, single-warp (conflict-free).  old_x (W0-1) and z (W3) load in parallel — all 4 warps busy
 // without the CTA-wide multi-warp writes that caused the d_split=2 LDGSTS bank conflict.
@@ -231,17 +239,34 @@ __device__ __forceinline__ void load_x(SmemT& smem, CheckpointingSsuParams const
   int64_t const x_base = outer * params.x_stride_seq + (int64_t)head * DIM + d_tile_off;
   using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
   using XShape = cute::Shape<cute::Int<SmemT::NPREDICTED_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
-  // C is per-GROUP → load once per head-tile (IS_FIRST only), on W1.
+  // C → slot, on W1.
+  auto* C_slot = smem.C + tile_buf * SmemT::C_ELEMS;
   if constexpr (IS_FIRST)
     if (warp == 1)
-      load_tile_async<CShape, NPREDICTED>(smem.C, C_ptr + C_base, params.C_stride_token, lane,
+      load_tile_async<CShape, NPREDICTED>(C_slot, C_ptr + C_base, params.C_stride_token, lane,
                                           seq_len);
-  // x is per-HEAD → every head, single-warp on W2 (W0-1 carry old_x, W3 carries z).
+  // x → slot, single-warp on W2 (W0-1 carry old_x, W3 carries z).
   auto* x_slot = smem.x + tile_buf * SmemT::X_ELEMS;
   if (warp == 2)
     load_tile_async<XShape, NPREDICTED>(x_slot, x_ptr + x_base, params.x_stride_token, lane,
                                         seq_len);
-  // NOTE: NO commit/wait — head_loop owns the pipeline.
+  // NOTE: NO commit/wait — process_head owns the pipeline.
+}
+
+// load_cumAdt: load ONE work-unit's cumAdt (precompute output) gmem → smem ring slot tile_buf.
+// WARP-0 ONLY (the caller guards with `if (warp == 0)`); lanes 0..seq_len-1 each carry one element.
+// Plain stores (not cp.async) → never touches the cp.async ring FIFO; the caller's __syncthreads()
+// broadcasts to all warps.  MUST run AFTER the gdc_wait that makes cumAdt_vec globally visible.
+template <typename SmemT>
+__device__ __forceinline__ void load_cumAdt(SmemT& smem, CheckpointingSsuParams const& params,
+                                            int lane, int seq, int first_head, int seq_len,
+                                            int tile_buf) {
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  auto const* __restrict__ cumAdt_ptr = reinterpret_cast<float const*>(params.cumAdt_vec);
+  float* cumAdt_slot = smem.cumAdt + tile_buf * SmemT::CUMADT_ELEMS;
+  if (lane < seq_len)
+    cumAdt_slot[lane] =
+        cumAdt_ptr[(int64_t)(seq * params.nheads + first_head) * NPREDICTED_PAD_MMA_M + lane];
 }
 
 template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
@@ -279,6 +304,38 @@ __device__ __forceinline__ void output_head(SmemT& smem, CheckpointingSsuParams 
                                                      cache_slot, write_offset, seq_len, tile_buf);
 }
 
+// add_init_out_ring: main-local copy of common.cuh's add_init_out, but with C ALSO slot-indexed
+// (by state_buf) for the persistent ring — C is per-slot here, single-slot in the monolith.  The
+// shared add_init_out is left untouched (it reads smem.C at slot 0).  Identical otherwise.
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
+          typename TiledMma, typename ThrMma, typename... FragY>
+__device__ __forceinline__ void add_init_out_ring(SmemT const& smem, TiledMma const& tiled_mma,
+                                                  ThrMma const& thr_mma, int tid, int state_buf,
+                                                  FragY&... frag_y) {
+  using namespace cute;
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
+  constexpr int NUM_K_TILES = DSTATE / K_TILE;
+  static_assert(sizeof(state_t) != 1, "add_init_out_ring is the 2/4-byte path");
+  constexpr bool is_2byte_smem = (sizeof(state_t) == 2);
+  using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>;
+  using BTypeIn = state_t;
+  auto layout_C_swz =
+      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, SmemT::NPREDICTED>();
+  // C at ring slot state_buf (input_t units) before the operand_t view cast.
+  Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(
+                                  smem.C + state_buf * SmemT::C_ELEMS)),
+                              layout_C_swz);
+  Tensor smem_C_ktiled = local_tile(smem_C, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<K_TILE>{}),
+                                    make_coord(_0{}, _));
+  auto const layout_state_swz = make_swizzled_layout_rc<BTypeIn, D_PER_CTA, DSTATE>();
+  state_view_t const* smem_state_ptr = reinterpret_cast<state_view_t const*>(
+      reinterpret_cast<state_t const*>(smem.state) + state_buf * D_PER_CTA * DSTATE);
+  Tensor smem_state = make_tensor(make_smem_ptr(smem_state_ptr), layout_state_swz);
+  pipelined_kloop_gemm<3, NUM_K_TILES, input_t, BTypeIn, MMA_prop::operand_t>(
+      tiled_mma, thr_mma, tid, smem_C_ktiled, smem_state, frag_y...);
+}
+
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, bool MUST_CHECKPOINT,
           typename FragCBNew, typename FragCBOld, typename SmemT>
@@ -286,8 +343,7 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
                                                int lane, int warp, int d_tile, int head,
                                                int64_t cache_slot, int prev_k, int64_t out_seq_base,
                                                int write_offset, int seq_len, float D_val,
-                                               int tile_buf, int cumAdt_h,
-                                               FragCBNew const& frag_CB_new,
+                                               int tile_buf, FragCBNew const& frag_CB_new,
                                                FragCBOld const& frag_CB_old) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "output_head_2k requires 2-byte input type");
@@ -331,7 +387,7 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
 
   // ── Decay broadcast: cumAdt[t] with stride-0 on N ──
   constexpr int N_TILE = cute::tile_size<1>(decltype(tiled_mma){});
-  float const* cumAdt_slot = smem.cumAdt + cumAdt_h * NPREDICTED_PAD_MMA_M;
+  float const* cumAdt_slot = smem.cumAdt + tile_buf * SmemT::CUMADT_ELEMS;
   Tensor decay_bcast = make_tensor(
       make_smem_ptr(cumAdt_slot),
       make_layout(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<N_TILE>{}), make_stride(_1{}, _0{})));
@@ -379,8 +435,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
     if constexpr (NUM_N_TILES == 2) {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
       Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-      add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
-                                                        frag_y_0, frag_y_1);
+      add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                             tile_buf, frag_y_0, frag_y_1);
       if constexpr (!kSkipSmemToGmemState)
         store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
                                                                 head, cache_slot, tile_buf);
@@ -388,8 +444,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
       epilogue(frag_y_1, 1);
     } else {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
-      add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
-                                                        frag_y_0);
+      add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                             tile_buf, frag_y_0);
       if constexpr (!kSkipSmemToGmemState)
         store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
                                                                 head, cache_slot, tile_buf);
@@ -453,14 +509,14 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
     if constexpr (NUM_N_TILES == 2) {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
       Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-      add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
-                                                        frag_y_0, frag_y_1);
+      add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                             tile_buf, frag_y_0, frag_y_1);
       epilogue(frag_y_0, 0);
       epilogue(frag_y_1, 1);
     } else {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
-      add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
-                                                        frag_y_0);
+      add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                             tile_buf, frag_y_0);
       epilogue(frag_y_0, 0);
     }
   }
@@ -471,27 +527,381 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
                                                      cache_slot, write_offset, seq_len, tile_buf);
 }
 
-template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
-          int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS,
-          bool MUST_CHECKPOINT, int MAIN_HEADS_PER_CTA, int PIPELINE_STAGES,
-          bool DO_GDC_WAIT = true, typename SmemT>
-__device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams const& params,
-                                          int lane, int warp, int d_tile, int first_head,
-                                          int group_idx, int seq, int64_t cache_slot, int buf_read,
-                                          int prev_k, int64_t outer, int seq_len,
-                                          int64_t out_seq_base, int write_offset) {
-  int64_t const rand_seed = (MUST_CHECKPOINT && PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
-  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
-  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
-  auto const* __restrict__ cumAdt_ptr = reinterpret_cast<float const*>(params.cumAdt_vec);
-  // D is static model weight — safe to issue before the PDL gdc_wait; hides LDG latency
-  // under the async state/tile prefetches and the replay MMA.
-  float const D_val_0 = D_ptr ? toFloat(D_ptr[first_head]) : 0.f;
-
-  // CB fragment infrastructure for hoisted LDGs (output_head_2k).
-  // These compile-time objects are zero-cost; declared once and reused per head iteration.
+// replay_state_mma_ring: main-local copy of ssu.cuh's replay_state_mma, but with old_B ALSO
+// slot-indexed (by tile_buf) for the persistent ring — old_B is per-slot here, single-slot in
+// the monolith.  The shared replay_state_mma is left untouched.  Only the old_B read changes.
+template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS,
+          int NUM_WARPS, typename SmemT>
+__device__ __forceinline__ void replay_state_mma_ring(SmemT& smem,
+                                                      CheckpointingSsuParams const& params,
+                                                      int warp, int lane, int prev_k, int d_tile,
+                                                      int64_t state_ptr_offset,
+                                                      state_t* state_w_base, int64_t rand_seed,
+                                                      bool must_checkpoint, int tile_buf = 0) {
   using namespace cute;
+  static_assert(sizeof(input_t) == 2, "replay_state_mma requires 2-byte input type");
+  static_assert(D_PER_CTA % 16 == 0, "D_PER_CTA must be divisible by 16 (m16n8 atom)");
+  static_assert(D_PER_CTA >= 16, "D_PER_CTA must be at least 16");
+
+  constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;  // 8 or 16
   int const tid = warp * warpSize + lane;
+
+  // Atom K matches the cache-window tile (MAX_WINDOW_PAD_MMA_K).
+  //   K == MMA_prop::K_BIG   (16) → m16n8k16 + x4/x2 ldmatrix.trans
+  //   K == MMA_prop::K_SMALL (8)  → m16n8k8  + x2/x1 ldmatrix.trans
+  using MmaAtomType = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, MMA_prop::AtomK16,
+                                         MMA_prop::AtomK8>;
+  using LdsmA = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x8_LDSM_T,
+                                   SM75_U16x4_LDSM_T>;
+  using LdsmB = std::conditional_t<MAX_WINDOW_PAD_MMA_K == MMA_prop::K_BIG, SM75_U16x4_LDSM_T,
+                                   SM75_U16x2_LDSM_T>;
+
+  // Warp layout (M_WARPS, 4): always 4 warps along N=DSTATE; M_WARPS = NUM_WARPS/4 warps
+  // split M=D_PER_CTA (each covers D_PER_CTA/M_WARPS/16 m-atoms + its own M-slice of the
+  // A operand, cutting the redundant old_x LDSM by M_WARPS).  NUM_WARPS=4 → (1,4) = the
+  // original _1x4 (byte-identical); 8 → (2,4); 16 → (4,4).
+  // TODO(int8-8warp): the int8/fp8 amax (kernel_checkpointing_ssu_8bit.cuh) is warp-local
+  // ONLY with full-N-per-warp (_W×1); this N-split layout would need a cross-warp amax
+  // reduce.  bf16/fp16 are unaffected (deterministic state / order-free SR).
+  constexpr int M_WARPS = NUM_WARPS / 4;
+  static_assert(NUM_WARPS % 4 == 0, "replay_state_mma needs NUM_WARPS a multiple of 4");
+  auto tiled_mma =
+      make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomType>>{}, Layout<Shape<Int<M_WARPS>, _4>>{});
+  auto thr_mma = tiled_mma.get_slice(tid);
+
+  // Per-pass output tile is (D_PER_CTA/M_WARPS, N_PER_PASS).  N_PER_PASS = 4 warps × n8 = 32.
+  constexpr int N_PER_PASS = 4 * MMA_prop::N;
+  static_assert(DSTATE % N_PER_PASS == 0,
+                "DSTATE must be divisible by 4 * MMA_prop::N for the (M_WARPS,4) warp layout");
+  constexpr int NUM_N_PASSES = DSTATE / N_PER_PASS;
+
+  // tile_buf selects the pipeline slot for all per-head smem arrays (old_cumAdt, old_dt, old_x).
+  constexpr int MAX_WINDOW = SmemT::MAX_WINDOW;
+  float const* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
+  float const* old_dt_slot = smem.old_dt + tile_buf * MAX_WINDOW;
+  float total_cumAdt = (prev_k > 0) ? old_cumAdt_slot[prev_k - 1] : 0.f;
+  float total_decay = (prev_k > 0) ? __expf(total_cumAdt) : 1.f;
+
+  // ── A operand: old_x [MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS] Swizzle<3,3,3>, transposed
+  // view [M=D_SMEM_COLS, K=MAX_WINDOW_PAD_MMA_K].  D_SMEM_COLS may be padded above
+  // D_PER_CTA when D_PER_CTA < swizzle atom; local_tile to D_PER_CTA
+  // restricts the LDSM to the valid sub-tile.  Each warp loads the FULL M (4×
+  // redundant across warps).  See header comment for traffic accounting. ──
+  constexpr int D_SMEM_COLS = SmemT::D_SMEM_COLS;
+  auto layout_A_full =
+      make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, D_SMEM_COLS>();
+  auto const* old_x_slot = smem.old_x + tile_buf * MAX_WINDOW_PAD_MMA_K * D_SMEM_COLS;
+  Tensor smem_A_full = make_tensor(
+      make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(old_x_slot)), layout_A_full);
+  Tensor smem_A = local_tile(smem_A_full, make_shape(Int<D_PER_CTA>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+                             make_coord(_0{}, _0{}));
+
+  auto s2r_A = make_tiled_copy_A(Copy_Atom<LdsmA, MMA_prop::operand_t>{}, tiled_mma);
+  auto s2r_thr_A = s2r_A.get_slice(tid);
+  Tensor smem_A_s2r = s2r_thr_A.partition_S(smem_A);
+  Tensor frag_A = thr_mma.partition_fragment_A(make_tensor(
+      (MMA_prop::operand_t*)0x0, make_shape(Int<D_PER_CTA>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
+  Tensor frag_A_view = s2r_thr_A.retile_D(frag_A);
+
+  cute::copy(s2r_A, smem_A_s2r, frag_A_view);
+  // old_x is input_t == MMA_prop::operand_t (bf16) — no conversion needed.
+
+  // ── B operand: old_B [MAX_WINDOW_PAD_MMA_K, DSTATE] swizzled, transposed view
+  // [N=DSTATE, K=MAX_WINDOW_PAD_MMA_K].  Per pass loads N_PER_PASS=32 cols across
+  // 4 warps; partition_S splits — each warp gets its disjoint 8-col slice. ──
+  auto layout_B = make_swizzled_layout_rc_transpose<input_t, MAX_WINDOW_PAD_MMA_K, DSTATE>();
+  Tensor smem_B_full = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(
+                                       smem.old_B + tile_buf * SmemT::OLD_B_ELEMS)),
+                                   layout_B);
+
+  auto s2r_B = make_tiled_copy_B(Copy_Atom<LdsmB, MMA_prop::operand_t>{}, tiled_mma);
+  auto s2r_thr_B = s2r_B.get_slice(tid);
+
+  // ── State: per-CTA swizzle layout [D_PER_CTA, DSTATE].  tile_buf selects the
+  // double-buffered slot (cross-head prefetch); 0 ⇒ the single original buffer. ──
+  auto layout_state_swz = make_swizzled_layout_rc<state_t, D_PER_CTA, DSTATE>();
+  state_t* state_base = reinterpret_cast<state_t*>(smem.state) + tile_buf * D_PER_CTA * DSTATE;
+
+  // ── Per-pass identity for (row, col) coords ──
+  // partition_C of an identity tensor of the per-pass output shape gives this
+  // thread's (row, col) at every C-frag position, including warp-N offset.
+  // Frag size per thread = (M_atoms=D_PER_CTA/16) × (N_atoms_per_warp=1) × 4 elts.
+  auto id_tile = make_identity_tensor(make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{}));
+  auto id_part = thr_mma.partition_C(id_tile);
+  // Linear order from CuTe's column-major partition_C with m16n8 atom:
+  //   i=0,1: same row (= row_lo of M-atom 0), adjacent cols (col_off, col_off+1)
+  //   i=2,3: same row (= row_hi of M-atom 0), adjacent cols
+  //   i=4,5: same row (= row_lo of M-atom 1)
+  //   ... (V index 0..3 inside each m16n8, then M-atoms in M-major order)
+  // Pair load at (i, i+1) covers two consecutive bf16 elts → one 32-bit LDS.
+
+  // Precompute dB coefficients once — depend only on K (lane), not on N.
+  constexpr int LANES_PER_N_COL = warpSize / MMA_prop::N;  // = 4 for m16n8k_
+  constexpr int DB_COEFFS_PER_LANE = MAX_WINDOW_PAD_MMA_K / LANES_PER_N_COL;
+  float dB_coeff[DB_COEFFS_PER_LANE];
+  precompute_dB_coeff<DB_COEFFS_PER_LANE>(dB_coeff, old_cumAdt_slot, old_dt_slot, total_cumAdt,
+                                          prev_k, lane);
+
+  using pair_t = Pair<state_t>;
+
+  // Philox state amortized across 4 consecutive pair conversions: each call
+  // returns 4 randints, all 4 get consumed before the next refresh (vs. 1-of-4
+  // in the Triton-bit-equal layout — see writeback loop below).  Compile-time
+  // pair_idx (n-loop and i-loop both unrolled) keeps `rand_idx[pair_idx & 3]`
+  // as a known register access — no local-memory spill.
+  constexpr bool kPhiloxF16 = (PHILOX_ROUNDS > 0) && std::is_same_v<state_t, __half>;
+  [[maybe_unused]] uint32_t rand_idx[4];
+  // state_w_base is the pre-combined (params.state + state_gmem_off) base
+  // pointer — see the function header.  No separate state_w / state_gmem_off
+  // alive in this scope.
+
+  // ── Vectorized state writeback (cross-pass STG.64 fusion) ──────────
+  // smem always gets nearest-even f32→state_t (consumed by matmul 3 — must
+  // match Triton's f32→bf16 path as closely as possible).  Gmem cache, when
+  // PHILOX_ROUNDS > 0 and state_t == __half, gets PTX cvt.rs.f16x2.f32
+  // stochastic rounding direct from registers via cross-pass STG.64; the
+  // smem→gmem `store_state` is gated off in compute_and_store_output.
+  //
+  // Cross-pass STG fusion: do PASS n0 and PASS n1 back-to-back, buffering
+  // the post-cvt_rs packed u32s of n0 across n1's HMMA + cvt_rs.  Then issue
+  // ONE STG.64 instruction per pair iter, all 32 lanes active:
+  //   - even lane stores PASS n0 data at the warp's n0 column slice
+  //   - odd  lane stores PASS n1 data at the warp's n1 column slice
+  // Halves the STG instruction count vs per-pass writeback (16 STG.64/thread
+  // per 2 passes vs 16 + 16 = 32 STG.64/thread previously — same byte volume).
+  //
+  // Randint amortization: rand_idx[4] refreshed every 4 pairs; each pair's
+  // cvt_rs uses one of the 4 randints.  Triton bit-equality is intentionally
+  // given up; unbiasedness still holds.
+  // Per-warp M-rows = D_PER_CTA / M_WARPS, so pairs/pass = (D_PER_CTA/M_WARPS)/8.  (NUM_WARPS=4
+  // → M_WARPS=1 → D_PER_CTA/8, the original.)  Keeps the philox my_packed buffer + STG fusion
+  // sized to this warp's actual fragment under the (M_WARPS,4) split.
+  constexpr int PAIRS_PER_PASS = (D_PER_CTA / M_WARPS) / 8;  // = (per-warp M-atoms) × 2 row-pairs
+  static_assert(NUM_N_PASSES % 2 == 0, "Cross-pass STG fusion requires even NUM_N_PASSES");
+
+#pragma unroll
+  for (int np = 0; np < NUM_N_PASSES; np += 2) {
+    // Buffer of post-cvt_rs packed u32s for both passes (philox path only).
+    [[maybe_unused]] uint32_t my_packed[2][PAIRS_PER_PASS];
+
+#pragma unroll
+    for (int local_n = 0; local_n < 2; ++local_n) {
+      int const n = np + local_n;
+      int const n_base = n * N_PER_PASS;
+
+      // ── Allocate per-pass C-frag (4 × M_atoms fp32 elts/thread) ──
+      Tensor frag_h = thr_mma.partition_fragment_C(
+          make_tensor((float*)0x0, make_shape(Int<D_PER_CTA>{}, Int<N_PER_PASS>{})));
+
+      // ── Load state × total_decay into frag_h. ──
+#pragma unroll
+      for (int i = 0; i < size(frag_h); i += 2) {
+        int const row = get<0>(id_part(i));
+        int const col = get<1>(id_part(i)) + n_base;
+        int const off = layout_state_swz(row, col);
+        pair_t const p = *reinterpret_cast<pair_t const*>(&state_base[off]);
+        frag_h(i) = toFloat(p[cute::Int<0>{}]) * total_decay;
+        frag_h(i + 1) = toFloat(p[cute::Int<1>{}]) * total_decay;
+      }
+
+      // ── LDSM.T per-pass B (per warp = 1 atom of 8 cols of N) ──
+      Tensor smem_B_n =
+          local_tile(smem_B_full, make_tile(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{}),
+                     make_coord(n, _0{}));
+      auto smem_B_s2r_n = s2r_thr_B.partition_S(smem_B_n);
+
+      Tensor frag_B = thr_mma.partition_fragment_B(make_tensor(
+          (MMA_prop::operand_t*)0x0, make_shape(Int<N_PER_PASS>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
+      auto frag_B_view = s2r_thr_B.retile_D(frag_B);
+
+      cute::copy(s2r_B, smem_B_s2r_n, frag_B_view);
+
+      compute_dB_scaling<DB_COEFFS_PER_LANE>(frag_B, dB_coeff);
+
+      // ── HMMA: frag_h += frag_A @ frag_B ──
+      cute::gemm(tiled_mma, frag_h, frag_A, frag_B, frag_h);
+
+      // ── Smem write (always) + cvt_rs into my_packed (philox path) ──
+#pragma unroll
+      for (int i = 0; i < size(frag_h); i += 2) {
+        int const row = get<0>(id_part(i));
+        int const col = get<1>(id_part(i)) + n_base;
+        int const off = layout_state_swz(row, col);
+
+        // Smem write — always nearest-even (output's matmul 3 reads this).
+        pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
+        *reinterpret_cast<pair_t*>(&state_base[off]) = q;
+
+        if constexpr (kPhiloxF16) {
+          static_assert(sizeof(state_t) == 2, "STG.64 cooperative path requires 2-byte state_t");
+          int const pair_idx = n * PAIRS_PER_PASS + i / 2;
+          // Per-lane philox_off is unique per (thread, refresh group) — each
+          // pair gets its own randint bits.  Always computed; only consumed
+          // by the refresh branch inside the helper.
+          int64_t const philox_off =
+              state_ptr_offset + (int64_t)(d_tile * D_PER_CTA + row) * DSTATE + col;
+          // Buffer the SR'd packed u32 — store happens after BOTH passes.
+          my_packed[local_n][i / 2] = stochastic_round_pair_with_philox_refresh<PHILOX_ROUNDS>(
+              frag_h(i), frag_h(i + 1), pair_idx, rand_seed, philox_off, rand_idx);
+        }
+      }
+    }
+
+    // ── Cross-pass STG.64: all 32 lanes active. ─────────────────────────
+    // m16n8 lane layout: lane k → row k/4, cols (k%4)*2..(k%4)*2+1.  Lanes
+    // (2k, 2k+1) hold adjacent col-pairs of the same row.  After shfl_xor,
+    // the even/odd lane each has a 4-col contiguous block (in different
+    // bit-orders).  Even lane STG.64s the n0-pass block at its own col
+    // base; odd lane STG.64s the n1-pass block at the peer's (lower) col
+    // — both 8-byte aligned for state_t = f16.
+    // Runtime-gated on must_checkpoint: non-checkpoint steps skip the gmem
+    // STGs entirely (state HBM remains the prior checkpoint).  The cvt_rs
+    // SR + philox refresh above still ran — only the STGs are elided —
+    // because skipping them would require routing must_checkpoint into the
+    // pair_idx amortization logic, which lives across the n-loop.
+    if constexpr (kPhiloxF16) {
+      if (must_checkpoint) {
+        exchange_ntile_state_store_global<PAIRS_PER_PASS, N_PER_PASS, DSTATE>(
+            state_w_base, np, lane, my_packed, id_part);
+      }
+    }
+  }
+}
+
+// HeadMetaSSU: the MINIMAL per-work-unit ring entry — the grid-stride tile index and its resolved
+// cache slot.  cache_slot = sbi[seq] is the HEAD of the dependent chain (cache_slot → prev_ptr/
+// buf_idx[cache_slot]); prefetching just this into the ring resolves it ahead, so process-time pays
+// only the single ~700 ns prev/buf load, never the chain.  Holding STAGES of these is ~3 regs each
+// instead of ~12 — the meta[] register bloat was the spill source.  cache_slot == pad_slot_id ⇒
+// skip.
+struct HeadMetaSSU {
+  int tile;
+  int64_t cache_slot;
+};
+
+// derive_head: expand the trimmed ring entry {tile, cache_slot} into the working scalars, ON THE
+// FLY at each use (no held struct).  Tile-derived (d_tile/seq/head/group) are constexpr divides;
+// buf_read/prev_k are one load each off the already-resolved cache_slot (the chain head sbi[seq]
+// was done at fetch); seq_len stays the NPREDICTED constexpr (non-varlen).  __forceinline__ so
+// unused outputs fold away per call site.
+template <int NHEADS, int HEADS_PER_GROUP, int D_SPLIT, int NPREDICTED, bool VARLEN>
+__device__ __forceinline__ void derive_head(CheckpointingSsuParams const& params,
+                                            HeadMetaSSU const& m, int& d_tile, int& seq,
+                                            int& first_head, int& group_idx, int& buf_read,
+                                            int& prev_k, int& seq_len, int64_t& outer) {
+  first_head = m.tile % NHEADS;  // compile-time NHEADS divisor
+  int const t = m.tile / NHEADS;
+  d_tile = t % D_SPLIT;                      // compile-time D_SPLIT divisor
+  seq = t / D_SPLIT;                         // batch is the range, never a divisor
+  group_idx = first_head / HEADS_PER_GROUP;  // compile-time HEADS_PER_GROUP divisor
+  buf_read = __ldg(reinterpret_cast<int32_t const*>(params.cache_buf_idx) + m.cache_slot);
+  prev_k = reinterpret_cast<int32_t const*>(params.prev_num_accepted)[m.cache_slot];
+  if constexpr (VARLEN) {
+    auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
+    int const bos = __ldg(&cu[seq]);
+    seq_len = __ldg(&cu[seq + 1]) - bos;
+    outer = (int64_t)bos;
+  } else {
+    seq_len = NPREDICTED;  // keep the compile-time constant
+    outer = (int64_t)seq;
+  }
+}
+
+template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
+          int D_PER_CTA, int DSTATE, int NUM_WARPS, int NHEADS, int HEADS_PER_GROUP, bool VARLEN,
+          typename SmemT>
+__device__ __forceinline__ void prefetch_async_pre_gdc(SmemT& smem,
+                                                       CheckpointingSsuParams const& params,
+                                                       int lane, int warp, HeadMetaSSU const& m,
+                                                       int slot, bool must_checkpoint) {
+  constexpr int D_SPLIT = DIM / D_PER_CTA;
+  int d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len;
+  int64_t outer;
+  derive_head<NHEADS, HEADS_PER_GROUP, D_SPLIT, NPREDICTED, VARLEN>(
+      params, m, d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len, outer);
+  prefetch_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, lane, warp, d_tile,
+                                                             first_head, m.cache_slot, slot);
+  load_head<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+            /*IS_FIRST=*/true>(smem, params, lane, warp, d_tile, first_head, group_idx,
+                               m.cache_slot, buf_read, outer, seq_len, must_checkpoint, prev_k,
+                               slot);
+}
+
+// prefetch_async_post_gdc: the gdc-DEPENDENT half into ring slot `slot` — conv1d/precompute outputs
+// C + new-token x (load_x) + cumAdt (load_cumAdt, warp-0).  MUST be issued AFTER gdc_wait, else the
+// cp.async read races the producer (cp.async initiates the read at the instruction, not at commit —
+// PTX ISA: commit_group only batches "prior initiated" copies).  ISSUE ONLY; caller commits.
+template <typename input_t, int NPREDICTED, int DIM, int D_PER_CTA, int DSTATE, int NHEADS,
+          int HEADS_PER_GROUP, bool VARLEN, typename SmemT>
+__device__ __forceinline__ void prefetch_async_post_gdc(SmemT& smem,
+                                                        CheckpointingSsuParams const& params,
+                                                        int lane, int warp, HeadMetaSSU const& m,
+                                                        int slot) {
+  constexpr int D_SPLIT = DIM / D_PER_CTA;
+  int d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len;
+  int64_t outer;
+  derive_head<NHEADS, HEADS_PER_GROUP, D_SPLIT, NPREDICTED, VARLEN>(
+      params, m, d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len, outer);
+  load_x<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, /*IS_FIRST=*/true>(
+      smem, params, lane, warp, d_tile, first_head, group_idx, outer, seq_len, slot);
+  if (warp == 0) load_cumAdt(smem, params, lane, seq, first_head, seq_len, slot);
+}
+
+template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
+          int D_PER_CTA, int DSTATE, int NUM_WARPS, int NHEADS, int HEADS_PER_GROUP, bool VARLEN,
+          typename SmemT>
+__device__ __forceinline__ void prefetch_async(SmemT& smem, CheckpointingSsuParams const& params,
+                                               int lane, int warp, HeadMetaSSU const& m, int slot,
+                                               bool must_checkpoint) {
+  prefetch_async_pre_gdc<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                         NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, m,
+                                                                     slot, must_checkpoint);
+  prefetch_async_post_gdc<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NHEADS, HEADS_PER_GROUP,
+                          VARLEN>(smem, params, lane, warp, m, slot);
+}
+
+// replay_state: write-path state-checkpoint replay for one work-unit, reading its ring slot `slot`.
+// The bundle (state + old-tiles) must already be drained and published cross-warp by the caller.
+template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
+          int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, int NHEADS,
+          int HEADS_PER_GROUP, bool VARLEN, typename SmemT>
+__device__ __forceinline__ void replay_state(SmemT& smem, CheckpointingSsuParams const& params,
+                                             int lane, int warp, HeadMetaSSU const& m, int slot) {
+  constexpr int D_SPLIT = DIM / D_PER_CTA;
+  int d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len;
+  int64_t outer;
+  derive_head<NHEADS, HEADS_PER_GROUP, D_SPLIT, NPREDICTED, VARLEN>(
+      params, m, d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len, outer);
+  int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
+  int64_t const state_ptr_offset =
+      m.cache_slot * params.state_stride_seq + (int64_t)first_head * DIM * DSTATE;
+  state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) + state_ptr_offset +
+                                (int64_t)d_tile * D_PER_CTA * DSTATE;
+  replay_state_mma_ring<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
+      smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
+      /*must_checkpoint=*/true, slot);
+}
+
+// compute_output_and_store: the output MMA (β·C@state + CB@x + CB_old@old_x + D·x + z-gate) + cache
+// writeback for one work-unit, reading its ring slot `slot`.  cb operands LDG to registers here.
+// All smem inputs must already be drained + published cross-warp by the caller.
+template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
+          int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, int NHEADS,
+          int HEADS_PER_GROUP, bool VARLEN, bool MUST_CHECKPOINT, typename SmemT>
+__device__ __forceinline__ void compute_output_and_store(SmemT& smem,
+                                                         CheckpointingSsuParams const& params,
+                                                         int lane, int warp, HeadMetaSSU const& m,
+                                                         int slot) {
+  using namespace cute;
+  constexpr int D_SPLIT = DIM / D_PER_CTA;
+  int d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len;
+  int64_t outer;
+  derive_head<NHEADS, HEADS_PER_GROUP, D_SPLIT, NPREDICTED, VARLEN>(
+      params, m, d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len, outer);
+  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
+  float const D_val = D_ptr ? toFloat(D_ptr[first_head]) : 0.f;
+  int const tid = warp * warpSize + lane;
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
   constexpr int CB_NEW_REGS = NPREDICTED_PAD_MMA_M / 2;
   constexpr int CB_OLD_REGS = MAX_WINDOW_PAD_MMA_K / 2;
@@ -503,254 +913,46 @@ __device__ __forceinline__ void head_loop(SmemT& smem, CheckpointingSsuParams co
       make_tiled_mma(MMA_Atom<MMA_Traits<MmaAtomOld_t>>{}, Layout<Shape<_1, Int<NUM_WARPS>>>{});
   auto thr_mma_cb = tiled_mma_cb.get_slice(tid);
   auto thr_mma_old_cb = tiled_mma_old_cb.get_slice(tid);
-
-  static_assert(PIPELINE_STAGES <= 2, "head_loop generic for STAGES > 2 not yet implemented");
-
-  // ── PRE-GDC PROLOGUE ──
-  // G0: state_0 alone (MUST be its own group so wait_prior(1) can keep state_1 in flight).
-  prefetch_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, lane, warp, d_tile,
-                                                             first_head, cache_slot, /*buf=*/0);
-  __pipeline_commit();  // G0: state_0
-
-  // G1: old_tiles_0 (load_head is issue-only).
-  load_head<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-            /*IS_FIRST=*/true>(smem, params, lane, warp, d_tile, first_head, group_idx, cache_slot,
-                               buf_read, outer, seq_len, MUST_CHECKPOINT, prev_k, /*tile_buf=*/0);
-  __pipeline_commit();  // G1: old_tiles_0
-
-  // G2: state_1 + old_tiles_1 — pre-issued for STAGES=2 so they load across the head-0 replay.
-  if constexpr (PIPELINE_STAGES > 1 && MAIN_HEADS_PER_CTA > 1) {
-    prefetch_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-        smem, params, lane, warp, d_tile, first_head + 1, cache_slot, /*buf=*/1);
-    load_head<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-              /*IS_FIRST=*/false>(smem, params, lane, warp, d_tile, first_head + 1, group_idx,
-                                  cache_slot, buf_read, outer, seq_len, MUST_CHECKPOINT, prev_k,
-                                  /*tile_buf=*/1);
-    __pipeline_commit();  // G2: state_1 + old_tiles_1
-  }
-
-  // Drain G0+G1 (state_0+old_tiles_0 ready); keep G2 in flight across the head-0 replay.
-  __pipeline_wait_prior(PIPELINE_STAGES > 1 && MAIN_HEADS_PER_CTA > 1 ? 1 : 0);
-  __syncwarp();
-
-  // ── HEAD 0: REPLAY (write path only) ──
-  // Pre-replay fence: publish the prefetch_state-loaded state cross-warp before replay_state_mma
-  // reads it by M-shard (a different partition than the coalesced load).
-  if constexpr (MUST_CHECKPOINT) {
-    __syncthreads();
-    int64_t const state_ptr_offset =
-        cache_slot * params.state_stride_seq + (int64_t)first_head * DIM * DSTATE;
-    state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) + state_ptr_offset +
-                                  (int64_t)d_tile * D_PER_CTA * DSTATE;
-    replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
-        smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
-        /*must_checkpoint=*/true, /*tile_buf=*/0);
-  }
-  // Unconditional CTA barrier: publishes the prefetch-loaded (+ replayed, write path) state
-  // cross-warp before the output MMA reads it.  Must run on every work-unit (BOTH paths).
-  // (Also serves as the warp-convergence fence for the gdc_wait below, when it fires.)
-  __syncthreads();
-  // ONE-SHOT PDL gdc_wait — fires only on a CTA's FIRST work-unit (DO_GDC_WAIT).  Once any
-  // work-unit has waited, the precompute is done + globally visible, so subsequent grid-stride
-  // iterations read cb_scaled / cumAdt_vec without re-waiting.  gdc_wait is a no-op without a
-  // programmatic predecessor (non-PDL / T0).
-  if constexpr (DO_GDC_WAIT) cudaGridDependencySynchronize();
-  // precompute output (cumAdt_vec, cb_scaled) is now globally visible.
-  // Batch-load ALL MAIN_HEADS_PER_CTA heads' cumAdt at once.  MAX_WINDOW ≤ 16 floats/head;
-  // we cover 2 heads per pass by using all 32 warp-0 lanes: lanes 0..15 → head hh,
-  // lanes 16..31 → head hh+1.  The __syncthreads() below broadcasts to all warps once.
-  if (warp == 0) {
-    int const h_off = lane >> 4;                           // 0 for lanes 0-15, 1 for lanes 16-31
-    int const h_lane = lane & (NPREDICTED_PAD_MMA_M - 1);  // 0..NPREDICTED_PAD_MMA_M-1
-#pragma unroll
-    for (int hh = 0; hh < MAIN_HEADS_PER_CTA; hh += 2) {
-      int const hh_abs = hh + h_off;
-      if (hh_abs < MAIN_HEADS_PER_CTA && h_lane < seq_len)
-        (smem.cumAdt + hh_abs * NPREDICTED_PAD_MMA_M)[h_lane] =
-            cumAdt_ptr[(int64_t)(seq * params.nheads + first_head + hh_abs) * NPREDICTED_PAD_MMA_M +
-                       h_lane];
-    }
-  }
-  // ── POST-GDC X PIPELINE ──
-  // G3: C + x_0.  (For STAGES=1 or MHC=1 this is the only post-gdc group.)
-  load_x<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, /*IS_FIRST=*/true>(
-      smem, params, lane, warp, d_tile, first_head, group_idx, outer, seq_len, /*tile_buf=*/0);
-  __pipeline_commit();  // G3: C + x_0
-
-  // G4: x_1 — pre-issued for STAGES=2 so x_1 loads across output_head(0).
-  if constexpr (PIPELINE_STAGES > 1 && MAIN_HEADS_PER_CTA > 1) {
-    load_x<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, /*IS_FIRST=*/false>(
-        smem, params, lane, warp, d_tile, first_head + 1, group_idx, outer, seq_len,
-        /*tile_buf=*/1);
-    __pipeline_commit();  // G4: x_1
-  }
-
-  // CB LDG for head 0: issued here so its HBM latency hides behind __pipeline_wait_prior +
-  // __syncthreads + add_init_out K-loop.  Placed after G3/G4 commits so the x pipeline
-  // is already full before we issue another LDG stream.
-  auto frag_CB_new_0 = thr_mma_cb.partition_fragment_A(
+  auto frag_CB_new = thr_mma_cb.partition_fragment_A(
       make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<NPREDICTED_PAD_MMA_M>{})));
-  auto frag_CB_old_0 = thr_mma_old_cb.partition_fragment_A(
+  auto frag_CB_old = thr_mma_old_cb.partition_fragment_A(
       make_identity_tensor(make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
   {
-    auto const* cb_ptr_0 = reinterpret_cast<input_t const*>(params.cb_scaled) +
-                           (int64_t)(seq * params.nheads + first_head) * warpSize * CB_NEW_REGS;
-    load_cb_fragA<CB_NEW_REGS, input_t>(frag_CB_new_0, lane, cb_ptr_0);
+    auto const* cb_ptr = reinterpret_cast<input_t const*>(params.cb_scaled) +
+                         (int64_t)(seq * params.nheads + first_head) * warpSize * CB_NEW_REGS;
+    load_cb_fragA<CB_NEW_REGS, input_t>(frag_CB_new, lane, cb_ptr);
   }
   if constexpr (!MUST_CHECKPOINT) {
-    auto const* cb_old_ptr_0 = reinterpret_cast<input_t const*>(params.cb_old) +
-                               (int64_t)(seq * params.nheads + first_head) * warpSize * CB_OLD_REGS;
-    load_cb_fragA<CB_OLD_REGS, input_t>(frag_CB_old_0, lane, cb_old_ptr_0);
+    auto const* cb_old_ptr = reinterpret_cast<input_t const*>(params.cb_old) +
+                             (int64_t)(seq * params.nheads + first_head) * warpSize * CB_OLD_REGS;
+    load_cb_fragA<CB_OLD_REGS, input_t>(frag_CB_old, lane, cb_old_ptr);
   }
-  // Drain G2+G3 (old_tiles_1+state_1+C+x_0 ready); keep G4=x_1 in flight.
-  __pipeline_wait_prior(PIPELINE_STAGES > 1 && MAIN_HEADS_PER_CTA > 1 ? 1 : 0);
-  __syncthreads();  // broadcast all-MHC-heads cumAdt from warp-0 to all warps
-
-  // ── HEAD 0: OUTPUT ──
+  int64_t const out_seq_base = outer * params.out_stride_seq;
+  int const write_offset = MUST_CHECKPOINT ? 0 : prev_k;
   output_head_2k<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS,
-                 NUM_WARPS, MUST_CHECKPOINT>(
-      smem, params, lane, warp, d_tile, first_head, cache_slot, prev_k, out_seq_base, write_offset,
-      seq_len, D_val_0, /*tile_buf=*/0, /*cumAdt_h=*/0, frag_CB_new_0, frag_CB_old_0);
+                 NUM_WARPS, MUST_CHECKPOINT>(smem, params, lane, warp, d_tile, first_head,
+                                             m.cache_slot, prev_k, out_seq_base, write_offset,
+                                             seq_len, D_val, slot, frag_CB_new, frag_CB_old);
+}
 
-  // ── HEADS 1 .. MAIN_HEADS_PER_CTA-1 ──
-  for (int h = 1; h < MAIN_HEADS_PER_CTA; ++h) {
-    int const head = first_head + h;
-    int const cur_buf = h % PIPELINE_STAGES;
-    int const next_buf = (h + 1) % PIPELINE_STAGES;
-    bool const has_next = (h + 1 < MAIN_HEADS_PER_CTA);
-
-    __syncthreads();  // inter-head barrier: prev head's output / store_old_x done
-
-    // Hoist D LDG before the pipeline branches to hide its latency under cp.async setup + replay
-    // MMA. cumAdt for all heads was batch-prefetched in the head-0 prologue — no per-head load
-    // needed.
-    float const D_val_h = D_ptr ? toFloat(D_ptr[head]) : 0.f;
-
-    if constexpr (PIPELINE_STAGES == 1) {
-      // STAGES=1: issue state_h + old_tiles_h here (no pre-fetch from prologue/prior iter).
-      prefetch_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, lane, warp, d_tile,
-                                                                 head, cache_slot, /*buf=*/0);
-      load_head<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                /*IS_FIRST=*/false>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
-                                    buf_read, outer, seq_len, MUST_CHECKPOINT, prev_k,
-                                    /*tile_buf=*/0);
-      __pipeline_commit();  // G_tiles: state_h + old_tiles_h
-
-      // Issue x_h in a SEPARATE group so it overlaps with the replay below.
-      load_x<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, /*IS_FIRST=*/false>(
-          smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len, /*tile_buf=*/0);
-      __pipeline_commit();  // G_x: x_h
-
-      __pipeline_wait_prior(1);  // drain G_tiles (state+tiles ready); keep G_x in flight
-      __syncwarp();
-      // REPLAY (write path only).  Pre-replay fence: publish loaded state cross-warp before the
-      // M-shard replay read (a different partition than prefetch_state's coalesced load).  No
-      // post-replay fence: the pre-output __syncthreads below publishes the in-place-replayed
-      // state (only gmem CB LDGs run in between → no cross-warp state read → that barrier
-      // suffices).
-      if constexpr (MUST_CHECKPOINT) {
-        __syncthreads();
-        int64_t const state_ptr_offset =
-            cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
-        state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) + state_ptr_offset +
-                                      (int64_t)d_tile * D_PER_CTA * DSTATE;
-        replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
-            smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
-            /*must_checkpoint=*/true, /*tile_buf=*/0);
-      }
-      // CB LDG after the replay: declared here to keep live range short (not across replay).
-      auto frag_CB_new_h = thr_mma_cb.partition_fragment_A(make_identity_tensor(
-          make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<NPREDICTED_PAD_MMA_M>{})));
-      auto frag_CB_old_h = thr_mma_old_cb.partition_fragment_A(make_identity_tensor(
-          make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
-      {
-        auto const* cb_ptr_h = reinterpret_cast<input_t const*>(params.cb_scaled) +
-                               (int64_t)(seq * params.nheads + head) * warpSize * CB_NEW_REGS;
-        load_cb_fragA<CB_NEW_REGS, input_t>(frag_CB_new_h, lane, cb_ptr_h);
-      }
-      if constexpr (!MUST_CHECKPOINT) {
-        auto const* cb_old_ptr_h = reinterpret_cast<input_t const*>(params.cb_old) +
-                                   (int64_t)(seq * params.nheads + head) * warpSize * CB_OLD_REGS;
-        load_cb_fragA<CB_OLD_REGS, input_t>(frag_CB_old_h, lane, cb_old_ptr_h);
-      }
-      __pipeline_wait_prior(0);  // drain G_x → x_h in smem
-      __syncthreads();           // fence smem.x_h visible to all warps; cumAdt already broadcast
-
-      output_head_2k<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                     PHILOX_ROUNDS, NUM_WARPS, MUST_CHECKPOINT>(
-          smem, params, lane, warp, d_tile, head, cache_slot, prev_k, out_seq_base, write_offset,
-          seq_len, D_val_h, cur_buf, /*cumAdt_h=*/h, frag_CB_new_h, frag_CB_old_h);
-    } else {
-      // STAGES=2: state_h + old_tiles_h already in smem (pre-issued in prologue or prior iter).
-      // Issue state_{h+1} + old_tiles_{h+1} together in G_tiles (if there's a next head).
-      if (has_next) {
-        prefetch_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, lane, warp, d_tile,
-                                                                   head + 1, cache_slot, next_buf);
-        load_head<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                  /*IS_FIRST=*/false>(smem, params, lane, warp, d_tile, head + 1, group_idx,
-                                      cache_slot, buf_read, outer, seq_len, MUST_CHECKPOINT, prev_k,
-                                      next_buf);
-        __pipeline_commit();  // G_tiles: state_{h+1} + old_tiles_{h+1}
-      }
-
-      // Issue x_{h+1} in its own group so it stays in flight across replay + output of head h.
-      if (has_next) {
-        load_x<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, /*IS_FIRST=*/false>(
-            smem, params, lane, warp, d_tile, head + 1, group_idx, outer, seq_len, next_buf);
-        __pipeline_commit();  // G_xnext: x_{h+1}
-      }
-
-      // ── DRAIN TILES FOR REPLAY ──
-      // has_next:  3 in-flight = [x_h(prev), G_tiles(h+1), G_xnext(h+1)].
-      //            wait_prior(3) keeps all 3 in flight — the replay does NOT need x_h,
-      //            so its HBM latency is hidden behind the replay MMA.
-      // !has_next: 1 in-flight = [x_h].
-      //            wait_prior(1) = no stall (already ≤1). x_h loads during the replay.
-      __pipeline_wait_prior(has_next ? 3 : 1);
-      __syncwarp();
-
-      // REPLAY (write path only).  Pre-replay fence: publish loaded state cross-warp before the
-      // M-shard replay read (a different partition than prefetch_state's coalesced load).  No
-      // post-replay fence: the pre-output __syncthreads below publishes the in-place-replayed
-      // state (only gmem CB LDGs run in between → no cross-warp state read → that barrier
-      // suffices).
-      if constexpr (MUST_CHECKPOINT) {
-        __syncthreads();
-        int64_t const state_ptr_offset =
-            cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
-        state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) + state_ptr_offset +
-                                      (int64_t)d_tile * D_PER_CTA * DSTATE;
-        replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
-            smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
-            /*must_checkpoint=*/true, cur_buf);
-      }
-      // CB LDG after the replay: declared here to keep live range short (not across replay).
-      auto frag_CB_new_h = thr_mma_cb.partition_fragment_A(make_identity_tensor(
-          make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<NPREDICTED_PAD_MMA_M>{})));
-      auto frag_CB_old_h = thr_mma_old_cb.partition_fragment_A(make_identity_tensor(
-          make_shape(Int<NPREDICTED_PAD_MMA_M>{}, Int<MAX_WINDOW_PAD_MMA_K>{})));
-      {
-        auto const* cb_ptr_h = reinterpret_cast<input_t const*>(params.cb_scaled) +
-                               (int64_t)(seq * params.nheads + head) * warpSize * CB_NEW_REGS;
-        load_cb_fragA<CB_NEW_REGS, input_t>(frag_CB_new_h, lane, cb_ptr_h);
-      }
-      if constexpr (!MUST_CHECKPOINT) {
-        auto const* cb_old_ptr_h = reinterpret_cast<input_t const*>(params.cb_old) +
-                                   (int64_t)(seq * params.nheads + head) * warpSize * CB_OLD_REGS;
-        load_cb_fragA<CB_OLD_REGS, input_t>(frag_CB_old_h, lane, cb_old_ptr_h);
-      }
-      // ── DRAIN X FOR OUTPUT ──
-      // has_next:  x_h still in flight; wait_prior(2) drains it (drops G_xprev(x_h),
-      //            leaving G_tiles(h+1)+G_xnext(h+1) in flight for next iteration).
-      // !has_next: x_h still in flight; wait_prior(0) drains it.
-      __pipeline_wait_prior(has_next ? 2 : 0);  // drain x_h
-      __syncthreads();  // fence smem.x_h visible to all warps; cumAdt already broadcast
-      output_head_2k<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                     PHILOX_ROUNDS, NUM_WARPS, MUST_CHECKPOINT>(
-          smem, params, lane, warp, d_tile, head, cache_slot, prev_k, out_seq_base, write_offset,
-          seq_len, D_val_h, cur_buf, /*cumAdt_h=*/h, frag_CB_new_h, frag_CB_old_h);
-    }
+// process_head: PURE CONSUMER of a prefetched ring slot — replay (write path) then output.  The
+// slot's bundle is already drained by the caller's pipeline_wait; this issues NO cp.async (only the
+// on-the-fly scalar derives + cb LDGs).  The barriers publish the drained slot cross-warp.
+template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
+          int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, int NHEADS,
+          int HEADS_PER_GROUP, bool VARLEN, bool MUST_CHECKPOINT, typename SmemT>
+__device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams const& params,
+                                             int lane, int warp, HeadMetaSSU const& m, int slot) {
+  __syncthreads();  // publish the drained bundle (state + old-tiles + C/x/cumAdt) cross-warp
+  if constexpr (MUST_CHECKPOINT) {
+    replay_state<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                 PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane,
+                                                                            warp, m, slot);
+    __syncthreads();  // publish the in-place-replayed state cross-warp before the output MMA
   }
+  compute_output_and_store<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA,
+                           DSTATE, PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
+                           MUST_CHECKPOINT>(smem, params, lane, warp, m, slot);
 }
 
 // =============================================================================
@@ -761,9 +963,18 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1,
           bool VARLEN = false, int NGROUPS = 1>
-// __maxnreg__(64): 65536/(64·128)=8 blocks/SM at 50% occupancy.  Spills ~4 scalar regs
-// (from tile_buf address arithmetic), but fewer blocks/SM from a higher cap hurts more.
-__global__ __maxnreg__(64) void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
+// __maxnreg__ tracks the ring depth, because the two regimes are opposite:
+//   STATE_PIPE=1: ≈19 KB smem allows >8 blocks/SM, so the kernel is REGISTER-bound — cap at 64 to
+//     hold 8 blocks (65536/(64·128)=8).
+//   STATE_PIPE≥2: the STATE_PIPE-strided bundle is SMEM-bound (≈38 KB → 5 blocks at depth 2), so
+//   the
+//     per-block register budget is ~102/thread.  Capping at 64 there only forces spills (measured:
+//     200 MB local-store traffic, 7× the global stores).  Cap at 96 instead — above the natural use
+//     (88 regs at depth 2, no spills) and below the ~102 budget so registers never undercut the
+//     smem-bound 5 blocks/SM.
+__global__ __maxnreg__(MAIN_STATE_PIPE == 1
+                           ? 64
+                           : 96) void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
   static_assert(DIM % D_SPLIT == 0, "DIM must be divisible by D_SPLIT");
   constexpr int D_PER_CTA = DIM / D_SPLIT;
   static_assert(D_PER_CTA >= 32, "D_PER_CTA must be >= 32 (output MMA m16n8 with _1×4 layout)");
@@ -771,8 +982,15 @@ __global__ __maxnreg__(64) void checkpointing_ssu_main_kernel(CheckpointingSsuPa
   static_assert(MAX_WINDOW <= MMA_prop::K_BIG, "MAX_WINDOW must be <= MMA::K_BIG=16");
   assert(params.d_split == D_SPLIT);
 
-  using SmemT =
-      CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE>;
+  // ── EXTERNAL PDL: signal a programmatic DOWNSTREAM kernel that `output` is fully written
+  // (ALL work-units done; the per-head cache writes are next-step-only).  Gated by ENABLE_PDL.
+  // (The internal precompute→main chain uses the one-shot gdc_wait on the first work-unit.) ──
+  if constexpr (ENABLE_PDL) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+
+  using SmemT = CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
+                                            DSTATE, MAIN_STATE_PIPE>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
@@ -794,114 +1012,167 @@ __global__ __maxnreg__(64) void checkpointing_ssu_main_kernel(CheckpointingSsuPa
   int const stride = (int)gridDim.x;
 
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  auto const* __restrict__ buf_idx_ptr = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
 
-  // Per-work-unit scalar setup, SOFTWARE-PIPELINED.  The metadata loads (cache_buf_idx,
-  // prev_num_accepted, cu_seqlens) are DEPENDENT on cache_slot and gate head_loop's 16 KB state
-  // load + the write/no-write dispatch (must_checkpoint = prev_k+seq_len > MAX_WINDOW).  Issuing
-  // them at the top of every iteration exposes that dependent-load stall on the critical path —
-  // the regression vs the old grid where one CTA amortized the setup across its heads.  Instead we
-  // prefetch the NEXT work-unit's setup before head_loop (its loads overlap head_loop + the fence),
-  // so each iteration consumes already-arrived metadata.  next_tile = tile + gridDim.x is exact
-  // (grid-stride is a fixed progression — no data-dependent next).
-  struct Setup {
-    int d_tile, seq, group_idx, first_head, buf_read, prev_k, seq_len;
-    int64_t cache_slot, outer;
-    bool valid;  // false ⇒ pad slot / empty varlen row (skip, but still pipelines the next)
+  // fetch: resolve ONLY the ring entry {tile, cache_slot}.  cache_slot = sbi[seq] is the HEAD of
+  // the dependent chain; prefetching it STAGES ahead (into meta[]) means the consumer only pays the
+  // single-hop prev/buf load off the resolved cache_slot, never the chain.  Everything else
+  // (indices, prev_k, buf_read, seq_len) is derived on the fly at use (see derive_head).
+  auto fetch = [&](int tile) -> HeadMetaSSU {
+    int const seq = (tile / NHEADS) / D_SPLIT;  // compile-time NHEADS, D_SPLIT divisors
+    HeadMetaSSU m;
+    m.tile = tile;
+    m.cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
+    return m;
   };
-  auto fetch = [&](int tile) -> Setup {
-    int const head = tile % NHEADS;  // compile-time NHEADS divisor
-    int const t = tile / NHEADS;
-    Setup s;
-    s.d_tile = t % D_SPLIT;                // compile-time D_SPLIT divisor
-    s.seq = t / D_SPLIT;                   // batch is the range, never a divisor
-    s.group_idx = head / HEADS_PER_GROUP;  // compile-time HEADS_PER_GROUP divisor
-    s.first_head = head;
-    s.cache_slot = sbi ? static_cast<int64_t>(sbi[s.seq]) : s.seq;
-    if (s.cache_slot == params.pad_slot_id) {
-      s.valid = false;
-      return s;
+
+  // ── CROSS-ITERATION N-STAGE RING ──
+  // head_meta[] is a register-resident SHIFT-REGISTER of the trimmed {tile, cache_slot}, prefetched
+  // STAGES ahead so cache_slot is resolved before it's consumed.  CRITICAL: it is indexed ONLY by
+  // compile-time-constant subscripts (head_meta[0], head_meta[k] inside #pragma unroll,
+  // head_meta[STAGES-1]) so SROA keeps it in registers.  A runtime subscript (the old meta[j %
+  // STAGES]) would force the whole array to LOCAL memory — then "prefetched cache_slot" is read
+  // back from local at ~the same latency as the global load it replaced (measured: the #1
+  // long_scoreboard site + 3.3 MB local traffic).  The runtime smem-buffer index `slot = j %
+  // STAGES` is kept SEPARATE and used only to address the smem ring (a runtime offset into shared
+  // memory is fine; it is not local memory).
+  //
+  // Invariant at the top of steady iteration j: head_meta[k] == meta(j + k) for k = 0..STAGES-1, so
+  // head_meta[0] is always the unit to process now.  Each iteration: process head_meta[0] from smem
+  // buffer `slot`; shift the queue left (constant indices); append meta(j+STAGES) into
+  // head_meta[STAGES-1] and prefetch it into the freed buffer `slot` (since (j+STAGES) % STAGES ==
+  // j % STAGES).  The physical smem layout (unit u in buffer u % STAGES) and the cp.async FIFO
+  // depth are UNCHANGED, so the result is bit-identical. tile 0 is split pre/post-gdc (single
+  // scalar m0) so its 16 KB state load overlaps the precompute and its replay runs in the gdc
+  // window.  Every work-unit is exactly one cp.async group (EMPTY for a pad / past-the-end), so
+  // wait_prior(STAGES-1) drains exactly the work-unit being processed.
+  constexpr int STAGES = MAIN_STATE_PIPE;
+  HeadMetaSSU head_meta[STAGES];
+  auto fetch_head_meta = [&](int i) -> HeadMetaSSU {
+    int const wu = blockIdx.x + i * stride;
+    if (wu >= total_work) {
+      HeadMetaSSU m;
+      m.tile = wu;
+      m.cache_slot = params.pad_slot_id;  // sentinel ⇒ skip (past-the-end)
+      return m;
     }
-    s.buf_read = __ldg(&buf_idx_ptr[s.cache_slot]);
-    s.prev_k = prev_ptr[s.cache_slot];
+    return fetch(wu);
+  };
+  // valid / must_checkpoint derived on the fly from {tile, cache_slot} (one prev/cu load off the
+  // resolved cache_slot; seq_len is the NPREDICTED constexpr in the common non-varlen path).
+  auto is_valid = [&](HeadMetaSSU const& m) -> bool {
+    if (m.cache_slot == params.pad_slot_id) return false;
     if constexpr (VARLEN) {
-      int const bos = __ldg(&cu[s.seq]);
-      int const eos = __ldg(&cu[s.seq + 1]);
-      s.seq_len = eos - bos;
-      s.outer = (int64_t)bos;
-      s.valid = (s.seq_len > 0);
-    } else {
-      s.seq_len = NPREDICTED;
-      s.outer = (int64_t)s.seq;
-      s.valid = true;
+      int const seq = (m.tile / NHEADS) / D_SPLIT;
+      return __ldg(&cu[seq + 1]) - __ldg(&cu[seq]) > 0;  // empty varlen row ⇒ skip
     }
-    return s;
+    return true;
+  };
+  auto mc_of = [&](HeadMetaSSU const& m) -> bool {
+    int const prev_k = prev_ptr[m.cache_slot];
+    if constexpr (VARLEN) {
+      int const seq = (m.tile / NHEADS) / D_SPLIT;
+      return prev_k + (__ldg(&cu[seq + 1]) - __ldg(&cu[seq])) > MAX_WINDOW;
+    }
+    return prev_k + NPREDICTED > MAX_WINDOW;
   };
 
-  // gdc_wait fires only on a CTA's FIRST work-unit that actually runs; once any work-unit has
-  // waited, the precompute is done + globally visible for the rest of the loop.
-  bool did_gdc = false;
-  Setup pending = fetch(blockIdx.x);  // prologue: prefetch the first work-unit's setup
+  // ── PROLOGUE: tile 0 (smem buffer 0), pre-gdc half first to overlap the precompute. ──
+  HeadMetaSSU const m0 =
+      fetch_head_meta(0);  // wu(0)=blockIdx.x < total_work (CTA has ≥1 work-unit)
+  bool const v0 = is_valid(m0);
+  bool const mc0 = v0 && mc_of(m0);
+  if (v0)
+    prefetch_async_pre_gdc<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                           NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, m0,
+                                                                       /*slot=*/0, mc0);
+  __pipeline_commit();  // G_pre0 (empty if tile 0 is a pad)
+  // Resolve units 1..STAGES-1's cache_slot ahead (overlaps tile-0's pre-gdc load); unit p →
+  // head_meta[p-1].
+#pragma unroll
+  for (int p = 1; p < STAGES; ++p) head_meta[p - 1] = fetch_head_meta(p);
 
-  for (int tile = blockIdx.x; tile < total_work; tile += stride) {
-    Setup const cur = pending;
-    bool const has_next = (tile + stride < total_work);
-    if (has_next) pending = fetch(tile + stride);  // prefetch next BEFORE head_loop + fence
-    if (!cur.valid)
-      continue;  // pad / empty varlen: skip (next already prefetched, no smem touched)
+  __pipeline_wait_prior(0);  // tile-0 pre-gdc bundle ready for replay
+  __syncthreads();           // publish it cross-warp
+  if (mc0)
+    replay_state<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                 PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane,
+                                                                            warp, m0, 0);
+  __syncthreads();                  // publish replayed state + gdc convergence
+  cudaGridDependencySynchronize();  // gdc ONCE — precompute outputs (cb / cumAdt / x / C) now
+                                    // visible
 
-    int64_t const out_seq_base = cur.outer * params.out_stride_seq;
-    bool const must_checkpoint = (cur.prev_k + cur.seq_len > MAX_WINDOW);
-    int const write_offset = must_checkpoint ? 0 : cur.prev_k;
-    bool const do_gdc = !did_gdc;  // uniform across the CTA
-    did_gdc = true;
+  if (v0)
+    prefetch_async_post_gdc<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NHEADS, HEADS_PER_GROUP,
+                            VARLEN>(smem, params, lane, warp, m0, 0);
+  __pipeline_commit();  // G_post0
 
-    // Runtime do_gdc → compile-time DO_GDC_WAIT (gates the one-shot gdc_wait inside head_loop).
-    if (must_checkpoint) {
-      if (do_gdc)
-        head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, /*MAIN_HEADS_PER_CTA=*/1,
-                  /*PIPELINE_STAGES=*/1, /*DO_GDC_WAIT=*/true>(
-            smem, params, lane, warp, cur.d_tile, cur.first_head, cur.group_idx, cur.seq,
-            cur.cache_slot, cur.buf_read, cur.prev_k, cur.outer, cur.seq_len, out_seq_base,
-            write_offset);
-      else
-        head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/true, /*MAIN_HEADS_PER_CTA=*/1,
-                  /*PIPELINE_STAGES=*/1, /*DO_GDC_WAIT=*/false>(
-            smem, params, lane, warp, cur.d_tile, cur.first_head, cur.group_idx, cur.seq,
-            cur.cache_slot, cur.buf_read, cur.prev_k, cur.outer, cur.seq_len, out_seq_base,
-            write_offset);
-    } else {
-      if (do_gdc)
-        head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, /*MAIN_HEADS_PER_CTA=*/1,
-                  /*PIPELINE_STAGES=*/1, /*DO_GDC_WAIT=*/true>(
-            smem, params, lane, warp, cur.d_tile, cur.first_head, cur.group_idx, cur.seq,
-            cur.cache_slot, cur.buf_read, cur.prev_k, cur.outer, cur.seq_len, out_seq_base,
-            write_offset);
-      else
-        head_loop<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
-                  PHILOX_ROUNDS, NUM_WARPS, /*MUST_CHECKPOINT=*/false, /*MAIN_HEADS_PER_CTA=*/1,
-                  /*PIPELINE_STAGES=*/1, /*DO_GDC_WAIT=*/false>(
-            smem, params, lane, warp, cur.d_tile, cur.first_head, cur.group_idx, cur.seq,
-            cur.cache_slot, cur.buf_read, cur.prev_k, cur.outer, cur.seq_len, out_seq_base,
-            write_offset);
-    }
-
-    // Loop-boundary fence: this work-unit's output_head_2k / store_old_x reads of smem must finish
-    // before the next work-unit's prefetch_state / load_head / load_x overwrite the same buffers
-    // (single-buffered across work-units).  Only when a next iteration exists (uniform condition).
-    if (has_next) __syncthreads();
+  // Prefetch units 1..STAGES-1 (full bundles; gdc already fired) — unit p into smem buffer p.
+#pragma unroll
+  for (int p = 1; p < STAGES; ++p) {
+    if (is_valid(head_meta[p - 1]))
+      prefetch_async<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                     NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, head_meta[p - 1],
+                                                      /*slot=*/p, mc_of(head_meta[p - 1]));
+    __pipeline_commit();  // G_full_p (empty if pad / past-the-end)
   }
 
-  // ── EXTERNAL PDL: signal a programmatic DOWNSTREAM kernel that `output` is fully written
-  // (ALL work-units done; the per-head cache writes are next-step-only).  Gated by ENABLE_PDL.
-  // (The internal precompute→main chain uses the one-shot gdc_wait on the first work-unit.) ──
-  if constexpr (ENABLE_PDL) {
-    cudaTriggerProgrammaticLaunchCompletion();
+  // FIFO: [G_post0, G_full_1 .. G_full_{STAGES-1}] = STAGES groups.  Drain + output tile 0.
+  __pipeline_wait_prior(STAGES - 1);
+  __syncthreads();  // publish tile-0 post-gdc data (C / x / cumAdt) cross-warp before its output
+  if (v0) {
+    if (mc0)
+      compute_output_and_store<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA,
+                               DSTATE, PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
+                               /*MUST_CHECKPOINT=*/true>(smem, params, lane, warp, m0, 0);
+    else
+      compute_output_and_store<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA,
+                               DSTATE, PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
+                               /*MUST_CHECKPOINT=*/false>(smem, params, lane, warp, m0, 0);
+  }
+  __syncthreads();  // tile-0 output done reading buffer 0 before the tile-STAGES prefetch
+                    // overwrites it
+
+  // Prefetch unit STAGES into buffer 0 (freed by tile-0's output) → head_meta[STAGES-1].  Now the
+  // queue holds units 1..STAGES (head_meta[k] == meta(k+1)), establishing the steady invariant for
+  // j == 1.
+  head_meta[STAGES - 1] = fetch_head_meta(STAGES);
+  if (is_valid(head_meta[STAGES - 1]))
+    prefetch_async<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                   NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, head_meta[STAGES - 1],
+                                                    /*slot=*/0, mc_of(head_meta[STAGES - 1]));
+  __pipeline_commit();
+
+  // ── STEADY STATE: process head_meta[0] (== unit j, prefetched STAGES ago, cache_slot in a
+  // register), shift
+  //    the queue, append + prefetch unit (j+STAGES) into the freed buffer `slot`. ──
+  for (int j = 1; blockIdx.x + j * stride < total_work; ++j) {
+    int const slot = j % STAGES;         // smem buffer of unit j (== buffer of unit j+STAGES)
+    HeadMetaSSU const m = head_meta[0];  // register-resident: unit j, cache_slot already resolved
+    bool const v = is_valid(m);
+    __pipeline_wait_prior(STAGES - 1);  // drain unit j's bundle (the oldest group)
+    if (v) {
+      if (mc_of(m))
+        process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                     PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
+                     /*MUST_CHECKPOINT=*/true>(smem, params, lane, warp, m, slot);
+      else
+        process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
+                     PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
+                     /*MUST_CHECKPOINT=*/false>(smem, params, lane, warp, m, slot);
+    }
+    __syncthreads();  // output done reading `slot` before the prefetch below overwrites it
+
+    // Shift the queue left (constant indices → stays in registers), append the next unit.
+#pragma unroll
+    for (int k = 0; k < STAGES - 1; ++k) head_meta[k] = head_meta[k + 1];
+    head_meta[STAGES - 1] = fetch_head_meta(j + STAGES);
+    if (is_valid(head_meta[STAGES - 1]))
+      prefetch_async<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                     NHEADS, HEADS_PER_GROUP, VARLEN>(
+          smem, params, lane, warp, head_meta[STAGES - 1], slot, mc_of(head_meta[STAGES - 1]));
+    __pipeline_commit();  // keep the FIFO at STAGES groups (empty for pad / past-the-end)
   }
 }
 
