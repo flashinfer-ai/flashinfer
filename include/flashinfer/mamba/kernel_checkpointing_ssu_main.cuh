@@ -277,6 +277,25 @@ __device__ __forceinline__ void load_cumAdt(SmemT& smem, CheckpointingSsuParams 
         cumAdt_ptr[(int64_t)(seq * params.nheads + first_head) * NPREDICTED_PAD_MMA_M + lane];
 }
 
+// load_cumAdt_async: cp.async variant of load_cumAdt — joins the post-gdc cp.async group instead of
+// a synchronous LDG+STS (which was the #1 long_scoreboard pole: the STS stalled on its feeding
+// LDG). WARP-0 ONLY; lanes 0..seq_len-1 each cp.async one float.  Drained + published by the
+// caller's pipeline_wait + __syncthreads, same as the rest of the bundle.  ISSUE ONLY — caller
+// commits.
+template <typename SmemT>
+__device__ __forceinline__ void load_cumAdt_async(SmemT& smem, CheckpointingSsuParams const& params,
+                                                  int lane, int seq, int first_head, int seq_len,
+                                                  int tile_buf) {
+  constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
+  auto const* __restrict__ cumAdt_ptr = reinterpret_cast<float const*>(params.cumAdt_vec);
+  float* cumAdt_slot = smem.cumAdt + tile_buf * SmemT::CUMADT_ELEMS;
+  if (lane < seq_len)
+    __pipeline_memcpy_async(
+        &cumAdt_slot[lane],
+        &cumAdt_ptr[(int64_t)(seq * params.nheads + first_head) * NPREDICTED_PAD_MMA_M + lane],
+        sizeof(float));
+}
+
 // load_cb_async: cp.async the per-(seq,head) CB blocks (precompute outputs, fragA-native,
 // lane-major) gmem → smem ring slot tile_buf, so the output MMA's A-operand loads from smem (LDS,
 // short scoreboard) instead of a just-in-time LDG straight to registers — the latter was the #1
@@ -520,7 +539,9 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
 
     auto epilogue = [&](auto& frag_y, int n) {
 #pragma unroll
-      for (int i = 0; i < size(frag_y); ++i) frag_y(i) *= beta_extra * __expf(decay_part(i));
+      for (int i = 0; i < size(frag_y); ++i) {
+        frag_y(i) *= beta_extra * __expf(decay_part(i));
+      }
       add_cb_x<input_t, MMA_prop::operand_t, N_TILE, NPREDICTED_PAD_MMA_M>(
           frag_y, frag_CB_new, smem_x_trans, s2r_B_trans, s2r_thr_B_trans, thr_mma, tiled_mma, n);
       add_cb_old_x<input_t, MMA_prop::operand_t, N_TILE, MAX_WINDOW_PAD_MMA_K>(
@@ -877,7 +898,7 @@ __device__ __forceinline__ void prefetch_async_post_gdc(SmemT& smem,
   derive_head<NHEADS, HEADS_PER_GROUP, D_SPLIT, NPREDICTED, VARLEN>(
       params, m, d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len, outer);
   if (warp == 0) {
-    load_cumAdt(smem, params, lane, seq, first_head, seq_len, slot);
+    load_cumAdt_async(smem, params, lane, seq, first_head, seq_len, slot);
   } else if (warp == 1 || warp == 2) {
     load_x<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, /*IS_FIRST=*/true>(
         smem, params, lane, warp, d_tile, first_head, group_idx, outer, seq_len, slot);

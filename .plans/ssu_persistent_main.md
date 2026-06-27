@@ -333,6 +333,63 @@ CUPTI; ncu = lineinfo `--set full` b1024):
 long_scoreboard is `load_cumAdt`'s SYNCHRONOUS LDG+STS (`main.cuh:274`, 32%) — cumAdt is the last
 post-gdc input not on cp.async.
 
+### Full write/no-write comparison — we still LOSE to the monolith on no-write (B200, e829c35e)
+
+Whole-kernel CUPTI (`bench_checkpointing_ssu.py`, mtp=6, mw=16, bf16; `cuda-incr-2k` = precompute +
+persistent main, the precompute overlapped under PDL).  prev_k 0/8 = no-write, 12/16 = write
+(must_checkpoint = prev_k+6 > 16).  **Best per column in bold.**
+
+**b512**
+
+| kernel | nw0 | nw8 | wr12 | wr16 |
+|--------|----:|----:|-----:|-----:|
+| cuda-incr-2k (ours)  | 64.8 | 75.4 | 95.8 | 97.1 |
+| cuda-incr (monolith) | 62.6 | **63.0** | **82.3** | **82.3** |
+| triton-replay        | 72.1 | 77.9 | 139.9 | 141.6 |
+| triton-replay-pm     | **41.9** | **45.3** | 94.9 | 95.7 |
+
+**b1024**
+
+| kernel | nw0 | nw8 | wr12 | wr16 |
+|--------|----:|----:|-----:|-----:|
+| cuda-incr-2k (ours)  | 120.8 | 141.5 | 184.1 | 187.0 |
+| cuda-incr (monolith) | 113.3 | **114.1** | **159.6** | **159.7** |
+| triton-replay        | 130.6 | 152.3 | 225.0 | 227.3 |
+| triton-replay-pm     | **75.5** | **80.3** | 184.4 | 186.6 |
+
+**The 2k persistent main is SLOWER than the monolith on the no-write path it was built to win**
+(b512 nw0 64.8 vs 62.6; b1024 nw0 120.8 vs 113.3) and the gap widens with prev_k (nw8: 75.4 vs 63.0;
+141.5 vs 114.1).  triton-pm dominates no-write (b1024 75.5).  On write the monolith is fastest and
+we ≈ triton-pm.  This contradicts the original B300 "Why" table (which claimed the 2k crushed
+triton-pm on write) — either a B300→B200 inversion or a structural regression in the persistent
+pipeline.
+
+**RESOLVED — the depth-2 pipeline itself is the regression.**  Setting `MAIN_STATE_PIPE=1`
+(single-buffer, no cross-iteration overlap; all the latency cuts above still apply — they're
+pipe-independent) is **~33% faster**:
+
+| no-write | pipe=2 | **pipe=1** | monolith | triton-pm |
+|----------|------:|-------:|--------:|----------:|
+| b512 CUPTI  | 64.8 | **49.0** | 62.6 | 41.9 |
+| b1024 CUPTI | 120.8 | **90.0** | 113.1 | 75.5 |
+| ncu dur (b1024) | 110.85 | **83.4** | — | — |
+| registers / smem / blocks / occ | 88 / 40.4 KB / 5 / 28.7% | **64 / 20.2 KB / 8 / 47.2%** | — | — |
+
+pipe=1 has **zero spills** (maxnreg(64) → exactly 8 blocks) and flips us from *losing* to the
+monolith to *beating* it (b1024 90 vs 113).  Why depth-2 loses: the `state` buffer is 16 KB of the
+20 KB bundle, so double-buffering it pushes smem 20→40 KB → **5 blocks instead of 8**.  On this
+kernel **occupancy (more warps to hide the state reload) beats prefetch (a cp.async ring at half the
+warps)** — the monolith was implicitly right to single-buffer.  This also **supersedes Plan B
+(state-only pipelining)**: state is the 16 KB pole, so any depth-2 variant that double-buffers it
+lands ≥28 KB / ≤7 blocks — still worse than depth-1's 20 KB / 8 blocks.  **depth-1 is optimal here.**
+
+**cumAdt → cp.async (`load_cumAdt_async`)** landed on top of this (the last synchronous post-gdc
+load; was the #1 long_scoreboard at pipe=2, 32%).  At pipe=2: b512 64.8→62.9, b1024 120.8→117.25,
+ncu 110.85→107.46; the cumAdt STS stall is gone, leaving `wait` (20%) + scattered per-work-unit
+address-arithmetic long_scoreboard — i.e. pipe=2 is now drained of memory stalls and PURELY
+occupancy-bound at 5 blocks, still ~24 µs (ncu) behind pipe=1.  cumAdt async is pipe-independent so
+it helps pipe=1 too (it was 14.8% of pipe=1's long_scoreboard).
+
 ### Next levers
 
 - **cumAdt → cp.async:** fold cumAdt into the post-gdc cp.async group (same pattern as CB) — it's
