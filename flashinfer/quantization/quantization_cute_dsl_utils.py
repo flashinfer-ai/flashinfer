@@ -1848,6 +1848,71 @@ def process_nvfp4_block_bfloat(
 
 
 @cute.jit
+def process_nvfp4_block_bfloat_scaled(
+    row_tensor,
+    pre_quant_scale_tensor,
+    elem_base: Int32,
+    global_scale: Float32,
+    disable_fp4_quant_fast_math: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    row_amax: Float32 | None = None,
+) -> tuple:
+    """Process a BF16 NVFP4 block after applying a per-channel BF16 scale.
+
+    The multiply is performed with packed ``mul.bf16x2`` before the amax and
+    FP4 conversion.  This preserves the BF16 rounding boundary of materializing
+    ``row_tensor * pre_quant_scale_tensor`` while avoiding the intermediate.
+    """
+    from ..cute_dsl.fp4_common import (
+        bfloat2_mul,
+        get_ptr_as_int64,
+        ld_global_v4_u32,
+    )
+
+    # Load 16 BF16 activation values and their 16 per-channel scales.
+    x_ptr0 = get_ptr_as_int64(row_tensor, elem_base)
+    x_ptr1 = get_ptr_as_int64(row_tensor, elem_base + Int32(8))
+    p_ptr0 = get_ptr_as_int64(pre_quant_scale_tensor, elem_base)
+    p_ptr1 = get_ptr_as_int64(pre_quant_scale_tensor, elem_base + Int32(8))
+
+    h0, h1, h2, h3 = ld_global_v4_u32(x_ptr0)
+    h4, h5, h6, h7 = ld_global_v4_u32(x_ptr1)
+    p0, p1, p2, p3 = ld_global_v4_u32(p_ptr0)
+    p4, p5, p6, p7 = ld_global_v4_u32(p_ptr1)
+
+    h0 = bfloat2_mul(h0, p0)
+    h1 = bfloat2_mul(h1, p1)
+    h2 = bfloat2_mul(h2, p2)
+    h3 = bfloat2_mul(h3, p3)
+    h4 = bfloat2_mul(h4, p4)
+    h5 = bfloat2_mul(h5, p5)
+    h6 = bfloat2_mul(h6, p6)
+    h7 = bfloat2_mul(h7, p7)
+
+    block_max_h2 = bfloat2_max_abs_8(h0, h1, h2, h3, h4, h5, h6, h7)
+    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+
+    if cutlass.const_expr(nvfp4_4over6_config is not None):
+        values = _bfloat2x8_to_f32x16(h0, h1, h2, h3, h4, h5, h6, h7)
+        scale_fp8, packed64 = _nvfp4_4over6_quant_from_values(
+            values,
+            block_max,
+            global_scale,
+            row_amax,
+            disable_fp4_quant_fast_math,
+            nvfp4_4over6_config,
+        )
+        return scale_fp8, packed64
+
+    scale_fp8, output_scale = _nvfp4_standard_quant_from_amax(
+        block_max, global_scale, disable_fp4_quant_fast_math
+    )
+    packed64 = bfloat2x8_to_e2m1x16_packed(h0, h1, h2, h3, h4, h5, h6, h7, output_scale)
+
+    return scale_fp8, packed64
+
+
+@cute.jit
 def fp8x16_to_e2m1x16_packed(
     w0: Uint32,
     w1: Uint32,
