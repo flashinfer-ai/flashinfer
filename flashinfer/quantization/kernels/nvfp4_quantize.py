@@ -1779,6 +1779,15 @@ def nvfp4_quantize_cute_dsl(
     if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
         raise ValueError("FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input")
     use_tma = _should_use_tma(m, k, input.dtype) and nvfp4_4over6_config is None
+    if apply_pre_quant_scale and sf_layout == SF_LAYOUT_128x4:
+        major, minor = torch.cuda.get_device_capability(input.device)
+        if (major, minor) == (10, 0) and (k == 12288 or m % ROW_TILE_SIZE != 0):
+            # On SM100, SVDQuant's fused-PQS path is faster in the predicated
+            # kernel for the wide MLP-down input, and it avoids materializing
+            # an activation-sized padded copy for a partial 128x4 row tile.
+            # Other layouts, architectures, and no-PQS callers retain the
+            # established TMA heuristic.
+            use_tma = False
 
     if use_tma:
         tma_row_tile = _TMA_ROW_TILE
