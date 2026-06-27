@@ -108,6 +108,122 @@ def test_nvfp4_kv_dequant(shape, dtype):
     torch.testing.assert_close(output.float(), ref.float(), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("block_table_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype):
+    """Test paged NVFP4 KV dequantization against PyTorch reference."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    torch.manual_seed(42)
+
+    num_pages = 8
+    page_size = 3
+    batch_size = 2
+    max_seq_len = 7
+    num_kv_heads = 2
+    k_head_dim = 64
+    v_head_dim = 128
+    k_scale_dim = k_head_dim // 16
+    v_scale_dim = v_head_dim // 16
+
+    k_cache_nhd = torch.randint(
+        0,
+        256,
+        (num_pages, page_size, num_kv_heads, k_head_dim // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    v_cache_nhd = torch.randint(
+        0,
+        256,
+        (num_pages, page_size, num_kv_heads, v_head_dim // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    k_scales_nhd = torch.randint(
+        1,
+        120,
+        (num_pages, page_size, num_kv_heads, k_scale_dim),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e4m3fn)
+    v_scales_nhd = torch.randint(
+        1,
+        120,
+        (num_pages, page_size, num_kv_heads, v_scale_dim),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e4m3fn)
+
+    if kv_layout == "NHD":
+        k_cache = k_cache_nhd
+        v_cache = v_cache_nhd
+        k_scales = k_scales_nhd
+        v_scales = v_scales_nhd
+    else:
+        k_cache = k_cache_nhd.permute(0, 2, 1, 3).contiguous()
+        v_cache = v_cache_nhd.permute(0, 2, 1, 3).contiguous()
+        k_scales = k_scales_nhd.permute(0, 2, 1, 3).contiguous()
+        v_scales = v_scales_nhd.permute(0, 2, 1, 3).contiguous()
+
+    block_tables = torch.tensor(
+        [[2, 5, 1], [6, 3, 0]], dtype=block_table_dtype, device="cuda"
+    )
+    seq_lens = torch.tensor([7, 4], dtype=torch.int32, device="cuda")
+    k_scale_val = 0.5
+    v_scale_val = 0.25
+    k_scale = torch.tensor([k_scale_val], dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor([v_scale_val], dtype=torch.float32, device="cuda")
+
+    output_k = torch.full(
+        (batch_size, max_seq_len, num_kv_heads, k_head_dim),
+        123.0,
+        dtype=dtype,
+        device="cuda",
+    )
+    output_v = torch.full(
+        (batch_size, max_seq_len, num_kv_heads, v_head_dim),
+        123.0,
+        dtype=dtype,
+        device="cuda",
+    )
+
+    flashinfer.nvfp4_kv_dequantize_paged(
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        block_tables,
+        seq_lens,
+        k_scale,
+        v_scale,
+        output_k,
+        output_v,
+        kv_layout=kv_layout,
+    )
+
+    ref_k = torch.full_like(output_k, 123.0)
+    ref_v = torch.full_like(output_v, 123.0)
+    for batch_idx, seq_len in enumerate(seq_lens.cpu().tolist()):
+        for token_idx in range(seq_len):
+            page = int(block_tables[batch_idx, token_idx // page_size].item())
+            entry = token_idx % page_size
+            k_rows = k_cache_nhd[page, entry]
+            v_rows = v_cache_nhd[page, entry]
+            k_scale_rows = k_scales_nhd[page, entry]
+            v_scale_rows = v_scales_nhd[page, entry]
+            ref_k[batch_idx, token_idx] = reference_dequant(
+                k_rows, k_scale_rows, k_scale_val, dtype
+            )
+            ref_v[batch_idx, token_idx] = reference_dequant(
+                v_rows, v_scale_rows, v_scale_val, dtype
+            )
+
+    torch.testing.assert_close(output_k.float(), ref_k.float(), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(output_v.float(), ref_v.float(), atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_nvfp4_kv_quant(shape, dtype):
