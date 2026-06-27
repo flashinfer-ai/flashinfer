@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from ...fused_moe.utils import last_positive_power_of_2
+from ...fused_moe.utils import next_positive_power_of_2
 
 _SM100_MMA_TILER_MN_CANDIDATES = [
     (128, 8),
@@ -30,26 +30,23 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
     (256, 256),
 ]
 
-# Tactic cache: (n, real_k, sm_count) -> dict[(m_bucket, is_8_aligned) -> tactic_tuple]
+# Tactic cache: (n, real_k, sm_count) -> dict[m_bucket -> tactic_tuple]
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
 # M bucket boundaries — powers of 2 for fast bucketing via
-# last_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
-# Each bucket is precomputed for both 8-aligned and non-8-aligned M,
-# keyed as (bucket, is_8_aligned).
+# next_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
 _M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
-def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
+def _compute_tactic_for_m(rep_m, n, real_k, sm_count):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
     Selects swap_ab, tile shape, and cluster shape sequentially:
 
-    1. **swap_ab**: Swap A and B operands when M is small (8-16) and
+    1. **swap_ab**: Swap A and B operands when M is small (1-32) and N is
        8-aligned, putting the larger N dimension on the M-axis to increase
-       the number of CTAs.  Also swaps when N is not 8-aligned (required
-       for memory alignment).
+       the number of CTAs.
 
     2. **Tile shape**: Scores all 8 candidates from _SM100_MMA_TILER_MN_CANDIDATES.
        The score balances three factors:
@@ -71,9 +68,7 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, m_aligned):
     n_aligned = n % 8 == 0
 
     swap_ab = False
-    if m_aligned and 8 <= rep_m <= 16 and n > rep_m:
-        swap_ab = True
-    if not swap_ab and not n_aligned and m_aligned:
+    if n_aligned and 1 <= rep_m <= 32 and n > rep_m:
         swap_ab = True
 
     prob_m = n if swap_ab else rep_m
@@ -164,11 +159,8 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count):
     if bucket_tactics is None:
         bucket_tactics = {}
         for rep_m in _M_BUCKETS:
-            for aligned in (True, False):
-                bucket_tactics[(rep_m, aligned)] = _compute_tactic_for_m(
-                    rep_m, n, real_k, sm_count, aligned
-                )
+            bucket_tactics[rep_m] = _compute_tactic_for_m(rep_m, n, real_k, sm_count)
         _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
-    bucket = min(last_positive_power_of_2(m), _M_BUCKETS[-1])
-    return bucket_tactics[(bucket, m % 8 == 0)]
+    bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
+    return bucket_tactics[bucket]

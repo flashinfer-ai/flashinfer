@@ -42,7 +42,7 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.utils import device_support_pdl
 
-from .test_trtllm_gen_fused_moe import (
+from .trtllm_gen_fused_moe_utils import (
     FP8BlockScaleMoe,
     QuantMode,
     routing_reference_renormalize,

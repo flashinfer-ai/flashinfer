@@ -2947,7 +2947,7 @@ class GatedDeltaNetChunkedKernel:
         """Load S_init from GMEM into state TMEM (fp32).
 
         Two steps:
-          1. GMEM fp32 -> registers
+          1. GMEM state dtype -> registers
           2. registers -> state TMEM (fp32), signal kv_acc so MMA can start GEMM 7
         """
         num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
@@ -2983,7 +2983,7 @@ class GatedDeltaNetChunkedKernel:
         tGR_tCgState = thr_state_r2t.partition_S(gS_init)
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
         for sub in cutlass.range(tRT_tCrState.shape[2]):
-            # 1. Load S_init fp32 GMEM -> fp32 registers
+            # 1. Load S_init GMEM -> state dtype registers
             cute.autovec_copy(
                 tGR_tCgState[None, 0, sub],
                 tGR_tCrState[None, 0, sub],
@@ -2991,7 +2991,7 @@ class GatedDeltaNetChunkedKernel:
             )
             if cutlass.const_expr(self.state_dtype != self.acc_dtype):
                 tRT_tCrState[None, 0, sub].store(
-                    tGR_tCrState[None, 0, sub].load().to(self.state_dtype)
+                    tGR_tCrState[None, 0, sub].load().to(self.acc_dtype)
                 )
             else:
                 tRT_tCrState = tGR_tCrState
