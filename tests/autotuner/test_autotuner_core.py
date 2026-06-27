@@ -1110,9 +1110,7 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     # Fresh lambda each iteration -> distinct cache key each call -> leak.
     N = 5_000
     for _ in range(N):
-        config = _build_num_tokens_tuning_config(
-            lambda x: last_positive_power_of_2(x)
-        )
+        config = _build_num_tokens_tuning_config(lambda x: last_positive_power_of_2(x))
         AutoTuner._find_nearest_profile(shapes, config)
 
     snapshot_after = tracemalloc.take_snapshot()
@@ -1124,8 +1122,7 @@ def test_find_nearest_profile_cache_grows_with_fresh_callable():
     AutoTuner._find_nearest_profile.cache_clear()
 
     assert cache_growth == N, (
-        f"Expected {N} new cache entries (one per fresh callable), got "
-        f"{cache_growth}."
+        f"Expected {N} new cache entries (one per fresh callable), got {cache_growth}."
     )
     assert allocated_bytes > 0, "Expected Python allocation growth from the leak"
 
