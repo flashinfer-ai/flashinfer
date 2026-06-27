@@ -46,6 +46,7 @@ def main() -> int:
     )
 
     from flashinfer.moe_ep import (
+        dummy_moe_weights,
         BootstrapConfig,
         EpAlgorithm,
         FleetParams,
@@ -89,6 +90,10 @@ def main() -> int:
             token_hidden_size=hidden,
             dtype_bytes=2,
             algorithm=EpAlgorithm.LOW_LATENCY,
+            weights=dummy_moe_weights(
+                num_local_experts=num_experts // world_size,
+                hidden=hidden,
+            ),
         ),
         backend="nixl_ep",
     )

@@ -7,6 +7,7 @@ from typing import Sequence, Union
 
 from .algo_knobs import AlgoKnob
 from .config import BootstrapConfig, FleetParams
+from .core.kernel.registry import is_mega_kernel_config, is_split_kernel_config
 from .modes.config import MegaConfig, SplitConfig
 from .modes.mega_layer import MoEEpMegaLayer
 from .modes.split_layer import MoEEpSplitLayer
@@ -34,4 +35,17 @@ def MoEEpLayer(
                 stacklevel=2,
             )
         return MoEEpMegaLayer(bootstrap, fleet_params, backend)
+
+    if is_mega_kernel_config(backend):
+        raise TypeError(
+            f"Wrap {type(backend).__name__} in MegaConfig(megakernel=...); "
+            "raw megakernel configs cannot be passed as backend=."
+        )
+
+    if is_split_kernel_config(backend):
+        raise TypeError(
+            f"Pass split inner kernels via SplitConfig(kernel={type(backend).__name__}(...)); "
+            f"got raw {type(backend).__name__} as backend=."
+        )
+
     return MoEEpSplitLayer(bootstrap, fleet_params, fleet_knobs, backend=backend)

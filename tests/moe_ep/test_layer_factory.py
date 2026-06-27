@@ -6,18 +6,24 @@ import pytest
 
 
 def _split_fleet_params():
-    from flashinfer.moe_ep import FleetParams
+    from flashinfer.moe_ep import FleetParams, dummy_moe_weights
 
-    return FleetParams(num_experts=2, max_tokens_per_rank=4, token_hidden_size=8)
+    return FleetParams(
+        num_experts=2,
+        max_tokens_per_rank=4,
+        token_hidden_size=8,
+        weights=dummy_moe_weights(num_local_experts=2, hidden=8),
+    )
 
 
 def _nvep_fleet_params():
-    from flashinfer.moe_ep import FleetParams
+    from flashinfer.moe_ep import FleetParams, dummy_moe_weights
 
     return FleetParams(
         num_experts=8,
         max_tokens_per_rank=128,
         token_hidden_size=4096,
+        weights=dummy_moe_weights(num_local_experts=8, hidden=4096),
     )
 
 
@@ -27,7 +33,7 @@ def _mega_fleet_params():
     from flashinfer.moe_ep import FleetParams, MoEWeightPack
 
     return FleetParams(
-        num_experts=8,
+        num_experts=1,
         max_tokens_per_rank=64,
         token_hidden_size=128,
         weights=MoEWeightPack(
@@ -40,9 +46,15 @@ def _mega_fleet_params():
 def _mega_config(*, preprocess_weights: bool = False):
     from flashinfer.moe_ep import DeepGemmMegaMoeConfig, MegaConfig
 
+    if preprocess_weights:
+        return MegaConfig(
+            megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+            preprocess_weights=True,
+        )
     return MegaConfig(
         megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
-        preprocess_weights=preprocess_weights,
+        preprocess_weights=False,
+        transformed_weights=((None, None), (None, None)),
     )
 
 
@@ -161,3 +173,25 @@ def test_split_destroy_is_idempotent(stubbed_fleet_registry):
     split.destroy()
     split.destroy()
     assert log.count("destroy") == 1
+
+
+def test_factory_rejects_raw_mega_kernel_config():
+    from flashinfer.moe_ep import BootstrapConfig, DeepGemmMegaMoeConfig, MoEEpLayer
+
+    with pytest.raises(TypeError, match="MegaConfig"):
+        MoEEpLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0),
+            fleet_params=_split_fleet_params(),
+            backend=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+        )
+
+
+def test_factory_rejects_raw_split_kernel_config():
+    from flashinfer.moe_ep import BootstrapConfig, IdentityConfig, MoEEpLayer
+
+    with pytest.raises(TypeError, match="SplitConfig"):
+        MoEEpLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0),
+            fleet_params=_split_fleet_params(),
+            backend=IdentityConfig(),
+        )

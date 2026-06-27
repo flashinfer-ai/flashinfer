@@ -29,27 +29,30 @@ class TestIdentitySplitKernel:
     def test_passes_expert_tensors_through_unchanged(self) -> None:
         import torch
 
-        from flashinfer.moe_ep import FleetParams, IdentityConfig, SplitKernelContext, run_split_kernel
+        from flashinfer.moe_ep import FleetParams, dummy_moe_weights, IdentityConfig, SplitKernelContext, run_split_kernel
 
         expert = torch.randn(8, 128)
         ctx = SplitKernelContext(
             expert_tensors=expert,
             num_tokens=8,
             fleet_params=FleetParams(
-                num_experts=4, max_tokens_per_rank=8, token_hidden_size=128
+                num_experts=1,
+                max_tokens_per_rank=8,
+                token_hidden_size=128,
+                weights=dummy_moe_weights(num_local_experts=1, hidden=128),
             ),
         )
         out = run_split_kernel(IdentityConfig(), ctx)
         assert out is expert
 
-    def test_resolve_returns_identity_kernel(self) -> None:
+    def test_create_returns_identity_kernel(self) -> None:
         from flashinfer.moe_ep import IdentityConfig
         from flashinfer.moe_ep.backends.split.kernel.identity.backend import (
             IdentitySplitKernelBackend,
         )
-        from flashinfer.moe_ep.core.kernel.registry import resolve_split_kernel
+        from flashinfer.moe_ep.core.kernel.registry import create_split_kernel
 
-        kernel = resolve_split_kernel(IdentityConfig())
+        kernel = create_split_kernel(IdentityConfig())
         assert isinstance(kernel, IdentitySplitKernelBackend)
 
 
@@ -57,7 +60,7 @@ class TestSplitKernelRegistry:
     def test_unknown_kernel_raises(self) -> None:
         import torch
 
-        from flashinfer.moe_ep import FleetParams, SplitKernelContext, run_split_kernel
+        from flashinfer.moe_ep import FleetParams, dummy_moe_weights, SplitKernelContext, run_split_kernel
 
         class _UnknownKernel:
             kernel_name = "unknown"
@@ -66,7 +69,10 @@ class TestSplitKernelRegistry:
             expert_tensors=torch.zeros(2, 4),
             num_tokens=2,
             fleet_params=FleetParams(
-                num_experts=2, max_tokens_per_rank=2, token_hidden_size=4
+                num_experts=2,
+                max_tokens_per_rank=2,
+                token_hidden_size=4,
+                weights=dummy_moe_weights(num_local_experts=2, hidden=4),
             ),
         )
         with pytest.raises(KeyError, match="unknown"):
@@ -134,6 +140,7 @@ def test_split_layer_identity_kernel_wires_dispatch_to_combine(capturing_stub_fl
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
+        dummy_moe_weights,
         IdentityConfig,
         MoEEpSplitLayer,
         MoEEpTensors,
@@ -146,7 +153,10 @@ def test_split_layer_identity_kernel_wires_dispatch_to_combine(capturing_stub_fl
     split = MoEEpSplitLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0),
         fleet_params=FleetParams(
-            num_experts=2, max_tokens_per_rank=4, token_hidden_size=6
+            num_experts=2,
+            max_tokens_per_rank=4,
+            token_hidden_size=6,
+            weights=dummy_moe_weights(num_local_experts=2, hidden=6),
         ),
         backend=SplitConfig(comm=NCCLEPConfig(), kernel=IdentityConfig()),
     )
@@ -184,6 +194,7 @@ def test_identity_split_kernel_multirank_roundtrip(comm_backend):
         BootstrapConfig,
         EpAlgorithm,
         FleetParams,
+        dummy_moe_weights,
         IdentityConfig,
         MoEEpSplitLayer,
         MoEEpTensors,
@@ -255,6 +266,10 @@ def test_identity_split_kernel_multirank_roundtrip(comm_backend):
             token_hidden_size=hidden,
             dtype_bytes=2,
             algorithm=EpAlgorithm.LOW_LATENCY,
+            weights=dummy_moe_weights(
+                num_local_experts=num_experts // world_size,
+                hidden=hidden,
+            ),
         ),
         backend=SplitConfig(comm=comm, kernel=IdentityConfig()),
     )

@@ -68,6 +68,7 @@ from .core.validation import (
     validate_arch_for_backend,
     validate_bootstrap_world_size,
     validate_fleet_params,
+    validate_fleet_weights,
     validate_mega_arch,
     validate_mega_fleet_params,
     validate_mega_forward_inputs,
@@ -89,7 +90,7 @@ from .modes import (
     run_split_kernel,
 )
 from .tensors import MoEEpTensors
-from .weights import MoEWeightPack
+from .weights import MoEWeightPack, dummy_moe_weights
 
 __all__ = [
     "AlgoKnob",
@@ -102,7 +103,6 @@ __all__ = [
     "EpAlgorithm",
     "EpLayout",
     "Fleet",
-    "finalize_moe_ep_runtime",
     "FleetAlgoKnobNumChannelsPerRank",
     "FleetAlgoKnobNumQpsPerRank",
     "FleetAlgoKnobQuantization",
@@ -137,6 +137,7 @@ __all__ = [
     "available_backends",
     "bootstrap_moe_ep_runtime",
     "create_fleet",
+    "dummy_moe_weights",
     "ensure_moe_ep_cuda_device",
     "finalize_moe_ep_runtime",
     "have_nccl_ep",
@@ -149,6 +150,7 @@ __all__ = [
     "validate_arch_for_backend",
     "validate_bootstrap_world_size",
     "validate_fleet_params",
+    "validate_fleet_weights",
     "validate_mega_arch",
     "validate_mega_fleet_params",
     "validate_mega_forward_inputs",

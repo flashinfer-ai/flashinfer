@@ -105,8 +105,8 @@ from .split_backends import NcclEpConfig, NvepConfig
 from .mega.config import DeepGemmMegaMoeConfig
 ```
 
-Call sites unchanged: `MoEEpLayer(..., backend=DeepGemmMegaMoeConfig(...))`.
-The factory still reads `backend.backend_name`; only the module path differs.
+Call sites use `MoEEpLayer(..., backend=MegaConfig(megakernel=DeepGemmMegaMoeConfig(...)))`.
+Raw megakernel configs cannot be passed as `backend=` directly.
 
 ---
 
@@ -177,23 +177,21 @@ classDiagram
 ```python
 def MoEEpLayer(
     bootstrap: BootstrapConfig,
-    fleet_params: FleetParams,
+    fleet_params: SplitFleetParams | MegaFleetParams,
     fleet_knobs: Sequence[AlgoKnob] = (),
-    backend: str | object = "nccl_ep",
-    weights: MoEEpWeightPack | None = None,
-    **kwargs,
-) -> MoEEpLayerBase:
-    name = getattr(backend, "backend_name", backend)
-    if name == "deep_gemm_mega_moe":
-        return MoEEpMegaLayer(bootstrap, fleet_params, backend, weights, **kwargs)
-    return MoEEpSplitLayer(bootstrap, fleet_params, fleet_knobs, backend)
+    backend: str | SplitConfig | MegaConfig = "nccl_ep",
+) -> MoEEpSplitLayer | MoEEpMegaLayer:
+    if isinstance(backend, MegaConfig):
+        return MoEEpMegaLayer(bootstrap, fleet_params, backend)
+    return MoEEpSplitLayer(bootstrap, fleet_params, fleet_knobs, backend=backend)
 ```
 
 | `backend` | Layer class | Transport |
 |-----------|-------------|-----------|
-| `"nccl_ep"`, `NcclEpConfig()` | `MoEEpSplitLayer` | `NcclEpFleet` |
-| `"nixl_ep"`, `NvepConfig()` | `MoEEpSplitLayer` | `NixlEpFleet` |
-| `"deep_gemm_mega_moe"`, `DeepGemmMegaMoeConfig()` | `MoEEpMegaLayer` | `SymmMemoryPool` |
+| `"nccl_ep"`, `NcclEpConfig()`, `SplitConfig(...)` | `MoEEpSplitLayer` | `NcclEpFleet` / `NixlEpFleet` |
+| `MegaConfig(megakernel=DeepGemmMegaMoeConfig(...))` | `MoEEpMegaLayer` | symmetric workspace (no Fleet) |
+
+Raw megakernel or split-kernel configs must be wrapped in `MegaConfig` / `SplitConfig`.
 
 ---
 
@@ -312,7 +310,7 @@ MoEEpSplitLayer.destroy() → Fleet.destroy()
 ```mermaid
 flowchart TB
     subgraph init ["Init (once)"]
-        BC[BootstrapConfig + FleetParams]
+        BC[BootstrapConfig + SplitFleetParams | MegaFleetParams]
         CFG[DeepGemmMegaMoeConfig]
         W[MoEEpWeightPack]
         BC --> POOL[SymmMemoryPool]
@@ -352,14 +350,16 @@ but colocated with mega implementation.
 | `fast_math` | Default `True` |
 | `normalize_topk_weights` | Default `False` (match dummy script) |
 
-### `FleetParams` reuse (Mega)
+### `MegaFleetParams` (mega path)
 
 | Field | Mega use |
 |-------|----------|
 | `num_experts` | Global expert count |
 | `max_tokens_per_rank` | Symm buffer capacity |
 | `token_hidden_size` | `hidden` |
-| `dtype_bytes`, `algorithm` | Ignored |
+| `weights` | Required `MoEWeightPack` (per-rank canonical layout) |
+
+Split-only fields (`dtype_bytes`, `algorithm`, `layout`) live on `SplitFleetParams` and are unused by mega.
 
 ### `MoEEpTensors` → symm buffer
 
@@ -396,7 +396,7 @@ after every step. Mega tests are **additive** and gated so CI without Blackwell 
 
 | File | What it covers | Step 1 impact |
 |------|----------------|---------------|
-| `test_config.py` | `FleetParams`, `BootstrapConfig` ctor validation | None |
+| `test_config.py` | `SplitFleetParams`, `MegaFleetParams`, `BootstrapConfig` ctor validation | None |
 | `test_constraints.py` | `validate_fleet_params`, arch for nccl/nixl | None until Step 3 |
 | `test_layer_single_gpu.py` | Stub `_BACKEND_REGISTRY`; dispatch→combine order | Update import if `MoEEpLayer` becomes factory; assert same log sequence |
 | `nccl_ep/test_fleet_mock.py` | `NcclEpFleet` init, handle lifecycle (mocked) | None |
@@ -546,7 +546,7 @@ def mock_symm_buffer():
 
 @pytest.fixture
 def mega_fleet_params():
-    """FleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=256)."""
+    """MegaFleetParams(num_experts=8, max_tokens_per_rank=64, token_hidden_size=256, weights=...)."""
 
 @pytest.fixture
 def mega_config():
@@ -627,17 +627,29 @@ mega; a mega job does not require `BUILD_NVEP=1`.
 from flashinfer.moe_ep import (
     BootstrapConfig,
     DeepGemmMegaMoeConfig,
-    FleetParams,
+    MegaFleetParams,
+    MegaConfig,
     MoEEpLayer,
     MoEEpTensors,
+    MoEWeightPack,
+    dummy_moe_weights,
+    SplitFleetParams,
     MoEEpSplitLayer,
     MoEEpMegaLayer,
 )
 
-# Split (unchanged semantics)
+# Split (identity / comm-only)
 split = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=4, rank=rank),
-    fleet_params=FleetParams(num_experts=256, max_tokens_per_rank=8192, token_hidden_size=4096),
+    fleet_params=SplitFleetParams(
+        num_experts=256,
+        max_tokens_per_rank=8192,
+        token_hidden_size=4096,
+        weights=dummy_moe_weights(
+            num_local_experts=256 // 4,
+            hidden=4096,
+        ),
+    ),
     backend="nccl_ep",
 )
 # equivalent: MoEEpSplitLayer(...)
@@ -645,9 +657,15 @@ split = MoEEpLayer(
 # Mega
 mega = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=4, rank=rank),
-    fleet_params=FleetParams(num_experts=256, max_tokens_per_rank=8192, token_hidden_size=4096),
-    backend=DeepGemmMegaMoeConfig(intermediate_size=2048, top_k=6),
-    weights=weight_pack,
+    fleet_params=MegaFleetParams(
+        num_experts=256,
+        max_tokens_per_rank=8192,
+        token_hidden_size=4096,
+        weights=weight_pack,
+    ),
+    backend=MegaConfig(
+        megakernel=DeepGemmMegaMoeConfig(intermediate_size=2048, top_k=6),
+    ),
 )
 out = mega(MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights))
 ```

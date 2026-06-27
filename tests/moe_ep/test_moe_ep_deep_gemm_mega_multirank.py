@@ -1,7 +1,7 @@
-"""Multi-rank smoke + correctness tests for MoEEpMegaLayer.
+"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (DeepGEMM backend).
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and the ``deep_gemm`` package with
 ``fp8_fp4_mega_moe`` support.
@@ -190,10 +190,13 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
     """Reference deep_gemm mega-MoE path for correctness checks."""
     import torch
 
+    from flashinfer.moe_ep import DeepGemmMegaMoeConfig, preprocess_mega_weights
+    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend import (
+        DeepGemmMegaKernelBackend,
+    )
     from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep import preprocess_mega_weights
 
     symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
@@ -223,13 +226,19 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
     y = torch.empty(
         num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
     )
-    deep_gemm.fp8_fp4_mega_moe(
-        y,
-        transformed_l1,
-        transformed_l2,
+    kernel = DeepGemmMegaKernelBackend(
+        DeepGemmMegaMoeConfig(
+            intermediate_size=problem["intermediate"],
+            top_k=problem["topk"],
+            activation_clamp=problem["activation_clamp"],
+            fast_math=problem["fast_math"],
+        )
+    )
+    kernel.compute(
         symm_buffer,
-        activation_clamp=problem["activation_clamp"],
-        fast_math=problem["fast_math"],
+        (transformed_l1, transformed_l2),
+        num_tokens=num_tokens,
+        output=y,
     )
     torch.cuda.synchronize()
     if destroy_buffer:

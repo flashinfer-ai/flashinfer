@@ -7,8 +7,6 @@ from .registry import (
     kernel_requires_weights,
     register_mega_kernel,
     register_split_kernel,
-    resolve_mega_kernel,
-    resolve_split_kernel,
     run_split_kernel,
 )
 
@@ -21,7 +19,5 @@ __all__ = [
     "kernel_requires_weights",
     "register_mega_kernel",
     "register_split_kernel",
-    "resolve_mega_kernel",
-    "resolve_split_kernel",
     "run_split_kernel",
 ]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -110,10 +110,6 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         num_tokens: int,
     ) -> None:
         if stage_inputs:
-            # sgl-deep-gemm 0.1.3 slices the fp8 dispatch slot as int8 storage;
-            # the staging kernel writes float8_e4m3fn. Reinterpret (same 1-byte
-            # layout) so the triton store type-checks; the kernel reads the same
-            # bytes back as int8.
             x_slot = workspace.x[:num_tokens]
             if x_slot.dtype != torch.float8_e4m3fn:
                 x_slot = x_slot.view(torch.float8_e4m3fn)

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Callable, Sequence
 
 if TYPE_CHECKING:
     from ...algo_knobs import AlgoKnob
-    from ...config import BootstrapConfig, FleetParams, HandleParams
+    from ...config import BootstrapConfig, HandleParams, FleetParams
     from .handle import Handle
 
 
@@ -57,6 +57,9 @@ def create_fleet(
     backend: str | object = "nccl_ep",
 ) -> Fleet:
     """Instantiate the registered Fleet class for ``backend``."""
+    from ...core.validation.common import validate_fleet_weights
+
+    validate_fleet_weights(params, bootstrap.world_size)
     name = getattr(backend, "backend_name", backend)
     if not isinstance(name, str):
         raise TypeError(

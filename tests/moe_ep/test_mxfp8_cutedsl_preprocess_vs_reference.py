@@ -19,7 +19,7 @@ import os
 
 import pytest
 
-pytest.importorskip("cutedsl_nvfp4_mega_moe_front_end")
+pytest.importorskip("cutedsl_megamoe_front_end")
 
 
 def _require_cuda():
@@ -184,7 +184,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference():
 
     import torch
 
-    from cutedsl_nvfp4_mega_moe_front_end import (
+    from cutedsl_megamoe_front_end import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )

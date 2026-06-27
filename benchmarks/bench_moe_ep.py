@@ -194,6 +194,7 @@ def main() -> int:
         EpAlgorithm,
         EpLayout,
         FleetParams,
+        dummy_moe_weights,
         FusedMoeKernelConfig,
         IdentityConfig,
         MoEEpLayer,
@@ -275,6 +276,11 @@ def main() -> int:
             dtype_bytes=2,
             algorithm=ep_algorithm,
             layout=ep_layout,
+            weights=dummy_moe_weights(
+                num_local_experts=local_num_experts,
+                hidden=args.hidden,
+                device=device,
+            ),
         )
     else:
         moe_config, canonical_weights = _build_compute(

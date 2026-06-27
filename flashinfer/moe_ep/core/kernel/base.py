@@ -36,7 +36,8 @@ class SplitKernelBackend(ABC):
     @abstractmethod
     def kernel_name(cls) -> str: ...
 
-    def requires_weights(self) -> bool:
+    @classmethod
+    def requires_weights(cls) -> bool:
         return True
 
     def validate_init(
@@ -69,9 +70,6 @@ class MegaKernelBackend(ABC):
     @classmethod
     @abstractmethod
     def kernel_name(cls) -> str: ...
-
-    def requires_weights(self) -> bool:
-        return True
 
     def runtime_requirements(
         self, bootstrap: "BootstrapConfig"
@@ -121,7 +119,7 @@ class MegaKernelBackend(ABC):
         stage_inputs: bool,
         num_tokens: int,
     ) -> None:
-        """Copy or transform activations into workspace buffers."""
+        """Copy or quantize activations into workspace buffers."""
 
     @abstractmethod
     def compute(

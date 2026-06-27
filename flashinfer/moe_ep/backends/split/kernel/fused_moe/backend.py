@@ -38,9 +38,6 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
     def kernel_name(cls) -> str:
         return "fused_moe"
 
-    def requires_weights(self) -> bool:
-        return True
-
     def validate_init(
         self,
         bootstrap: BootstrapConfig,

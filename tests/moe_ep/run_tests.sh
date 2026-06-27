@@ -54,7 +54,7 @@ run_unit() {
   "${PY}" -m pytest tests/moe_ep/ -v \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
-    --ignore=tests/moe_ep/test_moe_ep_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
@@ -98,7 +98,7 @@ run_correctness() {
 run_mega() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_moe_ep_mega_multirank.py \
+    tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v \
     -m "gpu_4 and arch_blackwell"

@@ -14,6 +14,7 @@ def test_forward_call_order(stubbed_fleet_registry):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
+        dummy_moe_weights,
         IdentityConfig,
         MoEEpSplitLayer,
         MoEEpTensors,
@@ -25,7 +26,10 @@ def test_forward_call_order(stubbed_fleet_registry):
     split = MoEEpSplitLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0),
         fleet_params=FleetParams(
-            num_experts=2, max_tokens_per_rank=4, token_hidden_size=8
+            num_experts=2,
+            max_tokens_per_rank=4,
+            token_hidden_size=8,
+            weights=dummy_moe_weights(num_local_experts=2, hidden=8),
         ),
         backend=SplitConfig(comm=NCCLEPConfig(), kernel=IdentityConfig()),
     )
@@ -48,6 +52,7 @@ def test_factory_routes_split_backend(stubbed_fleet_registry):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
+        dummy_moe_weights,
         MoEEpLayer,
         MoEEpSplitLayer,
         MoEEpTensors,
@@ -58,7 +63,10 @@ def test_factory_routes_split_backend(stubbed_fleet_registry):
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0),
         fleet_params=FleetParams(
-            num_experts=2, max_tokens_per_rank=4, token_hidden_size=8
+            num_experts=2,
+            max_tokens_per_rank=4,
+            token_hidden_size=8,
+            weights=dummy_moe_weights(num_local_experts=2, hidden=8),
         ),
         backend=NcclEpConfig(),
     )
@@ -90,53 +98,18 @@ def _minimal_bf16_moe_config():
         experts=ExpertConfig(
             intermediate_size=4,
             local_expert_offset=0,
-            local_num_experts=1,
+            local_num_experts=2,
         ),
         backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
         execution=ExecutionConfig(tune_max_num_tokens=4),
     )
 
 
-def test_split_layer_requires_weights_for_non_identity_kernel():
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        FleetParams,
-        FusedMoeKernelConfig,
-        MoEEpSplitLayer,
-        SplitConfig,
-    )
+def test_split_fleet_params_requires_weights():
+    from flashinfer.moe_ep import FleetParams
 
-    with pytest.raises(ValueError, match="FleetParams.weights"):
-        MoEEpSplitLayer(
-            bootstrap=BootstrapConfig(world_size=1, rank=0),
-            fleet_params=FleetParams(
-                num_experts=2, max_tokens_per_rank=4, token_hidden_size=8
-            ),
-            backend=SplitConfig(
-                kernel=FusedMoeKernelConfig(moe_config=_minimal_bf16_moe_config()),
-            ),
-        )
-
-
-def test_split_layer_preprocess_requires_weights():
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        FleetParams,
-        IdentityConfig,
-        MoEEpSplitLayer,
-        SplitConfig,
-    )
-
-    with pytest.raises(ValueError, match="FleetParams.weights"):
-        MoEEpSplitLayer(
-            bootstrap=BootstrapConfig(world_size=1, rank=0),
-            fleet_params=FleetParams(
-                num_experts=2, max_tokens_per_rank=4, token_hidden_size=8
-            ),
-            backend=SplitConfig(
-                kernel=IdentityConfig(require_weights=True),
-            ),
-        )
+    with pytest.raises(TypeError):
+        FleetParams(num_experts=2, max_tokens_per_rank=4, token_hidden_size=8)
 
 
 def test_split_layer_accepts_fused_moe_kernel_with_weights(stubbed_fleet_registry):
@@ -167,8 +140,8 @@ def test_split_layer_accepts_fused_moe_kernel_with_weights(stubbed_fleet_registr
                 max_tokens_per_rank=4,
                 token_hidden_size=8,
                 weights=MoEWeightPack(
-                    w13=torch.zeros(1, 4, 8, device="cuda"),
-                    w2=torch.zeros(1, 8, 4, device="cuda"),
+                    w13=torch.zeros(2, 4, 8, device="cuda"),
+                    w2=torch.zeros(2, 8, 4, device="cuda"),
                 ),
             ),
             backend=SplitConfig(
@@ -182,6 +155,7 @@ def test_split_layer_rejects_nixl_oversized_tokens_at_init():
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
+        dummy_moe_weights,
         MoEEpConfigError,
         MoEEpSplitLayer,
         NvepConfig,
@@ -191,7 +165,10 @@ def test_split_layer_rejects_nixl_oversized_tokens_at_init():
         MoEEpSplitLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0),
             fleet_params=FleetParams(
-                num_experts=8, max_tokens_per_rank=2048, token_hidden_size=4096
+                num_experts=8,
+                max_tokens_per_rank=2048,
+                token_hidden_size=4096,
+                weights=dummy_moe_weights(num_local_experts=8, hidden=4096),
             ),
             backend=NvepConfig(),
         )
@@ -202,6 +179,7 @@ def test_split_layer_rejects_nixl_topology_capacity_mismatch_at_init():
         BootstrapConfig,
         FleetAlgoKnobTopologyCapacity,
         FleetParams,
+        dummy_moe_weights,
         MoEEpConfigError,
         MoEEpSplitLayer,
         NvepConfig,
@@ -211,7 +189,10 @@ def test_split_layer_rejects_nixl_topology_capacity_mismatch_at_init():
         MoEEpSplitLayer(
             bootstrap=BootstrapConfig(world_size=2, rank=0),
             fleet_params=FleetParams(
-                num_experts=8, max_tokens_per_rank=128, token_hidden_size=4096
+                num_experts=8,
+                max_tokens_per_rank=128,
+                token_hidden_size=4096,
+                weights=dummy_moe_weights(num_local_experts=4, hidden=4096),
             ),
             fleet_knobs=[FleetAlgoKnobTopologyCapacity(n=3)],
             backend=NvepConfig(),
@@ -227,6 +208,7 @@ def test_split_layer_forward_rejects_token_overflow(stubbed_fleet_registry):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
+        dummy_moe_weights,
         MoEEpConfigError,
         MoEEpSplitLayer,
         MoEEpTensors,
@@ -235,7 +217,10 @@ def test_split_layer_forward_rejects_token_overflow(stubbed_fleet_registry):
     split = MoEEpSplitLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0),
         fleet_params=FleetParams(
-            num_experts=2, max_tokens_per_rank=4, token_hidden_size=8
+            num_experts=2,
+            max_tokens_per_rank=4,
+            token_hidden_size=8,
+            weights=dummy_moe_weights(num_local_experts=2, hidden=8),
         ),
         backend="nccl_ep",
     )
@@ -246,3 +231,62 @@ def test_split_layer_forward_rejects_token_overflow(stubbed_fleet_registry):
     )
     with pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"):
         split.forward(t)
+
+
+def test_split_layer_nixl_rejects_missing_tcp_store_at_init():
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        MoEEpConfigError,
+        MoEEpSplitLayer,
+        NvepConfig,
+        FleetParams,
+        dummy_moe_weights,
+    )
+
+    with pytest.raises(MoEEpConfigError, match="tcp_store"):
+        MoEEpSplitLayer(
+            bootstrap=BootstrapConfig(world_size=2, rank=0),
+            fleet_params=FleetParams(
+                num_experts=8,
+                max_tokens_per_rank=128,
+                token_hidden_size=4096,
+                weights=dummy_moe_weights(num_local_experts=4, hidden=4096),
+            ),
+            backend=NvepConfig(),
+        )
+
+
+def test_split_layer_forward_accepts_partial_batch(stubbed_fleet_registry):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        IdentityConfig,
+        MoEEpSplitLayer,
+        MoEEpTensors,
+        NCCLEPConfig,
+        SplitConfig,
+        FleetParams,
+        dummy_moe_weights,
+    )
+
+    split = MoEEpSplitLayer(
+        bootstrap=BootstrapConfig(world_size=1, rank=0),
+        fleet_params=FleetParams(
+            num_experts=2,
+            max_tokens_per_rank=8,
+            token_hidden_size=8,
+            weights=dummy_moe_weights(num_local_experts=2, hidden=8),
+        ),
+        backend=SplitConfig(comm=NCCLEPConfig(), kernel=IdentityConfig()),
+    )
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(3, 8, device="cuda"),
+        topk_ids=torch.zeros(3, 2, dtype=torch.int64, device="cuda"),
+        topk_weights=torch.ones(3, 2, device="cuda") * 0.5,
+    )
+    out = split.forward(t)
+    assert out.shape == (3, 8)

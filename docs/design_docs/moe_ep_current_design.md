@@ -13,7 +13,7 @@ split-path fused MoE compute plugin.
 flashinfer/moe_ep/
 ├── __init__.py              # Public re-exports, build probes, plugin import side-effects
 ├── layer.py                 # MoEEpLayer factory → MoEEpSplitLayer | MoEEpMegaLayer
-├── config.py                # BootstrapConfig, FleetParams, HandleParams, I/O envelopes
+├── config.py                # BootstrapConfig, SplitFleetParams, MegaFleetParams, HandleParams, I/O envelopes
 ├── tensors.py               # MoEEpTensors
 ├── weights.py               # Canonical MoEWeightPack (w13, w2, optional scales)
 ├── algo_knobs.py            # Fleet/Handle AlgoKnob hierarchy
@@ -22,6 +22,7 @@ flashinfer/moe_ep/
 ├── core/
 │   ├── comm/                # Fleet + Handle ABCs, create_fleet(), _BACKEND_REGISTRY
 │   ├── kernel/              # Split/Mega kernel ABCs, @register_* registry
+│   ├── runtime/             # bootstrap_moe_ep_runtime, NVSHMEM / torch.dist lifecycle
 │   └── validation/          # validate_fleet_params, forward-input checks, mega validators
 ├── backends/
 │   ├── split/
@@ -33,7 +34,9 @@ flashinfer/moe_ep/
 │   │       └── fused_moe/   # FusedMoeKernelConfig + MoELayer compute bridge
 │   └── mega/
 │       └── kernel/
-│           └── deep_gemm_mega/  # DeepGemmMegaMoeConfig, staging, weights
+│           ├── deep_gemm_mega/   # DeepGemmMegaMoeConfig
+│           ├── mxfp8_cutedsl/    # Mxfp8CutedslMegaMoeConfig
+│           └── nvfp4_cutedsl/    # Nvfp4CutedslMegaMoeConfig
 └── modes/
     ├── config.py            # SplitConfig, MegaConfig
     ├── split_layer.py       # MoEEpSplitLayer (dispatch → kernel → combine)
@@ -50,9 +53,9 @@ Native transport libs (built with `BUILD_NVEP=1`) stage under
 `SplitConfig` (`modes/config.py`) pairs **comm** (NCCL-EP / NIXL-EP) with **kernel**
 (identity or fused MoE). Defaults: `comm=NcclEpConfig()`, `kernel=IdentityConfig()`.
 
-| Kernel | Config | Weights on `FleetParams` | Role |
-|--------|--------|--------------------------|------|
-| `identity` | `IdentityConfig()` | not required | Comm-only roundtrip |
+| Kernel | Config | Weights on fleet params | Role |
+|--------|--------|-------------------------|------|
+| `identity` | `IdentityConfig()` | required (`dummy_moe_weights` OK; kernel ignores) | Comm-only roundtrip |
 | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` | required (`MoEWeightPack`) | `flashinfer.fused_moe.MoELayer` over dispatched tokens |
 
 **Fused MoE example:**
@@ -61,7 +64,7 @@ Native transport libs (built with `BUILD_NVEP=1`) stage under
 from flashinfer.fused_moe.api import MoEConfig, ...  # build moe_config
 from flashinfer.moe_ep import (
     BootstrapConfig,
-    FleetParams,
+    SplitFleetParams,
     FusedMoeKernelConfig,
     MoEEpLayer,
     MoEEpTensors,
@@ -72,7 +75,7 @@ from flashinfer.moe_ep import (
 
 layer = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=8, rank=rank),
-    fleet_params=FleetParams(
+    fleet_params=SplitFleetParams(
         num_experts=64,
         max_tokens_per_rank=128,
         token_hidden_size=4096,
@@ -244,7 +247,7 @@ classDiagram
 
     class MoEEpSplitLayer {
         -BootstrapConfig _bootstrap
-        -FleetParams _fleet_params
+        -SplitFleetParams _fleet_params
         -SplitKernelBackend _kernel
         -Fleet _fleet
         +forward(t: MoEEpTensors) torch.Tensor
@@ -266,7 +269,7 @@ classDiagram
     MoEEpSplitLayer ..> MoEEpTensors : forward input
     MoEEpSplitLayer ..> Fleet : owns (lazy)
     MoEEpSplitLayer ..> BootstrapConfig : uses
-    MoEEpSplitLayer ..> FleetParams : uses
+    MoEEpSplitLayer ..> SplitFleetParams : uses
     MoEEpSplitLayer ..> AlgoKnob : fleet + handle knobs
 ```
 
@@ -294,7 +297,7 @@ classDiagram
     }
 
     class NcclEpFleet {
-        -FleetParams _params
+        -SplitFleetParams _params
         -dict _fleet_knobs
         -BootstrapConfig _bootstrap
         -int _stream
@@ -307,7 +310,7 @@ classDiagram
         +use_ue8m0 bool
         +group c_void_p
         +stream int
-        +params FleetParams
+        +params SplitFleetParams
         +bootstrap BootstrapConfig
         -_build_group_config() ncclEpGroupConfig_t
         -_knob_or_auto(knob_cls, field) int
@@ -333,7 +336,7 @@ classDiagram
     }
 
     class NixlEpFleet {
-        -FleetParams _params
+        -SplitFleetParams _params
         -dict _fleet_knobs
         -BootstrapConfig _bootstrap
         -int _capacity
@@ -342,7 +345,7 @@ classDiagram
         +use_fp8 bool
         +use_ue8m0 bool
         +buffer nixl_ep.Buffer
-        +params FleetParams
+        +params SplitFleetParams
     }
 
     class NixlEpHandle {
@@ -422,8 +425,18 @@ classDiagram
         +int num_experts
         +int max_tokens_per_rank
         +int token_hidden_size
+        +MoEWeightPack weights
+    }
+
+    class SplitFleetParams {
+        <<frozen dataclass>>
         +int dtype_bytes
         +EpAlgorithm algorithm
+        +EpLayout layout
+    }
+
+    class MegaFleetParams {
+        <<frozen dataclass tag>>
     }
 
     class HandleParams {
@@ -463,9 +476,12 @@ classDiagram
         +str backend_name = "nixl_ep"
     }
 
-    FleetParams --> EpAlgorithm
+    FleetParams <|-- SplitFleetParams
+    FleetParams <|-- MegaFleetParams
+    SplitFleetParams --> EpAlgorithm
+    SplitFleetParams --> EpLayout
     Fleet ..> BootstrapConfig : constructed with
-    Fleet ..> FleetParams : constructed with
+    Fleet ..> SplitFleetParams : constructed with
     Handle ..> HandleParams : constructed with
     Handle ..> DispatchInputParams : dispatch()
     Handle ..> DispatchOutput : dispatch()
@@ -710,7 +726,9 @@ flowchart TB
 | `NixlEpFleet` | `nixl_ep/fleet.py` | NIXL-EP `Buffer` owner |
 | `NixlEpHandle` | `nixl_ep/handle.py` | NIXL per-dispatch handle tuple |
 | `BootstrapConfig` | `config.py` | Rank/world + NCCL comm or TCPStore |
-| `FleetParams` | `config.py` | Expert count, token sizing, algorithm |
+| `FleetParams` | `config.py` | Base sizing + required `weights` (use subclasses at API boundary) |
+| `SplitFleetParams` | `config.py` | Split path: adds `algorithm`, `layout`, `dtype_bytes` |
+| `MegaFleetParams` | `config.py` | Mega path tag type |
 | `HandleParams` | `config.py` | Per-iteration `topk_ids` |
 | `DispatchInputParams` / `DispatchOutput` | `config.py` | Dispatch I/O envelope |
 | `CombineInputParams` / `CombineOutput` | `config.py` | Combine I/O envelope |

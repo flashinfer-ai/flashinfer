@@ -87,7 +87,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> Any:
-        from cutedsl_nvfp4_mega_moe_front_end import get_symm_buffer_for_mxfp8_mega_moe
+        from cutedsl_megamoe_front_end import get_symm_buffer_for_mxfp8_mega_moe
 
         rank, world_size = self._resolve_rank_world(bootstrap)
         k = self._kernel_config
@@ -178,7 +178,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         num_tokens: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from cutedsl_nvfp4_mega_moe_front_end import mxfp8_mega_moe
+        from cutedsl_megamoe_front_end import mxfp8_mega_moe
 
         kcfg = self._kernel_config
         mxfp8_mega_moe(

@@ -36,12 +36,30 @@ def _kernel_name(config: object) -> str:
     return name
 
 
+def is_split_kernel_config(config: object) -> bool:
+    """True when ``config`` names a registered split-path inner kernel."""
+    try:
+        name = _kernel_name(config)
+    except TypeError:
+        return False
+    return name in _SPLIT_KERNEL_REGISTRY
+
+
 def create_split_kernel(config: object) -> SplitKernelBackend:
     name = _kernel_name(config)
     if name not in _SPLIT_KERNEL_REGISTRY:
         available = sorted(_SPLIT_KERNEL_REGISTRY)
         raise KeyError(f"unknown split kernel {name!r}; available: {available}")
     return _SPLIT_KERNEL_REGISTRY[name](config)
+
+
+def is_mega_kernel_config(config: object) -> bool:
+    """True when ``config`` names a registered mega-kernel plugin."""
+    try:
+        name = _kernel_name(config)
+    except TypeError:
+        return False
+    return name in _MEGA_KERNEL_REGISTRY
 
 
 def create_mega_kernel(config: object) -> MegaKernelBackend:
@@ -52,16 +70,12 @@ def create_mega_kernel(config: object) -> MegaKernelBackend:
     return _MEGA_KERNEL_REGISTRY[name](config)
 
 
-def resolve_split_kernel(config: object) -> SplitKernelBackend:
-    return create_split_kernel(config)
-
-
-def resolve_mega_kernel(config: object) -> MegaKernelBackend:
-    return create_mega_kernel(config)
-
-
 def kernel_requires_weights(config: object) -> bool:
-    return create_split_kernel(config).requires_weights()
+    name = _kernel_name(config)
+    if name not in _SPLIT_KERNEL_REGISTRY:
+        available = sorted(_SPLIT_KERNEL_REGISTRY)
+        raise KeyError(f"unknown split kernel {name!r}; available: {available}")
+    return _SPLIT_KERNEL_REGISTRY[name].requires_weights()
 
 
 def run_split_kernel(config: object, ctx: SplitKernelContext):

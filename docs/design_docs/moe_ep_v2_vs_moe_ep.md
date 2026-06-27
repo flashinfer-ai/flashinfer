@@ -19,7 +19,7 @@ Native NCCL/NIXL transport libraries are staged under
 | **Split path** | Inline identity / `compute_config` kwargs | `SplitConfig(comm, kernel)`; kernels in `backends/split/kernel/` |
 | **Fused MoE compute** | `_compute_bridge.py` + inline `_inner_compute` | `FusedMoeKernelConfig` → `backends/split/kernel/fused_moe/` |
 | **Mega path** | Not present | `MoEEpMegaLayer` + `backends/mega/kernel/deep_gemm_mega/` |
-| **Weights** | `compute_config` + `fused_moe.api.MoEWeightPack` kwargs | Canonical `MoEWeightPack` on `FleetParams`; kernel materializes native views |
+| **Weights** | `compute_config` + `fused_moe.api.MoEWeightPack` kwargs | Required `MoEWeightPack` on `SplitFleetParams` / `MegaFleetParams`; kernel materializes native views |
 | **Tests** | `tests/moe_ep/` | `tests/moe_ep/` (+ `test_fused_moe_weights.py`, NVFP4 compute correctness) |
 
 ---
@@ -79,7 +79,7 @@ tests/moe_ep/
 ├── test_split_kernels.py                    # Kernel registry + identity wiring
 ├── test_layer_single_gpu.py                 # Split layer sequencing (stubbed fleet)
 ├── test_moe_ep_layer_multirank.py           # Identity roundtrip on 4+ GPUs
-├── test_moe_ep_mega_multirank.py            # Mega-path correctness
+├── test_moe_ep_deep_gemm_mega_multirank.py  # DeepGEMM mega-path correctness
 ├── smoke_nccl_ep.py, smoke_nixl_ep.py
 ├── nccl_ep/test_fleet_mock.py, test_ndtensor.py
 └── nixl_ep/test_fleet_mock.py
@@ -109,9 +109,8 @@ classDiagram
     class MoEEpMegaLayer {
         +forward(MoEEpTensors) Tensor
         +destroy()
-        +get_symm_buffer()
         -_transformed weights
-        -_symm_buffer
+        -_workspace
     }
 
     class Fleet {
@@ -140,9 +139,10 @@ classDiagram
     }
 
     class MegaConfig {
-        +kernel DeepGemmMegaMoeConfig
-        +stage_inputs bool
-        +preprocess_weights bool
+        +megakernel
+        +input_mode auto|quantize|copy
+        +weight_mode auto|transform|passthrough
+        +transformed_weights optional
     }
 
     class IdentitySplitKernel {
@@ -231,7 +231,7 @@ sequenceDiagram
     participant Symm as deep_gemm symm buffer
     participant DG as deep_gemm.fp8_fp4_mega_moe
 
-    User->>Layer: __init__(MegaConfig, FleetParams.weights)
+    User->>Layer: __init__(MegaConfig, MegaFleetParams.weights)
     Layer->>Layer: validate_mega_arch() (sm_100+)
     Layer->>Layer: preprocess_mega_weights() (optional at init)
 
@@ -261,9 +261,10 @@ All symbols below are importable from `flashinfer.moe_ep`.
 | Symbol | Role |
 |--------|------|
 | `BootstrapConfig` | `world_size`, `rank`, `stream`, `nccl_comm`, `tcp_store` (NIXL) |
-| `FleetParams` | `num_experts`, `max_tokens_per_rank`, `token_hidden_size`, optional `weights` |
+| `SplitFleetParams` | Split path sizing + required `weights`; adds `algorithm`, `layout`, `dtype_bytes` |
+| `MegaFleetParams` | Mega path sizing + required `weights` (tag type) |
 | `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`, optional `scales` |
-| `MoEWeightPack` | Per-rank expert weights (`w13`, `w2`, optional FP4 scales) |
+| `MoEWeightPack` | Per-rank expert weights (`w13`, `w2`, optional FP4 scales); `dummy_moe_weights()` for identity |
 | `MoEEpLayer(...)` | Factory — returns `MoEEpSplitLayer` or `MoEEpMegaLayer` |
 | `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()` | Probe staged native libs |
 
@@ -278,17 +279,22 @@ pluggable inner kernel between dispatch and combine. Requires **sm_90+**.
 import torch
 from flashinfer.moe_ep import (
     BootstrapConfig,
-    FleetParams,
+    SplitFleetParams,
+    dummy_moe_weights,
     MoEEpLayer,
     MoEEpTensors,
 )
 
 layer = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=8, rank=rank),
-    fleet_params=FleetParams(
+    fleet_params=SplitFleetParams(
         num_experts=64,
         max_tokens_per_rank=128,
         token_hidden_size=4096,
+        weights=dummy_moe_weights(
+            num_local_experts=64 // 8,
+            hidden=4096,
+        ),
     ),
     backend="nccl_ep",
 )
@@ -351,7 +357,7 @@ from flashinfer.fused_moe.api import (
 )
 from flashinfer.moe_ep import (
     BootstrapConfig,
-    FleetParams,
+    SplitFleetParams,
     FusedMoeKernelConfig,
     MoEEpLayer,
     MoEEpTensors,
@@ -374,7 +380,7 @@ moe_config = MoEConfig(
 
 layer = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
-    fleet_params=FleetParams(
+    fleet_params=SplitFleetParams(
         num_experts=64,
         max_tokens_per_rank=128,
         token_hidden_size=4096,
@@ -387,7 +393,7 @@ layer = MoEEpLayer(
 )
 ```
 
-The kernel plugin materializes `FleetParams.weights` into
+The kernel plugin materializes `SplitFleetParams.weights` into
 `flashinfer.fused_moe.api.MoEWeightPack` native views via
 `materialize_fused_moe_weights()` during layer init.
 
@@ -427,14 +433,14 @@ fleet.destroy()
 ### Mega path
 
 **When to use:** Fused Blackwell mega-MoE via `deep_gemm.fp8_fp4_mega_moe`.
-Requires **sm_100+**, `torch.distributed` initialized, and `FleetParams.weights`.
+Requires **sm_100+**, `torch.distributed` initialized, and `MegaFleetParams.weights`.
 
 ```python
 import torch.distributed as dist
 from flashinfer.moe_ep import (
     BootstrapConfig,
     DeepGemmMegaMoeConfig,
-    FleetParams,
+    MegaFleetParams,
     MegaConfig,
     MoEEpLayer,
     MoEWeightPack,
@@ -445,7 +451,7 @@ dist.init_process_group(backend="nccl")
 
 layer = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=8, rank=rank),
-    fleet_params=FleetParams(
+    fleet_params=MegaFleetParams(
         num_experts=64,
         max_tokens_per_rank=64,
         token_hidden_size=4096,
@@ -456,8 +462,8 @@ layer = MoEEpLayer(
             intermediate_size=2048,
             top_k=4,
         ),
-        stage_inputs=True,       # Triton FP8 staging from bf16 hidden_states
-        preprocess_weights=True, # FP4 transform at init
+        input_mode="auto",         # bf16 → quantize; pre-quantized → copy
+        weight_mode="auto",        # transform MoEWeightPack at init
     ),
 )
 
@@ -471,8 +477,9 @@ out = layer(MoEEpTensors(
 layer.destroy()
 ```
 
-**`stage_inputs=False`** — caller supplies pre-quantized `MoEEpTensors.scales`
-and copies activations into the symm buffer layout directly.
+**`input_mode="copy"`** (or `auto` with pre-quantized activations) — caller supplies
+quantized `MoEEpTensors.hidden_states` + `scales`. **`weight_mode="passthrough"`**
+requires `MegaConfig.transformed_weights` from `preprocess_mega_weights()` etc.
 
 **Direct construction** (skip factory):
 
@@ -488,7 +495,7 @@ mega = MoEEpMegaLayer(bootstrap, fleet_params, mega_config)
 
 ## Unchanged from v1 (split path)
 
-`BootstrapConfig`, `FleetParams`, `Fleet` / `Handle` ABC, `MoEEpTensors`, algo
+`BootstrapConfig`, `SplitFleetParams` / `MegaFleetParams`, `Fleet` / `Handle` ABC, `MoEEpTensors`, algo
 knobs, and NCCL/NIXL wrappers. Default `backend="nccl_ep"` + `IdentityConfig`
 matches v1's identity roundtrip.
 

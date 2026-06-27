@@ -15,7 +15,7 @@ from ..core.runtime import (
     ensure_moe_ep_cuda_device,
     finalize_moe_ep_runtime,
 )
-from ..core.validation.common import validate_bootstrap_world_size
+from ..core.validation.common import MoEEpConfigError, validate_bootstrap_world_size
 from ..weights import MoEWeightPack
 from .config import MegaConfig
 
@@ -38,9 +38,6 @@ class MoEEpMegaLayer(nn.Module):
         self._mega_config = backend
         self._megakernel_config = backend.megakernel
 
-        if fleet_params.weights is None:
-            raise ValueError("MoEEpMegaLayer requires FleetParams.weights")
-
         ensure_moe_ep_cuda_device(bootstrap)
 
         self._kernel = create_mega_kernel(self._megakernel_config)
@@ -58,7 +55,9 @@ class MoEEpMegaLayer(nn.Module):
         self._transformed: Optional[Any] = None
         self._workspace: Any = None
 
-        if backend.preprocess_weights:
+        if backend.transformed_weights is not None:
+            self._transformed = backend.transformed_weights
+        elif backend.preprocess_weights:
             self._preprocess_weights()
 
     def _preprocess_weights(self) -> None:
@@ -69,32 +68,42 @@ class MoEEpMegaLayer(nn.Module):
         )
 
     def _ensure_workspace(self) -> Any:
-        if self._workspace is not None and getattr(self._workspace, "x", None) is None:
-            self._workspace = None
         if self._workspace is None:
             self._workspace = self._kernel.prepare_workspace(
                 self._bootstrap, self._fleet_params
             )
         return self._workspace
 
+    def _resolve_stage_inputs(self, t: "MoEEpTensors") -> bool:
+        if not self._mega_config.stage_inputs:
+            return False
+        return t.hidden_states.dtype == torch.bfloat16
+
     def forward(self, t: "MoEEpTensors") -> torch.Tensor:
+        stage_inputs = self._resolve_stage_inputs(t)
+
         self._kernel.validate_forward(
             t,
             self._fleet_params,
-            stage_inputs=self._mega_config.stage_inputs,
+            stage_inputs=stage_inputs,
         )
 
         if self._transformed is None:
+            if not self._mega_config.preprocess_weights:
+                raise MoEEpConfigError(
+                    "preprocess_weights=False requires "
+                    "MegaConfig.transformed_weights at init"
+                )
             self._preprocess_weights()
         assert self._transformed is not None
 
         workspace = self._ensure_workspace()
-        num_tokens = t.hidden_states.shape[0]
+        num_tokens = t.num_tokens
 
         self._kernel.stage_inputs(
             t,
             workspace,
-            stage_inputs=self._mega_config.stage_inputs,
+            stage_inputs=stage_inputs,
             num_tokens=num_tokens,
         )
 

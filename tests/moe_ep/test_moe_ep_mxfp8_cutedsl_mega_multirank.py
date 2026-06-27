@@ -3,7 +3,7 @@
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
-Requires Blackwell (sm_100+), >=4 GPUs, and the ``cutedsl_nvfp4_mega_moe_front_end``
+Requires Blackwell (sm_100+), >=4 GPUs, and the ``cutedsl_megamoe_front_end``
 package (``pip install -e cutedsl_megamoe/front_end``).
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
@@ -22,7 +22,7 @@ import os
 
 import pytest
 
-pytest.importorskip("cutedsl_nvfp4_mega_moe_front_end")
+pytest.importorskip("cutedsl_megamoe_front_end")
 
 
 def _require_cuda():
@@ -146,7 +146,7 @@ def _reference_mxfp8_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
     import torch
     import torch.distributed as dist
 
-    from cutedsl_nvfp4_mega_moe_front_end import (
+    from cutedsl_megamoe_front_end import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -217,7 +217,7 @@ def _reference_mxfp8_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from cutedsl_nvfp4_mega_moe_front_end import (
+    from cutedsl_megamoe_front_end import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -320,7 +320,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from cutedsl_nvfp4_mega_moe_front_end import (
+            from cutedsl_megamoe_front_end import (
                 get_symm_buffer_for_mxfp8_mega_moe,
             )
 

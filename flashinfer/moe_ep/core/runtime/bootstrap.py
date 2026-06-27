@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import FrozenSet
@@ -11,6 +12,8 @@ from ...config import BootstrapConfig
 Requirement = str
 TORCH_DIST = "torch_dist"
 NVSHMEM = "nvshmem"
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -109,7 +112,7 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
     if _mega_no_dist() or _nvshmem_initialized():
         return False
 
-    import cutedsl_nvfp4_mega_moe_front_end  # noqa: F401 — bootstrap_paths
+    import cutedsl_megamoe_front_end  # noqa: F401 — bootstrap_paths
     import numpy as np
     import nvshmem.core
     import torch
@@ -208,8 +211,8 @@ def finalize_moe_ep_runtime(handle: MoEEpRuntimeHandle | None) -> None:
             import nvshmem.core
 
             nvshmem.core.finalize()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("moe_ep NVSHMEM finalize failed: %s", exc, exc_info=True)
         _STATE.owned_nvshmem = False
 
     if _STATE.owned_torch_dist and not _launched_via_torchrun():
@@ -218,8 +221,10 @@ def finalize_moe_ep_runtime(handle: MoEEpRuntimeHandle | None) -> None:
 
             if dist.is_initialized():
                 dist.destroy_process_group()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "moe_ep torch.distributed teardown failed: %s", exc, exc_info=True
+            )
         _STATE.owned_torch_dist = False
     elif _STATE.owned_torch_dist and _launched_via_torchrun():
         # torchrun / pytest-xdist owns the process group for the whole job.

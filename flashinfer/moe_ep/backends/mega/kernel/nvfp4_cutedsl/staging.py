@@ -8,7 +8,7 @@ from .....core.validation.common import MoEEpConfigError
 
 
 def _require_cutedsl_paths() -> None:
-    import cutedsl_nvfp4_mega_moe_front_end  # noqa: F401
+    import cutedsl_megamoe_front_end  # noqa: F401
 
 
 def stage_mega_moe_inputs(

@@ -1,6 +1,7 @@
 """Canonical MoE weight container for all moe_ep paths.
 
-Users supply a single :class:`MoEWeightPack` via :attr:`FleetParams.weights`.
+Users supply a single :class:`MoEWeightPack` via
+:attr:`~flashinfer.moe_ep.config.FleetParams.weights`.
 Split and mega kernel plugins materialize backend-specific layouts in
 :meth:`~flashinfer.moe_ep.core.kernel.base.SplitKernelBackend.preprocess_weights`
 or the mega equivalent — callers never touch per-backend native views directly.
@@ -9,7 +10,7 @@ or the mega equivalent — callers never touch per-backend native views directly
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -32,3 +33,16 @@ class MoEWeightPack:
     w2: torch.Tensor
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
+
+
+def dummy_moe_weights(
+    *,
+    num_local_experts: int,
+    hidden: int,
+    intermediate: int = 1,
+    device: Union[torch.device, str] = "cpu",
+) -> MoEWeightPack:
+    """Placeholder weights for identity / comm-only split paths."""
+    w13 = torch.zeros(num_local_experts, 2 * intermediate, hidden, device=device)
+    w2 = torch.zeros(num_local_experts, hidden, intermediate, device=device)
+    return MoEWeightPack(w13=w13, w2=w2)

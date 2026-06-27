@@ -10,4 +10,3 @@ class IdentityConfig:
     """Inner compute stub — passes dispatched tokens through unchanged."""
 
     kernel_name: str = "identity"
-    require_weights: bool = False

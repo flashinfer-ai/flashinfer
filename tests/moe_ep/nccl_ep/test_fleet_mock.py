@@ -163,6 +163,7 @@ def bypass_build_checks():
 
 
 def test_fleet_builds_group_config(fake_nccl_ep, bypass_build_checks):
+    from flashinfer.moe_ep import dummy_moe_weights
     from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm, FleetParams
     from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
 
@@ -170,6 +171,7 @@ def test_fleet_builds_group_config(fake_nccl_ep, bypass_build_checks):
         num_experts=8,
         max_tokens_per_rank=128,
         token_hidden_size=7168,
+        weights=dummy_moe_weights(num_local_experts=2, hidden=7168),
         dtype_bytes=2,
         algorithm=EpAlgorithm.LOW_LATENCY,
     )
@@ -187,7 +189,7 @@ def test_fleet_builds_group_config(fake_nccl_ep, bypass_build_checks):
 
 
 def test_fleet_rejects_non_divisible_experts(fake_nccl_ep, bypass_build_checks):
-    from flashinfer.moe_ep import MoEEpConfigError
+    from flashinfer.moe_ep import MoEEpConfigError, dummy_moe_weights
     from flashinfer.moe_ep.config import BootstrapConfig, FleetParams
     from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
 
@@ -195,6 +197,7 @@ def test_fleet_rejects_non_divisible_experts(fake_nccl_ep, bypass_build_checks):
         num_experts=7,
         max_tokens_per_rank=128,
         token_hidden_size=7168,
+        weights=dummy_moe_weights(num_local_experts=1, hidden=7168),
     )
     with pytest.raises(MoEEpConfigError):
         NcclEpFleet(BootstrapConfig(world_size=4, rank=0), params)
@@ -208,11 +211,17 @@ def test_handle_create_uses_expert_major_and_int64_topk(
     if not torch.cuda.is_available():
         pytest.skip("handle alloc needs a CUDA device")
 
+    from flashinfer.moe_ep import dummy_moe_weights
     from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobTopKWeights
     from flashinfer.moe_ep.config import BootstrapConfig, FleetParams, HandleParams
     from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
 
-    params = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=7168)
+    params = FleetParams(
+        num_experts=8,
+        max_tokens_per_rank=128,
+        token_hidden_size=7168,
+        weights=dummy_moe_weights(num_local_experts=2, hidden=7168),
+    )
     fleet = NcclEpFleet(BootstrapConfig(world_size=4, rank=0), params)
 
     topk_ids = torch.zeros(16, 2, dtype=torch.int32, device="cuda")
@@ -233,6 +242,7 @@ def test_handle_create_uses_rank_major_layout(fake_nccl_ep, bypass_build_checks)
     if not torch.cuda.is_available():
         pytest.skip("handle alloc needs a CUDA device")
 
+    from flashinfer.moe_ep import dummy_moe_weights
     from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobTopKWeights
     from flashinfer.moe_ep.config import (
         BootstrapConfig,
@@ -247,6 +257,7 @@ def test_handle_create_uses_rank_major_layout(fake_nccl_ep, bypass_build_checks)
         num_experts=8,
         max_tokens_per_rank=128,
         token_hidden_size=7168,
+        weights=dummy_moe_weights(num_local_experts=2, hidden=7168),
         algorithm=EpAlgorithm.LOW_LATENCY,
         layout=EpLayout.RANK_MAJOR,
     )
@@ -265,6 +276,7 @@ def test_handle_create_uses_rank_major_layout(fake_nccl_ep, bypass_build_checks)
 
 
 def test_fleet_params_rejects_rank_major_under_ht():
+    from flashinfer.moe_ep import dummy_moe_weights
     from flashinfer.moe_ep.config import EpAlgorithm, EpLayout, FleetParams
 
     with pytest.raises(ValueError):
@@ -272,6 +284,7 @@ def test_fleet_params_rejects_rank_major_under_ht():
             num_experts=8,
             max_tokens_per_rank=128,
             token_hidden_size=7168,
+            weights=dummy_moe_weights(num_local_experts=2, hidden=7168),
             algorithm=EpAlgorithm.HIGH_THROUGHPUT,
             layout=EpLayout.RANK_MAJOR,
         )

@@ -34,9 +34,11 @@ from ..core.runtime import (
     split_comm_runtime_requirements,
 )
 from ..core.validation.common import (
+    MoEEpConfigError,
     validate_arch_for_backend,
     validate_bootstrap_world_size,
     validate_fleet_params,
+    validate_fleet_weights,
     validate_split_forward_inputs,
 )
 from .config import SplitConfig
@@ -71,12 +73,6 @@ class MoEEpSplitLayer(nn.Module):
 
         ensure_moe_ep_cuda_device(bootstrap)
 
-        if self._kernel.requires_weights() and fleet_params.weights is None:
-            raise ValueError(
-                "MoEEpSplitLayer requires FleetParams.weights for "
-                f"kernel {type(self._kernel_config).__name__}"
-            )
-
         self._runtime = None
         if bootstrap.auto_bootstrap:
             self._runtime = bootstrap_moe_ep_runtime(
@@ -87,7 +83,7 @@ class MoEEpSplitLayer(nn.Module):
         self._validate_at_init()
         self._kernel.validate_init(bootstrap, fleet_params)
 
-        if self._kernel.requires_weights() and fleet_params.weights is not None:
+        if type(self._kernel).requires_weights():
             self._kernel.preprocess_weights(fleet_params.weights, fleet_params)
 
         self._fleet: Fleet | None = None
@@ -111,6 +107,12 @@ class MoEEpSplitLayer(nn.Module):
     def _validate_at_init(self) -> None:
         backend_name = self._comm_backend_name()
         validate_bootstrap_world_size(self._bootstrap)
+        validate_fleet_weights(self._fleet_params, self._bootstrap.world_size)
+        if backend_name == "nixl_ep" and self._bootstrap.tcp_store is None:
+            raise MoEEpConfigError(
+                "nixl_ep requires BootstrapConfig.tcp_store; construct a "
+                "torch.distributed.TCPStore and pass it at layer init."
+            )
         if backend_name not in ("nccl_ep", "nixl_ep"):
             return
         validate_arch_for_backend(backend_name)

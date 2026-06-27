@@ -7,8 +7,6 @@ from .kernel.registry import (
     create_mega_kernel,
     create_split_kernel,
     kernel_requires_weights,
-    resolve_mega_kernel,
-    resolve_split_kernel,
     run_split_kernel,
 )
 
@@ -22,7 +20,5 @@ __all__ = [
     "create_mega_kernel",
     "create_split_kernel",
     "kernel_requires_weights",
-    "resolve_mega_kernel",
-    "resolve_split_kernel",
     "run_split_kernel",
 ]

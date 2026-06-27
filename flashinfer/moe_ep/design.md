@@ -30,15 +30,15 @@ comm fleets when their `fleet.py` is imported from `__init__.py`.
 | Type | Role |
 |------|------|
 | `BootstrapConfig` | `world_size`, `rank`, `stream`, `nccl_comm`, `tcp_store`, `auto_bootstrap=True` |
-| `FleetParams` | EP sizing (`num_experts`, `max_tokens_per_rank`, `token_hidden_size`), `algorithm` (LL/HT), `layout` (EXPERT_MAJOR / RANK_MAJOR), optional `weights` |
-| `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales` (pre-staged mega), routing/count fields for split backends |
-| `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); backends convert in `preprocess_weights()` |
+| `FleetParams` | EP sizing + required `weights`; split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
+| `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales` (pre-staged mega) |
+| `MoEWeightPack` | Canonical `w13` / `w2` (+ optional scales); `dummy_moe_weights()` for comm-only split |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
-| `MegaConfig` | `megakernel`, `stage_inputs=True`, `preprocess_weights=True` |
+| `MegaConfig` | `megakernel`, `stage_inputs`, `preprocess_weights`, optional `transformed_weights` |
 
-**Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). Fleet is lazy-created on first `forward()`; a new Handle per forward.
+**Split:** pass `FleetParams` + `SplitConfig(comm=..., kernel=...)` or a comm string (kernel defaults to `IdentityConfig`). Fleet is lazy-created on first `forward()`; a new Handle per forward.
 
-**Mega:** pass `MegaConfig(megakernel=...)`. Requires `FleetParams.weights`. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]`. `fleet_knobs` are ignored.
+**Mega:** pass `FleetParams` + `MegaConfig(megakernel=...)`. Weights are required on `fleet_params`. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
 ## Architecture
 
@@ -86,24 +86,23 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 |------|------|--------|
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |
-| Split kernel | `identity` | `IdentityConfig` — comm-only; weights optional |
+| Split kernel | `identity` | `IdentityConfig` — comm-only; weights required on params but kernel ignores them (`dummy_moe_weights` OK) |
 | Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe.MoELayer`; needs weights |
 | Mega kernel | `deep_gemm_mega` | `DeepGemmMegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `nvfp4_cutedsl` | `Nvfp4CutedslMegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `mxfp8_cutedsl` | `Mxfp8CutedslMegaMoeConfig` — MXFP8, sm_100+ |
 
-**Mega weights (`nvfp4_cutedsl`):** kernel expects NVFP4 + swizzled-SF expert weights. Supply bf16 `MoEWeightPack` with `preprocess_weights=True` (default), or pre-quantized NVFP4 with `w13_scale` / `w2_scale`.
+**Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or logical pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (kernel-ready layout from `preprocess_*_mega_weights`).
 
-**Mega weights (`mxfp8_cutedsl`):** kernel expects MXFP8 + swizzled E8M0-SF expert weights. Supply bf16 `MoEWeightPack` with `preprocess_weights=True` (default), or pre-quantized kernel-layout fp8 weights with plain `w13_scale` / `w2_scale`.
-
-**Mega input staging:** `stage_inputs=True` accepts bf16 activations; `False` expects caller-supplied quantized `hidden_states` + `scales` (NVFP4 packed shape `[T, hidden/2]`; MXFP8 fp8 shape `[T, hidden]` + E8M0 scales).
+**Mega activations:** with `stage_inputs=True` (default), bf16 `[T, hidden]` is quantized into the symm workspace at forward. With `stage_inputs=False`, copy pre-quantized activations (+ `MoEEpTensors.scales`) into the workspace.
 
 ## Usage
 
 ```python
 from flashinfer.fused_moe.api import MoEConfig
 from flashinfer.moe_ep import (
-    MoEEpLayer, BootstrapConfig, FleetParams, MoEEpTensors, MoEWeightPack,
+    MoEEpLayer, BootstrapConfig, FleetParams, FleetParams,
+    MoEEpTensors, MoEWeightPack, dummy_moe_weights,
     SplitConfig, NcclEpConfig, FusedMoeKernelConfig,
     MegaConfig, DeepGemmMegaMoeConfig,
 )
@@ -122,10 +121,23 @@ layer = MoEEpLayer(
 )
 out = layer.forward(MoEEpTensors(hidden_states=..., topk_ids=..., topk_weights=...))
 
-# Mega: fused kernel (DeepGEMM or Nvfp4CutedslMegaMoeConfig)
+# Split: comm-only identity (dummy weights)
 layer = MoEEpLayer(
     bootstrap=BootstrapConfig(world_size=4, rank=rank),
-    fleet_params=FleetParams(..., weights=MoEWeightPack(w13=..., w2=...)),
+    fleet_params=FleetParams(
+        num_experts=32, max_tokens_per_rank=256, token_hidden_size=2048,
+        weights=dummy_moe_weights(num_local_experts=8, hidden=2048),
+    ),
+    backend="nccl_ep",
+)
+
+# Mega: fused kernel (wrap megakernel config in MegaConfig)
+layer = MoEEpLayer(
+    bootstrap=BootstrapConfig(world_size=4, rank=rank),
+    fleet_params=FleetParams(
+        num_experts=32, max_tokens_per_rank=256, token_hidden_size=2048,
+        weights=MoEWeightPack(w13=..., w2=...),
+    ),
     backend=MegaConfig(megakernel=DeepGemmMegaMoeConfig(intermediate_size=1024, top_k=4)),
 )
 out = layer.forward(MoEEpTensors(...))

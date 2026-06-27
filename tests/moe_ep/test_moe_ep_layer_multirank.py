@@ -43,6 +43,7 @@ def test_moe_ep_roundtrip_ll_bf16_h4096(comm_backend):
         BootstrapConfig,
         EpAlgorithm,
         FleetParams,
+        dummy_moe_weights,
         IdentityConfig,
         MoEEpLayer,
         MoEEpTensors,
@@ -114,6 +115,10 @@ def test_moe_ep_roundtrip_ll_bf16_h4096(comm_backend):
             token_hidden_size=hidden,
             dtype_bytes=2,
             algorithm=EpAlgorithm.LOW_LATENCY,
+            weights=dummy_moe_weights(
+                num_local_experts=num_experts // world_size,
+                hidden=hidden,
+            ),
         ),
         backend=SplitConfig(comm=comm, kernel=IdentityConfig()),
     )

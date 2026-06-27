@@ -16,14 +16,9 @@ class IdentitySplitKernelBackend(SplitKernelBackend):
     def kernel_name(cls) -> str:
         return "identity"
 
-    def requires_weights(self) -> bool:
-        cfg = self._config
-        if isinstance(cfg, IdentityConfig):
-            return cfg.require_weights
-        return bool(getattr(cfg, "require_weights", False))
-
-    def preprocess_weights(self, weights, fleet_params):
-        return super().preprocess_weights(weights, fleet_params)
+    @classmethod
+    def requires_weights(cls) -> bool:
+        return False
 
     def compute(self, ctx: SplitKernelContext):
         return ctx.expert_tensors

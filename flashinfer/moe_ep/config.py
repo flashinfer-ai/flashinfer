@@ -1,7 +1,8 @@
 """Config dataclasses + I/O envelopes for moe_ep.
 
 Frozen dataclasses for `BootstrapConfig` (the inputs each backend needs at
-construction), `FleetParams` (durable transport sizing), `HandleParams`
+construction), `FleetParams` (EP sizing + weights; split transport fields
+have defaults mega ignores), `HandleParams`
 (per-iteration topk_ids), and the four envelope types
 :class:`DispatchInputParams` / :class:`DispatchOutput` /
 :class:`CombineInputParams` / :class:`CombineOutput` that the Handle
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     import torch
@@ -85,24 +86,21 @@ class BootstrapConfig:
 
 @dataclass(frozen=True)
 class FleetParams:
-    """Durable sizing for an EP Fleet.
+    """EP sizing, canonical weights, and split-path transport defaults.
 
-    `num_channels`, `num_qp_per_rank`, `rdma_buffer_size` are exposed as
+    ``num_channels``, ``num_qp_per_rank``, ``rdma_buffer_size`` are exposed as
     :mod:`flashinfer.moe_ep.algo_knobs` Fleet-level knobs rather than top-level
-    fields, since they're backend-specific tuning rather than contract-level
-    sizing.
-
-    ``weights`` holds per-rank expert weights in canonical :class:`MoEWeightPack`
-    layout (required for compute kernels and mega paths).
+    fields. Split-only fields ``dtype_bytes``, ``algorithm``, and ``layout`` are
+    ignored by the mega path.
     """
 
     num_experts: int
     max_tokens_per_rank: int
     token_hidden_size: int
+    weights: "MoEWeightPack"
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
     layout: EpLayout = EpLayout.EXPERT_MAJOR
-    weights: Optional["MoEWeightPack"] = None
 
     def __post_init__(self) -> None:
         for name in (

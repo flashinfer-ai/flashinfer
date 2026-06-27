@@ -29,3 +29,4 @@ class MegaConfig:
     megakernel: object
     stage_inputs: bool = True
     preprocess_weights: bool = True
+    transformed_weights: object | None = None

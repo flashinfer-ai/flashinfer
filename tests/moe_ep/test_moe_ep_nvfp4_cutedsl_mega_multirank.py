@@ -3,7 +3,7 @@
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
-Requires Blackwell (sm_100+), >=4 GPUs, and the ``cutedsl_nvfp4_mega_moe_front_end``
+Requires Blackwell (sm_100+), >=4 GPUs, and the ``cutedsl_megamoe_front_end``
 package (``pip install -e cutedsl_megamoe/front_end``).
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
@@ -22,7 +22,7 @@ import os
 
 import pytest
 
-pytest.importorskip("cutedsl_nvfp4_mega_moe_front_end")
+pytest.importorskip("cutedsl_megamoe_front_end")
 
 
 def _require_cuda():
@@ -68,7 +68,7 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from cutedsl_nvfp4_mega_moe_front_end import make_dummy_epilogue_params
+    from cutedsl_megamoe_front_end import make_dummy_epilogue_params
 
     g = torch.Generator(device="cuda").manual_seed(19 + rank)
     return make_dummy_epilogue_params(num_local_experts, generator=g)
@@ -204,7 +204,7 @@ def _reference_nvfp4_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
     import torch
     import torch.distributed as dist
 
-    from cutedsl_nvfp4_mega_moe_front_end import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
+    from cutedsl_megamoe_front_end import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
         stage_mega_moe_inputs,
@@ -272,7 +272,7 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from cutedsl_nvfp4_mega_moe_front_end import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
+    from cutedsl_megamoe_front_end import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
         preprocess_mega_weights,
@@ -381,7 +381,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from cutedsl_nvfp4_mega_moe_front_end import get_symm_buffer_for_mega_moe
+            from cutedsl_megamoe_front_end import get_symm_buffer_for_mega_moe
 
             staging_buffer = get_symm_buffer_for_mega_moe(
                 problem["num_experts"],
