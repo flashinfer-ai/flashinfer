@@ -195,30 +195,33 @@ def _time_call(call, iters=10, warmup=3):
 
 
 def _autotune_tactic(N, K, M, r, device=None):
-    """Time-select the fastest tactic for (N,K,M-bucket,r). Returns a (tile,cluster,prefetch) tuple,
+    """Time-select the fastest tactic for (N,K,timing-M,r). Returns a (tile,cluster,prefetch) tuple,
     or None if timing is unavailable (CUDA-graph capture) -> caller falls back to the heuristic.
-    Random correctly-sized operands (timing is shape-, not value-, dependent). Cached per M-bucket."""
+    Random correctly-sized operands (timing is shape-, not value-, dependent)."""
     try:
         if torch.cuda.is_current_stream_capturing():
             return None
     except Exception:
         return None
-    bucket = 1 << max(0, (M - 1).bit_length())  # next power of 2 >= M
     dev = (
         torch.device(device)
         if device is not None
         else torch.device("cuda", torch.cuda.current_device())
     )
-    key = (dev.index, N, K, bucket, r)
+    # Preserve exact-M choices through the allocation cap. Power-of-two bucketing aliases materially
+    # different shapes (for example M=6889 and M=8192), so a startup tune can otherwise select the
+    # wrong tactic for a later batch. Shapes above the cap intentionally share its measured tactic.
+    timing_m = min(M, 32768)
+    key = (dev.index, N, K, timing_m, r)
     if key in _TACTIC_CHOICE_CACHE:
         return _TACTIC_CHOICE_CACHE[key]
 
     Kp = K // 2
     lora_k = _ceil_div(r, 16) * 16
     # Cap the timing-M to avoid huge autotune allocations (out[M,N] is ~3.6GB at M=147k/b16 ->
-    # OOM). The best tactic is ~M-bucket-invariant in the large-M (compute-bound) regime, and the
+    # OOM). The best tactic is stable in the large-M (compute-bound) regime, and the
     # compiled kernel is symbolic in M, so timing at a capped M picks the same tactic.
-    M = min(M, 32768)
+    M = timing_m
     sf_m = _ceil_div(M, 128)
     sf_n = _ceil_div(N, 128)
     sf_k = _ceil_div(_ceil_div(K, 16), 4)
@@ -296,7 +299,7 @@ def prepare_svdquant_state(
         raise ValueError("Rq must be a CUDA tensor")
     dev = Rq.device
 
-    # Time-select the tile/cluster once per (shape, M-bucket) during warmup. Under CUDA-graph
+    # Time-select the tile/cluster once per (shape, capped exact M) during warmup. Under CUDA-graph
     # capture the private autotuner returns None and _build_compiled uses its analytical heuristic.
     with torch.cuda.device(dev):
         tactic = _autotune_tactic(O, I, M, r, device=dev)
