@@ -415,12 +415,14 @@ def msa_sparse_attention(
         # query-tile + block-union + in-kernel online softmax: no GMEM partials and
         # no combine kernel (the memory-bound KV-major path's ~6x prefill headroom on
         # SM12x). bf16/fp16 flat K/V only for now.
-        if paged:
-            raise ValueError("union=True does not support paged KV yet")
         if q_fp8 or kv_fp8 or kv_nvfp4 or qk_fp8_mma or pv_fp8_mma:
             raise ValueError("union=True supports bf16/fp16 only (no fp8/NVFP4) yet")
         if return_temperature_lse:
             raise ValueError("union=True does not support return_temperature_lse yet")
+        # paged is supported (page_size == _BLK_KV, one page per KV block); the
+        # paged k/v shape was validated above and cu_seqlens_k was derived from
+        # seqused_k. The union metadata builder works on batch-local block ids
+        # either way -- the forward remaps them through page_table when paged.
         dev = q.device
         cu_q_dev = cu_seqlens_q.to(dev, non_blocking=True)
         cu_k_dev = cu_seqlens_k.to(dev, non_blocking=True)
@@ -433,6 +435,7 @@ def msa_sparse_attention(
             cu_q_dev,
             cu_k_dev,
             qoff_dev,
+            page_table=page_table if paged else None,
             causal=causal,
             softmax_scale=softmax_scale,
             group_size=group_size,
@@ -650,6 +653,7 @@ def _msa_sparse_attention_union(
     cu_k_dev,
     qoff_dev,
     *,
+    page_table=None,
     causal,
     softmax_scale,
     group_size,
@@ -658,8 +662,9 @@ def _msa_sparse_attention_union(
     return_softmax_lse,
 ):
     """Union-tile prefill path (query-tile + block-union + in-kernel online softmax,
-    no GMEM partials / no combine). bf16/fp16, flat K/V. See
-    :class:`...cute_dsl.sparse_fwd_union_sm12x.SparseAttentionUnionFwdSm12x`."""
+    no GMEM partials / no combine). bf16/fp16; flat K/V, or paged ``(num_pages,
+    Hkv, _BLK_KV, d)`` with one page per KV block when ``page_table`` is given.
+    See :class:`...cute_dsl.sparse_fwd_union_sm12x.SparseAttentionUnionFwdSm12x`."""
     import cutlass
     import cutlass.cute as cute
 
@@ -668,6 +673,12 @@ def _msa_sparse_attention_union(
 
     total_q, num_qo_heads, head_dim = q.shape
     dev = q.device
+    paged = page_table is not None
+    # page table is read only on the paged path; a (1, 1) dummy keeps the call
+    # signature uniform for the flat kernel.
+    page_table_arg = (
+        page_table if paged else torch.zeros((1, 1), dtype=torch.int32, device=dev)
+    )
     m_block, num_threads = _union_tile_config(group_size)
     tokens_per_tile = m_block // group_size
 
@@ -684,13 +695,23 @@ def _msa_sparse_attention_union(
         (num_qo_heads, total_q), -float("inf"), dtype=torch.float32, device=dev
     )
 
-    key = ("sparse_attn_union", str(q.dtype), group_size, causal, m_block, num_threads)
+    key = (
+        "sparse_attn_union",
+        str(q.dtype),
+        group_size,
+        causal,
+        m_block,
+        num_threads,
+        paged,
+    )
     compiled = _compile_cache.get(key)
     if compiled is None:
         cdt = _cutlass_dtype(q.dtype)
         i32 = _cutlass_dtype(torch.int32)
         f32 = _cutlass_dtype(torch.float32)
-        s = [cute.sym_int() for _ in range(9)]
+        s = [cute.sym_int() for _ in range(13)]
+        # K/V are 3D flat or 4D paged (num_pages, Hkv, _BLK_KV, d).
+        kv_shape = (s[9], s[10], _BLK_KV, head_dim) if paged else (s[2], s[3], head_dim)
         kernel_obj = SparseAttentionUnionFwdSm12x(
             head_dim=head_dim,
             m_block_size=m_block,
@@ -699,12 +720,13 @@ def _msa_sparse_attention_union(
             num_threads=num_threads,
             is_causal=causal,
             return_softmax_lse=True,
+            paged=paged,
         )
         compiled = cute.compile(
             kernel_obj,
             _fake(cdt, (s[0], s[1], head_dim)),
-            _fake(cdt, (s[2], s[3], head_dim)),
-            _fake(cdt, (s[2], s[3], head_dim)),
+            _fake(cdt, kv_shape),
+            _fake(cdt, kv_shape),
             _fake(cdt, (s[0], s[1], head_dim)),
             _fake(f32, (s[1], s[0]), align=4),
             _fake(i32, (s[6], s[7]), align=4),
@@ -715,6 +737,7 @@ def _msa_sparse_attention_union(
             _fake(i32, (s[4],), align=4),
             _fake(i32, (s[4],), align=4),
             _fake(i32, (s[5],), align=4),
+            _fake(i32, (s[11], s[12]), align=4),
             cutlass.Float32(1.0),
             cutlass.Int32(1),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -737,6 +760,7 @@ def _msa_sparse_attention_union(
         cu_q_dev,
         cu_k_dev,
         qoff_dev,
+        page_table_arg,
         float(softmax_scale),
         int(n),
     )

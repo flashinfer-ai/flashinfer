@@ -46,8 +46,10 @@ class SparseAttentionUnionFwdSm12x:
     """Union-tile (query-major) sparse attention forward for SM12x.
 
     Static config: head_dim (128), n_block (128 = blk_kv), m tile (64 rows =
-    tokens_per_tile x group_size), GQA group size, causal flag. bf16/fp16, flat
-    K/V. Writes the final output + optional log2-domain LSE directly.
+    tokens_per_tile x group_size), GQA group size, causal flag. bf16/fp16. K/V
+    are either flat ``(total_k, Hkv, d)`` or paged ``(num_pages, Hkv, 128, d)``
+    with page_size == n_block (one page per KV block). Writes the final output +
+    optional log2-domain LSE directly.
     """
 
     def __init__(
@@ -59,6 +61,7 @@ class SparseAttentionUnionFwdSm12x:
         num_threads: int = 128,
         is_causal: bool = True,
         return_softmax_lse: bool = False,
+        paged: bool = False,
     ):
         if head_dim != 128 or n_block_size != 128:
             raise ValueError("only head_dim == n_block_size == 128 is supported")
@@ -72,6 +75,7 @@ class SparseAttentionUnionFwdSm12x:
         self._num_threads = num_threads
         self._is_causal = is_causal
         self._return_softmax_lse = return_softmax_lse
+        self._paged = paged
         self._q_smem_stride = head_dim + 8
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=num_threads
@@ -90,8 +94,8 @@ class SparseAttentionUnionFwdSm12x:
     def __call__(
         self,
         mQ: cute.Tensor,  # (total_q, Hq, d)
-        mK: cute.Tensor,  # (total_k, Hkv, d) flat
-        mV: cute.Tensor,  # (total_k, Hkv, d) flat
+        mK: cute.Tensor,  # (total_k, Hkv, d) flat | (num_pages, Hkv, 128, d) paged
+        mV: cute.Tensor,  # (total_k, Hkv, d) flat | (num_pages, Hkv, 128, d) paged
         mO: cute.Tensor,  # (total_q, Hq, d) final output
         mLse: cute.Tensor,  # (Hq, total_q) f32 LSE (dummy (1,1) if off)
         mUnionBlocks: cute.Tensor,  # (capacity, max_union) int32 kv-block ids
@@ -100,8 +104,9 @@ class SparseAttentionUnionFwdSm12x:
         mWorkMeta: cute.Tensor,  # (capacity, 3) int32 {batch, q_tile, kv_head}
         mWorkCount: cute.Tensor,  # (1,) int32
         mCuQ: cute.Tensor,  # (B + 1,) int32
-        mCuK: cute.Tensor,  # (B + 1,) int32
+        mCuK: cute.Tensor,  # (B + 1,) int32 (paged: cumsum of seqused_k)
         mQOffset: cute.Tensor,  # (B,) int32 causal offset (MSA q_offset)
+        mPageTable: cute.Tensor,  # (B, max_pages) int32 (dummy (1,1) if flat)
         softmax_scale: cutlass.Float32,
         work_capacity: cutlass.Int32,
         stream: cuda.CUstream,
@@ -175,6 +180,7 @@ class SparseAttentionUnionFwdSm12x:
             mCuQ,
             mCuK,
             mQOffset,
+            mPageTable,
             softmax_scale_log2,
             sQ_layout,
             gmem_tiled_copy_KV,
@@ -202,6 +208,7 @@ class SparseAttentionUnionFwdSm12x:
         mCuQ: cute.Tensor,
         mCuK: cute.Tensor,
         mQOffset: cute.Tensor,
+        mPageTable: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.Layout,
         gmem_tiled_copy_KV: cute.TiledCopy,
@@ -328,16 +335,18 @@ class SparseAttentionUnionFwdSm12x:
             tVsV = gmem_thr_copy_KV.partition_D(sV)
             cKV = cute.make_identity_tensor((self._n_block_size, self._head_dim))
             tKVcKV = gmem_thr_copy_KV.partition_S(cKV)
-            mK_h = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
-            mV_h = cute.domain_offset((k_start, 0), mV[None, kv_head, None])
-            gK_all = cute.local_tile(
-                mK_h, (self._n_block_size, self._head_dim), (None, 0)
-            )
-            gV_all = cute.local_tile(
-                mV_h, (self._n_block_size, self._head_dim), (None, 0)
-            )
-            tKgK = gmem_thr_copy_KV.partition_S(gK_all)
-            tVgV = gmem_thr_copy_KV.partition_S(gV_all)
+            if cutlass.const_expr(not self._paged):
+                # flat: one batch-contiguous K/V tile, blocks indexed at read time.
+                mK_h = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
+                mV_h = cute.domain_offset((k_start, 0), mV[None, kv_head, None])
+                gK_all = cute.local_tile(
+                    mK_h, (self._n_block_size, self._head_dim), (None, 0)
+                )
+                gV_all = cute.local_tile(
+                    mV_h, (self._n_block_size, self._head_dim), (None, 0)
+                )
+                tKgK = gmem_thr_copy_KV.partition_S(gK_all)
+                tVgV = gmem_thr_copy_KV.partition_S(gV_all)
 
             # ///////////////////////////////////////////////////////////////
             # Loop over the union of KV blocks selected by this tile's tokens
@@ -347,18 +356,39 @@ class SparseAttentionUnionFwdSm12x:
                 mask_word = mUnionMasks[work_idx, u]
                 base = kv_block * self._n_block_size
 
+                # paged: the block IS one page -> remap through the page table and
+                # rebuild the gmem source tile per block (block coord 0). flat:
+                # reuse the batch tile set up above, indexed by kv_block.
+                if cutlass.const_expr(self._paged):
+                    page = mPageTable[batch_idx, kv_block]
+                    mK_pg = mK[page, kv_head, None, None]
+                    mV_pg = mV[page, kv_head, None, None]
+                    gK_b = cute.local_tile(
+                        mK_pg, (self._n_block_size, self._head_dim), (None, 0)
+                    )
+                    gV_b = cute.local_tile(
+                        mV_pg, (self._n_block_size, self._head_dim), (None, 0)
+                    )
+                    tKgK_b = gmem_thr_copy_KV.partition_S(gK_b)
+                    tVgV_b = gmem_thr_copy_KV.partition_S(gV_b)
+                    blk_coord = cutlass.Int32(0)
+                else:
+                    tKgK_b = tKgK
+                    tVgV_b = tVgV
+                    blk_coord = kv_block
+
                 # previous block's K/V fragment reads must be done first
                 self.cta_sync_barrier.arrive_and_wait()
                 for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
                     if cute.elem_less(base + tKVcKV[0, n, 0][0], seqlen_k):
                         cute.copy(
                             gmem_tiled_copy_KV,
-                            tKgK[None, n, None, kv_block],
+                            tKgK_b[None, n, None, blk_coord],
                             tKsK[None, n, None],
                         )
                         cute.copy(
                             gmem_tiled_copy_KV,
-                            tVgV[None, n, None, kv_block],
+                            tVgV_b[None, n, None, blk_coord],
                             tVsV[None, n, None],
                         )
                     else:

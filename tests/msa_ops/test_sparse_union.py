@@ -79,7 +79,7 @@ def _compile_union(G, causal, m_block, num_threads, hd, return_lse):
     cdt = _cutlass_dtype(torch.bfloat16)
     i32 = _cutlass_dtype(torch.int32)
     f32 = _cutlass_dtype(torch.float32)
-    s = [cute.sym_int() for _ in range(9)]
+    s = [cute.sym_int() for _ in range(11)]
     obj = SparseAttentionUnionFwdSm12x(
         head_dim=hd,
         m_block_size=m_block,
@@ -104,6 +104,7 @@ def _compile_union(G, causal, m_block, num_threads, hd, return_lse):
         _fake(i32, (s[4],), align=4),
         _fake(i32, (s[4],), align=4),
         _fake(i32, (s[5],), align=4),
+        _fake(i32, (s[9], s[10]), align=4),
         cutlass.Float32(1.0),
         cutlass.Int32(1),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -182,6 +183,7 @@ def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):
     wc = torch.tensor([n], dtype=torch.int32, device=dev)
     out = torch.empty(B * S, Hq, hd, dtype=torch.bfloat16, device=dev)
     lse = torch.empty(Hq, B * S, dtype=torch.float32, device=dev)
+    ptab_dummy = torch.zeros((1, 1), dtype=torch.int32, device=dev)
     compiled = _compile_union(G, True, m_block, num_threads, hd, False)
     compiled(
         q,
@@ -197,6 +199,7 @@ def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):
         cu,
         cu,
         qoff,
+        ptab_dummy,
         cutlass.Float32(scale),
         cutlass.Int32(n),
     )
@@ -210,6 +213,61 @@ def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):
     # to bf16 precision.
     assert mae_oracle <= mae_kv_oracle * 1.5 + 1e-6, (mae_oracle, mae_kv_oracle)
     assert mae_vs_kv < 5e-4, mae_vs_kv
+
+
+@pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
+def test_union_paged_matches_flat(B, S):
+    """Paged-KV union (page_size == block == 128, one page per KV block) matches
+    the flat union path bit-for-bit on identical data -- the paged path only
+    remaps the K/V block address through the page table."""
+    _skip()
+    from flashinfer.msa_ops import msa_sparse_attention
+
+    dev = "cuda"
+    Hq, Hkv, topk, hd = 64, 4, 16, 128
+    scale = 1.0 / math.sqrt(hd)
+    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    torch.manual_seed(17)
+    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=9)
+
+    flat = msa_sparse_attention(
+        q, k, v, q2k, cu, cu, union=True, causal=True, softmax_scale=scale
+    )
+
+    # relay flat K/V into a randomly-permuted paged cache (one 128-token page per
+    # KV block) and build the page table, then run the same union path paged.
+    npages = [S // BLK] * B
+    perm = torch.randperm(sum(npages))
+    k_pg = torch.zeros(sum(npages), Hkv, BLK, hd, dtype=k.dtype, device=dev)
+    v_pg = torch.zeros_like(k_pg)
+    ptab = torch.full((B, max(npages)), -1, dtype=torch.int32, device=dev)
+    pi = 0
+    for b in range(B):
+        for blk in range(npages[b]):
+            pg = int(perm[pi])
+            pi += 1
+            ptab[b, blk] = pg
+            rows = slice(b * S + blk * BLK, b * S + (blk + 1) * BLK)
+            k_pg[pg] = k[rows].transpose(0, 1)
+            v_pg[pg] = v[rows].transpose(0, 1)
+    seqused = torch.tensor([S] * B, dtype=torch.int32, device=dev)
+    paged = msa_sparse_attention(
+        q,
+        k_pg.contiguous(),
+        v_pg.contiguous(),
+        q2k,
+        cu,
+        page_table=ptab,
+        seqused_k=seqused,
+        union=True,
+        causal=True,
+        softmax_scale=scale,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(paged, flat)
 
 
 @pytest.mark.parametrize("B,S", [(1, 1024), (3, 384)])
