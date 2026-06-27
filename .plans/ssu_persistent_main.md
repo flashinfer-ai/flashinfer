@@ -307,13 +307,38 @@ NCU diff (lineinfo `--set full`, no-write b1024, `checkpointing_ssu_main_kernel`
   recompute-vs-store follow-up). Other top sites are now genuine compute (HMMA
   `common.cuh:1279` 24.9%, cumAdt STS `main.cuh:267` 16.9%).
 
+### Follow-ups landed: prev_k in entry + CB→smem (B200, 2026-06-26)
+
+Two latency cuts on top of the shift-register, no-write b1024 / b512 (`bench_checkpointing_ssu.py`
+CUPTI; ncu = lineinfo `--set full` b1024):
+
+| step | b512 | b1024 | ncu dur | long_scoreboard | notes |
+|---|---:|---:|---:|---:|---|
+| shift-register | 68.4 | 130.8 | 121.3 | 27.7% | (above) |
+| **+ prev_k in entry** | 66.5 | 126.2 | 116.8 | 21.2% | prev_num_accepted loaded ONCE at fetch |
+| **+ CB→smem cp.async** | **64.8** | **120.8** | **110.85** | 15.9% | CB A-operand from smem, not LDG |
+
+- **prev_k → `HeadMetaSSU` (1b).**  Was the #1 long_scoreboard site (`mc_of`/`derive_head` reloaded
+  `prev_num_accepted[cache_slot]` 3–5×/unit on the critical path).  Resolved at `fetch` (with
+  cache_slot, prefetched STAGES ahead, guarded `!= pad_slot_id`); `mc_of`/`derive_head` read the
+  register.  +1 int/entry, still register-resident.  INT compute 44.2→35.5%.
+- **CB → smem (`load_cb_async`).**  `load_cb_fragA` reads `Pack[lane]` *by lane*, so all NUM_WARPS
+  warps read the SAME 32 Packs → the just-in-time path did **128 redundant LDGs** for 32 unique
+  Packs, and the output HMMA stalled on them (`common.cuh:1279`, 27% of long_scoreboard).  Now W3
+  (idle in `load_x`'s post-gdc set) cp.async's the fragA-native blocks into 2 tiny smem buffers
+  (cb_new ≤512 B, cb_old ≤512 B; +2 KB total, **occupancy held at 5 blocks**) inside the post-gdc
+  group; consume is an LDS.  cb_old gated by `!must_checkpoint` (mirrors old_B).  CB HMMA stall gone.
+
+**Cumulative this session: b1024 142.2→120.8 µs (−15.0%), b512 74.2→64.8 µs (−12.7%).**  New #1
+long_scoreboard is `load_cumAdt`'s SYNCHRONOUS LDG+STS (`main.cuh:274`, 32%) — cumAdt is the last
+post-gdc input not on cp.async.
+
 ### Next levers
 
-- **1b:** carry `prev_k`/`mc` in the now-register-resident `head_meta` entry (resolved once at
-  prefetch) → kills `:1067`'s `prev_ptr[cache_slot]` reloads (loaded 3–5×/unit today). Cheap
-  now that the entry is register-resident.
+- **cumAdt → cp.async:** fold cumAdt into the post-gdc cp.async group (same pattern as CB) — it's
+  now the #1 long_scoreboard site (synchronous LDG+STS).
 - **2 (Plan B):** state-only pipelining — ring holds only `state`, C/old_B/x/cumAdt
-  single-buffered → smem ~38→~23 KB → **8 blocks**, to hide the residual long_scoreboard via
+  single-buffered → smem ~40→~24 KB → **8 blocks**, to hide the residual long_scoreboard via
   occupancy.
 
 ## TODO
