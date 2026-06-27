@@ -664,14 +664,17 @@ def _msa_sparse_attention_union(
     import cutlass.cute as cute
 
     from .cute_dsl.sparse_fwd_union_sm12x import SparseAttentionUnionFwdSm12x
-    from ._union_metadata import build_msa_union_metadata
+    from ._union_metadata import build_msa_union_metadata_device
 
     total_q, num_qo_heads, head_dim = q.shape
     dev = q.device
     m_block, num_threads = _union_tile_config(group_size)
     tokens_per_tile = m_block // group_size
 
-    ub, um, uc, wm, n = build_msa_union_metadata(
+    # On-device metadata builder: keeps the (Hkv, total_q, topk) selection on the
+    # GPU (only cu_seqlens is read host-side). The host reference
+    # build_msa_union_metadata is retained as the test oracle.
+    ub, um, uc, wm, n = build_msa_union_metadata_device(
         q2k_indices, cu_q_dev, tokens_per_tile, topk
     )
     # outputs default to 0 / -inf so query tiles that emit no work item (or rows a

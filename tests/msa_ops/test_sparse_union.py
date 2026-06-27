@@ -111,6 +111,47 @@ def _compile_union(G, causal, m_block, num_threads, hd, return_lse):
     )
 
 
+def _canon_union_meta(ub, um, uc, wm, n):
+    """Map a union-metadata tuple to {(batch, q_tile, kv_head): (blocks, masks)}
+    over its non-empty work items, so two builders can be compared regardless of
+    work-item emission order or empty-item padding."""
+    ub, um, uc, wm = (t.cpu() for t in (ub, um, uc, wm))
+    out = {}
+    for i in range(n):
+        cnt = int(uc[i])
+        if cnt == 0:
+            continue
+        key = tuple(int(x) for x in wm[i].tolist())
+        out[key] = (
+            tuple(int(x) for x in ub[i, :cnt].tolist()),
+            tuple(int(x) for x in um[i, :cnt].tolist()),
+        )
+    return out
+
+
+@pytest.mark.parametrize("tpt", [8, 16])
+@pytest.mark.parametrize("B,S", [(1, 2048), (3, 640)])
+def test_union_metadata_device_matches_host(tpt, B, S):
+    """The on-device union-metadata builder produces the same per-(batch, q-tile,
+    kv-head) unions and membership masks as the host reference builder."""
+    _skip()
+    from flashinfer.msa_ops._union_metadata import (
+        build_msa_union_metadata,
+        build_msa_union_metadata_device,
+    )
+
+    dev = "cuda"
+    Hkv, topk = 4, 16
+    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=13)
+
+    host = build_msa_union_metadata(q2k, cu, tpt, topk)
+    devb = build_msa_union_metadata_device(q2k, cu, tpt, topk)
+    torch.cuda.synchronize()
+
+    assert _canon_union_meta(*host) == _canon_union_meta(*devb)
+
+
 @pytest.mark.parametrize("m_block,num_threads", [(64, 128), (128, 256)])
 @pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
 def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):

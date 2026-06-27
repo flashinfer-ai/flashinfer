@@ -109,3 +109,123 @@ def build_msa_union_metadata(
         torch.tensor(meta, dtype=torch.int32, device=dev).reshape(n, 3),
         n,
     )
+
+
+# Compiled CuTe-DSL union builders, keyed by (topk, tokens_per_tile).
+_union_compile_cache: dict = {}
+
+
+def _get_compiled_union(topk: int, tokens_per_tile: int):
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.build_union_meta_sm12x import BuildUnionMetaSm12x
+    from .sparse_index_utils import _fake_i32
+
+    key = (topk, tokens_per_tile)
+    compiled = _union_compile_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    kernel_obj = BuildUnionMetaSm12x(topk=topk, tokens_per_tile=tokens_per_tile)
+    compiled = cute.compile(
+        kernel_obj,
+        _fake_i32(3),  # q2k
+        _fake_i32(1),  # tile_batch
+        _fake_i32(1),  # tile_t
+        _fake_i32(1),  # tile_qbase
+        _fake_i32(1),  # tile_ntok
+        _fake_i32(2),  # union_blocks (out)
+        _fake_i32(2),  # union_masks (out)
+        _fake_i32(1),  # union_count (out)
+        _fake_i32(2),  # work_meta (out)
+        cutlass.Int32(1),  # H
+        cutlass.Int32(1),  # total_tiles
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+    _union_compile_cache[key] = compiled
+    return compiled
+
+
+def build_msa_union_metadata_device(
+    q2k_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    tokens_per_tile: int,
+    topk: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """On-device equivalent of :func:`build_msa_union_metadata`.
+
+    Produces the same five outputs, but keeps the ``(num_kv_heads, total_q,
+    topk)`` selection on the GPU -- only ``cu_seqlens_q`` (a tiny ``(batch +
+    1,)`` tensor) is read host-side to lay out the work items, so there is no
+    host copy of the large q2k tensor (the production win over the reference
+    builder). A CuTe-DSL warp-per-work-item k-way merge (:class:`...cute_dsl.
+    build_union_meta_sm12x.BuildUnionMetaSm12x`) forms each union on device.
+
+    The emitted blocks are ascending (k-way merge of ascending lists), matching
+    the reference. Work items are enumerated over **all** (batch, q-tile,
+    kv-head) -- no empty-union compaction (a tile spanning valid queries always
+    selects at least one block), so the count is statically ``total_tiles *
+    num_kv_heads``; the order differs from the reference but the forward scatters
+    by ``work_meta`` so order is immaterial.
+    """
+    num_kv_heads, total_q, topk_in = q2k_indices.shape
+    if topk_in != topk:
+        raise ValueError(f"q2k_indices topk {topk_in} != {topk}")
+    dev = q2k_indices.device
+    max_union = tokens_per_tile * topk
+
+    # Work-item geometry from cu_seqlens alone: one tile per ``tokens_per_tile``
+    # queries per batch, for every kv-head.
+    cu = cu_seqlens_q.detach().to(device="cpu", dtype=torch.int64)
+    seqlens = cu[1:] - cu[:-1]
+    batch_size = seqlens.numel()
+    tpt = tokens_per_tile
+    ntiles_per_batch = (seqlens + tpt - 1) // tpt
+    total_tiles = int(ntiles_per_batch.sum())
+    work_items = total_tiles * num_kv_heads
+
+    if work_items == 0:
+        zeros2 = torch.empty((0, max_union), dtype=torch.int32, device=dev)
+        return (
+            zeros2,
+            zeros2.clone(),
+            torch.empty((0,), dtype=torch.int32, device=dev),
+            torch.empty((0, 3), dtype=torch.int32, device=dev),
+            0,
+        )
+
+    # Per-global-tile (batch, within-batch tile idx, query base, valid tokens).
+    tile_batch = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.int64), ntiles_per_batch
+    )
+    tile_base = torch.zeros(batch_size, dtype=torch.int64)
+    tile_base[1:] = ntiles_per_batch.cumsum(0)[:-1]
+    tile_t = torch.arange(total_tiles, dtype=torch.int64) - tile_base[tile_batch]
+    tile_qbase = cu[:-1][tile_batch] + tile_t * tpt
+    tile_ntok = torch.clamp(seqlens[tile_batch] - tile_t * tpt, max=tpt)
+
+    def _to_dev(t: torch.Tensor) -> torch.Tensor:
+        return t.to(dtype=torch.int32, device=dev)
+
+    union_blocks = torch.empty((work_items, max_union), dtype=torch.int32, device=dev)
+    union_masks = torch.empty((work_items, max_union), dtype=torch.int32, device=dev)
+    union_count = torch.empty((work_items,), dtype=torch.int32, device=dev)
+    work_meta = torch.empty((work_items, 3), dtype=torch.int32, device=dev)
+
+    compiled = _get_compiled_union(topk, tpt)
+    compiled(
+        q2k_indices,
+        _to_dev(tile_batch),
+        _to_dev(tile_t),
+        _to_dev(tile_qbase),
+        _to_dev(tile_ntok),
+        union_blocks,
+        union_masks,
+        union_count,
+        work_meta,
+        int(num_kv_heads),
+        int(total_tiles),
+    )
+    return union_blocks, union_masks, union_count, work_meta, work_items
