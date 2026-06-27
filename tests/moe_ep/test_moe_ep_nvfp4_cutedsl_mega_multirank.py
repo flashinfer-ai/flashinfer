@@ -3,8 +3,9 @@
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
-Requires Blackwell (sm_100+), >=4 GPUs, and the ``cutedsl_megamoe_front_end``
-package (``pip install -e cutedsl_megamoe/front_end``).
+Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
+(``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
+``flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -22,7 +23,7 @@ import os
 
 import pytest
 
-pytest.importorskip("cutedsl_megamoe_front_end")
+pytest.importorskip("flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels")
 
 
 def _require_cuda():
@@ -68,7 +69,7 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from cutedsl_megamoe_front_end import make_dummy_epilogue_params
+    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import make_dummy_epilogue_params
 
     g = torch.Generator(device="cuda").manual_seed(19 + rank)
     return make_dummy_epilogue_params(num_local_experts, generator=g)
@@ -204,7 +205,7 @@ def _reference_nvfp4_mega_moe_staged(problem: dict, *, destroy_buffer: bool = Tr
     import torch
     import torch.distributed as dist
 
-    from cutedsl_megamoe_front_end import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
+    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
         stage_mega_moe_inputs,
@@ -272,7 +273,7 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from cutedsl_megamoe_front_end import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
+    from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe, nvfp4_mega_moe
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
         preprocess_mega_weights,
@@ -381,7 +382,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from cutedsl_megamoe_front_end import get_symm_buffer_for_mega_moe
+            from flashinfer.moe_ep.backends.mega.kernel.cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe
 
             staging_buffer = get_symm_buffer_for_mega_moe(
                 problem["num_experts"],
@@ -562,7 +563,9 @@ def test_nvfp4_cutedsl_staging_uses_input_norm_const():
     topk = problem["topk"]
     sf_cols = hidden // 16
 
-    x_nvfp4_a = torch.empty(num_tokens, hidden // 2, dtype=torch.uint8, device="cuda")
+    x_nvfp4_a = torch.empty(
+        num_tokens, hidden // 2, dtype=torch.float4_e2m1fn_x2, device="cuda"
+    )
     x_nvfp4_b = torch.empty_like(x_nvfp4_a)
     x_sf_a = torch.empty(num_tokens, sf_cols, dtype=torch.float8_e4m3fn, device="cuda")
     x_sf_b = torch.empty_like(x_sf_a)

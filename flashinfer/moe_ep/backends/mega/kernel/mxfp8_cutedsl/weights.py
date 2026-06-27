@@ -18,7 +18,9 @@ Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
 
 
 def _require_cutedsl_paths() -> None:
-    import cutedsl_megamoe_front_end  # noqa: F401
+    from ..cutedsl_backend_kernels import bootstrap_paths
+
+    bootstrap_paths()
 
 
 def _mxfp8_data_dtype(kind: Mxfp8Kind) -> "torch.dtype":

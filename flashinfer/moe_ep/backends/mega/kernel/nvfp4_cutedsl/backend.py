@@ -86,7 +86,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> Any:
-        from cutedsl_megamoe_front_end import get_symm_buffer_for_mega_moe
+        from ..cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe
 
         rank, world_size = self._resolve_rank_world(bootstrap)
         k = self._kernel_config
@@ -180,7 +180,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         num_tokens: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from cutedsl_megamoe_front_end import nvfp4_mega_moe
+        from ..cutedsl_backend_kernels.frontend import nvfp4_mega_moe
 
         kcfg = self._kernel_config
         nvfp4_mega_moe(

@@ -8,7 +8,7 @@ from typing import Literal
 
 @dataclass
 class Mxfp8CutedslMegaMoeConfig:
-    """Kernel params for ``cutedsl_megamoe_front_end.mxfp8_mega_moe``.
+    """Kernel params for ``cutedsl_backend_kernels.frontend.mxfp8_mega_moe``.
 
     Expert weights must be MXFP8 at kernel launch; supply bf16 ``MoEWeightPack``
     and enable ``MegaConfig.preprocess_weights`` (default), or pass pre-quantized

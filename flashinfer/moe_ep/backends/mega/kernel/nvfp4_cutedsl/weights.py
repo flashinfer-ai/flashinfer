@@ -16,7 +16,9 @@ TransformedMegaWeights = Tuple[
 
 
 def _require_cutedsl_paths() -> None:
-    import cutedsl_megamoe_front_end  # noqa: F401
+    from ..cutedsl_backend_kernels import bootstrap_paths
+
+    bootstrap_paths()
 
 
 def _resolve_gate_up_clamp(

@@ -19,6 +19,7 @@ moe_ep/
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/{deep_gemm_mega,mxfp8_cutedsl,nvfp4_cutedsl}
+  backends/mega/kernel/cutedsl_backend_kernels/{common,frontend,moe_mxfp8_glu,moe_nvfp4_swapab,src}
   modes/{split_layer,mega_layer,config}.py
 ```
 

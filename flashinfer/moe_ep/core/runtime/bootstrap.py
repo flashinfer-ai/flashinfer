@@ -112,7 +112,9 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
     if _mega_no_dist() or _nvshmem_initialized():
         return False
 
-    import cutedsl_megamoe_front_end  # noqa: F401 — bootstrap_paths
+    from ...backends.mega.kernel.cutedsl_backend_kernels import bootstrap_paths
+
+    bootstrap_paths()
     import numpy as np
     import nvshmem.core
     import torch
