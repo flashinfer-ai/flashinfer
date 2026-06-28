@@ -23,6 +23,7 @@
 
 #include <cstdint>
 
+#include "flashinfer/utils.cuh"
 #include "tvm_ffi_utils.h"
 
 // Number of elements per block scale group
@@ -386,6 +387,7 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
           static_cast<out_type*>(output_k.data_ptr()), batch_size, max_seq_len,
           block_tables.size(1), num_pages, page_size, num_heads, k_head_dim, k_stride_page,
           k_stride_n, k_stride_h, k_scale_stride_page, k_scale_stride_n, k_scale_stride_h);
+      FLASHINFER_CUDA_CHECK(cudaGetLastError());
       nvfp4_paged_dequant_kernel<out_type, id_type><<<grid, v_block, 0, stream>>>(
           static_cast<const uint8_t*>(paged_v_cache.data_ptr()),
           static_cast<const uint8_t*>(v_scales.data_ptr()),
@@ -395,6 +397,7 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
           static_cast<out_type*>(output_v.data_ptr()), batch_size, max_seq_len,
           block_tables.size(1), num_pages, page_size, num_heads, v_head_dim, v_stride_page,
           v_stride_n, v_stride_h, v_scale_stride_page, v_scale_stride_n, v_scale_stride_h);
+      FLASHINFER_CUDA_CHECK(cudaGetLastError());
       return true;
     });
     return true;

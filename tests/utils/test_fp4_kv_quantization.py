@@ -242,6 +242,91 @@ def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype, non_cont
 
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_nvfp4_kv_dequantize_paged_long_context(kv_layout):
+    """Exercise a long single-request cached-prefill style page walk."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    page_size = 16
+    batch_size = 1
+    max_seq_len = 16674
+    num_pages = (max_seq_len + page_size - 1) // page_size
+    num_kv_heads = 4
+    k_head_dim = 128
+    v_head_dim = 128
+    k_scale_dim = k_head_dim // 16
+    v_scale_dim = v_head_dim // 16
+
+    k_cache_nhd = torch.zeros(
+        (num_pages, page_size, num_kv_heads, k_head_dim // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    v_cache_nhd = torch.zeros(
+        (num_pages, page_size, num_kv_heads, v_head_dim // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    k_scales_nhd = torch.zeros(
+        (num_pages, page_size, num_kv_heads, k_scale_dim),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e4m3fn)
+    v_scales_nhd = torch.zeros(
+        (num_pages, page_size, num_kv_heads, v_scale_dim),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e4m3fn)
+
+    if kv_layout == "NHD":
+        k_cache = k_cache_nhd
+        v_cache = v_cache_nhd
+        k_scales = k_scales_nhd
+        v_scales = v_scales_nhd
+    else:
+        k_cache = k_cache_nhd.permute(0, 2, 1, 3).contiguous()
+        v_cache = v_cache_nhd.permute(0, 2, 1, 3).contiguous()
+        k_scales = k_scales_nhd.permute(0, 2, 1, 3).contiguous()
+        v_scales = v_scales_nhd.permute(0, 2, 1, 3).contiguous()
+
+    block_tables = torch.arange(num_pages, dtype=torch.int32, device="cuda").reshape(
+        batch_size, num_pages
+    )
+    seq_lens = torch.tensor([max_seq_len], dtype=torch.int32, device="cuda")
+    k_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    output_k = torch.full(
+        (batch_size, max_seq_len, num_kv_heads, k_head_dim),
+        123.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output_v = torch.full(
+        (batch_size, max_seq_len, num_kv_heads, v_head_dim),
+        123.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    flashinfer.nvfp4_kv_dequantize_paged(
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        block_tables,
+        seq_lens,
+        k_scale,
+        v_scale,
+        output_k,
+        output_v,
+        kv_layout=kv_layout,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(output_k).item() == 0
+    assert torch.count_nonzero(output_v).item() == 0
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_nvfp4_kv_dequantize_paged_stacked_cache(kv_layout, dtype):
     """Test stacked paged KV cache input for the paged NVFP4 dequant helper."""
