@@ -422,10 +422,11 @@ class BlockSparseAttentionWrapper:
         # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
         if self._backend == "vsa_blackwell":
             cc = get_compute_capability(self.device)
-            if cc[0] < 10:
+            arch = cc[0] * 10 + cc[1]
+            if arch // 10 not in (10, 11):
                 raise RuntimeError(
-                    f"vsa_blackwell backend requires SM100+ (Blackwell), "
-                    f"current device is SM{cc[0] * 10 + cc[1]}"
+                    f"vsa_blackwell backend requires SM100/SM110 (Blackwell), "
+                    f"current device is SM{arch}"
                 )
             # BSA blk128 kernel uses 128-token compute tiles; block index granularity = R = C = 128.
             if R != 128 or C != 128:
@@ -515,10 +516,11 @@ class BlockSparseAttentionWrapper:
         # ---- VSA Blackwell blk64 backend (BSA blk64 C++ kernel) ------------------
         if self._backend == "vsa_blackwell_blk64":
             cc = get_compute_capability(self.device)
-            if cc[0] < 10:
+            arch = cc[0] * 10 + cc[1]
+            if arch // 10 != 10:
                 raise RuntimeError(
-                    f"vsa_blackwell_blk64 backend requires SM100+ (Blackwell), "
-                    f"current device is SM{cc[0] * 10 + cc[1]}"
+                    f"vsa_blackwell_blk64 backend requires SM100 (Blackwell), "
+                    f"current device is SM{arch}"
                 )
             # blk64 kernel uses 64-token compute tiles; block index granularity = R = C = 64.
             if R != 64 or C != 64:

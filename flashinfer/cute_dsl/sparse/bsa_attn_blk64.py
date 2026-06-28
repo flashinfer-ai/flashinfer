@@ -67,6 +67,10 @@ def bsa_attn_blk64_fwd(
     assert k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16
     assert head_dim == 128, f"blk64 kernel requires head_dim=128, got {head_dim}"
     assert q.is_cuda and k.is_cuda and v.is_cuda
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = major * 10 + minor
+    if arch // 10 != 10:
+        raise RuntimeError(f"BSA blk64 only supports SM100, current device is SM{arch}")
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
