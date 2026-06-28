@@ -309,6 +309,8 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
     TVM_FFI_ICHECK(v_scales.size(3) == v_scale_dim) << "v_scales head_dim mismatch";
   }
   TVM_FFI_ICHECK(cache_num_heads == num_heads) << "cache num_heads mismatch";
+  TVM_FFI_ICHECK(block_tables.size(1) * page_size >= max_seq_len)
+      << "block_tables column count insufficient for max_seq_len";
 
   auto check_cache_shape = [&](TensorView data, TensorView scales, const int packed_dim,
                                const int scale_dim, const char* name) {

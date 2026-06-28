@@ -241,6 +241,58 @@ def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype, non_cont
     torch.testing.assert_close(output_v.float(), ref_v.float(), atol=1e-3, rtol=1e-3)
 
 
+def test_nvfp4_kv_dequantize_paged_rejects_short_block_tables():
+    """Reject page tables that cannot cover the requested output length."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    num_pages = 2
+    page_size = 4
+    batch_size = 1
+    max_seq_len = 5
+    num_kv_heads = 1
+    head_dim = 64
+    scale_dim = head_dim // 16
+
+    k_cache = torch.empty(
+        (num_pages, page_size, num_kv_heads, head_dim // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    v_cache = torch.empty_like(k_cache)
+    k_scales = torch.empty(
+        (num_pages, page_size, num_kv_heads, scale_dim),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e4m3fn)
+    v_scales = torch.empty_like(k_scales)
+    # max_seq_len=5 and page_size=4 require two page table columns.
+    block_tables = torch.zeros((batch_size, 1), dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([max_seq_len], dtype=torch.int32, device="cuda")
+    k_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    output_k = torch.empty(
+        (batch_size, max_seq_len, num_kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output_v = torch.empty_like(output_k)
+
+    with pytest.raises(RuntimeError, match="block_tables column count insufficient"):
+        flashinfer.nvfp4_kv_dequantize_paged(
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            block_tables,
+            seq_lens,
+            k_scale,
+            v_scale,
+            output_k,
+            output_v,
+            kv_layout="NHD",
+        )
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_nvfp4_kv_quant(shape, dtype):
