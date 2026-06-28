@@ -1921,6 +1921,10 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
             FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
             id="MxFp8",
         ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="DSFp8",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1955,7 +1959,11 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
-                "compatible_moe_impls": [BF16Moe, MxInt4BlockScaleMoe],
+                "compatible_moe_impls": [
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                    FP8BlockScaleMoe,
+                ],
             },
             id="Shuffled_BlockMajorK",
         ),
@@ -1965,7 +1973,7 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
                 "layout": WeightLayout.MajorK,
                 "compatible_moe_impls": [FP8BlockScaleMoe],
             },
-            id="Shuffled_MajorK_MxFp8",
+            id="Shuffled_MajorK",
         ),
     ],
 )
