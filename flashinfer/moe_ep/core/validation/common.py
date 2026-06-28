@@ -174,7 +174,7 @@ def validate_mega_forward_inputs(
     fleet_params: FleetParams,
     *,
     top_k: int,
-    stage_inputs: bool,
+    quantize_input: bool,
     scales: "torch.Tensor | None" = None,
 ) -> None:
     num_tokens = hidden_states.shape[0]
@@ -205,9 +205,9 @@ def validate_mega_forward_inputs(
         )
     if topk_weights.shape != topk_ids.shape:
         raise MoEEpConfigError("topk_weights and topk_ids must have the same shape")
-    if not stage_inputs and scales is None:
+    if not quantize_input and scales is None:
         raise MoEEpConfigError(
-            "MoEEpTensors.scales is required when MegaConfig.stage_inputs=False"
+            "MoEEpTensors.scales is required when MegaConfig.quantize_input=False"
         )
 
 

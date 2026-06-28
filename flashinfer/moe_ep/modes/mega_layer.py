@@ -57,6 +57,11 @@ class MoEEpMegaLayer(nn.Module):
 
         if backend.transformed_weights is not None:
             self._transformed = backend.transformed_weights
+            self._kernel.validate_transformed_weights(
+                self._transformed,
+                self._bootstrap,
+                self._fleet_params,
+            )
         elif backend.preprocess_weights:
             self._preprocess_weights()
 
@@ -74,18 +79,18 @@ class MoEEpMegaLayer(nn.Module):
             )
         return self._workspace
 
-    def _resolve_stage_inputs(self, t: "MoEEpTensors") -> bool:
-        if not self._mega_config.stage_inputs:
+    def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
+        if not self._mega_config.quantize_input:
             return False
         return t.hidden_states.dtype == torch.bfloat16
 
     def forward(self, t: "MoEEpTensors") -> torch.Tensor:
-        stage_inputs = self._resolve_stage_inputs(t)
+        quantize_input = self._resolve_quantize_input(t)
 
         self._kernel.validate_forward(
             t,
             self._fleet_params,
-            stage_inputs=stage_inputs,
+            quantize_input=quantize_input,
         )
 
         if self._transformed is None:
@@ -103,7 +108,7 @@ class MoEEpMegaLayer(nn.Module):
         self._kernel.stage_inputs(
             t,
             workspace,
-            stage_inputs=stage_inputs,
+            quantize_input=quantize_input,
             num_tokens=num_tokens,
         )
 

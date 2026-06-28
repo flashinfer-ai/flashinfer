@@ -283,7 +283,7 @@ def _run_mega_layer(rank, world_size):
                 activation_clamp=problem["activation_clamp"],
                 fast_math=problem["fast_math"],
             ),
-            stage_inputs=True,
+            quantize_input=True,
             preprocess_weights=True,
         ),
     )

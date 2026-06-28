@@ -344,7 +344,7 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool):
     return Nvfp4CutedslMegaMoeConfig(**kwargs)
 
 
-def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
+def _run_mega_layer(rank, world_size, *, quantize_input: bool):
     import torch
     import torch.distributed as dist
 
@@ -370,7 +370,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
 
     problem = _mega_problem(rank, world_size)
     kernel = create_mega_kernel(
-        _megakernel_config(problem, epilogue_via_config=stage_inputs)
+        _megakernel_config(problem, epilogue_via_config=quantize_input)
     )
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
@@ -378,7 +378,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
     )
 
     try:
-        if stage_inputs:
+        if quantize_input:
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
@@ -422,16 +422,16 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
             ),
             backend=MegaConfig(
                 megakernel=_megakernel_config(
-                    problem, epilogue_via_config=stage_inputs
+                    problem, epilogue_via_config=quantize_input
                 ),
-                stage_inputs=stage_inputs,
+                quantize_input=quantize_input,
                 preprocess_weights=True,
             ),
         )
         assert isinstance(mega, MoEEpMegaLayer)
 
         tensor_kwargs = {}
-        if not stage_inputs:
+        if not quantize_input:
             tensor_kwargs = dict(
                 fc1_alpha=problem["fc1_alpha"],
                 fc2_alpha=problem["fc2_alpha"],
@@ -448,7 +448,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
         torch.cuda.synchronize()
         dist.barrier()
 
-        if stage_inputs:
+        if quantize_input:
             y_ref = _reference_nvfp4_mega_moe_staged(problem, destroy_buffer=True)
         else:
             y_ref = _reference_nvfp4_mega_moe_prestaged(
@@ -478,7 +478,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
-    rank = _run_mega_layer(rank, world_size, stage_inputs=True)
+    rank = _run_mega_layer(rank, world_size, quantize_input=True)
     print(f"rank {rank}: nvfp4_cutedsl mega layer (staged inputs) matches reference")
 
 
@@ -488,13 +488,13 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     """MoEEpMegaLayer (nvfp4_cutedsl) with pre-staged NVFP4 activations.
 
     Per-expert epilogue scalars are supplied via :class:`MoEEpTensors` and copied
-    into the symm workspace during ``stage_inputs``.
+    into the symm workspace when ``quantize_input=False``.
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
-    rank = _run_mega_layer(rank, world_size, stage_inputs=False)
+    rank = _run_mega_layer(rank, world_size, quantize_input=False)
     print(
         f"rank {rank}: nvfp4_cutedsl mega layer (prestaged inputs) matches reference"
     )

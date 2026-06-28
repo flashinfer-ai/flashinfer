@@ -219,4 +219,78 @@ def preprocess_mega_weights(
     return (fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf)
 
 
-__all__ = ["MoEWeightPack", "TransformedMegaWeights", "preprocess_mega_weights"]
+def _mxfp8_swizzled_flat_sf_size(rows: int, cols: int) -> int:
+    import torch
+
+    _require_cutedsl_paths()
+    from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype, to_blocked
+
+    plain = torch.zeros(rows, cols, dtype=Mxfp8ScaleDtype)
+    return to_blocked(plain).numel()
+
+
+def validate_transformed_mega_weights(
+    transformed: TransformedMegaWeights,
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    kind: Mxfp8Kind = "mxfp8_e4m3",
+    world_size: int,
+    num_experts: int,
+) -> None:
+    """One-time check for kernel-ready MXFP8 weights (``preprocess_weights=False``)."""
+    import torch
+
+    from .....core.validation.common import MoEEpConfigError
+    from ..weight_validation import (
+        check_transformed_mega_weights_structure,
+        check_transformed_weight_pair,
+    )
+
+    if world_size <= 0:
+        raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
+    if num_experts % world_size != 0:
+        raise MoEEpConfigError(
+            f"num_experts ({num_experts}) must be divisible by world_size ({world_size})"
+        )
+
+    local_experts = num_experts // world_size
+    i_down = intermediate_size // 2
+    data_dtype = _mxfp8_data_dtype(kind)
+
+    _require_cutedsl_paths()
+    from common.megamoe_constants import Mxfp8BlockSize
+    from moe_nvfp4_swapab.runner_common import ceil_div
+
+    hidden_sf_cols = ceil_div(hidden_size, Mxfp8BlockSize)
+    i_down_sf_cols = ceil_div(i_down, Mxfp8BlockSize)
+    fc1_flat_sf = _mxfp8_swizzled_flat_sf_size(intermediate_size, hidden_sf_cols)
+    fc2_flat_sf = _mxfp8_swizzled_flat_sf_size(hidden_size, i_down_sf_cols)
+
+    check_transformed_mega_weights_structure(transformed)
+    check_transformed_weight_pair(
+        transformed[0],
+        label="fc1",
+        num_local_experts=local_experts,
+        weight_dtype=data_dtype,
+        expected_weight_shape=(local_experts, hidden_size, intermediate_size),
+        scale_dtype=torch.uint8,
+        expected_scale_shape=(local_experts, fc1_flat_sf),
+    )
+    check_transformed_weight_pair(
+        transformed[1],
+        label="fc2",
+        num_local_experts=local_experts,
+        weight_dtype=data_dtype,
+        expected_weight_shape=(local_experts, i_down, hidden_size),
+        scale_dtype=torch.uint8,
+        expected_scale_shape=(local_experts, fc2_flat_sf),
+    )
+
+
+__all__ = [
+    "MoEWeightPack",
+    "TransformedMegaWeights",
+    "preprocess_mega_weights",
+    "validate_transformed_mega_weights",
+]

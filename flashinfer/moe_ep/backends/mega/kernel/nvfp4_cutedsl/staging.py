@@ -71,20 +71,20 @@ def validate_nvfp4_forward_inputs(
     fleet_params,
     *,
     top_k: int,
-    stage_inputs: bool,
+    quantize_input: bool,
     scales: torch.Tensor | None = None,
 ) -> None:
     """NVFP4 mega-path validation (bf16 staging or pre-staged NVFP4)."""
     from .....core.validation.common import validate_mega_forward_inputs
 
-    if stage_inputs:
+    if quantize_input:
         validate_mega_forward_inputs(
             hidden_states,
             topk_ids,
             topk_weights,
             fleet_params,
             top_k=top_k,
-            stage_inputs=True,
+            quantize_input=True,
         )
         return
 
@@ -92,7 +92,7 @@ def validate_nvfp4_forward_inputs(
     hidden = fleet_params.token_hidden_size
     if scales is None:
         raise MoEEpConfigError(
-            "MoEEpTensors.scales is required when MegaConfig.stage_inputs=False"
+            "MoEEpTensors.scales is required when MegaConfig.quantize_input=False"
         )
     if num_tokens > fleet_params.max_tokens_per_rank:
         raise MoEEpConfigError(

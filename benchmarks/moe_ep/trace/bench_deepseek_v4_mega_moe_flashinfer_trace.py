@@ -103,7 +103,7 @@ def _build_mega_moe_layer(
                 activation_clamp=activation_clamp,
                 fast_math=fast_math,
             ),
-            stage_inputs=True,
+            quantize_input=True,
             preprocess_weights=True,
         ),
     )
@@ -217,7 +217,7 @@ def main() -> int:
             activation_clamp=activation_clamp,
             routing_mode=routing_mode_from_args(args),
             extra_lines=(
-                "  stage_inputs=True preprocess_weights=True",
+                "  quantize_input=True preprocess_weights=True",
                 "  nvtx_ranges=setup,cold_start,warmup,steady_capture,forward",
             ),
             timing_mode_note=MOE_EP_V2_TIMING_MODE_NOTE,

@@ -78,21 +78,21 @@ def validate_mxfp8_forward_inputs(
     fleet_params,
     *,
     top_k: int,
-    stage_inputs: bool,
+    quantize_input: bool,
     kind: str = "mxfp8_e4m3",
     scales: torch.Tensor | None = None,
 ) -> None:
     """MXFP8 mega-path validation (bf16 staging or pre-staged fp8)."""
     from .....core.validation.common import validate_mega_forward_inputs
 
-    if stage_inputs:
+    if quantize_input:
         validate_mega_forward_inputs(
             hidden_states,
             topk_ids,
             topk_weights,
             fleet_params,
             top_k=top_k,
-            stage_inputs=True,
+            quantize_input=True,
         )
         return
 
@@ -105,7 +105,7 @@ def validate_mxfp8_forward_inputs(
     data_dtype = _mxfp8_data_dtype(kind)
     if scales is None:
         raise MoEEpConfigError(
-            "MoEEpTensors.scales is required when MegaConfig.stage_inputs=False"
+            "MoEEpTensors.scales is required when MegaConfig.quantize_input=False"
         )
     if num_tokens > fleet_params.max_tokens_per_rank:
         raise MoEEpConfigError(

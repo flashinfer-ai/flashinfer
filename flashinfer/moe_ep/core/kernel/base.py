@@ -107,16 +107,24 @@ class MegaKernelBackend(ABC):
         t: "MoEEpTensors",
         fleet_params: "FleetParams",
         *,
-        stage_inputs: bool,
+        quantize_input: bool,
     ) -> None:
         """Optional per-iteration validation before staging/compute."""
+
+    def validate_transformed_weights(
+        self,
+        transformed_weights: Any,
+        bootstrap: "BootstrapConfig",
+        fleet_params: "FleetParams",
+    ) -> None:
+        """Optional init-time validation for user-supplied kernel-ready weights."""
 
     def stage_inputs(
         self,
         t: "MoEEpTensors",
         workspace: Any,
         *,
-        stage_inputs: bool,
+        quantize_input: bool,
         num_tokens: int,
     ) -> None:
         """Copy or quantize activations into workspace buffers."""

@@ -87,4 +87,78 @@ def preprocess_mega_weights(
     return deep_gemm.transform_weights_for_mega_moe(l1, l2)
 
 
-__all__ = ["MoEWeightPack", "TransformedMegaWeights", "preprocess_mega_weights"]
+def validate_transformed_mega_weights(
+    transformed: TransformedMegaWeights,
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    world_size: int,
+    num_experts: int,
+) -> None:
+    """One-time check for kernel-ready DeepGEMM fp4 weights (``preprocess_weights=False``)."""
+    import torch
+
+    from .....core.validation.common import MoEEpConfigError
+
+    if world_size <= 0:
+        raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
+    if num_experts % world_size != 0:
+        raise MoEEpConfigError(
+            f"num_experts ({num_experts}) must be divisible by world_size ({world_size})"
+        )
+
+    local_experts = num_experts // world_size
+    fc1_out = 2 * intermediate_size
+    expected_fc1_w = (local_experts, fc1_out, hidden_size // 2)
+    expected_fc2_w = (local_experts, hidden_size, intermediate_size // 2)
+
+    if not isinstance(transformed, tuple) or len(transformed) != 2:
+        raise MoEEpConfigError(
+            f"transformed_weights must be a 2-tuple (fc1, fc2), got {type(transformed).__name__}"
+        )
+
+    for label, pair, expected_shape in (
+        ("fc1", transformed[0], expected_fc1_w),
+        ("fc2", transformed[1], expected_fc2_w),
+    ):
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            continue
+        weight, scale = pair
+        if not isinstance(weight, torch.Tensor):
+            raise MoEEpConfigError(
+                f"transformed_weights {label} weight must be a torch.Tensor, "
+                f"got {type(weight).__name__}"
+            )
+        if not isinstance(scale, torch.Tensor):
+            raise MoEEpConfigError(
+                f"transformed_weights {label} scale must be a torch.Tensor, "
+                f"got {type(scale).__name__}"
+            )
+        if weight.dtype != torch.int8:
+            raise MoEEpConfigError(
+                f"transformed_weights {label} weight must be torch.int8 (NVFP4), "
+                f"got {weight.dtype}"
+            )
+        if weight.shape != expected_shape:
+            raise MoEEpConfigError(
+                f"transformed_weights {label} weight must have shape "
+                f"{expected_shape}, got {tuple(weight.shape)}"
+            )
+        if weight.shape[0] != local_experts:
+            raise MoEEpConfigError(
+                f"transformed_weights {label} leading dim ({weight.shape[0]}) must "
+                f"match num_experts // world_size ({local_experts})"
+            )
+        if scale.shape[0] != local_experts:
+            raise MoEEpConfigError(
+                f"transformed_weights {label} scale leading dim ({scale.shape[0]}) "
+                f"must match num_experts // world_size ({local_experts})"
+            )
+
+
+__all__ = [
+    "MoEWeightPack",
+    "TransformedMegaWeights",
+    "preprocess_mega_weights",
+    "validate_transformed_mega_weights",
+]

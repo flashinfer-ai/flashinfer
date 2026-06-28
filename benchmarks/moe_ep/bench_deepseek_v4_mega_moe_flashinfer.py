@@ -112,7 +112,7 @@ def _build_mega_moe_layer(
                 activation_clamp=activation_clamp,
                 fast_math=fast_math,
             ),
-            stage_inputs=True,
+            quantize_input=True,
             preprocess_weights=True,
         ),
     )
@@ -218,7 +218,7 @@ def main() -> int:
             num_experts=num_experts,
             activation_clamp=activation_clamp,
             routing_mode=routing_mode_from_args(args),
-            extra_lines=("  stage_inputs=True preprocess_weights=True",),
+            extra_lines=("  quantize_input=True preprocess_weights=True",),
             timing_mode_note=MOE_EP_V2_TIMING_MODE_NOTE,
         )
         print_benchmark_timing(

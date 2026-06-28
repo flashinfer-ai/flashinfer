@@ -10,11 +10,27 @@ import pytest
 _KERNEL_READY = ((None, None), (None, None))
 
 
+def _fake_deep_gemm_transformed(
+    *,
+    num_experts: int = 1,
+    intermediate: int = 128,
+    hidden: int = 128,
+):
+    import torch
+
+    fc1_out = 2 * intermediate
+    w1 = torch.zeros(num_experts, fc1_out, hidden // 2, dtype=torch.int8)
+    sf1 = torch.zeros(num_experts, fc1_out, hidden // 32)
+    w2 = torch.zeros(num_experts, hidden, intermediate // 2, dtype=torch.int8)
+    sf2 = torch.zeros(num_experts, hidden, intermediate // 32)
+    return ((w1, sf1), (w2, sf2))
+
+
 def _mega_layer(
     *,
-    stage_inputs: bool = True,
+    quantize_input: bool = True,
     preprocess_weights: bool = False,
-    transformed_weights=_KERNEL_READY,
+    transformed_weights=None,
 ):
     import torch
 
@@ -28,6 +44,8 @@ def _mega_layer(
     )
 
     with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
+        if transformed_weights is None:
+            transformed_weights = _fake_deep_gemm_transformed()
         return MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(
@@ -41,7 +59,7 @@ def _mega_layer(
             ),
             backend=MegaConfig(
                 megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
-                stage_inputs=stage_inputs,
+                quantize_input=quantize_input,
                 preprocess_weights=preprocess_weights,
                 transformed_weights=transformed_weights,
             ),
@@ -142,7 +160,7 @@ def test_mega_layer_forward_requires_scales_when_copy_mode():
 
     from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
 
-    layer = _mega_layer(stage_inputs=False)
+    layer = _mega_layer(quantize_input=False)
     layer._workspace = _fake_symm_buffer()  # type: ignore[attr-defined]
 
     t = MoEEpTensors(
@@ -184,3 +202,171 @@ def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():
         with mock.patch("torch.distributed.get_world_size", return_value=8):
             with pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"):
                 _mega_layer()
+
+
+def test_mega_layer_forward_passes_quantize_input_to_kernel():
+    import torch
+
+    from flashinfer.moe_ep import MoEEpTensors
+
+    layer = _mega_layer(quantize_input=True)
+    layer._workspace = _fake_symm_buffer(max_tokens=64)  # type: ignore[attr-defined]
+
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(8, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(8, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(8, 2),
+    )
+    with mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states):
+        with mock.patch.object(layer._kernel, "stage_inputs") as stage_mock:
+            layer.forward(t)
+            stage_mock.assert_called_once()
+            assert stage_mock.call_args.kwargs["quantize_input"] is True
+
+
+def test_mega_layer_forward_skips_quantize_when_config_disabled():
+    import torch
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("needs torch.float8_e4m3fn")
+
+    from flashinfer.moe_ep import MoEEpTensors
+
+    layer = _mega_layer(quantize_input=False)
+    layer._workspace = _fake_symm_buffer(max_tokens=64)  # type: ignore[attr-defined]
+
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(8, 128, dtype=torch.float8_e4m3fn),
+        topk_ids=torch.zeros(8, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(8, 2),
+        scales=torch.zeros(8, 4),
+    )
+    with mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states):
+        with mock.patch.object(layer._kernel, "stage_inputs") as stage_mock:
+            layer.forward(t)
+            stage_mock.assert_called_once()
+            assert stage_mock.call_args.kwargs["quantize_input"] is False
+
+
+def test_mega_layer_auto_skips_quantize_for_prequantized_fp8():
+    """quantize_input=True but bf16 dtype check skips quantize for fp8 inputs."""
+    import torch
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("needs torch.float8_e4m3fn")
+
+    from flashinfer.moe_ep import MoEEpTensors
+
+    layer = _mega_layer(quantize_input=True)
+    layer._workspace = _fake_symm_buffer(max_tokens=64)  # type: ignore[attr-defined]
+
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(8, 128, dtype=torch.float8_e4m3fn),
+        topk_ids=torch.zeros(8, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(8, 2),
+        scales=torch.zeros(8, 4),
+    )
+    with mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states):
+        with mock.patch.object(layer._kernel, "stage_inputs") as stage_mock:
+            layer.forward(t)
+            stage_mock.assert_called_once()
+            assert stage_mock.call_args.kwargs["quantize_input"] is False
+
+
+def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
+    import torch
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("needs torch.float8_e4m3fn")
+
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend import (
+        DeepGemmMegaKernelBackend,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.config import (
+        DeepGemmMegaMoeConfig,
+    )
+
+    backend = DeepGemmMegaKernelBackend(
+        DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2)
+    )
+    num_tokens = 4
+    hidden = 128
+    top_k = 2
+    workspace = _fake_symm_buffer(max_tokens=64, hidden=hidden, top_k=top_k)
+
+    hidden_fp8 = torch.randn(num_tokens, hidden).to(torch.float8_e4m3fn)
+    scales = torch.randn(num_tokens, hidden // 32)
+    topk_ids = torch.tensor([[0, 1], [1, 0], [0, 0], [1, 1]], dtype=torch.int64)
+    topk_weights = torch.randn(num_tokens, top_k)
+
+    t = MoEEpTensors(
+        hidden_states=hidden_fp8,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        scales=scales,
+    )
+    backend.stage_inputs(t, workspace, quantize_input=False, num_tokens=num_tokens)
+
+    assert torch.equal(
+        workspace.x[:num_tokens], hidden_fp8.to(torch.float32)
+    )
+    assert torch.equal(workspace.x_sf[:num_tokens], scales)
+    assert torch.equal(workspace.topk_idx[:num_tokens], topk_ids)
+    assert torch.equal(workspace.topk_weights[:num_tokens], topk_weights)
+
+
+def test_mega_layer_init_accepts_valid_transformed_weights():
+    layer = _mega_layer()
+    assert layer._transformed is not None
+
+
+def test_mega_layer_init_rejects_invalid_transformed_weight_dtype():
+    import torch
+
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    bad = _fake_deep_gemm_transformed()
+    bad[0][0] = bad[0][0].to(torch.float32)
+    with pytest.raises(MoEEpConfigError, match="torch.int8"):
+        _mega_layer(transformed_weights=bad)
+
+
+def test_mega_layer_init_rejects_invalid_transformed_structure():
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    with pytest.raises(MoEEpConfigError, match="2-tuple"):
+        _mega_layer(
+            transformed_weights=(_fake_deep_gemm_transformed()[0],),
+        )
+
+
+def test_deep_gemm_validate_transformed_weights_accepts_preprocess_output():
+    pytest.importorskip("deep_gemm")
+    import torch
+
+    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.weights import (
+        preprocess_mega_weights,
+        validate_transformed_mega_weights,
+    )
+    from flashinfer.moe_ep.weights import MoEWeightPack
+
+    num_experts = 1
+    intermediate = 128
+    hidden = 128
+    weights = MoEWeightPack(
+        w13=torch.randn(num_experts, 2 * intermediate, hidden),
+        w2=torch.randn(num_experts, hidden, intermediate),
+    )
+    transformed = preprocess_mega_weights(
+        weights,
+        intermediate_size=intermediate,
+        hidden_size=hidden,
+    )
+    validate_transformed_mega_weights(
+        transformed,
+        intermediate_size=intermediate,
+        hidden_size=hidden,
+        world_size=1,
+        num_experts=num_experts,
+    )

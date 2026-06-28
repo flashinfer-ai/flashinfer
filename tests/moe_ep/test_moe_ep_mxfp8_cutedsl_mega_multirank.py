@@ -285,7 +285,7 @@ def _megakernel_config(problem: dict):
     )
 
 
-def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
+def _run_mega_layer(rank, world_size, *, quantize_input: bool):
     import torch
     import torch.distributed as dist
 
@@ -317,7 +317,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
     )
 
     try:
-        if stage_inputs:
+        if quantize_input:
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
@@ -365,7 +365,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
             ),
             backend=MegaConfig(
                 megakernel=_megakernel_config(problem),
-                stage_inputs=stage_inputs,
+                quantize_input=quantize_input,
                 preprocess_weights=True,
             ),
         )
@@ -381,7 +381,7 @@ def _run_mega_layer(rank, world_size, *, stage_inputs: bool):
         torch.cuda.synchronize()
         dist.barrier()
 
-        if stage_inputs:
+        if quantize_input:
             y_ref = _reference_mxfp8_mega_moe_staged(problem, destroy_buffer=True)
         else:
             y_ref = _reference_mxfp8_mega_moe_prestaged(
@@ -407,7 +407,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_matches_reference():
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
-    rank = _run_mega_layer(rank, world_size, stage_inputs=True)
+    rank = _run_mega_layer(rank, world_size, quantize_input=True)
     print(f"rank {rank}: mxfp8_cutedsl mega layer (staged inputs) matches reference")
 
 
@@ -419,7 +419,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
-    rank = _run_mega_layer(rank, world_size, stage_inputs=False)
+    rank = _run_mega_layer(rank, world_size, quantize_input=False)
     print(
         f"rank {rank}: mxfp8_cutedsl mega layer (prestaged inputs) matches reference"
     )

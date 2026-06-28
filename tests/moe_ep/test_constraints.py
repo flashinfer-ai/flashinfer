@@ -178,7 +178,7 @@ def test_mega_forward_inputs_rejects_hidden_mismatch():
             torch.zeros(4, 2),
             p,
             top_k=2,
-            stage_inputs=True,
+            quantize_input=True,
         )
 
 
@@ -192,7 +192,7 @@ def test_mega_forward_inputs_happy_path():
         torch.zeros(4, 2),
         p,
         top_k=2,
-        stage_inputs=True,
+        quantize_input=True,
     )
 
 

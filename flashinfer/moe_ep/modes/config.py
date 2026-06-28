@@ -27,6 +27,6 @@ class MegaConfig:
     """Fused expert-parallel mega kernel (symmetric memory)."""
 
     megakernel: object
-    stage_inputs: bool = True
+    quantize_input: bool = True
     preprocess_weights: bool = True
     transformed_weights: object | None = None

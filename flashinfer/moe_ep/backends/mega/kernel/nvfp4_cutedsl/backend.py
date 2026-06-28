@@ -25,7 +25,11 @@ from .....core.validation.common import (
 from .....weights import MoEWeightPack
 from .config import Nvfp4CutedslMegaMoeConfig
 from .staging import stage_mega_moe_inputs, validate_nvfp4_forward_inputs
-from .weights import TransformedMegaWeights, preprocess_mega_weights
+from .weights import (
+    TransformedMegaWeights,
+    preprocess_mega_weights,
+    validate_transformed_mega_weights,
+)
 
 if TYPE_CHECKING:
     from .....tensors import MoEEpTensors
@@ -76,6 +80,25 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             activation_clamp=self._kernel_config.activation_clamp,
         )
 
+    def validate_transformed_weights(
+        self,
+        transformed_weights: TransformedMegaWeights,
+        bootstrap: BootstrapConfig,
+        fleet_params: FleetParams,
+    ) -> None:
+        world_size = (
+            dist.get_world_size()
+            if dist.is_initialized()
+            else bootstrap.world_size
+        )
+        validate_transformed_mega_weights(
+            transformed_weights,
+            intermediate_size=self._kernel_config.intermediate_size,
+            hidden_size=fleet_params.token_hidden_size,
+            world_size=world_size,
+            num_experts=fleet_params.num_experts,
+        )
+
     def _resolve_rank_world(self, bootstrap: BootstrapConfig) -> tuple[int, int]:
         if dist.is_initialized():
             return dist.get_rank(), dist.get_world_size()
@@ -112,7 +135,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         t: "MoEEpTensors",
         fleet_params: FleetParams,
         *,
-        stage_inputs: bool,
+        quantize_input: bool,
     ) -> None:
         validate_nvfp4_forward_inputs(
             t.hidden_states,
@@ -120,7 +143,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             t.topk_weights,
             fleet_params,
             top_k=self._kernel_config.top_k,
-            stage_inputs=stage_inputs,
+            quantize_input=quantize_input,
             scales=t.scales,
         )
 
@@ -129,10 +152,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         t: "MoEEpTensors",
         workspace: Any,
         *,
-        stage_inputs: bool,
+        quantize_input: bool,
         num_tokens: int,
     ) -> None:
-        if stage_inputs:
+        if quantize_input:
             stage_mega_moe_inputs(
                 t.hidden_states,
                 t.topk_weights,

@@ -18,7 +18,7 @@ from .....core.validation.common import (
 from .....weights import MoEWeightPack
 from .config import DeepGemmMegaMoeConfig
 from .staging import stage_mega_moe_inputs
-from .weights import TransformedMegaWeights, preprocess_mega_weights
+from .weights import TransformedMegaWeights, preprocess_mega_weights, validate_transformed_mega_weights
 
 if TYPE_CHECKING:
     from .....tensors import MoEEpTensors
@@ -58,6 +58,25 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
             hidden_size=fleet_params.token_hidden_size,
         )
 
+    def validate_transformed_weights(
+        self,
+        transformed_weights: TransformedMegaWeights,
+        bootstrap: BootstrapConfig,
+        fleet_params: FleetParams,
+    ) -> None:
+        world_size = (
+            dist.get_world_size()
+            if dist.is_initialized()
+            else bootstrap.world_size
+        )
+        validate_transformed_mega_weights(
+            transformed_weights,
+            intermediate_size=self._kernel_config.intermediate_size,
+            hidden_size=fleet_params.token_hidden_size,
+            world_size=world_size,
+            num_experts=fleet_params.num_experts,
+        )
+
     def _process_group(self) -> dist.ProcessGroup:
         if not dist.is_initialized():
             raise RuntimeError(
@@ -89,7 +108,7 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         t: "MoEEpTensors",
         fleet_params: FleetParams,
         *,
-        stage_inputs: bool,
+        quantize_input: bool,
     ) -> None:
         validate_mega_forward_inputs(
             t.hidden_states,
@@ -97,7 +116,7 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
             t.topk_weights,
             fleet_params,
             top_k=self._kernel_config.top_k,
-            stage_inputs=stage_inputs,
+            quantize_input=quantize_input,
             scales=t.scales,
         )
 
@@ -106,10 +125,10 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         t: "MoEEpTensors",
         workspace: Any,
         *,
-        stage_inputs: bool,
+        quantize_input: bool,
         num_tokens: int,
     ) -> None:
-        if stage_inputs:
+        if quantize_input:
             x_slot = workspace.x[:num_tokens]
             if x_slot.dtype != torch.float8_e4m3fn:
                 x_slot = x_slot.view(torch.float8_e4m3fn)
