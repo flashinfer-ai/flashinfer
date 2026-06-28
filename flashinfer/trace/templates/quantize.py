@@ -538,6 +538,7 @@ def _nvfp4_kv_dequantize_paged_init(
     page_size: int = 16,
     block_table_stride: int = 0,
     scalar: int = 1,
+    kv_layout: str = "NHD",
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -553,32 +554,44 @@ def _nvfp4_kv_dequantize_paged_init(
         block_table_stride = pages_per_request
     if num_pages == 0:
         num_pages = batch_size * block_table_stride
+    if kv_layout == "NHD":
+        k_cache_shape = (num_pages, page_size, num_heads, k_packed)
+        v_cache_shape = (num_pages, page_size, num_heads, v_packed)
+        k_scales_shape = (num_pages, page_size, num_heads, k_scales_dim)
+        v_scales_shape = (num_pages, page_size, num_heads, v_scales_dim)
+    elif kv_layout == "HND":
+        k_cache_shape = (num_pages, num_heads, page_size, k_packed)
+        v_cache_shape = (num_pages, num_heads, page_size, v_packed)
+        k_scales_shape = (num_pages, num_heads, page_size, k_scales_dim)
+        v_scales_shape = (num_pages, num_heads, page_size, v_scales_dim)
+    else:
+        raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
 
     k_cache = torch.randint(
         0,
         256,
-        (num_pages, page_size, num_heads, k_packed),
+        k_cache_shape,
         dtype=torch.uint8,
         device=device,
     )
     v_cache = torch.randint(
         0,
         256,
-        (num_pages, page_size, num_heads, v_packed),
+        v_cache_shape,
         dtype=torch.uint8,
         device=device,
     )
     k_scales = torch.randint(
         1,
         120,
-        (num_pages, page_size, num_heads, k_scales_dim),
+        k_scales_shape,
         dtype=torch.uint8,
         device=device,
     ).view(torch.float8_e4m3fn)
     v_scales = torch.randint(
         1,
         120,
-        (num_pages, page_size, num_heads, v_scales_dim),
+        v_scales_shape,
         dtype=torch.uint8,
         device=device,
     ).view(torch.float8_e4m3fn)
@@ -607,81 +620,125 @@ def _nvfp4_kv_dequantize_paged_init(
         "v_scale": torch.tensor([1.0], dtype=torch.float32, device=device),
         "output_k": output_k,
         "output_v": output_v,
-        "kv_layout": "NHD",
+        "kv_layout": kv_layout,
     }
 
 
-nvfp4_kv_dequantize_paged_trace = TraceTemplate(
-    op_type="dequantize_fp4",
-    name_prefix="nvfp4_kv_dequantize_paged",
-    description=(
-        "Gather and dequantize a paged NVFP4 KV cache through block tables "
-        "into caller-owned contiguous K/V output buffers."
-    ),
-    axes={
-        "batch_size": Var(),
-        "max_seq_len": Var(),
-        "num_heads": Const(abbrev="h"),
-        "k_head_dim": Const(abbrev="dk"),
-        "v_head_dim": Const(abbrev="dv"),
-        "k_packed_dim": Var(description="k_head_dim // 2."),
-        "v_packed_dim": Var(description="v_head_dim // 2."),
-        "k_scale_dim": Var(description="k_head_dim // 16."),
-        "v_scale_dim": Var(description="v_head_dim // 16."),
-        "num_pages": Var(),
-        "page_size": Const(abbrev="ps"),
-        "block_table_stride": Var(),
-        "scalar": Var(description="Global scale tensor length, normally 1."),
-    },
-    inputs={
-        "paged_k_cache": Tensor(
-            ["num_pages", "page_size", "num_heads", "k_packed_dim"],
-            param="paged_kv_cache",
-            tuple_idx=0,
+def _make_nvfp4_kv_dequantize_paged_trace(
+    *, kv_layout: str, name_prefix: str
+) -> TraceTemplate:
+    if kv_layout == "NHD":
+        k_cache_dims = ["num_pages", "page_size", "num_heads", "k_packed_dim"]
+        v_cache_dims = ["num_pages", "page_size", "num_heads", "v_packed_dim"]
+        k_scales_dims = ["num_pages", "page_size", "num_heads", "k_scale_dim"]
+        v_scales_dims = ["num_pages", "page_size", "num_heads", "v_scale_dim"]
+    elif kv_layout == "HND":
+        k_cache_dims = ["num_pages", "num_heads", "page_size", "k_packed_dim"]
+        v_cache_dims = ["num_pages", "num_heads", "page_size", "v_packed_dim"]
+        k_scales_dims = ["num_pages", "num_heads", "page_size", "k_scale_dim"]
+        v_scales_dims = ["num_pages", "num_heads", "page_size", "v_scale_dim"]
+    else:
+        raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
+
+    return TraceTemplate(
+        op_type="dequantize_fp4",
+        name_prefix=name_prefix,
+        description=(
+            "Gather and dequantize a paged NVFP4 KV cache through block tables "
+            "into caller-owned contiguous K/V output buffers."
         ),
-        "paged_v_cache": Tensor(
-            ["num_pages", "page_size", "num_heads", "v_packed_dim"],
-            param="paged_kv_cache",
-            tuple_idx=1,
-        ),
-        "k_scales": Tensor(
-            ["num_pages", "page_size", "num_heads", "k_scale_dim"],
-            param="kv_cache_sf",
-            tuple_idx=0,
-        ),
-        "v_scales": Tensor(
-            ["num_pages", "page_size", "num_heads", "v_scale_dim"],
-            param="kv_cache_sf",
-            tuple_idx=1,
-        ),
-        "block_tables": Tensor(["batch_size", "block_table_stride"], dtype="int32"),
-        "seq_lens": Tensor(["batch_size"], dtype="int32"),
-        "k_scale": Tensor(["scalar"], dtype="float32"),
-        "v_scale": Tensor(["scalar"], dtype="float32"),
-        "output_k": Tensor(["batch_size", "max_seq_len", "num_heads", "k_head_dim"]),
-        "output_v": Tensor(["batch_size", "max_seq_len", "num_heads", "v_head_dim"]),
-    },
-    outputs={
-        "output_k": Tensor(
-            ["batch_size", "max_seq_len", "num_heads", "k_head_dim"],
-            dtype_from="output_k",
-        ),
-        "output_v": Tensor(
-            ["batch_size", "max_seq_len", "num_heads", "v_head_dim"],
-            dtype_from="output_v",
-        ),
-    },
-    constraints=[
-        "k_head_dim == k_packed_dim * 2",
-        "v_head_dim == v_packed_dim * 2",
-        "k_head_dim == k_scale_dim * 16",
-        "v_head_dim == v_scale_dim * 16",
-        "block_table_stride * page_size >= max_seq_len",
-        "scalar == 1",
-    ],
-    tags=["status:verified", "quantization:fp4"],
-    init=_nvfp4_kv_dequantize_paged_init,
+        axes={
+            "batch_size": Var(),
+            "max_seq_len": Var(),
+            "num_heads": Const(abbrev="h"),
+            "k_head_dim": Const(abbrev="dk"),
+            "v_head_dim": Const(abbrev="dv"),
+            "k_packed_dim": Var(description="k_head_dim // 2."),
+            "v_packed_dim": Var(description="v_head_dim // 2."),
+            "k_scale_dim": Var(description="k_head_dim // 16."),
+            "v_scale_dim": Var(description="v_head_dim // 16."),
+            "num_pages": Var(),
+            "page_size": Const(abbrev="ps"),
+            "block_table_stride": Var(),
+            "scalar": Var(description="Global scale tensor length, normally 1."),
+        },
+        inputs={
+            "paged_k_cache": Tensor(
+                k_cache_dims,
+                param="paged_kv_cache",
+                tuple_idx=0,
+            ),
+            "paged_v_cache": Tensor(
+                v_cache_dims,
+                param="paged_kv_cache",
+                tuple_idx=1,
+            ),
+            "k_scales": Tensor(
+                k_scales_dims,
+                param="kv_cache_sf",
+                tuple_idx=0,
+            ),
+            "v_scales": Tensor(
+                v_scales_dims,
+                param="kv_cache_sf",
+                tuple_idx=1,
+            ),
+            "block_tables": Tensor(["batch_size", "block_table_stride"], dtype="int32"),
+            "seq_lens": Tensor(["batch_size"], dtype="int32"),
+            "k_scale": Tensor(["scalar"], dtype="float32"),
+            "v_scale": Tensor(["scalar"], dtype="float32"),
+            "output_k": Tensor(
+                ["batch_size", "max_seq_len", "num_heads", "k_head_dim"]
+            ),
+            "output_v": Tensor(
+                ["batch_size", "max_seq_len", "num_heads", "v_head_dim"]
+            ),
+        },
+        outputs={
+            "output_k": Tensor(
+                ["batch_size", "max_seq_len", "num_heads", "k_head_dim"],
+                dtype_from="output_k",
+            ),
+            "output_v": Tensor(
+                ["batch_size", "max_seq_len", "num_heads", "v_head_dim"],
+                dtype_from="output_v",
+            ),
+        },
+        constraints=[
+            "k_head_dim == k_packed_dim * 2",
+            "v_head_dim == v_packed_dim * 2",
+            "k_head_dim == k_scale_dim * 16",
+            "v_head_dim == v_scale_dim * 16",
+            "block_table_stride * page_size >= max_seq_len",
+            "scalar == 1",
+        ],
+        tags=["status:verified", "quantization:fp4"],
+        init=_nvfp4_kv_dequantize_paged_init,
+    )
+
+
+_nvfp4_kv_dequantize_paged_nhd_trace = _make_nvfp4_kv_dequantize_paged_trace(
+    kv_layout="NHD", name_prefix="nvfp4_kv_dequantize_paged"
 )
+_nvfp4_kv_dequantize_paged_hnd_trace = _make_nvfp4_kv_dequantize_paged_trace(
+    kv_layout="HND", name_prefix="nvfp4_kv_dequantize_paged_hnd"
+)
+
+
+def nvfp4_kv_dequantize_paged_trace(**kwargs):
+    """Return a layout-specific trace template for paged NVFP4 KV dequant."""
+    kv_layout = kwargs.get("kv_layout", "NHD")
+    if kv_layout == "NHD":
+        return _nvfp4_kv_dequantize_paged_nhd_trace
+    if kv_layout == "HND":
+        return _nvfp4_kv_dequantize_paged_hnd_trace
+    raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
+
+
+nvfp4_kv_dequantize_paged_trace.templates = [  # type: ignore[attr-defined]
+    _nvfp4_kv_dequantize_paged_nhd_trace,
+    _nvfp4_kv_dequantize_paged_hnd_trace,
+]
 
 
 nvfp4_kv_quantize_trace = TraceTemplate(
