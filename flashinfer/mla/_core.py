@@ -2134,6 +2134,7 @@ def _cute_dsl_incompatibility_reason(
     _, q_len, num_heads, _ = query.shape
     try:
         from ..cute_dsl.attention.mla_dispatch import _resolve_impl
+
         resolved_impl = _resolve_impl(requested=cute_dsl_impl, kwargs={"sinks": sinks})
     except (ValueError, ImportError) as e:
         return f"cute-dsl backend (MLA decode kernel): {e}"
