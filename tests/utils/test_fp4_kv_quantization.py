@@ -241,6 +241,113 @@ def test_nvfp4_kv_dequantize_paged(kv_layout, block_table_dtype, dtype, non_cont
     torch.testing.assert_close(output_v.float(), ref_v.float(), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nvfp4_kv_dequantize_paged_stacked_cache(kv_layout, dtype):
+    """Test stacked paged KV cache input for the paged NVFP4 dequant helper."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    torch.manual_seed(7)
+
+    num_pages = 5
+    page_size = 4
+    batch_size = 2
+    max_seq_len = 6
+    num_kv_heads = 2
+    head_dim = 64
+    scale_dim = head_dim // 16
+
+    k_cache_nhd = torch.randint(
+        0,
+        256,
+        (num_pages, page_size, num_kv_heads, head_dim // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    v_cache_nhd = torch.randint(
+        0,
+        256,
+        (num_pages, page_size, num_kv_heads, head_dim // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    k_scales_nhd = torch.randint(
+        1,
+        120,
+        (num_pages, page_size, num_kv_heads, scale_dim),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e4m3fn)
+    v_scales_nhd = torch.randint(
+        1,
+        120,
+        (num_pages, page_size, num_kv_heads, scale_dim),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e4m3fn)
+
+    if kv_layout == "NHD":
+        stacked_cache = torch.stack([k_cache_nhd, v_cache_nhd], dim=1).contiguous()
+        stacked_scales = torch.stack([k_scales_nhd, v_scales_nhd], dim=1).contiguous()
+    else:
+        k_cache_hnd = k_cache_nhd.permute(0, 2, 1, 3).contiguous()
+        v_cache_hnd = v_cache_nhd.permute(0, 2, 1, 3).contiguous()
+        k_scales_hnd = k_scales_nhd.permute(0, 2, 1, 3).contiguous()
+        v_scales_hnd = v_scales_nhd.permute(0, 2, 1, 3).contiguous()
+        stacked_cache = torch.stack([k_cache_hnd, v_cache_hnd], dim=1).contiguous()
+        stacked_scales = torch.stack([k_scales_hnd, v_scales_hnd], dim=1).contiguous()
+
+    block_tables = torch.tensor([[1, 3], [4, 2]], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([6, 3], dtype=torch.int32, device="cuda")
+    k_scale_val = 0.75
+    v_scale_val = 0.5
+    k_scale = torch.tensor([k_scale_val], dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor([v_scale_val], dtype=torch.float32, device="cuda")
+    output_k = torch.full(
+        (batch_size, max_seq_len, num_kv_heads, head_dim),
+        123.0,
+        dtype=dtype,
+        device="cuda",
+    )
+    output_v = torch.full_like(output_k, 123.0)
+
+    flashinfer.nvfp4_kv_dequantize_paged(
+        stacked_cache,
+        stacked_scales,
+        block_tables,
+        seq_lens,
+        k_scale,
+        v_scale,
+        output_k,
+        output_v,
+        kv_layout=kv_layout,
+    )
+
+    ref_k = torch.full_like(output_k, 123.0)
+    ref_v = torch.full_like(output_v, 123.0)
+    for batch_idx, seq_len in enumerate(seq_lens.cpu().tolist()):
+        for token_idx in range(seq_len):
+            page = int(block_tables[batch_idx, token_idx // page_size].item())
+            entry = token_idx % page_size
+            ref_k[batch_idx, token_idx] = reference_dequant(
+                k_cache_nhd[page, entry],
+                k_scales_nhd[page, entry],
+                k_scale_val,
+                dtype,
+            )
+            ref_v[batch_idx, token_idx] = reference_dequant(
+                v_cache_nhd[page, entry],
+                v_scales_nhd[page, entry],
+                v_scale_val,
+                dtype,
+            )
+
+    torch.testing.assert_close(output_k.float(), ref_k.float(), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(output_v.float(), ref_v.float(), atol=1e-3, rtol=1e-3)
+
+
 def test_nvfp4_kv_dequantize_paged_rejects_short_block_tables():
     """Reject page tables that cannot cover the requested output length."""
     cc = get_compute_capability()
@@ -280,6 +387,57 @@ def test_nvfp4_kv_dequantize_paged_rejects_short_block_tables():
     output_v = torch.empty_like(output_k)
 
     with pytest.raises(RuntimeError, match="block_tables column count insufficient"):
+        flashinfer.nvfp4_kv_dequantize_paged(
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            block_tables,
+            seq_lens,
+            k_scale,
+            v_scale,
+            output_k,
+            output_v,
+            kv_layout="NHD",
+        )
+
+
+def test_nvfp4_kv_dequantize_paged_rejects_non_scalar_scale():
+    """Reject global scale tensors with more than one element."""
+    cc = get_compute_capability()
+    if cc < 80:
+        pytest.skip(f"SM{cc} does not support FP8 E4M3 (requires SM80+)")
+
+    num_pages = 1
+    page_size = 1
+    batch_size = 1
+    max_seq_len = 1
+    num_kv_heads = 1
+    head_dim = 64
+    scale_dim = head_dim // 16
+
+    k_cache = torch.empty(
+        (num_pages, page_size, num_kv_heads, head_dim // 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    v_cache = torch.empty_like(k_cache)
+    k_scales = torch.empty(
+        (num_pages, page_size, num_kv_heads, scale_dim),
+        dtype=torch.uint8,
+        device="cuda",
+    ).view(torch.float8_e4m3fn)
+    v_scales = torch.empty_like(k_scales)
+    block_tables = torch.zeros((batch_size, 1), dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([max_seq_len], dtype=torch.int32, device="cuda")
+    k_scale = torch.ones((2,), dtype=torch.float32, device="cuda")
+    v_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
+    output_k = torch.empty(
+        (batch_size, max_seq_len, num_kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output_v = torch.empty_like(output_k)
+
+    with pytest.raises(ValueError, match="k_scale and v_scale must be scalar tensors"):
         flashinfer.nvfp4_kv_dequantize_paged(
             (k_cache, v_cache),
             (k_scales, v_scales),

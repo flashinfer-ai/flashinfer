@@ -24,6 +24,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.quantize import (
     fp4_quantize_trace,
     mxfp4_quantize_trace,
+    nvfp4_kv_dequantize_paged_trace,
     nvfp4_kv_quantize_trace,
     nvfp4_quantize_trace,
 )
@@ -1966,7 +1967,7 @@ def _nvfp4_paged_kv_dequant_check(*args, **kwargs):
 
 
 @backend_requirement({}, common_check=_nvfp4_paged_kv_dequant_check)
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_kv_dequantize_paged_trace)
 def nvfp4_kv_dequantize_paged(
     paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     kv_cache_sf: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -2024,6 +2025,8 @@ def nvfp4_kv_dequantize_paged(
         )
     if k_scale.dtype != torch.float32 or v_scale.dtype != torch.float32:
         raise ValueError("k_scale and v_scale must have dtype torch.float32")
+    if k_scale.numel() != 1 or v_scale.numel() != 1:
+        raise ValueError("k_scale and v_scale must be scalar tensors")
     if output_k.dtype != output_v.dtype:
         raise ValueError("output_k and output_v must have the same dtype")
     if output_k.dtype not in (torch.float16, torch.bfloat16):

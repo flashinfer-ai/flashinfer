@@ -288,6 +288,74 @@ def test_mm_bf16_fi_trace():
 
 
 # ---------------------------------------------------------------------------
+# quantization
+# ---------------------------------------------------------------------------
+
+
+def test_nvfp4_kv_dequantize_paged_fi_trace():
+    import flashinfer
+
+    batch_size = 2
+    max_seq_len = 7
+    num_pages = 8
+    page_size = 4
+    num_heads = 2
+    k_head_dim = 64
+    v_head_dim = 128
+
+    k_cache = torch.empty(
+        num_pages, page_size, num_heads, k_head_dim // 2, dtype=torch.uint8
+    )
+    v_cache = torch.empty(
+        num_pages, page_size, num_heads, v_head_dim // 2, dtype=torch.uint8
+    )
+    k_scales = torch.empty(
+        num_pages, page_size, num_heads, k_head_dim // 16, dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    v_scales = torch.empty(
+        num_pages, page_size, num_heads, v_head_dim // 16, dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    block_tables = torch.zeros(batch_size, 2, dtype=torch.int32)
+    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32)
+    k_scale = torch.ones(1, dtype=torch.float32)
+    v_scale = torch.ones(1, dtype=torch.float32)
+    output_k = torch.empty(
+        batch_size, max_seq_len, num_heads, k_head_dim, dtype=torch.bfloat16
+    )
+    output_v = torch.empty(
+        batch_size, max_seq_len, num_heads, v_head_dim, dtype=torch.bfloat16
+    )
+
+    defn = flashinfer.nvfp4_kv_dequantize_paged.fi_trace(
+        paged_kv_cache=(k_cache, v_cache),
+        kv_cache_sf=(k_scales, v_scales),
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        output_k=output_k,
+        output_v=output_v,
+        kv_layout="NHD",
+    )
+    _check_defn(defn, "dequantize_fp4", "nvfp4_kv_dequantize_paged")
+    axes = defn["axes"]
+    assert axes["num_heads"]["value"] == num_heads
+    assert axes["k_head_dim"]["value"] == k_head_dim
+    assert axes["v_head_dim"]["value"] == v_head_dim
+    assert axes["page_size"]["value"] == page_size
+    assert axes["batch_size"]["type"] == "var"
+
+    assert defn["inputs"]["paged_k_cache"]["shape"] == [
+        "num_pages",
+        "page_size",
+        "num_heads",
+        "k_packed_dim",
+    ]
+    assert defn["outputs"]["output_k"]["dtype"] == "bfloat16"
+    assert "block_table_stride * page_size >= max_seq_len" in defn["constraints"]
+
+
+# ---------------------------------------------------------------------------
 # GQA paged decode
 # ---------------------------------------------------------------------------
 

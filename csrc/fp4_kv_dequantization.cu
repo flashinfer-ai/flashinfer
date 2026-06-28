@@ -126,7 +126,7 @@ __global__ void nvfp4_dequant_vectorized_kernel(const uint8_t* __restrict__ fp4_
   }
 }
 
-template <typename OutType, typename IdType, int BLOCK_SIZE = 128>
+template <typename OutType, typename IdType>
 __global__ void nvfp4_paged_dequant_kernel(
     const uint8_t* __restrict__ paged_cache, const uint8_t* __restrict__ paged_scales,
     const IdType* __restrict__ block_tables, const int32_t* __restrict__ seq_lens,
@@ -165,7 +165,7 @@ __global__ void nvfp4_paged_dequant_kernel(
       output + ((static_cast<int64_t>(batch) * max_seq_len + token) * num_heads + head) * head_dim;
   const float global_scale = *global_scale_ptr;
 
-  for (int packed_col = tid; packed_col < packed_dim; packed_col += BLOCK_SIZE) {
+  for (int packed_col = tid; packed_col < packed_dim; packed_col += blockDim.x) {
     const uint8_t packed_fp4 = row_fp4[packed_col];
     const int col = packed_col * 2;
     const int scale_idx = col / NVFP4_BLOCK_SIZE;
@@ -267,6 +267,8 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
   TVM_FFI_ICHECK(seq_lens.dtype() == dl_int32) << "seq_lens must have dtype int32";
   TVM_FFI_ICHECK(k_global_scale.dtype() == dl_float32) << "k_global_scale must have dtype float32";
   TVM_FFI_ICHECK(v_global_scale.dtype() == dl_float32) << "v_global_scale must have dtype float32";
+  TVM_FFI_ICHECK(k_global_scale.numel() == 1) << "k_global_scale must be a scalar tensor";
+  TVM_FFI_ICHECK(v_global_scale.numel() == 1) << "v_global_scale must be a scalar tensor";
   TVM_FFI_ICHECK(output_k.dtype() == output_v.dtype())
       << "output_k and output_v must have the same dtype";
 
@@ -285,6 +287,8 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
   TVM_FFI_ICHECK(output_v.size(2) == num_heads) << "output_v num_heads mismatch";
   TVM_FFI_ICHECK(block_tables.size(0) == batch_size) << "block_tables batch size mismatch";
   TVM_FFI_ICHECK(seq_lens.size(0) == batch_size) << "seq_lens batch size mismatch";
+  TVM_FFI_ICHECK(k_head_dim > 0) << "output_k head_dim must be positive";
+  TVM_FFI_ICHECK(v_head_dim > 0) << "output_v head_dim must be positive";
   TVM_FFI_ICHECK(k_head_dim % NVFP4_BLOCK_SIZE == 0)
       << "output_k head_dim must be divisible by " << NVFP4_BLOCK_SIZE;
   TVM_FFI_ICHECK(v_head_dim % NVFP4_BLOCK_SIZE == 0)
@@ -365,13 +369,15 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
   ffi::CUDADeviceGuard device_guard(paged_k_cache.device().device_id);
   cudaStream_t stream = get_stream(paged_k_cache.device());
 
-  constexpr int BLOCK_SIZE = 128;
-  dim3 block(BLOCK_SIZE);
+  const int k_block_size = k_packed_dim < 128 ? k_packed_dim : 128;
+  const int v_block_size = v_packed_dim < 128 ? v_packed_dim : 128;
+  dim3 k_block(k_block_size);
+  dim3 v_block(v_block_size);
   dim3 grid(batch_size * max_seq_len * num_heads);
 
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(block_tables.dtype(), id_type, [&] {
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(output_k.dtype(), out_type, [&] {
-      nvfp4_paged_dequant_kernel<out_type, id_type, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+      nvfp4_paged_dequant_kernel<out_type, id_type><<<grid, k_block, 0, stream>>>(
           static_cast<const uint8_t*>(paged_k_cache.data_ptr()),
           static_cast<const uint8_t*>(k_scales.data_ptr()),
           static_cast<const id_type*>(block_tables.data_ptr()),
@@ -380,7 +386,7 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
           static_cast<out_type*>(output_k.data_ptr()), batch_size, max_seq_len,
           block_tables.size(1), num_pages, page_size, num_heads, k_head_dim, k_stride_page,
           k_stride_n, k_stride_h, k_scale_stride_page, k_scale_stride_n, k_scale_stride_h);
-      nvfp4_paged_dequant_kernel<out_type, id_type, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+      nvfp4_paged_dequant_kernel<out_type, id_type><<<grid, v_block, 0, stream>>>(
           static_cast<const uint8_t*>(paged_v_cache.data_ptr()),
           static_cast<const uint8_t*>(v_scales.data_ptr()),
           static_cast<const id_type*>(block_tables.data_ptr()),
