@@ -1213,18 +1213,7 @@ def _fa2_head_dim_nvcc_flags(
     return None
 
 
-def _fa2_batch_prefill_head_dim_nvcc_flags(
-    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
-) -> Optional[List[str]]:
-    return _fa2_head_dim_nvcc_flags(
-        head_dim_qk,
-        head_dim_vo,
-        dtype_kv,
-        allow_nvfp4_sm8_large_head=True,
-    )
-
-
-def _fa2_single_prefill_head_dim_nvcc_flags(
+def _fa2_prefill_head_dim_nvcc_flags(
     head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
 ) -> Optional[List[str]]:
     return _fa2_head_dim_nvcc_flags(
@@ -1420,7 +1409,7 @@ def gen_customize_single_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_single_prefill_head_dim_nvcc_flags(
+            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
                 head_dim_qk, head_dim_vo, dtype_kv
             ),
         )
@@ -1693,9 +1682,7 @@ def gen_customize_batch_prefill_module(
             uri,
             source_paths,
             extra_cuda_cflags=(
-                _fa2_batch_prefill_head_dim_nvcc_flags(
-                    head_dim_qk, head_dim_vo, dtype_kv
-                )
+                _fa2_prefill_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv)
                 if allow_nvfp4_sm8_large_head
                 else _fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv)
             ),
