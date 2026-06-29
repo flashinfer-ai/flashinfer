@@ -125,6 +125,11 @@ MixedInputScaleModeTag = {
     "pre_mma_e8m0": "cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0",
 }
 
+Sm90MixedInputKernelScheduleTag = {
+    "single_warpgroup_prefill": "tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL",
+    "single_warpgroup_rolling": "tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING",
+}
+
 
 ################################################################################
 # A data structure holding all info to instantiate gemm launchers in TRT LLM.
@@ -149,6 +154,7 @@ class TrtLlm_GemmLauncher:
         epi_fusion=None,
         is_mx_fpx=False,
         mixed_input_scale_mode="post_mma",
+        sm90_mixed_input_kernel_type="warp_specialized",
         dynamic_cga=False,
         swap_ab=False,
     ):
@@ -171,6 +177,7 @@ class TrtLlm_GemmLauncher:
         self.epi_fusion = epi_fusion
         self.is_mx_fpx = is_mx_fpx
         self.mixed_input_scale_mode = mixed_input_scale_mode
+        self.sm90_mixed_input_kernel_type = sm90_mixed_input_kernel_type
         self.swap_ab = swap_ab
 
     def __repr__(self):
@@ -205,6 +212,8 @@ class TrtLlm_GemmLauncher:
         )
         if self.mixed_input_scale_mode != "post_mma":
             hopper_suffix += f"_{self.mixed_input_scale_mode}"
+        if self.sm90_mixed_input_kernel_type != "warp_specialized":
+            hopper_suffix += f"_{self.sm90_mixed_input_kernel_type}"
 
         if self.arch >= 90:
             return kernel_prefix + hopper_suffix
@@ -249,14 +258,32 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
         if operation.arch == 90 and operation.act_type != operation.weight_type:
             # Mixed MoE GEMM
             weight_tag = CudaTypeName[operation.weight_type]
-            mixed_input_scale_mode_arg = ""
+            optional_template_args = []
             if operation.mixed_input_scale_mode != "post_mma":
-                mixed_input_scale_mode_arg = MixedInputScaleModeTag[
-                    operation.mixed_input_scale_mode
-                ]
+                optional_template_args.append(
+                    MixedInputScaleModeTag[operation.mixed_input_scale_mode]
+                )
+            if operation.sm90_mixed_input_kernel_type != "warp_specialized":
+                if operation.mixed_input_scale_mode == "post_mma":
+                    optional_template_args.append(
+                        MixedInputScaleModeTag[operation.mixed_input_scale_mode]
+                    )
+                optional_template_args.append(
+                    Sm90MixedInputKernelScheduleTag[
+                        operation.sm90_mixed_input_kernel_type
+                    ]
+                )
+            optional_template_args = "".join(
+                f", {arg}" for arg in optional_template_args
+            )
+            launcher_name = (
+                "sm90_generic_mixed_moe_gemm_kernelLauncher"
+                if operation.sm90_mixed_input_kernel_type == "warp_specialized"
+                else "sm90_generic_mixed_moe_small_k_kernelLauncher"
+            )
             instantiation = f"""
-template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
-{epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}{", " + mixed_input_scale_mode_arg if mixed_input_scale_mode_arg else ""}> (
+template void {launcher_name}<{act_tag}, {weight_tag}, {out_tag},
+{epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}{optional_template_args}> (
 GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size);
 """
         else:
@@ -751,6 +778,33 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                 mixed_input_scale_mode=mixed_input_scale_mode,
             )
             operations.append(moe_gemm_operation)
+
+    small_k_shapes = [(128, token_tile, 128) for token_tile in [8, 16, 32, 40]]
+    small_k_kernel_types = [
+        "single_warpgroup_prefill",
+        "single_warpgroup_rolling",
+    ]
+    for dtype_combo in supported_dtypes_fp4:
+        if dtype_combo[0] != DataType.e4m3:
+            continue
+        for cta_shape_mnk, kernel_type in product(small_k_shapes, small_k_kernel_types):
+            operations.append(
+                TrtLlm_GemmLauncher(
+                    GemmKind.Grouped,
+                    arch,
+                    *dtype_combo,
+                    TrtLlm_QuantOp.finegrained_scale_only,
+                    TrtLlm_EpilogueTag.epilogue_op_default,
+                    cta_shape_mnk,
+                    warp_shape,
+                    3,
+                    (1, 1, 1),
+                    KernelScheduleType.TmaWarpSpecializedPingpong,
+                    EpilogueScheduleType.TmaWarpSpecializedCooperative,
+                    mixed_input_scale_mode="pre_mma_e8m0",
+                    sm90_mixed_input_kernel_type=kernel_type,
+                )
+            )
     return operations
 
 

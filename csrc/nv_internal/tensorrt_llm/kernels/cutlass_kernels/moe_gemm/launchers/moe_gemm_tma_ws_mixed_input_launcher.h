@@ -39,6 +39,17 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
         inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size);
 
+template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
+          typename CTAShape, typename ClusterShape, typename MainloopScheduleType,
+          typename EpilogueScheduleType, cutlass::WeightOnlyQuantOp QuantOp,
+          cutlass::gemm::collective::MixedInputScaleMode ScaleMode,
+          tensorrt_llm::cutlass_extensions::MainloopScheduleType KernelType>
+void sm90_generic_mixed_moe_small_k_kernelLauncher(
+    tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput<T, WeightType, GemmOutputType,
+                                                             GemmOutputType>
+        inputs,
+    TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size);
+
 }  // namespace cutlass_kernels_oss
 }  // namespace kernels
 }  // namespace tensorrt_llm

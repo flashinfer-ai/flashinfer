@@ -98,9 +98,16 @@ inline uint64_t max_work_tiles_from_total_tokens(int num_experts, int64_t total_
 
 inline size_t precomputed_scheduler_workspace_size(int num_experts, int64_t total_routed_tokens,
                                                    int64_t max_channels) {
-  uint64_t const max_work_tiles = max_work_tiles_from_total_tokens<64, 16, 2, 2>(
+  uint64_t const regular_max_work_tiles = max_work_tiles_from_total_tokens<64, 16, 2, 2>(
       num_experts, total_routed_tokens, max_channels, kPrecomputedSchedulerMaxSwizzle);
-  uint64_t const work_tile_capacity = max_work_tiles + kPrecomputedSchedulerSentinelTiles;
+  uint64_t const single_warpgroup_max_work_tiles = max_work_tiles_from_total_tokens<128, 8, 1, 1>(
+      num_experts, total_routed_tokens, max_channels, kPrecomputedSchedulerMaxSwizzle);
+  uint64_t const max_work_tiles = regular_max_work_tiles > single_warpgroup_max_work_tiles
+                                      ? regular_max_work_tiles
+                                      : single_warpgroup_max_work_tiles;
+  // Chunk-major storage rounds every worker chunk up independently and appends
+  // one sentinel per worker. Its capacity is strictly below max_tiles + 2 * workers.
+  uint64_t const work_tile_capacity = max_work_tiles + 2 * kPrecomputedSchedulerSentinelTiles;
 
   size_t bytes = 0;
   bytes += align_bytes(size_t(work_tile_capacity) * sizeof(uint64_t), 128);
@@ -116,15 +123,18 @@ struct PrecomputedSchedulerWorkspace {
   cute::TmaDescriptor* prebuilt_tma_desc_B = nullptr;
   size_t required_bytes = 0;
   dim3 gemm_grid_shape = dim3(1, 1, 1);
+  uint32_t work_tiles_per_worker = 0;
 };
 
-template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN>
+template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
+          bool ChunkMajorWorkMap = false>
 inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
     TmaWarpSpecializedGroupedGemmInput const& hopper_inputs, int num_experts,
     int64_t total_routed_tokens, int64_t channels, int sm_count) {
   using ProblemShape = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt;
   using Scheduler =
-      cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8>;
+      cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8,
+                                                                                 ChunkMajorWorkMap>;
   using SchedulerParams = typename Scheduler::Params;
 
   cutlass::KernelHardwareInfo hw_info;
@@ -142,7 +152,25 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
           num_experts, total_routed_tokens, channels, kPrecomputedSchedulerMaxSwizzle);
   uint64_t const sentinel_count =
       uint64_t(gemm_grid_shape.x) * uint64_t(gemm_grid_shape.y) * uint64_t(gemm_grid_shape.z);
-  uint64_t const work_tile_capacity = max_work_tiles + sentinel_count;
+  TLLM_CHECK_WITH_INFO(sentinel_count > 0,
+                       "Precomputed scheduler requires at least one logical worker.");
+  TLLM_CHECK_WITH_INFO(gemm_grid_shape.z == 1,
+                       "Precomputed grouped scheduler work-map requires a 2D launch grid.");
+  uint32_t work_tiles_per_worker = 0;
+  uint64_t work_tile_capacity = max_work_tiles + sentinel_count;
+  if constexpr (ChunkMajorWorkMap) {
+    TLLM_CHECK_WITH_INFO(
+        sentinel_count <= kPrecomputedSchedulerSentinelTiles,
+        "Single-warpgroup logical worker count exceeds precomputed scheduler workspace bound.");
+    uint64_t const work_tiles_per_worker_u64 =
+        (max_work_tiles + sentinel_count - 1) / sentinel_count + 1;
+    TLLM_CHECK_WITH_INFO(work_tiles_per_worker_u64 <= uint64_t(0xffffffffu),
+                         "Precomputed scheduler worker chunk exceeds uint32_t index range.");
+    work_tiles_per_worker = static_cast<uint32_t>(work_tiles_per_worker_u64);
+    work_tile_capacity = sentinel_count * uint64_t(work_tiles_per_worker);
+  }
+  TLLM_CHECK_WITH_INFO(work_tile_capacity <= uint64_t(0xffffffffu),
+                       "Precomputed scheduler work-map exceeds uint32_t index range.");
 
   size_t const work_tiles_bytes = align_bytes(size_t(work_tile_capacity) * sizeof(uint64_t), 128);
   size_t const prebuilt_a_bytes = align_bytes(sizeof(cute::TmaDescriptor), 128);
@@ -167,6 +195,7 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
       reinterpret_cast<cute::TmaDescriptor*>(base + work_tiles_bytes + prebuilt_a_bytes);
   workspace.required_bytes = required_bytes;
   workspace.gemm_grid_shape = gemm_grid_shape;
+  workspace.work_tiles_per_worker = work_tiles_per_worker;
   return workspace;
 }
 
@@ -327,21 +356,20 @@ __device__ __forceinline__ void build_prebuilt_tma_descriptors(
   }
 }
 
-template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN, class Problem,
-          class MainloopParams>
-__global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_shapes, int groups,
-                                                       int swizzle_log, int gemm_grid_x,
-                                                       int gemm_grid_y, uint64_t* work_tiles,
-                                                       MainloopParams mainloop_params,
-                                                       cute::TmaDescriptor* prebuilt_tma_desc_A,
-                                                       cute::TmaDescriptor* prebuilt_tma_desc_B) {
+template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
+          bool ChunkMajorWorkMap, class Problem, class MainloopParams>
+__global__ void build_precomputed_work_tile_map_kernel(
+    Problem const* problem_shapes, int groups, int swizzle_log, int gemm_grid_x, int gemm_grid_y,
+    uint32_t work_tiles_per_worker, uint64_t* work_tiles, MainloopParams mainloop_params,
+    cute::TmaDescriptor* prebuilt_tma_desc_A, cute::TmaDescriptor* prebuilt_tma_desc_B) {
   int const tid = threadIdx.x;
   uint64_t const total_grid_size = uint64_t(gemm_grid_x) * uint64_t(gemm_grid_y);
 
   if (groups <= 0) {
     if (blockIdx.x == 0) {
       for (uint64_t i = uint64_t(tid); i < total_grid_size; i += uint64_t(blockDim.x)) {
-        work_tiles[i] = PrecomputedWorkTileCodec::Invalid;
+        uint64_t const storage_idx = ChunkMajorWorkMap ? i * uint64_t(work_tiles_per_worker) : i;
+        work_tiles[storage_idx] = PrecomputedWorkTileCodec::Invalid;
       }
     }
     return;
@@ -356,7 +384,14 @@ __global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_sh
   cute::TmaDescriptor* smem_tma_desc = reinterpret_cast<cute::TmaDescriptor*>(shared_storage);
   unsigned long long* prefix_partials =
       reinterpret_cast<unsigned long long*>(shared_storage + kPrebuiltTmaDescriptorScratchBytes);
-  unsigned long long* group_info_storage = prefix_partials + blockDim.x;
+  unsigned long long* total_partials = nullptr;
+  unsigned long long* group_info_storage = nullptr;
+  if constexpr (ChunkMajorWorkMap) {
+    total_partials = prefix_partials + blockDim.x;
+    group_info_storage = total_partials + blockDim.x;
+  } else {
+    group_info_storage = prefix_partials + blockDim.x;
+  }
 
   if (tid == 0) {
     PrecomputedGroupInfo const info =
@@ -370,11 +405,25 @@ __global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_sh
                                  prebuilt_tma_desc_A, prebuilt_tma_desc_B);
 
   uint64_t prefix_sum = 0;
-  for (int prefix_group = tid; prefix_group < group; prefix_group += blockDim.x) {
-    PrecomputedGroupInfo const info =
-        get_group_info_static<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN>(
-            problem_shapes[prefix_group], swizzle_log);
-    prefix_sum += info.group_tiles;
+  if constexpr (ChunkMajorWorkMap) {
+    uint64_t total_sum = 0;
+    for (int scan_group = tid; scan_group < groups; scan_group += blockDim.x) {
+      PrecomputedGroupInfo const info =
+          get_group_info_static<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN>(
+              problem_shapes[scan_group], swizzle_log);
+      total_sum += info.group_tiles;
+      if (scan_group < group) {
+        prefix_sum += info.group_tiles;
+      }
+    }
+    total_partials[tid] = static_cast<unsigned long long>(total_sum);
+  } else {
+    for (int prefix_group = tid; prefix_group < group; prefix_group += blockDim.x) {
+      PrecomputedGroupInfo const info =
+          get_group_info_static<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN>(
+              problem_shapes[prefix_group], swizzle_log);
+      prefix_sum += info.group_tiles;
+    }
   }
 
   prefix_partials[tid] = static_cast<unsigned long long>(prefix_sum);
@@ -383,6 +432,9 @@ __global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_sh
   for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
     if (tid < offset) {
       prefix_partials[tid] += prefix_partials[tid + offset];
+      if constexpr (ChunkMajorWorkMap) {
+        total_partials[tid] += total_partials[tid + offset];
+      }
     }
     __syncthreads();
   }
@@ -390,24 +442,47 @@ __global__ void build_precomputed_work_tile_map_kernel(Problem const* problem_sh
   uint64_t const group_start = static_cast<uint64_t>(prefix_partials[0]);
   uint64_t const problem_blocks_m = static_cast<uint64_t>(group_info_storage[0]);
   uint64_t const group_tiles = static_cast<uint64_t>(group_info_storage[1]);
+  uint64_t total_tiles = 0;
+  uint64_t tiles_per_worker = 0;
+  if constexpr (ChunkMajorWorkMap) {
+    total_tiles = static_cast<uint64_t>(total_partials[0]);
+    tiles_per_worker = total_tiles == 0 ? 1 : (total_tiles + total_grid_size - 1) / total_grid_size;
+  }
 
   for (uint64_t local_tile = uint64_t(tid); local_tile < group_tiles;
        local_tile += uint64_t(blockDim.x)) {
     uint64_t const global_tile = group_start + local_tile;
-    work_tiles[global_tile] = make_work_tile_static<ClusterShapeM, ClusterShapeN>(
+    uint64_t storage_idx = global_tile;
+    if constexpr (ChunkMajorWorkMap) {
+      uint64_t const worker_idx = global_tile / tiles_per_worker;
+      uint64_t const worker_tile_idx = global_tile % tiles_per_worker;
+      storage_idx = worker_idx * uint64_t(work_tiles_per_worker) + worker_tile_idx;
+    }
+    work_tiles[storage_idx] = make_work_tile_static<ClusterShapeM, ClusterShapeN>(
         global_tile, local_tile, group, problem_blocks_m, swizzle_log, gemm_grid_x, gemm_grid_y);
   }
 
   if (group == groups - 1) {
-    uint64_t const sentinel_start = group_start + group_tiles;
+    [[maybe_unused]] uint64_t const sentinel_start = group_start + group_tiles;
     for (uint64_t i = uint64_t(tid); i < total_grid_size; i += uint64_t(blockDim.x)) {
-      work_tiles[sentinel_start + i] = PrecomputedWorkTileCodec::Invalid;
+      if constexpr (ChunkMajorWorkMap) {
+        uint64_t const worker_start = i * tiles_per_worker;
+        uint64_t const worker_tile_count =
+            worker_start < total_tiles
+                ? ((total_tiles - worker_start < tiles_per_worker) ? total_tiles - worker_start
+                                                                   : tiles_per_worker)
+                : 0;
+        work_tiles[i * uint64_t(work_tiles_per_worker) + worker_tile_count] =
+            PrecomputedWorkTileCodec::Invalid;
+      } else {
+        work_tiles[sentinel_start + i] = PrecomputedWorkTileCodec::Invalid;
+      }
     }
   }
 }
 
-template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN, class Problem,
-          class MainloopParams>
+template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
+          bool ChunkMajorWorkMap = false, class Problem, class MainloopParams>
 inline void build_precomputed_work_tile_map(PrecomputedSchedulerWorkspace const& workspace,
                                             Problem const* problem_shapes, int groups,
                                             int64_t total_routed_tokens, int64_t channels,
@@ -420,13 +495,15 @@ inline void build_precomputed_work_tile_map(PrecomputedSchedulerWorkspace const&
   dim3 const scheduler_grid(groups > 0 ? groups : 1);
   size_t const scheduler_smem =
       kPrebuiltTmaDescriptorScratchBytes +
-      size_t(kPrecomputedSchedulerThreads + 2) * sizeof(unsigned long long);
+      size_t((ChunkMajorWorkMap ? kPrecomputedSchedulerThreads * 2 : kPrecomputedSchedulerThreads) +
+             2) *
+          sizeof(unsigned long long);
   build_precomputed_work_tile_map_kernel<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN,
-                                         Problem, MainloopParams>
+                                         ChunkMajorWorkMap, Problem, MainloopParams>
       <<<scheduler_grid, kPrecomputedSchedulerThreads, scheduler_smem, stream>>>(
           problem_shapes, groups, swizzle_log, workspace.gemm_grid_shape.x,
-          workspace.gemm_grid_shape.y, workspace.work_tiles, mainloop_params,
-          workspace.prebuilt_tma_desc_A, workspace.prebuilt_tma_desc_B);
+          workspace.gemm_grid_shape.y, workspace.work_tiles_per_worker, workspace.work_tiles,
+          mainloop_params, workspace.prebuilt_tma_desc_A, workspace.prebuilt_tma_desc_B);
   TLLM_CUDA_CHECK(cudaPeekAtLastError());
 }
 

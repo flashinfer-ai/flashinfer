@@ -19,6 +19,8 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif  // __GNUC__
 
+#include <cstdint>
+
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -41,10 +43,12 @@
 #include "cutlass/util/reference/host/tensor_norm.h"
 #include "cutlass/util/tensor_view_io.h"
 #include "cutlass_extensions/compute_occupancy.h"
+#include "cutlass_extensions/epilogue/collective/default_epilogue_array_per_token_scale.hpp"
 #include "cutlass_extensions/epilogue/collective/sm90_epilogue_array_tma_warpspecialized_mixed_input.hpp"
 #include "cutlass_extensions/epilogue/fusion/sm90_ptr_array_per_token_scale_callbacks_tma_warpspecialized.hpp"
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/collective/collective_builder_mixed_input.hpp"
+#include "cutlass_extensions/gemm/kernel/sm90_gemm_array_tma_single_warpgroup_persistent.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_gemm_array_tma_warpspecialized_cooperative_precomputed.hpp"
 #include "cutlass_extensions/gemm/kernel/sm90_gemm_array_tma_warpspecialized_pingpong_precomputed.hpp"
 #include "cutlass_extensions/gemm_configs.h"
@@ -75,11 +79,73 @@ namespace tkc = tensorrt_llm::cutlass_extensions;
 
 using namespace cute;
 
+namespace mixed_input_detail {
+
+template <bool UseSingleWarpgroup, class TileShape, class ClusterShape, class ElementAccumulator,
+          class ElementC, class LayoutC, int AlignmentC, class ElementD, class LayoutD,
+          int AlignmentD, class EpilogueSchedule, class FusionOperation>
+struct EpilogueSelector;
+
+template <class TileShape, class ClusterShape, class ElementAccumulator, class ElementC,
+          class LayoutC, int AlignmentC, class ElementD, class LayoutD, int AlignmentD,
+          class EpilogueSchedule, class FusionOperation>
+struct EpilogueSelector<false, TileShape, ClusterShape, ElementAccumulator, ElementC, LayoutC,
+                        AlignmentC, ElementD, LayoutD, AlignmentD, EpilogueSchedule,
+                        FusionOperation> {
+  using Type = typename tensorrt_llm::cutlass_extensions::epilogue::collective::
+      MixedInputSm90TmaEpilogueBuilder<
+          cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
+          ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC, ElementD,
+          typename cutlass::layout::LayoutTranspose<LayoutD>::type*, AlignmentD, EpilogueSchedule,
+          FusionOperation>::CollectiveOp;
+};
+
+template <class TileShape, class ClusterShape, class ElementAccumulator, class ElementC,
+          class LayoutC, int AlignmentC, class ElementD, class LayoutD, int AlignmentD,
+          class EpilogueSchedule, class FusionOperation>
+struct EpilogueSelector<true, TileShape, ClusterShape, ElementAccumulator, ElementC, LayoutC,
+                        AlignmentC, ElementD, LayoutD, AlignmentD, EpilogueSchedule,
+                        FusionOperation> {
+  using EpilogueLayoutC = typename cutlass::layout::LayoutTranspose<LayoutC>::type;
+  using EpilogueLayoutD = typename cutlass::layout::LayoutTranspose<LayoutD>::type;
+  using Epilogue = cutlass::epilogue::collective::SmemEpilogueArrayPerTokenScale<
+      TileShape, ElementC, cutlass::detail::TagToStrideC_t<EpilogueLayoutC*>, ElementD,
+      cutlass::detail::TagToStrideC_t<EpilogueLayoutD*>, ElementAccumulator, ElementAccumulator>;
+  using Type = cutlass::epilogue::collective::detail::Sm90TmaWarpSpecializedAdapter<Epilogue>;
+};
+
+template <bool UseSingleWarpgroup, class ProblemShape, class CollectiveMainloop,
+          class CollectiveEpilogue, int CtasPerSm, bool RollingRefill>
+struct GemmKernelSelector;
+
+template <class ProblemShape, class CollectiveMainloop, class CollectiveEpilogue, int CtasPerSm,
+          bool RollingRefill>
+struct GemmKernelSelector<false, ProblemShape, CollectiveMainloop, CollectiveEpilogue, CtasPerSm,
+                          RollingRefill> {
+  using Type =
+      cutlass::gemm::kernel::GemmUniversalPrecomputedScheduler<ProblemShape, CollectiveMainloop,
+                                                               CollectiveEpilogue>;
+};
+
+template <class ProblemShape, class CollectiveMainloop, class CollectiveEpilogue, int CtasPerSm,
+          bool RollingRefill>
+struct GemmKernelSelector<true, ProblemShape, CollectiveMainloop, CollectiveEpilogue, CtasPerSm,
+                          RollingRefill> {
+  using Type = cutlass::gemm::kernel::SingleWarpgroupPersistentGemm<
+      ProblemShape, CollectiveMainloop, CollectiveEpilogue, CtasPerSm, 3,
+      RollingRefill ? cutlass::gemm::kernel::SingleWarpgroupPipelineMode::RollingRefill
+                    : cutlass::gemm::kernel::SingleWarpgroupPipelineMode::PrefillAll>;
+};
+
+}  // namespace mixed_input_detail
+
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
           typename CTAShape, typename ClusterShape, typename MainloopScheduleType,
           typename EpilogueScheduleType, cutlass::WeightOnlyQuantOp QuantOp,
-          cutlass::gemm::collective::MixedInputScaleMode ScaleMode>
-void sm90_generic_mixed_moe_gemm_kernelLauncher(
+          cutlass::gemm::collective::MixedInputScaleMode ScaleMode,
+          tkc::MainloopScheduleType KernelType>
+void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
     GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
   TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -139,8 +205,6 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
       cutlass::arch::Sm90;  // Tag indicating the minimum SM that supports the intended feature
   using OperatorClass = cutlass::arch::OpClassTensorOp;  // Operator class tag
   using TileShape = CTAShape;                            // Threadblock-level tile size
-  using StageCountType =
-      cutlass::gemm::collective::StageCountAuto;  // Stage count maximized based on the tile size
   using KernelSchedule = std::conditional_t<
       std::is_same_v<MainloopScheduleType, cutlass::gemm::KernelTmaWarpSpecializedPingpong>,
       cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong,
@@ -151,6 +215,24 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
       cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>;  // Epilogue to launch
   constexpr bool use_fused_e8m0_scale =
       ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0;
+  constexpr bool use_single_warpgroup =
+      KernelType == tkc::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL ||
+      KernelType == tkc::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING;
+  constexpr bool use_rolling_refill =
+      KernelType == tkc::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING;
+  constexpr int SmallKTileN = cute::size<1>(TileShape{});
+  constexpr int SmallKCtasPerSm = SmallKTileN <= 16 ? 5 : (SmallKTileN == 32 ? 4 : 3);
+
+  static_assert(!use_single_warpgroup || use_fused_e8m0_scale,
+                "The single-warpgroup kernel is only valid for pre-MMA E8M0 scaling.");
+  static_assert(!use_single_warpgroup || cute::size(ClusterShape{}) == 1,
+                "The single-warpgroup kernel requires a 1x1x1 cluster.");
+  static_assert(
+      !use_single_warpgroup ||
+          (cute::size<0>(TileShape{}) == 128 && cute::size<2>(TileShape{}) == 128 &&
+           (SmallKTileN == 8 || SmallKTileN == 16 || SmallKTileN == 32 || SmallKTileN == 40)),
+      "Unsupported single-warpgroup tile shape.");
+
   using FusionOperation =
       std::conditional_t<use_fused_e8m0_scale,
                          cutlass::epilogue::fusion::PtrArrayPerTokenScaledAcc<
@@ -158,28 +240,28 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
                          cutlass::epilogue::fusion::LinearCombination<
                              ElementD, ElementAccumulator, ElementC, ElementAccumulator>>;
 
-  using CollectiveEpilogue = typename tensorrt_llm::cutlass_extensions::epilogue::collective::
-      MixedInputSm90TmaEpilogueBuilder<
-          cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
-          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
-          ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC, ElementD,
-          typename cutlass::layout::LayoutTranspose<LayoutD>::type*, AlignmentD, EpilogueSchedule,
-          FusionOperation>::CollectiveOp;
+  using CollectiveEpilogue = typename mixed_input_detail::EpilogueSelector<
+      use_single_warpgroup, TileShape, ClusterShape, ElementAccumulator, ElementC, LayoutC,
+      AlignmentC, ElementD, LayoutD, AlignmentD, EpilogueSchedule, FusionOperation>::Type;
 
   // =========================================================== MIXED INPUT WITH SCALES
   // =========================================================================== The Scale
   // information must get paired with the operand that will be scaled. In this example, B is scaled
   // so we make a tuple of B's information and the scale information.
+  using StageCountType =
+      std::conditional_t<use_single_warpgroup, cutlass::gemm::collective::StageCount<3>,
+                         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+                             sizeof(typename CollectiveEpilogue::SharedStorage))>>;
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<
       ArchTag, OperatorClass, cute::tuple<ElementB, ElementScale>, LayoutB_Transpose*, AlignmentB,
       ElementA, LayoutA_Transpose*, AlignmentA, ElementAccumulator, TileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-          sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      KernelSchedule, ScaleMode>::CollectiveOp;
+      StageCountType, KernelSchedule, ScaleMode>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversalPrecomputedScheduler<
-      cutlass::gemm::GroupProblemShape<Shape<int, int, int>>, CollectiveMainloop,
-      CollectiveEpilogue>;
+  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+  using GemmKernel =
+      typename mixed_input_detail::GemmKernelSelector<use_single_warpgroup, ProblemShape,
+                                                      CollectiveMainloop, CollectiveEpilogue,
+                                                      SmallKCtasPerSm, use_rolling_refill>::Type;
 
   using GemmGrouped = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   using StrideC = typename GemmKernel::InternalStrideC;
@@ -208,22 +290,39 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = 0;
-  hw_info.sm_count = sm_count_;
+  hw_info.sm_count = use_single_warpgroup ? sm_count_ * SmallKCtasPerSm : sm_count_;
 
-  arguments =
-      Args{cutlass::gemm::GemmUniversalMode::kGrouped,
-           {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
-           {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),
-            reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
-            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
-            reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
-            reinterpret_cast<ElementScale const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
-            reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
-           {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
-            reinterpret_cast<StrideC*>(hopper_inputs.stride_c),
-            reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
-            reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
-           hw_info};
+  if constexpr (use_single_warpgroup) {
+    arguments = Args{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
+        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),
+         reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
+         reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
+         reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
+         reinterpret_cast<ElementScale const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+         reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
+        {fusion_args, nullptr, reinterpret_cast<StrideC*>(hopper_inputs.stride_c),
+         reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
+         reinterpret_cast<StrideD*>(hopper_inputs.stride_d), reinterpret_cast<ElementD*>(inputs.C),
+         inputs.n, inputs.n, ElementAccumulator(0)},
+        hw_info};
+  } else {
+    arguments = Args{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
+        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),
+         reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
+         reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
+         reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
+         reinterpret_cast<ElementScale const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
+         reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
+        {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
+         reinterpret_cast<StrideC*>(hopper_inputs.stride_c),
+         reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
+         reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
+        hw_info};
+  }
 
   // Optimize tile scheduling for better L2 locality
   using RasterOrderOptions =
@@ -237,6 +336,22 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
     return;
   }
 
+  if constexpr (use_single_warpgroup) {
+    TLLM_CHECK_WITH_INFO(inputs.k > 0 && inputs.k % 128 == 0,
+                         "Single-warpgroup GEMM requires K to be a positive multiple of 128.");
+    if constexpr (use_rolling_refill) {
+      TLLM_CHECK_WITH_INFO(inputs.k > 384,
+                           "Rolling-refill single-warpgroup GEMM requires K > 384.");
+    } else {
+      TLLM_CHECK_WITH_INFO(inputs.k <= 384, "Prefill single-warpgroup GEMM requires K <= 384.");
+    }
+    TLLM_CHECK_WITH_INFO(inputs.n > 0 && inputs.n % 128 == 0,
+                         "Single-warpgroup GEMM requires output channels to be 128 aligned.");
+    TLLM_CHECK_WITH_INFO(
+        inputs.C != nullptr && reinterpret_cast<std::uintptr_t>(inputs.C) % 16 == 0,
+        "Single-warpgroup GEMM requires a 16B-aligned contiguous output base.");
+  }
+
   static constexpr int CurrentTileShapeM = cute::size<0>(TileShape{});
   static constexpr int CurrentTileShapeN = cute::size<1>(TileShape{});
   static constexpr int CurrentClusterShapeM = cute::size<0>(ClusterShape{});
@@ -246,9 +361,14 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
                        "Precomputed scheduler requires total routed token count.");
   auto precomputed_workspace =
       detail::partition_precomputed_scheduler_workspace<CurrentTileShapeM, CurrentTileShapeN,
-                                                        CurrentClusterShapeM, CurrentClusterShapeN>(
-          hopper_inputs, inputs.num_experts, total_routed_tokens, inputs.n, sm_count_);
+                                                        CurrentClusterShapeM, CurrentClusterShapeN,
+                                                        use_single_warpgroup>(
+          hopper_inputs, inputs.num_experts, total_routed_tokens, inputs.n, hw_info.sm_count);
   arguments.scheduler.precomputed_work_tiles = precomputed_workspace.work_tiles;
+  if constexpr (use_single_warpgroup) {
+    arguments.scheduler.precomputed_work_tiles_per_worker =
+        precomputed_workspace.work_tiles_per_worker;
+  }
   arguments.mainloop.ptr_A_prebuilt_tma_desc = precomputed_workspace.prebuilt_tma_desc_A;
   arguments.mainloop.ptr_B_prebuilt_tma_descs = precomputed_workspace.prebuilt_tma_desc_B;
 
@@ -277,7 +397,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
   }
 
   detail::build_precomputed_work_tile_map<CurrentTileShapeM, CurrentTileShapeN,
-                                          CurrentClusterShapeM, CurrentClusterShapeN>(
+                                          CurrentClusterShapeM, CurrentClusterShapeN,
+                                          use_single_warpgroup>(
       precomputed_workspace, hopper_inputs.int4_groupwise_params.shape.problem_shapes,
       inputs.num_experts, total_routed_tokens, inputs.n, gemm.params().mainloop, inputs.stream);
 
@@ -288,6 +409,36 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(
     throw std::runtime_error("[Mixed dtype WS grouped GEMM] " + err_msg);
   }
   return;
+}
+
+template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
+          typename CTAShape, typename ClusterShape, typename MainloopScheduleType,
+          typename EpilogueScheduleType, cutlass::WeightOnlyQuantOp QuantOp,
+          cutlass::gemm::collective::MixedInputScaleMode ScaleMode>
+void sm90_generic_mixed_moe_gemm_kernelLauncher(
+    GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
+    TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
+  sm90_generic_mixed_moe_gemm_kernelLauncher_impl<
+      T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
+      EpilogueScheduleType, QuantOp, ScaleMode, tkc::MainloopScheduleType::AUTO>(
+      inputs, hopper_inputs, sm_count_, workspace_size);
+}
+
+template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
+          typename CTAShape, typename ClusterShape, typename MainloopScheduleType,
+          typename EpilogueScheduleType, cutlass::WeightOnlyQuantOp QuantOp,
+          cutlass::gemm::collective::MixedInputScaleMode ScaleMode,
+          tkc::MainloopScheduleType KernelType>
+void sm90_generic_mixed_moe_small_k_kernelLauncher(
+    GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputType> inputs,
+    TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
+  static_assert(KernelType == tkc::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL ||
+                    KernelType == tkc::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING,
+                "Small-K launcher requires a single-warpgroup schedule.");
+  sm90_generic_mixed_moe_gemm_kernelLauncher_impl<
+      T, WeightType, GemmOutputType, EpilogueTag, CTAShape, ClusterShape, MainloopScheduleType,
+      EpilogueScheduleType, QuantOp, ScaleMode, KernelType>(inputs, hopper_inputs, sm_count_,
+                                                            workspace_size);
 }
 
 }  // namespace cutlass_kernels_oss

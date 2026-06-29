@@ -3361,26 +3361,26 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
       TLLM_CHECK(alpha_scale_ptr_array != nullptr);
     }
 
-    auto universal_input =
-        GroupedGemmInput<T, WeightType, OutputType, OutputType>{input,
-                                                                total_tokens_including_expert,
-                                                                /*weights*/ nullptr,
-                                                                /*scales*/ nullptr,
-                                                                /*zeros*/ nullptr,
-                                                                /*biases*/ nullptr,
-                                                                /*C*/ nullptr,
-                                                                alpha_scale_ptr_array,
-                                                                /*occupancy*/ nullptr,
-                                                                fc1_activation_type,
-                                                                num_rows,
-                                                                /*N*/ int64_t(fc1_out_size),
-                                                                /*K*/ hidden_size,
-                                                                num_experts_per_node,
-                                                                quant_params.groupwise.group_size,
-                                                                /*bias_is_broadcast*/ true,
-                                                                /*use_fused_moe*/ false,
-                                                                stream,
-                                                                config};
+    auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{
+        input,
+        total_tokens_including_expert,
+        /*weights*/ nullptr,
+        /*scales*/ nullptr,
+        /*zeros*/ nullptr,
+        /*biases*/ nullptr,
+        /*C*/ static_cast<OutputType*>(gemm_output),
+        alpha_scale_ptr_array,
+        /*occupancy*/ nullptr,
+        fc1_activation_type,
+        num_rows,
+        /*N*/ int64_t(fc1_out_size),
+        /*K*/ hidden_size,
+        num_experts_per_node,
+        quant_params.groupwise.group_size,
+        /*bias_is_broadcast*/ true,
+        /*use_fused_moe*/ false,
+        stream,
+        config};
     gemm_runner.moeGemm(universal_input, tma_ws_input);
 
     sync_check_cuda_error(stream);
