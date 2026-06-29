@@ -62,7 +62,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
-                 bool normTopkProb, int16_t* routing_replay_out) {
+                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
     // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
@@ -71,7 +71,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mDtypeInput = dtypeLogits;
-    routingData.mUsePdl = true;
+    routingData.mUsePdl = enable_pdl;
     routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
     routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
     routingData.mPtrRoutingBias = routingBias;
@@ -111,7 +111,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mDtypeInput = dtypeLogits;
-    routingData.mUsePdl = true;
+    routingData.mUsePdl = enable_pdl;
     routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
     routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
     routingData.mPtrRoutingBias = routingBias;
@@ -152,7 +152,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         btg::Dtype::Bfloat16;               // for DeepSeek, the expW is currently always bfloat16
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
     routingData.mDtypeBias = dtypeBias;     // for DeepSeek, the bias can be bfloat16 or fp32
-    routingData.mUsePdl = true;
+    routingData.mUsePdl = enable_pdl;
 
     int32_t const totalExpertsPerToken = topK + numFusedSharedExpert;
 
@@ -214,7 +214,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     moe::dev::routing::routingLlama4::Data routingData;
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
-    routingData.mUsePdl = true;
+    routingData.mUsePdl = enable_pdl;
 
     // output:
     routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -262,7 +262,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mDtypeInput = dtypeLogits;  // routing logits can be bfloat16 or fp32
-    routingData.mUsePdl = true;
+    routingData.mUsePdl = enable_pdl;
 
     // Map routing method types to policy-based routing:
     // Note: RenormalizeNaive (Softmax → TopK → SumNormalize) is mathematically equivalent
@@ -383,15 +383,17 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
   bool isGatedAct = isGatedActivation(activationType);
   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
-  auto fusedBiasShuffleMode = useBiasMn ? batchedGemm::gemm::FusedBiasShuffleMode::ReorderAndShuffle
-                                        : batchedGemm::gemm::FusedBiasShuffleMode::None;
+  // ReorderAndShuffle is only supported on fused-act (gated) paths in trtllm-gen.
+  // DSFp8 uses non-fused activation, so it must use Shuffle mode for biasMn.
+  auto fusedBiasShuffleMode =
+      useBiasMn ? (useDeepSeekFp8 ? batchedGemm::gemm::FusedBiasShuffleMode::Shuffle
+                                  : batchedGemm::gemm::FusedBiasShuffleMode::ReorderAndShuffle)
+                : batchedGemm::gemm::FusedBiasShuffleMode::None;
   auto const biasDtype = batchedGemm::trtllm::gen::Dtype::Bfloat16;
   if (useBiasMn) {
     // These checks are because trtllm-gen only exports a subset of the bias types and modes
     FLASHINFER_CHECK(isGatedAct,
                      "PermuteGemm1 BiasType::Mn requires a gated activation (SwiGlu/GeGlu)");
-    FLASHINFER_CHECK(!useDeepSeekFp8,
-                     "PermuteGemm1 BiasType::Mn requires fusedAct=true (not DeepSeek FP8)");
     FLASHINFER_CHECK(useShuffledMatrix,
                      "PermuteGemm1 BiasType::Mn requires useShuffledMatrix=true");
   }
@@ -667,7 +669,7 @@ Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
              usePerChannelScalingGemm2) {}
 
 void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
-                        moe::dev::convertsf::Data& convertSfData,
+                        bool const enablePdl, moe::dev::convertsf::Data& convertSfData,
                         moe::dev::activation::Data& activationData,
                         moe::dev::finalize::Data& finalizeData) {
   // Setup sf conversion data if needed
@@ -677,14 +679,14 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   convertSfData.numTokens = args.num_tokens;
   convertSfData.sfLayoutSrc = btg::SfLayout::R128c4;
   convertSfData.sfLayoutDst = btg::SfLayout::Linear;
-  convertSfData.mUsePdl = true;
+  convertSfData.mUsePdl = enablePdl;
 
   int32_t const totalNumExperts = args.num_experts + args.num_fused_shared_experts;
   int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
 
   // Setup activation data
   activationData.mDtypeElt = args.mDtypeElt;
-  activationData.mUsePdl = true;
+  activationData.mUsePdl = enablePdl;
   activationData.mUseDeepSeekFp8 = true;
   activationData.inPtr = workspace.gemm1_output;
   activationData.outPtr = workspace.activation_output;
@@ -703,7 +705,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     // Setup finalize data
     finalizeData.mDtypeElt = args.mDtypeOut;
     finalizeData.mDtypeExpW = args.mDtypeExpW;
-    finalizeData.mUsePdl = true;
+    finalizeData.mUsePdl = enablePdl;
     finalizeData.mUseDeepSeekFp8 = false;
     finalizeData.inPtr = workspace.gemm2_output;
     finalizeData.outPtr = args.output;
@@ -793,7 +795,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   moe::dev::finalize::Data finalizeData;
   moe::dev::convertsf::Data convertSfData;
   sync_check_cuda_error(stream);
-  setOpsData(args, workspace, convertSfData, activationData, finalizeData);
+  setOpsData(args, workspace, enable_pdl, convertSfData, activationData, finalizeData);
 
   void* hidden_states_scale_linear{args.hidden_states_scale};
 

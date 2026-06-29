@@ -349,6 +349,7 @@ def bench_gdn_mtp(
     disable_state_update: bool = True,
     warmup_iters: int = 10,
     bench_iters: int = 100,
+    ssm_state_indices_mode: str = "none",
 ):
     """Benchmark GDN MTP kernel using bench_gpu_time with CUPTI."""
     num_o_heads = max(num_q_heads, num_v_heads)
@@ -374,8 +375,26 @@ def bench_gdn_mtp(
         else torch.zeros(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
     )
 
+    # FLA-style per-token pool scatter (vLLM API compat).
+    assert ssm_state_indices_mode in ("none", "unique"), (
+        f"ssm_state_indices_mode must be 'none' or 'unique', got "
+        f"{ssm_state_indices_mode!r}"
+    )
+    fla_scatter = ssm_state_indices_mode != "none"
+    if fla_scatter:
+        assert T >= 2, f"--ssm-state-indices requires seq_len>=2, got T={T}"
+        assert not cache_intermediate_states, (
+            "--ssm-state-indices is mutex with --cache (no intermediate buffer)"
+        )
+        assert not disable_state_update, (
+            "--ssm-state-indices requires state writes; pass --update-state"
+        )
+
     # Initial state: [pool_size, HV, V, K] (K-last layout for MTP)
-    pool_size = batch_size
+    # FLA scatter needs an extra B*T slots for the per-token scatter destinations.
+    base_pool_size = batch_size
+    fla_extra_slots = batch_size * T if fla_scatter else 0
+    pool_size = base_pool_size + fla_extra_slots
     initial_state = torch.randn(
         pool_size,
         num_sab_heads,
@@ -385,6 +404,16 @@ def bench_gdn_mtp(
         device="cuda",
     )
     initial_state_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+
+    # FLA-style scatter destinations: B*T fresh slots at the tail of the pool.
+    ssm_state_indices_tensor = None
+    if fla_scatter:
+        ssm_state_indices_tensor = torch.arange(
+            base_pool_size,
+            base_pool_size + batch_size * T,
+            dtype=torch.int32,
+            device="cuda",
+        ).reshape(batch_size, T)
 
     # Intermediate states buffer (optional)
     if cache_intermediate_states:
@@ -423,6 +452,7 @@ def bench_gdn_mtp(
             scale,
             output,
             intermediate_states_buffer,
+            ssm_state_indices=ssm_state_indices_tensor,
             disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
         ),
@@ -1028,7 +1058,11 @@ def gdn_decode_bf16_state_wrapper(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     intermediate_states_buffer=None,
+    accepted_steps=None,
+    ssm_state_indices=None,
     disable_state_update: bool = False,
+    disable_output: bool = False,
+    recovery_steps: int = 0,
     initial_state_indices=None,
     output_state_indices=None,
 ):
@@ -1078,7 +1112,11 @@ def gdn_decode_bf16_state_wrapper(
             initial_state_indices=initial_state_indices,
             output_state_indices=output_state_indices,
             intermediate_states_buffer=intermediate_states_buffer,
+            accepted_steps=accepted_steps,
+            ssm_state_indices=ssm_state_indices,
             disable_state_update=disable_state_update,
+            disable_output=disable_output,
+            recovery_steps=recovery_steps,
             use_qk_l2norm_in_kernel=use_qk_l2norm,
             scale=scale,
             output=output,
@@ -1447,9 +1485,14 @@ def bench_gdn_decode_bf16_state(
     use_qk_l2norm: bool = True,
     cache_intermediate_states: bool = False,
     disable_state_update: bool = False,
+    disable_output: bool = False,
+    recovery_steps: int = 0,
     warmup_iters: int = 10,
     bench_iters: int = 100,
     pool_mode: str = "single",
+    accepted_steps_mode: str = "none",
+    accepted_steps_target_ar: float = -1.0,
+    ssm_state_indices_mode: str = "none",
 ):
     """Benchmark BF16 state kernel.
 
@@ -1467,6 +1510,24 @@ def bench_gdn_decode_bf16_state(
     assert pool_mode in ("single", "split"), (
         f"BF16 state path supports pool_mode in {{single, split}}, got {pool_mode}"
     )
+    assert ssm_state_indices_mode in ("none", "unique"), (
+        f"ssm_state_indices_mode must be 'none' or 'unique', got "
+        f"{ssm_state_indices_mode!r}"
+    )
+    # FLA-style per-token scatter requires T >= 2 (asserted by the wrapper)
+    # and is mutex with cache_intermediate_states and recovery_steps.
+    fla_scatter = ssm_state_indices_mode != "none"
+    if fla_scatter:
+        assert seq_len >= 2, f"--ssm-state-indices requires seq_len>=2, got T={seq_len}"
+        assert not cache_intermediate_states, (
+            "--ssm-state-indices is mutex with --cache (no intermediate buffer)"
+        )
+        assert not disable_state_update, (
+            "--ssm-state-indices requires state writes; pass --update-state"
+        )
+        assert recovery_steps == 0, (
+            "--ssm-state-indices does not support --recovery-steps yet"
+        )
 
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
@@ -1484,8 +1545,11 @@ def bench_gdn_decode_bf16_state(
     b = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
 
     # Pool sized for the indexing mode: split needs 2B slots so write slots
-    # are distinct from read slots.
-    pool_size = 2 * batch_size if pool_mode == "split" else batch_size
+    # are distinct from read slots. FLA scatter needs an extra B*T slots for
+    # the per-token scatter destinations.
+    base_pool_size = 2 * batch_size if pool_mode == "split" else batch_size
+    fla_extra_slots = batch_size * T if fla_scatter else 0
+    pool_size = base_pool_size + fla_extra_slots
     state = torch.randn(
         pool_size,
         num_sab_heads,
@@ -1526,6 +1590,82 @@ def bench_gdn_decode_bf16_state(
     else:
         output_state_indices = None
 
+    # FLA-style scatter destinations: B*T fresh slots at the tail of the pool.
+    # Layout: [h0_slots 0..B][split-pool out slots if any][FLA per-token slots]
+    ssm_state_indices_tensor = None
+    if fla_scatter:
+        ssm_state_indices_tensor = torch.arange(
+            base_pool_size,
+            base_pool_size + batch_size * T,
+            dtype=torch.int32,
+            device="cuda",
+        ).reshape(batch_size, T)
+
+    # Build accepted_steps tensor based on mode. None means uniform-T (legacy
+    # path, no per-request K support compiled in).
+    # `--accepted-steps-target-ar AR` (when >= 0) takes precedence over mode
+    # and generates binomial-sampled K values with mean AR per request.
+    accepted_steps_tensor = None
+    if accepted_steps_target_ar >= 0.0:
+        # Binomial sampling: K_tokens ~ B(n=T, p=AR/T) so E[K_tokens] = AR.
+        # Map to accepted_step (0-indexed last accepted): K_tokens - 1.
+        # Clamp at [0, T-1]. K_tokens=0 → accepted_step=-1 would mean "no
+        # tokens", but the kernel needs accepted_step in [0, T-1] for the
+        # loop bound to be valid. We clamp to 0 (= 1 token) to match the
+        # FLA convention.
+        if not (0.0 < accepted_steps_target_ar <= T):
+            raise ValueError(
+                f"--accepted-steps-target-ar={accepted_steps_target_ar} must "
+                f"be in (0, T={T}]"
+            )
+        torch.manual_seed(42)
+        # n=T-1, p=(AR-1)/(T-1) gives E[accepted_step] = AR - 1.
+        # Handle edge case T=1 (degenerate).
+        if T == 1:
+            accepted_steps_tensor = torch.zeros(
+                batch_size, dtype=torch.int32, device="cuda"
+            )
+        else:
+            p = (accepted_steps_target_ar - 1.0) / (T - 1)
+            p = max(0.0, min(1.0, p))
+            n_tensor = torch.full((batch_size,), float(T - 1), device="cuda")
+            p_tensor = torch.full((batch_size,), p, device="cuda")
+            accepted_steps_tensor = (
+                torch.binomial(n_tensor, p_tensor).clamp(0, T - 1).to(torch.int32)
+            )
+    elif accepted_steps_mode == "uniform":
+        # All requests process all T tokens (K = T-1 each). Verifies early-break
+        # check overhead is negligible when the break never fires.
+        accepted_steps_tensor = torch.full(
+            (batch_size,), T - 1, dtype=torch.int32, device="cuda"
+        )
+    elif accepted_steps_mode == "uniform-half":
+        # All requests process ~T/2 tokens. Verifies wallclock scales with K.
+        kval = max(0, (T // 2) - 1)
+        accepted_steps_tensor = torch.full(
+            (batch_size,), kval, dtype=torch.int32, device="cuda"
+        )
+    elif accepted_steps_mode == "random":
+        # Uniform random K ∈ [0, T-1]. Realistic spec-decode acceptance mix.
+        torch.manual_seed(42)
+        accepted_steps_tensor = torch.randint(
+            0, T, (batch_size,), dtype=torch.int32, device="cuda"
+        )
+    elif accepted_steps_mode == "one-outlier":
+        # One request at K=T-1, rest at K=0 (1 token). The "stress" case
+        # — early-break should reduce wallclock from T*sum-cost to ~1*sum-cost
+        # for the majority + T*1 for the outlier.
+        accepted_steps_tensor = torch.zeros(
+            batch_size, dtype=torch.int32, device="cuda"
+        )
+        if batch_size > 0:
+            accepted_steps_tensor[0] = T - 1
+    elif accepted_steps_mode != "none":
+        raise ValueError(
+            f"Unknown accepted_steps_mode: {accepted_steps_mode!r}. "
+            f"Choose from: none, uniform, uniform-half, random, one-outlier"
+        )
+
     # Scale factor
     scale = 1.0 / (head_size**0.5)
 
@@ -1544,7 +1684,11 @@ def bench_gdn_decode_bf16_state(
             output,
             use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
+            accepted_steps=accepted_steps_tensor,
+            ssm_state_indices=ssm_state_indices_tensor,
             disable_state_update=disable_state_update,
+            disable_output=disable_output,
+            recovery_steps=recovery_steps,
             initial_state_indices=initial_state_indices,
             output_state_indices=output_state_indices,
         ),
@@ -1600,7 +1744,12 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
 
     cache_intermediate = getattr(args, "cache_intermediate_states", False)
     disable_state_update = not getattr(args, "update_state", False)
+    disable_output = getattr(args, "no_output", False)
+    recovery_steps = getattr(args, "recovery_steps", 0)
     pool_mode = getattr(args, "pool_mode", "single")
+    accepted_steps_mode = getattr(args, "accepted_steps_mode", "none")
+    accepted_steps_target_ar = getattr(args, "accepted_steps_target_ar", -1.0)
+    ssm_state_indices_mode = getattr(args, "ssm_state_indices", "none")
 
     print("\n" + "=" * 100)
     print(f"BF16 State GDN Benchmark (T={valid_seq_lens})")
@@ -1610,7 +1759,11 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
         f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}, "
         f"cache_intermediate={'ON' if cache_intermediate else 'OFF'}, "
         f"update_state={'ON' if not disable_state_update else 'OFF'}, "
-        f"pool_mode={pool_mode}"
+        f"output={'OFF' if disable_output else 'ON'}, "
+        f"recovery_steps={recovery_steps}, "
+        f"pool_mode={pool_mode}, "
+        f"accepted_steps={accepted_steps_mode}, "
+        f"ssm_state_indices={ssm_state_indices_mode}"
     )
     print("=" * 100)
     print()
@@ -1632,9 +1785,14 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
                     use_qk_l2norm=use_qk_l2norm,
                     cache_intermediate_states=cache_intermediate,
                     disable_state_update=disable_state_update,
+                    disable_output=disable_output,
+                    recovery_steps=min(recovery_steps, seq_len),
                     warmup_iters=args.warmup,
                     bench_iters=args.iters,
                     pool_mode=pool_mode,
+                    accepted_steps_mode=accepted_steps_mode,
+                    accepted_steps_target_ar=accepted_steps_target_ar,
+                    ssm_state_indices_mode=ssm_state_indices_mode,
                 )
                 all_results.append(result)
 
@@ -1708,6 +1866,9 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
                         disable_state_update=not args.update_state,
                         warmup_iters=args.warmup,
                         bench_iters=args.iters,
+                        ssm_state_indices_mode=getattr(
+                            args, "ssm_state_indices", "none"
+                        ),
                     )
 
                     kernel_time_us = result["kernel_median_us"]
@@ -2029,6 +2190,53 @@ Examples:
         help="Update final state (disable_state_update=False) for MTP benchmark",
     )
     parser.add_argument(
+        "--no-output",
+        action="store_true",
+        help=(
+            "Skip the per-token output projection (state-only mode). "
+            "Sets disable_output=True; the kernel still runs the recurrence "
+            "(state update) but skips the second inner product (h_new @ q), "
+            "the butterfly reduce of o, and the per-token output STG."
+        ),
+    )
+    parser.add_argument(
+        "--accepted-steps-mode",
+        choices=("none", "uniform", "uniform-half", "random", "one-outlier"),
+        default="none",
+        help=(
+            "Per-request K (accepted_steps) mode for the recovery kernel. "
+            "'none': legacy uniform-T (no accepted_steps tensor; no kernel "
+            "code change). 'uniform': all K=T-1 (verifies zero overhead of "
+            "the runtime loop bound). 'uniform-half': all K=T/2-1. 'random': "
+            "uniform random K∈[0,T-1] (realistic spec-decode mix). "
+            "'one-outlier': K[0]=T-1, rest=0 — early-break stress case."
+        ),
+    )
+    parser.add_argument(
+        "--accepted-steps-target-ar",
+        type=float,
+        default=-1.0,
+        help=(
+            "Per-request K with binomial-sampled accepted_steps targeting an "
+            "average # accepted tokens (AR) per request. Sampled as "
+            "B(n=T-1, p=(AR-1)/(T-1)) with seed=42 (deterministic). When >= 0, "
+            "overrides --accepted-steps-mode. Example: --accepted-steps-target-ar 5.0 "
+            "at T=8 → per-request K averaging 5 tokens."
+        ),
+    )
+    parser.add_argument(
+        "--recovery-steps",
+        type=int,
+        default=0,
+        help=(
+            "Fused recovery+decode mode. Of the T total tokens, the first "
+            "K=recovery-steps run state-only (no output); the remaining "
+            "T-K run with output. State h_K is asynchronously written to "
+            "GMEM at the boundary (overlapped with decode compute). The "
+            "post-decode state h_T is discarded. K must be in [0, T]."
+        ),
+    )
+    parser.add_argument(
         "--pool-mode",
         choices=("single", "split"),
         default="single",
@@ -2039,6 +2247,19 @@ Examples:
             "'split': allocate a pool of size 2*B; reads from slots [0..B), "
             "writes to slots [B..2B), exercising the split-pool dispatch "
             "(speculative-decoding / MTP-verify shape)."
+        ),
+    )
+    parser.add_argument(
+        "--ssm-state-indices",
+        choices=("none", "unique"),
+        default="none",
+        help=(
+            "FLA-style per-token pool scatter. 'none' (default): legacy "
+            "behavior (dense intermediate buffer or none). 'unique': "
+            "allocate B*T extra pool slots and pass ssm_state_indices=[B,T] "
+            "int32 to the kernel, so each h_{t+1} writes directly to "
+            "pool[ssm_state_indices[i, t]] (matches FLA's Triton API). "
+            "Requires T>=2 and is mutex with --cache."
         ),
     )
     parser.add_argument(

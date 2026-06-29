@@ -30,6 +30,19 @@ from .gdn_kernels import (
 )
 
 
+_SM100_STATE_DTYPES: tuple[torch.dtype, ...] = (
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+)
+
+
+def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
+    return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
+
+
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
@@ -129,7 +142,9 @@ def chunk_gated_delta_rule(
     initial_state : torch.Tensor, optional
         Initial KV state of shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
-        float32.  Starts from zero state when ``None``.
+        float32 on SM90/SM120.  The SM100 path also accepts bfloat16,
+        float16, float8_e4m3fn, and float8_e5m2.  Starts from zero state
+        when ``None``.
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
@@ -149,11 +164,15 @@ def chunk_gated_delta_rule(
         ``None``.
     output_state : torch.Tensor, optional
         Pre-allocated output state tensor of shape ``[num_seqs,
-        num_sab_heads, head_size, head_size]``, float32.  Required when
+        num_sab_heads, head_size, head_size]``.  Must be float32 on
+        SM90/SM120.  The SM100 path also accepts bfloat16, float16,
+        float8_e4m3fn, and float8_e5m2.  Required when
         ``output_final_state=True``.
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
-        num_sab_heads, head_size, head_size]``, float32.  Required when
+        num_sab_heads, head_size, head_size]``.  Must be float32 on
+        SM90/SM120.  The SM100 path also accepts bfloat16, float16,
+        float8_e4m3fn, and float8_e5m2.  Required when
         ``checkpoint_every_n_tokens > 0``.
     checkpoint_cu_starts : torch.Tensor, optional
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int64.
@@ -227,9 +246,14 @@ def chunk_gated_delta_rule(
 
     if checkpoint_every_n_tokens > 0:
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
-        if state_checkpoints.dtype != torch.float32:
+        state_checkpoint_dtypes: tuple[torch.dtype, ...] = (torch.float32,)
+        if q.is_cuda and get_compute_capability(q.device)[0] == 10:
+            state_checkpoint_dtypes = _SM100_STATE_DTYPES
+        if state_checkpoints.dtype not in state_checkpoint_dtypes:
             raise ValueError(
-                f"state_checkpoints must be float32, got {state_checkpoints.dtype}"
+                "state_checkpoints must have dtype "
+                f"{_format_dtype_list(state_checkpoint_dtypes)}, "
+                f"got {state_checkpoints.dtype}"
             )
         if state_checkpoints.ndim != 4:
             raise ValueError(
