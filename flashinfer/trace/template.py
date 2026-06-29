@@ -257,7 +257,7 @@ def _get_tensor(
             # (k_cache, v_cache) tuple; the k/v split lives on dim 1. Recover
             # the per-cache view so dtype/shape extraction matches the
             # template's dim_names.
-            val = val[:, tuple_idx]
+            val = val[:, tuple_idx] if tuple_idx < val.shape[1] else None
         else:
             return None
     return val if isinstance(val, torch.Tensor) else None
