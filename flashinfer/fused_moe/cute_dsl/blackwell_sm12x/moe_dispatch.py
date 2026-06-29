@@ -24,7 +24,7 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     make_ptr,
 )
-from .moe_activation import GATED_ACTIVATIONS
+from .moe_activation import is_gated_activation
 from .moe_dynamic_kernel import MoEDynamicKernel
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
@@ -568,7 +568,7 @@ def _get_static_kernel(
         input_scales_are_reciprocal=input_scales_are_reciprocal,
     )
 
-    is_gated = activation in GATED_ACTIVATIONS
+    is_gated = is_gated_activation(activation)
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -813,7 +813,7 @@ def _get_micro_kernel(
         single_token=single_token,
     )
 
-    is_gated = activation in GATED_ACTIVATIONS
+    is_gated = is_gated_activation(activation)
     w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -1581,7 +1581,7 @@ def _get_dynamic_kernel(
     if cached is not None:
         return cached
 
-    is_gated = activation in GATED_ACTIVATIONS
+    is_gated = is_gated_activation(activation)
     w1_rows = (2 if is_gated else 1) * n
 
     scratch_dtype = cutlass.Float4E2M1FN
@@ -2569,7 +2569,7 @@ def launch_sm120_moe(
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    is_gated = activation in GATED_ACTIVATIONS
+    is_gated = is_gated_activation(activation)
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size

@@ -543,7 +543,7 @@ class B12xMoEWrapper:
             _get_weight_views as _get_sm120_weight_views,
             _pad_intermediate_to_tile,
             _LEVEL_TILE_N,
-            GATED_ACTIVATIONS,
+            is_gated_activation,
         )
 
         # Pick the right pre-allocated workspace for this call's token
@@ -588,7 +588,7 @@ class B12xMoEWrapper:
                     self._padded_weights is None
                     or self._padded_weight_key != padded_weight_key
                 ):
-                    is_gated = self.activation in GATED_ACTIVATIONS
+                    is_gated = is_gated_activation(self.activation)
                     self._padded_weights = _pad_intermediate_to_tile(
                         w1_weight,
                         w1_weight_sf,

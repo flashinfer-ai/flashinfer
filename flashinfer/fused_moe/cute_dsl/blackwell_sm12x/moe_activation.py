@@ -8,7 +8,9 @@ from cutlass import Float32
 
 from flashinfer.cute_dsl.fp4_common import fmax_f32, fmin_f32
 
-GATED_ACTIVATIONS = ("silu", "gelu_tanh", "swigluoai_uninterleave")
+
+def is_gated_activation(activation: str) -> bool:
+    return activation in ("silu", "gelu_tanh", "swigluoai_uninterleave")
 
 
 def gated_activation_f32(
