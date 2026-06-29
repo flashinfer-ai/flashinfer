@@ -3521,7 +3521,7 @@ def trtllm_fp8_block_scale_moe(
         gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
-        None,  # output, allocated inside op
+        output,
         num_experts,
         top_k,
         n_group,
