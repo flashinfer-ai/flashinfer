@@ -781,6 +781,26 @@ mla_paged_decode_trace = TraceTemplate(
                 "based on head dimensions before matrix absorption. Set during plan(), not run()."
             ),
         ),
+        "ckv_scale": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "Per-tensor dequantization scale for the compressed-KV cache when "
+                "kv_data_type is FP8 (real = quantized * ckv_scale). Required "
+                "together with kpe_scale for the FP8 KV cache path on the fa3 "
+                "backend. Set during run(), not plan()."
+            ),
+        ),
+        "kpe_scale": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "Per-tensor dequantization scale for the rope-K cache when "
+                "kv_data_type is FP8 (real = quantized * kpe_scale). Required "
+                "together with ckv_scale for the FP8 KV cache path on the fa3 "
+                "backend. Set during run(), not plan()."
+            ),
+        ),
         "return_lse": Scalar(
             "int32", optional=True, description="Bool: also return LSE."
         ),

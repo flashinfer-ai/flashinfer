@@ -78,9 +78,16 @@ def _cutlass_state_dtype(torch_dtype: torch.dtype):
         return cutlass.Float32
     elif torch_dtype == torch.bfloat16:
         return cutlass.BFloat16
+    elif torch_dtype == torch.float16:
+        return cutlass.Float16
+    elif torch_dtype == torch.float8_e4m3fn:
+        return cutlass.Float8E4M3FN
+    elif torch_dtype == torch.float8_e5m2:
+        return cutlass.Float8E5M2
     else:
         raise ValueError(
-            f"Unsupported state dtype {torch_dtype}, expected float32 or bfloat16"
+            f"Unsupported state dtype {torch_dtype}, expected float32, bfloat16, "
+            "float16, float8_e4m3fn, or float8_e5m2"
         )
 
 
@@ -116,12 +123,12 @@ def chunk_gated_delta_rule_sm100(
         beta: ``(total_tokens, HO)`` float32, update gate
         output: ``(total_tokens, HO, DK)`` float16/bfloat16, pre-allocated
         cu_seqlens: ``(num_seqs + 1,)`` int32
-        initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
-        output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
+        initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
+        output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
         scale: attention scale factor (must not be 0)
         checkpoint_every_n_tokens: store intermediate state every N tokens (0 = disabled)
         cu_checkpoints: ``(num_seqs + 1,)`` int32, cumulative checkpoint counts
-        output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16, or None
+        output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
     """
     HQ = q.size(1)
     HV = v.size(1)

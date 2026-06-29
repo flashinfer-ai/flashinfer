@@ -49,19 +49,28 @@ from cutlass.cute.runtime import from_dlpack
 
 
 def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
-    # PyTorch's `.contiguous()` does NOT repack a slice whose leading dim has
-    # size 1 — size-1 dims don't affect PyTorch's contiguity check, so the
-    # parent's stride[0] survives. CUTE's mark_compact_shape_dynamic is
-    # stricter: it requires stride[0] == stride[1] * shape[1] (canonical
-    # compact). Detect the mismatch and rebuild with `.clone()` (forces
-    # contiguous-format allocation with canonical strides).
-    if torch_t.dim() > 1 and torch_t.stride(0) != torch_t.stride(1) * torch_t.size(1):
-        torch_t = torch_t.clone(memory_format=torch.contiguous_format)
-    # explicit stride_order: auto-deduction is ambiguous at B=1/T=1.
+    # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
+    return from_dlpack(
+        torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
+    ).mark_layout_dynamic()
+
+
+def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # Only the leading (mode 0) dim dynamic; inner dims stay static so launchers
+    # can derive constexpr tile counts (num_v_tiles) from the pool/cache shape.
+    stride_order = tuple(range(torch_t.dim()))
+    return from_dlpack(
+        torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
+    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
+
+
+def _mark_index_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
+    # Batch-dynamic compact marking for contiguous index/step tensors; explicit
+    # stride_order disambiguates size-1 dims that mark_layout_dynamic cannot.
     stride_order = tuple(sorted(range(torch_t.dim()), key=lambda d: -torch_t.stride(d)))
     return from_dlpack(
         torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
-    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order)
+    ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
 
 
 # ==============================================================================
@@ -3160,15 +3169,14 @@ def gated_delta_rule_mtp_wide_vec(
         )
 
         if contiguous_pool:
-            h_ = _mark_batch_dynamic(h0_source)
+            h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
         inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        # Mark the flat-3D view's slot dim dynamic so the cubin works across
-        # pool_size variations (FLA-flat aliases h0_source as a flat [pool*HV,
-        # V, K] view whose slot dim varies with pool_size).
+        # Mark the flat-3D view's slot dim dynamic (mode 0 only; inner dims stay
+        # static) so the cubin works across pool_size variations.
         if cache_intermediate_states or per_token_pool_scatter_flat:
-            inter_ = _mark_batch_dynamic(intermediate_states)
+            inter_ = _mark_slot_dynamic(intermediate_states)
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
@@ -3177,18 +3185,18 @@ def gated_delta_rule_mtp_wide_vec(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
         )
         h0_out_idx_ = h0_idx_
-        acc_steps_ = _mark_batch_dynamic(
+        acc_steps_ = _mark_index_dynamic(
             accepted_steps
             if accepted_steps is not None
             else _placeholder_accepted_steps
         )
-        ssm_idx_ = _mark_batch_dynamic(
+        ssm_idx_ = _mark_index_dynamic(
             ssm_state_indices
             if ssm_state_indices is not None
             else _placeholder_ssm_state_indices
@@ -3430,13 +3438,16 @@ def gated_delta_rule_t1_wide_vec(
         )
 
         if contiguous_pool:
-            h_ = _mark_batch_dynamic(h0_source)
+            h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
         if cache_intermediate_states:
-            # Dummy [1,1,1] tensor (caching off) has no unique stride-1 dim.
-            inter_ = _mark_batch_dynamic(intermediate_states)
+            inter_ = _mark_slot_dynamic(intermediate_states)
+        else:
+            # Caching-off dummy ([1,1,1]) is never read; don't mark it.
+            inter_ = from_dlpack(
+                intermediate_states, assumed_align=32, enable_tvm_ffi=True
+            )
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
@@ -3445,7 +3456,7 @@ def gated_delta_rule_t1_wide_vec(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
@@ -3799,15 +3810,17 @@ def gated_delta_rule_mtp(
         )
 
         if contiguous_pool:
-            h_ = _mark_batch_dynamic(h0_source)
+            h_ = _mark_slot_dynamic(h0_source)
         else:
             h_ = from_dlpack(h0_source, assumed_align=32, enable_tvm_ffi=True)
-        inter_ = from_dlpack(intermediate_states, assumed_align=32, enable_tvm_ffi=True)
-        # Mark the flat-3D view's slot dim dynamic so the cubin works across
-        # pool_size variations (FLA-flat aliases h0_source as a flat [pool*HV,
-        # V, K] view whose slot dim varies with pool_size).
+        # Slot dim dynamic (mode 0 only) for the caching/scatter path; the
+        # caching-off dummy is never read so convert it directly.
         if cache_intermediate_states or per_token_pool_scatter_flat:
-            inter_ = _mark_batch_dynamic(intermediate_states)
+            inter_ = _mark_slot_dynamic(intermediate_states)
+        else:
+            inter_ = from_dlpack(
+                intermediate_states, assumed_align=32, enable_tvm_ffi=True
+            )
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
@@ -3816,18 +3829,18 @@ def gated_delta_rule_mtp(
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
-        h0_idx_ = _mark_batch_dynamic(
+        h0_idx_ = _mark_index_dynamic(
             initial_state_indices
             if initial_state_indices is not None
             else _placeholder_indices
         )
         h0_out_idx_ = h0_idx_
-        acc_steps_ = _mark_batch_dynamic(
+        acc_steps_ = _mark_index_dynamic(
             accepted_steps
             if accepted_steps is not None
             else _placeholder_accepted_steps
         )
-        ssm_idx_ = _mark_batch_dynamic(
+        ssm_idx_ = _mark_index_dynamic(
             ssm_state_indices
             if ssm_state_indices is not None
             else _placeholder_ssm_state_indices

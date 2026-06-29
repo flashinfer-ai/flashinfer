@@ -134,6 +134,16 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
         __VA_ARGS__;                                                                   \
         break;                                                                         \
       }                                                                                \
+      case MoeA2ACombineQuantMode::NVFP4: {                                            \
+        constexpr auto QUANT_MODE = MoeA2ACombineQuantMode::NVFP4;                     \
+        __VA_ARGS__;                                                                   \
+        break;                                                                         \
+      }                                                                                \
+      case MoeA2ACombineQuantMode::MXFP4: {                                            \
+        constexpr auto QUANT_MODE = MoeA2ACombineQuantMode::MXFP4;                     \
+        __VA_ARGS__;                                                                   \
+        break;                                                                         \
+      }                                                                                \
       default: {                                                                       \
         FLASHINFER_CHECK(false, "Unsupported quant_mode for moe_a2a_combine");         \
       }                                                                                \
@@ -551,7 +561,8 @@ template <int VEC_SIZE_BYTES, int TOP_K, typename T,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, int row_idx,
                                         int row_size, int rank_id, int max_tokens_per_rank,
-                                        CombineKernelPointers const& ptrs) {
+                                        CombineKernelPointers const& ptrs,
+                                        float OutputScalarScale = 1.0f) {
   constexpr int elems_per_vec = VEC_SIZE_BYTES / sizeof(T);
   const int size_per_token = row_size * sizeof(T);
   using flashinfer::vec_t;
@@ -560,9 +571,12 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
   if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
     dst_bytes = reinterpret_cast<uint8_t*>(static_cast<T*>(output_buffer) + row_idx * row_size);
   } else {
-    // MXFP8 output stores one byte per logical element while accumulation reads T-sized inputs.
-    dst_bytes = static_cast<uint8_t*>(output_buffer) +
-                static_cast<size_t>(row_idx) * static_cast<size_t>(row_size);
+    // MXFP8 stores one byte per logical element; FP4 packs two e2m1 values per byte, so its
+    // rows are half as wide. The accumulation still reads T-sized inputs either way.
+    size_t const bytes_per_row = QuantMode == MoeA2ACombineQuantMode::MXFP8
+                                     ? static_cast<size_t>(row_size)
+                                     : static_cast<size_t>(row_size) / 2;
+    dst_bytes = static_cast<uint8_t*>(output_buffer) + static_cast<size_t>(row_idx) * bytes_per_row;
   }
 
   int const stride = blockDim.x * VEC_SIZE_BYTES;
@@ -751,7 +765,7 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
     if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
       acc[0].store(dst_bytes + offset);
     } else {
-      constexpr uint32_t sf_vec_size = QuantMode == MoeA2ACombineQuantMode::MXFP8 ? 32 : 16;
+      constexpr uint32_t sf_vec_size = QuantMode == MoeA2ACombineQuantMode::NVFP4 ? 16 : 32;
       constexpr uint32_t threads_per_sf = sf_vec_size / elems_per_vec;
       uint8_t scale;
       auto store_sf = [&]() {
@@ -769,15 +783,28 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
           reinterpret_cast<uint8_t*>(sf_output)[sf_offset] = scale;
         }
       };
+      auto packed_vec =
+          reinterpret_cast<tensorrt_llm::kernels::PackedVec<T, elems_per_vec>&>(acc[0]);
       if constexpr (QuantMode == MoeA2ACombineQuantMode::MXFP8) {
         static_assert(elems_per_vec == 8, "MXFP8 quantization requires 8 elements per vector");
-        auto packed_vec =
-            reinterpret_cast<tensorrt_llm::kernels::PackedVec<T, elems_per_vec>&>(acc[0]);
         uint64_t fp8x8 =
             tensorrt_llm::kernels::cvt_warp_fp16_to_mxfp8<T, 32, elems_per_vec>(packed_vec, &scale);
         reinterpret_cast<uint64_t*>(dst_bytes)[logical_offset / elems_per_vec] = fp8x8;
-        store_sf();
+      } else if constexpr (QuantMode == MoeA2ACombineQuantMode::NVFP4 ||
+                           QuantMode == MoeA2ACombineQuantMode::MXFP4) {
+        static_assert(elems_per_vec == 8 || elems_per_vec == 16,
+                      "FP4 quantization requires 8 or 16 elements per vector");
+        constexpr int SF_VEC_SIZE = QuantMode == MoeA2ACombineQuantMode::MXFP4 ? 32 : 16;
+        auto fp4_packed = tensorrt_llm::kernels::cvt_warp_fp16_to_fp4 < T, SF_VEC_SIZE,
+             elems_per_vec,
+             QuantMode == MoeA2ACombineQuantMode::MXFP4 > (packed_vec, OutputScalarScale, &scale);
+        // cvt_warp_fp16_to_fp4 returns uint32_t for 8 elems (4 packed bytes) and uint64_t for 16
+        // (8 packed bytes); store at the matching width so packed rows stay contiguous and fit the
+        // dim/2-byte output buffer (a wider store would overflow into the next token's row).
+        reinterpret_cast<decltype(fp4_packed)*>(dst_bytes)[logical_offset / elems_per_vec] =
+            fp4_packed;
       }
+      store_sf();
     }
   }
 }
@@ -787,10 +814,12 @@ template <int TOP_K, typename T, MoeA2ACombineQuantMode QuantMode = MoeA2ACombin
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __device__ void vectorized_combine(void* output_buffer, void* sf_output, int row_idx, int row_size,
                                    int rank_id, int max_tokens_per_rank,
-                                   CombineKernelPointers const& ptrs) {
+                                   CombineKernelPointers const& ptrs,
+                                   float OutputScalarScale = 1.0f) {
   if constexpr (QuantMode != MoeA2ACombineQuantMode::NONE) {
     vectorized_combine_impl<16, TOP_K, T, QuantMode, SwizzleMode>(
-        output_buffer, sf_output, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
+        output_buffer, sf_output, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs,
+        OutputScalarScale);
   } else {
     if (row_size % 16 == 0) {
       vectorized_combine_impl<16, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
@@ -852,8 +881,8 @@ template <typename T, int TOP_K, MoeA2ACombineQuantMode QuantMode = MoeA2ACombin
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
-    int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id,
-    int ep_size) {
+    int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
+    float OutputScalarScale) {
   int local_token_idx = blockIdx.x;
 
   if (local_num_tokens == 0) {
@@ -926,9 +955,9 @@ __global__ void moeA2ACombineKernel(
   if (local_num_tokens == 0) return;
 
   // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(ptrs.src_data_ptrs[0], ptrs.output_scales,
-                                                       local_token_idx, elements_per_token, rank_id,
-                                                       max_tokens_per_rank, ptrs);
+  vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(
+      ptrs.src_data_ptrs[0], ptrs.output_scales, local_token_idx, elements_per_token, rank_id,
+      max_tokens_per_rank, ptrs, OutputScalarScale);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
@@ -1011,7 +1040,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
           moeA2ACombineKernel<TKernelType, TOP_K, QUANT_MODE, SWIZZLE_MODE>
               <<<grid_size_block, kBlockSize, 0, params.stream>>>(
                   kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-                  params.local_num_tokens, params.ep_rank, params.ep_size);
+                  params.local_num_tokens, params.ep_rank, params.ep_size,
+                  params.output_scalar_scale);
         });
       });
     });

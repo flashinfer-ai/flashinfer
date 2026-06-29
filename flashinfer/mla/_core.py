@@ -1597,6 +1597,44 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
+        # Other 1-byte dtypes (uint8, fp4, e5m2) would JIT-map to non-FP8
+        # element types and silently take an unsupported code path inside
+        # the kernel, so allowlist exactly the dtypes the kernel can handle.
+        _SUPPORTED_MLA_KV_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        if kv_data_type not in _SUPPORTED_MLA_KV_DTYPES:
+            raise ValueError(
+                f"MLA kv_data_type {kv_data_type} is not supported. "
+                f"Supported dtypes: {list(_SUPPORTED_MLA_KV_DTYPES)}."
+            )
+        if kv_data_type == torch.float8_e4m3fn:
+            if self._backend != "fa3":
+                raise ValueError(
+                    "FP8 kv_data_type for MLA is only supported with the fa3 "
+                    f"backend on SM90, got backend={self._backend!r}."
+                )
+            # Backend selection is independent of the runtime device; FP8 MLA
+            # requires SM90 specifically.
+            major, minor = get_compute_capability(self.device)
+            if major != 9:
+                raise ValueError(
+                    "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
+                    f"got SM{major}{minor}."
+                )
+            # Removing this guard exposes vec_cast<half, fp8_e4m3>, which
+            # exists but is untested for MLA — silent wrong output.
+            if q_data_type != torch.bfloat16:
+                raise ValueError(
+                    "FP8 kv_data_type for MLA currently only supports "
+                    f"q_data_type=torch.bfloat16, got {q_data_type}."
+                )
+            # Also enforced by static_assert in mla_hopper.cuh.
+            if head_dim_ckv != 512 or head_dim_kpe != 64:
+                raise ValueError(
+                    "FP8 kv_data_type for MLA currently only supports "
+                    "head_dim_ckv=512 and head_dim_kpe=64 (DeepSeek MLA), got "
+                    f"head_dim_ckv={head_dim_ckv}, head_dim_kpe={head_dim_kpe}."
+                )
+
         self._cached_module = get_batch_mla_module(
             self._backend,
             q_data_type,
@@ -1624,6 +1662,11 @@ class BatchMLAPagedAttentionWrapper:
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
+        # Used by run() to reject dtype mismatches; the C++ launcher
+        # reinterprets storage by the JIT-template type chosen at plan(),
+        # so a mismatch produces silent wrong output.
+        self._q_data_type = q_data_type
+        self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
 
         self._plan_info = self._cached_module.plan(
@@ -1653,6 +1696,9 @@ class BatchMLAPagedAttentionWrapper:
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
+        *,
+        ckv_scale: Optional[float] = None,
+        kpe_scale: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1670,6 +1716,9 @@ class BatchMLAPagedAttentionWrapper:
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
+        *,
+        ckv_scale: Optional[float] = None,
+        kpe_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api(trace=mla_paged_decode_trace)
@@ -1687,6 +1736,9 @@ class BatchMLAPagedAttentionWrapper:
         page_table: Optional[torch.Tensor] = None,
         return_lse_base_on_e: bool = False,
         o_scale: Optional[float] = None,
+        *,
+        ckv_scale: Optional[float] = None,
+        kpe_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -1725,6 +1777,16 @@ class BatchMLAPagedAttentionWrapper:
             FP8 output dequantization scale (``real = quantized * o_scale``).
             When provided, ``out`` must be an FP8 tensor. Only supported with
             the ``cutlass`` backend.
+        ckv_scale : Optional[float]
+            Per-tensor dequantization scale for the compressed-KV cache when
+            ``kv_data_type`` is FP8 (``real = quantized * ckv_scale``). Required
+            (together with ``kpe_scale``) for the FP8 KV cache path on the
+            ``fa3`` backend. Must be a finite positive value. Must not be
+            provided when ``kv_data_type`` is BF16/FP16.
+        kpe_scale : Optional[float]
+            Per-tensor dequantization scale for the rope-K cache when
+            ``kv_data_type`` is FP8 (``real = quantized * kpe_scale``). Same
+            usage rules as ``ckv_scale``.
         """
         if self._backend == "cutlass":
             if return_lse:
@@ -1732,6 +1794,11 @@ class BatchMLAPagedAttentionWrapper:
             if profiler_buffer is not None:
                 raise ValueError(
                     "profiler_buffer does not support cutlass backend for now."
+                )
+            if ckv_scale is not None or kpe_scale is not None:
+                raise ValueError(
+                    "ckv_scale / kpe_scale are only supported with the fa3 backend "
+                    "and FP8 kv_data_type."
                 )
             self._cached_module = get_mla_module()
             output_scale = 1.0
@@ -1779,6 +1846,56 @@ class BatchMLAPagedAttentionWrapper:
             raise ValueError(
                 "o_scale is only supported with the cutlass backend for now."
             )
+
+        # The C++ launcher reinterprets tensor storage by the JIT-template
+        # type chosen at plan(); a dtype mismatch here silently produces
+        # wrong output.
+        if q_nope.dtype != self._q_data_type:
+            raise ValueError(
+                f"q_nope.dtype={q_nope.dtype} does not match the planned "
+                f"q_data_type={self._q_data_type}."
+            )
+        if q_pe.dtype != self._q_data_type:
+            raise ValueError(
+                f"q_pe.dtype={q_pe.dtype} does not match the planned "
+                f"q_data_type={self._q_data_type}."
+            )
+        if ckv_cache.dtype != self._kv_data_type:
+            raise ValueError(
+                f"ckv_cache.dtype={ckv_cache.dtype} does not match the planned "
+                f"kv_data_type={self._kv_data_type}."
+            )
+        if kpe_cache.dtype != self._kv_data_type:
+            raise ValueError(
+                f"kpe_cache.dtype={kpe_cache.dtype} does not match the planned "
+                f"kv_data_type={self._kv_data_type}."
+            )
+
+        # e4m3fn is the only FP8 dtype reachable here (plan() rejects others).
+        kv_is_fp8 = self._kv_data_type == torch.float8_e4m3fn
+        if kv_is_fp8:
+            if ckv_scale is None or kpe_scale is None:
+                raise ValueError(
+                    "ckv_scale and kpe_scale are required when kv_data_type is FP8."
+                )
+            ckv_scale_f = float(ckv_scale)
+            kpe_scale_f = float(kpe_scale)
+            if not math.isfinite(ckv_scale_f) or ckv_scale_f <= 0.0:
+                raise ValueError(
+                    f"ckv_scale must be a finite positive value, got {ckv_scale}"
+                )
+            if not math.isfinite(kpe_scale_f) or kpe_scale_f <= 0.0:
+                raise ValueError(
+                    f"kpe_scale must be a finite positive value, got {kpe_scale}"
+                )
+        else:
+            if ckv_scale is not None or kpe_scale is not None:
+                raise ValueError(
+                    "ckv_scale / kpe_scale are only valid when kv_data_type is FP8."
+                )
+            ckv_scale_f = 1.0
+            kpe_scale_f = 1.0
+
         if profiler_buffer is None:
             if self._use_profiler:
                 raise ValueError(
@@ -1821,6 +1938,8 @@ class BatchMLAPagedAttentionWrapper:
             page_size,
             sm_scale,
             return_lse_base_on_e,
+            ckv_scale_f,
+            kpe_scale_f,
             *profiler_args,
         )
 
