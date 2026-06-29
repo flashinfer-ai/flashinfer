@@ -1563,6 +1563,30 @@ def gen_customize_batch_prefill_module(
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
+    def append_nvfp4_sf_stride_setter(additional_params_setter: str) -> str:
+        stride_setters = []
+        if "maybe_k_cache_sf" in additional_tensor_names:
+            stride_setters.append(
+                "if (maybe_k_cache_sf) { const auto& sf_tensor = maybe_k_cache_sf.value(); "
+                "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+                "params.k_sf_stride_page = sf_strides.stride_page; "
+                "params.k_sf_stride_n = sf_strides.stride_n; "
+                "params.k_sf_stride_h = sf_strides.stride_h; }"
+            )
+        if "maybe_v_cache_sf" in additional_tensor_names:
+            stride_setters.append(
+                "if (maybe_v_cache_sf) { const auto& sf_tensor = maybe_v_cache_sf.value(); "
+                "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+                "params.v_sf_stride_page = sf_strides.stride_page; "
+                "params.v_sf_stride_n = sf_strides.stride_n; "
+                "params.v_sf_stride_h = sf_strides.stride_h; }"
+            )
+        if not stride_setters:
+            return additional_params_setter
+        if additional_params_setter:
+            return additional_params_setter + " \\\n" + " \\\n".join(stride_setters)
+        return " \\\n".join(stride_setters)
+
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1588,6 +1612,9 @@ def gen_customize_batch_prefill_module(
                 additional_scalar_names,
                 additional_scalar_dtypes,
             )
+        )
+        additional_params_setter = append_nvfp4_sf_stride_setter(
+            additional_params_setter
         )
 
         with open(

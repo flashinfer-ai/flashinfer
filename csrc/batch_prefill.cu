@@ -44,6 +44,35 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
+struct FP4ScaleStrides {
+  uint32_t stride_page;
+  uint32_t stride_n;
+  uint32_t stride_h;
+};
+
+FP4ScaleStrides GetFP4ScaleStrides(const TensorView& sf, QKVLayout kv_layout) {
+  TVM_FFI_ICHECK(sf.ndim() == 3 || sf.ndim() == 4)
+      << "NVFP4 scale tensor must be 3D or 4D, got " << sf.ndim() << "D";
+  FP4ScaleStrides strides{0, 0, 0};
+  if (sf.ndim() == 4) {
+    strides.stride_page = static_cast<uint32_t>(sf.stride(0));
+    if (kv_layout == QKVLayout::kHND) {
+      strides.stride_h = static_cast<uint32_t>(sf.stride(1));
+      strides.stride_n = static_cast<uint32_t>(sf.stride(2));
+    } else {
+      strides.stride_n = static_cast<uint32_t>(sf.stride(1));
+      strides.stride_h = static_cast<uint32_t>(sf.stride(2));
+    }
+  } else if (kv_layout == QKVLayout::kHND) {
+    strides.stride_h = static_cast<uint32_t>(sf.stride(0));
+    strides.stride_n = static_cast<uint32_t>(sf.stride(1));
+  } else {
+    strides.stride_n = static_cast<uint32_t>(sf.stride(0));
+    strides.stride_h = static_cast<uint32_t>(sf.stride(1));
+  }
+  return strides;
+}
+
 Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
     TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
@@ -153,6 +182,12 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         params.max_total_num_rows = 0;
         params.padded_batch_size = 0;
         params.partition_kv = false;
+        params.k_sf_stride_page = 0;
+        params.k_sf_stride_n = 0;
+        params.k_sf_stride_h = 0;
+        params.v_sf_stride_page = 0;
+        params.v_sf_stride_n = 0;
+        params.v_sf_stride_h = 0;
 
         ADDITIONAL_PARAMS_SETTER
 
@@ -286,6 +321,12 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.max_total_num_rows = 0;
         params.padded_batch_size = 0;
         params.partition_kv = false;
+        params.k_sf_stride_page = 0;
+        params.k_sf_stride_n = 0;
+        params.k_sf_stride_h = 0;
+        params.v_sf_stride_page = 0;
+        params.v_sf_stride_n = 0;
+        params.v_sf_stride_h = 0;
 
         ADDITIONAL_PARAMS_SETTER
 
