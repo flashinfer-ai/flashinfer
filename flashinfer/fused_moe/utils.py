@@ -4,10 +4,11 @@ import logging
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
+from flashinfer.autotuner import Arithmetic, Geometric, Identity, Union
 from flashinfer.utils import ceil_div, next_positive_power_of_2, round_up
 
 logger = logging.getLogger(__name__)
@@ -186,6 +187,36 @@ _PHASE3_STEP = 512
 _PHASE3_END = 4096
 
 
+# Tuning buckets with adaptive spacing, expressed declaratively as a
+# composition of bucket generators (see :mod:`flashinfer.autotuner`).
+#
+# Pure power-of-2 spacing creates huge gaps at large values (e.g. 1024 between
+# bucket 1024 and 2048). For MoE workloads the avg_tokens_per_expert can jump
+# across multiple tile boundaries inside a single gap, forcing the autotuner to
+# pick a kernel optimised for a very different workload size. The four phases
+# use progressively coarser spacing::
+#
+#     Phase 1:  [1 .. 256]      power-of-2    (step ×2)
+#     Phase 2:  (256 .. 2048]   linear step 256
+#     Phase 3:  (2048 .. 4096]  linear step 512
+#     Phase 4:  (4096 .. max]   power-of-2    (step ×2)
+#
+# ``Identity`` guarantees the runtime ``max_num_tokens`` is always a bucket.
+HYBRID_NUM_TOKENS_BUCKETS = Union(
+    (
+        Geometric(start=1, ratio=2, stop=_PHASE1_END),
+        Arithmetic(
+            start=_PHASE1_END + _PHASE2_STEP, step=_PHASE2_STEP, stop=_PHASE2_END
+        ),
+        Arithmetic(
+            start=_PHASE2_END + _PHASE3_STEP, step=_PHASE3_STEP, stop=_PHASE3_END
+        ),
+        Geometric(start=_PHASE3_END * 2, ratio=2),
+        Identity(),
+    )
+)
+
+
 def _ceil_to_step(x: int, step: int) -> int:
     return ((x + step - 1) // step) * step
 
@@ -193,42 +224,29 @@ def _ceil_to_step(x: int, step: int) -> int:
 def get_hybrid_num_tokens_buckets(
     max_num_tokens: int, min_num_tokens: int = 1
 ) -> Tuple[int, ...]:
-    """Generate tuning buckets with adaptive spacing.
+    """Materialize hybrid tuning buckets between the requested bounds.
 
-    Pure power-of-2 spacing creates huge gaps at large values (e.g. 1024
-    between bucket 1024 and 2048).  For MoE workloads the
-    avg_tokens_per_expert can jump across multiple tile boundaries inside a
-    single gap, forcing the autotuner to pick a kernel optimised for a very
-    different workload size.
-
-    This function uses four phases with progressively coarser spacing::
-
-        Phase 1:  [min .. 256]   — power-of-2    (step ×2)
-        Phase 2:  (256 .. 2048]  — linear step 256
-        Phase 3:  (2048 .. 4096] — linear step 512
-        Phase 4:  (4096 .. max]  — power-of-2    (step ×2)
+    Tuners that should adapt their bucket set to the runtime dimension size
+    pass :data:`HYBRID_NUM_TOKENS_BUCKETS` directly. This wrapper preserves
+    the fixed-range API used by existing callers.
     """
     buckets: List[int] = []
 
-    # Phase 1: power-of-2 up to _PHASE1_END
     m = max(min_num_tokens, 1)
     while m <= min(max_num_tokens, _PHASE1_END):
         buckets.append(m)
         m *= 2
 
-    # Phase 2: linear step 256 in (_PHASE1_END, _PHASE2_END]
     m = _PHASE1_END + _PHASE2_STEP
     while m <= min(max_num_tokens, _PHASE2_END):
         buckets.append(m)
         m += _PHASE2_STEP
 
-    # Phase 3: linear step 512 in (_PHASE2_END, _PHASE3_END]
     m = _PHASE2_END + _PHASE3_STEP
     while m <= min(max_num_tokens, _PHASE3_END):
         buckets.append(m)
         m += _PHASE3_STEP
 
-    # Phase 4: power-of-2 beyond _PHASE3_END
     m = _PHASE3_END * 2
     while m <= max_num_tokens:
         buckets.append(m)
@@ -260,15 +278,14 @@ def map_to_hybrid_bucket(x: int, max_num_tokens: int) -> int:
 
 
 @functools.cache
-def make_hybrid_bucket_mapper(max_num_tokens: int) -> Callable[[int], int]:
-    """Return a stable callable that maps token counts to hybrid buckets.
+def make_hybrid_bucket_mapper(max_num_tokens: int) -> "HybridTokenMapper":
+    """Return a stable, hashable mapper from token counts to hybrid buckets.
 
     Cached by ``max_num_tokens`` so the same object is returned on every call
-    with the same argument.  This keeps AutoTuner._find_nearest_profile's
-    lru_cache key stable — a fresh ``lambda`` or ``partial`` on every inference
-    call would produce a new key each time and cause unbounded cache growth.
+    with the same argument, keeping AutoTuner._find_nearest_profile's lru_cache
+    key stable.
     """
-    return functools.partial(map_to_hybrid_bucket, max_num_tokens=max_num_tokens)
+    return HybridTokenMapper(cap=max_num_tokens)
 
 
 def map_to_hybrid_bucket_uncapped(x: int) -> int:
@@ -289,27 +306,23 @@ def map_to_hybrid_bucket_uncapped(x: int) -> int:
     return next_positive_power_of_2(x)
 
 
-def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
-    """Compute the FP4 tensor shape and scaling-factor size from a full-precision shape."""
-    m = 1
-    for i in range(len(input_shape) - 1):
-        m *= input_shape[i]
+@dataclass(frozen=True)
+class HybridTokenMapper:
+    """Map a token count to the nearest hybrid tuning bucket.
 
-    output_shape = [i for i in input_shape]
-    output_shape[-1] //= 2
+    The inference-time counterpart of :data:`HYBRID_NUM_TOKENS_BUCKETS`. A
+    frozen (hence hashable) ``BucketMapper``: pass it as a spec's
+    ``map_to_tuning_buckets``. With ``cap`` set the result is clamped to
+    ``[1, cap]`` (see :func:`map_to_hybrid_bucket`); ``cap=None`` is the
+    uncapped variant (:func:`map_to_hybrid_bucket_uncapped`).
+    """
 
-    scale_shape = (
-        round_up(m, 128) * round_up(input_shape[-1] // sf_vec_size, 4)
-        if is_swizzled_layout
-        else m * (input_shape[-1] // sf_vec_size)
-    )
-    return output_shape, scale_shape
+    cap: int | None = None
 
-
-def fp4_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor."""
-    out_shape, scale_shape = get_fp4_shape(input_shapes[0], sf_vec_size=16)
-    return scale_shape * 2
+    def __call__(self, x: int) -> int:
+        if self.cap is None:
+            return map_to_hybrid_bucket_uncapped(x)
+        return map_to_hybrid_bucket(x, self.cap)
 
 
 _enable_piecewise_cuda_graph = True

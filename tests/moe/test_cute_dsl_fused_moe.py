@@ -711,23 +711,24 @@ class TestAutotunerBucketConfig:
     maps to the smaller cached bucket and uses a tactic profiled at
     the wrong workload size.
 
-    The correct form passes the bucket generators as bare callables;
-    the autotuner invokes them with the actual input dim at autotune
-    time so the bucket set adapts to the workload.
+    The correct form passes a BucketGen generator (e.g. the composed
+    ``HYBRID_NUM_TOKENS_BUCKETS``); the autotuner invokes it with the
+    actual input dim at autotune time so the bucket set adapts to the
+    workload.
     """
 
     def test_gen_tuning_buckets_is_callable_not_static_tuple(self, bucket_spec):
-        """``gen_tuning_buckets`` must be a callable that adapts to the
-        actual input dim at autotune time — not a pre-computed
+        """``gen_tuning_buckets`` must be an adaptive BucketGen generator
+        (callable on the runtime input dim) — not a pre-computed
         tuple/sequence that bakes in a hardcoded cap.
         """
         assert callable(bucket_spec.gen_tuning_buckets), (
-            f"gen_tuning_buckets must be a callable that adapts to the "
-            f"runtime input dim — got "
+            f"gen_tuning_buckets must be a BucketGen generator that adapts "
+            f"to the runtime input dim — got "
             f"{type(bucket_spec.gen_tuning_buckets).__name__}. A "
             f"pre-computed sequence (e.g., a tuple) likely indicates a "
-            f"bucket set with a hardcoded cap; pass the bare function "
-            f"reference instead."
+            f"bucket set with a hardcoded cap; pass the generator "
+            f"(e.g. HYBRID_NUM_TOKENS_BUCKETS) instead."
         )
 
     def test_gen_tuning_buckets_responds_to_input_dim(self, bucket_spec):

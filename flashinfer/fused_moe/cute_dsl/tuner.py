@@ -31,13 +31,18 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 
 import itertools
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 
 from ...autotuner import (
+    DimensionCoordinates,
     DynamicTensorSpec,
+    Empty,
+    Ones,
     OptimizationProfile,
+    RandInt,
     TunableRunner,
     TuningConfig,
 )
@@ -48,11 +53,29 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from ..utils import (
-    get_hybrid_num_tokens_buckets,
-    map_to_hybrid_bucket_uncapped,
+    HYBRID_NUM_TOKENS_BUCKETS,
+    HybridTokenMapper,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
 from .moe_utils import normalize_cute_dsl_moe_activation_type
+
+
+@dataclass(frozen=True)
+class _SeededSoftmaxScales:
+    """token_final_scales init: seeded softmax-normalized random scores (fp32)."""
+
+    seed: int
+
+    def __call__(self, shapes, dtype, device):
+        return torch.softmax(
+            torch.randn(
+                shapes,
+                device=device,
+                generator=torch.Generator(device=device).manual_seed(self.seed),
+            ),
+            dim=-1,
+        ).to(torch.float32)
+
 
 logger = logging.getLogger(__name__)
 
@@ -313,75 +336,46 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    input_idx=(0, 1, 2, 3, 11)
-                    + ((12,) if use_per_token_activation else ()),
-                    dim_idx=(0,) * (6 if use_per_token_activation else 5),
-                    # Bare callables: autotuner adapts the bucket set to
-                    # the actual input dim (matches the
-                    # _FP8_GEMM_SM100_TUNING_CONFIG pattern in
+                    dimensions=tuple(
+                        DimensionCoordinates(input_idx, 0)
+                        for input_idx in (0, 1, 2, 3, 11)
+                        + ((12,) if use_per_token_activation else ())
+                    ),
+                    # Adaptive generator: the autotuner derives the bucket
+                    # set from the actual input dim at autotune time (matches
+                    # the _FP8_GEMM_SM100_TUNING_CONFIG pattern in
                     # `gemm/gemm_base.py`).
-                    gen_tuning_buckets=get_hybrid_num_tokens_buckets,
-                    map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
-                    tensor_initializers=[
-                        # 0: x — FP4 quantized input (uint8 packed). Seeded
-                        # for cross-process determinism of autotune picks
-                        # (matches trt-llm's seed=515 convention).
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            256,
-                            shapes,
-                            dtype=torch.uint8,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 1: x_sf — FP8 scale factors (uint8). Seeded.
-                        lambda shapes, dtype, device: torch.randint(
-                            1,
-                            128,
-                            shapes,
-                            dtype=torch.uint8,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 2: token_selected_experts — output is overwritten
-                        # by inputs_pre_hook (CuteDslMoEInputsHelper), but
-                        # seed the initializer too in case the hook is ever
-                        # disabled.
-                        lambda shapes, dtype, device: torch.randint(
-                            0,
-                            max(num_experts, 1),
-                            shapes,
-                            dtype=torch.int32,
-                            device=device,
-                            generator=torch.Generator(device=device).manual_seed(515),
-                        ),
-                        # 3: token_final_scales — softmax-normalized. Seeded.
-                        lambda shapes, dtype, device: torch.softmax(
-                            torch.randn(
-                                shapes,
-                                device=device,
-                                generator=torch.Generator(device=device).manual_seed(
-                                    515
-                                ),
-                            ),
-                            dim=-1,
-                        ).to(torch.float32),
-                        *(
-                            [
-                                lambda shapes, dtype, device: torch.ones(
-                                    shapes, dtype=torch.float32, device=device
-                                )
-                            ]
-                            if use_per_token_activation
-                            else []
-                        ),
-                        lambda shapes, dtype, device: torch.empty(
-                            shapes, dtype=dtype, device=device
-                        ),
-                    ],
+                    gen_tuning_buckets=HYBRID_NUM_TOKENS_BUCKETS,
+                    map_to_tuning_buckets=HybridTokenMapper(),
                 ),
             ),
-            inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
+            # Per-input initializers, aligned positionally by input_idx
+            # (None -> autotuner default). Dynamic inputs: x(0), x_sf(1),
+            # token_selected_experts(2), token_final_scales(3), and output(11/12).
+            tensor_initializers=(
+                # 0: x — FP4 quantized input (uint8 packed). Seeded for
+                # cross-process determinism (matches trt-llm's seed=515).
+                RandInt(0, 256, dtype=torch.uint8, seed=515),
+                # 1: x_sf — FP8 scale factors (uint8). Seeded.
+                RandInt(1, 128, dtype=torch.uint8, seed=515),
+                # 2: token_selected_experts — overwritten by inputs_pre_hook
+                # (CuteDslMoEInputsHelper); seeded too in case the hook is
+                # ever disabled.
+                RandInt(0, max(num_experts, 1), dtype=torch.int32, seed=515),
+                # 3: token_final_scales — softmax-normalized. Seeded.
+                _SeededSoftmaxScales(515),
+                # 4..10: inputs without a custom initializer -> default
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            + ((Ones(),) if use_per_token_activation else ())
+            + (Empty(),),
+            inputs_pre_hook=self._inputs_helper,
             # Cold-L2 measurement matches TRT-LLM's
             # CuteDslFusedMoENvfp4Runner.tuning_config; flushing L2
             # between profile iterations yields autotune timings

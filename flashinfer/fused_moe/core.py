@@ -36,12 +36,14 @@ from ..trace.templates.moe import (
 )
 from flashinfer.autotuner import (
     AutoTuner,
+    DimensionCoordinates,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
 )
 from flashinfer.autotuner.initializers import (
+    TensorInitializer,
     autotuner_initializer_empty,
     autotuner_initializer_ones,
     autotuner_initializer_rand,
@@ -91,19 +93,20 @@ from .utils import (
 # and re-exported here for compatibility (``core.RoutingInputMode``).
 
 
-@functools.cache
-def _moe_topk_ids_init(num_experts: int):
-    """Return a packed-topk-ids initializer for a given expert count. Cached for
-    object identity preservation.
+@dataclass(frozen=True)
+class _PackedTopkIds:
+    """topk_ids init: random expert ids packed as ``(id << 16) | weight``.
+
+    A frozen ``TensorInitializer`` parameterized by the expert count.
     """
 
-    def _init(
-        shapes: tuple[int, ...],
-        dtype: torch.dtype,
-        device: torch.device,
+    num_experts: int
+
+    def __call__(
+        self, shapes: tuple[int, ...], dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
         expert_ids = make_random_topk_ids(
-            num_experts=num_experts,
+            num_experts=self.num_experts,
             num_tokens=math.prod(shapes[:-1]),
             top_k=shapes[-1],
             device=device,
@@ -112,8 +115,6 @@ def _moe_topk_ids_init(num_experts: int):
             torch.int16
         )
         return (expert_ids << 16) | expert_weights
-
-    return _init
 
 
 @functools.cache
@@ -330,8 +331,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    (0,),
-                    (0,),
+                    (DimensionCoordinates(0, 0),),
                     get_hybrid_num_tokens_buckets(8192),
                     make_hybrid_bucket_mapper(8192),
                 ),
@@ -551,8 +551,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             cls.tuning_config = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
-                        (0,),
-                        (0,),
+                        (DimensionCoordinates(0, 0),),
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens),
                         make_hybrid_bucket_mapper(tune_max_num_tokens),
                     ),
@@ -1245,7 +1244,7 @@ def get_trtllm_moe_sm100_module():
             if moe_inputs.routing_logits is not None:
                 spec["routing_logits"] = autotuner_initializer_rand
             if moe_inputs.topk_ids is not None:
-                spec["topk_ids"] = _moe_topk_ids_init(self.num_experts)
+                spec["topk_ids"] = _PackedTopkIds(self.num_experts)
             if moe_inputs.expert_weights is not None:
                 spec["expert_weights"] = autotuner_initializer_ones
             if moe_inputs.hidden_states_scale is not None:
@@ -1283,17 +1282,27 @@ def get_trtllm_moe_sm100_module():
 
             dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
             initializers = [init for _, _, init in sorted_inputs]
+            # Scatter the per-input initializers into a tuple aligned by
+            # input_idx (TuningConfig.tensor_initializers); gaps and trailing
+            # inputs fall back to the autotuner's default initializer.
+            config_initializers: list[TensorInitializer | None] = [None] * (
+                (max(input_idx) + 1) if input_idx else 0
+            )
+            for idx, init in zip(input_idx, initializers, strict=True):
+                config_initializers[idx] = init
 
             return TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
-                        input_idx,
-                        dim_idx,
-                        get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
+                        tuple(
+                            DimensionCoordinates(i, d)
+                            for i, d in zip(input_idx, dim_idx, strict=True)
+                        ),
+                        get_hybrid_num_tokens_buckets(tune_max_num_tokens),
                         make_hybrid_bucket_mapper(tune_max_num_tokens),
-                        initializers,
                     ),
                 ),
+                tensor_initializers=tuple(config_initializers),
                 **kwargs,
             )
 

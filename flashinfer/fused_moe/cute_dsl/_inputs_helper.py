@@ -40,18 +40,21 @@ tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py.
 """
 
 import math
+from dataclasses import dataclass
 from typing import List
 
 import torch
 
 
+@dataclass(frozen=True)
 class CuteDslMoEInputsHelper:
     """Generates a balanced approx-max-load distribution for autotune profiling.
 
-    Used as ``TuningConfig(inputs_pre_hook=helper.inputs_pre_hook, ...)`` in
-    the CuteDSL MoE autotune setup. The hook intercepts profile-time inputs
-    after the autotuner synthesizes them and replaces ``token_selected_experts``
-    with a deterministic balanced assignment.
+    A frozen (hashable) ``InputsPreHook``: pass the instance itself as
+    ``TuningConfig(inputs_pre_hook=helper, ...)`` (it is callable via
+    ``__call__``). The hook intercepts profile-time inputs after the autotuner
+    synthesizes them and replaces ``token_selected_experts`` with a
+    deterministic balanced assignment.
 
     Args:
         num_experts: Total number of experts in the MoE layer.
@@ -63,19 +66,14 @@ class CuteDslMoEInputsHelper:
         seed: Seed for reproducibility (default 515, matches trt-llm).
     """
 
-    def __init__(
-        self,
-        num_experts: int,
-        top_k: int,
-        num_local_experts: int,
-        local_expert_offset: int = 0,
-        seed: int = 515,
-    ):
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.num_local_experts = num_local_experts
-        self.local_expert_offset = local_expert_offset
-        self.seed = seed
+    num_experts: int
+    top_k: int
+    num_local_experts: int
+    local_expert_offset: int = 0
+    seed: int = 515
+
+    def __call__(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return self.inputs_pre_hook(inputs)
 
     def generate_num_tokens_per_expert(
         self, num_tokens: int, approx_max_load: bool = False

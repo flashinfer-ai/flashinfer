@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import functools
 import os
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -51,9 +52,16 @@ import torch
 
 from ..autotuner import (
     AutoTuner,
+    CapLengthToIndices,
+    ChainedInputsPreHook,
     ConstraintSpec,
+    CopyDim,
+    DimensionCoordinates,
     DynamicTensorSpec,
+    Full,
     OptimizationProfile,
+    RandInt,
+    SnapToBuckets,
     TunableRunner,
     TuningConfig,
 )
@@ -887,57 +895,37 @@ def _get_sparse_mla_decode_dsv4_module():
     return SimpleNamespace(module=module, runner_cls=SparseMlaDecodeV3Runner)
 
 
-def _decode_dsv4_num_token_buckets(*_args, **_kwargs):
-    """Power-of-2-ish T buckets matching the contested decode shapes."""
-    return (1, 4, 8, 16, 32, 64)
+# Round T up to the next bucket boundary used by tuning. A hashable
+# BucketMapper (callable) shared by the tuning specs and the forward path.
+_decode_dsv4_map_to_token_bucket = SnapToBuckets((1, 4, 8, 16, 32, 64), round_up=True)
 
 
-def _decode_dsv4_map_to_token_bucket(x):
-    """Round T up to the next bucket boundary used by tuning."""
-    buckets = (1, 4, 8, 16, 32, 64)
-    for b in buckets:
-        if x <= b:
-            return b
-    return buckets[-1]
-
-
-def _decode_dsv4_init_q(shapes, dtype, device):
+@dataclass(frozen=True)
+class _DecodeDsv4QInit:
     """bf16 q ~ N(0, 0.1) clamped to [-1, 1] — matches the unit test distribution."""
-    return (
-        (torch.randn(shapes, device=device, dtype=torch.float32) / 10.0)
-        .clamp(-1, 1)
-        .to(dtype)
-    )
+
+    def __call__(self, shapes, dtype, device):
+        return (
+            (torch.randn(shapes, device=device, dtype=torch.float32) / 10.0)
+            .clamp(-1, 1)
+            .to(dtype)
+        )
 
 
-def _decode_dsv4_init_indices(shapes, dtype, device):
-    """int32 indices in a small safe range; assumes kv_cache has >=256 blocks.
-
-    AutoTuner only profiles wall time, not correctness — random valid indices
-    are sufficient. The cache built for the real call uses the ACTUAL indices.
-    """
-    return torch.randint(0, 256, shapes, dtype=dtype, device=device)
-
-
-def _decode_dsv4_init_topk_length(shapes, dtype, device):
-    """Placeholder full-active topk_length for autotune profiling."""
-    return torch.full(shapes, 1 << 30, dtype=dtype, device=device)
+# q: bespoke clamped-normal. indices: int32 in a small safe range (assumes
+# kv_cache has >=256 blocks; AutoTuner only profiles wall time, so random valid
+# indices suffice). topk_length: placeholder full-active value for profiling.
+_decode_dsv4_init_q = _DecodeDsv4QInit()
+_decode_dsv4_init_indices = RandInt(0, 256)
+_decode_dsv4_init_topk_length = Full(1 << 30)
 
 
-def _decode_dsv4_inputs_pre_hook(inputs):
-    """Pair (indices, topk_length) and (extra_indices, extra_topk_length)
-    after per-tensor synthesis: cap lengths to their paired indices' top-k.
-    """
-    inputs = list(inputs)
-    indices = inputs[1] if len(inputs) > 1 else None
-    topk_length = inputs[6] if len(inputs) > 6 else None
-    extra_indices = inputs[8] if len(inputs) > 8 else None
-    extra_topk_length = inputs[9] if len(inputs) > 9 else None
-    if topk_length is not None and indices is not None:
-        inputs[6] = torch.full_like(topk_length, indices.shape[-1])
-    if extra_topk_length is not None and extra_indices is not None:
-        inputs[9] = torch.full_like(extra_topk_length, extra_indices.shape[-1])
-    return inputs
+# After per-tensor synthesis, cap each topk_length to its paired indices'
+# top-k width (a cross-tensor coupling): topk_length(6) <- indices(1),
+# extra_topk_length(9) <- extra_indices(8).
+_decode_dsv4_inputs_pre_hook = ChainedInputsPreHook(
+    (CapLengthToIndices(6, 1), CapLengthToIndices(9, 8))
+)
 
 
 @functools.cache
@@ -945,18 +933,32 @@ def _decode_dsv4_tuning_config() -> TuningConfig:
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0, 1, 6, 8, 9),
-                dim_idx=(0, 0, 0, 0, 0),
-                gen_tuning_buckets=_decode_dsv4_num_token_buckets,
+                dimensions=(
+                    DimensionCoordinates(0, 0),
+                    DimensionCoordinates(1, 0),
+                    DimensionCoordinates(6, 0),
+                    DimensionCoordinates(8, 0),
+                    DimensionCoordinates(9, 0),
+                ),
+                gen_tuning_buckets=(1, 4, 8, 16, 32, 64),
                 map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
-                tensor_initializers=[
-                    _decode_dsv4_init_q,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                ],
             ),
+        ),
+        # Per-input initializers, aligned positionally by input_idx
+        # (None -> autotuner default). q(0), indices(1/8), topk_length(6/9);
+        # the constrained outputs mid_out(2)/mid_lse(3)/output(4)/out_lse(5)
+        # and input 7 use the default.
+        tensor_initializers=(
+            _decode_dsv4_init_q,  # 0: q
+            _decode_dsv4_init_indices,  # 1: indices
+            None,  # 2: mid_out
+            None,  # 3: mid_lse
+            None,  # 4: output
+            None,  # 5: out_lse
+            _decode_dsv4_init_topk_length,  # 6: topk_length
+            None,  # 7
+            _decode_dsv4_init_indices,  # 8: indices
+            _decode_dsv4_init_topk_length,  # 9: topk_length
         ),
         inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
         # Constrain T (dim 0) of all output/scratch tensors to q's T so the
@@ -964,10 +966,18 @@ def _decode_dsv4_tuning_config() -> TuningConfig:
         # output (4), out_lse (5). Without these constraints, the kernel
         # writes past the real tensors' T dim → IMA.
         constraint_specs=(
-            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),  # mid_out
-            ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),  # mid_lse
-            ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),  # output
-            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),  # out_lse
+            ConstraintSpec(
+                DimensionCoordinates(2, 0), CopyDim(DimensionCoordinates(0, 0))
+            ),  # mid_out
+            ConstraintSpec(
+                DimensionCoordinates(3, 0), CopyDim(DimensionCoordinates(0, 0))
+            ),  # mid_lse
+            ConstraintSpec(
+                DimensionCoordinates(4, 0), CopyDim(DimensionCoordinates(0, 0))
+            ),  # output
+            ConstraintSpec(
+                DimensionCoordinates(5, 0), CopyDim(DimensionCoordinates(0, 0))
+            ),  # out_lse
         ),
     )
 
@@ -977,26 +987,44 @@ def _decode_dsv3_2_tuning_config() -> TuningConfig:
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(0, 1, 6),
-                dim_idx=(0, 0, 0),
-                gen_tuning_buckets=_decode_dsv4_num_token_buckets,
+                dimensions=(
+                    DimensionCoordinates(0, 0),
+                    DimensionCoordinates(1, 0),
+                    DimensionCoordinates(6, 0),
+                ),
+                gen_tuning_buckets=(1, 4, 8, 16, 32, 64),
                 map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
-                tensor_initializers=[
-                    _decode_dsv4_init_q,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                ],
             ),
+        ),
+        # Per-input initializers, aligned positionally by input_idx
+        # (None -> autotuner default). q(0), indices(1), topk_length(6);
+        # constrained outputs mid_out(2)/mid_lse(3)/output(4)/out_lse(5) default.
+        tensor_initializers=(
+            _decode_dsv4_init_q,  # 0: q
+            _decode_dsv4_init_indices,  # 1: indices
+            None,  # 2: mid_out
+            None,  # 3: mid_lse
+            None,  # 4: output
+            None,  # 5: out_lse
+            _decode_dsv4_init_topk_length,  # 6: topk_length
         ),
         inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
         # Constrain T (dim 0) of all output/scratch tensors to q's T so the
         # autotuner's synthesised q propagates to mid_out (2), mid_lse (3),
         # output (4), out_lse (5).
         constraint_specs=(
-            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),  # mid_out
-            ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),  # mid_lse
-            ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),  # output
-            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),  # out_lse
+            ConstraintSpec(
+                DimensionCoordinates(2, 0), CopyDim(DimensionCoordinates(0, 0))
+            ),  # mid_out
+            ConstraintSpec(
+                DimensionCoordinates(3, 0), CopyDim(DimensionCoordinates(0, 0))
+            ),  # mid_lse
+            ConstraintSpec(
+                DimensionCoordinates(4, 0), CopyDim(DimensionCoordinates(0, 0))
+            ),  # output
+            ConstraintSpec(
+                DimensionCoordinates(5, 0), CopyDim(DimensionCoordinates(0, 0))
+            ),  # out_lse
         ),
     )
 
