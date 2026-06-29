@@ -67,11 +67,11 @@ try:
 except ImportError:
     pass
 
-# is_cuda_tile_available is always importable — cutile_common.py has no
-# cuda.tile imports by design, so this never fails even when cuda-tile is
-# absent.  Mirrors how is_cute_dsl_available is exported unconditionally
+# is_cuda_tile_available is always importable: flashinfer.cutile.cutile_common
+# has no cuda.tile imports by design, so this never fails even when cuda-tile is
+# absent. Mirrors how is_cute_dsl_available is exported unconditionally
 # from flashinfer.cute_dsl.
-from .kernels.cutile.cutile_common import (
+from ..cutile import (
     is_cuda_tile_available as is_cuda_tile_available,
 )
 

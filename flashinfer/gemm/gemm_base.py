@@ -7239,6 +7239,11 @@ def group_gemm_fp8_nt_groupwise(
     out_dtype: Optional[torch.dtype]
         The data type of the output tensor, must be ``torch.bfloat16`` or ``torch.float16``.
 
+    backend: Literal["trtllm", "cutile"]
+        Backend implementation to use.  ``"trtllm"`` uses the TensorRT-LLM
+        grouped GEMM kernel; ``"cutile"`` uses the cuTile Python kernel.
+        Defaults to ``"trtllm"``.
+
     Returns
     -------
     out: torch.Tensor

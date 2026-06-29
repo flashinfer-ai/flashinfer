@@ -33,6 +33,7 @@ from flashinfer.utils import device_support_pdl
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
 from flashinfer.cute_dsl.utils import (
+    _as_cute_dsl_workspace_i8,
     get_max_active_clusters,
     get_num_sm,
     torch_to_cutlass_dtype,
@@ -332,7 +333,7 @@ def cute_dsl_mla_decode(
     kv_cache : torch.Tensor
         [num_pages, page_size, D_ckv + D_kpe] (3D) or [num_pages, 1, page_size, D_ckv + D_kpe] (4D)
     workspace_buffer : torch.Tensor
-        Pre-allocated workspace buffer (uint8). Required size depends on batch size
+        Pre-allocated workspace buffer (int8 or uint8). Required size depends on batch size
         and split_kv (auto-computed from B, q_len, and number of SMs):
 
         - Formula: ``B * H * q_len * split_kv * (kv_lora_rank + 1) * 4`` bytes
@@ -436,14 +437,14 @@ def cute_dsl_mla_decode(
         B, q_len, H, kv_lora_rank, max_active_blocks
     )
 
-    # Prepare workspace: slice of contiguous 1D buffer is already contiguous
-    assert workspace_buffer.dtype == torch.int8, (
-        f"workspace_buffer must be torch.int8, got {workspace_buffer.dtype}"
-    )
-    assert workspace_buffer.numel() >= workspace_size, (
-        f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
-        f"need {workspace_size} bytes"
-    )
+    # Prepare workspace: the CUTE signature uses int8, while public FlashInfer
+    # workspace buffers are byte storage and may be uint8.
+    workspace_buffer = _as_cute_dsl_workspace_i8(workspace_buffer)
+    if workspace_buffer.numel() < workspace_size:
+        raise ValueError(
+            f"workspace_buffer too small: {workspace_buffer.numel()} bytes, "
+            f"need {workspace_size} bytes"
+        )
     is_workspace_size_zero = workspace_size == 0
     if is_workspace_size_zero:
         workspace_bytes = None
