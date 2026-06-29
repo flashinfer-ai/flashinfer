@@ -1006,25 +1006,14 @@ def run_pretranspose_decode(
                 mode=0, stride_order=(0, 1, 2), divisibility=1
             )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2), divisibility=1
-        )
+        # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
+        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-        )
-        k_tensor = from_dlpack(k, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-        )
-        v_tensor = from_dlpack(v, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-        )
-        b_tensor = from_dlpack(b, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2), divisibility=1
-        )
-        o_tensor = from_dlpack(output, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=(0, 1, 2, 3), divisibility=1
-        )
+        q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
+        k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
+        v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
         h0_indices_tensor = from_dlpack(
             h0_indices, assumed_align=16
         ).mark_layout_dynamic()
