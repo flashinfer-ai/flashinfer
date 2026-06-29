@@ -2067,7 +2067,7 @@ struct SwigluStepAdaptor {
 };
 
 // ============================== Gated Activation =================================
-constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
+constexpr static int MAX_ACTIVATION_THREADS_PER_BLOCK = 256;
 
 template <class ActivationOutputType, class GemmOutputType, class ActFn>
 __global__ void doGatedActivationKernel(ActivationOutputType* output,
@@ -2092,7 +2092,7 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output,
   auto gemm_result_vec = reinterpret_cast<GemmResultElem const*>(gemm_result);
   auto output_vec = reinterpret_cast<OutputElem*>(output);
   int64_t const start_offset = tid;
-  int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
+  int64_t const stride = MAX_ACTIVATION_THREADS_PER_BLOCK;
   assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
   int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
   int64_t const inter_size_vec = inter_size / ACTIVATION_ELEM_PER_THREAD;
@@ -2134,7 +2134,7 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                        int64_t num_tokens, int64_t num_experts_per_node,
                        ActivationParams activation_type, cudaStream_t stream) {
   int64_t const blocks = num_tokens;
-  int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
+  int64_t const threads = MAX_ACTIVATION_THREADS_PER_BLOCK;
 
   auto* fn = (activation_type == ActivationType::Swiglu)
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType,
@@ -2160,7 +2160,7 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
           bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
-__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKernel(
+__global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivationKernel(
     T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
     ScaleBiasType const* bias_ptr, bool bias_is_broadcast, int64_t const* expert_first_token_offset,
     int num_experts_per_node, int64_t inter_size, float const* fc2_act_global_scale,
@@ -2256,7 +2256,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     assert(reinterpret_cast<std::uintptr_t>(bias_ptr_vec) % sizeof(BiasElem) == 0);
 
     int64_t const start_offset = tid;
-    int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
+    int64_t const stride = blockDim.x;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
@@ -2359,12 +2359,35 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   QuantParams const& quant_params, bool use_per_expert_act_scale,
                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, bool enable_pdl,
                   cudaStream_t stream) {
-  static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-  // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
   // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
   // tokens_to_expert), so the grid is driven purely by the expanded token count.
-  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, int64_t{1}));
-  int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
+
+  // Select block size (up to MAX_ACTIVATION_THREADS_PER_BLOCK) per the threads
+  // needed to process each row to avoid inactive warps and improve occupancy.
+#ifdef ENABLE_FP4
+  constexpr bool use_fpx_elem_per_thread =
+      std::is_same_v<T, __nv_fp4_e2m1> || std::is_same_v<T, __nv_fp8_e4m3>;
+#else
+  constexpr bool use_fpx_elem_per_thread = false;
+#endif
+  constexpr int64_t elem_per_thread =
+      use_fpx_elem_per_thread
+          ? CVT_ELTS_PER_THREAD
+          : (128 / std::min(sizeof_bits<T>::value, sizeof_bits<GemmOutputType>::value));
+  int64_t const loads_per_row = std::max<int64_t>(inter_size / elem_per_thread, int64_t{1});
+  int64_t const threads =
+      std::min<int64_t>(MAX_ACTIVATION_THREADS_PER_BLOCK,
+                        tensorrt_llm::common::roundUp(loads_per_row, int64_t{WARP_SIZE}));
+
+  // Limit the grid size to be proportional to the SM count in order to mitigate
+  // the warp scheduling pressure on each SM. The proportion can range from 8 to
+  // 32 blocks per SM and is adaptive to the block size.
+  static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+  int64_t const blocks_per_sm = std::min<int64_t>(
+      int64_t{32},
+      tensorrt_llm::common::ceilDiv(int64_t{8} * MAX_ACTIVATION_THREADS_PER_BLOCK, threads));
+  int64_t const blocks =
+      std::min(smCount * blocks_per_sm, std::max(expanded_num_tokens, int64_t{1}));
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type, auto disableFP4QuantFastMathTag,
