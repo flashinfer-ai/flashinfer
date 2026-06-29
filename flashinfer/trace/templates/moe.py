@@ -1921,8 +1921,9 @@ def _moe_bf16_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation="silu",
 ):
-    """Un-quantized (bf16) MoE expert computation with SwiGLU."""
+    """Un-quantized (bf16) MoE expert computation (SwiGLU or ReLU^2)."""
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
     I = gemm1_out // 2
@@ -1942,31 +1943,34 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
-        X1, X2 = G1[:, :I], G1[:, I:]
-        if gemm1_clamp_limit is not None:
-            limit = gemm1_clamp_limit[le].to(device=X1.device, dtype=torch.float32)
-            X1 = torch.clamp(X1, min=-limit, max=limit)
-            X2 = torch.clamp(X2, max=limit)
-        if (
-            gemm1_alpha is not None
-            or gemm1_beta is not None
-            or gemm1_clamp_limit is not None
-        ):
-            alpha = (
-                1.0
-                if gemm1_alpha is None
-                else gemm1_alpha[le].to(device=X2.device, dtype=torch.float32)
-            )
-            beta = (
-                0.0
-                if gemm1_beta is None
-                else gemm1_beta[le].to(device=X1.device, dtype=torch.float32)
-            )
-            activation = X2 * torch.sigmoid(alpha * X2) * (X1 + beta)
+        if activation == "relu2":
+            act = torch.relu(G1) ** 2
         else:
-            silu_X2 = X2 / (1.0 + torch.exp(-X2))
-            activation = silu_X2 * X1
-        expert_out = activation.matmul(W2[le].t())
+            X1, X2 = G1[:, :I], G1[:, I:]
+            if gemm1_clamp_limit is not None:
+                limit = gemm1_clamp_limit[le].to(device=X1.device, dtype=torch.float32)
+                X1 = torch.clamp(X1, min=-limit, max=limit)
+                X2 = torch.clamp(X2, max=limit)
+            if (
+                gemm1_alpha is not None
+                or gemm1_beta is not None
+                or gemm1_clamp_limit is not None
+            ):
+                alpha = (
+                    1.0
+                    if gemm1_alpha is None
+                    else gemm1_alpha[le].to(device=X2.device, dtype=torch.float32)
+                )
+                beta = (
+                    0.0
+                    if gemm1_beta is None
+                    else gemm1_beta[le].to(device=X1.device, dtype=torch.float32)
+                )
+                act = X2 * torch.sigmoid(alpha * X2) * (X1 + beta)
+            else:
+                silu_X2 = X2 / (1.0 + torch.exp(-X2))
+                act = silu_X2 * X1
+        expert_out = act.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
         w_e = (w_tok * match).sum(dim=1)
@@ -2676,7 +2680,13 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "num_fp4_intermediate_blocks": Var(
             description="NvFP4 scale-factor count along intermediate_size."
         ),
-        "gemm1_out_size": Const(abbrev="", description="2 * intermediate_size."),
+        "gemm1_out_size": Const(
+            abbrev="",
+            description=(
+                "FC1 output rows: 2 * intermediate_size for gated SwiGLU, "
+                "intermediate_size for non-gated ReLU^2."
+            ),
+        ),
     },
     inputs={
         "x": Tensor(
@@ -2733,6 +2743,14 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "local_expert_offset": Scalar(
             "int32", optional=True, description="Offset of local experts."
         ),
+        "activation": Scalar(
+            "string",
+            optional=True,
+            description=(
+                "FC1 activation: 'silu' for gated SwiGLU (default) or 'relu2' "
+                "for non-gated ReLU^2. Determines gemm1_out_size."
+            ),
+        ),
     },
     outputs={
         "output": Tensor(
@@ -2758,6 +2776,11 @@ _cute_dsl_wrapper_inputs["top_k"] = Scalar(
     "int32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["activation"] = Scalar(
+    "string",
+    optional=True,
+    description="Set at wrapper __init__ ('silu'/'relu2'), not passed to run().",
 )
 
 _cute_dsl_wrapper_axes = dict(cute_dsl_fused_moe_nvfp4_trace.axes)
@@ -2940,6 +2963,7 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     w2_alpha,
     num_experts,
     top_k,
+    activation="silu",
     **_unused,
 ):
     """Reference for CuteDSL NvFP4 fused MoE — bridges to the FP4
@@ -2960,6 +2984,7 @@ def _cute_dsl_fused_moe_nvfp4_reference(
         token_selected_experts.to(torch.int64),
         local_expert_offset=0,
         E_global=int(num_experts),
+        activation=str(activation),
     )
 
 

@@ -1,7 +1,8 @@
 import os
 import tempfile
 import types
-import typing
+import warnings
+from collections.abc import Hashable
 
 import cutlass.cute as cute
 from cutlass.base_dsl.compiler import DumpDir
@@ -33,28 +34,38 @@ def _as_options_tuple(options):
 
 
 class KeyedCompileMixin:
+    def manual_cache_key(self, *attr_names):
+        collected_attrs = tuple(
+            (attr_name, getattr(self, attr_name)) for attr_name in attr_names
+        )
+        compile_key = (type(self).__mro__,) + collected_attrs
+        hash(compile_key)
+        setattr(self, "_KeyedCompileMixin_compile_key", compile_key)  # noqa: B010
+
     def _get_compile_key(self):
         compile_key = getattr(self, "_KeyedCompileMixin_compile_key", None)
         if compile_key is None:
-            collected_attrs = []
-            for attr_name in sorted(dir(self)):
-                attr_value = getattr(self, attr_name)
-                if attr_name.startswith("__"):
-                    continue
-                if isinstance(
-                    attr_value,
-                    (
-                        types.MethodType,
-                        types.BuiltinMethodType,
-                        types.MethodWrapperType,
-                    ),
-                ):
-                    continue
-
-                if isinstance(attr_value, typing.Hashable):
-                    collected_attrs.append((attr_name, attr_value))
-
+            warnings.warn(
+                f"{type(self).__name__} is using automatic DSL compile-cache key generation; "
+                "call manual_cache_key(...) at the end of __init__ to avoid host launch overhead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            collected_attrs = tuple(
+                (attr_name, attr_value)
+                for attr_name, attr_value in sorted(self.__dict__.items())
+                if not attr_name.startswith("_")
+            )
             compile_key = (str(type(self).__mro__),) + tuple(collected_attrs)
+            try:
+                hash(compile_key)
+            except TypeError:
+                collected_attrs = tuple(
+                    (attr_name, attr_value)
+                    for attr_name, attr_value in collected_attrs
+                    if isinstance(attr_value, Hashable)
+                )
+                compile_key = (str(type(self).__mro__),) + tuple(collected_attrs)
             setattr(self, "_KeyedCompileMixin_compile_key", compile_key)  # noqa: B010
 
         return compile_key

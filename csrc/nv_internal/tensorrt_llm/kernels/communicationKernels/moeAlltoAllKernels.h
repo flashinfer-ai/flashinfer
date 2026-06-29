@@ -124,6 +124,8 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 enum class MoeA2ACombineQuantMode : uint32_t {
   NONE,
   MXFP8,
+  MXFP4,
+  NVFP4,
 };
 
 // NOTE(siyuan): keep this align with include/flashinfer/fp4_layout.cuh
@@ -154,6 +156,8 @@ struct MoeA2ACombineParams {
       MoeA2ACombineSwizzleSFMode::LINEAR};  // Output swizzle mode
   void* output_data;                        // Output buffer [local_num_tokens, elements_per_token]
   void* output_scales;                      // Optional output scales for quantized outputs
+  float output_scalar_scale{1.0f};  // Per-tensor global scale applied before FP4 block scaling
+                                    // (SFScaleVal); ignored by MXFP8/MXFP4 paths
 
   // Payload information
   int elements_per_token;    // Number of elements per token
