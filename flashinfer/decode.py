@@ -2533,7 +2533,6 @@ def _check_xqa_nvfp4_page_size(page_size: int) -> None:
         )
 
 
-@flashinfer_api(trace=trtllm_batch_decode_trace)
 def _pack_trtllm_gen_spec_dec_mask(
     mask: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2633,6 +2632,7 @@ def _pack_trtllm_gen_spec_dec_mask(
     return packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv
 
 
+@flashinfer_api(trace=trtllm_batch_decode_trace)
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
