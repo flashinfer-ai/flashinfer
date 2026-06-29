@@ -637,7 +637,8 @@ class GdnDecodeKernel:
     """CuTeDSL GDN MTP decode (noprepack) — WY-parallel, inference only."""
 
     def __init__(
-        self, disable_state_update=False, min_blocks_per_mp=2, t_input=16, bv=None
+        self, disable_state_update=False, min_blocks_per_mp=2, t_input=16, bv=None,
+        n_valid=16, qkv_row_stride=0, ab_native=False,
     ):
         assert disable_state_update, "State update not implemented in CuTeDSL kernel"
         # `bv` is accepted only for bench-script signature compatibility — the
@@ -646,6 +647,24 @@ class GdnDecodeKernel:
         self._disable_state_update = disable_state_update
         self._min_blocks_per_mp = min_blocks_per_mp
         self._t_input = int(t_input)
+        # (native-short-T) number of valid token rows actually present in the q/k
+        # gmem tensors. When n_valid < T the kernel loads only these rows via the
+        # K/Q cp.async and zeros the sK/sQ[n_valid:T] smem tail itself, instead of
+        # the host staging q/k into a T=16 zero-padded buffer. Default T (=16) keeps
+        # the original behavior (host provides a full T-row, zero-padded tensor).
+        self._n_valid = int(n_valid)
+        # (strided-qkv) per-token row stride of the q/k/v gmem tensors, in elements.
+        # 0 -> compact (token stride = H*K_DIM / HV*V_DIM, the staged/contiguous path).
+        # >0 -> q/k/v are read directly from the fused conv-output column slices whose
+        # token stride is conv_dim (= q_dim+k_dim+v_dim); the kernel loads from that
+        # stride instead of requiring the host to .contiguous() them. Features within a
+        # token stay contiguous (stride 1) so the smem layout / MMA path is unchanged.
+        self._qkv_row_stride = int(qkv_row_stride)
+        # (native-a/b) when True, a/b are the real [B, n_valid, HV] tensors (not staged into
+        # T_KERNEL zero-padded buffers): batch stride = n_valid*HV and the warp-3 load/compute
+        # gate uses n_valid instead of T. Tail lanes [n_valid:T] are not loaded; their gamma
+        # (log_alpha=0) cannot reach the real rows through the causal prefix-sum.
+        self._ab_native = bool(ab_native)
 
     @cute.experimental.jit
     def __call__(
@@ -738,29 +757,48 @@ class GdnDecodeKernel:
         tma_atom_h: cute.CopyAtom,
         tma_tensor_h: cute.Tensor,
     ):
-        # Strides (contiguous layout assumed)
+        # Strides (contiguous layout assumed). q/k/v use the batch stride of their
+        # ACTUAL row count: n_valid (== T in the default/staged path, so unchanged;
+        # < T in the native-short-T path where q/k/v are the real [B,n_valid,...]
+        # tensors and the kernel loads n_valid rows + zeros its smem tail).
+        # (strided-qkv) when qkv_row_stride>0, q/k/v are the fused conv-output column
+        # slices: per-token row stride is conv_dim (shared by q/k/v) rather than the
+        # compact per-tensor H*K_DIM / HV*V_DIM. Head/element strides are unchanged
+        # because each token's features stay contiguous within its slice.
+        _rs = self._qkv_row_stride
+        _qt = _rs if _rs > 0 else H * K_DIM
+        _kt = _rs if _rs > 0 else H * K_DIM
+        _vt = _rs if _rs > 0 else HV * V_DIM
         cutlass.Int32(1)
         sq_h = K_DIM
-        sq_t = H * K_DIM
-        sq_b = T * H * K_DIM
+        sq_t = _qt
+        sq_b = self._n_valid * _qt
         cutlass.Int32(1)
         sk_h = K_DIM
-        sk_t = H * K_DIM
-        sk_b = T * H * K_DIM
+        sk_t = _kt
+        sk_b = self._n_valid * _kt
         cutlass.Int32(1)
         sv_hv = V_DIM
-        sv_t = HV * V_DIM
-        sv_b = T * HV * V_DIM
+        sv_t = _vt
+        sv_b = self._n_valid * _vt
         cutlass.Int32(1)
         so_hv = V_DIM
         so_t = HV * V_DIM
-        so_b = T * HV * V_DIM
+        # Output batch stride matches the output tensor's row count: n_valid (== T in
+        # the staged path -> [B,T_KERNEL] out; == T in the native path where out is
+        # the compact [B,T] tensor, valid because native is gated to T==t_disc so the
+        # t_input-gated STG writes exactly T rows). Removes the caller's reshape copy.
+        so_b = self._n_valid * HV * V_DIM
+        # (native-a/b) a/b rows actually present in the tensor: n_valid when native (real
+        # [B,n_valid,HV] passed) else T (staged T_KERNEL-row zero-padded buffer). The warp-3
+        # load/compute gate below uses the same count so tail lanes never read OOB.
+        _ab_rows = self._n_valid if self._ab_native else T
         sa_hv = cutlass.Int32(1)
         sa_t = HV
-        sa_b = T * HV
+        sa_b = _ab_rows * HV
         sb_hv = cutlass.Int32(1)
         sb_t = HV
-        sb_b = T * HV
+        sb_b = _ab_rows * HV
         # H0 natural layout: (pool, HV, V, K) bf16 contiguous → strides (HV*V*K, V*K, K, 1)
         # H0 layout strides — v6 unused (TMA handles addressing); kept for
         # clarity if future cycles need raw GMEM offsets.
@@ -784,7 +822,9 @@ class GdnDecodeKernel:
         _v7e_b_bf16 = f32(0.0)
         _v7e_alog_bf16 = f32(0.0)
         _v7e_dt_bf16 = f32(0.0)
-        if warp_id == 3 and lane_id < T:
+        # (native-a/b) load only the _ab_rows present in the a/b tensors (n_valid native,
+        # T staged) so tail lanes never index past the real [B,n_valid,HV] rows.
+        if warp_id == 3 and lane_id < _ab_rows:
             _v7e_a_bf16 = gA.iterator[
                 pid_b * sa_b + lane_id * sa_t + pid_hv * sa_hv
             ].to(f32)
@@ -925,16 +965,32 @@ class GdnDecodeKernel:
             _smem_byte_off = _kq_row * Int32(K_PADDED * 2) + _kq_col_bf16_async * Int32(
                 2
             )
-            _cp_async_bf16x8(
-                _gK_base,
-                k_base + _kq_row * sk_t + _kq_col_bf16_async,
-                _sK_base_async + _smem_byte_off,
-            )
-            _cp_async_bf16x8(
-                _gQ_base,
-                q_base + _kq_row * sq_t + _kq_col_bf16_async,
-                _sQ_base_async + _smem_byte_off,
-            )
+            # (native-short-T) when n_valid < T the q/k gmem tensors hold only
+            # n_valid rows; skip the cp.async for rows >= n_valid (those would read
+            # OOB). The sK/sQ[n_valid:T] smem tail is zeroed after the wait below.
+            if const_expr(self._n_valid < T):
+                if _kq_row < Int32(self._n_valid):
+                    _cp_async_bf16x8(
+                        _gK_base,
+                        k_base + _kq_row * sk_t + _kq_col_bf16_async,
+                        _sK_base_async + _smem_byte_off,
+                    )
+                    _cp_async_bf16x8(
+                        _gQ_base,
+                        q_base + _kq_row * sq_t + _kq_col_bf16_async,
+                        _sQ_base_async + _smem_byte_off,
+                    )
+            else:
+                _cp_async_bf16x8(
+                    _gK_base,
+                    k_base + _kq_row * sk_t + _kq_col_bf16_async,
+                    _sK_base_async + _smem_byte_off,
+                )
+                _cp_async_bf16x8(
+                    _gQ_base,
+                    q_base + _kq_row * sq_t + _kq_col_bf16_async,
+                    _sQ_base_async + _smem_byte_off,
+                )
         _cp_async_commit_group()  # group 0 = K+Q
 
         # ============================================================
@@ -961,7 +1017,10 @@ class GdnDecodeKernel:
         if warp_id == 3:
             log_alpha = f32(0.0)
             beta_val = f32(0.0)
-            if lane_id < T:
+            # (native-a/b) gate by _ab_rows: tail lanes [n_valid:T] are not loaded (their
+            # _v7e_a/b regs are undefined), so they must keep log_alpha=beta=0. The causal
+            # prefix-sum makes their (zero) contribution invisible to rows 0..n_valid-1.
+            if lane_id < _ab_rows:
                 a_val = _v7e_a_bf16
                 b_val = _v7e_b_bf16
                 A_log_val = _v7e_alog_bf16
@@ -980,6 +1039,12 @@ class GdnDecodeKernel:
             if lane_id < T:
                 exp_g = _exp_approx_f32(cumsum)
                 sGamma.iterator[T + lane_id] = exp_g
+                # (local fix) store log-domain cumsum in the free sGamma[0:T] slots so the
+                # decay matrix can be formed as exp(cumsum_r - cumsum_c) directly (bounded
+                # <=1 for the causal r>=c region) instead of exp(cumsum_r)*exp(-cumsum_c),
+                # whose exp(-cumsum_c) overflows to inf for strong real decay (large A_log)
+                # -> 0*inf = NaN. Keeps exact math; fixes the NaN that broke MTP verify.
+                sGamma.iterator[lane_id] = cumsum
                 sBeta.iterator[lane_id] = beta_val
                 sBeta.iterator[T + lane_id] = f32(1.0) / exp_g
 
@@ -988,6 +1053,17 @@ class GdnDecodeKernel:
         # not cp.async commit groups, so wait_group(0) is sufficient.
         # ============================================================
         _cp_async_wait_group_0()
+        # (native-short-T) zero the sK/sQ tail rows [n_valid:T] that were NOT loaded
+        # from gmem (q/k held only n_valid rows). This restores the documented
+        # sK/sQ[..:T]=0 invariant the t_input<=8 zero-propagation proof relies on
+        # (see the QT@V comment), previously supplied by the host zero-padding the
+        # staged buffer. tidx in [0,THREADS=128) covers K_DIM=128 cols exactly;
+        # pad cols [K_DIM:K_PADDED) are never read. The following sync_threads()
+        # publishes both the loaded rows and these zeros before the L2-norm reads.
+        if const_expr(self._n_valid < T):
+            for _zr in cutlass.range_constexpr(self._n_valid, T):
+                sK.iterator[_zr * K_PADDED + tidx] = io(0.0)
+                sQ.iterator[_zr * K_PADDED + tidx] = io(0.0)
         sync_threads()
 
         # L2 norm for K (warps 0,1) and Q (warps 2,3) — t-aware warp skip.
@@ -1155,8 +1231,17 @@ class GdnDecodeKernel:
             flat = tidx + idx * THREADS
             r = flat // T
             c = flat % T
+            # (local fix) stable decay: exp(cumsum_r - cumsum_c) directly (<=1 for r>c),
+            # instead of sGamma[T+r]*sBeta[T+c] = exp(cumsum_r)*exp(-cumsum_c) (overflows).
+            # exp_gij is only consumed for r>=c (below); r<c value is discarded.
             exp_gij = (
-                f32(1.0) if r == c else sGamma.iterator[T + r] * sBeta.iterator[T + c]
+                f32(1.0)
+                if r == c
+                else (
+                    _exp_approx_f32(sGamma.iterator[r] - sGamma.iterator[c])
+                    if r > c
+                    else f32(0.0)
+                )
             )
             qkt = sNegL.iterator[r * BF_PAD + c].to(f32)
             sNegL.iterator[r * BF_PAD + c] = (
@@ -1485,11 +1570,22 @@ class GdnDecodeKernel:
             _smem_byte_off_v = _v_row * Int32(V_PADDED * 2) + _v_col_bf16_async * Int32(
                 2
             )
-            _cp_async_bf16x8(
-                _gV_base,
-                _v_base_bf16 + _v_row * sv_t + _v_col_bf16_async,
-                _sV_base_async + _smem_byte_off_v,
-            )
+            # (native-short-T) v holds only n_valid rows; skip rows >= n_valid (OOB).
+            # The sV working-set tail [n_valid:8] is zeroed after the V wait below;
+            # rows [8:16) stay garbage (proof-safe: sPowk[*,8:15]=0 -> garbage*0=0).
+            if const_expr(self._n_valid < T):
+                if _v_row < Int32(self._n_valid):
+                    _cp_async_bf16x8(
+                        _gV_base,
+                        _v_base_bf16 + _v_row * sv_t + _v_col_bf16_async,
+                        _sV_base_async + _smem_byte_off_v,
+                    )
+            else:
+                _cp_async_bf16x8(
+                    _gV_base,
+                    _v_base_bf16 + _v_row * sv_t + _v_col_bf16_async,
+                    _sV_base_async + _smem_byte_off_v,
+                )
         _cp_async_commit_group()  # group = V (K+Q's group already waited at line 717)
 
         # ============================================================
@@ -1720,6 +1816,14 @@ class GdnDecodeKernel:
         # whatever didn't finish in the H GEMM's shadow. Same proxy as
         # K+Q LDGSTS — no fence_view_async_shared needed.
         _cp_async_wait_group_0()
+        # (native-short-T) zero the sV working-set tail rows [n_valid:8] that were NOT
+        # loaded (v held only n_valid rows). The QT@V reduction reads the 8-row working
+        # set for t_input<=8; rows [n_valid:8] must be zero (staging supplied them
+        # before). Rows [8:16) stay garbage — proof-safe (sPowk[*,8:15]=0). tidx in
+        # [0,THREADS=128) covers V_DIM_C=128 cols; the following sync publishes it.
+        if const_expr(self._n_valid < T):
+            for _zr in cutlass.range_constexpr(self._n_valid, 8):
+                sV.iterator[_zr * V_PADDED + tidx] = io(0.0)
         sync_threads()
         _qtvr = _qtv_4mma(_qt_a0, _qt_a1, _qt_a2, _qt_a3, _qtv_base)
 
@@ -1798,6 +1902,37 @@ _STAGE: dict = {}
 # q/k/v/a/b directly into the persistent T=16 buffers (the fixed-buffer serving
 # pattern) or to benchmark the bare kernel. Default True = always safe drop-in.
 _RESTAGE = True
+# (native-short-T) When set, the T<T_KERNEL path passes q/k to the kernel as the
+# real [B,T,...] tensors (no host staging copy) and the kernel loads only those T
+# rows + zeros its sK/sQ smem tail. Removes the two big q/k gmem->gmem staging
+# copies. v/a/b stay staged (v is already minimized by _v_iters=1 at t_input<=8;
+# a/b feed the per-lane gamma path). Off by default (full staging) for safety.
+import os as _os
+_NATIVE_T = _os.environ.get("SGLANG_GDN_WY_NATIVE_T", "0") != "0"
+# (strided-qkv) read q/k/v directly from the fused conv-output column slices (token
+# stride = conv_dim) instead of .contiguous()-materializing them. Removes the 3 big
+# q/k/v copies from the verify region. Only valid on the native path (T in {4,8}).
+_STRIDED_QKV = _os.environ.get("SGLANG_GDN_WY_STRIDED_QKV", "0") != "0"
+# (native-a/b) read a/b directly from the real [B, n_valid, HV] tensors instead of staging
+# them into T_KERNEL-row zero-padded buffers (removes the 2 a/b staging copies). Bit-exact on
+# the compact [B,T] output: gamma is a causal prefix-sum, so the unloaded tail rows (which get
+# log_alpha=0 instead of the staged-zero value) cannot affect rows 0..n_valid-1, and the tail
+# output is discarded. Native path only (T in {4,8}).
+_NATIVE_AB = _os.environ.get("SGLANG_GDN_WY_NATIVE_AB", "0") != "0"
+# Cache the bf16 cast of the per-layer CONSTANT weights A_log/dt_bias, keyed by
+# storage identity (data_ptr, shape). They are persistent tensors passed every verify
+# call; caching turns the per-call `.to(bf16)` into a one-time (warm-up) cast that does
+# not appear in the captured CUDA graph. Safe for inference (weights never change).
+_BF16_CACHE: dict = {}
+def _cached_bf16(t):
+    if t.dtype == torch.bfloat16 and t.is_contiguous():
+        return t
+    key = (t.data_ptr(), tuple(t.shape), str(t.dtype))
+    c = _BF16_CACHE.get(key)
+    if c is None:
+        c = t.to(torch.bfloat16).contiguous()
+        _BF16_CACHE[key] = c
+    return c
 
 
 def gated_delta_rule_mtp(
@@ -1888,43 +2023,102 @@ def gated_delta_rule_mtp(
     _io_dtype = q.dtype
     HK = k.shape[2]
 
-    # A_log / dt_bias are read as bf16 by the kernel (matches the validated path);
-    # accept the flashinfer fp32 convention and convert.
-    A_log = A_log.to(torch.bfloat16).contiguous()
-    dt_bias = dt_bias.to(torch.bfloat16).contiguous()
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    a = a.contiguous()
-    b = b.contiguous()
+    # A_log / dt_bias are read as bf16 by the kernel. They are per-layer constants, so
+    # cache the bf16 cast by storage identity (one-time at warm-up; absent from the
+    # captured graph). Falls back to a plain cast if already bf16-contiguous.
+    A_log = _cached_bf16(A_log)
+    dt_bias = _cached_bf16(dt_bias)
     h0 = initial_state_source.contiguous()
+    # n_valid = token rows actually present in the q/k tensors handed to the kernel.
+    # Native-short-T (SGLANG_GDN_WY_NATIVE_T): pass q/k as the real [B,T,...] tensors
+    # (n_valid=T); the kernel loads only those rows and zeros its sK/sQ smem tail,
+    # skipping the two big q/k gmem->gmem staging copies. Otherwise q/k are staged
+    # into a T_KERNEL-row zero-padded buffer (n_valid=T_KERNEL = original behavior).
+    # Native-short-T is gated to T in {4, 8}: only there does T == t_disc, so (a) the
+    # t_input-gated output STG writes exactly T rows (compact [B,T] output is safe) and
+    # (b) the smem-tail zeroing aligns with the kernel's working-set masking. T=4 is the
+    # draft-len-3 verify shape. Other T (1-3,5-7,9-15) fall back to full staging.
+    _native = _NATIVE_T and (T == 4 or T == 8)
+    n_valid = T if _native else T_KERNEL
 
-    # The kernel is a fixed T=16 tile. For T<16, stage the inputs into
-    # persistent, pre-zeroed T=16 buffers (keyed by shape AND T, so rows
-    # [T:16) stay zero and are never re-touched) and copy only the T valid
-    # rows in each call. This replaces the old per-call torch.nn.functional.pad
-    # (fresh alloc + full re-zero every call), which dominated short-T decode.
+    # Contiguity: tensors the kernel reads DIRECTLY from gmem need canonical-compact
+    # strides for the CuTe descriptor; staged tensors get this for free from .copy_().
+    _qkv_rs = 0  # >0 => strided q/k/v read (token stride = conv_dim); see _STRIDED_QKV
+    _ab_native_flag = False  # True => a/b read native [B,n_valid,HV] (no staging); _NATIVE_AB
+    if T == T_KERNEL:
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        a = a.contiguous()
+        b = b.contiguous()
+    elif _native:
+        # q/k/v are read natively (kernel loads n_valid rows + zeros its smem tail).
+        # Default: .contiguous() so the kernel's compact-stride descriptor is valid.
+        # Strided-qkv: q/k/v are the fused conv-output column slices (token stride =
+        # conv_dim, features contiguous within a token). Pass that row stride to the
+        # kernel and skip the copies — bit-identical (same values, strided gmem read).
+        if _STRIDED_QKV and q.stride(1) == k.stride(1) == v.stride(1):
+            _qkv_rs = q.stride(1)
+        else:
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+
+    # For T<T_KERNEL, stage the inputs into persistent, pre-zeroed T_KERNEL-row
+    # buffers (keyed by shape AND T so rows [T:T_KERNEL) stay zero) and copy only the
+    # T valid rows per call. Those zero rows are load-bearing: the kernel's
+    # ldmatrix/MMA reads the full tile (NaN-tail probe confirmed). The native path
+    # stages only a/b and moves the q/k/v zero-fill into the kernel (smem tail).
     if T < T_KERNEL:
-        skey = (str(device), B, H, HK, HV, K_dim, V_dim, str(_io_dtype), T)
-        buf = _STAGE.get(skey)
-        _fresh = buf is None
-        if _fresh:
-            buf = (
-                torch.zeros(B, T_KERNEL, H, K_dim, dtype=_io_dtype, device=device),
-                torch.zeros(B, T_KERNEL, HK, K_dim, dtype=_io_dtype, device=device),
-                torch.zeros(B, T_KERNEL, HV, V_dim, dtype=_io_dtype, device=device),
-                torch.zeros(B, T_KERNEL, HV, dtype=_io_dtype, device=device),
-                torch.zeros(B, T_KERNEL, HV, dtype=_io_dtype, device=device),
-            )
-            _STAGE[skey] = buf
-        qb, kb, vb, ab, bb = buf
-        if _fresh or _RESTAGE:  # always fill a fresh buffer; otherwise honor _RESTAGE
-            qb[:, :T].copy_(q)
-            kb[:, :T].copy_(k)
-            vb[:, :T].copy_(v)
-            ab[:, :T].copy_(a)
-            bb[:, :T].copy_(b)
-        q, k, v, a, b = qb, kb, vb, ab, bb
+        if _native and _NATIVE_AB and a.is_contiguous() and b.is_contiguous():
+            # Native-a/b: pass the real [B, T(=n_valid), HV] tensors straight to the kernel
+            # (batch stride = n_valid*HV, contiguous). The kernel gates the warp-3 load/compute
+            # by n_valid, so no T_KERNEL zero-pad staging copy is needed. Bit-exact on the
+            # compact [B,T] output (causal prefix-sum isolates the unloaded tail rows).
+            _ab_native_flag = True
+            # q, k, v and a, b all stay native [B, T, ...].
+        elif _native:
+            skey = (str(device), B, HV, str(_io_dtype), T, "ab")
+            buf = _STAGE.get(skey)
+            _fresh = buf is None
+            if _fresh:
+                with torch.inference_mode(False):
+                    buf = (
+                        torch.zeros(B, T_KERNEL, HV, dtype=_io_dtype, device=device),
+                        torch.zeros(B, T_KERNEL, HV, dtype=_io_dtype, device=device),
+                    )
+                _STAGE[skey] = buf
+            ab, bb = buf
+            if _fresh or _RESTAGE:
+                ab[:, :T].copy_(a)
+                bb[:, :T].copy_(b)
+            a, b = ab, bb
+            # q, k, v stay as the native [B, T, ...] tensors.
+        else:
+            skey = (str(device), B, H, HK, HV, K_dim, V_dim, str(_io_dtype), T)
+            buf = _STAGE.get(skey)
+            _fresh = buf is None
+            if _fresh:
+                # (local patch) allocate OUTSIDE inference_mode so they are normal
+                # tensors; otherwise the in-place .copy_() is rejected during
+                # sglang CUDA-graph capture ("Inplace update to inference tensor").
+                with torch.inference_mode(False):
+                    buf = (
+                        torch.zeros(B, T_KERNEL, H, K_dim, dtype=_io_dtype, device=device),
+                        torch.zeros(B, T_KERNEL, HK, K_dim, dtype=_io_dtype, device=device),
+                        torch.zeros(B, T_KERNEL, HV, V_dim, dtype=_io_dtype, device=device),
+                        torch.zeros(B, T_KERNEL, HV, dtype=_io_dtype, device=device),
+                        torch.zeros(B, T_KERNEL, HV, dtype=_io_dtype, device=device),
+                    )
+                _STAGE[skey] = buf
+            qb, kb, vb, ab, bb = buf
+            if _fresh or _RESTAGE:  # always fill a fresh buffer; else honor _RESTAGE
+                qb[:, :T].copy_(q)
+                kb[:, :T].copy_(k)
+                vb[:, :T].copy_(v)
+                ab[:, :T].copy_(a)
+                bb[:, :T].copy_(b)
+            q, k, v, a, b = qb, kb, vb, ab, bb
 
     pool_size = h0.shape[0]
     _num_sms = 148  # B200
@@ -1934,7 +2128,9 @@ def gated_delta_rule_mtp(
     mbp = max(1, min(_needed + 1, 4))
     # T-aware Phase-2 squaring depth.
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
-    cache_key = (str(device), B, pool_size, mbp, t_disc)
+    # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
+    # different kernels (different q/k batch stride + the smem-tail-zero path).
+    cache_key = (str(device), B, pool_size, mbp, t_disc, n_valid, _qkv_rs, _ab_native_flag)
     mk = from_dlpack
 
     # The kernel always writes a full T=16 output tile. If the caller did not
@@ -1944,6 +2140,11 @@ def gated_delta_rule_mtp(
     # rows back.
     if output is not None and T == T_KERNEL:
         out16 = output
+    elif _native:
+        # Native (T in {4,8}): the STG writes exactly T rows, so a compact [B,T,HV,V]
+        # output is correct. Returning it contiguous makes the caller's
+        # reshape(1, B*T, ...) a free view instead of a ~5us materializing copy.
+        out16 = torch.empty(B, T, HV, V_dim, dtype=_io_dtype, device=device)
     else:
         out16 = torch.empty(B, T_KERNEL, HV, V_dim, dtype=_io_dtype, device=device)
 
@@ -1969,7 +2170,8 @@ def gated_delta_rule_mtp(
     if cache_key not in _CACHE:
         _CACHE[cache_key] = cute.compile(
             GdnDecodeKernel(
-                disable_state_update=True, min_blocks_per_mp=mbp, t_input=t_disc
+                disable_state_update=True, min_blocks_per_mp=mbp, t_input=t_disc,
+                n_valid=n_valid, qkv_row_stride=_qkv_rs, ab_native=_ab_native_flag,
             ),
             *args,
         )
