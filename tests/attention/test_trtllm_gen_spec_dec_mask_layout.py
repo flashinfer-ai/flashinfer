@@ -83,7 +83,25 @@ def test_spec_dec_tree_native_window_uses_tail_only_mask_stride():
     assert native_words == 8 * 2 * 2 * 128
 
 
-def test_spec_dec_tree_swaps_straddling_tail_forces_keeps_fallback():
+def test_spec_dec_tree_swaps_default_forces_keeps_until_perf_boundary():
+    layout = _select_trtllm_gen_spec_dec_tree_kernel(
+        torch.bfloat16,
+        torch.bfloat16,
+        num_heads_q_per_kv=5,
+        q_len=4,
+    )
+
+    assert layout.kernel_layout == "swaps"
+    assert _should_force_trtllm_gen_spec_dec_tree_keeps(
+        layout,
+        torch.tensor([1280], dtype=torch.int32),
+        q_len=4,
+        window_left=-1,
+    )
+
+
+def test_spec_dec_tree_swaps_opt_in_straddling_tail_forces_keeps_fallback(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_TRTLLM_GEN_SPEC_DEC_TREE_ENABLE_SWAPS", "1")
     layout = _select_trtllm_gen_spec_dec_tree_kernel(
         torch.bfloat16,
         torch.bfloat16,

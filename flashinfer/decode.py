@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 import warnings
 from types import SimpleNamespace
 from typing import Any, List, Literal, NamedTuple, Optional, Tuple, Union, overload
@@ -2599,6 +2600,10 @@ def _should_force_trtllm_gen_spec_dec_tree_keeps(
 ) -> bool:
     if layout.kernel_layout != "swaps":
         return False
+    if os.environ.get("FLASHINFER_TRTLLM_GEN_SPEC_DEC_TREE_ENABLE_SWAPS") != "1":
+        # Swaps remains available for explicit benchmarking, but regresses the
+        # small B300 verify shapes measured for the initial native artifact.
+        return True
     if window_left >= 0:
         return True
     if seq_lens.is_cuda and torch.cuda.is_current_stream_capturing():
