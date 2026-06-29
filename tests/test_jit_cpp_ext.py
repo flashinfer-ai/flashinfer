@@ -1,6 +1,10 @@
 import subprocess
 
+import pytest
+import torch
+
 from flashinfer.jit import core, cpp_ext
+from flashinfer.jit.attention import modules as attention_modules
 
 
 def test_nvcc_parallelism_flags_use_flashinfer_nvcc_threads(monkeypatch):
@@ -136,3 +140,36 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(
+        attention_modules.current_compilation_context, "TARGET_CUDA_ARCHS", {(8, 6)}
+    )
+    monkeypatch.setattr(
+        attention_modules.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path / "gen"
+    )
+
+    spec = attention_modules.gen_customize_batch_prefill_module(
+        "fa2",
+        "test_batch_prefill_nvfp4_large_head",
+        torch.float16,
+        torch.uint8,
+        torch.float16,
+        torch.int32,
+        512,
+        512,
+        [],
+        [],
+        ["sm_scale"],
+        ["double"],
+        "DefaultAttention<false, false, false, false>",
+        "#include <flashinfer/attention/variants.cuh>",
+    )
+
+    assert any("sm_86" in flag for flag in spec.extra_cuda_cflags)
+    with pytest.raises(RuntimeError, match="No supported CUDA architectures"):
+        attention_modules._fa2_head_dim_nvcc_flags(512, 512, torch.uint8)

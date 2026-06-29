@@ -1085,7 +1085,6 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
-        allow_nvfp4_sm8_large_head=(backend == "fa2"),
     )
 
 
@@ -1588,7 +1587,6 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
-    allow_nvfp4_sm8_large_head: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1681,10 +1679,8 @@ def gen_customize_batch_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=(
-                _fa2_prefill_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv)
-                if allow_nvfp4_sm8_large_head
-                else _fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv)
+            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
+                head_dim_qk, head_dim_vo, dtype_kv
             ),
         )
     elif backend == "fa3":
