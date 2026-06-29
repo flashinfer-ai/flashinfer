@@ -387,6 +387,11 @@ class MoEDynamicKernel:
             self.smem_capacity,
             self.occupancy,
         )
+        # The gated path stages a second weight pipeline (sB_up / sSFB_up) that
+        # _compute_stages doesn't model. Extra smem usage requires capping at 2
+        # to stay within the SM12x smem budget.
+        if self.is_gated:
+            self.ab_stage = max(1, min(self.ab_stage, 2))
         # ab_stage must divide k_tile_cnt evenly to avoid pipeline phase mismatch.
         # _compute_stages returns the max that fits in smem, but it may not
         # divide k_tile_cnt. Round down to the nearest divisor.

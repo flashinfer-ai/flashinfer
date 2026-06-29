@@ -1140,11 +1140,14 @@ class TestB12xFunctional:
     )
     @pytest.mark.parametrize("num_tokens", [8, 128, 515])
     def test_activation_accuracy(self, activation: str, num_tokens: int):
-        """Accuracy of each gated activation: SwiGLU (silu), GeGLU (gelu_tanh),
-        and SwiGLU-OAI (swigluoai_uninterleave, MiniMax-M3)."""
+        """Accuracy of each gated activation: SwiGLU, GeGLU and SwiGLU-OAI.
+
+        Num tokens chosen to trigger the micro, static and dynamic backends to ensure
+        that all three backends are tested.
+        """
         from flashinfer import b12x_fused_moe
 
-        hidden_size, intermediate_size = 512, 256
+        hidden_size, intermediate_size = 1536, 768
         num_experts, top_k = 8, 2
         swiglu_limit = (
             7.0 if activation == "swigluoai_uninterleave" else None
