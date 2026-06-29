@@ -263,10 +263,15 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     # Copy first output tensor into inplace_combine_tensor
     inplace_combine_tensor.copy_(output_tensors[hidden_state_index])
 
+    output_buffer = torch.empty_like(input_tensors[hidden_state_index])
     output = moe_a2a.combine(
-        inplace_combine_tensor, num_tokens, payload_in_workspace=True
+        inplace_combine_tensor,
+        num_tokens,
+        payload_in_workspace=True,
+        output=output_buffer,
     )
 
+    assert output is output_buffer
     # Should just be a direct copy for 1 GPU
     torch.testing.assert_close(
         output, input_tensors[hidden_state_index], atol=0, rtol=0
