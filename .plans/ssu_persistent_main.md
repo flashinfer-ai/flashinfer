@@ -51,7 +51,7 @@ ${CUDA_HOME}/ncu --target-processes all --set full --import-source yes \
 # Non-mixed single-mode bench
 
 ```bash
-export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.0 BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
+export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.1 BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
     uv run python benchmarks/bench_checkpointing_ssu.py \
     --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
     --prev-tokens-fracs ${PNAT}
@@ -410,6 +410,69 @@ adding hot-loop code (meta-hoist / warp-templating both regressed via codegen/i-
   fetch (`:1109`, depth-1 prefetches meta only 1 ahead) — with a **deeper register-only meta ring**
   (decoupled from the state-ring depth; 3 ints/entry, zero smem cost).
 - The warp-branch and HMMA stalls are NOT worth chasing on pipe=2 (occupancy-bound at 5 blocks).
+
+## Why triton-pm wins no-write: it's the INDEX MATH, not the matmuls (B200, 2026-06-27)
+
+Profiled triton-replay-pm's `_persistent_main_kernel` (no-write, prev_k=8, b1024) vs our
+`checkpointing_ssu_main_kernel`, same `dump_int_overhead.py` static SASS analysis + per-kernel CUPTI.
+
+**Clean per-kernel CUPTI (no ncu artifacts) — the gap is the MAIN, not precompute, not PDL:**
+
+| | precompute | main | whole path |
+|---|---:|---:|---:|
+| ours (cuda-incr-2k) | 13.6 µs | ~110 µs | 120.7 |
+| triton-pm | 14.9 µs | **~70.6 µs** | 79.0 |
+
+Our precompute is *faster* (13.6 < 14.9); PDL overlap is ~3 µs (irrelevant at b=1024).  All ~40 µs is
+the main.  (NB: ncu base-clock durations LIE here — they show our main faster; trust the CUPTI.)
+
+**Same memory, 3.3× the instructions.**  DRAM read is identical (318.5 vs 317.8 MB) — same math, same
+data.  But: ours 50.06 M dynamic instructions vs triton 15.61 M; static SASS ours 3432 vs 1840.
+
+| static SASS | triton-pm | ours |
+|---|---:|---:|
+| total | 1840 | 3432 |
+| **INT** | 555 (30%) | **1831 (53%)** |
+| UNIFORM | 232 (13%) | 183 (5%) |
+| LD/ST | 245 | 696 |
+| TENSOR | 108 (6%) | 54 (2%) |
+
+**It's address math, on the wrong datapath.**  Neither kernel is matmul-bound (tensor 2–6%).  We
+execute 3.3× more INT (IMAD/LEA/LOP3/SHF) — almost all **CuTe per-access swizzle/layout/pointer
+recomputation** (`pointer_base:155` 220 INT @4%, `stride/swizzle/tensor_impl/copy` ~200, plus our own
+`main.cuh` load/output/loop lines), **re-run every work-unit**.  Triton's heavy INT is **hoisted** —
+its 96-IMAD index block (`:1352`) and swizzle (`:2168`) sit at ~0% time (computed once); its hot
+samples are loads.  And triton offloads warp-uniform address math to the **uniform datapath** (13% vs
+our 5%; `UIMAD`/`ULEA`/`ULDC`), keeping the main pipe free.
+
+**The 3× LD/ST is the same root.**  Breakdown: `LDSM` (cooperative-MMA ldmatrix) is *equal* (3.5 vs
+2.9%) — not our problem.  Our excess is `LDC` (param re-loads from constant mem: **6.1% vs 0.2%**) +
+`LDS` (smem operand re-reads: **5.6% vs 0.6%**).  We re-fetch strides/pointers and re-read swizzled
+smem per access because CuTe recomputes addressing AND our **87-register budget can't cache it**;
+triton's **190 registers** hold params+operands resident → near-zero LDC/LDS.
+
+**Reframe:** more *registers* (to cache params + hoist invariant addressing) is what cuts the
+INT/LDC/LDS count — not occupancy.  triton trades occupancy (10%) for registers (190) + hoisting; we
+do the opposite (28% / 87).  For this address-heavy memory-streamer, triton's bet wins.
+
+### Index-math simplification plan (staged)
+
+1. **Hoist loop-invariant CuTe setup out of the per-work-unit path.**  `output_head_2k` /
+   `compute_output_and_store` / `add_init_out_ring` / `replay_state_mma_ring` rebuild `make_tiled_mma`,
+   `get_slice(tid)`, `partition_fragment_*`, the s2r `Copy_Atom`s, and the swizzled layouts **every
+   work-unit** — all depend only on `tid`/types, not the work-unit.  Build them ONCE in `head_loop`
+   before the steady loop, pass by ref.  Per-work-unit cost drops to base-pointer + slot offset.
+   Target: collapse the `pointer_base`/`stride`/`swizzle` INT (re-run → once).
+2. **Template / precompute the hot smem offsets.**  Where a swizzled address is `base + f(lane)` with
+   `f(lane)` work-unit-invariant, precompute `f(lane)` once (or make it a `constexpr` offset table)
+   and hand-roll the per-access add — instead of CuTe regenerating the swizzle (`LOP3`/`SHF`) each
+   time.  Hot targets from ncu: the `add_init_out` C@state operand, the output store, `:457`/`:208`.
+2b. **Kill the LDC param re-loads.**  Hoist `params.*_stride_*` / base pointers into local registers
+   once at `head_loop` entry so nvcc stops re-issuing `LDC` per access (6.1%→~0).
+3. **Uniform-ize the bases** so nvcc emits `UIMAD`/`ULEA` for the warp-invariant address parts (push
+   work onto the idle uniform datapath), leaving only the per-lane swizzle on the main pipe.
+
+Start with **#1** (biggest, cleanest): hoist the CuTe MMA/partition/layout objects to `head_loop`.
 
 ## TODO
 
