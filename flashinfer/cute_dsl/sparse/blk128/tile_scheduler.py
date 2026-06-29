@@ -43,7 +43,9 @@ class WorkTileInfo(cutlass.utils.WorkTileInfo):
     def __new_from_mlir_values__(self, values: list[ir.Value]) -> "WorkTileInfo":
         assert len(values) == 5
         new_tile_idx = cutlass.new_from_mlir_values(self._tile_idx, values[:-1])
-        new_is_valid_tile = cutlass.new_from_mlir_values(self._is_valid_tile, [values[-1]])
+        new_is_valid_tile = cutlass.new_from_mlir_values(
+            self._is_valid_tile, [values[-1]]
+        )
         return WorkTileInfo(new_tile_idx, new_is_valid_tile)
 
 
@@ -105,7 +107,9 @@ class SingleTileScheduler:
         return SingleTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
-    def create(params: Params, clc_response_ptr=None, *, loc=None, ip=None) -> "SingleTileScheduler":
+    def create(
+        params: Params, clc_response_ptr=None, *, loc=None, ip=None
+    ) -> "SingleTileScheduler":
         blk_coord = cute.arch.block_idx()
         return SingleTileScheduler(params, blk_coord, loc=loc, ip=ip)
 
@@ -117,7 +121,9 @@ class SingleTileScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        assert params.cluster_shape_mn[1] == 1, (
+            "Only cluster_shape_mn[1] == 1 is supported"
+        )
         return (
             cute.round_up(params.num_block, params.cluster_shape_mn[0]),
             params.num_head * params.num_splits,
@@ -156,7 +162,9 @@ class SingleTileScheduler:
 
     def __new_from_mlir_values__(self, values):
         obj_list = []
-        for obj, n_items in zip([self.params, self._blk_coord], self._values_pos):
+        for obj, n_items in zip(
+            [self.params, self._blk_coord], self._values_pos, strict=False
+        ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
@@ -182,7 +190,9 @@ class StaticPersistentTileScheduler:
             loc=None,
             ip=None,
         ) -> "StaticPersistentTileScheduler.Params":
-            num_block_cluster = cute.ceil_div(args.num_block, cute.size(args.cluster_shape_mn))
+            num_block_cluster = cute.ceil_div(
+                args.num_block, cute.size(args.cluster_shape_mn)
+            )
             total_blocks_cluster = num_block_cluster * args.num_head * args.num_batch
             return StaticPersistentTileScheduler.Params(
                 FastDivmodDivisor(num_block_cluster),
@@ -236,6 +246,7 @@ class StaticPersistentTileScheduler:
                 ClcDynamicPersistentTileScheduler,
                 ClcDynamicPersistentTileSchedulerParams,
             )
+
             cutlass_params = ClcDynamicPersistentTileSchedulerParams(
                 problem_shape_ntile_mnl=(
                     cute.round_up(params.num_block, params.cluster_shape_m),
@@ -280,7 +291,9 @@ class StaticPersistentTileScheduler:
         sm_count = hardware_info.get_device_multiprocessor_count()
         # Grid must be a multiple of cluster_shape_m for CUDA cluster launch.
         max_ctas = (sm_count // params.cluster_shape_m) * params.cluster_shape_m
-        grid_x = cutlass.min(max_ctas, params.total_blocks_cluster * params.cluster_shape_m)
+        grid_x = cutlass.min(
+            max_ctas, params.total_blocks_cluster * params.cluster_shape_m
+        )
         return (grid_x, Int32(1), Int32(1))
 
     @cute.jit
@@ -360,7 +373,7 @@ class StaticPersistentTileScheduler:
         objs = [self.params, self._tile_idx]
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
             objs += [self._clc_scheduler, self._clc_pipeline, self._clc_consumer_state]
-        for obj, n_items in zip(objs, self._values_pos):
+        for obj, n_items in zip(objs, self._values_pos, strict=False):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return StaticPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)

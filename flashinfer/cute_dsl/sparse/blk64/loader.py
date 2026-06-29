@@ -16,7 +16,6 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-import torch
 from torch.utils.cpp_extension import load
 
 
@@ -40,7 +39,11 @@ def load_blk64_ext():
     cutlass_root = _get_cutlass_root()
 
     build_dir = (
-        Path(os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home() / ".cache" / "flashinfer"))
+        Path(
+            os.environ.get(
+                "FLASHINFER_WORKSPACE_BASE", Path.home() / ".cache" / "flashinfer"
+            )
+        )
         / "blk64_ext"
     )
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -75,7 +78,8 @@ def load_blk64_ext():
         sources=[
             str(_THIS_DIR / "bindings.cpp"),
             str(_THIS_DIR / "flash_fwd_launch_template.cu"),
-        ] + instantiation_sources,
+        ]
+        + instantiation_sources,
         extra_cflags=["-O3", "-std=c++20", "-Wno-deprecated-declarations"],
         extra_cuda_cflags=nvcc_flags,
         build_directory=str(build_dir),

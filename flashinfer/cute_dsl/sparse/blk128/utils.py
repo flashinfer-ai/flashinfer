@@ -96,7 +96,7 @@ def hash_callable(
             base_hash = _compute_base_hash(base_func)
 
             if set_cute_hash:
-                base_func.__cute_hash__ = base_hash
+                base_func.__cute_hash__ = base_hash  # type: ignore[union-attr]
 
     # Mix in mutable metadata dunders
     mixer_values = tuple(getattr(func, attr, None) for attr in mixer_attrs)
@@ -106,7 +106,7 @@ def hash_callable(
 
     hasher = hashlib.sha256(base_hash.encode())
 
-    for attr, val in zip(_MIXER_ATTRS, mixer_values):
+    for attr, val in zip(_MIXER_ATTRS, mixer_values, strict=False):
         hasher.update(f"{attr}={val!r}".encode())
 
     return hasher.hexdigest()
@@ -134,7 +134,9 @@ def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Te
 
 
 def make_tiled_copy_A(
-    copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
+    copy_atom: cute.CopyAtom,
+    tiled_mma: cute.TiledMma,
+    swapAB: cutlass.Constexpr[bool] = False,
 ) -> cute.TiledCopy:
     if const_expr(swapAB):
         return cute.make_tiled_copy_B(copy_atom, tiled_mma)
@@ -143,7 +145,9 @@ def make_tiled_copy_A(
 
 
 def make_tiled_copy_B(
-    copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
+    copy_atom: cute.CopyAtom,
+    tiled_mma: cute.TiledMma,
+    swapAB: cutlass.Constexpr[bool] = False,
 ) -> cute.TiledCopy:
     if const_expr(swapAB):
         return cute.make_tiled_copy_A(copy_atom, tiled_mma)
@@ -152,7 +156,9 @@ def make_tiled_copy_B(
 
 
 def mma_make_fragment_A(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor,
+    thr_mma: cute.core.ThrMma,
+    swapAB: cutlass.Constexpr[bool] = False,
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_B(smem, thr_mma)
@@ -161,7 +167,9 @@ def mma_make_fragment_A(
 
 
 def mma_make_fragment_B(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor,
+    thr_mma: cute.core.ThrMma,
+    swapAB: cutlass.Constexpr[bool] = False,
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_A(smem, thr_mma)
@@ -170,7 +178,9 @@ def mma_make_fragment_B(
 
 
 def get_smem_store_atom(
-    arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
+    arch: cutlass.Constexpr[int],
+    element_type: Type[cute.Numeric],
+    transpose: bool = False,
 ) -> cute.CopyAtom:
     if const_expr(arch < 90 or element_type.width != 16):
         return cute.make_copy_atom(
@@ -205,7 +215,12 @@ def warp_reduce(
 
 @dsl_user_op
 def fmax(
-    a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
+    a: float | Float32,
+    b: float | Float32,
+    c: float | Float32 | None = None,
+    *,
+    loc=None,
+    ip=None,
 ) -> Float32:
     from cutlass import CUDA_VERSION
 
@@ -237,7 +252,9 @@ def fmax(
 
 @cute.jit
 def fmax_reduce(
-    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+    x: cute.TensorSSA,
+    init_val: float | Float32 | None = None,
+    arch: cutlass.Constexpr[int] = 80,
 ) -> Float32:
     if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         res = cute.make_fragment(x.shape, Float32)
@@ -251,7 +268,11 @@ def fmax_reduce(
         local_max[0] = fmax(local_max[0], local_max[1])
         local_max[2] = fmax(local_max[2], local_max[3])
         local_max[0] = fmax(local_max[0], local_max[2])
-        return local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val)
+        return (
+            local_max[0]
+            if const_expr(init_val is None)
+            else fmax(local_max[0], init_val)
+        )
     else:
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
@@ -277,7 +298,9 @@ def fmax_reduce(
 
 @cute.jit
 def fadd_reduce(
-    x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
+    x: cute.TensorSSA,
+    init_val: float | Float32 | None = None,
+    arch: cutlass.Constexpr[int] = 80,
 ) -> Float32:
     if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         if const_expr(init_val is None):
@@ -293,10 +316,18 @@ def fadd_reduce(
         )
         local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
         for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
-            local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
-            local_sum[1] = cute.arch.add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
-            local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
-            local_sum[3] = cute.arch.add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
+            local_sum[0] = cute.arch.add_packed_f32x2(
+                local_sum[0], (res[i + 0], res[i + 1])
+            )
+            local_sum[1] = cute.arch.add_packed_f32x2(
+                local_sum[1], (res[i + 2], res[i + 3])
+            )
+            local_sum[2] = cute.arch.add_packed_f32x2(
+                local_sum[2], (res[i + 4], res[i + 5])
+            )
+            local_sum[3] = cute.arch.add_packed_f32x2(
+                local_sum[3], (res[i + 6], res[i + 7])
+            )
         local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[1])
         local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], local_sum[3])
         local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[2])
@@ -304,14 +335,21 @@ def fadd_reduce(
 
 
 @dsl_user_op
-def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
+def atomic_add_fp32(
+    a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
+) -> None:
     nvvm.atomicrmw(
-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
+        res=T.f32(),
+        op=nvvm.AtomicOpKind.FADD,
+        ptr=gmem_ptr.llvm_ptr,
+        a=Float32(a).ir_value(),
     )
 
 
 @dsl_user_op
-def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+def elem_pointer(
+    x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None
+) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
@@ -320,14 +358,20 @@ def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
     tApA = cute.make_fragment(
         cute.make_layout(
-            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+            (
+                cute.size(tAcA, mode=[0, 1]),
+                cute.size(tAcA, mode=[1]),
+                cute.size(tAcA, mode=[2]),
+            ),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
         ),
         cutlass.Boolean,
     )
     for rest_v in cutlass.range_constexpr(tApA.shape[0]):
         for rest_k in cutlass.range_constexpr(tApA.shape[2]):
-            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+            tApA[rest_v, 0, rest_k] = cute.elem_less(
+                tAcA[(0, rest_v), 0, rest_k][1], limit
+            )
     return tApA
 
 
@@ -354,12 +398,16 @@ def shuffle_sync(
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):
-        val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
+        val_i32[i] = cute.arch.shuffle_sync(
+            val_i32[i], offset, mask_and_clamp=mask_and_clamp
+        )
     return val[0]
 
 
 @dsl_user_op
-def shl_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+def shl_u32(
+    val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None
+) -> cutlass.Uint32:
     """
     Left-shift val by shift bits using PTX shl.b32 (sign-agnostic).
 
@@ -393,7 +441,9 @@ def shl_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
 
 
 @dsl_user_op
-def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+def shr_u32(
+    val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None
+) -> cutlass.Uint32:
     """
     Unsigned right-shift val by shift bits using PTX shr.u32 (zero-fills).
 
@@ -417,7 +467,9 @@ def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
 
 
 @cute.jit
-def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+def warp_prefix_sum(
+    val: cutlass.Int32, lane: Optional[cutlass.Int32] = None
+) -> cutlass.Int32:
     if const_expr(lane is None):
         lane = cute.arch.lane_idx()
     for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
@@ -433,7 +485,9 @@ def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) ->
 def cvt_f16x2_f32(
     a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None
 ) -> cutlass.Int32:
-    assert to_dtype in [cutlass.BFloat16, cutlass.Float16], "to_dtype must be BFloat16 or Float16"
+    assert to_dtype in [cutlass.BFloat16, cutlass.Float16], (
+        "to_dtype must be BFloat16 or Float16"
+    )
     return cutlass.Int32(
         llvm.inline_asm(
             T.i32(),
@@ -475,7 +529,9 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
     else:
         # tensor variant: write to dst
         dst = dst_or_dtype
-        assert cute.size(dst.shape) == cute.size(src.shape), "dst and src must have the same size"
+        assert cute.size(dst.shape) == cute.size(src.shape), (
+            "dst and src must have the same size"
+        )
         assert cute.size(src.shape) % 2 == 0, "src must have an even number of elements"
         assert dst.element_type in [cutlass.BFloat16, cutlass.Float16], (
             "dst must be BFloat16 or Float16"
@@ -489,7 +545,9 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
 
 @dsl_user_op
 @cute.jit
-def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Float32:
+def evaluate_polynomial(
+    x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None
+) -> Float32:
     deg = len(poly) - 1
     out = poly[deg]
     for i in cutlass.range_constexpr(deg - 1, -1, -1):
@@ -510,7 +568,9 @@ def evaluate_polynomial_2(
 
 
 @dsl_user_op
-def add_round_down(x: float | Float32, y: float | Float32, *, loc=None, ip=None) -> Float32:
+def add_round_down(
+    x: float | Float32, y: float | Float32, *, loc=None, ip=None
+) -> Float32:
     # There's probably a way to call llvm or nvvm to do this instead of ptx
     return cutlass.Float32(
         llvm.inline_asm(
@@ -526,7 +586,9 @@ def add_round_down(x: float | Float32, y: float | Float32, *, loc=None, ip=None)
 
 
 @dsl_user_op
-def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None) -> Float32:
+def combine_int_frac_ex2(
+    x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None
+) -> Float32:
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
@@ -576,7 +638,9 @@ def ex2_emulation_2(
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
-    xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
+    )
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
     xy_rounded_back = quack.activation.sub_packed_f32x2(

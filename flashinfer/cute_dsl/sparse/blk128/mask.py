@@ -26,7 +26,9 @@ def mask_r2p_lambda(
     rank1: bool = False,
 ) -> None:
     """Apply R2P masking with a custom bitmask generator."""
-    ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
+    ncol = const_expr(
+        cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape)
+    )
     CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
         mask = mask_gen_fn(s)

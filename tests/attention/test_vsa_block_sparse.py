@@ -18,7 +18,6 @@ import math
 import os
 import statistics
 
-import numpy as np
 import pytest
 import torch
 
@@ -86,9 +85,9 @@ def _bsr_to_dense_mask(
 
 
 def _pytorch_ref(
-    q: torch.Tensor,     # [M, H, D]
-    k: torch.Tensor,     # [N, H, D]
-    v: torch.Tensor,     # [N, H, D]
+    q: torch.Tensor,  # [M, H, D]
+    k: torch.Tensor,  # [N, H, D]
+    v: torch.Tensor,  # [N, H, D]
     indptr: torch.Tensor,
     indices: torch.Tensor,
     R: int,
@@ -104,13 +103,13 @@ def _pytorch_ref(
 
     mask = _bsr_to_dense_mask(indptr, indices, MB, NB, R, C, q.device)
 
-    qf = q.float().permute(1, 0, 2)           # [H, M, D]
-    kf = k.float().permute(1, 0, 2)           # [H, N, D]
-    vf = v.float().permute(1, 0, 2)           # [H, N, D]
+    qf = q.float().permute(1, 0, 2)  # [H, M, D]
+    kf = k.float().permute(1, 0, 2)  # [H, N, D]
+    vf = v.float().permute(1, 0, 2)  # [H, N, D]
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale  # [H, M, N]
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
     probs = torch.softmax(scores, dim=-1)
-    out = torch.matmul(probs, vf)             # [H, M, D]
+    out = torch.matmul(probs, vf)  # [H, M, D]
     return out.permute(1, 0, 2).to(q.dtype)  # [M, H, D]
 
 
@@ -128,12 +127,15 @@ def _make_wrapper(workspace):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype,density,num_blocks,num_heads", [
-    (torch.bfloat16, 0.25, 16, 8),
-    (torch.bfloat16, 0.75,  4, 8),
-    (torch.float16,  0.25, 16, 8),
-    (torch.float16,  0.75,  4, 8),
-])
+@pytest.mark.parametrize(
+    "dtype,density,num_blocks,num_heads",
+    [
+        (torch.bfloat16, 0.25, 16, 8),
+        (torch.bfloat16, 0.75, 4, 8),
+        (torch.float16, 0.25, 16, 8),
+        (torch.float16, 0.75, 4, 8),
+    ],
+)
 def test_vsa_accuracy(dtype, density, num_blocks, num_heads, workspace):
     """VSA output must match PyTorch dense reference."""
     device = torch.device("cuda")
@@ -150,14 +152,20 @@ def test_vsa_accuracy(dtype, density, num_blocks, num_heads, workspace):
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
 
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
-
 
 
 @pytest.mark.parametrize("sm_scale", [0.5])
@@ -178,15 +186,21 @@ def test_vsa_sm_scale(sm_scale, workspace):
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
         sm_scale=sm_scale,
     )
     o = wrapper.run(q, k, v)
 
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
-
 
 
 def test_vsa_vs_auto_80k(workspace):
@@ -211,22 +225,35 @@ def test_vsa_vs_auto_80k(workspace):
 
     ref_w = BlockSparseAttentionWrapper(workspace, backend="auto")
     ref_w.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
     )
     o_ref = ref_w.run(q, k, v)
 
     vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
     vsa_w.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
     )
     o_vsa = vsa_w.run(q, k, v)
 
     torch.testing.assert_close(o_ref.float(), o_vsa.float(), atol=1e-2, rtol=1e-2)
-
 
 
 # ---------------------------------------------------------------------------
@@ -247,16 +274,25 @@ def test_vsa_per_head_mask_correctness(workspace):
     v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
 
     # Construct distinct per-head masks
-    block_mask = torch.zeros(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    block_mask = torch.zeros(
+        num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device
+    )
     for h in range(num_heads):
         # Each head attends to a different set of blocks
-        chosen = torch.randperm(num_blocks)[:max(1, num_blocks // 2)]
+        chosen = torch.randperm(num_blocks)[: max(1, num_blocks // 2)]
         block_mask[h, :, chosen] = True
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        None, None, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        None,
+        None,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
         block_mask=block_mask,
     )
@@ -266,16 +302,16 @@ def test_vsa_per_head_mask_correctness(workspace):
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
     o_ref = torch.empty_like(o_vsa)
     for h in range(num_heads):
-        qh = q[:, h, :].float()    # [M, D]
-        kh = k[:, h, :].float()    # [N, D]
-        vh = v[:, h, :].float()    # [N, D]
+        qh = q[:, h, :].float()  # [M, D]
+        kh = k[:, h, :].float()  # [N, D]
+        vh = v[:, h, :].float()  # [N, D]
         # Expand block_mask[h] to token-level
         token_mask = torch.zeros(M, N, dtype=torch.bool, device=device)
         for qi in range(num_blocks):
             for ki in range(num_blocks):
                 if block_mask[h, qi, ki]:
-                    token_mask[qi*R:(qi+1)*R, ki*C:(ki+1)*C] = True
-        scores = torch.matmul(qh, kh.t()) * sm_scale      # [M, N]
+                    token_mask[qi * R : (qi + 1) * R, ki * C : (ki + 1) * C] = True
+        scores = torch.matmul(qh, kh.t()) * sm_scale  # [M, N]
         scores = scores.masked_fill(~token_mask, float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         o_ref[:, h, :] = torch.matmul(probs, vh).to(dtype)
@@ -296,21 +332,30 @@ def test_vsa_per_head_mask_differs_across_heads(workspace):
     v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
 
     # Maximally different masks: head h attends only to block h (mod num_blocks)
-    block_mask = torch.zeros(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    block_mask = torch.zeros(
+        num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device
+    )
     for h in range(num_heads):
         block_mask[h, :, h % num_blocks] = True
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        None, None, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        None,
+        None,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
         block_mask=block_mask,
     )
     o_per_head = wrapper.run(q, k, v)
 
     # Head-averaged BSR (union of all per-head blocks)
-    union_mask_bool = block_mask.any(dim=0)   # [MB, NB]
+    union_mask_bool = block_mask.any(dim=0)  # [MB, NB]
     nz = union_mask_bool.nonzero(as_tuple=False)
     indptr = torch.zeros(num_blocks + 1, dtype=torch.int32, device=device)
     row_counts = union_mask_bool.sum(dim=1).to(torch.int32)
@@ -319,8 +364,15 @@ def test_vsa_per_head_mask_differs_across_heads(workspace):
 
     wrapper2 = _make_wrapper(workspace)
     wrapper2.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
     )
     o_head_avg = wrapper2.run(q, k, v)
@@ -377,17 +429,19 @@ def _compute_vsa_compress_and_mask(
     v_pooled = v.view(NB, C, H, D).float().mean(dim=1).permute(1, 0, 2)  # [H, NB, D]
 
     # Dense attention on pooled tokens
-    scores = torch.matmul(q_pooled, k_pooled.transpose(-1, -2)) * sm_scale  # [H, MB, NB]
-    block_attn_score = torch.softmax(scores, dim=-1)                          # [H, MB, NB]
-    out_pooled = torch.matmul(block_attn_score, v_pooled)                    # [H, MB, D]
+    scores = (
+        torch.matmul(q_pooled, k_pooled.transpose(-1, -2)) * sm_scale
+    )  # [H, MB, NB]
+    block_attn_score = torch.softmax(scores, dim=-1)  # [H, MB, NB]
+    out_pooled = torch.matmul(block_attn_score, v_pooled)  # [H, MB, D]
 
     # Broadcast compress output: [H, MB, D] → [M, H, D]
     # Each pooled block result is replicated for all R tokens in the block.
     output_compress = (
-        out_pooled.permute(1, 0, 2)          # [MB, H, D]
-        .unsqueeze(1)                         # [MB, 1, H, D]
-        .expand(-1, R, -1, -1)               # [MB, R, H, D]
-        .reshape(M, H, D)                    # [M, H, D]
+        out_pooled.permute(1, 0, 2)  # [MB, H, D]
+        .unsqueeze(1)  # [MB, 1, H, D]
+        .expand(-1, R, -1, -1)  # [MB, R, H, D]
+        .reshape(M, H, D)  # [M, H, D]
         .to(q.dtype)
     )
 
@@ -459,14 +513,26 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
 
     # Stage 1: compress attention + per-head block mask
     output_compress, block_mask, actual_density = _compute_vsa_compress_and_mask(
-        q, k, v, R, C, topk,
+        q,
+        k,
+        v,
+        R,
+        C,
+        topk,
     )
 
     # Stage 2: block-sparse attention (select branch)
     vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
     vsa_w.plan(
-        None, None, seqlen, seqlen, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        None,
+        None,
+        seqlen,
+        seqlen,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
         block_mask=block_mask,
     )
@@ -530,12 +596,24 @@ def test_vsa_performance_vs_dense(workspace):
 
         # Pre-run: get block_mask and plan wrapper
         output_compress, block_mask, actual_density = _compute_vsa_compress_and_mask(
-            q, k, v, R, C, topk,
+            q,
+            k,
+            v,
+            R,
+            C,
+            topk,
         )
         vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
         vsa_w.plan(
-            None, None, seqlen, seqlen, R, C,
-            num_heads, num_heads, HEAD_DIM,
+            None,
+            None,
+            seqlen,
+            seqlen,
+            R,
+            C,
+            num_heads,
+            num_heads,
+            HEAD_DIM,
             q_data_type=dtype,
             block_mask=block_mask,
         )
@@ -572,18 +650,21 @@ def test_vsa_performance_vs_dense(workspace):
 # blk64 tests — BSA blk64 C++ kernel (kSparseBlockSize=64, kRows=64)
 # ===========================================================================
 
-R64 = C64 = 64          # blk64 block granularity
-HEAD_DIM_BLK64 = 128   # blk64 kernel requires head_dim=128
+R64 = C64 = 64  # blk64 block granularity
+HEAD_DIM_BLK64 = 128  # blk64 kernel requires head_dim=128
 
 
 def _make_wrapper_blk64(workspace):
     return BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell_blk64")
 
 
-@pytest.mark.parametrize("density,num_blocks,num_heads", [
-    (0.25, 16, 8),
-    (0.75,  4, 8),
-])
+@pytest.mark.parametrize(
+    "density,num_blocks,num_heads",
+    [
+        (0.25, 16, 8),
+        (0.75, 4, 8),
+    ],
+)
 def test_vsa_blk64_accuracy(density, num_blocks, num_heads, workspace):
     """blk64 output must match PyTorch dense reference (bfloat16 only)."""
     device = torch.device("cuda")
@@ -601,8 +682,15 @@ def test_vsa_blk64_accuracy(density, num_blocks, num_heads, workspace):
 
     wrapper = _make_wrapper_blk64(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R64, C64,
-        num_heads, num_heads, HEAD_DIM_BLK64,
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
         q_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
@@ -610,11 +698,12 @@ def test_vsa_blk64_accuracy(density, num_blocks, num_heads, workspace):
     torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
 
 
-
-
-@pytest.mark.parametrize("seqlen,topk_frac", [
-    (4096, 0.5),
-])
+@pytest.mark.parametrize(
+    "seqlen,topk_frac",
+    [
+        (4096, 0.5),
+    ],
+)
 def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac, workspace):
     """blk64 output must be close to dense attention for the selected blocks."""
     device = torch.device("cuda")
@@ -635,8 +724,15 @@ def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac, workspace):
 
     wrapper = _make_wrapper_blk64(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R64, C64,
-        num_heads, num_heads, HEAD_DIM_BLK64,
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
         q_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
@@ -681,21 +777,41 @@ def test_vsa_blk64_perf_sweep(workspace):
 
             wrapper = _make_wrapper_blk64(workspace)
             wrapper.plan(
-                indptr, indices, seqlen, seqlen, R64, C64,
-                num_heads, num_heads, HEAD_DIM_BLK64,
+                indptr,
+                indices,
+                seqlen,
+                seqlen,
+                R64,
+                C64,
+                num_heads,
+                num_heads,
+                HEAD_DIM_BLK64,
                 q_data_type=dtype,
             )
             wrapper.run(q, k, v)  # warm-up
 
-            times = bench_gpu_time(lambda w=wrapper, _q=q, _k=k, _v=v: w.run(_q, _k, _v))
+            times = bench_gpu_time(
+                lambda w=wrapper, _q=q, _k=k, _v=v: w.run(_q, _k, _v)
+            )
             ms = statistics.median(times)
 
             # FLOPs = 2 * (QK matmul + PV matmul) per active block pair
-            flops = 2 * 2 * num_blocks * active_blocks * R64 * C64 * num_heads * HEAD_DIM_BLK64
+            flops = (
+                2
+                * 2
+                * num_blocks
+                * active_blocks
+                * R64
+                * C64
+                * num_heads
+                * HEAD_DIM_BLK64
+            )
             tflops = flops / (ms * 1e-3) / 1e12
 
             actual_density = active_blocks / (num_blocks * num_blocks)
-            print(f"{seqlen:>8}  {actual_density:>8.3f}  {active_blocks:>12}  {ms:>10.3f}  {tflops:>8.2f}")
+            print(
+                f"{seqlen:>8}  {actual_density:>8.3f}  {active_blocks:>12}  {ms:>10.3f}  {tflops:>8.2f}"
+            )
 
         print(sep)
 
@@ -714,9 +830,9 @@ def test_vsa_blk64_perf_sweep(workspace):
 
 
 def _pytorch_ref_gqa(
-    q: torch.Tensor,      # [M, Hq, D]
-    k: torch.Tensor,      # [N, Hkv, D]
-    v: torch.Tensor,      # [N, Hkv, D]
+    q: torch.Tensor,  # [M, Hq, D]
+    k: torch.Tensor,  # [N, Hkv, D]
+    v: torch.Tensor,  # [N, Hkv, D]
     indptr: torch.Tensor,
     indices: torch.Tensor,
     R: int,
@@ -747,12 +863,15 @@ def _pytorch_ref_gqa(
     return output
 
 
-@pytest.mark.parametrize("num_qo_heads,num_kv_heads,dtype", [
-    (8, 4, torch.bfloat16),   # GQA 2x
-    (8, 2, torch.bfloat16),   # GQA 4x
-    (8, 1, torch.bfloat16),   # MQA
-    (8, 4, torch.float16),    # GQA 2x, fp16
-])
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads,dtype",
+    [
+        (8, 4, torch.bfloat16),  # GQA 2x
+        (8, 2, torch.bfloat16),  # GQA 4x
+        (8, 1, torch.bfloat16),  # MQA
+        (8, 4, torch.float16),  # GQA 2x, fp16
+    ],
+)
 def test_vsa_gqa_native_bsr(num_qo_heads, num_kv_heads, dtype, workspace):
     """Native GQA via BSR path: plan() with num_qo_heads != num_kv_heads.
 
@@ -774,8 +893,15 @@ def test_vsa_gqa_native_bsr(num_qo_heads, num_kv_heads, dtype, workspace):
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_qo_heads, num_kv_heads, HEAD_DIM,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_qo_heads,
+        num_kv_heads,
+        HEAD_DIM,
         q_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
@@ -783,10 +909,13 @@ def test_vsa_gqa_native_bsr(num_qo_heads, num_kv_heads, dtype, workspace):
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [
-    (8, 4),   # GQA 2x
-    (8, 2),   # GQA 4x
-])
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads",
+    [
+        (8, 4),  # GQA 2x
+        (8, 2),  # GQA 4x
+    ],
+)
 def test_vsa_gqa_native_block_mask(num_qo_heads, num_kv_heads, workspace):
     """Native GQA via per-head block_mask: accepts (num_qo_heads, MB, NB) shape.
 
@@ -806,16 +935,27 @@ def test_vsa_gqa_native_block_mask(num_qo_heads, num_kv_heads, workspace):
     v = torch.randn(N, num_kv_heads, HEAD_DIM, dtype=dtype, device=device)
 
     # Per-KV-head mask [Hkv, MB, NB], broadcast to [Hq, MB, NB]
-    block_mask_kv = torch.zeros(num_kv_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    block_mask_kv = torch.zeros(
+        num_kv_heads, num_blocks, num_blocks, dtype=torch.bool, device=device
+    )
     for h in range(num_kv_heads):
-        chosen = torch.randperm(num_blocks)[:max(1, num_blocks // 2)]
+        chosen = torch.randperm(num_blocks)[: max(1, num_blocks // 2)]
         block_mask_kv[h, :, chosen] = True
-    block_mask_qo = block_mask_kv.repeat_interleave(qhead_per_kvhead, dim=0)  # [Hq, MB, NB]
+    block_mask_qo = block_mask_kv.repeat_interleave(
+        qhead_per_kvhead, dim=0
+    )  # [Hq, MB, NB]
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        None, None, M, N, R, C,
-        num_qo_heads, num_kv_heads, HEAD_DIM,
+        None,
+        None,
+        M,
+        N,
+        R,
+        C,
+        num_qo_heads,
+        num_kv_heads,
+        HEAD_DIM,
         q_data_type=dtype,
         block_mask=block_mask_qo,
     )
@@ -833,7 +973,7 @@ def test_vsa_gqa_native_block_mask(num_qo_heads, num_kv_heads, workspace):
         for qi in range(num_blocks):
             for ki in range(num_blocks):
                 if block_mask_kv[h_kv, qi, ki]:
-                    token_mask[qi*R:(qi+1)*R, ki*C:(ki+1)*C] = True
+                    token_mask[qi * R : (qi + 1) * R, ki * C : (ki + 1) * C] = True
         scores = torch.matmul(qh, kh.t()) * sm_scale
         scores = scores.masked_fill(~token_mask, float("-inf"))
         probs = torch.softmax(scores, dim=-1)
@@ -846,12 +986,16 @@ def test_vsa_gqa_native_block_mask(num_qo_heads, num_kv_heads, workspace):
 # 2. head_dim variants (64, 96) — blk128
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("head_dim,density,num_blocks", [
-    (64, 0.5, 8),
-    (64, 0.25, 16),
-    (96, 0.5, 8),
-    (96, 0.25, 16),
-])
+
+@pytest.mark.parametrize(
+    "head_dim,density,num_blocks",
+    [
+        (64, 0.5, 8),
+        (64, 0.25, 16),
+        (96, 0.5, 8),
+        (96, 0.25, 16),
+    ],
+)
 def test_vsa_head_dim_accuracy(head_dim, density, num_blocks, workspace):
     """VSA blk128 with head_dim=64/96 must match PyTorch dense reference."""
     device = torch.device("cuda")
@@ -869,8 +1013,15 @@ def test_vsa_head_dim_accuracy(head_dim, density, num_blocks, workspace):
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, head_dim,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        head_dim,
         q_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
@@ -882,11 +1033,15 @@ def test_vsa_head_dim_accuracy(head_dim, density, num_blocks, workspace):
 # 3. seqlen_q != seqlen_k (cross-attention shape) — blk128
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("MB,NB,num_heads,density", [
-    (4, 8, 8, 0.5),
-    (8, 4, 4, 0.5),
-    (2, 16, 4, 0.25),
-])
+
+@pytest.mark.parametrize(
+    "MB,NB,num_heads,density",
+    [
+        (4, 8, 8, 0.5),
+        (8, 4, 4, 0.5),
+        (2, 16, 4, 0.25),
+    ],
+)
 def test_vsa_asymmetric_seqlen(MB, NB, num_heads, density, workspace):
     """VSA blk128 with seqlen_q != seqlen_k must match PyTorch dense reference."""
     device = torch.device("cuda")
@@ -903,8 +1058,15 @@ def test_vsa_asymmetric_seqlen(MB, NB, num_heads, density, workspace):
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
@@ -916,10 +1078,14 @@ def test_vsa_asymmetric_seqlen(MB, NB, num_heads, density, workspace):
 # 4. seqlen_q != seqlen_k — blk64
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("MB64,NB64,density", [
-    (4, 8, 0.5),
-    (8, 4, 0.5),
-])
+
+@pytest.mark.parametrize(
+    "MB64,NB64,density",
+    [
+        (4, 8, 0.5),
+        (8, 4, 0.5),
+    ],
+)
 def test_vsa_blk64_asymmetric_seqlen(MB64, NB64, density, workspace):
     """VSA blk64 with seqlen_q != seqlen_k must match PyTorch dense reference."""
     device = torch.device("cuda")
@@ -937,8 +1103,15 @@ def test_vsa_blk64_asymmetric_seqlen(MB64, NB64, density, workspace):
 
     wrapper = _make_wrapper_blk64(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R64, C64,
-        num_heads, num_heads, HEAD_DIM_BLK64,
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
         q_data_type=dtype,
     )
     o = wrapper.run(q, k, v)
@@ -950,10 +1123,14 @@ def test_vsa_blk64_asymmetric_seqlen(MB64, NB64, density, workspace):
 # 5. LSE output validation — blk128
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("dtype,num_blocks,num_heads", [
-    (torch.bfloat16, 8, 4),
-    (torch.float16,  8, 4),
-])
+
+@pytest.mark.parametrize(
+    "dtype,num_blocks,num_heads",
+    [
+        (torch.bfloat16, 8, 4),
+        (torch.float16, 8, 4),
+    ],
+)
 def test_vsa_return_lse(dtype, num_blocks, num_heads, workspace):
     """return_lse=True must produce LSE values consistent with the attention output."""
     device = torch.device("cuda")
@@ -968,16 +1145,23 @@ def test_vsa_return_lse(dtype, num_blocks, num_heads, workspace):
     # Reference LSE from PyTorch
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
     mask = _bsr_to_dense_mask(indptr, indices, num_blocks, num_blocks, R, C, device)
-    qf = q.float().permute(1, 0, 2)   # [H, M, D]
-    kf = k.float().permute(1, 0, 2)   # [H, N, D]
-    scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale   # [H, M, N]
+    qf = q.float().permute(1, 0, 2)  # [H, M, D]
+    kf = k.float().permute(1, 0, 2)  # [H, N, D]
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale  # [H, M, N]
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
-    lse_ref = torch.logsumexp(scores, dim=-1).permute(1, 0)       # [M, H]
+    lse_ref = torch.logsumexp(scores, dim=-1).permute(1, 0)  # [M, H]
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        indptr,
+        indices,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
     )
     _, lse = wrapper.run(q, k, v, return_lse=True)
@@ -993,6 +1177,7 @@ def test_vsa_return_lse(dtype, num_blocks, num_heads, workspace):
 # ---------------------------------------------------------------------------
 # 6. LSE output validation — blk64
 # ---------------------------------------------------------------------------
+
 
 def test_vsa_blk64_return_lse(workspace):
     """blk64 return_lse=True must produce finite LSE values matching PyTorch reference."""
@@ -1013,12 +1198,19 @@ def test_vsa_blk64_return_lse(workspace):
     kf = k.float().permute(1, 0, 2)
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * sm_scale
     scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
-    lse_ref = torch.logsumexp(scores, dim=-1).permute(1, 0)   # [M, H]
+    lse_ref = torch.logsumexp(scores, dim=-1).permute(1, 0)  # [M, H]
 
     wrapper = _make_wrapper_blk64(workspace)
     wrapper.plan(
-        indptr, indices, M, N, R64, C64,
-        num_heads, num_heads, HEAD_DIM_BLK64,
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
         q_data_type=dtype,
     )
     _, lse = wrapper.run(q, k, v, return_lse=True)
@@ -1033,6 +1225,7 @@ def test_vsa_blk64_return_lse(workspace):
 # ---------------------------------------------------------------------------
 # 7. Per-q-block variable KV-block count via block_mask — blk128
 # ---------------------------------------------------------------------------
+
 
 def test_vsa_variable_blocks_per_q(workspace):
     """Per-head block_mask with variable KV count per Q-block must match per-head PyTorch ref.
@@ -1051,16 +1244,25 @@ def test_vsa_variable_blocks_per_q(workspace):
     v = torch.randn(N, num_heads, HEAD_DIM, dtype=dtype, device=device)
 
     # Each Q-block attends to i+1 KV blocks (varying count per row, same across heads)
-    block_mask = torch.zeros(num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device)
+    block_mask = torch.zeros(
+        num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device
+    )
     for i in range(num_blocks):
-        cnt = i + 1   # Q-block 0 → 1 block, Q-block 7 → 8 blocks
+        cnt = i + 1  # Q-block 0 → 1 block, Q-block 7 → 8 blocks
         chosen = torch.randperm(num_blocks)[:cnt]
         block_mask[:, i, chosen] = True
 
     wrapper = _make_wrapper(workspace)
     wrapper.plan(
-        None, None, M, N, R, C,
-        num_heads, num_heads, HEAD_DIM,
+        None,
+        None,
+        M,
+        N,
+        R,
+        C,
+        num_heads,
+        num_heads,
+        HEAD_DIM,
         q_data_type=dtype,
         block_mask=block_mask,
     )
@@ -1077,11 +1279,13 @@ def test_vsa_variable_blocks_per_q(workspace):
         for qi in range(num_blocks):
             for ki in range(num_blocks):
                 if block_mask[h, qi, ki]:
-                    token_mask[qi*R:(qi+1)*R, ki*C:(ki+1)*C] = True
+                    token_mask[qi * R : (qi + 1) * R, ki * C : (ki + 1) * C] = True
         scores = torch.matmul(qh, kh.t()) * sm_scale
         scores = scores.masked_fill(~token_mask, float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         o_ref[:, h, :] = torch.matmul(probs, vh).to(dtype)
 
     torch.testing.assert_close(o_ref, o_vsa, atol=1e-2, rtol=1e-2)
+
+
 # ---------------------------------------------------------------------------

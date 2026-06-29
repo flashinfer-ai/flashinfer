@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import time
+
 try:
     from setuptools._distutils.ccompiler import CCompiler, new_compiler
 except ImportError:
@@ -41,7 +42,9 @@ logger.setLevel(logging.WARNING)
 
 
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
-CUTE_DSL_CACHE_ENABLED: bool = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
+CUTE_DSL_CACHE_ENABLED: bool = (
+    os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
+)
 
 
 # Customize cache dir via `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`, default is
@@ -53,7 +56,9 @@ def get_cache_path() -> Path:
     if CUTE_DSL_CACHE_DIR is not None:
         cache_dir = Path(CUTE_DSL_CACHE_DIR)
     else:
-        cache_dir = Path(tempfile.gettempdir()) / getuser() / "flash_attention_cute_dsl_cache"
+        cache_dir = (
+            Path(tempfile.gettempdir()) / getuser() / "flash_attention_cute_dsl_cache"
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -125,7 +130,9 @@ class FileLock:
         return f"{kind} {self.label}" if self.label else kind
 
     def __enter__(self) -> "FileLock":
-        open_flags = os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
+        open_flags = (
+            os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
+        )
         lock_type = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
 
         self._fd = os.open(str(self.lock_path), open_flags)
@@ -236,7 +243,9 @@ class JITPersistentCache(JITCache):
                 logger.debug("Cache miss on disk for key hash %s", sha256_hex)
         return False
 
-    def _try_export_to_storage(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
+    def _try_export_to_storage(
+        self, key: CompileKeyType, fn: JitCompiledFunction
+    ) -> None:
         """Export a compiled function to persistent storage under exclusive lock."""
         sha256_hex = self._key_to_hash(key)
         with FileLock(
@@ -261,7 +270,9 @@ class JITPersistentCache(JITCache):
             # files. Link ourselves to workaround.
             if JITPersistentCache._compiler is None:
                 JITPersistentCache._compiler = new_compiler()
-            JITPersistentCache._compiler.link_shared_object([str(obj_path)], str(so_path))
+            JITPersistentCache._compiler.link_shared_object(
+                [str(obj_path)], str(so_path)
+            )
             obj_path.unlink()
             logger.debug("Successfully exported compiled function to disk: %s", so_path)
 

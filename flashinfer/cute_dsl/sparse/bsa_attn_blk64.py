@@ -88,12 +88,16 @@ def bsa_attn_blk64_fwd(
     # activates that path and ensures phantom blocks are zeroed in softmax.
     if block_sizes is None and has_variable_block_nums:
         num_kv_blocks = (seqlen_k + 63) // 64
-        block_sizes = torch.full((num_kv_blocks,), 64, dtype=torch.int32, device=q.device)
+        block_sizes = torch.full(
+            (num_kv_blocks,), 64, dtype=torch.int32, device=q.device
+        )
     has_block_sizes = block_sizes is not None
 
     # Prepare optional tensors: pass empty tensors for undefined args (C++ binding checks .defined()).
     block_sizes_arg = block_sizes.contiguous() if has_block_sizes else torch.Tensor()
-    q2k_block_nums_arg = q2k_block_nums.contiguous() if has_variable_block_nums else torch.Tensor()
+    q2k_block_nums_arg = (
+        q2k_block_nums.contiguous() if has_variable_block_nums else torch.Tensor()
+    )
 
     ext = load_blk64_ext()
     results = ext.bsa_fused_fwd_blk64(

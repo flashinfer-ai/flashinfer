@@ -215,15 +215,21 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+            lambda: self.sync_object_empty.wait(
+                state.index, state.phase, loc=loc, ip=ip
+            ),
             loc=loc,
             ip=ip,
         )
         if const_expr(extra_tx_count == 0):
-            self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
+            self.sync_object_full.arrive(
+                state.index, self.producer_mask, loc=loc, ip=ip
+            )
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
-            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
+            self.sync_object_full.arrive_and_expect_tx(
+                state.index, tx_count, loc=loc, ip=ip
+            )
 
 
 @dataclass(frozen=True)
@@ -255,7 +261,9 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+            lambda: self.sync_object_empty.wait(
+                state.index, state.phase, loc=loc, ip=ip
+            ),
             loc=loc,
             ip=ip,
         )
@@ -300,7 +308,9 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         )
         if_generate(
             self.is_leader_cta,
-            lambda: self.sync_object_full.arrive(index, self.producer_mask, loc=loc, ip=ip),
+            lambda: self.sync_object_full.arrive(
+                index, self.producer_mask, loc=loc, ip=ip
+            ),
             loc=loc,
             ip=ip,
         )
@@ -327,7 +337,9 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         """
         UMMA consumer release buffer empty, cta_group needs to be provided.
         """
-        self.sync_object_empty.arrive(index, self.consumer_mask, self.cta_group, loc=loc, ip=ip)
+        self.sync_object_empty.arrive(
+            index, self.consumer_mask, self.cta_group, loc=loc, ip=ip
+        )
 
 
 @dataclass(frozen=True)
@@ -361,7 +373,9 @@ class PipelineUmmaAsync(PipelineUmmaAsyncOg):
         """
         UMMA producer commit buffer full, cta_group needs to be provided.
         """
-        self.sync_object_full.arrive(index, self.producer_mask, self.cta_group, loc=loc, ip=ip)
+        self.sync_object_full.arrive(
+            index, self.producer_mask, self.cta_group, loc=loc, ip=ip
+        )
 
     @dsl_user_op
     def consumer_wait_w_index_phase(
@@ -437,4 +451,6 @@ class PipelineAsyncUmma(PipelineAsyncUmmaOg):
         """
         UMMA consumer release buffer empty, cta_group needs to be provided.
         """
-        self.sync_object_empty.arrive(index, self.consumer_mask, self.cta_group, loc=loc, ip=ip)
+        self.sync_object_empty.arrive(
+            index, self.consumer_mask, self.cta_group, loc=loc, ip=ip
+        )

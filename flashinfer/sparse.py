@@ -41,6 +41,7 @@ from .utils import (
     is_float8,
 )
 
+
 def _bsr_to_vsa_index(
     indptr: torch.Tensor,
     indices: torch.Tensor,
@@ -86,12 +87,19 @@ def _bsr_to_vsa_index(
     # repeat_interleave gives [blk0]*R, [blk1]*R, ... so that packed m_block b uses
     # the same KV list as original Q block b // qhead_per_kvhead.
     if qhead_per_kvhead > 1:
-        q2k_index_flat = q2k_index_flat.repeat_interleave(qhead_per_kvhead, dim=0)  # [MB * qhead_per_kvhead, NB]
-        q2k_num_flat = q2k_num_flat.repeat_interleave(qhead_per_kvhead)              # [MB * qhead_per_kvhead]
+        q2k_index_flat = q2k_index_flat.repeat_interleave(
+            qhead_per_kvhead, dim=0
+        )  # [MB * qhead_per_kvhead, NB]
+        q2k_num_flat = q2k_num_flat.repeat_interleave(
+            qhead_per_kvhead
+        )  # [MB * qhead_per_kvhead]
 
     # Broadcast the same pattern to every KV head: [1, H, MB_packed, NB]
     q2k_index = (
-        q2k_index_flat.unsqueeze(0).unsqueeze(0).expand(1, num_heads, -1, -1).contiguous()
+        q2k_index_flat.unsqueeze(0)
+        .unsqueeze(0)
+        .expand(1, num_heads, -1, -1)
+        .contiguous()
     )
     q2k_num = (
         q2k_num_flat.unsqueeze(0).unsqueeze(0).expand(1, num_heads, -1).contiguous()
@@ -129,7 +137,7 @@ def _block_mask_to_vsa_index(
     H, MB, NB = block_mask.shape
     block_mask_cpu = block_mask.cpu()
 
-    q2k_num = block_mask_cpu.sum(dim=-1).to(torch.int32)   # [H, MB]
+    q2k_num = block_mask_cpu.sum(dim=-1).to(torch.int32)  # [H, MB]
     max_nnz = int(q2k_num.max().item())
     if max_nnz == 0:
         max_nnz = 1  # avoid zero-size tensor
@@ -139,18 +147,25 @@ def _block_mask_to_vsa_index(
 
     # mask out positions beyond each row's actual count
     valid = torch.arange(max_nnz).unsqueeze(0).unsqueeze(0) < q2k_num.unsqueeze(-1)
-    q2k_index = torch.where(valid, sorted_idx, torch.full_like(sorted_idx, -1)).to(torch.int32)
+    q2k_index = torch.where(valid, sorted_idx, torch.full_like(sorted_idx, -1)).to(
+        torch.int32
+    )
     # q2k_index: [H, MB, max_nnz],  q2k_num: [H, MB]
 
     # Tile m_block dimension for pack_gqa: packed m_block b → original Q block b // qhead_per_kvhead.
     if qhead_per_kvhead > 1:
-        q2k_index = q2k_index.repeat_interleave(qhead_per_kvhead, dim=1)  # [H, MB * qhead_per_kvhead, max_nnz]
-        q2k_num = q2k_num.repeat_interleave(qhead_per_kvhead, dim=1)      # [H, MB * qhead_per_kvhead]
+        q2k_index = q2k_index.repeat_interleave(
+            qhead_per_kvhead, dim=1
+        )  # [H, MB * qhead_per_kvhead, max_nnz]
+        q2k_num = q2k_num.repeat_interleave(
+            qhead_per_kvhead, dim=1
+        )  # [H, MB * qhead_per_kvhead]
 
     return (
         q2k_index.unsqueeze(0).to(device, non_blocking=non_blocking),
         q2k_num.unsqueeze(0).to(device, non_blocking=non_blocking),
     )
+
 
 def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor) -> torch.Tensor:
     r"""Convert mask from BSR data layout to flashinfer's flattened mask layout.
@@ -418,7 +433,7 @@ class BlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
-        
+
         # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
         if self._backend == "vsa_blackwell":
             cc = get_compute_capability(self.device)
@@ -431,8 +446,7 @@ class BlockSparseAttentionWrapper:
             # BSA blk128 kernel uses 128-token compute tiles; block index granularity = R = C = 128.
             if R != 128 or C != 128:
                 raise ValueError(
-                    "VSA Blackwell backend requires R == C == 128 "
-                    f"(got R={R}, C={C})"
+                    f"VSA Blackwell backend requires R == C == 128 (got R={R}, C={C})"
                 )
             if head_dim not in (64, 96, 128):
                 raise ValueError(
@@ -483,8 +497,13 @@ class BlockSparseAttentionWrapper:
                 # mask is used. This is a kernel limitation of pack_gqa (blk128 schedules one block
                 # index list per KV head); in true GQA VSA the compress stage produces per-QO-head
                 # scores that may differ within a group.
-                if block_mask.shape == (num_qo_heads, MB, NB) and num_qo_heads != num_kv_heads:
-                    block_mask = block_mask[::qhead_per_kvhead]  # [num_kv_heads, MB, NB]
+                if (
+                    block_mask.shape == (num_qo_heads, MB, NB)
+                    and num_qo_heads != num_kv_heads
+                ):
+                    block_mask = block_mask[
+                        ::qhead_per_kvhead
+                    ]  # [num_kv_heads, MB, NB]
                 if block_mask.shape != (H_idx, MB, NB):
                     raise ValueError(
                         f"block_mask must have shape (num_kv_heads={H_idx}, MB={MB}, NB={NB}) "
@@ -492,7 +511,10 @@ class BlockSparseAttentionWrapper:
                         f"got {tuple(block_mask.shape)}"
                     )
                 self._vsa_q2k_index, self._vsa_q2k_num = _block_mask_to_vsa_index(
-                    block_mask, self.device, non_blocking, qhead_per_kvhead=qhead_per_kvhead
+                    block_mask,
+                    self.device,
+                    non_blocking,
+                    qhead_per_kvhead=qhead_per_kvhead,
                 )
             else:
                 # Head-independent BSR path: broadcast the same pattern across all KV heads.
@@ -502,7 +524,13 @@ class BlockSparseAttentionWrapper:
                         "(indptr, indices) to be provided."
                     )
                 self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
-                    indptr, indices, MB, NB, H_idx, self.device, non_blocking,
+                    indptr,
+                    indices,
+                    MB,
+                    NB,
+                    H_idx,
+                    self.device,
+                    non_blocking,
                     qhead_per_kvhead=qhead_per_kvhead,
                 )
 
@@ -850,7 +878,7 @@ class BlockSparseAttentionWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
-        
+
         # ---- VSA Blackwell backend (BSA blk128 kernel) ----------------------------
         if self._backend == "vsa_blackwell":
             from flashinfer.cute_dsl.sparse import bsa_attn_fwd  # noqa: PLC0415
@@ -860,17 +888,17 @@ class BlockSparseAttentionWrapper:
                 sm_scale = 1.0 / math.sqrt(q.size(-1))
 
             # NHD -> BSHD  (batch=1, seqlen, heads, dim) — layout expected by BSA kernel
-            Q_bsa = q.unsqueeze(0).contiguous()   # [1, M, H, D]
-            K_bsa = k.unsqueeze(0).contiguous()   # [1, N, H_kv, D]
-            V_bsa = v.unsqueeze(0).contiguous()   # [1, N, H_kv, D]
+            Q_bsa = q.unsqueeze(0).contiguous()  # [1, M, H, D]
+            K_bsa = k.unsqueeze(0).contiguous()  # [1, N, H_kv, D]
+            V_bsa = v.unsqueeze(0).contiguous()  # [1, N, H_kv, D]
 
             o_bsa, lse_bsa = bsa_attn_fwd(
                 Q_bsa,
                 K_bsa,
                 V_bsa,
-                self._vsa_q2k_index,          # [1, H, MB, NB] int32
-                block_sparse_num=2,            # ignored when q2k_block_nums is provided
-                block_sizes=None,              # full blocks (no per-block padding masking)
+                self._vsa_q2k_index,  # [1, H, MB, NB] int32
+                block_sparse_num=2,  # ignored when q2k_block_nums is provided
+                block_sizes=None,  # full blocks (no per-block padding masking)
                 q2k_block_nums=self._vsa_q2k_num,  # [1, H, MB] int32
                 softmax_scale=sm_scale,
                 return_lse=True,
@@ -909,7 +937,7 @@ class BlockSparseAttentionWrapper:
                 K_bsa,
                 V_bsa,
                 self._vsa_q2k_index,
-                block_sparse_num=1,           # ignored when q2k_block_nums is provided
+                block_sparse_num=1,  # ignored when q2k_block_nums is provided
                 block_sizes=None,
                 q2k_block_nums=self._vsa_q2k_num,
                 softmax_scale=sm_scale,

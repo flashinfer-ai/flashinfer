@@ -14,11 +14,9 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
 
 from .bsa_utils.cache_utils import get_jit_cache
 from .bsa_utils.testing import is_fake_mode
-from .blk128 import utils as blk128_utils
 from .bsa_utils import fa_logging
 from .blk128.cute_dsl_utils import to_cute_tensor
 from .blk128.flash_fwd_sm100 import FlashAttentionForwardSm100
@@ -32,6 +30,7 @@ def _get_use_clc_scheduler() -> bool:
 
 def _parse_arch_str(arch_str):
     import re
+
     match = re.match(r"^(?:sm_?|SM_?)?(\d+)(\d)([af]?)$", arch_str)
     if not match:
         raise ValueError(f"Invalid arch format: {arch_str}")
@@ -97,11 +96,13 @@ def bsa_attn_fwd(
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     batch_size, seqlen_q, num_head, head_dim = q.shape
-    seqlen_k = k.shape[1]
+    k.shape[1]
     num_head_kv = k.shape[2]
     head_dim_v = v.shape[-1]
 
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
+    assert q.dtype in [torch.float16, torch.bfloat16], (
+        "inputs must be float16 or bfloat16"
+    )
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
 
     if not is_fake_mode():
@@ -181,14 +182,16 @@ def bsa_attn_fwd(
         has_block_sizes,
     )
 
-    if compile_key not in bsa_attn_fwd.compile_cache:
+    if compile_key not in bsa_attn_fwd.compile_cache:  # type: ignore[attr-defined]
         q_tensor, k_tensor, v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (q, k, v, out)
         ]
         lse_tensor = to_cute_tensor(lse, assumed_align=4) if lse is not None else None
         block_index_tensor = to_cute_tensor(q2k_block_index)
         block_sizes_tensor = to_cute_tensor(block_sizes) if has_block_sizes else None
-        block_nums_tensor = to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
+        block_nums_tensor = (
+            to_cute_tensor(q2k_block_nums) if has_variable_block_nums else None
+        )
 
         fa_fwd = FlashAttentionForwardSm100(
             head_dim,
@@ -204,7 +207,7 @@ def bsa_attn_fwd(
             has_block_sizes=has_block_sizes,
         )
 
-        bsa_attn_fwd.compile_cache[compile_key] = cute.compile(
+        bsa_attn_fwd.compile_cache[compile_key] = cute.compile(  # type: ignore[attr-defined]
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -222,7 +225,7 @@ def bsa_attn_fwd(
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_fwd_kernel"):
-            bsa_attn_fwd.compile_cache[compile_key](
+            bsa_attn_fwd.compile_cache[compile_key](  # type: ignore[attr-defined]
                 q.detach(),
                 k.detach(),
                 v.detach(),
@@ -239,4 +242,4 @@ def bsa_attn_fwd(
     return out, lse
 
 
-bsa_attn_fwd.compile_cache = get_jit_cache("bsa_fwd")
+bsa_attn_fwd.compile_cache = get_jit_cache("bsa_fwd")  # type: ignore[attr-defined]
