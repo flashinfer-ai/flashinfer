@@ -53,94 +53,6 @@ MHC×STAGES sweep @ b=1024 (mixed, conv1d) confirmed MHC=4/STAGES=1 is already
 optimal among the non-persistent knobs (124.98µs), so further head-tiling/pipeline
 tuning is exhausted — the only remaining lever is persistence.
 
-## Choices (locked)
-
-1. **Replace** the non-persistent main — the persistent loop subsumes it
-   (`cta_per_sm` high ⇒ `grid == total_work` ⇒ one work-unit/CTA ⇒ identical).
-2. **`cta_per_sm` via env** `FLASHINFER_SSU_MAIN_CTA_PER_SM` (read per-launch so the
-   test can vary it; baked into a heuristic later).
-3. **Ditch MHC** — work-unit = single head. Flatten **head-fastest**
-   (`tile = (d_tile·batch + seq)·nheads + head`) so consecutive work-units are
-   consecutive heads of one `(d_tile, seq)` → per-group `C`/`old_B` stay L2-hot.
-4. **One-shot gdc_wait** — fires only on a CTA's FIRST outer iteration
-   (`DO_GDC_WAIT` template param on `head_loop`, gates ONLY
-   `cudaGridDependencySynchronize()`; the surrounding barriers that publish
-   state/cumAdt/x stay on every iteration).
-
-## Test (xfail-first)
-
-- [ ] **T_PERSIST** `tests/mamba/test_checkpointing_ssu.py::test_persistent_main_matches_monolithic`
-  — set `FLASHINFER_SSU_MAIN_CTA_PER_SM` small so **`work_units > occupancy · NUM_SMS`**
-  (grid genuinely can't hold all work-units → each CTA grid-strides ≥2×). Assert
-  bit-exact vs monolithic (`out`, `state`, `old_x`, `old_B`, `old_dt`, `old_cumAdt`)
-  on BOTH the no-write and write paths. **Initially xfail** (no loop yet). *EASY*
-
-## Steps
-
-1. [ ] **T_PERSIST xfail** test as above. *EASY*
-2. [ ] **Ditch the MHC knob**: launcher dispatches the main at MHC=1 only; remove
-   `FLASHINFER_SSU_MAIN_HEADS_PER_CTA` env read, the auto-heuristic, and the Python
-   `main_heads_per_cta` handle. (`head_loop`'s MHC>1 inner loop / STAGES=2 cross-head
-   paths become dead at MHC=1 — leave correct-at-MHC=1, clean up in a follow-up.)
-   `launch_checkpointing_ssu.cuh`, `flashinfer/...` Python wrapper. *MEDIUM*
-3. [ ] **Env knob** `FLASHINFER_SSU_MAIN_CTA_PER_SM` + cached `NUM_SMS`
-   (`cudaDevAttrMultiProcessorCount`, static like the precompute's `sm_count`).
-   `launch_checkpointing_ssu.cuh`. *EASY*
-4. [ ] **1D persistent grid**: main grid → `dim3(min(cta_per_sm·NUM_SMS, total_work))`,
-   `total_work = D_SPLIT · batch · nheads`. Default `cta_per_sm` ⇒ `grid == total_work`.
-   `launch_checkpointing_ssu.cuh`. *MEDIUM*
-5. [ ] **Grid-stride loop + `DO_GDC_WAIT`** in `checkpointing_ssu_main_kernel`:
-   wrap the per-work-unit body (unflatten head-fastest → d_tile/seq/head/group, per-slot
-   setup, `head_loop`) in `for (int tile = blockIdx.x; tile < total_work; tile += gridDim.x)`.
-   Dispatch `head_loop<DO_GDC_WAIT = (tile == blockIdx.x)>` (compile-time via if/else on the
-   runtime first-iter check). Add `DO_GDC_WAIT` template param to `head_loop` gating only the
-   `cudaGridDependencySynchronize()`. Loop-boundary `__syncthreads()` at the bottom so
-   iteration N's output/store_old_x finish before N+1 overwrites smem.
-   `kernel_checkpointing_ssu_main.cuh` (kernel body L763-848 + `head_loop`). *HARD*
-6. [ ] **Make T_PERSIST pass**; confirm **T0** (`test_two_kernel_matches_monolithic`)
-   and mw=16 still bit-exact at default `cta_per_sm` (grid == total_work). *MEDIUM*
-7. [ ] *(follow-up, perf)* **Skip `C`/`old_B` reload** when the next tile shares
-   `(seq, group)` — recovers MHC's smem-level reuse on top of L2. *MEDIUM*
-
-## How to measure overlap (conv1d + precompute + main)
-
-`SSU_CUPTI_DEBUG=1` with the mixed bench's `--with-conv1d` prints per-kernel
-start/end timestamps (relative to the first kernel) to stderr:
-
-```bash
-SSU_CUPTI_DEBUG=1 uv run python benchmarks/bench_ssu_checkpoint_mixed.py \
-    --kernels cuda-incr-2k,triton-replay-pm --batch-sizes 1024 --with-conv1d \
-    --iters 5 --warmup 3 --output-prefix - 2>&1 | grep -E "CUPTI-DEBUG|start="
-```
-```
-[CUPTI-DEBUG] tag=... iter=0 n_kernels=3
-  start=  0.000 end=  3.840 µs  _causal_conv1d_update_kernel
-  start=  2.528 end=  7.296 µs  _checkpointing_ssu_precompute_kernel...
-  start=  3.649 end= 10.176 µs  _checkpointing_ssu_main_kernel...
-```
-`start` is relative to the first kernel. The main's `start` shows whether it
-co-resides with conv1d (persistent target: main starts during conv1d, like triton-pm).
-
-## Findings archive (B300, 2026-06-25)
-
-**Per-head barriers** (no-write hot path): cut from 3→2/head (dropped the redundant
-post-replay barrier; cumAdt batch-prefetch removed per-head STS + drain). NCU
-(MHC=4 auto, b=512, no-write): duration 44.0µs, barrier 13.5%, `long_scoreboard`
-35.4% (state load — the persistent target), occupancy 45%, eligible warps 0.93.
-
-**Load balance**: per-head loads distributed one-tensor-per-warp (old_x→W0/W1 split
-+ predicated to prev_k, x→W2, z→W3) — all single-warp (conflict-free). Earlier
-CTA-wide loads introduced a 2-way LDGSTS conflict (d_split=2 half-width write); the
-per-warp form removes it.
-
-**No-write progression** (CUPTI, b=512, prev_k=0, mw=8): 51.5 (postbarrier) → 50.7
-(CTA-wide x) → 50.9 (CTA all) → **48.8** (predicate+split+per-warp, new best).
-
-**Target**: close the no-write gap to triton-replay-pm via persistence
-(b=1024: 90.5 vs 75.4 = **15µs**; b=512: 50.5 vs 42.1 = **8µs**).
-
-## Persistent main results @ b=1024 (mixed PNAT + conv1d, 2026-06-25)
-
 The persistent main (v1.0, MHC=1 single-head work-units) **regresses b=1024**.
 `cta_per_sm` sweep (grid = min(cta_per_sm·NUM_SMS≈148, total_work=32768)):
 
@@ -390,13 +302,62 @@ address-arithmetic long_scoreboard — i.e. pipe=2 is now drained of memory stal
 occupancy-bound at 5 blocks, still ~24 µs (ncu) behind pipe=1.  cumAdt async is pipe-independent so
 it helps pipe=1 too (it was 14.8% of pipe=1's long_scoreboard).
 
+### Tried + REVERTED: warp-templated head_loop (B200, 2026-06-27)
+
+To kill the per-iteration warp-dispatch branch (`post_gdc`'s `if (warp==X)`, ~5% of the `wait`
+bucket = ~1% of total), templated the whole loop on `int WARP` (`head_loop<…,WARP>`) and dispatched
+once at kernel entry, so the loader guards fold to `if constexpr`.  **Net REGRESSION at pipe=2:**
+
+| no-write | pipe=2 +cumAdt | + warp-templated head_loop |
+|----------|---------------:|---------------------------:|
+| b512 CUPTI  | 62.9 | 73.3 |
+| b1024 CUPTI | 117.25 | 143.1 |
+| ncu dur (b1024) | 107.46 | 136.54 |
+
+ncu root cause: **`no_instruction` jumped to 31.8%** (the new #1 stall; issue rate 39.9→30.9%,
+eligible warps 0.63→0.48).  Templating the *whole* loop 4×-inlines the heavy tensor-core path
+(replay/output, which never branches on warp — pure tid arithmetic), so four distinct instruction
+streams go resident → **i-cache thrashing**.  Registers 87→96 (hit the maxnreg cap), **no spills**,
+occupancy unchanged (5 blocks) — confirming it's purely instruction fetch, not regs/occupancy.
+
+**Lesson:** warp specialization via whole-loop templating is wrong when the warp-uniform code (the
+MMA) dwarfs the warp-divergent code (the loaders).  The branch it removes (~1%) is far cheaper than
+the i-cache cost of 4×ing the MMA.  A per-call dispatch (template only the loaders, MMA shared,
+runtime warp) avoids the bloat but keeps a per-iteration dispatch — not worth it for ~1%.  **Reverted
+to the cumAdt-async version (62.9 / 117.25).**  The warp branch is an occupancy symptom; the real
+lever remains pipe=1.
+
+### D_val → head_meta, and the barrier investigation (B200, 2026-06-27)
+
+After reverting the warp-templating, profiled the no-write **barrier** stall (22.8%, the #1 stall at
+pipe=2, the `:1222` "publish drained bundle" `__syncthreads`).
+
+**D_val → `head_meta`:** `D_val = params.D[first_head]` was the only un-prefetched output input — a
+per-work-unit global LDG in `compute_output_and_store`, and ncu pinned 81.8% of the barrier to it.
+Hoisted it into the entry (resolved at `fetch`, like `prev_k`; +1 float/entry).  CUPTI no-write:
+b512 62.9→61.6, b1024 117.25→114.3 (−3 µs); ncu (prev_k=1) 110.6→108.8.  **But the barrier %
+didn't move (22.8→23.0)** — confirming D_val was a *compiler-hoist artifact* (the latency-tolerant
+LDG was scheduled just before the barrier, so the PC parked there during the rendezvous; not the
+cause).  Real −3 µs from cutting `wait`/long_scoreboard, though.  KEEPER.
+
+**The actual barrier laggard (prev_k>0):** with D_val gone, the #1 long_scoreboard (40%) resolves to
+`load_head:201` — `old_cumAdt_slot[prev_k-1] = oca_ptr[...]`, a **synchronous, single-lane
+(`warp==0 && lane==0`), uncoalesced** global load of the β-decay tail, sitting in the *prefetch*
+path.  One lane does a ~700 ns LDG → that lane is the laggard → all 127 other threads idle at the
+`:1222` rendezvous.  That's how a single scalar becomes ~23% barrier.  DRAM is only **38.9%** (not
+BW-bound), so it's pure latency-skew, not a memory wall.  The full `old_cumAdt` smem load
+(`load_old_dt_cumAdt`) is **write-path only**; no-write folds the window into precomputed `cb_old` and
+needs just this tail — so there's no smem copy to reuse, the gmem load is the source.
+**Fix (in progress):** hoist `old_cumAdt[prev_k-1]` into `head_meta` (resolve at fetch, same pattern
+as prev_k/D_val) → deletes the synchronous single-lane LDG, which feeds *both* the long_scoreboard
+and the barrier.  prev_k>0-specific (guarded off at prev_k=0, which is why prev_k=0 is already faster).
+
 ### Next levers
 
-- **cumAdt → cp.async:** fold cumAdt into the post-gdc cp.async group (same pattern as CB) — it's
-  now the #1 long_scoreboard site (synchronous LDG+STS).
-- **2 (Plan B):** state-only pipelining — ring holds only `state`, C/old_B/x/cumAdt
-  single-buffered → smem ~40→~24 KB → **8 blocks**, to hide the residual long_scoreboard via
-  occupancy.
+- **Flip to pipe=1** (the measured 33% win above) and attack ITS #1 stall — the under-prefetched meta
+  fetch (`:1109`, depth-1 prefetches meta only 1 ahead) — with a **deeper register-only meta ring**
+  (decoupled from the state-ring depth; 3 ints/entry, zero smem cost).
+- The warp-branch and HMMA stalls are NOT worth chasing on pipe=2 (occupancy-bound at 5 blocks).
 
 ## TODO
 
@@ -417,3 +378,27 @@ it helps pipe=1 too (it was 14.8% of pipe=1's long_scoreboard).
 uv run pytest tests/mamba/test_checkpointing_ssu.py -v -s -x -k "two_kernel or persistent"
 ```
 Don't run the full mamba suite — it's long.
+
+## Ncu
+This runs the no-write benchmark with ncu
+```bash
+export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.0a BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
+${CUDA_HOME}/ncu --target-processes all --set full --import-source yes \
+    --kernel-name "regex:checkpointing_ssu_(precompute|main)_kernel" \
+    --launch-skip 0 --launch-count 100 -f \
+    -o /home/scratch.ishovkun_gpu/benchmarks/mamba_decode/ssu_2k_v${SSU_TAG}_b${BATCH}_${DTYPE}_${MTP}_pnat${PNAT} \
+    uv run python benchmarks/bench_checkpointing_ssu.py \
+    --warmup 0 --iters 1 --no-l2-flush --no-cuda-graph \
+    --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
+    --prev-tokens-fracs ${PNAT} \
+    --output -
+```
+
+# Non-mixed single-mode bench
+
+```bash
+export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.0 BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
+    uv run python benchmarks/bench_checkpointing_ssu.py \
+    --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
+    --prev-tokens-fracs ${PNAT}
+```

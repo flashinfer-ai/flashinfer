@@ -41,7 +41,7 @@
 // load + are consumed POST-gdc_wait: they are NOT available earlier — when the
 // main co-launches, conv1d may still be writing x/C (the precompute is itself
 // blocked on its conv1d gdc_wait), so a pre-wait load would read stale data.
-// gdc_wait is a no-op without a programmatic predecessor (T0 / non-PDL).
+// gdc_wait is a no-op without a programmatic predecessor (T0 / non-PDL)
 // =============================================================================
 #ifndef FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_MAIN_CUH_
 #define FLASHINFER_MAMBA_KERNEL_CHECKPOINTING_SSU_MAIN_CUH_
@@ -836,6 +836,8 @@ struct HeadMetaSSU {
   int tile{-1};
   int prev_k{0};
   int64_t cache_slot{-1};
+  float D_val{
+      0.f};  // params.D[head] skip coeff — the one un-prefetched output input; resolve at fetch
 };
 
 // derive_head: expand the ring entry {tile, cache_slot, prev_k} into the working scalars, ON THE
@@ -942,9 +944,6 @@ __device__ __forceinline__ void replay_state(SmemT& smem, CheckpointingSsuParams
       /*must_checkpoint=*/true, slot);
 }
 
-// compute_output_and_store: the output MMA (β·C@state + CB@x + CB_old@old_x + D·x + z-gate) + cache
-// writeback for one work-unit, reading its ring slot `slot`.  cb operands LDG to registers here.
-// All smem inputs must already be drained + published cross-warp by the caller.
 template <typename input_t, typename weight_t, typename state_t, int NPREDICTED, int MAX_WINDOW,
           int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, int NHEADS,
           int HEADS_PER_GROUP, bool VARLEN, bool MUST_CHECKPOINT, typename SmemT>
@@ -958,8 +957,7 @@ __device__ __forceinline__ void compute_output_and_store(SmemT& smem,
   int64_t outer;
   derive_head<NHEADS, HEADS_PER_GROUP, D_SPLIT, NPREDICTED, VARLEN>(
       params, m, d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len, outer);
-  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
-  float const D_val = D_ptr ? toFloat(D_ptr[first_head]) : 0.f;
+  float const D_val = m.D_val;  // resolved at fetch (prefetched STAGES ahead), not reloaded here
   int const tid = warp * warpSize + lane;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
@@ -1004,7 +1002,6 @@ template <typename input_t, typename weight_t, typename state_t, int NPREDICTED,
           int HEADS_PER_GROUP, bool VARLEN, bool MUST_CHECKPOINT, typename SmemT>
 __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams const& params,
                                              int lane, int warp, HeadMetaSSU const& m, int slot) {
-  __syncthreads();  // publish the drained bundle (state + old-tiles + C/x/cumAdt) cross-warp
   if constexpr (MUST_CHECKPOINT) {
     replay_state<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                  PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane,
@@ -1075,6 +1072,7 @@ __global__ __maxnreg__(MAIN_STATE_PIPE == 1
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
+  auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
 
   // fetch: resolve the ring entry {tile, cache_slot, prev_k}.  cache_slot = sbi[seq] heads the
   // dependent chain (cache_slot → prev_num_accepted[cache_slot]); resolving BOTH here, STAGES ahead
@@ -1088,6 +1086,7 @@ __global__ __maxnreg__(MAIN_STATE_PIPE == 1
     m.tile = tile;
     m.cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
     m.prev_k = (m.cache_slot != params.pad_slot_id) ? prev_ptr[m.cache_slot] : 0;
+    m.D_val = D_ptr ? toFloat(D_ptr[tile % NHEADS]) : 0.f;  // D skip-coeff, prefetched STAGES ahead
     return m;
   };
 
@@ -1120,6 +1119,7 @@ __global__ __maxnreg__(MAIN_STATE_PIPE == 1
       m.tile = wu;
       m.cache_slot = params.pad_slot_id;  // sentinel ⇒ skip (past-the-end)
       m.prev_k = 0;                       // unused (skipped); keep deterministic
+      m.D_val = 0.f;
       return m;
     }
     return fetch(wu);
@@ -1217,6 +1217,7 @@ __global__ __maxnreg__(MAIN_STATE_PIPE == 1
     bool const v = is_valid(m);
     __pipeline_wait_prior(STAGES - 1);  // drain unit j's bundle (the oldest group)
     if (v) {
+      __syncthreads();  // publish the drained bundle (state + old-tiles + C/x/cumAdt) cross-warp
       if (mc_of(m))
         process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                      PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
@@ -1232,6 +1233,7 @@ __global__ __maxnreg__(MAIN_STATE_PIPE == 1
 #pragma unroll
     for (int k = 0; k < STAGES - 1; ++k) head_meta[k] = head_meta[k + 1];
     head_meta[STAGES - 1] = fetch_head_meta(j + STAGES);
+
     if (is_valid(head_meta[STAGES - 1]))
       prefetch_async<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
                      NHEADS, HEADS_PER_GROUP, VARLEN>(
