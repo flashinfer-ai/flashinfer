@@ -199,7 +199,11 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
     int64_t const ca_base = cache_slot * params.old_cumAdt_stride_seq +
                             (int64_t)buf_read * params.old_cumAdt_stride_dbuf +
                             (int64_t)head * params.old_cumAdt_stride_head;
-    old_cumAdt_slot[prev_k - 1] = oca_ptr[ca_base + prev_k - 1];  // tail for β only
+    // β tail (one float).  cp.async, NOT a synchronous LDG→STS: this is the only blocking load left
+    // in the prefetch path, and as a single-lane sync load it made W0 the laggard at the publish
+    // barrier.  As cp.async it's non-blocking (W0 issues + continues) and drains with the bundle.
+    __pipeline_memcpy_async(&old_cumAdt_slot[prev_k - 1], &oca_ptr[ca_base + prev_k - 1],
+                            sizeof(float));
   }
   if (warp == 3 && z_ptr) {
     int64_t const z_base = outer * params.z_stride_seq + (int64_t)head * DIM + d_tile_off;

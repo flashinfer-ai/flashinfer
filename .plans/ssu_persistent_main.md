@@ -26,6 +26,37 @@ Default `cta_per_sm` high ⇒ `grid == total_work` ⇒ one work-unit/CTA ⇒
 `FLASHINFER_SSU_MAIN_HEADS_PER_CTA` env / Python handle / auto-heuristic. The
 grid-stride loop replaces head-tiling.
 
+## Tests
+
+```bash
+uv run pytest tests/mamba/test_checkpointing_ssu.py -v -s -x -k "two_kernel or persistent"
+```
+Don't run the full mamba suite — it's long.
+
+## Ncu
+This runs the no-write benchmark with ncu
+```bash
+export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.0a BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
+${CUDA_HOME}/ncu --target-processes all --set full --import-source yes \
+    --kernel-name "regex:checkpointing_ssu_(precompute|main)_kernel" \
+    --launch-skip 0 --launch-count 100 -f \
+    -o /home/scratch.ishovkun_gpu/benchmarks/mamba_decode/ssu_2k_v${SSU_TAG}_b${BATCH}_${DTYPE}_${MTP}_pnat${PNAT} \
+    uv run python benchmarks/bench_checkpointing_ssu.py \
+    --warmup 0 --iters 1 --no-l2-flush --no-cuda-graph \
+    --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
+    --prev-tokens-fracs ${PNAT} \
+    --output -
+```
+
+# Non-mixed single-mode bench
+
+```bash
+export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.0 BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
+    uv run python benchmarks/bench_checkpointing_ssu.py \
+    --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
+    --prev-tokens-fracs ${PNAT}
+```
+
 ## Why — write/no-write split at PRODUCTION max_window=16 (B300, 2026-06-25)
 
 Per-path isolation, `bench_checkpointing_ssu.py` (CUPTI, SSU-kernel-only, mtp=6, bf16),
@@ -348,9 +379,30 @@ path.  One lane does a ~700 ns LDG → that lane is the laggard → all 127 othe
 BW-bound), so it's pure latency-skew, not a memory wall.  The full `old_cumAdt` smem load
 (`load_old_dt_cumAdt`) is **write-path only**; no-write folds the window into precomputed `cb_old` and
 needs just this tail — so there's no smem copy to reuse, the gmem load is the source.
-**Fix (in progress):** hoist `old_cumAdt[prev_k-1]` into `head_meta` (resolve at fetch, same pattern
-as prev_k/D_val) → deletes the synchronous single-lane LDG, which feeds *both* the long_scoreboard
-and the barrier.  prev_k>0-specific (guarded off at prev_k=0, which is why prev_k=0 is already faster).
+**Fix v1 (meta-hoist) → REVERTED:** hoisted `old_cumAdt[prev_k-1]` into `head_meta` (resolve at
+fetch, like prev_k/D_val).  Bit-exact, but **regressed prev_k=0 by +11 µs** (b1024 114→125) — the
+case that doesn't even use it.  A/B (neuter the fetch load → 114; full → 125) isolated it to the
+guarded global-load chain added to `fetch`: **no register/occupancy/spill change (87/5/0)**, pure
+**codegen/i-cache** — `fetch` is inlined in the hot loop and at 5 blocks it won't absorb extra code
+(same failure mode as the warp-templating).  Reverted.
+
+**Fix v2 (cp.async in place) → LANDED.**  Kept the load in `load_head` (already the prefetch path,
+no fetch bloat) but swapped the synchronous single-lane LDG→STS for `__pipeline_memcpy_async` — W0
+issues + continues instead of blocking, and the tail drains with the bundle.  **One-line change, big
+win on the no-write-with-history path:**
+
+| no-write b1024 | nw0 (pk=0) | nw8 (pk=8) | | b512 | nw0 | nw8 |
+|----------------|-----------:|-----------:|-|------|----:|----:|
+| `e829c35e`     | 120.8 | 141.5 | | | 64.8 | 75.4 |
+| + D_val + cumAdt-async + **cp.async-tail** | **112.5** | **118.3** | | | **61.1** | **65.1** |
+| Δ | −8.3 | **−23.2** | | | −3.7 | **−10.3** |
+
+ncu (prev_k=8): **barrier 22.8%→9.6%** (the laggard is gone), `:201` old_cumAdt dropped out of the
+long_scoreboard top sites entirely; 87 regs / 5 blocks unchanged; prev_k=0 unchanged (in-place
+cp.async never touches the common path).  We now **beat the monolith on nw0** (112.5 vs 113.3) and
+nearly tie on nw8 (118.3 vs 114.1, was +27 behind).  Write path (wr12/16) untouched — cp.async-tail
+is no-write-only.  **Lesson:** at 5 blocks, fix stalls *in place* (swap sync→async) rather than
+adding hot-loop code (meta-hoist / warp-templating both regressed via codegen/i-cache).
 
 ### Next levers
 
@@ -371,34 +423,3 @@ and the barrier.  prev_k>0-specific (guarded off at prev_k=0, which is why prev_
   Add a variant to `test_persistent_main_matches_monolithic` with some
   `state_batch_indices` entries = `pad_slot_id` (reference monolith skips them too) to
   cover it.  Believed-correct (skip is CTA-uniform → barriers stay matched), just unproven.
-
-## Tests
-
-```bash
-uv run pytest tests/mamba/test_checkpointing_ssu.py -v -s -x -k "two_kernel or persistent"
-```
-Don't run the full mamba suite — it's long.
-
-## Ncu
-This runs the no-write benchmark with ncu
-```bash
-export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.0a BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
-${CUDA_HOME}/ncu --target-processes all --set full --import-source yes \
-    --kernel-name "regex:checkpointing_ssu_(precompute|main)_kernel" \
-    --launch-skip 0 --launch-count 100 -f \
-    -o /home/scratch.ishovkun_gpu/benchmarks/mamba_decode/ssu_2k_v${SSU_TAG}_b${BATCH}_${DTYPE}_${MTP}_pnat${PNAT} \
-    uv run python benchmarks/bench_checkpointing_ssu.py \
-    --warmup 0 --iters 1 --no-l2-flush --no-cuda-graph \
-    --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
-    --prev-tokens-fracs ${PNAT} \
-    --output -
-```
-
-# Non-mixed single-mode bench
-
-```bash
-export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.0 BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
-    uv run python benchmarks/bench_checkpointing_ssu.py \
-    --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
-    --prev-tokens-fracs ${PNAT}
-```
