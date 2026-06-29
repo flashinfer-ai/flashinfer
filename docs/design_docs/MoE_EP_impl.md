@@ -32,7 +32,7 @@ forward(t: MoEEpTensors)                                   # flashinfer/moe_ep/l
 │      algo_knobs=[HandleAlgoKnobUserStream(stream),                  #   creates nccl.ep handle for
 │                  HandleAlgoKnobTopKWeights(weights=t.topk_weights)])#   the chosen Layout
 ├─ handle.dispatch(DispatchInputParams(x=[t.hidden_states]))         # → _dispatch_ll / _dispatch_ll_rank_major
-│      → nccl.ep dispatch + complete  →  DispatchOutput(expert_tensors, num_tokens, …)  #   / _dispatch_ht
+│      → nccl.ep dispatch + complete  →  DispatchOutput(expert_tensors, recv_topk_idx/weights)  #   / _dispatch_ht
 ├─ _inner_compute(d):                                                # the EP→compute bridge
 │      EXPERT_MAJOR → build_activation_pack(...)        ┐ flatten 3D recv → token-major
 │      RANK_MAJOR/HT → build_activation_pack_rank_major ┘ pack (selected_experts, final_scales)

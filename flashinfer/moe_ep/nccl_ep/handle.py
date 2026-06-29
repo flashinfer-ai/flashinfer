@@ -67,12 +67,12 @@ _hprof: "dict[str, list]" = {}
 
 # NV_FI_EP_FAST_PATH=1 enables the Python-side host-call optimizations (measured against
 # the EP_PROFILE_HOST burn-down):
-#   (1) defer the LL recv-count .sum().item() readback + its stream sync — return a
-#       lazy num_tokens (resolved on demand) so the comm path pays nothing;
-#   (2) cache the per-call FFI wrapper objects built over STABLE tensors (recv
+#   (1) cache the per-call FFI wrapper objects built over STABLE tensors (recv
 #       buffer / counters / weights / configs); only the per-call input-token wrap
 #       is rebuilt (it may alias a new tensor each call);
-#   (3) cache the LL recv buffer instead of torch.empty() every dispatch.
+#   (2) cache the LL recv buffer instead of torch.empty() every dispatch.
+# (The recv-count .sum().item() readback that used to dominate the LL host call is
+# now removed unconditionally — DispatchOutput no longer carries num_tokens.)
 _FAST = _os.environ.get("NV_FI_EP_FAST_PATH") == "1"
 
 
@@ -267,25 +267,10 @@ class NcclEpHandle(Handle):
         self._dispatch_layout = layout_info
         self._dispatch_output_t = out_t
 
-        # (1) defer the recv-count readback. The eager path syncs self._stream and
-        # reduces recv_count to host (a per-dispatch reduce + D2H + sync); instead
-        # return a thunk that does it on demand (resolved at most once by the compute
-        # bridge, never on the comm-only path). nccl.ep itself completed the receive
-        # in complete() above, so the recv buffer is already valid for combine.
-        if _FAST:
-
-            def _num_tokens():
-                torch.cuda.ExternalStream(self._stream).synchronize()
-                return int(self._recv_count_t.sum().item())
-
-            _t = _hp("ll_disp.defer_count", _t)
-            return DispatchOutput(expert_tensors=out_t, num_tokens=_num_tokens)
-
-        torch.cuda.ExternalStream(self._stream).synchronize()
-        _t = _hp("ll_disp.synchronize", _t)
-        num_tokens = int(self._recv_count_t.sum().item())
-        _t = _hp("ll_disp.recvcount_sum_item", _t)
-        return DispatchOutput(expert_tensors=out_t, num_tokens=num_tokens)
+        # The library wrote per-expert recv counts into self._recv_count_t (via the
+        # LayoutInfo above), but nothing consumes them — combine masks padding via
+        # the routing, not a count — so we skip the device->host readback entirely.
+        return DispatchOutput(expert_tensors=out_t)
 
     def _dispatch_ll_rank_major(self, x) -> DispatchOutput:
         """LL RANK_MAJOR dispatch.
@@ -360,14 +345,12 @@ class NcclEpHandle(Handle):
         self._dispatch_out_w = out_w
         self._dispatch_out_idx = out_idx
 
-        # src_rank_counters is written on self._stream; sync before the host read.
-        torch.cuda.ExternalStream(self._stream).synchronize()
-        num_tokens = int(self._recv_count_t.sum().item())
+        # src_rank_counters were written into self._recv_count_t (LayoutInfo above);
+        # nothing consumes them, so we skip the device->host readback.
         # Flatten the rank-grouped routing to the [M, top_k] view the compute
         # bridge consumes (row-major, matching out_t.reshape(M, hidden)).
         return DispatchOutput(
             expert_tensors=out_t,
-            num_tokens=num_tokens,
             recv_topk_idx=out_idx.reshape(m, self._top_k),
             recv_topk_weights=out_w.reshape(m, self._top_k),
         )
@@ -478,7 +461,6 @@ class NcclEpHandle(Handle):
         out_3d = out_t.view(world, max_per_rank, hidden)
         return DispatchOutput(
             expert_tensors=out_3d,
-            num_tokens=num_recv,
             recv_topk_idx=out_idx,
             recv_topk_weights=out_w,
         )

@@ -130,9 +130,7 @@ class MoEEpLayer(nn.Module):
         return self._compute
 
     @staticmethod
-    def _inner_compute_identity(
-        expert_tensors: "torch.Tensor", num_tokens: int
-    ) -> "torch.Tensor":
+    def _inner_compute_identity(expert_tensors: "torch.Tensor") -> "torch.Tensor":
         """Stub inner compute — passes dispatched tokens through unchanged.
 
         Used when no ``compute_config`` was supplied (comm-only path).
@@ -151,7 +149,7 @@ class MoEEpLayer(nn.Module):
         """
         expert_tensors = d.expert_tensors
         if self._compute_config is None:
-            return self._inner_compute_identity(expert_tensors, d.get_num_tokens())
+            return self._inner_compute_identity(expert_tensors)
 
         from ..fused_moe.api import QuantVariant
         from .config import EpAlgorithm, EpLayout

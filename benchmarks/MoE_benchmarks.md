@@ -76,8 +76,8 @@ ssh prenyx "cd $RW && JOBID=<jid> REMOTE_WORK=$RW \
 - `EP_TIMING=pipeline` — drop the per-iter `torch.cuda.synchronize()` so each stage's host
   prep overlaps the prior kernel (`EP_NO_BARRIER=1` for LL). Default `baseline`.
 - `EP_REUSE_PARAMS=1` — reuse the outer `Dispatch/CombineInputParams` objects.
-- `NV_FI_EP_FAST_PATH=1` — wrapper fast path (lazy `num_tokens`, cached FFI wrappers, cached LL
-  recv buffer) — see §3.2. **Off by default** (opt-in; read once at `flashinfer.moe_ep` import).
+- `NV_FI_EP_FAST_PATH=1` — wrapper fast path (cached FFI wrappers + cached LL recv buffer) —
+  see §3.1. **Off by default** (opt-in; read once at `flashinfer.moe_ep` import).
 - `EP_PROFILE_HOST=1` (`EP_PROFILE_SKIP=N`) — print a per-step host-wall burn-down on rank 0.
 
 ### 2b. Full MoE compute (`bench_moe_ep.py`)
@@ -99,7 +99,7 @@ autotunes the trtllm bf16 kernel (~12–15 min).
 All µs/call, BF16, hidden 7168 / top-k 8 / 256 experts, Pre-Nyx B200 (8 GPU/node, NDR IB).
 `kernel` = pure GPU device time (ep: CUPTI; FI: Nsight Systems `cuda_gpu_kern_sum`).
 `event measured` = the per-call `cudaEvent`-bracketed host-call (ep_bench "total"; FI bench
-"kernel-only"). FI columns use `NV_FI_EP_FAST_PATH=1` (§3.2). Cross-node confirmed to 64 GPU.
+"kernel-only"). FI columns use `NV_FI_EP_FAST_PATH=1` (§3.1). Cross-node confirmed to 64 GPU.
 
 ### 3.1 Same kernels, same GPU time — and the host-call comparison
 
@@ -147,11 +147,12 @@ ep_bench-parity check **24/28** (the 4 LL 64-GPU cases fail at `nccl_ep.cc:1491`
 **Validation.** The fast path round-trips correctly (`--validate`: dispatch+combine OK)
 single-node and **multi-node** — LL EXPERT_MAJOR at 8/16/32 GPU and HT FLAT at 8/16/32/64 GPU
 (1/2/4/8 nodes, `NCCL_MNNVL_ENABLE=1`). The §3.1 "FI measured (fast)" cross-scale numbers were
-all taken with `NV_FI_EP_FAST_PATH=1`. Caveat: the fast path currently covers LL EXPERT_MAJOR
-+ HT (LL RANK_MAJOR still uses the eager readback), and it changes two contracts — `num_tokens`
-becomes a lazy thunk (read via `get_num_tokens()`) and LL dispatch returns a reused recv buffer
-— so it stays opt-in until those are extended/audited and run through the numerical correctness
-suite with the flag on.
+all taken with `NV_FI_EP_FAST_PATH=1`. Caveat: the fast path's wrapper-object + recv-buffer
+caching currently covers LL EXPERT_MAJOR + HT (LL RANK_MAJOR rebuilds per call), and it makes
+LL dispatch return a reused recv buffer — so it stays opt-in until extended/audited and run
+through the numerical correctness suite with the flag on. (The per-dispatch recv-count
+host-sync readback is now removed unconditionally — `DispatchOutput` no longer carries
+`num_tokens` — so it is no longer a fast-path-only win.)
 
 ---
 
