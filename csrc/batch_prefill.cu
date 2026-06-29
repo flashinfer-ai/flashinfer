@@ -53,6 +53,8 @@ struct FP4ScaleStrides {
 FP4ScaleStrides GetFP4ScaleStrides(const TensorView& sf, QKVLayout kv_layout) {
   TVM_FFI_ICHECK(sf.ndim() == 3 || sf.ndim() == 4)
       << "NVFP4 scale tensor must be 3D or 4D, got " << sf.ndim() << "D";
+  TVM_FFI_ICHECK(sf.stride(sf.ndim() - 1) == 1)
+      << "NVFP4 scale tensor innermost stride must be 1, got " << sf.stride(sf.ndim() - 1);
   FP4ScaleStrides strides{0, 0, 0};
   if (sf.ndim() == 4) {
     strides.stride_page = static_cast<uint32_t>(sf.stride(0));

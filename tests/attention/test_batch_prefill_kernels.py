@@ -1307,6 +1307,33 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views(kv_layout):
     assert torch.isfinite(strided_out).all()
     torch.testing.assert_close(strided_out, compact_out, rtol=1e-3, atol=1e-3)
 
+    bad_k_sf_parent = torch.empty(
+        *strided_k_sf.shape[:-1],
+        strided_k_sf.shape[-1] * 2,
+        dtype=torch.uint8,
+        device="cuda:0",
+    )
+    bad_v_sf_parent = torch.empty(
+        *strided_v_sf.shape[:-1],
+        strided_v_sf.shape[-1] * 2,
+        dtype=torch.uint8,
+        device="cuda:0",
+    )
+    bad_k_sf = bad_k_sf_parent[..., ::2]
+    bad_v_sf = bad_v_sf_parent[..., ::2]
+    assert bad_k_sf.shape == strided_k_sf.shape
+    assert bad_v_sf.shape == strided_v_sf.shape
+    assert bad_k_sf.stride(-1) == 2
+    assert bad_v_sf.stride(-1) == 2
+    with pytest.raises(Exception, match="innermost stride must be 1"):
+        wrapper.run(
+            q,
+            strided_cache,
+            k_scale=k_global_scale.item(),
+            v_scale=v_global_scale.item(),
+            kv_cache_sf=(bad_k_sf, bad_v_sf),
+        )
+
 
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_len", [128, 256])
