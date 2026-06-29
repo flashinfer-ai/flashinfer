@@ -97,7 +97,11 @@ def test_trtllm_batch_decode(
     # xqa backend does not support non-contiguous query yet
     if backend == "xqa" and non_contiguous_query:
         pytest.skip("xqa backend does not support non-contiguous query")
-    if backend == "xqa" and torch.device(device="cuda")[0] not in [9, 10, 12]:
+    if backend == "xqa" and torch.cuda.get_device_capability("cuda")[0] not in [
+        9,
+        10,
+        12,
+    ]:
         pytest.skip("xqa backend requires SM90, SM100, SM120/SM121 GPUs")
     # General set of tests for xqa decode
     _test_trtllm_batch_decode(
