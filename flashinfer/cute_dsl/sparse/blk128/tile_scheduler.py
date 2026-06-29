@@ -4,10 +4,7 @@ from enum import IntEnum
 from typing import Tuple, Protocol, runtime_checkable
 from dataclasses import dataclass
 
-try:
-    from typing import override
-except ImportError:  # Python < 3.12
-    from typing_extensions import override
+from typing_extensions import override
 
 import cutlass
 from cutlass._mlir import ir
