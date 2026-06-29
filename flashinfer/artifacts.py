@@ -288,12 +288,14 @@ def download_artifacts() -> None:
 
         with ThreadPoolExecutor(num_threads) as pool:
             futures = []
-            for name, _ in cubin_files:
+            for name, checksum in cubin_files:
                 source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
                 local_path = FLASHINFER_CUBIN_DIR / name
                 # Ensure parent directory exists
                 local_path.parent.mkdir(parents=True, exist_ok=True)
-                fut = pool.submit(download_file, source, str(local_path))
+                fut = pool.submit(
+                    download_file, source, str(local_path), expected_sha256=checksum
+                )
                 fut.add_done_callback(update_pbar_cb)
                 futures.append(fut)
 
