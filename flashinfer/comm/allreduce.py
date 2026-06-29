@@ -281,6 +281,19 @@ def _all_ranks_support_mnnvl(
         else:
             comm = MPIBackend()
 
+    # A comm wider than world_size (e.g. a default COMM_WORLD/WORLD) would make
+    # allgather poll the wrong peers or block; fall back to TRT-LLM consistently.
+    comm_size = comm.Get_size()
+    if comm_size != world_size:
+        logger.warning(
+            "[MNNVL] capability-vote comm size %d != world_size %d; disabling "
+            "MNNVL auto-selection. Pass a comm_backend/group scoped to the "
+            "workspace ranks to enable it.",
+            comm_size,
+            world_size,
+        )
+        return False
+
     return all(comm.allgather(local_supported))
 
 
