@@ -2,7 +2,8 @@
 
 Validates that ``mxfp8_cutedsl.preprocess_mega_weights`` produces fp8 weights and
 plain E8M0 scale layouts consistent with the CuTeDSL torch reference, and that a
-single-rank ``mxfp8_mega_moe`` launch matches the reference after top-k summation.
+single-rank ``mxfp8_mega_moe`` launch matches the reference after weighted top-k
+reduction.
 
 Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
 
@@ -101,7 +102,6 @@ def _plain_mxfp8_from_bf16(problem: dict):
     intermediate_size = problem["intermediate"]
     hidden_size = problem["hidden"]
     kind = problem["kind"]
-    i_down = intermediate_size // 2
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     num_experts = pack.w13.shape[0]
 
@@ -120,7 +120,7 @@ def _plain_mxfp8_from_bf16(problem: dict):
         fc1_weights.append(fc1_q.transpose(0, 1))
         fc1_plain_sf.append(fc1_sf)
 
-        fc2_hw = pack.w2[expert, :, :i_down]
+        fc2_hw = pack.w2[expert]
         fc2_q, fc2_sf = _quantize_mxfp8_weight_k_major(
             fc2_hw,
             kind=kind,
@@ -172,6 +172,100 @@ def test_mxfp8_preprocess_fp8_weights_match_plain_quant():
     torch.testing.assert_close(
         fc2_kernel.view(torch.uint8),
         fc2_plain.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.arch_blackwell
+def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
+    _require_cuda()
+
+    import torch
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+    from common.megamoe_constants import Mxfp8BlockSize
+    from moe_mxfp8_glu.mega_runner import (
+        _make_e8m0_scale_tensor,
+        _make_fp8_tensor,
+    )
+
+    problem = _single_rank_problem()
+    num_experts = problem["num_experts"]
+    hidden = problem["hidden"]
+    intermediate = problem["intermediate"]
+    data_dtype = torch.float8_e4m3fn
+
+    g = torch.Generator(device="cuda").manual_seed(19)
+    w13 = _make_fp8_tensor(
+        g,
+        (num_experts, 2 * intermediate, hidden),
+        data_dtype,
+        perf_run=True,
+    )
+    w2 = _make_fp8_tensor(
+        g,
+        (num_experts, hidden, intermediate),
+        data_dtype,
+        perf_run=True,
+    )
+    w13_scale = _make_e8m0_scale_tensor(
+        g,
+        num_experts * 2 * intermediate,
+        hidden,
+        blocksize=Mxfp8BlockSize,
+    ).reshape(num_experts, 2 * intermediate, hidden // Mxfp8BlockSize)
+    w2_scale = _make_e8m0_scale_tensor(
+        g,
+        num_experts * hidden,
+        intermediate,
+        blocksize=Mxfp8BlockSize,
+    ).reshape(num_experts, hidden, intermediate // Mxfp8BlockSize)
+
+    transformed_l1, transformed_l2 = preprocess_mega_weights(
+        MoEWeightPack(
+            w13=w13,
+            w2=w2,
+            w13_scale=w13_scale.view(torch.uint8),
+            w2_scale=w2_scale.view(torch.uint8),
+        ),
+        intermediate_size=intermediate,
+        hidden_size=hidden,
+        kind=problem["kind"],
+    )
+
+    fc1_weight, fc1_sf = transformed_l1
+    fc2_weight, fc2_sf = transformed_l2
+    assert fc1_weight.shape == (num_experts, hidden, 2 * intermediate)
+    assert fc2_weight.shape == (num_experts, intermediate, hidden)
+    assert fc1_weight.dtype == data_dtype
+    assert fc2_weight.dtype == data_dtype
+    assert fc1_sf.dtype == torch.uint8
+    assert fc2_sf.dtype == torch.uint8
+
+    block = Mxfp8BlockSize
+    expected_gate0 = w13[:, :block, :].transpose(1, 2).contiguous()
+    expected_up0 = w13[:, intermediate : intermediate + block, :].transpose(
+        1, 2
+    ).contiguous()
+    torch.testing.assert_close(
+        fc1_weight[:, :, :block].view(torch.uint8),
+        expected_gate0.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        fc1_weight[:, :, block : 2 * block].view(torch.uint8),
+        expected_up0.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        fc2_weight.view(torch.uint8),
+        w2.transpose(1, 2).contiguous().view(torch.uint8),
         atol=0,
         rtol=0,
     )
@@ -265,7 +359,10 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference():
             ab_dtype=data_dtype,
             gate_up_clamp=problem["gate_up_clamp"],
         )
-        y_ref = combine_ref[0].to(torch.float32).sum(dim=1).to(torch.bfloat16)
+        y_ref = (
+            combine_ref[0].to(torch.float32)
+            * topk_weights[:, :, None].to(torch.float32)
+        ).sum(dim=1).to(torch.bfloat16)
 
         y_kernel = torch.empty(
             num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
@@ -280,7 +377,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference():
         )
         torch.cuda.synchronize()
 
-        # Per-(token, topk) cells first (Form A); then the host top-k sum.
+        # Per-(token, topk) cells first (Form A); then the host top-k reduction.
         # Random bf16 activations/weights yield |y|~1e2–1e3; kernel vs torch
         # ref can differ by ~1 bf16 ULP (|Δ|≈8) on a handful of cells.
         _atol = 8.0

@@ -8,7 +8,8 @@ Output is bf16 after top-k combine.  Call layout mirrors the NVFP4 frontend
 
   * Activations: fp8 e4m3 / e5m2 data + E8M0 block SF (``sf_vec_size = 32``).
   * Weights: fp8 + atom-swizzled SF (kernel-ready layout from ``mega_runner``).
-  * fc1 layout: ``(E, hidden, intermediate)`` with hidden K-major (stride-1).
+  * fc1 layout: ``(E, hidden, 2 * intermediate)`` with hidden K-major
+    (stride-1), where ``intermediate`` is the post-SwiGLU width.
 
 Workspace vs per-launch inputs (mirrors the NVFP4 frontend):
 
@@ -135,6 +136,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     ``kind`` selects the fp8 element format (``mxfp8_e4m3`` or ``mxfp8_e5m2``).
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is a
     deprecated alias for ``gate_up_clamp``.
+    ``intermediate`` is the post-SwiGLU width, matching NVFP4 and SGLang.
 
     Expert weights are not allocated here; supply kernel-ready ``(weight, scale)``
     tuples to :func:`mxfp8_mega_moe` instead.
@@ -284,9 +286,16 @@ def mxfp8_mega_moe(
         if out is not None:
             y.copy_(out[:n])
     else:
-        out = symm_buffer._frontend.run(inputs, num_tokens=None)
+        out = symm_buffer._frontend.run(
+            inputs,
+            num_tokens=None,
+            reduce_topk=False,
+        )
         if out is not None:
-            reduced = out[:n].to(torch.float32).sum(dim=1).to(y.dtype)
+            reduced = (
+                out[:n].to(torch.float32)
+                * symm_buffer.topk_weights[:n, :, None].to(torch.float32)
+            ).sum(dim=1).to(y.dtype)
             y.copy_(reduced)
 
 
@@ -308,22 +317,22 @@ def _create_dummy_weights(
 
     data_dtype = _KIND_TO_TORCH_DTYPE[kind]
 
-    intermediate_down = intermediate // 2
+    fc1_out = 2 * intermediate
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
-    intermediate_down_sf_cols = ceil_div(intermediate_down, Mxfp8BlockSize)
+    intermediate_sf_cols = ceil_div(intermediate, Mxfp8BlockSize)
 
     fc1_weight = _make_fp8_tensor(
         generator,
-        (num_local_experts, hidden, intermediate),
+        (num_local_experts, hidden, fc1_out),
         data_dtype,
         perf_run=True,
     )
     fc1_weight_sf_plain = _make_e8m0_scale_tensor(
         generator,
-        num_local_experts * intermediate,
+        num_local_experts * fc1_out,
         hidden,
         blocksize=Mxfp8BlockSize,
-    ).reshape(num_local_experts, intermediate, hidden_sf_cols)
+    ).reshape(num_local_experts, fc1_out, hidden_sf_cols)
     fc1_sf_swizzled = [
         to_blocked(fc1_weight_sf_plain[e]) for e in range(num_local_experts)
     ]
@@ -335,16 +344,16 @@ def _create_dummy_weights(
 
     fc2_weight = _make_fp8_tensor(
         generator,
-        (num_local_experts, intermediate_down, hidden),
+        (num_local_experts, intermediate, hidden),
         data_dtype,
         perf_run=True,
     )
     fc2_weight_sf_plain = _make_e8m0_scale_tensor(
         generator,
         num_local_experts * hidden,
-        intermediate_down,
+        intermediate,
         blocksize=Mxfp8BlockSize,
-    ).reshape(num_local_experts, hidden, intermediate_down_sf_cols)
+    ).reshape(num_local_experts, hidden, intermediate_sf_cols)
     fc2_sf_swizzled = [
         to_blocked(fc2_weight_sf_plain[e]) for e in range(num_local_experts)
     ]

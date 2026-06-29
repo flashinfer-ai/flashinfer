@@ -453,11 +453,11 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
     assert fc1_weight.shape == (
         num_local_experts,
         problem["hidden"],
-        problem["intermediate"],
+        2 * problem["intermediate"],
     )
     assert fc2_weight.shape == (
         num_local_experts,
-        problem["intermediate"] // 2,
+        problem["intermediate"],
         problem["hidden"],
     )
     assert fc1_weight.dtype == torch.float8_e4m3fn

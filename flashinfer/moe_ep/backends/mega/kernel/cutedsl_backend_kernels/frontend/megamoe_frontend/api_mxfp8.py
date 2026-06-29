@@ -34,7 +34,11 @@ def _kind_to_cutlass_dtype(kind: str):
 
 @dataclasses.dataclass(frozen=True)
 class MegaMoEMxfp8Config:
-    """Compile-time / launch-time MXFP8 MegaMoE configuration."""
+    """Compile-time / launch-time MXFP8 MegaMoE configuration.
+
+    ``intermediate`` is the post-SwiGLU width. The MXFP8 kernel's full FC1
+    gate+up width is derived as ``2 * intermediate``.
+    """
 
     rank: int
     world_size: int
@@ -131,6 +135,10 @@ class MegaMoEMxfp8Config:
     def torch_ab_dtype(self) -> torch.dtype:
         return _KIND_TO_TORCH_DTYPE[self.kind]
 
+    @property
+    def fc1_out(self) -> int:
+        return 2 * self.intermediate
+
 
 @dataclasses.dataclass
 class MegaMoEMxfp8Inputs:
@@ -191,15 +199,25 @@ class MegaMoEMxfp8Frontend:
         num_tokens: Optional[int] = None,
         sync: bool = True,
         reset_counters: bool = True,
+        reduce_topk: bool = True,
     ) -> Optional[torch.Tensor]:
         """Launch MXFP8 MegaMoE.
 
         Returns ``combine_output.squeeze(1)`` when ``in_kernel_fc2_reduce=True``;
         otherwise form-A ``combine_output`` with shape ``(T, top_k, hidden)``.
+        If ``reduce_topk=True`` with ``in_kernel_fc2_reduce=False``, raises:
+        MXFP8 has no separate frontend top-k reduce kernel, so non-in-kernel
+        reduction remains the caller's responsibility.
         """
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return None
+        if reduce_topk and not self.config.in_kernel_fc2_reduce:
+            raise ValueError(
+                "MXFP8 MegaMoE has no separate top-k reduce kernel; call "
+                "run(..., reduce_topk=False) and reduce form-A output externally, "
+                "or enable in_kernel_fc2_reduce."
+            )
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         if reset_counters:
@@ -254,7 +272,7 @@ class MegaMoEMxfp8Frontend:
         c = self.config
         static_expert_shape = (
             c.num_experts_per_rank,
-            c.intermediate,
+            c.fc1_out,
             c.hidden,
         )
 
@@ -397,7 +415,6 @@ class MegaMoEMxfp8Frontend:
                 f"({c.num_tokens_per_rank})."
             )
 
-        intermediate_down = c.intermediate // 2
         e = c.num_experts_per_rank
 
         def _require_cuda(name: str, tensor: torch.Tensor) -> None:
@@ -482,8 +499,8 @@ class MegaMoEMxfp8Frontend:
             )
 
         weight_checks = (
-            ("fc1_weight", inputs.fc1_weight, (e, c.hidden, c.intermediate)),
-            ("fc2_weight", inputs.fc2_weight, (e, intermediate_down, c.hidden)),
+            ("fc1_weight", inputs.fc1_weight, (e, c.hidden, c.fc1_out)),
+            ("fc2_weight", inputs.fc2_weight, (e, c.intermediate, c.hidden)),
         )
         for name, tensor, shape in weight_checks:
             _require_cuda(name, tensor)

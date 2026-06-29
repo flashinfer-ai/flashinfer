@@ -13,7 +13,8 @@ Topk weighting: the MXFP8 fused fc1+fc2 epilogue applies **no** topk weighting
 the swiglu output -- mirroring the MXFP8 fc12 standalone tester, which inherits
 the no-op pre/post topk hooks).  ``norm_const`` is hard-coded to 1.0 in the
 kernel epilogue.  This reference therefore produces *unweighted* per-(token,
-topk) fc12 outputs; the caller compares them per-(token, topk) cell.
+topk) fc12 outputs; callers must multiply by topk weights when reducing form-A
+outputs to final per-token outputs.
 
 The per-expert chain (dequant input -> gather -> fc1 -> swiglu fold + fc1-out
 MXFP8 round-trip -> fc2 -> scatter back) mirrors the MXFP8 fc12 reference in
@@ -44,7 +45,7 @@ def compute_megamoe_reference_mxfp8(
     input_activation: torch.Tensor,        # (num_ranks, num_tokens_per_rank, hidden) fp8
     input_activation_sf: torch.Tensor,     # (num_ranks, num_tokens_per_rank, hidden//32) E8M0
     input_topk_idx: torch.Tensor,          # (num_ranks, num_tokens_per_rank, num_topk) int64
-    input_topk_weights: torch.Tensor,      # (num_ranks, num_tokens_per_rank, num_topk) fp32 (unused)
+    input_topk_weights: torch.Tensor,      # (num_ranks, num_tokens_per_rank, num_topk) fp32
     fc1_weight: torch.Tensor,              # (num_ranks, num_experts_per_rank, hidden, intermediate) fp8, hidden stride-1
     fc1_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, intermediate, hidden//32) E8M0
     fc2_weight: torch.Tensor,              # (num_ranks, num_experts_per_rank, intermediate//2, hidden) fp8, inter//2 stride-1
@@ -58,10 +59,10 @@ def compute_megamoe_reference_mxfp8(
     """Return ``(num_ranks, num_tokens_per_rank, num_topk, hidden)`` combine reference.
 
     ``norm_const`` / ``ref_compute_graph`` are accepted for API parity with the
-    NVFP4 reference but carry no topk weighting on the MXFP8 path (see module
-    docstring); ``norm_const`` is not applied to the fc1-out quant because the
-    MXFP8 kernel hard-codes a 1.0 norm const and ``mxfp8_quantize_per_block_32``
-    takes no norm-const argument.
+    NVFP4 reference. Top-k weighting is intentionally left to callers reducing
+    the returned form-A tensor; ``norm_const`` is not applied to the fc1-out
+    quant because the MXFP8 kernel hard-codes a 1.0 norm const and
+    ``mxfp8_quantize_per_block_32`` takes no norm-const argument.
     """
     if fc2_output_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(
