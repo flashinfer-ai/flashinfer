@@ -69,7 +69,7 @@ from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
-from .mnnvl import CommBackend, SymmDeviceMemory
+from .mnnvl import CommBackend, MPIBackend, SymmDeviceMemory, TorchDistBackend
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
@@ -247,6 +247,43 @@ def _mnnvl_workspace_check(
         return False
 
 
+def _all_ranks_support_mnnvl(
+    local_supported: bool,
+    world_size: int,
+    comm_backend: Optional[CommBackend],
+    group: Optional[ProcessGroup],
+) -> bool:
+    """AND-reduce the local multicast probe so all ranks agree on MNNVL.
+
+    ``backend="auto"`` must pick the same workspace type everywhere, or ranks
+    build mismatched backends and deadlock in the collective rendezvous. So we
+    allgather the per-rank ``_mnnvl_workspace_check`` result and enable MNNVL
+    only when every rank supports it (mirrors ``_resolve_fabric_support``).
+
+    Caller contract: invoke on every auto rank unconditionally -- skipping the
+    allgather on some ranks while others enter it would itself deadlock.
+    """
+    if world_size <= 1:
+        return local_supported
+
+    comm = comm_backend
+    if comm is None:
+        # No explicit comm: use a transport that spans the world ranks just for
+        # this vote -- torch.distributed when initialized, else MPI. The result
+        # is transport-independent (a logical AND over the same rank set), so it
+        # stays valid even though the selected workspace may rendezvous over a
+        # different but co-spanning comm (e.g. the MNNVL constructor's MPI
+        # barrier).
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            comm = TorchDistBackend(group=group)
+        else:
+            comm = MPIBackend()
+
+    return all(comm.allgather(local_supported))
+
+
 # ============================================================================
 # HEURISTIC - Performance-based backend selection
 # ============================================================================
@@ -418,13 +455,20 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
         ):
             suitable_backends.append("trtllm")
-        if _mnnvl_workspace_check(
+        # _mnnvl_workspace_check is a per-rank probe; reconcile it across the
+        # whole group so every rank agrees on MNNVL eligibility and constructs
+        # the same workspace type. The allgather inside _all_ranks_support_mnnvl
+        # runs on every auto rank regardless of the local probe result.
+        local_mnnvl_supported = _mnnvl_workspace_check(
             backend=backend,
             world_size=world_size,
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
+        )
+        if _all_ranks_support_mnnvl(
+            local_mnnvl_supported, world_size, comm_backend, group
         ):
             suitable_backends.append("mnnvl")
 

@@ -568,110 +568,100 @@ class MnnvlMemory:  # type: ignore[no-redef]
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
 
-        # Place the rendezvous socket inside a private, per-exchange directory
-        # created with 0700 permissions (mkdtemp also gives it an unpredictable
-        # name).  This prevents another local process from pre-binding the path
-        # or connecting to our listener to inject a bogus handle fd: only the
-        # owning user can traverse the directory, and the peer ranks of the same
-        # job share that uid.  A predictable name under the world-writable temp
-        # dir would otherwise be open to squatting/impersonation.
-        xchg_dir = tempfile.mkdtemp(prefix=f"cuda_fd_xchg_{os.getpid()}_{comm_rank}_")
-        sock_path = os.path.join(xchg_dir, "fd.sock")
-
-        # try/finally guarantees the private dir + socket are removed on every
-        # exit path (including the connect-timeout RuntimeError below); a unique
-        # mkdtemp name is not self-healing across runs the way the old fixed
-        # name was, so a leak here would accumulate stale 0700 dirs under /tmp.
-        server = None
-        try:
+        # Put the rendezvous socket in a private 0700 dir with an unpredictable
+        # name (mkdtemp semantics) so another local process can't pre-bind the
+        # path or connect to inject a bogus handle fd; same-uid peer ranks can
+        # still reach it. TemporaryDirectory removes the dir and socket on every
+        # exit path (rmtree); ignore_cleanup_errors avoids masking a real error.
+        with tempfile.TemporaryDirectory(
+            prefix=f"cuda_fd_xchg_{os.getpid()}_{comm_rank}_",
+            ignore_cleanup_errors=True,
+        ) as xchg_dir:
+            sock_path = os.path.join(xchg_dir, "fd.sock")
             all_sock_paths = comm.allgather(sock_path)
 
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server.bind(sock_path)
-            server.listen(comm_size)
-            server.settimeout(30.0)
+            try:
+                server.bind(sock_path)
+                server.listen(comm_size)
+                server.settimeout(30.0)
 
-            received_fds: List[Optional[int]] = [None] * comm_size
-            received_fds[comm_rank] = local_fd
-            accept_errors = []
+                received_fds: List[Optional[int]] = [None] * comm_size
+                received_fds[comm_rank] = local_fd
+                accept_errors = []
 
-            def accept_loop():
-                for _ in range(comm_size - 1):
-                    try:
-                        conn, _ = server.accept()
-                        rank_bytes = b""
-                        while len(rank_bytes) < 4:
-                            chunk = conn.recv(4 - len(rank_bytes))
-                            if not chunk:
-                                break
-                            rank_bytes += chunk
-                        sender_rank = int.from_bytes(rank_bytes, "little")
-                        fds_arr = array.array("i")
-                        _, ancdata, _, _ = conn.recvmsg(
-                            1, socket.CMSG_SPACE(fds_arr.itemsize)
-                        )
-                        for cmsg_level, cmsg_type, cmsg_data in ancdata:
-                            if (
-                                cmsg_level == socket.SOL_SOCKET
-                                and cmsg_type == socket.SCM_RIGHTS
-                            ):
-                                trim = len(cmsg_data) - (
-                                    len(cmsg_data) % fds_arr.itemsize
-                                )
-                                fds_arr.frombytes(cmsg_data[:trim])
-                        if fds_arr:
-                            received_fds[sender_rank] = fds_arr[0]
-                        conn.close()
-                    except Exception as exc:
-                        accept_errors.append(exc)
+                def accept_loop():
+                    for _ in range(comm_size - 1):
+                        try:
+                            conn, _ = server.accept()
+                            rank_bytes = b""
+                            while len(rank_bytes) < 4:
+                                chunk = conn.recv(4 - len(rank_bytes))
+                                if not chunk:
+                                    break
+                                rank_bytes += chunk
+                            sender_rank = int.from_bytes(rank_bytes, "little")
+                            fds_arr = array.array("i")
+                            _, ancdata, _, _ = conn.recvmsg(
+                                1, socket.CMSG_SPACE(fds_arr.itemsize)
+                            )
+                            for cmsg_level, cmsg_type, cmsg_data in ancdata:
+                                if (
+                                    cmsg_level == socket.SOL_SOCKET
+                                    and cmsg_type == socket.SCM_RIGHTS
+                                ):
+                                    trim = len(cmsg_data) - (
+                                        len(cmsg_data) % fds_arr.itemsize
+                                    )
+                                    fds_arr.frombytes(cmsg_data[:trim])
+                            if fds_arr:
+                                received_fds[sender_rank] = fds_arr[0]
+                            conn.close()
+                        except Exception as exc:
+                            accept_errors.append(exc)
 
-            t = threading.Thread(target=accept_loop, daemon=True)
-            t.start()
+                t = threading.Thread(target=accept_loop, daemon=True)
+                t.start()
 
-            for target_rank in range(comm_size):
-                if target_rank == comm_rank:
-                    continue
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                target_path = all_sock_paths[target_rank]
-                deadline = time.monotonic() + 30.0
-                while True:
-                    try:
-                        sock.connect(target_path)
-                        break
-                    except (ConnectionRefusedError, FileNotFoundError):
-                        if time.monotonic() > deadline:
-                            raise RuntimeError(
-                                f"[MnnvlMemory] timed out connecting to rank "
-                                f"{target_rank} at {target_path}"
-                            ) from None
-                        time.sleep(0.01)
-                sock.sendall(comm_rank.to_bytes(4, "little"))
-                fds_arr = array.array("i", [local_fd])
-                sock.sendmsg(
-                    [b"\x00"],
-                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds_arr)],
-                )
-                sock.close()
+                for target_rank in range(comm_size):
+                    if target_rank == comm_rank:
+                        continue
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    target_path = all_sock_paths[target_rank]
+                    deadline = time.monotonic() + 30.0
+                    while True:
+                        try:
+                            sock.connect(target_path)
+                            break
+                        except (ConnectionRefusedError, FileNotFoundError):
+                            if time.monotonic() > deadline:
+                                raise RuntimeError(
+                                    f"[MnnvlMemory] timed out connecting to rank "
+                                    f"{target_rank} at {target_path}"
+                                ) from None
+                            time.sleep(0.01)
+                    sock.sendall(comm_rank.to_bytes(4, "little"))
+                    fds_arr = array.array("i", [local_fd])
+                    sock.sendmsg(
+                        [b"\x00"],
+                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds_arr)],
+                    )
+                    sock.close()
 
-            t.join(timeout=30.0)
+                t.join(timeout=30.0)
 
-            if accept_errors:
-                raise RuntimeError(
-                    f"[MnnvlMemory] SCM_RIGHTS accept errors: {accept_errors}"
-                )
-            missing = [i for i, fd in enumerate(received_fds) if fd is None]
-            if missing:
-                raise RuntimeError(
-                    f"[MnnvlMemory] did not receive file descriptors from ranks: {missing}"
-                )
-            return received_fds
-        finally:
-            if server is not None:
+                if accept_errors:
+                    raise RuntimeError(
+                        f"[MnnvlMemory] SCM_RIGHTS accept errors: {accept_errors}"
+                    )
+                missing = [i for i, fd in enumerate(received_fds) if fd is None]
+                if missing:
+                    raise RuntimeError(
+                        f"[MnnvlMemory] did not receive file descriptors from ranks: {missing}"
+                    )
+                return received_fds
+            finally:
                 server.close()
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(sock_path)
-            with contextlib.suppress(OSError):
-                os.rmdir(xchg_dir)
 
     @staticmethod
     def open_mnnvl_memory(mapping: Mapping, size: int):
