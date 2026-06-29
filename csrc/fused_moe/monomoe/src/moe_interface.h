@@ -48,7 +48,7 @@ struct MoEDimensions {
 // sides.  Phase 3 (up-proj) uses the Hopper wgmma.mma_async fp8 path with a
 // v1 dual-warpgroup K=128 streaming pipeline.  Group geometry (UP_GRID,
 // UP_GROUPS, DOWN_GRID, DOWN_GROUPS) and the TMA caller contracts live in
-// DESIGN.md §5/§6; per-tensor specifics are in the moe_tma.h factory docs.
+// docs/design_docs/monomoe_kernel.md §5/§6; per-tensor specifics are in the moe_tma.h factory docs.
 struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;

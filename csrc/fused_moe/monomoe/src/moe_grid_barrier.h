@@ -12,15 +12,15 @@
 //
 // Full protocol (seed + high-bit, ping-pong slots, fence discipline,
 // self-maintaining reset) and the per-site arrival-set recipe live in
-// DESIGN.md §2.  Deadlock-freedom rests on the co-residency invariant
-// (DESIGN.md §3).  Comments here only flag the per-step intent.
+// docs/design_docs/monomoe_kernel.md §2.  Deadlock-freedom rests on the co-residency invariant
+// (docs/design_docs/monomoe_kernel.md §3).  Comments here only flag the per-step intent.
 
 namespace monomoe {
 
 /**
  * @brief Software grid-wide barrier (all `GRID_SIZE_STATIC` blocks),
  *        cooperative-groups-equivalent happens-before with a standard
- *        launch.  Protocol: DESIGN.md §2.
+ *        launch.  Protocol: docs/design_docs/monomoe_kernel.md §2.
  *
  * @tparam GRID_SIZE_STATIC   Compile-time block count
  *                            (`Dims::KernelConfig::GRID_SIZE`); folds the
@@ -28,7 +28,7 @@ namespace monomoe {
  * @param  counters           Two-slot ping-pong Counter_Pair (e.g.
  *                            `&spec->grid_barrier.slot[0]`).  Host
  *                            zero-inits on first use; self-maintaining
- *                            thereafter (DESIGN.md §4).
+ *                            thereafter (docs/design_docs/monomoe_kernel.md §4).
  * @param  phase              In/out phase counter; active slot is
  *                            `phase & 1`.  Init to 0 at kernel entry.
  */
@@ -54,7 +54,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
 
     if (blockIdx.x == 0) {
       // step 3: seed.  Mask strips the previous call's leftover high-bit
-      // marker, folding back only real early arrivals (DESIGN.md §2).
+      // marker, folding back only real early arrivals (docs/design_docs/monomoe_kernel.md §2).
       const uint32_t prior = atomicExch(c, SEED);
       const uint32_t to_fold = prior & 0x7FFFFFFFu;
       if (to_fold != 0u) {
@@ -67,7 +67,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
 
   // step 4: thread 0 alone spins; atomicAdd(c, 0u) is an uncached
   // device-scope read (== ld.acquire.gpu on SM90).  Others wait at the
-  // step-6 sync.  Happens-before chain: DESIGN.md §2.
+  // step-6 sync.  Happens-before chain: docs/design_docs/monomoe_kernel.md §2.
   if (threadIdx.x == 0) {
     while ((atomicAdd(c, 0u) & 0x80000000u) == 0u) {
     }
@@ -82,7 +82,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
  * @brief Software sub-grid (partial) barrier over a caller-specified
  *        arrival set.  Underlies `expert_barrier` (site #2) and
  *        `colstripe_barrier` (site #3).  Protocol, caller contract, and
- *        per-site seed/arrival recipe: DESIGN.md §2.
+ *        per-site seed/arrival recipe: docs/design_docs/monomoe_kernel.md §2.
  *
  * Identical to `grid_barrier` except the slot is per-id
  * (`counter_region + id*2 + (phase&1)`) and the seed block /
@@ -93,7 +93,7 @@ __device__ __forceinline__ void grid_barrier(uint32_t* __restrict__ counters, ui
  *
  * @param counter_region          Base of this region's Counter_Pair array
  *                                (`expert_slot`/`colstripe_slot`).  Host
- *                                zero-inits on first use (DESIGN.md §4).
+ *                                zero-inits on first use (docs/design_docs/monomoe_kernel.md §4).
  * @param id                      Barrier id (expert group or col stripe).
  * @param arrival_count           Blocks arriving for this `id`
  *                                (`UP_GRID` or `DOWN_GROUPS`).
@@ -127,7 +127,7 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
     __threadfence();  // step 2: release pre-barrier global writes
 
     if (blockIdx.x == seed_thread_blockidx) {
-      // step 3: seed (mask strips leftover high-bit marker; DESIGN.md §2)
+      // step 3: seed (mask strips leftover high-bit marker; docs/design_docs/monomoe_kernel.md §2)
       const uint32_t prior = atomicExch(c, SEED);
       const uint32_t to_fold = prior & 0x7FFFFFFFu;
       if (to_fold != 0u) {
@@ -153,7 +153,7 @@ __device__ __forceinline__ void partial_barrier(uint32_t* __restrict__ counter_r
  * @brief Phase 3→4 expert-local barrier (site #2).  Thin `__forceinline__`
  *        alias for `partial_barrier` (zero runtime cost).  Recipe:
  *        `id = up_group`, `arrival_count = UP_GRID`,
- *        `seed_blockidx = up_group * UP_GRID` (DESIGN.md §2).
+ *        `seed_blockidx = up_group * UP_GRID` (docs/design_docs/monomoe_kernel.md §2).
  */
 __device__ __forceinline__ void expert_barrier(uint32_t* __restrict__ expert_counters,
                                                uint32_t expert_id, uint32_t arrival_count,
@@ -166,7 +166,7 @@ __device__ __forceinline__ void expert_barrier(uint32_t* __restrict__ expert_cou
  *        `__forceinline__` alias for `partial_barrier` (zero runtime
  *        cost).  Recipe: `id = blockIdx.x % DOWN_GRID`,
  *        `arrival_count = DOWN_GROUPS`, `seed_blockidx = id` (the
- *        Phase-5 writer is its own seed; DESIGN.md §2).
+ *        Phase-5 writer is its own seed; docs/design_docs/monomoe_kernel.md §2).
  */
 __device__ __forceinline__ void colstripe_barrier(uint32_t* __restrict__ colstripe_counters,
                                                   uint32_t col_stripe, uint32_t arrival_count,

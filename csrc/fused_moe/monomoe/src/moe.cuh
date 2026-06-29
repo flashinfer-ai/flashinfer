@@ -24,10 +24,10 @@ namespace monomoe {
 /**
  * @brief Top-K MoE kernel — split-phase WGMMA path for BS <= 8.
  *
- * The five-phase pipeline (routing+prefetch / quantize / up-proj / down-proj /
- * writeback) and the two grid syncs between them are described in DESIGN.md §1;
- * the barriers are DESIGN.md §2.  Phase markers below tie each block of code to
- * that table.
+ * Design doc: docs/design_docs/monomoe_kernel.md.  The five-phase pipeline
+ * (routing+prefetch / quantize / up-proj / down-proj / writeback) and the two
+ * grid syncs between them are described in §1; the barriers in §2.  Phase
+ * markers below tie each block of code to that table.
  */
 template <typename Dims>
 __device__ void moe_kernel_topk_BS8(
@@ -208,7 +208,7 @@ __device__ void moe_kernel_topk_BS8(
   __syncthreads();
 
 
-  // ── Up-projection group mapping (DESIGN.md §6) ──────────────────────────
+  // ── Up-projection group mapping (docs/design_docs/monomoe_kernel.md §6) ────────────────────────
   // UP_GRID blocks cover one expert's 2*N rows; UP_GROUPS expert groups run
   // in parallel.  For this shape: UP_GRID=8, UP_GROUPS=16.
   constexpr std::uint32_t UP_GRID = 2 * Dims::N / CoreDims::W_UP_TILE_EFFECTIVE;
@@ -228,7 +228,7 @@ __device__ void moe_kernel_topk_BS8(
   // up_group/up_block_idx math is pure register work.  The up-proj helper
   // primes its own weight tile (pre-loop `bar_w[0]` arm + first TMA).
 
-  // ── Phase 3: Up-projection — expert groups in parallel (DESIGN.md §1) ──
+  // ── Phase 3: Up-projection — expert groups in parallel (docs/design_docs/monomoe_kernel.md §1)
   // Group `g` iterates experts from index `g` stepping by UP_GROUPS, writing
   // disjoint `temp_fp8` slabs (no write conflict).  TMA+WGMMA dispatch is
   // unconditional (asserted at function top).
@@ -241,7 +241,7 @@ __device__ void moe_kernel_topk_BS8(
   }
 
 
-  // ── Site #2 — Expert-local barrier, Phase 3→4 (DESIGN.md §2) ─────────
+  // ── Site #2 — Expert-local barrier, Phase 3→4 (docs/design_docs/monomoe_kernel.md §2) ─────────
   // DOWN_GROUPS == UP_GROUPS aligns the producer set (8 blocks that wrote
   // expert group `g`'s temp_fp8 rows) with the consumer set, so an
   // expert_barrier keyed on `up_group` is sufficient (vs a full grid sync).
@@ -254,7 +254,8 @@ __device__ void moe_kernel_topk_BS8(
   }
 
 
-  // ── Phase 4 (WGMMA): dual-WG streaming down-projection (DESIGN.md §1,§6) ─
+  // ── Phase 4 (WGMMA): dual-WG streaming down-projection ──
+  // (docs/design_docs/monomoe_kernel.md §1,§6)
   // Blocks partition into DOWN_GROUPS expert groups × DOWN_GRID col-blocks,
   // each owning DOWN_COL_TILE output cols.  Every contributing block
   // atomicAdds its partial into the single-buffer `down_partial_out` (zeroed
@@ -264,7 +265,7 @@ __device__ void moe_kernel_topk_BS8(
                                                      down_activations_desc);
 
 
-  // ── Site #3 — Col-stripe-local barrier, Phase 4→5 (DESIGN.md §2) ─────
+  // ── Site #3 — Col-stripe-local barrier, Phase 4→5 (docs/design_docs/monomoe_kernel.md §2) ─────
   // Phase 5 reader for col stripe `b` is `blockIdx.x == b`; its producer set
   // is the DOWN_GROUPS blocks with `blockIdx.x % DOWN_GRID == b`, which is
   // exactly the colstripe_barrier arrival set (and `b` is its own seed).
@@ -278,7 +279,7 @@ __device__ void moe_kernel_topk_BS8(
   }
 
 
-  // ── Phase 5 (WGMMA): bf16 cast + writeback (DESIGN.md §1) ──────────────
+  // ── Phase 5 (WGMMA): bf16 cast + writeback (docs/design_docs/monomoe_kernel.md §1) ─────────────
   // Each Phase-5 block reads its own DOWN_COL_TILE cols × BS tokens of fp32
   // sums (already reduced by the Phase-4 atomicAdds) and casts to bf16 — a
   // streaming load+cast+store, no cross-group reduction.  Only the first
@@ -332,8 +333,9 @@ __device__ void moe_kernel_topk_BS8(
  * cost.
  */
 // `__launch_bounds__(BLOCK_SIZE, 1)` pins one block per SM — the compile-time
-// half of the co-residency invariant the barrier spin depends on (DESIGN.md §3);
-// the launcher enforces `GRID_SIZE <= SM_count` at runtime.
+// half of the co-residency invariant the barrier spin depends on
+// (docs/design_docs/monomoe_kernel.md §3); the launcher enforces
+// `GRID_SIZE <= SM_count` at runtime.
 template <typename Dims>
 __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
     const A_element* __restrict__ activations_in, std::uint32_t token_count,
@@ -380,9 +382,9 @@ __global__ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_
   extern __shared__ char shmem_buffer[];
   MoE_SHM<Dims>* shmem = reinterpret_cast<MoE_SHM<Dims>*>(shmem_buffer);
 
-  // Barrier counter-region pointers (into the scratchpad tail, DESIGN.md §4)
-  // and per-region phase counters (block-local registers, init 0, bumped by
-  // each barrier call; see DESIGN.md §2).
+  // Barrier counter-region pointers (into the scratchpad tail; see
+  // docs/design_docs/monomoe_kernel.md §4) and per-region phase counters
+  // (block-local registers, init 0, bumped by each barrier call; §2).
   uint32_t* grid_counters = spec->grid_barrier.slot;
   uint32_t* expert_counters = &spec->partial_barrier.expert_slot[0][0];
   uint32_t* colstripe_counters = &spec->partial_barrier.colstripe_slot[0][0];

@@ -7,12 +7,14 @@ ordering between phases provided by software barriers (no cooperative-groups
 launch, so it is CUDA-Graph-capturable).
 
 This document is the single home for the cross-cutting concepts. Source comments
-describe what a given line does and link here (`see DESIGN.md §N`) for the
-shared "why". When you change a mechanism, update the section here rather than
-re-explaining it in another file.
+in `csrc/fused_moe/monomoe/` describe what a given line does and link here
+(`see docs/design_docs/monomoe_kernel.md §N`) for the shared "why". When you
+change a mechanism, update the section here rather than re-explaining it in
+another file.
 
 Fixed shape (`Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA`, see
-`src/moe_interface.h`): `E=256` experts, `K = HIDDEN_STATES = 2048`, `N = 512`
+`csrc/fused_moe/monomoe/src/moe_interface.h`): `E=256` experts,
+`K = HIDDEN_STATES = 2048`, `N = 512`
 (gate and up each have `N` rows), `BS ≤ 8` tokens, block-FP8 (128×128) weights,
 `GRID_SIZE = 128`, `BLOCK_SIZE = 384` (12 warps). The kernel is hard-specialized
 to this shape; `BS ≤ 8` is enforced by `static_assert`.
@@ -43,7 +45,7 @@ and §6 for the group geometry (`UP_GRID`, `UP_GROUPS`, `DOWN_GRID`,
 
 ## §2 — Software grid / partial barriers (seed + high-bit protocol)
 
-Defined in `src/moe_grid_barrier.h`. `grid_barrier` (all blocks) and
+Defined in `csrc/fused_moe/monomoe/src/moe_grid_barrier.h`. `grid_barrier` (all blocks) and
 `partial_barrier` (a caller-specified arrival set) give
 cooperative-groups-equivalent happens-before with a standard launch. The thin
 aliases `expert_barrier` / `colstripe_barrier` are `partial_barrier` with the
@@ -114,8 +116,8 @@ is resident on the GPU for the kernel's whole lifetime — a block must never sp
 waiting on a block that hasn't been scheduled yet. The kernel guarantees this:
 
 - `GRID_SIZE <= SM_count` so every block gets a slot. The host checks this once
-  before launch (`monomoe_wrapper.cuh`); `GRID_SIZE` is a compile-time constant
-  and SM count is a static device property.
+  before launch (`csrc/fused_moe/monomoe/monomoe_wrapper.cuh`); `GRID_SIZE` is a
+  compile-time constant and SM count is a static device property.
 - `__launch_bounds__(BLOCK_SIZE, 1)` pins one block per SM.
 - Opt-in dynamic SHM (> half the per-SM budget) reinforces one-block-per-SM
   occupancy.
@@ -125,7 +127,7 @@ waiting on a block that hasn't been scheduled yet. The kernel guarantees this:
 ## §4 — Scratchpad (`MoEGemmSpec<Dims>`) and zero-init
 
 The global scratchpad is reinterpreted as a `MoEGemmSpec<Dims>` (layout in
-`src/moe_internal.h`). It holds the inter-phase tensors (`temp_bf16`,
+`csrc/fused_moe/monomoe/src/moe_internal.h`). It holds the inter-phase tensors (`temp_bf16`,
 `temp_fp8`, `down_partial_out`) and, at its **tail**, the barrier Counter_Pairs
 (`grid_barrier`, `partial_barrier`). The host sizes the buffer from
 `sizeof(MoEGemmSpec<Dims>)` (exported via `monomoe_scratchpad_size`) so Python
@@ -145,7 +147,8 @@ uninitialized counters and deadlock the spin. Zeroing the entire scratchpad
 descriptor (§5) by adding the compile-time `MoEGemmSpec<Dims>::TEMP_FP8_OFFSET`
 to the scratchpad base. That constant MUST equal
 `offsetof(MoEGemmSpec<Dims>, temp_fp8)`, enforced by a `static_assert` in
-`monomoe_wrapper.cuh`. New fields (e.g. extra barrier counters) MUST be appended
+`csrc/fused_moe/monomoe/monomoe_wrapper.cuh`. New fields (e.g. extra barrier
+counters) MUST be appended
 *after* `temp_fp8` — anything inserted before it shifts the offset and silently
 corrupts TMA fetches.
 
@@ -155,8 +158,9 @@ corrupts TMA fetches.
 
 The BS8 path loads weights and activations with TMA
 (`cp.async.bulk.tensor.2d`). Host-side `create_*_tma_desc` factories
-(`src/moe_tma.cu`, declared in `src/moe_tma.h`) build the `CUtensorMap`s; the
-kernel takes them as `__grid_constant__ CUtensorMap const` params.
+(`csrc/fused_moe/monomoe/src/moe_tma.cu`, declared in `…/src/moe_tma.h`) build
+the `CUtensorMap`s; the kernel takes them as `__grid_constant__ CUtensorMap
+const` params.
 
 **Caller contracts** (encoded once in the factory doc comments):
 
@@ -216,6 +220,8 @@ contributing block `atomicAdd`s into the single-buffer `down_partial_out`; Phase
 ---
 
 ## File map
+
+Paths are relative to `csrc/fused_moe/monomoe/`.
 
 | File | Role |
 |------|------|

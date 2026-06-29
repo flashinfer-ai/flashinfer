@@ -134,10 +134,10 @@ struct MoEGemmSpec {
   float temp_act_scale[TEMP_ROWS * TEMP_ACT_SCALE_COLS];
 
   // Byte offset of `temp_fp8`, so the host can address it from the
-  // scratchpad base without reading the layout at runtime (DESIGN.md §4).
+  // scratchpad base without reading the layout at runtime (docs/design_docs/monomoe_kernel.md §4).
   static constexpr size_t TEMP_FP8_OFFSET = offsetof(MoEGemmSpec<Dims>, temp_fp8);
 
-  // Down-projection group layout (DESIGN.md §6): DOWN_COL_TILE=256,
+  // Down-projection group layout (docs/design_docs/monomoe_kernel.md §6): DOWN_COL_TILE=256,
   // DOWN_GRID=8, DOWN_GROUPS=16 for the BS8 TMA path.  `DOWN_GROUPS ==
   // UP_GROUPS` is the prerequisite for the Site-#2 Expert_Barrier; the value
   // is mirrored in MoECoreDims with a cross-checking static_assert.
@@ -145,7 +145,7 @@ struct MoEGemmSpec {
   static constexpr uint32_t DOWN_GRID = Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr uint32_t DOWN_GROUPS =
       DOWN_GRID == 0 ? 1 : Dims::KernelConfig::GRID_SIZE / DOWN_GRID;
-  // Single-buffer fp32 accumulator for the down-projection (DESIGN.md §1).
+  // Single-buffer fp32 accumulator for the down-projection (docs/design_docs/monomoe_kernel.md §1).
   // [BS][HIDDEN_STATES] = 64 KB for Qwen3.5.  fp32 (not bf16) so the 16-way
   // Phase-4 atomicAdd keeps precision; Phase 5 casts each cell once.  Zeroed
   // at kernel entry, fenced by the Site-#2/#3 barriers.
@@ -159,8 +159,8 @@ struct MoEGemmSpec {
       (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;
   float act_scale[Dims::BS][ACT_SCALE_BLOCKS];
 
-  // Software barrier counters (DESIGN.md §2), at the TAIL of the struct so
-  // TEMP_FP8_OFFSET is unaffected (DESIGN.md §4).  Counter_Pairs are
+  // Software barrier counters (docs/design_docs/monomoe_kernel.md §2), at the TAIL of the struct so
+  // TEMP_FP8_OFFSET is unaffected (docs/design_docs/monomoe_kernel.md §4).  Counter_Pairs are
   // ping-pong slots: `grid_barrier.slot[2]` (all blocks),
   // `expert_slot[id][2]` (one per expert group, arrival UP_GRID),
   // `colstripe_slot[id][2]` (one per col stripe, arrival DOWN_GROUPS).
@@ -509,8 +509,9 @@ struct MoE_SHM {
       // BF16 input buffer in tile-major `[K_BLOCKS_TOTAL][BS][K_STEP_WGMMA]`
       // (not `[BS][HIDDEN_STATES]`) so each `boxDim=(128,8)` TMA write lands
       // in its own 2 KB slab without overlapping the next K-substep; full
-      // rationale in DESIGN.md §5.  Total 32 KB, unchanged from the natural
-      // shape, so the union and SHM budget are unaffected.
+      // rationale in docs/design_docs/monomoe_kernel.md §5.  Total 32 KB,
+      // unchanged from the natural shape, so the union and SHM budget are
+      // unaffected.
       static constexpr uint32_t BF16_IN_FULL_K_BLOCKS = K_BLOCKS_TOTAL;
       static constexpr uint32_t BF16_IN_FULL_BS = Dims::BS;
       static constexpr uint32_t BF16_IN_FULL_K = CoreDims::K_STEP_WGMMA;
@@ -628,7 +629,7 @@ struct MoE_SHM {
         // `[BS][HIDDEN_STATES]`) so each `boxDim=(128,8)` TMA write gets its
         // own 2 KB slot in the TMA's compact write order, and
         // `routing_phase_quantize` reads `bf16_in_full[kblk][token]` as a
-        // natural row — rationale in DESIGN.md §5.
+        // natural row — rationale in docs/design_docs/monomoe_kernel.md §5.
         //
         // Aligned to 1024 B to inherit the SWZ128 alignment of the
         // unioned weight buffers (the bf16 activation TMA descriptor

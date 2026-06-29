@@ -16,7 +16,8 @@
 #include "moe_tma.h"
 #include "ptx_utils.h"
 
-// Phase 3 up-projection (DESIGN.md §1/§5/§6): `moe_up_projection_BS8_..._tma`
+// Phase 3 up-projection — `moe_up_projection_BS8_..._tma`
+// (docs/design_docs/monomoe_kernel.md §1/§5/§6).  It
 // streams fp8 weight tiles via a single TMA launcher (warp 8 lane 0) into
 // double-buffered SHM (TinyDataWGMMA_TMA layout, see moe_internal.h) and the
 // calc warps consume them via chained `wgmma.mma_async`.  Per-function and

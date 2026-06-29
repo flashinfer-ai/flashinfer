@@ -22,7 +22,7 @@
 // TEMP_FP8_OFFSET regression anchor: the down-activation TMA descriptor
 // addresses `spec->temp_fp8` as `scratchpad_ptr + TEMP_FP8_OFFSET`, so that
 // constant must equal `offsetof(MoEGemmSpec<Dims>, temp_fp8)`.  New fields
-// MUST be appended after temp_fp8 or this fires (DESIGN.md §4).
+// MUST be appended after temp_fp8 or this fires (docs/design_docs/monomoe_kernel.md §4).
 static_assert(
     offsetof(
         monomoe::MoEGemmSpec<monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>,
@@ -37,10 +37,12 @@ static_assert(
 /**
  * @brief Host launcher for `moe_kernel_topk`, parameterized on the compile-time
  * @p Dims shape variant with runtime top_k / scoring_func / renormalize.
- * Checks the co-residency invariant (DESIGN.md §3), zero-inits the scratchpad
- * on first use (DESIGN.md §4), builds the TMA descriptors (DESIGN.md §5), and
- * launches the §1 pipeline.  Each shape variant is materialized by an explicit
- * instantiation below and exported from monomoe_binding.cu.
+ *
+ * Design doc: docs/design_docs/monomoe_kernel.md (section numbers below).
+ * Checks the co-residency invariant (§3), zero-inits the scratchpad on first
+ * use (§4), builds the TMA descriptors (§5), and launches the §1 pipeline.
+ * Each shape variant is materialized by an explicit instantiation below and
+ * exported from monomoe_binding.cu.
  */
 template <class Dims>
 void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
@@ -87,7 +89,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   const uint32_t top_k_u32 = static_cast<uint32_t>(top_k);
   const ScoringFunc sf = static_cast<ScoringFunc>(scoring_func);
 
-  // TMA descriptors (DESIGN.md §5).  Non-TMA variants leave these
+  // TMA descriptors (docs/design_docs/monomoe_kernel.md §5).  Non-TMA variants leave these
   // zero-initialized; the kernel params are always present but only the
   // TMA path consumes them.  Per-tensor caller contracts (pre-interleave
   // up-weights, raw down-weights, swizzle modes) live in the factory doc
@@ -106,7 +108,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
         reinterpret_cast<const void*>(expert_weights_down_ptr), Dims::NUM_EXPERTS,
         Dims::HIDDEN_STATES, Dims::N, /*row_box=*/MoECoreDims<Dims>::DOWN_COL_TILE);
     // Down-activation descriptor reads `spec->temp_fp8` inside the
-    // scratchpad: base + compile-time offset (DESIGN.md §4).
+    // scratchpad: base + compile-time offset (docs/design_docs/monomoe_kernel.md §4).
     const void* temp_fp8_ptr =
         reinterpret_cast<const char*>(scratchpad_ptr) + MoEGemmSpec<Dims>::TEMP_FP8_OFFSET;
     down_activations_desc = create_down_activation_tma_desc(
@@ -116,7 +118,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   const cudaStream_t stream = get_stream(activations_in.device());
   CUDA_CHECK(cudaFuncSetAttribute(moe_kernel_topk<Dims>,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
-  // Co-residency invariant (DESIGN.md §3): the barrier spin only avoids
+  // Co-residency invariant (docs/design_docs/monomoe_kernel.md §3): the barrier spin only avoids
   // deadlock if GRID_SIZE <= SM count.  Single cheap query off the hot path.
   int sm_count = 0;
   cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
@@ -125,7 +127,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
       << "monomoe requires GRID_SIZE (=" << Dims::KernelConfig::GRID_SIZE
       << ") <= SM count (=" << sm_count
       << ") for software grid barrier co-residency invariant.";
-  // First-use scratchpad zero-init (DESIGN.md §4): the barrier counters
+  // First-use scratchpad zero-init (docs/design_docs/monomoe_kernel.md §4): the barrier counters
   // must start at 0; the ping-pong reset is self-maintaining thereafter.
   // Key the guard on buffer identity (ptr, size, device) — a process-wide
   // one-shot flag would leave a second distinct scratchpad with

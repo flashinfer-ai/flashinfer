@@ -15,7 +15,8 @@
 #include "moe_tma.h"
 #include "ptx_utils.h"
 
-// Phase 4 down-projection (DESIGN.md §1/§6): `moe_down_projection_BS8_..._tma`
+// Phase 4 down-projection — `moe_down_projection_BS8_..._tma`
+// (docs/design_docs/monomoe_kernel.md §1/§6)
 // streams fp8 weight/activation tiles via TMA into double-buffered SHM, runs the
 // dual-warpgroup WGMMA K-loop with per-128-K block-FP8 scale-apply, overlaps
 // expert transitions via inter-expert lookahead, then atomicAdds each block's

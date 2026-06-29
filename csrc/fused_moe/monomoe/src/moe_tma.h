@@ -427,7 +427,7 @@ __device__ __forceinline__ void moe_load_full_bf16_input(
     const std::uint32_t k_start = kk * K_STEP_WGMMA;
     // Each issue writes a self-contained 2 KB box (BS × 128 BF16) into
     // tile-major slot `kk` (`&dest[kk][0][0]`), matching the
-    // `boxDim=(128,8)` byte layout exactly (DESIGN.md §5).
+    // `boxDim=(128,8)` byte layout exactly (docs/design_docs/monomoe_kernel.md §5).
     tma_load_bf16_input_tile(activations_desc, /*k_start=*/k_start,
                              /*dest_smem_ptr=*/&dest[kk][0][0],
                              /*bar_smem_ptr=*/bar_smem_ptr);
