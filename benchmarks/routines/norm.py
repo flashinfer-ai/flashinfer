@@ -929,7 +929,7 @@ def testRmsnormQuant(args):
         rmsnorm_output = input_tensor.float() / rms * weight.float()
         # Quantize to output dtype
         reference_output = (
-            (rmsnorm_output * scale)
+            (rmsnorm_output / scale)
             .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
             .to(out_dtype)
         )
@@ -1115,18 +1115,14 @@ def testFusedAddRmsnormQuant(args):
     # Reference: PyTorch implementation of fused add + RMSNorm + quantization
     has_reference_output = False
     if run_refcheck:
-        # Clone residual for reference computation since it gets modified
-        ref_residual = residual_tensor.clone()
-        # Step 1: residual += input
-        ref_residual = ref_residual + input_tensor
+        # Compute the add in fp32 to match the CuTe kernel and unit-test reference.
+        ref_residual = input_tensor.float() + residual_tensor.float()
         # Step 2: RMSNorm on residual
-        rms = torch.sqrt(
-            torch.mean(ref_residual.float() ** 2, dim=-1, keepdim=True) + eps
-        )
-        rmsnorm_output = ref_residual.float() / rms * weight.float()
+        rms = torch.sqrt(torch.mean(ref_residual**2, dim=-1, keepdim=True) + eps)
+        rmsnorm_output = ref_residual / rms * weight.float()
         # Quantize to output dtype
         reference_output = (
-            (rmsnorm_output * scale)
+            (rmsnorm_output / scale)
             .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
             .to(out_dtype)
         )
