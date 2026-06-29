@@ -106,8 +106,10 @@ def test_batch_decode_workspace_size_plans_with_exact_buffers(use_cuda_graph):
     assert wrapper._plan_info is not None
 
 
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-def test_batch_prefill_workspace_size_plans_with_exact_buffers(use_cuda_graph):
+def _run_batch_prefill_workspace_size_plan(
+    use_cuda_graph=False,
+    fixed_split_size=None,
+):
     batch_size = 3
     qo_len = 64
     kv_len = 1024
@@ -142,6 +144,13 @@ def test_batch_prefill_workspace_size_plans_with_exact_buffers(use_cuda_graph):
         _byte_workspace(32 * 1024 * 1024), backend="fa2", **kwargs
     )
 
+    plan_kwargs = {}
+    if fixed_split_size is not None:
+        plan_kwargs = {
+            "fixed_split_size": fixed_split_size,
+            "disable_split_kv": False,
+        }
+
     float_workspace_size, int_workspace_size = wrapper.workspace_size(
         qo_indptr,
         paged_kv_indptr,
@@ -151,8 +160,7 @@ def test_batch_prefill_workspace_size_plans_with_exact_buffers(use_cuda_graph):
         num_kv_heads,
         head_dim,
         page_size,
-        fixed_split_size=fixed_split_size,
-        disable_split_kv=False,
+        **plan_kwargs,
     )
     assert float_workspace_size > 0
     assert int_workspace_size > 0
@@ -170,7 +178,14 @@ def test_batch_prefill_workspace_size_plans_with_exact_buffers(use_cuda_graph):
         num_kv_heads,
         head_dim,
         page_size,
-        fixed_split_size=fixed_split_size,
-        disable_split_kv=False,
+        **plan_kwargs,
     )
     assert wrapper._plan_info is not None
+
+
+def test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers():
+    _run_batch_prefill_workspace_size_plan(fixed_split_size=16)
+
+
+def test_batch_prefill_workspace_size_plans_cuda_graph_with_exact_buffers():
+    _run_batch_prefill_workspace_size_plan(use_cuda_graph=True)
