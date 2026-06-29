@@ -2635,6 +2635,7 @@ def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
     max_q_len: int,
     max_seq_len: int,
     uses_shared_paged_kv_idx: bool,
+    force_keeps: bool,
 ) -> bool:
     return bool(
         get_trtllm_gen_fmha_module().trtllm_fmha_has_spec_dec_tree_kernel(
@@ -2646,6 +2647,7 @@ def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
             max_q_len,
             max_seq_len,
             uses_shared_paged_kv_idx,
+            force_keeps,
             True,
         )
     )
@@ -3190,6 +3192,14 @@ def trtllm_batch_decode_with_kv_cache(
                 query.size(1) // num_kv_heads,
                 q_len_per_req,
             )
+            native_force_spec_dec_tree_keeps = (
+                _should_force_trtllm_gen_spec_dec_tree_keeps(
+                    spec_dec_tree_layout,
+                    seq_lens,
+                    q_len_per_req,
+                    -1,
+                )
+            )
             custom_mask_uses_sliding_window = (
                 window_left >= 0
                 and _has_trtllm_gen_native_spec_dec_tree_window_kernel(
@@ -3201,9 +3211,12 @@ def trtllm_batch_decode_with_kv_cache(
                     max_q_len,
                     max_seq_len,
                     uses_shared_paged_kv_idx,
+                    native_force_spec_dec_tree_keeps,
                 )
             )
-            mask_pack_window_left = -1 if custom_mask_uses_sliding_window else window_left
+            mask_pack_window_left = (
+                -1 if custom_mask_uses_sliding_window else window_left
+            )
             force_spec_dec_tree_keeps = _should_force_trtllm_gen_spec_dec_tree_keeps(
                 spec_dec_tree_layout,
                 seq_lens,

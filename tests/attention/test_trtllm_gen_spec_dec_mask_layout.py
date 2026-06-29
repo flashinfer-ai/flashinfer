@@ -3,10 +3,40 @@ import pytest
 
 import flashinfer.decode
 from flashinfer.decode import (
+    _has_trtllm_gen_native_spec_dec_tree_window_kernel,
     _pack_trtllm_gen_spec_dec_mask,
     _select_trtllm_gen_spec_dec_tree_kernel,
     _should_force_trtllm_gen_spec_dec_tree_keeps,
 )
+
+
+def test_native_window_probe_checks_forced_keeps_variant(monkeypatch):
+    calls = []
+
+    class FakeModule:
+        def trtllm_fmha_has_spec_dec_tree_kernel(self, *args):
+            calls.append(args)
+            return True
+
+    monkeypatch.setattr(
+        flashinfer.decode, "get_trtllm_gen_fmha_module", lambda: FakeModule()
+    )
+    query = torch.empty(2, 4, 64)
+    cache = torch.empty(1, 1, 16, 64)
+    out = torch.empty_like(query)
+
+    assert _has_trtllm_gen_native_spec_dec_tree_window_kernel(
+        query,
+        cache,
+        cache,
+        out,
+        batch_size=1,
+        max_q_len=2,
+        max_seq_len=16,
+        uses_shared_paged_kv_idx=True,
+        force_keeps=True,
+    )
+    assert calls[0][-2:] == (True, True)
 
 
 def test_untrimmed_swa_spec_dec_tree_capability_flag():

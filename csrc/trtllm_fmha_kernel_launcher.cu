@@ -242,8 +242,8 @@ void trtllm_paged_attention_launcher(
           << "custom_mask_offsets and first_sparse_mask_offsets_kv must be provided with "
              "packed_custom_mask";
       runner_params.mMaskType = custom_mask_uses_sliding_window
-                                     ? TrtllmGenAttentionMaskType::SlidingWindowCustom
-                                     : TrtllmGenAttentionMaskType::Custom;
+                                    ? TrtllmGenAttentionMaskType::SlidingWindowCustom
+                                    : TrtllmGenAttentionMaskType::Custom;
       runner_params.customMaskPtr = packed_custom_mask;
       runner_params.customMaskOffsetsPtr = custom_mask_offsets;
       runner_params.firstSparseMaskOffsetsKvPtr = first_sparse_mask_offsets_kv;
@@ -345,8 +345,8 @@ void trtllm_paged_attention_decode(
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
     int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode,
     Optional<TensorView> packed_custom_mask, Optional<TensorView> custom_mask_offsets,
-    Optional<TensorView> first_sparse_mask_offsets_kv,
-    bool force_spec_dec_tree_keeps, bool custom_mask_uses_sliding_window) {
+    Optional<TensorView> first_sparse_mask_offsets_kv, bool force_spec_dec_tree_keeps,
+    bool custom_mask_uses_sliding_window) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -494,15 +494,15 @@ void trtllm_paged_attention_decode(
       sm_count, enable_pdl, workspace_size, k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads,
       v_sf_stride_batch, /*is_causal=*/true, lse_stride_tokens, lse_stride_heads,
       bf16q_fp8kv_transform_mode, packed_custom_mask_ptr, custom_mask_offsets_ptr,
-      first_sparse_mask_offsets_kv_ptr,
-      force_spec_dec_tree_keeps, custom_mask_uses_sliding_window, stream);
+      first_sparse_mask_offsets_kv_ptr, force_spec_dec_tree_keeps, custom_mask_uses_sliding_window,
+      stream);
 }
 
 bool trtllm_fmha_has_spec_dec_tree_kernel(TensorView query, TensorView key_cache,
                                           TensorView value_cache, TensorView out,
-                                          int64_t batch_size, int64_t max_q_len,
-                                          int64_t max_kv_len,
+                                          int64_t batch_size, int64_t max_q_len, int64_t max_kv_len,
                                           Optional<bool> uses_shared_paged_kv_idx,
+                                          bool force_spec_dec_tree_keeps,
                                           bool custom_mask_uses_sliding_window) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto k_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
@@ -572,6 +572,7 @@ bool trtllm_fmha_has_spec_dec_tree_kernel(TensorView query, TensorView key_cache
   runner_params.mHasSlidingWindowKvPool = false;
   runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx.value_or(true);
   runner_params.mSkipsSoftmaxWhenPossible = false;
+  runner_params.mForceSpecDecTreeKeeps = force_spec_dec_tree_keeps;
   runner_params.mSkipSoftmaxThresholdScaleFactor = 0.0f;
   runner_params.mScaleSfKv = 1.0f;
   runner_params.mScaleSfO = -1.0f;
