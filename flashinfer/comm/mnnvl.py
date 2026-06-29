@@ -708,10 +708,11 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        if (
+        is_fabric = (
             allocation_prop.requestedHandleTypes
             == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        ):
+        )
+        if is_fabric:
             all_handles_data = comm.allgather(exported_fabric_handle.data)
         else:
             # SCM_RIGHTS fd passing uses AF_UNIX sockets, which are host-local.
@@ -764,8 +765,15 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 checkCudaErrors(
                     cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0)
                 )
+                # Close received fd after import (POSIX import doesn't take ownership).
+                if not is_fabric:
+                    os.close(remote_handle_data)
 
             checkCudaErrors(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
+
+        # Local export fd is no longer needed (peers hold their own dups); close it.
+        if not is_fabric:
+            os.close(exported_fabric_handle)
 
         ptr = MnnvlMemory.current_start_address + MnnvlMemory.current_mem_offset
         stride = MnnvlMemory.current_rank_stride
