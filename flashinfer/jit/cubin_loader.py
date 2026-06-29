@@ -21,6 +21,7 @@ import pathlib
 import random
 from urllib.parse import urljoin
 import shutil
+import threading
 import time
 from typing import Union
 import uuid
@@ -45,6 +46,19 @@ def safe_urljoin(base, path):
     return urljoin(base, path)
 
 
+_thread_local = threading.local()
+
+
+def _get_thread_session():
+    import requests  # type: ignore[import-untyped]
+
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _thread_local.session = session
+    return session
+
+
 def download_file(
     source: str,
     destination: str,
@@ -66,6 +80,7 @@ def download_file(
     - delay (int): Initial delay in seconds for exponential backoff (default: 5).
     - timeout (int): Timeout for the HTTP request in seconds (default: 10).
     - lock_timeout (int): Timeout in seconds for the file lock (default: 30).
+    - session: When None, a per-thread session is used
 
     Returns:
     - bool: True if download or copy is successful, False otherwise.
@@ -74,7 +89,7 @@ def download_file(
     import requests  # type: ignore[import-untyped]
 
     if session is None:
-        session = requests.Session()
+        session = _get_thread_session()
 
     lock_path = f"{destination}.lock"  # Lock file path
     lock = filelock.FileLock(lock_path, timeout=lock_timeout)
