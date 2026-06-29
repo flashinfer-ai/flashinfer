@@ -124,6 +124,7 @@ def gdn_decode_bytes(
     seq_len: int = 1,
     disable_state_update: bool = False,
     state_dtype_bytes: int = 4,  # 4 for FP32, 2 for BF16
+    cache_intermediate_states: bool = False,
 ) -> int:
     """
     Calculate memory bytes for GDN.
@@ -175,10 +176,10 @@ def gdn_decode_bytes(
     # b: [B, T, HV] - dtype
     b_bytes = batch_size * seq_len * num_sab_heads * elem_size
 
-    # Intermediate states: [B, T, HV, K, V] - only for MTP (seq_len > 1)
-    # Write all T steps of intermediate states
+    # Intermediate states: [B, T, HV, K, V] - only written when MTP
+    # intermediate-state caching is enabled
     intermediate_bytes = 0
-    if seq_len > 1:
+    if cache_intermediate_states and seq_len > 1:
         intermediate_bytes = (
             batch_size
             * seq_len
@@ -206,837 +207,16 @@ def gdn_decode_bytes(
 # ============================================================================
 # Triton Kernels for comparison benchmarks
 # ============================================================================
-
-try:
-    import triton
-    import triton.language as tl
-
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-
-if TRITON_AVAILABLE:
-
-    @triton.jit
-    def fused_sigmoid_gating_delta_rule_kernel(
-        # Pointers to matrices
-        Q,
-        K,
-        V,
-        O,
-        H,  # Hidden state [B, HV, K, V]
-        A_LOG,  # Log decay [HV]
-        A,  # Input-dependent decay [B, HV]
-        DT_BIAS,  # Decay bias [HV]
-        B_GATE,  # Update gate [B, HV]
-        # Strides
-        stride_qb,
-        stride_qh,
-        stride_qk,
-        stride_kb,
-        stride_kh,
-        stride_kk,
-        stride_vb,
-        stride_vh,
-        stride_vv,
-        stride_ob,
-        stride_oh,
-        stride_ov,
-        stride_hb,
-        stride_hh,
-        stride_hk,
-        stride_hv,
-        # Parameters
-        softplus_beta: tl.constexpr,
-        softplus_threshold: tl.constexpr,
-        scale: tl.constexpr,
-        use_qk_l2norm: tl.constexpr,
-        B: tl.constexpr,
-        HV: tl.constexpr,
-        H_Q: tl.constexpr,
-        H_K: tl.constexpr,
-        K_DIM: tl.constexpr,
-        V_DIM: tl.constexpr,
-        BK: tl.constexpr,
-        BV: tl.constexpr,
-    ):
-        """
-        Triton kernel for fused sigmoid gating delta rule update.
-
-        Follows SGLang's implementation:
-        1. g = -exp(A_log) * softplus(a + dt_bias)
-        2. beta = sigmoid(b)
-        3. h *= exp(g)
-        4. v_new = v - k @ h
-        5. v_new *= beta
-        6. h += outer(k, v_new)
-        7. o = q @ h
-        """
-        # Block indices
-        i_bh = tl.program_id(0)
-        i_k = tl.program_id(1)
-        i_v = tl.program_id(2)
-
-        i_b = i_bh // HV
-        i_hv = i_bh % HV
-
-        # GVA head mapping (num_v_heads > num_q_heads)
-        h_ratio_q = HV // H_Q
-        h_ratio_k = HV // H_K
-        i_hq = i_hv // h_ratio_q
-        i_hk = i_hv // h_ratio_k
-
-        # Load A_log and dt_bias for this head
-        b_A_log = tl.load(A_LOG + i_hv).to(tl.float32)
-        b_dt_bias = tl.load(DT_BIAS + i_hv).to(tl.float32)
-
-        # Load a (input-dependent decay) for this batch and head
-        b_a = tl.load(A + i_b * HV + i_hv).to(tl.float32)
-
-        # Load b (update gate) for this batch and head
-        b_b = tl.load(B_GATE + i_b * HV + i_hv).to(tl.float32)
-
-        # Compute softplus: softplus(x) = (1/beta) * log(1 + exp(beta*x))
-        x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-
-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
-        b_g = -tl.exp(b_A_log) * softplus_x
-
-        # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-
-        # Block offsets
-        o_k = i_k * BK + tl.arange(0, BK)
-        o_v = i_v * BV + tl.arange(0, BV)
-
-        # Load q, k, v
-        p_q = Q + i_b * stride_qb + i_hq * stride_qh + o_k * stride_qk
-        p_k = K + i_b * stride_kb + i_hk * stride_kh + o_k * stride_kk
-        p_v = V + i_b * stride_vb + i_hv * stride_vh + o_v * stride_vv
-
-        b_q = tl.load(p_q, mask=o_k < K_DIM, other=0.0).to(tl.float32)
-        b_k = tl.load(p_k, mask=o_k < K_DIM, other=0.0).to(tl.float32)
-        b_v = tl.load(p_v, mask=o_v < V_DIM, other=0.0).to(tl.float32)
-
-        # Apply L2 normalization (if enabled)
-        if use_qk_l2norm:
-            # Compute L2 norm across K dimension (need reduction across blocks)
-            # For simplicity, assume single K block
-            q_norm = tl.sqrt(tl.sum(b_q * b_q) + 1e-8)
-            k_norm = tl.sqrt(tl.sum(b_k * b_k) + 1e-8)
-            b_q = b_q / q_norm
-            b_k = b_k / k_norm
-
-        # Apply scale to q
-        b_q = b_q * scale
-
-        # Load hidden state h[K, V] from state[B, HV, K, V]
-        p_h = (
-            H
-            + i_b * stride_hb
-            + i_hv * stride_hh
-            + o_k[:, None] * stride_hk
-            + o_v[None, :] * stride_hv
-        )
-        b_h = tl.load(
-            p_h, mask=(o_k[:, None] < K_DIM) & (o_v[None, :] < V_DIM), other=0.0
-        ).to(tl.float32)
-
-        # Step 1: Apply decay to hidden state: h *= exp(g)
-        b_h = b_h * tl.exp(b_g)
-
-        # Step 2: Delta rule: v -= sum(h * k, dim=0) = k @ h
-        # b_h is [BK, BV], b_k is [BK]
-        # We need to compute k @ h = sum(k[:, None] * h, dim=0)
-        b_v = b_v - tl.sum(b_h * b_k[:, None], 0)
-
-        # Step 3: Apply beta gating: v *= beta
-        b_v = b_v * b_beta
-
-        # Step 4: Update hidden state: h += outer(k, v) = k[:, None] * v[None, :]
-        b_h = b_h + b_k[:, None] * b_v[None, :]
-
-        # Step 5: Compute output: o = q @ h = sum(q[:, None] * h, dim=0)
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-
-        # Store output
-        p_o = O + i_b * stride_ob + i_hv * stride_oh + o_v * stride_ov
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=o_v < V_DIM)
-
-        # Store updated hidden state
-        tl.store(
-            p_h,
-            b_h.to(p_h.dtype.element_ty),
-            mask=(o_k[:, None] < K_DIM) & (o_v[None, :] < V_DIM),
-        )
-
-    @triton.jit
-    def fused_sigmoid_gating_delta_rule_mtp_kernel(
-        # Pointers to matrices
-        Q,  # [B, T, H_Q, K]
-        K,  # [B, T, H_K, K]
-        V,  # [B, T, HV, V]
-        O,  # [B, T, HV, V]
-        H,  # Hidden state [pool_size, HV, V, K] (K-last layout)
-        INTERMEDIATE,  # Intermediate states [pool_size, T, HV, V, K]
-        H0_INDICES,  # [B]
-        A_LOG,  # Log decay [HV]
-        A,  # Input-dependent decay [B, T, HV]
-        DT_BIAS,  # Decay bias [HV]
-        B_GATE,  # Update gate [B, T, HV]
-        # Strides for Q, K, V, O [B, T, H, dim]
-        stride_qb,
-        stride_qt,
-        stride_qh,
-        stride_qk,
-        stride_kb,
-        stride_kt,
-        stride_kh,
-        stride_kk,
-        stride_vb,
-        stride_vt,
-        stride_vh,
-        stride_vv,
-        stride_ob,
-        stride_ot,
-        stride_oh,
-        stride_ov,
-        # Strides for hidden state [pool_size, HV, V, K]
-        stride_hp,
-        stride_hh,
-        stride_hv,
-        stride_hk,
-        # Strides for intermediate states [pool_size, T, HV, V, K]
-        stride_ip,
-        stride_it,
-        stride_ih,
-        stride_iv,
-        stride_ik,
-        # Strides for A [B, T, HV]
-        stride_ab,
-        stride_at,
-        stride_ah,
-        # Parameters
-        softplus_beta: tl.constexpr,
-        softplus_threshold: tl.constexpr,
-        scale: tl.constexpr,
-        use_qk_l2norm: tl.constexpr,
-        disable_state_update: tl.constexpr,
-        cache_intermediate_states: tl.constexpr,
-        B: tl.constexpr,
-        T: tl.constexpr,
-        HV: tl.constexpr,
-        H_Q: tl.constexpr,
-        H_K: tl.constexpr,
-        K_DIM: tl.constexpr,
-        V_DIM: tl.constexpr,
-        BK: tl.constexpr,
-        BV: tl.constexpr,
-    ):
-        """
-        Triton kernel for MTP (Multiple Token Processing) delta rule update.
-        Processes T tokens sequentially, updating state after each token.
-
-        Note: The delta rule operations are fundamentally GEMV (matrix-vector) and
-        rank-1 updates, which don't directly benefit from tensor cores. Tensor cores
-        are optimized for GEMM (matrix-matrix). To use tensor cores, we would need
-        to batch across multiple tokens/heads to form proper GEMM operations.
-        """
-        # Block indices
-        i_bh = tl.program_id(0)
-        i_k = tl.program_id(1)
-        i_v = tl.program_id(2)
-
-        i_b = i_bh // HV
-        i_hv = i_bh % HV
-
-        # GVA head mapping
-        h_ratio_q = HV // H_Q
-        h_ratio_k = HV // H_K
-        i_hq = i_hv // h_ratio_q
-        i_hk = i_hv // h_ratio_k
-
-        # Load initial state index for this batch
-        i_pool = tl.load(H0_INDICES + i_b)
-
-        # Load A_log and dt_bias for this head
-        b_A_log = tl.load(A_LOG + i_hv).to(tl.float32)
-        b_dt_bias = tl.load(DT_BIAS + i_hv).to(tl.float32)
-
-        # Block offsets
-        o_k = i_k * BK + tl.arange(0, BK)
-        o_v = i_v * BV + tl.arange(0, BV)
-
-        # Load initial hidden state h[V, K] from state[pool, HV, V, K]
-        p_h = (
-            H
-            + i_pool * stride_hp
-            + i_hv * stride_hh
-            + o_v[:, None] * stride_hv
-            + o_k[None, :] * stride_hk
-        )
-        b_h = tl.load(
-            p_h, mask=(o_v[:, None] < V_DIM) & (o_k[None, :] < K_DIM), other=0.0
-        ).to(tl.float32)  # [BV, BK]
-
-        # Process each token
-        for t in range(T):
-            # Load a for this batch, time, head
-            b_a = tl.load(A + i_b * stride_ab + t * stride_at + i_hv * stride_ah).to(
-                tl.float32
-            )
-            b_b = tl.load(
-                B_GATE + i_b * stride_ab + t * stride_at + i_hv * stride_ah
-            ).to(tl.float32)
-
-            # Compute softplus and decay
-            x = b_a + b_dt_bias
-            beta_x = softplus_beta * x
-            softplus_x = tl.where(
-                beta_x <= softplus_threshold,
-                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-                x,
-            )
-            b_g = -tl.exp(b_A_log) * softplus_x
-            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-
-            # Load q, k, v for this timestep
-            p_q = (
-                Q + i_b * stride_qb + t * stride_qt + i_hq * stride_qh + o_k * stride_qk
-            )
-            p_k = (
-                K + i_b * stride_kb + t * stride_kt + i_hk * stride_kh + o_k * stride_kk
-            )
-            p_v = (
-                V + i_b * stride_vb + t * stride_vt + i_hv * stride_vh + o_v * stride_vv
-            )
-
-            b_q = tl.load(p_q, mask=o_k < K_DIM, other=0.0).to(tl.float32)
-            b_k = tl.load(p_k, mask=o_k < K_DIM, other=0.0).to(tl.float32)
-            b_v = tl.load(p_v, mask=o_v < V_DIM, other=0.0).to(tl.float32)
-
-            # Apply L2 normalization
-            if use_qk_l2norm:
-                q_norm = tl.sqrt(tl.sum(b_q * b_q) + 1e-8)
-                k_norm = tl.sqrt(tl.sum(b_k * b_k) + 1e-8)
-                b_q = b_q / q_norm
-                b_k = b_k / k_norm
-
-            b_q = b_q * scale
-
-            # Step 1: Apply decay: h *= exp(g)
-            b_h = b_h * tl.exp(b_g)
-
-            # Step 2: Delta rule: v -= h @ k (h is [BV, BK], k is [BK])
-            # This is GEMV, which doesn't directly use tensor cores efficiently
-            # h @ k = sum(h * k[None, :], axis=1) -> [BV]
-            b_v = b_v - tl.sum(b_h * b_k[None, :], 1)
-
-            # Step 3: Apply beta gating
-            b_v = b_v * b_beta
-
-            # Step 4: Update state: h += outer(v, k) = v[:, None] * k[None, :]
-            # This is a rank-1 update
-            b_h = b_h + b_v[:, None] * b_k[None, :]
-
-            # Step 5: Compute output: o = h @ q = sum(h * q[None, :], axis=1) -> [BV]
-            # This is also GEMV
-            b_o = tl.sum(b_h * b_q[None, :], 1)
-
-            # Store output for this timestep
-            p_o = (
-                O + i_b * stride_ob + t * stride_ot + i_hv * stride_oh + o_v * stride_ov
-            )
-            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=o_v < V_DIM)
-
-            # Cache intermediate state if needed
-            if cache_intermediate_states:
-                p_inter = (
-                    INTERMEDIATE
-                    + i_pool * stride_ip
-                    + t * stride_it
-                    + i_hv * stride_ih
-                    + o_v[:, None] * stride_iv
-                    + o_k[None, :] * stride_ik
-                )
-                tl.store(
-                    p_inter,
-                    b_h.to(p_inter.dtype.element_ty),
-                    mask=(o_v[:, None] < V_DIM) & (o_k[None, :] < K_DIM),
-                )
-
-        # Store final state if state update is enabled
-        if not disable_state_update:
-            tl.store(
-                p_h,
-                b_h.to(p_h.dtype.element_ty),
-                mask=(o_v[:, None] < V_DIM) & (o_k[None, :] < K_DIM),
-            )
-
-    def triton_gdn_decode(
-        q: torch.Tensor,  # [B, 1, H_Q, K]
-        k: torch.Tensor,  # [B, 1, H_K, K]
-        v: torch.Tensor,  # [B, 1, HV, V]
-        state: torch.Tensor,  # [B, HV, K, V]
-        A_log: torch.Tensor,  # [HV]
-        a: torch.Tensor,  # [B, 1, HV]
-        dt_bias: torch.Tensor,  # [HV]
-        b: torch.Tensor,  # [B, 1, HV]
-        scale: float,
-        output: torch.Tensor,  # [B, 1, HV, V]
-        use_qk_l2norm: bool = True,
-        softplus_beta: float = 1.0,
-        softplus_threshold: float = 20.0,
-    ):
-        """
-        Triton-based GDN decode matching SGLang's implementation.
-        """
-        B, T, H_Q, K_DIM = q.shape
-        _, _, H_K, _ = k.shape
-        _, _, HV, V_DIM = v.shape
-
-        assert T == 1, "Triton kernel only supports decode (T=1)"
-
-        # Reshape inputs for kernel
-        q_flat = q.squeeze(1)  # [B, H_Q, K]
-        k_flat = k.squeeze(1)  # [B, H_K, K]
-        v_flat = v.squeeze(1)  # [B, HV, V]
-        a_flat = a.squeeze(1)  # [B, HV]
-        b_flat = b.squeeze(1)  # [B, HV]
-        o_flat = output.squeeze(1)  # [B, HV, V]
-
-        # Block sizes
-        BK = triton.next_power_of_2(K_DIM)
-        BV = triton.next_power_of_2(V_DIM)
-
-        # Limit block sizes (BV smaller to allow more V blocks)
-        BV = min(BV, 32)
-
-        # Number of blocks
-        NK = triton.cdiv(K_DIM, BK)
-        NV = triton.cdiv(V_DIM, BV)
-
-        assert NK == 1, f"Multi-block K not supported: NK={NK}"
-
-        # Launch kernel
-        grid = (B * HV, NK, NV)
-
-        fused_sigmoid_gating_delta_rule_kernel[grid](
-            q_flat,
-            k_flat,
-            v_flat,
-            o_flat,
-            state,
-            A_log,
-            a_flat,
-            dt_bias,
-            b_flat,
-            # Strides for q [B, H_Q, K]
-            q_flat.stride(0),
-            q_flat.stride(1),
-            q_flat.stride(2),
-            # Strides for k [B, H_K, K]
-            k_flat.stride(0),
-            k_flat.stride(1),
-            k_flat.stride(2),
-            # Strides for v [B, HV, V]
-            v_flat.stride(0),
-            v_flat.stride(1),
-            v_flat.stride(2),
-            # Strides for o [B, HV, V]
-            o_flat.stride(0),
-            o_flat.stride(1),
-            o_flat.stride(2),
-            # Strides for h [B, HV, K, V]
-            state.stride(0),
-            state.stride(1),
-            state.stride(2),
-            state.stride(3),
-            # Parameters
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            scale=scale,
-            use_qk_l2norm=use_qk_l2norm,
-            B=B,
-            HV=HV,
-            H_Q=H_Q,
-            H_K=H_K,
-            K_DIM=K_DIM,
-            V_DIM=V_DIM,
-            BK=BK,
-            BV=BV,
-        )
-
-        return output, state
-
-    @triton.jit
-    def fused_sigmoid_gating_delta_rule_kernel_pretranspose(
-        # Pointers to matrices
-        Q,
-        K,
-        V,
-        O,
-        H,  # Hidden state [B, HV, V, K] - V-major (pretranspose) layout
-        A_LOG,  # Log decay [HV]
-        A,  # Input-dependent decay [B, HV]
-        DT_BIAS,  # Decay bias [HV]
-        B_GATE,  # Update gate [B, HV]
-        # Strides
-        stride_qb,
-        stride_qh,
-        stride_qk,
-        stride_kb,
-        stride_kh,
-        stride_kk,
-        stride_vb,
-        stride_vh,
-        stride_vv,
-        stride_ob,
-        stride_oh,
-        stride_ov,
-        stride_hb,
-        stride_hh,
-        stride_hv,  # V dimension stride
-        stride_hk,  # K dimension stride
-        # Parameters
-        softplus_beta: tl.constexpr,
-        softplus_threshold: tl.constexpr,
-        scale: tl.constexpr,
-        use_qk_l2norm: tl.constexpr,
-        B: tl.constexpr,
-        HV: tl.constexpr,
-        H_Q: tl.constexpr,
-        H_K: tl.constexpr,
-        K_DIM: tl.constexpr,
-        V_DIM: tl.constexpr,
-        BK: tl.constexpr,
-        BV: tl.constexpr,
-    ):
-        """
-        Triton kernel for pretranspose layout [B, HV, V, K].
-
-        Key difference from nontranspose:
-        - State layout: [B, HV, V, K] instead of [B, HV, K, V]
-        - h is [BV, BK] instead of [BK, BV]
-        - h @ k = sum(h * k[None, :], axis=1) -> [BV]
-        - h += outer(v, k) = v[:, None] * k[None, :]
-        - o = h @ q = sum(h * q[None, :], axis=1) -> [BV]
-        """
-        # Block indices
-        i_bh = tl.program_id(0)
-        i_k = tl.program_id(1)
-        i_v = tl.program_id(2)
-
-        i_b = i_bh // HV
-        i_hv = i_bh % HV
-
-        # GVA head mapping (num_v_heads > num_q_heads)
-        h_ratio_q = HV // H_Q
-        h_ratio_k = HV // H_K
-        i_hq = i_hv // h_ratio_q
-        i_hk = i_hv // h_ratio_k
-
-        # Load A_log and dt_bias for this head
-        b_A_log = tl.load(A_LOG + i_hv).to(tl.float32)
-        b_dt_bias = tl.load(DT_BIAS + i_hv).to(tl.float32)
-
-        # Load a (input-dependent decay) for this batch and head
-        b_a = tl.load(A + i_b * HV + i_hv).to(tl.float32)
-
-        # Load b (update gate) for this batch and head
-        b_b = tl.load(B_GATE + i_b * HV + i_hv).to(tl.float32)
-
-        # Compute softplus: softplus(x) = (1/beta) * log(1 + exp(beta*x))
-        x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-
-        # Compute g = -exp(A_log) * softplus(a + dt_bias)
-        b_g = -tl.exp(b_A_log) * softplus_x
-
-        # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-
-        # Block offsets
-        o_k = i_k * BK + tl.arange(0, BK)
-        o_v = i_v * BV + tl.arange(0, BV)
-
-        # Load q, k, v
-        p_q = Q + i_b * stride_qb + i_hq * stride_qh + o_k * stride_qk
-        p_k = K + i_b * stride_kb + i_hk * stride_kh + o_k * stride_kk
-        p_v = V + i_b * stride_vb + i_hv * stride_vh + o_v * stride_vv
-
-        b_q = tl.load(p_q, mask=o_k < K_DIM, other=0.0).to(tl.float32)
-        b_k = tl.load(p_k, mask=o_k < K_DIM, other=0.0).to(tl.float32)
-        b_v = tl.load(p_v, mask=o_v < V_DIM, other=0.0).to(tl.float32)
-
-        # Apply L2 normalization (if enabled)
-        if use_qk_l2norm:
-            q_norm = tl.sqrt(tl.sum(b_q * b_q) + 1e-8)
-            k_norm = tl.sqrt(tl.sum(b_k * b_k) + 1e-8)
-            b_q = b_q / q_norm
-            b_k = b_k / k_norm
-
-        # Apply scale to q
-        b_q = b_q * scale
-
-        # Load hidden state h[V, K] from state[B, HV, V, K] - pretranspose layout
-        p_h = (
-            H
-            + i_b * stride_hb
-            + i_hv * stride_hh
-            + o_v[:, None] * stride_hv
-            + o_k[None, :] * stride_hk
-        )
-        b_h = tl.load(
-            p_h, mask=(o_v[:, None] < V_DIM) & (o_k[None, :] < K_DIM), other=0.0
-        ).to(tl.float32)  # [BV, BK]
-
-        # Step 1: Apply decay to hidden state: h *= exp(g)
-        b_h = b_h * tl.exp(b_g)
-
-        # Step 2: Delta rule: v -= h @ k = sum(h * k[None, :], axis=1)
-        # b_h is [BV, BK], b_k is [BK]
-        b_v = b_v - tl.sum(b_h * b_k[None, :], 1)
-
-        # Step 3: Apply beta gating: v *= beta
-        b_v = b_v * b_beta
-
-        # Step 4: Update hidden state: h += outer(v, k) = v[:, None] * k[None, :]
-        b_h = b_h + b_v[:, None] * b_k[None, :]
-
-        # Step 5: Compute output: o = h @ q = sum(h * q[None, :], axis=1)
-        b_o = tl.sum(b_h * b_q[None, :], 1)
-
-        # Store output
-        p_o = O + i_b * stride_ob + i_hv * stride_oh + o_v * stride_ov
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=o_v < V_DIM)
-
-        # Store updated hidden state
-        tl.store(
-            p_h,
-            b_h.to(p_h.dtype.element_ty),
-            mask=(o_v[:, None] < V_DIM) & (o_k[None, :] < K_DIM),
-        )
-
-    def triton_gdn_decode_pretranspose(
-        q: torch.Tensor,  # [B, 1, H_Q, K]
-        k: torch.Tensor,  # [B, 1, H_K, K]
-        v: torch.Tensor,  # [B, 1, HV, V]
-        state: torch.Tensor,  # [B, HV, V, K] - pretranspose layout
-        A_log: torch.Tensor,  # [HV]
-        a: torch.Tensor,  # [B, 1, HV]
-        dt_bias: torch.Tensor,  # [HV]
-        b: torch.Tensor,  # [B, 1, HV]
-        scale: float,
-        output: torch.Tensor,  # [B, 1, HV, V]
-        use_qk_l2norm: bool = True,
-        softplus_beta: float = 1.0,
-        softplus_threshold: float = 20.0,
-    ):
-        """
-        Triton-based GDN decode for pretranspose layout [B, HV, V, K].
-        """
-        B, T, H_Q, K_DIM = q.shape
-        _, _, H_K, _ = k.shape
-        _, _, HV, V_DIM = v.shape
-
-        assert T == 1, "Triton kernel only supports decode (T=1)"
-
-        # Reshape inputs for kernel
-        q_flat = q.squeeze(1)  # [B, H_Q, K]
-        k_flat = k.squeeze(1)  # [B, H_K, K]
-        v_flat = v.squeeze(1)  # [B, HV, V]
-        a_flat = a.squeeze(1)  # [B, HV]
-        b_flat = b.squeeze(1)  # [B, HV]
-        o_flat = output.squeeze(1)  # [B, HV, V]
-
-        # Block sizes
-        BK = triton.next_power_of_2(K_DIM)
-        BV = triton.next_power_of_2(V_DIM)
-
-        # Limit block sizes (BV smaller to allow more V blocks)
-        BV = min(BV, 32)
-
-        # Number of blocks
-        NK = triton.cdiv(K_DIM, BK)
-        NV = triton.cdiv(V_DIM, BV)
-
-        assert NK == 1, f"Multi-block K not supported: NK={NK}"
-
-        # Launch kernel
-        grid = (B * HV, NK, NV)
-
-        fused_sigmoid_gating_delta_rule_kernel_pretranspose[grid](
-            q_flat,
-            k_flat,
-            v_flat,
-            o_flat,
-            state,
-            A_log,
-            a_flat,
-            dt_bias,
-            b_flat,
-            # Strides for q [B, H_Q, K]
-            q_flat.stride(0),
-            q_flat.stride(1),
-            q_flat.stride(2),
-            # Strides for k [B, H_K, K]
-            k_flat.stride(0),
-            k_flat.stride(1),
-            k_flat.stride(2),
-            # Strides for v [B, HV, V]
-            v_flat.stride(0),
-            v_flat.stride(1),
-            v_flat.stride(2),
-            # Strides for o [B, HV, V]
-            o_flat.stride(0),
-            o_flat.stride(1),
-            o_flat.stride(2),
-            # Strides for h [B, HV, V, K] - pretranspose layout
-            state.stride(0),
-            state.stride(1),
-            state.stride(2),
-            state.stride(3),
-            # Parameters
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            scale=scale,
-            use_qk_l2norm=use_qk_l2norm,
-            B=B,
-            HV=HV,
-            H_Q=H_Q,
-            H_K=H_K,
-            K_DIM=K_DIM,
-            V_DIM=V_DIM,
-            BK=BK,
-            BV=BV,
-        )
-
-        return output, state
-
-    def triton_gdn_mtp(
-        q: torch.Tensor,  # [B, T, H_Q, K]
-        k: torch.Tensor,  # [B, T, H_K, K]
-        v: torch.Tensor,  # [B, T, HV, V]
-        initial_state: torch.Tensor,  # [pool_size, HV, V, K]
-        initial_state_indices: torch.Tensor,  # [B]
-        A_log: torch.Tensor,  # [HV]
-        a: torch.Tensor,  # [B, T, HV]
-        dt_bias: torch.Tensor,  # [HV]
-        b: torch.Tensor,  # [B, T, HV]
-        scale: float,
-        output: torch.Tensor,  # [B, T, HV, V]
-        intermediate_states_buffer: torch.Tensor = None,  # [pool_size, T, HV, V, K]
-        disable_state_update: bool = True,
-        use_qk_l2norm: bool = True,
-        softplus_beta: float = 1.0,
-        softplus_threshold: float = 20.0,
-    ):
-        """
-        Triton-based GDN MTP matching SGLang's implementation.
-        """
-        B, T, H_Q, K_DIM = q.shape
-        _, _, H_K, _ = k.shape
-        _, _, HV, V_DIM = v.shape
-
-        # Block sizes (BV smaller to allow more V blocks)
-        BK = triton.next_power_of_2(K_DIM)
-        BV = triton.next_power_of_2(V_DIM)
-        BV = min(BV, 32)
-
-        NK = triton.cdiv(K_DIM, BK)
-        NV = triton.cdiv(V_DIM, BV)
-
-        assert NK == 1, f"Multi-block K not supported: NK={NK}"
-
-        cache_intermediate_states = intermediate_states_buffer is not None
-        if cache_intermediate_states:
-            intermediate = intermediate_states_buffer
-        else:
-            intermediate = torch.zeros(
-                1, 1, 1, 1, 1, dtype=torch.float32, device=q.device
-            )
-
-        # Launch kernel
-        grid = (B * HV, NK, NV)
-
-        fused_sigmoid_gating_delta_rule_mtp_kernel[grid](
-            q,
-            k,
-            v,
-            output,
-            initial_state,
-            intermediate,
-            initial_state_indices,
-            A_log,
-            a,
-            dt_bias,
-            b,
-            # Q strides
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            # K strides
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            # V strides
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
-            # O strides
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            output.stride(3),
-            # H strides [pool_size, HV, V, K]
-            initial_state.stride(0),
-            initial_state.stride(1),
-            initial_state.stride(2),
-            initial_state.stride(3),
-            # Intermediate strides [pool_size, T, HV, V, K]
-            intermediate.stride(0),
-            intermediate.stride(1),
-            intermediate.stride(2) if cache_intermediate_states else 0,
-            intermediate.stride(3) if cache_intermediate_states else 0,
-            intermediate.stride(4) if cache_intermediate_states else 0,
-            # A strides [B, T, HV]
-            a.stride(0),
-            a.stride(1),
-            a.stride(2),
-            # Parameters
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            scale=scale,
-            use_qk_l2norm=use_qk_l2norm,
-            disable_state_update=disable_state_update,
-            cache_intermediate_states=cache_intermediate_states,
-            B=B,
-            T=T,
-            HV=HV,
-            H_Q=H_Q,
-            H_K=H_K,
-            K_DIM=K_DIM,
-            V_DIM=V_DIM,
-            BK=BK,
-            BV=BV,
-        )
-
-        return output, initial_state
+# The Triton GDN kernels live in benchmarks/gdn_triton_reference.py (same
+# directory as this script) so they can be shared with the
+# flashinfer_benchmark.py GDN routines (benchmarks/routines/gdn.py).
+
+from gdn_triton_reference import (
+    TRITON_AVAILABLE,
+    triton_gdn_decode,
+    triton_gdn_decode_pretranspose,
+    triton_gdn_mtp,
+)
 
 
 # ============================================================================
@@ -1169,6 +349,7 @@ def bench_gdn_mtp(
     disable_state_update: bool = True,
     warmup_iters: int = 10,
     bench_iters: int = 100,
+    ssm_state_indices_mode: str = "none",
 ):
     """Benchmark GDN MTP kernel using bench_gpu_time with CUPTI."""
     num_o_heads = max(num_q_heads, num_v_heads)
@@ -1194,8 +375,26 @@ def bench_gdn_mtp(
         else torch.zeros(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
     )
 
+    # FLA-style per-token pool scatter (vLLM API compat).
+    assert ssm_state_indices_mode in ("none", "unique"), (
+        f"ssm_state_indices_mode must be 'none' or 'unique', got "
+        f"{ssm_state_indices_mode!r}"
+    )
+    fla_scatter = ssm_state_indices_mode != "none"
+    if fla_scatter:
+        assert T >= 2, f"--ssm-state-indices requires seq_len>=2, got T={T}"
+        assert not cache_intermediate_states, (
+            "--ssm-state-indices is mutex with --cache (no intermediate buffer)"
+        )
+        assert not disable_state_update, (
+            "--ssm-state-indices requires state writes; pass --update-state"
+        )
+
     # Initial state: [pool_size, HV, V, K] (K-last layout for MTP)
-    pool_size = batch_size
+    # FLA scatter needs an extra B*T slots for the per-token scatter destinations.
+    base_pool_size = batch_size
+    fla_extra_slots = batch_size * T if fla_scatter else 0
+    pool_size = base_pool_size + fla_extra_slots
     initial_state = torch.randn(
         pool_size,
         num_sab_heads,
@@ -1205,6 +404,16 @@ def bench_gdn_mtp(
         device="cuda",
     )
     initial_state_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+
+    # FLA-style scatter destinations: B*T fresh slots at the tail of the pool.
+    ssm_state_indices_tensor = None
+    if fla_scatter:
+        ssm_state_indices_tensor = torch.arange(
+            base_pool_size,
+            base_pool_size + batch_size * T,
+            dtype=torch.int32,
+            device="cuda",
+        ).reshape(batch_size, T)
 
     # Intermediate states buffer (optional)
     if cache_intermediate_states:
@@ -1243,6 +452,7 @@ def bench_gdn_mtp(
             scale,
             output,
             intermediate_states_buffer,
+            ssm_state_indices=ssm_state_indices_tensor,
             disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
         ),
@@ -1265,6 +475,7 @@ def bench_gdn_mtp(
         dtype,
         seq_len,
         disable_state_update=disable_state_update,
+        cache_intermediate_states=cache_intermediate_states,
     )
 
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
@@ -1847,7 +1058,11 @@ def gdn_decode_bf16_state_wrapper(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     intermediate_states_buffer=None,
+    accepted_steps=None,
+    ssm_state_indices=None,
     disable_state_update: bool = False,
+    disable_output: bool = False,
+    recovery_steps: int = 0,
     initial_state_indices=None,
     output_state_indices=None,
 ):
@@ -1897,7 +1112,11 @@ def gdn_decode_bf16_state_wrapper(
             initial_state_indices=initial_state_indices,
             output_state_indices=output_state_indices,
             intermediate_states_buffer=intermediate_states_buffer,
+            accepted_steps=accepted_steps,
+            ssm_state_indices=ssm_state_indices,
             disable_state_update=disable_state_update,
+            disable_output=disable_output,
+            recovery_steps=recovery_steps,
             use_qk_l2norm_in_kernel=use_qk_l2norm,
             scale=scale,
             output=output,
@@ -2073,11 +1292,27 @@ def bench_all_layouts(
         output = torch.empty(
             batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
         )
+        # The BF16 state kernels are pool-only: treat the [B, HV, V, K] state
+        # as a pool of size B with sequential indices (read == write).
+        initial_state_indices = torch.arange(
+            batch_size, dtype=torch.int32, device="cuda"
+        )
 
         try:
             times = bench_gpu_time(
                 lambda: gdn_decode_bf16_state_wrapper(
-                    q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+                    q,
+                    k,
+                    v,
+                    state,
+                    A_log,
+                    a,
+                    dt_bias,
+                    b,
+                    scale,
+                    output,
+                    use_qk_l2norm,
+                    initial_state_indices=initial_state_indices,
                 ),
                 enable_cupti=True,
                 dry_run_iters=warmup_iters,
@@ -2250,9 +1485,14 @@ def bench_gdn_decode_bf16_state(
     use_qk_l2norm: bool = True,
     cache_intermediate_states: bool = False,
     disable_state_update: bool = False,
+    disable_output: bool = False,
+    recovery_steps: int = 0,
     warmup_iters: int = 10,
     bench_iters: int = 100,
     pool_mode: str = "single",
+    accepted_steps_mode: str = "none",
+    accepted_steps_target_ar: float = -1.0,
+    ssm_state_indices_mode: str = "none",
 ):
     """Benchmark BF16 state kernel.
 
@@ -2270,6 +1510,24 @@ def bench_gdn_decode_bf16_state(
     assert pool_mode in ("single", "split"), (
         f"BF16 state path supports pool_mode in {{single, split}}, got {pool_mode}"
     )
+    assert ssm_state_indices_mode in ("none", "unique"), (
+        f"ssm_state_indices_mode must be 'none' or 'unique', got "
+        f"{ssm_state_indices_mode!r}"
+    )
+    # FLA-style per-token scatter requires T >= 2 (asserted by the wrapper)
+    # and is mutex with cache_intermediate_states and recovery_steps.
+    fla_scatter = ssm_state_indices_mode != "none"
+    if fla_scatter:
+        assert seq_len >= 2, f"--ssm-state-indices requires seq_len>=2, got T={seq_len}"
+        assert not cache_intermediate_states, (
+            "--ssm-state-indices is mutex with --cache (no intermediate buffer)"
+        )
+        assert not disable_state_update, (
+            "--ssm-state-indices requires state writes; pass --update-state"
+        )
+        assert recovery_steps == 0, (
+            "--ssm-state-indices does not support --recovery-steps yet"
+        )
 
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
@@ -2287,8 +1545,11 @@ def bench_gdn_decode_bf16_state(
     b = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
 
     # Pool sized for the indexing mode: split needs 2B slots so write slots
-    # are distinct from read slots.
-    pool_size = 2 * batch_size if pool_mode == "split" else batch_size
+    # are distinct from read slots. FLA scatter needs an extra B*T slots for
+    # the per-token scatter destinations.
+    base_pool_size = 2 * batch_size if pool_mode == "split" else batch_size
+    fla_extra_slots = batch_size * T if fla_scatter else 0
+    pool_size = base_pool_size + fla_extra_slots
     state = torch.randn(
         pool_size,
         num_sab_heads,
@@ -2329,6 +1590,82 @@ def bench_gdn_decode_bf16_state(
     else:
         output_state_indices = None
 
+    # FLA-style scatter destinations: B*T fresh slots at the tail of the pool.
+    # Layout: [h0_slots 0..B][split-pool out slots if any][FLA per-token slots]
+    ssm_state_indices_tensor = None
+    if fla_scatter:
+        ssm_state_indices_tensor = torch.arange(
+            base_pool_size,
+            base_pool_size + batch_size * T,
+            dtype=torch.int32,
+            device="cuda",
+        ).reshape(batch_size, T)
+
+    # Build accepted_steps tensor based on mode. None means uniform-T (legacy
+    # path, no per-request K support compiled in).
+    # `--accepted-steps-target-ar AR` (when >= 0) takes precedence over mode
+    # and generates binomial-sampled K values with mean AR per request.
+    accepted_steps_tensor = None
+    if accepted_steps_target_ar >= 0.0:
+        # Binomial sampling: K_tokens ~ B(n=T, p=AR/T) so E[K_tokens] = AR.
+        # Map to accepted_step (0-indexed last accepted): K_tokens - 1.
+        # Clamp at [0, T-1]. K_tokens=0 → accepted_step=-1 would mean "no
+        # tokens", but the kernel needs accepted_step in [0, T-1] for the
+        # loop bound to be valid. We clamp to 0 (= 1 token) to match the
+        # FLA convention.
+        if not (0.0 < accepted_steps_target_ar <= T):
+            raise ValueError(
+                f"--accepted-steps-target-ar={accepted_steps_target_ar} must "
+                f"be in (0, T={T}]"
+            )
+        torch.manual_seed(42)
+        # n=T-1, p=(AR-1)/(T-1) gives E[accepted_step] = AR - 1.
+        # Handle edge case T=1 (degenerate).
+        if T == 1:
+            accepted_steps_tensor = torch.zeros(
+                batch_size, dtype=torch.int32, device="cuda"
+            )
+        else:
+            p = (accepted_steps_target_ar - 1.0) / (T - 1)
+            p = max(0.0, min(1.0, p))
+            n_tensor = torch.full((batch_size,), float(T - 1), device="cuda")
+            p_tensor = torch.full((batch_size,), p, device="cuda")
+            accepted_steps_tensor = (
+                torch.binomial(n_tensor, p_tensor).clamp(0, T - 1).to(torch.int32)
+            )
+    elif accepted_steps_mode == "uniform":
+        # All requests process all T tokens (K = T-1 each). Verifies early-break
+        # check overhead is negligible when the break never fires.
+        accepted_steps_tensor = torch.full(
+            (batch_size,), T - 1, dtype=torch.int32, device="cuda"
+        )
+    elif accepted_steps_mode == "uniform-half":
+        # All requests process ~T/2 tokens. Verifies wallclock scales with K.
+        kval = max(0, (T // 2) - 1)
+        accepted_steps_tensor = torch.full(
+            (batch_size,), kval, dtype=torch.int32, device="cuda"
+        )
+    elif accepted_steps_mode == "random":
+        # Uniform random K ∈ [0, T-1]. Realistic spec-decode acceptance mix.
+        torch.manual_seed(42)
+        accepted_steps_tensor = torch.randint(
+            0, T, (batch_size,), dtype=torch.int32, device="cuda"
+        )
+    elif accepted_steps_mode == "one-outlier":
+        # One request at K=T-1, rest at K=0 (1 token). The "stress" case
+        # — early-break should reduce wallclock from T*sum-cost to ~1*sum-cost
+        # for the majority + T*1 for the outlier.
+        accepted_steps_tensor = torch.zeros(
+            batch_size, dtype=torch.int32, device="cuda"
+        )
+        if batch_size > 0:
+            accepted_steps_tensor[0] = T - 1
+    elif accepted_steps_mode != "none":
+        raise ValueError(
+            f"Unknown accepted_steps_mode: {accepted_steps_mode!r}. "
+            f"Choose from: none, uniform, uniform-half, random, one-outlier"
+        )
+
     # Scale factor
     scale = 1.0 / (head_size**0.5)
 
@@ -2347,7 +1684,11 @@ def bench_gdn_decode_bf16_state(
             output,
             use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
+            accepted_steps=accepted_steps_tensor,
+            ssm_state_indices=ssm_state_indices_tensor,
             disable_state_update=disable_state_update,
+            disable_output=disable_output,
+            recovery_steps=recovery_steps,
             initial_state_indices=initial_state_indices,
             output_state_indices=output_state_indices,
         ),
@@ -2372,6 +1713,7 @@ def bench_gdn_decode_bf16_state(
         seq_len,
         disable_state_update=disable_state_update,
         state_dtype_bytes=2,  # BF16 state for gdn_decode_bf16_state
+        cache_intermediate_states=cache_intermediate_states,
     )
 
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
@@ -2402,7 +1744,12 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
 
     cache_intermediate = getattr(args, "cache_intermediate_states", False)
     disable_state_update = not getattr(args, "update_state", False)
+    disable_output = getattr(args, "no_output", False)
+    recovery_steps = getattr(args, "recovery_steps", 0)
     pool_mode = getattr(args, "pool_mode", "single")
+    accepted_steps_mode = getattr(args, "accepted_steps_mode", "none")
+    accepted_steps_target_ar = getattr(args, "accepted_steps_target_ar", -1.0)
+    ssm_state_indices_mode = getattr(args, "ssm_state_indices", "none")
 
     print("\n" + "=" * 100)
     print(f"BF16 State GDN Benchmark (T={valid_seq_lens})")
@@ -2412,7 +1759,11 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
         f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}, "
         f"cache_intermediate={'ON' if cache_intermediate else 'OFF'}, "
         f"update_state={'ON' if not disable_state_update else 'OFF'}, "
-        f"pool_mode={pool_mode}"
+        f"output={'OFF' if disable_output else 'ON'}, "
+        f"recovery_steps={recovery_steps}, "
+        f"pool_mode={pool_mode}, "
+        f"accepted_steps={accepted_steps_mode}, "
+        f"ssm_state_indices={ssm_state_indices_mode}"
     )
     print("=" * 100)
     print()
@@ -2434,9 +1785,14 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
                     use_qk_l2norm=use_qk_l2norm,
                     cache_intermediate_states=cache_intermediate,
                     disable_state_update=disable_state_update,
+                    disable_output=disable_output,
+                    recovery_steps=min(recovery_steps, seq_len),
                     warmup_iters=args.warmup,
                     bench_iters=args.iters,
                     pool_mode=pool_mode,
+                    accepted_steps_mode=accepted_steps_mode,
+                    accepted_steps_target_ar=accepted_steps_target_ar,
+                    ssm_state_indices_mode=ssm_state_indices_mode,
                 )
                 all_results.append(result)
 
@@ -2510,6 +1866,9 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
                         disable_state_update=not args.update_state,
                         warmup_iters=args.warmup,
                         bench_iters=args.iters,
+                        ssm_state_indices_mode=getattr(
+                            args, "ssm_state_indices", "none"
+                        ),
                     )
 
                     kernel_time_us = result["kernel_median_us"]
@@ -2831,6 +2190,53 @@ Examples:
         help="Update final state (disable_state_update=False) for MTP benchmark",
     )
     parser.add_argument(
+        "--no-output",
+        action="store_true",
+        help=(
+            "Skip the per-token output projection (state-only mode). "
+            "Sets disable_output=True; the kernel still runs the recurrence "
+            "(state update) but skips the second inner product (h_new @ q), "
+            "the butterfly reduce of o, and the per-token output STG."
+        ),
+    )
+    parser.add_argument(
+        "--accepted-steps-mode",
+        choices=("none", "uniform", "uniform-half", "random", "one-outlier"),
+        default="none",
+        help=(
+            "Per-request K (accepted_steps) mode for the recovery kernel. "
+            "'none': legacy uniform-T (no accepted_steps tensor; no kernel "
+            "code change). 'uniform': all K=T-1 (verifies zero overhead of "
+            "the runtime loop bound). 'uniform-half': all K=T/2-1. 'random': "
+            "uniform random K∈[0,T-1] (realistic spec-decode mix). "
+            "'one-outlier': K[0]=T-1, rest=0 — early-break stress case."
+        ),
+    )
+    parser.add_argument(
+        "--accepted-steps-target-ar",
+        type=float,
+        default=-1.0,
+        help=(
+            "Per-request K with binomial-sampled accepted_steps targeting an "
+            "average # accepted tokens (AR) per request. Sampled as "
+            "B(n=T-1, p=(AR-1)/(T-1)) with seed=42 (deterministic). When >= 0, "
+            "overrides --accepted-steps-mode. Example: --accepted-steps-target-ar 5.0 "
+            "at T=8 → per-request K averaging 5 tokens."
+        ),
+    )
+    parser.add_argument(
+        "--recovery-steps",
+        type=int,
+        default=0,
+        help=(
+            "Fused recovery+decode mode. Of the T total tokens, the first "
+            "K=recovery-steps run state-only (no output); the remaining "
+            "T-K run with output. State h_K is asynchronously written to "
+            "GMEM at the boundary (overlapped with decode compute). The "
+            "post-decode state h_T is discarded. K must be in [0, T]."
+        ),
+    )
+    parser.add_argument(
         "--pool-mode",
         choices=("single", "split"),
         default="single",
@@ -2841,6 +2247,19 @@ Examples:
             "'split': allocate a pool of size 2*B; reads from slots [0..B), "
             "writes to slots [B..2B), exercising the split-pool dispatch "
             "(speculative-decoding / MTP-verify shape)."
+        ),
+    )
+    parser.add_argument(
+        "--ssm-state-indices",
+        choices=("none", "unique"),
+        default="none",
+        help=(
+            "FLA-style per-token pool scatter. 'none' (default): legacy "
+            "behavior (dense intermediate buffer or none). 'unique': "
+            "allocate B*T extra pool slots and pass ssm_state_indices=[B,T] "
+            "int32 to the kernel, so each h_{t+1} writes directly to "
+            "pool[ssm_state_indices[i, t]] (matches FLA's Triton API). "
+            "Requires T>=2 and is mutex with --cache."
         ),
     )
     parser.add_argument(

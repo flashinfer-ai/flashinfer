@@ -52,6 +52,7 @@ def _decode_reference_paged(
     kv_indices: torch.Tensor,
     kv_last_page_len: torch.Tensor,
     sm_scale: float,
+    o_scale: float = 1.0,
 ):
     """Single-token GQA decode reference using a paged KV cache (NHD layout)."""
     batch_size = kv_indptr.numel() - 1
@@ -87,6 +88,7 @@ def _decode_reference_paged(
         logits = torch.einsum("hd,nhd->hn", q_f32[b], keys) * sm_scale
         probs = torch.softmax(logits, dim=-1)
         out[b] = torch.einsum("hn,nhd->hd", probs, values)
+    out *= o_scale
     return out.to(q.dtype)
 
 
@@ -488,8 +490,7 @@ def test_cute_dsl_decode_paged_wrapper_speculative_runtime(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_batch_decode_wrapper_cute_dsl_v_scale(dtype):
-    """v_scale must be folded into the cute-dsl kernel's o_scale: the output
-    of run(v_scale=k) should equal k * run() (within fp tolerance)."""
+    """v_scale is folded into the cute-dsl kernel's o_scale before output store."""
     batch_size, page_size, kv_len = 4, 16, 1024
     torch.manual_seed(0)
     q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
@@ -511,16 +512,24 @@ def test_batch_decode_wrapper_cute_dsl_v_scale(dtype):
         q_data_type=dtype,
         kv_data_type=dtype,
     )
-    out_unit = cd.run(q, kv)
     k = 2.5
     out_scaled = cd.run(q, kv, v_scale=k)
-    torch.testing.assert_close(out_scaled, k * out_unit, rtol=5e-3, atol=5e-3)
+    ref_scaled = _decode_reference_paged(
+        q,
+        kv[:, 0],
+        kv[:, 1],
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        1.0 / math.sqrt(HEAD_DIM),
+        o_scale=k,
+    )
+    torch.testing.assert_close(out_scaled, ref_scaled, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_cute_dsl_decode_paged_wrapper_o_scale(dtype):
-    """Standalone BatchDecodePagedCuteDSLWrapper.run(o_scale=k) is equivalent
-    to multiplying the unscaled output by k."""
+    """Standalone BatchDecodePagedCuteDSLWrapper.run(o_scale=k) scales before store."""
     batch_size, page_size, kv_len = 4, 16, 1024
     torch.manual_seed(0)
     q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
@@ -541,10 +550,19 @@ def test_cute_dsl_decode_paged_wrapper_o_scale(dtype):
         page_size=page_size,
         q_data_type=dtype,
     )
-    out_unit = wrapper.run(q, k_cache, v_cache)
     k = 0.375
     out_scaled = wrapper.run(q, k_cache, v_cache, o_scale=k)
-    torch.testing.assert_close(out_scaled, k * out_unit, rtol=5e-3, atol=5e-3)
+    ref_scaled = _decode_reference_paged(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        1.0 / math.sqrt(HEAD_DIM),
+        o_scale=k,
+    )
+    torch.testing.assert_close(out_scaled, ref_scaled, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

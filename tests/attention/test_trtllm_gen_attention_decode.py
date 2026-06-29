@@ -1447,6 +1447,8 @@ def test_trtllm_batch_decode_dynamic_page_size_gqa(
         (4, 1, 32, 2, 5),
         (4, 3, 64, 4, 1),
         (128, 3, 16, 4, 8),
+        (1, 6, 64, 2, 8),
+        (4, 8, 64, 2, 8),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])

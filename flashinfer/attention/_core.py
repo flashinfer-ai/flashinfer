@@ -157,6 +157,16 @@ class BatchAttention:
             logits_soft_cap = 0.0
         self._logits_soft_cap = logits_soft_cap
 
+        # head_dim > 256 is for holistic (persistent) kernel.
+        if head_dim_qk > 256 or head_dim_vo > 256:
+            raise ValueError(
+                "BatchAttention (holistic persistent kernel) does not support "
+                f"head_dim > 256 (got head_dim_qk={head_dim_qk}, "
+                f"head_dim_vo={head_dim_vo}). Use "
+                "BatchPrefillWithPagedKVCacheWrapper(backend='fa2') or "
+                "BatchDecodeWithPagedKVCacheWrapper(use_tensor_cores=True) instead."
+            )
+
         # get jit module
         get_module_args = (
             q_data_type,
