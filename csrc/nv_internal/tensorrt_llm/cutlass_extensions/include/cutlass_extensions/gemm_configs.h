@@ -120,12 +120,14 @@ enum class CutlassTileConfigSM90 : int {
   CtaShape64x256x128B = shape_tuple_to_enum(64, 256, 128),
 
   // CTA configs for M=128
+  CtaShape128x8x128B = shape_tuple_to_enum(128, 8, 128),
   CtaShape128x16x128B = shape_tuple_to_enum(128, 16, 128),
   CtaShape128x16x256B = shape_tuple_to_enum(128, 16, 256),
   CtaShape128x16x512B = shape_tuple_to_enum(128, 16, 512),
   CtaShape128x32x128B = shape_tuple_to_enum(128, 32, 128),
   CtaShape128x32x256B = shape_tuple_to_enum(128, 32, 256),
   CtaShape128x32x512B = shape_tuple_to_enum(128, 32, 512),
+  CtaShape128x40x128B = shape_tuple_to_enum(128, 40, 128),
   CtaShape128x64x128B = shape_tuple_to_enum(128, 64, 128),
   CtaShape128x64x256B = shape_tuple_to_enum(128, 64, 256),
   CtaShape128x64x512B = shape_tuple_to_enum(128, 64, 512),
@@ -201,7 +203,9 @@ enum class MainloopScheduleType {
          // architectures, this defaults to the "legacy" main loop schedule.
   PINGPONG,
   COOPERATIVE,
-  WARPSPECIALIZED
+  WARPSPECIALIZED,
+  SINGLE_WARPGROUP_PREFILL,
+  SINGLE_WARPGROUP_ROLLING
 };
 
 static auto get_mainloop_schedule_name(MainloopScheduleType schedule) {
@@ -213,6 +217,10 @@ static auto get_mainloop_schedule_name(MainloopScheduleType schedule) {
     return "cooperative";
   } else if (schedule == MainloopScheduleType::WARPSPECIALIZED) {
     return "warpspecialized";
+  } else if (schedule == MainloopScheduleType::SINGLE_WARPGROUP_PREFILL) {
+    return "single_warpgroup_prefill";
+  } else if (schedule == MainloopScheduleType::SINGLE_WARPGROUP_ROLLING) {
+    return "single_warpgroup_rolling";
   }
   return "unknown schedule";
 }

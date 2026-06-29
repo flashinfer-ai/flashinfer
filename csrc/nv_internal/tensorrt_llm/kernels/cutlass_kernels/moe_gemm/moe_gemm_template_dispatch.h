@@ -682,6 +682,23 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
                          tma_ws_configs.end());
   }
 
+  if constexpr (use_wfp4afp8 && Wfp4Afp8Mode == Wfp4Afp8ScaleMode::kHummingPreMmaE8M0) {
+    if (sm == 90) {
+      using Tile = cutlass_extensions::CutlassTileConfigSM90;
+      using Schedule = cutlass_extensions::MainloopScheduleType;
+      for (Tile tile : {Tile::CtaShape128x8x128B, Tile::CtaShape128x16x128B,
+                        Tile::CtaShape128x32x128B, Tile::CtaShape128x40x128B}) {
+        for (Schedule schedule :
+             {Schedule::SINGLE_WARPGROUP_PREFILL, Schedule::SINGLE_WARPGROUP_ROLLING}) {
+          CutlassGemmConfig config(tile, schedule, cutlass_extensions::EpilogueScheduleType::AUTO,
+                                   cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
+          config.swap_ab = true;
+          tma_ws_configs.push_back(config);
+        }
+      }
+    }
+  }
+
   return tma_ws_configs;
 }
 

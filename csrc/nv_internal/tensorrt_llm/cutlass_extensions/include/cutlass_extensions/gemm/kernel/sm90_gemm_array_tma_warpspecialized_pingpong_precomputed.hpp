@@ -142,14 +142,14 @@ class GemmUniversalPrecomputedScheduler<
 
   static constexpr bool IsGroupedGemmKernel = !cute::is_same_v<InternalStrideA, StrideA>;
 
-  static_assert(
-      cute::is_void_v<TileScheduler_>,
-      "Ptr-Array Pingpong and Grouped Gemm Pingpong kernel only supports the default scheduler.");
   static_assert(IsGroupedGemmKernel,
                 "Precomputed grouped scheduler kernel is only for grouped ptr-array GEMM.");
 
   using SchedulerTag = GroupScheduler;
-  using TileScheduler = detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8>;
+  using TileScheduler =
+      cute::conditional_t<cute::is_void_v<TileScheduler_>,
+                          detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8>,
+                          TileScheduler_>;
 
   using TileSchedulerArguments = typename TileScheduler::Arguments;
   using TileSchedulerParams = typename TileScheduler::Params;

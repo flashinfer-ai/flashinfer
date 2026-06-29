@@ -87,8 +87,16 @@ struct PrecomputedGroupWorkTile {
   }
 };
 
+template <bool ChunkMajorWorkMap>
+struct PrecomputedWorkMapStride {};
+
+template <>
+struct PrecomputedWorkMapStride<true> {
+  uint32_t precomputed_work_tiles_per_worker = 0;
+};
+
 // Persistent Thread Block (TB) scheduler
-template <class GroupProblemShape, int SchedulerPipelineStageCount>
+template <class GroupProblemShape, int SchedulerPipelineStageCount, bool ChunkMajorWorkMap = false>
 class PersistentTileSchedulerSm90GroupPrecomputed {
   //
   // Data members
@@ -121,7 +129,7 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
 
   using ProblemShape = typename GroupProblemShape::UnderlyingProblemShape;
   using ParamsBase = PersistentTileSchedulerSm90GroupParams<GroupProblemShape>;
-  struct Params : ParamsBase {
+  struct Params : ParamsBase, PrecomputedWorkMapStride<ChunkMajorWorkMap> {
     uint64_t const* precomputed_work_tiles_ = nullptr;
 
     void initialize_precomputed(dim3 problem_blocks, GemmCoord cluster_shape,
@@ -175,7 +183,7 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     alignas(16) SchedulerResponse data_[SchedulerPipelineStageCount];
   };
 
-  struct Arguments {
+  struct Arguments : PrecomputedWorkMapStride<ChunkMajorWorkMap> {
     int max_swizzle_size = 1;
     // Not applying Heuristics for Grouped problems, since largest dimension can change per group
     RasterOrderOptions raster_order = RasterOrderOptions::AlongM;
@@ -209,6 +217,9 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     params.initialize_precomputed(problem_blocks, to_gemm_coord(cluster_shape), hw_info,
                                   arguments.max_swizzle_size, RasterOrderOptions::AlongM);
     params.precomputed_work_tiles_ = arguments.precomputed_work_tiles;
+    if constexpr (ChunkMajorWorkMap) {
+      params.precomputed_work_tiles_per_worker = arguments.precomputed_work_tiles_per_worker;
+    }
 
     return params;
   }
@@ -266,7 +277,11 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
   }
 
   static bool can_implement(Arguments const& args) {
-    return args.precomputed_work_tiles != nullptr;
+    bool implementable = args.precomputed_work_tiles != nullptr;
+    if constexpr (ChunkMajorWorkMap) {
+      implementable &= args.precomputed_work_tiles_per_worker > 0;
+    }
+    return implementable;
   }
 
   PersistentTileSchedulerSm90GroupPrecomputed() = default;
@@ -279,12 +294,17 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     // like blockIdx and gridDim, with __CUDA_ARCH__.
 #if defined(__CUDA_ARCH__)
     CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
-    current_work_linear_idx_ =
+    WorkLinearIdx const worker_idx =
         WorkLinearIdx(blockIdx.x) * WorkLinearIdx(gridDim.y) + WorkLinearIdx(blockIdx.y) +
         WorkLinearIdx(blockIdx.z) * WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y);
-
-    total_grid_size_ =
-        WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
+    if constexpr (ChunkMajorWorkMap) {
+      current_work_linear_idx_ = worker_idx * scheduler_params.precomputed_work_tiles_per_worker;
+      total_grid_size_ = 1;
+    } else {
+      current_work_linear_idx_ = worker_idx;
+      total_grid_size_ =
+          WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
+    }
 
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");
@@ -298,12 +318,17 @@ class PersistentTileSchedulerSm90GroupPrecomputed {
     // like blockIdx and gridDim, with __CUDA_ARCH__.
 #if defined(__CUDA_ARCH__)
     CUTLASS_ASSERT(scheduler_params.precomputed_work_tiles_ != nullptr);
-    current_work_linear_idx_ =
+    WorkLinearIdx const worker_idx =
         WorkLinearIdx(blockIdx.x) * WorkLinearIdx(gridDim.y) + WorkLinearIdx(blockIdx.y) +
         WorkLinearIdx(blockIdx.z) * WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y);
-
-    total_grid_size_ =
-        WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
+    if constexpr (ChunkMajorWorkMap) {
+      current_work_linear_idx_ = worker_idx * scheduler_params.precomputed_work_tiles_per_worker;
+      total_grid_size_ = 1;
+    } else {
+      current_work_linear_idx_ = worker_idx;
+      total_grid_size_ =
+          WorkLinearIdx(gridDim.x) * WorkLinearIdx(gridDim.y) * WorkLinearIdx(gridDim.z);
+    }
 
 #else
     CUTLASS_ASSERT(false && "This line should never be reached");

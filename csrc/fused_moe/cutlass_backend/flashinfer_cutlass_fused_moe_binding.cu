@@ -907,6 +907,25 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (mUseW4GroupScaling && gemm_n % tile_m != 0) {
       return false;
     }
+    bool const is_single_warpgroup =
+        profile.mainloop_schedule ==
+            tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL ||
+        profile.mainloop_schedule ==
+            tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING;
+    if (is_single_warpgroup) {
+      if (!mUseWfp4Afp8Humming || profile.sm_version != 90 || tile_m != 128 || tile_k != 128 ||
+          (tile_n != 8 && tile_n != 16 && tile_n != 32 && tile_n != 40) ||
+          profile.cluster_shape !=
+              tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_1x1x1 ||
+          gemm_n % 128 != 0) {
+        return false;
+      }
+      if (profile.mainloop_schedule ==
+          tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL) {
+        return gemm_k <= 384;
+      }
+      return gemm_k > 384;
+    }
     if (isWFP4A16Quant()) {
       if (tile_k == 256 && ((tile_m == 128 && tile_n == 256) || (tile_m == 256 && tile_n == 128))) {
         return false;
