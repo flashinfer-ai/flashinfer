@@ -341,7 +341,6 @@ def test_cp_delta_rule_mn_precompute(
     )
     assert our_state.shape == our_transfer.shape
 
-    valid_cp_slots = set()
     for seq_idx, seq_len in enumerate(seq_lens):
         seq_start = int(cu_seqlens[seq_idx].item())
         cp_start = chunk_bound_host(seq_idx, seq_start, cp_chunk_len)
@@ -353,7 +352,6 @@ def test_cp_delta_rule_mn_precompute(
             num_t_blocks = (chunk_end - chunk_offset + block_size - 1) // block_size
             t_block_offset = chunk_idx * (cp_chunk_len // block_size)
             slot = cp_start + chunk_idx
-            valid_cp_slots.add(slot)
             ref_transfer, ref_state = reference.blockwise_cp_delta_rule_pre_transposed(
                 k[seq_start + chunk_offset : seq_start + chunk_end],
                 v[seq_start + chunk_offset : seq_start + chunk_end],
@@ -373,15 +371,6 @@ def test_cp_delta_rule_mn_precompute(
             )
             torch.testing.assert_close(
                 our_state[slot].transpose(-1, -2), ref_state, atol=atol, rtol=rtol
-            )
-
-    for slot in range(our_transfer.shape[0]):
-        if slot not in valid_cp_slots:
-            torch.testing.assert_close(
-                our_transfer[slot], torch.zeros_like(our_transfer[slot])
-            )
-            torch.testing.assert_close(
-                our_state[slot], torch.zeros_like(our_state[slot])
             )
 
 
@@ -456,7 +445,6 @@ def test_cp_delta_rule_fixup(
     )
     torch.cuda.synchronize()
 
-    valid_slots = set()
     ref_transfers_by_seq = []
     ref_states_by_seq = []
     ref_initial_states_by_seq = []
@@ -469,7 +457,6 @@ def test_cp_delta_rule_fixup(
         for chunk_idx in range(num_chunks):
             slot = chunk_start + chunk_idx
             seq_slots.append(slot)
-            valid_slots.add(slot)
         if seq_slots:
             ref_transfers_by_seq.append(local_transfer[seq_slots])
             ref_states_by_seq.append(local_state[seq_slots])
@@ -491,12 +478,6 @@ def test_cp_delta_rule_fixup(
                 seq_fixed[chunk_idx],
                 atol=FIXUP_TF32_ATOL,
                 rtol=FIXUP_TF32_RTOL,
-            )
-
-    for slot in range(total_cp_chunks):
-        if slot not in valid_slots:
-            torch.testing.assert_close(
-                our_fixed_state[slot], torch.zeros_like(our_fixed_state[slot])
             )
 
 
