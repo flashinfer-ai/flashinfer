@@ -37,7 +37,8 @@ Example (Wrapper API with CUDA Graph):
     >>> output = moe.run(x=hidden_states_bf16, ...)
 """
 
-from typing import Optional, Tuple
+import os
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -234,10 +235,26 @@ class B12xMoEWrapper:
             this selects the backend and internal workspace family.
         source_format: Source weight format for quant_mode="w4a16".
             Supports "modelopt" and "compressed_tensors". Default: "modelopt".
+        cutlass_prefill_threshold: When ``> 0`` and ``x.shape[0] >= threshold``,
+            ``run()`` forwards to ``cutlass_fused_moe`` instead of the b12x
+            kernels. Use to keep b12x's micro/static decode path while routing
+            prefill chunks (where b12x's dynamic kernel underperforms) to
+            CUTLASS. Requires :meth:`register_cutlass_prefill_weights` to be
+            called before the first prefill call. Default ``0`` disables
+            hybrid dispatch (pure b12x). The env var
+            ``FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD`` overrides this if set.
 
     Example:
         >>> moe = B12xMoEWrapper(num_experts=256, top_k=8, ...)
         >>> output = moe.run(x=hidden_states_bf16, ...)
+
+    Hybrid prefill example::
+
+        >>> moe = B12xMoEWrapper(..., cutlass_prefill_threshold=9)
+        >>> moe.register_cutlass_prefill_weights(
+        ...     w1_q=w1_cutlass, w2_q=w2_cutlass, quant_scales=[...]
+        ... )
+        >>> moe.run(x=hidden_states_bf16, ...)  # routes per call
     """
 
     @supported_compute_capability([120, 121])
@@ -258,6 +275,7 @@ class B12xMoEWrapper:
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
+        cutlass_prefill_threshold: int = 0,
     ):
         r"""Configure the b12x fused-MoE wrapper.
 
@@ -341,6 +359,14 @@ class B12xMoEWrapper:
         )
         self.source_format = source_format
 
+        env_override = os.environ.get("FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD")
+        if env_override is not None:
+            try:
+                cutlass_prefill_threshold = int(env_override)
+            except ValueError:
+                pass
+        self.cutlass_prefill_threshold = cutlass_prefill_threshold
+
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
         # to whichever workspace was allocated at init time.
@@ -349,6 +375,14 @@ class B12xMoEWrapper:
         self._weight_views: object = None
         self._weight_key: Optional[Tuple] = None
         self._moe_output: Optional[torch.Tensor] = None
+
+        # CUTLASS-format prefill weights, registered post-construction via
+        # register_cutlass_prefill_weights(). Held alongside the b12x weights
+        # the caller passes to run() — same FP4 numeric values, different
+        # physical layout (gate/up interleave + non-MMA SF for CUTLASS).
+        self._cutlass_w1: Optional[torch.Tensor] = None
+        self._cutlass_w2: Optional[torch.Tensor] = None
+        self._cutlass_quant_scales: Optional[List[torch.Tensor]] = None
 
         if use_cuda_graph:
             self._allocate_buffers()
@@ -442,6 +476,87 @@ class B12xMoEWrapper:
             device=self.device,
         )
 
+    def register_cutlass_prefill_weights(
+        self,
+        *,
+        w1_q: torch.Tensor,
+        w2_q: torch.Tensor,
+        quant_scales: List[torch.Tensor],
+    ) -> None:
+        """Register CUTLASS-format NVFP4 weights for the prefill dispatch.
+
+        Required when ``cutlass_prefill_threshold > 0``. The b12x decode path
+        (un-normalized SF + MMA-swizzled layout) and the CUTLASS prefill path
+        (normalized FP8 SF + non-interleave-aware layout) share FP4 numeric
+        values but use different physical packings. The wrapper holds both
+        alive — the caller must FP4-quantize weights twice at load time
+        (mirroring TRT-LLM's ``FlashInferFusedMoE.post_load_weights``).
+
+        Args:
+            w1_q: FC1 FP4 weights, uint8 packed.
+                ``[E, 2*intermediate_size, hidden_size//2]`` for SwiGLU,
+                ``[E, intermediate_size, hidden_size//2]`` for ReLU2.
+            w2_q: FC2 FP4 weights, uint8 packed
+                ``[E, hidden_size, intermediate_size//2]``.
+            quant_scales: 6-element list expected by ``cutlass_fused_moe``
+                NVFP4 mode: ``[a1_gs, w1_blockscale_int32, 1/(a1_gs*w1_gs),
+                a2_gs, w2_blockscale_int32, 1/(a2_gs*w2_gs)]``. Build with
+                the same recipe as the cutlass NVFP4 benchmark variant
+                (``benchmarks/routines/moe.py::testCutlassFusedMoe``).
+        """
+        # Pre-view to long once; the b12x decode path won't touch these
+        # tensors, so the view is stable for the lifetime of the wrapper
+        # (or until the caller re-registers).
+        self._cutlass_w1 = w1_q.contiguous().view(torch.long)
+        self._cutlass_w2 = w2_q.contiguous().view(torch.long)
+        self._cutlass_quant_scales = quant_scales
+
+    def _should_route_to_cutlass(self, num_tokens: int) -> bool:
+        return (
+            self.cutlass_prefill_threshold > 0
+            and num_tokens >= self.cutlass_prefill_threshold
+        )
+
+    def _run_cutlass_prefill(
+        self,
+        *,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        from ..core import ActivationType, cutlass_fused_moe
+
+        if self._cutlass_w1 is None:
+            raise RuntimeError(
+                f"B12xMoEWrapper: x.shape[0]={x.shape[0]} >= "
+                f"cutlass_prefill_threshold={self.cutlass_prefill_threshold} "
+                "but CUTLASS prefill weights have not been registered. Call "
+                "register_cutlass_prefill_weights(...) after weight loading, "
+                "or set cutlass_prefill_threshold=0 to disable hybrid dispatch."
+            )
+
+        activation_type = (
+            ActivationType.Swiglu if self.activation == "silu" else ActivationType.Relu2
+        )
+        # cutlass_fused_moe returns a list (carryover from min-latency mode's
+        # multi-output case); it writes into the pre-allocated `output` buffer
+        # we pass, so we return that directly to keep our run() contract a
+        # single Tensor.
+        cutlass_fused_moe(
+            input=x,
+            token_selected_experts=token_selected_experts.to(torch.int),
+            token_final_scales=token_final_scales,
+            fc1_expert_weights=self._cutlass_w1,
+            fc2_expert_weights=self._cutlass_w2,
+            output_dtype=self.output_dtype,
+            quant_scales=self._cutlass_quant_scales,
+            input_sf=None,
+            output=output,
+            activation_type=activation_type,
+        )
+        return output
+
     @flashinfer_api(trace=b12x_moe_wrapper_run_trace)
     def run(
         self,
@@ -509,6 +624,14 @@ class B12xMoEWrapper:
                 (num_tokens, self.hidden_size),
                 dtype=self.output_dtype,
                 device=x.device,
+            )
+
+        if self._should_route_to_cutlass(num_tokens):
+            return self._run_cutlass_prefill(
+                x=x,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                output=moe_output,
             )
 
         from .blackwell_sm12x.moe_dispatch import (
