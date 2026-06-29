@@ -1346,6 +1346,19 @@ __device__ __forceinline__ void compute_z_gating(FragY& frag_y, SmemZ const& sme
   }
 }
 
+// x4 ldmatrix at a precomputed swizzled smem address (uint).  Mirrors cute's
+// SM75_U32x4_LDSM_N::copy but takes the address directly, so the caller supplies
+// a precomputed (off0 + Δk) ^ swizzle_mask offset instead of re-deriving the
+// swizzle per access (see pipelined_kloop_gemm's hand-rolled A path).
+__device__ __forceinline__ void ldmatrix_x4_addr(uint32_t addr, uint32_t& d0, uint32_t& d1,
+                                                 uint32_t& d2, uint32_t& d3) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+  asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+               : "r"(addr));
+#endif
+}
+
 // =============================================================================
 // Pipelined K-loop GEMM
 // =============================================================================
@@ -1428,9 +1441,48 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
                 "all FragY parameters must be the same type");
   FragY0* frag_y_p[NumNTiles] = {(&frag_y)...};
 
+  // ── Hand-rolled A-operand (C) LDSM source addressing ──
+  // The LDSM source for k-tile k is A_base + byteoffA[k].  byteoffA[k] is the
+  // swizzled byte offset of this lane's k-tile *relative to the C slot base* — a
+  // pure function of (lane, k): the ring-slot pointer lives in A_base (the engine
+  // .data()), not in the layout, so byteoffA is invariant across heads.  Computing
+  // it from the static swizzled layout lets LICM hoist the 8 swizzle evals out of
+  // the head loop (once per thread) instead of cute re-deriving them per access,
+  // bundled with the per-head base pointer.  recast<uint32_t> of the retiled
+  // fragment matches what cute::copy writes internally, so the dst register order
+  // is identical — only the source-address path is replaced.
+  using SwizA = decltype(get_swizzle_portion(smem_A_ktiled.layout()));
+#if defined(SSU_NO_HANDROLL_A)
+  constexpr bool kHandrollA = false;  // A/B switch: -DSSU_NO_HANDROLL_A reverts to cute::copy
+#else
+  constexpr bool kHandrollA = (SwizA::num_bits > 0) && (sizeof(MmaT) == 2);
+#endif
+  uint32_t const A_base = cast_smem_ptr_to_uint(raw_pointer_cast(smem_A_s2r.data()));
+  uint32_t byteoffA[NumKTiles];
+  CUTE_UNROLL
+  for (int k = 0; k < NumKTiles; ++k)
+    byteoffA[k] =
+        uint32_t(smem_A_s2r.layout()(make_coord(_0{}, _0{}, _0{}, k))) * uint32_t(sizeof(MmaT));
+
+  // NOTE: the state (B) operand was tried with the same hand-rolled precomputed
+  // addressing (2D table, inline layout-eval, and off0+invariant-mask forms — all
+  // measured) and consistently regressed ~1-1.5us at b1024: unlike A's swizzle (a
+  // hoistable per-access recompute), B's LDSM is not the bottleneck, and the
+  // just-in-time address compute only lengthens the load→HMMA dependency chain in
+  // the software pipeline.  B stays on cute::copy.
+
   // ── Per-stage operations (slot is constant after #pragma unroll) ──
   auto load_one = [&](int k_src, int slot) {
-    cute::copy(s2r_A, smem_A_s2r(_, _, _, k_src), frag_A_view[slot]);
+    if constexpr (kHandrollA) {
+      auto rA = recast<uint32_t>(frag_A_view[slot]);
+      ldmatrix_x4_addr(A_base + byteoffA[k_src], rA(0), rA(1), rA(2), rA(3));
+#if defined(SSU_VERIFY_LDSM)
+      assert(A_base + byteoffA[k_src] ==
+             cast_smem_ptr_to_uint(&smem_A_s2r(_0{}, _0{}, _0{}, k_src)));
+#endif
+    } else {
+      cute::copy(s2r_A, smem_A_s2r(_, _, _, k_src), frag_A_view[slot]);
+    }
     CUTE_UNROLL
     for (int n = 0; n < NumNTiles; ++n) {
       cute::copy(s2r_B, smem_B_s2r[n](_, _, _, k_src), frag_B_stg_view[n][slot]);
