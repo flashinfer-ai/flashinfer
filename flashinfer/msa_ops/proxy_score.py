@@ -277,6 +277,12 @@ def msa_proxy_score(
 
     There is no softmax and no V: this is MSA pipeline stage 1.
 
+    Short-q decode (any ``group_size`` dividing the 64-row q-tile with
+    ``q_len <= 64 // group_size`` -- e.g. MiniMax-M3's group_size 4 at
+    ``q_len <= 16``) uses a head-fused packed schedule that scores all
+    ``group_size`` heads of a kv_head from one shared index-K read
+    (``group_size`` x less K traffic). fp8 K and prefill use the general schedule.
+
     Parameters
     ----------
     q : torch.Tensor
@@ -323,7 +329,10 @@ def msa_proxy_score(
     import cutlass
     import cutlass.cute as cute
 
-    from .cute_dsl.proxy_score_sm12x import MsaProxyScoreSm12x
+    from .cute_dsl.proxy_score_sm12x import (
+        MsaProxyScoreDecodePackedSm12x,
+        MsaProxyScoreSm12x,
+    )
     from .sparse_attention import (
         _compile_cache,
         _cutlass_dtype,
@@ -388,7 +397,27 @@ def msa_proxy_score(
     else:
         per_head = output
 
-    key = ("proxy", str(q.dtype), causal, paged, kv_fp8)
+    # Head-fused decode path (E10): pack all group_size heads of a kv_head x
+    # pack_q_len q-tokens into one 64-row MMA tile so the shared index-K is read
+    # once per (batch, kv_head) instead of once per query head (group_size x less K
+    # traffic). Valid for any group_size dividing the 64-row tile when the q-len fits
+    # the resulting per-head slot (pack_q_len = 64 // group_size); the MiniMax-M3
+    # indexer (group_size 4) decodes at 4 x 16. fp8 K stays on the general schedule.
+    # Outside this regime (prefill, group_size not dividing 64) use the general
+    # per-(q-tile, head) schedule.
+    _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
+    group_size = num_qo_heads // num_kv_heads
+    use_packed = (
+        not kv_fp8
+        and group_size >= 2
+        and _PACK_ROWS % group_size == 0
+        and max_seqlen_q <= _PACK_ROWS // group_size
+    )
+    pack_q_len = _PACK_ROWS // group_size if use_packed else 0
+
+    # group_size keys the packed schedule: pack_q_len = 64 // group_size is
+    # constexpr-baked into the gather/epilogue, so each factorization is its own kernel.
+    key = ("proxy", str(q.dtype), causal, paged, kv_fp8, use_packed, pack_q_len)
     compiled = _compile_cache.get(key)
     if compiled is None:
         cdt = _cutlass_dtype(q.dtype)
@@ -400,15 +429,29 @@ def msa_proxy_score(
         )
         k_shape = (s_tk, s_hkv, _BLK_KV, head_dim) if paged else (s_tk, s_hkv, head_dim)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel_obj = MsaProxyScoreSm12x(
-            head_dim=head_dim,
-            m_block_size=64,
-            n_block_size=_BLK_KV,
-            num_threads=128,
-            is_causal=causal,
-            paged=paged,
-            kv_fp8=kv_fp8,
-        )
+        kernel_obj: "MsaProxyScoreSm12x"
+        if use_packed:
+            kernel_obj = MsaProxyScoreDecodePackedSm12x(
+                head_dim=head_dim,
+                m_block_size=64,
+                n_block_size=_BLK_KV,
+                num_threads=128,
+                is_causal=causal,
+                paged=paged,
+                kv_fp8=kv_fp8,
+                qhead_per_kv=group_size,
+                pack_q_len=pack_q_len,
+            )
+        else:
+            kernel_obj = MsaProxyScoreSm12x(
+                head_dim=head_dim,
+                m_block_size=64,
+                n_block_size=_BLK_KV,
+                num_threads=128,
+                is_causal=causal,
+                paged=paged,
+                kv_fp8=kv_fp8,
+            )
         compiled = cute.compile(
             kernel_obj,
             _fake(cdt, (s_tq, s_hq, head_dim)),
@@ -428,9 +471,13 @@ def msa_proxy_score(
         )
         _compile_cache[key] = compiled
 
-    # base grid CTAs: one per (q-tile, batch, head) with 64-row q-tiles. Feeds the
-    # split-K factor (see _proxy_split_k); num_splits is a runtime arg, not a cache key.
-    base_ctas = ((max_seqlen_q + 63) // 64) * batch_size * num_qo_heads
+    # base grid CTAs (feeds split-K, see _proxy_split_k): the packed path is one
+    # CTA per (batch, kv_head); the general path one per (q-tile, batch, head) with
+    # 64-row q-tiles. num_splits is a runtime arg, not part of the cache key.
+    if use_packed:
+        base_ctas = batch_size * num_kv_heads
+    else:
+        base_ctas = ((max_seqlen_q + 63) // 64) * batch_size * num_qo_heads
 
     def _call(tensors, ns):
         q_, k_, pt_, ph_, cq_, ck_, qoff_ = tensors

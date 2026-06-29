@@ -1063,6 +1063,44 @@ def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
         assert (got[fin] - ref[fin]).abs().max().item() < 1e-2
 
 
+@pytest.mark.parametrize(
+    "B,Hq,Hkv,seqlen_q,seqlen_k,causal",
+    [
+        (4, 4, 1, 1, 8192, True),  # group 4, q_len 1 -> packed (4 x 16 tile)
+        (2, 4, 1, 16, 4096, True),  # group 4, q_len at the gate edge (16)
+        (3, 8, 2, 8, 2048, True),  # group 4 (Hq/Hkv), q_len 8
+        (2, 4, 1, 16, 4096, False),  # non-causal packed
+    ],
+)
+def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
+    """Short-q decode dispatches the head-fused packed bf16 kernel
+    (MsaProxyScoreDecodePackedSm12x): all group_size heads of a kv_head packed into
+    one 64-row tile, scored against a single index-K read. group_size 4 with
+    q_len <= 16 is the MiniMax-M3 indexer shape. Validated vs the same torch oracle
+    as the general path."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_proxy_score
+
+    torch.manual_seed(170 + B)
+    dev = "cuda"
+    # equal-length batch keeps max_seqlen_q == seqlen_q so the packed gate fires.
+    cu_q = torch.arange(0, (B + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=dev)
+    cu_k = torch.arange(0, (B + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=dev)
+    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
+    q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
+    out = msa_proxy_score(q, k, cu_q, cu_k, causal=causal)
+    torch.cuda.synchronize()
+    ref = _ref_proxy_score(
+        q.cpu(), k.cpu(), cu_q.cpu(), cu_k.cpu(), causal, out.shape[1]
+    )
+    got = out.cpu()
+    assert ((got == float("-inf")) == (ref == float("-inf"))).all(), "-inf pattern"
+    fin = ref != float("-inf")
+    if fin.any():
+        assert (got[fin] - ref[fin]).abs().max().item() < 1e-2
+
+
 @pytest.mark.parametrize("Hq,Hkv", [(4, 1), (8, 2)])
 def test_msa_proxy_score_reduce_heads(Hq, Hkv):
     """``reduce_heads=True`` returns the head-max-reduced (1, max_k_tiles,
