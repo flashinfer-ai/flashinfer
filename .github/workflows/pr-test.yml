@@ -144,7 +144,7 @@ jobs:
       - name: Get Docker Tag
         id: get-tag
         run: |
-          TAG=$(grep 'flashinfer/flashinfer-ci-cu129:' ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
+          TAG=$(grep 'flashinfer/flashinfer-ci-cu126:' ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
           if [ -z "$TAG" ]; then
             echo "::error::Failed to extract Docker tag from ci/docker-tags.yml"
             exit 1
@@ -201,7 +201,7 @@ jobs:
       fail-fast: true
       matrix:
         arch: [x64, arm64]
-        cuda: [cu126, cu128, cu129, cu130]
+        cuda: [cu126, cu130, cu132]
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
     steps:
@@ -273,7 +273,7 @@ jobs:
         run: |
           MATRIX='{"include":['
           for arch in x64 arm64; do
-            for cuda in cu126 cu128 cu129 cu130; do
+            for cuda in cu126 cu130 cu132; do
               MATRIX+='{"arch":"'$arch'","cuda":"'$cuda'"},'
             done
           done
@@ -355,7 +355,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5]
     env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu132:${{ needs.setup.outputs.docker_tag }}
     steps:
       - name: Cleanup
         run: |
@@ -428,7 +428,7 @@ jobs:
       fail-fast: true
       matrix: ${{ fromJSON(needs.analyze-gpu-a10g-failure.outputs.rerun_matrix) }}
     env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu132:${{ needs.setup.outputs.docker_tag }}
     steps:
       - name: Cleanup
         run: |
@@ -471,7 +471,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, gpu, sm75, spot]
     timeout-minutes: 360
     env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu132:${{ needs.setup.outputs.docker_tag }}
     steps:
       - name: Cleanup
         run: |
@@ -533,7 +533,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, gpu, sm75, on-demand]
     timeout-minutes: 360
     env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu132:${{ needs.setup.outputs.docker_tag }}
     steps:
       - name: Cleanup
         run: |
@@ -577,7 +577,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, gpu, h100]
     timeout-minutes: 480
     env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu132:${{ needs.setup.outputs.docker_tag }}
     steps:
       - name: Cleanup
         run: |

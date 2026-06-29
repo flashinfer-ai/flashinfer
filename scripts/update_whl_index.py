@@ -4,7 +4,7 @@ Update wheel index for flashinfer packages.
 This script generates PEP 503 compatible simple repository index pages for:
 - flashinfer-python (no CUDA suffix in version)
 - flashinfer-cubin (no CUDA suffix in version)
-- flashinfer-jit-cache (has CUDA suffix like +cu130)
+- flashinfer-jit-cache (has CUDA suffix like +cu132)
 
 The index is organized by CUDA version for jit-cache, and flat for others.
 """
@@ -19,7 +19,7 @@ from typing import Optional
 
 def get_cuda_version(wheel_name: str) -> Optional[str]:
     """Extract CUDA version from wheel filename."""
-    # Match patterns like +cu128, +cu129, +cu130
+    # Match patterns like +cu126, +cu130, +cu132
     match = re.search(r"\+cu(\d+)", wheel_name)
     if match:
         return match.group(1)
@@ -170,7 +170,7 @@ def update_index(
             base_output = base_output / "nightly"
 
         if cuda:
-            # CUDA-specific index for jit-cache: whl/nightly/cu130/flashinfer-jit-cache/
+            # CUDA-specific index for jit-cache: whl/nightly/cu132/flashinfer-jit-cache/
             index_dir = base_output / f"cu{cuda}" / package
         else:
             # No CUDA version for python/cubin: whl/nightly/flashinfer-python/

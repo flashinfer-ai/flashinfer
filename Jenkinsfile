@@ -323,24 +323,6 @@ stage('Unittest') {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu126',
         { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu126') })
     },
-    // CUDA 12.8 AOT Tests
-    'AOT-Build-Import-x86-64-cu128': {
-      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu128',
-        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu128') })
-    },
-    'AOT-Build-Import-aarch64-cu128': {
-      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu128',
-        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu128') })
-    },
-    // CUDA 12.9 AOT Tests
-    'AOT-Build-Import-x86-64-cu129': {
-      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu129',
-        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu129') })
-    },
-    'AOT-Build-Import-aarch64-cu129': {
-      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu129',
-        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu129') })
-    },
     // CUDA 13.0 AOT Tests
     'AOT-Build-Import-x86-64-cu130': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu130',
@@ -350,32 +332,41 @@ stage('Unittest') {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu130',
         { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu130') })
     },
-    // JIT unittest only for cu129
-    'JIT-Unittest-1-cu129': {
-      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-1-cu129',
-        { node_type -> shard_run_unittest_GPU(node_type, 1, 'cu129') })
+    // CUDA 13.2 AOT Tests
+    'AOT-Build-Import-x86-64-cu132': {
+      run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu132',
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu132') })
     },
-    'JIT-Unittest-2-cu129': {
-      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-2-cu129',
-        { node_type -> shard_run_unittest_GPU(node_type, 2, 'cu129') })
+    'AOT-Build-Import-aarch64-cu132': {
+      run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu132',
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu132') })
     },
-    'JIT-Unittest-3-cu129': {
-      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-3-cu129',
-        { node_type -> shard_run_unittest_GPU(node_type, 3, 'cu129') })
+    // JIT unittest only for cu132
+    'JIT-Unittest-1-cu132': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-1-cu132',
+        { node_type -> shard_run_unittest_GPU(node_type, 1, 'cu132') })
     },
-    'JIT-Unittest-4-cu129': {
-      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-4-cu129',
-        { node_type -> shard_run_unittest_GPU(node_type, 4, 'cu129') })
+    'JIT-Unittest-2-cu132': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-2-cu132',
+        { node_type -> shard_run_unittest_GPU(node_type, 2, 'cu132') })
     },
-    'JIT-Unittest-5-cu129': {
-      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-5-cu129',
-        { node_type -> shard_run_unittest_GPU(node_type, 5, 'cu129') })
+    'JIT-Unittest-3-cu132': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-3-cu132',
+        { node_type -> shard_run_unittest_GPU(node_type, 3, 'cu132') })
     },
-    // JIT unit test for CUDA 12.9 with SM75 (AWS G4)
+    'JIT-Unittest-4-cu132': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-4-cu132',
+        { node_type -> shard_run_unittest_GPU(node_type, 4, 'cu132') })
+    },
+    'JIT-Unittest-5-cu132': {
+      run_with_spot_retry('GPU-G5-SPOT', 'GPU-G5', 'JIT-Unittest-5-cu132',
+        { node_type -> shard_run_unittest_GPU(node_type, 5, 'cu132') })
+    },
+    // JIT unit test for CUDA 13.2 with SM75 (AWS G4)
     // For now, we only enable sampling test for SM75
-    'JIT-Unittest-G4-cu129': {
-      run_with_spot_retry('GPU-G4-SPOT', 'GPU-G4', 'JIT-Unittest-G4-cu129',
-        { node_type -> shard_run_unittest_GPU(node_type, 3, 'cu129') })
+    'JIT-Unittest-G4-cu132': {
+      run_with_spot_retry('GPU-G4-SPOT', 'GPU-G4', 'JIT-Unittest-G4-cu132',
+        { node_type -> shard_run_unittest_GPU(node_type, 3, 'cu132') })
     },
   )
 }
