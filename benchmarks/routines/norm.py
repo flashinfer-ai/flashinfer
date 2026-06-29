@@ -1874,8 +1874,10 @@ def testFusedDitLayernorm(args):
     res = []
     cur_res = defaultdict(str)
     cur_res["routine"] = args.routine
-    cur_res["median_ms"] = fused_ms
-    cur_res["std_ms"] = float(np.std(fused_times))
+    cur_res["median_time"] = fused_ms
+    cur_res["std_time"] = float(np.std(fused_times))
+    cur_res["tflops"] = 0.0
+    cur_res["tb_per_sec"] = tb_per_sec
     cur_res["batch_size"] = batch_size
     cur_res["hidden_size"] = hidden_dim
     cur_res["input_dtype"] = str(torch.bfloat16)
@@ -1892,6 +1894,7 @@ def testFusedDitLayernorm(args):
         )
 
     res.append(cur_res)
+    return res
 
 
 def testFusedQkRmsnormRope(args):
