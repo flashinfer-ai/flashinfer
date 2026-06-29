@@ -134,3 +134,14 @@ def validate_compute_consistency(
             f"ExpertConfig.local_expert_offset ({experts.local_expert_offset}) != "
             f"rank * local_num_experts ({expected_offset}) for rank {rank}."
         )
+
+    # The EP bridge reshapes a finalized [M, hidden] tensor back for combine, and
+    # RANK_MAJOR/HT rely on the runner's weighted local pre-reduce. do_finalize=False
+    # would pass the un-reduced expert outputs through, which MoEEpLayer then
+    # consumes as if finalized.
+    if not compute_config.execution.do_finalize:
+        raise MoEEpConfigError(
+            "compute_config.execution.do_finalize must be True for MoE-EP: the "
+            "bridge consumes a finalized [M, hidden] output and RANK_MAJOR/HT need "
+            "the runner's weighted local pre-reduce."
+        )

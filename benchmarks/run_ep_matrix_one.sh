@@ -22,16 +22,28 @@ export LD_LIBRARY_PATH="$NCCLLIB:/opt/mellanox/doca/lib/x86_64-linux-gnu:/usr/lo
 # HT runtime-JIT toolchain: cross-node HT JIT-compiles a scan kernel that
 # #includes <nccl_device.h> (ships in the NCCL wheel, not the nccl.ep include).
 # Build a combined include dir once per node (localid 0), others wait.
-WHEEL_EP=$(python -c "import nccl.ep,os;print(os.path.dirname(nccl.ep.__file__))" 2>/dev/null)
-NCCL_INC=$(python -c "import nvidia.nccl,os;print(list(nvidia.nccl.__path__)[0]+'/include')" 2>/dev/null)
+WHEEL_EP=$(python -c "import nccl.ep,os;print(os.path.dirname(nccl.ep.__file__))" 2>/dev/null) || true
+NCCL_INC=$(python -c "import nvidia.nccl,os;print(list(nvidia.nccl.__path__)[0]+'/include')" 2>/dev/null) || true
 JIT_INC=/host/jit_inc
+# Fail fast if include discovery failed — otherwise the symlinks below silently
+# produce a broken tree and .ready still gets published, wedging the HT JIT later.
+[ -n "$WHEEL_EP" ] && [ -d "$WHEEL_EP/include" ] || {
+  echo "ERROR: nccl.ep include dir not found (WHEEL_EP='$WHEEL_EP')" >&2; exit 1; }
+[ -n "$NCCL_INC" ] && [ -d "$NCCL_INC" ] || {
+  echo "ERROR: nvidia.nccl include dir not found (NCCL_INC='$NCCL_INC')" >&2; exit 1; }
 if [ "${SLURM_LOCALID:-0}" = "0" ]; then
   mkdir -p "$JIT_INC"
-  ln -sfn "$WHEEL_EP"/include/* "$JIT_INC"/ 2>/dev/null
-  ln -sfn "$NCCL_INC"/* "$JIT_INC"/ 2>/dev/null
+  ln -sfn "$WHEEL_EP"/include/* "$JIT_INC"/
+  ln -sfn "$NCCL_INC"/* "$JIT_INC"/
+  # The HT JIT needs nccl_device.h reachable in the combined tree; verify before
+  # signalling the other ranks to proceed.
+  [ -e "$JIT_INC/nccl_device.h" ] || {
+    echo "ERROR: nccl_device.h missing from $JIT_INC after symlink" >&2; exit 1; }
   touch "$JIT_INC/.ready"
 else
   for _ in $(seq 1 50); do [ -f "$JIT_INC/.ready" ] && break; sleep 0.2; done
+  [ -f "$JIT_INC/.ready" ] || {
+    echo "ERROR: timed out waiting for $JIT_INC/.ready (rank-0 include setup failed)" >&2; exit 1; }
 fi
 export NCCL_EP_JIT_SOURCE_DIR="$WHEEL_EP/include/nccl_ep"
 export NCCL_EP_JIT_BUILD_INCLUDE_DIR="$JIT_INC"

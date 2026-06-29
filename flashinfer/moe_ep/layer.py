@@ -8,9 +8,12 @@ Inner compute is the **identity** when no ``compute_config`` is supplied
 (comm-only, backward compatible).  When a ``compute_config`` (a
 :class:`flashinfer.fused_moe.api.MoEConfig`) and ``weights`` are given, the
 dispatched per-expert tokens are run through the unified MoE compute API
-(``flashinfer.fused_moe.MoELayer``) as a *per-expert grouped GEMM* — no routing,
-no weighted finalize, since EP ``dispatch``/``combine`` own those.  See
-:mod:`flashinfer.moe_ep._compute_bridge` for the layout translation.
+(``flashinfer.fused_moe.MoELayer``) as a *per-expert grouped GEMM*.  EXPERT_MAJOR
+runs a ``top_k=1`` pre-routed pack and ``combine`` applies the routing weights on
+receive; RANK_MAJOR and HT instead drive the runner with the *received* per-token
+routing at the real ``top_k`` (weighted, ``do_finalize=True``) and ``combine`` sums
+the per-rank partials.  See :mod:`flashinfer.moe_ep._compute_bridge` for the layout
+translation.
 """
 
 from __future__ import annotations
@@ -142,8 +145,8 @@ class MoEEpLayer(nn.Module):
 
         Bridges the 3D dispatch output to the token-major compute pack, runs
         ``flashinfer.fused_moe.MoELayer``, and reshapes back to the 3D combine
-        layout.  EXPERT_MAJOR / HT use a top_k=1 pre-routed pack (combine owns the
-        reweight); RANK_MAJOR uses the received per-token routing at the real
+        layout.  EXPERT_MAJOR uses a top_k=1 pre-routed pack (combine owns the
+        reweight); RANK_MAJOR and HT use the received per-token routing at the real
         top_k with do_finalize (this rank applies the weights).  See
         :mod:`flashinfer.moe_ep._compute_bridge`.
         """
@@ -213,14 +216,19 @@ class MoEEpLayer(nn.Module):
         )
 
         if not self.enable_timing:
-            d = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
-            expert_out = self._inner_compute(d)
-            c = handle.combine(
-                CombineInputParams(
-                    x=[expert_out], out=torch.empty_like(t.hidden_states)
+            # try/finally so the handle lifecycle is always drained (complete()):
+            # the fused compute or combine can raise after dispatch, and skipping
+            # complete() would leave the EP handle in an incomplete state.
+            try:
+                d = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
+                expert_out = self._inner_compute(d)
+                c = handle.combine(
+                    CombineInputParams(
+                        x=[expert_out], out=torch.empty_like(t.hidden_states)
+                    )
                 )
-            )
-            handle.complete()
+            finally:
+                handle.complete()
             return c.x
 
         # Profiling path: bracket each stage with CUDA events. EP ops + compute
@@ -234,18 +242,22 @@ class MoEEpLayer(nn.Module):
             )
             for k in ("dispatch", "compute", "combine")
         }
-        ev["dispatch"][0].record()
-        d = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
-        ev["dispatch"][1].record()
-        ev["compute"][0].record()
-        expert_out = self._inner_compute(d)
-        ev["compute"][1].record()
-        ev["combine"][0].record()
-        c = handle.combine(
-            CombineInputParams(x=[expert_out], out=torch.empty_like(t.hidden_states))
-        )
-        ev["combine"][1].record()
-        handle.complete()
+        try:
+            ev["dispatch"][0].record()
+            d = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
+            ev["dispatch"][1].record()
+            ev["compute"][0].record()
+            expert_out = self._inner_compute(d)
+            ev["compute"][1].record()
+            ev["combine"][0].record()
+            c = handle.combine(
+                CombineInputParams(
+                    x=[expert_out], out=torch.empty_like(t.hidden_states)
+                )
+            )
+            ev["combine"][1].record()
+        finally:
+            handle.complete()
         torch.cuda.synchronize()
         self.last_timings_ms = {
             k: start.elapsed_time(end) for k, (start, end) in ev.items()

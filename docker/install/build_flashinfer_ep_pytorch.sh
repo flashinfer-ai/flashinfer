@@ -31,10 +31,10 @@ echo "== pin NCCL-EP runtime wheels to ep_bench's verified set =="
 # libnccl_ep.so expects. --no-deps on the NCCL wheels keeps the base torch intact;
 # nccl.ep additionally imports cuda.core / cuda.bindings, installed explicitly at
 # ep_bench's exact versions (cuda-core 1.0.1, cuda-bindings 13.2.0).
-PIP_CONSTRAINT= pip install --no-cache-dir --no-deps \
+PIP_CONSTRAINT="" pip install --no-cache-dir --no-deps \
     "nvidia-nccl-cu13==${NCCL_VERSION}" \
     "${NCCL4PY_SPEC}"
-PIP_CONSTRAINT= pip install --no-cache-dir \
+PIP_CONSTRAINT="" pip install --no-cache-dir \
     "cuda-core==${CUDA_CORE_VERSION}" \
     "cuda-bindings==${CUDA_BINDINGS_VERSION}"
 python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep + nccl4py import OK')"

@@ -224,7 +224,7 @@ def pytest_generate_tests(metafunc):
 @pytest.mark.gpu_8
 @pytest.mark.arch_blackwell
 def test_moe_ep_ht_matches_dense_reference(per_rank):
-    """HT (FLAT) bf16 dispatch->compute->combine equals a non-EP MoE reference."""
+    """High-throughput (HT, FLAT) bf16 dispatch->compute->combine equals a non-EP MoE reference."""
     import torch.distributed as dist
 
     if not dist.is_initialized():

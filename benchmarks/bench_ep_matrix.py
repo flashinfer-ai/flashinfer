@@ -1,7 +1,7 @@
 """FlashInfer EP comm benchmark — apples-to-apples with contrib/nccl_ep/ep_bench.
 
 Measures FlashInfer's NCCL-EP dispatch+combine (comm only, NO expert FFN) the same
-way ep_bench does, so the 28-case matrix (LL em/rm @128, HT @4096/8192, ×
+way ep_bench does, so the 28-case matrix (LL em/rm @128, HT @4096/8192, x
 {8,16,32,64} GPU, IB + MNNVL) is directly comparable. Emits ep_bench-compatible
 text so the upstream scripts/parse_results.py parses these logs unchanged.
 
@@ -125,6 +125,9 @@ def main() -> int:
     offset = rank * local_n
     is_ht = args.algorithm == "ht"
     algo = EpAlgorithm.HIGH_THROUGHPUT if is_ht else EpAlgorithm.LOW_LATENCY
+    # EpLayout exposes only the two LL receive layouts. HT ("fl") always uses the
+    # library's FLAT layout internally, so FleetParams.layout is ignored for HT —
+    # EXPERT_MAJOR is just an inert placeholder there.
     layout = EpLayout.RANK_MAJOR if args.layout == "rm" else EpLayout.EXPERT_MAJOR
 
     # Inputs: DISTINCT top-k experts per token (matches ep_bench randperm routing).

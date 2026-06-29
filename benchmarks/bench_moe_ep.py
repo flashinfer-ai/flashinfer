@@ -39,7 +39,7 @@ top_k=min(8,world), num_experts=min(256, top_k*world), per contrib/nccl_ep/
 ep_test.py) and sweep ``--tokens-per-rank {4096,8192}``.
 
 The CSV reports BOTH per-stage latency (µs) and dispatch/combine bandwidth (GB/s,
-ep_bench send-side convention: unique (token,node) selections × hidden × dtype /
+ep_bench send-side convention: unique (token,node) selections x hidden x dtype /
 stage time; ``*_rdma_*`` = remote-node only).
 """
 
@@ -279,7 +279,9 @@ def main() -> int:
     ep_layout = (
         EpLayout.RANK_MAJOR if args.layout == "rank_major" else EpLayout.EXPERT_MAJOR
     )
-    # RANK_MAJOR is LL-only; fall back to EXPERT_MAJOR under HT (which ignores it).
+    # EpLayout exposes only the two LL receive layouts. HT always uses the library's
+    # FLAT layout internally, so FleetParams.layout is ignored for HT — set the inert
+    # EXPERT_MAJOR placeholder (RANK_MAJOR is LL-only).
     if ep_algorithm is EpAlgorithm.HIGH_THROUGHPUT:
         ep_layout = EpLayout.EXPERT_MAJOR
 

@@ -149,20 +149,21 @@ def build_activation_pack_rank_major(
     weights = recv_topk_weights
     if weights.dtype != torch.float32:
         weights = weights.to(torch.float32)
-    if idx.shape[0] != m or weights.shape[0] != m:
+    if idx.shape != weights.shape or idx.shape[0] != m:
         raise ValueError(
-            f"recv_topk_idx/weights row count ({idx.shape[0]}/{weights.shape[0]}) "
-            f"must match the flattened recv token count ({m})."
+            f"recv_topk_idx/weights must share shape [M={m}, top_k]; got "
+            f"{tuple(idx.shape)} / {tuple(weights.shape)}."
         )
 
     # The RANK_MAJOR dispatch returns LOCAL expert indices (0-based within this
     # rank's experts) for each token's picks, with -1 marking a pick routed to a
     # NON-local expert (handled by another rank). Convert local->global
     # (idx + local_expert_offset) for the runner, which expects global ids and
-    # filters by local_expert_offset. Non-local picks (-1) are masked to a valid
-    # local id with weight 0, so the weighted finalize sum drops them; combine then
-    # sums each token's per-rank partial reductions across ranks.
-    is_local = idx >= 0
+    # filters by local_expert_offset. Only [0, num_local_experts) is local; -1 and
+    # any out-of-range id are masked to a valid local id with weight 0, so the
+    # weighted finalize sum drops them; combine then sums each token's per-rank
+    # partial reductions across ranks.
+    is_local = (idx >= 0) & (idx < num_local_experts)
     selected_experts = torch.where(
         is_local,
         idx + local_expert_offset,

@@ -346,7 +346,8 @@ class TrtllmBf16RoutedRunner(TunableRunner):
     weight dtypes and no scale-factor tensors, wrapping the same inner
     ``MoERunner`` (whose ``forward`` dispatches to ``moe_op.trtllm_bf16_moe`` when
     ``dtype_weights == Bfloat16``).  Used for the EP grouped-GEMM bf16 path: the
-    packed pre-routed ids carry ``((expert_id - local_offset) << 16) | bf16(weight)``;
+    packed pre-routed ids carry ``(GLOBAL expert_id << 16) | bf16(weight)`` (with
+    ``local_expert_offset`` passed separately);
     with the EP bridge's synthesized ``top_k=1`` + ``weight=1`` and
     ``do_finalize=True``, the output comes back in input row order.
 

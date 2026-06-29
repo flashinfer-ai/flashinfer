@@ -94,6 +94,11 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
+            # Skip backends that cannot execute the configured quant variant, so a
+            # mixed candidate list (e.g. BF16 with (CuteDslConfig, TrtllmBf16Config))
+            # never instantiates a runner that would mis-handle the pack contract.
+            if config.quant.variant not in _RUNNER_QUANTS.get(type(backend_cfg), ()):
+                continue
             self.runners.append(runner_cls(config, device=self.device))
 
         if not self.runners:
