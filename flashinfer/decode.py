@@ -2601,6 +2601,10 @@ def _should_force_trtllm_gen_spec_dec_tree_keeps(
         return False
     if window_left >= 0:
         return True
+    if seq_lens.is_cuda and torch.cuda.is_current_stream_capturing():
+        # Sequence lengths are device-resident during graph capture. Avoid a
+        # host sync and select the layout that is valid for every alignment.
+        return True
     tile_size_kv_per_cta = 128 * layout.num_insts_kv
     prefix_lens = seq_lens - q_len
     straddles_kv_cta = (

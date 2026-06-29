@@ -440,8 +440,6 @@ struct TllmGenSelectKernelParams {
   int mTileSizeKv;
   // Use 2 CTA MMA or not.
   bool mUses2CtaMma;
-  // Whether the selected generation kernel groups tokensQ and headsQ into one CTA.
-  bool mGroupsTokensHeadsQ;
   // Transform mode for BF16 query + FP8 KV generation kernels.
   Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
 
@@ -466,6 +464,5 @@ struct TllmGenSelectKernelParams {
         mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false),
-        mGroupsTokensHeadsQ(false),
         mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode) {};
 };

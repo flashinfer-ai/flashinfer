@@ -113,6 +113,29 @@ def test_spec_dec_tree_swaps_straddling_tail_forces_keeps_fallback():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_spec_dec_tree_capture_forces_keeps_without_host_sync(monkeypatch):
+    layout = _select_trtllm_gen_spec_dec_tree_kernel(
+        torch.bfloat16,
+        torch.bfloat16,
+        num_heads_q_per_kv=5,
+        q_len=4,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def fail_on_host_sync(*args, **kwargs):
+        raise AssertionError("capture path must not inspect device sequence lengths")
+
+    monkeypatch.setattr(torch, "any", fail_on_host_sync)
+
+    assert _should_force_trtllm_gen_spec_dec_tree_keeps(
+        layout,
+        torch.tensor([1280], dtype=torch.int32, device="cuda"),
+        q_len=4,
+        window_left=-1,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_pack_spec_dec_tree_mask_swaps_layout_bits():
     tree_mask = torch.tensor([[[True, False], [True, True]]], device="cuda")
     seq_lens = torch.tensor([6], dtype=torch.int32, device="cuda")
@@ -169,4 +192,3 @@ def test_pack_spec_dec_tree_mask_swaps_layout_bits():
     for head_idx_q in range(4):
         word_idx, bit_idx = swaps_word_bit(0, 5, head_idx_q)
         assert not (words[word_idx].item() & (1 << bit_idx))
-
