@@ -2,6 +2,11 @@
 # Common test functions for FlashInfer test scripts
 # This file is meant to be sourced by test runner scripts
 
+TEST_UTILS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Normalize Python before any installs in callers.
+# shellcheck disable=SC1091
+source "${TEST_UTILS_DIR}/python_env.sh"
+
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
 
