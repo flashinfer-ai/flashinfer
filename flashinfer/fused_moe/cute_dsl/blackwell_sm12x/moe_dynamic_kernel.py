@@ -338,7 +338,8 @@ class MoEDynamicKernel:
             self.acc_dtype,
             self.sf_dtype,
         )
-        atom_layout = cute.make_layout((2, 2, 1))
+        atom_shape = (2, 2, 1)
+        atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.tile_shape_mnk,
             self.sf_vec_size,
@@ -351,9 +352,12 @@ class MoEDynamicKernel:
         )
         self.mma_atom = cute.make_mma_atom(mma_op)
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
-        self.num_m_tiles = self.tile_shape_mnk[0] // (16 * 4)
-        self.num_n_tiles = self.tile_shape_mnk[1] // (8 * 2)
-        self.num_k_blocks = self.tile_shape_mnk[2] // 64
+        # Derive loop bounds from atom_shape (like the dense kernel). The old
+        # hardcoded (16*4) assumed dense's (4,2,1); this kernel is (2,2,1).
+        mma_m, mma_n, mma_k = 16, 8, 64
+        self.num_m_tiles = self.tile_shape_mnk[0] // (mma_m * atom_shape[0])
+        self.num_n_tiles = self.tile_shape_mnk[1] // (mma_n * atom_shape[1])
+        self.num_k_blocks = self.tile_shape_mnk[2] // mma_k
 
         sfa_smem = sm120_make_smem_layout_sfa(
             self.tiled_mma,
