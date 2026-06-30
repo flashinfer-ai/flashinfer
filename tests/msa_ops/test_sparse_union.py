@@ -308,3 +308,29 @@ def test_union_public_api(B, S, return_lse):
     mae_kv = (ref.float() - oracle).abs().mean().item()
     assert mae_o <= mae_kv * 1.5 + 1e-6, (mae_o, mae_kv)
     assert (got.float() - ref.float()).abs().mean().item() < 5e-4
+
+
+@pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
+@pytest.mark.parametrize("causal", [True, False])
+def test_union_fp8_kv_matches_split(B, S, causal):
+    """union=True with fp8 (E4M3) K/V dequant-on-load matches the KV-major split
+    path on the same fp8 inputs (both upconvert to the bf16 compute dtype)."""
+    _skip()
+    from flashinfer.msa_ops import msa_sparse_attention
+
+    dev = "cuda"
+    Hq, Hkv, topk, hd = 64, 4, 16, 128
+    scale = 1.0 / math.sqrt(hd)
+    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    torch.manual_seed(17)
+    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
+    k8 = (torch.randn(B * S, Hkv, hd, device=dev) / 3).to(torch.float8_e4m3fn)
+    v8 = (torch.randn(B * S, Hkv, hd, device=dev) / 3).to(torch.float8_e4m3fn)
+    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=7)
+
+    kw = dict(causal=causal, softmax_scale=scale)
+    split = msa_sparse_attention(q, k8, v8, q2k, cu, cu, **kw)
+    union = msa_sparse_attention(q, k8, v8, q2k, cu, cu, union=True, **kw)
+    torch.cuda.synchronize()
+    assert union.shape == (B * S, Hq, hd)
+    assert (union.float() - split.float()).abs().max().item() < 5e-3

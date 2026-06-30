@@ -415,8 +415,11 @@ def msa_sparse_attention(
         # query-tile + block-union + in-kernel online softmax: no GMEM partials and
         # no combine kernel (the memory-bound KV-major path's ~6x prefill headroom on
         # SM12x). bf16/fp16 flat K/V only for now.
-        if q_fp8 or kv_fp8 or kv_nvfp4 or qk_fp8_mma or pv_fp8_mma:
-            raise ValueError("union=True supports bf16/fp16 only (no fp8/NVFP4) yet")
+        if q_fp8 or kv_nvfp4 or qk_fp8_mma or pv_fp8_mma:
+            raise ValueError(
+                "union=True supports bf16/fp16 Q with bf16/fp16 or fp8 (E4M3) K/V; "
+                "q_fp8 / NVFP4 KV / native fp8-MMA are not on the union path yet"
+            )
         if return_temperature_lse:
             raise ValueError("union=True does not support return_temperature_lse yet")
         # paged is supported (page_size == _BLK_KV, one page per KV block); the
@@ -442,6 +445,7 @@ def msa_sparse_attention(
             topk=topk,
             compute_dtype=compute_dtype,
             return_softmax_lse=return_softmax_lse,
+            kv_fp8=kv_fp8,
         )
 
     if schedule is None:
@@ -660,11 +664,13 @@ def _msa_sparse_attention_union(
     topk,
     compute_dtype,
     return_softmax_lse,
+    kv_fp8=False,
 ):
     """Union-tile prefill path (query-tile + block-union + in-kernel online softmax,
-    no GMEM partials / no combine). bf16/fp16; flat K/V, or paged ``(num_pages,
-    Hkv, _BLK_KV, d)`` with one page per KV block when ``page_table`` is given.
-    See :class:`...cute_dsl.sparse_fwd_union_sm12x.SparseAttentionUnionFwdSm12x`."""
+    no GMEM partials / no combine). bf16/fp16 Q; K/V are bf16/fp16, or fp8 (E4M3)
+    dequantized to the compute dtype on load (``kv_fp8``); flat K/V, or paged
+    ``(num_pages, Hkv, _BLK_KV, d)`` with one page per KV block when ``page_table``
+    is given. See :class:`...cute_dsl.sparse_fwd_union_sm12x.SparseAttentionUnionFwdSm12x`."""
     import cutlass
     import cutlass.cute as cute
 
@@ -698,15 +704,18 @@ def _msa_sparse_attention_union(
     key = (
         "sparse_attn_union",
         str(q.dtype),
+        str(k.dtype),
         group_size,
         causal,
         m_block,
         num_threads,
         paged,
+        kv_fp8,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
-        cdt = _cutlass_dtype(q.dtype)
+        cdt = _cutlass_dtype(q.dtype)  # compute dtype (Q + output)
+        kdt = _cutlass_dtype(k.dtype)  # K/V storage dtype (fp8 when kv_fp8)
         i32 = _cutlass_dtype(torch.int32)
         f32 = _cutlass_dtype(torch.float32)
         s = [cute.sym_int() for _ in range(13)]
@@ -721,12 +730,13 @@ def _msa_sparse_attention_union(
             is_causal=causal,
             return_softmax_lse=True,
             paged=paged,
+            kv_fp8=kv_fp8,
         )
         compiled = cute.compile(
             kernel_obj,
             _fake(cdt, (s[0], s[1], head_dim)),
-            _fake(cdt, kv_shape),
-            _fake(cdt, kv_shape),
+            _fake(kdt, kv_shape),
+            _fake(kdt, kv_shape),
             _fake(cdt, (s[0], s[1], head_dim)),
             _fake(f32, (s[1], s[0]), align=4),
             _fake(i32, (s[6], s[7]), align=4),

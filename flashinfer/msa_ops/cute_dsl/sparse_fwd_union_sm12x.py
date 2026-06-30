@@ -62,11 +62,15 @@ class SparseAttentionUnionFwdSm12x:
         is_causal: bool = True,
         return_softmax_lse: bool = False,
         paged: bool = False,
+        kv_fp8: bool = False,
+        kv_nvfp4: bool = False,
     ):
         if head_dim != 128 or n_block_size != 128:
             raise ValueError("only head_dim == n_block_size == 128 is supported")
         if m_block_size % group_size != 0:
             raise ValueError("group_size must divide m_block_size")
+        if kv_fp8 and kv_nvfp4:
+            raise ValueError("kv_fp8 and kv_nvfp4 are mutually exclusive")
         self._head_dim = head_dim
         self._m_block_size = m_block_size
         self._n_block_size = n_block_size
@@ -76,6 +80,15 @@ class SparseAttentionUnionFwdSm12x:
         self._is_causal = is_causal
         self._return_softmax_lse = return_softmax_lse
         self._paged = paged
+        # fp8 (E4M3) and NVFP4 K/V caches are dequantized to the compute dtype
+        # elementwise on load (no native fp8/fp4 MMA -- the QK/PV matmuls stay in
+        # the bf16/fp16 compute dtype), so the K/V HBM read is at ~1 byte / ~0.5
+        # byte per element while the mainloop is unchanged. The swizzled SMEM
+        # layout is reused (the 8-element dequant chunk writes are swizzle-safe,
+        # as in the proxy fp8 kernel); the split kernel's wider padded layout
+        # would overflow the ~99KB consumer SMEM at the m_block=128 tile.
+        self._kv_fp8 = kv_fp8
+        self._kv_nvfp4 = kv_nvfp4
         self._q_smem_stride = head_dim + 8
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=num_threads
@@ -89,6 +102,60 @@ class SparseAttentionUnionFwdSm12x:
             cute.make_layout((8, 64), stride=(64, 1)),
         )
         return cute.tile_to_shape(atom, (self._n_block_size, self._head_dim), (0, 1))
+
+    @cute.jit
+    def _load_kv_fp8(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        mPageTable: cute.Tensor,
+        batch_idx: cutlass.Int32,
+        kv_head: cutlass.Int32,
+        k_start: cutlass.Int32,
+        kv_block: cutlass.Int32,
+        seqlen_k: cutlass.Int32,
+        tidx: cutlass.Int32,
+    ):
+        """Dequant-on-load fp8 (E4M3) K/V: vectorized load -> upconvert to the
+        compute dtype -> swizzled SMEM (the same target the bf16 cp.async path
+        fills). e4m3->f16 is the native cvt; bf16 routes through f32. Rows past
+        ``seqlen_k`` are zero-filled (masked in the epilogue). Mirrors the
+        KV-major ``sparse_fwd_sm12x`` fp8 load, minus the native-fp8-MMA modes."""
+        if cutlass.const_expr(self._paged):
+            page = mPageTable[batch_idx, kv_block]
+            mK_h8 = mK[page, kv_head, None, None]
+            mV_h8 = mV[page, kv_head, None, None]
+            row_off = cutlass.Int32(0)
+        else:
+            mK_h8 = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
+            mV_h8 = cute.domain_offset((k_start, 0), mV[None, kv_head, None])
+            row_off = kv_block * self._n_block_size
+        chunks_per_row = self._head_dim // 8
+        total_chunks = self._n_block_size * chunks_per_row
+        cvt_frag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
+        for kv_it in cutlass.range_constexpr(total_chunks // self._num_threads):
+            kv_chunk = tidx + kv_it * self._num_threads
+            kv_m = kv_chunk // chunks_per_row
+            kv_c8 = kv_chunk % chunks_per_row
+            sK_chunk = cute.local_tile(sK[kv_m, None], (8,), (kv_c8,))
+            sV_chunk = cute.local_tile(sV[kv_m, None], (8,), (kv_c8,))
+            if (kv_block * self._n_block_size + kv_m) < seqlen_k:
+                gKc = cute.local_tile(mK_h8[row_off + kv_m, None], (8,), (kv_c8,))
+                gVc = cute.local_tile(mV_h8[row_off + kv_m, None], (8,), (kv_c8,))
+                cvt_frag.store(
+                    gKc.load().to(cutlass.Float16).to(cutlass.Float32).to(self._dtype)
+                )
+                cute.autovec_copy(cvt_frag, sK_chunk)
+                cvt_frag.store(
+                    gVc.load().to(cutlass.Float16).to(cutlass.Float32).to(self._dtype)
+                )
+                cute.autovec_copy(cvt_frag, sV_chunk)
+            else:
+                cvt_frag.fill(0)
+                cute.autovec_copy(cvt_frag, sK_chunk)
+                cute.autovec_copy(cvt_frag, sV_chunk)
 
     @cute.jit
     def __call__(
@@ -111,17 +178,27 @@ class SparseAttentionUnionFwdSm12x:
         work_capacity: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        if cutlass.const_expr(
-            not (mQ.element_type == mK.element_type == mV.element_type)
-        ):
-            raise TypeError("Q/K/V must have the same data type")
+        if cutlass.const_expr(not (self._kv_fp8 or self._kv_nvfp4)):
+            if cutlass.const_expr(
+                not (mQ.element_type == mK.element_type == mV.element_type)
+            ):
+                raise TypeError("Q/K/V must have the same data type")
         if cutlass.const_expr(
             not (
                 mQ.element_type == cutlass.Float16
                 or mQ.element_type == cutlass.BFloat16
             )
         ):
-            raise TypeError("Only Float16 or BFloat16 is supported")
+            raise TypeError("Q must be Float16 or BFloat16 (the compute dtype)")
+        if cutlass.const_expr(self._kv_fp8):
+            if cutlass.const_expr(
+                not (
+                    mK.element_type == cutlass.Float8E4M3FN
+                    and mV.element_type == cutlass.Float8E4M3FN
+                )
+            ):
+                raise TypeError("kv_fp8 requires K/V to be Float8E4M3FN")
+        # Q sets the compute dtype; fp8/NVFP4 K/V are dequantized to it on load.
         self._dtype = mQ.element_type
 
         skv_cosize = cute.cosize(self._make_skv_layout())
@@ -356,46 +433,61 @@ class SparseAttentionUnionFwdSm12x:
                 mask_word = mUnionMasks[work_idx, u]
                 base = kv_block * self._n_block_size
 
-                # paged: the block IS one page -> remap through the page table and
-                # rebuild the gmem source tile per block (block coord 0). flat:
-                # reuse the batch tile set up above, indexed by kv_block.
-                if cutlass.const_expr(self._paged):
-                    page = mPageTable[batch_idx, kv_block]
-                    mK_pg = mK[page, kv_head, None, None]
-                    mV_pg = mV[page, kv_head, None, None]
-                    gK_b = cute.local_tile(
-                        mK_pg, (self._n_block_size, self._head_dim), (None, 0)
-                    )
-                    gV_b = cute.local_tile(
-                        mV_pg, (self._n_block_size, self._head_dim), (None, 0)
-                    )
-                    tKgK_b = gmem_thr_copy_KV.partition_S(gK_b)
-                    tVgV_b = gmem_thr_copy_KV.partition_S(gV_b)
-                    blk_coord = cutlass.Int32(0)
-                else:
-                    tKgK_b = tKgK
-                    tVgV_b = tVgV
-                    blk_coord = kv_block
-
                 # previous block's K/V fragment reads must be done first
                 self.cta_sync_barrier.arrive_and_wait()
-                for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                    if cute.elem_less(base + tKVcKV[0, n, 0][0], seqlen_k):
-                        cute.copy(
-                            gmem_tiled_copy_KV,
-                            tKgK_b[None, n, None, blk_coord],
-                            tKsK[None, n, None],
+                if cutlass.const_expr(self._kv_fp8):
+                    # dequant-on-load fp8 K/V (synchronous; no cp.async group)
+                    self._load_kv_fp8(
+                        mK,
+                        mV,
+                        sK,
+                        sV,
+                        mPageTable,
+                        batch_idx,
+                        kv_head,
+                        k_start,
+                        kv_block,
+                        seqlen_k,
+                        tidx,
+                    )
+                else:
+                    # bf16/fp16: cp.async load. paged remaps the block through the
+                    # page table (block coord 0); flat reuses the batch tile.
+                    if cutlass.const_expr(self._paged):
+                        gK_b = cute.local_tile(
+                            mK[mPageTable[batch_idx, kv_block], kv_head, None, None],
+                            (self._n_block_size, self._head_dim),
+                            (None, 0),
                         )
-                        cute.copy(
-                            gmem_tiled_copy_KV,
-                            tVgV_b[None, n, None, blk_coord],
-                            tVsV[None, n, None],
+                        gV_b = cute.local_tile(
+                            mV[mPageTable[batch_idx, kv_block], kv_head, None, None],
+                            (self._n_block_size, self._head_dim),
+                            (None, 0),
                         )
+                        tKgK_b = gmem_thr_copy_KV.partition_S(gK_b)
+                        tVgV_b = gmem_thr_copy_KV.partition_S(gV_b)
+                        blk_coord = cutlass.Int32(0)
                     else:
-                        tKsK[None, n, None].fill(0)
-                        tVsV[None, n, None].fill(0)
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
+                        tKgK_b = tKgK
+                        tVgV_b = tVgV
+                        blk_coord = kv_block
+                    for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                        if cute.elem_less(base + tKVcKV[0, n, 0][0], seqlen_k):
+                            cute.copy(
+                                gmem_tiled_copy_KV,
+                                tKgK_b[None, n, None, blk_coord],
+                                tKsK[None, n, None],
+                            )
+                            cute.copy(
+                                gmem_tiled_copy_KV,
+                                tVgV_b[None, n, None, blk_coord],
+                                tVsV[None, n, None],
+                            )
+                        else:
+                            tKsK[None, n, None].fill(0)
+                            tVsV[None, n, None].fill(0)
+                    cute.arch.cp_async_commit_group()
+                    cute.arch.cp_async_wait_group(0)
                 self.cta_sync_barrier.arrive_and_wait()
 
                 for k in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
