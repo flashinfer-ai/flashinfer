@@ -1702,6 +1702,7 @@ def main():
                 # Re-seed per case so page_table and ragged see identical inputs,
                 # keeping the per-case transform comparison and length stats equivalent.
                 generator.manual_seed(1234 + case_idx)
+                needs_cache_cleanup = False
                 try:
                     result = bench_varlen_transform(
                         case,
@@ -1766,18 +1767,19 @@ def main():
                     print(line)
                 except RuntimeError as e:
                     error_label = classify_benchmark_runtime_error(e)
-                    if error_label is not None:
-                        print(
-                            f"{case.regime:>8} {case.length_dist:>10} "
-                            f"{transform:>11} {case.max_len:>9} {case.k:>6} | {error_label}"
-                        )
-                        # Drop the exception reference so its traceback stops pinning
-                        # bench_varlen_transform's frame (and its large GPU tensors)
-                        # before reclaiming cached memory.
-                        del e
-                        torch.cuda.empty_cache()
-                    else:
+                    if error_label is None:
                         raise
+                    print(
+                        f"{case.regime:>8} {case.length_dist:>10} "
+                        f"{transform:>11} {case.max_len:>9} {case.k:>6} | {error_label}"
+                    )
+                    needs_cache_cleanup = True
+                # Reclaim cached memory only after the except block exits. While the
+                # handler is active, the in-flight exception keeps bench_varlen_transform's
+                # frame (and its large GPU tensors) alive, so empty_cache() inside the
+                # handler would be a no-op; releasing here lets the next case start clean.
+                if needs_cache_cleanup:
+                    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
