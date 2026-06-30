@@ -258,13 +258,29 @@ class TllmGenFmhaKernel {
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
-    // The selectKernelParams that might be updated.
     SelectKernelParams selectKernelParams{params};
-    // Select the kernel.
-    selectKernel(params, selectKernelParams);
-    // Hash the runner params.
-    auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
-    return std::make_pair(mKernelMetaMap.find(hashId) != mKernelMetaMap.end(), info);
+    CtaLaunchParams ctaLaunchParams;
+
+    // Match run(): a shape can reselect after CTA sizing (for example, short KV sequences
+    // disable multi-CTA reduction). Checking only the initial key can therefore report a kernel
+    // that the launch will not use.
+    static constexpr int kMaxKernelSelectionPasses = 4;
+    std::string info;
+    for (int pass = 0; pass < kMaxKernelSelectionPasses; ++pass) {
+      selectKernel(params, selectKernelParams);
+      auto [hashId, currentInfo] = hashFromRunnerParams(params, selectKernelParams);
+      info = currentInfo;
+      auto const kernelIt = mKernelMetaMap.find(hashId);
+      if (kernelIt == mKernelMetaMap.end()) {
+        return std::make_pair(false, info);
+      }
+      computeCtaAndClusterConfig(ctaLaunchParams, params, mKernelMeta[kernelIt->second],
+                                 selectKernelParams);
+      if (!selectKernelParams.mSelectNewKernel) {
+        return std::make_pair(true, info);
+      }
+    }
+    return std::make_pair(false, info);
   }
 
   // start here
