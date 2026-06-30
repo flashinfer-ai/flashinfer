@@ -586,6 +586,8 @@ def test_xqa_batch_decode(
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
+        (1, 1, 16, 2, 4),
+        (1, 1, 32, 2, 4),
         (4, 4, 64, 4, 2),
         (1, 1, 64, 2, 4),
         (1, 1, 64, 2, 8),

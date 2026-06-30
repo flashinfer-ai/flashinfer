@@ -20,6 +20,7 @@ import torch
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules
 
 import flashinfer
+from tests.test_helpers.test_helpers import assert_close_chunked
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import has_flashinfer_jit_cache
 
@@ -813,7 +814,12 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
         o_causal, _ = wrapper.run(q, k, v, return_lse=True)
     else:
         o_causal = wrapper.run(q, k, v)
-    torch.testing.assert_close(o_custom, o_causal, rtol=1e-3, atol=1e-3)
+    # Free everything but the two outputs before comparing: for the largest
+    # parametrizations o_custom/o_causal are ~1.1 GiB each and
+    # torch.testing.assert_close allocates several full-size temporaries
+    # inside torch.isclose, which OOMs 24 GB CI GPUs (issue #3603).
+    del q, k, v, custom_mask, wrapper, workspace_buffer
+    assert_close_chunked(o_custom, o_causal, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1])

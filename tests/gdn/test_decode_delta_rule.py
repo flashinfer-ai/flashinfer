@@ -1304,6 +1304,324 @@ def test_mtp_fp32_state_with_cache_and_state_update(
 
 
 # ============================================================================
+# Test fp32 MTP pool+indices path: non-trivial indices and (optional)
+# separate output_state_indices. Verifies the pool path matches the gather →
+# direct → scatter reference, that non-selected pool slots are unchanged, and
+# (when output indices differ) that the write lands in the destination slots
+# rather than the read slots.
+# ============================================================================
+
+
+def _test_mtp_fp32_state_pool(
+    batch_size: int,
+    seq_len: int,
+    head_size: int = 128,
+    pool_multiplier: int = 3,
+    use_separate_output_indices: bool = False,
+    cache_intermediate_states: bool = False,
+    dtype: str = "bfloat16",
+    seed: int | None = None,
+):
+    """fp32 MTP pool path must match gather → direct → scatter reference."""
+    _skip_if_not_sm90_or_later()
+
+    if seed is not None:
+        random.seed(seed)
+        torch.random.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+    num_q_heads = 16
+    num_k_heads = 16
+    num_v_heads = 32
+    HV = num_v_heads
+    K = V = head_size
+    B = batch_size
+    T = seq_len
+    pool_size = B * pool_multiplier
+
+    dtype_torch = getattr(torch, dtype)
+    device = torch.device("cuda")
+    scale_val = 1.0 / math.sqrt(K)
+
+    with device:
+        q = torch.randn(B, T, num_q_heads, K, dtype=dtype_torch) * 0.1
+        k = torch.nn.functional.normalize(
+            torch.randn(B, T, num_k_heads, K, dtype=dtype_torch),
+            p=2.0,
+            dim=-1,
+        )
+        v = torch.randn(B, T, HV, V, dtype=dtype_torch) * 0.1
+
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+        a = torch.randn(B, T, HV, dtype=dtype_torch) * 0.1
+        b = torch.randn(B, T, HV, dtype=dtype_torch)
+
+        # fp32 pool in [pool, HV, V, K] K-last layout
+        pool = torch.randn(pool_size, HV, V, K, dtype=torch.float32) * 0.01
+
+        # Non-trivial read indices: every pool_multiplier-th slot (so non-selected
+        # slots are interleaved with selected ones).
+        read_indices = (
+            torch.arange(B, dtype=torch.int32, device=device) * pool_multiplier
+        )
+
+        if use_separate_output_indices:
+            # Write target = one past the read slot (still distinct, non-trivial).
+            write_indices = read_indices + 1
+        else:
+            write_indices = None
+
+        intermediate_buffer = (
+            torch.zeros(B, T, HV, V, K, dtype=torch.float32, device=device)
+            if cache_intermediate_states
+            else None
+        )
+
+    # ── Pool path under test ─────────────────────────────────────────────────
+    pool_under_test = pool.clone()
+    out_pool, _ = gated_delta_rule_mtp(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=pool_under_test,
+        initial_state_indices=read_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale_val,
+        intermediate_states_buffer=intermediate_buffer,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+        output_state_indices=write_indices,
+    )
+
+    # ── Gather → direct → scatter reference ─────────────────────────────────
+    gathered_state = pool[read_indices].clone()  # [B, HV, V, K] — own slots only.
+    # To exercise the same code path, treat the gathered states as a B-sized pool
+    # with identity indices on both ends — that gives us the "direct" semantics
+    # without depending on a separate T>1 direct API. We also pass the reference
+    # path its own intermediate buffer (when caching is on) so we can compare
+    # the kernel's cached intermediates head-to-head.
+    direct_indices = torch.arange(B, dtype=torch.int32, device=device)
+    intermediate_buffer_ref = (
+        torch.zeros(B, T, HV, V, K, dtype=torch.float32, device=device)
+        if cache_intermediate_states
+        else None
+    )
+    out_direct, updated_direct = gated_delta_rule_mtp(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=gathered_state,
+        initial_state_indices=direct_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale_val,
+        intermediate_states_buffer=intermediate_buffer_ref,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+    )
+
+    atol = 1e-3
+    rtol = 1e-3
+
+    # Outputs must match (the kernel computation is independent of the write
+    # destination — only the writeback target differs).
+    torch.testing.assert_close(out_pool, out_direct, atol=atol, rtol=rtol)
+
+    # Verify writes landed in the right pool slots.
+    expected_write_indices = (
+        write_indices if write_indices is not None else read_indices
+    )
+    torch.testing.assert_close(
+        pool_under_test[expected_write_indices], updated_direct, atol=atol, rtol=rtol
+    )
+
+    # Non-targeted pool slots must be exactly unchanged. When read != write,
+    # the read slots count as non-targeted (kernel only writes to write_indices).
+    touched = torch.zeros(pool_size, dtype=torch.bool, device=device)
+    touched[expected_write_indices] = True
+    torch.testing.assert_close(
+        pool_under_test[~touched], pool[~touched], atol=0.0, rtol=0.0
+    )
+
+    # Verify cached intermediate states (the kernel populates these every
+    # timestep). Both runs start from the same initial state and feed the same
+    # q/k/v/g/β, so the cached intermediates must match cell-for-cell.
+    if cache_intermediate_states:
+        torch.testing.assert_close(
+            intermediate_buffer,
+            intermediate_buffer_ref,
+            atol=atol,
+            rtol=rtol,
+        )
+
+    print(
+        f"✓ fp32 MTP pool path passed "
+        f"(B={B}, T={T}, pool={pool_size}, separate_out={use_separate_output_indices})"
+    )
+
+
+@pytest.mark.parametrize("cache_intermediate_states", [False, True])
+@pytest.mark.parametrize("use_separate_output_indices", [False, True])
+@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+def test_mtp_fp32_state_pool(
+    batch_size: int,
+    seq_len: int,
+    use_separate_output_indices: bool,
+    cache_intermediate_states: bool,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _test_mtp_fp32_state_pool(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        use_separate_output_indices=use_separate_output_indices,
+        cache_intermediate_states=cache_intermediate_states,
+        seed=seed,
+    )
+
+
+# ============================================================================
+# fp32 MTP with a NON-CONTIGUOUS pool (e.g., vLLM page-strided SSM pool).
+# Exercises the native 4D-pool kernel path (`use_pool_indexing=True`) which
+# reads/writes the strided pool in place without densification. Without this
+# kernel-level support, the wrapper would either copy the pool every call
+# (slow) or silently lose updates (correctness bug).
+# ============================================================================
+
+
+def _test_mtp_fp32_state_pool_non_contiguous(
+    batch_size: int = 4,
+    seq_len: int = 4,
+    head_size: int = 128,
+    stride_multiplier: int = 2,
+    seed: int | None = None,
+):
+    _skip_if_not_sm90_or_later()
+
+    if seed is not None:
+        random.seed(seed)
+        torch.random.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+    num_q_heads = 16
+    num_k_heads = 16
+    num_v_heads = 32
+    HV = num_v_heads
+    K = V = head_size
+    B = batch_size
+    T = seq_len
+
+    device = torch.device("cuda")
+    scale_val = 1.0 / math.sqrt(K)
+
+    with device:
+        q = torch.randn(B, T, num_q_heads, K, dtype=torch.bfloat16) * 0.1
+        k = torch.nn.functional.normalize(
+            torch.randn(B, T, num_k_heads, K, dtype=torch.bfloat16), p=2.0, dim=-1
+        )
+        v = torch.randn(B, T, HV, V, dtype=torch.bfloat16) * 0.1
+        A_log = torch.randn(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
+        a = torch.randn(B, T, HV, dtype=torch.bfloat16) * 0.1
+        b = torch.randn(B, T, HV, dtype=torch.bfloat16)
+
+        # Build a non-contiguous 4D pool by allocating an oversized HV axis
+        # and slicing every Nth head-slot. The slice has stride > V*K on the
+        # HV dim — reshape to [B*HV, V, K] cannot return a contiguous view,
+        # so the kernel must use 4D indexing to write the pool in place.
+        backing = torch.empty(B, HV * stride_multiplier, V, K, dtype=torch.float32)
+        backing.normal_(0.0, 0.01)
+        pool_strided = backing[:, ::stride_multiplier, :, :]
+        assert pool_strided.shape == (B, HV, V, K)
+        assert not pool_strided.is_contiguous()
+        backing_before = backing.clone()
+
+        read_indices = torch.arange(B, dtype=torch.int32, device=device)
+
+    # Snapshot the initial pool BEFORE either kernel mutates it.
+    pool_initial_contig = pool_strided.contiguous()
+
+    out_strided, _ = gated_delta_rule_mtp(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=pool_strided,
+        initial_state_indices=read_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale_val,
+        intermediate_states_buffer=None,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+    )
+
+    out_contig, _ = gated_delta_rule_mtp(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=pool_initial_contig,
+        initial_state_indices=read_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale_val,
+        intermediate_states_buffer=None,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+    )
+
+    atol = 1e-3
+    rtol = 1e-3
+
+    torch.testing.assert_close(out_strided, out_contig, atol=atol, rtol=rtol)
+    # Strided pool received updates in place via the 4D-pool kernel path.
+    torch.testing.assert_close(pool_strided, pool_initial_contig, atol=atol, rtol=rtol)
+    # Non-selected backing slots interleaved between the read slots must be
+    # bit-exactly unchanged.
+    non_selected_mask = torch.ones(
+        HV * stride_multiplier, dtype=torch.bool, device=device
+    )
+    non_selected_mask[::stride_multiplier] = False
+    torch.testing.assert_close(
+        backing[:, non_selected_mask],
+        backing_before[:, non_selected_mask],
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    print(
+        f"✓ fp32 MTP non-contig pool (4D kernel path) passed "
+        f"(B={B}, T={T}, stride={stride_multiplier})"
+    )
+
+
+@pytest.mark.parametrize("stride_multiplier", [2, 3])
+@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_mtp_fp32_state_pool_non_contiguous(
+    batch_size: int,
+    seq_len: int,
+    stride_multiplier: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _test_mtp_fp32_state_pool_non_contiguous(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        stride_multiplier=stride_multiplier,
+        seed=seed,
+    )
+
+
+# ============================================================================
 # Test BF16 state kernel (T=1..4, bf16 state, K-last)
 # Reference: bf16 h state only here (state_dtype=torch.bfloat16). Other kernels
 # above use fp32 h state reference.
@@ -3694,3 +4012,129 @@ def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
             assert diff == 0, (
                 f"FP32 FLA mismatch at (i={i}, t={t}, slot={slot}): {diff}"
             )
+
+
+# ============================================================================
+# Packed (non-compact) Q/K/V coverage (regression test for PR #3649): q/k/v as
+# head-dim slices of a fused QKV buffer (SGLang layout) must match contiguous.
+# ============================================================================
+
+
+def _packed_qkv(
+    batch_size, seq_len, num_q_heads, num_k_heads, num_v_heads, head_size, device
+):
+    """q/k/v as non-compact head-dim slices of one fused [B, T, Htot, D] buffer."""
+    htot = num_q_heads + num_k_heads + num_v_heads
+    fused = torch.randn(
+        batch_size, seq_len, htot, head_size, dtype=torch.bfloat16, device=device
+    )
+    q = fused[:, :, :num_q_heads, :]
+    k = fused[:, :, num_q_heads : num_q_heads + num_k_heads, :]
+    v = fused[:, :, num_q_heads + num_k_heads :, :]
+    assert not q.is_contiguous(), "expected a non-compact (packed) view"
+    return q, k, v
+
+
+def _packed_qkv_params(batch_size, seq_len, num_v_heads, device):
+    a = (
+        torch.randn(
+            batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+        )
+        * 0.1
+    )
+    b = torch.randn(
+        batch_size, seq_len, num_v_heads, dtype=torch.bfloat16, device=device
+    )
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    return a, b, A_log, dt_bias
+
+
+@pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("batch_size", [2, 8, 64])
+def test_decode_pretranspose_packed_qkv(batch_size: int, state_dtype: str):
+    """Pretranspose decode must accept packed q/k/v (bit-identical to contiguous)."""
+    _skip_if_not_sm90_or_later()
+    torch.manual_seed(0)
+    Hq = Hk = 16
+    HV = 32
+    D = 128
+    dev = torch.device("cuda")
+    scale = 1.0 / math.sqrt(D)
+    kv_dtype = getattr(torch, state_dtype)
+
+    q, k, v = _packed_qkv(batch_size, 1, Hq, Hk, HV, D, dev)
+    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, 1, HV, dev)
+    state = torch.randn(batch_size, HV, D, D, dtype=kv_dtype, device=dev)
+
+    kw = dict(A_log=A_log, a=a, dt_bias=dt_bias, b=b, scale=scale, use_qk_l2norm=True)
+    o_p, s_p = gated_delta_rule_decode_pretranspose(
+        q=q, k=k, v=v, state=state.clone(), **kw
+    )
+    o_c, s_c = gated_delta_rule_decode_pretranspose(
+        q=q.contiguous(), k=k.contiguous(), v=v.contiguous(), state=state.clone(), **kw
+    )
+    torch.testing.assert_close(o_p, o_c, atol=0, rtol=0)
+    torch.testing.assert_close(s_p, s_c, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch_size", [2, 8, 64])
+def test_decode_nontranspose_packed_qkv(batch_size: int):
+    """Nontranspose decode must accept packed q/k/v (bit-identical to contiguous)."""
+    _skip_if_not_sm90_or_later()
+    torch.manual_seed(0)
+    Hq = Hk = 16
+    HV = 32
+    D = 128
+    dev = torch.device("cuda")
+    scale = 1.0 / math.sqrt(D)
+
+    q, k, v = _packed_qkv(batch_size, 1, Hq, Hk, HV, D, dev)
+    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, 1, HV, dev)
+    state = torch.randn(batch_size, HV, D, D, dtype=torch.float32, device=dev)
+
+    kw = dict(A_log=A_log, a=a, dt_bias=dt_bias, b=b, scale=scale, use_qk_l2norm=True)
+    o_p, s_p = gated_delta_rule_decode(q=q, k=k, v=v, state=state.clone(), **kw)
+    o_c, s_c = gated_delta_rule_decode(
+        q=q.contiguous(), k=k.contiguous(), v=v.contiguous(), state=state.clone(), **kw
+    )
+    torch.testing.assert_close(o_p, o_c, atol=0, rtol=0)
+    torch.testing.assert_close(s_p, s_c, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch_size", [2, 8, 64])
+@pytest.mark.parametrize("seq_len", [2, 4])
+def test_mtp_packed_qkv(batch_size: int, seq_len: int):
+    """MTP decode must accept packed q/k/v (bit-identical to contiguous)."""
+    _skip_if_not_sm90_or_later()
+    torch.manual_seed(0)
+    Hq = Hk = 16
+    HV = 32
+    D = 128
+    dev = torch.device("cuda")
+    scale = 1.0 / math.sqrt(D)
+
+    q, k, v = _packed_qkv(batch_size, seq_len, Hq, Hk, HV, D, dev)
+    a, b, A_log, dt_bias = _packed_qkv_params(batch_size, seq_len, HV, dev)
+    pool = torch.randn(batch_size, HV, D, D, dtype=torch.float32, device=dev)
+    idx = torch.arange(batch_size, dtype=torch.int32, device=dev)
+
+    kw = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state_indices=idx,
+        scale=scale,
+        disable_state_update=True,
+        use_qk_l2norm=True,
+    )
+    o_p, _ = gated_delta_rule_mtp(q=q, k=k, v=v, initial_state=pool.clone(), **kw)
+    o_c, _ = gated_delta_rule_mtp(
+        q=q.contiguous(),
+        k=k.contiguous(),
+        v=v.contiguous(),
+        initial_state=pool.clone(),
+        **kw,
+    )
+    torch.testing.assert_close(o_p, o_c, atol=0, rtol=0)
