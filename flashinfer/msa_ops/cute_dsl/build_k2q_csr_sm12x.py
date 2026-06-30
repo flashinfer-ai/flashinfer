@@ -132,9 +132,7 @@ class BuildK2qCsrSm12x:
                 work_capacity,
             ).launch(grid=(total_rows, H, 1), block=(1, 1, 1), stream=stream)
 
-    # -----------------------------------------------------------------------
     # H: per-(head, chunk) histogram of row hits, one warp per (chunk, head).
-    # -----------------------------------------------------------------------
     @cute.kernel
     def _k_hist(
         self,
@@ -171,11 +169,9 @@ class BuildK2qCsrSm12x:
                 _atomic_add_i32(1, ptr)
             q += 1
 
-    # -----------------------------------------------------------------------
-    # PR-chunks: in-place exclusive prefix of tile_counts over the chunk axis,
-    # plus per-row totals. One warp per (head, row); the 32 lanes scan the chunk
-    # axis in 32-wide tiles with a Hillis-Steele warp scan.
-    # -----------------------------------------------------------------------
+    # PR-chunks: in-place exclusive prefix of tile_counts over the chunk axis, plus
+    # per-row totals. One warp per (head, row); the 32 lanes scan the chunk axis in
+    # 32-wide tiles with a Hillis-Steele warp scan.
     @cute.kernel
     def _k_prefix_chunks(
         self,
@@ -213,11 +209,9 @@ class BuildK2qCsrSm12x:
             if lane == 0:
                 mRowCounts[h, row] = running
 
-    # -----------------------------------------------------------------------
-    # PR-rows: inclusive prefix of row_counts over rows -> row_ptr[1:]. One warp
-    # per head; the 32 lanes scan the row axis in 32-wide tiles (same warp scan
-    # as PR-chunks), so long context (large total_rows) stays cheap.
-    # -----------------------------------------------------------------------
+    # PR-rows: inclusive prefix of row_counts over rows -> row_ptr[1:]. One warp per
+    # head; the 32 lanes scan the row axis in 32-wide tiles (same scan as PR-chunks),
+    # so long context (large total_rows) stays cheap.
     @cute.kernel
     def _k_row_ptr(
         self,
@@ -251,9 +245,7 @@ class BuildK2qCsrSm12x:
             running += cute.arch.shuffle_sync(x, 31)
             r0 += 32
 
-    # -----------------------------------------------------------------------
     # S: scatter queries into CSR order, ascending within each row.
-    # -----------------------------------------------------------------------
     @cute.kernel
     def _k_scatter(
         self,
@@ -305,11 +297,9 @@ class BuildK2qCsrSm12x:
                     mQSplit[h, pos] = qloc | (split_slot << 24)
             q += 1
 
-    # -----------------------------------------------------------------------
     # Scheduler: one thread per (kv-head, row); each nonzero row reserves its
     # work-item slots via one atomicAdd on the pre-zeroed global counter. Emission
     # order is irrelevant: the forward consumes work items independently.
-    # -----------------------------------------------------------------------
     @cute.kernel
     def _k_scheduler(
         self,

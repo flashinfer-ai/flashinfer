@@ -28,7 +28,7 @@ kernel (contrast ``sparse_fwd_sm12x`` + ``sparse_combine_sm12x``).
 A query token attends only the blocks it actually selected: a per-(union-block)
 ``tokens_per_tile``-bit membership mask (built by the union-metadata pass) gates
 each row, so a token's scores for a block it didn't pick are forced to -inf.
-This is the b12x ``msa_union_tile`` design ported to the SM12x warp-MMA + cp.async
+This is a query-tile block-union prefill design on the SM12x warp-MMA + cp.async
 mainloop; on sm12x (memory-bound, no partials round-trip) it removes the ~19x
 partial write-amplification of the KV-major path.
 
@@ -82,13 +82,9 @@ class SparseAttentionUnionFwdSm12x:
         self._return_softmax_lse = return_softmax_lse
         self._return_temperature_lse = return_temperature_lse
         self._paged = paged
-        # fp8 (E4M3) and NVFP4 K/V caches are dequantized to the compute dtype
-        # elementwise on load (no native fp8/fp4 MMA -- the QK/PV matmuls stay in
-        # the bf16/fp16 compute dtype), so the K/V HBM read is at ~1 byte / ~0.5
-        # byte per element while the mainloop is unchanged. The swizzled SMEM
-        # layout is reused (the 8-element dequant chunk writes are swizzle-safe,
-        # as in the proxy fp8 kernel); the split kernel's wider padded layout
-        # would overflow the ~99KB consumer SMEM at the m_block=128 tile.
+        # fp8/NVFP4 K/V are dequantized to the compute dtype on load (no native
+        # fp8/fp4 MMA); the mainloop and swizzled SMEM layout are unchanged, only
+        # the K/V HBM read shrinks to ~1 / ~0.5 byte per element.
         self._kv_fp8 = kv_fp8
         self._kv_nvfp4 = kv_nvfp4
         self._q_smem_stride = head_dim + 8
@@ -120,11 +116,8 @@ class SparseAttentionUnionFwdSm12x:
         seqlen_k: cutlass.Int32,
         tidx: cutlass.Int32,
     ):
-        """Dequant-on-load fp8 (E4M3) K/V: vectorized load -> upconvert to the
-        compute dtype -> swizzled SMEM (the same target the bf16 cp.async path
-        fills). e4m3->f16 is the native cvt; bf16 routes through f32. Rows past
-        ``seqlen_k`` are zero-filled (masked in the epilogue). Mirrors the
-        KV-major ``sparse_fwd_sm12x`` fp8 load, minus the native-fp8-MMA modes."""
+        """Dequant-on-load fp8 (E4M3) K/V into the swizzled compute-dtype SMEM the
+        bf16 path fills. Rows past ``seqlen_k`` are zero-filled (epilogue masks)."""
         if cutlass.const_expr(self._paged):
             page = mPageTable[batch_idx, kv_block]
             mK_h8 = mK[page, kv_head, None, None]
@@ -176,12 +169,9 @@ class SparseAttentionUnionFwdSm12x:
         seqlen_k: cutlass.Int32,
         tidx: cutlass.Int32,
     ):
-        """Dequant-on-load NVFP4 K/V: packed e2m1 (one int32 word = 8 values) x
-        e4m3 block scale (cuBLAS 128x4 tiled, 1 scale / 16 elements) -> compute
-        dtype -> swizzled SMEM. K's global scale is pre-folded into softmax_scale
-        on the host; V's global scale is applied to the output via ``out_scale``
-        (the union has no combine kernel to carry it). Mirrors the KV-major
-        ``sparse_fwd_sm12x`` NVFP4 load. mK/mV are int32 views (8 e2m1 / word)."""
+        """Dequant-on-load NVFP4 K/V (packed e2m1 x cuBLAS-128x4-tiled e4m3 block
+        scale) into the swizzled compute-dtype SMEM. mK/mV are int32 views (8 e2m1
+        / word); global scales are folded into softmax_scale / out_scale."""
         from ...fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import (
             cvt_e4m3_to_f32_via_f16,
             fp4_decode_4bytes,
@@ -304,7 +294,6 @@ class SparseAttentionUnionFwdSm12x:
                 )
             ):
                 raise TypeError("kv_fp8 requires K/V to be Float8E4M3FN")
-        # Q sets the compute dtype; fp8/NVFP4 K/V are dequantized to it on load.
         self._dtype = mQ.element_type
 
         skv_cosize = cute.cosize(self._make_skv_layout())
@@ -516,12 +505,9 @@ class SparseAttentionUnionFwdSm12x:
                     tSrQ_copy_view[None, None, k],
                 )
 
-            # ---- online-softmax running state ----
-            # row_sum_t is a second running sum whose exponent is scaled by the MSA
-            # temperature (lse_temp_scale_log2 instead of softmax_scale_log2). It
-            # shares the running raw-score max row_max, so it is rescaled by the same
-            # max-shift as row_sum on each update (the split path computes this
-            # per-block and the combine reduces it; the union accumulates it online).
+            # online-softmax running state. row_sum_t is a second running sum with the
+            # MSA-temperature-scaled exponent; it shares row_max and so takes the same
+            # per-update max-shift as row_sum, accumulated online.
             row_max = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
             row_sum = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
             row_sum_t = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
@@ -550,9 +536,7 @@ class SparseAttentionUnionFwdSm12x:
                 tKgK = gmem_thr_copy_KV.partition_S(gK_all)
                 tVgV = gmem_thr_copy_KV.partition_S(gV_all)
 
-            # ///////////////////////////////////////////////////////////////
             # Loop over the union of KV blocks selected by this tile's tokens
-            # ///////////////////////////////////////////////////////////////
             for u in cutlass.range(union_count):
                 kv_block = mUnionBlocks[work_idx, u]
                 mask_word = mUnionMasks[work_idx, u]
@@ -561,7 +545,7 @@ class SparseAttentionUnionFwdSm12x:
                 # previous block's K/V fragment reads must be done first
                 self.cta_sync_barrier.arrive_and_wait()
                 if cutlass.const_expr(self._kv_fp8):
-                    # dequant-on-load fp8 K/V (synchronous; no cp.async group)
+                    # synchronous (no cp.async group)
                     self._load_kv_fp8(
                         mK,
                         mV,
@@ -576,7 +560,7 @@ class SparseAttentionUnionFwdSm12x:
                         tidx,
                     )
                 elif cutlass.const_expr(self._kv_nvfp4):
-                    # dequant-on-load NVFP4 K/V (synchronous; no cp.async group)
+                    # synchronous (no cp.async group)
                     self._load_kv_nvfp4(
                         mK,
                         mV,
@@ -665,10 +649,9 @@ class SparseAttentionUnionFwdSm12x:
                         col_limit = cutlass.min(q_loc + q_off + 1, seqlen_k)
                     else:
                         col_limit = seqlen_k
-                    # union membership: token attends this block only if its bit is
-                    # set. Fold the bit into col_limit (bit==0 -> col_limit 0 -> the
-                    # same causal test masks the whole row) instead of a separate
-                    # branch, so a token's scores for an unselected block are -inf.
+                    # union membership: fold the token's bit into col_limit (bit==0 ->
+                    # col_limit 0 -> the causal test masks the whole row) so an
+                    # unselected block's scores go -inf without a separate branch.
                     bit = (mask_word >> tok) & cutlass.Int32(1)
                     col_limit = col_limit * bit
                     for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
@@ -696,9 +679,8 @@ class SparseAttentionUnionFwdSm12x:
                     row_sum[r] = rsum + row_sum[r] * prev_scale
                     if cutlass.const_expr(self._return_temperature_lse):
                         # temperature-scaled running sum: same masked scores and
-                        # max-shift as row_sum, but the exponent uses the temperature
-                        # scale. acc_S_row is the masked raw score (read before the
-                        # acc_S_mn overwrite below).
+                        # max-shift as row_sum, exponent uses the temperature scale.
+                        # acc_S_row is the masked raw score (read before acc_S_mn).
                         p_row_t = cute.math.exp2(
                             acc_S_row * lse_temp_scale_log2
                             - rmax_safe * lse_temp_scale_log2,
@@ -745,9 +727,7 @@ class SparseAttentionUnionFwdSm12x:
                         acc_O,
                     )
 
-            # ///////////////////////////////////////////////////////////////
             # Epilogue: normalize and store the final output + LSE directly
-            # ///////////////////////////////////////////////////////////////
             for r in cutlass.range_constexpr(n_rows):
                 m_local = tScS_mn[r, 0][0]
                 tok = m_local // G

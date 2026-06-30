@@ -29,7 +29,7 @@ The metadata ops (topk select, union/decode metadata builders) produce integer
 indices / dataclasses rather than numeric tensors and have no torch reference, so
 they are intentionally not traced here.
 
-All five ops are varlen-packed: tokens for the whole batch are concatenated and
+All four ops are varlen-packed: tokens for the whole batch are concatenated and
 ``cu_seqlens_*`` (shape ``batch_size + 1``) gives per-sequence offsets. The
 reference functions mirror the torch oracles in ``tests/msa_ops/``
 (``_ref_proxy_score``, ``_ref_proxy_fp4``, ``_ref_sparse_attention``).

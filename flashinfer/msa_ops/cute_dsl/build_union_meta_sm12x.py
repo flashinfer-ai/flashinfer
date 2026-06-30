@@ -79,7 +79,7 @@ class BuildUnionMetaSm12x:
         total_tiles: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        # grid = (total_tiles, Hkv); one warp per (tile, kv-head) work item.
+        # one warp per (tile, kv-head) work item
         self._k_build(
             mQ2k,
             mTileBatch,
@@ -127,10 +127,9 @@ class BuildUnionMetaSm12x:
         p = cutlass.Int32(0)  # cursor into this lane's top-k list
 
         u = cutlass.Int32(0)
-        # The union has at most max_union distinct blocks (one consumed per
-        # iteration). A rolled loop over this fixed bound keeps the trip count
-        # uniform across the warp without unrolling 128-256 bodies; exhausted
-        # iterations (every lane at the sentinel) are no-ops.
+        # at most max_union distinct blocks (one consumed per iteration); a rolled
+        # loop over this fixed bound keeps the warp trip count uniform without
+        # unrolling 128-256 bodies. Exhausted iterations (all lanes sentinel) no-op.
         for _ in cutlass.range(self._max_union):
             head = sentinel
             if active:

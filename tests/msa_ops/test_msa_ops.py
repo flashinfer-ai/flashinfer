@@ -426,9 +426,9 @@ def test_sparse_decode(B, sq, Hq, Hkv, topk, kv_dtype, paged):
     ],
 )
 def test_sparse_decode_fused(B, sq, Hq, Hkv, topk, kv_dtype, paged):
-    # E12: the fused decode (force_fused=True -> one CTA per token loops all its
-    # blocks, no combine) must match the per-block split+combine path (output and
-    # LSE) and the torch oracle. force_fused exercises it regardless of batch.
+    # the fused decode (force_fused=True -> one CTA per token loops all its blocks,
+    # no combine) must match the per-block split+combine path (output and LSE) and
+    # the torch oracle. force_fused exercises it regardless of batch.
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_decode_attention
 
@@ -501,7 +501,6 @@ def test_sparse_decode_cuda_graph():
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         out = call()
-    # mutate inputs in place; replay must track them
     torch.manual_seed(91)
     q.copy_(torch.randn_like(q) / 3)
     g.replay()
@@ -998,7 +997,7 @@ def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
 
     torch.manual_seed(170 + B)
     dev = "cuda"
-    # equal-length batch keeps max_seqlen_q == seqlen_q so the packed gate fires.
+    # max_seqlen_q == seqlen_q so the packed decode gate fires
     cu_q = torch.arange(0, (B + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=dev)
     cu_k = torch.arange(0, (B + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=dev)
     total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
@@ -1039,7 +1038,7 @@ def test_msa_proxy_score_reduce_heads(Hq, Hkv):
 
     assert per_head.shape == (Hq, per_head.shape[1], total_q)
     assert reduced.shape == (1, per_head.shape[1], total_q)
-    # post-kernel amax over the same per-head buffer -> bit-exact
+    # amax over the same per-head buffer -> bit-exact vs the kernel's reduce_heads
     assert torch.equal(reduced, per_head.amax(dim=0, keepdim=True))
 
     # caller-provided output of the reduced shape is honored
@@ -1241,7 +1240,7 @@ def test_q_offset_override():
     torch.cuda.synchronize()
     for b in range(B):
         lo = int(cu_q[b])
-        limit0 = int(q_offsets[b])  # first query's causal limit
+        limit0 = int(q_offsets[b])
         first_masked_tile = limit0 // BLK_KV + 1
         if first_masked_tile < ms.shape[1]:
             assert (ms[:, first_masked_tile:, lo] == float("-inf")).all()

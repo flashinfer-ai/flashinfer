@@ -200,12 +200,9 @@ class TopKSelectRadixSm12x:
             )
         cute.arch.barrier()
 
-        # ---- MSD radix-select stages (high -> mid -> low 10 bits) -----------
-        # The Python loop is unrolled at trace time, so `step` is a constant and
-        # the per-stage shift / pattern logic specializes statically. `done` is
-        # block-uniform (thread 0 writes it, all read after a barrier), so every
-        # `if dn == 0:` guard is uniform and the unconditional barriers between
-        # guarded blocks stay balanced across the CTA.
+        # MSD radix-select stages (high -> mid -> low 10 bits). The Python loop is
+        # unrolled at trace time so `step` specializes statically; `done` is
+        # block-uniform, so the `if dn == 0:` guards keep the barriers balanced.
         for step in (1, 2, 3):
             shift = _STAGE_SHIFT[step]
 
@@ -251,10 +248,9 @@ class TopKSelectRadixSm12x:
                     b += _KTHREADS
             cute.arch.barrier()
 
-            # --- 2-level threshold scan ---
-            # Phase A: first n_groups threads each sum one contiguous _GROUP-bin
-            # group. Phase B/C: thread 0 finds the group holding the threshold and
-            # refines within it. Critical serial path ~ 2*_GROUP, not _NUM_BINS.
+            # 2-level threshold scan: phase A sums contiguous _GROUP-bin groups (one
+            # per thread); phase B/C has thread 0 find and refine within the
+            # threshold's group. Critical serial path ~ 2*_GROUP, not _NUM_BINS.
             dn = scal[5]
             if dn == cutlass.Int32(0):
                 if tid < n_groups:
@@ -313,9 +309,8 @@ class TopKSelectRadixSm12x:
                     scal[4] = fbs
                     if cutlass.const_expr(step == 3):
                         # Terminal stage emits sub-threshold and threshold-bin
-                        # candidates concurrently, so they need disjoint output
-                        # ranges: sub-threshold via `found` [found, found+base),
-                        # threshold-bin via this counter [found+base, target).
+                        # candidates into disjoint ranges: sub-threshold via `found`
+                        # [found, found+base), threshold-bin here [found+base, target).
                         scal[1] = scal[0] + base
             cute.arch.barrier()
 

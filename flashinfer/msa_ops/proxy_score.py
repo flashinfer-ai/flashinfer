@@ -32,16 +32,9 @@ _SF_VEC_SIZE = 16
 
 
 def _resolve_proxy_dims(cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output):
-    """Resolve the host-side grid dims ``(max_seqlen_q, max_k_tiles)``.
-
-    These size the launch grid and the score buffer, so they must be Python ints.
-    Passing them -- or a pre-allocated ``output`` whose ``shape[1]`` is
-    ``max_k_tiles`` -- resolves them with no stream sync, keeping the proxy
-    **CUDA-graph-capturable** (the prerequisite for using the MSA indexer inside a
-    captured decode graph). Otherwise they are read from ``cu_seqlens`` on the host
-    (``.cpu()``/``.item()``), which is *illegal during graph capture*; rather than
-    emit the cryptic "copy between CPU and CUDA during capture" error we raise an
-    actionable one. Outside capture the host read is kept for eager convenience."""
+    """Resolve the grid dims ``(max_seqlen_q, max_k_tiles)`` as Python ints. Passing
+    them (or a pre-allocated ``output``) avoids the ``cu_seqlens`` host read, which
+    is illegal during CUDA-graph capture -- under capture we raise instead."""
     if max_k_tiles is None and output is not None:
         max_k_tiles = int(output.shape[1])
     if max_seqlen_q is not None and max_k_tiles is not None:
@@ -148,10 +141,9 @@ class _ProxySplitKRunner(TunableRunner):
         return hash(type(self))
 
     def get_valid_tactics(self, inputs, profile):
-        # Candidate split factors: powers of two filling up to ~4 SM-waves, capped
-        # by the kv-block count (a split cannot exceed max_k_tiles). The closed-form
-        # heuristic value is always included so a tuned op is never worse than eager
-        # (the heuristic may pick a non-power-of-two, e.g. 3).
+        # Candidate split factors: powers of two up to ~4 SM-waves, capped by
+        # max_k_tiles. The closed-form heuristic value is always included (it may be
+        # non-power-of-two) so a tuned op is never worse than eager.
         num_sms = get_device_sm_count(self._device)
         cap = min(self._mkt, max(1, -(-4 * num_sms // max(self._base, 1))))
         cands = {s for s in (1, 2, 4, 8, 16, 32) if s <= cap}
@@ -172,12 +164,9 @@ class _ProxySplitKRunner(TunableRunner):
         return self._call(inputs, int(ns))
 
 
-# (op, shape) keys that have been through the autotuner this process. Until a
-# given shape is tuned, the proxy uses its closed-form heuristic directly and
-# skips choose_one entirely: the decode proxy is tiny at low batch, where
-# choose_one's per-call lock and bookkeeping (~tens of us) would dominate the
-# kernel. Keying by shape (not bare op name) keeps that fast path for untuned
-# shapes even after a different shape of the same op has been tuned.
+# (op, shape) keys already through the autotuner this process. Until a shape is
+# tuned the proxy uses its closed-form heuristic and skips choose_one, whose
+# per-call lock/bookkeeping (~tens of us) would dominate the tiny low-batch decode.
 _PROXY_TUNED: set = set()
 
 
@@ -397,14 +386,9 @@ def msa_proxy_score(
     else:
         per_head = output
 
-    # Head-fused decode path (E10): pack all group_size heads of a kv_head x
-    # pack_q_len q-tokens into one 64-row MMA tile so the shared index-K is read
-    # once per (batch, kv_head) instead of once per query head (group_size x less K
-    # traffic). Valid for any group_size dividing the 64-row tile when the q-len fits
-    # the resulting per-head slot (pack_q_len = 64 // group_size); the MiniMax-M3
-    # indexer (group_size 4) decodes at 4 x 16. fp8 K stays on the general schedule.
-    # Outside this regime (prefill, group_size not dividing 64) use the general
-    # per-(q-tile, head) schedule.
+    # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
+    # 64-row MMA tile so index-K is read once per (batch, kv_head). Outside the regime
+    # (prefill, fp8 K, group_size not dividing 64) use the general schedule.
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
     group_size = num_qo_heads // num_kv_heads
     use_packed = (
@@ -689,14 +673,9 @@ def msa_proxy_score_fp4(
     else:
         per_head = output
 
-    # Head-fused decode path: pack all group_size heads of a kv_head x pack_q_len
-    # q-tokens into one 128-row MMA tile so the shared index-K is read once per
-    # (batch, kv_head) instead of once per query head (group_size x less K traffic).
-    # Valid for any group_size that divides the 128-row tile when the q-len fits the
-    # resulting per-head slot (pack_q_len = 128 // group_size). The MiniMax-M3 indexer
-    # (group_size 4) decodes at 4 x 32; the 16-head deployment at 16 x 8. Outside this
-    # regime (prefill, or group_size not dividing 128) use the per-(q-tile, head)
-    # general schedule.
+    # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
+    # 128-row MMA tile so index-K is read once per (batch, kv_head). Outside the
+    # regime (prefill, group_size not dividing 128) use the general schedule.
     _PACK_ROWS = MsaProxyScoreFp4MmaSm12x._M  # 128-row fp4-MMA tile
     group_size = num_qo_heads // num_kv_heads
     use_packed = (

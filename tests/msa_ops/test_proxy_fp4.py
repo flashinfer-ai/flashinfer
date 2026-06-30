@@ -182,9 +182,8 @@ def test_proxy_fp4_selection_overlap_vs_bf16():
             if len(a) >= topk:
                 overlaps.append(len(a & b) / len(a))
     mean_overlap = sum(overlaps) / len(overlaps)
-    # Unstructured Gaussian Q/K is the worst case for selection overlap: block
-    # scores are near-tied, so fp4 rounding flips many boundary blocks (real
-    # indexer Q/K has clear winners and overlaps far higher). The bar only needs
+    # Unstructured Gaussian Q/K is the worst case for selection overlap (near-tied
+    # block scores, so fp4 rounding flips many boundary blocks). The bar only needs
     # to separate a working kernel (~0.89) from a broken one (~topk/nb ≈ 0.5).
     assert mean_overlap > 0.8, f"mean topk overlap {mean_overlap} too low"
 
@@ -309,7 +308,7 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
     assert out.shape == (Hq, nb, total_q)
 
     got = out.float().cpu()
-    # dequant the full tensors (SF row = token*heads+head spans all batches), slice
+    # SF row = token*heads+head spans all batches, so dequant whole then slice per batch
     q_deq, k_deq = _dequant_qk(
         q_fp4.cpu(), q_scale.cpu(), inv_q, k_fp4.cpu(), k_scale.cpu(), inv_k
     )
@@ -493,7 +492,7 @@ def test_proxy_fp4_split_k_decode(Hq, Hkv):
     cu_q = torch.tensor([0, seqlen_q], dtype=torch.int32, device=dev)
     cu_k = torch.tensor([0, seqlen_k], dtype=torch.int32, device=dev)
 
-    # base grid is 1 q-tile * 1 batch * (heads or kv_heads) << 2*SMs, so split > 1.
+    # base grid << 2*SMs here, so the split-K heuristic must pick split > 1
     # fp4-MMA uses a 128-row q-tile for both the general and packed schedules.
     base = (1 if group_size == 16 else -(-seqlen_q // 128)) * (
         Hkv if group_size == 16 else Hq

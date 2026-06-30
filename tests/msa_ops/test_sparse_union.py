@@ -1,7 +1,5 @@
-"""Tests for the union-tile sparse-attention prefill kernel
-(``sparse_fwd_union_sm12x``): query-tile-major + in-kernel online softmax + direct
-output (no GMEM partials, no combine). This is the prefill path behind the public
-``msa_sparse_attention``; validated against an fp32 torch oracle on the same causal
+"""Tests for the union-tile sparse-attention prefill path behind the public
+``msa_sparse_attention``: validated against an fp32 torch oracle on a causal
 per-query block selection, plus flat-vs-paged consistency."""
 
 import math

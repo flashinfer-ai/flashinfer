@@ -64,12 +64,9 @@ class SparseDecodeForwardSm12x:
             raise ValueError("only head_dim=blk_kv=128, sub_block=64 supported")
         if group_size > 16:
             raise ValueError("group_size must be <= 16")
-        # E12 adaptive-split: when the per-token grid (total_q x num_kv_heads)
-        # already fills the SMs, one CTA per (token, kv_head) loops every selected
-        # block with in-kernel online softmax and writes the final output directly,
-        # dropping the GMEM partials + the mandatory combine pass. nvfp4 KV keeps
-        # the per-block split path (its decode is the bandwidth-bound case where the
-        # combine is relatively cheap, and it keeps this kernel small).
+        # adaptive-split: when the per-token grid (total_q x num_kv_heads) fills the
+        # SMs, one CTA per (token, kv_head) loops every selected block with in-kernel
+        # online softmax, dropping the GMEM partials + combine pass. nvfp4 KV splits.
         if fused and kv_nvfp4:
             raise ValueError("fused decode does not support nvfp4 KV")
         self._head_dim = head_dim
@@ -136,8 +133,6 @@ class SparseDecodeForwardSm12x:
         LOG2_E = 1.4426950408889634074
         softmax_scale_log2 = softmax_scale * LOG2_E
         if cutlass.const_expr(self._fused):
-            # one CTA per (token, kv_head): loops every selected block with online
-            # softmax and writes the final output + LSE directly (no combine).
             self.kernel_fused(
                 mQ,
                 mK,
@@ -222,9 +217,7 @@ class SparseDecodeForwardSm12x:
             k_start = mCuK[batch_idx]
             seqlen_k = mCuK[batch_idx + 1] - k_start
 
-            # ///////////////////////////////////////////////////////////////
             # SMEM (plain padded layouts)
-            # ///////////////////////////////////////////////////////////////
             sQ_layout = cute.make_layout(
                 (self._m_tile, self._head_dim), stride=(self._pad_stride, 1)
             )
@@ -265,9 +258,7 @@ class SparseDecodeForwardSm12x:
                 ),
             )
 
-            # ///////////////////////////////////////////////////////////////
             # Load Q (G rows of one token; pad rows zero-filled)
-            # ///////////////////////////////////////////////////////////////
             chunks_per_row = self._head_dim // 8
             q_chunks = self._m_tile * chunks_per_row
             qfrag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
@@ -296,9 +287,7 @@ class SparseDecodeForwardSm12x:
                         qfrag.fill(0)
                         cute.autovec_copy(qfrag, s_chunk)
 
-            # ///////////////////////////////////////////////////////////////
             # MMA setup (single compute warp)
-            # ///////////////////////////////////////////////////////////////
             tiled_mma = cute.make_tiled_mma(
                 warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
                 (1, 1, 1),
@@ -350,7 +339,6 @@ class SparseDecodeForwardSm12x:
             row_max.fill(-cutlass.Float32.inf)
             row_sum.fill(0.0)
 
-            # gmem K/V views for this block
             if cutlass.const_expr(self._paged):
                 page = mPageTable[batch_idx, kv_block]
                 mK_blk = mK[page, kv_head, None, None]  # (128, d)
@@ -402,12 +390,9 @@ class SparseDecodeForwardSm12x:
                         tSrQ_copy_view[None, None, k],
                     )
 
-            # ///////////////////////////////////////////////////////////////
             # Two 64-token sub-blocks with online softmax
-            # ///////////////////////////////////////////////////////////////
             for half in cutlass.range_constexpr(self._n_sub):
                 base = kv_block * self._blk_kv + half * self._sub_block
-                # all threads load this sub-block (upconverting if fp8)
                 for kv_it in cutlass.range_constexpr(
                     cute.ceil_div(kv_chunks, self._num_threads)
                 ):
@@ -587,9 +572,7 @@ class SparseDecodeForwardSm12x:
                 # protect sK/sV before the next sub-block overwrites them
                 self.cta_sync_barrier.arrive_and_wait()
 
-            # ///////////////////////////////////////////////////////////////
             # Store normalized partial + log2-domain LSE
-            # ///////////////////////////////////////////////////////////////
             if tidx < 32:
                 for r in cutlass.range_constexpr(n_rows):
                     g = tScO_mn[r, 0][0]
@@ -629,12 +612,9 @@ class SparseDecodeForwardSm12x:
         out_scale: cutlass.Float32,
         seqlen_q: cutlass.Int32,
     ):
-        # E12 fused decode: one CTA per (token, kv_head) attends *all* the token's
-        # selected blocks with a single in-kernel online softmax (the same scheme
-        # the split kernel runs over two 64-token sub-blocks, extended over the
-        # whole selected-block list) and writes the final normalized output + LSE
-        # directly. The union-tile prefill uses the identical dynamic-loop online
-        # softmax; this is its decode analogue. Restricted to non-nvfp4 KV.
+        # fused decode: one CTA per (token, kv_head) attends *all* the token's
+        # selected blocks with a single in-kernel online softmax (the union-tile
+        # prefill's scheme, decode analogue), writing output + LSE directly.
         tidx, _, _ = cute.arch.thread_idx()
         _, qi, kv_head = cute.arch.block_idx()  # grid x is 1 (no split slots)
 
@@ -656,9 +636,7 @@ class SparseDecodeForwardSm12x:
             else:
                 in_prefix = cutlass.Boolean(False)
 
-        # ///////////////////////////////////////////////////////////////
-        # SMEM (plain padded layouts; same as the split kernel)
-        # ///////////////////////////////////////////////////////////////
+        # SMEM layouts same as the split kernel
         sQ_layout = cute.make_layout(
             (self._m_tile, self._head_dim), stride=(self._pad_stride, 1)
         )
@@ -693,9 +671,7 @@ class SparseDecodeForwardSm12x:
             ),
         )
 
-        # ///////////////////////////////////////////////////////////////
         # Load Q (G rows of one token; pad rows zero-filled)
-        # ///////////////////////////////////////////////////////////////
         chunks_per_row = self._head_dim // 8
         q_chunks = self._m_tile * chunks_per_row
         qfrag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
@@ -722,9 +698,7 @@ class SparseDecodeForwardSm12x:
                     qfrag.fill(0)
                     cute.autovec_copy(qfrag, s_chunk)
 
-        # ///////////////////////////////////////////////////////////////
         # MMA setup (single compute warp; same as split)
-        # ///////////////////////////////////////////////////////////////
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
             (1, 1, 1),
@@ -795,10 +769,8 @@ class SparseDecodeForwardSm12x:
                     tSrQ_copy_view[None, None, k],
                 )
 
-        # ///////////////////////////////////////////////////////////////
-        # Loop over every selected block (online softmax carried across all
-        # of them). cnt is thread-uniform, so the barriers stay collective.
-        # ///////////////////////////////////////////////////////////////
+        # Loop over every selected block (online softmax carried across all of them).
+        # cnt is thread-uniform, so the barriers stay collective.
         for it in cutlass.range(cnt):
             kv_block = mQ2K[kv_head, qi, it]
             if cutlass.const_expr(self._paged):
@@ -939,10 +911,8 @@ class SparseDecodeForwardSm12x:
                 # protect sK/sV before the next sub-block overwrites them
                 self.cta_sync_barrier.arrive_and_wait()
 
-        # ///////////////////////////////////////////////////////////////
         # Epilogue: normalize, write final output + natural-log LSE.
         # Always runs (cnt == 0 -> zero output, -inf LSE).
-        # ///////////////////////////////////////////////////////////////
         if tidx < 32:
             for r in cutlass.range_constexpr(n_rows):
                 g = tScO_mn[r, 0][0]

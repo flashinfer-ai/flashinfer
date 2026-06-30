@@ -119,12 +119,9 @@ class MsaProxyScoreSm12x:
             raise TypeError("Only Float16 or BFloat16 q is supported")
         self._dtype: Type[cutlass.Numeric] = mQ.element_type
 
-        # split-K: fold a kv-block split factor into grid x. At long context with
-        # low batch the base grid (1, batch, heads) is < #SMs (e.g. B8 q1 -> 32
-        # CTAs) so the GPU starves; splitting each sequence's kv-block range across
-        # CTAs fills it. The output is per-(head, kv_block, query), so the splits
-        # write disjoint columns and need no reduction. The host passes
-        # num_splits==1 when the base grid already fills the SMs.
+        # split-K: fold a kv-block split factor into grid x to fill the SMs when the
+        # base grid (1, batch, heads) starves at low batch. Output is per-(head,
+        # kv_block, query) so splits write disjoint columns, no reduction.
         self.kernel(
             mQ,
             mK,
@@ -192,9 +189,7 @@ class MsaProxyScoreSm12x:
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)
 
-            # ///////////////////////////////////////////////////////////////
-            # GMEM tiled copy (Q always; K only on the non-fp8 path)
-            # ///////////////////////////////////////////////////////////////
+            # K is in this tiled copy only on the non-fp8 path (fp8 K loads separately)
             universal_copy_bits = 128
             async_copy_elems = universal_copy_bits // self._dtype.width
             atom_async_copy = cute.make_copy_atom(
@@ -232,9 +227,7 @@ class MsaProxyScoreSm12x:
                     tQsQ[None, m, None].fill(0)
             cute.arch.cp_async_commit_group()
 
-            # ///////////////////////////////////////////////////////////////
             # MMA setup (S = Q K^T only; no V)
-            # ///////////////////////////////////////////////////////////////
             tiled_mma = cute.make_tiled_mma(
                 warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
                 (self._num_threads // 32, 1, 1),
@@ -291,17 +284,9 @@ class MsaProxyScoreSm12x:
                     tSrQ_copy_view[None, None, kk],
                 )
 
-            # ///////////////////////////////////////////////////////////////
-            # split-K: this CTA owns kv_block = split_idx, split_idx + num_splits,
-            # ... < max_k_tiles (disjoint across splits, union covers every column
-            # once, no reduction). num_splits==1 -> the original [0, max_k_tiles).
-            # ///////////////////////////////////////////////////////////////
-            # E11 causal tiling: skip the K-load + MMA for kv-blocks entirely above
-            # this q-tile's causal limit (they would be fully masked to -inf
-            # anyway -- the ~1.9x masked-MMA waste) and write their -inf directly.
-            # The tile's bottom query row m_block*M + (M-1) at global position
-            # +mQOffset sees kv up to (..)//N; clamp to the last valid block.
-            # Non-causal keeps last_block == num_kv_blocks-1 (unchanged behavior).
+            # split-K strides kv_block by num_splits (disjoint columns, no reduction).
+            # causal tiling: skip K-load + MMA for kv-blocks above the q-tile's causal
+            # limit (else ~1.9x masked-MMA waste), writing their -inf directly.
             if cutlass.const_expr(self._is_causal):
                 causal_last = (
                     m_block * self._m_block_size
@@ -319,7 +304,6 @@ class MsaProxyScoreSm12x:
                     # previous iteration's K fragment reads must be complete
                     self.cta_sync_barrier.arrive_and_wait()
                     if cutlass.const_expr(self._kv_fp8):
-                        # fp8 K: vectorized load -> upconvert -> SMEM
                         if cutlass.const_expr(self._paged):
                             page8 = mPageTable[batch_idx, kv_block]
                             mK_h8 = mK[page8, kv_head, None, None]
@@ -435,9 +419,9 @@ class MsaProxyScoreSm12x:
                             # duplicate stores are idempotent
                             mMaxScore[qo_head, kv_block, q_start + q_loc] = tile_max
                 elif kv_block < max_k_tiles:
-                    # padding tile in [num_kv_blocks, max_k_tiles) -> -inf. Bounded
-                    # by max_k_tiles because split-K can stride kv_block past the
-                    # last output column (those overshoot blocks write nothing).
+                    # block past last_block (causally-future real, or padding) -> -inf,
+                    # skipping its MMA. Bounded by max_k_tiles so split-K overshoot
+                    # blocks write nothing.
                     for r in cutlass.range_constexpr(n_rows):
                         row_local2 = tScS_mn[r, 0][0]
                         q_loc2 = m_block * self._m_block_size + row_local2
@@ -475,8 +459,8 @@ class MsaProxyScoreSm12x:
 
 
 class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
-    """Head-fused packed-decode schedule for the bf16/fp16 proxy: the E10
-    counterpart of :class:`MsaProxyScoreFp4MmaDecodePackedSm12x` on the f16 path.
+    """Head-fused packed-decode schedule for the bf16/fp16 proxy: the f16
+    counterpart of :class:`MsaProxyScoreFp4MmaDecodePackedSm12x`.
 
     The bf16 MMA tile is ``m_block_size`` rows == ``qhead_per_kv x pack_q_len``, so
     the packed schedule is a relabel of the parent general kernel: pack all
@@ -622,9 +606,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         sQ = storage.sQ.get_tensor(sQ_layout)
         sK = storage.sK.get_tensor(sK_layout)
 
-        # ///////////////////////////////////////////////////////////////
         # GMEM tiled copy (K only; Q is gathered head-by-head below)
-        # ///////////////////////////////////////////////////////////////
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self._dtype.width
         atom_async_copy = cute.make_copy_atom(
@@ -640,12 +622,9 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         gmem_tiled_copy = cute.make_tiled_copy_tv(atom_async_copy, t_layout, v_layout)
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
 
-        # ----- gather the qhead_per_kv-head x pack_q_len-q packed Q tile into smem -
         self._gather_packed_q(mQ, sQ, q_start, kv_head, seqlen_q, tidx)
 
-        # ///////////////////////////////////////////////////////////////
         # MMA setup (S = Q K^T only; no V)
-        # ///////////////////////////////////////////////////////////////
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
             (self._num_threads // 32, 1, 1),
@@ -702,13 +681,9 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                 tSrQ_copy_view[None, None, kk],
             )
 
-        # ///////////////////////////////////////////////////////////////
-        # split-K: this CTA owns kv_block = split_idx, split_idx + num_splits, ...
-        # < max_k_tiles (disjoint across splits, union covers every column once, no
-        # reduction). num_splits==1 -> the original [0, max_k_tiles). The packed
-        # decode attends every kv-block (the per-token causal tail is masked in the
-        # epilogue), so there is no E11 causal-tiling skip here, unlike the parent.
-        # ///////////////////////////////////////////////////////////////
+        # split-K: this CTA strides kv_block by num_splits (disjoint columns, no
+        # reduction). No causal skip here -- packed decode attends every kv-block
+        # and masks the per-token causal tail in the epilogue.
         n_iter = cute.ceil_div(max_k_tiles, num_splits)
         for it in cutlass.range(n_iter):
             kv_block = split_idx + it * num_splits
@@ -716,7 +691,6 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                 # previous iteration's K fragment reads must be complete
                 self.cta_sync_barrier.arrive_and_wait()
                 if cutlass.const_expr(self._kv_fp8):
-                    # fp8 K: vectorized load -> upconvert -> SMEM
                     if cutlass.const_expr(self._paged):
                         page8 = mPageTable[batch_idx, kv_block]
                         mK_h8 = mK[page8, kv_head, None, None]
@@ -846,13 +820,9 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
 
     @cute.jit
     def _gather_packed_q(self, mQ, sQ, q_start, kv_head, seqlen_q, tidx):
-        """Gather ``qhead_per_kv`` heads x ``pack_q_len`` q-tokens of bf16/fp16 Q
-        into the ``m_block_size``-row swizzled smem tile. Packed row ``r =
-        local_head * pack_q_len + token``; ``head = kv_head * qhead_per_kv +
-        local_head``; ``gi = q_start + token``. Rows with ``token >= seqlen_q`` are
-        zero-filled (masked out in the epilogue anyway). The per-chunk register-stage
-        + ``autovec_copy`` write into the swizzled layout matches the fp8 K path."""
-        elems = 128 // self._dtype.width  # 8 f16 per 128-bit chunk
+        """Gather the packed Q tile into swizzled smem; rows past seqlen_q are
+        zero-filled (epilogue masks them)."""
+        elems = 128 // self._dtype.width
         chunks = self._head_dim // elems
         total = self._m_block_size * chunks
         frag = cute.make_rmem_tensor(cute.make_layout(elems), self._dtype)

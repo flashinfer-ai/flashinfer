@@ -82,7 +82,7 @@ def msa_sparse_decode_attention(
     causal : bool
         Right-aligned causal masking (default True for decode).
     force_fused : bool, optional
-        Override the E12 adaptive-split decision. The default per-block split
+        Override the adaptive-split decision. The default per-block split
         writes ``topk`` partials per token and reduces them with the combine
         kernel; the fused path instead has one CTA per (token, kv-head) loop
         over all selected blocks with an in-kernel online softmax and write the
@@ -219,12 +219,9 @@ def msa_sparse_decode_attention(
     ):
         raise ValueError(f"unsupported partial_dtype {partial_dtype}")
 
-    # E12 adaptive-split: fuse when the (token x kv-head) grid already fills the
-    # SMs, so a single CTA per token can loop all its blocks and write the final
-    # output directly -- dropping the topk partials + the combine pass. The split
-    # path's combine is only worth its extra-pass cost when the grid underfills
-    # (low batch) and the topk-wide fan-out is needed for parallelism. NVFP4 KV
-    # is not supported by the fused kernel, so it always splits.
+    # adaptive-split: fuse when the (token x kv-head) grid fills the SMs (one CTA per
+    # token loops all its blocks, dropping the topk partials + combine pass); else
+    # split for the topk-wide parallelism. NVFP4 splits always (no fused kernel).
     if force_fused and kv_nvfp4:
         raise ValueError("force_fused is not supported with NVFP4 KV")
     if force_fused is None:
@@ -289,10 +286,9 @@ def msa_sparse_decode_attention(
         kv_word = k_pass.shape[-1]  # 128 (or 16 int32 words for nvfp4)
         s_tq, s_hq, s_tk, s_hkv, s_b1, s_b0 = (cute.sym_int() for _ in range(6))
         s_pb, s_pm, s_ksf, s_vsf = (cute.sym_int() for _ in range(4))
-        # The fused and split paths each pass dummies for the other's output
-        # tensors, so those tensors get their own symbols (not tied to mQ's
-        # total_q/Hq) -- mirroring the combine kernel. Only the always-real inputs
-        # (mQ/mK/mQ2K/...) keep shared symbols. topk and head_dim stay static.
+        # Fused and split paths each pass dummies for the other's output tensors, so
+        # those get their own symbols (not tied to mQ's total_q/Hq); only the
+        # always-real inputs keep shared symbols. topk and head_dim stay static.
         s_ptq, s_phq = cute.sym_int(), cute.sym_int()  # mOp/mLse (split partials)
         s_sc0, s_sc1 = cute.sym_int(), cute.sym_int()  # mSplitCounts
         s_otq, s_ohq = cute.sym_int(), cute.sym_int()  # mOut/mLseOut (fused)
