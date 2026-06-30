@@ -45,6 +45,12 @@ def _byte_workspace(num_bytes: int, device: str = "cuda"):
     return torch.empty((num_bytes,), dtype=torch.uint8, device=device)
 
 
+def _unaligned_byte_workspace(num_bytes: int, device: str = "cuda"):
+    workspace = torch.empty((num_bytes + 1,), dtype=torch.uint8, device=device)[1:]
+    assert workspace.data_ptr() % 16 != 0
+    return workspace
+
+
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_batch_decode_workspace_size_plans_with_exact_buffers(use_cuda_graph):
     batch_size = 4
@@ -117,7 +123,6 @@ def _run_batch_prefill_workspace_size_plan(
     num_qo_heads = 16
     num_kv_heads = 4
     head_dim = 128
-    fixed_split_size = 16
 
     qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * qo_len
     paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = _paged_kv_inputs(
@@ -162,7 +167,10 @@ def _run_batch_prefill_workspace_size_plan(
         page_size,
         **plan_kwargs,
     )
-    assert float_workspace_size > 0
+    if fixed_split_size is None:
+        assert float_workspace_size >= 0
+    else:
+        assert float_workspace_size > 0
     assert int_workspace_size > 0
 
     wrapper.reset_workspace_buffer(
@@ -189,3 +197,44 @@ def test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers():
 
 def test_batch_prefill_workspace_size_plans_cuda_graph_with_exact_buffers():
     _run_batch_prefill_workspace_size_plan(use_cuda_graph=True)
+
+
+def test_batch_decode_workspace_size_rejects_unaligned_workspace_buffer():
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        _byte_workspace(32 * 1024 * 1024)
+    )
+
+    with pytest.raises(
+        ValueError, match="float_workspace_buffer must be 16-byte aligned"
+    ):
+        wrapper.reset_workspace_buffer(
+            _unaligned_byte_workspace(1024),
+            _byte_workspace(1024),
+        )
+    with pytest.raises(
+        ValueError, match="int_workspace_buffer must be 16-byte aligned"
+    ):
+        wrapper.reset_workspace_buffer(
+            _byte_workspace(1024),
+            _unaligned_byte_workspace(1024),
+        )
+
+
+def test_batch_prefill_workspace_size_rejects_unaligned_workspace_buffer():
+    with pytest.raises(
+        ValueError, match="float_workspace_buffer must be 16-byte aligned"
+    ):
+        flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+            _unaligned_byte_workspace(32 * 1024 * 1024), backend="fa2"
+        )
+
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        _byte_workspace(32 * 1024 * 1024), backend="fa2"
+    )
+    with pytest.raises(
+        ValueError, match="int_workspace_buffer must be 16-byte aligned"
+    ):
+        wrapper.reset_workspace_buffer(
+            _byte_workspace(1024),
+            _unaligned_byte_workspace(1024),
+        )

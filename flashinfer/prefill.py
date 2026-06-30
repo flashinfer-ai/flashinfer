@@ -59,6 +59,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
+    _check_workspace_buffer_alignment,
     check_shape_dtype_device,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
@@ -1650,6 +1651,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
         """
+        _check_workspace_buffer_alignment(
+            float_workspace_buffer, "float_workspace_buffer"
+        )
         _check_kv_layout(kv_layout)
 
         if backend == "cute-dsl":
@@ -1758,6 +1762,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The new int workspace buffer, the device of the new int workspace buffer should
             be the same as the device of the input tensors.
         """
+        _check_workspace_buffer_alignment(
+            float_workspace_buffer, "float_workspace_buffer"
+        )
+        _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
@@ -1822,6 +1830,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        _check_workspace_buffer_alignment(
+            self._float_workspace_buffer, "float_workspace_buffer"
+        )
         del (
             block_tables,
             max_item_len_ptr,
@@ -2105,6 +2116,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_workspace_buffer_alignment(
+            self._float_workspace_buffer, "float_workspace_buffer"
+        )
+        _check_workspace_buffer_alignment(
+            self._int_workspace_buffer, "int_workspace_buffer"
+        )
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
