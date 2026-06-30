@@ -42,7 +42,7 @@ def _file_has_marker(path: str, marker: str) -> bool:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             tree = ast.parse(fh.read(), filename=path)
-    except (SyntaxError, UnicodeDecodeError, OSError, ValueError):
+    except Exception:
         return False
     for node in ast.walk(tree):
         if (

@@ -1574,15 +1574,13 @@ derive_scheduling_patterns_from_markers() {
     solo_list="$("$py" "$scanner" solo "$tests_root" 2>/dev/null)"
 
     if [ -n "$long_list" ]; then
-        # shellcheck disable=SC2206  # word-splitting on newlines is intended
-        LONG_RUNNING_TEST_PATTERNS=($long_list)
+        mapfile -t LONG_RUNNING_TEST_PATTERNS <<< "$long_list"
         echo "Derived ${#LONG_RUNNING_TEST_PATTERNS[@]} long-running test pattern(s) from @pytest.mark.long_running."
     else
         echo "NOTE: no @pytest.mark.long_running files found; keeping built-in long-running defaults."
     fi
     if [ -n "$solo_list" ]; then
-        # shellcheck disable=SC2206  # word-splitting on newlines is intended
-        SOLO_TEST_PATTERNS=($solo_list)
+        mapfile -t SOLO_TEST_PATTERNS <<< "$solo_list"
         echo "Derived ${#SOLO_TEST_PATTERNS[@]} solo test pattern(s) from @pytest.mark.solo."
     else
         echo "NOTE: no @pytest.mark.solo files found; keeping built-in solo defaults."
