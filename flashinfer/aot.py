@@ -892,8 +892,9 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        # Note: (512, 512): FA2 prefill/decode only; no holistic batch-attention kernel.
-        "fa2_head_dim": [(64, 64), (128, 128), (256, 256), (512, 512)],
+        # Note: head_dim=512 (FA2 prefill/decode, SM100+) excluded to reduce
+        # space in the jit-cache wheel.
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
         "f16_dtype": [torch.float16, torch.bfloat16],
         "f8_dtype": [torch.float8_e4m3fn],
