@@ -62,6 +62,7 @@ from ..utils import (
     register_custom_op,
     register_fake_op,
     get_compute_capability,
+    round_up,
 )
 from .utils import (
     get_hybrid_num_tokens_buckets,
@@ -1234,9 +1235,14 @@ def get_trtllm_moe_sm100_module():
                     shapes, dtype=dtype, device=device
                 )
             if moe_inputs.hidden_states_scale is not None:
-                spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
-                    shapes, device=device
-                ).to(dtype)
+                def _init_hidden_states_scale(shapes, dtype, device):
+                    rows = shapes[0]
+                    buf = torch.ones(
+                        [round_up(rows, 128), *shapes[1:]], device=device
+                    ).to(dtype)
+                    return buf[:rows]
+
+                spec["hidden_states_scale"] = _init_hidden_states_scale
             if moe_inputs.gemm1_lora_delta is not None:
                 spec["gemm1_lora_delta"] = lambda shapes, dtype, device: torch.zeros(
                     shapes, dtype=dtype, device=device
