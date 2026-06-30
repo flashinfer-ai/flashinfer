@@ -23,9 +23,9 @@ KV blocks those tokens selected together with a per-(union-block)
 selected that block). The union kernel walks this list with online softmax, so a
 token attends only the blocks it picked.
 
-This is a correctness-first host builder (the q2k_indices it consumes are tiny --
-``total_q x topk`` ints); ``build_msa_union_metadata_device`` is the on-device
-CuTe-DSL builder used in production.
+This host builder is the correctness-first test oracle;
+``build_msa_union_metadata_device`` is the on-device CuTe-DSL builder the forward
+path calls.
 """
 
 from typing import Tuple
@@ -34,16 +34,13 @@ import torch
 
 
 def _fake_i32(ndim):
-    """Fake compact int32 tensor for TVM-FFI compilation (symbolic dims)."""
+    """Fake compact int32 tensor with ``ndim`` symbolic dims, for TVM-FFI compile."""
     import cutlass
     import cutlass.cute as cute
 
-    return cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        tuple(cute.sym_int() for _ in range(ndim)),
-        stride_order=tuple(reversed(range(ndim))),
-        assumed_align=4,
-    )
+    from .sparse_attention import _fake
+
+    return _fake(cutlass.Int32, tuple(cute.sym_int() for _ in range(ndim)), align=4)
 
 
 def build_msa_union_metadata(
@@ -52,33 +49,12 @@ def build_msa_union_metadata(
     tokens_per_tile: int,
     topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Build the union-tile work list from per-query top-k block selections.
-
-    Parameters
-    ----------
-    q2k_indices : torch.Tensor
-        ``(num_kv_heads, total_q, topk)`` int32, batch-local KV-block ids per query
-        (ascending, ``-1`` padded), shared across the kv-head's GQA query heads.
-    cu_seqlens_q : torch.Tensor
-        ``(batch_size + 1,)`` int32 cumulative query lengths.
-    tokens_per_tile : int
-        Query tokens per CTA tile (``m_block // group_size``).
-    topk : int
-        Per-query selection width (bounds ``max_union = tokens_per_tile * topk``).
-
-    Returns
-    -------
-    union_blocks, union_masks : torch.Tensor
-        ``(work_items, max_union)`` int32: the union's KV-block ids and the
-        ``tokens_per_tile``-bit per-block membership masks (zero-padded past
-        ``union_count``).
-    union_count : torch.Tensor
-        ``(work_items,)`` int32, blocks in each union.
-    work_meta : torch.Tensor
-        ``(work_items, 3)`` int32 ``{batch_idx, q_tile_idx, kv_head}``.
-    work_items : int
-        Number of emitted work items.
-    """
+    """Host reference union builder (test oracle). From per-query top-k selections
+    ``q2k_indices`` ``(num_kv_heads, total_q, topk)`` and ``cu_seqlens_q``, returns
+    ``(union_blocks, union_masks, union_count, work_meta, work_items)``: per
+    (batch, q-tile, kv-head) work item, the union's KV-block ids, the
+    ``tokens_per_tile``-bit membership masks, the block count, and
+    ``{batch_idx, q_tile_idx, kv_head}``."""
     num_kv_heads, total_q, topk_in = q2k_indices.shape
     if topk_in != topk:
         raise ValueError(f"q2k_indices topk {topk_in} != {topk}")
@@ -115,9 +91,13 @@ def build_msa_union_metadata(
 
     dev = q2k_indices.device
     n = len(counts)
+    # masks built as int64 (bit 31 -> 2**31 overflows int32 at construction), then
+    # cast to int32 to keep the kernel's 32-bit membership bit pattern.
     return (
         torch.tensor(blocks, dtype=torch.int32, device=dev).reshape(n, max_union),
-        torch.tensor(masks, dtype=torch.int32, device=dev).reshape(n, max_union),
+        torch.tensor(masks, dtype=torch.int64, device=dev)
+        .reshape(n, max_union)
+        .to(torch.int32),
         torch.tensor(counts, dtype=torch.int32, device=dev),
         torch.tensor(meta, dtype=torch.int32, device=dev).reshape(n, 3),
         n,
@@ -166,27 +146,15 @@ def build_msa_union_metadata_device(
     tokens_per_tile: int,
     topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """On-device equivalent of :func:`build_msa_union_metadata`.
+    """On-device equivalent of :func:`build_msa_union_metadata`, called by the
+    forward path (the host reference is the test oracle).
 
-    Produces the same five outputs, but keeps the ``(num_kv_heads, total_q,
-    topk)`` selection on the GPU -- only ``cu_seqlens_q`` (a tiny ``(batch +
-    1,)`` tensor) is read host-side to lay out the work items, so there is no
-    host copy of the large q2k tensor (the production win over the reference
-    builder). A CuTe-DSL warp-per-work-item k-way merge (:class:`...cute_dsl.
-    build_union_meta_sm12x.BuildUnionMetaSm12x`) forms each union on device.
-
-    The emitted blocks are ascending (k-way merge of ascending lists), matching
-    the reference. The order of work items differs from the reference, but the
-    forward scatters by ``work_meta`` so order is immaterial.
-
-    **CUDA-graph capturable.** The work-item count and all metadata tensors are
-    sized to a *static* upper bound on the number of tiles, ``ceil(total_q / tpt)
-    + batch_size``, computed from shapes alone (no read of ``cu_seqlens`` values).
-    The per-tile geometry (batch / query-base / valid-token-count) is then derived
-    **on device** from ``cu_seqlens`` -- a ``searchsorted`` over the per-batch tile
-    cumsum -- so there is no host copy or host sync anywhere on this path. Padding
-    slots beyond the true tile count get ``tile_ntok == 0``; the union builder
-    emits ``union_count == 0`` for them and the forward kernel skips them.
+    Same five outputs (work-item order differs but the forward scatters by
+    ``work_meta``). Keeps the q2k selection on the GPU and is CUDA-graph
+    capturable: tensors are sized to the static tile bound ``ceil(total_q / tpt)
+    + batch_size`` and the per-tile geometry is derived on device from
+    ``cu_seqlens`` (a searchsorted), so no host copy/sync. Padding slots get
+    ``tile_ntok == 0`` -> ``union_count == 0`` and are skipped by the forward.
     """
     num_kv_heads, total_q, topk_in = q2k_indices.shape
     if topk_in != topk:
@@ -196,10 +164,8 @@ def build_msa_union_metadata_device(
     tpt = tokens_per_tile
     batch_size = cu_seqlens_q.shape[0] - 1
 
-    # Static upper bound on the (batch, q-tile) count: every batch contributes at
-    # most one extra partial tile, so sum_b ceil(sq_b / tpt) <= ceil(total_q / tpt)
-    # + batch_size. Derived from shapes only -> the grid and metadata tensors are
-    # statically shaped (capturable); the few extra slots are empty (see below).
+    # Static upper bound on the (batch, q-tile) count (shapes only, so capturable):
+    # sum_b ceil(sq_b / tpt) <= ceil(total_q / tpt) + batch_size. Extra slots empty.
     total_tiles = (total_q + tpt - 1) // tpt + batch_size
     work_items = total_tiles * num_kv_heads
 
@@ -213,10 +179,9 @@ def build_msa_union_metadata_device(
             0,
         )
 
-    # On-device per-tile geometry (no cu_seqlens host copy -> capture-safe). A flat
-    # tile index t in [0, total_tiles) maps to its batch via searchsorted over the
-    # per-batch tile cumsum; padding indices (t >= the true count) clamp to the last
-    # batch with an out-of-range within-batch index, so tile_ntok clamps to 0.
+    # On-device per-tile geometry (no cu_seqlens host copy -> capture-safe): map each
+    # flat tile index to its batch via searchsorted over the per-batch tile cumsum.
+    # Padding indices clamp to the last batch with tile_ntok -> 0.
     cu = cu_seqlens_q.to(dtype=torch.int64)
     seqlens = cu[1:] - cu[:-1]
     ntiles = (seqlens + tpt - 1) // tpt
