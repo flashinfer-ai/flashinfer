@@ -10,12 +10,12 @@ from flashinfer.autotuner import (
     DynamicTensorSpec,
     TuningConfig,
     TunableRunner,
-)
-from flashinfer.fused_moe.utils import (
-    last_positive_power_of_2,
     make_bucket_mapper,
     round_to_nearest_bucket,
 )
+
+from flashinfer.utils import last_positive_power_of_2
+
 from .utils import reset_autotuner
 
 
@@ -1015,3 +1015,65 @@ def test_skip_ops_restored_after_context():
 
     # After context, skip_ops should be empty — op goes through normal path
     assert tuner._effective_skip_ops == frozenset()
+
+
+def test_find_nearest_profile_lru_cache_memory_leak():
+    """
+    Regression test: _find_nearest_profile is decorated with @lru_cache(maxsize=None).
+    Each unique raw input shape produces a distinct cache entry even when it maps to
+    the same bucket, so the cache grows without bound as the token count varies.
+
+    This test demonstrates the leak by calling _find_nearest_profile with N distinct
+    shapes and asserting that the cache size grew by exactly N entries.  It also
+    uses tracemalloc to measure Python-level allocation growth.
+    """
+    import tracemalloc
+
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(512, 1024, 2048, 4096, 8192),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+    )
+
+    # Warm up: one call to ensure the function is compiled/cached.
+    AutoTuner._find_nearest_profile(((1, 128),), tuning_config)
+    cache_before = AutoTuner._find_nearest_profile.cache_info().currsize
+
+    tracemalloc.start()
+    snapshot_before = tracemalloc.take_snapshot()
+
+    # Each token count is a distinct cache key even though many map to the same
+    # bucket — the cache stores the raw (shapes, config) pair as the key.
+    N = 5_000
+    for num_tokens in range(2, N + 2):
+        AutoTuner._find_nearest_profile(((num_tokens, 128),), tuning_config)
+
+    snapshot_after = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+
+    cache_after = AutoTuner._find_nearest_profile.cache_info().currsize
+    cache_growth = cache_after - cache_before
+
+    stats = snapshot_after.compare_to(snapshot_before, "lineno")
+    allocated_bytes = sum(s.size_diff for s in stats if s.size_diff > 0)
+
+    # Every unique shape is a separate entry — the cache grew by exactly N.
+    assert cache_growth == N, (
+        f"Expected {N} new cache entries, got {cache_growth}. "
+        "If this is less than N the cache was bounded (leak fixed)."
+    )
+    # Sanity-check that Python-level memory grew from caching the entries.
+    assert allocated_bytes > 0, "Expected Python allocation growth from unbounded cache"
+    AutoTuner._find_nearest_profile.cache_clear()
+
+    print(
+        f"\nCache grew by {cache_growth} entries. "
+        f"Python allocations grew by {allocated_bytes / 1024:.1f} KB."
+    )

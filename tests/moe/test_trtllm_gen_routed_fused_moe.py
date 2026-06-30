@@ -67,7 +67,7 @@ from flashinfer.utils import get_compute_capability
     ],
 )
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
-@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
+@pytest.mark.parametrize("routing_format", ["packed", "unpacked", "unpacked_fp32"])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -76,7 +76,7 @@ def test_trtllm_gen_routed_fused_moe(
     num_experts: int,
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
-    routing_format: Literal["packed", "unpacked"],
+    routing_format: Literal["packed", "unpacked", "unpacked_fp32"],
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -218,17 +218,24 @@ def test_trtllm_gen_routed_fused_moe(
     topk_ids = permute_info["topKIndices"].to(torch.int32)
     topk_weights = expert_weights.view(num_tokens, num_experts)[
         torch.arange(num_tokens).unsqueeze(1), topk_ids
-    ].to(torch.bfloat16)
+    ]
 
     # Prepare routing input based on format
     if routing_format == "packed":
-        # Packed format: (score << 16 | expert_id)
+        # Packed format: (score << 16 | expert_id); the weight occupies the low
+        # 16 bits, so it must be bfloat16.
+        topk_weights = topk_weights.to(torch.bfloat16)
         routing_input = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
             torch.int16
         )
+    elif routing_format == "unpacked_fp32":
+        # Unpacked tuple with float32 weights (the dtype routers natively emit).
+        # The kernel must consume them at fp32 with no cast; before the fix the
+        # finalize kernel reinterpreted the fp32 bytes as bf16 -> garbage output.
+        routing_input = (topk_ids, topk_weights.to(torch.float32))
     else:
-        # Unpacked format: (topk_ids, topk_weights) tuple
-        routing_input = (topk_ids, topk_weights)
+        # Unpacked format: (topk_ids, topk_weights) tuple, bfloat16 weights.
+        routing_input = (topk_ids, topk_weights.to(torch.bfloat16))
 
     output = trtllm_fp4_block_scale_routed_moe(
         routing_input,

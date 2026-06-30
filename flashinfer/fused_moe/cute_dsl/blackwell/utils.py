@@ -222,6 +222,10 @@ def fmin(
     else:
         # CUDA 13: nvvm.fmin(a, b, ...)
         result = nvvm.fmin(a_val, b_val, nan=nan, loc=loc, ip=ip)
+    # Newer MLIR Python bindings (cutlass-dsl ≥4.5, CUDA 13.x) return OpResultList
+    # instead of ir.Value for single-result ops; unwrap to ir.Value.
+    if isinstance(result, ir.OpResultList):
+        result = result[0]
     return cutlass.Float32(result)
 
 

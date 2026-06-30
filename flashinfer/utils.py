@@ -121,6 +121,18 @@ def next_positive_power_of_2(x: int) -> int:
     return n + 1
 
 
+def last_positive_power_of_2(x: int) -> int:
+    """Return the largest power of 2 that is ``<= x``.
+
+    If *x* is itself a power of 2, returns *x*.
+    """
+    n = next_positive_power_of_2(x)
+    if n == x:
+        return n
+
+    return n // 2
+
+
 def calculate_tile_tokens_dim(
     num_tokens: int, num_experts: int, top_k: int, max_tile_tokens_dim: int = 128
 ) -> int:

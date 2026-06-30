@@ -13,7 +13,9 @@ from .utils import reset_autotuner
 TUNE_MAX = 8192
 
 
-def _prepare_bf16_moe_weights(num_experts, intermediate_size, hidden_size, device):
+def _prepare_bf16_moe_weights(
+    num_experts: int, intermediate_size: int, hidden_size: int, device: torch.device
+):
     """Prepare shuffled BF16 weights in BlockMajorK layout."""
     from flashinfer import shuffle_matrix_a
     from flashinfer.fused_moe import convert_to_block_layout
@@ -59,14 +61,14 @@ def _overwrite_cached_tactic_for_op(custom_op: str, new_tactic):
 
 def _tune_bf16_moe_once(
     *,
-    device,
+    device: torch.device,
     tune_num_tokens: int,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
-    gemm1_weights,
-    gemm2_weights,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
     tune_max: int,
 ):
     from flashinfer.fused_moe import trtllm_bf16_moe, WeightLayout
@@ -101,14 +103,14 @@ def _tune_bf16_moe_once(
 
 def _run_bf16_moe_infer(
     *,
-    device,
+    device: torch.device,
     infer_num_tokens: int,
     num_experts: int,
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
-    gemm1_weights,
-    gemm2_weights,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
     tune_max: int,
 ):
     from flashinfer.fused_moe import trtllm_bf16_moe, WeightLayout
