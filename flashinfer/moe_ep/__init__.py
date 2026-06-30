@@ -55,6 +55,11 @@ from .config import (
     HandleParams,
     QuantType,
 )
+from .core.bootstrap_utils import (
+    bootstrap_comm_group,
+    bootstrap_ep_rank_world,
+    bootstrap_ep_world_size,
+)
 from .core.comm.fleet import Fleet, create_fleet
 from .core.comm.handle import Handle
 from .core.runtime import (
@@ -135,6 +140,9 @@ __all__ = [
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
+    "bootstrap_comm_group",
+    "bootstrap_ep_rank_world",
+    "bootstrap_ep_world_size",
     "bootstrap_moe_ep_runtime",
     "create_fleet",
     "dummy_moe_weights",

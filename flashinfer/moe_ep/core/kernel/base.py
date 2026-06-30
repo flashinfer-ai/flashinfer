@@ -66,6 +66,10 @@ class MegaKernelBackend(ABC):
     def __init__(self, config: object) -> None:
         self._config = config
         self._transformed_weights: Any = None
+        self._ep_bootstrap: BootstrapConfig | None = None
+        self._ep_comm_group: Any = None
+        self._ep_rank: int = 0
+        self._ep_world_size: int = 0
 
     @classmethod
     @abstractmethod
@@ -78,6 +82,56 @@ class MegaKernelBackend(ABC):
         from ...core.runtime import TORCH_DIST
 
         return frozenset({TORCH_DIST})
+
+    def bind_ep_bootstrap(self, bootstrap: "BootstrapConfig") -> None:
+        """Resolve EP rank/world once; comm group when dist is available."""
+        self._ep_bootstrap = bootstrap
+        self._ep_rank = bootstrap.rank
+        self._ep_world_size = bootstrap.world_size
+        self._ep_comm_group = None
+        self._try_resolve_ep_comm_group(bootstrap)
+
+    def _try_resolve_ep_comm_group(self, bootstrap: "BootstrapConfig") -> None:
+        import torch.distributed as dist
+
+        from ...core.bootstrap_utils import bootstrap_comm_group, bootstrap_ep_rank_world
+
+        if bootstrap.process_group is not None or dist.is_initialized():
+            self._ep_comm_group = bootstrap_comm_group(bootstrap)
+            self._ep_rank, self._ep_world_size = bootstrap_ep_rank_world(bootstrap)
+
+    def _ensure_ep_bootstrap(self, bootstrap: "BootstrapConfig") -> None:
+        if self._ep_bootstrap is not bootstrap:
+            self.bind_ep_bootstrap(bootstrap)
+        elif self._ep_comm_group is None:
+            self._try_resolve_ep_comm_group(bootstrap)
+
+    @property
+    def ep_comm_group(self) -> "torch.distributed.ProcessGroup":
+        if self._ep_comm_group is None and self._ep_bootstrap is not None:
+            self._try_resolve_ep_comm_group(self._ep_bootstrap)
+        if self._ep_comm_group is None:
+            raise RuntimeError(
+                "EP comm group is unavailable; initialize torch.distributed "
+                "or set BootstrapConfig.process_group before workspace allocation"
+            )
+        return self._ep_comm_group
+
+    @property
+    def ep_rank(self) -> int:
+        if self._ep_bootstrap is None:
+            raise RuntimeError(
+                "EP bootstrap is not bound; call bind_ep_bootstrap() first"
+            )
+        return self._ep_rank
+
+    @property
+    def ep_world_size(self) -> int:
+        if self._ep_bootstrap is None:
+            raise RuntimeError(
+                "EP bootstrap is not bound; call bind_ep_bootstrap() first"
+            )
+        return self._ep_world_size
 
     def validate_init(
         self,
@@ -99,8 +153,13 @@ class MegaKernelBackend(ABC):
         bootstrap: "BootstrapConfig",
         fleet_params: "FleetParams",
     ) -> Any:
-        """Allocate durable resources (e.g. symmetric memory buffers)."""
-        return None
+        """Bind EP bootstrap (once) and allocate symmetric-memory workspace."""
+        self._ensure_ep_bootstrap(bootstrap)
+        return self._allocate_workspace(fleet_params)
+
+    @abstractmethod
+    def _allocate_workspace(self, fleet_params: "FleetParams") -> Any:
+        """Backend-specific symmetric-memory / workspace allocation."""
 
     def validate_forward(
         self,
@@ -125,7 +184,6 @@ class MegaKernelBackend(ABC):
         workspace: Any,
         *,
         quantize_input: bool,
-        num_tokens: int,
     ) -> None:
         """Copy or quantize activations into workspace buffers."""
 
@@ -135,7 +193,6 @@ class MegaKernelBackend(ABC):
         workspace: Any,
         transformed_weights: Any,
         *,
-        num_tokens: int,
         output: "torch.Tensor",
     ) -> "torch.Tensor": ...
 

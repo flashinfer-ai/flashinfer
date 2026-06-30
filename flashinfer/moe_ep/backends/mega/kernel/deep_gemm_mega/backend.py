@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.distributed as dist
 
 from .....config import BootstrapConfig, FleetParams
 from .....core.kernel.base import MegaKernelBackend
@@ -64,38 +63,21 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
-        world_size = (
-            dist.get_world_size()
-            if dist.is_initialized()
-            else bootstrap.world_size
-        )
         validate_transformed_mega_weights(
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
-            world_size=world_size,
+            world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
         )
 
-    def _process_group(self) -> dist.ProcessGroup:
-        if not dist.is_initialized():
-            raise RuntimeError(
-                "MoEEpMegaLayer requires torch.distributed to be initialized"
-            )
-        return dist.group.WORLD
-
-    def prepare_workspace(
-        self,
-        bootstrap: BootstrapConfig,
-        fleet_params: FleetParams,
-    ) -> Any:
+    def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         import deep_gemm
 
-        group = self._process_group()
         k = self._kernel_config
         fp = fleet_params
         return deep_gemm.get_symm_buffer_for_mega_moe(
-            group,
+            self.ep_comm_group,
             fp.num_experts,
             fp.max_tokens_per_rank,
             k.top_k,
@@ -126,8 +108,8 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         *,
         quantize_input: bool,
-        num_tokens: int,
     ) -> None:
+        num_tokens = t.hidden_states.shape[0]
         if quantize_input:
             x_slot = workspace.x[:num_tokens]
             if x_slot.dtype != torch.float8_e4m3fn:
@@ -154,7 +136,6 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
         *,
-        num_tokens: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
         import deep_gemm

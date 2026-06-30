@@ -16,7 +16,7 @@ backend's Fleet __init__.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 if TYPE_CHECKING:
@@ -66,6 +66,11 @@ class BootstrapConfig:
     Backends consume only the fields they care about (NCCL-EP uses
     ``nccl_comm`` + ``stream``; NIXL-EP uses ``tcp_store``). Carrying both
     here lets a single bootstrap config drive either backend.
+
+    ``world_size`` and ``rank`` describe the EP comm domain. When the host
+    framework uses a non-WORLD process group (e.g. vLLM expert parallel within
+    a PP stage), pass that group via ``process_group``; mega kernels then use
+    it for symmetric-memory setup and collectives instead of WORLD.
     """
 
     world_size: int
@@ -76,6 +81,11 @@ class BootstrapConfig:
         None  # int representation of ncclComm_t; None = derive from PG
     )
     tcp_store: Optional["torch.distributed.TCPStore"] = None
+    process_group: Optional["torch.distributed.ProcessGroup"] = field(
+        default=None,
+        compare=False,
+        hash=False,
+    )
 
     def __post_init__(self) -> None:
         if self.world_size <= 0:

@@ -237,7 +237,6 @@ def _reference_mega_moe(group, problem: dict, *, destroy_buffer: bool = True):
     kernel.compute(
         symm_buffer,
         (transformed_l1, transformed_l2),
-        num_tokens=num_tokens,
         output=y,
     )
     torch.cuda.synchronize()

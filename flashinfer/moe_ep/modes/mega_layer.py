@@ -41,6 +41,7 @@ class MoEEpMegaLayer(nn.Module):
         ensure_moe_ep_cuda_device(bootstrap)
 
         self._kernel = create_mega_kernel(self._megakernel_config)
+        self._kernel.bind_ep_bootstrap(bootstrap)
         self._runtime = None
         if bootstrap.auto_bootstrap:
             self._runtime = bootstrap_moe_ep_runtime(
@@ -103,17 +104,15 @@ class MoEEpMegaLayer(nn.Module):
         assert self._transformed is not None
 
         workspace = self._ensure_workspace()
-        num_tokens = t.num_tokens
 
         self._kernel.stage_inputs(
             t,
             workspace,
             quantize_input=quantize_input,
-            num_tokens=num_tokens,
         )
 
         y = torch.empty(
-            num_tokens,
+            t.num_tokens,
             self._fleet_params.token_hidden_size,
             dtype=torch.bfloat16,
             device=t.hidden_states.device,
@@ -121,7 +120,6 @@ class MoEEpMegaLayer(nn.Module):
         return self._kernel.compute(
             workspace,
             self._transformed,
-            num_tokens=num_tokens,
             output=y,
         )
 

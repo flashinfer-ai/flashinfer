@@ -192,6 +192,7 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
         _make_e8m0_scale_tensor,
         _make_fp8_tensor,
     )
+    from moe_nvfp4_swapab.runner_common import Mxfp8ScaleDtype
 
     problem = _single_rank_problem()
     num_experts = problem["num_experts"]
@@ -243,8 +244,8 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     assert fc2_weight.shape == (num_experts, intermediate, hidden)
     assert fc1_weight.dtype == data_dtype
     assert fc2_weight.dtype == data_dtype
-    assert fc1_sf.dtype == torch.uint8
-    assert fc2_sf.dtype == torch.uint8
+    assert fc1_sf.dtype == Mxfp8ScaleDtype
+    assert fc2_sf.dtype == Mxfp8ScaleDtype
 
     block = Mxfp8BlockSize
     expected_gate0 = w13[:, :block, :].transpose(1, 2).contiguous()

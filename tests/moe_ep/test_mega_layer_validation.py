@@ -190,9 +190,12 @@ def test_mega_layer_forward_rejects_hidden_mismatch():
 
 @mock.patch("torch.distributed.is_initialized", return_value=False)
 def test_mega_layer_prepare_workspace_requires_dist(mock_dist_init):
+    import sys
+
     layer = _mega_layer()
-    with pytest.raises(RuntimeError, match="torch.distributed"):
-        layer._ensure_workspace()
+    with mock.patch.dict(sys.modules, {"deep_gemm": mock.MagicMock()}):
+        with pytest.raises(RuntimeError, match="torch.distributed"):
+            layer._ensure_workspace()
 
 
 def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():
@@ -200,8 +203,9 @@ def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():
 
     with mock.patch("torch.distributed.is_initialized", return_value=True):
         with mock.patch("torch.distributed.get_world_size", return_value=8):
-            with pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"):
-                _mega_layer()
+            with mock.patch("torch.distributed.get_rank", return_value=0):
+                with pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"):
+                    _mega_layer()
 
 
 def test_mega_layer_forward_passes_quantize_input_to_kernel():
@@ -306,7 +310,7 @@ def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
         topk_weights=topk_weights,
         scales=scales,
     )
-    backend.stage_inputs(t, workspace, quantize_input=False, num_tokens=num_tokens)
+    backend.stage_inputs(t, workspace, quantize_input=False)
 
     assert torch.equal(
         workspace.x[:num_tokens], hidden_fp8.to(torch.float32)
@@ -327,7 +331,7 @@ def test_mega_layer_init_rejects_invalid_transformed_weight_dtype():
     from flashinfer.moe_ep import MoEEpConfigError
 
     bad = _fake_deep_gemm_transformed()
-    bad[0][0] = bad[0][0].to(torch.float32)
+    bad = ((bad[0][0].to(torch.float32), bad[0][1]), bad[1])
     with pytest.raises(MoEEpConfigError, match="torch.int8"):
         _mega_layer(transformed_weights=bad)
 

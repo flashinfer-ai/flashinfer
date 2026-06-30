@@ -12,7 +12,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.distributed as dist
 
 from .....config import BootstrapConfig, FleetParams
 from .....core.kernel.base import MegaKernelBackend
@@ -86,32 +85,17 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
-        world_size = (
-            dist.get_world_size()
-            if dist.is_initialized()
-            else bootstrap.world_size
-        )
         validate_transformed_mega_weights(
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
-            world_size=world_size,
+            world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
         )
 
-    def _resolve_rank_world(self, bootstrap: BootstrapConfig) -> tuple[int, int]:
-        if dist.is_initialized():
-            return dist.get_rank(), dist.get_world_size()
-        return bootstrap.rank, bootstrap.world_size
-
-    def prepare_workspace(
-        self,
-        bootstrap: BootstrapConfig,
-        fleet_params: FleetParams,
-    ) -> Any:
+    def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ..cutedsl_backend_kernels.frontend import get_symm_buffer_for_mega_moe
 
-        rank, world_size = self._resolve_rank_world(bootstrap)
         k = self._kernel_config
         fp = fleet_params
         return get_symm_buffer_for_mega_moe(
@@ -120,8 +104,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.top_k,
             fp.token_hidden_size,
             2 * k.intermediate_size,
-            rank,
-            world_size,
+            self.ep_rank,
+            self.ep_world_size,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
@@ -153,8 +137,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         *,
         quantize_input: bool,
-        num_tokens: int,
     ) -> None:
+        num_tokens = t.hidden_states.shape[0]
         if quantize_input:
             stage_mega_moe_inputs(
                 t.hidden_states,
@@ -200,7 +184,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
         *,
-        num_tokens: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
         from ..cutedsl_backend_kernels.frontend import nvfp4_mega_moe
@@ -211,7 +194,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             transformed_weights[0],
             transformed_weights[1],
             workspace,
-            num_tokens=num_tokens,
+            num_tokens=output.shape[0],
             gate_up_clamp=_resolve_gate_up_clamp(kcfg),
             activation_clamp=kcfg.activation_clamp,
             fast_math=kcfg.fast_math,

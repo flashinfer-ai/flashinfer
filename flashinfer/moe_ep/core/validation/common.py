@@ -36,13 +36,41 @@ def _device_capability() -> tuple[int, int]:
 def validate_bootstrap_world_size(bootstrap: BootstrapConfig) -> None:
     import torch.distributed as dist
 
+    from ..bootstrap_utils import bootstrap_comm_group, bootstrap_ep_rank_world
+
     if not dist.is_initialized():
         return
-    dist_ws = dist.get_world_size()
-    if bootstrap.world_size != dist_ws:
+
+    pg = bootstrap_comm_group(bootstrap)
+    pg_ws = dist.get_world_size(pg)
+    pg_rank = dist.get_rank(pg)
+    if bootstrap.world_size != pg_ws:
+        pg_label = (
+            "BootstrapConfig.process_group"
+            if bootstrap.process_group is not None
+            else "torch.distributed world"
+        )
         raise MoEEpConfigError(
             f"BootstrapConfig.world_size ({bootstrap.world_size}) must match "
-            f"torch.distributed world size ({dist_ws})"
+            f"{pg_label} size ({pg_ws})"
+        )
+    if bootstrap.rank != pg_rank:
+        pg_label = (
+            "BootstrapConfig.process_group"
+            if bootstrap.process_group is not None
+            else "torch.distributed world"
+        )
+        raise MoEEpConfigError(
+            f"BootstrapConfig.rank ({bootstrap.rank}) must match "
+            f"{pg_label} rank ({pg_rank})"
+        )
+    # Sanity: resolved EP sizing matches the configured bootstrap fields.
+    resolved_rank, resolved_ws = bootstrap_ep_rank_world(bootstrap)
+    if resolved_rank != bootstrap.rank or resolved_ws != bootstrap.world_size:
+        raise MoEEpConfigError(
+            f"BootstrapConfig rank/world_size ({bootstrap.rank}, "
+            f"{bootstrap.world_size}) does not match resolved EP comm "
+            f"({resolved_rank}, {resolved_ws})"
         )
 
 

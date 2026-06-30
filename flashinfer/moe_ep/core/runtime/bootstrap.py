@@ -130,10 +130,12 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
             "NVSHMEM bootstrap requires torch.distributed to be initialized first."
         )
 
-    local_rank = int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    from ..bootstrap_utils import bootstrap_comm_group, bootstrap_ep_rank_world
 
+    pg = bootstrap_comm_group(bootstrap)
+    rank, world_size = bootstrap_ep_rank_world(bootstrap)
+
+    local_rank = int(os.environ.get("LOCAL_RANK", str(bootstrap.rank)))
     torch.cuda.set_device(local_rank)
     dev = Device(local_rank)
     dev.set_current()
@@ -141,8 +143,8 @@ def _init_nvshmem_after_dist(bootstrap: BootstrapConfig) -> bool:
     uid = nvshmem.core.get_unique_id(empty=(rank != 0))
     uid_bytes = uid._data.view(np.uint8).copy()
     uid_tensor = torch.from_numpy(uid_bytes).cuda()
-    dist.broadcast(uid_tensor, src=0)
-    dist.barrier()
+    dist.broadcast(uid_tensor, src=0, group=pg)
+    dist.barrier(group=pg)
     uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
 
     nvshmem.core.init(

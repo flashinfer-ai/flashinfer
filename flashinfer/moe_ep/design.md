@@ -30,7 +30,7 @@ comm fleets when their `fleet.py` is imported from `__init__.py`.
 
 | Type | Role |
 |------|------|
-| `BootstrapConfig` | `world_size`, `rank`, `stream`, `nccl_comm`, `tcp_store`, `auto_bootstrap=True` |
+| `BootstrapConfig` | `world_size`, `rank`, `stream`, `nccl_comm`, `tcp_store`, optional `process_group` (EP comm; defaults to WORLD), `auto_bootstrap=True` |
 | `FleetParams` | EP sizing + required `weights`; split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
 | `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales` (pre-staged mega) |
 | `MoEWeightPack` | Canonical `w13` / `w2` (+ optional scales); `dummy_moe_weights()` for comm-only split |
@@ -97,6 +97,14 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 
 **Mega activations:** with `stage_inputs=True` (default), bf16 `[T, hidden]` is quantized into the symm workspace at forward. With `stage_inputs=False`, copy pre-quantized activations (+ `MoEEpTensors.scales`) into the workspace.
 
+**Host framework bootstrap (e.g. vLLM):** when the host already initialized
+``torch.distributed`` and expert parallel uses a subgroup (not WORLD), pass
+``BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank,
+auto_bootstrap=False)`` and call ``bootstrap_moe_ep_runtime(bootstrap, reqs)``
+once per worker. All mega kernels resolve comm via
+``bootstrap_comm_group`` / ``bootstrap_ep_rank_world`` (via
+``MegaKernelBackend.bind_ep_bootstrap``).
+
 ## Usage
 
 ```python
@@ -162,7 +170,7 @@ Useful exports: `bootstrap_moe_ep_runtime`, `finalize_moe_ep_runtime`, `ensure_m
 ## Extending
 
 1. **Split kernel** — `backends/split/kernel/<name>/`: subclass `SplitKernelBackend`, `@register_split_kernel`, import in `backends/split/kernel/__init__.py`.
-2. **Mega kernel** — `backends/mega/kernel/<name>/`: subclass `MegaKernelBackend`, implement `compute` / `prepare_workspace` / `stage_inputs`, override `runtime_requirements()` if needed, `@register_mega_kernel`, import in `backends/mega/kernel/__init__.py`.
+2. **Mega kernel** — `backends/mega/kernel/<name>/`: subclass `MegaKernelBackend`, implement ``compute`` / ``_allocate_workspace`` / ``stage_inputs``, override ``runtime_requirements()`` if needed, ``@register_mega_kernel``, import in ``backends/mega/kernel/__init__.py``.
 3. **Comm backend** (split only) — `backends/split/comm/<name>/` with `config.py`, `fleet.py`, `handle.py`; import fleet from `moe_ep.__init__.py`.
 
 ## Tests
