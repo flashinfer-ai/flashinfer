@@ -522,7 +522,7 @@ def test_batch_mla_collapsed_cache_shape_raises(backend):
         batch_size, num_heads, head_dim_ckv, dtype=dtype, device=device
     )
     q_pe = torch.randn(batch_size, num_heads, head_dim_kpe, dtype=dtype, device=device)
-    # Wrong (collapsed) layout: page_size folded into dim-0, dim-1 forced to 1.
+    # Invalid (collapsed) layout: page_size folded into dim-0, dim-1 forced to 1.
     ckv_bad = torch.randn(
         batch_size * pages_num * page_size, 1, head_dim_ckv, dtype=dtype, device=device
     )
