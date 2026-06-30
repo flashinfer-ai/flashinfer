@@ -18,9 +18,7 @@ def stubbed_fleet_registry():
             log.append("dispatch")
             from flashinfer.moe_ep import DispatchOutput
 
-            return DispatchOutput(
-                expert_tensors=params.x[0], num_tokens=params.x[0].size(0)
-            )
+            return DispatchOutput(expert_tensors=params.x[0])
 
         def combine(self, params):
             log.append("combine")

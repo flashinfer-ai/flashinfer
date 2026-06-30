@@ -28,13 +28,22 @@ cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
 # Runtime deps for the moe_ep transport backends. Pair with the BUILD_NVEP=1
 # env var at install time: `BUILD_NVEP=1 pip install -e ".[nvep]"`. The env var
-# triggers the in-tree submodule build (NIXL meson + NCCL make) and the
-# build_backend.py hook also pip-installs `nixl-cu13>=1.0.1` and
-# `nvidia-nccl-cu13>=2.30.4` with --no-deps (matching SGLang's Dockerfile
-# pattern) so they don't drag transitive constraints that downgrade torch.
-# Only cuda-python is listed here because it has no torch-conflicting deps.
+# triggers the NIXL-EP submodule build (meson); the build_backend.py hook also
+# pip-installs `nixl-cu13>=1.0.1` with --no-deps (matching SGLang's Dockerfile
+# pattern) so it doesn't drag transitive constraints that downgrade torch.
+#
+# NCCL-EP is NO LONGER built from the in-tree submodule: it is provided by the
+# released `nccl4py` wheel (>=0.3.1), which ships the `nccl.ep` Pythonic API and
+# bundles libnccl_ep.so (loaded via cuda-pathfinder, so no LD_LIBRARY_PATH hack).
+# `flashinfer.moe_ep.nccl_ep` imports `nccl.ep`; availability is probed via
+# `find_spec("nccl.ep")`.
 nvep = [
   "cuda-python>=13.0",
+  "nccl4py>=0.3.1",
+  # NCCL-EP group-create fails on B200 with older NCCL (2.27.x/2.29.x); >=2.30.7
+  # carries the B200 EP support. Ensure this wheel's libnccl is loaded (first on
+  # LD_LIBRARY_PATH) rather than a base-image system NCCL.
+  "nvidia-nccl-cu13>=2.30.7",
 ]
 
 [project.scripts]
