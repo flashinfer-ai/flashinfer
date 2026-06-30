@@ -297,9 +297,11 @@ def msa_sparse_attention(
         split-KV + combine. A CTA owns a tile of query tokens and runs an
         in-kernel online softmax over the *union* of the blocks they selected,
         writing the final output directly (no GMEM partials, no combine) -- the
-        memory-bound KV-major path's prefill headroom on SM12x. Currently
-        bf16/fp16, flat K/V, no ``return_temperature_lse``; ``schedule`` is
-        ignored. The metadata is built internally from ``q2k_indices``.
+        memory-bound KV-major path's prefill headroom on SM12x. Supports bf16/fp16
+        Q with bf16/fp16, fp8 (E4M3), or NVFP4 K/V (flat or paged), plus
+        ``return_softmax_lse`` and ``return_temperature_lse``. ``q_fp8`` / native
+        fp8-MMA are not on the union path; ``schedule`` is ignored. The metadata is
+        built internally from ``q2k_indices``.
 
     Returns
     -------
@@ -420,8 +422,6 @@ def msa_sparse_attention(
                 "union=True supports bf16/fp16 Q with bf16/fp16, fp8 (E4M3), or "
                 "NVFP4 K/V; q_fp8 / native fp8-MMA are not on the union path yet"
             )
-        if return_temperature_lse:
-            raise ValueError("union=True does not support return_temperature_lse yet")
         # paged is supported (page_size == _BLK_KV, one page per KV block); the
         # paged k/v shape was validated above and cu_seqlens_k was derived from
         # seqused_k. The union metadata builder works on batch-local block ids
@@ -445,6 +445,8 @@ def msa_sparse_attention(
             topk=topk,
             compute_dtype=compute_dtype,
             return_softmax_lse=return_softmax_lse,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=lse_temperature_scale,
             kv_fp8=kv_fp8,
             kv_nvfp4=kv_nvfp4,
             k_scale=k_scale,
@@ -668,6 +670,8 @@ def _msa_sparse_attention_union(
     topk,
     compute_dtype,
     return_softmax_lse,
+    return_temperature_lse=False,
+    lse_temperature_scale=1.0,
     kv_fp8=False,
     kv_nvfp4=False,
     k_scale=None,
@@ -726,6 +730,14 @@ def _msa_sparse_attention_union(
     lse2 = torch.full(
         (num_qo_heads, total_q), -float("inf"), dtype=torch.float32, device=dev
     )
+    # temperature LSE: same (Hq, total_q) log2-domain layout as lse2; a (1, 1) dummy
+    # keeps the call signature uniform when the temperature LSE is not requested.
+    if return_temperature_lse:
+        lse2_t = torch.full(
+            (num_qo_heads, total_q), -float("inf"), dtype=torch.float32, device=dev
+        )
+    else:
+        lse2_t = torch.zeros((1, 1), dtype=torch.float32, device=dev)
 
     key = (
         "sparse_attn_union",
@@ -738,6 +750,7 @@ def _msa_sparse_attention_union(
         paged,
         kv_fp8,
         kv_nvfp4,
+        return_temperature_lse,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
@@ -746,7 +759,7 @@ def _msa_sparse_attention_union(
         i32 = _cutlass_dtype(torch.int32)
         u8 = _cutlass_dtype(torch.uint8)
         f32 = _cutlass_dtype(torch.float32)
-        s = [cute.sym_int() for _ in range(15)]
+        s = [cute.sym_int() for _ in range(17)]
         kv_last = k_pass.shape[-1]  # head_dim (bf16/fp8) or 16 int32 words (NVFP4)
         # K/V are 3D flat or 4D paged (num_pages, Hkv, _BLK_KV, kv_last).
         kv_shape = (s[9], s[10], _BLK_KV, kv_last) if paged else (s[2], s[3], kv_last)
@@ -758,6 +771,7 @@ def _msa_sparse_attention_union(
             num_threads=num_threads,
             is_causal=causal,
             return_softmax_lse=True,
+            return_temperature_lse=return_temperature_lse,
             paged=paged,
             kv_fp8=kv_fp8,
             kv_nvfp4=kv_nvfp4,
@@ -771,6 +785,8 @@ def _msa_sparse_attention_union(
             _fake(u8, (s[14],), align=4),
             _fake(cdt, (s[0], s[1], head_dim)),
             _fake(f32, (s[1], s[0]), align=4),
+            # mLseT: independent dims so the off-path (1, 1) dummy is accepted.
+            _fake(f32, (s[15], s[16]), align=4),
             _fake(i32, (s[6], s[7]), align=4),
             _fake(i32, (s[6], s[7]), align=4),
             _fake(i32, (s[6],), align=4),
@@ -780,6 +796,7 @@ def _msa_sparse_attention_union(
             _fake(i32, (s[4],), align=4),
             _fake(i32, (s[5],), align=4),
             _fake(i32, (s[11], s[12]), align=4),
+            cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             cutlass.Int32(1),
@@ -797,6 +814,7 @@ def _msa_sparse_attention_union(
         vsf_dev,
         out,
         lse2,
+        lse2_t,
         ub,
         um,
         uc,
@@ -808,11 +826,18 @@ def _msa_sparse_attention_union(
         page_table_arg,
         float(softmax_scale),
         float(out_scale),
+        float(lse_temperature_scale),
         int(n),
     )
+    # kernel writes log2-domain LSE as (Hq, total_q); the public contract is
+    # natural-log (total_q, num_qo_heads). The temperature-LSE return mirrors the
+    # split path: (out, lse, lse_t) when temperature LSE is requested (lse is
+    # always materialized alongside it), (out, lse) for plain LSE, else out.
+    if return_temperature_lse:
+        lse_out = (lse2 * _LN2).t().contiguous()
+        lse_t_out = (lse2_t * _LN2).t().contiguous()
+        return out, lse_out, lse_t_out
     if return_softmax_lse:
-        # kernel writes log2-domain LSE as (Hq, total_q); the public contract is
-        # natural-log (total_q, num_qo_heads).
         lse_out = (lse2 * _LN2).t().contiguous()
         return out, lse_out
     return out

@@ -61,6 +61,7 @@ class SparseAttentionUnionFwdSm12x:
         num_threads: int = 128,
         is_causal: bool = True,
         return_softmax_lse: bool = False,
+        return_temperature_lse: bool = False,
         paged: bool = False,
         kv_fp8: bool = False,
         kv_nvfp4: bool = False,
@@ -79,6 +80,7 @@ class SparseAttentionUnionFwdSm12x:
         self._num_threads = num_threads
         self._is_causal = is_causal
         self._return_softmax_lse = return_softmax_lse
+        self._return_temperature_lse = return_temperature_lse
         self._paged = paged
         # fp8 (E4M3) and NVFP4 K/V caches are dequantized to the compute dtype
         # elementwise on load (no native fp8/fp4 MMA -- the QK/PV matmuls stay in
@@ -266,6 +268,7 @@ class SparseAttentionUnionFwdSm12x:
         mVSf: cute.Tensor,  # nvfp4: V block scales (flat uint8 128x4); dummy (1,) else
         mO: cute.Tensor,  # (total_q, Hq, d) final output
         mLse: cute.Tensor,  # (Hq, total_q) f32 LSE (dummy (1,1) if off)
+        mLseT: cute.Tensor,  # (Hq, total_q) f32 temperature LSE (dummy (1,1) if off)
         mUnionBlocks: cute.Tensor,  # (capacity, max_union) int32 kv-block ids
         mUnionMasks: cute.Tensor,  # (capacity, max_union) int32 tpt-bit masks
         mUnionCount: cute.Tensor,  # (capacity,) int32 blocks in the union
@@ -277,6 +280,7 @@ class SparseAttentionUnionFwdSm12x:
         mPageTable: cute.Tensor,  # (B, max_pages) int32 (dummy (1,1) if flat)
         softmax_scale: cutlass.Float32,  # nvfp4: K global scale pre-folded by host
         out_scale: cutlass.Float32,  # nvfp4: V global scale (1.0 otherwise); no combine
+        lse_temperature_scale: cutlass.Float32,  # MSA temperature LSE scale
         work_capacity: cutlass.Int32,
         stream: cuda.CUstream,
     ):
@@ -345,6 +349,7 @@ class SparseAttentionUnionFwdSm12x:
 
         LOG2_E = 1.4426950408889634074
         softmax_scale_log2 = softmax_scale * LOG2_E
+        lse_temp_scale_log2 = softmax_scale_log2 * lse_temperature_scale
         self.kernel(
             mQ,
             mK,
@@ -353,6 +358,7 @@ class SparseAttentionUnionFwdSm12x:
             mVSf,
             mO,
             mLse,
+            mLseT,
             mUnionBlocks,
             mUnionMasks,
             mUnionCount,
@@ -364,6 +370,7 @@ class SparseAttentionUnionFwdSm12x:
             mPageTable,
             softmax_scale_log2,
             out_scale,
+            lse_temp_scale_log2,
             sQ_layout,
             gmem_tiled_copy_KV,
             tiled_mma,
@@ -384,6 +391,7 @@ class SparseAttentionUnionFwdSm12x:
         mVSf: cute.Tensor,
         mO: cute.Tensor,
         mLse: cute.Tensor,
+        mLseT: cute.Tensor,
         mUnionBlocks: cute.Tensor,
         mUnionMasks: cute.Tensor,
         mUnionCount: cute.Tensor,
@@ -395,6 +403,7 @@ class SparseAttentionUnionFwdSm12x:
         mPageTable: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         out_scale: cutlass.Float32,
+        lse_temp_scale_log2: cutlass.Float32,
         sQ_layout: cute.Layout,
         gmem_tiled_copy_KV: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
@@ -508,11 +517,19 @@ class SparseAttentionUnionFwdSm12x:
                 )
 
             # ---- online-softmax running state ----
+            # row_sum_t is a second running sum whose exponent is scaled by the MSA
+            # temperature (lse_temp_scale_log2 instead of softmax_scale_log2). It
+            # shares the running raw-score max row_max, so it is rescaled by the same
+            # max-shift as row_sum on each update (the split path computes this
+            # per-block and the combine reduces it; the union accumulates it online).
             row_max = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
             row_sum = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
+            row_sum_t = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
             for r in cutlass.range_constexpr(n_rows):
                 row_max[r] = -cutlass.Float32.inf
                 row_sum[r] = cutlass.Float32.zero
+                if cutlass.const_expr(self._return_temperature_lse):
+                    row_sum_t[r] = cutlass.Float32.zero
             acc_O.fill(0.0)
 
             gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(tidx)
@@ -677,6 +694,25 @@ class SparseAttentionUnionFwdSm12x:
                         fastmath=True,
                     )
                     row_sum[r] = rsum + row_sum[r] * prev_scale
+                    if cutlass.const_expr(self._return_temperature_lse):
+                        # temperature-scaled running sum: same masked scores and
+                        # max-shift as row_sum, but the exponent uses the temperature
+                        # scale. acc_S_row is the masked raw score (read before the
+                        # acc_S_mn overwrite below).
+                        p_row_t = cute.math.exp2(
+                            acc_S_row * lse_temp_scale_log2
+                            - rmax_safe * lse_temp_scale_log2,
+                            fastmath=True,
+                        )
+                        rsum_t = p_row_t.reduce(
+                            cute.ReductionOp.ADD, cutlass.Float32.zero, 0
+                        )
+                        prev_scale_t = cute.math.exp2(
+                            rmax_prev * lse_temp_scale_log2
+                            - rmax_safe * lse_temp_scale_log2,
+                            fastmath=True,
+                        )
+                        row_sum_t[r] = rsum_t + row_sum_t[r] * prev_scale_t
                     acc_O_mn[r, None] = acc_O_mn[r, None].load() * prev_scale
                     row_max[r] = rmax
                     acc_S_mn[r, None] = p_row
@@ -738,6 +774,12 @@ class SparseAttentionUnionFwdSm12x:
                         mLse[hq, q_global] = (
                             rmax_safe * softmax_scale_log2
                             + cute.math.log2(rs, fastmath=True)
+                        )
+                    if cutlass.const_expr(self._return_temperature_lse):
+                        rs_t = self._threadquad_reduce_sum(row_sum_t[r])
+                        mLseT[hq, q_global] = (
+                            rmax_safe * lse_temp_scale_log2
+                            + cute.math.log2(rs_t, fastmath=True)
                         )
 
     @cute.jit

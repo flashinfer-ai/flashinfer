@@ -67,7 +67,9 @@ def _torch_oracle(q, k, v, q2k, cu_q, cu_k, blk, G, scale):
     return out
 
 
-def _compile_union(G, causal, m_block, num_threads, hd, return_lse):
+def _compile_union(
+    G, causal, m_block, num_threads, hd, return_lse, return_temp_lse=False
+):
     import cutlass
     import cutlass.cute as cute
 
@@ -78,8 +80,9 @@ def _compile_union(G, causal, m_block, num_threads, hd, return_lse):
 
     cdt = _cutlass_dtype(torch.bfloat16)
     i32 = _cutlass_dtype(torch.int32)
+    u8 = _cutlass_dtype(torch.uint8)
     f32 = _cutlass_dtype(torch.float32)
-    s = [cute.sym_int() for _ in range(11)]
+    s = [cute.sym_int() for _ in range(15)]
     obj = SparseAttentionUnionFwdSm12x(
         head_dim=hd,
         m_block_size=m_block,
@@ -88,14 +91,18 @@ def _compile_union(G, causal, m_block, num_threads, hd, return_lse):
         num_threads=num_threads,
         is_causal=causal,
         return_softmax_lse=return_lse,
+        return_temperature_lse=return_temp_lse,
     )
     return cute.compile(
         obj,
         _fake(cdt, (s[0], s[1], hd)),
         _fake(cdt, (s[2], s[3], hd)),
         _fake(cdt, (s[2], s[3], hd)),
+        _fake(u8, (s[11],), align=4),
+        _fake(u8, (s[12],), align=4),
         _fake(cdt, (s[0], s[1], hd)),
         _fake(f32, (s[1], s[0]), align=4),
+        _fake(f32, (s[13], s[14]), align=4),
         _fake(i32, (s[6], s[7]), align=4),
         _fake(i32, (s[6], s[7]), align=4),
         _fake(i32, (s[6],), align=4),
@@ -105,6 +112,8 @@ def _compile_union(G, causal, m_block, num_threads, hd, return_lse):
         _fake(i32, (s[4],), align=4),
         _fake(i32, (s[5],), align=4),
         _fake(i32, (s[9], s[10]), align=4),
+        cutlass.Float32(1.0),
+        cutlass.Float32(1.0),
         cutlass.Float32(1.0),
         cutlass.Int32(1),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -183,14 +192,19 @@ def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):
     wc = torch.tensor([n], dtype=torch.int32, device=dev)
     out = torch.empty(B * S, Hq, hd, dtype=torch.bfloat16, device=dev)
     lse = torch.empty(Hq, B * S, dtype=torch.float32, device=dev)
+    lse_t = torch.zeros((1, 1), dtype=torch.float32, device=dev)
+    sf_dummy = torch.zeros(1, dtype=torch.uint8, device=dev)
     ptab_dummy = torch.zeros((1, 1), dtype=torch.int32, device=dev)
     compiled = _compile_union(G, True, m_block, num_threads, hd, False)
     compiled(
         q,
         k,
         v,
+        sf_dummy,
+        sf_dummy,
         out,
         lse,
+        lse_t,
         ub,
         um,
         uc,
@@ -201,6 +215,8 @@ def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):
         qoff,
         ptab_dummy,
         cutlass.Float32(scale),
+        cutlass.Float32(1.0),
+        cutlass.Float32(1.0),
         cutlass.Int32(n),
     )
     torch.cuda.synchronize()
@@ -308,6 +324,46 @@ def test_union_public_api(B, S, return_lse):
     mae_kv = (ref.float() - oracle).abs().mean().item()
     assert mae_o <= mae_kv * 1.5 + 1e-6, (mae_o, mae_kv)
     assert (got.float() - ref.float()).abs().mean().item() < 5e-4
+
+
+@pytest.mark.parametrize("B,S", [(1, 1024), (3, 384)])
+@pytest.mark.parametrize("causal", [True, False])
+def test_union_temperature_lse_matches_split(B, S, causal):
+    """union=True with return_temperature_lse returns (out, lse, lse_t) matching the
+    KV-major split+combine path. The temperature LSE is the online-accumulated
+    temperature-scaled sum the split path computes per-block and combines."""
+    _skip()
+    from flashinfer.msa_ops import msa_sparse_attention
+
+    dev = "cuda"
+    Hq, Hkv, topk, hd = 64, 4, 16, 128
+    scale = 1.0 / math.sqrt(hd)
+    T = 0.7
+    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    torch.manual_seed(13)
+    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=7)
+
+    kw = dict(
+        causal=causal,
+        softmax_scale=scale,
+        return_temperature_lse=True,
+        lse_temperature_scale=T,
+    )
+    ref_o, ref_lse, ref_lse_t = msa_sparse_attention(q, k, v, q2k, cu, cu, **kw)
+    got_o, got_lse, got_lse_t = msa_sparse_attention(
+        q, k, v, q2k, cu, cu, union=True, **kw
+    )
+    torch.cuda.synchronize()
+
+    assert got_lse_t.shape == (B * S, Hq)
+    assert (got_o.float() - ref_o.float()).abs().mean().item() < 5e-4
+    finite = torch.isfinite(ref_lse)
+    assert (got_lse[finite] - ref_lse[finite]).abs().max().item() < 5e-2
+    finite_t = torch.isfinite(ref_lse_t)
+    assert (got_lse_t[finite_t] - ref_lse_t[finite_t]).abs().max().item() < 5e-2
 
 
 @pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
