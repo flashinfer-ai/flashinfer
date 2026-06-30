@@ -326,6 +326,39 @@ def test_union_public_api(B, S, return_lse):
     assert (got.float() - ref.float()).abs().mean().item() < 5e-4
 
 
+@pytest.mark.parametrize("Hq,Hkv", [(1, 1), (2, 2), (4, 2)])
+@pytest.mark.parametrize("B,S", [(1, 1024), (2, 384)])
+def test_union_small_group_matches_split(Hq, Hkv, B, S):
+    """Small / unit GQA groups, including MHA (group_size=1 -> the 32-row tile,
+    tokens_per_tile=32 = the membership mask's exact capacity), match the KV-major
+    path and the fp32 oracle."""
+    _skip()
+    from flashinfer.msa_ops import msa_sparse_attention
+
+    dev = "cuda"
+    topk, hd = 16, 128
+    G = Hq // Hkv
+    scale = 1.0 / math.sqrt(hd)
+    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    torch.manual_seed(17)
+    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=9)
+    oracle = _torch_oracle(q, k, v, q2k, cu, cu, BLK, G, scale)
+
+    kw = dict(causal=True, softmax_scale=scale)
+    ref = msa_sparse_attention(q, k, v, q2k, cu, cu, **kw)
+    got = msa_sparse_attention(q, k, v, q2k, cu, cu, union=True, **kw)
+    torch.cuda.synchronize()
+
+    assert got.shape == (B * S, Hq, hd)
+    mae_o = (got.float() - oracle).abs().mean().item()
+    mae_kv = (ref.float() - oracle).abs().mean().item()
+    assert mae_o <= mae_kv * 1.5 + 1e-6, (mae_o, mae_kv)
+    assert (got.float() - ref.float()).abs().mean().item() < 5e-4
+
+
 @pytest.mark.parametrize("B,S", [(1, 1024), (3, 384)])
 @pytest.mark.parametrize("causal", [True, False])
 def test_union_temperature_lse_matches_split(B, S, causal):

@@ -293,15 +293,17 @@ def msa_sparse_attention(
         Also return the natural-log LSE, shape ``(total_q, num_qo_heads)``
         float32 (``-inf`` for queries with no valid selected blocks).
     union : bool
-        Use the query-tile **union** kernel instead of the default KV-major
-        split-KV + combine. A CTA owns a tile of query tokens and runs an
-        in-kernel online softmax over the *union* of the blocks they selected,
-        writing the final output directly (no GMEM partials, no combine) -- the
-        memory-bound KV-major path's prefill headroom on SM12x. Supports bf16/fp16
-        Q with bf16/fp16, fp8 (E4M3), or NVFP4 K/V (flat or paged), plus
-        ``return_softmax_lse`` and ``return_temperature_lse``. ``q_fp8`` / native
-        fp8-MMA are not on the union path; ``schedule`` is ignored. The metadata is
-        built internally from ``q2k_indices``.
+        The query-tile **union** kernel is the default prefill path: a CTA owns a
+        tile of query tokens and runs an in-kernel online softmax over the *union*
+        of the blocks they selected, writing the final output directly (no GMEM
+        partials, no combine) -- the memory-bound KV-major path's prefill headroom
+        on SM12x. It is selected automatically for every config it supports:
+        bf16/fp16 Q with bf16/fp16, fp8 (E4M3), or NVFP4 K/V (flat or paged), GQA
+        and MHA, ``return_softmax_lse`` and ``return_temperature_lse``. The
+        KV-major split+combine kernel runs only for native fp8-Q / fp8-MMA compute
+        modes (``q_fp8`` / ``qk_dtype`` / ``pv_dtype``). On the union path
+        ``schedule`` is ignored and the metadata is built internally from
+        ``q2k_indices``.
 
     Returns
     -------
@@ -413,14 +415,20 @@ def msa_sparse_attention(
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
+    # The union-tile kernel is the default prefill path: it covers the full surface
+    # (bf16/fp16 + fp8/NVFP4 KV, flat+paged, GQA and MHA, softmax/temperature LSE)
+    # with ~6x the KV-major path's prefill headroom on SM12x (no GMEM partials, no
+    # combine). The KV-major split+combine kernel is kept only for the native fp8-Q /
+    # fp8-MMA compute modes the union does not implement.
+    union = union or not (q_fp8 or qk_fp8_mma or pv_fp8_mma)
+
     if union:
         # query-tile + block-union + in-kernel online softmax: no GMEM partials and
-        # no combine kernel (the memory-bound KV-major path's ~6x prefill headroom on
-        # SM12x). bf16/fp16 flat K/V only for now.
+        # no combine kernel.
         if q_fp8 or qk_fp8_mma or pv_fp8_mma:
             raise ValueError(
                 "union=True supports bf16/fp16 Q with bf16/fp16, fp8 (E4M3), or "
-                "NVFP4 K/V; q_fp8 / native fp8-MMA are not on the union path yet"
+                "NVFP4 K/V; q_fp8 / native fp8-MMA are not on the union path"
             )
         # paged is supported (page_size == _BLK_KV, one page per KV block); the
         # paged k/v shape was validated above and cu_seqlens_k was derived from
@@ -639,17 +647,17 @@ _LN2 = 0.6931471805599453
 
 
 def _union_tile_config(group_size: int):
-    """Pick (m_block, num_threads) for the union path: an 8-row-per-warp MMA tile
-    (m_block=128, 256 threads) when group_size divides it and the resulting
-    tokens_per_tile (= m_block // group_size) fits the 32-bit membership mask, else
-    the 64-row tile. M3 attention (group_size 16) -> 128 / 256 / tpt 8."""
-    for m_block in (128, 64):
+    """Pick (m_block, num_threads) for the union path: the largest MMA tile whose
+    tokens_per_tile (= m_block // group_size) still fits the 32-bit membership mask.
+    M3 attention (group_size 16) -> 128 / 256 / tpt 8; MHA (group_size 1) -> the
+    32-row tile (64 threads, tpt 32, the mask's exact capacity)."""
+    for m_block in (128, 64, 32):
         if m_block % group_size == 0 and m_block // group_size <= (
             _UNION_MAX_TOKENS_PER_TILE
         ):
             return m_block, m_block * 2
     raise ValueError(
-        f"union path needs group_size dividing 64 or 128 with "
+        f"union path needs group_size dividing 32/64/128 with "
         f"<= {_UNION_MAX_TOKENS_PER_TILE} tokens/tile, got group_size {group_size}"
     )
 
