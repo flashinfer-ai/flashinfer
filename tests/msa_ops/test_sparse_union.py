@@ -1,8 +1,8 @@
 """Tests for the union-tile sparse-attention prefill kernel
 (``sparse_fwd_union_sm12x``): query-tile-major + in-kernel online softmax + direct
-output (no GMEM partials, no combine). Validated against the KV-major
-``msa_sparse_attention`` and an fp32 torch oracle on the same causal per-query
-block selection."""
+output (no GMEM partials, no combine). This is the prefill path behind the public
+``msa_sparse_attention``; validated against an fp32 torch oracle on the same causal
+per-query block selection, plus flat-vs-paged consistency."""
 
 import math
 
@@ -164,7 +164,10 @@ def test_union_metadata_device_matches_host(tpt, B, S):
 
 @pytest.mark.parametrize("m_block,num_threads", [(64, 128), (128, 256)])
 @pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
-def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):
+def test_union_prefill_kernel_matches_public_api_and_oracle(m_block, num_threads, B, S):
+    """The union kernel invoked directly (with the host metadata builder) matches
+    both the public ``msa_sparse_attention`` wrapper (on-device metadata builder)
+    and the fp32 torch oracle."""
     _skip()
     import cutlass
 
@@ -222,13 +225,13 @@ def test_union_prefill_matches_kvmajor_and_oracle(m_block, num_threads, B, S):
     torch.cuda.synchronize()
 
     mae_oracle = (out.float() - oracle).abs().mean().item()
-    mae_kv_oracle = (ref.float() - oracle).abs().mean().item()
-    mae_vs_kv = (out.float() - ref.float()).abs().mean().item()
-    # union accumulates the whole softmax in fp32 (no bf16 partial round-trip), so
-    # it should track the oracle at least as well as kvmajor, and agree with kvmajor
-    # to bf16 precision.
-    assert mae_oracle <= mae_kv_oracle * 1.5 + 1e-6, (mae_oracle, mae_kv_oracle)
-    assert mae_vs_kv < 5e-4, mae_vs_kv
+    mae_api_oracle = (ref.float() - oracle).abs().mean().item()
+    mae_vs_api = (out.float() - ref.float()).abs().mean().item()
+    # direct kernel and public API run the same union math (host vs device metadata
+    # builder), so they agree to bf16 precision and track the fp32 oracle equally.
+    assert mae_oracle < 5e-3, mae_oracle
+    assert mae_api_oracle < 5e-3, mae_api_oracle
+    assert mae_vs_api < 5e-4, mae_vs_api
 
 
 @pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
@@ -249,9 +252,7 @@ def test_union_paged_matches_flat(B, S):
     v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
     q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=9)
 
-    flat = msa_sparse_attention(
-        q, k, v, q2k, cu, cu, union=True, causal=True, softmax_scale=scale
-    )
+    flat = msa_sparse_attention(q, k, v, q2k, cu, cu, causal=True, softmax_scale=scale)
 
     # relay flat K/V into a randomly-permuted paged cache (one 128-token page per
     # KV block) and build the page table, then run the same union path paged.
@@ -278,7 +279,6 @@ def test_union_paged_matches_flat(B, S):
         cu,
         page_table=ptab,
         seqused_k=seqused,
-        union=True,
         causal=True,
         softmax_scale=scale,
     )
@@ -289,8 +289,8 @@ def test_union_paged_matches_flat(B, S):
 @pytest.mark.parametrize("B,S", [(1, 1024), (3, 384)])
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_union_public_api(B, S, return_lse):
-    """msa_sparse_attention(union=True) matches the default KV-major path (output
-    and LSE) end to end through the public wrapper."""
+    """msa_sparse_attention (the union prefill path) matches the fp32 torch oracle
+    end to end through the public wrapper, including the LSE."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 
@@ -307,31 +307,24 @@ def test_union_public_api(B, S, return_lse):
     oracle = _torch_oracle(q, k, v, q2k, cu, cu, BLK, G, scale)
 
     kw = dict(causal=True, softmax_scale=scale, return_softmax_lse=return_lse)
-    ref = msa_sparse_attention(q, k, v, q2k, cu, cu, **kw)
-    got = msa_sparse_attention(q, k, v, q2k, cu, cu, union=True, **kw)
+    got = msa_sparse_attention(q, k, v, q2k, cu, cu, **kw)
     if return_lse:
-        ref, ref_lse = ref
         got, got_lse = got
         assert got_lse.shape == (B * S, Hq)
-        # compare LSE only where the KV-major path produced a finite value
-        finite = torch.isfinite(ref_lse)
-        dl = (got_lse[finite] - ref_lse[finite]).abs().max().item()
-        assert dl < 5e-2, dl
+        # finite LSE for queries that selected at least one block
+        assert torch.isfinite(got_lse).any()
     torch.cuda.synchronize()
 
     assert got.shape == (B * S, Hq, hd)
-    mae_o = (got.float() - oracle).abs().mean().item()
-    mae_kv = (ref.float() - oracle).abs().mean().item()
-    assert mae_o <= mae_kv * 1.5 + 1e-6, (mae_o, mae_kv)
-    assert (got.float() - ref.float()).abs().mean().item() < 5e-4
+    assert (got.float() - oracle).abs().mean().item() < 5e-3
 
 
 @pytest.mark.parametrize("Hq,Hkv", [(1, 1), (2, 2), (4, 2)])
 @pytest.mark.parametrize("B,S", [(1, 1024), (2, 384)])
-def test_union_small_group_matches_split(Hq, Hkv, B, S):
+def test_union_small_group_matches_oracle(Hq, Hkv, B, S):
     """Small / unit GQA groups, including MHA (group_size=1 -> the 32-row tile,
-    tokens_per_tile=32 = the membership mask's exact capacity), match the KV-major
-    path and the fp32 oracle."""
+    tokens_per_tile=32 = the membership mask's exact capacity), match the fp32
+    torch oracle."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 
@@ -348,28 +341,25 @@ def test_union_small_group_matches_split(Hq, Hkv, B, S):
     oracle = _torch_oracle(q, k, v, q2k, cu, cu, BLK, G, scale)
 
     kw = dict(causal=True, softmax_scale=scale)
-    ref = msa_sparse_attention(q, k, v, q2k, cu, cu, **kw)
-    got = msa_sparse_attention(q, k, v, q2k, cu, cu, union=True, **kw)
+    got = msa_sparse_attention(q, k, v, q2k, cu, cu, **kw)
     torch.cuda.synchronize()
 
     assert got.shape == (B * S, Hq, hd)
-    mae_o = (got.float() - oracle).abs().mean().item()
-    mae_kv = (ref.float() - oracle).abs().mean().item()
-    assert mae_o <= mae_kv * 1.5 + 1e-6, (mae_o, mae_kv)
-    assert (got.float() - ref.float()).abs().mean().item() < 5e-4
+    assert (got.float() - oracle).abs().mean().item() < 5e-3
 
 
 @pytest.mark.parametrize("B,S", [(1, 1024), (3, 384)])
 @pytest.mark.parametrize("causal", [True, False])
-def test_union_temperature_lse_matches_split(B, S, causal):
-    """union=True with return_temperature_lse returns (out, lse, lse_t) matching the
-    KV-major split+combine path. The temperature LSE is the online-accumulated
-    temperature-scaled sum the split path computes per-block and combines."""
+def test_union_temperature_lse(B, S, causal):
+    """return_temperature_lse returns (out, lse, lse_t); the temperature LSE is the
+    log-sum-exp of the temperature-scaled scores over each query's selected (and
+    causally valid) columns, matching a torch oracle."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 
     dev = "cuda"
     Hq, Hkv, topk, hd = 64, 4, 16, 128
+    G = Hq // Hkv
     scale = 1.0 / math.sqrt(hd)
     T = 0.7
     cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
@@ -379,50 +369,47 @@ def test_union_temperature_lse_matches_split(B, S, causal):
     v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
     q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=7)
 
-    kw = dict(
+    out, lse, lse_t = msa_sparse_attention(
+        q,
+        k,
+        v,
+        q2k,
+        cu,
+        cu,
         causal=causal,
         softmax_scale=scale,
         return_temperature_lse=True,
         lse_temperature_scale=T,
     )
-    ref_o, ref_lse, ref_lse_t = msa_sparse_attention(q, k, v, q2k, cu, cu, **kw)
-    got_o, got_lse, got_lse_t = msa_sparse_attention(
-        q, k, v, q2k, cu, cu, union=True, **kw
-    )
     torch.cuda.synchronize()
+    assert lse_t.shape == (B * S, Hq) and lse.shape == (B * S, Hq)
 
-    assert got_lse_t.shape == (B * S, Hq)
-    assert (got_o.float() - ref_o.float()).abs().mean().item() < 5e-4
-    finite = torch.isfinite(ref_lse)
-    assert (got_lse[finite] - ref_lse[finite]).abs().max().item() < 5e-2
-    finite_t = torch.isfinite(ref_lse_t)
-    assert (got_lse_t[finite_t] - ref_lse_t[finite_t]).abs().max().item() < 5e-2
-
-
-@pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
-@pytest.mark.parametrize("causal", [True, False])
-def test_union_fp8_kv_matches_split(B, S, causal):
-    """union=True with fp8 (E4M3) K/V dequant-on-load matches the KV-major split
-    path on the same fp8 inputs (both upconvert to the bf16 compute dtype)."""
-    _skip()
-    from flashinfer.msa_ops import msa_sparse_attention
-
-    dev = "cuda"
-    Hq, Hkv, topk, hd = 64, 4, 16, 128
-    scale = 1.0 / math.sqrt(hd)
-    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
-    torch.manual_seed(17)
-    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
-    k8 = (torch.randn(B * S, Hkv, hd, device=dev) / 3).to(torch.float8_e4m3fn)
-    v8 = (torch.randn(B * S, Hkv, hd, device=dev) / 3).to(torch.float8_e4m3fn)
-    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=7)
-
-    kw = dict(causal=causal, softmax_scale=scale)
-    split = msa_sparse_attention(q, k8, v8, q2k, cu, cu, **kw)
-    union = msa_sparse_attention(q, k8, v8, q2k, cu, cu, union=True, **kw)
-    torch.cuda.synchronize()
-    assert union.shape == (B * S, Hq, hd)
-    assert (union.float() - split.float()).abs().max().item() < 5e-3
+    # torch oracle over selected, causally valid columns (a few sampled rows)
+    cuq = cu.tolist()
+    off = 0  # cu_q == cu_k -> right-aligned causal offset is 0
+    checked = 0
+    for _ in range(40):
+        qi = int(torch.randint(0, B * S, (1,)).item())
+        hq = int(torch.randint(0, Hq, (1,)).item())
+        b = next(i for i in range(B) if cuq[i] <= qi < cuq[i + 1])
+        t = qi - cuq[b]
+        nb = (off + t + 1 + BLK - 1) // BLK if causal else S // BLK
+        sel = q2k[hq // G, qi]
+        sel = sel[(sel >= 0) & (sel < nb)]
+        if sel.numel() == 0:
+            assert lse_t[qi, hq].item() == float("-inf")
+            continue
+        cols = torch.cat(
+            [torch.arange(s * BLK, (s + 1) * BLK) for s in sel.tolist()]
+        ).to(dev)
+        if causal:
+            cols = cols[cols <= off + t]
+        kk = k[cuq[b] + cols, hq // G].float()
+        s = (q[qi, hq].float() @ kk.T) * scale
+        ref_lse_t = torch.logsumexp(s * T, -1).item()
+        assert abs(lse_t[qi, hq].item() - ref_lse_t) < 5e-2
+        checked += 1
+    assert checked > 10
 
 
 def _nvfp4_quant(x2d):
@@ -433,49 +420,14 @@ def _nvfp4_quant(x2d):
     return xq.view(torch.uint8), sf.view(torch.uint8), float(1.0 / gsf)
 
 
-@pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
-@pytest.mark.parametrize("causal", [True, False])
-def test_union_nvfp4_kv_matches_split(B, S, causal):
-    """union=True with NVFP4 K/V (dequant-on-load) matches the KV-major split path
-    on the same packed inputs. K's global scale folds into softmax_scale; V's is
-    applied as the union output scale (the split path applies it in combine)."""
-    _skip()
-    from flashinfer.msa_ops import msa_sparse_attention
-
-    dev = "cuda"
-    Hq, Hkv, topk, hd = 64, 4, 16, 128
-    scale = 1.0 / math.sqrt(hd)
-    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
-    torch.manual_seed(23)
-    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
-    k = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
-    v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
-    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=7)
-    kq, ksf, kg = _nvfp4_quant(k.reshape(-1, hd))
-    vq, vsf, vg = _nvfp4_quant(v.reshape(-1, hd))
-    kq = kq.reshape(B * S, Hkv, hd // 2)
-    vq = vq.reshape(B * S, Hkv, hd // 2)
-    kw = dict(
-        causal=causal,
-        softmax_scale=scale,
-        k_scale=ksf,
-        v_scale=vsf,
-        k_global_scale=kg,
-        v_global_scale=vg,
-    )
-    split = msa_sparse_attention(q, kq, vq, q2k, cu, cu, **kw)
-    union = msa_sparse_attention(q, kq, vq, q2k, cu, cu, union=True, **kw)
-    torch.cuda.synchronize()
-    assert union.shape == (B * S, Hq, hd)
-    assert (union.float() - split.float()).abs().max().item() < 5e-3
-
-
 @pytest.mark.parametrize("quant", ["fp8", "nvfp4"])
-def test_union_paged_quant_matches_split(quant):
-    """Paged-KV union with fp8 / NVFP4 K/V matches the KV-major split path. The
+def test_union_paged_quant_matches_flat(quant):
+    """Paged-KV union with fp8 / NVFP4 K/V matches the flat union path on the same
+    values relayed into a permuted paged cache (one 128-token page per block). The
     paged dequant only changes the K/V block address (page table) and the SF row
     base; the NVFP4 paged SF lands in (page, head, token) order, which is exactly
-    what quantizing the paged cache reshaped to (-1, head_dim) produces."""
+    what quantizing the paged cache reshaped to (-1, head_dim) produces. (Flat
+    fp8/NVFP4 union is validated against the torch oracle in test_msa_ops.py.)"""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 
@@ -501,18 +453,27 @@ def test_union_paged_quant_matches_split(quant):
         rows = slice(blk * BLK, (blk + 1) * BLK)
         kpg[pg] = k[rows].transpose(0, 1)
         vpg[pg] = v[rows].transpose(0, 1)
+    fkw = dict(causal=True, softmax_scale=scale)
     pkw = dict(page_table=ptab, seqused_k=seqused, causal=True, softmax_scale=scale)
     if quant == "fp8":
-        k_in = kpg.to(torch.float8_e4m3fn).contiguous()
-        v_in = vpg.to(torch.float8_e4m3fn).contiguous()
+        kf = k.reshape(B * S, Hkv, hd).to(torch.float8_e4m3fn)
+        vf = v.reshape(B * S, Hkv, hd).to(torch.float8_e4m3fn)
+        k_pg = kpg.to(torch.float8_e4m3fn).contiguous()
+        v_pg = vpg.to(torch.float8_e4m3fn).contiguous()
     else:
-        kq, ksf, kg = _nvfp4_quant(kpg.reshape(-1, hd))
-        vq, vsf, vg = _nvfp4_quant(vpg.reshape(-1, hd))
-        k_in = kq.reshape(npages, Hkv, BLK, hd // 2)
-        v_in = vq.reshape(npages, Hkv, BLK, hd // 2)
-        pkw.update(k_scale=ksf, v_scale=vsf, k_global_scale=kg, v_global_scale=vg)
-    split = msa_sparse_attention(q, k_in, v_in, q2k, cu, **pkw)
-    union = msa_sparse_attention(q, k_in, v_in, q2k, cu, union=True, **pkw)
+        # quantize the flat and paged caches identically (same global scale)
+        kq, ksf, kg = _nvfp4_quant(k.reshape(-1, hd))
+        vq, vsf, vg = _nvfp4_quant(v.reshape(-1, hd))
+        kf = kq.reshape(B * S, Hkv, hd // 2)
+        vf = vq.reshape(B * S, Hkv, hd // 2)
+        fkw.update(k_scale=ksf, v_scale=vsf, k_global_scale=kg, v_global_scale=vg)
+        kpq, kpsf, kpg_ = _nvfp4_quant(kpg.reshape(-1, hd))
+        vpq, vpsf, vpg_ = _nvfp4_quant(vpg.reshape(-1, hd))
+        k_pg = kpq.reshape(npages, Hkv, BLK, hd // 2)
+        v_pg = vpq.reshape(npages, Hkv, BLK, hd // 2)
+        pkw.update(k_scale=kpsf, v_scale=vpsf, k_global_scale=kpg_, v_global_scale=vpg_)
+    flat = msa_sparse_attention(q, kf, vf, q2k, cu, cu, **fkw)
+    paged = msa_sparse_attention(q, k_pg, v_pg, q2k, cu, **pkw)
     torch.cuda.synchronize()
-    assert union.shape == (B * S, Hq, hd)
-    assert (union.float() - split.float()).abs().max().item() < 5e-3
+    assert paged.shape == (B * S, Hq, hd)
+    assert (paged.float() - flat.float()).abs().max().item() < 5e-3

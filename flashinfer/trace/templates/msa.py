@@ -25,9 +25,9 @@ These cover the four numeric MSA pipeline ops (SM120/SM121):
 | ``msa_sparse_decode_attention``    | decode    | top-K block decode attention  |
 +------------------------------------+-----------+-------------------------------+
 
-The metadata ops (topk select, k2q-CSR build, decode-schedule build) produce
-integer indices / dataclasses rather than numeric tensors and have no torch
-reference, so they are intentionally not traced here.
+The metadata ops (topk select, union/decode metadata builders) produce integer
+indices / dataclasses rather than numeric tensors and have no torch reference, so
+they are intentionally not traced here.
 
 All five ops are varlen-packed: tokens for the whole batch are concatenated and
 ``cu_seqlens_*`` (shape ``batch_size + 1``) gives per-sequence offsets. The

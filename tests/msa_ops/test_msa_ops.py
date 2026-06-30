@@ -32,92 +32,7 @@ def _skip_if_unsupported():
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: msa_build_k2q_csr
-# ---------------------------------------------------------------------------
-
-
-def _ref_build_k2q_csr(q2k, cu_q, cu_k, blk_kv):
-    H, S_Q, topk = q2k.shape
-    B = cu_q.numel() - 1
-    seq_k = (cu_k[1:] - cu_k[:-1]).tolist()
-    rows_per_b = [(s + blk_kv - 1) // blk_kv for s in seq_k]
-    total_rows = sum(rows_per_b)
-    max_kv = max(rows_per_b) if rows_per_b else 0
-    row_map = {}
-    row_linear = 0
-    for level in range(max_kv):
-        for b in range(B):
-            if rows_per_b[b] > level:
-                row_map[(b, level)] = row_linear
-                row_linear += 1
-    row_ptr = torch.zeros(H, total_rows + 1, dtype=torch.int64)
-    q_lists = [[[] for _ in range(total_rows)] for _ in range(H)]
-    q2k_c, cu_q_c = q2k.cpu(), cu_q.cpu()
-    for h in range(H):
-        for b in range(B):
-            for qi in range(int(cu_q_c[b]), int(cu_q_c[b + 1])):
-                qloc = qi - int(cu_q_c[b])
-                for t in range(topk):
-                    kvb = int(q2k_c[h, qi, t])
-                    if 0 <= kvb < rows_per_b[b]:
-                        q_lists[h][row_map[(b, kvb)]].append(qloc)
-    for h in range(H):
-        for r in range(total_rows):
-            row_ptr[h, r + 1] = row_ptr[h, r] + len(q_lists[h][r])
-    return row_ptr, q_lists, total_rows
-
-
-@pytest.mark.parametrize(
-    "B,H,topk,seqs_q,seqs_k",
-    [
-        (1, 2, 16, [37], [1024]),
-        (3, 4, 16, [17, 64, 5], [512, 2048, 300]),
-        (2, 1, 8, [100, 33], [4096, 700]),
-        (2, 2, 32, [50, 21], [8192, 5000]),
-        (4, 3, 4, [1, 2, 3, 4], [128, 256, 384, 129]),
-    ],
-)
-def test_build_k2q_csr(B, H, topk, seqs_q, seqs_k):
-    _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_build_k2q_csr
-
-    torch.manual_seed(0)
-    dev = "cuda"
-    cu_q = torch.tensor(
-        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
-    )
-    cu_k = torch.tensor(
-        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
-    )
-    S_Q = int(cu_q[-1])
-    q2k = torch.full((H, S_Q, topk), -1, dtype=torch.int32, device=dev)
-    for b in range(B):
-        nb = (seqs_k[b] + BLK_KV - 1) // BLK_KV
-        lo, hi = int(cu_q[b]), int(cu_q[b + 1])
-        n = min(topk, nb)
-        for h in range(H):
-            for qi in range(lo, hi):
-                sel = torch.randperm(nb)[:n].sort().values.to(torch.int32)
-                q2k[h, qi, :n] = sel.to(dev)
-
-    sched = msa_build_k2q_csr(q2k, cu_q, cu_k, blk_kv=BLK_KV)
-    row_ptr, q_idx = sched.row_ptr, sched.q_indices
-    torch.cuda.synchronize()
-
-    ref_ptr, ref_lists, total_rows = _ref_build_k2q_csr(q2k, cu_q, cu_k, BLK_KV)
-    assert row_ptr.shape == (H, total_rows + 1)
-    assert torch.equal(row_ptr.cpu().long(), ref_ptr)
-    q_idx_c = q_idx.cpu()
-    for h in range(H):
-        for r in range(total_rows):
-            lo, hi = int(ref_ptr[h, r]), int(ref_ptr[h, r + 1])
-            got = q_idx_c[h, lo:hi].tolist()
-            assert got == sorted(got), f"row not q-ascending h={h} r={r}"
-            assert sorted(got) == sorted(ref_lists[h][r]), f"content h={h} r={r}"
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: msa_sparse_attention (sparse prefill)
+# msa_sparse_attention (sparse prefill)
 # ---------------------------------------------------------------------------
 
 
@@ -1333,38 +1248,6 @@ def test_q_offset_override():
         assert torch.isfinite(ms[:, : limit0 // BLK_KV, lo]).all()
 
 
-@pytest.mark.parametrize("pdt", [torch.float32, torch.float16, torch.float8_e4m3fn])
-def test_partial_dtype_options(pdt):
-    """Non-default partial_dtype must agree with the bf16-partials baseline
-    (fp32 tighter, fp8 looser)."""
-    _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention
-
-    q, k, v, idx, cu_q, cu_k = _make_case(
-        2, 4, 2, 16, [100, 64], [2048, 1024], torch.bfloat16, seed=190
-    )
-    scale = 1.0 / math.sqrt(128)
-    base = msa_sparse_attention(
-        q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
-    )
-    out = msa_sparse_attention(
-        q,
-        k,
-        v,
-        idx,
-        cu_q,
-        cu_k,
-        causal=True,
-        softmax_scale=scale,
-        partial_dtype=pdt,
-    )
-    torch.cuda.synchronize()
-    assert torch.isfinite(out.float()).all()
-    tol = 0.06 if pdt == torch.float8_e4m3fn else 1.5e-2
-    err = (out.float() - base.float()).abs().max().item()
-    assert err < tol, f"partial_dtype={pdt}: err={err}"
-
-
 def test_temperature_lse():
     """return_temperature_lse: LSE computed with the exponent multiplied by
     lse_temperature_scale (MSA semantics), merged across splits."""
@@ -1416,26 +1299,18 @@ def test_temperature_lse():
     assert checked > 20
 
 
-@pytest.mark.parametrize("which", ["prefill", "decode"])
-def test_fp8_q(which):
-    """All-fp8 inputs (Q, K, V all e4m3), MSA's fp8 serving configuration.
-    Q is upconverted in-kernel; reference uses the dequantized tensors."""
+def test_fp8_q_decode():
+    """All-fp8 decode inputs (Q, K, V all e4m3), MSA's fp8 serving configuration.
+    Q is upconverted in-kernel; reference uses the dequantized tensors. (Prefill is
+    bf16/fp16 Q only; fp8 K/V prefill is covered by test_sparse_attention_fp8_kv.)"""
     _skip_if_unsupported()
-    from flashinfer.msa_ops import (
-        msa_sparse_attention,
-        msa_sparse_decode_attention,
-    )
+    from flashinfer.msa_ops import msa_sparse_decode_attention
 
     torch.manual_seed(210)
     dev = "cuda"
-    if which == "prefill":
-        Hq, Hkv, topk = 8, 2, 16
-        seqs_q, seqs_k = [120, 70], [2048, 1280]
-        B = 2
-    else:
-        Hq, Hkv, topk = 8, 2, 16
-        B, seqs_q = 8, [1] * 8
-        seqs_k = [int(x) * BLK_KV for x in torch.randint(3, 16, (B,))]
+    Hq, Hkv, topk = 8, 2, 16
+    B, seqs_q = 8, [1] * 8
+    seqs_k = [int(x) * BLK_KV for x in torch.randint(3, 16, (B,))]
     cu_q = torch.tensor(
         [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
     )
@@ -1456,21 +1331,16 @@ def test_fp8_q(which):
                 sel = torch.randperm(nb)[:nsel].sort().values
                 idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
     scale = 1.0 / math.sqrt(128)
-    if which == "prefill":
-        out = msa_sparse_attention(
-            q8, k8, v8, idx, cu_q, cu_k, causal=True, softmax_scale=scale
-        )
-    else:
-        out = msa_sparse_decode_attention(
-            q8,
-            k8,
-            v8,
-            idx,
-            cu_seqlens_k=cu_k,
-            seqlen_q=1,
-            causal=True,
-            softmax_scale=scale,
-        )
+    out = msa_sparse_decode_attention(
+        q8,
+        k8,
+        v8,
+        idx,
+        cu_seqlens_k=cu_k,
+        seqlen_q=1,
+        causal=True,
+        softmax_scale=scale,
+    )
     torch.cuda.synchronize()
     assert out.dtype == torch.bfloat16
     ref = _ref_sparse_attention(
@@ -1484,130 +1354,4 @@ def test_fp8_q(which):
         scale,
     )
     err = (out.float().cpu() - ref).abs().max().item()
-    assert err < 2.5e-2, f"{which}: err={err}"
-
-
-def test_fp8_qk_native_mma():
-    """Route-B M2: native fp8 QK mma.sync (m16n8k32) must agree with the
-    upconvert path bit-for-bit-ish (e4m3 values are exact in bf16; only f32
-    accumulation order can differ) and with the dequantized reference."""
-    _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention
-
-    torch.manual_seed(230)
-    dev = "cuda"
-    B, Hq, Hkv, topk = 2, 8, 2, 16
-    seqs_q, seqs_k = [120, 70], [2048, 1280]
-    cu_q = torch.tensor(
-        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
-    )
-    cu_k = torch.tensor(
-        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
-    )
-    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
-    q8 = (torch.randn(total_q, Hq, 128, device=dev) / 3).to(torch.float8_e4m3fn)
-    k8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(torch.float8_e4m3fn)
-    v8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(torch.float8_e4m3fn)
-    idx = torch.full((Hkv, total_q, topk), -1, dtype=torch.int32, device=dev)
-    for b in range(B):
-        nb = seqs_k[b] // BLK_KV
-        lo, hi = int(cu_q[b]), int(cu_q[b + 1])
-        for h in range(Hkv):
-            for qi in range(lo, hi):
-                nsel = torch.randint(1, min(topk, nb) + 1, (1,)).item()
-                sel = torch.randperm(nb)[:nsel].sort().values
-                idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
-    scale = 1.0 / math.sqrt(128)
-    out_native = msa_sparse_attention(
-        q8,
-        k8,
-        v8,
-        idx,
-        cu_q,
-        cu_k,
-        causal=True,
-        softmax_scale=scale,
-        qk_dtype=torch.float8_e4m3fn,
-    )
-    out_upconv = msa_sparse_attention(
-        q8, k8, v8, idx, cu_q, cu_k, causal=True, softmax_scale=scale
-    )
-    torch.cuda.synchronize()
-    d = (out_native.float() - out_upconv.float()).abs().max().item()
-    assert d < 5e-3, f"native vs upconvert: {d}"
-    ref = _ref_sparse_attention(
-        q8.to(torch.bfloat16).cpu(),
-        k8.to(torch.bfloat16).cpu(),
-        v8.to(torch.bfloat16).cpu(),
-        idx.cpu(),
-        cu_q.cpu(),
-        cu_k.cpu(),
-        True,
-        scale,
-    )
-    err = (out_native.float().cpu() - ref).abs().max().item()
-    assert err < 2.5e-2, f"native vs reference: {err}"
-
-
-def test_fp8_pv_native_mma():
-    """Full-fp8 pipeline (qk_dtype=pv_dtype=e4m3): P quantized to e4m3
-    (x448, compensated), V pre-transposed in SMEM. Accuracy is the fp8-P
-    quantization class (MSA's own fp8 threshold: cosine > 0.999)."""
-    _skip_if_unsupported()
-    from flashinfer.msa_ops import msa_sparse_attention
-
-    torch.manual_seed(240)
-    dev = "cuda"
-    fp8 = torch.float8_e4m3fn
-    B, Hq, Hkv, topk = 2, 8, 2, 16
-    seqs_q, seqs_k = [120, 70], [2048, 1280]
-    cu_q = torch.tensor(
-        [0] + list(torch.tensor(seqs_q).cumsum(0)), dtype=torch.int32, device=dev
-    )
-    cu_k = torch.tensor(
-        [0] + list(torch.tensor(seqs_k).cumsum(0)), dtype=torch.int32, device=dev
-    )
-    total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
-    q8 = (torch.randn(total_q, Hq, 128, device=dev) / 3).to(fp8)
-    k8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(fp8)
-    v8 = (torch.randn(total_k, Hkv, 128, device=dev) / 3).to(fp8)
-    idx = torch.full((Hkv, total_q, topk), -1, dtype=torch.int32, device=dev)
-    for b in range(B):
-        nb = seqs_k[b] // BLK_KV
-        lo, hi = int(cu_q[b]), int(cu_q[b + 1])
-        for h in range(Hkv):
-            for qi in range(lo, hi):
-                nsel = torch.randint(1, min(topk, nb) + 1, (1,)).item()
-                sel = torch.randperm(nb)[:nsel].sort().values
-                idx[h, qi, :nsel] = sel.to(torch.int32).to(dev)
-    scale = 1.0 / math.sqrt(128)
-    out = msa_sparse_attention(
-        q8,
-        k8,
-        v8,
-        idx,
-        cu_q,
-        cu_k,
-        causal=True,
-        softmax_scale=scale,
-        qk_dtype=fp8,
-        pv_dtype=fp8,
-    )
-    torch.cuda.synchronize()
-    assert torch.isfinite(out.float()).all()
-    ref = _ref_sparse_attention(
-        q8.to(torch.bfloat16).cpu(),
-        k8.to(torch.bfloat16).cpu(),
-        v8.to(torch.bfloat16).cpu(),
-        idx.cpu(),
-        cu_q.cpu(),
-        cu_k.cpu(),
-        True,
-        scale,
-    )
-    got = out.float().cpu().flatten()
-    cos = torch.nn.functional.cosine_similarity(got, ref.flatten(), dim=0).item()
-    assert cos > 0.999, f"cosine {cos}"
-    # element-wise bound, scaled for fp8-P quantization error
-    err = (out.float().cpu() - ref).abs().max().item()
-    assert err < 8e-2, f"max abs err {err}"
+    assert err < 2.5e-2, f"err={err}"

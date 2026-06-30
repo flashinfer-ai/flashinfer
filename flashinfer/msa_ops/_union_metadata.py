@@ -24,13 +24,26 @@ selected that block). The union kernel walks this list with online softmax, so a
 token attends only the blocks it picked.
 
 This is a correctness-first host builder (the q2k_indices it consumes are tiny --
-``total_q x topk`` ints). An on-device CuTe-DSL builder mirroring
-``build_k2q_csr_sm12x`` is the production follow-up.
+``total_q x topk`` ints); ``build_msa_union_metadata_device`` is the on-device
+CuTe-DSL builder used in production.
 """
 
 from typing import Tuple
 
 import torch
+
+
+def _fake_i32(ndim):
+    """Fake compact int32 tensor for TVM-FFI compilation (symbolic dims)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    return cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32,
+        tuple(cute.sym_int() for _ in range(ndim)),
+        stride_order=tuple(reversed(range(ndim))),
+        assumed_align=4,
+    )
 
 
 def build_msa_union_metadata(
@@ -120,7 +133,6 @@ def _get_compiled_union(topk: int, tokens_per_tile: int):
     import cutlass.cute as cute
 
     from .cute_dsl.build_union_meta_sm12x import BuildUnionMetaSm12x
-    from .sparse_index_utils import _fake_i32
 
     key = (topk, tokens_per_tile)
     compiled = _union_compile_cache.get(key)
@@ -164,26 +176,31 @@ def build_msa_union_metadata_device(
     build_union_meta_sm12x.BuildUnionMetaSm12x`) forms each union on device.
 
     The emitted blocks are ascending (k-way merge of ascending lists), matching
-    the reference. Work items are enumerated over **all** (batch, q-tile,
-    kv-head) -- no empty-union compaction (a tile spanning valid queries always
-    selects at least one block), so the count is statically ``total_tiles *
-    num_kv_heads``; the order differs from the reference but the forward scatters
-    by ``work_meta`` so order is immaterial.
+    the reference. The order of work items differs from the reference, but the
+    forward scatters by ``work_meta`` so order is immaterial.
+
+    **CUDA-graph capturable.** The work-item count and all metadata tensors are
+    sized to a *static* upper bound on the number of tiles, ``ceil(total_q / tpt)
+    + batch_size``, computed from shapes alone (no read of ``cu_seqlens`` values).
+    The per-tile geometry (batch / query-base / valid-token-count) is then derived
+    **on device** from ``cu_seqlens`` -- a ``searchsorted`` over the per-batch tile
+    cumsum -- so there is no host copy or host sync anywhere on this path. Padding
+    slots beyond the true tile count get ``tile_ntok == 0``; the union builder
+    emits ``union_count == 0`` for them and the forward kernel skips them.
     """
     num_kv_heads, total_q, topk_in = q2k_indices.shape
     if topk_in != topk:
         raise ValueError(f"q2k_indices topk {topk_in} != {topk}")
     dev = q2k_indices.device
     max_union = tokens_per_tile * topk
-
-    # Work-item geometry from cu_seqlens alone: one tile per ``tokens_per_tile``
-    # queries per batch, for every kv-head.
-    cu = cu_seqlens_q.detach().to(device="cpu", dtype=torch.int64)
-    seqlens = cu[1:] - cu[:-1]
-    batch_size = seqlens.numel()
     tpt = tokens_per_tile
-    ntiles_per_batch = (seqlens + tpt - 1) // tpt
-    total_tiles = int(ntiles_per_batch.sum())
+    batch_size = cu_seqlens_q.shape[0] - 1
+
+    # Static upper bound on the (batch, q-tile) count: every batch contributes at
+    # most one extra partial tile, so sum_b ceil(sq_b / tpt) <= ceil(total_q / tpt)
+    # + batch_size. Derived from shapes only -> the grid and metadata tensors are
+    # statically shaped (capturable); the few extra slots are empty (see below).
+    total_tiles = (total_q + tpt - 1) // tpt + batch_size
     work_items = total_tiles * num_kv_heads
 
     if work_items == 0:
@@ -196,15 +213,21 @@ def build_msa_union_metadata_device(
             0,
         )
 
-    # Per-global-tile (batch, within-batch tile idx, query base, valid tokens).
-    tile_batch = torch.repeat_interleave(
-        torch.arange(batch_size, dtype=torch.int64), ntiles_per_batch
+    # On-device per-tile geometry (no cu_seqlens host copy -> capture-safe). A flat
+    # tile index t in [0, total_tiles) maps to its batch via searchsorted over the
+    # per-batch tile cumsum; padding indices (t >= the true count) clamp to the last
+    # batch with an out-of-range within-batch index, so tile_ntok clamps to 0.
+    cu = cu_seqlens_q.to(dtype=torch.int64)
+    seqlens = cu[1:] - cu[:-1]
+    ntiles = (seqlens + tpt - 1) // tpt
+    offsets = torch.cumsum(ntiles, 0)  # exclusive-end tile index per batch
+    t = torch.arange(total_tiles, dtype=torch.int64, device=dev)
+    tile_batch = torch.clamp(
+        torch.searchsorted(offsets, t, right=True), max=batch_size - 1
     )
-    tile_base = torch.zeros(batch_size, dtype=torch.int64)
-    tile_base[1:] = ntiles_per_batch.cumsum(0)[:-1]
-    tile_t = torch.arange(total_tiles, dtype=torch.int64) - tile_base[tile_batch]
+    tile_t = t - (offsets - ntiles)[tile_batch]  # within-batch tile index
     tile_qbase = cu[:-1][tile_batch] + tile_t * tpt
-    tile_ntok = torch.clamp(seqlens[tile_batch] - tile_t * tpt, max=tpt)
+    tile_ntok = torch.clamp(seqlens[tile_batch] - tile_t * tpt, min=0, max=tpt)
 
     def _to_dev(t: torch.Tensor) -> torch.Tensor:
         return t.to(dtype=torch.int32, device=dev)

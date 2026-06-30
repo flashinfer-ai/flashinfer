@@ -109,37 +109,30 @@ def test_msa_decode_pipeline_cuda_graph():
     assert torch.equal(out_g, eager)
 
 
-def _rand_q2k_causal(cu, Hkv, topk, dev, seed):
-    """Per-query causal top-k block selection (ascending, -1 trailing-padded)."""
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    cuq = cu.tolist()
-    out = torch.full((Hkv, cuq[-1], topk), -1, dtype=torch.int32)
-    for b in range(len(cuq) - 1):
-        qs, qe = cuq[b], cuq[b + 1]
-        for h in range(Hkv):
-            for t in range(qe - qs):
-                nb = (t + 1 + BLK - 1) // BLK
-                c = min(topk, nb)
-                out[h, qs + t, :c] = (
-                    torch.randperm(nb, generator=g)[:c].sort().values.int()
-                )
-    return out.to(dev)
+def test_msa_prefill_union_cuda_graph():
+    """The union prefill kernel is capturable as a single call: it builds its work
+    metadata on device (static work-item bound from shapes, per-tile geometry via a
+    searchsorted over cu_seqlens), so no host copy/sync runs during capture."""
+    _skip()
+    from flashinfer.msa_ops import msa_sparse_attention
 
-
-def _prefill_inputs(B, S):
-    Hq, Hkv, topk, hd = 64, 4, 16, 128
     dev = "cuda"
-    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    B, S, Hq, Hkv, topk, hd = 1, 4096, 64, 4, 16, 128
+    scale = 1.0 / math.sqrt(hd)
+    cu = _cu([S] * B, dev)
     torch.manual_seed(0)
     q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
     k = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
     v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
-    q2k = _rand_q2k_causal(cu, Hkv, topk, dev, seed=1)
-    return q, k, v, q2k, cu, 1.0 / math.sqrt(hd)
+    q2k = torch.full((Hkv, B * S, topk), -1, dtype=torch.int32, device=dev)
+    for t in range(S):
+        c = min(topk, t // BLK + 1)
+        q2k[:, t, :c] = torch.arange(c, dtype=torch.int32, device=dev)
 
-
-def _capture_and_check(run):
-    for _ in range(3):
+    run = lambda: msa_sparse_attention(  # noqa: E731
+        q, k, v, q2k, cu, cu, causal=True, softmax_scale=scale
+    )
+    for _ in range(3):  # JIT compile / warm caches before capture
         eager = run()
     torch.cuda.synchronize()
     side = torch.cuda.Stream()
@@ -154,21 +147,6 @@ def _capture_and_check(run):
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(out_g, eager)
-
-
-def test_msa_prefill_kvmajor_cuda_graph():
-    """KV-major prefill is capturable when the CSR schedule is built at plan time
-    (outside capture) and passed in -- the forward itself is sync-free."""
-    _skip()
-    from flashinfer.msa_ops import msa_build_k2q_csr, msa_sparse_attention
-
-    q, k, v, q2k, cu, scale = _prefill_inputs(B=1, S=4096)
-    schedule = msa_build_k2q_csr(q2k, cu, cu)  # PLAN: outside capture (host sync ok)
-    _capture_and_check(
-        lambda: msa_sparse_attention(
-            q, k, v, q2k, cu, cu, schedule=schedule, causal=True, softmax_scale=scale
-        )
-    )
 
 
 def test_proxy_capture_requires_plan_dims():

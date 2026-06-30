@@ -246,41 +246,33 @@ def msa_sparse_attention(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     causal: bool = False,
     softmax_scale: Optional[float] = None,
-    schedule=None,
-    target_q_per_cta: int = 128,
     page_table: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     return_softmax_lse: bool = False,
-    union: bool = False,
-    m_block_size: int = 64,
-    num_threads: int = 128,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
     k_global_scale: Optional[float] = None,
     v_global_scale: Optional[float] = None,
     q_offset=None,
-    partial_dtype: Optional[torch.dtype] = None,
     return_temperature_lse: bool = False,
     lse_temperature_scale: float = 1.0,
-    qk_dtype: Optional[torch.dtype] = None,
-    pv_dtype: Optional[torch.dtype] = None,
 ):
     """Minimax Sparse Attention forward (prefill) for SM120/SM121.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
-    Work is distributed over (kv-head, KV block) CSR rows built by
-    :func:`msa_build_k2q_csr` so each block is loaded once and shared by all
-    queries that selected it.
+    Runs the query-tile **union** kernel: a CTA owns a tile of query tokens and
+    runs an in-kernel online softmax over the *union* of the blocks they selected,
+    writing the final output directly (no GMEM partials, no combine pass). The
+    union metadata is built internally from ``q2k_indices``.
 
     ``q``/``k``/``v`` are ``(total_tokens, num_heads, head_dim)`` with varlen
     offsets ``cu_seqlens_q``/``cu_seqlens_k``; ``q2k_indices`` is
-    ``(num_kv_heads, total_q, topk)`` int32 (ascending, -1 padded).
+    ``(num_kv_heads, total_q, topk)`` int32 (ascending, -1 padded). ``q`` is
+    bf16/fp16; ``k``/``v`` are bf16/fp16, fp8 (E4M3), or packed NVFP4 (uint8 with
+    ``k_scale``/``v_scale``), in GQA or MHA layouts, flat or paged.
 
     Notable optional parameters:
 
-    schedule : MsaAttentionSchedule, optional
-        Pre-computed schedule (from :func:`msa_build_k2q_csr`) to
-        amortize index preprocessing across layers.
     page_table : torch.Tensor, optional
         Enables the paged-KV path: ``k``/``v`` are then
         ``(num_pages, num_kv_heads, 128, head_dim)`` and ``page_table`` is
@@ -292,47 +284,25 @@ def msa_sparse_attention(
     return_softmax_lse : bool
         Also return the natural-log LSE, shape ``(total_q, num_qo_heads)``
         float32 (``-inf`` for queries with no valid selected blocks).
-    union : bool
-        The query-tile **union** kernel is the default prefill path: a CTA owns a
-        tile of query tokens and runs an in-kernel online softmax over the *union*
-        of the blocks they selected, writing the final output directly (no GMEM
-        partials, no combine) -- the memory-bound KV-major path's prefill headroom
-        on SM12x. It is selected automatically for every config it supports:
-        bf16/fp16 Q with bf16/fp16, fp8 (E4M3), or NVFP4 K/V (flat or paged), GQA
-        and MHA, ``return_softmax_lse`` and ``return_temperature_lse``. The
-        KV-major split+combine kernel runs only for native fp8-Q / fp8-MMA compute
-        modes (``q_fp8`` / ``qk_dtype`` / ``pv_dtype``). On the union path
-        ``schedule`` is ignored and the metadata is built internally from
-        ``q2k_indices``.
+    return_temperature_lse : bool
+        Also return the MSA temperature LSE (exponent scaled by
+        ``lse_temperature_scale``), same shape as the softmax LSE. When set, the
+        return is ``(out, lse, lse_t)``.
 
     Returns
     -------
-    torch.Tensor or (torch.Tensor, torch.Tensor)
+    torch.Tensor or tuple of torch.Tensor
         Output ``(total_q, num_qo_heads, head_dim)``; plus LSE if
-        ``return_softmax_lse``.
+        ``return_softmax_lse``; plus the temperature LSE if
+        ``return_temperature_lse``.
     """
-    import cutlass
-    import cutlass.cute as cute
-
-    from .cute_dsl import SparseAttentionForwardSm12x
-    from .sparse_index_utils import msa_build_k2q_csr
-
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
             "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
         )
-    q_fp8 = q.dtype == torch.float8_e4m3fn
-    compute_dtype = torch.bfloat16 if q_fp8 else q.dtype
-    qk_fp8_mma = qk_dtype == torch.float8_e4m3fn
-    if qk_fp8_mma and not q_fp8:
-        raise ValueError("qk_dtype=float8_e4m3fn requires fp8 Q")
-    if qk_fp8_mma and k.dtype != torch.float8_e4m3fn:
-        raise ValueError("qk_dtype=float8_e4m3fn requires fp8 K/V")
-    pv_fp8_mma = pv_dtype == torch.float8_e4m3fn
-    if pv_fp8_mma and v.dtype != torch.float8_e4m3fn:
-        raise ValueError("pv_dtype=float8_e4m3fn requires fp8 V")
-    if not q_fp8 and q.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"q must be bf16/fp16/fp8_e4m3, got {q.dtype}")
+    compute_dtype = q.dtype
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"q must be bf16/fp16, got {q.dtype}")
     if q.ndim != 3:
         raise ValueError("q must be 3D (total_q, num_qo_heads, head_dim)")
     total_q, num_qo_heads, head_dim = q.shape
@@ -342,14 +312,8 @@ def msa_sparse_attention(
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be a multiple of num_kv_heads")
     group_size = num_qo_heads // num_kv_heads
-    if group_size > m_block_size or m_block_size % group_size != 0:
-        raise ValueError(
-            f"GQA group size {group_size} must divide m_block_size {m_block_size}"
-        )
-    if num_threads % 32 != 0:
-        raise ValueError(f"num_threads must be a multiple of 32, got {num_threads}")
-    # CSR builder compiles for a compact q2k layout; reject a strided q2k (e.g. a
-    # bare permute of msa_topk_select's output).
+    # union metadata uses a per-token bit mask -> reject a strided q2k (e.g. a bare
+    # permute of msa_topk_select's output).
     if q2k_indices.dtype != torch.int32 or q2k_indices.ndim != 3:
         raise ValueError("q2k_indices must be int32 of shape (Hkv, total_q, topk)")
     if not q2k_indices.is_contiguous():
@@ -372,9 +336,7 @@ def msa_sparse_attention(
             raise ValueError("k_scale/v_scale must be uint8 (E4M3 bytes)")
         if k_global_scale is not None:
             softmax_scale = softmax_scale * float(k_global_scale)
-    elif (k.dtype != compute_dtype or v.dtype != compute_dtype) and not (
-        q_fp8 and k.dtype == torch.float8_e4m3fn
-    ):
+    elif k.dtype != compute_dtype or v.dtype != compute_dtype:
         raise ValueError("k/v dtype must match q (or be fp8/packed NVFP4)")
 
     paged = page_table is not None
@@ -415,230 +377,38 @@ def msa_sparse_attention(
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
-    # The union-tile kernel is the default prefill path: it covers the full surface
-    # (bf16/fp16 + fp8/NVFP4 KV, flat+paged, GQA and MHA, softmax/temperature LSE)
-    # with ~6x the KV-major path's prefill headroom on SM12x (no GMEM partials, no
-    # combine). The KV-major split+combine kernel is kept only for the native fp8-Q /
-    # fp8-MMA compute modes the union does not implement.
-    union = union or not (q_fp8 or qk_fp8_mma or pv_fp8_mma)
-
-    if union:
-        # query-tile + block-union + in-kernel online softmax: no GMEM partials and
-        # no combine kernel.
-        if q_fp8 or qk_fp8_mma or pv_fp8_mma:
-            raise ValueError(
-                "union=True supports bf16/fp16 Q with bf16/fp16, fp8 (E4M3), or "
-                "NVFP4 K/V; q_fp8 / native fp8-MMA are not on the union path"
-            )
-        # paged is supported (page_size == _BLK_KV, one page per KV block); the
-        # paged k/v shape was validated above and cu_seqlens_k was derived from
-        # seqused_k. The union metadata builder works on batch-local block ids
-        # either way -- the forward remaps them through page_table when paged.
-        dev = q.device
-        cu_q_dev = cu_seqlens_q.to(dev, non_blocking=True)
-        cu_k_dev = cu_seqlens_k.to(dev, non_blocking=True)
-        qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k_dev, dev)
-        return _msa_sparse_attention_union(
-            q,
-            k,
-            v,
-            q2k_indices,
-            cu_q_dev,
-            cu_k_dev,
-            qoff_dev,
-            page_table=page_table if paged else None,
-            causal=causal,
-            softmax_scale=softmax_scale,
-            group_size=group_size,
-            topk=topk,
-            compute_dtype=compute_dtype,
-            return_softmax_lse=return_softmax_lse,
-            return_temperature_lse=return_temperature_lse,
-            lse_temperature_scale=lse_temperature_scale,
-            kv_fp8=kv_fp8,
-            kv_nvfp4=kv_nvfp4,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            v_global_scale=v_global_scale,
-        )
-
-    if schedule is None:
-        schedule = msa_build_k2q_csr(
-            q2k_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            blk_kv=_BLK_KV,
-            target_q_per_cta=target_q_per_cta,
-        )
-    elif schedule.topk != topk or schedule.split_counts.shape != (
-        total_q,
-        num_kv_heads,
-    ):
-        # A schedule built for a different topk / total_q / head count would index
-        # o_partial and the CSR head rows out of range; reject it instead.
-        raise ValueError(
-            "caller-provided schedule does not match (total_q, num_kv_heads, topk)"
-        )
-
+    # query-tile + block-union + in-kernel online softmax: no GMEM partials, no
+    # combine pass. Paged is supported (page_size == _BLK_KV, one page per KV block);
+    # the paged k/v shape was validated above and cu_seqlens_k was derived from
+    # seqused_k. The union metadata builder works on batch-local block ids either way
+    # -- the forward remaps them through page_table when paged.
     dev = q.device
-    if partial_dtype is None:
-        partial_dtype = compute_dtype
-    if partial_dtype not in (
-        torch.float32,
-        torch.bfloat16,
-        torch.float16,
-        torch.float8_e4m3fn,
-    ):
-        raise ValueError(f"unsupported partial_dtype {partial_dtype}")
-    o_partial = torch.empty(
-        (topk, total_q, num_qo_heads, head_dim), dtype=partial_dtype, device=dev
-    )
-    lse_partial = torch.empty(
-        (topk, total_q, num_qo_heads), dtype=torch.float32, device=dev
-    )
-    if return_temperature_lse:
-        lse_t_partial = torch.empty(
-            (topk, total_q, num_qo_heads), dtype=torch.float32, device=dev
-        )
-    else:
-        lse_t_partial = torch.zeros((1, 1, 1), dtype=torch.float32, device=dev)
-
     cu_q_dev = cu_seqlens_q.to(dev, non_blocking=True)
     cu_k_dev = cu_seqlens_k.to(dev, non_blocking=True)
     qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k_dev, dev)
-
-    if paged:
-        pt_dev = page_table.contiguous()
-    else:
-        # dummy 1x1 table for the flat path (kernel signature is shared)
-        pt_dev = torch.zeros((1, 1), dtype=torch.int32, device=dev)
-
-    if kv_nvfp4:
-        # int32 views of the packed bytes: one word = 8 e2m1 values
-        k_pass = k.view(torch.int32)
-        v_pass = v.view(torch.int32)
-        ksf_dev = k_scale.reshape(-1).contiguous()
-        vsf_dev = v_scale.reshape(-1).contiguous()
-    else:
-        k_pass, v_pass = k, v
-        ksf_dev = torch.zeros(1, dtype=torch.uint8, device=dev)
-        vsf_dev = ksf_dev
-
-    key = (
-        "sparse_attn",
-        str(q.dtype),
-        q_fp8,
-        qk_fp8_mma,
-        pv_fp8_mma,
-        group_size,
-        causal,
-        paged,
-        kv_fp8,
-        kv_nvfp4,
-        m_block_size,
-        num_threads,
-        str(partial_dtype),
-        return_temperature_lse,
-    )
-    compiled = _compile_cache.get(key)
-    if compiled is None:
-        q_in_cdt = _cutlass_dtype(q.dtype)
-        kv_cdt = _cutlass_dtype(k_pass.dtype)
-        i32 = _cutlass_dtype(torch.int32)
-        u8 = _cutlass_dtype(torch.uint8)
-        kv_last = k_pass.shape[-1]  # 128 (or 16 int32 words for nvfp4)
-        s_tq, s_hq, s_tk, s_hkv, s_topk, s_b1, s_b0 = (cute.sym_int() for _ in range(7))
-        s_lt0, s_lt1, s_lt2 = (cute.sym_int() for _ in range(3))
-        s_pb, s_pm, s_ksf, s_vsf, s_tr, s_qs, s_cap = (cute.sym_int() for _ in range(7))
-        kv_shape = (s_tk, s_hkv, _BLK_KV, kv_last) if paged else (s_tk, s_hkv, kv_last)
-        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel_obj = SparseAttentionForwardSm12x(
-            head_dim=head_dim,
-            m_block_size=m_block_size,
-            n_block_size=_BLK_KV,
-            group_size=group_size,
-            num_threads=num_threads,
-            is_causal=causal,
-            paged=paged,
-            kv_fp8=kv_fp8,
-            kv_nvfp4=kv_nvfp4,
-            return_temperature_lse=return_temperature_lse,
-            q_fp8=q_fp8,
-            qk_fp8_mma=qk_fp8_mma,
-            pv_fp8_mma=pv_fp8_mma,
-        )
-        compiled = cute.compile(
-            kernel_obj,
-            _fake(q_in_cdt, (s_tq, s_hq, head_dim)),
-            _fake(kv_cdt, kv_shape),
-            _fake(kv_cdt, kv_shape),
-            _fake(i32, (s_pb, s_pm), align=4),
-            _fake(u8, (s_ksf,), align=4),
-            _fake(u8, (s_vsf,), align=4),
-            _fake(_cutlass_dtype(partial_dtype), (s_topk, s_tq, s_hq, head_dim)),
-            _fake(_cutlass_dtype(torch.float32), (s_topk, s_tq, s_hq), align=4),
-            _fake(_cutlass_dtype(torch.float32), (s_lt0, s_lt1, s_lt2), align=4),
-            _fake(i32, (s_hkv, s_tr), align=4),
-            _fake(i32, (s_hkv, s_qs), align=4),
-            _fake(i32, (s_cap, 6), align=4),
-            _fake(i32, (1,), align=4),
-            _fake(i32, (s_b1,), align=4),
-            _fake(i32, (s_b1,), align=4),
-            _fake(i32, (s_b0,), align=4),
-            cutlass.Float32(1.0),
-            cutlass.Float32(1.0),
-            cutlass.Int32(1),
-            stream_fake,
-            options="--enable-tvm-ffi",
-        )
-        _compile_cache[key] = compiled
-
-    compiled(
+    return _msa_sparse_attention_union(
         q,
-        k_pass,
-        v_pass,
-        pt_dev,
-        ksf_dev,
-        vsf_dev,
-        o_partial,
-        lse_partial,
-        lse_t_partial,
-        schedule.row_ptr,
-        schedule.qsplit_indices,
-        schedule.scheduler_metadata,
-        schedule.work_count,
+        k,
+        v,
+        q2k_indices,
         cu_q_dev,
         cu_k_dev,
         qoff_dev,
-        float(softmax_scale),
-        float(lse_temperature_scale),
-        int(schedule.work_capacity),
+        page_table=page_table if paged else None,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        group_size=group_size,
+        topk=topk,
+        compute_dtype=compute_dtype,
+        return_softmax_lse=return_softmax_lse,
+        return_temperature_lse=return_temperature_lse,
+        lse_temperature_scale=lse_temperature_scale,
+        kv_fp8=kv_fp8,
+        kv_nvfp4=kv_nvfp4,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        v_global_scale=v_global_scale,
     )
-
-    lse_out = None
-    if return_softmax_lse or return_temperature_lse:
-        lse_out = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
-    lse_t_out = None
-    if return_temperature_lse:
-        lse_t_out = torch.empty(
-            (total_q, num_qo_heads), dtype=torch.float32, device=dev
-        )
-    out = _combine_partials(
-        o_partial,
-        lse_partial,
-        schedule.split_counts,
-        group_size,
-        compute_dtype,
-        lse_out=lse_out,
-        out_scale=float(v_global_scale) if v_global_scale is not None else 1.0,
-        lse_t_partial=lse_t_partial if return_temperature_lse else None,
-        lse_t_out=lse_t_out,
-    )
-    if return_temperature_lse:
-        return out, lse_out, lse_t_out
-    if return_softmax_lse:
-        return out, lse_out
-    return out
 
 
 # int32 union membership mask -> at most 32 query tokens may share one tile.
@@ -813,7 +583,9 @@ def _msa_sparse_attention_union(
         )
         _compile_cache[key] = compiled
 
-    wc = torch.tensor([n], dtype=torch.int32, device=dev)
+    # device-native fill (no host->device copy) so the single-call path stays
+    # CUDA-graph capturable; n is the static work-item upper bound.
+    wc = torch.full((1,), n, dtype=torch.int32, device=dev)
     compiled(
         q,
         k_pass,
