@@ -3930,7 +3930,12 @@ def _cudnn_gemm_bf16_runner(
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
             # out.dtype distinguishes bfloat16 / float16 / float32 output graphs
             _, _, bias, _, out, _ = inputs
-            return (out.dtype, bias is not None)
+            return (
+                out.dtype,
+                bias is not None,
+                self._is_a_k_major,
+                self._is_b_k_major,
+            )
 
         def get_valid_tactics(
             self,
