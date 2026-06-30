@@ -2041,6 +2041,7 @@ def run(
     quiet: bool = False,
     window_left=None,
     window_right=0,
+    sink: bool = False,
     **kwargs,
 ):
     # Example-only imports deferred here so importing the kernel module
@@ -2133,6 +2134,7 @@ def run(
         f" --scale {scale_s}"
         f" --iterations {iterations} --warmups {warmup_iterations}{' --use_warm_l2' if use_warm_l2 else ''}"
         f"{window_cli_args}"
+        f"{' --sink' if sink else ''}"
         f"{' --quiet' if quiet else ''}"
     )
 
@@ -2146,6 +2148,7 @@ def run(
             f"\tatol: {tolerance if not skip_ref_check else 'skip'}"
             f"\tscale_s: {f'1 / sqrt({headdim})' if scale_s == 0 else scale_s}\n"
             f"{window_summary}"
+            f"\tsink: {sink}\n"
             f"\titerations: {iterations}\twarmups: {warmup_iterations}\tL2 warm: {use_warm_l2}"
         )
 
@@ -2243,7 +2246,9 @@ def run(
         _, l_partial_cute, l_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
 
     # No sink refcheck for now, just test exec path
-    _, sink_cute, sink_torch = create_tensor((heads_q,), acc_dtype, init=-math.inf)
+    sink_cute = None
+    if sink:
+        _, sink_cute, _ = create_tensor((heads_q,), acc_dtype, init=-math.inf)
 
     #
     # Compile
@@ -2351,7 +2356,9 @@ def run(
             _, o_partial_cute, _ = create_tensor(qo_shape, acc_dtype)
             _, m_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
             _, l_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
-        _, sink_cute, _ = create_tensor((heads_q,), acc_dtype, init=-math.inf)
+        sink_cute = None
+        if sink:
+            _, sink_cute, _ = create_tensor((heads_q,), acc_dtype, init=-math.inf)
 
         args = testing.JitArguments(
             kv_splits,
@@ -2538,6 +2545,12 @@ if __name__ == "__main__":
         type=parse_none_or_int,
         default=argparse.SUPPRESS,
         help="sliding window right bound; use none for unbounded/dense, use 0 for causal",
+    )
+
+    parser.add_argument(
+        "--sink",
+        action="store_true",
+        help="compile and run with an attention sink tensor",
     )
 
     parser.add_argument(
