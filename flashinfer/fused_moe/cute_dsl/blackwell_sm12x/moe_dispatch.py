@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass.cute.typing import sym_int
 
 from flashinfer.cute_dsl.utils import (
     convert_sf_from_mma_layout,
@@ -23,9 +24,12 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     make_ptr,
 )
-from .moe_dynamic_kernel import MoEDynamicKernel
-from .moe_micro_kernel import MoEMicroKernel
-from .moe_static_kernel import MoEStaticKernel
+from .moe_activations import (
+    is_gated_moe_activation,
+    normalize_moe_activation,
+)
+from .moe_micro_kernel import MoEMicroKernelRelu2, MoEMicroKernelSilu
+from .moe_dynamic_kernel import MoEDynamicKernelRelu2, MoEDynamicKernelSilu
 from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
@@ -88,16 +92,6 @@ _STATIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
 )
 
 
-def _lookup_mac_ladder(
-    ladder: Tuple[Tuple[int, int], ...], routed_rows: int
-) -> int | None:
-    """Look up optimal MAC from a tuning ladder. Returns None if no match."""
-    for end_rows, mac in ladder:
-        if routed_rows <= end_rows:
-            return mac
-    return None
-
-
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
@@ -130,6 +124,20 @@ def _normalize_activation_precision(activation_precision: str) -> str:
             "activation_precision must be 'fp4' or 'bf16' "
             f"(got {activation_precision!r})."
         ) from exc
+
+
+# Quantization modes exposed by the dispatch layer:
+#   nvfp4  — FP4 weights + FP4 activations (NVFP4, E4M3 K/16 block scales)
+#   w4a16  — FP4 weights + BF16 activations (weight-only)
+# (Upstream's W4A8 FP8-activation tier is intentionally not exposed here.)
+
+# FP4-source formats for the nvfp4 path. "modelopt" is the legacy FlashInfer
+# alias for upstream "modelopt_nvfp4".
+_FP4_SOURCE_FORMATS = {
+    "modelopt": "modelopt_nvfp4",
+    "modelopt_nvfp4": "modelopt_nvfp4",
+    "compressed_tensors": "compressed_tensors",
+}
 
 
 def _normalize_quant_mode(
@@ -165,13 +173,49 @@ def _activation_precision_from_quant_mode(quant_mode: str) -> str:
     return "bf16" if _normalize_quant_mode(quant_mode) == "w4a16" else "fp4"
 
 
-def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
-    normalized = _normalize_source_format(source_format)
-    if quant_mode == "nvfp4" and normalized == "compressed_tensors":
+def _normalize_fp4_source_format(source_format: str) -> str:
+    """Normalize an FP4-path source format to the upstream canonical name."""
+    try:
+        return _FP4_SOURCE_FORMATS[str(source_format).lower()]
+    except KeyError as exc:
         raise ValueError(
-            "source_format='compressed_tensors' requires quant_mode='w4a16'."
-        )
-    return normalized
+            "source_format must be one of 'modelopt'/'modelopt_nvfp4' or "
+            f"'compressed_tensors', got {source_format!r}"
+        ) from exc
+
+
+def _validate_fp4_source_format_for_quant_mode(
+    *, source_format: str, quant_mode: str
+) -> None:
+    """(mode, source) compatibility matrix for the FP4 paths."""
+    normalized = _normalize_fp4_source_format(source_format)
+    mode = _normalize_quant_mode(quant_mode)
+    if mode == "w4a16":
+        return
+    if normalized == "modelopt_nvfp4":
+        return
+    raise ValueError(
+        f"source_format={normalized!r} with quant_mode={mode!r} is "
+        "unsupported; use quant_mode='w4a16' for non-NVFP4 sources, or "
+        "source_format='modelopt_nvfp4' for the NVFP4 kernel"
+    )
+
+
+def _normalize_source_format_for_quant_mode(source_format: str, quant_mode: str) -> str:
+    """Validate (mode, source) and return the format name for that path.
+
+    w4a16 keeps the FlashInfer-native 'modelopt'/'compressed_tensors' names
+    (consumed by the W4A16 weight-prep). The nvfp4 path uses the upstream
+    canonical FP4-source names.
+    """
+    mode = _normalize_quant_mode(quant_mode)
+    if mode == "w4a16":
+        return _normalize_source_format(source_format)
+    # nvfp4: validate against the source matrix.
+    _validate_fp4_source_format_for_quant_mode(
+        source_format=source_format, quant_mode=mode
+    )
+    return _normalize_fp4_source_format(source_format)
 
 
 def _is_w4a16(activation_precision: str) -> bool:
@@ -213,39 +257,6 @@ def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
         cached = max(0, int(cutover))
     _STATIC_COMPACT_CUTOVER_PAIRS_CACHE[activation_precision] = cached
     return cached
-
-
-def _select_moe_mma_tiler_mn(routed_rows: int, n: int) -> Tuple[int, int]:
-    """Select optimal MoE tile shape based on routed rows and N dimension.
-
-    Uses narrower 64x128 tiles when routed_rows <= 128 and default 128x128
-    would leave SMs idle.
-    """
-    sm_count = get_num_sm(torch.device("cuda"))
-    coarse_tile = (128, 128)
-    coarse_tiles = ((routed_rows + coarse_tile[0] - 1) // coarse_tile[0]) * (
-        (n + coarse_tile[1] - 1) // coarse_tile[1]
-    )
-    # Single-token decode often lands exactly on the "half the machine"
-    # boundary. Keeping the coarse 128x128 tile there leaves the M dimension
-    # badly underfilled, so take the narrow 64x128 tile inclusive of equality.
-    if routed_rows <= 128 and coarse_tiles <= max(1, sm_count // 2):
-        return (64, 128)
-    return (128, 128)
-
-
-def _as_grouped_scale_view(
-    scale_storage: torch.Tensor,
-    rows: int,
-    cols: int,
-) -> torch.Tensor:
-    """Create 6D MMA-compatible scale factor view from swizzled storage."""
-    batch = scale_storage.shape[0]
-    rows_padded = _align_up(rows, 128)
-    cols_padded = _align_up(cols // SF_VEC_SIZE, 4)
-    sf = scale_storage.view(torch.float8_e4m3fn)
-    sf = sf.view(batch, rows_padded // 128, cols_padded // 4, 32, 4, 4)
-    return sf.permute(3, 4, 1, 5, 2, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +395,25 @@ def _register_cache_eviction(cache: Dict, key: Tuple, *source_tensors) -> None:
 _WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
 
 
+# ---------------------------------------------------------------------------
+# Activation -> backend class resolvers
+# ---------------------------------------------------------------------------
+def _resolve_micro_cls(activation: str) -> type:
+    """Map a normalized activation name to its micro-kernel backend class."""
+    activation = normalize_moe_activation(activation)
+    if activation == "relu2":
+        return MoEMicroKernelRelu2
+    return MoEMicroKernelSilu
+
+
+def _resolve_dynamic_cls(activation: str) -> type:
+    """Map a normalized activation name to its dynamic-kernel backend class."""
+    activation = normalize_moe_activation(activation)
+    if activation == "relu2":
+        return MoEDynamicKernelRelu2
+    return MoEDynamicKernelSilu
+
+
 def _get_weight_views(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -398,7 +428,7 @@ def _get_weight_views(
     """Create permuted weight views for the static kernel.
 
     The kernel expects concatenated w13 data with shape [2*n, k//2, E]
-    via a single TMA descriptor.
+    via a single TMA descriptor. silu/relu2 are already kernel-native.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
     tile_n = _level_tile_n(activation_precision)
@@ -477,246 +507,8 @@ def _get_weight_views(
 
 
 # ---------------------------------------------------------------------------
-# Kernel compilation cache
+# Micro kernel compilation cache
 # ---------------------------------------------------------------------------
-_STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
-
-
-def _get_static_kernel(
-    state_E: int,
-    weight_E: int,
-    m: int,
-    k: int,
-    n: int,
-    num_topk: int,
-    max_rows: int,
-    *,
-    topk_ids_dtype: torch.dtype = torch.int32,
-    input_scales_are_reciprocal: bool = False,
-    fast_math: bool = True,
-    mac_override: int | None = None,
-    activation: str = "silu",
-    activation_precision: str = "fp4",
-):
-    """Compile (or retrieve cached) the SM120 static MoE kernel."""
-    activation_precision = _normalize_activation_precision(activation_precision)
-    if activation_precision == "bf16":
-        raise ValueError(
-            "internal routing error: quant_mode='w4a16' reached the NVFP4 static compiler"
-        )
-    sf_vec_size = 16
-    sm_count = get_num_sm(torch.device("cuda"))
-    mac = (
-        mac_override
-        if mac_override is not None
-        else min(get_max_active_clusters(1), sm_count)
-    )
-
-    # Select tile size based on actual routed rows
-    routed_rows = m * num_topk
-    mma_tiler_mn = (128, 128)
-    if activation_precision == "fp4" and num_topk > 1:
-        mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
-
-    cache_key = (
-        "static",
-        activation_precision,
-        state_E,
-        weight_E,
-        m,
-        k,
-        n,
-        num_topk,
-        max_rows,
-        mac,
-        mma_tiler_mn,
-        topk_ids_dtype,
-        input_scales_are_reciprocal,
-        fast_math,
-        activation,
-    )
-    cached = _STATIC_KERNEL_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    ab_dtype = cutlass.Float4E2M1FN
-    weight_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
-    a_dtype = cutlass.BFloat16
-    alpha_dtype = cutlass.Float32
-
-    output_tile_count_n = max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1])
-    kernel: Any = MoEStaticKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        output_tile_count_n=output_tile_count_n,
-        fast_math=fast_math,
-        activation=activation,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
-    )
-
-    is_gated = activation == "silu"
-    w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
-
-    rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
-
-    # Build fake tensors for compilation
-    a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    topk_ids_cutlass_dtype = (
-        cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
-    )
-    topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
-    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
-        topk_ids_cutlass_dtype,
-        (m * num_topk,),
-        assumed_align=topk_ids_align,
-    )
-    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (m * num_topk,),
-        assumed_align=4,
-    )
-    packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
-        (max_rows, k, state_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * max_rows * (k // 2),),
-        assumed_align=16,
-    )
-    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * rows_pad_k * cols_pad_k,),
-        assumed_align=16,
-    )
-    barrier_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
-    )
-    barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
-    )
-    b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype,
-        (w1_rows, k, weight_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    b_down_fake = cute.runtime.make_fake_compact_tensor(
-        weight_dtype,
-        (k, n, weight_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E,),
-        assumed_align=4,
-    )
-    active_expert_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
-    )
-    weight_expert_ids_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E,),
-        assumed_align=4,
-    )
-    global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (weight_E,),
-        assumed_align=4,
-    )
-    input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=4,
-    )
-    token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    compiled = cute.compile(
-        kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
-        barrier_count_fake,
-        barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
-        current_cuda_stream(),
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
-
-    result = (compiled, mac)
-    _STATIC_KERNEL_CACHE[cache_key] = result
-    return result
-
-
 _MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 
 
@@ -727,29 +519,26 @@ def _get_micro_kernel(
     k: int,
     n: int,
     num_topk: int,
-    max_rows: int,
     *,
     topk_ids_dtype: torch.dtype = torch.int32,
-    input_scales_are_reciprocal: bool = False,
     fast_math: bool = True,
     share_input_across_experts: bool = False,
     share_expert_scales: bool = False,
     single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
+    device: torch.device | None = None,
 ):
-    """Compile (or retrieve cached) the SM120 micro MoE kernel."""
-    sf_vec_size = 16
-    sm_count = get_num_sm(torch.device("cuda"))
-    mac = (
-        mac_override
-        if mac_override is not None
-        else min(get_max_active_clusters(1), sm_count)
-    )
+    """Compile (or retrieve cached) the SM120 micro MoE kernel.
 
-    # Micro always selects tile from routed rows (not just for multi-topk)
-    routed_rows = m * num_topk
-    mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
+    Uses the upstream MoEMicroKernelBackend harness: construct the
+    activation-specialized backend, run ``configure(...)`` to bind the problem
+    shape (and compute ``grid_x``), then ``cute.compile`` the pointer-taking
+    ``__call__``. Returns ``(compiled, kernel)``; the kernel instance carries
+    ``grid_x`` for the launch path.
+    """
+    sf_vec_size = 16
+    activation = normalize_moe_activation(activation)
 
     cache_key = (
         "micro",
@@ -759,196 +548,101 @@ def _get_micro_kernel(
         k,
         n,
         num_topk,
-        max_rows,
-        mac,
-        mma_tiler_mn,
         topk_ids_dtype,
-        input_scales_are_reciprocal,
         fast_math,
         share_input_across_experts,
         share_expert_scales,
         single_token,
+        mac_override,
         activation,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    ab_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
-    a_dtype = cutlass.BFloat16
-    alpha_dtype = cutlass.Float32
-
-    kernel = MoEMicroKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        output_tile_count_n=max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1]),
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    micro_cls = _resolve_micro_cls(activation)
+    mma_tiler_mn = (128, 128)
+    output_tile_count_n = max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1])
+    kernel: Any = micro_cls(
+        sf_vec_size,
+        mma_tiler_mn,
+        output_tile_count_n,
         fast_math=fast_math,
-        activation=activation,
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
         single_token=single_token,
     )
-
-    is_gated = activation == "silu"
-    w1_rows = (2 if is_gated else 1) * n
-
-    rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
-
-    # Build fake tensors for compilation (identical to static kernel)
-    a_input_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
+    # configure() must run before cute.compile so the shape config and grid_x
+    # are bound into the kernel instance.
+    kernel.configure(
+        m,
+        k,
+        n,
+        num_topk,
+        weight_E,
+        max_active_ctas=mac_override,
+        device=device,
     )
+
+    a_dtype = cutlass.BFloat16
+    alpha_dtype = cutlass.Float32
+
     topk_ids_cutlass_dtype = (
         cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
     )
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
-    topk_ids_fake = cute.runtime.make_fake_compact_tensor(
+
+    # The micro __call__ takes raw pointers for every operand plus two int32
+    # barrier tensors. Build fake pointers/tensors matching its signature.
+    x_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w1_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w1s_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w1a_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    a1_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    a2_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    inter_fake = make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w2_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w2s_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+    w2a_fake = make_ptr(alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    tid_fake = make_ptr(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        topk_ids_align,
+        cute.AddressSpace.gmem,
         assumed_align=topk_ids_align,
     )
-    topk_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (m * num_topk,),
-        assumed_align=4,
-    )
-    packed_a_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
-        (max_rows, k, state_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * max_rows * (k // 2),),
-        assumed_align=16,
-    )
-    scale_storage_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8,
-        (state_E * rows_pad_k * cols_pad_k,),
-        assumed_align=16,
-    )
+    tw_fake = make_ptr(alpha_dtype, 4, cute.AddressSpace.gmem, assumed_align=4)
+    out_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     barrier_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
+        cutlass.Int32, (1,), assumed_align=4
     )
     barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
+        cutlass.Int32, (1,), assumed_align=4
     )
-    b_w13_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
-        (w1_rows, k, weight_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    b_down_fake = cute.runtime.make_fake_compact_tensor(
-        ab_dtype,
-        (k, n, weight_E),
-        stride_order=(1, 0, 2),
-        assumed_align=16,
-    )
-    sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E,),
-        assumed_align=4,
-    )
-    active_expert_count_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        assumed_align=4,
-    )
-    weight_expert_ids_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E,),
-        assumed_align=4,
-    )
-    global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (weight_E,),
-        assumed_align=4,
-    )
-    input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (weight_E,),
-        assumed_align=16,
-    )
-    scatter_fake = cute.runtime.make_fake_compact_tensor(
-        a_dtype,
-        (m, k),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
-    token_map_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=4,
-    )
-    token_weights_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype,
-        (state_E, max_rows),
-        stride_order=(1, 0),
-        assumed_align=16,
-    )
+
     compiled = cute.compile(
         kernel,
-        a_input_fake,
-        topk_ids_fake,
-        topk_weights_fake,
-        packed_a_fake,
-        sfa_fake,
-        packed_a_storage_fake,
-        scale_storage_fake,
+        x_fake,
+        w1_fake,
+        w1s_fake,
+        w1a_fake,
+        a1_fake,
+        a2_fake,
+        inter_fake,
+        w2_fake,
+        w2s_fake,
+        w2a_fake,
+        tid_fake,
+        tw_fake,
+        out_fake,
         barrier_count_fake,
         barrier_epoch_fake,
-        b_w13_fake,
-        sfb_w13_fake,
-        b_down_fake,
-        sfb_down_fake,
-        row_counts_fake,
-        active_expert_count_fake,
-        weight_expert_ids_fake,
-        global_to_local_expert_fake,
-        input_gs_fake,
-        alpha_fake,
-        down_alpha_fake,
-        global_scale_fake,
-        scatter_fake,
-        token_map_fake,
-        token_weights_fake,
-        mac,
+        m,
+        kernel.grid_x,
         current_cuda_stream(),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
-    result = (compiled, mac)
+    result = (compiled, kernel)
     _MICRO_KERNEL_CACHE[cache_key] = result
     return result
 
@@ -983,11 +677,9 @@ def launch_sm120_static_moe(
     activation: str = "silu",
     activation_precision: str = "fp4",
 ) -> torch.Tensor:
-    """Launch the SM120 static or micro MoE kernel.
+    """Launch the SM120 "static" band via the MoEMicroKernelBackend harness.
 
-    Selects the micro kernel for tiny decode batches (routed_rows <= 20-40)
-    and the static kernel otherwise. The micro path runs a Triton pre-pass
-    to compact routing IDs before launching.
+    Micro kernel handles the small/medium decode band.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
@@ -995,36 +687,22 @@ def launch_sm120_static_moe(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 static launcher"
         )
 
-    # Flatten routing tensors
+    # Flatten routing tensors. The micro kernel consumes the routed expert ids
+    # and per-pair weights directly (no compaction pre-pass).
     flat_ids = topk_ids.view(-1).to(torch.int32)
     flat_weights = topk_weights.view(-1).to(torch.float32)
-    routed_rows = num_tokens * top_k
 
-    # Capture whether input_gs was a single shared scalar BEFORE expansion:
-    # the m=1 relu2 shared-input micro optimization only applies when every
-    # expert sees the same FC1-input global scale.
+    # Capture whether the FC1-input / FC2-input scales were single shared
+    # scalars BEFORE expansion: the ReLU2 single-token shared-scale micro
+    # specializations only apply when every expert sees the same scale.
     input_gs_is_shared = input_gs.numel() == 1
     down_input_scale_is_shared = down_input_scale.numel() == 1
 
-    # Broadcast scalar scales to per-expert [E] tensors
+    # Broadcast scalar scales to per-expert [E] tensors (the kernel indexes
+    # input_gs / down_input_scale by physical expert id).
     input_gs = _expand_to_experts(input_gs, num_experts)
     down_input_scale = _expand_to_experts(down_input_scale, num_experts)
 
-    # Decide micro vs static
-    micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS
-    if top_k > 1:
-        micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
-    use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
-
-    sm_count = get_num_sm(torch.device("cuda"))
-    base_mac = min(get_max_active_clusters(1), sm_count)
-    tuned_static_mac = _lookup_mac_ladder(_STATIC_MAC_LADDER, routed_rows)
-    static_mac = min(tuned_static_mac or base_mac, base_mac)
-    if activation_precision == "fp4" and not use_micro and routed_rows < 40:
-        static_mac = min(static_mac, 64)
-
-    # Shared-scale flags let compact W4A4 micro match the ReLU2 single-token
-    # specialization.
     share_input_across_experts = (
         activation == "relu2"
         and num_tokens == 1
@@ -1035,109 +713,49 @@ def launch_sm120_static_moe(
         activation == "relu2" and input_gs_is_shared and down_input_scale_is_shared
     )
 
-    if use_micro:
-        assert flat_ids.numel() <= workspace.compact_topk_ids.numel(), (
-            f"compact_topk_ids buffer too small: "
-            f"{workspace.compact_topk_ids.numel()} < {flat_ids.numel()}"
-        )
-        # Single-token ReLU2 is non-gated, so the micro kernel can launch on
-        # the routed expert ids directly. Gated SiLU still goes through the
-        # compact id buffer so the kernel can map compact launch ids back to
-        # the physical gate/up weight experts.
-        if num_tokens == 1 and activation == "relu2":
-            launch_ids = flat_ids
-        elif num_tokens == 1:
-            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            compact_ids.copy_(
-                torch.arange(
-                    flat_ids.numel(),
-                    device=flat_ids.device,
-                    dtype=torch.int32,
-                )
-            )
-            workspace.weight_expert_ids[: flat_ids.numel()].copy_(
-                flat_ids.to(torch.int32)
-            )
-            workspace.active_expert_count.fill_(flat_ids.numel())
-            launch_ids = compact_ids
-        else:
-            compact_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            from .triton_compact import compact_topk_ids as _triton_compact_topk_ids
+    compiled, kernel = _get_micro_kernel(
+        workspace.state_E,
+        num_experts,
+        num_tokens,
+        k,
+        n,
+        top_k,
+        topk_ids_dtype=flat_ids.dtype,
+        fast_math=fast_math,
+        share_input_across_experts=share_input_across_experts,
+        share_expert_scales=share_expert_scales,
+        single_token=num_tokens == 1,
+        activation=activation,
+        device=a.device,
+    )
 
-            _triton_compact_topk_ids(
-                flat_ids,
-                compact_ids,
-                workspace.weight_expert_ids,
-                workspace.active_expert_count,
-            )
-            launch_ids = compact_ids
-        # Select micro MAC: min of tuned ladder, work tiles, and hardware limit.
-        micro_work_tiles = max(1, routed_rows * max(1, (n + 128 - 1) // 128))
-        tuned_mac = _lookup_mac_ladder(_MICRO_MAC_LADDER, routed_rows)
-        micro_mac = min(tuned_mac or base_mac, micro_work_tiles, base_mac)
-        compiled, mac = _get_micro_kernel(
-            workspace.state_E,
-            num_experts,
-            num_tokens,
-            k,
-            n,
-            top_k,
-            workspace.max_rows,
-            topk_ids_dtype=launch_ids.dtype,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
-            fast_math=fast_math,
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=num_tokens == 1,
-            mac_override=micro_mac,
-            activation=activation,
-        )
-    else:
-        compiled, mac = _get_static_kernel(
-            workspace.state_E,
-            num_experts,
-            num_tokens,
-            k,
-            n,
-            top_k,
-            workspace.max_rows,
-            topk_ids_dtype=torch.int32,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
-            fast_math=fast_math,
-            mac_override=static_mac,
-            activation=activation,
-            activation_precision=activation_precision,
-        )
-        launch_ids = flat_ids
+    inter_elems = int(num_tokens) * int(kernel._cfg.inter_u32)
+    inter_fp32 = getattr(workspace, "_micro_inter", None)
+    if inter_fp32 is None or inter_fp32.numel() < inter_elems:
+        inter_fp32 = torch.empty(inter_elems, dtype=torch.uint32, device=a.device)
+        workspace._micro_inter = inter_fp32  # type: ignore[attr-defined]
 
-    # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
-    runtime_args: Tuple[Any, ...] = (
-        a,
-        launch_ids,
-        flat_weights,
-        workspace.packed_a_view,
-        workspace.packed_input_scale.data_ptr(),
-        workspace.packed_a_flat,
-        workspace.scale_flat,
+    _stream = current_cuda_stream()
+    compiled(
+        a.data_ptr(),
+        weights.w1_storage.data_ptr(),
+        weights._w13_sf_storage.data_ptr(),
+        weights.w1_alpha.data_ptr(),
+        input_gs.data_ptr(),
+        down_input_scale.data_ptr(),
+        inter_fp32.data_ptr(),
+        weights.w2_storage.data_ptr(),
+        weights._down_sf_storage.data_ptr(),
+        weights.w2_alpha.data_ptr(),
+        flat_ids.data_ptr(),
+        flat_weights.data_ptr(),
+        scatter_output.data_ptr(),
         workspace.barrier_count,
         workspace.barrier_epoch,
-        weights.w13_fp4,
-        weights._w13_sf_storage.data_ptr(),
-        weights.down_fp4,
-        weights._down_sf_storage.data_ptr(),
-        workspace.row_counts,
-        workspace.active_expert_count,
-        workspace.weight_expert_ids,
-        workspace.global_to_local_expert,
-        input_gs,
-        weights.w1_alpha,
-        weights.w2_alpha,
-        down_input_scale,
-        scatter_output,
-        workspace.token_map,
-        workspace.token_weights,
+        cutlass.Int32(int(num_tokens)),
+        cutlass.Int32(int(kernel.grid_x)),
+        _stream,
     )
-    compiled(*runtime_args, current_cuda_stream())
 
     return scatter_output
 
@@ -1509,6 +1127,7 @@ def _get_dynamic_kernel(
     share_input_across_experts: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
+    activation = normalize_moe_activation(activation)
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
@@ -1528,7 +1147,8 @@ def _get_dynamic_kernel(
     cache_key = (
         "dynamic",
         activation_precision,
-        E,
+        # E omitted: num_experts is a dynamic (SymInt) operand dim, so one
+        # compiled dynamic kernel serves any expert count (see note below).
         k,
         n,
         num_topk,
@@ -1544,7 +1164,7 @@ def _get_dynamic_kernel(
     if cached is not None:
         return cached
 
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
     w1_rows = (2 if is_gated else 1) * n
 
     scratch_dtype = cutlass.Float4E2M1FN
@@ -1553,12 +1173,11 @@ def _get_dynamic_kernel(
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
-    kernel: Any = MoEDynamicKernel(
-        sf_vec_size=sf_vec_size,
-        mma_tiler_mn=mma_tiler_mn,
-        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    dynamic_cls = _resolve_dynamic_cls(activation)
+    kernel: Any = dynamic_cls(
+        sf_vec_size,
+        mma_tiler_mn,
         fast_math=fast_math,
-        activation=activation,
         share_input_across_experts=share_input_across_experts,
     )
     launch = _DynamicMoELaunch(
@@ -1639,40 +1258,42 @@ def _get_dynamic_kernel(
         cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
 
+    E_sym = sym_int(32, divisibility=1, symbol="moe_E")
+    Ep1_sym = sym_int(32, divisibility=1, symbol="moe_Ep1")
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (w1_rows, k, E),
+        (w1_rows, k, E_sym),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     b_down_fake = cute.runtime.make_fake_compact_tensor(
         weight_dtype,
-        (k, n, E),
+        (k, n, E_sym),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     row_counts_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E,), assumed_align=4
+        cutlass.Int32, (E_sym,), assumed_align=4
     )
     expert_write_rows_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E,), assumed_align=4
+        cutlass.Int32, (E_sym,), assumed_align=4
     )
     expert_tile_base_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (E + 1,), assumed_align=4
+        cutlass.Int32, (Ep1_sym,), assumed_align=4
     )
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E_sym,), assumed_align=16
     )
     alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E_sym,), assumed_align=16
     )
     down_alpha_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E_sym,), assumed_align=16
     )
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
-        alpha_dtype, (E,), assumed_align=16
+        alpha_dtype, (E_sym,), assumed_align=16
     )
     scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
@@ -2418,9 +2039,12 @@ def launch_sm120_moe(
     source_format = _normalize_source_format_for_quant_mode(source_format, quant_mode)
     activation_precision = _activation_precision_from_quant_mode(quant_mode)
 
+    # Validate the activation name (unknown activations raise).
+    activation = normalize_moe_activation(activation)
+
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    is_gated = activation == "silu"
+    is_gated = is_gated_moe_activation(activation)
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
@@ -2498,12 +2122,30 @@ def launch_sm120_moe(
             num_topk=top_k,
             activation_precision=activation_precision,
         )
+
+        micro_cls = _resolve_micro_cls(activation)
+        micro_supported = micro_cls.is_supported(  # type: ignore[attr-defined]
+            num_tokens, k, n, top_k, num_experts
+        )
         # The dynamic kernel indexes row_counts/expert_write_rows directly with
         # topk_ids but those buffers are sized with num_local_experts. Unless
-        # num_local_experts == num_experts, fall back to the static backend which
-        # has global-to-local expert remapping.
-        if backend == "dynamic" and num_local_experts != num_experts:
+        # num_local_experts == num_experts the per-expert buffers do not line
+        # up; the micro path indexes weights by physical expert id and is the
+        # only backend here that tolerates num_local_experts != num_experts.
+        # (The public API rejects num_local_experts != num_experts outright;
+        # this keeps the dispatcher self-consistent regardless, never routing
+        # to the micro backend with a shape it does not support.)
+        if num_local_experts != num_experts:
+            if not micro_supported:
+                raise ValueError(
+                    "num_local_experts != num_experts requires the SM120 micro "
+                    "MoE backend, but it does not support this shape "
+                    f"(num_tokens={num_tokens}, k={k}, n={n}, top_k={top_k}, "
+                    f"num_experts={num_experts})."
+                )
             backend = "static"
+        elif backend == "static" and not micro_supported:
+            backend = "dynamic"
         workspace = _get_cached_workspace(
             backend=backend,
             state_E=num_local_experts,

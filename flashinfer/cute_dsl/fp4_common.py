@@ -2382,29 +2382,6 @@ def quantize_and_pack_16_fast(y_f32: cute.Tensor, inv_scale: Float32) -> Uint64:
 
 
 @cute.jit
-def quantize_block_fp4(
-    values: cute.Tensor,
-    max_abs: Float32,
-    global_scale_val: Float32,
-) -> Tuple[Uint64, Uint8]:
-    """Quantize 16 float32 values to packed FP4 + e4m3 scale byte.
-
-    Given 16 values and their pre-computed max_abs, derives the NVFP4 block
-    scale, quantizes to FP4, and packs into a uint64.  Returns
-    (packed_fp4_u64, scale_byte).
-    """
-    scale_float = max_abs / (Float32(FLOAT4_E2M1_MAX) * global_scale_val)
-    scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
-    scale_u32 = cvt_f32_to_e4m3(scale_float)
-    scale_byte = Uint8(scale_u32 & Uint32(0xFF))
-    quantized_scale = fp8_e4m3_to_f32(scale_u32)
-    packed64 = Uint64(0)
-    if quantized_scale != Float32(0.0) and global_scale_val != Float32(0.0):
-        packed64 = quantize_and_pack_16(values, quantized_scale * global_scale_val)
-    return packed64, scale_byte
-
-
-@cute.jit
 def quantize_block_fp4_fast(
     values: cute.Tensor,
     max_abs: Float32,
@@ -2457,23 +2434,6 @@ def silu_mul_16(
 
 
 @cute.jit
-def silu_mul_quantize_block_fp4(
-    gate: cute.Tensor,
-    up: cute.Tensor,
-    global_scale_val: Float32,
-) -> Tuple[Uint64, Uint8]:
-    """Fused SiLU(gate)*up + FP4 quantize for 16 element pairs."""
-    activated = silu_mul_16(gate, up)
-    block_max = max_abs_16(activated)
-    return quantize_block_fp4(activated, block_max, global_scale_val)
-
-
-# =============================================================================
-# ReLU2 Activation — ReLU(x)² for non-gated MoE (Nemotron-Super)
-# =============================================================================
-
-
-@cute.jit
 def relu2_16(x: cute.Tensor) -> cute.Tensor:
     """Compute ReLU²(x) = max(0, x)² for 16 float32 values."""
     out = cute.make_rmem_tensor((16,), Float32)
@@ -2481,14 +2441,3 @@ def relu2_16(x: cute.Tensor) -> cute.Tensor:
         v = fmax_f32(x[i], Float32(0.0))
         out[i] = v * v
     return out
-
-
-@cute.jit
-def relu2_quantize_block_fp4(
-    x: cute.Tensor,
-    global_scale_val: Float32,
-) -> Tuple[Uint64, Uint8]:
-    """Fused ReLU² + FP4 quantize for 16 float32 values."""
-    activated = relu2_16(x)
-    block_max = max_abs_16(activated)
-    return quantize_block_fp4(activated, block_max, global_scale_val)
