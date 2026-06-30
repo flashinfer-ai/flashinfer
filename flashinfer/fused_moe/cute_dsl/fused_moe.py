@@ -415,6 +415,9 @@ class CuteDslMoEWrapper:
             Device on which to allocate buffers.  Defaults to ``"cuda"``.
         enable_pdl : bool
             Enable Programmatic Dependent Launch.  Defaults to ``True``.
+        activation : str
+            FC1 activation function: ``"silu"`` for gated SwiGLU (default)
+            or ``"relu2"`` for ReLU².  Defaults to ``"silu"``.
         """
         self.num_experts = num_experts
         self.top_k = top_k
