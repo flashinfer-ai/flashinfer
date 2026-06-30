@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cmath>
 #include <flashinfer/page.cuh>
 
 #include "tvm_ffi_utils.h"
@@ -20,6 +21,23 @@
 using namespace flashinfer;
 
 using tvm::ffi::Tensor;
+
+namespace {
+
+void CheckPositiveFiniteFloatScalar(TensorView tensor, const char* name, cudaStream_t stream) {
+  float value = 0.0f;
+  cudaError_t status =
+      cudaMemcpyAsync(&value, tensor.data_ptr(), sizeof(float), cudaMemcpyDeviceToHost, stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Failed to copy " << name << " for validation: " << cudaGetErrorString(status);
+  status = cudaStreamSynchronize(stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Failed to synchronize " << name << " validation: " << cudaGetErrorString(status);
+  TVM_FFI_ICHECK(std::isfinite(value) && value > 0.0f)
+      << name << " must be a positive finite global decode scale";
+}
+
+}  // namespace
 
 void append_paged_kv_cache(TensorView append_key, TensorView append_value, TensorView batch_indices,
                            TensorView positions, TensorView paged_k_cache, TensorView paged_v_cache,
@@ -147,6 +165,8 @@ void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView appe
   CHECK_DEVICE(paged_v_cache, append_key);
   CHECK_DEVICE(k_scale_cache, append_key);
   CHECK_DEVICE(v_scale_cache, append_key);
+  CHECK_DEVICE(batch_indices, append_key);
+  CHECK_DEVICE(positions, append_key);
   CHECK_DEVICE(kv_indices, append_key);
   CHECK_DEVICE(kv_indptr, append_key);
   CHECK_DEVICE(kv_last_page_len, append_key);
@@ -165,8 +185,8 @@ void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView appe
   TVM_FFI_ICHECK(kv_indices.dtype() == dl_int32) << "kv_indices must be int32";
   TVM_FFI_ICHECK(kv_indptr.dtype() == dl_int32) << "kv_indptr must be int32";
   TVM_FFI_ICHECK(kv_last_page_len.dtype() == dl_int32) << "kv_last_page_len must be int32";
-  TVM_FFI_ICHECK(k_scale > 0.0 && v_scale > 0.0)
-      << "k_scale and v_scale must be positive global decode scales";
+  TVM_FFI_ICHECK(std::isfinite(k_scale) && std::isfinite(v_scale) && k_scale > 0.0 && v_scale > 0.0)
+      << "k_scale and v_scale must be positive finite global decode scales";
 
   const unsigned int nnz = append_key.size(0);
   const unsigned int batch_size = kv_last_page_len.size(0);
@@ -310,6 +330,11 @@ void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
   TVM_FFI_ICHECK_EQ(k_scale.numel(), 1) << "k_scale must be a single-element tensor";
   TVM_FFI_ICHECK_EQ(v_scale.numel(), 1) << "v_scale must be a single-element tensor";
 
+  ffi::CUDADeviceGuard device_guard(append_key.device().device_id);
+  const cudaStream_t stream = get_stream(append_key.device());
+  CheckPositiveFiniteFloatScalar(k_scale, "k_scale", stream);
+  CheckPositiveFiniteFloatScalar(v_scale, "v_scale", stream);
+
   const unsigned int nnz = slot_mapping.size(0);
   TVM_FFI_ICHECK_GE(append_key.size(0), nnz);
   TVM_FFI_ICHECK_GE(append_value.size(0), nnz);
@@ -374,8 +399,6 @@ void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
   const size_t append_v_stride_n = append_v_strides[0];
   const size_t append_v_stride_h = append_v_strides[1];
 
-  ffi::CUDADeviceGuard device_guard(append_key.device().device_id);
-  const cudaStream_t stream = get_stream(append_key.device());
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(append_key.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(slot_mapping.dtype(), id_type, [&] {
       cudaError_t status = NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(

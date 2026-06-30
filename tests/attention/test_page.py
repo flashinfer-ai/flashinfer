@@ -41,6 +41,39 @@ def _skip_if_fp8_e4m3_scale_unsupported():
         pytest.skip(f"SM{major}{minor} does not support FP8 E4M3 scale tensors")
 
 
+def _make_small_nvfp4_append_inputs():
+    _skip_if_fp8_e4m3_scale_unsupported()
+
+    nnz_kv = 1
+    num_kv_heads = 1
+    head_dim = 64
+    page_size = 1
+    max_num_pages = 1
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+    k_cache = torch.zeros(
+        max_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim // 2,
+        dtype=torch.uint8,
+        device="cuda:0",
+    )
+    v_cache = torch.zeros_like(k_cache)
+    k_scales = torch.zeros(
+        max_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim // 16,
+        dtype=torch.float8_e4m3fn,
+        device="cuda:0",
+    )
+    v_scales = torch.zeros_like(k_scales)
+    return k_append, v_append, k_cache, v_cache, k_scales, v_scales
+
+
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_append_paged_kv_cache(contiguous):
     nnz_kv = 100
@@ -382,39 +415,35 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_out_of_range(
     assert torch.equal(v_scales, v_scales_before)
 
 
+@pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("nan")])
+def test_nvfp4_quantize_append_paged_kv_cache_rejects_bad_scale(bad_scale):
+    k_append, v_append, k_cache, v_cache, k_scales, v_scales = (
+        _make_small_nvfp4_append_inputs()
+    )
+
+    with pytest.raises(ValueError, match="positive finite global decode scale"):
+        flashinfer.nvfp4_quantize_append_paged_kv_cache(
+            k_append,
+            v_append,
+            torch.zeros(1, dtype=torch.int32, device="cuda:0"),
+            torch.zeros(1, dtype=torch.int32, device="cuda:0"),
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            torch.zeros(1, dtype=torch.int32, device="cuda:0"),
+            torch.tensor([0, 1], dtype=torch.int32, device="cuda:0"),
+            torch.ones(1, dtype=torch.int32, device="cuda:0"),
+            bad_scale,
+            1.0,
+        )
+
+
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_scale():
-    _skip_if_fp8_e4m3_scale_unsupported()
+    k_append, v_append, k_cache, v_cache, k_scales, v_scales = (
+        _make_small_nvfp4_append_inputs()
+    )
+    slot_mapping = torch.zeros(1, dtype=torch.int32, device="cuda:0")
 
-    nnz_kv = 1
-    num_kv_heads = 1
-    head_dim = 64
-    page_size = 1
-    max_num_pages = 1
-    k_append = torch.randn(
-        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
-    )
-    v_append = torch.randn_like(k_append)
-    k_cache = torch.zeros(
-        max_num_pages,
-        page_size,
-        num_kv_heads,
-        head_dim // 2,
-        dtype=torch.uint8,
-        device="cuda:0",
-    )
-    v_cache = torch.zeros_like(k_cache)
-    k_scales = torch.zeros(
-        max_num_pages,
-        page_size,
-        num_kv_heads,
-        head_dim // 16,
-        dtype=torch.float8_e4m3fn,
-        device="cuda:0",
-    )
-    v_scales = torch.zeros_like(k_scales)
-    slot_mapping = torch.zeros(nnz_kv, dtype=torch.int32, device="cuda:0")
-
-    with pytest.raises(ValueError, match="positive global decode scale"):
+    with pytest.raises(ValueError, match="positive finite global decode scale"):
         flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
             k_append,
             v_append,
@@ -425,7 +454,7 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_scal
             1.0,
         )
 
-    with pytest.raises(ValueError, match="positive global decode scale"):
+    with pytest.raises(ValueError, match="positive finite global decode scale"):
         flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
             k_append,
             v_append,
@@ -434,6 +463,27 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_scal
             (k_scales, v_scales),
             1.0,
             torch.tensor([-1.0], dtype=torch.float32),
+        )
+
+
+@pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("nan")])
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_cuda_scale(
+    bad_scale,
+):
+    k_append, v_append, k_cache, v_cache, k_scales, v_scales = (
+        _make_small_nvfp4_append_inputs()
+    )
+    slot_mapping = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+
+    with pytest.raises(ValueError, match="positive finite global decode scale"):
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append,
+            v_append,
+            slot_mapping,
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            torch.tensor([bad_scale], dtype=torch.float32, device="cuda:0"),
+            torch.ones(1, dtype=torch.float32, device="cuda:0"),
         )
 
 

@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 from typing import Optional, Tuple, Union
 
 import torch
@@ -23,6 +24,8 @@ from .api_logging import flashinfer_api
 from .trace.templates.page import (
     append_paged_kv_cache_trace,
     append_paged_mla_kv_cache_trace,
+    nvfp4_quantize_append_paged_kv_cache_trace,
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace,
 )
 from .jit.page import gen_page_module
 from .utils import (
@@ -526,7 +529,7 @@ def append_paged_kv_cache(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_trace)
 def nvfp4_quantize_append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,
@@ -574,8 +577,17 @@ def nvfp4_quantize_append_paged_kv_cache(
         raise ValueError(
             "NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn"
         )
-    if k_scale <= 0.0 or v_scale <= 0.0:
-        raise ValueError("k_scale and v_scale must be positive global decode scales")
+    k_scale = float(k_scale)
+    v_scale = float(v_scale)
+    if (
+        not math.isfinite(k_scale)
+        or not math.isfinite(v_scale)
+        or k_scale <= 0.0
+        or v_scale <= 0.0
+    ):
+        raise ValueError(
+            "k_scale and v_scale must be positive finite global decode scales"
+        )
 
     _nvfp4_quantize_append_paged_kv_cache_kernel(
         append_key,
@@ -608,18 +620,19 @@ def _as_float32_scalar_tensor(
             )
         if value.dtype != torch.float32:
             raise ValueError(f"{name} must be torch.float32, got {value.dtype}")
-        if value.device.type == "cpu" and value.item() <= 0.0:
-            raise ValueError(f"{name} must be a positive global decode scale")
+        scalar = float(value.item())
+        if not math.isfinite(scalar) or scalar <= 0.0:
+            raise ValueError(f"{name} must be a positive finite global decode scale")
         if value.device != device:
             value = value.to(device=device)
         return value.contiguous()
     scalar = float(value)
-    if scalar <= 0.0:
-        raise ValueError(f"{name} must be a positive global decode scale")
+    if not math.isfinite(scalar) or scalar <= 0.0:
+        raise ValueError(f"{name} must be a positive finite global decode scale")
     return torch.tensor([scalar], dtype=torch.float32, device=device)
 
 
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace)
 def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     append_key: torch.Tensor,
     append_value: torch.Tensor,
