@@ -580,7 +580,9 @@ class TestMoELayerMVPValidation:
 
     @pytest.mark.parametrize(
         "variant",
-        [v for v in QuantVariant if v is not QuantVariant.NVFP4],
+        # NVFP4 (CuteDSL/TRTLLM-FP4) and BF16 (TRTLLM-BF16, the EP grouped-GEMM
+        # path) are both MVP-supported now; everything else is still rejected.
+        [v for v in QuantVariant if v not in (QuantVariant.NVFP4, QuantVariant.BF16)],
     )
     def test_non_nvfp4_quant_rejected(self, variant):
         from flashinfer.fused_moe import MoELayer

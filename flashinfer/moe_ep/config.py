@@ -29,6 +29,25 @@ class EpAlgorithm(enum.Enum):
     HIGH_THROUGHPUT = 1
 
 
+class EpLayout(enum.Enum):
+    """LL receive-buffer layout, mirroring ``nccl.ep.Layout`` for the LL paths.
+
+    * ``EXPERT_MAJOR`` — recv buffer ``[num_local_experts, max_tokens_per_rank *
+      world, hidden]``; each padded row is pre-assigned to one local expert and
+      combine reweights per-token on receive.
+    * ``RANK_MAJOR`` — recv buffer ``[world, max_tokens_per_rank, hidden]``;
+      tokens grouped by source rank (received once each, carrying their
+      ``topk_idx`` / ``topk_weights``). The caller pre-reduces across local
+      experts before combine; combine then just sums across ranks.
+
+    HT always uses the library's ``FLAT`` layout regardless of this field; it is
+    only consulted on the LL path.
+    """
+
+    EXPERT_MAJOR = 1
+    RANK_MAJOR = 2
+
+
 class QuantType(enum.Enum):
     """Quantization variants surfaced via FleetAlgoKnobQuantization."""
 
@@ -77,6 +96,8 @@ class FleetParams:
     token_hidden_size: int
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
+    # LL receive layout. Ignored by HT (always FLAT). RANK_MAJOR is LL-only.
+    layout: EpLayout = EpLayout.EXPERT_MAJOR
 
     def __post_init__(self) -> None:
         for name in (
@@ -88,6 +109,14 @@ class FleetParams:
             v = getattr(self, name)
             if v <= 0:
                 raise ValueError(f"FleetParams.{name} must be positive, got {v}")
+        if (
+            self.layout is EpLayout.RANK_MAJOR
+            and self.algorithm is not EpAlgorithm.LOW_LATENCY
+        ):
+            raise ValueError(
+                "FleetParams.layout=RANK_MAJOR is only valid with "
+                "algorithm=LOW_LATENCY (HT uses the FLAT layout)."
+            )
 
 
 @dataclass(frozen=True)
@@ -116,13 +145,17 @@ class DispatchOutput:
     """Outputs from :meth:`Handle.dispatch`.
 
     ``expert_tensors`` is the dispatched token tensor on the local rank
-    (shape: ``[num_recv_tokens, hidden]``). ``num_tokens`` is the actual
-    receive count (= ``max_tokens_per_rank`` in fixed-size LL mode; queried
-    via ``ncclEpHandleGetNumRecvTokens`` otherwise).
+    (shape: ``[num_recv_tokens, hidden]``).
+
+    ``recv_topk_idx`` / ``recv_topk_weights`` are the per-received-token routing
+    returned by the LL RANK_MAJOR (and HT) layouts — ``[num_recv_tokens, top_k]``
+    int64 / fp32. They are ``None`` for the LL EXPERT_MAJOR layout (whose rows are
+    pre-assigned to experts by position, so no per-token routing is returned).
     """
 
     expert_tensors: "torch.Tensor"
-    num_tokens: int
+    recv_topk_idx: Optional["torch.Tensor"] = None
+    recv_topk_weights: Optional["torch.Tensor"] = None
 
 
 @dataclass(frozen=True)

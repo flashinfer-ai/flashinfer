@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Reference Dockerfile for building FlashInfer with the moe_ep transport
-# backends enabled (NIXL-EP + NCCL-EP from in-tree git submodules).
+# backends enabled: NIXL-EP is compiled from the in-tree git submodule;
+# NCCL-EP is the released `nccl4py>=0.3.1` wheel (the `[nvep]` extra), which
+# ships the `nccl.ep` API + bundled libnccl_ep.so (no in-tree NCCL build).
 #
 # Usage:
 #   cd /path/to/flashinfer
@@ -170,18 +172,14 @@ WORKDIR ${FLASHINFER_SRC}
 # the submodule .git pointers reference the host superproject's .git/modules/
 # tree which isn't copied, and `git apply` in _apply_patches works on a plain
 # directory without a git repo.
+# The `[nvep]` extra pulls the released `nccl4py>=0.3.1` wheel (NCCL-EP: the
+# `nccl.ep` API + bundled libnccl_ep.so) — no in-tree NCCL build. BUILD_NIXL_EP
+# still builds NIXL-EP from the submodule via the build hook.
 RUN BUILD_NVEP=${BUILD_NVEP} \
     BUILD_NCCL_EP=${BUILD_NCCL_EP} \
     BUILD_NIXL_EP=${BUILD_NIXL_EP} \
     uv pip install --python ${VENV}/bin/python \
         --no-build-isolation -e ".[nvep]"
-
-# Post-build editable installs of the NCCL Python wrappers. These cannot run
-# from inside build_backend.py's BUILD_NVEP hook because `sys.executable`
-# there points at uv's isolated build env (which has no pip).
-RUN uv pip install --python ${VENV}/bin/python -e 3rdparty/nccl/contrib/nccl_ep/python
-RUN CUDA_HOME=/usr/local/cuda uv pip install --python ${VENV}/bin/python \
-        -e '3rdparty/nccl/bindings/nccl4py[cu13]'
 
 # Smoke probe. Assertions fail the build if the EP backends weren't
 # actually produced — without these, a silent skip in BUILD_NVEP=1's
@@ -194,6 +192,6 @@ b = available_backends(); \
 print('moe_ep backends:', b); \
 assert 'nccl_ep' in b, 'nccl_ep backend missing'; \
 assert 'nixl_ep' in b, 'nixl_ep backend missing'"
-RUN python -c "import nccl_ep; from nccl.core.communicator import Communicator; print('nccl_ep + nccl4py OK')"
+RUN python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep + nccl4py OK')"
 
 CMD ["bash"]
