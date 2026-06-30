@@ -415,10 +415,10 @@ def msa_sparse_attention(
         # query-tile + block-union + in-kernel online softmax: no GMEM partials and
         # no combine kernel (the memory-bound KV-major path's ~6x prefill headroom on
         # SM12x). bf16/fp16 flat K/V only for now.
-        if q_fp8 or kv_nvfp4 or qk_fp8_mma or pv_fp8_mma:
+        if q_fp8 or qk_fp8_mma or pv_fp8_mma:
             raise ValueError(
-                "union=True supports bf16/fp16 Q with bf16/fp16 or fp8 (E4M3) K/V; "
-                "q_fp8 / NVFP4 KV / native fp8-MMA are not on the union path yet"
+                "union=True supports bf16/fp16 Q with bf16/fp16, fp8 (E4M3), or "
+                "NVFP4 K/V; q_fp8 / native fp8-MMA are not on the union path yet"
             )
         if return_temperature_lse:
             raise ValueError("union=True does not support return_temperature_lse yet")
@@ -446,6 +446,10 @@ def msa_sparse_attention(
             compute_dtype=compute_dtype,
             return_softmax_lse=return_softmax_lse,
             kv_fp8=kv_fp8,
+            kv_nvfp4=kv_nvfp4,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            v_global_scale=v_global_scale,
         )
 
     if schedule is None:
@@ -665,12 +669,19 @@ def _msa_sparse_attention_union(
     compute_dtype,
     return_softmax_lse,
     kv_fp8=False,
+    kv_nvfp4=False,
+    k_scale=None,
+    v_scale=None,
+    v_global_scale=None,
 ):
     """Union-tile prefill path (query-tile + block-union + in-kernel online softmax,
-    no GMEM partials / no combine). bf16/fp16 Q; K/V are bf16/fp16, or fp8 (E4M3)
-    dequantized to the compute dtype on load (``kv_fp8``); flat K/V, or paged
-    ``(num_pages, Hkv, _BLK_KV, d)`` with one page per KV block when ``page_table``
-    is given. See :class:`...cute_dsl.sparse_fwd_union_sm12x.SparseAttentionUnionFwdSm12x`."""
+    no GMEM partials / no combine). bf16/fp16 Q; K/V are bf16/fp16, fp8 (E4M3), or
+    NVFP4 -- the quantized caches are dequantized to the compute dtype on load. The
+    NVFP4 K global scale is pre-folded into ``softmax_scale`` by the caller; the V
+    global scale is passed as ``out_scale`` and applied to the output here (the union
+    has no combine kernel). flat K/V, or paged ``(num_pages, Hkv, _BLK_KV, d)`` with
+    one page per KV block when ``page_table`` is given. See
+    :class:`...cute_dsl.sparse_fwd_union_sm12x.SparseAttentionUnionFwdSm12x`."""
     import cutlass
     import cutlass.cute as cute
 
@@ -685,6 +696,21 @@ def _msa_sparse_attention_union(
     page_table_arg = (
         page_table if paged else torch.zeros((1, 1), dtype=torch.int32, device=dev)
     )
+    # NVFP4: pass int32 views of the packed bytes (one word = 8 e2m1 values) + flat
+    # e4m3 block scales. K's global scale was pre-folded into softmax_scale by the
+    # caller; V's becomes out_scale (applied to the output, since union has no
+    # combine). bf16/fp16/fp8 pass K/V as-is with dummy (1,) scales and out_scale 1.
+    if kv_nvfp4:
+        k_pass = k.view(torch.int32)
+        v_pass = v.view(torch.int32)
+        ksf_dev = k_scale.reshape(-1).contiguous()
+        vsf_dev = v_scale.reshape(-1).contiguous()
+        out_scale = float(v_global_scale) if v_global_scale is not None else 1.0
+    else:
+        k_pass, v_pass = k, v
+        ksf_dev = torch.zeros(1, dtype=torch.uint8, device=dev)
+        vsf_dev = ksf_dev
+        out_scale = 1.0
     m_block, num_threads = _union_tile_config(group_size)
     tokens_per_tile = m_block // group_size
 
@@ -704,23 +730,26 @@ def _msa_sparse_attention_union(
     key = (
         "sparse_attn_union",
         str(q.dtype),
-        str(k.dtype),
+        str(k_pass.dtype),
         group_size,
         causal,
         m_block,
         num_threads,
         paged,
         kv_fp8,
+        kv_nvfp4,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
         cdt = _cutlass_dtype(q.dtype)  # compute dtype (Q + output)
-        kdt = _cutlass_dtype(k.dtype)  # K/V storage dtype (fp8 when kv_fp8)
+        kdt = _cutlass_dtype(k_pass.dtype)  # K/V storage (fp8, or int32 for NVFP4)
         i32 = _cutlass_dtype(torch.int32)
+        u8 = _cutlass_dtype(torch.uint8)
         f32 = _cutlass_dtype(torch.float32)
-        s = [cute.sym_int() for _ in range(13)]
-        # K/V are 3D flat or 4D paged (num_pages, Hkv, _BLK_KV, d).
-        kv_shape = (s[9], s[10], _BLK_KV, head_dim) if paged else (s[2], s[3], head_dim)
+        s = [cute.sym_int() for _ in range(15)]
+        kv_last = k_pass.shape[-1]  # head_dim (bf16/fp8) or 16 int32 words (NVFP4)
+        # K/V are 3D flat or 4D paged (num_pages, Hkv, _BLK_KV, kv_last).
+        kv_shape = (s[9], s[10], _BLK_KV, kv_last) if paged else (s[2], s[3], kv_last)
         kernel_obj = SparseAttentionUnionFwdSm12x(
             head_dim=head_dim,
             m_block_size=m_block,
@@ -731,12 +760,15 @@ def _msa_sparse_attention_union(
             return_softmax_lse=True,
             paged=paged,
             kv_fp8=kv_fp8,
+            kv_nvfp4=kv_nvfp4,
         )
         compiled = cute.compile(
             kernel_obj,
             _fake(cdt, (s[0], s[1], head_dim)),
             _fake(kdt, kv_shape),
             _fake(kdt, kv_shape),
+            _fake(u8, (s[13],), align=4),
+            _fake(u8, (s[14],), align=4),
             _fake(cdt, (s[0], s[1], head_dim)),
             _fake(f32, (s[1], s[0]), align=4),
             _fake(i32, (s[6], s[7]), align=4),
@@ -749,6 +781,7 @@ def _msa_sparse_attention_union(
             _fake(i32, (s[5],), align=4),
             _fake(i32, (s[11], s[12]), align=4),
             cutlass.Float32(1.0),
+            cutlass.Float32(1.0),
             cutlass.Int32(1),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
@@ -758,8 +791,10 @@ def _msa_sparse_attention_union(
     wc = torch.tensor([n], dtype=torch.int32, device=dev)
     compiled(
         q,
-        k,
-        v,
+        k_pass,
+        v_pass,
+        ksf_dev,
+        vsf_dev,
         out,
         lse2,
         ub,
@@ -772,6 +807,7 @@ def _msa_sparse_attention_union(
         qoff_dev,
         page_table_arg,
         float(softmax_scale),
+        float(out_scale),
         int(n),
     )
     if return_softmax_lse:

@@ -334,3 +334,96 @@ def test_union_fp8_kv_matches_split(B, S, causal):
     torch.cuda.synchronize()
     assert union.shape == (B * S, Hq, hd)
     assert (union.float() - split.float()).abs().max().item() < 5e-3
+
+
+def _nvfp4_quant(x2d):
+    from flashinfer import nvfp4_quantize
+
+    gsf = (448.0 * 6.0) / x2d.float().abs().max()
+    xq, sf = nvfp4_quantize(x2d, gsf.to(x2d.device), sf_vec_size=16)
+    return xq.view(torch.uint8), sf.view(torch.uint8), float(1.0 / gsf)
+
+
+@pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
+@pytest.mark.parametrize("causal", [True, False])
+def test_union_nvfp4_kv_matches_split(B, S, causal):
+    """union=True with NVFP4 K/V (dequant-on-load) matches the KV-major split path
+    on the same packed inputs. K's global scale folds into softmax_scale; V's is
+    applied as the union output scale (the split path applies it in combine)."""
+    _skip()
+    from flashinfer.msa_ops import msa_sparse_attention
+
+    dev = "cuda"
+    Hq, Hkv, topk, hd = 64, 4, 16, 128
+    scale = 1.0 / math.sqrt(hd)
+    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    torch.manual_seed(23)
+    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=7)
+    kq, ksf, kg = _nvfp4_quant(k.reshape(-1, hd))
+    vq, vsf, vg = _nvfp4_quant(v.reshape(-1, hd))
+    kq = kq.reshape(B * S, Hkv, hd // 2)
+    vq = vq.reshape(B * S, Hkv, hd // 2)
+    kw = dict(
+        causal=causal,
+        softmax_scale=scale,
+        k_scale=ksf,
+        v_scale=vsf,
+        k_global_scale=kg,
+        v_global_scale=vg,
+    )
+    split = msa_sparse_attention(q, kq, vq, q2k, cu, cu, **kw)
+    union = msa_sparse_attention(q, kq, vq, q2k, cu, cu, union=True, **kw)
+    torch.cuda.synchronize()
+    assert union.shape == (B * S, Hq, hd)
+    assert (union.float() - split.float()).abs().max().item() < 5e-3
+
+
+@pytest.mark.parametrize("quant", ["fp8", "nvfp4"])
+def test_union_paged_quant_matches_split(quant):
+    """Paged-KV union with fp8 / NVFP4 K/V matches the KV-major split path. The
+    paged dequant only changes the K/V block address (page table) and the SF row
+    base; the NVFP4 paged SF lands in (page, head, token) order, which is exactly
+    what quantizing the paged cache reshaped to (-1, head_dim) produces."""
+    _skip()
+    from flashinfer.msa_ops import msa_sparse_attention
+
+    dev = "cuda"
+    B, S, Hq, Hkv, topk, hd = 1, 1024, 64, 4, 16, 128
+    scale = 1.0 / math.sqrt(hd)
+    cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
+    torch.manual_seed(31)
+    q = torch.randn(B * S, Hq, hd, dtype=torch.bfloat16, device=dev) / 3
+    k = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    v = torch.randn(B * S, Hkv, hd, dtype=torch.bfloat16, device=dev) / 3
+    q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=9)
+    npages = S // BLK
+    perm = torch.randperm(npages)
+    ptab = torch.full((B, npages), -1, dtype=torch.int32, device=dev)
+    seqused = torch.tensor([S] * B, dtype=torch.int32, device=dev)
+    # relay flat K/V into a permuted paged bf16 cache (one 128-token page per block)
+    kpg = torch.zeros(npages, Hkv, BLK, hd, dtype=torch.bfloat16, device=dev)
+    vpg = torch.zeros_like(kpg)
+    for blk in range(npages):
+        pg = int(perm[blk])
+        ptab[0, blk] = pg
+        rows = slice(blk * BLK, (blk + 1) * BLK)
+        kpg[pg] = k[rows].transpose(0, 1)
+        vpg[pg] = v[rows].transpose(0, 1)
+    pkw = dict(page_table=ptab, seqused_k=seqused, causal=True, softmax_scale=scale)
+    if quant == "fp8":
+        k_in = kpg.to(torch.float8_e4m3fn).contiguous()
+        v_in = vpg.to(torch.float8_e4m3fn).contiguous()
+    else:
+        kq, ksf, kg = _nvfp4_quant(kpg.reshape(-1, hd))
+        vq, vsf, vg = _nvfp4_quant(vpg.reshape(-1, hd))
+        k_in = kq.reshape(npages, Hkv, BLK, hd // 2)
+        v_in = vq.reshape(npages, Hkv, BLK, hd // 2)
+        pkw.update(k_scale=ksf, v_scale=vsf, k_global_scale=kg, v_global_scale=vg)
+    split = msa_sparse_attention(q, k_in, v_in, q2k, cu, **pkw)
+    union = msa_sparse_attention(q, k_in, v_in, q2k, cu, union=True, **pkw)
+    torch.cuda.synchronize()
+    assert union.shape == (B * S, Hq, hd)
+    assert (union.float() - split.float()).abs().max().item() < 5e-3

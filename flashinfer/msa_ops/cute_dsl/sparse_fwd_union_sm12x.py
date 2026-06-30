@@ -158,11 +158,112 @@ class SparseAttentionUnionFwdSm12x:
                 cute.autovec_copy(cvt_frag, sV_chunk)
 
     @cute.jit
+    def _load_kv_nvfp4(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mKSf: cute.Tensor,
+        mVSf: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        mPageTable: cute.Tensor,
+        batch_idx: cutlass.Int32,
+        kv_head: cutlass.Int32,
+        k_start: cutlass.Int32,
+        kv_block: cutlass.Int32,
+        seqlen_k: cutlass.Int32,
+        tidx: cutlass.Int32,
+    ):
+        """Dequant-on-load NVFP4 K/V: packed e2m1 (one int32 word = 8 values) x
+        e4m3 block scale (cuBLAS 128x4 tiled, 1 scale / 16 elements) -> compute
+        dtype -> swizzled SMEM. K's global scale is pre-folded into softmax_scale
+        on the host; V's global scale is applied to the output via ``out_scale``
+        (the union has no combine kernel to carry it). Mirrors the KV-major
+        ``sparse_fwd_sm12x`` NVFP4 load. mK/mV are int32 views (8 e2m1 / word)."""
+        from ...fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import (
+            cvt_e4m3_to_f32_via_f16,
+            fp4_decode_4bytes,
+        )
+
+        if cutlass.const_expr(self._paged):
+            page = mPageTable[batch_idx, kv_block]
+            mK_h4 = mK[page, kv_head, None, None]
+            mV_h4 = mV[page, kv_head, None, None]
+            row_off4 = cutlass.Int32(0)
+            # scale rows flatten (page, head, token)
+            sf_row_base = (page * mK.shape[1] + kv_head) * self._n_block_size
+            sf_row_stride = cutlass.Int32(1)
+        else:
+            mK_h4 = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
+            mV_h4 = cute.domain_offset((k_start, 0), mV[None, kv_head, None])
+            row_off4 = kv_block * self._n_block_size
+            # scale rows flatten (token, head)
+            sf_row_base = (k_start + kv_block * self._n_block_size) * mK.shape[
+                1
+            ] + kv_head
+            sf_row_stride = mK.shape[1]
+        kv_chunks_per_row = self._head_dim // 8
+        kv_total_chunks = self._n_block_size * kv_chunks_per_row
+        sf_tiles_n = (self._head_dim // 16 + 3) // 4
+        cvt_frag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
+        pair_frag = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Uint32)
+        pair_f16 = cute.make_tensor(
+            cute.recast_ptr(pair_frag.iterator, dtype=cutlass.Float16),
+            cute.make_layout(8),
+        )
+        for kv_it in cutlass.range_constexpr(kv_total_chunks // self._num_threads):
+            kv_chunk = tidx + kv_it * self._num_threads
+            kv_m = kv_chunk // kv_chunks_per_row
+            kv_c8 = kv_chunk % kv_chunks_per_row
+            sK_chunk = cute.local_tile(sK[kv_m, None], (8,), (kv_c8,))
+            sV_chunk = cute.local_tile(sV[kv_m, None], (8,), (kv_c8,))
+            if (kv_block * self._n_block_size + kv_m) < seqlen_k:
+                # cuBLAS/cuDNN 128x4 tiled scale offset (an 8-elem chunk never
+                # crosses a 16-elem scale block)
+                srow = sf_row_base + kv_m * sf_row_stride
+                scol = kv_c8 // 2
+                srow_in = srow % 128
+                sf_off = (
+                    ((srow // 128) * sf_tiles_n + scol // 4) * 512
+                    + (srow_in % 32) * 16
+                    + (srow_in // 32) * 4
+                    + scol % 4
+                )
+                k_word = mK_h4[row_off4 + kv_m, kv_c8]
+                kp0, kp1, kp2, kp3 = fp4_decode_4bytes(cutlass.Uint32(k_word))
+                pair_frag[0] = kp0
+                pair_frag[1] = kp1
+                pair_frag[2] = kp2
+                pair_frag[3] = kp3
+                k_sc = cvt_e4m3_to_f32_via_f16(cutlass.Uint32(mKSf[sf_off]))
+                cvt_frag.store(
+                    (pair_f16.load().to(cutlass.Float32) * k_sc).to(self._dtype)
+                )
+                cute.autovec_copy(cvt_frag, sK_chunk)
+                v_word = mV_h4[row_off4 + kv_m, kv_c8]
+                vp0, vp1, vp2, vp3 = fp4_decode_4bytes(cutlass.Uint32(v_word))
+                pair_frag[0] = vp0
+                pair_frag[1] = vp1
+                pair_frag[2] = vp2
+                pair_frag[3] = vp3
+                v_sc = cvt_e4m3_to_f32_via_f16(cutlass.Uint32(mVSf[sf_off]))
+                cvt_frag.store(
+                    (pair_f16.load().to(cutlass.Float32) * v_sc).to(self._dtype)
+                )
+                cute.autovec_copy(cvt_frag, sV_chunk)
+            else:
+                cvt_frag.fill(0)
+                cute.autovec_copy(cvt_frag, sK_chunk)
+                cute.autovec_copy(cvt_frag, sV_chunk)
+
+    @cute.jit
     def __call__(
         self,
         mQ: cute.Tensor,  # (total_q, Hq, d)
         mK: cute.Tensor,  # (total_k, Hkv, d) flat | (num_pages, Hkv, 128, d) paged
         mV: cute.Tensor,  # (total_k, Hkv, d) flat | (num_pages, Hkv, 128, d) paged
+        mKSf: cute.Tensor,  # nvfp4: K block scales (flat uint8 128x4); dummy (1,) else
+        mVSf: cute.Tensor,  # nvfp4: V block scales (flat uint8 128x4); dummy (1,) else
         mO: cute.Tensor,  # (total_q, Hq, d) final output
         mLse: cute.Tensor,  # (Hq, total_q) f32 LSE (dummy (1,1) if off)
         mUnionBlocks: cute.Tensor,  # (capacity, max_union) int32 kv-block ids
@@ -174,7 +275,8 @@ class SparseAttentionUnionFwdSm12x:
         mCuK: cute.Tensor,  # (B + 1,) int32 (paged: cumsum of seqused_k)
         mQOffset: cute.Tensor,  # (B,) int32 causal offset (MSA q_offset)
         mPageTable: cute.Tensor,  # (B, max_pages) int32 (dummy (1,1) if flat)
-        softmax_scale: cutlass.Float32,
+        softmax_scale: cutlass.Float32,  # nvfp4: K global scale pre-folded by host
+        out_scale: cutlass.Float32,  # nvfp4: V global scale (1.0 otherwise); no combine
         work_capacity: cutlass.Int32,
         stream: cuda.CUstream,
     ):
@@ -247,6 +349,8 @@ class SparseAttentionUnionFwdSm12x:
             mQ,
             mK,
             mV,
+            mKSf,
+            mVSf,
             mO,
             mLse,
             mUnionBlocks,
@@ -259,6 +363,7 @@ class SparseAttentionUnionFwdSm12x:
             mQOffset,
             mPageTable,
             softmax_scale_log2,
+            out_scale,
             sQ_layout,
             gmem_tiled_copy_KV,
             tiled_mma,
@@ -275,6 +380,8 @@ class SparseAttentionUnionFwdSm12x:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mKSf: cute.Tensor,
+        mVSf: cute.Tensor,
         mO: cute.Tensor,
         mLse: cute.Tensor,
         mUnionBlocks: cute.Tensor,
@@ -287,6 +394,7 @@ class SparseAttentionUnionFwdSm12x:
         mQOffset: cute.Tensor,
         mPageTable: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
+        out_scale: cutlass.Float32,
         sQ_layout: cute.Layout,
         gmem_tiled_copy_KV: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
@@ -450,6 +558,23 @@ class SparseAttentionUnionFwdSm12x:
                         seqlen_k,
                         tidx,
                     )
+                elif cutlass.const_expr(self._kv_nvfp4):
+                    # dequant-on-load NVFP4 K/V (synchronous; no cp.async group)
+                    self._load_kv_nvfp4(
+                        mK,
+                        mV,
+                        mKSf,
+                        mVSf,
+                        sK,
+                        sV,
+                        mPageTable,
+                        batch_idx,
+                        kv_head,
+                        k_start,
+                        kv_block,
+                        seqlen_k,
+                        tidx,
+                    )
                 else:
                     # bf16/fp16: cp.async load. paged remaps the block through the
                     # page table (block coord 0); flat reuses the batch tile.
@@ -601,9 +726,12 @@ class SparseAttentionUnionFwdSm12x:
                     inv = 0.0 if (rs == 0.0 or rs != rs) else cute.arch.rcp_approx(rs)
                     q_global = q_start + q_loc
                     hq = kv_head * G + g
+                    # out_scale folds the NVFP4 V global scale (the split path's
+                    # combine applies it; the union writes the output directly). It
+                    # is 1.0 for bf16/fp16/fp8, so this is a no-op off the NVFP4 path.
                     for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                         d_pos = tScS_mn[0, c][1]
-                        mO[q_global, hq, d_pos] = (acc_O_mn[r, c] * inv).to(
+                        mO[q_global, hq, d_pos] = (acc_O_mn[r, c] * inv * out_scale).to(
                             mO.element_type
                         )
                     if cutlass.const_expr(self._return_softmax_lse):
