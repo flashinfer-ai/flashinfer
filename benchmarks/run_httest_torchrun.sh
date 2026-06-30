@@ -49,7 +49,8 @@ fi
 export NCCL_EP_JIT_SOURCE_DIR="$WHEEL_EP/include/nccl_ep"
 export NCCL_EP_JIT_BUILD_INCLUDE_DIR="$JIT_INC"
 export NCCL_EP_JIT_CUDA_INCLUDE_DIR="${CUDA_HOME:-/usr/local/cuda}/include"
-export NCCL_EP_JIT_NVCC="$(command -v nvcc)"
+NVCC="$(command -v nvcc)" || { echo "ERROR: nvcc not found on PATH (needed for the HT JIT)" >&2; exit 1; }
+export NCCL_EP_JIT_NVCC="$NVCC"
 export NCCL_EP_JIT_CACHE_DIR="/host/jitcache"; mkdir -p /host/jitcache 2>/dev/null
 
 # torchrun spawns the 8 ranks and sets RANK/WORLD_SIZE/LOCAL_RANK + the rendezvous;

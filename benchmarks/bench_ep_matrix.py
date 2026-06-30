@@ -223,6 +223,12 @@ def main() -> int:
             p = _comb_params.get("p")
             if p is None:
                 p = _comb_params["p"] = CombineInputParams(x=[cin], out=out_buf)
+            else:
+                # Reuse the wrapper object but refresh its input with THIS iter's
+                # dispatch output — `cin` is a fresh tensor each call (a new recv
+                # buffer without the fast path, or a per-iter clone under
+                # EP_SEPARATE_COMBINE_BUF=1); combining the cached `cin` would be stale.
+                p.x[0] = cin
             handle.combine(p)
         else:
             handle.combine(CombineInputParams(x=[cin], out=out_buf))

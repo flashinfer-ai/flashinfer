@@ -168,7 +168,7 @@ class NcclEpHandle(Handle):
         # per-source-rank token counts [world].
         recv_count_len = world_size if self._is_rank_major else self._num_local_experts
         self._recv_count_t = torch.zeros(
-            recv_count_len, dtype=torch.int32, device="cuda"
+            recv_count_len, dtype=torch.int32, device=topk_idx.device
         )
 
         if self._is_ht:
