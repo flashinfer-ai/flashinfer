@@ -9,6 +9,19 @@ import torch
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
+
+def _patch_cutlass_dsl_operand_major_mode():
+    try:
+        import cutlass.cute as cute
+        from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+    except ImportError:
+        return
+    if not hasattr(cute.nvgpu, "OperandMajorMode"):
+        cute.nvgpu.OperandMajorMode = OperandMajorMode
+
+
+_patch_cutlass_dsl_operand_major_mode()
+
 import flashinfer
 from flashinfer.jit import MissingJITCacheError
 

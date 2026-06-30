@@ -363,6 +363,34 @@ def _tgv_gemm_requirement(
 
 
 @supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _cutile_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal[
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
+    ] = "cudnn",
+):
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "The cuTile backend supports bfloat16 / float16 / float32 output only; "
+            f"got {out_dtype}."
+        )
+    if bias is not None:
+        raise ValueError(
+            "The cuTile backend ignores `bias`; pass bias=None or use the TGV / cuDNN backend."
+        )
+    if pdl:
+        raise ValueError(
+            "The cuTile backend ignores `pdl`; pass pdl=False or use the TGV / cuDNN backend."
+        )
+    return True
+
+
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
 def _tinygemm_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -480,6 +508,7 @@ def _heuristic_func_mm_bf16(
         "tgv": _tgv_gemm_requirement,
         "cublaslt": _cublaslt_mm_bf16_requirement,
         "tinygemm": _tinygemm_mm_bf16_requirement,
+        "cutile": _cutile_mm_bf16_requirement,
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
@@ -493,7 +522,7 @@ def mm_bf16(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal[
-        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
+        "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
     ] = "cudnn",
 ) -> torch.Tensor:
     r"""MM BF16
@@ -520,13 +549,16 @@ def mm_bf16(
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
         ``"tgv"`` uses the TGV backend.
         ``"cublaslt"`` uses the cuBLASLt backend with heuristic algorithm search.
         ``"tinygemm"`` uses the TinyGEMM backend for small-M BF16 GEMM.
+        ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
+            persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
+            ``bias`` / ``pdl``. Requires SM >= 90.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -574,6 +606,16 @@ def mm_bf16(
             device=a.device,
             dtype=out_dtype,
         )
+
+    # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
+    # Handled before the SM100 dispatch table because it does not consume
+    # `workspace_buffer` and ignores `bias` / `pdl`.
+    if backend == "cutile":
+        from .kernels.cutile.mm_bf16_cutile import mm_bf16_cutile
+
+        # out_dtype validation already handled by ``_cutile_mm_bf16_requirement``
+        # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
+        return mm_bf16_cutile(a, b, out)
 
     workspace_buffer = _get_cache_buf(
         "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
@@ -632,6 +674,25 @@ def _cudnn_bmm_bf16_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _cutile_bmm_bf16_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
+):
+    # The cuTile ragged-BMM kernel's epilogue uses ``ct.astype(dot_acc, c.dtype)``,
+    # so the store dtype is whatever the caller passes in. We accept the three
+    # standard output dtypes used by upstream FlashInfer.
+    if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "The cuTile backend supports bfloat16 / float16 / float32 output only "
+            f"for bmm_bf16; got {out_dtype}."
+        )
+    return True
+
+
 def _check_bmm_bf16_problem_size(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -686,6 +747,7 @@ def _heuristic_func_bmm_bf16(
     {
         "cutlass": _cutlass_bmm_bf16_requirement,
         "cudnn": _cudnn_bmm_bf16_requirement,
+        "cutile": _cutile_bmm_bf16_requirement,
     },
     common_check=_check_bmm_bf16_problem_size,
     heuristic_func=_heuristic_func_bmm_bf16,
@@ -696,7 +758,7 @@ def bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
 ) -> torch.Tensor:
     r"""BMM BF16
 
@@ -750,6 +812,16 @@ def bmm_bf16(
             device=A.device,
             dtype=out_dtype,
         )
+
+    # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
+    # Handled before the SM100 dispatch table because it does not consume
+    # `workspace_buffer`.
+    if backend == "cutile":
+        from .kernels.cutile.bmm_bf16_cutile import bmm_bf16_cutile
+
+        # out_dtype validation already handled by ``_cutile_bmm_bf16_requirement``
+        # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
+        return bmm_bf16_cutile(A, B, out)
 
     workspace_buffer = _get_cache_buf(
         "bmm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, A.device
@@ -4333,29 +4405,6 @@ _SM100_DEFAULT_MMA_TILER_MN = (128, 128)
 _SM100_DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
 
 
-def _select_default_sm120_mma_tiler(m, n, sm_count):
-    """Select optimal SM120 tile shape based on problem size and SM count.
-
-    Uses narrower tiles (64x64, 64x128, 128x64) when the default 128x128
-    would leave SMs idle on small-M shapes.
-    """
-    coarse_tile = (128, 128)
-    coarse_tiles = ((m + coarse_tile[0] - 1) // coarse_tile[0]) * (
-        (n + coarse_tile[1] - 1) // coarse_tile[1]
-    )
-    if m <= 128 and coarse_tiles < max(1, sm_count // 2):
-        if n > 1536:
-            return (64, 128)
-        medium_tile = (128, 64)
-        medium_tiles = ((m + medium_tile[0] - 1) // medium_tile[0]) * (
-            (n + medium_tile[1] - 1) // medium_tile[1]
-        )
-        if medium_tiles < max(1, sm_count // 2):
-            return (64, 64)
-        return (128, 64)
-    return (128, 128)
-
-
 def _get_approximate_cta_nums(m, n, tile_mn, cluster_shape_mn):
     tile_m, tile_n = tile_mn
     cluster_m, cluster_n = cluster_shape_mn
@@ -4384,16 +4433,13 @@ def _get_sm100_block_scaled_tactics(
     )
 
     batch_size = 1
-    m_aligned = m % 8 == 0
     n_aligned = n % 8 == 0
 
     valid_tactics = []
     for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
         for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
             for swap_ab in (False, True):
-                if not swap_ab and not n_aligned:
-                    continue
-                if swap_ab and not m_aligned:
+                if not n_aligned:
                     continue
 
                 if swap_ab:
@@ -5442,7 +5488,7 @@ def _cutlass_gemm_fp4_requirement(
 @supported_compute_capability([100, 103])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
-    b: torch.Tensor,  # unused
+    b: torch.Tensor,
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
     alpha: Optional[torch.Tensor] = None,  # unused
@@ -5450,9 +5496,7 @@ def _cute_dsl_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -5462,13 +5506,18 @@ def _cute_dsl_gemm_fp4_requirement(
     # preparation for 128x4 layout.
     if use_8x4_sf_layout:
         raise ValueError("cute_dsl FP4 GEMM only supports 128x4 scale factor layout.")
+    # N must be 8-aligned; raise only for explicit cute-dsl (never auto-selected).
+    if b.shape[1] % 8 != 0:
+        if backend != "cute-dsl":
+            return False
+        raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={b.shape[1]}")
     _check_cute_dsl_availability()
     return True
 
 
 @supported_compute_capability([120, 121])
 def _b12x_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
+    a: torch.Tensor,
     b: torch.Tensor,  # unused
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
@@ -5493,6 +5542,16 @@ def _b12x_gemm_fp4_requirement(
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
+    # K floor is 32 (TMA assumed_align=16 on K-major packed FP4), not tile_k=128: the
+    # mainloop predicates the partial tile, so ragged K (192) works. Mirror can_implement.
+    real_k = a.shape[1] * 2
+    if real_k % 32 != 0:
+        if backend != "b12x":
+            return False  # let "auto" fall back to cutlass/cudnn
+        raise ValueError(
+            "b12x FP4 GEMM requires the contraction dim K to be a multiple of 32 "
+            f"(TMA 16-byte alignment). Got K={real_k}."
+        )
     _check_cute_dsl_availability()
     return True
 
@@ -5586,15 +5645,7 @@ def _cute_dsl_gemm_fp4_runner(
                 a.device,
             )
 
-            if m == 1:
-                if n <= 1024:
-                    allowed_tiles = {(256, 64)}
-                elif n >= 8192:
-                    allowed_tiles = {(128, 128)}
-                else:
-                    allowed_tiles = {(128, 64)}
-                sm100_base = [t for t in sm100_base if t[0] in allowed_tiles]
-            elif m in (8, 16):
+            if m <= 32:
                 allowed_tiles = {
                     (128, 8),
                     (128, 16),
@@ -5809,6 +5860,7 @@ def _b12x_gemm_fp4_runner(
 
     from .kernels.dense_blockscaled_gemm_sm120_b12x import (
         Sm120B12xBlockScaledDenseGemmKernel,
+        _select_default_dense_gemm_plan,
     )
 
     cutlass_dtype_attr = _TORCH_TO_CUTLASS_DTYPE_ATTR.get(out_dtype)
@@ -5819,6 +5871,11 @@ def _b12x_gemm_fp4_runner(
         raise ValueError(
             f"b12x backend does not support output dtype {out_dtype}. "
             f"Supported: torch.bfloat16, torch.float16."
+        )
+
+    def _default_dense_plan(m, n, real_k, device):
+        return _select_default_dense_gemm_plan(
+            m, n, real_k, get_device_sm_count(device), expected_m=m
         )
 
     class B12xFp4GemmRunner(TunableRunner):
@@ -5846,14 +5903,9 @@ def _b12x_gemm_fp4_runner(
             batch_size = 1
 
             valid_tactics = []
-            sm120_mma_tiler_candidates = [
-                (64, 64),
-                (64, 128),
-                (128, 64),
-                (128, 128),
-            ]
-            swap_ab = False
-            for mma_tiler_mn in sm120_mma_tiler_candidates:
+
+            def _add(mma_tiler_mn, swap_ab):
+                # can_implement is M-independent (takes no `m`)
                 if not Sm120B12xBlockScaledDenseGemmKernel.can_implement(
                     ab_dtype,
                     sf_dtype,
@@ -5861,19 +5913,29 @@ def _b12x_gemm_fp4_runner(
                     c_cutlass_dtype,
                     mma_tiler_mn,
                     (1, 1),
-                    m,
                     n,
                     real_k,
                     batch_size,
                     "k",
                     "k",
                     "n",
+                    swap_ab=swap_ab,
                 ):
-                    continue
+                    return
                 for use_prefetch in (False, True):
-                    valid_tactics.append(
-                        (mma_tiler_mn, (1, 1), swap_ab, use_prefetch, "sm120", None)
-                    )
+                    tac = (mma_tiler_mn, (1, 1), swap_ab, use_prefetch, "sm120", None)
+                    if tac not in valid_tactics:
+                        valid_tactics.append(tac)
+
+            # A few balanced swap_ab-free tiles for the tuner to profile (a larger
+            # grid overfit the bucket representative and made picks noisier).
+            for mma_tiler_mn in [(64, 64), (64, 128), (128, 64), (128, 128)]:
+                _add(mma_tiler_mn, swap_ab=False)
+
+            # Also include the default-path tile (may be a narrow-N swap_ab tile
+            # absent from the set above) so the tuner can't pick worse than static.
+            plan = _default_dense_plan(m, n, real_k, a.device)
+            _add(plan.mma_tiler_mn, swap_ab=plan.swap_ab)
             return valid_tactics
 
         def forward(
@@ -5894,12 +5956,13 @@ def _b12x_gemm_fp4_runner(
             batch_size = 1
 
             if tactic is None or tactic == -1:
+                # Default path: the m-aware plan picks the tile (and swap_ab for
+                # narrow-N) for this shape; expected_m=m since m is the actual size.
+                plan = _default_dense_plan(m, n, real_k, a.device)
                 tactic = (
-                    _select_default_sm120_mma_tiler(
-                        m, n, get_device_sm_count(a.device)
-                    ),
+                    plan.mma_tiler_mn,
                     (1, 1),
-                    False,
+                    plan.swap_ab,
                     False,
                     "sm120",
                     None,
@@ -5914,13 +5977,11 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
             ) = tactic
 
-            # b12x SM120 kernel does not support swap_ab
-            kernel_m, kernel_n = m, n
             kernel_a, kernel_b = a, b.T
             kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
 
-            sf_m = (kernel_m + 127) // 128
-            sf_n = (kernel_n + 127) // 128
+            sf_m = (m + 127) // 128
+            sf_n = (n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
 
             cache_key = (
@@ -5935,14 +5996,20 @@ def _b12x_gemm_fp4_runner(
                 out_dtype,
             )
 
+            # ctor takes mma_k/tile_k/single_work_tile_per_cta before use_prefetch,
+            # so pass the later args by keyword to avoid mis-binding.
             make_kernel = lambda: Sm120B12xBlockScaledDenseGemmKernel(
                 sf_vec_size,
                 mma_tiler_mn,
                 cluster_shape_mn,
-                use_prefetch,
-                enable_pdl,
+                use_prefetch=use_prefetch,
+                enable_pdl=enable_pdl,
+                swap_ab=swap_ab,
             )
 
+            # swap_ab is device-internal (applied in the kernel ctor); public C
+            # stays row-major (m, n). Pass swap_ab=False to the harness so it keeps
+            # the (m, n) output convention, not the SM100 operand-swap one.
             compiled_gemm, _ = _compile_block_scaled_gemm(
                 _B12X_MM_FP4_KERNEL_CACHE,
                 cache_key,
@@ -5952,7 +6019,7 @@ def _b12x_gemm_fp4_runner(
                 c_cutlass_dtype=c_cutlass_dtype,
                 ab_assumed_align=32,
                 cluster_shape_mn=cluster_shape_mn,
-                swap_ab=swap_ab,
+                swap_ab=False,
                 sf_m=sf_m,
                 sf_n=sf_n,
                 sf_k=sf_k,
@@ -5961,6 +6028,7 @@ def _b12x_gemm_fp4_runner(
 
             alpha_for_launch = _prepare_alpha_for_launch(alpha_tensor, a.device)
 
+            # `out` passed as-is (row-major (m, n)).
             compiled_gemm(
                 kernel_a,
                 kernel_b,
@@ -6014,7 +6082,9 @@ def _heuristic_func_mm_fp4(
     is_sm103 = major == 10 and minor == 3
     is_sm120 = major == 12 and minor == 0
 
-    # SM120 + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
+    # SM120 + CUDA 13: prefer b12x. SM121 (GB10) is intentionally excluded -- b12x
+    # is supported there as an explicit backend, but cutlass/cudnn are faster in
+    # most cases, so `auto` keeps using them.
     if is_sm120 and use_nvfp4 and cuda_major >= 13:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
@@ -6055,6 +6125,8 @@ def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
 
 
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -6084,6 +6156,8 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
 
 
 _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -6564,10 +6638,40 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     return True
 
 
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutile_gemm_fp8_nt_groupwise_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
+    mma_sm: int = 1,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
+):
+    # v1 supports only K-major scales + (1, 128, 128) granularity.
+    # MN-major and other granularities are documented follow-ups.
+    if scale_major_mode not in (None, "K"):
+        raise ValueError(
+            f"The cuTile backend currently supports scale_major_mode='K' only; "
+            f"got {scale_major_mode!r}."
+        )
+    m_g, n_g, k_g = scale_granularity_mnk
+    if m_g != 1 or (n_g, k_g) != (128, 128):
+        raise ValueError(
+            f"The cuTile backend currently supports scale_granularity_mnk=(1, 128, 128) only; "
+            f"got {scale_granularity_mnk}."
+        )
+    return True
+
+
 @backend_requirement(
     {
         "cutlass": _cutlass_gemm_fp8_nt_groupwise_requirement,
         "trtllm": _trtllm_gemm_fp8_nt_groupwise_requirement,
+        "cutile": _cutile_gemm_fp8_nt_groupwise_requirement,
     },
     common_check=_check_gemm_fp8_nt_groupwise_problem_size,
 )
@@ -6582,7 +6686,7 @@ def gemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["cutlass", "trtllm"] = "cutlass",
+    backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
 ) -> torch.Tensor:
     r"""Performs matrix multiplication with FP8 data types using groupwise scaling.
 
@@ -6633,8 +6737,16 @@ def gemm_fp8_nt_groupwise(
         If out is not specified, we will create an output tensor with this dtype.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "trtllm"]
+    backend: Literal["cutlass", "trtllm", "cutile"]
         The backend to use for the operation. Defaults to ``"cutlass"``.
+
+        ``"cutile"`` (sm_100 / sm_103 / sm_110 / sm_120 / sm_121) is a pure
+        ``cuda.tile`` Python kernel. v1 restrictions enforced by
+        ``_cutile_gemm_fp8_nt_groupwise_requirement``: ``scale_major_mode``
+        must be ``"K"`` (or ``None``), and ``scale_granularity_mnk`` must be
+        ``(1, 128, 128)``. ``out_dtype`` is restricted to bfloat16 / float16
+        (the function-level ``_validate_fp8_output_dtype`` rejects fp32 for
+        all FP8 backends).
 
     Returns
     -------
@@ -6710,6 +6822,20 @@ def gemm_fp8_nt_groupwise(
             out,
             False,
             -1,
+        )
+    elif backend == "cutile":
+        from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import (
+            gemm_fp8_nt_groupwise_cutile,
+        )
+
+        gemm_fp8_nt_groupwise_cutile(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            out,
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode or "K",
         )
 
     return out
@@ -6995,6 +7121,7 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["trtllm", "cutile"] = "trtllm",
 ):
     if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(f"a must be a float8 tensor, but got {a.dtype}")
@@ -7068,6 +7195,7 @@ def group_gemm_fp8_nt_groupwise(
     mma_sm: int = 1,
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["trtllm", "cutile"] = "trtllm",
 ) -> torch.Tensor:
     r"""Perform group GEMM with FP8 data types using groupwise scaling. Currently only supported on NVIDIA
     Blackwell architecture.
@@ -7111,6 +7239,11 @@ def group_gemm_fp8_nt_groupwise(
     out_dtype: Optional[torch.dtype]
         The data type of the output tensor, must be ``torch.bfloat16`` or ``torch.float16``.
 
+    backend: Literal["trtllm", "cutile"]
+        Backend implementation to use.  ``"trtllm"`` uses the TensorRT-LLM
+        grouped GEMM kernel; ``"cutile"`` uses the cuTile Python kernel.
+        Defaults to ``"trtllm"``.
+
     Returns
     -------
     out: torch.Tensor
@@ -7141,6 +7274,25 @@ def group_gemm_fp8_nt_groupwise(
     out_shape = (a.shape[0], n)
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
+
+    # cuTile backend: pure cuda.tile Python kernel. Iterates over groups and
+    # dispatches the existing ``gemm_fp8_nt_groupwise_cutile`` per group.
+    # Constraints are checked by ``_cutile_group_gemm_fp8_nt_groupwise_requirement``.
+    if backend == "cutile":
+        from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import (
+            group_gemm_fp8_nt_groupwise_cutile,
+        )
+
+        return group_gemm_fp8_nt_groupwise_cutile(
+            a=a,
+            b=b,
+            a_scale=a_scale,
+            b_scale=b_scale,
+            m_indptr=m_indptr,
+            out=out,
+            scale_granularity_mnk=scale_granularity_mnk,
+            scale_major_mode=scale_major_mode or "K",
+        )
 
     if is_sm12x_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter
