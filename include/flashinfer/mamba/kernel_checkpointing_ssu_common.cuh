@@ -1504,16 +1504,26 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
       convert_frag<BTypeIn, MmaT>(frag_B_stg[n][slot], frag_B[n][slot]);
     }
   };
-  auto compute_one = [&](int slot) {
-    CUTE_UNROLL
-    for (int n = 0; n < NumNTiles; ++n) {
-      cute::gemm(tiled_mma, *frag_y_p[n], frag_A[slot], frag_B[n][slot], *frag_y_p[n]);
-    }
-  };
+  // ── 2-way accumulator split (C@state, ≥2 k-tiles) ──
+  // frag_y += A[k]@B[k] is a serial chain: HMMA[k] reads HMMA[k-1]'s frag_y.
+  // Routing odd-k tiles into a second accumulator gives two independent chains → 2
+  // HMMAs in flight, filling the tensor pipe (otherwise ~10% utilized) via per-warp
+  // ILP — needed because occupancy is only ~0.95 eligible warps/cycle, too low to
+  // hide HMMA latency across warps.  Reduced into frag_y_p after the loop.  Single-
+  // k-tile matmuls have no chain to break.
+#if defined(SSU_NO_ACC_SPLIT)
+  constexpr bool kSplitAcc = false;  // A/B switch: -DSSU_NO_ACC_SPLIT keeps one accumulator
+#else
+  constexpr bool kSplitAcc = (NumKTiles >= 2);
+#endif
+  FragY0 acc2[NumNTiles];
 
   // ── Clear accumulators ──
   CUTE_UNROLL
-  for (int n = 0; n < NumNTiles; ++n) clear(*frag_y_p[n]);
+  for (int n = 0; n < NumNTiles; ++n) {
+    clear(*frag_y_p[n]);
+    if constexpr (kSplitAcc) clear(acc2[n]);
+  }
 
   // ── Prologue: load + convert stages 0..NumStages-2 ──
   CUTE_UNROLL
@@ -1529,8 +1539,31 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
     int const slot_load = k_load % NumStages;
     int const slot_compute = k % NumStages;
     if (k_load < NumKTiles) load_one(k_load, slot_load);
-    compute_one(slot_compute);
+    CUTE_UNROLL
+    for (int n = 0; n < NumNTiles; ++n) {
+      if constexpr (kSplitAcc) {
+        // (k & 1) folds at compile time (loop fully unrolled) → one static
+        // accumulator per tile; even→frag_y, odd→acc2 are independent chains.
+        if (k & 1)
+          cute::gemm(tiled_mma, acc2[n], frag_A[slot_compute], frag_B[n][slot_compute], acc2[n]);
+        else
+          cute::gemm(tiled_mma, *frag_y_p[n], frag_A[slot_compute], frag_B[n][slot_compute],
+                     *frag_y_p[n]);
+      } else {
+        cute::gemm(tiled_mma, *frag_y_p[n], frag_A[slot_compute], frag_B[n][slot_compute],
+                   *frag_y_p[n]);
+      }
+    }
     if (k_load < NumKTiles) convert_one(slot_load);
+  }
+
+  // ── Reduce the odd-k accumulator into frag_y_p ──
+  if constexpr (kSplitAcc) {
+    CUTE_UNROLL
+    for (int n = 0; n < NumNTiles; ++n) {
+      CUTE_UNROLL
+      for (int i = 0; i < cute::size(*frag_y_p[n]); ++i) (*frag_y_p[n])(i) += acc2[n](i);
+    }
   }
 }
 
