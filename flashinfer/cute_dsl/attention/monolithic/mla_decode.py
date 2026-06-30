@@ -131,6 +131,7 @@ def _get_compiled_mla_kernel(
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
     enable_pdl: bool = False,
+    causal: bool = True,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -181,6 +182,7 @@ def _get_compiled_mla_kernel(
         num_heads=num_heads,
         seq_len_q=seq_len_q,
         fold_sq=fold_sq,
+        causal=causal,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -322,6 +324,7 @@ def cute_dsl_mla_decode(
     enable_pdl: Optional[bool] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    causal: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -380,6 +383,15 @@ def cute_dsl_mla_decode(
         Whether to return LSE values.  When True, the function returns
         ``(out, lse)`` (the ``lse`` tensor returned is in whatever shape
         the caller supplied; if no ``lse`` was supplied, ``[B, q_len, H]``).
+    causal : bool, default=True
+        Controls the per-row spec-decoding (MTP) causal mask among the
+        ``q_len`` query tokens (monolithic kernel only). When True (default),
+        row ``q_tok`` attends KV positions ``< K - (q_len - 1) + q_tok`` — the
+        MTP/chain behavior, unchanged for existing callers. When False, every
+        query attends the full sequence (``k_bound = K``); this is the
+        non-causal shared-prefix pass EAGLE tree-verify needs so all draft
+        tokens see the entire prefix (the tree structure among draft tokens is
+        applied separately by the caller).
 
     Returns
     -------
@@ -521,6 +533,7 @@ def cute_dsl_mla_decode(
         skip_correction_threshold=skip_correction_threshold,
         is_workspace_size_zero=is_workspace_size_zero,
         enable_pdl=enable_pdl,
+        causal=causal,
     )
 
     # Call the kernel

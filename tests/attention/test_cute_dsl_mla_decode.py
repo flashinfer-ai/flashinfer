@@ -374,6 +374,88 @@ def test_cute_dsl_mla_decode_fold_sq(
         torch.testing.assert_close(out, ref_out_cast, atol=1e-2, rtol=1e-2)
 
 
+# Exercises the NON-causal (causal=False) path: every q_len query attends the FULL
+# seq_len (no MTP causal k_bound) -- the shared-prefix pass EAGLE tree-verify needs so
+# all draft tokens see the whole prefix. causal=True (default) is the MTP-masked path
+# covered by test_cute_dsl_mla_decode_fold_sq; this verifies the toggle flips the mask.
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len_k", [128, 1024])
+@pytest.mark.parametrize("num_heads", [16, 64])
+@pytest.mark.parametrize("q_len", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float8_e4m3fn])
+def test_cute_dsl_mla_decode_noncausal(
+    batch_size, seq_len_k, num_heads, q_len, dtype, cute_dsl_impl
+):
+    """causal=False: all q_len queries attend the full prefix (no MTP causal mask)."""
+    if cute_dsl_impl != "monolithic":
+        pytest.skip("causal toggle / MTP mask are monolithic-only features")
+    skip_if_unsupported()
+
+    from flashinfer.cute_dsl.attention import cute_dsl_mla_decode
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    page_size = 64
+    latent_dim = 512
+    rope_dim = 64
+    softmax_scale = 1.0 / (latent_dim**0.5)
+    output_scale = 1.0
+    D_qk = latent_dim + rope_dim
+    is_fp8 = dtype == torch.float8_e4m3fn
+
+    def _rand(*shape):
+        t = torch.randn(*shape, dtype=torch.float16, device=device) * 0.1
+        return t.to(torch.float8_e4m3fn) if is_fp8 else t.to(dtype)
+
+    query = _rand(batch_size, q_len, num_heads, D_qk)
+    num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
+    total_pages = num_pages_per_batch * batch_size + 10
+    kv_cache = _rand(total_pages, page_size, D_qk)
+
+    block_tables = torch.zeros(
+        batch_size, num_pages_per_batch, dtype=torch.int32, device=device
+    )
+    for b in range(batch_size):
+        for p in range(num_pages_per_batch):
+            block_tables[b, p] = b * num_pages_per_batch + p
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    out = cute_dsl_mla_decode(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace_buffer,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=seq_len_k,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+        is_var_seq=False,
+        causal=False,  # <-- the new toggle under test
+        cute_dsl_impl=cute_dsl_impl,
+    )
+
+    cast = torch.float32 if is_fp8 else None
+    kv_flat = kv_cache.reshape(-1, D_qk)
+    kv_flat = kv_flat.to(cast) if cast is not None else kv_flat
+    q_nope = query[..., :latent_dim].to(cast) if cast is not None else query[..., :latent_dim]
+    q_rope = query[..., latent_dim:].to(cast) if cast is not None else query[..., latent_dim:]
+    ref_out = torch_reference_mla(
+        q_nope, q_rope, kv_flat[:, :latent_dim], kv_flat[:, latent_dim:],
+        block_tables, seq_lens, softmax_scale, output_scale, page_size,
+        apply_mtp_mask=False,  # non-causal reference: every query sees the full prefix
+    )
+
+    if is_fp8:
+        torch.testing.assert_close(
+            out.to(torch.float32), ref_out.to(torch.float32), atol=0.1, rtol=0.1
+        )
+    else:
+        torch.testing.assert_close(out, ref_out.to(dtype), atol=1e-2, rtol=1e-2)
+
+
 def test_compute_fold_sq_ratio():
     """Unit test the static helper used by both run() and the wrapper."""
     if not is_cute_dsl_available():
