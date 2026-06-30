@@ -1098,7 +1098,7 @@ def test_msa_proxy_score_paged_fp8():
 
 def test_e2e_full_pipeline_from_raw_tensors():
     """The complete MSA pipeline natively on SM12x: proxy scores -> top-k
-    selection -> CSR schedule -> KV-major sparse forward."""
+    selection -> union-tile sparse prefill."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import (
         msa_proxy_score,
