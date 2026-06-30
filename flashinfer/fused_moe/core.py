@@ -1235,6 +1235,7 @@ def get_trtllm_moe_sm100_module():
                     shapes, dtype=dtype, device=device
                 )
             if moe_inputs.hidden_states_scale is not None:
+
                 def _init_hidden_states_scale(shapes, dtype, device):
                     rows = shapes[0]
                     buf = torch.ones(
