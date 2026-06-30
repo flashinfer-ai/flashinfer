@@ -409,6 +409,9 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
                        bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
                        Optional<TensorView> outputScales, double outputScalarScale,
                        int64_t sfLayout) {
+  CHECK_INPUT(payload);
+  TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
+      << "payload must be [ep_size, runtime_max_tokens_per_rank, hidden]";
   int64_t const elementsPerToken = payload.size(2);
   auto const outputShape = outputDtype_.has_value() && outputDtype_.value() == dl_uint8
                                ? tvm::ffi::Shape{localNumTokens, elementsPerToken / 2}
