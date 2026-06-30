@@ -495,6 +495,73 @@ def test_batch_mla_oob_kv_nan(
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_collapsed_cache_shape_raises(backend):
+    """Feeding a collapsed kv-cache layout must raise instead of failing silently.
+
+    Related to https://github.com/flashinfer-ai/flashinfer/issues/3219: feeding
+    the kv-cache in a collapsed ``[num_pages * page_size, 1, head_dim]`` layout
+    (instead of ``[num_pages, page_size, head_dim]``) used to silently produce
+    all-zero / incorrect output. It must now raise a clear error.
+    """
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if backend == "fa3" and not is_sm90a_supported(device):
+        pytest.skip("FA3 is not supported on this device")
+    torch.manual_seed(42)
+    batch_size = 2
+    num_heads = 16
+    head_dim_ckv = 512
+    head_dim_kpe = 64
+    page_size = 64
+    kv_len = 256
+    dtype = torch.half
+    pages_num = math.ceil(kv_len / page_size)
+
+    q_nope = torch.randn(
+        batch_size, num_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.randn(batch_size, num_heads, head_dim_kpe, dtype=dtype, device=device)
+    # Wrong (collapsed) layout: page_size folded into dim-0, dim-1 forced to 1.
+    ckv_bad = torch.randn(
+        batch_size * pages_num * page_size, 1, head_dim_ckv, dtype=dtype, device=device
+    )
+    kpe_bad = torch.randn(
+        batch_size * pages_num * page_size, 1, head_dim_kpe, dtype=dtype, device=device
+    )
+
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        workspace_buffer, backend=backend
+    )
+    q_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * pages_num
+    )
+    kv_indices = torch.arange(
+        0, batch_size * pages_num, device=device, dtype=torch.int32
+    )
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_lens,
+        num_heads,
+        head_dim_ckv,
+        head_dim_kpe,
+        page_size,
+        False,
+        sm_scale,
+        q_nope.dtype,
+        ckv_bad.dtype,
+    )
+    with pytest.raises(ValueError, match="page_size"):
+        wrapper.run(q_nope, q_pe, ckv_bad, kpe_bad)
+
+
 @pytest.mark.parametrize("batch_size", [1, 3, 5, 7, 157])
 @pytest.mark.parametrize("kv_len", [0, 17, 33, 96, 97, 114, 514, 1024])
 @pytest.mark.parametrize("qo_len", [1, 3, 5, 7, 9, 11, 13, 15, 17])
