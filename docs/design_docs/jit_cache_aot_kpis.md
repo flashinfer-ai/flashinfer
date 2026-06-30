@@ -4,13 +4,19 @@
 
 ## 1. Purpose
 
-FlashInfer has three related but distinct runtime artifact paths:
+The choice of JIT vs AOT deployment of GPU kernels for inference requires reasoning about tradeoffs across binary size, warmup overhead, and runtime performance. FlashInfer leaves these tradeoffs to the user, providing three related but distinct runtime artifact paths:
 
 - `flashinfer-python`: the core package. It generates CUDA/C++ sources, compiles JIT shared libraries on demand, and can download cubin artifacts on demand.
 - `flashinfer-jit-cache`: an optional package containing pre-built JIT shared libraries (`.so` files) for a specific FlashInfer version, CUDA build, and architecture set.
 - `flashinfer-cubin`: an optional package containing pre-downloaded cubin/header artifacts used by some TensorRT-LLM, DeepGEMM, cuDNN, and CuTe DSL backed paths.
 
-This document captures the current design, likely use cases, requirements, KPIs, and concrete measurement methods. It is based on the repository implementation and should be treated as a starting point before validating requirements with integration teams such as vLLM, SGLang, and customers that want self-built AOT packages.
+However, today there are several problems:
+
+* It's not obvious what the JIT overhead implications are for some given subset of packages
+* The binary size of the `flashinfer-jit-cache` package is growing rapidly, and it's not obvious what to do about that
+* Users generally complain about a bucket of UX issues related to the above, and without an overall strategy, we're solving each one locally rather than moving in some coherent longer term direction
+
+This document is a proposal to address these problems. It summarizes the current design, use cases, requirements, KPIs, and concrete measurement methods. The intent is to iterate on this with the community to set a long term vision for improving the JIT/AOT experience for FlashInfer.
 
 ## 2. Current Design Summary
 
@@ -54,7 +60,7 @@ The AOT build:
 - copies `cached_ops/<name>/<name>.so` into `flashinfer_jit_cache/jit_cache/<name>/<name>.so`;
 - packages those `.so` files in a platform-specific wheel.
 
-AOT coverage is therefore an explicit registry problem: if a runtime call generates a `JitSpec.name` absent from the wheel, `flashinfer-jit-cache` cannot satisfy that call and runtime JIT is required unless disabled.
+AOT coverage is therefore an explicit registry problem: if a runtime call generates a `JitSpec.name` absent from the wheel, `flashinfer-jit-cache` cannot satisfy that call, and `JitSpec.build_and_load()` falls back to runtime JIT compilation. If `FLASHINFER_DISABLE_JIT` is set, that fallback is refused: `JitSpec.build()` raises `MissingJITCacheError` instead of compiling, so a JIT cache miss under that setting is a hard failure, not a silent compile ([`flashinfer/jit/core.py`](../../flashinfer/jit/core.py)).
 
 The current default AOT matrix includes common attention, GEMM, MoE, communication, activation, norm, sampling, page, rope, quantization, selective state update, XQA, and cuDNN FMHA modules. `flashinfer/aot.py` also documents some intentional exclusions, including `gen_pod_module` and `gen_deepgemm_sm100_module`.
 
@@ -89,25 +95,7 @@ The architecture set is controlled by `CompilationContext` in [`flashinfer/compi
 
 ## 3. Use Case Classes
 
-### 3.1 Kernel development
-
-Users edit `include/`, `csrc/`, Jinja templates, or Python dispatch code and want changes picked up without reinstalling the package.
-
-What matters most:
-
-- Fast edit-test loop.
-- Correct recompilation when sources or included headers change.
-- Generated source visibility for debugging.
-- Useful compiler output and line information when needed.
-- No writes into installed package directories.
-
-Primary package mode:
-
-- `flashinfer-python` editable install.
-- Usually no `flashinfer-jit-cache`.
-- `flashinfer-cubin` optional only when working on cubin-backed paths.
-
-### 3.2 General Python package users
+### 3.1 General Python package users
 
 Users install FlashInfer and call APIs directly in scripts, notebooks, or model-serving experiments.
 
@@ -124,7 +112,7 @@ Primary package mode:
 - `flashinfer-python` alone works when runtime compilation and downloads are acceptable.
 - Optional `flashinfer-cubin` and `flashinfer-jit-cache` reduce first-use overhead.
 
-### 3.3 Production serving with warmup allowed
+### 3.2 Production serving with warmup allowed
 
 Serving systems can run a startup warmup phase before admitting traffic.
 
@@ -140,7 +128,7 @@ Primary package mode:
 - Either `flashinfer-python` with a persisted runtime cache, or optional prebuilt packages.
 - `FLASHINFER_WORKSPACE_BASE` can point to a persistent local or shared cache.
 
-### 3.4 Production serving with strict cold-start or offline constraints
+### 3.3 Production serving with strict cold-start or offline constraints
 
 Serving systems cannot compile at runtime, cannot download artifacts, or have tight first-token/cold-start SLAs.
 
@@ -157,7 +145,7 @@ Primary package mode:
 - `flashinfer-python` plus `flashinfer-jit-cache` and usually `flashinfer-cubin`.
 - Validation should run with `FLASHINFER_DISABLE_JIT=1` and `FLASHINFER_NO_DOWNLOAD=1`.
 
-### 3.5 Framework integrators such as vLLM and SGLang
+### 3.4 Framework integrators such as vLLM and SGLang
 
 Frameworks exercise FlashInfer indirectly through many model, dtype, shape, backend, and architecture combinations.
 
@@ -175,7 +163,7 @@ Primary package mode:
 - For strict serving images, use the same validation as production offline mode.
 - For developer images, runtime JIT may be acceptable.
 
-### 3.6 Customers building pruned AOT packages
+### 3.5 Customers building pruned AOT packages
 
 Some customers want to compile only the AOT kernels they need, for only the SM families they deploy, and at a time controlled by their own model/framework automation.
 
@@ -194,7 +182,7 @@ Primary package mode:
 - `flashinfer-python` plus a customer-built, pruned `flashinfer-jit-cache` compatible wheel.
 - `flashinfer-cubin` may still be needed for cubin-backed paths unless a matching pruned cubin/artifact story exists.
 
-### 3.7 Release and CI maintainers
+### 3.6 Release and CI maintainers
 
 Maintainers build and publish `flashinfer-python`, `flashinfer-jit-cache`, and `flashinfer-cubin`.
 
@@ -212,14 +200,47 @@ Primary package mode:
 - Build all package artifacts in CI.
 - Run package-level tests in an isolated install environment.
 
+### 3.7 Kernel development
+
+This is an internal/advanced use case: FlashInfer contributors, not end users of `flashinfer-python`, editing `include/`, `csrc/`, Jinja templates, or Python dispatch code and wanting changes picked up without reinstalling the package.
+
+What matters most:
+
+- Fast edit-test loop.
+- Correct recompilation when sources or included headers change.
+- Generated source visibility for debugging.
+- Useful compiler output and line information when needed.
+- No writes into installed package directories.
+
+Primary package mode:
+
+- `flashinfer-python` editable install.
+- Usually no `flashinfer-jit-cache`.
+- `flashinfer-cubin` optional only when working on cubin-backed paths.
+
 ## 4. Requirements and KPIs
+
+### 4.1 High-level KPIs
+
+These three are coarse enough to put on a slide or discuss with the community, and are what we should optimize over time:
+
+| KPI | What "good" looks like | Measurement |
+| --- | --- | --- |
+| Package size | Wheels stay small enough for practical image builds/pulls, and grow predictably as kernels are added rather than unboundedly | Wheel size by package (`flashinfer-python`, `flashinfer-jit-cache`, `flashinfer-cubin`), CUDA index, and architecture set |
+| Model/workload coverage with all packages installed | A representative model suite runs with zero runtime JIT and zero runtime download once `flashinfer-jit-cache` and `flashinfer-cubin` are both installed | Missing `JitSpec.name` count and missing cubin/header count for the representative workload, run with `FLASHINFER_DISABLE_JIT=1` and `FLASHINFER_NO_DOWNLOAD=1`, target 0 |
+| JIT time when packages are not installed | Cold-compile time for representative APIs is bounded and predictable when `flashinfer-jit-cache`/`flashinfer-cubin` are absent | Cold first-call latency per representative API/module, broken out into compile time vs. download time |
+
+The rest of this section lists the supporting engineering requirements. Most of them are expected to "just work" rather than being independently remarkable on their own, but each is independently measurable and regressable, so we track it as a KPI too.
+
+### 4.2 Detailed requirements and KPIs
 
 | Use case | Requirement | KPI |
 | --- | --- | --- |
 | Kernel development | Source changes are picked up without reinstall | Time from source edit to passing targeted test; number of manual reinstall steps, target 0 |
 | Kernel development | Debuggable compiler/runtime failures | Presence of generated source, `build.ninja`, JIT log, and optional `-lineinfo`/debug build artifacts |
 | General users | First API call succeeds on supported systems | First-call success rate by API, CUDA version, and GPU arch |
-| General users | First-use overhead is understandable | Cold first-call latency and warm repeated-call latency per representative API |
+| General users | First-use behavior is understandable | Presence of a clear signal (log line or equivalent) of which path was taken on first call: AOT `.so` hit, local JIT-cache hit, runtime compile, or cubin download — these are not parallel checks at one point in time; AOT-vs-local-JIT is resolved inside `JitSpec.build_and_load()` before any compile, while a cubin download is a separate, later event triggered by the already-loaded kernel at launch time via `setup_cubin_loader()` |
+| General users | First-use overhead is acceptable | Cold first-call latency and warm repeated-call latency per representative API, against per-use-case targets to be defined with the community |
 | Warmup serving | Warmup absorbs all compilation/download work | Runtime JIT count after warmup, target 0; runtime download count after warmup, target 0 |
 | Offline serving | No compiler or network dependency | Test pass rate with `FLASHINFER_DISABLE_JIT=1` and `FLASHINFER_NO_DOWNLOAD=1`, target 100% for supported workload |
 | Offline serving | AOT package covers required modules | Missing `JitSpec.name` count, target 0 for the selected workload matrix |
@@ -316,7 +337,7 @@ Framework-specific caveats from OSS inspection:
 
 ### 5.4 Cold-start and warm-start latency
 
-Measure at least these package/cache scenarios:
+Measure at least these package/cache scenarios. The first four isolate which package or flag combination avoids compilation/download; the last one is narrower by design: it uses only `flashinfer-python` with a persisted `FLASHINFER_WORKSPACE_BASE` to measure whether a process/container restart reuses a prior run's compiled `.so` files instead of recompiling, which is the cache-persistence story called out in the "[Production serving with warmup allowed](#32-production-serving-with-warmup-allowed)" use case (§3.2). It is not meant to cover every package combination; if other combinations need their own warm-restart numbers, add separate rows rather than broadening this one.
 
 | Scenario | Packages | Cache state | Environment |
 | --- | --- | --- | --- |
@@ -324,7 +345,7 @@ Measure at least these package/cache scenarios:
 | Core plus cubin | `flashinfer-python`, `flashinfer-cubin` | empty JIT cache | downloads avoided for packaged cubins |
 | Core plus JIT cache | `flashinfer-python`, `flashinfer-jit-cache` | empty cubin cache | JIT avoided for covered modules |
 | Fully prebuilt/offline | all three packages | empty user cache | `FLASHINFER_DISABLE_JIT=1`, `FLASHINFER_NO_DOWNLOAD=1` |
-| Warm cache | any chosen package set | populated runtime cache | normal production env |
+| Warm cache, restart | `flashinfer-python` only | runtime cache already populated by a prior run at the same `FLASHINFER_WORKSPACE_BASE` | normal env, no disable flags |
 
 For each scenario, measure:
 
@@ -599,27 +620,28 @@ Priority assessment:
 
 ## 8. Questions for vLLM, SGLang, and Customers
 
-Ask each integration team for a concrete workload matrix, not just a package preference.
+Ask each integration team for a concrete workload matrix, not just a package preference. The questions below are grouped by which §4.1 high-level KPI they help pin down, rather than listed flat, and they exclude anything FlashInfer should already know about its own primitive coverage (for example, which FlashInfer APIs frameworks reach is not asked here; that gap, if any, is FlashInfer's to close, not the integration team's to report).
 
-Minimum questions:
+Package size:
 
-- Which FlashInfer APIs are reached in their supported serving paths?
-- Which models, dtypes, quantization modes, and attention backends must be covered?
-- Which head dimensions, page sizes, sliding-window modes, logits-soft-cap modes, index dtypes, and MLA/XQA/MoE variants are used?
+- What package size increase is acceptable? What is the target package size, image size, or image pull-time budget?
+- Is the package size concern limited to `flashinfer-jit-cache`, or does it also include `flashinfer-cubin` and TensorRT-LLM artifacts?
+- Do they need a single broad wheel or multiple CUDA/architecture-specific indexes?
+- Do they need customer-owned AOT package generation, or are official architecture-specific wheels sufficient? If customer-owned, should the input be a hand-written manifest, framework trace, model list, or generated `JitSpec.name` list?
+
+Model/workload coverage with all packages installed:
+
+- Which models, dtypes, quantization modes, attention backends, head dimensions, page sizes, sliding-window modes, logits-soft-cap modes, index dtypes, and MLA/XQA/MoE variants must be covered?
 - Which GPU architectures and CUDA versions are in their release/support matrix?
-- Is runtime `nvcc` available in production images?
-- Are production images expected to work without runtime `nvcc`, or is `nvcc` intentionally part of the serving image contract?
+- Which framework gates should be treated as release-blocking when FlashInfer is unavailable or skipped?
+- How should missing AOT coverage be reported in their CI: hard failure, skipped test report, or nightly advisory?
+
+JIT time when packages are not installed:
+
+- Is runtime `nvcc` available in production images? Are production images expected to work without runtime `nvcc`, or is `nvcc` intentionally part of the serving image contract?
 - Is network egress available during startup?
 - Is there an explicit cold-start, engine-start, or first-token latency SLA?
-- Is a startup warmup phase allowed, and how long may it run?
-- What package size increase is acceptable?
-- Do they need a single broad wheel or multiple CUDA/architecture-specific indexes?
-- Which framework gates should be treated as release-blocking when FlashInfer is unavailable or skipped?
-- Do they need customer-owned AOT package generation, or are official architecture-specific wheels sufficient?
-- If they want customer-owned packages, should the input be a hand-written manifest, framework trace, model list, or generated `JitSpec.name` list?
-- Is the package size concern limited to `flashinfer-jit-cache`, or does it also include `flashinfer-cubin` and TensorRT-LLM artifacts?
-- What is the target package size, image size, or image pull-time budget?
-- How should missing AOT coverage be reported in their CI: hard failure, skipped test report, or nightly advisory?
+- In the "[Production serving with warmup allowed](#32-production-serving-with-warmup-allowed)" use case (§3.2), how much overhead is acceptable for kernel compilation, and how long may a startup warmup phase run?
 
 Useful artifacts to request:
 
