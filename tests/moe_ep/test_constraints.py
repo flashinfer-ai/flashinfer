@@ -11,6 +11,8 @@ from flashinfer.moe_ep import (
     FleetParams,
     MoEEpConfigError,
     QuantType,
+    ensure_bootstrap_dist_validated,
+    validate_bootstrap_process_group_ready,
     validate_bootstrap_world_size,
     validate_fleet_params,
     validate_fleet_weights,
@@ -40,8 +42,8 @@ def _split(
 def test_num_experts_must_be_divisible_by_world_size():
     p = _split(num_experts=7, world_size=2, max_tokens_per_rank=64, num_local_experts=1)
     with pytest.raises(MoEEpConfigError, match="num_experts"):
-        validate_fleet_params(p, backend="nccl_ep", world_size=2)
-    # Also fails for nixl_ep.
+        validate_fleet_weights(p, world_size=2)
+    # nixl_ep also checks divisibility against topology capacity (defaults to world_size).
     p2 = _split(num_experts=7, world_size=2, max_tokens_per_rank=64, num_local_experts=1)
     with pytest.raises(MoEEpConfigError, match="num_experts"):
         validate_fleet_params(p2, backend="nixl_ep", world_size=2)
@@ -105,10 +107,22 @@ def test_bootstrap_world_size_must_match_dist_when_initialized():
     from unittest import mock
 
     bootstrap = BootstrapConfig(world_size=4, rank=0)
+    mock_pg = mock.MagicMock()
     with mock.patch("torch.distributed.is_initialized", return_value=True):
-        with mock.patch("torch.distributed.get_world_size", return_value=8):
-            with pytest.raises(MoEEpConfigError, match="BootstrapConfig.world_size"):
-                validate_bootstrap_world_size(bootstrap)
+        with mock.patch(
+            "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_comm_group",
+            return_value=mock_pg,
+        ):
+            with mock.patch("torch.distributed.get_world_size", return_value=8):
+                with mock.patch("torch.distributed.get_rank", return_value=0):
+                    with mock.patch(
+                        "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
+                        return_value=(0, 8),
+                    ):
+                        with pytest.raises(
+                            MoEEpConfigError, match="BootstrapConfig.world_size"
+                        ):
+                            validate_bootstrap_world_size(bootstrap)
 
 
 def test_bootstrap_world_size_skipped_when_dist_not_initialized():
@@ -117,6 +131,41 @@ def test_bootstrap_world_size_skipped_when_dist_not_initialized():
     bootstrap = BootstrapConfig(world_size=4, rank=0)
     with mock.patch("torch.distributed.is_initialized", return_value=False):
         validate_bootstrap_world_size(bootstrap)
+
+
+def test_bootstrap_process_group_requires_dist_at_init():
+    from unittest import mock
+
+    pg = mock.MagicMock()
+    bootstrap = BootstrapConfig(world_size=4, rank=0, process_group=pg)
+    with mock.patch("torch.distributed.is_initialized", return_value=False):
+        with pytest.raises(MoEEpConfigError, match="process_group is set"):
+            validate_bootstrap_process_group_ready(bootstrap)
+
+
+def test_ensure_bootstrap_dist_validated_deferred_world_size_check():
+    from unittest import mock
+
+    bootstrap = BootstrapConfig(world_size=4, rank=0)
+    with mock.patch("torch.distributed.is_initialized", return_value=False):
+        ensure_bootstrap_dist_validated(bootstrap)
+
+    mock_pg = mock.MagicMock()
+    with mock.patch("torch.distributed.is_initialized", return_value=True):
+        with mock.patch(
+            "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_comm_group",
+            return_value=mock_pg,
+        ):
+            with mock.patch("torch.distributed.get_world_size", return_value=8):
+                with mock.patch("torch.distributed.get_rank", return_value=0):
+                    with mock.patch(
+                        "flashinfer.moe_ep.core.bootstrap_utils.bootstrap_ep_rank_world",
+                        return_value=(0, 8),
+                    ):
+                        with pytest.raises(
+                            MoEEpConfigError, match="BootstrapConfig.world_size"
+                        ):
+                            ensure_bootstrap_dist_validated(bootstrap)
 
 
 def test_split_forward_inputs_rejects_token_overflow():

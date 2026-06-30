@@ -35,6 +35,7 @@ from ..core.runtime import (
 )
 from ..core.validation.common import (
     MoEEpConfigError,
+    ensure_bootstrap_dist_validated,
     validate_arch_for_backend,
     validate_bootstrap_world_size,
     validate_fleet_params,
@@ -150,6 +151,7 @@ class MoEEpSplitLayer(nn.Module):
         return self._kernel.compute(ctx)
 
     def forward(self, t: "MoEEpTensors") -> torch.Tensor:
+        ensure_bootstrap_dist_validated(self._bootstrap)
         validate_split_forward_inputs(
             t.hidden_states,
             t.topk_ids,

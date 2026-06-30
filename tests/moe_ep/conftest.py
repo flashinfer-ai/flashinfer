@@ -19,6 +19,20 @@ sys.path[:] = [
 ]
 
 
+@pytest.fixture
+def dist_not_initialized():
+    """Hide a prior torch.distributed init from bootstrap validation.
+
+    Earlier unit tests may leave a world_size=1 process group active via
+    ``auto_bootstrap=True`` layer construction; init tests that assert on
+    config fields other than bootstrap sizing need an isolated view of dist.
+    """
+    from unittest import mock
+
+    with mock.patch("torch.distributed.is_initialized", return_value=False):
+        yield
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--backend",

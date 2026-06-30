@@ -33,10 +33,24 @@ def _device_capability() -> tuple[int, int]:
     return torch.cuda.get_device_capability(torch.cuda.current_device())
 
 
+def validate_bootstrap_process_group_ready(bootstrap: BootstrapConfig) -> None:
+    """Fail fast when ``process_group`` is set but ``torch.distributed`` is not up."""
+    import torch.distributed as dist
+
+    if bootstrap.process_group is not None and not dist.is_initialized():
+        raise MoEEpConfigError(
+            "BootstrapConfig.process_group is set but torch.distributed is not "
+            "initialized; initialize torch.distributed before layer construction, "
+            "or set auto_bootstrap=True"
+        )
+
+
 def validate_bootstrap_world_size(bootstrap: BootstrapConfig) -> None:
     import torch.distributed as dist
 
     from ..bootstrap_utils import bootstrap_comm_group, bootstrap_ep_rank_world
+
+    validate_bootstrap_process_group_ready(bootstrap)
 
     if not dist.is_initialized():
         return
@@ -72,6 +86,18 @@ def validate_bootstrap_world_size(bootstrap: BootstrapConfig) -> None:
             f"{bootstrap.world_size}) does not match resolved EP comm "
             f"({resolved_rank}, {resolved_ws})"
         )
+
+
+def ensure_bootstrap_dist_validated(bootstrap: BootstrapConfig) -> None:
+    """Validate bootstrap against the active process group once dist is available.
+
+    Safe to call repeatedly. When ``torch.distributed`` is not initialized yet
+    (e.g. ``auto_bootstrap=False`` and the host framework has not inited dist),
+    only the ``process_group`` readiness check runs; full rank/world_size
+    cross-check runs on the first call after dist comes up.
+    """
+    validate_bootstrap_process_group_ready(bootstrap)
+    validate_bootstrap_world_size(bootstrap)
 
 
 def validate_split_forward_inputs(

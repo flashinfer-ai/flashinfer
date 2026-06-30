@@ -3,7 +3,9 @@
 from .common import (
     MoEEpArchError,
     MoEEpConfigError,
+    ensure_bootstrap_dist_validated,
     validate_arch_for_backend,
+    validate_bootstrap_process_group_ready,
     validate_bootstrap_world_size,
     validate_fleet_params,
     validate_fleet_weights,
@@ -16,7 +18,9 @@ from .common import (
 __all__ = [
     "MoEEpArchError",
     "MoEEpConfigError",
+    "ensure_bootstrap_dist_validated",
     "validate_arch_for_backend",
+    "validate_bootstrap_process_group_ready",
     "validate_bootstrap_world_size",
     "validate_fleet_params",
     "validate_fleet_weights",

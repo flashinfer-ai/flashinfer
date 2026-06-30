@@ -43,6 +43,22 @@ def _mega_fleet_params():
     )
 
 
+def _fake_deep_gemm_transformed(
+    *,
+    num_experts: int = 1,
+    intermediate: int = 128,
+    hidden: int = 128,
+):
+    import torch
+
+    fc1_out = 2 * intermediate
+    w1 = torch.zeros(num_experts, fc1_out, hidden // 2, dtype=torch.int8)
+    sf1 = torch.zeros(num_experts, fc1_out, hidden // 32)
+    w2 = torch.zeros(num_experts, hidden, intermediate // 2, dtype=torch.int8)
+    sf2 = torch.zeros(num_experts, hidden, intermediate // 32)
+    return ((w1, sf1), (w2, sf2))
+
+
 def _mega_config(*, preprocess_weights: bool = False):
     from flashinfer.moe_ep import DeepGemmMegaMoeConfig, MegaConfig
 
@@ -54,7 +70,7 @@ def _mega_config(*, preprocess_weights: bool = False):
     return MegaConfig(
         megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
         preprocess_weights=False,
-        transformed_weights=((None, None), (None, None)),
+        transformed_weights=_fake_deep_gemm_transformed(),
     )
 
 
@@ -80,21 +96,21 @@ def test_factory_returns_split_for_nvep_config():
     assert isinstance(layer, MoEEpSplitLayer)
 
 
-def test_factory_returns_mega_for_mega_config():
+def test_factory_returns_mega_for_mega_config(dist_not_initialized):
     from unittest import mock
 
     from flashinfer.moe_ep import BootstrapConfig, MoEEpLayer, MoEEpMegaLayer
 
     with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
         layer = MoEEpLayer(
-            bootstrap=BootstrapConfig(world_size=1, rank=0),
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
             fleet_params=_mega_fleet_params(),
             backend=_mega_config(),
         )
     assert isinstance(layer, MoEEpMegaLayer)
 
 
-def test_factory_mega_ignores_fleet_knobs_warns():
+def test_factory_mega_ignores_fleet_knobs_warns(dist_not_initialized):
     from unittest import mock
 
     from flashinfer.moe_ep import (
@@ -107,7 +123,7 @@ def test_factory_mega_ignores_fleet_knobs_warns():
     with mock.patch("flashinfer.moe_ep.core.validation.common.validate_mega_arch"):
         with pytest.warns(UserWarning, match="fleet_knobs are ignored"):
             layer = MoEEpLayer(
-                bootstrap=BootstrapConfig(world_size=1, rank=0),
+                bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
                 fleet_params=_mega_fleet_params(),
                 fleet_knobs=[FleetAlgoKnobNumChannelsPerRank(n=4)],
                 backend=_mega_config(),
@@ -173,6 +189,26 @@ def test_split_destroy_is_idempotent(stubbed_fleet_registry):
     split.destroy()
     split.destroy()
     assert log.count("destroy") == 1
+
+
+def test_split_layer_init_rejects_process_group_without_dist():
+    from unittest import mock
+
+    from flashinfer.moe_ep import BootstrapConfig, MoEEpConfigError, MoEEpSplitLayer
+
+    pg = mock.MagicMock()
+    with mock.patch("torch.distributed.is_initialized", return_value=False):
+        with pytest.raises(MoEEpConfigError, match="process_group is set"):
+            MoEEpSplitLayer(
+                bootstrap=BootstrapConfig(
+                    world_size=1,
+                    rank=0,
+                    process_group=pg,
+                    auto_bootstrap=False,
+                ),
+                fleet_params=_split_fleet_params(),
+                backend="nccl_ep",
+            )
 
 
 def test_factory_rejects_raw_mega_kernel_config():

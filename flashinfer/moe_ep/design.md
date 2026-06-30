@@ -35,7 +35,7 @@ comm fleets when their `fleet.py` is imported from `__init__.py`.
 | `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales` (pre-staged mega) |
 | `MoEWeightPack` | Canonical `w13` / `w2` (+ optional scales); `dummy_moe_weights()` for comm-only split |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
-| `MegaConfig` | `megakernel`, `stage_inputs`, `preprocess_weights`, optional `transformed_weights` |
+| `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
 
 **Split:** pass `FleetParams` + `SplitConfig(comm=..., kernel=...)` or a comm string (kernel defaults to `IdentityConfig`). Fleet is lazy-created on first `forward()`; a new Handle per forward.
 
@@ -95,22 +95,32 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or logical pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (kernel-ready layout from `preprocess_*_mega_weights`).
 
-**Mega activations:** with `stage_inputs=True` (default), bf16 `[T, hidden]` is quantized into the symm workspace at forward. With `stage_inputs=False`, copy pre-quantized activations (+ `MoEEpTensors.scales`) into the workspace.
+**Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into the symm workspace at forward. Non-bf16 activations with `quantize_input=True` raise `MoEEpConfigError`; use `quantize_input=False` and supply pre-quantized activations plus `MoEEpTensors.scales`.
 
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized
 ``torch.distributed`` and expert parallel uses a subgroup (not WORLD), pass
 ``BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank,
 auto_bootstrap=False)`` and call ``bootstrap_moe_ep_runtime(bootstrap, reqs)``
-once per worker. All mega kernels resolve comm via
-``bootstrap_comm_group`` / ``bootstrap_ep_rank_world`` (via
-``MegaKernelBackend.bind_ep_bootstrap``).
+once per worker **after** ``torch.distributed`` is initialized. All mega
+kernels resolve comm via ``bootstrap_comm_group`` / ``bootstrap_ep_rank_world``
+(via ``MegaKernelBackend.bind_ep_bootstrap``).
+
+When ``auto_bootstrap=False``:
+
+1. If ``BootstrapConfig.process_group`` is set, ``torch.distributed`` must
+   already be initialized at layer construction (fail-fast).
+2. Rank/world_size cross-checks against the active process group run at init
+   when dist is up, otherwise on the first ``forward()`` once dist becomes
+   available.
+3. Call ``bootstrap_moe_ep_runtime(bootstrap, reqs)`` yourself when the layer
+   would have acquired runtime resources with ``auto_bootstrap=True``.
 
 ## Usage
 
 ```python
 from flashinfer.fused_moe.api import MoEConfig
 from flashinfer.moe_ep import (
-    MoEEpLayer, BootstrapConfig, FleetParams, FleetParams,
+    MoEEpLayer, BootstrapConfig, FleetParams,
     MoEEpTensors, MoEWeightPack, dummy_moe_weights,
     SplitConfig, NcclEpConfig, FusedMoeKernelConfig,
     MegaConfig, DeepGemmMegaMoeConfig,
@@ -147,13 +157,16 @@ layer = MoEEpLayer(
         num_experts=32, max_tokens_per_rank=256, token_hidden_size=2048,
         weights=MoEWeightPack(w13=..., w2=...),
     ),
-    backend=MegaConfig(megakernel=DeepGemmMegaMoeConfig(intermediate_size=1024, top_k=4)),
+    backend=MegaConfig(
+        megakernel=DeepGemmMegaMoeConfig(intermediate_size=1024, top_k=4),
+        quantize_input=True,
+    ),
 )
 out = layer.forward(MoEEpTensors(...))
 layer.destroy()
 ```
 
-Under torchrun, dist/NVSHMEM init is automatic. Set `auto_bootstrap=False` when tests manage runtime themselves.
+Under torchrun, dist/NVSHMEM init is automatic. Set `auto_bootstrap=False` when the host framework owns runtime bootstrap (see **Host framework bootstrap** above).
 
 Useful exports: `bootstrap_moe_ep_runtime`, `finalize_moe_ep_runtime`, `ensure_moe_ep_cuda_device`, `preprocess_mega_weights`, `preprocess_nvfp4_cutedsl_mega_weights`, `preprocess_mxfp8_cutedsl_mega_weights`.
 

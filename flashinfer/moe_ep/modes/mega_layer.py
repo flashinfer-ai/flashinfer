@@ -15,7 +15,12 @@ from ..core.runtime import (
     ensure_moe_ep_cuda_device,
     finalize_moe_ep_runtime,
 )
-from ..core.validation.common import MoEEpConfigError, validate_bootstrap_world_size
+from ..core.validation.common import (
+    MoEEpConfigError,
+    ensure_bootstrap_dist_validated,
+    validate_bootstrap_world_size,
+    validate_fleet_weights,
+)
 from ..weights import MoEWeightPack
 from .config import MegaConfig
 
@@ -52,6 +57,9 @@ class MoEEpMegaLayer(nn.Module):
         validate_bootstrap_world_size(bootstrap)
         self._kernel.validate_init(bootstrap, fleet_params)
 
+        if backend.transformed_weights is None:
+            validate_fleet_weights(fleet_params, bootstrap.world_size)
+
         self._weights: MoEWeightPack = fleet_params.weights
         self._transformed: Optional[Any] = None
         self._workspace: Any = None
@@ -83,9 +91,16 @@ class MoEEpMegaLayer(nn.Module):
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
         if not self._mega_config.quantize_input:
             return False
-        return t.hidden_states.dtype == torch.bfloat16
+        if t.hidden_states.dtype != torch.bfloat16:
+            raise MoEEpConfigError(
+                f"MegaConfig.quantize_input=True expects bf16 hidden_states; "
+                f"got {t.hidden_states.dtype}. Set quantize_input=False and provide "
+                f"MoEEpTensors.scales for pre-quantized activations."
+            )
+        return True
 
     def forward(self, t: "MoEEpTensors") -> torch.Tensor:
+        ensure_bootstrap_dist_validated(self._bootstrap)
         quantize_input = self._resolve_quantize_input(t)
 
         self._kernel.validate_forward(
