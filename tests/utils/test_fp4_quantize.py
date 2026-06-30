@@ -705,23 +705,23 @@ def _te_ref_scale_bytes_for_layout(
     if sf_layout == SfLayout.layout_8x4:
         rows = ((scale_ref.shape[0] + 7) // 8) * 8
         cols = ((scale_ref.shape[1] + 3) // 4) * 4
+        # Vectorized 8x4 swizzle: flat_offset =
+        #   m_tile * (cols//4) * 32 + k_tile * 32 + inner_m * 4 + inner_k
+        row_idx = torch.arange(scale_ref.shape[0], device=scale_ref.device).unsqueeze(1)
+        col_idx = torch.arange(scale_ref.shape[1], device=scale_ref.device).unsqueeze(0)
+        flat_offset = (
+            (row_idx // 8) * (cols // 4) * 32
+            + (col_idx // 4) * 32
+            + (row_idx % 8) * 4
+            + col_idx % 4
+        )
         expected = torch.zeros(
-            (rows, cols),
+            rows * cols,
             dtype=torch.uint8,
             device=scale_ref.device,
         )
-        expected_flat = expected.view(-1)
-        for row in range(scale_ref.shape[0]):
-            for col in range(scale_ref.shape[1]):
-                inner_k = col % 4
-                inner_m = row % 8
-                k_tile = col // 4
-                m_tile = row // 8
-                flat_offset = (
-                    m_tile * (cols // 4) * 32 + k_tile * 32 + inner_m * 4 + inner_k
-                )
-                expected_flat[flat_offset] = scale_ref[row, col]
-        return expected
+        expected[flat_offset.reshape(-1)] = scale_ref.reshape(-1)
+        return expected.view(rows, cols)
     raise ValueError(f"Unknown scale-factor layout: {sf_layout}")
 
 

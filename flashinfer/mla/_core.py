@@ -2082,6 +2082,7 @@ def _cute_dsl_incompatibility_reason(
     is_var_seq: bool,
     return_lse: bool,
     lse: Optional[torch.Tensor],
+    cute_dsl_impl: str = "auto",
 ) -> Optional[str]:
     """Return None if cute-dsl can handle this call, else a human-readable reason.
 
@@ -2132,7 +2133,17 @@ def _cute_dsl_incompatibility_reason(
 
     _, q_len, num_heads, _ = query.shape
     try:
-        from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
+        from ..cute_dsl.attention.mla_dispatch import _resolve_impl
+
+        resolved_impl = _resolve_impl(requested=cute_dsl_impl, kwargs={"sinks": sinks})
+    except (ValueError, ImportError) as e:
+        return f"cute-dsl backend (MLA decode kernel): {e}"
+
+    try:
+        if resolved_impl == "monolithic":
+            from ..cute_dsl.attention.monolithic.mla_decode import _check_can_implement
+        else:
+            from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
 
         _check_can_implement(
             torch_dtype=query.dtype,
@@ -2668,8 +2679,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``.
     cute_dsl_impl : str = "auto"
-        Which cute-dsl implementation to use.  Honored only when
-        ``backend="cute-dsl"``; ignored for other backends.
+        Which cute-dsl implementation to use. Honored when
+        ``backend="cute-dsl"`` and when ``backend="auto"`` considers the
+        cute-dsl candidate; ignored for non-cute-dsl backends.
 
         * ``"auto"`` (default) — picks monolithic by default, automatically
           promoted to modular when the call uses a feature monolithic
@@ -3043,6 +3055,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         is_var_seq,
         return_lse,
         lse,
+        cute_dsl_impl,
     )
     if backend == "cute-dsl":
         if cute_dsl_reason is not None:
