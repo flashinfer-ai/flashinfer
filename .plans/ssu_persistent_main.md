@@ -56,7 +56,18 @@ export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.1 BATCH=1024 MTP=6 WINDOW=16 DTYPE=b
     --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
     --prev-tokens-fracs ${PNAT}
 ```
+This is only to run by the user. It produces a csv for various write/nowrite configs that
+show nicely in his external plot viewer.
+```bash
+uv run python benchmarks/collect_checkpointing_ssu_runs.py --batch-size 512 --state-dtypes bf16 --cupti --output-prefix incremental_ssu_b64_bf16_v23
+```
 
+# Mixed benchmark
+```bash
+export FLASHINFER_JIT_LINEINFO=1
+SSU_CUPTI_DEBUG=1 uv run python benchmarks/bench_ssu_checkpoint_mixed.py \
+    --batch-sizes 1024 -K 1 --with-conv1d --output-prefix -
+```
 ## Why — write/no-write split at PRODUCTION max_window=16 (B300, 2026-06-25)
 
 Per-path isolation, `bench_checkpointing_ssu.py` (CUPTI, SSU-kernel-only, mtp=6, bf16),
@@ -481,6 +492,82 @@ slower on 3.5× more instructions → triton runs lower-IPC / lower-occupancy). 
 per-work-unit CuTe addressing recompute, small tiles (more loop iterations), and the
 warp-specialized prefetch.  Closing it is the staged plan below.
 
+### SASS dumps for source-correlated comparison (B200, 2026-06-30)
+
+Captured paired `--set full --import-source yes` ncu reports + extracted SASS for the **exact
+profiled no-write main kernels** (b1024, mtp=6, mw=16, bf16, prev_k=0), to diff our SASS against
+triton-pm's and attribute the 4× body-size gap to source lines.  All artifacts +
+provenance/commands in:
+**`/home/scratch.ishovkun_gpu/benchmarking/mamba_decode/README_sass_compare.md`**
+
+- `{ours,triton_pm}_main_nw0_b1024.ncu-rep` — full reports (Nsight Compute GUI: correlated
+  Source/SASS + PC stalls).
+- `*.sass.txt` — authoritative SASS from the report (exact profiled cubin):
+  `offset | SASS | #PC-samples | top-2 stalls`.
+- `*.sass_src.txt` — `nvdisasm -gi`, SASS interleaved with `//## File … line N`
+  (ours → `kernel_checkpointing_ssu_main.cuh`; triton → `replay_selective_state_update.py`).
+  Offsets cross-reference the `.sass.txt` by `/*offset*/`.
+
+Static SASS (matches the dynamic north star): **ours 3440 vs triton 856 = 4.0× bigger body**,
+both ~50% integer (ours 53.2%, triton 50.8%).  So triton does *not* avoid integer ops
+proportionally — its kernel body is simply ~4× smaller (fewer unrolled iterations / bigger
+per-thread tiles / hoisted addressing).  Triton no-write half = grid 888 / 168 regs / 60.7 µs;
+ours = grid 2368 / 90 regs / 100.7 µs.
+
+### SASS-diff findings — the 3.5× gap is `prefetch_async` + CuTe-addressed `process_head` (2026-06-30)
+
+Per-source-line **dynamic executed** attribution (ncu "Instructions Executed" × nvdisasm `-gi`
+line map; totals reconcile to the north star 49.41M / 14.14M).  Lines = `kernel_checkpointing_ssu_main.cuh`.
+
+**OURS — 49.41M executed (53% int), concentrated in TWO inlined helpers in `head_loop`:**
+
+| line | helper | exec | %tot | int | ldst | tc | fp |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **1228** | `process_head<false>` (the no-write compute) | **19.1M** | **39%** | 10.46M | 3.40M | 1.22M | 2.31M |
+| **1240** | `prefetch_async` (steady bundle stager) | **14.6M** | **30%** | 8.85M | 2.32M | **0** | **0** |
+| 1237 | `fetch_head_meta` | 3.56M | 7% | 0.98M | 0.53M | 0 | 0 |
+| 1196 | `compute_output_and_store<false>` | 1.80M | 4% | 0.95M | 0.33M | 0.09M | 0.18M |
+| 1221/1216/1220/1219/1223 | driver loop / syncthreads / valid checks | ~3.6M | 7% | mostly int | | | |
+
+The two hot lines = **68% of executed, 73% of all integer** (19.3M of 26.4M int).
+
+**TRITON — 14.14M executed (41% int), spread thin (no line > 12%):**
+
+| line | what | exec | %tot | int | ldst | tc | fp |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1903 | `tl.dot(C_tile, stateᵀ)` (C@state) | 1.70M | 12% | **0** | 0.52M | 1.05M | 0 |
+| 1858 | `C_tile = tl.load(...)` | 0.92M | 6% | 0.38M | 0.44M | 0 | 0 |
+| 2168 | `tl.range(...)` persistent-loop header | 0.87M | 6% | 0.40M | 0.03M | 0 | 0 |
+| 1793 | `state = state_tma.load(...)` | 0.85M | 6% | 0.21M | 0.17M | 0 | 0 |
+| 1909 | `tl.dot(CB, x_window)` (token) | 0.82M | 6% | 0.03M | 0.26M | 0.13M | 0.26M |
+| 2172 | unflatten `pid_h = tile//(...)` | 0.79M | 6% | 0.69M | 0 | 0 | 0 |
+
+**Two structural differences, both attackable:**
+
+1. **`prefetch_async` (line 1240) is 30% of executed / 8.85M integer with ZERO matmul/fp — a stage
+   triton does not have.**  It is *pure address arithmetic + LDGSTS* to hand-stage the
+   gmem→smem bundle (state/C/x/cumAdt/old) with CuTe per-element swizzled addressing, re-derived
+   every work-unit.  Triton loads operands straight into the matmul via TMA/coalesced `tl.load`
+   (`:1793` state TMA, `:1858` C) with addressing the compiler hoists; its `num_stages` software
+   pipeline + `warp_specialize` (`tl.range`, `:2168`) do the staging with ~0.4M int for the *whole*
+   loop.  **This 14.6M is the single biggest, cleanest target.**
+2. **Triton's matmuls carry ~0 integer** (`:1903` C@state = 0 int; `:1909` token = 32K int) — operand
+   addresses computed once, tensor core streams.  OUR `process_head` (`:1228`) interleaves **10.46M
+   integer** into the same matmul region — CuTe regenerates LDSM/operand addresses per MMA tile per
+   work-unit.  Most of process_head's integer is hoistable addressing, not real compute.
+
+So **both** hot lines are dominated by address math triton hoists/elides; the matmul FLOPs are tiny
+in both.  Confirms the north star and pins the order: **(a) kill/shrink `prefetch_async`'s
+per-work-unit re-addressing** (its 8.85M int has zero compute — biggest single win), then
+**(b) hoist `process_head`'s CuTe operand addressing** (staged plan #1/#2 below).
+
+Separately (static, not dynamic): `process_head<true>` (`:1224`, 440 insts), `replay_state`
+(`:1165`, 281), `compute_output<true>` (`:1192`, 225) are **compiled-but-dead in no-write**
+(`mc_of` always false at prev_k=0) — ~27% of the 3440 static SASS is dead write-path code inflating
+i-cache / register pressure (90 regs → 5 blocks).  Triton sidesteps this with its **two-launch
+write/nowrite split** (`WRITE_CHECKPOINT` constexpr).  A kernel-level `MUST_CHECKPOINT` template +
+two launches would lean the no-write specialization (helps occupancy, not the dynamic count).
+
 ### Index-math simplification plan (staged)
 
 1. **Hoist loop-invariant CuTe setup out of the per-work-unit path.**  `output_head_2k` /
@@ -499,6 +586,39 @@ warp-specialized prefetch.  Closing it is the staged plan below.
    work onto the idle uniform datapath), leaving only the per-lane swizzle on the main pipe.
 
 Start with **#1** (biggest, cleanest): hoist the CuTe MMA/partition/layout objects to `head_loop`.
+
+### Stage 0 LANDED: byteoffA hoist + reg-cap lift (mechanism proof) (2026-06-30)
+
+Hoisted the C@state A-operand swizzled byte offsets (`byteoffA[8]`) out of the per-work-unit
+`pipelined_kloop_gemm` up to `head_loop` (`compute_C_byteoffA` once per thread → threaded
+`byteoffA_ext` through process_head→compute_output_and_store→output_head_2k→add_init_out_ring→
+pipelined_kloop_gemm; monolith passes nullptr → unchanged).  Bit-exact (4 two-kernel tests pass).
+
+**The reg cap, not the hoist, is the lever.**  ncu `--set full` int-mix, nw0 b1024:
+
+| build | regs / blocks | total exec | integer | uniform | nw0 / nw8 µs |
+|---|---|---:|---:|---:|---:|
+| baseline (cap 96) | 90 / 5 | 49,410,880 | 26,420,736 | 4,572,800 | 110.56 / 117.10 |
+| hoist, cap 96 | 89 / 5 | 50,564,928 | 25,577,472 | **6,618,688** | 110.56 / 117.10 |
+| **hoist, cap 128** | **118 / 4** | **46,192,320** | 27,291,776 | **805,376** | **108.82 / 114.55** |
+| hoist, cap 255 | 150 / 3 | — | — | — | 130.67 / 136.35 💀 |
+
+- At **cap 96** the hoist had no room (90 + 8 offsets > 96) so the compiler **REMATERIALIZED**
+  `compute_C_byteoffA` every work-unit onto the **uniform** pipe (uniform 4.57M→6.62M, total UP,
+  timing flat).  Confirmed **NOT a spill** (ncu_reader "no register spills", all
+  `*_register_spilling*` = 0, local ld/st sectors = 0).  Pure rematerialization.
+- At **cap 128 / 4 blocks** the offsets stay live → the per-work-unit address recompute **vanishes**
+  (uniform 4.57M→**0.8M**, total executed **49.4M→46.2M, −6.5%**), no spills, **nw0 −1.7 / nw8 −2.5 µs**.
+  The int↔uniform split reshuffled (int rose as uniform collapsed) — the meaningful metric is
+  **total executed**, which dropped.
+- **Fully uncapping (255) is a trap**: the compiler grabs 150 regs → 3 blocks → +20 µs.
+- Knob: `SSU_MAIN_MAXNREG_PIPE` (default **128**, was an implicit 96).  This is the Triton regime
+  (more regs, fewer blocks) and the **right baseline to land the bigger B-operand + partition_C
+  hoist on** — register headroom now exists to hold their offsets without rematerializing.
+
+**Mechanism proven:** hoist-to-head_loop + register headroom eliminates per-work-unit CuTe address
+recompute (byteoffA was a small slice — the large `pointer_base` 4.49M lives in the B operands /
+partition_C, Stage 1).
 
 ## TODO
 
