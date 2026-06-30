@@ -52,6 +52,8 @@ from .trtllm_gen_fused_moe_utils import (
 
 from flashinfer.utils import get_compute_capability
 
+pytestmark = pytest.mark.solo
+
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 2048, 3072, 4096])
