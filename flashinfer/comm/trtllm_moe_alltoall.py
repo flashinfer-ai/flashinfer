@@ -110,7 +110,8 @@ def get_moe_alltoall_module():
         payload_in_workspace: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         output_scales: Optional[torch.Tensor] = None,
-        sf_layout: SfLayout = SfLayout.layout_linear,
+        output_scalar_scale: float = 1.0,
+        sf_layout: Optional[SfLayout] = None,
     ) -> torch.Tensor:
         """
         Combine expert outputs back to originating tokens.
@@ -126,11 +127,16 @@ def get_moe_alltoall_module():
             top_k: Number of experts per token
             combine_payload_offset: Offset from dispatch
             payload_in_workspace: If True, payload is workspace-backed
-            output_dtype: Optional output data type
-                currently supports [torch.bfloat16, torch.float8_e4m3fn]
-            output_scales: Optional output scale tensor for quantized outputs
-                currently support ue8m0 (packed in torch.uint8) with vector size of 32
-            sf_layout: Output swizzle layout
+            output_dtype: Optional output data type. Supported types:
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.uint8 (packed fp4)
+            output_scales: Optional output scale tensor for quantized outputs. Support types:
+                torch.uint8 (packed ue8m0), vector size of 32
+                torch.float8_e4m3fn, vector size of 16
+            output_scalar_scale: Per-tensor global scale applied before FP4 block scaling
+                (NVFP4 SFScaleVal). Defaults to 1.0; ignored by MXFP8/MXFP4 paths.
+            sf_layout: Output swizzle layout. Defaults to linear.
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
         """
@@ -147,7 +153,8 @@ def get_moe_alltoall_module():
             payload_in_workspace,
             output_dtype,
             output_scales,
-            sf_layout.value,
+            output_scalar_scale,
+            sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
         )
 
     @register_custom_op(
@@ -391,6 +398,7 @@ def moe_a2a_combine(
     payload_in_workspace: bool = False,
     output_dtype: Optional[torch.dtype] = None,
     output_scales: Optional[torch.Tensor] = None,
+    output_scalar_scale: float = 1.0,
     sf_layout: SfLayout = SfLayout.layout_linear,
 ) -> torch.Tensor:
     r"""Combine per-expert outputs back to the originating ranks.
@@ -426,6 +434,18 @@ def moe_a2a_combine(
     payload_in_workspace : bool
         ``True`` if ``payload`` is already a workspace-backed view (skips
         the staging copy).  Defaults to ``False``.
+    output_dtype : Optional[torch.dtype]
+        Optional output data type.  Currently supports ``torch.bfloat16``
+        and ``torch.float8_e4m3fn``.
+    output_scales : Optional[torch.Tensor]
+        Optional output scale tensor for quantized outputs.  Currently
+        supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+    output_scalar_scale : float
+        Per-tensor global scale applied before FP4 block scaling
+        (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+        paths.
+    sf_layout : SfLayout
+        Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
 
     Returns
     -------
@@ -445,6 +465,7 @@ def moe_a2a_combine(
         payload_in_workspace,
         output_dtype,
         output_scales,
+        output_scalar_scale,
         sf_layout,
     )
 
@@ -831,6 +852,7 @@ class MoeAlltoAll:
         payload_in_workspace: bool = False,
         output_dtype: Optional[torch.dtype] = None,
         output_scales: Optional[torch.Tensor] = None,
+        output_scalar_scale: float = 1.0,
         sf_layout: SfLayout = SfLayout.layout_linear,
     ) -> torch.Tensor:
         r"""Run the MoE all-to-all combine phase.
@@ -846,6 +868,18 @@ class MoeAlltoAll:
         payload_in_workspace : bool
             ``True`` if ``payload`` is already a workspace-backed view (skips
             the staging copy).  Defaults to ``False``.
+        output_dtype : Optional[torch.dtype]
+            Optional output data type.  Currently supports ``torch.bfloat16``
+            and ``torch.float8_e4m3fn``.
+        output_scales : Optional[torch.Tensor]
+            Optional output scale tensor for quantized outputs.  Currently
+            supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+        output_scalar_scale : float
+            Per-tensor global scale applied before FP4 block scaling
+            (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+            paths.
+        sf_layout : SfLayout
+            Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
 
         Returns
         -------
@@ -872,6 +906,7 @@ class MoeAlltoAll:
             payload_in_workspace,
             output_dtype,
             output_scales,
+            output_scalar_scale,
             sf_layout,
         )
 
