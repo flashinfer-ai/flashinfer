@@ -198,11 +198,20 @@ def make_payload(num_tokens, vector_dim, dtype):
     "num_tokens,vector_dim,num_experts,top_k",
     SINGLE_GPU_PARAMS,
 )
+@pytest.mark.parametrize("payload_in_workspace", [False, True])
+@pytest.mark.parametrize("use_output_buffer", [False, True])
 @pytest.mark.skipif(
     not mnnvl_available(),
     reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
 )
-def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
+def test_moe_alltoall_single_gpu(
+    num_tokens,
+    vector_dim,
+    num_experts,
+    top_k,
+    payload_in_workspace,
+    use_output_buffer,
+):
     """Test MOE alltoall communication on single GPU."""
     torch.cuda.set_device(0)
     # Create a random input tensor
@@ -254,24 +263,30 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
         output_tensor, _ = torch.sort(output_tensor.flatten(end_dim=1), dim=0)
         torch.testing.assert_close(output_tensor, input_tensor, atol=0, rtol=0)
 
-    inplace_combine_tensor = moe_a2a.get_combine_payload_tensor_in_workspace(
-        num_tokens,
-        input_tensors[hidden_state_index].shape[-1],
-        input_tensors[hidden_state_index].dtype,
+    if payload_in_workspace:
+        combine_tensor = moe_a2a.get_combine_payload_tensor_in_workspace(
+            num_tokens,
+            input_tensors[hidden_state_index].shape[-1],
+            input_tensors[hidden_state_index].dtype,
+        )
+        combine_tensor.copy_(output_tensors[hidden_state_index])
+    else:
+        combine_tensor = output_tensors[hidden_state_index].clone()
+
+    output_buffer = (
+        torch.empty_like(input_tensors[hidden_state_index])
+        if use_output_buffer
+        else None
     )
-
-    # Copy first output tensor into inplace_combine_tensor
-    inplace_combine_tensor.copy_(output_tensors[hidden_state_index])
-
-    output_buffer = torch.empty_like(input_tensors[hidden_state_index])
     output = moe_a2a.combine(
-        inplace_combine_tensor,
+        combine_tensor,
         num_tokens,
-        payload_in_workspace=True,
+        payload_in_workspace=payload_in_workspace,
         output=output_buffer,
     )
 
-    assert output is output_buffer
+    if output_buffer is not None:
+        assert output is output_buffer
     # Should just be a direct copy for 1 GPU
     torch.testing.assert_close(
         output, input_tensors[hidden_state_index], atol=0, rtol=0
