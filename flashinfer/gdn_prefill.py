@@ -27,7 +27,9 @@ from .gdn_kernels import (
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
     cp_delta_rule_dsl_sm90,
+    cp_delta_rule_dsl_sm120,
 )
+from .gdn_kernels.delta_rule_dsl.varlen_helper import should_use_cp_host
 
 
 _SM100_STATE_DTYPES: tuple[torch.dtype, ...] = (
@@ -57,10 +59,14 @@ def _cp_delta_rule_rejection_reason(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
 ) -> Optional[str]:
-    if arch_major != 9:
-        return "CP delta rule is currently implemented only for SM90"
-    if cp_delta_rule_dsl_sm90 is None:
-        return "CP delta rule SM90 DSL kernel is unavailable"
+    if arch_major == 9:
+        if cp_delta_rule_dsl_sm90 is None:
+            return "CP delta rule SM90 DSL kernel is unavailable"
+    elif arch_major == 12:
+        if cp_delta_rule_dsl_sm120 is None:
+            return "CP delta rule SM120 DSL kernel is unavailable"
+    else:
+        return "CP delta rule is currently implemented only for SM90 and SM120"
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
@@ -184,7 +190,7 @@ def chunk_gated_delta_rule(
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
-        Whether to use the SM90 context-parallel DSL implementation when
+        Whether to use the SM90/SM120 context-parallel DSL implementation when
         low-parallelism heuristics match. ``"auto"`` enables conservative
         routing, ``True`` requires CP support, and ``False`` disables CP.
         Default: ``"auto"``.
@@ -302,8 +308,9 @@ def chunk_gated_delta_rule(
     _sm_count = get_device_sm_count(device)
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     _arch_major = get_compute_capability(device)[0]
-    cp_heuristic_matches = _arch_major == 9 and num_seqs * num_sab_heads < max(
-        1, _sm_count // 2
+    _device_name = torch.cuda.get_device_properties(device).name
+    cp_heuristic_matches = _arch_major in (9, 12) and should_use_cp_host(
+        num_seqs * num_sab_heads, _sm_count, _device_name
     )
     if use_cp is True or (use_cp == "auto" and cp_heuristic_matches):
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
@@ -349,7 +356,11 @@ def chunk_gated_delta_rule(
                     total_seq_len, num_sab_heads, dtype=torch.float32, device=device
                 )
             )
-            cp_delta_rule_dsl_sm90(
+            cp_delta_rule_dsl = (
+                cp_delta_rule_dsl_sm90 if _arch_major == 9 else cp_delta_rule_dsl_sm120
+            )
+            assert cp_delta_rule_dsl is not None
+            cp_delta_rule_dsl(
                 output,
                 output_state,
                 q,

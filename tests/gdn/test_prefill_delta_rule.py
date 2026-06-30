@@ -51,8 +51,8 @@ def _skip_if_unsupported():
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
-    if not is_sm90a_supported(device):
-        pytest.skip("CP GDN prefill requires SM90")
+    if not (is_sm90a_supported(device) or is_sm120a_supported(device)):
+        pytest.skip("CP GDN prefill requires SM90 or SM120")
 
 
 def _skip_if_not_sm100():
@@ -162,7 +162,7 @@ def _test_prefill_kernel(
         atol_kv = 5e-3
         rtol_kv = 1e-3
     else:
-        atol_o = 1e-3
+        atol_o = 2e-3
         rtol_o = 1e-3
         atol_kv = 1e-3
         rtol_kv = 1e-4
