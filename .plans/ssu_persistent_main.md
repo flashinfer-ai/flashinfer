@@ -455,6 +455,32 @@ triton's **190 registers** hold params+operands resident → near-zero LDC/LDS.
 INT/LDC/LDS count — not occupancy.  triton trades occupancy (10%) for registers (190) + hoisting; we
 do the opposite (28% / 87).  For this address-heavy memory-streamer, triton's bet wins.
 
+### Exact executed-instruction count vs triton — the north star (B200, 2026-06-29)
+
+Replaces the rough 50.06M/15.61M above with the exact **dynamic executed** mix
+(`sass__inst_executed_per_opcode_category`, ncu `--metrics`, nw0 b1024).  Ours = current
+committed main (C@state A-operand hand-roll + 2-way accumulator split, 99.9 µs);
+triton = `_persistent_main_kernel` nowrite-half (61 µs; the 4.8 µs launches are the empty
+write-half at prev_k=0).
+
+| executed instructions | ours (split) | triton-pm | ratio |
+|---|---:|---:|---:|
+| **total** | **49,410,880** | **14,139,640** | **3.49×** |
+| **integer** | **26,420,736 (53.5%)** | **5,745,000 (40.6%)** | **4.60×** |
+| load/store | 7,227,520 (14.6%) | — | |
+| uniform datapath | 5,395,328 (10.9%) | — | |
+| floating point | 3,801,088 (7.7%) | — | |
+| control | 3,820,800 (7.7%) | — | |
+
+Key reframing: **triton is also integer-heavy (40.6%)** — it doesn't avoid INT, it executes
+**3.5× fewer instructions total** (4.6× fewer integer).  Our IPC is *higher* (we're only 1.64×
+slower on 3.5× more instructions → triton runs lower-IPC / lower-occupancy).  So the
+**optimization north star is the instruction count itself**: drive total 49.4M → 14M, integer
+26.4M → 5.75M.  The A-hoist + acc-split shaved ~5 µs of stalls but barely dented the *count*
+(both were latency/ILP wins, not instruction-count wins) — the 3.5× gap is structural:
+per-work-unit CuTe addressing recompute, small tiles (more loop iterations), and the
+warp-specialized prefetch.  Closing it is the staged plan below.
+
 ### Index-math simplification plan (staged)
 
 1. **Hoist loop-invariant CuTe setup out of the per-work-unit path.**  `output_head_2k` /
