@@ -840,6 +840,8 @@ def bench_varlen_transform(
     dtype: torch.dtype,
     generator: torch.Generator,
     has_clusters: bool,
+    deterministic: bool = False,
+    compare_tie_break: bool = False,
 ) -> dict:
     """Benchmark a transform API on realistic variable-length segments."""
     device = torch.device("cuda")
@@ -852,20 +854,28 @@ def bench_varlen_transform(
     num_rows = scores.size(0)
     k = case.k
 
-    if transform == "page_table":
-
-        def flashinfer_fn():
+    def run(deterministic_mode, tie_break=TopKTieBreak.NONE):
+        if transform == "page_table":
             return flashinfer.top_k_page_table_transform(
-                scores, src_page_table, lengths, k, row_to_batch=row_to_batch
+                scores,
+                src_page_table,
+                lengths,
+                k,
+                row_to_batch=row_to_batch,
+                deterministic=deterministic_mode,
+                tie_break=tie_break,
             )
-
-    else:
-
-        def flashinfer_fn():
-            return flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+        return flashinfer.top_k_ragged_transform(
+            scores,
+            offsets,
+            lengths,
+            k,
+            deterministic=deterministic_mode,
+            tie_break=tie_break,
+        )
 
     set_topk_algo("default")
-    fi_ms = bench_median_ms(flashinfer_fn)
+    fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(run, deterministic)
 
     len_min, len_mean, len_max, trivial_frac = summarize_lengths(lengths, k)
     result = {
@@ -882,18 +892,38 @@ def bench_varlen_transform(
         "trivial_frac": trivial_frac,
         "flashinfer_us": fi_ms * 1e3,
     }
+    if fi_nondeterministic_ms is not None:
+        result["flashinfer_nondeterministic_us"] = fi_nondeterministic_ms * 1e3
+        result["deterministic_slowdown_vs_nondeterministic"] = (
+            fi_ms / fi_nondeterministic_ms
+        )
 
-    if has_clusters:
+    # clusters is a non-deterministic SM100 path; it cannot run under deterministic
+    # or tie_break modes, so only measure it for the plain comparison.
+    if has_clusters and not (deterministic or compare_tie_break):
         set_topk_algo("clusters")
-        clusters_ms = bench_median_ms(flashinfer_fn)
+        clusters_ms = bench_median_ms(lambda: run(False))
         result["clusters_us"] = clusters_ms * 1e3
         result["speedup_clusters_vs_default"] = fi_ms / clusters_ms
     set_topk_algo("auto")
 
+    if compare_tie_break:
+        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        baseline_ms = (
+            fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
+        )
+        result.update(
+            bench_tie_break_variants(
+                lambda tie_break: run(True, tie_break),
+                baseline_ms,
+            )
+        )
+
     # torch reference operates on a pre-masked tensor (mask built outside timing) so
     # we compare selection cost against the length-aware kernel.
     masked_scores = build_masked_scores(scores, lengths)
-    torch_ms = bench_median_ms(lambda: torch.topk(masked_scores, k, dim=-1))
+    with torch_deterministic_algorithms(deterministic):
+        torch_ms = bench_median_ms(lambda: torch.topk(masked_scores, k, dim=-1))
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
 
@@ -1594,10 +1624,15 @@ def main():
         generator = torch.Generator(device=device)
         generator.manual_seed(1234)
 
+        show_det_or_tie = args.deterministic or args.tie_break
+        # clusters is a non-deterministic SM100 path; omit it under deterministic/tie-break.
+        show_clusters = has_clusters and not show_det_or_tie
+
         print("\n" + "=" * 100)
         print(
             "varlen: Variable-length segment top-k transforms (production-realistic) "
-            f"(dtype={dtype_str}, length_dist={args.length_dist}, k={args.varlen_k})"
+            f"(dtype={dtype_str}, length_dist={args.length_dist}, k={args.varlen_k}, "
+            f"deterministic={args.deterministic}, tie_break={args.tie_break})"
         )
         print(
             "NOTE: lengths model per-row valid windows; decode = independent context "
@@ -1607,21 +1642,45 @@ def main():
             "NOTE: torch(mask) masks invalid positions once (outside timing) then "
             "torch.topk, isolating selection cost vs the length-aware kernel"
         )
-        if not has_clusters:
+        if show_det_or_tie:
+            if args.deterministic:
+                print(
+                    "NOTE: deterministic mode also benchmarks FlashInfer(non-det) "
+                    "for direct comparison"
+                )
+            if args.tie_break:
+                print(
+                    "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
+                    "slowdowns align with the same baseline as DetSlowdown"
+                )
+            print(
+                "NOTE: Clusters column omitted under deterministic/tie-break "
+                "(clusters requires the non-deterministic path)"
+            )
+        elif not has_clusters:
             print(
                 "NOTE: clusters path requires SM100 (Blackwell); omitting Clusters "
                 f"column on this device (SM{cap[0]}{cap[1]})"
             )
         print("=" * 100)
 
-        header = (
+        base_header = (
             f"{'regime':>8} {'dist':>10} {'transform':>11} {'rows':>8} {'reqs':>6} "
             f"{'max_len':>9} {'k':>6} | {'len_min':>8} {'len_mean':>9} {'len_max':>8} "
-            f"{'triv%':>6} | {'FlashInfer':>12}"
+            f"{'triv%':>6} | "
         )
-        if has_clusters:
-            header += f" {'Clusters':>12} {'vsClusters':>10}"
-        header += f" {'torch(mask)':>13} {'Speedup':>9}"
+        if show_det_or_tie:
+            header = (
+                base_header
+                + f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
+            )
+            header = append_tie_break_header(header, args.tie_break)
+            header += f" {'torch(mask)':>13} {'Speedup':>9}"
+        else:
+            header = base_header + f"{'FlashInfer':>12}"
+            if show_clusters:
+                header += f" {'Clusters':>12} {'vsClusters':>10}"
+            header += f" {'torch(mask)':>13} {'Speedup':>9}"
         print(header)
         print("-" * len(header))
 
@@ -1629,26 +1688,60 @@ def main():
             for transform in ["page_table", "ragged"]:
                 try:
                     result = bench_varlen_transform(
-                        case, transform, dtype, generator, has_clusters
+                        case,
+                        transform,
+                        dtype,
+                        generator,
+                        has_clusters,
+                        deterministic=args.deterministic,
+                        compare_tie_break=args.tie_break,
                     )
-                    line = (
+                    base_line = (
                         f"{result['regime']:>8} {result['length_dist']:>10} "
                         f"{result['transform']:>11} {result['num_rows']:>8} "
                         f"{result['num_requests']:>6} {result['max_len']:>9} "
                         f"{result['k']:>6} | {result['len_min']:>8} "
                         f"{result['len_mean']:>9.1f} {result['len_max']:>8} "
                         f"{100.0 * result['trivial_frac']:>5.1f}% | "
-                        f"{result['flashinfer_us']:>10.2f}us"
                     )
-                    if has_clusters and "clusters_us" in result:
-                        line += (
-                            f" {result['clusters_us']:>10.2f}us "
-                            f"{result['speedup_clusters_vs_default']:>9.2f}x"
+                    if show_det_or_tie:
+                        nondet_us = result.get("flashinfer_nondeterministic_us")
+                        if nondet_us is None:
+                            nondet_us = result["flashinfer_us"]
+                        det_us = result["flashinfer_us"] if args.deterministic else None
+                        det_us_str = (
+                            f"{det_us:>12.2f}us"
+                            if det_us is not None
+                            else f"{'n/a':>14}"
                         )
-                    line += (
-                        f" {result['torch_us']:>11.2f}us "
-                        f"{result['speedup_vs_torch']:>8.2f}x"
-                    )
+                        det_slowdown = result.get(
+                            "deterministic_slowdown_vs_nondeterministic"
+                        )
+                        det_slowdown_str = (
+                            f"{det_slowdown:>10.2f}x"
+                            if det_slowdown is not None
+                            else f"{'n/a':>11}"
+                        )
+                        line = (
+                            base_line
+                            + f"{nondet_us:>10.2f}us {det_us_str} {det_slowdown_str}"
+                        )
+                        line = append_tie_break_columns(line, result, args.tie_break)
+                        line += (
+                            f" {result['torch_us']:>11.2f}us "
+                            f"{result['speedup_vs_torch']:>8.2f}x"
+                        )
+                    else:
+                        line = base_line + f"{result['flashinfer_us']:>10.2f}us"
+                        if show_clusters and "clusters_us" in result:
+                            line += (
+                                f" {result['clusters_us']:>10.2f}us "
+                                f"{result['speedup_clusters_vs_default']:>9.2f}x"
+                            )
+                        line += (
+                            f" {result['torch_us']:>11.2f}us "
+                            f"{result['speedup_vs_torch']:>8.2f}x"
+                        )
                     print(line)
                 except RuntimeError as e:
                     error_label = classify_benchmark_runtime_error(e)
