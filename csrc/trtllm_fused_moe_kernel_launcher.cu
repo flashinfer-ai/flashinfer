@@ -817,20 +817,20 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     int32_t max_num_padded_tokens = workspace.total_max_padded_tokens;
     gemm1_output = alloc_tensor({max_num_padded_tokens, args->intermediate_size}, dl_bfloat16,
                                 hidden_states.device());
-    activation_output = alloc_tensor({max_num_padded_tokens, args->intermediate_size}, dl_bfloat16,
-                                     hidden_states.device());
     gemm2_output = alloc_tensor({max_num_padded_tokens, args->hidden_size}, dl_bfloat16,
                                 hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
     workspace.gemm1_output_scale = nullptr;
-    workspace.activation_output = activation_output.data_ptr();
+    workspace.activation_output = nullptr;
     workspace.activation_output_scale = nullptr;
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    if (args->output == nullptr) {
+    // Only the finalize step writes `output`; when do_finalize is false the
+    // result is taken from gemm2_output instead, so skip this allocation.
+    if (args->do_finalize && args->output == nullptr) {
       output =
           alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
       args->output = output.data_ptr();
@@ -1012,24 +1012,20 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         alloc_tensor({2 * args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
                      hidden_states.device());
 
-    activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
-                                     dl_uint8, hidden_states.device());
-    activation_output_scale =
-        alloc_tensor({args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
-                     hidden_states.device());
-
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
                                 hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
     workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
-    workspace.activation_output = activation_output.data_ptr();
-    workspace.activation_output_scale = static_cast<float*>(activation_output_scale.data_ptr());
+    workspace.activation_output = nullptr;
+    workspace.activation_output_scale = nullptr;
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    if (args->output == nullptr) {
+    // Only the finalize step writes `output`; when do_finalize is false the
+    // result is taken from gemm2_output instead, so skip this allocation.
+    if (args->do_finalize && args->output == nullptr) {
       output =
           alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
       args->output = output.data_ptr();
@@ -1372,6 +1368,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
     }
 
+    // DeepSeek FP8 doesn't fuse the activation
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
       activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
                                        dl_uint8, hidden_states.device());
@@ -1393,7 +1390,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    if (args->output == nullptr) {
+    // Only the finalize step writes `output`; when do_finalize is false the
+    // result is taken from gemm2_output instead, so skip this allocation.
+    if (args->do_finalize && args->output == nullptr) {
       output =
           alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
       args->output = output.data_ptr();
@@ -1943,6 +1942,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       // When per-token scales are used, the FC1 output is always BF16 and will be quantized
       gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
                                   dl_bfloat16, hidden_states.device());
+      // The per-token NvFP4 quant needs to stage the output for running the explicit quant kernel
       activation_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
                                        hidden_states.device());
       per_token_scales_fc2 =
@@ -2528,7 +2528,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     args->num_experts = num_experts;
     // For E2m1, hidden_size is already multiplied by 2 above, so use it directly
     args->hidden_size = hidden_size;
-    args->hidden_size_output = output.size(1);
+    args->hidden_size_output = output.size(1) > 0 ? output.size(1) : hidden_size / 2;
     args->top_k = top_k;
     args->n_group = n_group.value_or(0);
     args->topk_group = topk_group.value_or(0);

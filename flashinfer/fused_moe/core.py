@@ -1113,6 +1113,23 @@ class MoeRunnerInputs:
 MoEInputs = MoeRunnerInputs
 
 
+def _alloc_trtllm_moe_output(
+    num_tokens: int,
+    hidden_size: int,
+    do_finalize: bool,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Allocate the finalized-output buffer for a trtllm-gen MoE op.
+    When `do_finalize` is false, return a zero-width `(num_tokens, 0)`
+    placeholder instead: the leading `num_tokens` dim is preserved for
+    shape checks and the autotuner's token bucketing.
+    """
+    return torch.empty(
+        num_tokens, hidden_size if do_finalize else 0, dtype=dtype, device=device
+    )
+
+
 def _unpack_trtllm_moe_output(
     intermediate_output,
     output: torch.Tensor,
@@ -1652,13 +1669,10 @@ def get_trtllm_moe_sm100_module():
         hidden_size = hidden_states.shape[-1]
 
         if output is None:
-            output = torch.empty(
-                num_tokens,
-                hidden_size,
-                dtype=torch.bfloat16,
-                device=hidden_states.device,
+            output = _alloc_trtllm_moe_output(
+                num_tokens, hidden_size, do_finalize, hidden_states.device
             )
-        else:
+        elif do_finalize:
             check_shape_dtype_device(
                 output,
                 (num_tokens, hidden_size),
@@ -1857,13 +1871,10 @@ def get_trtllm_moe_sm100_module():
         hidden_size = hidden_states.shape[-1]
 
         if output is None:
-            output = torch.empty(
-                num_tokens,
-                hidden_size,
-                dtype=torch.bfloat16,
-                device=hidden_states.device,
+            output = _alloc_trtllm_moe_output(
+                num_tokens, hidden_size, do_finalize, hidden_states.device
             )
-        else:
+        elif do_finalize:
             check_shape_dtype_device(
                 output,
                 (num_tokens, hidden_size),
@@ -2066,13 +2077,10 @@ def get_trtllm_moe_sm100_module():
         hidden_size = hidden_states.shape[-1]
 
         if output is None:
-            output = torch.empty(
-                num_tokens,
-                hidden_size,
-                dtype=torch.bfloat16,
-                device=hidden_states.device,
+            output = _alloc_trtllm_moe_output(
+                num_tokens, hidden_size, do_finalize, hidden_states.device
             )
-        else:
+        elif do_finalize:
             check_shape_dtype_device(
                 output,
                 (num_tokens, hidden_size),
@@ -2338,13 +2346,10 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         if output is None:
-            output = torch.empty(
-                num_tokens,
-                hidden_size,
-                dtype=torch.bfloat16,
-                device=hidden_states.device,
+            output = _alloc_trtllm_moe_output(
+                num_tokens, hidden_size, do_finalize, hidden_states.device
             )
-        else:
+        elif do_finalize:
             check_shape_dtype_device(
                 output, None, torch.bfloat16, hidden_states.device, "output"
             )
@@ -2576,11 +2581,8 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         if output is None:
-            output = torch.empty(
-                num_tokens,
-                hidden_size,
-                dtype=torch.bfloat16,
-                device=hidden_states.device,
+            output = _alloc_trtllm_moe_output(
+                num_tokens, hidden_size, do_finalize, hidden_states.device
             )
 
         tuner = AutoTuner.get()
