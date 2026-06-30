@@ -9,12 +9,346 @@ different kernel variants (prefill, decode).
 """
 
 import enum
+import ctypes
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, is_dataclass, fields
+from cutlass._mlir import ir
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Int32, Float32
+from cutlass.cute.typing import Int32, Float32, Optional
 
 
+#
+# JIT-extendable masking configurations
+# Currently only supports GQA/MHA decode kernel
+# TODO: support skipping fully masked tiles for prefill integration
+#
+class AttentionMask(ABC):
+    """ABC interface for attention masking configurations.
+
+    Mark parametrized subclasses with @dataclass to avoid
+    writing custom DynamicExpression and JitArgument protocols.
+    """
+
+    # JitArgument protocol
+    def __c_pointers__(self) -> list[ctypes.c_void_p]:
+        pointers: list[ctypes.c_void_p] = []
+        if is_dataclass(self):
+            for f in fields(self):
+                v = getattr(self, f.name)
+                if hasattr(v, "__c_pointers__"):
+                    pointers.extend(v.__c_pointers__())
+        return pointers
+
+    def __get_mlir_types__(self) -> list[ir.Type]:
+        types: list[ir.Type] = []
+        if is_dataclass(self):
+            for f in fields(self):
+                v = getattr(self, f.name)
+                if hasattr(v, "__get_mlir_types__"):
+                    types.extend(v.__get_mlir_types__())
+        return types
+
+    # DynamicExpression protocol
+    def __extract_mlir_values__(self) -> list[ir.Value]:
+        values: list[ir.Value] = []
+        if is_dataclass(self):
+            for f in fields(self):
+                v = getattr(self, f.name)
+                if hasattr(v, "__extract_mlir_values__"):
+                    values.extend(v.__extract_mlir_values__())
+        return values
+
+    def __new_from_mlir_values__(self, values: list[ir.Value]) -> "AttentionMask":
+        args: list[object] = []
+        if is_dataclass(self):
+            for f in fields(self):
+                v = getattr(self, f.name)
+                if hasattr(v, "__new_from_mlir_values__"):
+                    args.extend([v.__new_from_mlir_values__(values[0:1])])
+                    values = values[1:]
+                else:
+                    args.extend([v])
+
+        return type(self)(*args)
+
+    @abstractmethod
+    def num_phases(self) -> int:
+        """Compile-time number of masking phases over the entire KV sequence outer mainloop,
+        where each phase can optionally generate masking code.
+        """
+        ...
+
+    @abstractmethod
+    def is_masked_phase(self, phase: int) -> bool:
+        """Compile-time condition deciding whether to generate masking code for a given phase."""
+        ...
+
+    @cute.jit
+    @abstractmethod
+    def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
+        """Whether the given KV token at idx_kv should be masked as OOB."""
+        ...
+
+    @cute.jit
+    @abstractmethod
+    def get_range_args(
+        self,
+        seqlen_q,
+        seqlen_kv,
+        tile_q,
+        tile_kv,
+        num_tiles_kv,
+        num_iters_kv,
+        kv_splits,
+        kv_split_idx,
+        warpgroups_kv,
+        warpgroup_kv_idx,
+    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
+        """Return a 3-tuple of args to cutlass.range for each masking phase.
+
+        For phases that generate masking code, range args must emit
+        tile_kv coordinates (index into total number of tiles KV across entire KV sequence)
+        so that kv token index can be correctly calculated.
+
+        Parameters
+        ----------
+        seqlen_q
+            Query sequence length
+        seqlen_kv
+            Key/Value sequence length
+        tile_q
+            Query sequence per threadblock
+        tile_kv
+            Key/Value sequence per threadblock per outer mainloop iteration
+        num_tiles_kv
+            KV tiles across entire KV sequence for this Q tile
+        num_iters_kv
+            KV tiles for this KV split, number of outer mainloop iterations
+        kv_splits
+            Threadblocks per KV sequence
+        kv_split_idx
+            Threadblock index into total KV splits
+        warpgroups_kv
+            Warpgroups per threadblock KV sequence
+        warpgroup_kv_idx
+            Warpgroup index into total KV warpgroups
+        """
+        ...
+
+
+class NoMask(AttentionMask):
+    """Every token attends to every other token.
+
+    OOB logits are TMA masked to 0 and will contribute to softmax denominator.
+    Valid for when KV sequence is a multiple of KV sequence tile.
+    """
+
+    def num_phases(self) -> int:
+        return 1
+
+    def is_masked_phase(self, phase: int) -> bool:
+        return False
+
+    @cute.jit
+    def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
+        return False
+
+    @cute.jit
+    def get_range_args(
+        self,
+        seqlen_q,
+        seqlen_kv,
+        tile_q,
+        tile_kv,
+        num_tiles_kv,
+        num_iters_kv,
+        kv_splits,
+        kv_split_idx,
+        warpgroups_kv,
+        warpgroup_kv_idx,
+    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
+        return ((warpgroup_kv_idx, num_iters_kv, warpgroups_kv),)
+
+
+class DenseMask(AttentionMask):  # aka ResidualMask
+    """Every token attends to every other token."""
+
+    def num_phases(self) -> int:
+        return 2
+
+    def is_masked_phase(self, phase: int) -> bool:
+        return phase == 1
+
+    @cute.jit
+    def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
+        return idx_kv >= seqlen_kv
+
+    @cute.jit
+    def get_range_args(
+        self,
+        seqlen_q,
+        seqlen_kv,
+        tile_q,
+        tile_kv,
+        num_tiles_kv,
+        num_iters_kv,
+        kv_splits,
+        kv_split_idx,
+        warpgroups_kv,
+        warpgroup_kv_idx,
+    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
+        is_last_split = kv_split_idx == (num_tiles_kv - 1) % kv_splits
+        is_last_phase = warpgroup_kv_idx == (num_iters_kv - 1) % warpgroups_kv
+
+        unmasked_start = warpgroup_kv_idx
+        unmasked_end = num_iters_kv
+        unmasked_step = warpgroups_kv
+        masked_start = masked_end = masked_step = 0
+
+        if seqlen_kv % tile_kv != 0 and is_last_split and is_last_phase:
+            unmasked_end -= 1
+            masked_start = num_tiles_kv - 1
+            masked_end = num_tiles_kv
+            masked_step = 1
+
+        return (
+            (unmasked_start, unmasked_end, unmasked_step),
+            (masked_start, masked_end, masked_step),
+        )
+
+
+class CausalMask(AttentionMask):
+    """Current tokens only attend to past tokens and itself."""
+
+    def num_phases(self) -> int:
+        return 2
+
+    def is_masked_phase(self, phase: int) -> bool:
+        return phase == 1
+
+    @cute.jit
+    def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
+        idx_current = seqlen_kv - seqlen_q + idx_q
+        return idx_kv > idx_current
+
+    @cute.jit
+    def get_range_args(
+        self,
+        seqlen_q,
+        seqlen_kv,
+        tile_q,
+        tile_kv,
+        num_tiles_kv,
+        num_iters_kv,
+        kv_splits,
+        kv_split_idx,
+        warpgroups_kv,
+        warpgroup_kv_idx,
+    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
+        is_last_split = kv_split_idx == (num_tiles_kv - 1) % kv_splits
+        is_prev_split = kv_split_idx == (num_tiles_kv - 2) % kv_splits
+        is_last_phase = warpgroup_kv_idx == (num_iters_kv - 1) % warpgroups_kv
+        is_prev_phase = warpgroup_kv_idx == (num_iters_kv - 2) % warpgroups_kv
+
+        unmasked_start = warpgroup_kv_idx
+        unmasked_end = num_iters_kv
+        unmasked_step = warpgroups_kv
+        masked_start = masked_end = masked_step = 0
+
+        # 2 masked tiles
+        if 0 < seqlen_kv % tile_kv < seqlen_q:
+            # 1 split masks 2 tiles
+            if kv_splits == 1:
+                unmasked_end -= 2
+                masked_start = num_tiles_kv - 2 + (0 if is_prev_phase else 1)
+                masked_end = num_tiles_kv
+                masked_step = warpgroups_kv
+            # 2 splits mask 1 tile each
+            elif (is_last_split or is_prev_split) and is_last_phase:
+                unmasked_end -= 1
+                masked_start = (
+                    (num_tiles_kv - 1) if is_last_split else (num_tiles_kv - 2)
+                )
+                masked_end = num_tiles_kv
+                masked_step = 2
+        # 1 masked tile
+        elif seqlen_q > 1 or seqlen_kv % tile_kv != 0:
+            # 1 split masks 1 tile
+            if is_last_split and is_last_phase:
+                unmasked_end -= 1
+                masked_start = num_tiles_kv - 1
+                masked_end = num_tiles_kv
+                masked_step = 1
+
+        return (
+            (unmasked_start, unmasked_end, unmasked_step),
+            (masked_start, masked_end, masked_step),
+        )
+
+
+@dataclass(frozen=True)
+class SlidingWindowMask(AttentionMask):
+    """Current tokens attend to a specified window of past and future tokens.
+
+    Parameters
+    ----------
+    window_left
+        Number of past tokens to attend to.
+        None will include all tokens left of causal diagonal.
+    window_right
+        Number of future tokens to attend to.
+        None will include all tokens right of causal diagonal.
+    """
+
+    # use int for compile-time config and Int32 for runtime config
+    window_left: Optional[Int32]
+    window_right: Optional[Int32] = 0
+
+    def num_phases(self) -> int:
+        # Assume KV seqlen roughly matches window size and that
+        # window is small enough to not need an unmasked phase
+        # Can revisit this for perf for very large windows
+        return 1
+
+    def is_masked_phase(self, phase: int) -> bool:
+        return True
+
+    @cute.jit
+    def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
+        is_oob = idx_kv >= seqlen_kv
+        idx_current = seqlen_kv - seqlen_q + idx_q
+        if cutlass.const_expr(self.window_left is not None):
+            is_oob |= idx_kv < idx_current - self.window_left
+        if cutlass.const_expr(self.window_right is not None):
+            is_oob |= idx_kv > idx_current + self.window_right
+        return is_oob
+
+    @cute.jit
+    def get_range_args(
+        self,
+        seqlen_q,
+        seqlen_kv,
+        tile_q,
+        tile_kv,
+        num_tiles_kv,
+        num_iters_kv,
+        kv_splits,
+        kv_split_idx,
+        warpgroups_kv,
+        warpgroup_kv_idx,
+    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
+        masked_start = kv_split_idx + warpgroup_kv_idx * kv_splits
+        masked_stop = num_tiles_kv
+        masked_step = warpgroups_kv * kv_splits
+        return ((masked_start, masked_stop, masked_step),)
+
+
+#
+# Legacy enum-based masking configuration
+# only supports GQA/MHA prefill kernel
+#
 class MaskType(enum.Enum):
     NO_MASK = enum.auto()
     RESIDUAL_MASK = enum.auto()
