@@ -688,9 +688,15 @@ class TraceTemplate:
                         descriptor.param if descriptor.param is not None else json_key
                     )
                     t = _get_tensor(kwargs, param, descriptor.tuple_idx)
+                    if t is not None:
+                        input_dtype = _dtype_str(t.dtype)
+                    elif descriptor.optional and descriptor.dtype is not None:
+                        input_dtype = descriptor.dtype
+                    else:
+                        input_dtype = "unknown"
                     entry = {
                         "shape": descriptor.dim_names,
-                        "dtype": _dtype_str(t.dtype) if t is not None else "unknown",
+                        "dtype": input_dtype,
                     }
                 if descriptor.optional:
                     entry["optional"] = True

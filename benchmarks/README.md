@@ -298,6 +298,7 @@ The `moe_a2a_dispatch_combine` routine benchmarks MoE All-to-All communication f
 | `--validate`             | Run correctness validation before benchmarking using deterministic fake MoE                                |
 | `--per_phase_timing`     | Enable per-phase timing (dispatch/combine/moe_kernel). Adds slight overhead from CUDA events               |
 | `--nvtx`                 | Enable NVTX markers for Nsight Systems profiling                                                           |
+| `--use_lora`             | Carry a per-token int32 LoRA adapter ID through dispatch as an extra payload.                                                                                                                  |
 
 **Launch Examples:**
 ```bash
@@ -323,6 +324,12 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
     --routine moe_a2a_dispatch_combine \
     --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
     --validate --per_phase_timing
+
+# Multi-tenant LoRA: carry per-token adapter ID through dispatch
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine moe_a2a_dispatch_combine \
+    --num_tokens 2048 --hidden_size 7168 --num_experts 256 --top_k 8 \
+    --use_lora --validate
 ```
 
 ### AllReduce Communication Flags (allreduce_fusion)

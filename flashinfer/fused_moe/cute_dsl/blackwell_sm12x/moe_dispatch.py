@@ -8,6 +8,7 @@ selection.
 from __future__ import annotations
 
 import os
+import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -371,7 +372,16 @@ class _WeightViews:
     _down_sf_storage: torch.Tensor | None = None
 
 
-_WEIGHT_CACHE: Dict[Tuple, _WeightViews] = {}
+def _register_cache_eviction(cache: Dict, key: Tuple, *source_tensors) -> None:
+    """Evict ``key`` when a source weight tensor is collected, so the cache
+    follows the weights' lifetime instead of growing for the whole process.
+    """
+    for tensor in source_tensors:
+        if tensor is not None:
+            weakref.finalize(tensor, cache.pop, key, None)
+
+
+_WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
 
 
 def _get_weight_views(
@@ -410,36 +420,37 @@ def _get_weight_views(
         w2_alphas.data_ptr(),
     )
     cached = _WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if cached is None:
+        # Cache the fresh buffers (scale factors + fp32 alphas).
+        w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
+        cached = (
+            convert_sf_from_mma_layout(
+                w1_blockscale, m=w1_rows, k=k, num_groups=w1_fp4.shape[0]
+            ).contiguous(),
+            convert_sf_from_mma_layout(
+                w2_blockscale, m=k, k=n, num_groups=w2_fp4.shape[0]
+            ).contiguous(),
+            w1_alphas.contiguous().to(torch.float32),
+            w2_alphas.contiguous().to(torch.float32),
+        )
+        _WEIGHT_CACHE[key] = cached
+        _register_cache_eviction(
+            _WEIGHT_CACHE,
+            key,
+            w1_fp4,
+            w1_blockscale,
+            w1_alphas,
+            w2_fp4,
+            w2_blockscale,
+            w2_alphas,
+        )
+    w13_sf_contiguous, down_sf_contiguous, w1_alpha, w2_alpha = cached
 
-    # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy)
-    # w1_rows is 2*n for gated (SiLU) or n for non-gated (ReLU2)
+    # Permute [E, w1_rows, k//2] -> [w1_rows, k//2, E] (view, no copy).
+    sf_dtype = cutlass.Float8E4M3FN
     w13 = w1_fp4.permute(1, 2, 0)
     down = w2_fp4.permute(1, 2, 0)
-
-    # The kernel's TMA descriptors read scale factors in the physical storage
-    # order produced by swizzle_block_scale: (batch, rows_padded, cols_padded).
-    # convert_sf_to_mma_layout returns a strided 6D view over this storage.
-    # We need the ORIGINAL physical storage, not .contiguous() of the view
-    # (which would write in permuted logical order).
-    # convert_sf_from_mma_layout reverses the permutation back to 2D swizzled.
-    sf_dtype = cutlass.Float8E4M3FN
-    w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
-    w13_sf_contiguous = convert_sf_from_mma_layout(
-        w1_blockscale,
-        m=w1_rows,
-        k=k,
-        num_groups=w1_fp4.shape[0],  # num_local_experts
-    ).contiguous()
-    down_sf_contiguous = convert_sf_from_mma_layout(
-        w2_blockscale,
-        m=k,
-        k=n,
-        num_groups=w2_fp4.shape[0],
-    ).contiguous()
-
-    views = _WeightViews(
+    return _WeightViews(
         w13_fp4=w13.view(torch.float4_e2m1fn_x2),
         down_fp4=down.view(torch.float4_e2m1fn_x2),
         sfb_w13_ptr=make_ptr(
@@ -454,18 +465,15 @@ def _get_weight_views(
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        w1_alpha=w1_alphas.contiguous().to(torch.float32),
-        w2_alpha=w2_alphas.contiguous().to(torch.float32),
+        w1_alpha=w1_alpha,
+        w2_alpha=w2_alpha,
         w1_storage=w1_fp4,
         w1_scale_storage=w13_sf_contiguous,
         w2_storage=w2_fp4,
         w2_scale_storage=down_sf_contiguous,
+        _w13_sf_storage=w13_sf_contiguous,
+        _down_sf_storage=down_sf_contiguous,
     )
-    # Keep references to prevent GC of contiguous buffers
-    views._w13_sf_storage = w13_sf_contiguous
-    views._down_sf_storage = down_sf_contiguous
-    _WEIGHT_CACHE[key] = views
-    return views
 
 
 # ---------------------------------------------------------------------------
@@ -2076,6 +2084,16 @@ def _get_w4a16_packed_weights(
         source_format=source_format,
     )
     _W4A16_WEIGHT_CACHE[key] = prepared
+    _register_cache_eviction(
+        _W4A16_WEIGHT_CACHE,
+        key,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+    )
     return prepared
 
 

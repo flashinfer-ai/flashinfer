@@ -78,7 +78,11 @@ from .quantization.fp4_quantization import (
     nvfp4_kv_dequantize,
     nvfp4_kv_quantize,
 )
-from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .quantization.fp8_quantization import (
+    mxfp8_dequantize_host,
+    mxfp8_grouped_quantize,
+    mxfp8_quantize,
+)
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
@@ -106,6 +110,8 @@ from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import mm_bf16_fp4 as mm_bf16_fp4
+from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
@@ -125,6 +131,13 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
+from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
+from .nvfp4_attention_sm120 import (
+    nvfp4_attention_sm120_fwd as nvfp4_attention_sm120_fwd,
+)
+from .nvfp4_attention_sm120 import (
+    nvfp4_attention_sm120_quantize_qkv as nvfp4_attention_sm120_quantize_qkv,
+)
 from .norm import (
     fused_dit_residual_layernorm_scale_shift as fused_dit_residual_layernorm_scale_shift,
 )
