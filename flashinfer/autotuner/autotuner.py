@@ -2168,13 +2168,31 @@ class AutoTuner:
                 )
                 return False
 
+        skipped_legacy_cudnn_tactics = 0
         with self._lock:
             for key, value in configs.items():
                 runner_name = value[0]
                 tactic = _json_to_tactic(value[1])
+                if (
+                    runner_name.startswith("Cudnn")
+                    and isinstance(tactic, int)
+                    and tactic >= 0
+                ):
+                    skipped_legacy_cudnn_tactics += 1
+                    continue
                 self._file_configs[key] = (runner_name, tactic)
 
-        logger.info(f"[Autotuner]: Loaded {len(configs)} configs from {path}")
+        if skipped_legacy_cudnn_tactics:
+            logger.warning(
+                f"[Autotuner]: Skipped {skipped_legacy_cudnn_tactics} legacy "
+                "cuDNN config(s) using integer plan-index tactics. They will "
+                "be re-tuned when autotuning is enabled."
+            )
+
+        logger.info(
+            f"[Autotuner]: Loaded {len(configs) - skipped_legacy_cudnn_tactics} "
+            f"configs from {path}"
+        )
         return True
 
     def _prepare_input_tensors_with_batches(
