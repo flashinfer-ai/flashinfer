@@ -150,10 +150,13 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
   auto const* __restrict__ old_x_ptr = reinterpret_cast<input_t const*>(params.old_x);
   auto const* __restrict__ old_B_ptr = reinterpret_cast<input_t const*>(params.old_B);
 
-  int64_t const ox_base = cache_slot * params.old_x_stride_seq + (int64_t)head * DIM + d_tile_off;
+  // Indices into contiguous inner dims (head·DIM, group·DSTATE) are ≪ 2^31 → fold in 32-bit and
+  // cast ONCE onto the int64 base (native IMAD, not a 64-bit chain).  Buffer/slot-distance strides
+  // (*_stride_seq, *_stride_dbuf) stay 64-bit — they can exceed 2^31 in production layouts.
+  int64_t const ox_base = cache_slot * params.old_x_stride_seq + (int64_t)(head * DIM + d_tile_off);
   int64_t const oB_base = cache_slot * params.old_B_stride_seq +
                           (int64_t)buf_read * params.old_B_stride_dbuf +
-                          (int64_t)group_idx * DSTATE;
+                          (int64_t)(group_idx * DSTATE);
 
   constexpr int MAX_WINDOW_PAD_MMA_K = SmemT::MAX_WINDOW_PAD_MMA_K;
   using ZShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<D_PER_CTA>>;
@@ -198,7 +201,7 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
     auto const* __restrict__ oca_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
     int64_t const ca_base = cache_slot * params.old_cumAdt_stride_seq +
                             (int64_t)buf_read * params.old_cumAdt_stride_dbuf +
-                            (int64_t)head * params.old_cumAdt_stride_head;
+                            (int64_t)(head * (int)params.old_cumAdt_stride_head);
     // β tail (one float).  cp.async, NOT a synchronous LDG→STS: this is the only blocking load left
     // in the prefetch path, and as a single-lane sync load it made W0 the laggard at the publish
     // barrier.  As cp.async it's non-blocking (W0 issues + continues) and drains with the bundle.
@@ -206,7 +209,7 @@ __device__ __forceinline__ void load_head(SmemT& smem, CheckpointingSsuParams co
                             sizeof(float));
   }
   if (warp == 3 && z_ptr) {
-    int64_t const z_base = outer * params.z_stride_seq + (int64_t)head * DIM + d_tile_off;
+    int64_t const z_base = outer * params.z_stride_seq + (int64_t)(head * DIM + d_tile_off);
     load_tile_async<ZShape, NPREDICTED>(z_slot, z_ptr + z_base, params.z_stride_token, lane,
                                         seq_len);
   }
@@ -219,8 +222,8 @@ __device__ __forceinline__ void prefetch_state(SmemT& smem, CheckpointingSsuPara
                                                int64_t cache_slot, int state_buf) {
   int const d_tile_off = d_tile * D_PER_CTA;
   auto const* __restrict__ state_ptr = reinterpret_cast<state_t const*>(params.state);
-  int64_t const state_base = cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE +
-                             (int64_t)d_tile_off * DSTATE;
+  int64_t const state_base =
+      cache_slot * params.state_stride_seq + (int64_t)(head * DIM * DSTATE + d_tile_off * DSTATE);
   if constexpr (DIM == D_PER_CTA) {
     load_state_per_warp<state_t, D_PER_CTA, DSTATE, NUM_WARPS>(smem, state_ptr, state_base, warp,
                                                                lane, state_buf);
@@ -247,8 +250,8 @@ __device__ __forceinline__ void load_x(SmemT& smem, CheckpointingSsuParams const
   int const d_tile_off = d_tile * D_PER_CTA;
   auto const* __restrict__ C_ptr = reinterpret_cast<input_t const*>(params.C);
   auto const* __restrict__ x_ptr = reinterpret_cast<input_t const*>(params.x);
-  int64_t const C_base = outer * params.C_stride_seq + (int64_t)group_idx * DSTATE;
-  int64_t const x_base = outer * params.x_stride_seq + (int64_t)head * DIM + d_tile_off;
+  int64_t const C_base = outer * params.C_stride_seq + (int64_t)(group_idx * DSTATE);
+  int64_t const x_base = outer * params.x_stride_seq + (int64_t)(head * DIM + d_tile_off);
   using CShape = cute::Shape<cute::Int<SmemT::NPREDICTED_SWIZZLE_R>, cute::Int<DSTATE>>;
   using XShape = cute::Shape<cute::Int<SmemT::NPREDICTED_PAD_MMA_M>, cute::Int<D_PER_CTA>>;
   // C → slot, on W1.

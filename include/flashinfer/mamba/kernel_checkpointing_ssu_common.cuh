@@ -483,12 +483,14 @@ __device__ __forceinline__ void load_old_dt_cumAdt(CheckpointingSsuParams const&
   if (lane < count) {
     auto const* __restrict__ old_dt_ptr = reinterpret_cast<float const*>(params.old_dt);
     auto const* __restrict__ old_cumAdt_ptr = reinterpret_cast<float const*>(params.old_cumAdt);
+    // head·head_stride is an index into a contiguous inner dim → 32-bit; buffer/slot-distance
+    // strides (*_stride_seq, *_stride_dbuf) stay 64-bit (can exceed 2^31 in production).
     int64_t const dt_base = cache_slot * params.old_dt_stride_seq +
                             (int64_t)buf_read * params.old_dt_stride_dbuf +
-                            (int64_t)head * params.old_dt_stride_head;
+                            (int64_t)(head * (int)params.old_dt_stride_head);
     int64_t const ca_base = cache_slot * params.old_cumAdt_stride_seq +
                             (int64_t)buf_read * params.old_cumAdt_stride_dbuf +
-                            (int64_t)head * params.old_cumAdt_stride_head;
+                            (int64_t)(head * (int)params.old_cumAdt_stride_head);
     dt_dst[lane] = old_dt_ptr[dt_base + lane];
     ca_dst[lane] = old_cumAdt_ptr[ca_base + lane];
   }
@@ -1631,8 +1633,8 @@ __device__ __forceinline__ void store_state(SmemT& smem, CheckpointingSsuParams 
                 "DIM_PER_WARP (D_PER_CTA/NUM_WARPS) must be a multiple of 4 for the (4,8) store");
   auto* __restrict__ state_w = reinterpret_cast<state_t*>(params.state);
   // gmem dest = head's full state base + d_tile's row slice.
-  int64_t const state_base = cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE +
-                             (int64_t)d_tile * D_PER_CTA * DSTATE;
+  int64_t const state_base = cache_slot * params.state_stride_seq +
+                             (int64_t)(head * DIM * DSTATE + d_tile * D_PER_CTA * DSTATE);
 
   // Per-warp D-slice store — the exact inverse of load_state_per_warp: each warp writes its
   // own DIM_PER_WARP rows with a 32-thread (4,8) copy, so ALL NUM_WARPS warps participate

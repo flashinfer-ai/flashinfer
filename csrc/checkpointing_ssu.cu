@@ -571,6 +571,24 @@ void checkpointing_ssu(
   p.old_cumAdt_stride_dbuf = old_cumAdt.stride(1);
   p.old_cumAdt_stride_head = old_cumAdt.stride(2);
 
+  // 32-bit address-fold guard.  The kernel folds within-buffer inner indices (head*dim*dstate,
+  // head*head_stride, group*dstate, …) into int32 before adding the int64 buffer/slot base — see
+  // load_head / prefetch_state / store_state / load_old_dt_cumAdt.  Buffer/slot-distance strides
+  // (*_stride_seq, *_stride_dbuf) stay int64 and are unconstrained; only these inner ceilings must
+  // fit int32.  `nheads*dim*dstate` (the per-slot state extent) dominates every constexpr-stride
+  // fold; the head-stride folds use runtime strides so are checked explicitly.  Assert here so a
+  // future large-tensor layout fails loudly instead of silently truncating an address.
+  constexpr int64_t kInt32Max = 2147483647;
+  FLASHINFER_CHECK(nheads * dim * dstate <= kInt32Max,
+                   "32-bit address fold would overflow: nheads*dim*dstate=", nheads * dim * dstate,
+                   " exceeds int32 max=", kInt32Max);
+  FLASHINFER_CHECK(nheads * p.old_dt_stride_head <= kInt32Max,
+                   "32-bit address fold would overflow: nheads*old_dt_stride_head=",
+                   nheads * p.old_dt_stride_head, " exceeds int32 max=", kInt32Max);
+  FLASHINFER_CHECK(nheads * p.old_cumAdt_stride_head <= kInt32Max,
+                   "32-bit address fold would overflow: nheads*old_cumAdt_stride_head=",
+                   nheads * p.old_cumAdt_stride_head, " exceeds int32 max=", kInt32Max);
+
   // Launch
   ffi::CUDADeviceGuard device_guard(state.device().device_id);
   const cudaStream_t stream = get_stream(state.device());
