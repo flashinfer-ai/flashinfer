@@ -83,7 +83,8 @@ class DtypeUtils {
 
 class FusedMoeRunner : public tvm::ffi::ModuleObj {
  public:
-  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false, bool IsMXFPX = false>
+  template <typename TypeAct, typename TypeWeight, bool NeedQuant = false, bool IsMXFPX = false,
+            kernels::Wfp4Afp8ScaleMode Wfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kNone>
   std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> switch_output_type(DLDataType output_type) {
     switch (encode_dlpack_dtype(output_type)) {
       case int64_code:  // INT64 == FP4
@@ -95,20 +96,21 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         // return std::make_unique<kernels::CutlassMoeFCRunner<Type, Type>>();
       case float16_code:
         if constexpr (NeedQuant) {
-          return std::make_unique<
-              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half, half, IsMXFPX>>();
+          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, half, half,
+                                                              IsMXFPX, Wfp4Afp8Mode>>();
         } else {
-          return std::make_unique<
-              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct, half, IsMXFPX>>();
+          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, half, TypeAct,
+                                                              half, IsMXFPX, Wfp4Afp8Mode>>();
         }
 #ifdef ENABLE_BF16
       case bfloat16_code:
         if constexpr (NeedQuant) {
-          return std::make_unique<kernels::CutlassMoeFCRunner<
-              TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, IsMXFPX>>();
+          return std::make_unique<
+              kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16, __nv_bfloat16,
+                                          __nv_bfloat16, IsMXFPX, Wfp4Afp8Mode>>();
         } else {
-          return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, TypeWeight, __nv_bfloat16,
-                                                              TypeAct, __nv_bfloat16, IsMXFPX>>();
+          return std::make_unique<kernels::CutlassMoeFCRunner<
+              TypeAct, TypeWeight, __nv_bfloat16, TypeAct, __nv_bfloat16, IsMXFPX, Wfp4Afp8Mode>>();
         }
 #endif
       default:
@@ -121,7 +123,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   FusedMoeRunner(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                  bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                 bool use_mxfp8_act_scaling, bool use_packed_weights) {
+                 bool use_mxfp8_act_scaling, bool use_packed_weights, bool use_wfp4afp8_humming) {
     mActivationDtype = activation_dtype;
     mWeightDtype = weight_dtype;
     mUsePackedWeights = use_packed_weights;
@@ -129,7 +131,23 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
     mUseW4GroupScaling = use_w4_group_scaling;
     mUseMxfp8ActScaling = use_mxfp8_act_scaling;
+    mUseWfp4Afp8Humming = use_wfp4afp8_humming;
+    mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kNone;
     mInnerDimMultiplier = 1;
+
+    auto make_humming_runner = [&] {
+      mInnerDimMultiplier = 2;
+      mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0;
+      TVM_FFI_ICHECK(mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16)
+          << "Humming-style MXFP4 x FP8 requires FP16/BF16 inputs and online FP8 activation "
+             "quantization.";
+      TVM_FFI_ICHECK(mActivationDtype == mOutputDtype)
+          << "Humming-style MXFP4 x FP8 online activation quantization currently requires "
+             "activation dtype and output dtype to match.";
+      mKernelRunner =
+          switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, true, false,
+                             kernels::Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>(mOutputDtype);
+    };
 
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
     if (mActivationDtype == dl_float16 && mWeightDtype == dl_float16) {
@@ -154,9 +172,29 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
 #endif
 #ifdef ENABLE_FP4
-    if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant()) {
+#if 0
+    // PHASE3_POST_MMA_PLACEHOLDER: keep these post-MMA MXFP4 routes as a
+    // reminder for future Hopper mixed-input integration, but do not expose the
+    // dl_int64 FP4 placeholder. The real Hopper mixed-input paths should use
+    // the same uint8-packed MXFP4 storage as the Humming-style path and select a
+    // different Wfp4Afp8ScaleMode explicitly.
+    if (isWMxfp4AFp8Quant()) {
       mInnerDimMultiplier = 16;  // 16 FP4 -> 1 LONG
-      mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp4_e2m1>(mOutputDtype);
+      mKernelRunner = switch_output_type<
+          __nv_fp8_e4m3, kernels::Fp4Type, false, false,
+          kernels::Wfp4Afp8ScaleMode::kPostMmaFp8Act>(mOutputDtype);
+    }
+
+    if (isWMxfp4AMxfp8Quant()) {
+      mInnerDimMultiplier = 16;  // 16 FP4 -> 1 LONG
+      mKernelRunner = switch_output_type<
+          __nv_fp8_e4m3, kernels::Fp4Type, false, false,
+          kernels::Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
+    }
+#endif
+
+    if (isWMxfp4AFp8HummingQuant()) {
+      make_humming_runner();
     }
 
     if (isNvfp4Quant()) {
@@ -166,22 +204,24 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #ifdef ENABLE_BF16
         case bfloat16_code:
 #endif
-          mKernelRunner = switch_output_type<__nv_fp4_e2m1, __nv_fp4_e2m1, true>(mOutputDtype);
+          mKernelRunner =
+              switch_output_type<kernels::Fp4Type, kernels::Fp4Type, true>(mOutputDtype);
           break;
         default:
-          mKernelRunner = switch_output_type<__nv_fp4_e2m1, __nv_fp4_e2m1, false>(mOutputDtype);
+          mKernelRunner =
+              switch_output_type<kernels::Fp4Type, kernels::Fp4Type, false>(mOutputDtype);
       }
     }
 
     if (isWFP4A16Quant()) {
       mInnerDimMultiplier = 2;
       if (mActivationDtype == dl_float16) {
-        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, __nv_fp4_e2m1>>();
+        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, kernels::Fp4Type>>();
       }
 #ifdef ENABLE_BF16
       else if (mActivationDtype == dl_bfloat16) {
         mKernelRunner =
-            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>>();
+            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, kernels::Fp4Type>>();
       }
 #endif
     }
@@ -320,7 +360,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     int64_t hidden_size = fc2_expert_weights.size(1);
     int64_t inter_size = fc2_expert_weights.size(2) * mInnerDimMultiplier;
 
-    if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant()) {
+    if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant() || isWMxfp4AFp8HummingQuant()) {
       // MXFP4 weights are required to bealigned to 128 bytes
       TVM_FFI_ICHECK_EQ(hidden_size % 128, 0)
           << "hidden_size must be divisible by 128 for MXFP4 weights";
@@ -379,8 +419,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
         base_activation_type, parallelism_config, min_latency_mode);
 
+    int64_t const routed_tokens = input.size(0) * token_selected_experts.size(1);
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-                                             quant_scales, base_activation_type);
+                                             routed_tokens, quant_scales, base_activation_type);
     kernels::MoeMinLatencyParams min_latency_params{};
 
     // TODO: support lora in the future
@@ -569,8 +610,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
         base_activation_type, parallelism_config, min_latency_mode);
 
+    int64_t const routed_tokens = input.size(0) * token_selected_experts.size(1);
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
-                                             quant_scales, base_activation_type);
+                                             routed_tokens, quant_scales, base_activation_type);
 
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -640,7 +682,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size
                       : -1;
     int64_t group_size =
-        isWFP4A16Quant()
+        (isWFP4A16Quant() || isWMxfp4AFp8HummingQuant())
             ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size
             : group_size_;
     int const num_experts = static_cast<int>(fc2_expert_weights.size(0) * ep_size);
@@ -679,14 +721,16 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                       DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                       hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
                       activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-                      /*need_weights*/ false, parallelism_config, enable_alltoall);
+                      /*need_weights*/ false, parallelism_config, mUseMxfp8ActScaling,
+                      enable_alltoall, mWfp4Afp8Mode);
 #else
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
                       DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
                       hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
                       activation_type, USE_BIAS, USE_LORA, min_latency_mode,
-                      /*need_weights*/ false, parallelism_config);
+                      /*need_weights*/ false, parallelism_config, mUseMxfp8ActScaling,
+                      /*enable_alltoall*/ false, mWfp4Afp8Mode);
 #endif
 
       size_t profile_workspace_size = mProfiler->getWorkspaceSize(num_rows);
@@ -739,6 +783,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         return static_cast<int64_t>(
             mKernelRunner->queryOccupancyForConfig(mAllProfiles[tactic_id]));
       });
+    } else if (name == "get_valid_tactics_for_shape") {
+      return Function::FromTyped(
+          [this](int64_t stage, int64_t gemm_n, int64_t gemm_k) -> Array<int64_t> {
+            std::lock_guard<std::mutex> lock(mMutex);
+            return getValidTacticsForShape(stage, gemm_n, gemm_k);
+          });
     } else if (name == "run_moe") {
       return Function::FromTyped(
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
@@ -805,12 +855,113 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool mUseDeepSeekFP8BlockScaling = false;
   bool mUseW4GroupScaling = false;
   bool mUseMxfp8ActScaling = false;
+  bool mUseWfp4Afp8Humming = false;
   bool mUsePackedWeights = false;
+  kernels::Wfp4Afp8ScaleMode mWfp4Afp8Mode = kernels::Wfp4Afp8ScaleMode::kNone;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
   int64_t mGemm1TacticCount{0};
   int64_t mGemm2TacticCount{0};
+
+  bool isProfileShapeSupported(Profile const& profile, int64_t gemm_n, int64_t gemm_k) const {
+    int64_t tile_m = 0;
+    int64_t tile_n = 0;
+    int64_t tile_k = 0;
+    if (profile.sm_version == 90) {
+      auto const [m, n, k] =
+          tensorrt_llm::cutlass_extensions::enum_to_shape_tuple(profile.tile_config_sm90);
+      tile_m = m;
+      tile_n = n;
+      tile_k = k;
+    } else if (profile.sm_version == 100) {
+      auto const [m, n, k] =
+          tensorrt_llm::cutlass_extensions::enum_to_shape_tuple(profile.tile_config_sm100);
+      tile_m = m;
+      tile_n = n;
+      tile_k = k;
+    } else if (profile.sm_version == 120) {
+      auto const [m, n, k] =
+          tensorrt_llm::cutlass_extensions::enum_to_shape_tuple(profile.tile_config_sm120);
+      tile_m = m;
+      tile_n = n;
+      tile_k = k;
+    }
+
+    if (tile_m <= 0 || tile_n <= 0 || tile_k <= 0 || gemm_n <= 0 || gemm_k <= 0) {
+      return false;
+    }
+    if (gemm_k < tile_k || gemm_k % tile_k != 0) {
+      return false;
+    }
+    if (gemm_n < tile_n) {
+      return false;
+    }
+    if (mUseW4GroupScaling && gemm_n % tile_m != 0) {
+      return false;
+    }
+    bool const is_single_warpgroup =
+        profile.mainloop_schedule ==
+            tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL ||
+        profile.mainloop_schedule ==
+            tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING;
+    if (is_single_warpgroup) {
+      if (!mUseWfp4Afp8Humming || profile.sm_version != 90 || tile_m != 128 || tile_k != 128 ||
+          (tile_n != 8 && tile_n != 16 && tile_n != 32 && tile_n != 40) ||
+          profile.cluster_shape !=
+              tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_1x1x1 ||
+          gemm_n % 128 != 0) {
+        return false;
+      }
+      if (profile.mainloop_schedule ==
+          tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL) {
+        return gemm_k <= 384;
+      }
+      return gemm_k > 384;
+    }
+    if (isWFP4A16Quant()) {
+      if (tile_k == 256 && ((tile_m == 128 && tile_n == 256) || (tile_m == 256 && tile_n == 128))) {
+        return false;
+      }
+      if (tile_k == 512 && tile_n >= 128) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Array<int64_t> getValidTacticsForShape(int64_t stage, int64_t gemm_n, int64_t gemm_k) const {
+    int64_t begin = 0;
+    int64_t end = static_cast<int64_t>(mAllProfiles.size());
+    if (stage == 1) {
+      end = mGemm1TacticCount;
+    } else if (stage == 2) {
+      begin = mGemm1TacticCount;
+      end = mGemm1TacticCount + mGemm2TacticCount;
+    }
+
+    int64_t const total = static_cast<int64_t>(mAllProfiles.size());
+    if (begin < 0) {
+      begin = 0;
+    }
+    if (begin > total) {
+      begin = total;
+    }
+    if (end < begin) {
+      end = begin;
+    }
+    if (end > total) {
+      end = total;
+    }
+
+    Array<int64_t> tactics;
+    for (int64_t tactic_id = begin; tactic_id < end; ++tactic_id) {
+      if (!mUseW4GroupScaling || isProfileShapeSupported(mAllProfiles[tactic_id], gemm_n, gemm_k)) {
+        tactics.push_back(tactic_id);
+      }
+    }
+    return tactics;
+  }
 
   void setRunnerProfiles(Optional<Array<int64_t>> profile_ids) {
     if (mUseDeepSeekFP8BlockScaling) {
@@ -884,7 +1035,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   kernels::QuantParams getQuantParams(
-      int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size,
+      int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size, int64_t routed_tokens,
       Optional<Array<Tensor>> quant_scales,
       ActivationType base_activation_type = ActivationType::Swiglu) const {
     if (isWMxfp8AMxfp8Quant()) {
@@ -991,9 +1142,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                        fc2_quant.ndim() == 1);
     } else if (isWMxfp4AFp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value())
-          << "Expecting quant scales for W4A8_MXFP4_MXF8 quantization";
+          << "Expecting quant scales for post-MMA MXFP4 x FP8 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 5)
-          << "Expecting 5 quant scales for W4A8_MXFP4_FP8 quantization";
+          << "Expecting 5 quant scales for post-MMA MXFP4 x FP8 quantization";
 
       auto const fc1_weight_block = quant_scales.value()[0];
       auto const fc1_global = quant_scales.value()[1];
@@ -1055,6 +1206,56 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           static_cast<float const*>(fc2_act_global.data_ptr()),
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
           static_cast<float const*>(fc2_global.data_ptr()), false, fc2_act_global.ndim() == 1);
+    } else if (isWMxfp4AFp8HummingQuant()) {
+      TVM_FFI_ICHECK(quant_scales.has_value())
+          << "Expecting quant scales for Humming-style MXFP4 x FP8 quantization";
+      TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 5)
+          << "Expecting 5 quant scales for Humming-style MXFP4 x FP8 quantization";
+
+      auto const fc1_weight_block = quant_scales.value()[0];
+      auto const fc1_token_scale = quant_scales.value()[1];
+      auto const fc2_act_global = quant_scales.value()[2];
+      auto const fc2_weight_block = quant_scales.value()[3];
+      auto const fc2_token_scale = quant_scales.value()[4];
+
+      CHECK_INPUT_TYPE(fc1_weight_block, dl_int32);
+      CHECK_INPUT_TYPE(fc1_token_scale, dl_float32);
+      CHECK_INPUT_TYPE(fc2_act_global, dl_float32);
+      CHECK_INPUT_TYPE(fc2_weight_block, dl_int32);
+      CHECK_INPUT_TYPE(fc2_token_scale, dl_float32);
+      CHECK_DIM(5, fc1_weight_block);
+      CHECK_DIM(1, fc1_token_scale);
+      TVM_FFI_ICHECK_LE(fc2_act_global.ndim(), 1)
+          << "fc2 act global must be a scalar or 1-D tensor";
+      CHECK_DIM(5, fc2_weight_block);
+      CHECK_DIM(1, fc2_token_scale);
+      int const fc1_n_mult = isGatedActivation(base_activation_type) ? 2 : 1;
+      TVM_FFI_ICHECK(fc1_weight_block.size(0) == num_experts_on_rank &&
+                     fc1_weight_block.size(1) * 64 == inter_size * fc1_n_mult &&
+                     fc1_weight_block.size(2) * 128 == hidden_size &&
+                     fc1_weight_block.size(3) == 16 && fc1_weight_block.size(4) == 4)
+          << "fc1 Humming-style folded weight scale must be "
+             "(num_experts_on_rank, inter_size"
+          << (fc1_n_mult == 2 ? " * 2" : "") << " / 64, hidden_size / 128, 16, 4)";
+      TVM_FFI_ICHECK_EQ(fc1_token_scale.size(0), routed_tokens)
+          << "fc1 token scale must have one element per routed token";
+      TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
+          << "fc2 act global must be scalar or (num_experts_on_rank,)";
+      TVM_FFI_ICHECK(fc2_weight_block.size(0) == num_experts_on_rank &&
+                     fc2_weight_block.size(1) * 64 == hidden_size &&
+                     fc2_weight_block.size(2) * 128 == inter_size &&
+                     fc2_weight_block.size(3) == 16 && fc2_weight_block.size(4) == 4)
+          << "fc2 Humming-style folded weight scale must be "
+             "(num_experts_on_rank, hidden_size / 64, inter_size / 128, 16, 4)";
+      TVM_FFI_ICHECK_EQ(fc2_token_scale.size(0), routed_tokens)
+          << "fc2 token scale must have one element per routed token";
+
+      return kernels::QuantParams::FP8MXFP4(
+          nullptr,
+          static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
+          static_cast<float const*>(fc1_token_scale.data_ptr()), nullptr,
+          static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
+          static_cast<float const*>(fc2_token_scale.data_ptr()), false, false);
     } else if (isWMxfp4AMxfp8Quant()) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value())
@@ -1271,35 +1472,54 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   bool isWFP4A16Quant() const {
-    return mUseW4GroupScaling && mWeightDtype == dl_uint8 && !mUsePackedWeights;
+    return mUseW4GroupScaling &&
+           (mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16) &&
+           mWeightDtype == dl_uint8 && !mUsePackedWeights && !mUseWfp4Afp8Humming;
   }
 
   bool isInt4Quant() const { return mWeightDtype == dl_uint8 && mUsePackedWeights; }
 
   bool isW4AFp8Quant() const { return mActivationDtype == dl_float8_e4m3fn && isInt4Quant(); }
 
+  bool isWMxfp4AFp8HummingQuant() const {
+    bool const supported_activation =
+        mActivationDtype == dl_float16 || mActivationDtype == dl_bfloat16;
+    return mUseWfp4Afp8Humming && mUseW4GroupScaling && supported_activation &&
+           mWeightDtype == dl_uint8 && !mUsePackedWeights && !mUseMxfp8ActScaling;
+  }
+
   bool isWMxfp4AFp8Quant() const {
-    return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 && !mUseMxfp8ActScaling;
+    // PHASE3_POST_MMA_PLACEHOLDER: disabled until this path is wired to
+    // uint8-packed MXFP4 storage instead of the dl_int64 FP4 placeholder.
+    // return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 &&
+    //        !mUseMxfp8ActScaling;
+    return false;
   }
 
   bool isWMxfp4AMxfp8Quant() const {
-    return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 && mUseMxfp8ActScaling;
+    // PHASE3_POST_MMA_PLACEHOLDER: disabled until this path is wired to
+    // uint8-packed MXFP4 storage instead of the dl_int64 FP4 placeholder.
+    // return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 &&
+    //        mUseMxfp8ActScaling;
+    return false;
   }
 };
 
 tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                       bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                      bool use_mxfp8_act_scaling, bool use_packed_weights) {
+                      bool use_mxfp8_act_scaling, bool use_packed_weights,
+                      bool use_wfp4afp8_humming) {
   auto ptr = tvm::ffi::make_object<FusedMoeRunner>(
       activation_dtype, weight_dtype, output_dtype, use_deepseek_fp8_block_scale,
-      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights);
+      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights, use_wfp4afp8_humming);
   return tvm::ffi::Module(ptr);
 }
 
 // Interleave a 4-bit packed weight tensor into the layout required by the
 // SM90 mixed-input MoE GEMM. Expected input shape (num_experts, n,
 // k / 2) uint8 on CUDA. Writes into an output tensor of the same shape.
-// quant_type: 0 for INT4 (W4A8), 1 for FP4 (W4A16 / MXFP4).
+// quant_type: 0 for INT4 (W4A8), 1 for FP4 (W4A16 / MXFP4 BF16),
+// 2 for FP4 consumed by FP8/Humming-style pre-MMA scaling.
 void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView weight_interleaved,
                                                 int64_t quant_type) {
   CHECK_INPUT_TYPE(weight, dl_uint8);
@@ -1314,8 +1534,8 @@ void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView we
       << "weight and weight_interleaved must share n dim";
   TVM_FFI_ICHECK_EQ(weight.size(2), weight_interleaved.size(2))
       << "weight and weight_interleaved must share packed-k dim";
-  TVM_FFI_ICHECK(quant_type == 0 || quant_type == 1)
-      << "quant_type must be 0 (INT4) or 1 (FP4), got " << quant_type;
+  TVM_FFI_ICHECK(quant_type == 0 || quant_type == 1 || quant_type == 2)
+      << "quant_type must be 0 (INT4), 1 (FP4), or 2 (FP4 for FP8), got " << quant_type;
 
   int64_t const num_experts = weight.size(0);
   int64_t const n = weight.size(1);
@@ -1330,6 +1550,9 @@ void interleave_moe_weights_for_sm90_mixed_gemm(TensorView weight, TensorView we
     uint8_t* dst_e = dst + e * per_expert_bytes;
     if (quant_type == 1) {
       tensorrt_llm::kernels::cutlass_kernels::interleave_fp4_weights_for_sm90_mixed_gemm(
+          src_e, dst_e, static_cast<int>(n), static_cast<int>(k), stream);
+    } else if (quant_type == 2) {
+      tensorrt_llm::kernels::cutlass_kernels::interleave_fp4_fp8_weights_for_sm90_mixed_gemm(
           src_e, dst_e, static_cast<int>(n), static_cast<int>(k), stream);
     } else {
       tensorrt_llm::kernels::cutlass_kernels::interleave_int4_weights_for_sm90_mixed_gemm(
