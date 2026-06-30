@@ -137,7 +137,7 @@ struct CollectiveMainloop {
     cute::prefetch_tma_descriptor(mainloop_params.tma_load_V.get_tma_descriptor());
   }
 
-CUTLASS_DEVICE
+  CUTLASS_DEVICE
   int get_num_kv_tiles(Params const& mainloop_params, int q_tile_idx, const int qo_len,
                        const int kv_len, const int batch_idx = 0) {
     static constexpr int CTA_Q = get<0>(TileShape_QKD{});

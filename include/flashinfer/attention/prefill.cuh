@@ -1935,9 +1935,14 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                   qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
         // apply mask
-        bool needs_mask = (MASK_MODE == MaskMode::kCustom) ||
-                          (MASK_MODE == MaskMode::kBlockExpanding && iter >= mask_iteration) ||
-                          (iter >= mask_iteration || iter < window_iteration);
+        bool needs_mask;
+        if constexpr (MASK_MODE == MaskMode::kCustom) {
+          needs_mask = true;
+        } else if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
+          needs_mask = (iter >= mask_iteration);
+        } else {
+          needs_mask = (iter >= mask_iteration || iter < window_iteration);
+        }
         if (needs_mask) {
           logits_mask<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
                                qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
@@ -2537,14 +2542,22 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                                   kv_head_idx);
 
         // apply mask
-        bool needs_mask = (MASK_MODE == MaskMode::kCustom) ||
-                          (MASK_MODE == MaskMode::kBlockExpanding && iter >= mask_iteration) ||
-                          (iter >= mask_iteration || iter < window_iteration);
+        bool needs_mask;
+        if constexpr (MASK_MODE == MaskMode::kCustom) {
+          needs_mask = true;
+        } else if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
+          needs_mask = (iter >= mask_iteration);
+        } else {
+          needs_mask = (iter >= mask_iteration || iter < window_iteration);
+        }
         if (needs_mask) {
           logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                kv_head_idx);
         }
+
+        // compute m,d states in online softmax
+        update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
         block.sync();
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
@@ -3219,7 +3232,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         const uint32_t kv_offset = params.get_kv_block_expanding_offset(request_idx);
         const uint32_t q_tile_start = ceil_div((qo_tile_idx * CTA_TILE_Q), group_size);
         mask_iteration = block_expanding_mask_iteration(
-            q_tile_start, chunk_start, chunk_size, dllm_block_size, CTA_TILE_Q, q_offset, kv_offset);
+            q_tile_start, chunk_start, chunk_size, dllm_block_size, CTA_TILE_KV, q_offset, kv_offset);
       } else if constexpr (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring) {
         mask_iteration =
             min(chunk_size,
@@ -3299,14 +3312,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                   kv_head_idx);
 
         // apply mask
-        if (MASK_MODE == MaskMode::kCustom) {
+        if constexpr (MASK_MODE == MaskMode::kCustom) {
           logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                kv_head_idx);
         } else {
           if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
-            bool needs_mask = (MASK_MODE == MaskMode::kBlockExpanding && iter >= mask_iteration) ||
-                              (iter >= mask_iteration || iter < window_iteration);
+            bool needs_mask;
+            if constexpr (MASK_MODE == MaskMode::kBlockExpanding) {
+              needs_mask = (iter >= mask_iteration);
+            } else {
+              needs_mask = (iter >= mask_iteration || iter < window_iteration);
+            }
             if (needs_mask) {
               logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                    kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
