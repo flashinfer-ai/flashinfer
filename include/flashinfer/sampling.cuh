@@ -864,6 +864,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
   float q = 1;
   float low = 0, high = 1.f;
   int sampled_id = -1;
+  int low_tie_break_id = -1;
   int round = 0;
   do {
     round += 1;
@@ -872,11 +873,8 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
-    // Break ties at the `low` boundary deterministically by token index: among tokens whose
-    // probability equals `low` (the previously rejected pivot), only those with a larger index
-    // are kept.  This turns the accept predicate into a strict total order on (prob, index),
-    // so tokens outside top-k tied with the k-th token are no longer spuriously accepted.
-    const int prev_sampled_id = sampled_id;
+    // Only lower bounds that come from an actual sampled pivot carry an index tie-break.
+    // Midpoint bounds (pivot_1) are pure numeric thresholds and must stay value-only.
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
@@ -888,8 +886,8 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
                              DETERMINISTIC>(
           i, d,
           [&](float x, uint32_t token_idx) {
-            if (prev_sampled_id < 0) return x > low;
-            return x > low || (x == low && token_idx > static_cast<uint32_t>(prev_sampled_id));
+            if (low_tie_break_id < 0) return x > low;
+            return x > low || (x == low && token_idx > static_cast<uint32_t>(low_tie_break_id));
           },
           u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
@@ -965,11 +963,13 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, bool* v
     if (aggregate_gt_pivot_1.count < k) {
       // case 2: pivot_0 rejected, pivot_1 accepted
       low = pivot_0;
+      low_tie_break_id = sampled_id;
       high = pivot_1;
       q = aggregate_gt_pivot_0.value;
     } else {
       // case 3: pivot_0 rejected, pivot_1 rejected
       low = pivot_1;
+      low_tie_break_id = -1;
       q = aggregate_gt_pivot_1.value;
     }
   } while (low < high);
@@ -1011,16 +1011,15 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
   float q = 1;
   float low = 0, high = 1.f;
   int sampled_id = -1;
+  int low_tie_break_id = -1;
   do {
     temp_storage.sampled_id = d;
     temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
-    // Break ties at the `low` boundary deterministically by token index (see TopK kernel):
-    // among tokens whose probability equals `low` (the previously rejected pivot), only those
-    // with a larger index are kept, giving a strict total order on (prob, index).
-    const int prev_sampled_id = sampled_id;
+    // Only lower bounds that come from an actual sampled pivot carry an index tie-break.
+    // Midpoint bounds (pivot_1) are pure numeric thresholds and must stay value-only.
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
@@ -1032,8 +1031,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
                              DETERMINISTIC>(
           i, d,
           [&](float x, uint32_t token_idx) {
-            if (prev_sampled_id < 0) return x > low;
-            return x > low || (x == low && token_idx > static_cast<uint32_t>(prev_sampled_id));
+            if (low_tie_break_id < 0) return x > low;
+            return x > low || (x == low && token_idx > static_cast<uint32_t>(low_tie_break_id));
           },
           u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
@@ -1108,11 +1107,13 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, bool* v
     if (aggregate_gt_pivot_1 < top_p) {
       // case 2: pivot_0 rejected, pivot_1 accepted
       low = pivot_0;
+      low_tie_break_id = sampled_id;
       high = pivot_1;
       q = aggregate_gt_pivot_0;
     } else {
       // case 3: pivot_0 rejected, pivot_1 rejected
       low = pivot_1;
+      low_tie_break_id = -1;
       q = aggregate_gt_pivot_1;
     }
   } while (low < high);
@@ -1252,16 +1253,15 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   float q = 1;
   float low = 0, high = 1.f;
   int sampled_id = -1;
+  int low_tie_break_id = -1;
   do {
     temp_storage.sampled_id = d;
     temp_storage.last_valid_id = -1;
     __syncthreads();
     float u = curand_uniform(&state) * q;
     aggregate = 0;
-    // Break ties at the `low` boundary deterministically by token index (see TopK kernel):
-    // among tokens whose probability equals `low` (the previously rejected pivot), only those
-    // with a larger index are kept, giving a strict total order on (prob, index).
-    const int prev_sampled_id = sampled_id;
+    // Only lower bounds that come from an actual sampled pivot carry an index tie-break.
+    // Midpoint bounds (pivot_1) are pure numeric thresholds and must stay value-only.
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
@@ -1273,8 +1273,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
                              DETERMINISTIC>(
           i, d,
           [&](float x, uint32_t token_idx) {
-            if (prev_sampled_id < 0) return x > low;
-            return x > low || (x == low && token_idx > static_cast<uint32_t>(prev_sampled_id));
+            if (low_tie_break_id < 0) return x > low;
+            return x > low || (x == low && token_idx > static_cast<uint32_t>(low_tie_break_id));
           },
           u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
@@ -1351,11 +1351,13 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
     if (aggregate_gt_pivot_1.count < k && aggregate_gt_pivot_1.value < p) {
       // case 2: pivot_0 rejected, pivot_1 accepted
       low = pivot_0;
+      low_tie_break_id = sampled_id;
       high = pivot_1;
       q = aggregate_gt_pivot_0.value;
     } else {
       // case 3: pivot_0 rejected, pivot_1 rejected
       low = pivot_1;
+      low_tie_break_id = -1;
       q = aggregate_gt_pivot_1.value;
     }
   } while (low < high);

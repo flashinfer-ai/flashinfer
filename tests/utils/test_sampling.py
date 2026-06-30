@@ -304,6 +304,34 @@ def _sample_freq_single_row(sample_fn, row_probs, num_trials):
     return counter, counter.float() / num_trials
 
 
+def test_midpoint_low_does_not_apply_index_tie_break():
+    """A midpoint lower bound is value-only, unlike a sampled-pivot lower bound.
+
+    In the dual-pivot rejection loop, case 3 sets ``low = pivot_1`` where
+    ``pivot_1 = (pivot_0 + high) / 2``.  That midpoint is not tied to the previously sampled
+    token, so tokens exactly equal to it must remain excluded by the next predicate.  Only
+    case 2, which sets ``low = pivot_0`` from an actual sampled token, may carry an index
+    tie-break.
+    """
+
+    def accepted_indices(row_probs, low, low_tie_break_id):
+        return [
+            idx
+            for idx, prob in enumerate(row_probs)
+            if prob > low
+            or (low_tie_break_id >= 0 and prob == low and idx > low_tie_break_id)
+        ]
+
+    row_probs = [0.4, 0.1, 0.25, 0.25]
+
+    # Model case 3: sampled_id=1 gave pivot_0=0.1 and high=0.4, so pivot_1=0.25.
+    # Since low is a midpoint, both 0.25 tokens must stay excluded.
+    assert accepted_indices(row_probs, low=0.25, low_tie_break_id=-1) == [0]
+
+    # Model case 2 with a real sampled-pivot lower bound. Here the index tie-break is valid.
+    assert accepted_indices(row_probs, low=0.1, low_tie_break_id=1) == [0, 2, 3]
+
+
 def test_top_k_sampling_boundary_tie():
     """Tokens tied with the k-th token but outside top-k must not be over-accepted.
 
