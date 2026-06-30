@@ -68,7 +68,7 @@ def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
     qo_indptr = torch.zeros(B + 1, dtype=torch.int32, device="cuda")
     qo_indptr[1:] = actual_seq_lens_q.cumsum(0)
-    batch_offsets = (qo_indptr.to(torch.int64) * Hq * D).to(torch.int32)
+    batch_offsets = (qo_indptr.to(torch.int64) * Hq * D).to(torch.int32).reshape(B + 1, 1, 1, 1)
     try:
         api_out, _ = cudnn_batch_prefill_with_kv_cache(
             q,
