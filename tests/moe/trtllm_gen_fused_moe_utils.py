@@ -40,6 +40,7 @@ from flashinfer.fused_moe import (
     bgmv_moe_gemm1_lora_delta,
     convert_to_block_layout,
     trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -108,9 +109,25 @@ class CUDAGraphMoE:
         self.input_tensor = None
         self.output_tensor = None
         self.is_captured = False
+        # Optional routed-mode slots (LoRA delta path). Allocated in capture()
+        # when corresponding samples are provided; remain None otherwise so
+        # _run_moe_computation can dispatch on their presence.
+        self.packed_topk_ids_slot = None
+        self.gemm1_lora_delta_slot = None
 
-    def capture(self, hidden_states_sample, **runtime_args):
-        """Capture CUDA graph with the given sample input."""
+    def capture(
+        self,
+        hidden_states_sample,
+        packed_topk_ids_sample=None,
+        gemm1_lora_delta_sample=None,
+        **runtime_args,
+    ):
+        """Capture CUDA graph with the given sample input.
+
+        For the routed (pre-computed routing) path, pass both
+        ``packed_topk_ids_sample`` and ``gemm1_lora_delta_sample``; they are
+        cloned into stable slots and become per-launch graph inputs.
+        """
         if self.is_captured:
             raise RuntimeError(
                 "Graph already captured. Call cleanup() first to re-capture."
@@ -118,6 +135,11 @@ class CUDAGraphMoE:
         if not isinstance(self.moe_impl, FP4Moe):
             raise NotImplementedError(
                 f"CUDA graph capture not yet implemented for {type(self.moe_impl)}"
+            )
+        if (packed_topk_ids_sample is None) != (gemm1_lora_delta_sample is None):
+            raise ValueError(
+                "packed_topk_ids_sample and gemm1_lora_delta_sample must be "
+                "provided together (or neither)."
             )
 
         # Create stream
@@ -130,6 +152,9 @@ class CUDAGraphMoE:
 
         # Store input tensor reference (will be updated in place during launch)
         self.input_tensor = hidden_states_sample.clone()
+        if packed_topk_ids_sample is not None:
+            self.packed_topk_ids_slot = packed_topk_ids_sample.clone()
+            self.gemm1_lora_delta_slot = gemm1_lora_delta_sample.clone()
 
         # Warmup
         with torch.cuda.stream(torch_stream), autotune(self.enable_autotune):
@@ -161,13 +186,33 @@ class CUDAGraphMoE:
             self.cleanup()
             raise RuntimeError(f"CUDA graph capture failed: {e}") from e
 
-    def launch(self, hidden_states_new):
-        """Launch captured CUDA graph with new input."""
+    def launch(self, hidden_states_new, packed_topk_ids=None, gemm1_lora_delta=None):
+        """Launch captured CUDA graph with new input.
+
+        ``packed_topk_ids`` and ``gemm1_lora_delta`` are only valid when their
+        corresponding slots were allocated at capture time; passing them here
+        overwrites the slot contents before launch. Default ``None`` keeps the
+        captured contents (one-shot capture+launch is the common case).
+        """
         if not self.is_captured:
             raise RuntimeError("Graph not captured. Call capture() first.")
 
         # Update input tensor in place
         self.input_tensor.copy_(hidden_states_new)
+        if packed_topk_ids is not None:
+            if self.packed_topk_ids_slot is None:
+                raise RuntimeError(
+                    "packed_topk_ids passed to launch() but no slot was "
+                    "allocated at capture time."
+                )
+            self.packed_topk_ids_slot.copy_(packed_topk_ids)
+        if gemm1_lora_delta is not None:
+            if self.gemm1_lora_delta_slot is None:
+                raise RuntimeError(
+                    "gemm1_lora_delta passed to launch() but no slot was "
+                    "allocated at capture time."
+                )
+            self.gemm1_lora_delta_slot.copy_(gemm1_lora_delta)
 
         # Launch graph
         err = runtime.cudaGraphLaunch(self.graph_exec, self.stream)[0]
@@ -194,6 +239,8 @@ class CUDAGraphMoE:
             self.stream = None
         self.input_tensor = None
         self.output_tensor = None
+        self.packed_topk_ids_slot = None
+        self.gemm1_lora_delta_slot = None
         self.is_captured = False
 
     def _run_moe_computation(self, runtime_args):
@@ -203,6 +250,41 @@ class CUDAGraphMoE:
             self.config["hidden_states_scale_global"],
             is_swizzling=False,
         )
+
+        if self.gemm1_lora_delta_slot is not None:
+            # Routed entry: pre-computed routing + LoRA delta. All inputs that
+            # vary per launch (input, packed_topk_ids, gemm1_lora_delta) come
+            # from the stable slots allocated in capture().
+            return trtllm_fp4_block_scale_routed_moe(
+                self.packed_topk_ids_slot,
+                runtime_args["routing_bias"],
+                input_quantized["hidden_states"],
+                input_quantized["hidden_states_scale"],
+                self.static_data["gemm1_weights_fp4_shuffled"],
+                self.static_data["gemm1_scales_fp4_shuffled"],
+                self.config["gemm1_bias"],
+                None,
+                None,
+                None,
+                self.static_data["gemm2_weights_fp4_shuffled"],
+                self.static_data["gemm2_scales_fp4_shuffled"],
+                self.config["gemm2_bias"],
+                self.static_data["scale_c_fc1"],
+                self.static_data["scale_gate_fc1"],
+                self.static_data["scale_c_fc2"],
+                self.config["num_experts"],
+                self.config["top_k"],
+                self.config["n_groups"],
+                self.config["top_k_groups"],
+                self.config["intermediate_size"],
+                0,
+                self.config["num_experts"],
+                self.config["routed_scaling"],
+                routing_method_type=self.config["routing_method_type"],
+                activation_type=self.config["activation_type"],
+                gemm1_lora_delta=self.gemm1_lora_delta_slot,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+            )
 
         output = trtllm_fp4_block_scale_moe(
             routing_logits=runtime_args["expert_logits"],
@@ -668,6 +750,8 @@ class FP4Moe(Moe):
         gemm1_bias = static_data["gemm1_bias_shuffled"]
         gemm2_bias = static_data["gemm2_bias_shuffled"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_lora_delta = kwargs.get("gemm1_lora_delta")
+        permute_info = kwargs.get("permute_info")
 
         # Create CUDA graph configuration
         config = {
@@ -691,12 +775,32 @@ class FP4Moe(Moe):
             "routing_bias": routing_bias,
         }
 
+        # LoRA delta path: precompute packed routing so the routed entry sees
+        # both samples as graph inputs. _run_moe_computation dispatches based
+        # on slot presence.
+        packed_topk_ids = None
+        if gemm1_lora_delta is not None:
+            packed_topk_ids = pack_topk_for_routed_moe(
+                permute_info["topKIndices"], permute_info["topKLogits"]
+            )
+
         # Create, capture and launch CUDA graph in one shot
         cuda_graph = CUDAGraphMoE(self, static_data, **config)
         try:
-            cuda_graph.capture(hidden_states_orig, **runtime_args)
-            output = cuda_graph.launch(hidden_states_orig)
-            return output[0].to(torch.float)
+            cuda_graph.capture(
+                hidden_states_orig,
+                packed_topk_ids_sample=packed_topk_ids,
+                gemm1_lora_delta_sample=gemm1_lora_delta,
+                **runtime_args,
+            )
+            output = cuda_graph.launch(
+                hidden_states_orig,
+                packed_topk_ids=packed_topk_ids,
+                gemm1_lora_delta=gemm1_lora_delta,
+            )
+            if isinstance(output, list):
+                return output[0].to(torch.float)
+            return output.to(torch.float)
         finally:
             cuda_graph.cleanup()
 
@@ -2753,6 +2857,7 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
         args.activation_type,
         gemm1_bias=args.gemm1_bias,
         gemm2_bias=args.gemm2_bias,
+        gemm1_lora_delta=args.gemm1_lora_delta,
     )
 
     return run_moe_dequant(args_dequant, quant_mode), args_dequant
