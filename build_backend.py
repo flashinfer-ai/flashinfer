@@ -535,7 +535,9 @@ def _build_nvep_if_enabled() -> None:
         return
 
     requested = [
-        b for b, on in (("NIXL-EP", _BUILD_NIXL_EP), ("NCCL-EP", _BUILD_NCCL_EP)) if on
+        b
+        for b, is_enabled in (("NIXL-EP", _BUILD_NIXL_EP), ("NCCL-EP", _BUILD_NCCL_EP))
+        if is_enabled
     ]
     mode = "best-effort" if _BUILD_NVEP_BEST_EFFORT else "strict"
     print(f"[BUILD_NVEP] requested: {', '.join(requested)} (mode: {mode})")
@@ -604,7 +606,7 @@ def _build_nvep_if_enabled() -> None:
         flush=True,
     )
 
-    built = [b for b, on in (("NIXL-EP", built_nixl),) if on]
+    built = [b for b, is_enabled in (("NIXL-EP", built_nixl),) if is_enabled]
     if _BUILD_NCCL_EP:
         built.append("NCCL-EP (via nccl4py wheel)")
     print(f"[BUILD_NVEP] done — built: {', '.join(built) if built else 'nothing'}")
