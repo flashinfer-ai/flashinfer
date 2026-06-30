@@ -1307,13 +1307,7 @@ __device__ __forceinline__ void add_cb_old_x(FragY& frag_y, FragCBOld const& fra
   cute::gemm(tiled_mma_old, frag_y, frag_CB_old, frag_B_old_x, frag_y);
 }
 
-// 3b. frag_y += D * x[t, d]  (per-thread skip connection)
-// The per-thread C-frag offset into the swizzled x tile is f(lane, n, i) — the id_part coords
-// through the compile-time layout — invariant across work-units; only the per-slot base pointer
-// changes per unit.  Computing the offset off the layout (instead of partition_C of the per-slot
-// tile) un-bundles it from the base so LICM hoists the swizzle/stride math out of the head loop
-// (the per-work-unit partition_C rebuild was the #1 in-loop integer line, ~1.9M+0.45M dyn INT).
-// Consecutive frag elements (i, i+1) are adjacent in smem (m16n8k16 N-column pairs) → one float2.
+// 3b. frag_y += D * x[t, d]  (per-thread skip connection via partition_C)
 template <typename input_t, int NPREDICTED_PAD_MMA_M, int N_TILE, typename FragY, typename SmemX,
           typename ThrMma>
 __device__ __forceinline__ void add_D_skip(FragY& frag_y, SmemX const& smem_x,
@@ -1365,48 +1359,6 @@ __device__ __forceinline__ void ldmatrix_x4_addr(uint32_t addr, uint32_t& d0, ui
 #endif
 }
 
-// Fill byteoffA[k] = swizzled byte offset of this lane's k-tile relative to the C
-// slot base — a pure function of (lane, k) (the slot pointer lives in A_base, not the
-// layout).  off0_A recovered by the involution SwizA{}(swizzled) == unswizzled
-// (Swizzle is its own inverse); X_A is the invariant swizzle mask.  Shared by the
-// per-work-unit path (pipelined_kloop_gemm) and the hoisted head-loop path
-// (compute_C_byteoffA) so the two produce bit-identical offsets.
-template <int NumKTiles, typename MmaT, typename SmemAS2R>
-__device__ __forceinline__ void fill_byteoffA(SmemAS2R const& smem_A_s2r, uint32_t* byteoffA) {
-  using namespace cute;
-  using SwizA = decltype(get_swizzle_portion(smem_A_s2r.layout()));
-  int const swz0_A = smem_A_s2r.layout()(make_coord(_0{}, _0{}, _0{}, _0{}));
-  int const off0_A = SwizA{}(swz0_A);
-  int const X_A = swz0_A ^ off0_A;
-  auto const plainA = get_nonswizzle_portion(smem_A_s2r.layout());
-  CUTE_UNROLL
-  for (int k = 0; k < NumKTiles; ++k)
-    byteoffA[k] = uint32_t((off0_A + int(plainA(make_coord(_0{}, _0{}, _0{}, k)))) ^ X_A) *
-                  uint32_t(sizeof(MmaT));
-}
-
-// Hoist the C@state A-operand byte offsets out of the per-work-unit matmul up to
-// head_loop: compute once per thread, hold in registers, thread into
-// pipelined_kloop_gemm (byteoffA_ext).  Rebuilds the EXACT C layout + s2r partition
-// of add_init_out_ring/pipelined_kloop_gemm (offsets are layout-only — the nullptr
-// smem ptr is never dereferenced); verified bit-identical by SSU_VERIFY_LDSM.
-template <typename input_t, int NPREDICTED_PAD_MMA_M, int DSTATE, int NPREDICTED, int NUM_WARPS>
-__device__ __forceinline__ void compute_C_byteoffA(int tid, uint32_t* byteoffA) {
-  using namespace cute;
-  auto tiled_mma = make_tiled_mma(MMA_Atom<MMA_Traits<MMA_prop::AtomK16>>{},
-                                  Layout<Shape<_1, Int<NUM_WARPS>>>{});
-  constexpr int K_TILE = cute::tile_size<2>(decltype(tiled_mma){});
-  auto layout_C_swz =
-      make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, NPREDICTED>();
-  Tensor smem_C =
-      make_tensor(make_smem_ptr(static_cast<MMA_prop::operand_t const*>(nullptr)), layout_C_swz);
-  Tensor smem_C_ktiled = local_tile(smem_C, make_tile(Int<NPREDICTED_PAD_MMA_M>{}, Int<K_TILE>{}),
-                                    make_coord(_0{}, _));
-  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MMA_prop::operand_t>{}, tiled_mma);
-  auto smem_A_s2r = s2r_A.get_slice(tid).partition_S(smem_C_ktiled);
-  fill_byteoffA<DSTATE / K_TILE, MMA_prop::operand_t>(smem_A_s2r, byteoffA);
-}
-
 // =============================================================================
 // Pipelined K-loop GEMM
 // =============================================================================
@@ -1424,9 +1376,10 @@ __device__ __forceinline__ void compute_C_byteoffA(int tid, uint32_t* byteoffA) 
 template <int NumStages, int NumKTiles, typename ATypeIn, typename BTypeIn, typename MmaT,
           typename TiledMma, typename ThrMma, typename SmemAKtiled, typename SmemB,
           typename... FragY>
-__device__ __forceinline__ void pipelined_kloop_gemm(
-    TiledMma const& tiled_mma, ThrMma const& thr_mma, int tid, SmemAKtiled const& smem_A_ktiled,
-    SmemB const& smem_B, uint32_t const* byteoffA_ext, FragY&... frag_y) {
+__device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
+                                                     ThrMma const& thr_mma, int tid,
+                                                     SmemAKtiled const& smem_A_ktiled,
+                                                     SmemB const& smem_B, FragY&... frag_y) {
   using namespace cute;
   constexpr int NumNTiles = sizeof...(FragY);
   static_assert(NumStages >= 2, "NumStages must be >= 2 for pipelining");
@@ -1505,13 +1458,20 @@ __device__ __forceinline__ void pipelined_kloop_gemm(
   constexpr bool kHandrollA = (SwizA::num_bits > 0) && (sizeof(MmaT) == 2);
 #endif
   uint32_t const A_base = cast_smem_ptr_to_uint(raw_pointer_cast(smem_A_s2r.data()));
-  // byteoffA[k] = swizzled byte offset of this lane's k-tile relative to A_base; per
-  // access we only add A_base.  Either supplied by the caller (byteoffA_ext, hoisted
-  // once-per-thread in head_loop — the 2k path) or computed here per work-unit
-  // (monolith / byteoffA_ext == nullptr).  The select is loop-invariant → resolved once.
-  uint32_t byteoffA_local[NumKTiles];
-  if (byteoffA_ext == nullptr) fill_byteoffA<NumKTiles, MmaT>(smem_A_s2r, byteoffA_local);
-  uint32_t const* byteoffA = (byteoffA_ext != nullptr) ? byteoffA_ext : byteoffA_local;
+  // byteoffA[k] is the stored swizzled byte offset (swizzle + offset baked in); per
+  // access we only add A_base.  Computed via the explicit closed form: off0 + Ck
+  // (compile-time k-delta) swizzled by the invariant mask X_A = (row&7)<<3 — cheap
+  // integer ALU rather than cute's per-k layout machinery.  off0_A recovered by the
+  // involution SwizA{}(swizzled) == unswizzled (Swizzle is its own inverse).
+  int const swz0_A = smem_A_s2r.layout()(make_coord(_0{}, _0{}, _0{}, _0{}));
+  int const off0_A = SwizA{}(swz0_A);
+  int const X_A = swz0_A ^ off0_A;
+  auto const plainA = get_nonswizzle_portion(smem_A_s2r.layout());
+  uint32_t byteoffA[NumKTiles];
+  CUTE_UNROLL
+  for (int k = 0; k < NumKTiles; ++k)
+    byteoffA[k] = uint32_t((off0_A + int(plainA(make_coord(_0{}, _0{}, _0{}, k)))) ^ X_A) *
+                  uint32_t(sizeof(MmaT));
 
   // NOTE: the state (B) operand was tried with the same hand-rolled precomputed
   // addressing (2D table, inline layout-eval, and off0+invariant-mask forms — all
@@ -1651,7 +1611,7 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
   Tensor smem_state = make_tensor(make_smem_ptr(smem_state_ptr), layout_state_swz);
 
   pipelined_kloop_gemm<3, NUM_K_TILES, input_t, BTypeIn, MMA_prop::operand_t>(
-      tiled_mma, thr_mma, tid, smem_C_ktiled, smem_state, /*byteoffA_ext=*/nullptr, frag_y...);
+      tiled_mma, thr_mma, tid, smem_C_ktiled, smem_state, frag_y...);
 }
 
 // store_state: vectorized smem → gmem state writeback (128 threads).

@@ -587,7 +587,17 @@ two launches would lean the no-write specialization (helps occupancy, not the dy
 
 Start with **#1** (biggest, cleanest): hoist the CuTe MMA/partition/layout objects to `head_loop`.
 
-### Stage 0 LANDED: byteoffA hoist + reg-cap lift (mechanism proof) (2026-06-30)
+### Stage 0 → hoist REVERTED, only the reg-cap kept (2026-06-30)
+
+**Update:** the manual byteoffA hoist was a dead end and is **reverted**.  A/B at cap 128 showed the
+hoist is *net-negative* (nw0 108.8 with hoist vs **104.8 without**) — `compute_C_byteoffA` boxes in
+the compiler, which hoists addressing better on its own once given register room.  **The entire win
+is the reg-cap lift 96→128** (nw0 110.6→104.8, nw8 117.1→110.2, ~−6 µs; total executed −6.5%).
+Kept: `SSU_MAIN_MAXNREG_PIPE=128` only.  **Lesson confirmed: integer COUNT does not move with
+hoisting or registers — only with the access pattern (structural).**  Next = the x/old_x fusion
+(3 matmuls → Triton's 2) to actually cut the access count.  Original mechanism notes below.
+
+### (superseded) byteoffA hoist + reg-cap lift (mechanism proof) (2026-06-30)
 
 Hoisted the C@state A-operand swizzled byte offsets (`byteoffA[8]`) out of the per-work-unit
 `pipelined_kloop_gemm` up to `head_loop` (`compute_C_byteoffA` once per thread → threaded

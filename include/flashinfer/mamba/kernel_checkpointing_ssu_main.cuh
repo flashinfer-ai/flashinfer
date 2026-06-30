@@ -363,11 +363,14 @@ __device__ __forceinline__ void output_head(SmemT& smem, CheckpointingSsuParams 
                                                      cache_slot, write_offset, seq_len, tile_buf);
 }
 
+// add_init_out_ring: main-local copy of common.cuh's add_init_out, but with C ALSO slot-indexed
+// (by state_buf) for the persistent ring — C is per-slot here, single-slot in the monolith.  The
+// shared add_init_out is left untouched (it reads smem.C at slot 0).  Identical otherwise.
 template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out_ring(SmemT const& smem, TiledMma const& tiled_mma,
                                                   ThrMma const& thr_mma, int tid, int state_buf,
-                                                  uint32_t const* byteoffA_ext, FragY&... frag_y) {
+                                                  FragY&... frag_y) {
   using namespace cute;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
@@ -389,7 +392,7 @@ __device__ __forceinline__ void add_init_out_ring(SmemT const& smem, TiledMma co
       reinterpret_cast<state_t const*>(smem.state) + state_buf * D_PER_CTA * DSTATE);
   Tensor smem_state = make_tensor(make_smem_ptr(smem_state_ptr), layout_state_swz);
   pipelined_kloop_gemm<3, NUM_K_TILES, input_t, BTypeIn, MMA_prop::operand_t>(
-      tiled_mma, thr_mma, tid, smem_C_ktiled, smem_state, byteoffA_ext, frag_y...);
+      tiled_mma, thr_mma, tid, smem_C_ktiled, smem_state, frag_y...);
 }
 
 template <typename input_t, typename state_t, int NPREDICTED, int MAX_WINDOW, int DIM,
@@ -399,8 +402,7 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
                                                int lane, int warp, int d_tile, int head,
                                                int64_t cache_slot, int prev_k, int64_t out_seq_base,
                                                int write_offset, int seq_len, float D_val,
-                                               int tile_buf, uint32_t const* byteoffA_ext,
-                                               FragCBNew const& frag_CB_new,
+                                               int tile_buf, FragCBNew const& frag_CB_new,
                                                FragCBOld const& frag_CB_old) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "output_head_2k requires 2-byte input type");
@@ -492,8 +494,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
     if constexpr (NUM_N_TILES == 2) {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
       Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-      add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(
-          smem, tiled_mma, thr_mma, tid, tile_buf, byteoffA_ext, frag_y_0, frag_y_1);
+      add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                             tile_buf, frag_y_0, frag_y_1);
       if constexpr (!kSkipSmemToGmemState)
         store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
                                                                 head, cache_slot, tile_buf);
@@ -502,7 +504,7 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
     } else {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
       add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
-                                                             tile_buf, byteoffA_ext, frag_y_0);
+                                                             tile_buf, frag_y_0);
       if constexpr (!kSkipSmemToGmemState)
         store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
                                                                 head, cache_slot, tile_buf);
@@ -568,14 +570,14 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
     if constexpr (NUM_N_TILES == 2) {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
       Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-      add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(
-          smem, tiled_mma, thr_mma, tid, tile_buf, byteoffA_ext, frag_y_0, frag_y_1);
+      add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
+                                                             tile_buf, frag_y_0, frag_y_1);
       epilogue(frag_y_0, 0);
       epilogue(frag_y_1, 1);
     } else {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
       add_init_out_ring<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
-                                                             tile_buf, byteoffA_ext, frag_y_0);
+                                                             tile_buf, frag_y_0);
       epilogue(frag_y_0, 0);
     }
   }
@@ -952,7 +954,7 @@ template <typename input_t, typename weight_t, typename state_t, int NPREDICTED,
 __device__ __forceinline__ void compute_output_and_store(SmemT& smem,
                                                          CheckpointingSsuParams const& params,
                                                          int lane, int warp, HeadMetaSSU const& m,
-                                                         int slot, uint32_t const* byteoffA_ext) {
+                                                         int slot) {
   using namespace cute;
   constexpr int D_SPLIT = DIM / D_PER_CTA;
   int d_tile, seq, first_head, group_idx, buf_read, prev_k, seq_len;
@@ -991,9 +993,9 @@ __device__ __forceinline__ void compute_output_and_store(SmemT& smem,
   int64_t const out_seq_base = outer * params.out_stride_seq;
   int const write_offset = MUST_CHECKPOINT ? 0 : prev_k;
   output_head_2k<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS,
-                 NUM_WARPS, MUST_CHECKPOINT>(
-      smem, params, lane, warp, d_tile, first_head, m.cache_slot, prev_k, out_seq_base,
-      write_offset, seq_len, D_val, slot, byteoffA_ext, frag_CB_new, frag_CB_old);
+                 NUM_WARPS, MUST_CHECKPOINT>(smem, params, lane, warp, d_tile, first_head,
+                                             m.cache_slot, prev_k, out_seq_base, write_offset,
+                                             seq_len, D_val, slot, frag_CB_new, frag_CB_old);
 }
 
 // process_head: PURE CONSUMER of a prefetched ring slot — replay (write path) then output.  The
@@ -1003,8 +1005,7 @@ template <typename input_t, typename weight_t, typename state_t, int NPREDICTED,
           int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS, int NUM_WARPS, int NHEADS,
           int HEADS_PER_GROUP, bool VARLEN, bool MUST_CHECKPOINT, typename SmemT>
 __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams const& params,
-                                             int lane, int warp, HeadMetaSSU const& m, int slot,
-                                             uint32_t const* byteoffA_ext) {
+                                             int lane, int warp, HeadMetaSSU const& m, int slot) {
   if constexpr (MUST_CHECKPOINT) {
     replay_state<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                  PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane,
@@ -1013,7 +1014,7 @@ __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams
   }
   compute_output_and_store<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA,
                            DSTATE, PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
-                           MUST_CHECKPOINT>(smem, params, lane, warp, m, slot, byteoffA_ext);
+                           MUST_CHECKPOINT>(smem, params, lane, warp, m, slot);
 }
 
 // =============================================================================
@@ -1027,13 +1028,12 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
 // __maxnreg__ tracks the ring depth, because the two regimes are opposite:
 //   STATE_PIPE=1: ≈19 KB smem allows >8 blocks/SM, so the kernel is REGISTER-bound — cap at 64 to
 //     hold 8 blocks (65536/(64·128)=8).
-//   STATE_PIPE≥2: SMEM-bound (≈38 KB → 5 blocks at depth 2).  The old 96-cap held 5 blocks but
-//     starved the hoisted-addressing path: under it the compiler REMATERIALIZED the per-thread
-//     byteoffA setup every work-unit (no room to keep it live) rather than spilling.  Lifting to
-//     128 → 4 blocks (118 regs, no spills) lets registers HOLD the hoisted offsets: the per-work-
-//     unit address recompute vanishes (uniform 4.57M→0.8M, total executed 49.4M→46.2M, −6.5%) and
-//     nw0/nw8 drop ~2 µs — the Triton regime (more regs, fewer blocks).  Fully uncapping (255) is
-//     worse: the compiler grabs 150 regs → 3 blocks → +20 µs.  Tune via SSU_MAIN_MAXNREG_PIPE.
+//   STATE_PIPE≥2: SMEM-bound (≈38 KB → 5 blocks at depth 2).  The old 96-cap forced the compiler to
+//     recompute per-work-unit addressing it could otherwise hold in registers.  Lifting to 128 →
+//     4 blocks/SM (118 regs, no spills) lets it hold the addressing: per-work-unit recompute drops
+//     (total executed −6.5%, nw0/nw8 −~6 µs).  The Triton regime (more regs, fewer blocks).  Fully
+//     uncapping (255) is worse: the compiler grabs 150 regs → 3 blocks → +20 µs.  Tune via the
+//     macro.
 #ifndef SSU_MAIN_MAXNREG_PIPE
 #define SSU_MAIN_MAXNREG_PIPE 128
 #endif
@@ -1081,15 +1081,6 @@ __global__ __maxnreg__(
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
   auto const* __restrict__ cu = reinterpret_cast<int32_t const*>(params.cu_seqlens);
   auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
-
-  // ── Hoisted C@state A-operand LDSM byte offsets: f(lane,k), computed ONCE per thread here and
-  // threaded into every process_head matmul so the per-work-unit cost is A_base + byteoffA[k]
-  // (no per-work-unit swizzle re-derivation).  See compute_C_byteoffA / pipelined_kloop_gemm. ──
-  int const tid = warp * warpSize + lane;
-  constexpr int NUM_K_TILES_C = DSTATE / MMA_prop::K_BIG;
-  uint32_t byteoffA_C[NUM_K_TILES_C];
-  compute_C_byteoffA<input_t, SmemT::NPREDICTED_PAD_MMA_M, DSTATE, NPREDICTED, NUM_WARPS>(
-      tid, byteoffA_C);
 
   // fetch: resolve the ring entry {tile, cache_slot, prev_k}.  cache_slot = sbi[seq] heads the
   // dependent chain (cache_slot → prev_num_accepted[cache_slot]); resolving BOTH here, STAGES ahead
@@ -1206,13 +1197,11 @@ __global__ __maxnreg__(
     if (mc0)
       compute_output_and_store<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA,
                                DSTATE, PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
-                               /*MUST_CHECKPOINT=*/true>(smem, params, lane, warp, m0, 0,
-                                                         byteoffA_C);
+                               /*MUST_CHECKPOINT=*/true>(smem, params, lane, warp, m0, 0);
     else
       compute_output_and_store<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA,
                                DSTATE, PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
-                               /*MUST_CHECKPOINT=*/false>(smem, params, lane, warp, m0, 0,
-                                                          byteoffA_C);
+                               /*MUST_CHECKPOINT=*/false>(smem, params, lane, warp, m0, 0);
   }
   __syncthreads();  // tile-0 output done reading buffer 0 before the tile-STAGES prefetch
                     // overwrites it
@@ -1240,11 +1229,11 @@ __global__ __maxnreg__(
       if (mc_of(m))
         process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                      PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
-                     /*MUST_CHECKPOINT=*/true>(smem, params, lane, warp, m, slot, byteoffA_C);
+                     /*MUST_CHECKPOINT=*/true>(smem, params, lane, warp, m, slot);
       else
         process_head<input_t, weight_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                      PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
-                     /*MUST_CHECKPOINT=*/false>(smem, params, lane, warp, m, slot, byteoffA_C);
+                     /*MUST_CHECKPOINT=*/false>(smem, params, lane, warp, m, slot);
     }
     __syncthreads();  // output done reading `slot` before the prefetch below overwrites it
 
