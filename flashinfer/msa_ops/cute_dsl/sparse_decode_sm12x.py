@@ -17,13 +17,16 @@ limitations under the License.
 
 Slim sparse decode kernel for SM120/SM121
 
-Decode shape: one query token (x its GQA query heads) attending one selected
-128-token KV block per CTA. Compared to running decode through the prefill
+Decode shape: one query token (x its GQA query heads) attending its selected
+128-token KV blocks. Compared to running decode through the prefill
 ``msa_sparse_attention`` kernel, this kernel:
 
-- uses a dense static grid ``(topk, total_q, Hkv)`` driven directly by
-  ``q2k_indices`` — no schedule tensors at all (split counts are computed
-  in-kernel by the slot-0 CTA);
+- uses a static grid ``(num_chunks, total_q, Hkv)`` driven directly by
+  ``q2k_indices`` — no schedule tensors at all. Each CTA online-softmaxes a
+  contiguous chunk of the token's selected list; ``num_chunks`` adapts to the
+  batch (one block per chunk at the small-batch extreme, all blocks in one
+  chunk at the large-batch extreme). Split counts are computed in-kernel by
+  the chunk-0 CTA;
 - uses an M=16 tile (the <=16 query heads of one token) instead of a 64-row
   tile that is mostly padding; multiple query tokens (seqlen_q>1, e.g. MTP) are
   handled as separate tiles;
@@ -114,6 +117,7 @@ class SparseDecodeForwardSm12x:
         seqlen_q: cutlass.Int32,
         total_q: cutlass.Int32,
         num_kv_heads: cutlass.Int32,
+        num_chunks: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self._q_fp8):
@@ -167,8 +171,9 @@ class SparseDecodeForwardSm12x:
                 mQOffset,
                 softmax_scale_log2,
                 seqlen_q,
+                num_chunks,
             ).launch(
-                grid=(self._topk, total_q, num_kv_heads),
+                grid=(num_chunks, total_q, num_kv_heads),
                 block=[self._num_threads, 1, 1],
                 stream=stream,
             )
@@ -190,28 +195,35 @@ class SparseDecodeForwardSm12x:
         mQOffset: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         seqlen_q: cutlass.Int32,
+        num_chunks: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        slot, qi, kv_head = cute.arch.block_idx()
+        chunk_idx, qi, kv_head = cute.arch.block_idx()
 
         G = self._group_size
-        kv_block = mQ2K[kv_head, qi, slot]
 
-        # slot-0 CTA publishes the split count: the leading run of valid blocks.
-        # combine reads slots [0, cnt) and a slot is written only when kv_block
-        # >= 0, so a -1 hole must stop the count rather than skip past it.
-        if slot == 0:
+        # valid blocks = leading run before the first -1 (msa_topk_select tail-pads
+        # with -1, so a hole stops the count rather than skipping past it).
+        cnt = cutlass.Int32(0)
+        in_prefix = cutlass.Boolean(True)
+        for t in cutlass.range_constexpr(self._topk):
+            if in_prefix and mQ2K[kv_head, qi, t] >= 0:
+                cnt = cnt + 1
+            else:
+                in_prefix = cutlass.Boolean(False)
+
+        # this CTA reduces a contiguous chunk [chunk_start, chunk_end) of the list;
+        # num_chunks == topk degenerates to one block per CTA (per-block split).
+        chunk_size = (self._topk + num_chunks - 1) // num_chunks
+        chunk_start = chunk_idx * chunk_size
+        chunk_end = cutlass.min(chunk_start + chunk_size, cnt)
+
+        # chunk-0 CTA publishes the active-chunk count combine reduces over.
+        if chunk_idx == 0:
             if tidx == 0:
-                cnt = cutlass.Int32(0)
-                in_prefix = cutlass.Boolean(True)
-                for t in cutlass.range_constexpr(self._topk):
-                    if in_prefix and mQ2K[kv_head, qi, t] >= 0:
-                        cnt = cnt + 1
-                    else:
-                        in_prefix = cutlass.Boolean(False)
-                mSplitCounts[qi, kv_head] = cnt
+                mSplitCounts[qi, kv_head] = (cnt + chunk_size - 1) // chunk_size
 
-        if kv_block >= 0:
+        if chunk_start < cnt:
             batch_idx = qi // seqlen_q
             tok_in_req = qi - batch_idx * seqlen_q
             k_start = mCuK[batch_idx]
@@ -339,20 +351,6 @@ class SparseDecodeForwardSm12x:
             row_max.fill(-cutlass.Float32.inf)
             row_sum.fill(0.0)
 
-            if cutlass.const_expr(self._paged):
-                page = mPageTable[batch_idx, kv_block]
-                mK_blk = mK[page, kv_head, None, None]  # (128, d)
-                mV_blk = mV[page, kv_head, None, None]
-            else:
-                mK_blk = cute.domain_offset(
-                    (k_start + kv_block * self._blk_kv, 0),
-                    mK[None, kv_head, None],
-                )
-                mV_blk = cute.domain_offset(
-                    (k_start + kv_block * self._blk_kv, 0),
-                    mV[None, kv_head, None],
-                )
-
             if cutlass.const_expr(self._is_causal):
                 # causal: query global position = q_offset[b] + tok_in_req
                 q_pos_limit = tok_in_req + mQOffset[batch_idx] + 1
@@ -363,16 +361,6 @@ class SparseDecodeForwardSm12x:
             kv_chunks = self._sub_block * chunks_per_row
             kvfrag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
             if cutlass.const_expr(self._kv_nvfp4):
-                # scale-row flattening per MSA quantize.py: paged caches are
-                # quantized as (page, head, token) rows; flat as (token, head)
-                if cutlass.const_expr(self._paged):
-                    sf_row_base = (page * mK.shape[1] + kv_head) * self._blk_kv
-                    sf_row_stride = cutlass.Int32(1)
-                else:
-                    sf_row_base = (k_start + kv_block * self._blk_kv) * mK.shape[
-                        1
-                    ] + kv_head
-                    sf_row_stride = mK.shape[1]
                 sf_tiles_n = (self._head_dim // 16 + 3) // 4
                 pair_frag = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Uint32)
                 pair_f16 = cute.make_tensor(
@@ -390,189 +378,221 @@ class SparseDecodeForwardSm12x:
                         tSrQ_copy_view[None, None, k],
                     )
 
-            # Two 64-token sub-blocks with online softmax
-            for half in cutlass.range_constexpr(self._n_sub):
-                base = kv_block * self._blk_kv + half * self._sub_block
-                for kv_it in cutlass.range_constexpr(
-                    cute.ceil_div(kv_chunks, self._num_threads)
-                ):
-                    kv_chunk = tidx + kv_it * self._num_threads
-                    if kv_chunk < kv_chunks:
-                        kv_m = kv_chunk // chunks_per_row
-                        kv_c8 = kv_chunk % chunks_per_row
-                        sK_chunk = cute.local_tile(sK[kv_m, None], (8,), (kv_c8,))
-                        sV_chunk = cute.local_tile(sV[kv_m, None], (8,), (kv_c8,))
-                        src_row = half * self._sub_block + kv_m
-                        if (base + kv_m) < seqlen_k:
-                            if cutlass.const_expr(self._kv_nvfp4):
-                                from ...fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import (
-                                    cvt_e4m3_to_f32_via_f16,
-                                    fp4_decode_4bytes,
-                                )
-
-                                srow = sf_row_base + src_row * sf_row_stride
-                                scol = kv_c8 // 2
-                                srow_in = srow % 128
-                                sf_off = (
-                                    ((srow // 128) * sf_tiles_n + scol // 4) * 512
-                                    + (srow_in % 32) * 16
-                                    + (srow_in // 32) * 4
-                                    + scol % 4
-                                )
-                                k_word = mK_blk[src_row, kv_c8]
-                                kp0, kp1, kp2, kp3 = fp4_decode_4bytes(
-                                    cutlass.Uint32(k_word)
-                                )
-                                pair_frag[0] = kp0
-                                pair_frag[1] = kp1
-                                pair_frag[2] = kp2
-                                pair_frag[3] = kp3
-                                k_sc = cvt_e4m3_to_f32_via_f16(
-                                    cutlass.Uint32(mKSf[sf_off])
-                                )
-                                kvfrag.store(
-                                    (pair_f16.load().to(cutlass.Float32) * k_sc).to(
-                                        self._dtype
-                                    )
-                                )
-                                cute.autovec_copy(kvfrag, sK_chunk)
-                                v_word = mV_blk[src_row, kv_c8]
-                                vp0, vp1, vp2, vp3 = fp4_decode_4bytes(
-                                    cutlass.Uint32(v_word)
-                                )
-                                pair_frag[0] = vp0
-                                pair_frag[1] = vp1
-                                pair_frag[2] = vp2
-                                pair_frag[3] = vp3
-                                v_sc = cvt_e4m3_to_f32_via_f16(
-                                    cutlass.Uint32(mVSf[sf_off])
-                                )
-                                kvfrag.store(
-                                    (pair_f16.load().to(cutlass.Float32) * v_sc).to(
-                                        self._dtype
-                                    )
-                                )
-                                cute.autovec_copy(kvfrag, sV_chunk)
-                                gK_chunk = None
-                                gV_chunk = None
-                            else:
-                                gK_chunk = cute.local_tile(
-                                    mK_blk[src_row, None], (8,), (kv_c8,)
-                                )
-                                gV_chunk = cute.local_tile(
-                                    mV_blk[src_row, None], (8,), (kv_c8,)
-                                )
-                            if cutlass.const_expr(self._kv_fp8 and not self._kv_nvfp4):
-                                kvfrag.store(
-                                    gK_chunk.load()
-                                    .to(cutlass.Float16)
-                                    .to(cutlass.Float32)
-                                    .to(self._dtype)
-                                )
-                                cute.autovec_copy(kvfrag, sK_chunk)
-                                kvfrag.store(
-                                    gV_chunk.load()
-                                    .to(cutlass.Float16)
-                                    .to(cutlass.Float32)
-                                    .to(self._dtype)
-                                )
-                                cute.autovec_copy(kvfrag, sV_chunk)
-                            elif cutlass.const_expr(not self._kv_nvfp4):
-                                cute.autovec_copy(gK_chunk, sK_chunk)
-                                cute.autovec_copy(gV_chunk, sV_chunk)
-                        else:
-                            kvfrag.fill(0)
-                            cute.autovec_copy(kvfrag, sK_chunk)
-                            cute.autovec_copy(kvfrag, sV_chunk)
-                self.cta_sync_barrier.arrive_and_wait()
-
-                if tidx < 32:
-                    # S = Q K^T for this sub-block
-                    acc_S.fill(0.0)
-                    for k in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
-                        cute.copy(
-                            smem_tiled_copy_K,
-                            tSsK[None, None, k],
-                            tSrK_copy_view[None, None, k],
-                        )
-                    for k in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
-                        cute.gemm(
-                            tiled_mma,
-                            acc_S,
-                            tSrQ[None, None, k],
-                            tSrK[None, None, k],
-                            acc_S,
-                        )
-
-                    # mask + online softmax update
-                    for r in cutlass.range_constexpr(n_rows):
-                        for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-                            k_pos = base + tScS_mn[0, c][1]
-                            if cute.elem_less(col_limit, k_pos + 1):
-                                acc_S_mn[r, c] = -cutlass.Float32.inf
-                        acc_S_row = acc_S_mn[r, None].load()
-                        rmax = acc_S_row.reduce(
-                            cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
-                        )
-                        rmax = self._threadquad_reduce_max(rmax)
-                        rmax_prev = row_max[r]
-                        rmax = cute.arch.fmax(rmax_prev, rmax)
-                        rmax_safe = 0.0 if rmax == -cutlass.Float32.inf else rmax
-                        p_row = cute.math.exp2(
-                            acc_S_row * softmax_scale_log2
-                            - rmax_safe * softmax_scale_log2,
-                            fastmath=True,
-                        )
-                        rsum = p_row.reduce(
-                            cute.ReductionOp.ADD, cutlass.Float32.zero, 0
-                        )
-                        prev_scale = cute.math.exp2(
-                            rmax_prev * softmax_scale_log2
-                            - rmax_safe * softmax_scale_log2,
-                            fastmath=True,
-                        )
-                        row_sum[r] = rsum + row_sum[r] * prev_scale
-                        acc_O_mn[r, None] = acc_O_mn[r, None].load() * prev_scale
-                        row_max[r] = rmax
-                        acc_S_mn[r, None] = p_row
-
-                    # O += P V
-                    rP = cute.make_fragment_like(acc_S, self._dtype)
-                    rP.store(acc_S.load().to(self._dtype))
-                    rP_div = cute.logical_divide(rP.layout, (None, None, 2))
-                    tOrS = cute.make_tensor(
-                        rP.iterator,
-                        cute.make_layout(
-                            (
-                                (rP_div.shape[0], rP_div.shape[2][0]),
-                                rP_div.shape[1],
-                                rP_div.shape[2][1],
-                            ),
-                            stride=(
-                                (rP_div.stride[0], rP_div.stride[2][0]),
-                                rP_div.stride[1],
-                                rP_div.stride[2][1],
-                            ),
-                        ),
+            # online softmax across this chunk's selected blocks; cnt/chunk bounds
+            # are thread-uniform so the per-sub-block barriers stay collective.
+            for it in cutlass.range(chunk_start, chunk_end):
+                kv_block = mQ2K[kv_head, qi, it]
+                if cutlass.const_expr(self._paged):
+                    page = mPageTable[batch_idx, kv_block]
+                    mK_blk = mK[page, kv_head, None, None]  # (128, d)
+                    mV_blk = mV[page, kv_head, None, None]
+                else:
+                    mK_blk = cute.domain_offset(
+                        (k_start + kv_block * self._blk_kv, 0),
+                        mK[None, kv_head, None],
                     )
-                    for k in cutlass.range_constexpr(cute.size(tOsVt.shape[2])):
-                        cute.copy(
-                            smem_tiled_copy_V,
-                            tOsVt[None, None, k],
-                            tOrVt_copy_view[None, None, k],
-                        )
-                    for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
-                        cute.gemm(
-                            tiled_mma,
-                            acc_O,
-                            tOrS[None, None, k],
-                            tOrVt[None, None, k],
-                            acc_O,
-                        )
-                # protect sK/sV before the next sub-block overwrites them
-                self.cta_sync_barrier.arrive_and_wait()
+                    mV_blk = cute.domain_offset(
+                        (k_start + kv_block * self._blk_kv, 0),
+                        mV[None, kv_head, None],
+                    )
+                if cutlass.const_expr(self._kv_nvfp4):
+                    # scale-row flattening per MSA quantize.py: paged caches are
+                    # quantized as (page, head, token) rows; flat as (token, head)
+                    if cutlass.const_expr(self._paged):
+                        sf_row_base = (page * mK.shape[1] + kv_head) * self._blk_kv
+                        sf_row_stride = cutlass.Int32(1)
+                    else:
+                        sf_row_base = (k_start + kv_block * self._blk_kv) * mK.shape[
+                            1
+                        ] + kv_head
+                        sf_row_stride = mK.shape[1]
 
-            # Store normalized partial + log2-domain LSE
+                for half in cutlass.range_constexpr(self._n_sub):
+                    base = kv_block * self._blk_kv + half * self._sub_block
+                    for kv_it in cutlass.range_constexpr(
+                        cute.ceil_div(kv_chunks, self._num_threads)
+                    ):
+                        kv_chunk = tidx + kv_it * self._num_threads
+                        if kv_chunk < kv_chunks:
+                            kv_m = kv_chunk // chunks_per_row
+                            kv_c8 = kv_chunk % chunks_per_row
+                            sK_chunk = cute.local_tile(sK[kv_m, None], (8,), (kv_c8,))
+                            sV_chunk = cute.local_tile(sV[kv_m, None], (8,), (kv_c8,))
+                            src_row = half * self._sub_block + kv_m
+                            if (base + kv_m) < seqlen_k:
+                                if cutlass.const_expr(self._kv_nvfp4):
+                                    from ...fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import (
+                                        cvt_e4m3_to_f32_via_f16,
+                                        fp4_decode_4bytes,
+                                    )
+
+                                    srow = sf_row_base + src_row * sf_row_stride
+                                    scol = kv_c8 // 2
+                                    srow_in = srow % 128
+                                    sf_off = (
+                                        ((srow // 128) * sf_tiles_n + scol // 4) * 512
+                                        + (srow_in % 32) * 16
+                                        + (srow_in // 32) * 4
+                                        + scol % 4
+                                    )
+                                    k_word = mK_blk[src_row, kv_c8]
+                                    kp0, kp1, kp2, kp3 = fp4_decode_4bytes(
+                                        cutlass.Uint32(k_word)
+                                    )
+                                    pair_frag[0] = kp0
+                                    pair_frag[1] = kp1
+                                    pair_frag[2] = kp2
+                                    pair_frag[3] = kp3
+                                    k_sc = cvt_e4m3_to_f32_via_f16(
+                                        cutlass.Uint32(mKSf[sf_off])
+                                    )
+                                    kvfrag.store(
+                                        (pair_f16.load().to(cutlass.Float32) * k_sc).to(
+                                            self._dtype
+                                        )
+                                    )
+                                    cute.autovec_copy(kvfrag, sK_chunk)
+                                    v_word = mV_blk[src_row, kv_c8]
+                                    vp0, vp1, vp2, vp3 = fp4_decode_4bytes(
+                                        cutlass.Uint32(v_word)
+                                    )
+                                    pair_frag[0] = vp0
+                                    pair_frag[1] = vp1
+                                    pair_frag[2] = vp2
+                                    pair_frag[3] = vp3
+                                    v_sc = cvt_e4m3_to_f32_via_f16(
+                                        cutlass.Uint32(mVSf[sf_off])
+                                    )
+                                    kvfrag.store(
+                                        (pair_f16.load().to(cutlass.Float32) * v_sc).to(
+                                            self._dtype
+                                        )
+                                    )
+                                    cute.autovec_copy(kvfrag, sV_chunk)
+                                    gK_chunk = None
+                                    gV_chunk = None
+                                else:
+                                    gK_chunk = cute.local_tile(
+                                        mK_blk[src_row, None], (8,), (kv_c8,)
+                                    )
+                                    gV_chunk = cute.local_tile(
+                                        mV_blk[src_row, None], (8,), (kv_c8,)
+                                    )
+                                if cutlass.const_expr(
+                                    self._kv_fp8 and not self._kv_nvfp4
+                                ):
+                                    kvfrag.store(
+                                        gK_chunk.load()
+                                        .to(cutlass.Float16)
+                                        .to(cutlass.Float32)
+                                        .to(self._dtype)
+                                    )
+                                    cute.autovec_copy(kvfrag, sK_chunk)
+                                    kvfrag.store(
+                                        gV_chunk.load()
+                                        .to(cutlass.Float16)
+                                        .to(cutlass.Float32)
+                                        .to(self._dtype)
+                                    )
+                                    cute.autovec_copy(kvfrag, sV_chunk)
+                                elif cutlass.const_expr(not self._kv_nvfp4):
+                                    cute.autovec_copy(gK_chunk, sK_chunk)
+                                    cute.autovec_copy(gV_chunk, sV_chunk)
+                            else:
+                                kvfrag.fill(0)
+                                cute.autovec_copy(kvfrag, sK_chunk)
+                                cute.autovec_copy(kvfrag, sV_chunk)
+                    self.cta_sync_barrier.arrive_and_wait()
+
+                    if tidx < 32:
+                        # S = Q K^T for this sub-block
+                        acc_S.fill(0.0)
+                        for k in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
+                            cute.copy(
+                                smem_tiled_copy_K,
+                                tSsK[None, None, k],
+                                tSrK_copy_view[None, None, k],
+                            )
+                        for k in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
+                            cute.gemm(
+                                tiled_mma,
+                                acc_S,
+                                tSrQ[None, None, k],
+                                tSrK[None, None, k],
+                                acc_S,
+                            )
+
+                        # mask + online softmax update
+                        for r in cutlass.range_constexpr(n_rows):
+                            for c in cutlass.range_constexpr(
+                                cute.size(tScS_mn.shape[1])
+                            ):
+                                k_pos = base + tScS_mn[0, c][1]
+                                if cute.elem_less(col_limit, k_pos + 1):
+                                    acc_S_mn[r, c] = -cutlass.Float32.inf
+                            acc_S_row = acc_S_mn[r, None].load()
+                            rmax = acc_S_row.reduce(
+                                cute.ReductionOp.MAX, -cutlass.Float32.inf, 0
+                            )
+                            rmax = self._threadquad_reduce_max(rmax)
+                            rmax_prev = row_max[r]
+                            rmax = cute.arch.fmax(rmax_prev, rmax)
+                            rmax_safe = 0.0 if rmax == -cutlass.Float32.inf else rmax
+                            p_row = cute.math.exp2(
+                                acc_S_row * softmax_scale_log2
+                                - rmax_safe * softmax_scale_log2,
+                                fastmath=True,
+                            )
+                            rsum = p_row.reduce(
+                                cute.ReductionOp.ADD, cutlass.Float32.zero, 0
+                            )
+                            prev_scale = cute.math.exp2(
+                                rmax_prev * softmax_scale_log2
+                                - rmax_safe * softmax_scale_log2,
+                                fastmath=True,
+                            )
+                            row_sum[r] = rsum + row_sum[r] * prev_scale
+                            acc_O_mn[r, None] = acc_O_mn[r, None].load() * prev_scale
+                            row_max[r] = rmax
+                            acc_S_mn[r, None] = p_row
+
+                        # O += P V
+                        rP = cute.make_fragment_like(acc_S, self._dtype)
+                        rP.store(acc_S.load().to(self._dtype))
+                        rP_div = cute.logical_divide(rP.layout, (None, None, 2))
+                        tOrS = cute.make_tensor(
+                            rP.iterator,
+                            cute.make_layout(
+                                (
+                                    (rP_div.shape[0], rP_div.shape[2][0]),
+                                    rP_div.shape[1],
+                                    rP_div.shape[2][1],
+                                ),
+                                stride=(
+                                    (rP_div.stride[0], rP_div.stride[2][0]),
+                                    rP_div.stride[1],
+                                    rP_div.stride[2][1],
+                                ),
+                            ),
+                        )
+                        for k in cutlass.range_constexpr(cute.size(tOsVt.shape[2])):
+                            cute.copy(
+                                smem_tiled_copy_V,
+                                tOsVt[None, None, k],
+                                tOrVt_copy_view[None, None, k],
+                            )
+                        for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
+                            cute.gemm(
+                                tiled_mma,
+                                acc_O,
+                                tOrS[None, None, k],
+                                tOrVt[None, None, k],
+                                acc_O,
+                            )
+                    # protect sK/sV before the next sub-block overwrites them
+                    self.cta_sync_barrier.arrive_and_wait()
+
+            # Store normalized partial + log2-domain LSE for this chunk
             if tidx < 32:
                 for r in cutlass.range_constexpr(n_rows):
                     g = tScO_mn[r, 0][0]
@@ -588,10 +608,10 @@ class SparseDecodeForwardSm12x:
                         hq = kv_head * G + g
                         for c in cutlass.range_constexpr(cute.size(tScO_mn.shape[1])):
                             d_pos = tScO_mn[0, c][1]
-                            mOp[slot, qi, hq, d_pos] = (acc_O_mn[r, c] * inv).to(
+                            mOp[chunk_idx, qi, hq, d_pos] = (acc_O_mn[r, c] * inv).to(
                                 mOp.element_type
                             )
-                        mLse[slot, qi, hq] = (
+                        mLse[chunk_idx, qi, hq] = (
                             rmax_safe * softmax_scale_log2
                             + cute.math.log2(rs, fastmath=True)
                         )

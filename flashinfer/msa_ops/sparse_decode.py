@@ -35,6 +35,22 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_decode_attention_trace
 
 
+def _decode_num_chunks(base_ctas: int, topk: int, device) -> int:
+    """Top-k split factor: fill the SMs at low batch, 1 (fused) when already full."""
+    from ..utils import get_device_sm_count
+
+    if base_ctas <= 0 or topk <= 1:
+        return 1
+    num_sms = get_device_sm_count(device)
+    if base_ctas >= num_sms:
+        return 1
+    chunks = -(-2 * num_sms // base_ctas)  # ceil to ~2 SM-waves
+    pow2 = 1
+    while pow2 * 2 <= chunks:
+        pow2 *= 2
+    return max(1, min(pow2, topk))
+
+
 @flashinfer_api(trace=msa_sparse_decode_attention_trace)
 def msa_sparse_decode_attention(
     q: torch.Tensor,
@@ -82,14 +98,14 @@ def msa_sparse_decode_attention(
     causal : bool
         Right-aligned causal masking (default True for decode).
     force_fused : bool, optional
-        Override the adaptive-split decision. The default per-block split
-        writes ``topk`` partials per token and reduces them with the combine
-        kernel; the fused path instead has one CTA per (token, kv-head) loop
-        over all selected blocks with an in-kernel online softmax and write the
-        final output directly (no GMEM partials, no combine), which wins once
-        the ``total_q * num_kv_heads`` grid already fills the SMs (high batch).
-        ``None`` (default) picks fused automatically when the grid is full;
-        ``True``/``False`` force it on/off. Fused is unavailable for NVFP4 KV.
+        Override the adaptive split-K decision. By default each token's selected
+        list is split into chunks (one CTA per chunk online-softmaxes its blocks
+        and writes a partial; the combine kernel reduces them), with the chunk
+        count adapting to fill the SMs — one block per chunk at low batch, a
+        single chunk at high batch. A single chunk is the *fused* path: one CTA
+        per (token, kv-head) writes the final output directly (no GMEM partials,
+        no combine). ``True``/``False`` force fused/split on; ``None`` (default)
+        adapts. Fused is unavailable for NVFP4 KV.
 
     Returns
     -------
@@ -100,7 +116,7 @@ def msa_sparse_decode_attention(
     import cutlass
     import cutlass.cute as cute
 
-    from ..utils import get_device_sm_count, is_sm12x_supported
+    from ..utils import is_sm12x_supported
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
     from .sparse_attention import (
         _combine_partials,
@@ -219,15 +235,20 @@ def msa_sparse_decode_attention(
     ):
         raise ValueError(f"unsupported partial_dtype {partial_dtype}")
 
-    # adaptive-split: fuse when the (token x kv-head) grid fills the SMs (one CTA per
-    # token loops all its blocks, dropping the topk partials + combine pass); else
-    # split for the topk-wide parallelism. NVFP4 splits always (no fused kernel).
+    # adaptive split-K: num_chunks fills the (chunk x token x kv-head) grid at low
+    # batch; num_chunks==1 is the fused path (no GMEM partials/combine) at high
+    # batch. NVFP4 keeps the per-block split.
     if force_fused and kv_nvfp4:
         raise ValueError("force_fused is not supported with NVFP4 KV")
-    if force_fused is None:
-        fused = (not kv_nvfp4) and (total_q * num_kv_heads >= get_device_sm_count(dev))
+    if kv_nvfp4:
+        fused, num_chunks = False, topk
+    elif force_fused is True:
+        fused, num_chunks = True, 1
+    elif force_fused is False:
+        fused, num_chunks = False, topk
     else:
-        fused = bool(force_fused) and (not kv_nvfp4)
+        num_chunks = _decode_num_chunks(total_q * num_kv_heads, topk, dev)
+        fused = num_chunks == 1
 
     if fused:
         # one CTA per (token, kv-head) writes the final output + LSE directly;
@@ -324,9 +345,10 @@ def msa_sparse_decode_attention(
             _fake(i32, (s_b0,), align=4),
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),  # out_scale
-            cutlass.Int32(1),
-            cutlass.Int32(1),
-            cutlass.Int32(1),
+            cutlass.Int32(1),  # seqlen_q
+            cutlass.Int32(1),  # total_q
+            cutlass.Int32(1),  # num_kv_heads
+            cutlass.Int32(1),  # num_chunks
             stream_fake,
             options="--enable-tvm-ffi",
         )
@@ -352,6 +374,7 @@ def msa_sparse_decode_attention(
         int(seqlen_q),
         int(total_q),
         int(num_kv_heads),
+        int(num_chunks),
     )
 
     if fused:
