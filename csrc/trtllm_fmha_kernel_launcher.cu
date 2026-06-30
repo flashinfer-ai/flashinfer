@@ -501,6 +501,7 @@ void trtllm_paged_attention_decode(
 bool trtllm_fmha_has_spec_dec_tree_kernel(TensorView query, TensorView key_cache,
                                           TensorView value_cache, TensorView out,
                                           int64_t batch_size, int64_t max_q_len, int64_t max_kv_len,
+                                          int64_t attention_window_size,
                                           Optional<bool> uses_shared_paged_kv_idx,
                                           bool force_spec_dec_tree_keeps,
                                           bool custom_mask_uses_sliding_window) {
@@ -566,7 +567,8 @@ bool trtllm_fmha_has_spec_dec_tree_kernel(TensorView query, TensorView key_cache
   runner_params.mQkvLayout = QkvLayout::PagedKv;
   runner_params.mMultiProcessorCount = getMultiProcessorCount();
   runner_params.mChunkedAttentionSize = INT_MAX;
-  runner_params.mAttentionWindowSize = custom_mask_uses_sliding_window ? max_kv_len : INT_MAX;
+  runner_params.mAttentionWindowSize =
+      custom_mask_uses_sliding_window ? attention_window_size : INT_MAX;
   runner_params.mSparseMlaType = TrtllmGenSparseMlaType::None;
   runner_params.mSparseMlaTopK = 0;
   runner_params.mHasSlidingWindowKvPool = false;

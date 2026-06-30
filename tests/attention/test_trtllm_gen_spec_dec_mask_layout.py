@@ -33,10 +33,11 @@ def test_native_window_probe_checks_forced_keeps_variant(monkeypatch):
         batch_size=1,
         max_q_len=2,
         max_seq_len=16,
+        window_left=8,
         uses_shared_paged_kv_idx=True,
         force_keeps=True,
     )
-    assert calls[0][-2:] == (True, True)
+    assert calls[0][-4:] == (8, True, True, True)
 
 
 def test_untrimmed_swa_spec_dec_tree_capability_flag():

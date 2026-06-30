@@ -2634,6 +2634,7 @@ def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
     batch_size: int,
     max_q_len: int,
     max_seq_len: int,
+    window_left: int,
     uses_shared_paged_kv_idx: bool,
     force_keeps: bool,
 ) -> bool:
@@ -2646,6 +2647,7 @@ def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
             batch_size,
             max_q_len,
             max_seq_len,
+            window_left,
             uses_shared_paged_kv_idx,
             force_keeps,
             True,
@@ -3210,6 +3212,7 @@ def trtllm_batch_decode_with_kv_cache(
                     batch_size,
                     max_q_len,
                     max_seq_len,
+                    window_left,
                     uses_shared_paged_kv_idx,
                     native_force_spec_dec_tree_keeps,
                 )

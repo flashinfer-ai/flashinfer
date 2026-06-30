@@ -534,6 +534,13 @@ class TllmGenFmhaKernel {
         } else {
           maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
         }
+      } else if (isSlidingWindowCustomMask(selectKernelParams.mMaskType)) {
+        int const windowAttention =
+            std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
+        int const windowCtas = flashinfer::ceil_div(windowAttention, 2 * kernelMeta.mStepKv);
+        if (windowCtas == 1) {
+          maxAttentionWindow = windowAttention;
+        }
       }
 
       // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
