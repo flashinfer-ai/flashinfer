@@ -898,9 +898,16 @@ def bench_varlen_transform(
             fi_ms / fi_nondeterministic_ms
         )
 
-    # clusters is a non-deterministic SM100 path; it cannot run under deterministic
-    # or tie_break modes, so only measure it for the plain comparison.
-    if has_clusters and not (deterministic or compare_tie_break):
+    # clusters is a non-deterministic SM100 path; it also only dispatches for
+    # page_table when row_to_batch is None (the prefill regime sets row_to_batch and
+    # falls back to the default path). Only measure/report it when it would actually
+    # run, otherwise the "clusters" timing would just be the default path relabeled.
+    can_run_clusters = (
+        has_clusters
+        and not (deterministic or compare_tie_break)
+        and not (transform == "page_table" and row_to_batch is not None)
+    )
+    if can_run_clusters:
         set_topk_algo("clusters")
         clusters_ms = bench_median_ms(lambda: run(False))
         result["clusters_us"] = clusters_ms * 1e3
@@ -1042,6 +1049,11 @@ def main():
         help="Query length per request for the varlen prefill (causal) regime (default: 128)",
     )
     args = parser.parse_args()
+
+    if args.varlen_k <= 0:
+        parser.error("--varlen-k must be a positive integer")
+    if args.varlen_q_len <= 0:
+        parser.error("--varlen-q-len must be a positive integer")
 
     dtype = parse_dtype(args.dtype)
 
@@ -1620,9 +1632,10 @@ def main():
             varlen_prefill_requests,
             args.varlen_q_len,
         )
-        # Fixed seed keeps the (otherwise random) length draws reproducible across runs.
+        # A torch.Generator drives the (otherwise random) length/score draws. It is
+        # re-seeded per case in the loop below so the page_table and ragged runs for a
+        # given case use identical inputs (and stays reproducible across runs).
         generator = torch.Generator(device=device)
-        generator.manual_seed(1234)
 
         show_det_or_tie = args.deterministic or args.tie_break
         # clusters is a non-deterministic SM100 path; omit it under deterministic/tie-break.
@@ -1684,8 +1697,11 @@ def main():
         print(header)
         print("-" * len(header))
 
-        for case in varlen_cases:
+        for case_idx, case in enumerate(varlen_cases):
             for transform in ["page_table", "ragged"]:
+                # Re-seed per case so page_table and ragged see identical inputs,
+                # keeping the per-case transform comparison and length stats equivalent.
+                generator.manual_seed(1234 + case_idx)
                 try:
                     result = bench_varlen_transform(
                         case,
@@ -1733,11 +1749,16 @@ def main():
                         )
                     else:
                         line = base_line + f"{result['flashinfer_us']:>10.2f}us"
-                        if show_clusters and "clusters_us" in result:
-                            line += (
-                                f" {result['clusters_us']:>10.2f}us "
-                                f"{result['speedup_clusters_vs_default']:>9.2f}x"
-                            )
+                        if show_clusters:
+                            # prefill page_table falls back to the default path, so it
+                            # has no clusters timing; pad to keep columns aligned.
+                            if "clusters_us" in result:
+                                line += (
+                                    f" {result['clusters_us']:>10.2f}us "
+                                    f"{result['speedup_clusters_vs_default']:>9.2f}x"
+                                )
+                            else:
+                                line += f" {'n/a':>12} {'n/a':>10}"
                         line += (
                             f" {result['torch_us']:>11.2f}us "
                             f"{result['speedup_vs_torch']:>8.2f}x"
@@ -1750,6 +1771,10 @@ def main():
                             f"{case.regime:>8} {case.length_dist:>10} "
                             f"{transform:>11} {case.max_len:>9} {case.k:>6} | {error_label}"
                         )
+                        # Drop the exception reference so its traceback stops pinning
+                        # bench_varlen_transform's frame (and its large GPU tensors)
+                        # before reclaiming cached memory.
+                        del e
                         torch.cuda.empty_cache()
                     else:
                         raise
