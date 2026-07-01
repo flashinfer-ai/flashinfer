@@ -22,7 +22,6 @@ from typing import Literal, Optional, Tuple
 
 import torch
 
-from ...api_logging import flashinfer_api
 from ...jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from ...utils import supported_compute_capability
 
@@ -92,7 +91,6 @@ def _check_scale_major_mode_mxfp8(scale_major_mode: str) -> None:
 
 
 @supported_compute_capability([120, 121])
-@flashinfer_api
 def moe_gemm_mxfp8_nt_groupwise(
     a: torch.Tensor,
     b: torch.Tensor,
