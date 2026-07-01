@@ -136,3 +136,48 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+def test_persistent_file_lock_keeps_lockfile_after_release(tmp_path):
+    # filelock deletes the lockfile on release, which turns peer NFS handles
+    # stale (Errno 116). The persistent lock must leave the file in place.
+    lock_path = tmp_path / "kernel.lock"
+
+    with core._PersistentFileLock(str(lock_path), thread_local=False):
+        assert lock_path.exists()
+
+    assert lock_path.exists()
+
+    # Re-acquiring the same, still-present lockfile must work.
+    with core._PersistentFileLock(str(lock_path), thread_local=False):
+        pass
+
+
+def test_build_and_load_warm_path_skips_lock(monkeypatch, tmp_path):
+    # An already-compiled .so must load without touching the FileLock so warm
+    # ranks never contend on the shared lockfile.
+    spec = core.JitSpec(
+        name="test_module",
+        sources=[],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+    so_path = tmp_path / "test_module.so"
+    so_path.touch()
+    monkeypatch.setattr(type(spec), "is_aot", property(lambda self: False))
+    monkeypatch.setattr(type(spec), "is_compiled", property(lambda self: True))
+    monkeypatch.setattr(type(spec), "jit_library_path", property(lambda self: so_path))
+
+    loaded = []
+    monkeypatch.setattr(spec, "load", lambda p: loaded.append(p) or "module")
+
+    def fail_lock(*args, **kwargs):
+        raise AssertionError("warm path must not acquire the lock")
+
+    monkeypatch.setattr(core, "_PersistentFileLock", fail_lock)
+
+    assert spec.build_and_load() == "module"
+    assert loaded == [so_path]

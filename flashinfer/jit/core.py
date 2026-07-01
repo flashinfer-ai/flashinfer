@@ -2,10 +2,10 @@ import dataclasses
 import functools
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union, Hashable
+from typing import Dict, List, Optional, Sequence, Union, Hashable, cast
 
 import tvm_ffi
 from filelock import FileLock
@@ -15,9 +15,34 @@ from . import env as jit_env
 from .cpp_ext import generate_ninja_build_for_op, get_nvcc_parallelism_flags, run_ninja
 from .utils import write_if_different
 
+try:
+    import fcntl
+except ImportError:  # non-Unix; JIT build path is Unix-only in practice
+    fcntl = None  # type: ignore[assignment]
+
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 # Note: Do NOT create FLASHINFER_CSRC_DIR here - it's the package directory
 # which may be read-only after installation
+
+
+class _PersistentFileLock(FileLock):
+    """FileLock that releases the lock but does not delete the lockfile.
+
+    filelock deletes the lockfile on release. On a shared NFS cache, deleting it
+    while a peer node holds it open makes that peer's handle stale, so its next
+    lock op fails with ``OSError: [Errno 116] Stale file handle``. Releasing the
+    advisory lock without unlinking removes that failure; the lock still
+    serializes the compile, and the leftover empty lockfile is harmless.
+    """
+
+    def _release(self) -> None:
+        fd = cast("int", self._context.lock_file_fd)
+        self._context.lock_file_fd = None
+        if fcntl is not None:
+            with suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(fd)
 
 
 class MissingJITCacheError(RuntimeError):
@@ -295,7 +320,9 @@ class JitSpec:
                 spec=self,
             )
         lock = (
-            FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
+            _PersistentFileLock(self.lock_path, thread_local=False)
+            if need_lock
+            else nullcontext()
         )
         with lock:
             self.write_ninja()
@@ -308,9 +335,17 @@ class JitSpec:
         if self.is_aot:
             return self.load(self.aot_path)
 
+        # Warm path: an already-built .so needs no compile, so skip the lock. On a
+        # shared NFS cache this keeps every warm rank off the lockfile.
+        if self.is_compiled:
+            try:
+                return self.load(self.jit_library_path)
+            except Exception:
+                pass  # fall through to the locked build/load
+
         # Guard both build and load with the same lock to avoid race condition
         # where another process is building the library and removes the .so file.
-        with FileLock(self.lock_path, thread_local=False):
+        with _PersistentFileLock(self.lock_path, thread_local=False):
             so_path = self.jit_library_path
             verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
             self.build(verbose, need_lock=False)
@@ -502,7 +537,7 @@ def build_jit_specs(
         if skip_prebuilt and spec.aot_path.exists():
             continue
         lines.append(f"subninja {spec.ninja_path}")
-        with FileLock(spec.lock_path, thread_local=False):
+        with _PersistentFileLock(spec.lock_path, thread_local=False):
             spec.write_ninja()
     if not lines:
         return
@@ -510,7 +545,7 @@ def build_jit_specs(
     lines = ["ninja_required_version = 1.3"] + lines + [""]
 
     tmpdir = get_tmpdir()
-    with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
+    with _PersistentFileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
         run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
