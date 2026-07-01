@@ -277,7 +277,13 @@ def test_trtllm_gen_routed_fused_moe(
     "routing_method_type",
     [
         RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
     ],
+)
+@pytest.mark.parametrize(
+    "routing_logits_dtype",
+    [torch.bfloat16, torch.float32],
+    ids=["bf16", "fp32"],
 )
 def test_trtllm_gen_fp8_routed_fused_moe(
     num_tokens: int,
@@ -286,8 +292,13 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     top_k: int,
     num_experts: int,
     routing_method_type: RoutingMethodType,
+    routing_logits_dtype: torch.dtype,
 ):
-    """Test FP8 block scale routed MoE matches standard routing."""
+    """Test FP8 block scale routed MoE matches standard routing.
+
+    Covers both bfloat16 and float32 routing logits: models like
+    MiniMax-M2.1 use RenormalizeNaive routing with float32 logits.
+    """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
@@ -295,9 +306,9 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
 
-    # Generate random routing logits for reference
+    # Generate random routing logits — parametrized over bfloat16 and float32.
     routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
-        torch.bfloat16
+        routing_logits_dtype
     )
 
     # Generate random hidden states in FP8
@@ -426,7 +437,13 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     "routing_method_type",
     [
         RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
     ],
+)
+@pytest.mark.parametrize(
+    "routing_logits_dtype",
+    [torch.bfloat16, torch.float32],
+    ids=["bf16", "fp32"],
 )
 def test_trtllm_gen_bf16_routed_fused_moe(
     num_tokens: int,
@@ -435,8 +452,12 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     top_k: int,
     num_experts: int,
     routing_method_type: RoutingMethodType,
+    routing_logits_dtype: torch.dtype,
 ):
-    """Test Bf16 scale routed MoE matches standard routing."""
+    """Test Bf16 scale routed MoE matches standard routing.
+
+    Covers both bfloat16 and float32 routing logits.
+    """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
@@ -444,9 +465,9 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
 
-    # Generate random routing logits for reference
+    # Generate random routing logits — parametrized over bfloat16 and float32.
     routing_logits = torch.rand(num_tokens, num_experts, device=device).to(
-        torch.bfloat16
+        routing_logits_dtype
     )
 
     # Generate random hidden states in FP8
