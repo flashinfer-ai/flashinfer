@@ -406,10 +406,13 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
 
-      - name: Download all artifacts
+      - name: Download wheel and sdist artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
+          # Only fetch wheel/sdist artifacts; skip the multi-GB jit-cache
+          # artifacts this job does not need (avoids running out of disk).
+          pattern: 'flashinfer-*'
 
       - name: Collect wheels and sdist
         run: |
