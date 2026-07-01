@@ -612,12 +612,8 @@ def _as_float32_scalar_tensors(
     *,
     device: torch.device,
 ) -> Tuple[torch.Tensor, ...]:
-    has_cuda_tensor = any(
-        isinstance(value, torch.Tensor) and value.is_cuda for _, value in values
-    )
     stream_capturing = (
-        has_cuda_tensor
-        and hasattr(torch.cuda, "is_current_stream_capturing")
+        hasattr(torch.cuda, "is_current_stream_capturing")
         and torch.cuda.is_current_stream_capturing()
     )
 
@@ -625,6 +621,11 @@ def _as_float32_scalar_tensors(
     cuda_tensors_to_validate = []
     for name, value in values:
         if not isinstance(value, torch.Tensor):
+            if stream_capturing:
+                raise ValueError(
+                    f"{name} must be a contiguous float32 CUDA tensor on {device} "
+                    "during CUDA graph capture"
+                )
             scalar = float(value)
             if not math.isfinite(scalar) or scalar <= 0.0:
                 raise ValueError(
@@ -640,22 +641,22 @@ def _as_float32_scalar_tensors(
         if value.dtype != torch.float32:
             raise ValueError(f"{name} must be torch.float32, got {value.dtype}")
         is_cuda_tensor = value.is_cuda
-        is_capturing = is_cuda_tensor and stream_capturing
-        if not value.is_cuda:
+        is_capturing = stream_capturing
+        if is_capturing and (
+            not is_cuda_tensor or value.device != device or not value.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous float32 CUDA tensor on {device} "
+                "during CUDA graph capture"
+            )
+        if not is_cuda_tensor:
             scalar = float(value.item())
             if not math.isfinite(scalar) or scalar <= 0.0:
                 raise ValueError(
                     f"{name} must be a positive finite global decode scale"
                 )
         if value.device != device:
-            if is_capturing:
-                raise ValueError(
-                    f"{name} must already be on device {device} during CUDA graph "
-                    f"capture, got {value.device}"
-                )
             value = value.to(device=device)
-        if is_capturing and not value.is_contiguous():
-            raise ValueError(f"{name} must be contiguous during CUDA graph capture")
         value = value.contiguous()
         tensors.append(value)
         if is_capturing:

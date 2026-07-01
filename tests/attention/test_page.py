@@ -491,6 +491,32 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_cuda
         )
 
 
+@pytest.mark.parametrize("k_scale", [1.0, torch.ones(1, dtype=torch.float32)])
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_capture_temp_scale(
+    k_scale,
+    monkeypatch,
+):
+    k_append, v_append, k_cache, v_cache, k_scales, v_scales = (
+        _make_small_nvfp4_append_inputs()
+    )
+    slot_mapping = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+    v_scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: True, raising=False
+    )
+
+    with pytest.raises(ValueError, match="CUDA graph capture"):
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append,
+            v_append,
+            slot_mapping,
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            k_scale,
+            v_scale,
+        )
+
+
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_capture():
     k_append, v_append, k_cache, v_cache, k_scales, v_scales = (
         _make_small_nvfp4_append_inputs()
