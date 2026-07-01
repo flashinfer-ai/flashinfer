@@ -42,3 +42,23 @@ if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   echo "nvidia-cutlass-dsl override complete."
   echo ""
 fi
+
+# Pre-install the CUDA-13 nvidia-cutlass-dsl backend ([cu13] extra, pinned from requirements.txt)
+# to prevent editable installs from leaving mismatched backend versions on CUDA 13 (sm_110a).
+# No-op on CUDA 12 or when CUTLASS_DSL_VERSION is set.
+if [ -z "${CUTLASS_DSL_VERSION:-}" ]; then
+  CUDA_MAJOR=$(python -c "import torch; print(torch.version.cuda.split('.')[0])" 2>/dev/null || echo "12")
+  if [ "$CUDA_MAJOR" = "13" ]; then
+    # Lift the pinned spec from requirements.txt and add the [cu13] extra, e.g.
+    # `nvidia-cutlass-dsl>=4.5.0` -> `nvidia-cutlass-dsl[cu13]>=4.5.0`.
+    DSL_SPEC=$(grep -E '^nvidia-cutlass-dsl([<>=!~]|$)' "${REPO_ROOT}/requirements.txt" | head -1 | tr -d '[:space:]')
+    if [ -n "$DSL_SPEC" ]; then
+      DSL_CU13="${DSL_SPEC/nvidia-cutlass-dsl/nvidia-cutlass-dsl[cu13]}"
+      echo "========================================"
+      echo "Ensuring CUDA-13 cutlass-dsl backend: ${DSL_CU13}"
+      echo "========================================"
+      pip install -U "${DSL_CU13}"
+      echo ""
+    fi
+  fi
+fi

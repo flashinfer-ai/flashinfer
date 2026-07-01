@@ -2765,6 +2765,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cc = get_compute_capability(query.device)
         if cc[0] == 12 and sparse_mla_top_k > 0:
             backend = "sparse"
+        elif cc[0] == 11:
+            backend = "cute-dsl"
         elif cc[0] != 10:
             backend = "xqa"
 
