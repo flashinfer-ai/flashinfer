@@ -27,13 +27,15 @@ Inputs that do not match are rejected up front rather than silently
 corrupting memory.
 """
 
+import contextlib
 import functools
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.moe import mono_moe_trace
+from ..utils import backend_requirement, supported_compute_capability
 
 # Hard-coded geometry of the only compiled variant
 # (Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA in
@@ -152,10 +154,8 @@ def interleave_for_tma_wgmma_up(w_fp8: torch.Tensor) -> torch.Tensor:
     stripes = torch.stack([gate_lo, up_lo, gate_hi, up_hi], dim=2)
     result = stripes.reshape(E, blocks * 128, K).contiguous()
 
-    try:
+    with contextlib.suppress(AttributeError, RuntimeError):
         w_fp8._tma_interleaved_up = result
-    except (AttributeError, RuntimeError):
-        pass
     return result
 
 
@@ -182,7 +182,9 @@ def _check_shapes(
     if activations_in.size(1) != K:
         raise ValueError(f"activations K must be {K}, got {activations_in.size(1)}")
     if tuple(router_logits.shape) != (m, E):
-        raise ValueError(f"router_logits must be [{m}, {E}], got {tuple(router_logits.shape)}")
+        raise ValueError(
+            f"router_logits must be [{m}, {E}], got {tuple(router_logits.shape)}"
+        )
 
     # Up weights: interleaved [E, 2*N, K]; up scales block-wise [E, 2N/128, K/128].
     if tuple(expert_weights_up.shape) != (E, 2 * N, K):
@@ -207,6 +209,48 @@ def _check_shapes(
     return m
 
 
+@supported_compute_capability([90])
+def _check_mono_moe_supported(
+    activations_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    expert_weights_up: torch.Tensor,
+    expert_scales_up: torch.Tensor,
+    expert_weights_down: torch.Tensor,
+    expert_scales_down: torch.Tensor,
+    top_k: int,
+    scoring_func: str = "softmax",
+    renormalize: bool = True,
+    out: Optional[torch.Tensor] = None,
+    scratchpad: Optional[torch.Tensor] = None,
+    interleave_up: bool = True,
+) -> bool:
+    """Backend-requirement check for :func:`mono_moe`.
+
+    Carries the ``@supported_compute_capability([90])`` annotation so the
+    ``@backend_requirement`` wrapper rejects any non-Hopper device with a
+    clear ``BackendSupportedError`` *before* the SM90a-only kernel is JIT
+    compiled — otherwise a call on, say, SM80 would fail deep inside nvcc
+    with a cryptic ``wgmma`` / TMA build error.  Also runs the fixed-shape
+    contract validation (delegated to :func:`_check_shapes`) so shape and
+    architecture support are decided in one place.
+
+    Accepts ``mono_moe``'s full signature because ``@backend_requirement``
+    forwards every (default-applied) argument to the checker.  Returns
+    ``True`` when the call is supported; raises ``ValueError`` on a shape
+    mismatch.
+    """
+    _check_shapes(
+        activations_in,
+        router_logits,
+        expert_weights_up,
+        expert_scales_up,
+        expert_weights_down,
+        expert_scales_down,
+    )
+    return True
+
+
+@backend_requirement({}, common_check=_check_mono_moe_supported)
 @flashinfer_api(trace=mono_moe_trace)
 def mono_moe(
     activations_in: torch.Tensor,
@@ -251,7 +295,9 @@ def mono_moe(
         raise ValueError(f"top_k must be in [1, 8], got {top_k}")
     sf_map = {"sigmoid": _SCORING_SIGMOID, "softmax": _SCORING_SOFTMAX}
     if scoring_func not in sf_map:
-        raise ValueError(f"scoring_func must be 'sigmoid' or 'softmax', got {scoring_func!r}")
+        raise ValueError(
+            f"scoring_func must be 'sigmoid' or 'softmax', got {scoring_func!r}"
+        )
 
     m = _check_shapes(
         activations_in,
