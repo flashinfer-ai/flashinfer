@@ -261,7 +261,12 @@ def ensure_symlink(
                 link.unlink()
             else:
                 shutil.rmtree(link)
-        link.symlink_to(target)
+        try:
+            link.symlink_to(target)
+        except FileExistsError:
+            if link.is_symlink() and link.resolve() == target.resolve():
+                return
+            raise
 
 
 def verify_symlinked_headers(
