@@ -56,6 +56,7 @@ class MNNVLQuantType:
     NONE = 0
     FP8 = 1
     NVFP4 = 2
+    DYNAMIC_FP8 = 3
 
 
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
@@ -603,15 +604,16 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             ``[num_tokens, hidden_dim]`` and dtype ``torch.float8_e4m3fn``. For
             NVFP4, shape must be ``[num_tokens, hidden_dim // 2]`` and dtype
             ``torch.uint8`` or ``torch.float4_e2m1fn_x2``.
-        scale_out: Optional NVFP4 scale output. For ``LINEAR`` layout, shape is
-            ``[num_tokens, hidden_dim // 16]``. For ``SWIZZLED_128x4``, provide a
-            1-D tensor large enough for the padded swizzled scale layout. FP8
-            ignores this argument.
+        scale_out: Optional scale output. Dynamic FP8 uses ``[num_tokens, 1]``
+            float32. NVFP4 uses ``[num_tokens, hidden_dim // 16]`` for
+            ``LINEAR`` layout, or a 1-D tensor large enough for the padded
+            ``SWIZZLED_128x4`` layout. Static FP8 ignores this argument.
         output_scale: Scalar float or float32 tensor used as the quantization
             output scale. Defaults to ``1.0``.
         layout_code: NVFP4 scale layout. MNNVL supports ``SWIZZLED_128x4`` and
             ``LINEAR``; ``SWIZZLED_8x4`` is not supported.
-        quant_type: ``MNNVLQuantType.FP8`` or ``MNNVLQuantType.NVFP4``.
+        quant_type: ``MNNVLQuantType.FP8``, ``MNNVLQuantType.NVFP4``, or
+            ``MNNVLQuantType.DYNAMIC_FP8``.
         launch_with_pdl: Whether to launch with PDL.
         strategy: MNNVL execution strategy. ``AUTO`` uses internal heuristics.
         weight_bias: Bias added to gamma before scaling. ``0.0`` for standard
@@ -619,12 +621,12 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
 
     Returns:
         A tuple ``(quant_out, scale_out, residual_out, output)``. ``scale_out``
-        is ``None`` for FP8, and ``output`` is ``None`` unless requested.
+        is ``None`` for static FP8; ``output`` is ``None`` unless requested.
     """
 
     if epsilon is None:
         epsilon = torch.finfo(input.dtype).eps
-    if output_scale is None:
+    if output_scale is None and quant_type != MNNVLQuantType.DYNAMIC_FP8:
         output_scale = 1.0
 
     if len(input.shape) != 2:
@@ -661,7 +663,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             f"output shape must match input shape, got {output.shape} and {input.shape}."
         )
 
-    if isinstance(output_scale, torch.Tensor):
+    if quant_type == MNNVLQuantType.DYNAMIC_FP8:
+        output_scale_tensor = None
+    elif isinstance(output_scale, torch.Tensor):
         if output_scale.numel() < 1:
             raise ValueError("output_scale must contain at least one element")
         output_scale_tensor = output_scale.to(device=input.device, dtype=torch.float32)
@@ -682,6 +686,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             raise ValueError(
                 f"quant_out dtype for FP8 must be float8_e4m3fn, got {quant_out.dtype}."
             )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for FP8.")
         scale_out = None
     elif quant_type == MNNVLQuantType.NVFP4:
         if input.dtype == torch.float32:
@@ -706,6 +712,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             raise ValueError(
                 f"quant_out dtype for NVFP4 must be uint8 or float4_e2m1fn_x2, got {quant_out.dtype}."
             )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for NVFP4.")
 
         expected_scale_out_numel = (
             token_num * hidden_dim // 16
@@ -733,6 +741,34 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             raise ValueError(
                 f"scale_out dtype for NVFP4 must be float8_e4m3fn, got {scale_out.dtype}."
             )
+    elif quant_type == MNNVLQuantType.DYNAMIC_FP8:
+        if quant_out is None:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        elif quant_out.shape != input.shape:
+            raise ValueError(
+                f"quant_out shape must be {tuple(input.shape)} for dynamic FP8, got {tuple(quant_out.shape)}."
+            )
+        if quant_out.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"quant_out dtype for dynamic FP8 must be float8_e4m3fn, got {quant_out.dtype}."
+            )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for dynamic FP8.")
+        expected_scale_shape = (token_num, 1)
+        if scale_out is None:
+            scale_out = torch.empty(
+                expected_scale_shape, dtype=torch.float32, device=input.device
+            )
+        elif tuple(scale_out.shape) != expected_scale_shape:
+            raise ValueError(
+                f"scale_out shape must be {expected_scale_shape} for dynamic FP8, got {tuple(scale_out.shape)}."
+            )
+        if scale_out.dtype != torch.float32:
+            raise ValueError(
+                f"scale_out dtype for dynamic FP8 must be float32, got {scale_out.dtype}."
+            )
+        if not scale_out.is_contiguous():
+            raise ValueError("scale_out must be contiguous for dynamic FP8.")
     else:
         raise ValueError(f"Unsupported MNNVL quant_type: {quant_type}")
 
