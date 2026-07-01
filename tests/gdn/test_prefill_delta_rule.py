@@ -359,6 +359,72 @@ def test_prefill_kernel_zero_length_sequence(
     torch.testing.assert_close(our_o, ref_o, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("use_cp", [False, True])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prefill_zero_length_sequence_state_untouched(
+    qkv_factory,
+    dtype: str,
+    use_cp: bool,
+    scale: float = 0.1,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    seq_len = 256
+    head_size = 128
+    num_heads = 1
+    sentinel = 123.0
+    dtype = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q, k, v = qkv_factory(
+            [seq_len], num_heads, num_heads, num_heads, head_size, dtype
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        alpha = torch.rand(seq_len, num_heads)
+        beta = torch.rand(seq_len, num_heads)
+        cu_seq_lens = torch.tensor([0, seq_len, seq_len], dtype=torch.int64)
+
+    our_o = torch.empty([seq_len, num_heads, head_size], dtype=q.dtype, device=q.device)
+    our_state = torch.empty(
+        (2, num_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    our_state.fill_(sentinel)
+
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seq_lens,
+        True,
+        output=our_o,
+        output_state=our_state,
+        use_cp=use_cp,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        our_state[1],
+        torch.full_like(our_state[1], sentinel),
+        atol=0,
+        rtol=0,
+    )
+
+
 def _test_chunked_prefill(
     qkv_factory,
     dtype: str,
