@@ -66,6 +66,9 @@ def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
     actual_seq_lens_kv = torch.full((B,), kv_len, dtype=torch.int32, device="cuda")
     scale = 1.0 / math.sqrt(D)
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    qo_indptr = torch.zeros(B + 1, dtype=torch.int32, device="cuda")
+    qo_indptr[1:] = actual_seq_lens_q.cumsum(0)
+    batch_offsets = (qo_indptr.to(torch.int64) * Hq * D).to(torch.int32).reshape(B + 1, 1, 1, 1)
     try:
         api_out, _ = cudnn_batch_prefill_with_kv_cache(
             q,
@@ -75,11 +78,13 @@ def test_cudnn_batch_prefill_reference_correctness(shape_kwargs):
             workspace,
             max_token_per_sequence=q_len,
             max_sequence_kv=kv_len,
-            actual_seq_lens_q=actual_seq_lens_q,
-            actual_seq_lens_kv=actual_seq_lens_kv,
+            actual_seq_lens_q=actual_seq_lens_q.reshape(B, 1, 1, 1),
+            actual_seq_lens_kv=actual_seq_lens_kv.reshape(B, 1, 1, 1),
             block_tables=block_tables,
             causal=True,
             return_lse=False,
+            batch_offsets_q=batch_offsets,
+            batch_offsets_o=batch_offsets,
         )
     except Exception as exc:
         pytest.skip(f"cudnn_batch_prefill_with_kv_cache unavailable: {exc}")
