@@ -75,6 +75,7 @@ from .quantization.fp4_quantization import (
     scaled_fp4_grouped_quantize,
     get_fp4_quantization_module,
     nvfp4_kv_dequantize,
+    nvfp4_kv_dequantize_paged,
     nvfp4_kv_quantize,
 )
 from .quantization.fp8_quantization import (
