@@ -11,28 +11,25 @@
 // `TVM_FFI_ICHECK`.  The vLLM tree's `cuda_utils.h` (which supplied
 // `CUDA_CHECK`) does not exist here; define a self-contained equivalent that
 // raises a TVM-FFI error on a non-success CUDA status.
-#define CUDA_CHECK(call)                                                  \
-  do {                                                                    \
-    cudaError_t _e = (call);                                             \
-    TVM_FFI_ICHECK(_e == cudaSuccess)                                     \
-        << "CUDA error " << cudaGetErrorString(_e) << " at " << __FILE__ \
-        << ":" << __LINE__;                                              \
+#define CUDA_CHECK(call)                                                                     \
+  do {                                                                                       \
+    cudaError_t _e = (call);                                                                 \
+    TVM_FFI_ICHECK(_e == cudaSuccess)                                                        \
+        << "CUDA error " << cudaGetErrorString(_e) << " at " << __FILE__ << ":" << __LINE__; \
   } while (0)
 
 // TEMP_FP8_OFFSET regression anchor: the down-activation TMA descriptor
 // addresses `spec->temp_fp8` as `scratchpad_ptr + TEMP_FP8_OFFSET`, so that
 // constant must equal `offsetof(MoEGemmSpec<Dims>, temp_fp8)`.  New fields
 // MUST be appended after temp_fp8 or this fires (docs/design_docs/monomoe_kernel.md §4).
-static_assert(
-    offsetof(
-        monomoe::MoEGemmSpec<monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>,
-        temp_fp8) ==
-        monomoe::MoEGemmSpec<
-            monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>::TEMP_FP8_OFFSET,
-    "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
-    "Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA. Do not insert fields "
-    "before temp_fp8; grid_barrier / partial_barrier belong at the tail of "
-    "MoEGemmSpec<Dims>.");
+static_assert(offsetof(monomoe::MoEGemmSpec<monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>,
+                       temp_fp8) ==
+                  monomoe::MoEGemmSpec<
+                      monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>::TEMP_FP8_OFFSET,
+              "TEMP_FP8_OFFSET must match offsetof(MoEGemmSpec<Dims>, temp_fp8) for "
+              "Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA. Do not insert fields "
+              "before temp_fp8; grid_barrier / partial_barrier belong at the tail of "
+              "MoEGemmSpec<Dims>.");
 
 /**
  * @brief Host launcher for `moe_kernel_topk`, parameterized on the compile-time
@@ -46,10 +43,10 @@ static_assert(
  */
 template <class Dims>
 void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
-                                  TensorView expert_weights_up, TensorView expert_scales_up,
-                                  TensorView expert_weights_down, TensorView expert_scales_down,
-                                  TensorView activations_out, TensorView scratchpad, int64_t top_k,
-                                  int64_t scoring_func, bool renormalize) {
+                           TensorView expert_weights_up, TensorView expert_scales_up,
+                           TensorView expert_weights_down, TensorView expert_scales_down,
+                           TensorView activations_out, TensorView scratchpad, int64_t top_k,
+                           int64_t scoring_func, bool renormalize) {
   CHECK_INPUT(activations_in);
   CHECK_INPUT(router_logits);
   CHECK_INPUT(expert_weights_up);
@@ -77,8 +74,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   const auto* expert_scales_up_ptr = static_cast<const S_element*>(expert_scales_up.data_ptr());
   const auto* expert_weights_down_ptr =
       static_cast<const W_element*>(expert_weights_down.data_ptr());
-  const auto* expert_scales_down_ptr =
-      static_cast<const S_element*>(expert_scales_down.data_ptr());
+  const auto* expert_scales_down_ptr = static_cast<const S_element*>(expert_scales_down.data_ptr());
   auto* activations_out_ptr = static_cast<R_element*>(activations_out.data_ptr());
   char* scratchpad_ptr = reinterpret_cast<char*>(scratchpad.data_ptr());
 
@@ -99,9 +95,8 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
   CUtensorMap down_weights_desc{};
   CUtensorMap down_activations_desc{};
   if constexpr (use_tma_v<Dims>) {
-    up_weights_desc =
-        create_up_weight_tma_desc(reinterpret_cast<const void*>(expert_weights_up_ptr),
-                                  Dims::NUM_EXPERTS, Dims::N, Dims::K);
+    up_weights_desc = create_up_weight_tma_desc(
+        reinterpret_cast<const void*>(expert_weights_up_ptr), Dims::NUM_EXPERTS, Dims::N, Dims::K);
     activations_desc = create_activations_tma_desc(
         reinterpret_cast<const void*>(activations_in_ptr), Dims::BS, Dims::HIDDEN_STATES);
     down_weights_desc = create_down_weight_tma_desc(
@@ -111,8 +106,8 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
     // scratchpad: base + compile-time offset (docs/design_docs/monomoe_kernel.md §4).
     const void* temp_fp8_ptr =
         reinterpret_cast<const char*>(scratchpad_ptr) + MoEGemmSpec<Dims>::TEMP_FP8_OFFSET;
-    down_activations_desc = create_down_activation_tma_desc(
-        temp_fp8_ptr, MoEGemmSpec<Dims>::TEMP_ROWS_TMA, Dims::N);
+    down_activations_desc =
+        create_down_activation_tma_desc(temp_fp8_ptr, MoEGemmSpec<Dims>::TEMP_ROWS_TMA, Dims::N);
   }
 
   const cudaStream_t stream = get_stream(activations_in.device());
@@ -125,8 +120,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
                          activations_in.device().device_id);
   TVM_FFI_ICHECK(Dims::KernelConfig::GRID_SIZE <= static_cast<uint32_t>(sm_count))
       << "monomoe requires GRID_SIZE (=" << Dims::KernelConfig::GRID_SIZE
-      << ") <= SM count (=" << sm_count
-      << ") for software grid barrier co-residency invariant.";
+      << ") <= SM count (=" << sm_count << ") for software grid barrier co-residency invariant.";
   // First-use scratchpad zero-init (docs/design_docs/monomoe_kernel.md §4): the barrier counters
   // must start at 0; the ping-pong reset is self-maintaining thereafter.
   // Key the guard on buffer identity (ptr, size, device) — a process-wide
@@ -158,8 +152,7 @@ void monomoe_topk_launcher(TensorView activations_in, TensorView router_logits,
 // Explicit instantiation for the only BS8 variant (TMA + WGMMA +
 // SWIZZLE_128B); materializes the launcher symbol that monomoe_binding.cu
 // exports through TVM-FFI.
-template void
-monomoe_topk_launcher<monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>(
+template void monomoe_topk_launcher<monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>(
     TensorView activations_in, TensorView router_logits, TensorView expert_weights_up,
     TensorView expert_scales_up, TensorView expert_weights_down, TensorView expert_scales_down,
     TensorView activations_out, TensorView scratchpad, int64_t top_k, int64_t scoring_func,

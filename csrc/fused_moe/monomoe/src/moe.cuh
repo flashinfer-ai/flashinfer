@@ -48,7 +48,6 @@ __device__ void moe_kernel_topk_BS8(
   static_assert(use_tma_v<Dims>, "BS8 path requires USE_TMA");
   using CoreDims = MoECoreDims<Dims>;
 
-
   // Zero-init `down_partial_out[BS][HIDDEN]` that Phase 4 atomicAdds into.
   // All blocks zero a chunk in parallel; the Site-#2 expert_barrier is the
   // cross-block visibility fence before any Phase-4 atomicAdd fires.
@@ -207,7 +206,6 @@ __device__ void moe_kernel_topk_BS8(
   }
   __syncthreads();
 
-
   // ── Up-projection group mapping (docs/design_docs/monomoe_kernel.md §6) ────────────────────────
   // UP_GRID blocks cover one expert's 2*N rows; UP_GROUPS expert groups run
   // in parallel.  For this shape: UP_GRID=8, UP_GROUPS=16.
@@ -240,7 +238,6 @@ __device__ void moe_kernel_topk_BS8(
         /*expert_stride=*/UP_GROUPS);
   }
 
-
   // ── Site #2 — Expert-local barrier, Phase 3→4 (docs/design_docs/monomoe_kernel.md §2) ─────────
   // DOWN_GROUPS == UP_GROUPS aligns the producer set (8 blocks that wrote
   // expert group `g`'s temp_fp8 rows) with the consumer set, so an
@@ -248,11 +245,10 @@ __device__ void moe_kernel_topk_BS8(
   // `in_up` is always true here but gated defensively for future configs.
   if (in_up) {
     monomoe::expert_barrier(expert_counters,
-                                   /*expert_id=*/up_group,
-                                   /*arrival_count=*/UP_GRID,
-                                   /*seed_blockidx=*/up_group * UP_GRID, expert_phase);
+                            /*expert_id=*/up_group,
+                            /*arrival_count=*/UP_GRID,
+                            /*seed_blockidx=*/up_group * UP_GRID, expert_phase);
   }
-
 
   // ── Phase 4 (WGMMA): dual-WG streaming down-projection ──
   // (docs/design_docs/monomoe_kernel.md §1,§6)
@@ -264,7 +260,6 @@ __device__ void moe_kernel_topk_BS8(
                                                      batch_size, spec, shmem, down_weights_desc,
                                                      down_activations_desc);
 
-
   // ── Site #3 — Col-stripe-local barrier, Phase 4→5 (docs/design_docs/monomoe_kernel.md §2) ─────
   // Phase 5 reader for col stripe `b` is `blockIdx.x == b`; its producer set
   // is the DOWN_GROUPS blocks with `blockIdx.x % DOWN_GRID == b`, which is
@@ -273,11 +268,10 @@ __device__ void moe_kernel_topk_BS8(
   {
     const uint32_t col_stripe_id = blockIdx.x % MoECoreDims<Dims>::DOWN_GRID;
     monomoe::colstripe_barrier(colstripe_counters,
-                                      /*col_stripe=*/col_stripe_id,
-                                      /*arrival_count=*/MoECoreDims<Dims>::DOWN_GROUPS,
-                                      /*seed_blockidx=*/col_stripe_id, colstripe_phase);
+                               /*col_stripe=*/col_stripe_id,
+                               /*arrival_count=*/MoECoreDims<Dims>::DOWN_GROUPS,
+                               /*seed_blockidx=*/col_stripe_id, colstripe_phase);
   }
-
 
   // ── Phase 5 (WGMMA): bf16 cast + writeback (docs/design_docs/monomoe_kernel.md §1) ─────────────
   // Each Phase-5 block reads its own DOWN_COL_TILE cols × BS tokens of fp32
@@ -316,7 +310,6 @@ __device__ void moe_kernel_topk_BS8(
       activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)0.0f;
     }
   }
-
 }
 
 /**

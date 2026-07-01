@@ -3,10 +3,9 @@
 
 #pragma once
 
-#include <cstdint>
-
 #include <cuda.h>  // CUtensorMap (Driver API) for the tma_load_2d signature
 
+#include <cstdint>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/mma_sm90.hpp>
 

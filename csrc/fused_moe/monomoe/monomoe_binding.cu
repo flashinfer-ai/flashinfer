@@ -51,11 +51,10 @@ bool shape_matches(const TensorView& activations_in, const TensorView& expert_we
 // matching hard-specialized Dims variant.  Today there is exactly one variant
 // (BS8 / E256 / Qwen3.5-35B block-FP8 WGMMA+TMA); a new shape gets a new
 // `if` branch plus its explicit instantiation in monomoe_wrapper.cuh.
-void monomoe_topk(TensorView activations_in, TensorView router_logits,
-                  TensorView expert_weights_up, TensorView expert_scales_up,
-                  TensorView expert_weights_down, TensorView expert_scales_down,
-                  TensorView activations_out, TensorView scratchpad, int64_t top_k,
-                  int64_t scoring_func, bool renormalize) {
+void monomoe_topk(TensorView activations_in, TensorView router_logits, TensorView expert_weights_up,
+                  TensorView expert_scales_up, TensorView expert_weights_down,
+                  TensorView expert_scales_down, TensorView activations_out, TensorView scratchpad,
+                  int64_t top_k, int64_t scoring_func, bool renormalize) {
   using Qwen35 = monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA;
   if (shape_matches<Qwen35>(activations_in, expert_weights_up, expert_weights_down)) {
     monomoe_topk_launcher<Qwen35>(activations_in, router_logits, expert_weights_up,
@@ -63,12 +62,13 @@ void monomoe_topk(TensorView activations_in, TensorView router_logits,
                                   activations_out, scratchpad, top_k, scoring_func, renormalize);
     return;
   }
-  TVM_FFI_ICHECK(false)
-      << "monomoe_topk: no kernel for this shape. Supported: E=" << Qwen35::NUM_EXPERTS
-      << ", N=" << Qwen35::N << ", K=" << Qwen35::K << ", BS<=" << Qwen35::BS
-      << " (got activations_in=[" << activations_in.size(0) << ", "
-      << (activations_in.ndim() == 2 ? activations_in.size(1) : -1) << "], expert_weights_up.dim0="
-      << (expert_weights_up.ndim() == 3 ? expert_weights_up.size(0) : -1) << ").";
+  TVM_FFI_ICHECK(false) << "monomoe_topk: no kernel for this shape. Supported: E="
+                        << Qwen35::NUM_EXPERTS << ", N=" << Qwen35::N << ", K=" << Qwen35::K
+                        << ", BS<=" << Qwen35::BS << " (got activations_in=["
+                        << activations_in.size(0) << ", "
+                        << (activations_in.ndim() == 2 ? activations_in.size(1) : -1)
+                        << "], expert_weights_up.dim0="
+                        << (expert_weights_up.ndim() == 3 ? expert_weights_up.size(0) : -1) << ").";
 }
 
 // Scratchpad size (bytes).  Exported so Python sizes the global scratchpad from
@@ -79,8 +79,8 @@ void monomoe_topk(TensorView activations_in, TensorView router_logits,
 // least this large.  With a single Dims variant this is its size; once more
 // variants exist, size to the max so any shape fits the same buffer.
 int64_t monomoe_scratchpad_size() {
-  return static_cast<int64_t>(sizeof(monomoe::MoEGemmSpec<
-                                     monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>));
+  return static_cast<int64_t>(
+      sizeof(monomoe::MoEGemmSpec<monomoe::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA>));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(monomoe_topk, monomoe_topk);
