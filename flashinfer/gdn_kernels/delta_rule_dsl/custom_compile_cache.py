@@ -93,7 +93,23 @@ def _has_option_value(options, option_type, option_value):
 
 
 def _needs_sm120a_tma_patch(options):
-    return _has_option_value(options, cute.GPUArch, "sm_120a")
+    return _has_option_value(options, cute.GPUArch, "sm_120a") or _has_option_value(
+        options, cute.GPUArch, "sm_121a"
+    )
+
+
+def _sm12x_jit_target(options):
+    import cuda.bindings.driver as cuda_driver
+
+    if _has_option_value(options, cute.GPUArch, "sm_121a"):
+        target = getattr(cuda_driver.CUjit_target, "CU_TARGET_COMPUTE_121A", None)
+        if target is None:
+            raise AttributeError(
+                "CU_TARGET_COMPUTE_121A is not defined in cuda.bindings.driver.CUjit_target. "
+                "Please upgrade your cuda-python package to a version that supports SM121 (CUDA 12.8+)."
+            )
+        return target
+    return cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A
 
 
 def _patched_compile_options(options, dump_dir):
@@ -142,7 +158,7 @@ def _patch_sm120a_tma_ptx(ptx_text: str) -> str:
     return patched
 
 
-def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
+def _install_patched_ptx_loader(compiled_fn, patched_ptx: str, jit_target=None):
     import ctypes
 
     import cuda.bindings.driver as cuda_driver
@@ -151,8 +167,10 @@ def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
     from cutlass.base_dsl.common import DSLRuntimeError
     from cutlass.base_dsl.runtime.cuda import checkCudaErrors
 
+    if jit_target is None:
+        jit_target = cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A
     jit_options = [cuda_driver.CUjit_option.CU_JIT_TARGET]
-    jit_option_values = [cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A]
+    jit_option_values = [jit_target]
 
     def _load_cuda_library(self):
         if self.engine is None:
@@ -213,7 +231,9 @@ def _patch_sm120a_tma(compiled_fn, options):
     patched_ptx = _patch_sm120a_tma_ptx(ptx)
     if patched_ptx == ptx:
         return compiled_fn
-    _install_patched_ptx_loader(compiled_fn, patched_ptx)
+    _install_patched_ptx_loader(
+        compiled_fn, patched_ptx, jit_target=_sm12x_jit_target(options)
+    )
     return compiled_fn
 
 
