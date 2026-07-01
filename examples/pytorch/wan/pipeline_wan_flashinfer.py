@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from transformer_wan_flashinfer import FlashInferWanTransformer3DModel, GEMMBackend
 
@@ -81,8 +80,7 @@ def load_wan_pipeline_with_flashinfer_transformers(
     prepare_weights: bool = False,
     **flashinfer_kwargs,
 ):
-    """Load diffusers WanPipeline and replace its denoiser(s) with FlashInfer.
-    """
+    """Load diffusers WanPipeline and replace its denoiser(s) with FlashInfer."""
     try:
         from diffusers import WanPipeline
     except ImportError as e:
@@ -174,7 +172,11 @@ def parse_args() -> argparse.Namespace:
         "--prompt",
         default="Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
     )
-    parser.add_argument("--negative-prompt", default="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走")  # noqa: RUF001
+    parser.add_argument(
+        "--negative-prompt",
+        default="gaudy colors, overexposed, static, blurry details, subtitles, style, artwork, painting, image, still, washed out, worst quality, low quality, JPEG artifacts, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, walking backwards",
+    )
+
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--num-frames", type=int, default=81)

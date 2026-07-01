@@ -225,7 +225,7 @@ class FlashInferLinear(nn.Module):
             warnings.warn(
                 f"{self._backend.value} GEMM backend requires "
                 f"{_gemm_backend_requirement_str(self._backend)}, "
-                f"but device is SM{major*10+minor}; falling back to TORCH.",
+                f"but device is SM{major * 10 + minor}; falling back to TORCH.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -596,9 +596,7 @@ class FlashInferLinear(nn.Module):
         weight_amax = weight.abs().amax().to(torch.float32).clamp(min=1e-12)
         weight_global_sf = (448.0 * 6.0) / weight_amax
 
-        weight_fp4, weight_descale = flashinfer.nvfp4_quantize(
-            weight, weight_global_sf
-        )
+        weight_fp4, weight_descale = flashinfer.nvfp4_quantize(weight, weight_global_sf)
 
         self._weight_fp4 = weight_fp4
         self._weight_descale = weight_descale
@@ -1038,9 +1036,7 @@ class FlashInferLinear(nn.Module):
         if not self._fp8_sm90_prepared:
             self._prepare_fp8_sm90_weights()
 
-        x_fp8, input_scale = self._quantize_activation_fp8_blockwise(
-            x, block_size=128
-        )
+        x_fp8, input_scale = self._quantize_activation_fp8_blockwise(x, block_size=128)
         out = flashinfer.gemm.fp8_blockscale_gemm_sm90(
             x_fp8,
             self._weight_fp8_sm90,
@@ -1822,9 +1818,7 @@ class FlashInferAttentionDispatcher(nn.Module):
         # The previous "one page per request" layout produced numTokensPerPage
         # == seq_len_kv (e.g. 1024 for WAN), which has no matching cubin.
         page_size = self._TRTLLM_PAGE_SIZE
-        padded_seq_kv = (
-            (seq_len_kv + page_size - 1) // page_size
-        ) * page_size
+        padded_seq_kv = ((seq_len_kv + page_size - 1) // page_size) * page_size
         num_pages_per_seq = padded_seq_kv // page_size
 
         if padded_seq_kv != seq_len_kv:

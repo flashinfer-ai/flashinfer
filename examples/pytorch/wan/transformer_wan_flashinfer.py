@@ -51,7 +51,7 @@ import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1268,7 +1268,12 @@ if __name__ == "__main__":
         "--torch-compile-mode",
         type=str,
         default="default",
-        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        choices=[
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ],
         help="torch.compile mode (default | reduce-overhead | max-autotune).",
     )
     parser.add_argument(
@@ -1290,9 +1295,14 @@ if __name__ == "__main__":
     # capture (and runs into stale-pointer errors when FlashInfer kernels
     # cause graph breaks between compiled regions). Force the non-cudagraph
     # mode in that case.
-    if args.cuda_graph and args.torch_compile and args.torch_compile_mode in (
-        "reduce-overhead",
-        "max-autotune",
+    if (
+        args.cuda_graph
+        and args.torch_compile
+        and args.torch_compile_mode
+        in (
+            "reduce-overhead",
+            "max-autotune",
+        )
     ):
         raise ValueError(
             f"--cuda-graph cannot combine with --torch-compile-mode "
