@@ -298,6 +298,58 @@ def test_batch_decode_wrapper_cute_dsl_backend(batch_size, kv_len, page_size, dt
     torch.testing.assert_close(out_buf, ref, rtol=5e-3, atol=5e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_batch_decode_wrapper_cute_dsl_sliding_window(dtype):
+    """Public cute-dsl decode path should honor plan(window_left=...)."""
+    batch_size, page_size, kv_len = 4, 16, 256
+    window_left = 63
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, kv_last_page_len, _seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+
+    cd = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+        kv_layout="NHD",
+        backend="cute-dsl",
+    )
+    cd.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        window_left=window_left,
+    )
+
+    ref_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+        kv_layout="NHD",
+        backend="fa2",
+    )
+    ref_wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        window_left=window_left,
+    )
+
+    out = cd.run(q, kv)
+    ref = ref_wrapper.run(q, kv)
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
+
+
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("kv_len", [1024])
 @pytest.mark.parametrize("page_size", [16])
@@ -714,19 +766,6 @@ def test_batch_decode_wrapper_cute_dsl_rejects_unsupported(dtype):
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace, kv_layout="NHD", backend="cute-dsl"
     )
-    with pytest.raises(NotImplementedError, match="sliding window"):
-        wrapper.plan(
-            kv_indptr,
-            kv_indices,
-            seq_lens,
-            NUM_QO_HEADS,
-            NUM_KV_HEADS,
-            HEAD_DIM,
-            page_size,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            window_left=64,
-        )
     with pytest.raises(NotImplementedError, match="logits_soft_cap"):
         wrapper.plan(
             kv_indptr,

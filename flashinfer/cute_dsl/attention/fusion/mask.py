@@ -12,11 +12,81 @@ import enum
 import ctypes
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, is_dataclass, fields
+from typing import Any, cast
 from cutlass._mlir import ir
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.base_dsl.utils.tree_utils import is_constexpr_field
 from cutlass.cute.typing import Int32, Float32, Optional
+
+
+# TODO: Consider moving this to the wheel
+class DataclassJIT:
+    """JitArgument and DynamicExpression protocol for generic dataclass."""
+
+    def __post_init__(self):
+        assert is_dataclass(self), f"{type(self)} must be dataclass"
+
+    # TVM FFI WAR since existing conversion path always treats
+    # Union[int, Int32] as dynamic and adds int to call signature
+    # TODO: handle Union[Constexpr[int], Int32] in TVM FFI conversion
+    @staticmethod
+    def _use_tvm_ffi_placeholder(value, field):
+        return value is not None and not is_constexpr_field(field)
+
+    # JitArgument protocol
+    def __c_pointers__(self) -> list[ctypes.c_void_p]:
+        pointers: list[ctypes.c_void_p] = []
+        tvm_ffi_placeholder = [ctypes.c_void_p()]
+        for f in fields(cast(Any, self)):
+            v = getattr(self, f.name)
+            if hasattr(v, "__c_pointers__"):
+                pointers.extend(v.__c_pointers__())
+            elif self._use_tvm_ffi_placeholder(v, f):
+                pointers.extend(tvm_ffi_placeholder)
+        return pointers
+
+    def __get_mlir_types__(self) -> list[ir.Type]:
+        types: list[ir.Type] = []
+        tvm_ffi_placeholder = Int32(0).__get_mlir_types__()
+        for f in fields(cast(Any, self)):
+            v = getattr(self, f.name)
+            if hasattr(v, "__get_mlir_types__"):
+                types.extend(v.__get_mlir_types__())
+            elif self._use_tvm_ffi_placeholder(v, f):
+                types.extend(tvm_ffi_placeholder)
+        return types
+
+    # DynamicExpression protocol
+    def __extract_mlir_values__(self) -> list[ir.Value]:
+        values: list[ir.Value] = []
+        tvm_ffi_placeholder = Int32(0).__extract_mlir_values__()
+        for f in fields(cast(Any, self)):
+            v = getattr(self, f.name)
+            if hasattr(v, "__extract_mlir_values__"):
+                values.extend(v.__extract_mlir_values__())
+            elif self._use_tvm_ffi_placeholder(v, f):
+                values.extend(tvm_ffi_placeholder)
+        return values
+
+    def __new_from_mlir_values__(self, values: list[ir.Value]) -> "DataclassJIT":
+        args: list[object] = []
+        v_idx = 0
+        for f in fields(cast(Any, self)):
+            v = getattr(self, f.name)
+            if hasattr(v, "__new_from_mlir_values__"):
+                # Assume fields can only have 1 IR value for now
+                # Otherwise we have to nest or track value counts
+                arg = v.__new_from_mlir_values__(values[v_idx : v_idx + 1])
+                args.extend([arg])
+                v_idx += 1
+            else:
+                args.extend([v])
+                if self._use_tvm_ffi_placeholder(v, f):
+                    v_idx += 1
+
+        return type(self)(*args)
 
 
 #
@@ -24,54 +94,8 @@ from cutlass.cute.typing import Int32, Float32, Optional
 # Currently only supports GQA/MHA decode kernel
 # TODO: support skipping fully masked tiles for prefill integration
 #
-class AttentionMask(ABC):
-    """ABC interface for attention masking configurations.
-
-    Mark parametrized subclasses with @dataclass to avoid
-    writing custom DynamicExpression and JitArgument protocols.
-    """
-
-    # JitArgument protocol
-    def __c_pointers__(self) -> list[ctypes.c_void_p]:
-        pointers: list[ctypes.c_void_p] = []
-        if is_dataclass(self):
-            for f in fields(self):
-                v = getattr(self, f.name)
-                if hasattr(v, "__c_pointers__"):
-                    pointers.extend(v.__c_pointers__())
-        return pointers
-
-    def __get_mlir_types__(self) -> list[ir.Type]:
-        types: list[ir.Type] = []
-        if is_dataclass(self):
-            for f in fields(self):
-                v = getattr(self, f.name)
-                if hasattr(v, "__get_mlir_types__"):
-                    types.extend(v.__get_mlir_types__())
-        return types
-
-    # DynamicExpression protocol
-    def __extract_mlir_values__(self) -> list[ir.Value]:
-        values: list[ir.Value] = []
-        if is_dataclass(self):
-            for f in fields(self):
-                v = getattr(self, f.name)
-                if hasattr(v, "__extract_mlir_values__"):
-                    values.extend(v.__extract_mlir_values__())
-        return values
-
-    def __new_from_mlir_values__(self, values: list[ir.Value]) -> "AttentionMask":
-        args: list[object] = []
-        if is_dataclass(self):
-            for f in fields(self):
-                v = getattr(self, f.name)
-                if hasattr(v, "__new_from_mlir_values__"):
-                    args.extend([v.__new_from_mlir_values__(values[0:1])])
-                    values = values[1:]
-                else:
-                    args.extend([v])
-
-        return type(self)(*args)
+class AttentionMask(ABC, DataclassJIT):
+    """ABC interface for attention masking configurations."""
 
     @abstractmethod
     def num_phases(self) -> int:
@@ -138,6 +162,7 @@ class AttentionMask(ABC):
         ...
 
 
+@dataclass(frozen=True)
 class NoMask(AttentionMask):
     """Every token attends to every other token.
 
@@ -172,6 +197,7 @@ class NoMask(AttentionMask):
         return ((warpgroup_kv_idx, num_iters_kv, warpgroups_kv),)
 
 
+@dataclass(frozen=True)
 class DenseMask(AttentionMask):  # aka ResidualMask
     """Every token attends to every other token."""
 
@@ -219,6 +245,7 @@ class DenseMask(AttentionMask):  # aka ResidualMask
         )
 
 
+@dataclass(frozen=True)
 class CausalMask(AttentionMask):
     """Current tokens only attend to past tokens and itself."""
 
@@ -303,8 +330,8 @@ class SlidingWindowMask(AttentionMask):
     """
 
     # use int for compile-time config and Int32 for runtime config
-    window_left: Optional[Int32]
-    window_right: Optional[Int32] = 0
+    window_left: Optional[int | Int32]
+    window_right: Optional[int | Int32] = 0
 
     def num_phases(self) -> int:
         # Assume KV seqlen roughly matches window size and that

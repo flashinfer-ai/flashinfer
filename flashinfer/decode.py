@@ -768,7 +768,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL GQA decode kernel for Blackwell
             (SM100+) and only supports a subset of features (equal head_dim_qk/vo,
-            no RoPE/ALiBi/soft-cap/sliding window).
+            no RoPE/ALiBi/soft-cap).
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1090,10 +1090,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "cute-dsl decode backend does not support logits_soft_cap"
                 )
-            if window_left >= 0:
-                raise NotImplementedError(
-                    "cute-dsl decode backend does not support sliding window"
-                )
             if pos_encoding_mode != "NONE":
                 raise NotImplementedError(
                     f"cute-dsl decode backend does not support "
@@ -1131,6 +1127,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 reduction="none" if disable_split_kv else "auto",
                 q_len_per_req=q_len_per_req,
                 is_causal=True,
+                window_left=window_left,
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
             )

@@ -28,6 +28,7 @@ from cutlass.cute.typing import Float32, Int32
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.cute_dsl.utils import get_num_sm
 
+from ..fusion.mask import AttentionMask, DenseMask, CausalMask, SlidingWindowMask
 from ..gqa_decode import GroupedQueryAttentionDecode
 from ..gqa_decode_paged import GroupedQueryAttentionDecodePaged
 
@@ -126,6 +127,15 @@ def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype")
     return "kernel"
 
 
+def _get_mask_config(
+    is_causal: bool,
+    window_left: int,
+) -> AttentionMask:
+    if window_left >= 0:
+        return SlidingWindowMask(window_left, 0)
+    return CausalMask() if is_causal else DenseMask()
+
+
 def _slice_workspace(
     workspace: torch.Tensor,
     kv_splits: int,
@@ -187,7 +197,8 @@ def _get_compiled_decode_kernel(
     head_dim: int,
     prediction: int,
     reduction: str,
-    tma_mask: bool,
+    window_left: int,
+    is_causal: bool,
     use_lse: bool,
 ):
     """Compile and cache the ragged (contiguous-KV) GQA decode kernel."""
@@ -206,8 +217,8 @@ def _get_compiled_decode_kernel(
         prediction_tile=prediction_tile,
         sequence_tile=sequence_tile,
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
-        tma_mask=tma_mask,
     )
+    mask_config = _get_mask_config(is_causal, window_left)
     has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
@@ -300,6 +311,7 @@ def _get_compiled_decode_kernel(
         l_partial_fake,
         m_partial_fake,
         None,  # sink_h
+        mask_config,
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         stream_fake,
@@ -318,7 +330,8 @@ def _get_compiled_paged_decode_kernel(
     head_dim: int,
     prediction: int,
     reduction: str,
-    tma_mask: bool,
+    window_left: int,
+    is_causal: bool,
     use_threshold: bool,
     use_lse: bool,
     use_sink: bool,
@@ -352,8 +365,8 @@ def _get_compiled_paged_decode_kernel(
         sequence_tile=sequence_tile,
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
         softmax_warpgroups=softmax_warpgroups,
-        tma_mask=tma_mask,
     )
+    mask_config = _get_mask_config(is_causal, window_left)
     has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
@@ -470,6 +483,7 @@ def _get_compiled_paged_decode_kernel(
         l_partial_fake,
         m_partial_fake,
         sink_fake,
+        mask_config,
         Float32(1.0),  # scale_s placeholder
         Float32(1.0),  # scale_o placeholder
         threshold_p_fake,
@@ -537,6 +551,7 @@ class BatchDecodeCuteDSLWrapper:
         reduction: str = "auto",
         q_len_per_req: int = 1,
         is_causal: bool = True,
+        window_left: int = -1,
     ) -> None:
         """Compile the ragged-KV decode kernel for the planned configuration.
 
@@ -572,6 +587,8 @@ class BatchDecodeCuteDSLWrapper:
             speculative decode).
         is_causal : bool
             Causal masking for speculative decode.
+        window_left : int
+            Sliding-window left bound. ``-1`` disables sliding-window masking.
         """
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
@@ -634,7 +651,7 @@ class BatchDecodeCuteDSLWrapper:
         # write to o_bshd directly (atomic via atomic_add, none via direct
         # store).
         self._has_workspace = reduction == "kernel"
-        self._tma_mask = not is_causal
+        self._mask_config = _get_mask_config(is_causal, window_left)
         if sm_scale is None:
             sm_scale = head_dim**-0.5
         self._sm_scale = sm_scale
@@ -664,7 +681,8 @@ class BatchDecodeCuteDSLWrapper:
             head_dim,
             q_len_per_req,
             reduction,
-            self._tma_mask,
+            window_left,
+            is_causal,
         )
         self._compiled_fmha_std = _get_compiled_decode_kernel(
             *self._compile_args, False
@@ -817,6 +835,7 @@ class BatchDecodeCuteDSLWrapper:
             l_partial,
             m_partial,
             None,  # sink_h
+            self._mask_config,
             Float32(scale_s),
             Float32(scale_o),
             enable_pdl,
@@ -879,6 +898,7 @@ class BatchDecodePagedCuteDSLWrapper:
         reduction: str = "auto",
         q_len_per_req: int = 1,
         is_causal: bool = True,
+        window_left: int = -1,
         max_kv_len: Optional[int] = None,
         non_blocking: bool = True,
         precompile_skip_softmax_kernel: bool = False,
@@ -915,6 +935,8 @@ class BatchDecodePagedCuteDSLWrapper:
             Predicted tokens per request (1 for plain decode).
         is_causal : bool
             Causal masking for speculative decode.
+        window_left : int
+            Sliding-window left bound. ``-1`` disables sliding-window masking.
         max_kv_len : Optional[int]
             Maximum KV sequence length across the batch.  Used to auto-tune
             ``kv_splits``; pass it explicitly to avoid a GPU→CPU sync.
@@ -1013,7 +1035,7 @@ class BatchDecodePagedCuteDSLWrapper:
         # Only kernel-reduction uses workspace tensors; atomic and none
         # write to o_bshd directly.
         self._has_workspace = reduction == "kernel"
-        self._tma_mask = not is_causal
+        self._mask_config = _get_mask_config(is_causal, window_left)
         if sm_scale is None:
             sm_scale = head_dim**-0.5
         self._sm_scale = sm_scale
@@ -1049,7 +1071,8 @@ class BatchDecodePagedCuteDSLWrapper:
             head_dim,
             q_len_per_req,
             reduction,
-            self._tma_mask,
+            window_left,
+            is_causal,
         )
         # Standard (no-BLASST, no-LSE) variant — always compiled at plan().
         # BLASST and LSE variants compile lazily on first use via the cache.
@@ -1315,6 +1338,7 @@ class BatchDecodePagedCuteDSLWrapper:
             l_partial,
             m_partial,
             sinks,
+            self._mask_config,
             Float32(scale_s),
             Float32(o_scale_val),
             threshold_arg,

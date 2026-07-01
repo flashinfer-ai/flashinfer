@@ -143,7 +143,7 @@ class GroupedQueryAttentionDecodePaged:
         l_partial_bsh: Optional[cute.Tensor],
         m_partial_bsh: Optional[cute.Tensor],
         sink_h: Optional[cute.Tensor],
-        mask_config: AttentionMask,
+        mask_config,  # duck-typed AttentionMask, TVM FFI conversion breaks if we annotate with base class for now
         scale_s: Float32,
         scale_o: Float32,
         threshold_scale_factor: Optional[Float32],
