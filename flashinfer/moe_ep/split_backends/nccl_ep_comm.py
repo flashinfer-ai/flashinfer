@@ -15,3 +15,7 @@ class NcclEpConfig:
     """Pass into ``MoEEpLayer(..., backend=NcclEpConfig())`` to select NCCL-EP."""
 
     backend_name: str = "nccl_ep"
+
+
+# Spelling alias matching the user-facing / mega_moe_integration naming.
+NCCLEPConfig = NcclEpConfig
