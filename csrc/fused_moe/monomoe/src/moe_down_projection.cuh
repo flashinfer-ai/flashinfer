@@ -228,7 +228,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     CUtensorMap const& down_weights_desc, CUtensorMap const& down_activations_desc) {
   static_assert(Dims::BS <= 8, "moe_down_projection_BS8_allexperts_wgmma_tma is BS<=8 only");
   using CoreDims = MoECoreDims<Dims>;
-  constexpr uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
 
   // `expert_weights_down` is retained on the parameter list for signature
   // parity with the `cp.async` reference but is not dereferenced on the
@@ -280,8 +279,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
   // covers one 128-K sub-block; an outer K-step issues
   // `K_SUBSTEPS_DOWN` such atoms back-to-back along the K axis.
   constexpr std::uint32_t DOWN_A_TX_BYTES_TOTAL = 1024u * K_SUBSTEPS_DOWN;
-  constexpr std::uint32_t W_DOWN_SCALE_COLS =
-      MoE_SHM<Dims>::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
+  constexpr std::uint32_t W_DOWN_SCALE_COLS = MoE_SHM<Dims>::TinyDataWGMMA_TMA::W_DOWN_SCALE_COLS;
 
   static_assert(Dims::N % K_STEP_DOWN == 0, "Dims::N must be a multiple of K_STEP_DOWN");
   static_assert(K_STEP_DOWN % K_STEP_WGMMA == 0,
@@ -389,7 +387,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     fence_mbarrier_init_release_cluster();
   }
   __syncthreads();
-
 
   const std::uint32_t expert_count = shmem->expert_count;
 
@@ -828,7 +825,7 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
           }
         }
       }
-      // Activation-slot tail is left uninitialized; 
+      // Activation-slot tail is left uninitialized;
       // Activation scales are loaded once per expert (top of expert
       // loop) — no per-K-step scale reload.  Prefetch warps still
       // run the PREVIOUS expert's deferred accumulate at iter 0 of
@@ -836,29 +833,50 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       // iter-0 WGMMA (see the K-loop block comment above for the
       // lifetime/hazard argument).
       if (is_prefetch_warp<Dims>()) {
-        // Deferred accumulate of the PREVIOUS expert.  Runs on
-        // prefetch warps only (warps 8..11, 128 threads), iterating
-        // over the (tok, col) plane in stride-128 chunks.  Calc warps
-        // run their iter-0 WGMMAs in parallel.
+        // Deferred accumulate of the PREVIOUS expert.  Runs on prefetch
+        // warps only (warps 8..11, 128 threads), iterating over the
+        // (tok, col) plane.  Calc warps run their WGMMAs in parallel.
+        //
+        // Distribute-across-K-steps (generic): the whole
+        // `batch_size * DOWN_COL_TILE` (tok, col) plane is split into
+        // `DEFER_ITERS_DOWN = K_TILES_DOWN - 1` contiguous flat-index
+        // chunks, one processed per K-loop iteration s in
+        // [0, DEFER_ITERS_DOWN).  The LAST iteration (s == K_TILES_DOWN-1)
+        // is left free — it carries the launcher's inter-expert lookahead
+        // TMA (the `else if (e + DOWN_GROUPS < expert_count)` branch
+        // above).  For the shipped Qwen3.5 shape K_TILES_DOWN=2, so
+        // DEFER_ITERS_DOWN=1 and this is byte-identical to the previous
+        // `s == 0` burst; for any other K_STEP_DOWN (e.g. 128 →
+        // K_TILES_DOWN=4) the epilogue spreads over the first
+        // K_TILES_DOWN-1 iterations instead of concentrating all of it
+        // into one, dropping the per-iteration `out_accum`/`down_out`
+        // SHM-traffic peak and overlapping each chunk with calc-warp
+        // WGMMA.
         //
         // Reads:
         //   * `shm->partial_result.down_out` — written by the
         //     previous expert's end-of-K-loop writeback, published by
-        //     the expert-loop top __syncthreads.
+        //     the expert-loop top __syncthreads.  Overwritten only at
+        //     THIS expert's end-of-K-loop (after all K_TILES_DOWN iters),
+        //     so reads at iters [0, K_TILES_DOWN-1) all precede it.
         //   * `shm->rank_for_tok` — computed at the end of the
         //     previous expert (after its writeback, before the
-        //     trailing __syncthreads), so it observes the same
-        //     publication path.
+        //     trailing __syncthreads), same lifetime as `down_out`.
         // Writes:
         //   * `shm->out_accum[tok][col]` — `+=` only, no contention
         //     with calc warps (they don't touch out_accum during the
-        //     K-loop).
-        if (has_prev_expert && s == 0u) {
+        //     K-loop).  Each (tok, col) cell is independent, so
+        //     splitting a token's columns across iterations is safe.
+        constexpr unsigned DEFER_ITERS_DOWN = K_TILES_DOWN - 1u;
+        if (has_prev_expert && s < DEFER_ITERS_DOWN) {
           const unsigned thread_in_pf =
               thread_in_block - CoreDims::CALC_WARP_COUNT * CoreDims::THREADS_PER_WARP;
           constexpr unsigned PF_THREADS =
               CoreDims::PREFETCH_WARP_COUNT * CoreDims::THREADS_PER_WARP;
-          for (unsigned tok_col = thread_in_pf; tok_col < batch_size * DOWN_COL_TILE;
+          const unsigned total = batch_size * DOWN_COL_TILE;
+          const unsigned flat_lo = s * total / DEFER_ITERS_DOWN;
+          const unsigned flat_hi = (s + 1u) * total / DEFER_ITERS_DOWN;
+          for (unsigned tok_col = flat_lo + thread_in_pf; tok_col < flat_hi;
                tok_col += PF_THREADS) {
             const unsigned tok = tok_col / DOWN_COL_TILE;
             const unsigned col = tok_col % DOWN_COL_TILE;
@@ -876,7 +894,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       // needed here — only the cross-warp `__syncthreads()`.
       __syncthreads();
     }  // end K-loop
-
 
     // ── End-of-expert: write final_d → partial_result.down_out[DCT][8] ─
     //
@@ -900,30 +917,34 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
       }
     }
 
-    // ── Compute rank_for_tok for the current expert ──────────────────
+    // ── Stage rank_for_tok for the current expert ────────────────────
     //
-    // Pre-compute rank for each token once per expert.  Sentinel 0xFF
-    // means this token does not route through the current expert (no
-    // contribution).
+    // Derive each token's intra-expert slot rank from the routing-time
+    // inverse map `expert_tok_krank[id][tok]` (built once in
+    // `prepare_moe_topk_BS8`) instead of re-scanning `topk_ids_flat`
+    // per expert.  A valid `k` gives the global slot
+    // `sorted_slot[tok*top_k + k]`; subtract `expert_start` for the
+    // intra-expert rank the accumulate loop indexes.  Sentinel 0xFF
+    // means the token does not route through this expert.
     //
-    // The accumulate that consumes both `down_out` and `rank_for_tok`
-    // is DEFERRED to the next expert's iter-0 prefetch-warp body (see
-    // the K-loop block comment above).  For the LAST expert in a
-    // group, an unconditional accumulate runs after the expert loop.
+    // Still staged into the per-expert `[BS]` `rank_for_tok` array
+    // (rather than read straight from the routing table in the inner
+    // loop) because the (tok, col) accumulate reads it once per column
+    // per token — a hot `[BS]`-sized row keeps that a broadcast.
     //
-    // 8 threads (one per token) compute the rank in parallel; the
-    // remaining 376 threads idle.  Runs together with the writeback
-    // above behind the same trailing __syncthreads().
+    // 8 threads (one per token) fill it in parallel; the accumulate
+    // that consumes both `down_out` and `rank_for_tok` is DEFERRED to
+    // the next expert's prefetch-warp body (see the K-loop block
+    // comment above).  For the LAST expert in a group, an
+    // unconditional accumulate runs after the expert loop.
     if (thread_in_block < batch_size) {
       const unsigned tok = thread_in_block;
       uint8_t rank_val = 0xFFu;
-      for (std::uint32_t k = 0; k < top_k; ++k) {
-        if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
-          const std::uint32_t pair = tok * top_k + k;
-          rank_val = static_cast<uint8_t>(static_cast<std::uint32_t>(shm->sorted_slot[pair]) -
-                                          expert_start);
-          break;
-        }
+      const uint8_t k = shm->expert_tok_krank[id * Dims::BS + tok];
+      if (k != 0xFFu) {
+        const std::uint32_t pair = tok * top_k + k;
+        rank_val =
+            static_cast<uint8_t>(static_cast<std::uint32_t>(shm->sorted_slot[pair]) - expert_start);
       }
       shm->rank_for_tok[tok] = rank_val;
     }
@@ -931,23 +952,23 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
 
   }  // end expert loop
 
-// ── Final accumulate for the LAST expert in this block's group ────────
-//
-// The pipelined deferred accumulate inside the K-loop covers experts
-// [down_group, down_group + DOWN_GROUPS, …, expert_count - DOWN_GROUPS).
-// The LAST expert visited (`e_last = down_group + ((expert_count -
-// 1 - down_group) / DOWN_GROUPS) * DOWN_GROUPS`) has nothing to
-// defer to, so we run one final accumulate here.  All warps
-// participate (now that the K-loop is done, the prefetch warps are
-// free to help).
-//
-// The expert-loop's trailing __syncthreads() already published this
-// block's `down_out` and `rank_for_tok`.  No additional sync
-// required before reading them.
-//
-// For blocks whose group has zero experts (expert_count <=
-// down_group), `e_started` stays false and the accumulate is
-// skipped — `down_out` was never written for this block.
+  // ── Final accumulate for the LAST expert in this block's group ────────
+  //
+  // The pipelined deferred accumulate inside the K-loop covers experts
+  // [down_group, down_group + DOWN_GROUPS, …, expert_count - DOWN_GROUPS).
+  // The LAST expert visited (`e_last = down_group + ((expert_count -
+  // 1 - down_group) / DOWN_GROUPS) * DOWN_GROUPS`) has nothing to
+  // defer to, so we run one final accumulate here.  All warps
+  // participate (now that the K-loop is done, the prefetch warps are
+  // free to help).
+  //
+  // The expert-loop's trailing __syncthreads() already published this
+  // block's `down_out` and `rank_for_tok`.  No additional sync
+  // required before reading them.
+  //
+  // For blocks whose group has zero experts (expert_count <=
+  // down_group), `e_started` stays false and the accumulate is
+  // skipped — `down_out` was never written for this block.
   if (expert_count > down_group) {
     for (unsigned tok_col = thread_in_block; tok_col < batch_size * DOWN_COL_TILE;
          tok_col += blockDim.x) {
@@ -960,7 +981,6 @@ __device__ inline void moe_down_projection_BS8_allexperts_wgmma_tma(
     }
   }
   __syncthreads();
-
 
   // ── After all experts in this group: atomicAdd out_accum → GM partial ─
   // Phase 5 then reads each cell ONCE and casts to bf16 — no 16-way

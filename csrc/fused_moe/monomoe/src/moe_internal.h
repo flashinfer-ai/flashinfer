@@ -42,7 +42,6 @@
 #define MONO_PROFILE_DEFER_UP_EPILOGUE
 #endif
 
-
 namespace monomoe {
 
 using T_element = float;              //< Type of fp32 accumulators (partial results, out_accum)
@@ -374,8 +373,7 @@ struct MoECoreDims {
   // The variant-dependent value MUST match
   // `MoEGemmSpec<Dims>::DOWN_COL_TILE`; the static_assert further down
   // cross-checks their derived DOWN_GROUPS.
-  static constexpr std::uint32_t DOWN_COL_TILE =
-      (use_tma_v<Dims> && Dims::BS <= 8) ? 256u : 128u;
+  static constexpr std::uint32_t DOWN_COL_TILE = (use_tma_v<Dims> && Dims::BS <= 8) ? 256u : 128u;
   static constexpr std::uint32_t DOWN_GRID = Dims::HIDDEN_STATES / DOWN_COL_TILE;
   static constexpr std::uint32_t DOWN_GROUPS =
       DOWN_GRID == 0 ? 1 : Dims::KernelConfig::GRID_SIZE / DOWN_GRID;
@@ -667,11 +665,11 @@ struct MoE_SHM {
       //
       // SHM cost: same as the 2-slot variant, because the union
       // is dominated by `w_down_wgmma` at 128 KB.
-      alignas(1024)
-          W_element w_wgmma[4][W_WGMMA_M_TOTAL][W_WGMMA_K];  // 4 slots × 32 KB = 128 KB total
+      alignas(
+          1024) W_element w_wgmma[4][W_WGMMA_M_TOTAL][W_WGMMA_K];  // 4 slots × 32 KB = 128 KB total
 #else
-      alignas(1024) W_element
-          w_wgmma[2][W_WGMMA_M_TOTAL][W_WGMMA_K];  // 128 wide × M stacked atoms (up-proj)
+      alignas(1024)
+          W_element w_wgmma[2][W_WGMMA_M_TOTAL][W_WGMMA_K];  // 128 wide × M stacked atoms (up-proj)
 #endif
       alignas(1024) W_element
           w_down_wgmma[2][W_DOWN_WGMMA_M_TOTAL][CoreDims::K_STEP_WGMMA];  // 128 wide × M
@@ -883,41 +881,61 @@ struct MoE_SHM {
     // and trigger `cudaErrorMisalignedAddress` at the STS.64 / LD.64.
     alignas(16) uint8_t expert_routed_count[Dims::NUM_EXPERTS];
     uint8_t sorted_slot[MAX_PAIRS];
-    // Per-expert per-token cached rank used by the down-proj
-    // accumulate loop (Phase 4 epilogue).  Rebuilt at the top of each
-    // expert iteration by 8 threads (one per token) so the inner
-    // (tok, col) loop can do a single SHM lookup instead of an
-    // 8-iter inner scan over `topk_ids_flat`.  Sentinel 0xFF means
+    // ── Routing-time inverse map: (expert id, token) → top-k rank ────────
+    //
+    // `expert_tok_krank[eid * Dims::BS + tok]` holds the top-k rank
+    // `k ∈ [0, top_k)` at which token `tok` routes to expert `eid`, or
+    // sentinel `0xFF` when the token does not route through that expert.
+    //
+    // Built ONCE, at routing time, by `prepare_moe_topk_BS8` (Phase C in
+    // `moe_routing.cuh`), which already enumerates every routed
+    // `(tok, k, eid)` pair to fill `sorted_slot`.  It scatters `k` into
+    // this table on the same pass — no extra scan.  This is the single
+    // source of truth both projection epilogues consume instead of each
+    // re-deriving `k` per expert:
+    //
+    //   * Up-proj  (`up_silu_quant_writeback_one_token`): reads
+    //     `k = expert_tok_krank[id*BS + tok]`; a valid `k` yields the
+    //     routing weight `topk_weights_flat[tok*MAX_TOPK + k]` and the
+    //     fp8 writeback row `sorted_slot[tok*top_k + k]`.
+    //   * Down-proj (Phase-4 epilogue): reads the same `k` and derives
+    //     the intra-expert slot `sorted_slot[tok*top_k + k] -
+    //     expert_slot_start[id]` into the per-expert `rank_for_tok`
+    //     staging array.
+    //
+    // Replaces the previous per-expert 8-iter scans over
+    // `topk_ids_flat` (one at the up-proj K-loop tail, one at the
+    // down-proj expert-loop tail) that ran O(BS·top_k) work for EVERY
+    // expert this block processes — pure duplication of routing-time
+    // information.  Because the table is immutable after routing, it
+    // also removes the single-buffer lifetime hazard the old
+    // per-expert `up_rank_for_tok` / scan-fed `rank_for_tok` carried
+    // across the deferred-epilogue expert boundary.
+    //
+    // Uniqueness: top-k selection picks DISTINCT experts per token (the
+    // selection loop masks each chosen expert to -FLT_MAX), so a given
+    // (eid, tok) pair occurs at most once — the scatter has no
+    // write conflict and needs no tie-break.
+    //
+    // SHM cost: NUM_EXPERTS * BS bytes (2 KB for E=256, BS=8).
+    //
+    // `alignas(16)`: `prepare_moe_topk_BS8` sentinel-fills this table with
+    // a per-lane vectorized `uint4` (STS.128) store, which requires a
+    // 16-byte-aligned base.  It currently lands 16-aligned after the
+    // 64-B `sorted_slot`, but making it explicit means a future layout
+    // change to a preceding field cannot silently misalign the fill.
+    alignas(16) uint8_t expert_tok_krank[Dims::NUM_EXPERTS * Dims::BS];
+    // Per-expert per-token cached intra-expert SLOT rank used by the
+    // down-proj accumulate loop (Phase 4 epilogue).  Rebuilt at the top
+    // of each expert iteration by 8 threads (one per token) — now a
+    // single `expert_tok_krank` lookup + `sorted_slot` read instead of
+    // an 8-iter scan.  Kept as a per-expert `[BS]` staging array (rather
+    // than reading the routing table directly) because the inner
+    // (tok, col) accumulate loop reads it many times per token; a hot
+    // `[BS]`-sized row keeps that a broadcast.  Sentinel 0xFF means
     // "this token does not route to the current expert; skip the
-    // contribution".  Sized to `Dims::BS = 8` bytes — negligible
-    // SHM overhead.
+    // contribution".
     uint8_t rank_for_tok[Dims::BS];
-#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
-    // Per-expert per-token cached top-k INDEX for the up-proj
-    // SiLU+fp8 quant writeback under DEFER.  For each token `tok`,
-    // holds the smallest `k ∈ [0, top_k)` such that
-    // `topk_ids_flat[tok*MAX_TOPK + k] == id`, or sentinel `0xFF`
-    // if no such `k` exists (token does not route through this
-    // expert).
-    //
-    // Computed once per expert by 8 calc threads at the K-loop
-    // tail (no extra sync — published by the existing wgmma_out
-    // publish `__syncthreads()`).  Read by the deferred SiLU body
-    // on prefetch warps inside the next expert's K-loop iters
-    // 0/1, replacing the 8-iter scan.
-    //
-    // ── Why DEFER-only ──
-    // The inline path also does the topk scan but every (lane, tok)
-    // pair is broadcasting the same SHM bytes — bank-conflict-free,
-    // cheap.  The deferred path runs the scan CONCURRENTLY with
-    // calc-warp WGMMA which contends for SHM banks; that's where
-    // the scan stretches from ~0.05 µs to ~0.46 µs.  The cache
-    // replaces the contended scan with a single `[tok]` byte read
-    // from a hot SHM cacheline.
-    //
-    // SHM cost: 8 bytes per block (Dims::BS = 8).
-    uint8_t up_rank_for_tok[Dims::BS];
-#endif
   } tiny_wgmma_tma;
 
   // ── Aliasing safety static_asserts ─────────────────
@@ -930,8 +948,7 @@ struct MoE_SHM {
   // aliasing) is caught at the build step rather than producing silent SHM
   // corruption at runtime.  Placed after the struct definition because
   // `offsetof` requires a complete type.
-  static_assert(offsetof(TinyDataWGMMA_TMA, bf16_in_full) ==
-                    offsetof(TinyDataWGMMA_TMA, w_wgmma),
+  static_assert(offsetof(TinyDataWGMMA_TMA, bf16_in_full) == offsetof(TinyDataWGMMA_TMA, w_wgmma),
                 "bf16_in_full must alias w_wgmma exactly.");
   static_assert(offsetof(TinyDataWGMMA_TMA, bf16_in_full) ==
                     offsetof(TinyDataWGMMA_TMA, w_down_wgmma),
@@ -954,7 +971,7 @@ struct MoE_SHM {
   // legacy `[Dims::BS][ACT_SCALE_BLOCKS]` layout had a 64-B row stride
   // (= 16 banks); for BS=8 the four toks read from the same warp lane
   // mapped to the same bank, producing a 4-way conflict per LDS that
-  // NCU flagged as the dominant excessive-wavefront source.  
+  // NCU flagged as the dominant excessive-wavefront source.
   static constexpr uint32_t ACT_BLOCK_SIZE = 128;
   static constexpr uint32_t ACT_SCALE_BLOCKS =
       (Dims::HIDDEN_STATES + ACT_BLOCK_SIZE - 1) / ACT_BLOCK_SIZE;

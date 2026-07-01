@@ -345,6 +345,31 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
   const uint32_t n_pairs = batch_size * top_k;
   auto* tma_shm = &shm->tiny_wgmma_tma;
 
+  // Sentinel-fill the routing-time inverse map `expert_tok_krank[E*BS]`
+  // to 0xFF ("token does not route to this expert") before the Phase C
+  // scatter overwrites the routed (eid, tok) cells.  Total bytes =
+  // NUM_EXPERTS * BS.  The 32 lanes sweep the array as a strided grid of
+  // 16-byte STS.128 stores: at step `v` lane `tid` writes vector
+  // `v*32 + tid` (so the warp covers 512 B contiguously per step, then
+  // strides on).  The STS.128 base is 16-aligned by the `alignas(16)` on
+  // the array.  This runs on warp 0 alongside the rest of the prepare
+  // phase; the epilogues read the table only after the caller's Phase-2
+  // trailing `__syncthreads()`.
+  {
+    constexpr uint32_t KRANK_BYTES = Dims::NUM_EXPERTS * Dims::BS;
+    static_assert(KRANK_BYTES % (32u * 16u) == 0u,
+                  "expert_tok_krank fill assumes NUM_EXPERTS*BS is a multiple "
+                  "of 32 lanes x 16 B (STS.128 per lane).");
+    constexpr uint32_t FILL_VECS_PER_LANE = KRANK_BYTES / (32u * 16u);
+    const uint4 sentinel = make_uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    uint4* base = reinterpret_cast<uint4*>(&tma_shm->expert_tok_krank[0]);
+#pragma unroll
+    for (uint32_t v = 0; v < FILL_VECS_PER_LANE; ++v) {
+      base[v * 32u + tid] = sentinel;
+    }
+  }
+  __syncwarp();
+
   // ───────────────── Phase A — Tally + cache eids ─────────────────────────
 
   // Cache eid0 / eid1 in registers — reused in Phase A tally AND Phase C
@@ -396,7 +421,6 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     }
     __syncwarp();
   }
-
 
   // ────────── Phase B — Fused prefix sum + active-expert enum ─────────────
 
@@ -488,7 +512,6 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     shm->expert_count = expert_count;
   }
 
-
   // ───────────────── Phase C — Slot assignment ────────────────────────────
   // Identical math to the v3 Pass 3 — see the long comment block in git
   // history for the evolution from v1 (single-threaded write_head) to v2
@@ -523,12 +546,22 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
 
   if (p0 < n_pairs && eid0 != 0xFFFF) {
     tma_shm->sorted_slot[p0] = static_cast<uint8_t>(tma_shm->expert_slot_start[eid0] + rank0);
+    // Scatter the (eid, tok) → k rank into the routing-time inverse map.
+    // `p0 = tok*top_k + k`, so k = p0 % top_k and tok = p0 / top_k.
+    // Top-k selection guarantees distinct experts per token, so
+    // (eid0, tok) is unique — no write conflict with the p1 store below
+    // or with any other lane.
+    const uint32_t tok0 = p0 / top_k;
+    const uint32_t k0 = p0 - tok0 * top_k;
+    tma_shm->expert_tok_krank[eid0 * Dims::BS + tok0] = static_cast<uint8_t>(k0);
   }
   if (p1 < n_pairs && eid1 != 0xFFFF) {
     tma_shm->sorted_slot[p1] =
         static_cast<uint8_t>(tma_shm->expert_slot_start[eid1] + rank1_intra + rank1_carry);
+    const uint32_t tok1 = p1 / top_k;
+    const uint32_t k1 = p1 - tok1 * top_k;
+    tma_shm->expert_tok_krank[eid1 * Dims::BS + tok1] = static_cast<uint8_t>(k1);
   }
-
 }
 
 }  // namespace monomoe

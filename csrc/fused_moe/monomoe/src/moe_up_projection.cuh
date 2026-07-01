@@ -121,30 +121,19 @@ __device__ __forceinline__ void up_silu_quant_writeback_one_token(
   float rw = 0.f;
   std::uint32_t dest_row = 0;
   if (tok < batch_size) {
-#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
-    // Use the per-expert `up_rank_for_tok` cache populated by 8 calc
-    // threads at the K-loop tail.  Replaces the 8-iter scan over
-    // `topk_ids_flat`, which contends with calc-warp K-loop reads
-    // when this body runs concurrently on prefetch warps under DEFER.
-    (void)id;
-    const uint8_t k = shm->up_rank_for_tok[tok];
+    // Single lookup into the routing-time inverse map
+    // `expert_tok_krank[id][tok]` (built once by `prepare_moe_topk_BS8`,
+    // see moe_internal.h) — replaces the per-expert 8-iter scan over
+    // `topk_ids_flat` that both the inline and deferred paths used to
+    // run.  A valid `k` yields the routing weight and the fp8 writeback
+    // row; sentinel 0xFF means this token does not route to expert `id`.
+    const uint8_t k = shm->expert_tok_krank[id * Dims::BS + tok];
     if (k != 0xFFu) {
       store = true;
       rw = shmem->topk_weights_flat[tok * MAX_TOPK + k];
       const std::uint32_t pair = tok * top_k + k;
       dest_row = shm->sorted_slot[pair];
     }
-#else
-    for (std::uint32_t k = 0; k < top_k; ++k) {
-      if (shmem->topk_ids_flat[tok * MAX_TOPK + k] == (uint16_t)id) {
-        store = true;
-        rw = shmem->topk_weights_flat[tok * MAX_TOPK + k];
-        const std::uint32_t pair = tok * top_k + k;
-        dest_row = shm->sorted_slot[pair];
-        break;
-      }
-    }
-#endif
   }
 
   // Compute val1 / val2 on every lane of the warp (needed so that the
@@ -274,7 +263,7 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
   constexpr uint64_t B_LBO =
       static_cast<uint64_t>(MoE_SHM<Dims>::TinyDataWGMMA_TMA::FP8_ACT_T_TILE_PADDED) *
       static_cast<uint64_t>(MoE_SHM<Dims>::TinyDataWGMMA_TMA::FP8_ACT_K_CHUNK);  // 9 × 16 =
-                                                                                    // 144 B
+                                                                                 // 144 B
   constexpr uint64_t B_SBO = B_LBO;  // unused (only 1 N-block for N=8)
 
   const unsigned thread_in_block = threadIdx.x;
@@ -697,97 +686,61 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
 #ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
       // ── Deferred SiLU + fp8 quant writeback for the PREVIOUS expert ──
       //
-      // Runs on prefetch warps (8..11, 128 threads) at iters `s == 0`
-      // AND `s == 1` of every expert AFTER the first.  The 8 tokens
-      // of the previous expert's `wgmma_out` are split across two
-      // K-loop iterations:
-      //   iter 0: tokens [0..3]   (4 warps × 1 token each)
-      //   iter 1: tokens [4..7]   (4 warps × 1 token each)
+      // Runs on prefetch warps (8..11) of every expert AFTER the first.
+      // Scheduling goal (two constraints together):
+      //   (1) FULLY USE THE 4 PREFETCH WARPS whenever the epilogue runs —
+      //       one warp per token (32 lanes cover a token's 64 output cols
+      //       via 4 gate/up pairs, and `warp_reduce_max_float` for the
+      //       fp8 block-scale needs the whole warp), so a "wave" is
+      //       PF = PREFETCH_WARP_COUNT = 4 tokens processed in lockstep.
+      //   (2) DISTRIBUTE THE WAVES ACROSS K-STEPS — the BS tokens split
+      //       into `WAVES = ceil(BS / PF)` waves, each fired at ONE
+      //       K-loop iteration, spaced evenly over the first
+      //       `DEFER_ITERS = K_TILES - 1` iterations (the LAST iteration,
+      //       s == K_TILES-1, is left free — it carries the cross-expert
+      //       weight-TMA stitch on the launcher thread).
       //
-      // Calc warps run their iter-0..iter-1 WGMMAs in parallel,
-      // hiding the SiLU/SFU + GM-store latency behind compute.  See
-      // the inline-vs-deferred A/B comment block at the top of the
-      // expert loop.
+      // Wave w fires at iteration `s_w = w * DEFER_ITERS / WAVES`; within
+      // it prefetch warp 8+i handles token `w*PF + i`.  Examples:
+      //   * BS=8,  K_TILES=8  → WAVES=2, waves at s=0,3 (4 warps each).
+      //   * BS=16, K_TILES=8  → WAVES=4, waves at s=0,1,3,5 (4 warps each,
+      //                         four iterations — the requested layout).
+      // vs. the old burst (all waves back-to-back at s=0,1): same 4-warp
+      // width, but spacing the waves lets DRAM drain the `temp_fp8` store
+      // burst between waves and overlaps each with more calc-warp WGMMA.
+      //
+      // `WAVES <= DEFER_ITERS` guarantees every wave lands on its own
+      // iteration (distinct `s_w`), so the helper is called at most once
+      // per warp per iteration — no double-processing.
+      //
+      // Numerically identical to any schedule: `wgmma_out` holds the
+      // PREVIOUS expert's data for the entire current K-loop (the current
+      // expert overwrites it only AFTER the loop), and `expert_tok_krank`
+      // / `sorted_slot` / `topk_weights_flat` are routing-time-immutable,
+      // so which iteration a token is processed at does not change the
+      // result.
       static_assert(K_TILES >= 2, "Deferred up-proj writeback requires K_TILES >= 2.");
-      // Phase-timing: bracket the deferred SiLU body so we can
-      // measure its per-iter wall-clock and compare against the
-      // calc-warp iter compute window.  Recorded on warp 8 lane 0
-      // (= threadIdx.x == 256, the first prefetch lane).
-      if (s == 0u && has_pending_writeback && is_prefetch_warp<Dims>()) {
+      constexpr uint32_t PF = CoreDims::PREFETCH_WARP_COUNT;  // 4
+      constexpr uint32_t WAVES = (Dims::BS + PF - 1u) / PF;   // ceil(BS/PF)
+      constexpr uint32_t DEFER_ITERS = K_TILES - 1u;
+      static_assert(WAVES <= DEFER_ITERS,
+                    "Not enough K-loop iterations to give each up-proj epilogue "
+                    "wave its own K-step (need ceil(BS/4) <= K_TILES-1).");
+      if (has_pending_writeback && is_prefetch_warp<Dims>() && s < DEFER_ITERS) {
         const unsigned pf_warp = warp - CoreDims::CALC_WARP_COUNT;  // 0..3
-        const uint32_t tok = pf_warp + 0u;                          // 0..3
         const uint32_t col_in_half = lane;                          // 0..31
-        up_silu_quant_writeback_one_token<Dims>(shmem, spec, shm, prev_id_for_writeback, tok,
-                                                col_in_half, lane, base_row_up, effective_bid,
-                                                top_k, batch_size);
-      } else if (s == 1u && has_pending_writeback && is_prefetch_warp<Dims>()) {
-        // Iter-1 path: same body as the helper, inlined here.  The SASS
-        // is equivalent to the helper call.
-        constexpr std::uint32_t MAX_TOPK = MoE_SHM<Dims>::MAX_TOPK;
-        const unsigned pf_warp = warp - CoreDims::CALC_WARP_COUNT;  // 0..3
-        const uint32_t tok = pf_warp + 4u;                          // 4..7
-        const uint32_t col_in_half = lane;                          // 0..31
-        const std::uint32_t id_local = prev_id_for_writeback;
-        (void)id_local;  // unused under DEFER (cache replaces topk scan).
-
-        // ── Section A: topk scan + SHM lookups ─────────────────────
-        bool store_local = false;
-        float rw_local = 0.f;
-        std::uint32_t dest_row_local = 0;
-        if (tok < batch_size) {
-          // Use the per-expert `up_rank_for_tok` cache populated by
-          // 8 calc threads at the previous expert's K-loop tail.
-          // Replaces the 8-iter scan over `topk_ids_flat`, which
-          // contended with calc-warp K-loop reads when run inside
-          // the deferred body.
-          const uint8_t k = shm->up_rank_for_tok[tok];
-          if (k != 0xFFu) {
-            store_local = true;
-            rw_local = shmem->topk_weights_flat[tok * MAX_TOPK + k];
-            const std::uint32_t pair = tok * top_k + k;
-            dest_row_local = shm->sorted_slot[pair];
-          }
-        }
-
-        // ── Section B: 4 wgmma_out SHM reads ───────────────────────
-        const float gate1_l = shm->partial_result.wgmma_out[col_in_half][tok];
-        const float up1_l = shm->partial_result.wgmma_out[col_in_half + 32][tok];
-        const float gate2_l = shm->partial_result.wgmma_out[col_in_half + 64][tok];
-        const float up2_l = shm->partial_result.wgmma_out[col_in_half + 96][tok];
-
-        // ── Section C: SiLU compute ─────────────────────────────────
-        float val1_l = rw_local * up1_l * gate1_l / (1.0f + __expf(-gate1_l));
-        float val2_l = rw_local * up2_l * gate2_l / (1.0f + __expf(-gate2_l));
-        const std::uint32_t out_col_1_l = base_row_up + col_in_half;
-        const std::uint32_t out_col_2_l = base_row_up + 32 + col_in_half;
-        const bool write1_l = store_local && (out_col_1_l < Dims::N);
-        const bool write2_l = store_local && (out_col_2_l < Dims::N);
-        if (!write1_l) val1_l = 0.f;
-        if (!write2_l) val2_l = 0.f;
-
-        // ── Section D: warp-reduce-max + fp8 quantize ──────────────
-        float local_max_l = fmaxf(fabsf(val1_l), fabsf(val2_l));
-        float block_max_l = warp_reduce_max_float(local_max_l);
-        if (block_max_l < __FLT_MIN__) block_max_l = 1.0f;
-        constexpr float FP8_MAX = 448.0f;
-        constexpr float FP8_MAX_INV = 1.0f / 448.0f;
-        const float block_scale_l = block_max_l * FP8_MAX_INV;
-        const float inv_scale_l = FP8_MAX / block_max_l;
-        const AQ_element q1_l = (AQ_element)(val1_l * inv_scale_l);
-        const AQ_element q2_l = (AQ_element)(val2_l * inv_scale_l);
-
-        // ── Section E: GM stores ───────────────────────────────────
-        if (store_local && tok < batch_size) {
-          if (write1_l) {
-            spec->temp_fp8[dest_row_local * Dims::N + out_col_1_l] = q1_l;
-          }
-          if (write2_l) {
-            spec->temp_fp8[dest_row_local * Dims::N + out_col_2_l] = q2_l;
-          }
-          if (lane == 0) {
-            constexpr std::uint32_t SCALE_COLS =
-                MoEGemmSpec<Dims>::TEMP_ACT_SCALE_COLS;  // = Dims::N / 64
-            spec->temp_act_scale[dest_row_local * SCALE_COLS + effective_bid] = block_scale_l;
+#pragma unroll
+        for (uint32_t w = 0; w < WAVES; ++w) {
+          // Uniform across the block (s) and the warp (w, pf_warp are
+          // lane-independent), so all 32 lanes stay in lockstep for the
+          // warp-reduce inside the helper.
+          if (s == w * DEFER_ITERS / WAVES) {
+            const uint32_t tok = w * PF + pf_warp;
+            if (tok < Dims::BS) {
+              up_silu_quant_writeback_one_token<Dims>(shmem, spec, shm, prev_id_for_writeback, tok,
+                                                      col_in_half, lane, base_row_up, effective_bid,
+                                                      top_k, batch_size);
+            }
           }
         }
       }
@@ -819,7 +772,6 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       __syncthreads();
     }  // end K-loop
 
-
     // ── End-of-expert: write final_d to partial_result.wgmma_out[128][8] ──
     // Canonical WGMMA D-matrix layout per thread (m64n8k32):
     //   d[0]: row = warp_in_wg*16 + lane/4 + 0,  col = (lane%4)*2 + 0
@@ -841,34 +793,10 @@ __device__ inline void moe_up_projection_BS8_allexperts_wgmma_tma(
       shm->partial_result.wgmma_out[row_base + 8][col_base + 1] = final_d3;
     }
 
-#ifdef MONO_PROFILE_DEFER_UP_EPILOGUE
-// Populate `up_rank_for_tok[tok]` for the deferred SiLU body
-// running at iters 0/1 of the next expert.  8 calc threads
-// (one per token) do the topk scan once now, before the
-// wgmma_out publish sync below — the same sync also publishes
-// these writes to prefetch warps for the next expert's
-// iter-0/iter-1 PF body.  This replaces the 8-iter inner scan
-// each (lane, tok) pair would otherwise do inside the deferred
-// body, which contends for SHM banks with concurrent calc-warp
-// K-loop reads (~0.46 µs at iter 1 of the next expert per the
-// section breakdown — the dominant cost in the body).
-//
-// Cost: 8 SHM byte-reads × 8 threads serially per expert ≈
-// ~0.05 µs amortized across 8 experts; the 8 threads run on
-// calc warps that have no other work between the wgmma_out
-// store and the publish sync.
-    if (thread_in_block < batch_size) {
-      const std::uint32_t tok = thread_in_block;
-      uint8_t k_found = 0xFFu;
-      for (std::uint32_t k = 0; k < top_k; ++k) {
-        if (shmem->topk_ids_flat[tok * MoE_SHM<Dims>::MAX_TOPK + k] == (uint16_t)id) {
-          k_found = static_cast<uint8_t>(k);
-          break;
-        }
-      }
-      shm->up_rank_for_tok[tok] = k_found;
-    }
-#endif  // MONO_PROFILE_DEFER_UP_EPILOGUE
+    // (The per-expert K-loop-tail scan that populated `up_rank_for_tok`
+    // is gone: the up-proj epilogue now reads the routing-time
+    // `expert_tok_krank[id][tok]` table built once in
+    // `prepare_moe_topk_BS8`.  See `up_silu_quant_writeback_one_token`.)
 
     __syncthreads();
 
