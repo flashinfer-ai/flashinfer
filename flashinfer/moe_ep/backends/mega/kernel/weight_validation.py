@@ -10,6 +10,19 @@ if TYPE_CHECKING:
 from ....core.validation.common import MoEEpConfigError
 
 
+def _dtype_itemsize(dtype: "torch.dtype") -> int:
+    import torch
+
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _scale_dtype_matches(actual: "torch.dtype", expected: "torch.dtype") -> bool:
+    """True when scale dtypes match or are 1-byte layout aliases (uint8 vs float8_*)."""
+    if actual == expected:
+        return True
+    return _dtype_itemsize(actual) == 1 and _dtype_itemsize(expected) == 1
+
+
 def check_transformed_mega_weights_structure(transformed: Any) -> None:
     """``((w, sf), (w, sf))`` top-level layout for all mega kernels."""
     if not isinstance(transformed, tuple) or len(transformed) != 2:
@@ -68,7 +81,7 @@ def check_transformed_weight_pair(
             f"transformed_weights {label} scale must have shape "
             f"{expected_scale_shape}, got {tuple(scale.shape)}"
         )
-    if scale.dtype != scale_dtype:
+    if not _scale_dtype_matches(scale.dtype, scale_dtype):
         raise MoEEpConfigError(
             f"transformed_weights {label} scale must have dtype {scale_dtype}, "
             f"got {scale.dtype}"

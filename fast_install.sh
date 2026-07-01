@@ -52,6 +52,7 @@ git submodule update --init 3rdparty/nccl
 
 # FlashInfer editable only; runtime deps (torch, etc.) should already be in the venv.
 pip_install --no-build-isolation --no-deps -e .
+pip install nvshmem4py-cu13 nvidia-nvshmem-cu13
 
 # flashinfer.jit.cubin_loader imports filelock; not always pulled transitively.
 pip_install filelock

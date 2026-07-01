@@ -284,6 +284,7 @@ def validate_transformed_mega_weights(
 
     local_experts = num_experts // world_size
     i_down = intermediate_size // 2
+    fc1_out = 2 * intermediate_size
     weight_dtype = _nvfp4_kernel_weight_dtype()
 
     _require_cutedsl_paths()
@@ -291,9 +292,9 @@ def validate_transformed_mega_weights(
     from moe_nvfp4_swapab.runner_common import ceil_div
 
     hidden_sf_cols = ceil_div(hidden_size, Nvfp4BlockSize)
-    i_down_sf_cols = ceil_div(i_down, Nvfp4BlockSize)
-    fc1_flat_sf = _nvfp4_swizzled_flat_sf_size(intermediate_size, hidden_sf_cols)
-    fc2_flat_sf = _nvfp4_swizzled_flat_sf_size(hidden_size, i_down_sf_cols)
+    intermediate_sf_cols = ceil_div(intermediate_size, Nvfp4BlockSize)
+    fc1_flat_sf = _nvfp4_swizzled_flat_sf_size(fc1_out, hidden_sf_cols)
+    fc2_flat_sf = _nvfp4_swizzled_flat_sf_size(hidden_size, intermediate_sf_cols)
 
     check_transformed_mega_weights_structure(transformed)
     check_transformed_weight_pair(
@@ -301,7 +302,7 @@ def validate_transformed_mega_weights(
         label="fc1",
         num_local_experts=local_experts,
         weight_dtype=weight_dtype,
-        expected_weight_shape=(local_experts, hidden_size, intermediate_size),
+        expected_weight_shape=(local_experts, hidden_size // 2, fc1_out),
         scale_dtype=torch.uint8,
         expected_scale_shape=(local_experts, fc1_flat_sf),
     )
