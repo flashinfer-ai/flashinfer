@@ -764,6 +764,115 @@ class TestUnifiedMoEAccuracy:
         )
 
 
+@sm100_required
+class TestUnifiedMoECalibratedScales:
+    """Calibrated (non-1.0) global scales must reach the kernels (gh #3548).
+
+    Activations are quantized with the real calibrated global scale
+    ``a1_gs = (448 * 6) / amax(x)`` (~2.6e3 for these magnitudes), weights
+    with real per-expert global scales (the ``prepare_*_weights`` default),
+    and the gemm1→gemm2 requant uses a calibrated intermediate scale.  Before
+    the fix the activation scale never reached the kernel and the output
+    silently inflated by ~``a1_gs``.
+    """
+
+    @pytest.mark.parametrize("backend_key", ["cute_dsl_nvfp4", "trtllm_fp4_routed"])
+    def test_backend_matches_reference_with_calibrated_scales(self, backend_key):
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_tokens = 256
+        hidden_size = SMALL["hidden_size"]
+        intermediate_size = SMALL["intermediate_size"]
+        num_experts = SMALL["num_experts"]
+        top_k = SMALL["top_k"]
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            calibrated_activation_scale=True,
+        )
+        # The case is only meaningful if the calibrated scale is non-trivial.
+        assert float(tensors["a1_gs"]) > 100.0
+
+        # Calibrated intermediate (c_global_sf / a2) scale from the bf16
+        # swiglu outputs over all (token, expert) pairs.
+        gemm1_out = torch.einsum(
+            "th,eoh->teo",
+            tensors["x_bf16"].float(),
+            tensors["w1_weight_bf16"].float(),
+        )
+        swiglu_out = (
+            torch.nn.functional.silu(gemm1_out[..., intermediate_size:])
+            * gemm1_out[..., :intermediate_size]
+        )
+        a2_gs = ((448 * 6) / swiglu_out.abs().nan_to_num().max()).reshape(1)
+
+        act_pack = MoEActivationPack(
+            hidden_states_q=tensors["x"],
+            hidden_states_scale=tensors["x_sf"].squeeze(-1),
+            selected_experts=tensors["token_selected_experts"],
+            final_scales=tensors["token_final_scales"],
+            hidden_states_scale_global=tensors["a1_gs"],
+        )
+        weight_pack = MoEWeightPack()
+        prepare_kwargs = dict(
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+            intermediate_scale_global=a2_gs,
+        )
+        weight_pack.prepare_for(
+            "cute_dsl_nvfp4",
+            CuteDslConfig.prepare_weights(
+                tensors["w1_weight_bf16"], tensors["w2_weight_bf16"], **prepare_kwargs
+            ),
+        )
+        weight_pack.prepare_for(
+            "trtllm_fp4_routed",
+            TrtllmFp4Config.prepare_weights(
+                tensors["w1_weight_bf16"], tensors["w2_weight_bf16"], **prepare_kwargs
+            ),
+        )
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            experts=ExpertConfig(intermediate_size=intermediate_size),
+            activation=ActivationConfig(),
+            backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+        )
+        layer = MoELayer(config)
+        runner = next(r for r in layer.runners if r.backend_key == backend_key)
+
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        out = runner.forward(inputs, tactic=-1)
+
+        ref = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float(),
+            gemm1_weights=tensors["w1_weight_bf16"].float(),
+            gemm2_weights=tensors["w2_weight_bf16"].float(),
+            token_selected_experts=act_pack.selected_experts,
+            token_final_scales=act_pack.final_scales,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=a2_gs,
+        )
+        passed, pct, atol = check_accuracy(out, ref)
+        assert passed, (
+            f"{backend_key} with calibrated scales (a1_gs="
+            f"{float(tensors['a1_gs']):.1f}, a2_gs={float(a2_gs):.1f}): "
+            f"{pct * 100:.2f}% within tolerance (atol={atol:.4f}) vs bf16 "
+            f"reference — gh #3548 regression"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 2. Dispatch plumbing
 # ---------------------------------------------------------------------------
@@ -847,17 +956,18 @@ class TestUnifiedMoEDispatch:
 
 @sm100_required
 class TestTrtllmEPOffset:
-    """TRTLLM routed packing must shift global expert ids down by the local
-    shard offset.
+    """TRTLLM routed packing must keep expert ids GLOBAL.
 
-    The packed int32 top-k id is ``((expert_id - offset) << 16) | bf16(weight)``;
-    the kernel indexes local experts as ``[0, local_num_experts)``.  Before the
-    CR3 fix, ``pack_inputs`` defaulted the offset to 0, so a nonzero local shard
-    produced out-of-range local expert ids.
+    The packed int32 top-k id is ``(global_expert_id << 16) | bf16(weight)``;
+    the kernel performs the global→local mapping itself by subtracting
+    ``local_expert_offset`` (``mLocalExpertsStartIdx`` in RoutingKernel.h).
+    Pre-subtracting the offset in ``pack_inputs`` applied it twice, pushing
+    every id below the local shard and silently zeroing the output for any
+    ``local_expert_offset > 0`` (gh #3547).
     """
 
     @pytest.mark.parametrize("local_expert_offset", [0, 32, 96])
-    def test_pack_inputs_applies_local_expert_offset(self, local_expert_offset):
+    def test_pack_inputs_preserves_global_expert_ids(self, local_expert_offset):
         device = torch.device("cuda", torch.cuda.current_device())
         num_experts = 128
         local_num_experts = 32
@@ -915,13 +1025,84 @@ class TestTrtllmEPOffset:
         inputs = runner.pack_inputs(act_pack, weight_pack)
         topk_ids = MoEInputs.from_list(inputs).topk_ids
 
-        # Upper 16 bits hold the (offset-shifted) local expert id.
-        decoded_local_ids = topk_ids >> 16
-        expected_local_ids = selected_experts - local_expert_offset
-        assert torch.equal(decoded_local_ids, expected_local_ids), (
-            f"offset={local_expert_offset}: packed local ids "
-            f"{decoded_local_ids} != expected {expected_local_ids}"
+        # Upper 16 bits hold the GLOBAL expert id, exactly as selected.
+        decoded_ids = topk_ids >> 16
+        assert torch.equal(decoded_ids, selected_experts), (
+            f"offset={local_expert_offset}: packed ids "
+            f"{decoded_ids} != global ids {selected_experts}"
         )
-        # Local ids must land inside the kernel's [0, local_num_experts) range.
-        assert int(decoded_local_ids.min()) >= 0
-        assert int(decoded_local_ids.max()) < local_num_experts
+        # Global ids land inside this rank's shard; the kernel maps them to
+        # [0, local_num_experts) by subtracting local_expert_offset.
+        assert int(decoded_ids.min()) >= local_expert_offset
+        assert int(decoded_ids.max()) < local_expert_offset + local_num_experts
+
+    @pytest.mark.parametrize("local_expert_offset", [32, 96])
+    def test_ep_shard_forward_matches_offset_zero(self, local_expert_offset):
+        """Full EP-shard forward equals the identical offset-0 run.
+
+        Same local-shard weights, same tokens, global ids shifted up by the
+        shard offset — the output must match the offset-0 baseline.  Before
+        the gh #3547 fix the EP run returned bit-exactly zero output.
+        """
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_experts = 128  # global expert count across all EP ranks
+        local_num_experts = 32
+        top_k = 4
+        num_tokens = 64
+        hidden_size = 512
+        intermediate_size = 512
+
+        # Sample routing within one shard so the same tensors serve both runs.
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=local_num_experts,
+            num_local_experts=local_num_experts,
+            top_k=top_k,
+        )
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for(
+            "trtllm_fp4_routed",
+            TrtllmFp4Config.prepare_weights(
+                tensors["w1_weight_bf16"],
+                tensors["w2_weight_bf16"],
+                num_local_experts=local_num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=device,
+            ),
+        )
+
+        def run(offset: int) -> torch.Tensor:
+            config = MoEConfig(
+                routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+                quant=QuantConfig(variant=QuantVariant.NVFP4),
+                experts=ExpertConfig(
+                    intermediate_size=intermediate_size,
+                    local_expert_offset=offset,
+                    local_num_experts=local_num_experts,
+                ),
+            )
+            act_pack = MoEActivationPack(
+                hidden_states_q=tensors["x"],
+                hidden_states_scale=tensors["x_sf"].squeeze(-1),
+                selected_experts=tensors["token_selected_experts"] + offset,
+                final_scales=tensors["token_final_scales"],
+            )
+            runner = TrtllmFp4RoutedRunner(config, device=device)
+            inputs = runner.pack_inputs(act_pack, weight_pack)
+            return runner.forward(inputs, tactic=-1).clone()
+
+        baseline = run(0)
+        ep_out = run(local_expert_offset)
+
+        # gh #3547 symptom: the EP-shard output was bit-exactly zero.
+        assert not bool((ep_out == 0).all()), (
+            f"offset={local_expert_offset}: EP-shard output is all-zero (gh #3547)"
+        )
+        passed, pct, atol = check_accuracy(ep_out, baseline)
+        assert passed, (
+            f"offset={local_expert_offset}: EP-shard output diverges from the "
+            f"offset-0 baseline ({pct * 100:.2f}% within tolerance, atol={atol:.4f})"
+        )
