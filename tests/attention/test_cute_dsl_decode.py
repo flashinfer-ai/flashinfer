@@ -217,6 +217,35 @@ def _make_paged_kv(
     return kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens
 
 
+def _make_paged_kv_varlen(
+    seq_lens: list[int],
+    page_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    """Create a paged KV cache with per-request sequence lengths."""
+    assert all(seq_len > 0 for seq_len in seq_lens)
+    pages_per_seq = [(seq_len + page_size - 1) // page_size for seq_len in seq_lens]
+    total_pages = sum(pages_per_seq)
+    kv = torch.randn(
+        total_pages, 2, page_size, num_kv_heads, head_dim, device=device, dtype=dtype
+    )
+    indptr = [0]
+    for pages in pages_per_seq:
+        indptr.append(indptr[-1] + pages)
+    kv_indptr = torch.tensor(indptr, device=device, dtype=torch.int32)
+    kv_indices = torch.arange(0, total_pages, device=device, dtype=torch.int32)
+    kv_last_page_len = torch.tensor(
+        [(seq_len - 1) % page_size + 1 for seq_len in seq_lens],
+        device=device,
+        dtype=torch.int32,
+    )
+    seq_lens_tensor = torch.tensor(seq_lens, device=device, dtype=torch.int32)
+    return kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens_tensor
+
+
 @pytest.mark.parametrize("batch_size", [1, 4, 17])
 @pytest.mark.parametrize("kv_len", [129, 1024])
 @pytest.mark.parametrize("page_size", [16, 32])
@@ -290,6 +319,56 @@ def test_cute_dsl_decode_paged_non_causal(
         sm_scale=sm_scale,
         q_len_per_req=q_len_per_req,
         is_causal=False,
+    )
+    out = wrapper.run(
+        q.reshape(batch_size * q_len_per_req, NUM_QO_HEADS, HEAD_DIM), k_cache, v_cache
+    )
+    ref = _decode_reference_paged_non_causal(
+        q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+    )
+    torch.testing.assert_close(
+        out.reshape(batch_size, q_len_per_req, NUM_QO_HEADS, HEAD_DIM),
+        ref,
+        rtol=5e-3,
+        atol=5e-3,
+    )
+
+
+def test_cute_dsl_decode_paged_non_causal_split_boundary_tile():
+    """Non-causal boundary mask on non-zero split and softmax phase."""
+    torch.manual_seed(0)
+    seq_lens_host = [16, 256, 511]
+    batch_size = len(seq_lens_host)
+    page_size = 16
+    q_len_per_req = 4
+    dtype = torch.bfloat16
+    q = torch.randn(
+        batch_size, q_len_per_req, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv_varlen(
+        seq_lens_host, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        page_size=page_size,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        kv_splits=2,
+        reduction="kernel",
+        q_len_per_req=q_len_per_req,
+        is_causal=False,
+        max_kv_len=max(seq_lens_host),
     )
     out = wrapper.run(
         q.reshape(batch_size * q_len_per_req, NUM_QO_HEADS, HEAD_DIM), k_cache, v_cache

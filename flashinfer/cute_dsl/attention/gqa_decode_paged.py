@@ -89,10 +89,8 @@ class GroupedQueryAttentionDecodePaged:
         softmax_warpgroups
             Number of softmax warpgroups (1 or 2).
         tma_mask
-            Disable causal masking — out-of-bounds scores are masked to 0
-            instead of -inf. Mathematically equivalent softmax, but may
-            produce subnormal exponentiations if non-oob scores are all
-            negative (max goes to 0).
+            Disable causal masking. KV lanes beyond the per-request sequence
+            length are masked to ``-inf`` by the boundary-mask loop.
         """
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
