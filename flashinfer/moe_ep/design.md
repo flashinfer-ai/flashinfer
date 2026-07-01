@@ -38,6 +38,33 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required on `fleet_params`. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
+## Architecture
+
+```mermaid
+classDiagram
+    direction TB
+
+    MoEEpLayer --> MoEEpSplitLayer : SplitConfig
+    MoEEpLayer --> MoEEpMegaLayer : MegaConfig
+
+    MoEEpSplitLayer --> Fleet
+    MoEEpSplitLayer --> SplitKernelBackend
+    MoEEpSplitLayer --> Handle : per forward
+
+    MoEEpMegaLayer --> MegaKernelBackend
+
+    Fleet <|-- NcclEpFleet
+    Fleet <|-- NixlEpFleet
+    Handle <|-- NcclEpHandle
+    Handle <|-- NixlEpHandle
+
+    SplitKernelBackend <|-- FusedMoeSplitKernelBackend
+    SplitKernelBackend <|-- IdentitySplitKernelBackend
+    MegaKernelBackend <|-- DeepGemmMegaKernelBackend
+    MegaKernelBackend <|-- Nvfp4CutedslMegaKernelBackend
+    MegaKernelBackend <|-- Mxfp8CutedslMegaKernelBackend
+```
+
 ## Built-in plugins
 
 | Kind | Name | Config |
@@ -126,3 +153,91 @@ Raw megakernel or split-kernel configs cannot be passed as `backend=`; wrap in `
 - **smoke** — quick NCCL-EP smoke scripts
 
 Requires `BUILD_NVEP=1` install for multirank/smoke; mega needs Blackwell, deep_gemm, triton.
+
+## Forward flow
+
+### Split
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Layer as MoEEpSplitLayer
+    participant Kernel as SplitKernelBackend
+    participant Runtime
+    participant Fleet
+    participant Handle
+
+    Note over Caller,Handle: Init
+    Caller->>Layer: __init__
+    Layer->>Layer: validate bootstrap / fleet / arch
+    Layer->>Kernel: create_split_kernel
+    opt auto_bootstrap
+        Layer->>Runtime: bootstrap (torch_dist)
+    end
+    Layer->>Kernel: validate_init
+    opt requires weights
+        Layer->>Kernel: preprocess_weights
+    end
+
+    Note over Caller,Handle: Forward
+    Caller->>Layer: forward(tensors)
+    Layer->>Layer: validate inputs
+    opt first forward
+        Layer->>Fleet: create_fleet
+    end
+    Layer->>Fleet: create_handle
+    Handle->>Handle: dispatch
+    Layer->>Kernel: inner_compute
+    Handle->>Handle: combine, complete
+    Handle->>Handle: destroy
+    Layer-->>Caller: combine.x
+
+    Note over Caller,Handle: Destroy
+    Caller->>Layer: destroy()
+    Layer->>Fleet: destroy
+    opt auto_bootstrap
+        Layer->>Runtime: finalize
+    end
+```
+
+### Mega
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Layer as MoEEpMegaLayer
+    participant Kernel as MegaKernelBackend
+    participant Runtime
+
+    Note over Caller,Runtime: Init
+    Caller->>Layer: __init__
+    Layer->>Layer: validate bootstrap / fleet / arch
+    Layer->>Kernel: create_mega_kernel
+    Layer->>Kernel: bind_ep_bootstrap
+    opt auto_bootstrap
+        Layer->>Runtime: bootstrap torch_dist + nvshmem
+    end
+    Layer->>Kernel: validate_init
+    alt preprocess_weights
+        Layer->>Kernel: preprocess_weights
+    else transformed_weights at init
+        Layer->>Kernel: validate_transformed_weights
+    end
+
+    Note over Caller,Runtime: Forward
+    Caller->>Layer: forward(tensors)
+    Layer->>Layer: validate inputs, quantize_input rules
+    opt first forward
+        Layer->>Kernel: prepare_workspace
+    end
+    Layer->>Kernel: stage_inputs
+    Layer->>Kernel: compute, output y
+    Layer-->>Caller: y
+
+    Note over Caller,Runtime: Destroy
+    Caller->>Layer: destroy()
+    Layer->>Kernel: destroy(workspace)
+    opt auto_bootstrap
+        Layer->>Runtime: finalize
+    end
+```
