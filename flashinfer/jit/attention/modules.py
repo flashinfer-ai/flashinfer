@@ -2022,6 +2022,13 @@ def gen_fmha_v2_module(
         compilation_context=current_compilation_context,
     )
 
+    # copy static fmha_v2_prepare.cu
+    static_prepare_path = csrc_dir / "fmha_v2_prepare.cu"
+    prepare_path = gen_directory / "fmha_v2_prepare.cu"
+    with open(static_prepare_path, "r") as f:
+        write_if_different(prepare_path, f.read())
+    source_paths.append(prepare_path)
+
     # copy static fmha_v2_run.cu
     static_run_path = csrc_dir / "fmha_v2_run.cu"
     run_path = gen_directory / "fmha_v2_run.cu"
