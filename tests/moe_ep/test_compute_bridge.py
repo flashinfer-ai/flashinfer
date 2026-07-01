@@ -56,16 +56,21 @@ def test_bf16_pack_shapes_and_routing():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_rank_major_pack_faithful_routing_and_masking():
+    # RANK_MAJOR recv is [world, max_tokens_per_rank, hidden]; compute is driven
+    # by the received per-token routing, masked to this rank's local experts.
     world, per_rank, hidden = 8, 16, 128
-    num_experts, top_k = 256, 8
+    top_k = 8
     num_local_experts = 4
     offset = 12  # local window = [12, 16)
     m = world * per_rank
     et = _dispatch_tensor(world, per_rank, hidden, "cuda")
 
     g = torch.Generator(device="cuda").manual_seed(0)
+    # RANK_MAJOR dispatch returns LOCAL expert indices (0-based within this rank's
+    # experts), with -1 marking a pick routed to a non-local expert (owned by
+    # another rank). Generate that convention: ids in [-1, num_local_experts).
     recv_idx = torch.randint(
-        0, num_experts, (m, top_k), device="cuda", dtype=torch.int64, generator=g
+        -1, num_local_experts, (m, top_k), device="cuda", dtype=torch.int64, generator=g
     )
     recv_w = torch.rand(m, top_k, device="cuda", generator=g)
 
@@ -83,15 +88,44 @@ def test_rank_major_pack_faithful_routing_and_masking():
     assert pack.selected_experts.shape == (m, top_k)  # real model top_k
     assert pack.final_scales.shape == (m, top_k)
 
-    is_local = (recv_idx >= offset) & (recv_idx < offset + num_local_experts)
+    is_local = recv_idx >= 0
+    # Local picks: local id -> global (id + offset), real weight kept. Non-local
+    # picks (-1) are pinned to the first local expert (offset) with weight 0
+    # (dropped by the weighted finalize).
     assert torch.equal(
-        pack.selected_experts[is_local], recv_idx[is_local].to(torch.int32)
+        pack.selected_experts[is_local], (recv_idx[is_local] + offset).to(torch.int32)
     )
     assert torch.all(pack.selected_experts[~is_local] == offset)
     assert torch.allclose(pack.final_scales[is_local], recv_w[is_local])
     assert torch.all(pack.final_scales[~is_local] == 0.0)
+    # Every synthesized expert id lands inside this rank's local-expert range.
     assert pack.selected_experts.min().item() >= offset
     assert pack.selected_experts.max().item() < offset + num_local_experts
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_rank_major_masks_out_of_range_local_expert_ids():
+    world, per_rank, hidden = 4, 8, 64
+    top_k = 4
+    num_local_experts = 4
+    offset = 8
+    m = world * per_rank
+    et = _dispatch_tensor(world, per_rank, hidden, "cuda")
+
+    recv_idx = torch.full((m, top_k), num_local_experts, dtype=torch.int64, device="cuda")
+    recv_w = torch.ones(m, top_k, device="cuda")
+
+    pack = build_activation_pack_rank_major(
+        et,
+        recv_idx,
+        recv_w,
+        num_local_experts=num_local_experts,
+        local_expert_offset=offset,
+        is_nvfp4=False,
+    )
+
+    assert torch.all(pack.selected_experts == offset)
+    assert torch.all(pack.final_scales == 0.0)
 
 
 def test_build_activation_pack_rank_major_rejects_2d():

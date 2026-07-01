@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 if TYPE_CHECKING:
     import torch

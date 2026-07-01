@@ -44,7 +44,10 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "nvep: requires BUILD_NVEP=1 install")
+    config.addinivalue_line(
+        "markers",
+        "nvep: requires nccl_ep and/or nixl_ep backends (fast_install.sh / BUILD_NCCL_EP=1)",
+    )
     config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")

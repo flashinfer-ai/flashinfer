@@ -51,12 +51,14 @@ def _import_nccl_ep():
 
 
 def _resolve_comm(bootstrap: "BootstrapConfig"):
-    """Return an ``nccl.core.Communicator`` mirroring the default torch PG."""
+    """Return an ``nccl.core.Communicator`` for the EP process group."""
     from nccl.ep.interop.torch import (  # type: ignore[import-not-found]
         get_nccl_comm_from_group,
     )
 
-    return get_nccl_comm_from_group(group=None)
+    from .....core.bootstrap_utils import bootstrap_comm_group
+
+    return get_nccl_comm_from_group(group=bootstrap_comm_group(bootstrap))
 
 
 def _map_algorithm(algo: EpAlgorithm):

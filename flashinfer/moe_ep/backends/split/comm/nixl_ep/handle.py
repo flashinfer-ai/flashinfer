@@ -8,7 +8,6 @@ from .....algo_knobs import (
     AlgoKnob,
     HandleAlgoKnobSplitOperation,
     HandleAlgoKnobTopKWeights,
-    HandleAlgoKnobUserStream,
     _index_knobs,
 )
 from .....config import (
@@ -43,18 +42,6 @@ class NixlEpHandle(Handle):
         self._event = None
         self._recv_hook = None
 
-    def _knob_stream(self) -> int:
-        k = self._handle_knobs.get(HandleAlgoKnobUserStream)
-        if k is not None:
-            return int(k.stream)  # type: ignore[attr-defined]
-        return int(self._fleet._bootstrap.stream)
-
-    def _sync_stream(self) -> None:
-        """Host-synchronize the CUDA stream NIXL dispatch was enqueued on."""
-        import torch
-
-        torch.cuda.ExternalStream(self._knob_stream()).synchronize()
-
     # @flashinfer_api  # disabled per PR #3453 review
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         """Forward to ``Buffer.low_latency_dispatch``."""
@@ -64,7 +51,7 @@ class NixlEpHandle(Handle):
         return_recv_hook = self._staged
         (
             recv_x,
-            recv_count,
+            _recv_count,
             handle,
             event,
             hook,
@@ -84,12 +71,12 @@ class NixlEpHandle(Handle):
         self._recv_hook = hook
         # recv_x is (fp8_tensor, scales) tuple when use_fp8 — pick the data tensor.
         expert_tensors = recv_x[0] if isinstance(recv_x, tuple) else recv_x
-        # In LL mode, num_tokens is bounded; recv_count is the per-expert breakdown.
-        # Block on the EP stream before the host read (mirrors NcclEpHandle).
-        self._sync_stream()
+        world = self._fleet._bootstrap.world_size
+        num_local = self._fleet.params.num_experts // world
+        num_tokens = num_local * self._fleet.params.max_tokens_per_rank * world
         return DispatchOutput(
             expert_tensors=expert_tensors,
-            num_tokens=int(recv_count.sum().item()),
+            num_tokens=num_tokens,
         )
 
     # @flashinfer_api  # disabled per PR #3453 review

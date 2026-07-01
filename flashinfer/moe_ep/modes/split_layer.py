@@ -167,6 +167,7 @@ class MoEEpSplitLayer(nn.Module):
             HandleParams(topk_ids=t.topk_ids),
             algo_knobs=handle_knobs,
         )
+        result: torch.Tensor | None = None
         try:
             if not self.enable_timing:
                 dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
@@ -177,38 +178,38 @@ class MoEEpSplitLayer(nn.Module):
                         out=torch.empty_like(t.hidden_states),
                     )
                 )
-                handle.complete()
-                return combine.x
-
-            ev = {
-                k: (
-                    torch.cuda.Event(enable_timing=True),
-                    torch.cuda.Event(enable_timing=True),
+                result = combine.x
+            else:
+                ev = {
+                    k: (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
+                    )
+                    for k in ("dispatch", "compute", "combine")
+                }
+                ev["dispatch"][0].record()
+                dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
+                ev["dispatch"][1].record()
+                ev["compute"][0].record()
+                expert_out = self._inner_compute(dispatch)
+                ev["compute"][1].record()
+                ev["combine"][0].record()
+                combine = handle.combine(
+                    CombineInputParams(
+                        x=[expert_out],
+                        out=torch.empty_like(t.hidden_states),
+                    )
                 )
-                for k in ("dispatch", "compute", "combine")
-            }
-            ev["dispatch"][0].record()
-            dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
-            ev["dispatch"][1].record()
-            ev["compute"][0].record()
-            expert_out = self._inner_compute(dispatch)
-            ev["compute"][1].record()
-            ev["combine"][0].record()
-            combine = handle.combine(
-                CombineInputParams(
-                    x=[expert_out],
-                    out=torch.empty_like(t.hidden_states),
-                )
-            )
-            ev["combine"][1].record()
-            handle.complete()
-            torch.cuda.synchronize()
-            self.last_timings_ms = {
-                k: start.elapsed_time(end) for k, (start, end) in ev.items()
-            }
-            return combine.x
+                ev["combine"][1].record()
+                torch.cuda.synchronize()
+                self.last_timings_ms = {
+                    k: start.elapsed_time(end) for k, (start, end) in ev.items()
+                }
+                result = combine.x
         finally:
+            handle.complete()
             handle.destroy()
+        return result
 
     def destroy(self) -> None:
         if self._fleet is not None:

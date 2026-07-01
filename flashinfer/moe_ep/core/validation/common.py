@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ...config import BootstrapConfig, FleetParams, QuantType
+from ...config import BootstrapConfig, EpAlgorithm, EpLayout, FleetParams, QuantType
 from ...weights import MoEWeightPack
 
 if TYPE_CHECKING:
@@ -275,6 +275,16 @@ def validate_fleet_params(
     import torch
 
     if backend == "nixl_ep":
+        if params.algorithm is not EpAlgorithm.LOW_LATENCY:
+            raise MoEEpConfigError(
+                "nixl_ep: only algorithm=LOW_LATENCY is supported "
+                "(HIGH_THROUGHPUT requires nccl_ep)."
+            )
+        if params.layout is not EpLayout.EXPERT_MAJOR:
+            raise MoEEpConfigError(
+                "nixl_ep: only layout=EXPERT_MAJOR is supported "
+                "(RANK_MAJOR requires nccl_ep)."
+            )
         cap = topology_capacity if topology_capacity is not None else world_size
         if cap <= 0:
             raise MoEEpConfigError(

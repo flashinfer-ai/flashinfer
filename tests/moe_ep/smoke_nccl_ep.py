@@ -3,14 +3,15 @@
 Usage:
     torchrun --nproc_per_node=4 tests/moe_ep/smoke_nccl_ep.py
 
-Constructs an :class:`MoEEpLayer` with ``backend="nccl_ep"`` and runs one
-dispatch → identity → combine → complete pass. Asserts the output has the
-same shape as the input. With identity inner compute on softmax-normalized
-topk_weights, the output approximates the input within bf16 tolerance.
+Constructs an :class:`MoEEpLayer` with ``backend="nccl_ep"`` (default
+``IdentityConfig`` inner kernel) and runs one dispatch → identity → combine
+pass. Asserts the output has the same shape as the input. With
+softmax-normalized topk_weights, the output approximates the input within
+bf16 tolerance.
 
-Designed for the Phase 4 on-cluster validation step. On the dev box this
-also exits 0 with ``--nproc_per_node=1`` provided the EP backends were
-built (``BUILD_NCCL_EP=1``).
+Requires ``nccl.ep`` (nccl4py) and ``libnccl_ep.so`` staged under
+``flashinfer/moe_ep/backends/split/comm/nccl_ep/_libs/`` — install via
+``bash fast_install.sh`` or ``BUILD_NCCL_EP=1 pip install -e ".[nvep]"``.
 """
 
 from __future__ import annotations

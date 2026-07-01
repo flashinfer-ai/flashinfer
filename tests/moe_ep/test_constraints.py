@@ -245,6 +245,46 @@ def test_mega_forward_inputs_happy_path():
     )
 
 
+def test_validate_compute_consistency_requires_do_finalize():
+    import dataclasses
+
+    from flashinfer.fused_moe.api import (
+        BackendOptions,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEConfig,
+        QuantConfig,
+        QuantVariant,
+        RoutingConfig,
+        TrtllmBf16Config,
+    )
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.validate import (
+        validate_compute_consistency,
+    )
+
+    bootstrap = BootstrapConfig(world_size=4, rank=0)
+    fleet = _split(num_experts=8, world_size=4)
+    moe_config = MoEConfig(
+        routing=RoutingConfig(num_experts=8, top_k=4),
+        quant=QuantConfig(variant=QuantVariant.BF16),
+        experts=ExpertConfig(
+            intermediate_size=2048,
+            local_expert_offset=0,
+            local_num_experts=2,
+        ),
+        backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=128, do_finalize=False),
+    )
+    with pytest.raises(MoEEpConfigError, match="do_finalize"):
+        validate_compute_consistency(fleet, bootstrap, moe_config)
+
+    ok_config = dataclasses.replace(
+        moe_config,
+        execution=dataclasses.replace(moe_config.execution, do_finalize=True),
+    )
+    validate_compute_consistency(fleet, bootstrap, ok_config)
+
+
 def test_ue8m0_quant_rejected_on_pre_blackwell_for_nixl():
     """If we're on sm_90, nixl_ep + UE8M0 should error.
 

@@ -106,7 +106,7 @@ class NcclEpHandle(Handle):
 
         recv_count_len = world_size if self._is_rank_major else self._num_local_experts
         self._recv_count_t = torch.zeros(
-            recv_count_len, dtype=torch.int32, device="cuda"
+            recv_count_len, dtype=torch.int32, device=topk_idx.device
         )
 
         if self._is_ht:
@@ -188,19 +188,9 @@ class NcclEpHandle(Handle):
         self._dispatch_layout = layout_info
         self._dispatch_output_t = out_t
 
-        if _FAST:
-
-            def _num_tokens():
-                torch.cuda.ExternalStream(self._stream).synchronize()
-                return int(self._recv_count_t.sum().item())
-
-            _t = _hp("ll_disp.defer_count", _t)
-            return DispatchOutput(expert_tensors=out_t, num_tokens=_num_tokens)
-
-        torch.cuda.ExternalStream(self._stream).synchronize()
-        _t = _hp("ll_disp.synchronize", _t)
-        num_tokens = int(self._recv_count_t.sum().item())
-        _t = _hp("ll_disp.recvcount_sum_item", _t)
+        # recv_count is written by the library but unused — combine masks padding
+        # via routing, so skip the device->host readback.
+        num_tokens = max_per_rank * world_size
         return DispatchOutput(expert_tensors=out_t, num_tokens=num_tokens)
 
     def _dispatch_ll_rank_major(self, x) -> DispatchOutput:
@@ -260,11 +250,9 @@ class NcclEpHandle(Handle):
         self._dispatch_out_w = out_w
         self._dispatch_out_idx = out_idx
 
-        torch.cuda.ExternalStream(self._stream).synchronize()
-        num_tokens = int(self._recv_count_t.sum().item())
         return DispatchOutput(
             expert_tensors=out_t,
-            num_tokens=num_tokens,
+            num_tokens=m,
             recv_topk_idx=out_idx.reshape(m, self._top_k),
             recv_topk_weights=out_w.reshape(m, self._top_k),
         )

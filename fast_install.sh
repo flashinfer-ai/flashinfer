@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Fast dev install for FlashInfer + NCCL-EP (moe_ep split comm via nccl.ep).
+# Fast dev install for FlashInfer: moe_ep NCCL-EP (nccl4py wheel) + NIXL-EP + mega runtime deps.
 #
 # Usage (from repo root):
 #   bash fast_install.sh
 #
-# What this builds:
-#   * libnccl_ep.so  -> flashinfer/moe_ep/backends/split/comm/nccl_ep/_libs/
-#   * nccl4py>=0.3.1 wheel (nccl.ep API)
-#   * nccl_ep python (import nccl_ep) — ctypes helpers / ndtensor
+# NCCL-EP (default): provided by the nccl4py wheel (>=0.3.1), which ships the
+#   nccl.ep API and bundled libnccl_ep.so. No in-tree make / submodule build.
 #
-# Override arch for H100:
-#   NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90" bash fast_install.sh
+# Mega path: installs nvshmem + CuTe DSL so nvfp4/mxfp8/deep_gemm mega kernels can
+#   bootstrap at runtime (deep_gemm itself remains a separate install).
 #
-# Override NCCL-EP wheel pins (match ep_bench defaults):
+# NIXL-EP (default): installs nixl-cu13, inits 3rdparty/nixl, builds nixl_ep_cpp.so.
+#   Needs meson, libibverbs. Skip with FI_ENABLE_NIXL_EP=0 or FI_BUILD_NIXL_EP=0.
+#
+# Override NCCL-EP wheel pins (match ep_bench / docker defaults):
 #   FI_NCCL_VERSION=2.30.7 FI_NCCL4PY_SPEC='nccl4py==0.3.1' bash fast_install.sh
+#
+# Skip NCCL-EP wheel install entirely:
+#   FI_ENABLE_NCCL_EP=0 bash fast_install.sh
 
 set -euo pipefail
 
@@ -23,13 +27,15 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # Do NOT inherit NCCL_VERSION here — use FI_NCCL_VERSION to override our PyPI pin.
 NCCL_PYPI_VERSION="${FI_NCCL_VERSION:-2.30.7}"
 # Do not use nccl4py[cu13]: its metadata can pull nvidia-nccl-cu13==2.28.3-1.
-# We install NCCL/cuda wheels explicitly below.
 NCCL4PY_SPEC="${FI_NCCL4PY_SPEC:-nccl4py==0.3.1}"
 CUDA_CORE_VERSION="${FI_CUDA_CORE_VERSION:-1.0.1}"
 CUDA_BINDINGS_VERSION="${FI_CUDA_BINDINGS_VERSION:-13.2.0}"
-# FlashInfer 0.6.x imports CuTe DSL at package load when cutlass is present; the
-# venv often has an older nvidia-cutlass-dsl that lacks cutlass.cute.nvgpu.OperandMajorMode.
 CUTLASS_DSL_SPEC="${FI_CUTLASS_DSL_SPEC:-nvidia-cutlass-dsl[cu13]>=4.5.0}"
+
+# NCCL-EP runtime wheels (nccl4py); no BUILD_NCCL_EP compile during pip install.
+ENABLE_NCCL_EP="${FI_ENABLE_NCCL_EP:-${FI_BUILD_NCCL_EP:-1}}"
+BUILD_NIXL_EP="${FI_BUILD_NIXL_EP:-${FI_ENABLE_NIXL_EP:-1}}"
+BUILD_NVEP=0
 
 # Ignore NVIDIA pip constraint/config files (pins like nvidia-nccl-cu13==2.28.3-1).
 pip_install() {
@@ -39,66 +45,86 @@ pip_install() {
     python -m pip install --no-cache-dir "$@"
 }
 
-# moe_ep comm uses nccl.ep from released nccl4py (>=0.3.1). Install NCCL wheels
-# before FlashInfer so `pip install -e .` does not downgrade NCCL via torch deps.
-echo "Installing nvidia-nccl-cu13==${NCCL_PYPI_VERSION} (${NCCL4PY_SPEC})"
-pip_install --no-deps "nvidia-nccl-cu13==${NCCL_PYPI_VERSION}"
-pip_install --no-deps "${NCCL4PY_SPEC}"
-pip_install --no-deps \
-  "cuda-core==${CUDA_CORE_VERSION}" \
-  "cuda-bindings==${CUDA_BINDINGS_VERSION}"
+echo "=== FlashInfer fast install (NCCL-EP=${ENABLE_NCCL_EP}, NIXL-EP=${BUILD_NIXL_EP}) ==="
 
-git submodule update --init 3rdparty/nccl
+if [[ "${ENABLE_NCCL_EP}" == "1" ]]; then
+  echo "Installing NCCL-EP runtime (nvidia-nccl-cu13==${NCCL_PYPI_VERSION}, ${NCCL4PY_SPEC})"
+  pip_install --no-deps "nvidia-nccl-cu13==${NCCL_PYPI_VERSION}"
+  pip_install --no-deps "${NCCL4PY_SPEC}"
+  pip_install --no-deps \
+    "cuda-core==${CUDA_CORE_VERSION}" \
+    "cuda-bindings==${CUDA_BINDINGS_VERSION}"
+  python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep + nccl4py import OK')"
+fi
 
-# FlashInfer editable only; runtime deps (torch, etc.) should already be in the venv.
-pip_install --no-build-isolation --no-deps -e .
-pip install nvshmem4py-cu13 nvidia-nvshmem-cu13
+if [[ "${BUILD_NIXL_EP}" == "1" ]]; then
+  echo "Installing nixl-cu13 (NIXL-EP runtime base lib)"
+  pip_install --no-deps "nixl-cu13>=1.0.1"
+fi
 
-# flashinfer.jit.cubin_loader imports filelock; not always pulled transitively.
+# Mega kernels: symmetric memory + CuTe DSL (imported by flashinfer + mega backends).
+echo "Installing mega runtime deps (nvshmem, CuTe DSL, filelock)"
+pip_install --no-deps nvshmem4py-cu13 nvidia-nvshmem-cu13
 pip_install filelock
-
-echo "Installing ${CUTLASS_DSL_SPEC} (import flashinfer requires CuTe DSL >= 4.5)"
 pip_install "${CUTLASS_DSL_SPEC}"
 
-python3 -c "
-from build_backend import _synthesize_nccl_builddir
-from pathlib import Path
-_synthesize_nccl_builddir(Path('build_nvep/nccl'))
-"
+if [[ "${BUILD_NIXL_EP}" == "1" ]]; then
+  echo "Initializing git submodules (NIXL-EP only)"
+  git submodule update --init --recursive 3rdparty/nixl
+fi
 
-# GB200/B200 = sm_100. Override for H100: NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90"
-: "${NVCC_GENCODE:=-gencode=arch=compute_100,code=sm_100}"
+# Editable FlashInfer. BUILD_NCCL_EP=0: NCCL-EP is the nccl4py wheel above, not an
+# in-tree compile. --no-deps: wheels above are already in the venv; --no-build-isolation:
+# build_backend runs in this env (meson needs torch on PATH for NIXL-EP).
+echo "Installing FlashInfer editable (NIXL-EP build=${BUILD_NIXL_EP})"
+BUILD_NVEP="${BUILD_NVEP}" \
+BUILD_NCCL_EP=0 \
+BUILD_NIXL_EP="${BUILD_NIXL_EP}" \
+  pip_install --no-build-isolation --no-deps -e ".[nvep]"
 
-make -C 3rdparty/nccl/contrib/nccl_ep \
-  BUILDDIR="$(pwd)/build_nvep/nccl" \
-  "NVCC_GENCODE=${NVCC_GENCODE}" \
-  _NCCL_EP_LSA_TEAM_SIZE_MIN=8 \
-  _NCCL_EP_LSA_TEAM_SIZE_MAX=8 \
-  _NCCL_EP_NUM_LSA_TEAMS_LIST="1" \
-  lib -j"$(nproc)"
-
-LIBNCCL_EP_SO="build_nvep/nccl/lib/libnccl_ep.so"
-NCCL_EP_LIBS="flashinfer/moe_ep/backends/split/comm/nccl_ep/_libs"
-
-mkdir -p "${NCCL_EP_LIBS}"
-cp "${LIBNCCL_EP_SO}" "${NCCL_EP_LIBS}/"
-
-# ctypes nccl_ep helpers (ndtensor); separate from nccl.ep API above.
-pip_install --no-deps -e 3rdparty/nccl/contrib/nccl_ep/python
-
-# Guard against any later package pulling torch's older NCCL pin.
-pip_install --no-deps --force-reinstall "nvidia-nccl-cu13==${NCCL_PYPI_VERSION}"
+if [[ "${ENABLE_NCCL_EP}" == "1" ]]; then
+  # Guard against any later package pulling torch's older NCCL pin.
+  pip_install --no-deps --force-reinstall "nvidia-nccl-cu13==${NCCL_PYPI_VERSION}"
+fi
 
 export FLASHINFER_DISABLE_VERSION_CHECK=1
+export BUILD_NIXL_EP
 
 echo "=== sanity checks ==="
 python -c "
 import importlib.util
+import os
 
-import nccl.ep  # noqa: F401
-from nccl.core import Communicator  # noqa: F401
-print('nccl.ep importable:', importlib.util.find_spec('nccl.ep') is not None)
+if importlib.util.find_spec('nccl.ep') is not None:
+    import nccl.ep  # noqa: F401
+    from nccl.core import Communicator  # noqa: F401
+    print('nccl.ep importable: True')
+else:
+    print('nccl.ep importable: False (FI_ENABLE_NCCL_EP=0?)')
 
-from flashinfer.moe_ep import available_backends
-print('flashinfer.moe_ep:', available_backends())
+from flashinfer.moe_ep import (
+    MegaConfig,
+    MoEEpLayer,
+    NcclEpConfig,
+    SplitConfig,
+    available_backends,
+    have_nccl_ep,
+    have_nixl_ep,
+)
+print('flashinfer.moe_ep backends:', available_backends())
+print('have_nccl_ep():', have_nccl_ep())
+print('have_nixl_ep():', have_nixl_ep())
+if importlib.util.find_spec('nccl.ep') is not None:
+    assert have_nccl_ep(), 'nccl_ep backend not available (need nccl4py>=0.3.1)'
+if os.environ.get('BUILD_NIXL_EP') == '1':
+    assert have_nixl_ep(), 'nixl_ep backend not available (need nixl-cu13 + BUILD_NIXL_EP=1 build)'
+
+# Mega API imports cleanly; runtime still needs nvshmem for symmetric-memory kernels.
+try:
+    import nvshmem.core  # noqa: F401
+    print('nvshmem.core importable: True')
+except ImportError as e:
+    print('nvshmem.core importable: False (%s)' % e)
+
+print('MegaConfig / SplitConfig import OK')
 "

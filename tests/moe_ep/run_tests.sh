@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Run all moe_ep tests (unit + multirank + smoke).
+# Run moe_ep tests (unit + multirank + smoke + mega).
 #
-# Usage (from anywhere):
+# Usage (from repo root):
 #   bash tests/moe_ep/run_tests.sh
-#   bash tests/moe_ep/run_tests.sh unit          # host-only pytest only
-#   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split-path only
-#   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega only
-#   bash tests/moe_ep/run_tests.sh correctness  # 4-GPU LL + HT + NVFP4 numerics
+#   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
+#   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
+#   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
+#   bash tests/moe_ep/run_tests.sh correctness   # 4-GPU LL/HT + NVFP4 numerics
+#   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
+#
+# Install (split NCCL-EP + mega runtime deps):
+#   bash fast_install.sh
+#   # equivalent: BUILD_NCCL_EP=1 pip install -e ".[nvep]" --no-build-isolation
 #
 # Requires:
 #   - FLASHINFER repo root on PYTHONPATH (handled below)
-#   - multirank/smoke: BUILD_NVEP=1 install, >=4 GPUs
-#   - mega: Blackwell (sm_100+), deep_gemm, triton
+#   - multirank/smoke/correctness: nccl.ep + staged libnccl_ep.so (fast_install.sh)
+#   - multirank/smoke/correctness: >=4 GPUs
+#   - mega: Blackwell (sm_100+), nvshmem, deep_gemm, triton
+#   - optional NIXL smoke: FI_BUILD_NIXL_EP=1 / BUILD_NIXL_EP=1 install
 
 set -uo pipefail
 
@@ -26,11 +33,27 @@ PY="${PYTHON:-python}"
 TORCHRUN="${TORCHRUN:-torchrun}"
 NPROC_MULTIRANK="${NPROC_MULTIRANK:-4}"
 NPROC_SMOKE="${NPROC_SMOKE:-4}"
-# Avoid loading tests/conftest.py (full flashinfer.jit); moe_ep hooks live locally.
 MOE_EP_PYTEST_FLAGS=(--confcutdir=tests/moe_ep)
 
 declare -a SECTION_NAMES=()
 declare -a SECTION_STATUS=()
+
+have_nccl_ep() {
+  "${PY}" -c "from flashinfer.moe_ep import have_nccl_ep; raise SystemExit(0 if have_nccl_ep() else 1)"
+}
+
+have_nixl_ep() {
+  "${PY}" -c "from flashinfer.moe_ep import have_nixl_ep; raise SystemExit(0 if have_nixl_ep() else 1)"
+}
+
+require_nccl_ep() {
+  if have_nccl_ep; then
+    return 0
+  fi
+  echo "nccl_ep backend not available." >&2
+  echo "Install with: bash fast_install.sh  (or BUILD_NCCL_EP=1 pip install -e \".[nvep]\")" >&2
+  return 1
+}
 
 run_section() {
   local name="$1"
@@ -65,6 +88,8 @@ run_unit() {
 }
 
 run_multirank() {
+  require_nccl_ep
+
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_layer_multirank.py -v \
@@ -75,17 +100,24 @@ run_multirank() {
     tests/moe_ep/test_split_kernels.py -v \
     -m "nvep and gpu_4" --backend=nccl_ep
 
-  # NIXL-EP (requires nixl_ep backend built)
-  # "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
-  #   tests/moe_ep/test_moe_ep_layer_multirank.py -v \
-  #   -m "nvep and gpu_4" --backend=nixl_ep
-  #
-  # "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
-  #   tests/moe_ep/test_split_kernels.py -v \
-  #   -m "nvep and gpu_4" --backend=nixl_ep
+  if have_nixl_ep; then
+    "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+      "${MOE_EP_PYTEST_FLAGS[@]}" \
+      tests/moe_ep/test_moe_ep_layer_multirank.py -v \
+      -m "nvep and gpu_4" --backend=nixl_ep
+
+    "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+      "${MOE_EP_PYTEST_FLAGS[@]}" \
+      tests/moe_ep/test_split_kernels.py -v \
+      -m "nvep and gpu_4" --backend=nixl_ep
+  else
+    echo "nixl_ep not built; skipping NIXL multirank (set FI_BUILD_NIXL_EP=1 in fast_install.sh)"
+  fi
 }
 
 run_correctness() {
+  require_nccl_ep
+
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
@@ -110,10 +142,15 @@ run_mega() {
 }
 
 run_smoke() {
+  require_nccl_ep
+
   "${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" tests/moe_ep/smoke_nccl_ep.py
 
-  # NIXL-EP smoke (requires nixl_ep backend built)
-  # "${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" tests/moe_ep/smoke_nixl_ep.py
+  if have_nixl_ep; then
+    "${TORCHRUN}" --nproc_per_node="${NPROC_SMOKE}" tests/moe_ep/smoke_nixl_ep.py
+  else
+    echo "nixl_ep not built; skipping smoke_nixl_ep.py"
+  fi
 }
 
 print_summary() {
