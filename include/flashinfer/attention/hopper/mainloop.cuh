@@ -202,7 +202,7 @@ struct CollectiveMainloop {
     if (lane_predicate) {
       pipeline_k.producer_acquire(smem_pipe_write_k);
       copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k),
-                                           /*mcast_mask=*/0),
+                                           /*mcast_mask=*/0, cute::TMA::CacheHintSm90::EVICT_LAST),
            tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write_k.index()));
       ++smem_pipe_write_k;
     }
@@ -230,14 +230,16 @@ struct CollectiveMainloop {
 #pragma unroll 2
       for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
         pipeline_k.producer_acquire(smem_pipe_write_k);
-        copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k),
-                                             /*mcast_mask=*/0),
-             tKgK(_, kv_tile_idx - 1), tKsK(_, smem_pipe_write_k.index()));
+        copy(
+            mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k),
+                                            /*mcast_mask=*/0, cute::TMA::CacheHintSm90::EVICT_LAST),
+            tKgK(_, kv_tile_idx - 1), tKsK(_, smem_pipe_write_k.index()));
         ++smem_pipe_write_k;
         pipeline_v.producer_acquire(smem_pipe_write_v);
-        copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v),
-                                             /*mcast_mask=*/0),
-             tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
+        copy(
+            mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v),
+                                            /*mcast_mask=*/0, cute::TMA::CacheHintSm90::EVICT_LAST),
+            tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
         ++smem_pipe_write_v;
       }
     }
@@ -245,7 +247,7 @@ struct CollectiveMainloop {
     if (lane_predicate) {
       pipeline_v.producer_acquire(smem_pipe_write_v);
       copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v),
-                                           /*mcast_mask=*/0),
+                                           /*mcast_mask=*/0, cute::TMA::CacheHintSm90::EVICT_LAST),
            tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
       ++smem_pipe_write_v;
     }
