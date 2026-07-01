@@ -9,6 +9,7 @@ helpers below.
 
 from .core import (
     _CUDNN_MOE_BLOCK_SCALE_MIN_VERSION,
+    _CUDNN_MOE_FP8_MIN_VERSION,
     _CUDNN_MOE_MIN_VERSION,
     _check_cudnn_version,
     _run_cudnn_moe_block_scale_grouped_gemm_fp4,
@@ -18,6 +19,7 @@ from .core import (
 
 __all__ = [
     "_CUDNN_MOE_BLOCK_SCALE_MIN_VERSION",
+    "_CUDNN_MOE_FP8_MIN_VERSION",
     "_CUDNN_MOE_MIN_VERSION",
     "_check_cudnn_version",
     "_run_cudnn_moe_block_scale_grouped_gemm_fp4",

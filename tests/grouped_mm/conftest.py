@@ -35,6 +35,16 @@ requires_cudnn_moe_block_scale = pytest.mark.skipif(
     reason="cuDNN MOE block-scale requires backend >= 9.21.0 and a frontend exposing moe_grouped_matmul_mode",
 )
 
+# FP8 needs a higher floor than bf16: backends 9.18.0-9.20.0 pass
+# check_support() but silently compute only the first expert group (gh #3792,
+# fixed in 9.21.0).
+requires_cudnn_moe_fp8 = pytest.mark.skipif(
+    not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 92100 or not CUDNN_HAS_MOE_API,
+    reason="cuDNN MOE FP8 requires backend >= 9.21.0 (9.18-9.20 silently compute "
+    "only the first expert group, gh #3792) and a frontend exposing "
+    "moe_grouped_matmul_mode",
+)
+
 
 def _requires_supported_cc(check_fn):
     # Skip mark whose allowlist is the `_supported_ccs` set attached to

@@ -22,6 +22,7 @@ from ..api_logging import flashinfer_api
 from ..utils import backend_requirement, supported_compute_capability
 from .cudnn import (
     _CUDNN_MOE_BLOCK_SCALE_MIN_VERSION,
+    _CUDNN_MOE_FP8_MIN_VERSION,
     _CUDNN_MOE_MIN_VERSION,
     _check_cudnn_version,
     _run_cudnn_moe_block_scale_grouped_gemm_fp4,
@@ -266,7 +267,7 @@ def grouped_mm_fp8(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_fp8")
+        _check_cudnn_version(_CUDNN_MOE_FP8_MIN_VERSION, "grouped_mm_fp8")
         return _run_cudnn_moe_grouped_gemm(
             a,
             b,
