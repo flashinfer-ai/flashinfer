@@ -316,6 +316,7 @@ def test_nvfp4_kv_dequantize_paged_fi_trace():
                 "k_packed_dim",
             ]
             expected_name = "nvfp4_kv_dequantize_paged"
+            expected_init_name = "_nvfp4_kv_dequantize_paged_nhd_init"
         else:
             k_cache_shape = (num_pages, num_heads, page_size, k_head_dim // 2)
             v_cache_shape = (num_pages, num_heads, page_size, v_head_dim // 2)
@@ -328,6 +329,7 @@ def test_nvfp4_kv_dequantize_paged_fi_trace():
                 "k_packed_dim",
             ]
             expected_name = "nvfp4_kv_dequantize_paged_hnd"
+            expected_init_name = "_nvfp4_kv_dequantize_paged_hnd_init"
 
         k_cache = torch.empty(k_cache_shape, dtype=torch.uint8)
         v_cache = torch.empty(v_cache_shape, dtype=torch.uint8)
@@ -371,6 +373,28 @@ def test_nvfp4_kv_dequantize_paged_fi_trace():
         assert defn["inputs"]["paged_k_cache"]["shape"] == expected_cache_shape
         assert defn["outputs"]["output_k"]["dtype"] == "bfloat16"
         assert "block_table_stride * page_size >= max_seq_len" in defn["constraints"]
+        assert "init" in defn
+
+        init_namespace = {}
+        exec(defn["init"], init_namespace)
+        dumped_init = init_namespace[expected_init_name]
+        dumped_init_inputs = dumped_init(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_heads=num_heads,
+            k_head_dim=k_head_dim,
+            v_head_dim=v_head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            device="cpu",
+        )
+        dumped_init_k_cache, dumped_init_v_cache = dumped_init_inputs["paged_kv_cache"]
+        dumped_init_k_scales, dumped_init_v_scales = dumped_init_inputs["kv_cache_sf"]
+        assert dumped_init_inputs["kv_layout"] == kv_layout
+        assert dumped_init_k_cache.shape == k_cache_shape
+        assert dumped_init_v_cache.shape == v_cache_shape
+        assert dumped_init_k_scales.shape == k_scale_shape
+        assert dumped_init_v_scales.shape == v_scale_shape
 
         init_inputs = flashinfer.nvfp4_kv_dequantize_paged.fi_init(
             batch_size=batch_size,

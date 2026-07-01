@@ -242,12 +242,12 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(paged_v_cache);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_scales);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_scales);
-  CHECK_INPUT(block_tables);
+  CHECK_CUDA(block_tables);
   CHECK_INPUT(seq_lens);
   CHECK_CUDA(k_global_scale);
   CHECK_CUDA(v_global_scale);
-  CHECK_INPUT(output_k);
-  CHECK_INPUT(output_v);
+  CHECK_CUDA(output_k);
+  CHECK_CUDA(output_v);
 
   TVM_FFI_ICHECK(kv_layout == 0 || kv_layout == 1) << "kv_layout must be 0 (NHD) or 1 (HND)";
   TVM_FFI_ICHECK(paged_k_cache.ndim() == 4) << "paged_k_cache must be 4D";
@@ -369,6 +369,14 @@ void nvfp4_paged_kv_dequant(TensorView paged_k_cache, TensorView paged_v_cache, 
 
   ffi::CUDADeviceGuard device_guard(paged_k_cache.device().device_id);
   cudaStream_t stream = get_stream(paged_k_cache.device());
+
+  if (batch_size == 0 || max_seq_len == 0 || num_heads == 0) {
+    return;
+  }
+
+  CHECK_INPUT(block_tables);
+  CHECK_INPUT(output_k);
+  CHECK_INPUT(output_v);
 
   const int k_block_size = k_packed_dim < 128 ? k_packed_dim : 128;
   const int v_block_size = v_packed_dim < 128 ? v_packed_dim : 128;

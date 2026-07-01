@@ -14,13 +14,18 @@
 
 """TraceTemplates for FP4 / FP8 quantization APIs."""
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 _AxisT = Union[Var, Const]
+
+
+def _bind_trace_init_dependencies(wrapper: Any, *dependencies: Any) -> Any:
+    wrapper._trace_init_dependencies = dependencies
+    return wrapper
 
 
 # ── Reference helpers ────────────────────────────────────────────────────────
@@ -624,6 +629,96 @@ def _nvfp4_kv_dequantize_paged_init(
     }
 
 
+def _nvfp4_kv_dequantize_paged_nhd_init(
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    num_heads: int,
+    k_head_dim: int = 128,
+    v_head_dim: int = 128,
+    k_packed_dim: int = 0,
+    v_packed_dim: int = 0,
+    k_scale_dim: int = 0,
+    v_scale_dim: int = 0,
+    num_pages: int = 0,
+    page_size: int = 16,
+    block_table_stride: int = 0,
+    scalar: int = 1,
+    kv_layout: str = "NHD",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    del kv_layout
+    return _nvfp4_kv_dequantize_paged_init(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_heads=num_heads,
+        k_head_dim=k_head_dim,
+        v_head_dim=v_head_dim,
+        k_packed_dim=k_packed_dim,
+        v_packed_dim=v_packed_dim,
+        k_scale_dim=k_scale_dim,
+        v_scale_dim=v_scale_dim,
+        num_pages=num_pages,
+        page_size=page_size,
+        block_table_stride=block_table_stride,
+        scalar=scalar,
+        kv_layout="NHD",
+        device=device,
+        seed=seed,
+    )
+
+
+def _nvfp4_kv_dequantize_paged_hnd_init(
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    num_heads: int,
+    k_head_dim: int = 128,
+    v_head_dim: int = 128,
+    k_packed_dim: int = 0,
+    v_packed_dim: int = 0,
+    k_scale_dim: int = 0,
+    v_scale_dim: int = 0,
+    num_pages: int = 0,
+    page_size: int = 16,
+    block_table_stride: int = 0,
+    scalar: int = 1,
+    kv_layout: str = "HND",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    del kv_layout
+    return _nvfp4_kv_dequantize_paged_init(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        num_heads=num_heads,
+        k_head_dim=k_head_dim,
+        v_head_dim=v_head_dim,
+        k_packed_dim=k_packed_dim,
+        v_packed_dim=v_packed_dim,
+        k_scale_dim=k_scale_dim,
+        v_scale_dim=v_scale_dim,
+        num_pages=num_pages,
+        page_size=page_size,
+        block_table_stride=block_table_stride,
+        scalar=scalar,
+        kv_layout="HND",
+        device=device,
+        seed=seed,
+    )
+
+
+_nvfp4_kv_dequantize_paged_nhd_init = _bind_trace_init_dependencies(
+    _nvfp4_kv_dequantize_paged_nhd_init,
+    _nvfp4_kv_dequantize_paged_init,
+)
+_nvfp4_kv_dequantize_paged_hnd_init = _bind_trace_init_dependencies(
+    _nvfp4_kv_dequantize_paged_hnd_init,
+    _nvfp4_kv_dequantize_paged_init,
+)
+
+
 def _make_nvfp4_kv_dequantize_paged_trace(
     *, kv_layout: str, name_prefix: str
 ) -> TraceTemplate:
@@ -639,6 +734,12 @@ def _make_nvfp4_kv_dequantize_paged_trace(
         v_scales_dims = ["num_pages", "num_heads", "page_size", "v_scale_dim"]
     else:
         raise ValueError(f"kv_layout must be 'NHD' or 'HND', got {kv_layout!r}")
+
+    init = (
+        _nvfp4_kv_dequantize_paged_nhd_init
+        if kv_layout == "NHD"
+        else _nvfp4_kv_dequantize_paged_hnd_init
+    )
 
     return TraceTemplate(
         op_type="dequantize_fp4",
@@ -713,7 +814,7 @@ def _make_nvfp4_kv_dequantize_paged_trace(
             "scalar == 1",
         ],
         tags=["status:verified", "quantization:fp4"],
-        init=_nvfp4_kv_dequantize_paged_init,
+        init=init,
     )
 
 
