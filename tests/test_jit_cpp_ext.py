@@ -1,4 +1,5 @@
 import subprocess
+import sys
 
 from flashinfer.jit import core, cpp_ext
 
@@ -105,6 +106,8 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
 
     assert commands == [
         [
+            sys.executable,
+            "-m",
             "ninja",
             "-v",
             "-C",
