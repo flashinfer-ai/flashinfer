@@ -246,6 +246,12 @@ def testMSAProxyScore(args):
     k = torch.randn(total_kv, Hkv, 128, device=device, dtype=gen_dtype) / 3
     cu_q, cu_k = _cu_seqlens(bs, s_qo, device), _cu_seqlens(bs, s_kv, device)
 
+    # Omitting these makes msa_proxy_score derive them via a blocking cu_seqlens D2H
+    # copy, which would time host-sync overhead instead of the kernel (and is illegal
+    # under CUDA-graph capture).
+    max_seqlen_q = s_qo
+    max_k_tiles = args.max_k_tiles or ((s_kv + 127) // 128)
+
     if is_fp4:
         from flashinfer.msa_ops import msa_proxy_score_fp4
         from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
@@ -265,10 +271,17 @@ def testMSAProxyScore(args):
                 cu_q,
                 cu_k,
                 causal=args.causal,
-                max_k_tiles=args.max_k_tiles,
+                max_seqlen_q=max_seqlen_q,
+                max_k_tiles=max_k_tiles,
             )
         return msa_proxy_score(
-            q, k, cu_q, cu_k, causal=args.causal, max_k_tiles=args.max_k_tiles
+            q,
+            k,
+            cu_q,
+            cu_k,
+            causal=args.causal,
+            max_seqlen_q=max_seqlen_q,
+            max_k_tiles=max_k_tiles,
         )
 
     # K-read bytes/elem: bf16 reads 2 B/elem; NVFP4 reads 0.5 (packed e2m1) + 1/16
@@ -314,7 +327,13 @@ def testMSAProxyScore(args):
     # overlap is the deployment metric (tests/msa_ops/test_proxy_fp4.py).
     if args.refcheck and is_fp4:
         ref = msa_proxy_score(
-            q, k, cu_q, cu_k, causal=args.causal, max_k_tiles=args.max_k_tiles
+            q,
+            k,
+            cu_q,
+            cu_k,
+            causal=args.causal,
+            max_seqlen_q=max_seqlen_q,
+            max_k_tiles=max_k_tiles,
         ).float()
         out = run().float()
         finite = torch.isfinite(ref) & torch.isfinite(out)
