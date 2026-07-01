@@ -79,6 +79,7 @@ def test_all_registered_trace_templates_have_check():
     import flashinfer.gdn_decode  # noqa: F401
     import flashinfer.gdn_prefill  # noqa: F401
     import flashinfer.gemm  # noqa: F401
+    import flashinfer.gpt_oss_ops  # noqa: F401
     import flashinfer.norm  # noqa: F401
     import flashinfer.page  # noqa: F401
     import flashinfer.prefill  # noqa: F401
