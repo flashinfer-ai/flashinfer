@@ -436,10 +436,12 @@ struct Compute {
       Circular_buffer_kv_reader& cbr_v, OrderedMutexAccessor& mutex, uint32_t* skip_softmax_vote,
       bool complete = false) {
     // Skip-softmax vote initialization
-    if (tidx == 0) {
-      // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before
-      // voting.
-      *skip_softmax_vote = 1;
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+      if (tidx == 0) {
+        // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before
+        // voting.
+        *skip_softmax_vote = 1;
+      }
     }
 // load the scales of K/V from global memory
 #define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                            \
@@ -474,7 +476,9 @@ struct Compute {
 
     // If skip_softmax is enabled, make sure there is no racing between the initialization and
     // writing of skip_softmax_vote.
-    named_barrier_wait(Kernel_traits::SKIP_SOFTMAX_BARRIER_ID + threadIdx.x / 128, 128);
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+      named_barrier_wait(Kernel_traits::SKIP_SOFTMAX_BARRIER_ID + threadIdx.x / 128, 128);
+    }
 
     // BMM1 (Q x K').
     warpgroup_arrive();
