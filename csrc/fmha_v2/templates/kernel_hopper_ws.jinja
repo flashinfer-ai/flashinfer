@@ -44,7 +44,8 @@ using Ktraits = {{ kernel_traits_header }}
                 {{ output_dtype_ }},
                 {{ sage_block_size_q }},
                 {{ sage_block_size_k }},
-                {{ sage_block_size_v }}>;
+                {{ sage_block_size_v }},
+                {{ fp8_two_level_interval }}>;
 
 using Ktraits_causal = {{ kernel_traits_header }}
                        {{ loop_step }},
@@ -65,7 +66,9 @@ using Ktraits_causal = {{ kernel_traits_header }}
                        {{ enable_attn_logit_softcapping_flag }},
                        {{ return_softmax_stats_flag }},
                        {{ enable_skip_softmax_flag }},
-                       {{ output_dtype_ }}>;
+                       {{ output_dtype_ }},
+                       0, 0, 0,
+                       {{ fp8_two_level_interval }}>;
 
 using Ktraits_sliding_or_chunked_causal = {{ kernel_traits_header }}
                                       {{ loop_step }},
@@ -86,7 +89,9 @@ using Ktraits_sliding_or_chunked_causal = {{ kernel_traits_header }}
                                       {{ enable_attn_logit_softcapping_flag }},
                                       {{ return_softmax_stats_flag }},
                                       {{ enable_skip_softmax_flag }},
-                                      {{ output_dtype_ }}>;
+                                      {{ output_dtype_ }},
+                                      0, 0, 0,
+                                      {{ fp8_two_level_interval }}>;
 
 using Ktraits_custom_mask = {{ kernel_traits_header }}
                             {{ loop_step }},
@@ -107,7 +112,9 @@ using Ktraits_custom_mask = {{ kernel_traits_header }}
                             {{ enable_attn_logit_softcapping_flag }},
                             {{ return_softmax_stats_flag }},
                             {{ enable_skip_softmax_flag }},
-                            {{ output_dtype_ }}>;
+                            {{ output_dtype_ }},
+                            0, 0, 0,
+                            {{ fp8_two_level_interval }}>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -156,6 +156,9 @@ kernel_spec = namedtuple(
         "output_dtype",
         "is_mtp",
         "enable_skip_softmax",
+        # FP8 two-level accumulation interval for Hopper warp-specialized kernels.
+        # 0 disables; N>0 merges the working acc_o into a persistent acc_o_accum every N KV-tiles.
+        "fp8_two_level_interval",
     ],
     defaults=(
         1,  # ctas_per_head
@@ -182,6 +185,7 @@ kernel_spec = namedtuple(
         None,  # output_dtype, same as dtype by default.
         False,  # is_mtp
         False,  # enable_skip_softmax
+        0,  # fp8_two_level_interval (0 = disabled)
     ),
 )
 spec_fields = kernel_spec._fields
@@ -1479,7 +1483,8 @@ using Ktraits = {kernel_traits_header}
                 {output_dtype_},
                 {sage_block_size_q},
                 {sage_block_size_k},
-                {sage_block_size_v}>;
+                {sage_block_size_v},
+                {fp8_two_level_interval}>;
 
 using Ktraits_causal = {kernel_traits_header}
                        {loop_step},
@@ -1500,7 +1505,9 @@ using Ktraits_causal = {kernel_traits_header}
                        {enable_attn_logit_softcapping_flag},
                        {return_softmax_stats_flag},
                        {enable_skip_softmax_flag},
-                       {output_dtype_}>;
+                       {output_dtype_},
+                       0, 0, 0,
+                       {fp8_two_level_interval}>;
 
 using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       {loop_step},
@@ -1521,7 +1528,9 @@ using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       {enable_attn_logit_softcapping_flag},
                                       {return_softmax_stats_flag},
                                       {enable_skip_softmax_flag},
-                                      {output_dtype_}>;
+                                      {output_dtype_},
+                                      0, 0, 0,
+                                      {fp8_two_level_interval}>;
 
 using Ktraits_custom_mask = {kernel_traits_header}
                             {loop_step},
@@ -1542,7 +1551,9 @@ using Ktraits_custom_mask = {kernel_traits_header}
                             {enable_attn_logit_softcapping_flag},
                             {return_softmax_stats_flag},
                             {enable_skip_softmax_flag},
-                            {output_dtype_}>;
+                            {output_dtype_},
+                            0, 0, 0,
+                            {fp8_two_level_interval}>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -4071,6 +4082,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
     sage_block_sizes: tuple[int, int, int] | None = None,
     output_dtype: str | None = None,
     enable_skip_softmax: bool = False,
+    fp8_two_level_interval: int = 0,
 ) -> None:
     scheduling_mode = int(os.getenv("SCHEDULING_MODE", "1"))
 
@@ -4138,6 +4150,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
                     enable_skip_softmax=enable_skip_softmax,
+                    fp8_two_level_interval=fp8_two_level_interval,
                 )
             )
 
@@ -4175,6 +4188,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
                     enable_skip_softmax=enable_skip_softmax,
+                    fp8_two_level_interval=fp8_two_level_interval,
                 )
             )
 
@@ -4212,6 +4226,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
                     enable_skip_softmax=enable_skip_softmax,
+                    fp8_two_level_interval=fp8_two_level_interval,
                 )
             )
 
@@ -4250,6 +4265,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
+                    fp8_two_level_interval=fp8_two_level_interval,
                 )
             )
 
