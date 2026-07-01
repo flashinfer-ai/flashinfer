@@ -1265,14 +1265,12 @@ class GroupedQueryAttentionDecode:
                 softmax_warpgroups,
                 softmax_phase,
             )
-            assert len(range_args) == mask_config.num_phases(), (
-                "range_args profile mismatch"
-            )
+            num_mask_phases = len(range_args)
 
             # Masking phase loop over all sequence tiles
-            for mask_phase in cutlass.range_constexpr(mask_config.num_phases()):
+            for mask_phase in cutlass.range_constexpr(num_mask_phases):
                 # Sequence tile loop per masking phase
-                start, stop, step = range_args[mask_phase]
+                start, stop, step, is_masked = range_args[mask_phase]
                 for coord_s in cutlass.range(start, stop, step):
                     s_token = s_consumer.try_wait()
                     p_token = p_producer.try_acquire()
@@ -1286,7 +1284,7 @@ class GroupedQueryAttentionDecode:
                     s_handle.release()
 
                     # Apply mask
-                    if cutlass.const_expr(mask_config.is_masked_phase(mask_phase)):
+                    if cutlass.const_expr(is_masked):
                         masked = cute.make_rmem_tensor(
                             (blk_tile_h, blk_tile_p, tiles_sm), acc_dtype
                         )

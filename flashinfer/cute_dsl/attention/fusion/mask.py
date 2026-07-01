@@ -97,18 +97,6 @@ class DataclassJIT:
 class AttentionMask(ABC, DataclassJIT):
     """ABC interface for attention masking configurations."""
 
-    @abstractmethod
-    def num_phases(self) -> int:
-        """Compile-time number of masking phases over the entire KV sequence outer mainloop,
-        where each phase can optionally generate masking code.
-        """
-        ...
-
-    @abstractmethod
-    def is_masked_phase(self, phase: int) -> bool:
-        """Compile-time condition deciding whether to generate masking code for a given phase."""
-        ...
-
     @cute.jit
     @abstractmethod
     def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
@@ -129,8 +117,8 @@ class AttentionMask(ABC, DataclassJIT):
         kv_split_idx,
         warpgroups_kv,
         warpgroup_kv_idx,
-    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
-        """Return a 3-tuple of args to cutlass.range for each masking phase.
+    ) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
+        """Return args to cutlass.range and a mask codegen flag for each masking phase.
 
         For phases that generate masking code, range args must emit
         tile_kv coordinates (index into total number of tiles KV across entire KV sequence)
@@ -170,12 +158,6 @@ class NoMask(AttentionMask):
     Valid for when KV sequence is a multiple of KV sequence tile.
     """
 
-    def num_phases(self) -> int:
-        return 1
-
-    def is_masked_phase(self, phase: int) -> bool:
-        return False
-
     @cute.jit
     def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
         return False
@@ -193,19 +175,13 @@ class NoMask(AttentionMask):
         kv_split_idx,
         warpgroups_kv,
         warpgroup_kv_idx,
-    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
-        return ((warpgroup_kv_idx, num_iters_kv, warpgroups_kv),)
+    ) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
+        return ((warpgroup_kv_idx, num_iters_kv, warpgroups_kv, False),)
 
 
 @dataclass(frozen=True)
 class DenseMask(AttentionMask):  # aka ResidualMask
     """Every token attends to every other token."""
-
-    def num_phases(self) -> int:
-        return 2
-
-    def is_masked_phase(self, phase: int) -> bool:
-        return phase == 1
 
     @cute.jit
     def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
@@ -224,7 +200,7 @@ class DenseMask(AttentionMask):  # aka ResidualMask
         kv_split_idx,
         warpgroups_kv,
         warpgroup_kv_idx,
-    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
+    ) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
         is_last_split = kv_split_idx == (num_tiles_kv - 1) % kv_splits
         is_last_phase = warpgroup_kv_idx == (num_iters_kv - 1) % warpgroups_kv
 
@@ -240,20 +216,14 @@ class DenseMask(AttentionMask):  # aka ResidualMask
             masked_step = 1
 
         return (
-            (unmasked_start, unmasked_end, unmasked_step),
-            (masked_start, masked_end, masked_step),
+            (unmasked_start, unmasked_end, unmasked_step, False),
+            (masked_start, masked_end, masked_step, True),
         )
 
 
 @dataclass(frozen=True)
 class CausalMask(AttentionMask):
     """Current tokens only attend to past tokens and itself."""
-
-    def num_phases(self) -> int:
-        return 2
-
-    def is_masked_phase(self, phase: int) -> bool:
-        return phase == 1
 
     @cute.jit
     def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
@@ -273,7 +243,7 @@ class CausalMask(AttentionMask):
         kv_split_idx,
         warpgroups_kv,
         warpgroup_kv_idx,
-    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
+    ) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
         is_last_split = kv_split_idx == (num_tiles_kv - 1) % kv_splits
         is_prev_split = kv_split_idx == (num_tiles_kv - 2) % kv_splits
         is_last_phase = warpgroup_kv_idx == (num_iters_kv - 1) % warpgroups_kv
@@ -310,8 +280,8 @@ class CausalMask(AttentionMask):
                 masked_step = 1
 
         return (
-            (unmasked_start, unmasked_end, unmasked_step),
-            (masked_start, masked_end, masked_step),
+            (unmasked_start, unmasked_end, unmasked_step, False),
+            (masked_start, masked_end, masked_step, True),
         )
 
 
@@ -332,15 +302,6 @@ class SlidingWindowMask(AttentionMask):
     # use int for compile-time config and Int32 for runtime config
     window_left: Optional[int | Int32]
     window_right: Optional[int | Int32] = 0
-
-    def num_phases(self) -> int:
-        # Assume KV seqlen roughly matches window size and that
-        # window is small enough to not need an unmasked phase
-        # Can revisit this for perf for very large windows
-        return 1
-
-    def is_masked_phase(self, phase: int) -> bool:
-        return True
 
     @cute.jit
     def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
@@ -365,11 +326,14 @@ class SlidingWindowMask(AttentionMask):
         kv_split_idx,
         warpgroups_kv,
         warpgroup_kv_idx,
-    ) -> tuple[tuple[Int32, Int32, Int32], ...]:
+    ) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
+        # Assume KV seqlen roughly matches window size and that
+        # window is small enough to not need an unmasked phase.
+        # Can revisit this for perf for very large windows.
         masked_start = kv_split_idx + warpgroup_kv_idx * kv_splits
         masked_stop = num_tiles_kv
         masked_step = warpgroups_kv * kv_splits
-        return ((masked_start, masked_stop, masked_step),)
+        return ((masked_start, masked_stop, masked_step, True),)
 
 
 #

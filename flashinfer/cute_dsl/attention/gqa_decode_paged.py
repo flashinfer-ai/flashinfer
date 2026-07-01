@@ -1459,9 +1459,7 @@ class GroupedQueryAttentionDecodePaged:
                 softmax_warpgroups,
                 softmax_phase,
             )
-            assert len(range_args) == mask_config.num_phases(), (
-                "range_args profile mismatch"
-            )
+            num_mask_phases = len(range_args)
 
             if cutlass.const_expr(enable_blasst):
                 # Tile skip tracking
@@ -1474,9 +1472,9 @@ class GroupedQueryAttentionDecodePaged:
 
             # Masking phase loop over all sequence tiles
             loop_idx = 0
-            for mask_phase in cutlass.range_constexpr(mask_config.num_phases()):
+            for mask_phase in cutlass.range_constexpr(num_mask_phases):
                 # Sequence tile loop per masking phase
-                start, stop, step = range_args[mask_phase]
+                start, stop, step, is_masked = range_args[mask_phase]
                 for coord_s in cutlass.range(start, stop, step):
                     # Load S from tmem and notify BMM1
                     s_token = s_consumer.try_wait()
@@ -1488,7 +1486,7 @@ class GroupedQueryAttentionDecodePaged:
                     s_handle.release()
 
                     # Apply mask
-                    if cutlass.const_expr(mask_config.is_masked_phase(mask_phase)):
+                    if cutlass.const_expr(is_masked):
                         masked = cute.make_rmem_tensor(
                             (blk_tile_h, blk_tile_p, tiles_sm), acc_dtype
                         )
