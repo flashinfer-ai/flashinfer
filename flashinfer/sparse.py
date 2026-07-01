@@ -905,7 +905,7 @@ class BlockSparseAttentionWrapper:
             )
 
             # BSHD -> NHD: [1, M, H, D][0] -> [M, H, D]
-            output = o_bsa[0].contiguous()
+            output = o_bsa[0]
             if out is not None:
                 out.copy_(output)
                 output = out
@@ -945,7 +945,7 @@ class BlockSparseAttentionWrapper:
             )
 
             # BSHD -> NHD
-            output = o_bsa[0].contiguous()
+            output = o_bsa[0]
             if out is not None:
                 out.copy_(output)
                 output = out
