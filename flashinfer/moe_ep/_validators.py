@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .config import FleetParams, QuantType
+from .config import BootstrapConfig, FleetParams, QuantType
 
 if TYPE_CHECKING:
+    from ..fused_moe.api import MoEConfig
     from .algo_knobs import FleetAlgoKnobQuantization
 
 
@@ -86,3 +87,61 @@ def validate_fleet_params(
                         f"nixl_ep: UE8M0 quantization requires sm_100+ (Blackwell); "
                         f"host has sm_{cc[0]}{cc[1]}"
                     )
+
+
+def validate_compute_consistency(
+    fleet_params: FleetParams,
+    bootstrap: BootstrapConfig,
+    compute_config: "MoEConfig",
+) -> None:
+    """Check the EP comm config and the unified-compute ``MoEConfig`` agree.
+
+    The two configs are authored separately (one sizes the transport, one drives
+    the per-expert FFN), so a mismatch is easy to introduce and produces a wrong
+    result rather than an error.  Enforce the shared invariants up front:
+
+    * global expert count: ``RoutingConfig.num_experts == FleetParams.num_experts``
+    * hidden size: compute is inferred from tensors, but the EP buffer is sized by
+      ``FleetParams.token_hidden_size`` — they must match (checked at forward via
+      tensor shapes; here we only sanity-check the static fields).
+    * per-rank sharding: ``ExpertConfig.local_num_experts`` and
+      ``local_expert_offset`` must match this rank's slice of the global experts.
+    """
+    world_size = bootstrap.world_size
+    rank = bootstrap.rank
+    routing = compute_config.routing
+    experts = compute_config.experts
+
+    if routing.num_experts != fleet_params.num_experts:
+        raise MoEEpConfigError(
+            f"RoutingConfig.num_experts ({routing.num_experts}) != "
+            f"FleetParams.num_experts ({fleet_params.num_experts}); the global "
+            "expert count must be a single source of truth."
+        )
+
+    expected_local = fleet_params.num_experts // world_size
+    local = experts.local_num_experts or routing.num_experts
+    if local != expected_local:
+        raise MoEEpConfigError(
+            f"ExpertConfig.local_num_experts ({local}) != "
+            f"num_experts // world_size ({expected_local}); each rank owns an "
+            "equal shard of the global experts."
+        )
+
+    expected_offset = rank * expected_local
+    if experts.local_expert_offset != expected_offset:
+        raise MoEEpConfigError(
+            f"ExpertConfig.local_expert_offset ({experts.local_expert_offset}) != "
+            f"rank * local_num_experts ({expected_offset}) for rank {rank}."
+        )
+
+    # The EP bridge reshapes a finalized [M, hidden] tensor back for combine, and
+    # RANK_MAJOR/HT rely on the runner's weighted local pre-reduce. do_finalize=False
+    # would pass the un-reduced expert outputs through, which MoEEpLayer then
+    # consumes as if finalized.
+    if not compute_config.execution.do_finalize:
+        raise MoEEpConfigError(
+            "compute_config.execution.do_finalize must be True for MoE-EP: the "
+            "bridge consumes a finalized [M, hidden] output and RANK_MAJOR/HT need "
+            "the runner's weighted local pre-reduce."
+        )

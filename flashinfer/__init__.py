@@ -94,7 +94,7 @@ from .fused_moe import (
     trtllm_fp8_per_tensor_scale_moe,
 )
 
-# CuteDSL MoE high-level APIs (conditionally if cute_dsl available)
+# CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
@@ -102,7 +102,7 @@ with contextlib.suppress(ImportError):
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
-from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+    from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8

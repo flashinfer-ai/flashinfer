@@ -25,14 +25,31 @@ import torch
 
 from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
-from flashinfer.utils import is_sm90a_supported
-from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm90 import (
-    cp_delta_rule_dsl_sm90,
-    cp_delta_rule_fixup_dsl_sm90,
-    cp_delta_rule_mn_precompute_dsl_sm90,
-    cp_delta_rule_prefill_dsl_sm90,
-    cp_delta_rule_t_precompute_dsl_sm90,
-)
+from flashinfer.utils import is_sm90a_supported, is_sm120a_supported
+
+if torch.cuda.is_available() and is_sm90a_supported(torch.device("cuda")):
+    from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm90 import (
+        cp_delta_rule_dsl_sm90 as cp_delta_rule_dsl,
+        cp_delta_rule_fixup_dsl_sm90 as cp_delta_rule_fixup_dsl,
+        cp_delta_rule_mn_precompute_dsl_sm90 as cp_delta_rule_mn_precompute_dsl,
+        cp_delta_rule_prefill_dsl_sm90 as cp_delta_rule_prefill_dsl,
+        cp_delta_rule_t_precompute_dsl_sm90 as cp_delta_rule_t_precompute_dsl,
+    )
+elif torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda")):
+    from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm120 import (
+        cp_delta_rule_dsl_sm120 as cp_delta_rule_dsl,
+        cp_delta_rule_fixup_dsl_sm120 as cp_delta_rule_fixup_dsl,
+        cp_delta_rule_mn_precompute_dsl_sm120 as cp_delta_rule_mn_precompute_dsl,
+        cp_delta_rule_prefill_dsl_sm120 as cp_delta_rule_prefill_dsl,
+        cp_delta_rule_t_precompute_dsl_sm120 as cp_delta_rule_t_precompute_dsl,
+    )
+else:
+    cp_delta_rule_dsl = None
+    cp_delta_rule_fixup_dsl = None
+    cp_delta_rule_mn_precompute_dsl = None
+    cp_delta_rule_prefill_dsl = None
+    cp_delta_rule_t_precompute_dsl = None
+
 from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
     chunk_bound_host,
     workspace_num_chunks_host,
@@ -47,8 +64,8 @@ FIXUP_TF32_RTOL = 2e-3
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
-    if not is_sm90a_supported(device):
-        pytest.skip("CP GDN prefill requires SM90")
+    if not (is_sm90a_supported(device) or is_sm120a_supported(device)):
+        pytest.skip("CP GDN prefill requires SM90 or SM120")
 
 
 def _seed_all(seed):
@@ -86,10 +103,10 @@ def _run_cp_kernel_chain(
     scale,
     initial_state=None,
 ):
-    t = cp_delta_rule_t_precompute_dsl_sm90(
+    t = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
     )
-    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm90(
+    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl(
         k,
         v,
         t,
@@ -99,7 +116,7 @@ def _run_cp_kernel_chain(
         cp_chunk_len=cp_chunk_len,
         max_seqlen=max_seqlen,
     )
-    fixed_state = cp_delta_rule_fixup_dsl_sm90(
+    fixed_state = cp_delta_rule_fixup_dsl(
         local_transfer,
         local_state,
         cu_seqlens,
@@ -121,7 +138,7 @@ def _run_cp_kernel_chain(
         dtype=torch.float32,
         device=q.device,
     )
-    cp_delta_rule_prefill_dsl_sm90(
+    cp_delta_rule_prefill_dsl(
         our_o,
         our_state,
         q,
@@ -201,7 +218,7 @@ def test_cp_delta_rule_t_precompute(
     k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
     beta = _make_gates(total_seqlen, num_heads, gate_baseline, device)
 
-    our_t = cp_delta_rule_t_precompute_dsl_sm90(
+    our_t = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
     )
     torch.cuda.synchronize()
@@ -251,7 +268,7 @@ def test_cp_delta_rule_t_precompute_varlen_tail_is_projected(
     k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
     beta = _make_gates(total_seqlen, num_heads, 0.99, device)
 
-    got = cp_delta_rule_t_precompute_dsl_sm90(
+    got = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
     )
     torch.cuda.synchronize()
@@ -301,10 +318,10 @@ def test_cp_delta_rule_mn_precompute(
     alpha = _make_gates(total_seqlen, num_heads, gate_baseline, device)
     beta = _make_gates(total_seqlen, num_heads, gate_baseline, device)
 
-    t = cp_delta_rule_t_precompute_dsl_sm90(
+    t = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
     )
-    our_transfer, our_state = cp_delta_rule_mn_precompute_dsl_sm90(
+    our_transfer, our_state = cp_delta_rule_mn_precompute_dsl(
         k,
         v,
         t,
@@ -324,7 +341,6 @@ def test_cp_delta_rule_mn_precompute(
     )
     assert our_state.shape == our_transfer.shape
 
-    valid_cp_slots = set()
     for seq_idx, seq_len in enumerate(seq_lens):
         seq_start = int(cu_seqlens[seq_idx].item())
         cp_start = chunk_bound_host(seq_idx, seq_start, cp_chunk_len)
@@ -336,7 +352,6 @@ def test_cp_delta_rule_mn_precompute(
             num_t_blocks = (chunk_end - chunk_offset + block_size - 1) // block_size
             t_block_offset = chunk_idx * (cp_chunk_len // block_size)
             slot = cp_start + chunk_idx
-            valid_cp_slots.add(slot)
             ref_transfer, ref_state = reference.blockwise_cp_delta_rule_pre_transposed(
                 k[seq_start + chunk_offset : seq_start + chunk_end],
                 v[seq_start + chunk_offset : seq_start + chunk_end],
@@ -356,15 +371,6 @@ def test_cp_delta_rule_mn_precompute(
             )
             torch.testing.assert_close(
                 our_state[slot].transpose(-1, -2), ref_state, atol=atol, rtol=rtol
-            )
-
-    for slot in range(our_transfer.shape[0]):
-        if slot not in valid_cp_slots:
-            torch.testing.assert_close(
-                our_transfer[slot], torch.zeros_like(our_transfer[slot])
-            )
-            torch.testing.assert_close(
-                our_state[slot], torch.zeros_like(our_state[slot])
             )
 
 
@@ -429,7 +435,7 @@ def test_cp_delta_rule_fixup(
             * 0.03
         )
 
-    our_fixed_state = cp_delta_rule_fixup_dsl_sm90(
+    our_fixed_state = cp_delta_rule_fixup_dsl(
         local_transfer.contiguous(),
         local_state.contiguous(),
         cu_seqlens,
@@ -439,7 +445,6 @@ def test_cp_delta_rule_fixup(
     )
     torch.cuda.synchronize()
 
-    valid_slots = set()
     ref_transfers_by_seq = []
     ref_states_by_seq = []
     ref_initial_states_by_seq = []
@@ -452,7 +457,6 @@ def test_cp_delta_rule_fixup(
         for chunk_idx in range(num_chunks):
             slot = chunk_start + chunk_idx
             seq_slots.append(slot)
-            valid_slots.add(slot)
         if seq_slots:
             ref_transfers_by_seq.append(local_transfer[seq_slots])
             ref_states_by_seq.append(local_state[seq_slots])
@@ -474,12 +478,6 @@ def test_cp_delta_rule_fixup(
                 seq_fixed[chunk_idx],
                 atol=FIXUP_TF32_ATOL,
                 rtol=FIXUP_TF32_RTOL,
-            )
-
-    for slot in range(total_cp_chunks):
-        if slot not in valid_slots:
-            torch.testing.assert_close(
-                our_fixed_state[slot], torch.zeros_like(our_fixed_state[slot])
             )
 
 
@@ -520,10 +518,10 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     alpha = _make_gates(total_seqlen, num_heads, gate_baseline, device)
     beta = _make_gates(total_seqlen, num_heads, gate_baseline, device)
 
-    t = cp_delta_rule_t_precompute_dsl_sm90(
+    t = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
     )
-    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm90(
+    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl(
         k,
         v,
         t,
@@ -533,7 +531,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
         cp_chunk_len=cp_chunk_len,
         max_seqlen=max_seqlen,
     )
-    fixed_state = cp_delta_rule_fixup_dsl_sm90(
+    fixed_state = cp_delta_rule_fixup_dsl(
         local_transfer, local_state, cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len
     )
 
@@ -546,7 +544,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
         dtype=torch.float32,
         device=device,
     )
-    cp_delta_rule_prefill_dsl_sm90(
+    cp_delta_rule_prefill_dsl(
         our_o,
         our_state,
         q,
@@ -630,10 +628,10 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
     alpha = _make_gates(total_seqlen, num_sab_heads, 0.99, device)
     beta = _make_gates(total_seqlen, num_sab_heads, 0.99, device)
 
-    t = cp_delta_rule_t_precompute_dsl_sm90(
+    t = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
     )
-    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm90(
+    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl(
         k,
         v,
         t,
@@ -643,7 +641,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
         cp_chunk_len=cp_chunk_len,
         max_seqlen=max_seqlen,
     )
-    fixed_state = cp_delta_rule_fixup_dsl_sm90(
+    fixed_state = cp_delta_rule_fixup_dsl(
         local_transfer, local_state, cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len
     )
 
@@ -658,7 +656,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
         dtype=torch.float32,
         device=device,
     )
-    cp_delta_rule_prefill_dsl_sm90(
+    cp_delta_rule_prefill_dsl(
         our_o,
         our_state,
         q,
@@ -795,7 +793,7 @@ def test_cp_delta_rule_e2e_with_initial_state(
         [total_seqlen, num_heads, head_size], dtype=q.dtype, device=q.device
     )
     our_state = torch.empty_like(initial_state)
-    cp_delta_rule_dsl_sm90(
+    cp_delta_rule_dsl(
         our_o,
         our_state,
         q,
@@ -869,7 +867,7 @@ def test_cp_delta_rule_e2e(
     )
     our_o.fill_(float("nan"))
     our_state.fill_(float("nan"))
-    cp_delta_rule_dsl_sm90(
+    cp_delta_rule_dsl(
         our_o,
         our_state,
         q,

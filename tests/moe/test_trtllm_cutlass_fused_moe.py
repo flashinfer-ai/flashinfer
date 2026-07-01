@@ -537,6 +537,74 @@ def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+def test_moe_unfused_finalize(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
+    """``use_fused_finalize=False`` selects the non-fused finalize path.
+
+    Unlike the fused GEMM2 epilogue (which reduces expert outputs via non-associative
+    atomics), this path must be bit-wise reproducible run-to-run while still matching
+    the reference.
+    """
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float16
+        ).cuda()
+        / 5
+    )
+    w2_weight = (
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, dtype=torch.float16
+        ).cuda()
+        / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts(
+        num_experts,
+        x,
+        w31_weight,
+        w2_weight,
+        selected_experts,
+        routing_weights,
+    )
+
+    def run_unfused():
+        out = torch.empty_like(ref_output)
+        return fused_moe.cutlass_fused_moe(
+            x,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            out.dtype,
+            output=out,
+            quant_scales=None,
+            use_fused_finalize=False,
+        )[0]
+
+    out1 = run_unfused()
+    out2 = run_unfused()
+
+    torch.testing.assert_close(ref_output, out1, rtol=1e-2, atol=1e-2)
+    assert torch.equal(out1, out2), (
+        "non-fused finalize path must produce deterministic results"
+    )
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("otype, wtype", [(torch.float16, torch.float8_e4m3fn)])
 @pytest.mark.parametrize(
     "activation_type",

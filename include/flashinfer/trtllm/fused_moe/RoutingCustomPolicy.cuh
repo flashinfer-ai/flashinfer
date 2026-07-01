@@ -697,17 +697,20 @@ struct PolicyTraits<SoftmaxPreprocess, NoOpPostprocess> {
 /// None + Softmax (Renormalize): many model configs.
 template <>
 struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> {
-  using Pairs = TierList<Tier<128, 4>,   // Mixtral 8x7B (topK=2), Qwen2-MoE (topK=4), Arctic
-                                         // (topK=2), DBRX (topK=4), GPT-OSS
-                         Tier<128, 8>,   // DeepSeek-V2-Lite (topK=6), Mixtral 8x22B (topK=2)
-                         Tier<160, 8>,   // Qwen3-Coder-480B
-                         Tier<256, 8>,   // Mistral Large 3 (topK=8)
-                         Tier<256, 16>,  // Models with 256 experts and topK 9..16
-                         Tier<512, 8>,   // Various 512-expert models
-                         Tier<512, 16>,  // Various 512-expert models with high topK
-                         Tier<512, 22>,  // Nemotron Super V3 (512 experts, topK=22)
-                         Tier<576, 8>,   // Customized model with 576 experts
-                         Tier<2048, 32>  // Large-expert fallback
+  using Pairs = TierList<Tier<128, 4>,    // Mixtral 8x7B (topK=2), Qwen2-MoE (topK=4), Arctic
+                                          // (topK=2), DBRX (topK=4), GPT-OSS
+                         Tier<128, 8>,    // DeepSeek-V2-Lite (topK=6), Mixtral 8x22B (topK=2)
+                         Tier<160, 8>,    // Qwen3-Coder-480B
+                         Tier<256, 8>,    // Mistral Large 3 (topK=8)
+                         Tier<256, 16>,   // Models with 256 experts and topK 9..16
+                         Tier<512, 8>,    // Various 512-expert models
+                         Tier<512, 16>,   // Various 512-expert models with high topK
+                         Tier<512, 22>,   // Nemotron Super V3 (512 experts, topK=22)
+                         Tier<512, 32>,   // 512-expert models with topK 23..32
+                         Tier<576, 8>,    // Customized model with 576 experts
+                         Tier<768, 32>,   // 576..768 experts with high topK
+                         Tier<1024, 32>,  // 768..1024 experts with high topK
+                         Tier<2048, 32>   // Large-expert fallback
                          >;
 };
 
@@ -752,18 +755,36 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
 // Generic per-policy dispatch.  Iterates PolicyTraits<PreProc, PostProc>::Pairs,
 // picking the first (expert, topK) pair that covers the runtime values.
 //
-// IMPORTANT: numThreads is clamped to at least min(MaxNumExperts, 1024) from the dispatched tier.
-#define LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,     \
-                                  stream, PreProc, PostProc)                                     \
+// THREAD-COUNT SAFETY: the default launch config clamps the launch thread count to at
+// least min(MaxNumExperts, 1024) from the dispatched tier. This prevents mismatches
+// when a policy's smallest tier is larger than getMaxNumExperts() returns for the
+// same numExperts. Kernels with a different internal block size can pass a custom
+// LaunchConfig through the WITH_CONFIG variants and must keep their own launch
+// bounds, blockDim, and gridDim consistent.
+template <int MaxNumExperts, int MaxNumTopExperts>
+struct DefaultRoutingLaunchConfig {
+  static constexpr int BlockDim = MaxNumExperts <= 1024 ? MaxNumExperts : 1024;
+
+  static int blockDim(Data const& /*data*/, int numThreads) {
+    return std::max(numThreads, BlockDim);
+  }
+
+  static int gridDim(Data const& /*data*/, int numBlocks, int /*blockDim*/) { return numBlocks; }
+};
+
+#define LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads,   \
+                                              smemSize, stream, PreProc, PostProc, LaunchConfig) \
   [&](auto pt_tag_) {                                                                            \
     using Pairs_ = typename decltype(pt_tag_)::Pairs;                                            \
     bool dispatched_ =                                                                           \
         dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [&](auto eTag_, auto kTag_) {     \
-          constexpr int tierMaxExp_ = decltype(eTag_)::value;                                    \
-          constexpr int tierThreads_ = tierMaxExp_ <= 1024 ? tierMaxExp_ : 1024;                 \
-          int const effectiveThreads_ = std::max(static_cast<int>(numThreads), tierThreads_);    \
-          LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, effectiveThreads_,   \
-                                       smemSize, stream, PreProc, PostProc,                      \
+          using LaunchConfig_ = LaunchConfig<decltype(eTag_)::value, decltype(kTag_)::value>;    \
+          int const effectiveThreads_ =                                                          \
+              LaunchConfig_::blockDim(data, static_cast<int>(numThreads));                       \
+          int const effectiveBlocks_ =                                                           \
+              LaunchConfig_::gridDim(data, static_cast<int>(numBlocks), effectiveThreads_);      \
+          LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, effectiveBlocks_,               \
+                                       effectiveThreads_, smemSize, stream, PreProc, PostProc,   \
                                        decltype(eTag_)::value, decltype(kTag_)::value);          \
         });                                                                                      \
     if (!dispatched_) {                                                                          \
@@ -774,6 +795,11 @@ struct PolicyTraits<NoOpPreprocess, NoOpPostprocess> {
           data.mTopK);                                                                           \
     }                                                                                            \
   }(PolicyTraits<PreProc, PostProc>{})
+
+#define LAUNCH_ROUTING_FOR_POLICY(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,       \
+                                  stream, PreProc, PostProc)                                       \
+  LAUNCH_ROUTING_FOR_POLICY_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
+                                        stream, PreProc, PostProc, DefaultRoutingLaunchConfig)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // CUSTOM EXPERT SELECT DISPATCH
@@ -898,19 +924,22 @@ inline bool queryPolicySupportsBlockPerToken(Data const& data) {
 }
 
 // Top-level dispatch: maps runtime preprocess/postprocess enums to compile-time policy types,
-// then delegates to LAUNCH_ROUTING_FOR_POLICY which reads PolicyTraits for tier support.
-#define LAUNCH_ROUTING_CUSTOM(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream) \
+// then delegates to the policy tier list using the supplied launch config.
+#define LAUNCH_ROUTING_CUSTOM_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads,       \
+                                          smemSize, stream, LaunchConfig)                        \
   dispatchRoutingPolicy(data, [&](auto preProc_, auto postProc_, char const* policyName_) {      \
     using PreProc_ = decltype(preProc_);                                                         \
     using PostProc_ = decltype(postProc_);                                                       \
     using Pairs_ = typename PolicyTraits<PreProc_, PostProc_>::Pairs;                            \
     bool dispatched_ =                                                                           \
         dispatchTierPairs(static_cast<Pairs_*>(nullptr), data, [&](auto eTag_, auto kTag_) {     \
-          constexpr int tierMaxExp_ = decltype(eTag_)::value;                                    \
-          constexpr int tierThreads_ = tierMaxExp_ <= 1024 ? tierMaxExp_ : 1024;                 \
-          int const effectiveThreads_ = std::max(static_cast<int>(numThreads), tierThreads_);    \
-          LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, effectiveThreads_,   \
-                                       smemSize, stream, PreProc_, PostProc_,                    \
+          using LaunchConfig_ = LaunchConfig<decltype(eTag_)::value, decltype(kTag_)::value>;    \
+          int const effectiveThreads_ =                                                          \
+              LaunchConfig_::blockDim(data, static_cast<int>(numThreads));                       \
+          int const effectiveBlocks_ =                                                           \
+              LaunchConfig_::gridDim(data, static_cast<int>(numBlocks), effectiveThreads_);      \
+          LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, effectiveBlocks_,               \
+                                       effectiveThreads_, smemSize, stream, PreProc_, PostProc_, \
                                        decltype(eTag_)::value, decltype(kTag_)::value);          \
         });                                                                                      \
     if (!dispatched_) {                                                                          \
@@ -921,6 +950,10 @@ inline bool queryPolicySupportsBlockPerToken(Data const& data) {
           data.mTopK);                                                                           \
     }                                                                                            \
   })
+
+#define LAUNCH_ROUTING_CUSTOM(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream) \
+  LAUNCH_ROUTING_CUSTOM_WITH_CONFIG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,   \
+                                    stream, DefaultRoutingLaunchConfig)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
