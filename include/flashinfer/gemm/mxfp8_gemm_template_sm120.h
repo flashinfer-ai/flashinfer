@@ -246,8 +246,25 @@ size_t genericMxfp8GemmKernelLauncherSm120(void* D, void const* A, void const* B
     }                                                                                             \
     auto initStatus = gemm.initialize(args, workspace, stream);                                   \
     if (initStatus != cutlass::Status::kSuccess) {                                                \
+      /* kErrorInternal from initialize() typically means cudaFuncSetAttribute failed when        \
+       * requesting more dynamic shared memory than the device allows.  SM121 (GB10 / DGX Spark   \
+       * GeForce Blackwell) has ~99 KB shared-memory opt-in per SM, while the 256×128 and        \
+       * 128×256 CTA tiles compiled with StageCount<2> require ~99 KB — right at the limit.    \
+       * The Python-side _probe_mxfp8_gemm_tactics() pre-filters these tactics so the             \
+       * autotuner never reaches this path on SM121. */                                           \
+      std::string smem_hint;                                                                      \
+      if (initStatus == cutlass::Status::kErrorInternal) {                                        \
+        int device_id, max_smem_optin;                                                            \
+        if (cudaGetDevice(&device_id) == cudaSuccess &&                                           \
+            cudaDeviceGetAttribute(&max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,      \
+                                   device_id) == cudaSuccess) {                                   \
+          smem_hint = " (Device shared-memory opt-in limit: " + std::to_string(max_smem_optin) +  \
+                      " bytes.  256x128 and 128x256 tiles need ~101376 bytes with StageCount<2>"  \
+                      " and will fail on devices with less than that.)";                          \
+        }                                                                                         \
+      }                                                                                           \
       std::string errMsg = "Failed to initialize cutlass MXFP8 gemm on sm120. Error: " +          \
-                           std::string(cutlass::cutlassGetStatusString(initStatus));              \
+                           std::string(cutlass::cutlassGetStatusString(initStatus)) + smem_hint;  \
       throw std::runtime_error("[MXFP8 SM120 gemm Runner] " + errMsg);                            \
     }                                                                                             \
     auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);              \
