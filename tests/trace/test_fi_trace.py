@@ -617,6 +617,68 @@ def test_usecase_sampling_vocab_discovery():
     assert parsed["outputs"]["samples"]["dtype"] == "int64"
 
 
+def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
+    import flashinfer.mla
+
+    common = {
+        "kv_cache": torch.empty(4, 64, 576, dtype=torch.bfloat16),
+        "workspace_buffer": torch.empty(1024, dtype=torch.int8),
+        "qk_nope_head_dim": 512,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "block_tables": torch.zeros(2, 1, dtype=torch.int32),
+        "seq_lens": torch.full((2,), 64, dtype=torch.int32),
+        "max_seq_len": 64,
+    }
+
+    dense = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        query=torch.empty(2, 3, 128, 576, dtype=torch.bfloat16),
+        **common,
+    )
+    _check_defn(
+        dense,
+        "mla_paged",
+        "flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+    )
+    assert dense["name"].startswith("trtllm_batch_decode_mla_dense")
+    assert dense["inputs"]["query"]["shape"] == [
+        "batch_size",
+        "q_len_per_request",
+        "num_heads",
+        "head_dim_qk",
+    ]
+    assert dense["outputs"]["output"]["shape"] == [
+        "batch_size",
+        "q_len_per_request",
+        "num_heads",
+        "kv_lora_rank",
+    ]
+
+    ragged = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        query=torch.empty(5, 128, 576, dtype=torch.bfloat16),
+        cum_seq_lens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+        max_q_len=3,
+        **common,
+    )
+    _check_defn(
+        ragged,
+        "mla_paged",
+        "flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla",
+    )
+    assert ragged["name"].startswith("trtllm_batch_decode_mla_ragged")
+    assert ragged["inputs"]["query"]["shape"] == [
+        "num_tokens",
+        "num_heads",
+        "head_dim_qk",
+    ]
+    assert ragged["outputs"]["output"]["shape"] == [
+        "num_tokens",
+        "num_heads",
+        "kv_lora_rank",
+    ]
+    assert ragged["inputs"]["max_q_len"]["shape"] is None
+
+
 # ---------------------------------------------------------------------------
 # JSON file output
 # ---------------------------------------------------------------------------
