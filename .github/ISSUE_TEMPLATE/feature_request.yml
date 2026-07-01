@@ -1,0 +1,59 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+labels: ["feature request", "needs-triage"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Attention
+        - GEMM
+        - MoE
+        - MoE Routing
+        - Communication (allreduce, alltoall)
+        - Norm (RMSNorm, etc.)
+        - Sampling / TopK
+        - Quantization (FP4, FP8, etc.)
+        - JIT Compilation
+        - New operation
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: framework
+    attributes:
+      label: Framework (if applicable)
+      options:
+        - None (direct FlashInfer API)
+        - vLLM
+        - SGLang
+        - TensorRT-LLM
+        - Other
+    validations:
+      required: false
+
+  - type: input
+    id: model
+    attributes:
+      label: Model (if applicable)
+      placeholder: e.g., DeepSeek-V3, Qwen3-Coder-480B, Llama-4-Maverick
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What would you like to see and why is it useful?
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: Target GPU (if relevant)
+      placeholder: e.g., H100/SM90, B200/SM100, RTX 5090/SM120
+    validations:
+      required: false
