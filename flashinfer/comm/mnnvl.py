@@ -356,7 +356,6 @@ class MnnvlConfig:
 
 @dataclass
 class _MnnvlAllocationRecord:
-    mapping: Mapping
     comm: CommBackend
     comm_size: int
     comm_rank: int
@@ -402,113 +401,20 @@ class MnnvlMemory:  # type: ignore[no-redef]
             if hasattr(self, "ptr"):
                 MnnvlMemory.close_mnnvl_memory(self.ptr)
 
+    @property
+    def mapped(self) -> bool:
+        return MnnvlMemory.allocated_map[self.ptr].mapped
+
     def as_torch_strided_tensor(self, dtype):
         record = MnnvlMemory.allocated_map[self.ptr]
-        num_segments = record.comm.Get_size()
         return pack_strided_memory(
             self.ptr,
             self.segment_size,
             self.rank_stride,
-            num_segments,
+            record.comm_size,
             dtype,
             MnnvlMemory.dev_id,
         )
-
-    def detach_handles(self) -> None:
-        """Release mapped MNNVL handles while keeping graph-visible VAs alive.
-
-        CUDA synchronization is performed internally before unmapping.
-        """
-        MnnvlMemory._detach_mnnvl_handles(self.ptr)
-
-    def reattach_handles(
-        self,
-        *,
-        comm: Optional[CommBackend] = None,
-    ) -> None:
-        """Map fresh MNNVL handles at the preserved virtual addresses.
-
-        CUDA synchronization is performed internally before remapping.
-        """
-        MnnvlMemory._reattach_mnnvl_handles(
-            self.ptr,
-            comm=comm,
-        )
-
-    def get_graph_visible_addresses(self) -> Dict[str, Any]:
-        """Return the VA/layout state captured by CUDA graph-visible tensors."""
-        record = MnnvlMemory.allocated_map[self.ptr]
-        return {
-            "ptr": self.ptr,
-            "segment_size": self.segment_size,
-            "rank_stride": self.rank_stride,
-            "start_address": record.start_address,
-            "address_offset": record.address_offset,
-            "aligned_size": record.aligned_size,
-            "comm_size": record.comm_size,
-            "comm_rank": record.comm_rank,
-            "rank_ptrs": [
-                record.start_address + i * record.rank_stride + record.address_offset
-                for i in range(record.comm_size)
-            ],
-        }
-
-    def validate_graph_visible_addresses(
-        self,
-        expected: Optional[Dict[str, Any]],
-        tensor: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Validate that graph-visible VAs and optional tensor metadata are stable."""
-        if expected is None:
-            raise RuntimeError("Missing captured MNNVL graph-visible address metadata")
-
-        current = self.get_graph_visible_addresses()
-        expected_keys = set(expected)
-        current_keys = set(current)
-        missing = expected_keys - current_keys
-        if missing:
-            field = sorted(missing)[0]
-            raise RuntimeError(
-                f"MNNVL graph-visible address metadata missing field {field!r}"
-            )
-        extra = current_keys - expected_keys
-        if extra:
-            field = sorted(extra)[0]
-            raise RuntimeError(
-                f"MNNVL graph-visible address metadata has extra field {field!r}"
-            )
-        for key, expected_value in expected.items():
-            current_value = current[key]
-            if current_value != expected_value:
-                raise RuntimeError(
-                    f"MNNVL graph-visible address field {key} changed: "
-                    f"{current_value!r} != {expected_value!r}"
-                )
-
-        if tensor is not None:
-            element_size = tensor.element_size()
-            if tensor.data_ptr() != current["ptr"]:
-                raise RuntimeError(
-                    f"MNNVL tensor data_ptr changed: {tensor.data_ptr()} "
-                    f"!= {current['ptr']}"
-                )
-            if tensor.size(0) != current["comm_size"]:
-                raise RuntimeError(
-                    f"MNNVL tensor rank dimension changed: {tensor.size(0)} "
-                    f"!= {current['comm_size']}"
-                )
-            expected_segment_elements = current["segment_size"] // element_size
-            if tensor.size(1) != expected_segment_elements:
-                raise RuntimeError(
-                    "MNNVL tensor segment dimension changed: "
-                    f"{tensor.size(1)} != {expected_segment_elements}"
-                )
-            if tensor.stride(0) * element_size != current["rank_stride"]:
-                raise RuntimeError(
-                    "MNNVL tensor rank stride changed: "
-                    f"{tensor.stride(0) * element_size} != "
-                    f"{current['rank_stride']}"
-                )
 
     @staticmethod
     def initialize():
@@ -524,10 +430,8 @@ class MnnvlMemory:  # type: ignore[no-redef]
 
     @staticmethod
     def set_comm_from_config(mapping: Mapping, config: MnnvlConfig = None):
-        MnnvlMemory.config = config or MnnvlConfig(comm_backend=MPIBackend())
-        if MnnvlMemory.config.comm_backend is None:
-            raise RuntimeError("MNNVL config must provide a communication backend")
-        comm = MnnvlMemory.config.comm_backend.Split(
+        MnnvlMemory.config = config or MnnvlConfig(comm_backend=MPIBackend())  # type: ignore[attr-defined]
+        comm = config.comm_backend.Split(
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
         )
         MnnvlMemory.comm = comm  # type: ignore[assignment]
@@ -536,15 +440,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
     def get_comm(mapping: Mapping):
         if MnnvlMemory.comm is not None:
             return MnnvlMemory.comm
-        if MnnvlMemory.config is not None:
-            config = MnnvlMemory.config
-            if config.comm_backend is not None:
-                comm = config.comm_backend.Split(
-                    mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
-                    mapping.tp_rank,
-                )
-                MnnvlMemory.comm = comm
-                return comm
         comm = MpiComm().Split(
             mapping.pp_rank * mapping.cp_size + mapping.cp_rank, mapping.tp_rank
         )
@@ -604,54 +499,64 @@ class MnnvlMemory:  # type: ignore[no-redef]
         ):
             return comm.allgather(exported_fabric_handle.data)
 
-        all_handles_data = comm.allgather(exported_fabric_handle)
-        all_pids = comm.allgather(os.getpid())
-        libc = ctypes.CDLL(None, use_errno=True)
-        syscall = libc.syscall
-        SYS_pidfd_open = 434
-        SYS_pidfd_getfd = 438
-        pidfds = []
-        for pid in all_pids:
-            pidfd = syscall(SYS_pidfd_open, pid, 0)
-            if pidfd < 0:
-                err = ctypes.get_errno()
-                raise RuntimeError(
-                    f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                )
-            pidfds.append(pidfd)
-
+        exported_fd = int(exported_fabric_handle)
         remote_fds = []
-        for pidfd, fd in zip(pidfds, all_handles_data, strict=True):
-            remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-            if remote_fd < 0:
-                err = ctypes.get_errno()
-                error_msg = (
-                    f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno "
-                    f"{err}: {os.strerror(err)}."
-                )
-                if err == 1:  # EPERM
-                    error_msg += (
-                        " Permission denied. If running in a container, try "
-                        "adding --cap-add=SYS_PTRACE to your docker run command."
-                    )
-                else:
-                    error_msg += (
-                        " This may be due to kernel version (requires Linux 5.6+)."
-                    )
-                raise RuntimeError(error_msg)
-            remote_fds.append(remote_fd)
+        try:
+            all_handles_data = comm.allgather(exported_fd)
+            all_pids = comm.allgather(os.getpid())
+            libc = ctypes.CDLL(None, use_errno=True)
+            syscall = libc.syscall
+            SYS_pidfd_open = 434
+            SYS_pidfd_getfd = 438
 
-        return remote_fds
+            for pid, fd in zip(all_pids, all_handles_data, strict=True):
+                pidfd = syscall(SYS_pidfd_open, pid, 0)
+                if pidfd < 0:
+                    err = ctypes.get_errno()
+                    raise RuntimeError(
+                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                    )
+                try:
+                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                    if remote_fd < 0:
+                        err = ctypes.get_errno()
+                        error_msg = (
+                            f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with "
+                            f"errno {err}: {os.strerror(err)}."
+                        )
+                        if err == 1:  # EPERM
+                            error_msg += (
+                                " Permission denied. If running in a container, "
+                                "try adding --cap-add=SYS_PTRACE to your docker "
+                                "run command."
+                            )
+                        else:
+                            error_msg += (
+                                " This may be due to kernel version "
+                                "(requires Linux 5.6+)."
+                            )
+                        raise RuntimeError(error_msg)
+                    remote_fds.append(remote_fd)
+                finally:
+                    os.close(pidfd)
+
+            # Every rank must duplicate every exported FD before its owner closes it.
+            comm.barrier()
+            return remote_fds
+        except BaseException:
+            for remote_fd in remote_fds:
+                os.close(remote_fd)
+            raise
+        finally:
+            os.close(exported_fd)
 
     @staticmethod
     def _create_and_map_mnnvl_handles(
-        mapping: Mapping,
+        comm: CommBackend,
         aligned_size: int,
         start_address: int,
         rank_stride: int,
         address_offset: int,
-        *,
-        comm: Optional[CommBackend] = None,
     ) -> List[Any]:
         dev = checkCudaErrors(cuda.cuCtxGetDevice())
         dev_id = int(dev)
@@ -659,7 +564,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
             f"Different dev_id found dev_id={dev_id} but "
             f"MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
         )
-        comm = comm or MnnvlMemory.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
         allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
@@ -670,27 +574,36 @@ class MnnvlMemory:  # type: ignore[no-redef]
             comm, allocation_prop, allocated_mem_handle
         )
 
-        madesc = cuda.CUmemAccessDesc()
-        madesc.location = allocation_prop.location
-        madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-
         mem_handles = [None] * comm_size
+        try:
+            madesc = cuda.CUmemAccessDesc()
+            madesc.location = allocation_prop.location
+            madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
 
-        for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = start_address + rank_stride * i + address_offset
-            if i == comm_rank:
-                mem_handles[i] = allocated_mem_handle
-            else:
-                imported_mem_handle = checkCudaErrors(
-                    cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, allocation_prop.requestedHandleTypes
+            for i, remote_handle_data in enumerate(all_handles_data):
+                rank_ptr = start_address + rank_stride * i + address_offset
+                if i == comm_rank:
+                    mem_handles[i] = allocated_mem_handle
+                else:
+                    imported_mem_handle = checkCudaErrors(
+                        cuda.cuMemImportFromShareableHandle(
+                            remote_handle_data, allocation_prop.requestedHandleTypes
+                        )
                     )
+                    mem_handles[i] = imported_mem_handle
+                checkCudaErrors(
+                    cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handles[i], 0)
                 )
-                mem_handles[i] = imported_mem_handle
-            checkCudaErrors(
-                cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handles[i], 0)
-            )
-            checkCudaErrors(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
+                checkCudaErrors(
+                    cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1)
+                )
+        finally:
+            if (
+                allocation_prop.requestedHandleTypes
+                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            ):
+                for shareable_fd in all_handles_data:
+                    os.close(int(shareable_fd))
 
         return mem_handles
 
@@ -747,15 +660,13 @@ class MnnvlMemory:  # type: ignore[no-redef]
         stride = MnnvlMemory.current_rank_stride
         comm = MnnvlMemory.get_comm(mapping)
         mem_handles = MnnvlMemory._create_and_map_mnnvl_handles(
-            mapping,
+            comm,
             aligned_size,
             MnnvlMemory.current_start_address,
             MnnvlMemory.current_rank_stride,
             MnnvlMemory.current_mem_offset,
-            comm=comm,
         )
         MnnvlMemory.allocated_map[ptr] = _MnnvlAllocationRecord(
-            mapping=mapping,
             comm=comm,
             comm_size=comm.Get_size(),
             comm_rank=comm.Get_rank(),
@@ -793,9 +704,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
             MnnvlMemory.address_refcnt.pop(record.start_address)
             device_ptr = cuda.CUdeviceptr(record.start_address)
             checkCudaErrors(
-                cuda.cuMemAddressFree(
-                    device_ptr, record.comm_size * record.rank_stride
-                )
+                cuda.cuMemAddressFree(device_ptr, record.comm_size * record.rank_stride)
             )
             if record.start_address == MnnvlMemory.current_start_address:
                 MnnvlMemory.current_start_address = 0
@@ -803,53 +712,36 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 MnnvlMemory.current_mem_offset = 0
 
     @staticmethod
-    def _detach_mnnvl_handles(ptr: int) -> None:
+    def _detach_mnnvl_handles(ptr: int) -> bool:
         record = MnnvlMemory.allocated_map[ptr]
-        comm = record.comm
-        mapped_states = comm.allgather(record.mapped)
-        if any(mapped_states) and not all(mapped_states):
-            raise RuntimeError("Inconsistent MNNVL mapped state across ranks")
-        if not any(mapped_states):
-            return
+        if not record.mapped:
+            return False
+        comm_rank = record.comm.Get_rank()
+        comm_size = record.comm.Get_size()
+        if comm_rank != record.comm_rank or comm_size != record.comm_size:
+            raise RuntimeError(
+                "MNNVL communicator does not match the allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
+            )
 
         checkCudaErrors(cuda.cuCtxSynchronize())
+        record.comm.barrier()
         MnnvlMemory._unmap_and_release_mnnvl_handles(record)
         record.mem_handles = [None] * record.comm_size
         record.mapped = False
+        return True
 
     @staticmethod
     def _reattach_mnnvl_handles(
         ptr: int,
-        *,
-        comm: Optional[CommBackend] = None,
-        config: Optional[MnnvlConfig] = None,
-    ) -> None:
+        comm_backend: CommBackend,
+    ) -> bool:
         record = MnnvlMemory.allocated_map[ptr]
-        if config is not None and comm is not None:
-            raise RuntimeError("Pass either comm or config when reattaching MNNVL")
-        if (config is not None or (comm is not None and comm is not record.comm)) and (
-            record.mapped
-        ):
-            raise RuntimeError(
-                "Cannot refresh MNNVL communicator while allocation is still mapped; "
-                "call detach_handles before checkpoint reattach"
-            )
-        if config is not None:
-            if config.comm_backend is None:
-                raise RuntimeError(
-                    "MNNVL reattach config must provide a communication backend"
-                )
-            MnnvlMemory.config = config
-            comm = config.comm_backend.Split(
-                record.mapping.pp_rank * record.mapping.cp_size
-                + record.mapping.cp_rank,
-                record.mapping.tp_rank,
-            )
-            MnnvlMemory.comm = comm
-        else:
-            comm = comm or record.comm
-        comm_size = comm.Get_size()
-        comm_rank = comm.Get_rank()
+        if record.mapped:
+            return False
+        comm_size = comm_backend.Get_size()
+        comm_rank = comm_backend.Get_rank()
         if comm_size != record.comm_size or comm_rank != record.comm_rank:
             raise RuntimeError(
                 "Restored MNNVL communicator does not match the graph-visible "
@@ -857,23 +749,18 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 f"rank/size {comm_rank}/{comm_size} != "
                 f"{record.comm_rank}/{record.comm_size}"
             )
-        record.comm = comm
-        mapped_states = comm.allgather(record.mapped)
-        if any(mapped_states) and not all(mapped_states):
-            raise RuntimeError("Inconsistent MNNVL mapped state across ranks")
-        if all(mapped_states):
-            return
-
         checkCudaErrors(cuda.cuCtxSynchronize())
         record.mem_handles = MnnvlMemory._create_and_map_mnnvl_handles(
-            record.mapping,
+            comm_backend,
             record.aligned_size,
             record.start_address,
             record.rank_stride,
             record.address_offset,
-            comm=comm,
         )
+        record.comm = comm_backend
+        MnnvlMemory.comm = comm_backend
         record.mapped = True
+        return True
 
     @staticmethod
     def support_nvlink(need_all_up: bool = True):

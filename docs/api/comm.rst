@@ -120,43 +120,6 @@ Core Classes
     MnnvlMemory
     McastGPUBuffer
 
-CUDA graph-stable checkpoint detach/reattach
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-MNNVL workspaces used by MoE all-to-all kernels are CUDA VMM allocations.
-For process checkpoint/restore, callers may release the non-checkpointable
-physical/imported MNNVL handles while keeping the CUDA virtual address
-reservations and Python workspace tensors alive.  Use
-``detach_handles`` only after all kernels using the workspace have
-quiesced.  After restore, use ``reattach_handles`` to recreate/export/
-import handles and map them at the original virtual addresses before replaying
-captured CUDA graphs.  CUDA synchronization needed for safe unmap/remap is
-performed internally:
-
-.. code-block:: python
-
-    workspace.detach_handles()
-    workspace.reattach_handles()
-
-The reattach path refreshes communicator/transport state
-from the current ``MnnvlConfig`` when provided; it does not reuse stale
-cross-process handles from the checkpoint.  ``reattach_handles`` maps fresh
-physical handles back into the preserved graph-visible virtual addresses and
-never reserves fresh graph-visible VA.
-
-CUDA graphs remain valid only if every graph-visible workspace tensor pointer,
-rank stride, rank count, rank id, and tensor layout validates unchanged.  The
-MNNVL APIs fail closed when this metadata changes.  Non-workspace tensors
-captured by a graph remain the caller's responsibility.
-
-.. autosummary::
-    :toctree: ../generated
-
-    MnnvlMemory.detach_handles
-    MnnvlMemory.reattach_handles
-    MnnvlMemory.get_graph_visible_addresses
-    MnnvlMemory.validate_graph_visible_addresses
-
 TensorRT-LLM MNNVL AllReduce
 ----------------------------
 
@@ -193,6 +156,29 @@ MNNVL A2A (Throughput Backend)
     :show-inheritance:
 
     .. automethod:: __init__
+
+``MoeAlltoAll`` preserves its CUDA virtual addresses across process
+checkpoint/restore.  After quiescing all work, call ``checkpoint_prepare`` to
+release the non-checkpointable physical MNNVL handles.  Then call
+``checkpoint_restore`` with a fresh communication backend before replaying a
+captured CUDA graph:
+
+.. code-block:: python
+
+    moe_alltoall.checkpoint_prepare()
+    moe_alltoall.checkpoint_restore(comm_backend)
+
+Both methods are collective.  Every rank must call them in the same order, and
+``comm_backend`` must reproduce the original rank and world size.
+Repeated calls are no-ops after the workspace reaches the requested state.
+If an exception occurs after a physical detach or reattach begins, do not retry
+or reuse the workspace; restart the affected rank.
+
+.. autosummary::
+    :toctree: ../generated
+
+    MoeAlltoAll.checkpoint_prepare
+    MoeAlltoAll.checkpoint_restore
 
 DCP All-to-All (Context-Parallel Attention Reduction)
 -----------------------------------------------------

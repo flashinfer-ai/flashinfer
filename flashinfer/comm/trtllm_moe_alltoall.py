@@ -589,7 +589,6 @@ class MoeAlltoAll:
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
-                "graph_visible_addresses": mnnvl_mem.get_graph_visible_addresses(),
             }
             return cls._WORKSPACE_CACHE[key]
 
@@ -730,7 +729,6 @@ class MoeAlltoAll:
         self.ep_rank = mapping.moe_ep_rank
         self.top_k = top_k
         self.num_experts = num_experts
-        self.mnnvl_config = mnnvl_config
 
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError("top_k must be a positive int")
@@ -760,34 +758,41 @@ class MoeAlltoAll:
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
 
-    def get_graph_visible_addresses(self) -> dict:
-        """Return CUDA graph-visible MNNVL workspace VA/layout metadata."""
-        return dict(self._WORKSPACE["graph_visible_addresses"])
+    def _require_handles_attached(self) -> None:
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are not attached")
 
-    def validate_graph_visible_addresses(self) -> None:
-        """Validate that the cached workspace tensor still uses its original VA."""
-        self.mnnvl_mem.validate_graph_visible_addresses(
-            self._WORKSPACE["graph_visible_addresses"], self.workspace
-        )
-
-    def detach_handles(self) -> None:
-        """Release MNNVL mappings while preserving workspace tensor pointers."""
+    @flashinfer_api
+    def checkpoint_prepare(self) -> None:
+        """Detach MNNVL backing; repeated successful calls are no-ops."""
+        if not self.mnnvl_mem.mapped:
+            return
         if self._state.phase != "idle":
-            raise RuntimeError("Cannot detach MNNVL workspace during an active A2A phase")
-        self.validate_graph_visible_addresses()
-        self.mnnvl_mem.detach_handles()
+            raise RuntimeError(
+                "Cannot prepare a checkpoint during an active all-to-all phase"
+            )
 
-    def reattach_handles(
+        if not MnnvlMemory._detach_mnnvl_handles(self.mnnvl_mem.ptr):
+            raise RuntimeError(
+                "MNNVL allocation state disagrees with its checkpoint lifecycle"
+            )
+
+    @flashinfer_api
+    def checkpoint_restore(
         self,
-        *,
-        comm: Optional[CommBackend] = None,
+        comm_backend: CommBackend,
     ) -> None:
-        """Reattach MNNVL workspace at the original VA and refresh local state."""
-        MnnvlMemory._reattach_mnnvl_handles(
+        """Restore MNNVL backing; repeated successful calls are no-ops."""
+        if self.mnnvl_mem.mapped:
+            return
+
+        if not MnnvlMemory._reattach_mnnvl_handles(
             self.mnnvl_mem.ptr,
-            comm=comm,
-            config=None if comm is not None else self.mnnvl_config,
-        )
+            comm_backend,
+        ):
+            raise RuntimeError(
+                "MNNVL allocation state disagrees with its checkpoint lifecycle"
+            )
         refreshed_metainfo = moe_a2a_initialize(
             self.workspace,
             self.ep_rank,
@@ -798,12 +803,14 @@ class MoeAlltoAll:
             raise RuntimeError(
                 "MoeAlltoAll metainfo changed during MNNVL reattach; "
                 "existing CUDA graphs are not safe to replay"
-            )
-        self.validate_graph_visible_addresses()
+        )
+        torch.cuda.synchronize()
+        comm_backend.barrier()
         self._state = _A2AState()
 
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
+        self._require_handles_attached()
         torch.cuda.synchronize()
         del self._WORKSPACE
         del self._WORKSPACE_CACHE[
@@ -850,6 +857,7 @@ class MoeAlltoAll:
             Workspace-backed receive tensors, one per ``input_payloads``
             entry, each shaped ``[ep_size, runtime_max_tokens_per_rank, *]``.
         """
+        self._require_handles_attached()
         assert self._state.phase == "idle", "dispatch called twice without combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
@@ -930,6 +938,7 @@ class MoeAlltoAll:
         torch.Tensor
             ``[local_num_tokens, elements_per_token]`` combined tensor.
         """
+        self._require_handles_attached()
         assert self._state.phase == "dispatched", (
             "combine called before successful dispatch"
         )
@@ -954,7 +963,6 @@ class MoeAlltoAll:
             sf_layout,
         )
 
-        # Reset state for next round
         self._state = _A2AState()
 
         return output
@@ -993,6 +1001,7 @@ class MoeAlltoAll:
         RuntimeError
             If called before a successful :meth:`dispatch`.
         """
+        self._require_handles_attached()
         if self._state.phase != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before successful dispatch"
