@@ -102,7 +102,9 @@ def moe_reference_fp32(x, w13, w2, topk_w, topk_ids):
 
 
 def cosine(a, b):
-    return F.cosine_similarity(a.float().reshape(-1), b.float().reshape(-1), dim=0).item()
+    return F.cosine_similarity(
+        a.float().reshape(-1), b.float().reshape(-1), dim=0
+    ).item()
 
 
 def summarize(times_ms):
@@ -114,7 +116,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, nargs="+", default=[1, 2, 4, 8])
     ap.add_argument("--top-k", type=int, nargs="+", default=[8])
-    ap.add_argument("--cupti", action="store_true", help="use CUPTI timing if available")
+    ap.add_argument(
+        "--cupti", action="store_true", help="use CUPTI timing if available"
+    )
     args = ap.parse_args()
 
     dev = torch.device("cuda")
@@ -159,9 +163,17 @@ def main():
 
             def run_mono():
                 mono_moe(
-                    x, logits, w13_fp8, s13, w2_fp8, s2,
-                    top_k=top_k, scoring_func="softmax", renormalize=True,
-                    out=out_mono, scratchpad=scratch,
+                    x,
+                    logits,
+                    w13_fp8,
+                    s13,
+                    w2_fp8,
+                    s2,
+                    top_k=top_k,
+                    scoring_func="softmax",
+                    renormalize=True,
+                    out=out_mono,
+                    scratchpad=scratch,
                 )
 
             # ── cutlass_fused_moe: pre-computed routing, deepseek block-FP8 ──
@@ -224,7 +236,9 @@ def main():
             )
             if have_cutlass:
                 cut_med, cut_std = summarize(
-                    bench_gpu_time(run_cutlass, use_cuda_graph=True, enable_cupti=args.cupti)
+                    bench_gpu_time(
+                        run_cutlass, use_cuda_graph=True, enable_cupti=args.cupti
+                    )
                 )
                 cut_str = f"{cut_med:7.4f} ± {cut_std:6.4f} ms"
                 speedup = f"{cut_med / mono_med:6.2f}x"

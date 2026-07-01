@@ -66,7 +66,9 @@ def _block_wise_gemm(w_fp8, scales_bw, x_fp8, x_scales, block_row=128, block_col
         r0, r1 = ri * block_row, min((ri + 1) * block_row, rows)
         for ci in range(cb):
             c0, c1 = ci * block_col, min((ci + 1) * block_col, cols)
-            result[r0:r1] += (wf[r0:r1, c0:c1] @ xf[c0:c1]) * scales_bw[ri, ci] * x_scales[ci]
+            result[r0:r1] += (
+                (wf[r0:r1, c0:c1] @ xf[c0:c1]) * scales_bw[ri, ci] * x_scales[ci]
+            )
     return result
 
 

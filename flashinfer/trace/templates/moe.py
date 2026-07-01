@@ -2366,9 +2366,7 @@ def _mono_moe_reference(
         scores = torch.sigmoid(logits)
     else:
         scores = torch.softmax(logits, dim=-1)
-    topk_vals, topk_idx = torch.topk(
-        scores, k=TOP_K, dim=1, largest=True, sorted=False
-    )
+    topk_vals, topk_idx = torch.topk(scores, k=TOP_K, dim=1, largest=True, sorted=False)
     if renormalize:
         weights = topk_vals / (topk_vals.sum(dim=1, keepdim=True) + 1e-20)
     else:
@@ -2430,11 +2428,17 @@ def _mono_moe_init(
         seq_len, num_experts, dtype=torch.bfloat16, device=device
     )
     w13_bf16 = 0.1 * torch.randn(
-        num_experts, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16,
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.bfloat16,
         device=device,
     )
     w2_bf16 = 0.1 * torch.randn(
-        num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
         device=device,
     )
     w13, w13s = fp8_block_quant_2d(w13_bf16, block=BLOCK)

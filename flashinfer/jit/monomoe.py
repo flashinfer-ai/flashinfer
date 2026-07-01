@@ -33,12 +33,7 @@ def _get_monomoe_csrc_dir() -> Path:
     if standard_path.exists():
         return standard_path
 
-    dev_path = (
-        Path(__file__).parent.parent.parent
-        / "csrc"
-        / "fused_moe"
-        / "monomoe"
-    )
+    dev_path = Path(__file__).parent.parent.parent / "csrc" / "fused_moe" / "monomoe"
     if dev_path.exists():
         return dev_path
 

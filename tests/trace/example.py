@@ -522,15 +522,19 @@ with contextlib.suppress(Exception):
         _mm_E, 2 * _mm_N, _mm_K, dtype=torch.float8_e4m3fn, device=device
     )
     _mm_s13 = torch.ones(
-        _mm_E, (2 * _mm_N) // _mm_BLK, _mm_K // _mm_BLK,
-        dtype=torch.float32, device=device,
+        _mm_E,
+        (2 * _mm_N) // _mm_BLK,
+        _mm_K // _mm_BLK,
+        dtype=torch.float32,
+        device=device,
     )
-    _mm_w2 = torch.zeros(
-        _mm_E, _mm_K, _mm_N, dtype=torch.float8_e4m3fn, device=device
-    )
+    _mm_w2 = torch.zeros(_mm_E, _mm_K, _mm_N, dtype=torch.float8_e4m3fn, device=device)
     _mm_s2 = torch.ones(
-        _mm_E, _mm_K // _mm_BLK, _mm_N // _mm_BLK,
-        dtype=torch.float32, device=device,
+        _mm_E,
+        _mm_K // _mm_BLK,
+        _mm_N // _mm_BLK,
+        dtype=torch.float32,
+        device=device,
     )
     flashinfer.fused_moe.mono_moe(
         _mm_act,
