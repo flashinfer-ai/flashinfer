@@ -123,6 +123,22 @@ class TllmGenFmhaKernel {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
+      // The BF16Q+FP8KV K-only-transform kernels are an opt-in feature that is
+      // not wired up here yet; they share hash keys with the default
+      // full-transform kernels, so skip them at load.
+      if (kernelMeta.mEnablesBf16QFp8KvKOnlyTransform) {
+        continue;
+      }
+      // Mixed-dtype SwapsMmaAb generation kernels ship in both
+      // groupsTokensHeadsQ variants since the BF16Q+FP8KV full-transform
+      // rework; the token-grouping variant needs selection heuristics that
+      // are not wired up here yet and shares hash keys with the non-grouping
+      // one, so skip it at load (matches the previous artifact's inventory).
+      if (kernelMeta.mGroupsTokensHeadsQ &&
+          kernelMeta.mKernelType == static_cast<int>(FmhaKernelType::SwapsMmaAbForGeneration) &&
+          kernelMeta.mDataTypeQ != kernelMeta.mDataTypeK) {
+        continue;
+      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV &&
           kernelMeta.mDataTypeO == mDtypeOut &&
@@ -892,6 +908,36 @@ class TllmGenFmhaKernel {
     }
   }
 
+  // Selects the generation kernel for custom-mask (spec-dec tree) attention.
+  // Mirrors trtllm-gen FmhaAutoTuner::selectSpecDecTreeKernel, constrained to
+  // the cubins shipped in the current artifact: Q128 KeepsMmaAbForGeneration
+  // (groupsTokensHeadsQ) with tileSizeKv = 128. Small numTokensHeadsQ shapes
+  // would prefer the SwapsMmaAb Q8/16/32 custom-mask kernels, which are not
+  // exported yet; revisit the heuristic when they are published.
+  // CgaSmemReduction is only wired up for SwapsMmaAb kernels, so the
+  // multiCtasKv path stays on GmemReduction, matching trtllm-gen's choice
+  // for spec-dec tree (Q128 can exceed the 16-CTA cluster limit).
+  void selectSpecDecTreeGenerationKernel(RunnerParams const& params,
+                                         SelectKernelParams& selectKernelParams) const {
+    FLASHINFER_CHECK(params.mHeadDimQk == 64 || params.mHeadDimQk == 128,
+                     "Custom-mask spec-dec generation requires headDimQk 64 or 128, got %d.",
+                     params.mHeadDimQk);
+    FLASHINFER_CHECK(isPagedKv(params.mQkvLayout),
+                     "Custom-mask spec-dec generation requires a paged KV cache.");
+    // The published custom-mask cubins have no SlidingWindow+Custom mask
+    // type; callers fold sliding windows into the packed mask and disable
+    // the kernel-side window (see _pack_trtllm_gen_spec_dec_mask). Proper
+    // combined kernel support in trtllm-gen is a planned follow-up.
+    FLASHINFER_CHECK(
+        params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
+            params.mChunkedAttentionSize == INT_MAX,
+        "Custom-mask spec-dec generation does not support sliding-window or chunked attention; "
+        "fold the window into the packed custom mask instead.");
+    selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+    selectKernelParams.mTileSizeQ = 128;
+    selectKernelParams.mTileSizeKv = 128;
+  }
+
   // Select a kernel based on the heuristic.
   void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const {
     // Normalize this before heuristic probing; some GQA-generation heuristics load candidate
@@ -913,7 +959,11 @@ class TllmGenFmhaKernel {
             "TRTLLM-GEN MLA generation does not support sliding-window or chunked attention.");
       }
     } else if (isGenerationKernel(params.mKernelType)) {
-      selectGqGenerationKernel(params, selectKernelParams);
+      if (isCustomMask(selectKernelParams.mMaskType)) {
+        selectSpecDecTreeGenerationKernel(params, selectKernelParams);
+      } else {
+        selectGqGenerationKernel(params, selectKernelParams);
+      }
     }
 
     // For headDimV > 256, set headDimPerCtaV to 256 for context and keepsMmaAbForGeneration
@@ -927,7 +977,7 @@ class TllmGenFmhaKernel {
     // Enable sliding window or chunked causal if the max kv sequence length exceeds attention
     // window size or chunked attention size. This is supported by causal-mask context kernels and
     // generation-phase kernels.
-    if (!isSparseMla(params.mSparseMlaType) &&
+    if (!isSparseMla(params.mSparseMlaType) && !isCustomMask(selectKernelParams.mMaskType) &&
         (selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal ||
          !isContextKernel(params.mKernelType)) &&
         (params.mMaxSeqLenKv > params.mAttentionWindowSize ||
