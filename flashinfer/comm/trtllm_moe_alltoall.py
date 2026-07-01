@@ -758,29 +758,17 @@ class MoeAlltoAll:
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
 
-    def _require_handles_attached(self) -> None:
-        if not self.mnnvl_mem.mapped:
-            raise RuntimeError("MNNVL handles are not attached")
-
     @flashinfer_api
-    def detach_handles(self) -> None:
-        """Detach MNNVL handles; repeated successful calls are no-ops."""
+    def checkpoint_prepare(self) -> None:
+        """Unmap MNNVL handles for checkpointing; repeated calls are no-ops."""
         record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
         if not record.mapped:
             return
         if self._state.phase != "idle":
             raise RuntimeError(
-                "Cannot detach MNNVL handles during an active all-to-all phase"
+                "Cannot unmap MNNVL handles during an active all-to-all phase"
             )
 
-        comm_rank = record.comm.Get_rank()
-        comm_size = record.comm.Get_size()
-        if comm_rank != record.comm_rank or comm_size != record.comm_size:
-            raise RuntimeError(
-                "MNNVL communicator does not match the allocation layout: "
-                f"rank/size {comm_rank}/{comm_size} != "
-                f"{record.comm_rank}/{record.comm_size}"
-            )
         # Every rank must stop using the workspace before releasing its backing.
         torch.cuda.synchronize()
         record.comm.barrier()
@@ -789,11 +777,11 @@ class MoeAlltoAll:
         record.mapped = False
 
     @flashinfer_api
-    def attach_handles(
+    def checkpoint_restore(
         self,
         comm_backend: CommBackend,
     ) -> None:
-        """Attach MNNVL handles; repeated successful calls are no-ops."""
+        """Remap MNNVL handles after restore; repeated calls are no-ops."""
         record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
         if record.mapped:
             return
@@ -802,8 +790,8 @@ class MoeAlltoAll:
         comm_rank = comm_backend.Get_rank()
         if comm_size != record.comm_size or comm_rank != record.comm_rank:
             raise RuntimeError(
-                "MNNVL communicator does not match the graph-visible "
-                "allocation layout: "
+                "Cannot remap MNNVL handles because the communicator does not "
+                "match the graph-visible allocation layout: "
                 f"rank/size {comm_rank}/{comm_size} != "
                 f"{record.comm_rank}/{record.comm_size}"
             )
@@ -827,7 +815,7 @@ class MoeAlltoAll:
         )
         if not torch.equal(refreshed_metainfo, self.metainfo):
             raise RuntimeError(
-                "MoeAlltoAll metainfo changed after attaching MNNVL handles; "
+                "MoeAlltoAll metainfo changed during MNNVL handle remap; "
                 "existing CUDA graphs are not safe to replay"
             )
         torch.cuda.synchronize()
@@ -836,7 +824,8 @@ class MoeAlltoAll:
 
     def _reset_workspace(self):
         """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
-        self._require_handles_attached()
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         torch.cuda.synchronize()
         del self._WORKSPACE
         del self._WORKSPACE_CACHE[
@@ -883,7 +872,8 @@ class MoeAlltoAll:
             Workspace-backed receive tensors, one per ``input_payloads``
             entry, each shaped ``[ep_size, runtime_max_tokens_per_rank, *]``.
         """
-        self._require_handles_attached()
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "idle", "dispatch called twice without combine"
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "runtime_max_tokens_per_rank exceeds max_num_tokens"
@@ -964,7 +954,8 @@ class MoeAlltoAll:
         torch.Tensor
             ``[local_num_tokens, elements_per_token]`` combined tensor.
         """
-        self._require_handles_attached()
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         assert self._state.phase == "dispatched", (
             "combine called before successful dispatch"
         )
@@ -1027,7 +1018,8 @@ class MoeAlltoAll:
         RuntimeError
             If called before a successful :meth:`dispatch`.
         """
-        self._require_handles_attached()
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("MNNVL handles are unmapped")
         if self._state.phase != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before successful dispatch"
