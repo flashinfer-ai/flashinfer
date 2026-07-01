@@ -276,6 +276,16 @@ def gen_dcp_alltoall_module() -> JitSpec:
             / "cpp"
             / "common"
             / "tllmException.cpp",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "cpp"
+            / "common"
+            / "logger.cpp",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "cpp"
+            / "common"
+            / "stringUtils.cpp",
         ],
         extra_include_paths=[
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
