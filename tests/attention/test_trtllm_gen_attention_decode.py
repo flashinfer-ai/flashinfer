@@ -25,8 +25,8 @@ DTYPE_MAP = {
 
 GPU_DEVICE = "cuda:0"
 
-global_workspace_buffer = None  # can.be empty initialized
-global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
+global_workspace_buffer = None
+global_workspace_buffer_ref = None
 workspace_size = 256 * 1024 * 1024
 
 # Counter slab at the head of the generation workspace: 8192 batches * 256 heads * 4 bytes/int32.
@@ -361,17 +361,16 @@ def flatten_paged_kv(
 
 
 def create_workspace_buffers(device: torch.device):
-    # Lazily initialize and reuse global workspace buffers
-    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
+    global global_workspace_buffer, global_workspace_buffer_ref
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+    if global_workspace_buffer_ref is None:
+        global_workspace_buffer_ref = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
-    return global_trtllm_gen_fmha_workspace_buffer, global_workspace_buffer
+    return global_workspace_buffer, global_workspace_buffer_ref
 
 
 def create_output(

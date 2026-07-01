@@ -1189,7 +1189,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses packed
         uint8 head dim 584. Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
-        Backend workspace buffer. Must be zero-initialized for first use.
+        TRTLLM-GEN workspace buffer. The first 8 MB (counter region) is automatically zero-initialised on every call.
     sparse_indices : torch.Tensor
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
     compressed_kv_cache : Optional[torch.Tensor]
@@ -1334,6 +1334,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         )
 
     sm_count = get_device_sm_count(query.device)
+    workspace_buffer.view(torch.uint8)[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
     run_func(
         out,
         query_flat,
@@ -2354,6 +2355,16 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
+        # Zero the counter region on every call. Other runners (cute-dsl)
+        # may share this workspace_buffer and write scratch into the first
+        # bytes, which would leave non-zero values in trtllm-gen's
+        # mandatory-zero semaphore region and cause kernel hangs. Done
+        # inside forward() rather than only at dispatcher final-call time so
+        # that autotune profile-loop invocations are also protected.
+        # The 8 MB memset is ~5us on B200, negligible vs kernel time.
+        self.workspace_buffer.view(torch.uint8)[
+            :_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES
+        ].zero_()
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
