@@ -712,57 +712,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 MnnvlMemory.current_mem_offset = 0
 
     @staticmethod
-    def _detach_mnnvl_handles(ptr: int) -> bool:
-        record = MnnvlMemory.allocated_map[ptr]
-        if not record.mapped:
-            return False
-        comm_rank = record.comm.Get_rank()
-        comm_size = record.comm.Get_size()
-        if comm_rank != record.comm_rank or comm_size != record.comm_size:
-            raise RuntimeError(
-                "MNNVL communicator does not match the allocation layout: "
-                f"rank/size {comm_rank}/{comm_size} != "
-                f"{record.comm_rank}/{record.comm_size}"
-            )
-
-        checkCudaErrors(cuda.cuCtxSynchronize())
-        record.comm.barrier()
-        MnnvlMemory._unmap_and_release_mnnvl_handles(record)
-        record.mem_handles = [None] * record.comm_size
-        record.mapped = False
-        return True
-
-    @staticmethod
-    def _reattach_mnnvl_handles(
-        ptr: int,
-        comm_backend: CommBackend,
-    ) -> bool:
-        record = MnnvlMemory.allocated_map[ptr]
-        if record.mapped:
-            return False
-        comm_size = comm_backend.Get_size()
-        comm_rank = comm_backend.Get_rank()
-        if comm_size != record.comm_size or comm_rank != record.comm_rank:
-            raise RuntimeError(
-                "Restored MNNVL communicator does not match the graph-visible "
-                "allocation layout: "
-                f"rank/size {comm_rank}/{comm_size} != "
-                f"{record.comm_rank}/{record.comm_size}"
-            )
-        checkCudaErrors(cuda.cuCtxSynchronize())
-        record.mem_handles = MnnvlMemory._create_and_map_mnnvl_handles(
-            comm_backend,
-            record.aligned_size,
-            record.start_address,
-            record.rank_stride,
-            record.address_offset,
-        )
-        record.comm = comm_backend
-        MnnvlMemory.comm = comm_backend
-        record.mapped = True
-        return True
-
-    @staticmethod
     def support_nvlink(need_all_up: bool = True):
         dev_id = torch.cuda.current_device()
         handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)

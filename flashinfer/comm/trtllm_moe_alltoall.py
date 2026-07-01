@@ -763,36 +763,62 @@ class MoeAlltoAll:
             raise RuntimeError("MNNVL handles are not attached")
 
     @flashinfer_api
-    def checkpoint_prepare(self) -> None:
-        """Detach MNNVL backing; repeated successful calls are no-ops."""
-        if not self.mnnvl_mem.mapped:
+    def detach_handles(self) -> None:
+        """Detach MNNVL handles; repeated successful calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if not record.mapped:
             return
         if self._state.phase != "idle":
             raise RuntimeError(
-                "Cannot prepare a checkpoint during an active all-to-all phase"
+                "Cannot detach MNNVL handles during an active all-to-all phase"
             )
 
-        if not MnnvlMemory._detach_mnnvl_handles(self.mnnvl_mem.ptr):
+        comm_rank = record.comm.Get_rank()
+        comm_size = record.comm.Get_size()
+        if comm_rank != record.comm_rank or comm_size != record.comm_size:
             raise RuntimeError(
-                "MNNVL allocation state disagrees with its checkpoint lifecycle"
+                "MNNVL communicator does not match the allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
             )
+        # Every rank must stop using the workspace before releasing its backing.
+        torch.cuda.synchronize()
+        record.comm.barrier()
+        MnnvlMemory._unmap_and_release_mnnvl_handles(record)
+        record.mem_handles = [None] * record.comm_size
+        record.mapped = False
 
     @flashinfer_api
-    def checkpoint_restore(
+    def attach_handles(
         self,
         comm_backend: CommBackend,
     ) -> None:
-        """Restore MNNVL backing; repeated successful calls are no-ops."""
-        if self.mnnvl_mem.mapped:
+        """Attach MNNVL handles; repeated successful calls are no-ops."""
+        record = MnnvlMemory.allocated_map[self.mnnvl_mem.ptr]
+        if record.mapped:
             return
 
-        if not MnnvlMemory._reattach_mnnvl_handles(
-            self.mnnvl_mem.ptr,
-            comm_backend,
-        ):
+        comm_size = comm_backend.Get_size()
+        comm_rank = comm_backend.Get_rank()
+        if comm_size != record.comm_size or comm_rank != record.comm_rank:
             raise RuntimeError(
-                "MNNVL allocation state disagrees with its checkpoint lifecycle"
+                "MNNVL communicator does not match the graph-visible "
+                "allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
             )
+        # CUDA work must quiesce before the workspace is remapped.
+        torch.cuda.synchronize()
+        record.mem_handles = MnnvlMemory._create_and_map_mnnvl_handles(
+            comm_backend,
+            record.aligned_size,
+            record.start_address,
+            record.rank_stride,
+            record.address_offset,
+        )
+        record.comm = comm_backend
+        MnnvlMemory.comm = comm_backend
+        record.mapped = True
         refreshed_metainfo = moe_a2a_initialize(
             self.workspace,
             self.ep_rank,
@@ -801,9 +827,9 @@ class MoeAlltoAll:
         )
         if not torch.equal(refreshed_metainfo, self.metainfo):
             raise RuntimeError(
-                "MoeAlltoAll metainfo changed during MNNVL reattach; "
+                "MoeAlltoAll metainfo changed after attaching MNNVL handles; "
                 "existing CUDA graphs are not safe to replay"
-        )
+            )
         torch.cuda.synchronize()
         comm_backend.barrier()
         self._state = _A2AState()
