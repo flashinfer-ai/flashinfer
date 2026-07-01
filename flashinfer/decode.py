@@ -2246,6 +2246,25 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
 
+def _get_trtllm_gen_bmm1_scale_arg(
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm1_scale_log2: Optional[torch.Tensor],
+    device: torch.device,
+) -> Union[float, torch.Tensor]:
+    if bmm1_scale_log2 is not None:
+        if bmm1_scale_log2.dtype != torch.float32:
+            raise TypeError("bmm1_scale_log2 tensor must have dtype torch.float32")
+        if bmm1_scale_log2.device != device:
+            raise ValueError("bmm1_scale_log2 must be on the same device as query")
+        if bmm1_scale_log2.numel() < 1:
+            raise ValueError("bmm1_scale_log2 must contain at least one element")
+        return bmm1_scale_log2
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        return bmm1_scale * log2e
+    return bmm1_scale
+
+
 class TrtllmGenDecodeModule:
     def __init__(self) -> None:
         self._sm_count: Optional[int] = None
@@ -2276,15 +2295,16 @@ class TrtllmGenDecodeModule:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
         lse: Optional[torch.Tensor] = None,
+        bmm1_scale_log2: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
 
-        if isinstance(bmm1_scale, torch.Tensor):
-            assert bmm1_scale.dtype == torch.float32
-            bmm1_scale = bmm1_scale * log2e
+        bmm1_scale = _get_trtllm_gen_bmm1_scale_arg(
+            bmm1_scale, bmm1_scale_log2, query.device
+        )
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
@@ -2514,6 +2534,7 @@ def trtllm_batch_decode_with_kv_cache(
     uses_shared_paged_kv_idx: bool = True,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    bmm1_scale_log2: Optional[torch.Tensor] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -2553,6 +2574,11 @@ def trtllm_batch_decode_with_kv_cache(
     bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
         when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+
+    bmm1_scale_log2 : Optional[torch.Tensor] = None
+        Optional precomputed log2-form bmm1 scale for ``trtllm-gen``. When provided,
+        this FP32 device tensor is passed directly to the FFI and takes precedence over
+        tensor ``bmm1_scale``, avoiding the internal ``bmm1_scale * log2e`` CUDA kernel.
 
     bmm2_scale : Union[float, torch.Tensor]
         fused scale for bmm2 input.
@@ -2710,6 +2736,9 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
+    if backend != "trtllm-gen" and bmm1_scale_log2 is not None:
+        raise ValueError("bmm1_scale_log2 is only supported by the trtllm-gen backend")
+
     if backend == "xqa":
         # xqa backend doesn't support nvfp4 output
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
@@ -2846,9 +2875,9 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
-        if isinstance(bmm1_scale, torch.Tensor):
-            assert bmm1_scale.dtype == torch.float32
-            bmm1_scale = bmm1_scale * log2e
+        bmm1_scale = _get_trtllm_gen_bmm1_scale_arg(
+            bmm1_scale, bmm1_scale_log2, query.device
+        )
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
