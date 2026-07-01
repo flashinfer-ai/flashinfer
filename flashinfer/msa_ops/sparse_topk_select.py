@@ -22,20 +22,29 @@ from ..api_logging import flashinfer_api
 from ..utils import is_sm12x_supported
 
 
-_radix_compile_cache: dict = {}
+_topk_compile_cache: dict = {}
 
 
-def _get_compiled_radix_topk(topk: int):
-    """Compile the multi-stage radix-select top-k: the CuTe-DSL port of the CUDA
-    ``IndexerTopKWithSortKernel``, O(max_k_tiles) per row."""
+def _get_compiled_topk(topk: int, small: bool):
+    """Compile the top-k kernel: the O(N^2) count-rank kernel when ``small`` (small
+    ``max_k_tiles``), else the O(max_k_tiles) radix kernel. Same call signature;
+    identical selections on distinct-score inputs."""
     import cutlass
     import cutlass.cute as cute
 
-    from .cute_dsl.topk_select_radix_sm12x import TopKSelectRadixSm12x
-
-    compiled = _radix_compile_cache.get(topk)
+    key = (topk, small)
+    compiled = _topk_compile_cache.get(key)
     if compiled is not None:
         return compiled
+
+    if small:
+        from .cute_dsl.topk_select_countrank_sm12x import TopKSelectCountRankSm12x
+
+        kernel_obj = TopKSelectCountRankSm12x(topk=topk)
+    else:
+        from .cute_dsl.topk_select_radix_sm12x import TopKSelectRadixSm12x
+
+        kernel_obj = TopKSelectRadixSm12x(topk=topk)
 
     def fk(dtype, ndim, align):
         return cute.runtime.make_fake_compact_tensor(
@@ -47,7 +56,7 @@ def _get_compiled_radix_topk(topk: int):
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     compiled = cute.compile(
-        TopKSelectRadixSm12x(topk=topk),
+        kernel_obj,
         fk(cutlass.Float32, 3, 4),  # max_score (H, P, S)
         fk(cutlass.Int32, 3, 4),  # out (S, H, topk)
         cutlass.Int32(1),  # num_valid_pages
@@ -59,7 +68,7 @@ def _get_compiled_radix_topk(topk: int):
         stream_fake,
         options="--enable-tvm-ffi",
     )
-    _radix_compile_cache[topk] = compiled
+    _topk_compile_cache[key] = compiled
     return compiled
 
 
@@ -169,7 +178,11 @@ def msa_topk_select(
     # its staging buffer is bounded and it supports max_k_tiles < 12288 (~1.5M ctx).
     if max_k_tiles >= 12288:
         raise ValueError(f"max_k_tiles must be < 12288, got {max_k_tiles}")
-    _get_compiled_radix_topk(topk)(
+    # Small block counts (<= 16k context) go to the cheaper O(N^2) count-rank kernel.
+    from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
+
+    small = max_k_tiles <= _MAX_BLOCKS
+    _get_compiled_topk(topk, small)(
         max_score,
         output,
         int(num_valid_pages),

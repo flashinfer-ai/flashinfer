@@ -704,7 +704,9 @@ def test_sparse_decode_nvfp4():
 # ---------------------------------------------------------------------------
 
 
-def test_msa_topk_select_forced_and_clamped():
+# P=128 exercises the count-rank kernel, P=256 the radix kernel (crossover at 128).
+@pytest.mark.parametrize("P", [128, 256])
+def test_msa_topk_select_forced_and_clamped(P):
     """force_begin/force_end blocks must always be selected (within the topk
     budget) and num_valid_pages must clamp the candidate range, mirrors
     MSA's smoke/test_sparse_topk_forced.py."""
@@ -713,8 +715,8 @@ def test_msa_topk_select_forced_and_clamped():
 
     torch.manual_seed(120)
     dev = "cuda"
-    H, P, S = 2, 256, 64
-    topk, nvp, fb, fe = 16, 200, 3, 2
+    H, S = 2, 64
+    topk, nvp, fb, fe = 16, P - 56, 3, 2
     max_score = torch.randn(H, P, S, dtype=torch.float32, device=dev)
     max_score[:, nvp:, :] = float("-inf")
     # give the forced regions the WORST scores: they must still be selected
