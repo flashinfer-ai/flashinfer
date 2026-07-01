@@ -620,11 +620,26 @@ def _as_float32_scalar_tensor(
             )
         if value.dtype != torch.float32:
             raise ValueError(f"{name} must be torch.float32, got {value.dtype}")
-        scalar = float(value.item())
-        if not math.isfinite(scalar) or scalar <= 0.0:
-            raise ValueError(f"{name} must be a positive finite global decode scale")
+        is_capturing = (
+            value.is_cuda
+            and hasattr(torch.cuda, "is_current_stream_capturing")
+            and torch.cuda.is_current_stream_capturing()
+        )
+        if not is_capturing:
+            scalar = float(value.item())
+            if not math.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError(
+                    f"{name} must be a positive finite global decode scale"
+                )
         if value.device != device:
+            if is_capturing:
+                raise ValueError(
+                    f"{name} must already be on device {device} during CUDA graph "
+                    f"capture, got {value.device}"
+                )
             value = value.to(device=device)
+        if is_capturing and not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous during CUDA graph capture")
         return value.contiguous()
     scalar = float(value)
     if not math.isfinite(scalar) or scalar <= 0.0:

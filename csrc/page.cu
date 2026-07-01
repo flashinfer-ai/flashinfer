@@ -24,7 +24,18 @@ using tvm::ffi::Tensor;
 
 namespace {
 
+bool IsStreamCapturing(cudaStream_t stream) {
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  cudaError_t status = cudaStreamIsCapturing(stream, &capture_status);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Failed to query CUDA stream capture status: " << cudaGetErrorString(status);
+  return capture_status != cudaStreamCaptureStatusNone;
+}
+
 void CheckPositiveFiniteFloatScalar(TensorView tensor, const char* name, cudaStream_t stream) {
+  if (IsStreamCapturing(stream)) {
+    return;
+  }
   float value = 0.0f;
   cudaError_t status =
       cudaMemcpyAsync(&value, tensor.data_ptr(), sizeof(float), cudaMemcpyDeviceToHost, stream);

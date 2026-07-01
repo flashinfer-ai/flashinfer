@@ -487,6 +487,40 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_bad_cuda
         )
 
 
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_capture():
+    k_append, v_append, k_cache, v_cache, k_scales, v_scales = (
+        _make_small_nvfp4_append_inputs()
+    )
+    slot_mapping = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
+    v_scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
+
+    flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        k_scale,
+        v_scale,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append,
+            v_append,
+            slot_mapping,
+            (k_cache, v_cache),
+            (k_scales, v_scales),
+            k_scale,
+            v_scale,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+
 def test_nvfp4_quantize_append_paged_kv_cache_empty_append_noop():
     _skip_if_fp8_e4m3_scale_unsupported()
 
