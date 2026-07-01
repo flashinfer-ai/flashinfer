@@ -28,9 +28,10 @@ where ``s`` ranges over the query's valid split slots
 memory and are never read. Optionally writes the combined natural-log LSE and a
 separately-accumulated temperature LSE (both converted log2 -> ln at the end).
 
-One CTA per (query token, query head); a single thread builds the slot weights
-in SMEM (count <= topk <= 256), then all threads cooperatively reduce the
-head_dim channels.
+One CTA per (query token, query head): each thread loads one slot's LSE, then
+every thread rebuilds the weights from SMEM and reduces its head_dim channels
+branch-free. The weight build is per-thread (not single-thread) so the low-batch
+sub-wave grid does not serialize on one thread.
 """
 
 from typing import Type
@@ -119,92 +120,85 @@ class SparseCombineSm12x:
         if count > self._topk:
             count = cutlass.Int32(self._topk)
 
+        lse_t_slots = self._topk if self._has_lse_t else 1
+
         @cute.struct
         class SharedStorage:
-            s_w: cute.struct.MemRange[cutlass.Float32, self._topk]
-            s_denom: cute.struct.MemRange[cutlass.Float32, 1]
+            s_lse: cute.struct.MemRange[cutlass.Float32, self._topk]
+            s_lse_t: cute.struct.MemRange[cutlass.Float32, lse_t_slots]
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
-        s_w = storage.s_w.get_tensor(cute.make_layout(self._topk))
-        s_denom = storage.s_denom.get_tensor(cute.make_layout(1))
+        s_lse = storage.s_lse.get_tensor(cute.make_layout(self._topk))
+        s_lse_t = storage.s_lse_t.get_tensor(cute.make_layout(lse_t_slots))
 
         neg_inf = -cutlass.Float32.inf
 
-        if count <= 0:
-            # No valid splits: zero the output, -inf LSE.
-            zero = cutlass.Float32(0.0).to(mOut.element_type)
-            for i in cutlass.range_constexpr(self._channels_per_thread):
-                c = tidx + i * self._num_threads
-                mOut[q, h, c] = zero
-            if cutlass.const_expr(self._has_lse_out):
-                if tidx == 0:
-                    mLseOut[q, h] = neg_inf
+        # One thread per slot loads its LSE (invalid slots -> -inf). count <= 0
+        # falls out for free: no slot passes `s < count`, so every weight is 0.
+        if tidx < self._topk:
+            v = neg_inf
+            if tidx < count:
+                v = mLse2[tidx, q, h]
+            s_lse[tidx] = v
             if cutlass.const_expr(self._has_lse_t):
-                if tidx == 0:
-                    mLseTOut[q, h] = neg_inf
-        else:
-            # Thread 0 builds the slot weights (count <= topk is small).
-            if tidx == 0:
-                m = neg_inf
-                for s in cutlass.range_constexpr(self._topk):
-                    if s < count:
-                        v = mLse2[s, q, h]
-                        s_w[s] = v
-                        m = cute.arch.fmax(m, v)
-                m_finite = m > neg_inf
-                denom = cutlass.Float32(0.0)
-                for s in cutlass.range_constexpr(self._topk):
-                    if s < count:
-                        w = cutlass.Float32(0.0)
-                        if m_finite:
-                            w = cute.math.exp2(s_w[s] - m, fastmath=True)
-                        s_w[s] = w
-                        denom += w
-                s_denom[0] = denom
+                vt = neg_inf
+                if tidx < count:
+                    vt = mLseT2[tidx, q, h]
+                s_lse_t[tidx] = vt
+        cute.arch.sync_threads()
 
-                if cutlass.const_expr(self._has_lse_t):
-                    mt = neg_inf
+        # Every thread rebuilds the weights from SMEM (parallel, no global-load
+        # latency) and keeps them in registers for its channel reduction.
+        m = neg_inf
+        for s in cutlass.range_constexpr(self._topk):
+            if s < count:
+                m = cute.arch.fmax(m, s_lse[s])
+        m_finite = m > neg_inf
+        w_frag = cute.make_rmem_tensor(cute.make_layout(self._topk), cutlass.Float32)
+        denom = cutlass.Float32(0.0)
+        for s in cutlass.range_constexpr(self._topk):
+            w = cutlass.Float32(0.0)
+            if s < count and m_finite:
+                w = cute.math.exp2(s_lse[s] - m, fastmath=True)
+            w_frag[s] = w
+            denom += w
+        inv = cutlass.Float32(0.0)
+        if denom > 0.0:
+            inv = cutlass.Float32(1.0) / denom
+
+        # Branch-free reduction: partials are allocated for all topk slots, so the
+        # loads are unconditional (they pipeline); invalid slots carry weight 0.
+        for i in cutlass.range_constexpr(self._channels_per_thread):
+            c = tidx + i * self._num_threads
+            acc = cutlass.Float32(0.0)
+            for s in cutlass.range_constexpr(self._topk):
+                e = mO_partial[s, q, h, c]
+                if cutlass.const_expr(self._partial_is_fp8):
+                    ef = e.to(cutlass.Float16).to(cutlass.Float32)
+                else:
+                    ef = e.to(cutlass.Float32)
+                acc += w_frag[s] * ef
+            mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
+
+        if cutlass.const_expr(self._has_lse_out):
+            if tidx == 0:
+                lse = neg_inf
+                if denom > 0.0:
+                    lse = (m + cute.math.log2(denom)) * _LN2
+                mLseOut[q, h] = lse
+        if cutlass.const_expr(self._has_lse_t):
+            if tidx == 0:
+                mt = neg_inf
+                for s in cutlass.range_constexpr(self._topk):
+                    if s < count:
+                        mt = cute.arch.fmax(mt, s_lse_t[s])
+                dt = cutlass.Float32(0.0)
+                if mt > neg_inf:
                     for s in cutlass.range_constexpr(self._topk):
                         if s < count:
-                            mt = cute.arch.fmax(mt, mLseT2[s, q, h])
-                    mt_finite = mt > neg_inf
-                    dt = cutlass.Float32(0.0)
-                    if mt_finite:
-                        for s in cutlass.range_constexpr(self._topk):
-                            if s < count:
-                                dt += cute.math.exp2(
-                                    mLseT2[s, q, h] - mt, fastmath=True
-                                )
-                    lse_t = neg_inf
-                    if dt > 0.0:
-                        lse_t = (mt + cute.math.log2(dt)) * _LN2
-                    mLseTOut[q, h] = lse_t
-
-                if cutlass.const_expr(self._has_lse_out):
-                    lse = neg_inf
-                    if denom > 0.0:
-                        lse = (m + cute.math.log2(denom)) * _LN2
-                    mLseOut[q, h] = lse
-
-            cute.arch.sync_threads()
-
-            denom = s_denom[0]
-            inv = cutlass.Float32(0.0)
-            if denom > 0.0:
-                inv = cutlass.Float32(1.0) / denom
-
-            for i in cutlass.range_constexpr(self._channels_per_thread):
-                c = tidx + i * self._num_threads
-                acc = cutlass.Float32(0.0)
-                for s in cutlass.range_constexpr(self._topk):
-                    if s < count:
-                        w = s_w[s]
-                        if w > 0.0:
-                            e = mO_partial[s, q, h, c]
-                            if cutlass.const_expr(self._partial_is_fp8):
-                                ef = e.to(cutlass.Float16).to(cutlass.Float32)
-                            else:
-                                ef = e.to(cutlass.Float32)
-                            acc += w * ef
-                mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
+                            dt += cute.math.exp2(s_lse_t[s] - mt, fastmath=True)
+                lse_t = neg_inf
+                if dt > 0.0:
+                    lse_t = (mt + cute.math.log2(dt)) * _LN2
+                mLseTOut[q, h] = lse_t
