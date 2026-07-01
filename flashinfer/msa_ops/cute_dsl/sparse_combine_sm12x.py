@@ -99,6 +99,7 @@ class SparseCombineSm12x:
             grid=(total_q, num_qo_heads, 1),
             block=[self._num_threads, 1, 1],
             stream=stream,
+            use_pdl=True,
         )
 
     @cute.kernel
@@ -117,6 +118,8 @@ class SparseCombineSm12x:
         tidx, _, _ = cute.arch.thread_idx()
         q, h, _ = cute.arch.block_idx()
 
+        # PDL: launched early; wait for the forward's partials before reading.
+        cute.arch.griddepcontrol_wait()
         hkv = h // group_size
         count = mSplitCounts[q, hkv]
         if count > self._topk:

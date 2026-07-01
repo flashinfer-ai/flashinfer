@@ -792,6 +792,9 @@ class SparseDecodeForwardSm12x:
                                 )
                         # protect sK/sV before the next sub-block overwrites them
                         self.cta_sync_barrier.arrive_and_wait()
+            # combine (PDL dependent) may start its prologue; it gdc-waits before
+            # reading the partials this epilogue writes.
+            cute.arch.griddepcontrol_launch_dependents()
             # Store normalized partial + log2-domain LSE for this chunk
             if tidx < 32:
                 for r in cutlass.range_constexpr(n_rows):
