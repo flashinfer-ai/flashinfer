@@ -94,18 +94,68 @@ logger = FlashInferJITLogger("flashinfer.jit")
 
 
 def check_cuda_arch():
-    # Collect all detected CUDA architectures
-    eligible = False
-    for major, minor in current_compilation_context.TARGET_CUDA_ARCHS:
-        if major >= 8:
-            eligible = True
-        elif major == 7 and minor.isdigit():
-            if int(minor) >= 5:
-                eligible = True
+    # Minimum supported: sm75 (compute 75). sm87 (8.7), sm89, etc. are supported.
+    MIN_COMPUTE_VERSION = 75
 
-    # Raise error only if all detected architectures are lower than sm75
+    def _archs_eligible(archs):
+        for major, minor in archs:
+            if major >= 8:
+                return True
+            if major == 7:
+                try:
+                    if int(minor) >= 5:
+                        return True
+                except (ValueError, TypeError):
+                    # For sm7x, we only consider integer minor versions.
+                    pass
+        return False
+
+    # Use compilation context (from FLASHINFER_CUDA_ARCH_LIST or auto-detect at import time)
+    archs = current_compilation_context.TARGET_CUDA_ARCHS
+    eligible = _archs_eligible(archs)
+
+    # If context was empty (e.g. CUDA not visible at first import), re-query once
+    if not eligible and len(archs) == 0:
+        try:
+            fresh = CompilationContext()
+            if fresh.TARGET_CUDA_ARCHS:
+                eligible = _archs_eligible(fresh.TARGET_CUDA_ARCHS)
+        except (ValueError, RuntimeError, OSError) as e:
+            logger.debug("Re-query of CUDA archs failed: %s", e)
+
+    # If still not eligible, check actual GPU capability at runtime
+
+    if not eligible and len(archs) == 0:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                for device in range(torch.cuda.device_count()):
+                    major, minor = torch.cuda.get_device_capability(device)
+                    compute_version = major * 10 + minor
+                    if compute_version >= MIN_COMPUTE_VERSION:
+                        eligible = True
+                        arch_minor = str(minor) + "a" if major >= 9 else str(minor)
+                        current_compilation_context.TARGET_CUDA_ARCHS.add(
+                            (major, arch_minor)
+                        )
+                        logger.info(
+                            "GPU %s supports sm%s%s (compute %s), enabling FlashInfer",
+                            device,
+                            major,
+                            minor,
+                            compute_version,
+                        )
+                        break
+        except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError) as e:
+            logger.warning("Failed to check GPU capability: %s", e)
+
     if not eligible:
-        raise RuntimeError("FlashInfer requires GPUs with sm75 or higher")
+        raise RuntimeError(
+            "FlashInfer requires GPUs with sm75 or higher (e.g. sm75, sm80, sm87, sm89, sm90). "
+            "If you have a supported GPU (e.g. Jetson sm87), set FLASHINFER_CUDA_ARCH_LIST before "
+            "importing flashinfer (e.g. export FLASHINFER_CUDA_ARCH_LIST='8.7') and try again."
+        )
 
 
 def clear_cache_dir():
