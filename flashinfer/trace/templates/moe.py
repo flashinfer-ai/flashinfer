@@ -3174,3 +3174,107 @@ b12x_moe_wrapper_run_trace = TraceTemplate(
     tags=b12x_fused_moe_trace.tags,
     reference=_b12x_fused_moe_reference,
 )
+
+
+# ── W4A8 MXFP4 fused MoE (Hopper SM90) ───────────────────────────────────────
+# Full MoE wrapper over the CuTe-DSL W4A8 MXFP4 grouped GEMM: FP8 e4m3 activation
+# x MXFP4 weight (FP4 e2m1 packed [N, K/2] uint8 + UE8M0 per-32-K-block scale).
+# Signature mirrors cutlass_fused_moe. fc1 is [E, 2I, H/2] with gate/up interleaved;
+# the per-expert UE8M0 scales arrive as the quant_scales=[fc1_scale, fc2_scale] list
+# (referenced via tuple_idx). Clamped-SwiGLU params (swiglu_alpha/beta/limit) are
+# optional per-expert vectors. No init/reference here (matches b12x_fused_moe);
+# correctness is covered by tests/moe/test_w4a8_mxfp4_moe.py.
+w4a8_mxfp4_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="w4a8_mxfp4_moe",
+    description=(
+        "W4A8 MXFP4 CuTe-DSL fused MoE (Hopper SM90). FP8 e4m3 activation x MXFP4 "
+        "weight (FP4 e2m1 + UE8M0 scale), gate/up-interleaved FC1, fused (optionally "
+        "clamped) SwiGLU; signature-aligned with cutlass_fused_moe."
+    ),
+    axes={
+        "num_tokens": Var(description="Total number of tokens (batch_size * seq_len)."),
+        "hidden_size": Const(abbrev="h", description="Model hidden size H."),
+        "num_experts": Const(abbrev="e", description="Number of experts E."),
+        "top_k": Const(abbrev="topk", description="Experts selected per token."),
+        "gemm1_out_size": Const(
+            abbrev="", description="FC1 output rows = 2*I (interleaved gate/up)."
+        ),
+        "num_packed_hidden": Var(description="H // 2 (FP4-packed hidden)."),
+        "num_packed_intermediate": Var(description="I // 2 (FP4-packed intermediate)."),
+        "num_hidden_blocks": Var(description="H // 32 (UE8M0 blocks over hidden)."),
+        "num_intermediate_blocks": Var(
+            description="I // 32 (UE8M0 blocks over intermediate)."
+        ),
+    },
+    inputs={
+        "input": Tensor(
+            ["num_tokens", "hidden_size"],
+            param="input",
+            description="BF16/FP16 input activations (cast to FP8 e4m3 internally).",
+        ),
+        "token_selected_experts": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k expert ids per token.",
+        ),
+        "token_final_scales": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Precomputed per-token routing scales.",
+        ),
+        "fc1_expert_weights": Tensor(
+            ["num_experts", "gemm1_out_size", "num_packed_hidden"],
+            dtype="uint8",
+            description="FC1 weights, MXFP4-packed, gate/up interleaved.",
+        ),
+        "fc2_expert_weights": Tensor(
+            ["num_experts", "hidden_size", "num_packed_intermediate"],
+            dtype="uint8",
+            description="FC2 (down) weights, MXFP4-packed.",
+        ),
+        "fc1_scale": Tensor(
+            ["num_experts", "gemm1_out_size", "num_hidden_blocks"],
+            param="quant_scales",
+            tuple_idx=0,
+            dtype="uint8",
+            description="FC1 UE8M0 block scales (quant_scales[0]).",
+        ),
+        "fc2_scale": Tensor(
+            ["num_experts", "hidden_size", "num_intermediate_blocks"],
+            param="quant_scales",
+            tuple_idx=1,
+            dtype="uint8",
+            description="FC2 UE8M0 block scales (quant_scales[1]).",
+        ),
+        "swiglu_alpha": Tensor(
+            ["num_experts"],
+            param="swiglu_alpha",
+            dtype="float32",
+            optional=True,
+            description="Per-expert clamped-SwiGLU alpha (uniform; None => 1).",
+        ),
+        "swiglu_beta": Tensor(
+            ["num_experts"],
+            param="swiglu_beta",
+            dtype="float32",
+            optional=True,
+            description="Per-expert clamped-SwiGLU beta (uniform; None => 0).",
+        ),
+        "swiglu_limit": Tensor(
+            ["num_experts"],
+            param="swiglu_limit",
+            dtype="float32",
+            optional=True,
+            description="Per-expert SwiGLU clamp limit (uniform; None => plain silu).",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype="bfloat16",
+            description="MoE output.",
+        ),
+    },
+    tags=["status:experimental", "backend:cute-dsl", "quantization:mxfp4"],
+)
