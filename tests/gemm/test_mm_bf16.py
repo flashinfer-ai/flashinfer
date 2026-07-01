@@ -189,5 +189,42 @@ def test_cublaslt_bf16_runner_zero_algos():
         runner._get_algos = original_get_algos
 
 
+def test_tinygemm_bf16_runner_multi_tactic():
+    """TinyGemmBf16GemmRunner enumerates STAGES tactics and each must be correct."""
+    from flashinfer.gemm.gemm_base import _tinygemm_bf16_gemm_runner
+    from flashinfer.utils import get_compute_capability
+
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("tinygemm", cc_num):
+        pytest.skip("tinygemm backend not supported on this GPU")
+
+    runner = _tinygemm_bf16_gemm_runner()
+
+    m, n, k = 8, 1024, 2048
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    b = weight.transpose(-2, -1)  # mm_bf16 convention: pass b as (k, n)
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(0, device="cuda", dtype=torch.uint8)
+    inputs = [a, b, None, False, out, workspace]
+
+    reference = torch.mm(a, weight.T)
+
+    tactics = runner.get_valid_tactics(inputs, None)
+    # All tactics must be multiples of 4 in [4, 16]; at least one must exist.
+    assert len(tactics) >= 1
+    assert all(t % 4 == 0 and 4 <= t <= 16 for t in tactics)
+    assert len(set(tactics)) == len(tactics)
+
+    # The fallback (auto-selected depth) and every explicit tactic must be correct.
+    for tactic in [-1, *tactics]:
+        out.zero_()
+        runner.forward(inputs, tactic=tactic)
+        cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
+        assert cos_sim > 0.99, f"tactic={tactic} produced incorrect result"
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
