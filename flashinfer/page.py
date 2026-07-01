@@ -607,24 +607,40 @@ def nvfp4_quantize_append_paged_kv_cache(
     )
 
 
-def _as_float32_scalar_tensor(
-    value: Union[float, torch.Tensor],
+def _as_float32_scalar_tensors(
+    values: Tuple[Tuple[str, Union[float, torch.Tensor]], ...],
     *,
     device: torch.device,
-    name: str,
-) -> torch.Tensor:
-    if isinstance(value, torch.Tensor):
+) -> Tuple[torch.Tensor, ...]:
+    has_cuda_tensor = any(
+        isinstance(value, torch.Tensor) and value.is_cuda for _, value in values
+    )
+    stream_capturing = (
+        has_cuda_tensor
+        and hasattr(torch.cuda, "is_current_stream_capturing")
+        and torch.cuda.is_current_stream_capturing()
+    )
+
+    tensors = []
+    cuda_tensors_to_validate = []
+    for name, value in values:
+        if not isinstance(value, torch.Tensor):
+            scalar = float(value)
+            if not math.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError(
+                    f"{name} must be a positive finite global decode scale"
+                )
+            tensors.append(torch.tensor([scalar], dtype=torch.float32, device=device))
+            continue
+
         if value.numel() != 1:
             raise ValueError(
                 f"{name} must have exactly one element, got {value.numel()}"
             )
         if value.dtype != torch.float32:
             raise ValueError(f"{name} must be torch.float32, got {value.dtype}")
-        is_capturing = (
-            value.is_cuda
-            and hasattr(torch.cuda, "is_current_stream_capturing")
-            and torch.cuda.is_current_stream_capturing()
-        )
+        is_cuda_tensor = value.is_cuda
+        is_capturing = is_cuda_tensor and stream_capturing
         if not value.is_cuda:
             scalar = float(value.item())
             if not math.isfinite(scalar) or scalar <= 0.0:
@@ -640,34 +656,32 @@ def _as_float32_scalar_tensor(
             value = value.to(device=device)
         if is_capturing and not value.is_contiguous():
             raise ValueError(f"{name} must be contiguous during CUDA graph capture")
-        return value.contiguous()
-    scalar = float(value)
-    if not math.isfinite(scalar) or scalar <= 0.0:
-        raise ValueError(f"{name} must be a positive finite global decode scale")
-    return torch.tensor([scalar], dtype=torch.float32, device=device)
-
-
-def _validate_cuda_float32_scalar_tensors(
-    values: Tuple[Tuple[str, torch.Tensor], ...],
-) -> None:
-    values = tuple((name, value) for name, value in values if value.is_cuda)
-    if not values:
-        return
-    if (
-        hasattr(torch.cuda, "is_current_stream_capturing")
-        and torch.cuda.is_current_stream_capturing()
-    ):
-        return
+        value = value.contiguous()
+        tensors.append(value)
+        if is_capturing:
+            continue
+        if is_cuda_tensor:
+            cuda_tensors_to_validate.append((name, value))
 
     # Validate CUDA scalar tensors with one device-to-host transfer instead of
     # a separate implicit sync for each tensor.
-    host_values = (
-        torch.stack([value.reshape(()) for _, value in values]).detach().cpu().tolist()
-    )
-    for (name, _), scalar in zip(values, host_values, strict=True):
-        scalar = float(scalar)
-        if not math.isfinite(scalar) or scalar <= 0.0:
-            raise ValueError(f"{name} must be a positive finite global decode scale")
+    if cuda_tensors_to_validate:
+        host_values = (
+            torch.stack([value.reshape(()) for _, value in cuda_tensors_to_validate])
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        for (name, _), scalar in zip(
+            cuda_tensors_to_validate, host_values, strict=True
+        ):
+            scalar = float(scalar)
+            if not math.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError(
+                    f"{name} must be a positive finite global decode scale"
+                )
+
+    return tuple(tensors)
 
 
 @flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace)
@@ -723,23 +737,9 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
             "NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn"
         )
 
-    validate_k_scale_cuda = isinstance(k_scale, torch.Tensor) and k_scale.is_cuda
-    validate_v_scale_cuda = isinstance(v_scale, torch.Tensor) and v_scale.is_cuda
-    k_scale_tensor = _as_float32_scalar_tensor(
-        k_scale, device=append_key.device, name="k_scale"
-    )
-    v_scale_tensor = _as_float32_scalar_tensor(
-        v_scale, device=append_key.device, name="v_scale"
-    )
-    _validate_cuda_float32_scalar_tensors(
-        tuple(
-            scale
-            for should_validate, scale in (
-                (validate_k_scale_cuda, ("k_scale", k_scale_tensor)),
-                (validate_v_scale_cuda, ("v_scale", v_scale_tensor)),
-            )
-            if should_validate
-        )
+    k_scale_tensor, v_scale_tensor = _as_float32_scalar_tensors(
+        (("k_scale", k_scale), ("v_scale", v_scale)),
+        device=append_key.device,
     )
 
     _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
