@@ -45,7 +45,7 @@ def _skip_if_fp8_e4m3_scale_unsupported():
         pytest.skip(f"SM{major}{minor} does not support FP8 E4M3 scale tensors")
 
 
-def _make_small_nvfp4_append_inputs():
+def _make_small_nvfp4_append_inputs(device="cuda:0"):
     _skip_if_fp8_e4m3_scale_unsupported()
 
     nnz_kv = 1
@@ -54,7 +54,7 @@ def _make_small_nvfp4_append_inputs():
     page_size = 1
     max_num_pages = 1
     k_append = torch.randn(
-        nnz_kv, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+        nnz_kv, num_kv_heads, head_dim, device=device, dtype=torch.float16
     )
     v_append = torch.randn_like(k_append)
     k_cache = torch.zeros(
@@ -63,7 +63,7 @@ def _make_small_nvfp4_append_inputs():
         num_kv_heads,
         head_dim // 2,
         dtype=torch.uint8,
-        device="cuda:0",
+        device=device,
     )
     v_cache = torch.zeros_like(k_cache)
     k_scales = torch.zeros(
@@ -72,7 +72,7 @@ def _make_small_nvfp4_append_inputs():
         num_kv_heads,
         head_dim // 16,
         dtype=torch.float8_e4m3fn,
-        device="cuda:0",
+        device=device,
     )
     v_scales = torch.zeros_like(k_scales)
     return k_append, v_append, k_cache, v_cache, k_scales, v_scales
@@ -515,6 +515,44 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_rejects_capture_
             k_scale,
             v_scale,
         )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_capture_check_uses_append_device(
+    monkeypatch,
+):
+    target_device = torch.device("cuda:1")
+    previous_device = torch.cuda.current_device()
+    torch.cuda.set_device(0)
+    k_append, v_append, k_cache, v_cache, k_scales, v_scales = (
+        _make_small_nvfp4_append_inputs(device=target_device)
+    )
+    slot_mapping = torch.zeros(1, dtype=torch.int32, device=target_device)
+    v_scale = torch.ones(1, dtype=torch.float32, device=target_device)
+
+    def is_current_stream_capturing():
+        return torch.cuda.current_device() == target_device.index
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        is_current_stream_capturing,
+        raising=False,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="CUDA graph capture"):
+            flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+                k_append,
+                v_append,
+                slot_mapping,
+                (k_cache, v_cache),
+                (k_scales, v_scales),
+                1.0,
+                v_scale,
+            )
+    finally:
+        torch.cuda.set_device(previous_device)
 
 
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_capture():

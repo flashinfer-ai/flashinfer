@@ -612,10 +612,7 @@ def _as_float32_scalar_tensors(
     *,
     device: torch.device,
 ) -> Tuple[torch.Tensor, ...]:
-    stream_capturing = (
-        hasattr(torch.cuda, "is_current_stream_capturing")
-        and torch.cuda.is_current_stream_capturing()
-    )
+    stream_capturing = _is_stream_capturing_on_device(device)
 
     tensors = []
     cuda_tensors_to_validate = []
@@ -683,6 +680,15 @@ def _as_float32_scalar_tensors(
                 )
 
     return tuple(tensors)
+
+
+def _is_stream_capturing_on_device(device: torch.device) -> bool:
+    if not hasattr(torch.cuda, "is_current_stream_capturing"):
+        return False
+    if device.type != "cuda":
+        return False
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
 
 
 @flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace)
