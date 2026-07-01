@@ -1347,6 +1347,9 @@ def single_prefill_with_kv_cache(
         if scale_v is None:
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
 
+    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim.
+    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+
     if backend == "auto":
         backend = determine_attention_backend(
             q.device,
@@ -1355,6 +1358,8 @@ def single_prefill_with_kv_cache(
             packed_custom_mask is not None,  # use_custom_mask
             q.dtype,
             k.dtype,
+            head_dim_qk=q.shape[-1],
+            head_dim_vo=out_head_dim,
         )
 
     # Unpack NVFP4 scale factors
@@ -1368,8 +1373,6 @@ def single_prefill_with_kv_cache(
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
-    # For NVFP4 KV (uint8 packed), last dim is head_dim//2; output uses q head_dim
-    out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
     out = torch.empty(q.shape[:-1] + (out_head_dim,), dtype=o_dtype, device=q.device)
 
     module = get_single_prefill_module(
@@ -2076,6 +2079,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                 )
             if self._backend != "cudnn":
                 get_module_args = (
@@ -3186,6 +3191,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                 )
 
             get_module_args = (
