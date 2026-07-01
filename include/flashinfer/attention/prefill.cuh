@@ -203,8 +203,8 @@ struct KernelTraits {
 
   static constexpr bool IsInvalid() {
     // The first clause prunes (CTA_TILE_Q, head_dim) pairs FA2DetermineCtaTileQ
-    // never selects: {16, 32} for head_dim_vo >= 512, {16, 64, 128} otherwise.
-    return ((HEAD_DIM_VO >= 512 ? (CTA_TILE_Q > 32) : (CTA_TILE_Q == 32)) || (NUM_MMA_D_VO < 4) ||
+    // never selects: {16, 32} for head_dim_qk >= 512, {16, 64, 128} otherwise.
+    return ((HEAD_DIM_QK >= 512 ? (CTA_TILE_Q > 32) : (CTA_TILE_Q == 32)) || (NUM_MMA_D_VO < 4) ||
             (NUM_MMA_D_VO == 4 && NUM_MMA_KV % 2 == 1) ||
             (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && NUM_MMA_D_VO > 4 &&
              NUM_MMA_D_VO % (2 * NUM_WARPS_Q) != 0) ||
@@ -491,8 +491,8 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
  * SF bytes per iteration, advancing by NUM_WARPS * 128 bytes across iterations.
  * The SF smem layout is a plain flat byte array — no swizzle.
  *
- * SF strides are KV byte strides divided by SF_CONTAINERS (= NVFP4_SF_VEC_SIZE/2 = 8),
- * which is exact because all NVFP4-compatible head_dims are divisible by 16.
+ * SF strides are passed explicitly by the caller instead of being derived from KV data strides.
+ * This lets runtimes pass scale-factor tensors from interleaved or separately allocated KV pools.
  * No-op when KTraits::DTypeKV is not FP4.
  *
  * \tparam produce_v  true → fill v_sf_smem, false → fill k_sf_smem.
@@ -503,9 +503,9 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
  * \param packed_page_iter_base  Packed page-iter for the start of this CTA tile.
  * \param packed_kv_bound     Upper bound for valid packed page-iters (last_indptr * page_size).
  * \param kv_head_idx         KV head index.
- * \param kv_stride_page      Byte stride per page in the KV tensor.
- * \param kv_stride_h         Byte stride per head in the KV tensor.
- * \param kv_stride_n         Byte stride per token in the KV tensor.
+ * \param sf_stride_page      Byte stride per page in the SF tensor.
+ * \param sf_stride_h         Byte stride per head in the SF tensor.
+ * \param sf_stride_n         Byte stride per token in the SF tensor.
  * \param page_size           Page size (fast divisor).
  * \param indices             Page index array.
  * \param kv_idx_base         First KV row index for this tile within the chunk.
@@ -513,11 +513,15 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
  * \param warp_idx            Global warp index within the CTA.
  * \param lane_idx            Lane index within the warp.
  */
+#ifndef FLASHINFER_PAGED_V_SF_DESWIZZLE
+#define FLASHINFER_PAGED_V_SF_DESWIZZLE 0
+#endif
+
 template <bool produce_v, typename KTraits, typename SmemStorage, typename IdType>
 __device__ __forceinline__ void page_produce_kv_sf(
     SmemStorage* smem_storage, uint8_t* sf_ptr, const uint32_t packed_page_iter_base,
-    const uint32_t packed_kv_bound, const uint32_t kv_head_idx, const uint32_t kv_stride_page,
-    const uint32_t kv_stride_h, const uint32_t kv_stride_n, const uint_fastdiv& page_size,
+    const uint32_t packed_kv_bound, const uint32_t kv_head_idx, const uint32_t sf_stride_page,
+    const uint32_t sf_stride_h, const uint32_t sf_stride_n, const uint_fastdiv& page_size,
     const IdType* indices, const uint32_t kv_idx_base, const uint32_t kv_len,
     const uint32_t warp_idx, const uint32_t lane_idx) {
   if constexpr (!is_fp4_type_v<typename KTraits::DTypeKV>) return;
@@ -526,8 +530,6 @@ __device__ __forceinline__ void page_produce_kv_sf(
   constexpr uint32_t SF_COLS = HEAD_DIM / NVFP4_SF_VEC_SIZE;  // SF bytes per KV row
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  // DTypeKV containers per SF byte: NVFP4_SF_VEC_SIZE FP4 / 2 FP4-per-container.
-  constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;  // = 8
   constexpr uint32_t SF_TOTAL_BYTES = CTA_TILE_KV * SF_COLS;
   static_assert(SF_TOTAL_BYTES % 4 == 0, "SF smem size must be 4-byte aligned for 32-bit LDGSTS");
   // Each thread loads 4 SF bytes (32 bits) per iteration via LDGSTS.32.
@@ -548,26 +550,48 @@ __device__ __forceinline__ void page_produce_kv_sf(
     // For k < NUM_SF_ITERS-1, (flat_byte < SF_TOTAL_BYTES) is always true (optimized away).
     const bool in_bounds = (flat_byte < SF_TOTAL_BYTES) && (kv_idx_base + sf_smem_row < kv_len);
 
-    // SF strides are KV byte strides / SF_CONTAINERS (1 SF byte per SF_CONTAINERS KV containers).
     // packed_kv_bound guards indices[] access; returns offset 0 for out-of-range rows.
     uint32_t page_iter, entry_idx;
     const uint32_t packed_block_iter = packed_page_iter_base + sf_smem_row;
     page_size.divmod(packed_block_iter, page_iter, entry_idx);
-    const size_t sf_gmem_offset =
+    const size_t page_head_base =
         static_cast<size_t>(packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) *
-            (kv_stride_page / SF_CONTAINERS) +
-        kv_head_idx * (kv_stride_h / SF_CONTAINERS) + entry_idx * (kv_stride_n / SF_CONTAINERS) +
-        sf_smem_col;
+            sf_stride_page +
+        kv_head_idx * sf_stride_h;
 
-    // V SF must zero-fill out-of-bounds entries: compute_sfm_v reads SF for all CTA_TILE_KV rows
-    // including padding, and 0 (softmax weight) * NaN (uninitialized SF) = NaN (IEEE 754).
-    // K SF can use kNoFill since NaN K scores are replaced by -inf via logits_mask before
-    // update_mdo_states, so they never reach the accumulator.
-    constexpr auto fill_mode =
-        produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
-    cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
-                                       reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
-                                       in_bounds);
+    if constexpr (produce_v && FLASHINFER_PAGED_V_SF_DESWIZZLE) {
+      static_assert(SF_COLS % 4 == 0,
+                    "Paged V-SF de-swizzle requires HEAD_DIM_VO divisible by 64");
+      uint32_t packed = 0;
+      if (in_bounds) {
+        constexpr uint32_t SF_GROUPS = SF_COLS / 4;
+        const uint32_t a4 = entry_idx & ~3u;
+        const uint32_t e = entry_idx & 3u;
+        uint8_t* packed_bytes = reinterpret_cast<uint8_t*>(&packed);
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+          const uint32_t dcol = sf_smem_col + j;
+          const uint32_t swz_entry = a4 + dcol / SF_GROUPS;
+          const uint32_t swz_sd = (dcol % SF_GROUPS) * 4 + e;
+          packed_bytes[j] =
+              sf_ptr[page_head_base + static_cast<size_t>(swz_entry) * sf_stride_n + swz_sd];
+        }
+      }
+      // NUM_SF_ITERS is rounded up, so the last iter has lanes with
+      // flat_byte >= SF_TOTAL_BYTES. Unlike the predicated cp_async store below,
+      // this write is unconditional, so guard it on the buffer bound (not in_bounds,
+      // which would also skip the intended zero-fill of in-buffer padding rows).
+      if (flat_byte < SF_TOTAL_BYTES) {
+        *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
+      }
+    } else {
+      const size_t sf_gmem_offset = page_head_base + entry_idx * sf_stride_n + sf_smem_col;
+      constexpr auto fill_mode =
+          produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
+      cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+                                         reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
+                                         in_bounds);
+    }
   }
 }
 
@@ -577,7 +601,7 @@ __device__ __forceinline__ void page_produce_kv_sf(
  * Contiguous analog of page_produce_kv_sf — no page indirection.
  * kv_abs_base is the absolute first token index for this CTA tile
  * (kv_indptr[request_idx] + chunk_start for ragged, chunk_start for single prefill).
- * SF strides are KV byte strides / SF_CONTAINERS (exact for all valid head_dims).
+ * SF strides are passed explicitly by the caller.
  * No-op when DTypeKV is not FP4.
  *
  * \tparam produce_v  true → fill v_sf_smem, false → fill k_sf_smem.
@@ -586,8 +610,8 @@ __device__ __forceinline__ void page_produce_kv_sf(
  * \param sf_ptr              Base pointer to the flat uint8_t SF array (K or V).
  * \param kv_abs_base         Absolute first token index for this CTA tile.
  * \param kv_head_idx         KV head index.
- * \param kv_stride_n         Byte stride per token in the KV tensor.
- * \param kv_stride_h         Byte stride per head in the KV tensor.
+ * \param sf_stride_n         Byte stride per token in the SF tensor.
+ * \param sf_stride_h         Byte stride per head in the SF tensor.
  * \param kv_idx_base         First KV row index for this tile within the chunk.
  * \param kv_len              Chunk size; rows at or beyond this are not loaded.
  * \param warp_idx            Global warp index within the CTA.
@@ -597,8 +621,8 @@ template <bool produce_v, typename KTraits>
 __device__ __forceinline__ void produce_kv_sf(typename KTraits::SharedStorage* smem_storage,
                                               uint8_t* sf_ptr, const uint32_t kv_abs_base,
                                               const uint32_t kv_head_idx,
-                                              const uint32_t kv_stride_n,
-                                              const uint32_t kv_stride_h,
+                                              const uint32_t sf_stride_n,
+                                              const uint32_t sf_stride_h,
                                               const uint32_t kv_idx_base, const uint32_t kv_len,
                                               const uint32_t warp_idx, const uint32_t lane_idx) {
   if constexpr (!is_fp4_type_v<typename KTraits::DTypeKV>) return;
@@ -607,8 +631,6 @@ __device__ __forceinline__ void produce_kv_sf(typename KTraits::SharedStorage* s
   constexpr uint32_t SF_COLS = HEAD_DIM / NVFP4_SF_VEC_SIZE;
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  // DTypeKV containers per SF byte: NVFP4_SF_VEC_SIZE FP4 / 2 FP4-per-container.
-  constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;  // = 8
   constexpr uint32_t SF_TOTAL_BYTES = CTA_TILE_KV * SF_COLS;
   static_assert(SF_TOTAL_BYTES % 4 == 0, "SF smem size must be 4-byte aligned for 32-bit LDGSTS");
   // Each thread loads 4 SF bytes (32 bits) per iteration via LDGSTS.32.
@@ -617,8 +639,6 @@ __device__ __forceinline__ void produce_kv_sf(typename KTraits::SharedStorage* s
 
   uint8_t* sf_smem = produce_v ? smem_storage->v_sf_smem : smem_storage->k_sf_smem;
   const uint32_t thread_id = warp_idx * 32 + lane_idx;
-  const uint32_t sf_stride_n = kv_stride_n / SF_CONTAINERS;
-  const uint32_t sf_stride_h = kv_stride_h / SF_CONTAINERS;
 
 #pragma unroll
   for (uint32_t i = 0; i < NUM_SF_ITERS; ++i) {
@@ -647,7 +667,10 @@ __device__ __forceinline__ void init_rope_freq(float (*rope_freq)[4], const floa
   constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
   const uint32_t lane_idx = tid_x;
 #pragma unroll
-  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO / 2; ++mma_d) {
+  // rope_freq is sized [NUM_MMA_D_QK/2][4] and the rotary appliers index it up to
+  // NUM_MMA_D_QK/2; for asymmetric QK/VO (e.g. qk=512, vo=256) NUM_MMA_D_VO/2 would
+  // leave the upper half of the table uninitialized, so bound on QK.
+  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_QK / 2; ++mma_d) {
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
       rope_freq[mma_d][j] =
@@ -1746,12 +1769,18 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     const uint_fastdiv& group_size = params.group_size;
 
     uint8_t* maybe_k_cache_sf = nullptr;
+    uint32_t k_cache_sf_stride_n = 0, k_cache_sf_stride_h = 0;
     if constexpr (has_maybe_k_cache_sf_v<Params>) {
       maybe_k_cache_sf = params.maybe_k_cache_sf;
+      k_cache_sf_stride_n = params.maybe_k_cache_sf_stride_n;
+      k_cache_sf_stride_h = params.maybe_k_cache_sf_stride_h;
     }
     uint8_t* maybe_v_cache_sf = nullptr;
+    uint32_t v_cache_sf_stride_n = 0, v_cache_sf_stride_h = 0;
     if constexpr (has_maybe_v_cache_sf_v<Params>) {
       maybe_v_cache_sf = params.maybe_v_cache_sf;
+      v_cache_sf_stride_n = params.maybe_v_cache_sf_stride_n;
+      v_cache_sf_stride_h = params.maybe_v_cache_sf_stride_h;
     }
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -1863,7 +1892,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
                                                              k_stride_n, 0, chunk_size, tid);
       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
-                                    k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
+                                    k_cache_sf_stride_n, k_cache_sf_stride_h, 0, chunk_size, warp_idx, lane_idx);
       cp_async::commit_group();
       if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
         // Shared K/V: don't preload V(0) (it would clobber K(0)); V(0) is loaded
@@ -1871,7 +1900,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
                                                                 v_stride_n, 0, chunk_size, tid);
         produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
-                                     v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
+                                     v_cache_sf_stride_n, v_cache_sf_stride_h, 0, chunk_size, warp_idx, lane_idx);
         cp_async::commit_group();
       }
 
@@ -1923,7 +1952,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
               tid);
           produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
-                                        k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV,
+                                        k_cache_sf_stride_n, k_cache_sf_stride_h, (iter + 1) * CTA_TILE_KV,
                                         chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
           cp_async::wait_group<1>();
@@ -1949,7 +1978,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
               v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
               tid);
           produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
-                                       v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                       v_cache_sf_stride_n, v_cache_sf_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
                                        warp_idx, lane_idx);
           cp_async::commit_group();
         }
@@ -2039,7 +2068,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t packed_qo_len = qo_len * group_size;
-  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
+  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO, HEAD_DIM_QK);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     // hd512 uses the 2-Q x 2-KV-warp layout at CTA_TILE_Q=32. Unlike the paged
@@ -2081,7 +2110,11 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                    : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
         (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                        sizeof(DTypeQ))
-                    : 0u);
+                    : 0u) +
+        // NVFP4 K/V scale-factor smem (k_sf_smem + v_sf_smem) also scales with
+        // CTA_TILE_KV (= NUM_MMA_KV*16); count it so the occupancy budget doesn't
+        // over-select a tile whose SharedStorage then exceeds the smem limit.
+        (is_fp4_type_v<DTypeKV> ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 / NVFP4_SF_VEC_SIZE) : 0u);
     // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
     // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0); size the
     // occupancy budget against the minimum *valid* tile so the staging buffer
@@ -2113,6 +2146,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     }
 
     // control NUM_MMA_KV for maximum warp occupancy
+    FA2_REJECT_IF_KV_SMEM_INSUFFICIENT();
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
       using KTraits =
           KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
@@ -2251,12 +2285,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint_fastdiv& group_size = params.group_size;
 
     uint8_t* maybe_k_cache_sf = nullptr;
+    uint32_t k_cache_sf_stride_n = 0, k_cache_sf_stride_h = 0;
     if constexpr (has_maybe_k_cache_sf_v<Params>) {
       maybe_k_cache_sf = params.maybe_k_cache_sf;
+      k_cache_sf_stride_n = params.maybe_k_cache_sf_stride_n;
+      k_cache_sf_stride_h = params.maybe_k_cache_sf_stride_h;
     }
     uint8_t* maybe_v_cache_sf = nullptr;
+    uint32_t v_cache_sf_stride_n = 0, v_cache_sf_stride_h = 0;
     if constexpr (has_maybe_v_cache_sf_v<Params>) {
       maybe_v_cache_sf = params.maybe_v_cache_sf;
+      v_cache_sf_stride_n = params.maybe_v_cache_sf_stride_n;
+      v_cache_sf_stride_h = params.maybe_v_cache_sf_stride_h;
     }
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -2425,7 +2465,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
                                                              k_stride_n, 0, chunk_size, tid);
       produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
-                                    k_stride_n, k_stride_h, 0, chunk_size, warp_idx, lane_idx);
+                                    k_cache_sf_stride_n, k_cache_sf_stride_h, 0,
+                                    chunk_size, warp_idx, lane_idx);
       cp_async::commit_group();
       if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
         // Shared K/V: don't preload V(0) (it would clobber K(0)); V(0) is loaded
@@ -2433,7 +2474,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(v_smem, &v_smem_offset_w, &v_ptr,
                                                                 v_stride_n, 0, chunk_size, tid);
         produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
-                                     v_stride_n, v_stride_h, 0, chunk_size, warp_idx, lane_idx);
+                                     v_cache_sf_stride_n, v_cache_sf_stride_h, 0, chunk_size, warp_idx, lane_idx);
         cp_async::commit_group();
       }
 
@@ -2505,7 +2546,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
               k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
               tid);
           produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, kv_abs_base, kv_head_idx,
-                                        k_stride_n, k_stride_h, (iter + 1) * CTA_TILE_KV,
+                                        k_cache_sf_stride_n, k_cache_sf_stride_h, (iter + 1) * CTA_TILE_KV,
                                         chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
           cp_async::wait_group<1>();
@@ -2543,7 +2584,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
               v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV, chunk_size,
               tid);
           produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, kv_abs_base, kv_head_idx,
-                                       v_stride_n, v_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                       v_cache_sf_stride_n, v_cache_sf_stride_h, (iter + 1) * CTA_TILE_KV, chunk_size,
                                        warp_idx, lane_idx);
           cp_async::commit_group();
         }
@@ -2908,12 +2949,20 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       maybe_max_item_len_ptr = params.maybe_max_item_len_ptr;
     }
     uint8_t* maybe_k_cache_sf = nullptr;
+    uint32_t k_cache_sf_stride_page = 0, k_cache_sf_stride_h = 0, k_cache_sf_stride_n = 0;
     if constexpr (has_maybe_k_cache_sf_v<Params>) {
       maybe_k_cache_sf = params.maybe_k_cache_sf;
+      k_cache_sf_stride_page = params.maybe_k_cache_sf_stride_page;
+      k_cache_sf_stride_h = params.maybe_k_cache_sf_stride_h;
+      k_cache_sf_stride_n = params.maybe_k_cache_sf_stride_n;
     }
     uint8_t* maybe_v_cache_sf = nullptr;
+    uint32_t v_cache_sf_stride_page = 0, v_cache_sf_stride_h = 0, v_cache_sf_stride_n = 0;
     if constexpr (has_maybe_v_cache_sf_v<Params>) {
       maybe_v_cache_sf = params.maybe_v_cache_sf;
+      v_cache_sf_stride_page = params.maybe_v_cache_sf_stride_page;
+      v_cache_sf_stride_h = params.maybe_v_cache_sf_stride_h;
+      v_cache_sf_stride_n = params.maybe_v_cache_sf_stride_n;
     }
 
     static_assert(sizeof(DTypeQ) == 2);
@@ -3030,7 +3079,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
 
       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
-      size_t thr_local_kv_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
+      size_t thr_local_kv_offset_k[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
+      size_t thr_local_kv_offset_v[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
       // K/V-shared path: V(iter) reuses the page offsets that loaded K(iter) (same
       // tile). thr_local_kv_offset gets overwritten with the NEXT tile's offsets at
       // the loop head, so stash the current tile's offsets here for the V load.
@@ -3076,32 +3126,35 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                   page_iter, entry_idx);
         // FP4: GMEM is packed (2 FP4/byte), so the column byte offset is halved relative to fp8
         constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
-        thr_local_kv_offset[i] = paged_kv.protective_get_kv_offset(
-            page_iter, kv_head_idx, entry_idx,
-            (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor, last_indptr);
+        const uint32_t feat_idx =
+            (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
+        thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
+            page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+        thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+            page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
       }
       page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data, 0,
-                                      thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+                                      thr_local_kv_offset_k, chunk_size, warp_idx, lane_idx);
       page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
                                          last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-                                         paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
-                                         paged_kv.page_size, paged_kv.indices, 0, chunk_size,
-                                         warp_idx, lane_idx);
+                                         k_cache_sf_stride_page, k_cache_sf_stride_h,
+                                         k_cache_sf_stride_n, paged_kv.page_size, paged_kv.indices,
+                                         0, chunk_size, warp_idx, lane_idx);
       cp_async::commit_group();
       if constexpr (KTraits::USE_KV_SHARED_SMEM) {
         // Shared K/V: don't preload V(0) (it would clobber K(0)); V(0) is loaded
         // inside iter 0 after Q.K^T. Stash tile-0 offsets for that load.
 #pragma unroll
         for (uint32_t i = 0; i < NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q; ++i) {
-          shared_v_kv_offset[i] = thr_local_kv_offset[i];
+          shared_v_kv_offset[i] = thr_local_kv_offset_v[i];
         }
       } else {
         page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
-                                       thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+                                       thr_local_kv_offset_v, chunk_size, warp_idx, lane_idx);
         page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
                                           last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-                                          paged_kv.stride_page, paged_kv.stride_h,
-                                          paged_kv.stride_n, paged_kv.page_size, paged_kv.indices,
+                                          v_cache_sf_stride_page, v_cache_sf_stride_h,
+                                          v_cache_sf_stride_n, paged_kv.page_size, paged_kv.indices,
                                           0, chunk_size, warp_idx, lane_idx);
         cp_async::commit_group();
       }
@@ -3182,10 +3235,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                     page_iter, entry_idx);
           // FP4: GMEM is packed (2 FP4/byte), so the column byte offset is halved relative to fp8
           constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
-          thr_local_kv_offset[i] = paged_kv.protective_get_kv_offset(
-              page_iter, kv_head_idx, entry_idx,
-              (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor,
-              last_indptr);
+          const uint32_t feat_idx =
+              (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
+          thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
+              page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+          thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+              page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
         }
         // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
@@ -3277,12 +3332,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           cp_async::wait_group<0>();
         } else {
           page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
-                                          (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
-                                          warp_idx, lane_idx);
+                                          (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
+                                          chunk_size, warp_idx, lane_idx);
           page_produce_kv_sf<false, KTraits>(
               &smem_storage, maybe_k_cache_sf, packed_page_iter_base,
-              last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, paged_kv.stride_page,
-              paged_kv.stride_h, paged_kv.stride_n, paged_kv.page_size, paged_kv.indices,
+              last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, k_cache_sf_stride_page,
+              k_cache_sf_stride_h, k_cache_sf_stride_n, paged_kv.page_size, paged_kv.indices,
               (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
           cp_async::wait_group<1>();
@@ -3316,21 +3371,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         block.sync();
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
           page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
-                                          (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
-                                          warp_idx, lane_idx);
+                                          (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
+                                          chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
 #pragma unroll
           for (uint32_t i = 0; i < NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q; ++i) {
-            shared_v_kv_offset[i] = thr_local_kv_offset[i];
+            shared_v_kv_offset[i] = thr_local_kv_offset_v[i];
           }
         } else {
           page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                         (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
-                                         warp_idx, lane_idx);
+                                         (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_v,
+                                         chunk_size, warp_idx, lane_idx);
           page_produce_kv_sf<true, KTraits>(
               &smem_storage, maybe_v_cache_sf, packed_page_iter_base,
-              last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, paged_kv.stride_page,
-              paged_kv.stride_h, paged_kv.stride_n, paged_kv.page_size, paged_kv.indices,
+              last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, v_cache_sf_stride_page,
+              v_cache_sf_stride_h, v_cache_sf_stride_n, paged_kv.page_size, paged_kv.indices,
               (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
         }
@@ -3476,7 +3531,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                  : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
-                  : 0u);
+                  : 0u) +
+      // NVFP4 K/V scale-factor smem (k_sf_smem + v_sf_smem) also scales with
+      // CTA_TILE_KV (= NUM_MMA_KV*16); count it so the occupancy budget doesn't
+      // over-select a tile whose SharedStorage then exceeds the smem limit.
+      (is_fp4_type_v<DTypeKV> ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 / NVFP4_SF_VEC_SIZE) : 0u);
   // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
   // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0). When the
   // staging buffer shrinks the tile on tight-smem parts (e.g. SM120), we must
@@ -3514,6 +3573,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
     FLASHINFER_ERROR(err_msg.str());
   }
 
+  FA2_REJECT_IF_KV_SMEM_INSUFFICIENT();
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
@@ -3664,7 +3724,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u) +
-      (kVOSplitDispatch ? (CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ)) : 0u);
+      (kVOSplitDispatch ? (CTA_TILE_Q * NUM_WARPS_KV * 16 * sizeof(DTypeQ)) : 0u) +
+      // NVFP4 K/V scale-factor smem (k_sf_smem + v_sf_smem) also scales with
+      // CTA_TILE_KV (= NUM_MMA_KV*16); count it so the occupancy budget doesn't
+      // over-select a tile whose SharedStorage then exceeds the smem limit.
+      (is_fp4_type_v<DTypeKV> ? ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 / NVFP4_SF_VEC_SIZE) : 0u);
   // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
   // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0). When the
   // staging buffer shrinks the tile on tight-smem parts (e.g. SM120), we must
@@ -3699,6 +3763,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     FLASHINFER_ERROR(err_msg.str());
   }
 
+  FA2_REJECT_IF_KV_SMEM_INSUFFICIENT();
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,

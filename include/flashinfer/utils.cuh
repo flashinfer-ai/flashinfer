@@ -110,6 +110,30 @@
     FLASHINFER_ERROR(err_msg.str());                     \
   }
 
+// Clean, real-shared-memory rejection. If even the minimum *valid* KV tile won't fit this GPU's
+// shared memory, abort with an actionable message (real byte counts + cause) instead of the cryptic
+// "Unsupported max_mma_kv: 0" / "Invalid configuration NUM_MMA_KV=1 ...". Fires e.g. for fp8 KV at
+// head_dim_qk=512 on CC 12.x, where the bf16 repack staging buffer (which nvfp4 avoids via in-loop
+// dequant) blows the ~100 KB/SM budget. Self-clearing: allows the config on any GPU/dtype where it
+// genuinely fits, so this is a correctness guard, not a hardcoded "unsupported". Expanded where the
+// loop-local names below are in scope (the three FA2 prefill dispatch sites).
+#define FA2_REJECT_IF_KV_SMEM_INSUFFICIENT()                                                     \
+  if (min(max_num_mma_kv_smem, max_num_mma_kv_reg) < kMinValidMmaKV) {                           \
+    std::ostringstream _fi_kv_e;                                                                 \
+    _fi_kv_e << "FlashInfer: KV tile (head_dim_qk=" << HEAD_DIM_QK                               \
+             << " head_dim_vo=" << HEAD_DIM_VO << " cta_tile_q=" << CTA_TILE_Q << ", "           \
+             << (sizeof(DTypeKV) == 1 ? "1-byte" : "2-byte")                                     \
+             << " KV) does not fit shared memory on this GPU: the minimum valid tile needs "     \
+             << (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kMinValidMmaKV * kKVSmemPerMmaKV)   \
+             << " B but only " << max_smem_per_threadblock << " B/threadblock is available ("    \
+             << max_smem_per_sm << " B/SM). "                                                    \
+             << (kUseRepack ? "fp8 KV needs a bf16 repack staging buffer in shared memory that " \
+                              "nvfp4 avoids (in-loop dequant) -- use an nvfp4 KV cache, "         \
+                            : "Use ")                                                            \
+             << "a smaller head_dim, or a GPU with more shared memory per SM.";                  \
+    FLASHINFER_ERROR(_fi_kv_e.str());                                                            \
+  }
+
 #define DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, ...)   \
   switch (cta_tile_q) {                                    \
     case 128: {                                            \
@@ -151,6 +175,9 @@
     __VA_ARGS__                                              \
   } else if (group_size == 4) {                              \
     constexpr size_t GROUP_SIZE = 4;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 6) {                              \
+    constexpr size_t GROUP_SIZE = 6;                         \
     __VA_ARGS__                                              \
   } else if (group_size == 8) {                              \
     constexpr size_t GROUP_SIZE = 8;                         \
@@ -386,12 +413,25 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
-inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
+                                     uint32_t head_dim_qk = 0) {
+  // head_dim is the VO dim at the batch-prefill call sites; head_dim_qk (when
+  // nonzero) lets asymmetric (QK != VO) configurations report the dim that
+  // actually drives shared-memory cost.
+  const uint32_t qk = head_dim_qk ? head_dim_qk : head_dim;
   if (head_dim >= 512) {
+    // True VO-split (VO >= 512): the split halves o_frag register pressure, so
+    // CTA_TILE_Q=32 is feasible for long-q; CTA16 for decode / short-q.
     if (avg_packed_qo_len <= 32) {
       return 16;  // decode / short-q (incl. speculative decode): lean CTA16
     }
     return 32;  // Long-q prefill use CTA_TILE_Q=32
+  }
+  if (qk >= 512) {
+    // Asymmetric large-QK but VO <= 256: VO-split does NOT engage (NUM_MMA_D_VO
+    // == 16), so o_frag is sized by the full NUM_MMA_D_VO_TILE=16. CTA_TILE_Q>16
+    // (NUM_MMA_Q>=2) overflows the 256-register o_frag wall -> only CTA16 is valid.
+    return 16;
   }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;
@@ -403,7 +443,24 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
         // avg_packed_qo_len <= 64
         return 64;
       } else {
-        // avg_packed_qo_len <= 16
+        // avg_packed_qo_len <= 16: prefer the 1x4 warp layout (cta_tile_q=16),
+        // but ONLY if one NUM_MMA_KV step fits shared memory. With 4 kv-warps a
+        // step costs (qk+vo)*16*4*sizeof(dtype); at (512,256) bf16 that is 96KB
+        // + a 16KB Q tile > the ~100KB/SM budget of CC 12.x consumer Blackwell
+        // (and would yield the unrecoverable "Unsupported max_mma_kv: 0"
+        // dispatch failure). Fall back to cta_tile_q=64 (4x1 layout, 4x
+        // cheaper KV step) exactly like the Turing branch below. sizeof
+        // assumed 2 (worst case): only configurations that could not run at
+        // all are moved.
+        int dev_id = 0, max_smem_per_sm = 0;
+        cudaGetDevice(&dev_id);
+        cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                               dev_id);
+        const uint32_t q_tile_smem = 16 * qk * 2;
+        const uint32_t kv_step_smem_1x4 = (qk + head_dim) * 16 * 4 * 2;
+        if (q_tile_smem + kv_step_smem_1x4 > (uint32_t)max_smem_per_sm) {
+          return 64;
+        }
         return 16;
       }
     } else {

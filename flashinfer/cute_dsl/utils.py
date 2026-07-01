@@ -28,6 +28,12 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
+if not hasattr(cute.nvgpu, "OperandMajorMode"):
+    try:
+        cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
+    except AttributeError:
+        pass
+
 
 def ceil_div(a: int, b: int) -> int:
     """Ceiling division."""

@@ -126,15 +126,10 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   const auto q_stride_n = q.stride(0);
   const auto q_stride_h = q.stride(1);
 
-  // get kv_cache_strides
-  const int64_t* kv_cache_strides = nullptr;
+  // get kv-cache strides
   auto k_strides = paged_k_cache.strides();
   auto v_strides = paged_v_cache.strides();
   TVM_FFI_ICHECK_EQ(k_strides.size(), v_strides.size());
-  for (int i = 0; i < k_strides.size(); ++i) {
-    TVM_FFI_ICHECK_EQ(k_strides[i], v_strides[i]);
-  }
-  kv_cache_strides = k_strides.data();
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
@@ -145,7 +140,7 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
         paged_kv_t<DTypeKV, IdType> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_QK, batch_size, kv_layout,
             static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
-            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
+            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), k_strides.data(), v_strides.data(),
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
