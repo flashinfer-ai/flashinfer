@@ -113,21 +113,23 @@ def _normalize_scale_tensor(
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
-    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+    ``out[i] = (input[i] / RMS(input)) * weight[i]`` if ``weight`` is provided,
+    otherwise ``out[i] = input[i] / RMS(input)``.
 
     Parameters
     ----------
     input: torch.Tensor
         Input tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
+    weight: Optional[torch.Tensor]
+        Weight tensor, shape (hidden_size,). If None, RMSNorm runs without
+        normalization weights.
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
@@ -151,13 +153,13 @@ def rmsnorm(
 def _rmsnorm_impl(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if weight is None or _USE_CUDA_NORM:
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
     else:
         if input.dim() == 3:
@@ -174,7 +176,7 @@ def _rmsnorm_impl(
 def _rmsnorm_impl_fake(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
@@ -240,7 +242,7 @@ def _rmsnorm_quant_fake(
 def fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -250,7 +252,8 @@ def fused_add_rmsnorm(
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+    ``input[i] = (residual[i] / RMS(residual)) * weight[i]`` if ``weight`` is
+    provided, otherwise ``input[i] = residual[i] / RMS(residual)``.
 
     Parameters
     ----------
@@ -258,8 +261,9 @@ def fused_add_rmsnorm(
         Input tensor, shape (batch_size, hidden_size).
     residual: torch.Tensor
         Residual tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
+    weight: Optional[torch.Tensor]
+        Weight tensor, shape (hidden_size,). If None, RMSNorm runs without
+        normalization weights.
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
@@ -268,7 +272,7 @@ def fused_add_rmsnorm(
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _USE_CUDA_NORM:
+    if weight is None or _USE_CUDA_NORM:
         get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
         fused_add_rmsnorm_cute(
@@ -280,7 +284,7 @@ def fused_add_rmsnorm(
 def _fused_add_rmsnorm_fake(
     input: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -1427,19 +1431,6 @@ def fused_dit_residual_layernorm_scale_shift(
 ####################################################################################################
 
 
-@functools.cache
-def _get_fused_qk_rmsnorm_rope_module():
-    """Compile the norm module for fused_qk_rmsnorm_rope.
-
-    Separate from get_norm_module() so this kernel can be used regardless
-    of _USE_CUDA_NORM (which gates CuTe DSL vs CUDA JIT for standard norms).
-    The underlying .so is the same norm module, but this accessor is always
-    available and only triggers compilation when fused_qk_rmsnorm_rope is
-    actually called.
-    """
-    return gen_norm_module().build_and_load()
-
-
 @supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
 def _check_fused_qk_rmsnorm_rope(
     qkv,
@@ -1694,7 +1685,7 @@ def fused_qk_rmsnorm_rope(
     k_out_flat = k_out.view(num_tokens, -1)
     v_out_flat = v_out.view(num_tokens, -1)
 
-    _get_fused_qk_rmsnorm_rope_module().fused_qk_rmsnorm_rope(
+    get_norm_module().fused_qk_rmsnorm_rope(
         qkv_flat,
         q_weight,
         k_weight,
