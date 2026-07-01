@@ -27,7 +27,22 @@ from .gdn_kernels import (
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
     cp_delta_rule_dsl_sm90,
+    cp_delta_rule_dsl_sm120,
 )
+from .gdn_kernels.delta_rule_dsl.varlen_helper import should_use_cp_host
+
+
+_SM100_STATE_DTYPES: tuple[torch.dtype, ...] = (
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+)
+
+
+def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
+    return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
 
 
 def _cp_delta_rule_rejection_reason(
@@ -44,10 +59,14 @@ def _cp_delta_rule_rejection_reason(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
 ) -> Optional[str]:
-    if arch_major != 9:
-        return "CP delta rule is currently implemented only for SM90"
-    if cp_delta_rule_dsl_sm90 is None:
-        return "CP delta rule SM90 DSL kernel is unavailable"
+    if arch_major == 9:
+        if cp_delta_rule_dsl_sm90 is None:
+            return "CP delta rule SM90 DSL kernel is unavailable"
+    elif arch_major == 12:
+        if cp_delta_rule_dsl_sm120 is None:
+            return "CP delta rule SM120 DSL kernel is unavailable"
+    else:
+        return "CP delta rule is currently implemented only for SM90 and SM120"
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
@@ -129,7 +148,9 @@ def chunk_gated_delta_rule(
     initial_state : torch.Tensor, optional
         Initial KV state of shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
-        float32.  Starts from zero state when ``None``.
+        float32 on SM90/SM120.  The SM100 path also accepts bfloat16,
+        float16, float8_e4m3fn, and float8_e5m2.  Starts from zero state
+        when ``None``.
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
@@ -149,11 +170,15 @@ def chunk_gated_delta_rule(
         ``None``.
     output_state : torch.Tensor, optional
         Pre-allocated output state tensor of shape ``[num_seqs,
-        num_sab_heads, head_size, head_size]``, float32.  Required when
+        num_sab_heads, head_size, head_size]``.  Must be float32 on
+        SM90/SM120.  The SM100 path also accepts bfloat16, float16,
+        float8_e4m3fn, and float8_e5m2.  Required when
         ``output_final_state=True``.
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
-        num_sab_heads, head_size, head_size]``, float32.  Required when
+        num_sab_heads, head_size, head_size]``.  Must be float32 on
+        SM90/SM120.  The SM100 path also accepts bfloat16, float16,
+        float8_e4m3fn, and float8_e5m2.  Required when
         ``checkpoint_every_n_tokens > 0``.
     checkpoint_cu_starts : torch.Tensor, optional
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int64.
@@ -165,7 +190,7 @@ def chunk_gated_delta_rule(
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
-        Whether to use the SM90 context-parallel DSL implementation when
+        Whether to use the SM90/SM120 context-parallel DSL implementation when
         low-parallelism heuristics match. ``"auto"`` enables conservative
         routing, ``True`` requires CP support, and ``False`` disables CP.
         Default: ``"auto"``.
@@ -227,9 +252,14 @@ def chunk_gated_delta_rule(
 
     if checkpoint_every_n_tokens > 0:
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
-        if state_checkpoints.dtype != torch.float32:
+        state_checkpoint_dtypes: tuple[torch.dtype, ...] = (torch.float32,)
+        if q.is_cuda and get_compute_capability(q.device)[0] == 10:
+            state_checkpoint_dtypes = _SM100_STATE_DTYPES
+        if state_checkpoints.dtype not in state_checkpoint_dtypes:
             raise ValueError(
-                f"state_checkpoints must be float32, got {state_checkpoints.dtype}"
+                "state_checkpoints must have dtype "
+                f"{_format_dtype_list(state_checkpoint_dtypes)}, "
+                f"got {state_checkpoints.dtype}"
             )
         if state_checkpoints.ndim != 4:
             raise ValueError(
@@ -278,8 +308,9 @@ def chunk_gated_delta_rule(
     _sm_count = get_device_sm_count(device)
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
     _arch_major = get_compute_capability(device)[0]
-    cp_heuristic_matches = _arch_major == 9 and num_seqs * num_sab_heads < max(
-        1, _sm_count // 2
+    _device_name = torch.cuda.get_device_properties(device).name
+    cp_heuristic_matches = _arch_major in (9, 12) and should_use_cp_host(
+        num_seqs * num_sab_heads, _sm_count, _device_name
     )
     if use_cp is True or (use_cp == "auto" and cp_heuristic_matches):
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
@@ -325,7 +356,11 @@ def chunk_gated_delta_rule(
                     total_seq_len, num_sab_heads, dtype=torch.float32, device=device
                 )
             )
-            cp_delta_rule_dsl_sm90(
+            cp_delta_rule_dsl = (
+                cp_delta_rule_dsl_sm90 if _arch_major == 9 else cp_delta_rule_dsl_sm120
+            )
+            assert cp_delta_rule_dsl is not None
+            cp_delta_rule_dsl(
                 output,
                 output_state,
                 q,
