@@ -772,9 +772,11 @@ class MoeAlltoAll:
         # Every rank must stop using the workspace before releasing its backing.
         torch.cuda.synchronize()
         record.comm.barrier()
-        MnnvlMemory._unmap_and_release_mnnvl_handles(record)
+        MnnvlMemory._unmap_and_release_handles(record)
         record.mem_handles = [None] * record.comm_size
         record.mapped = False
+        # Do not return until every rank has released its handles.
+        record.comm.barrier()
 
     @flashinfer_api
     def checkpoint_restore(
@@ -797,7 +799,7 @@ class MoeAlltoAll:
             )
         # CUDA work must quiesce before the workspace is remapped.
         torch.cuda.synchronize()
-        record.mem_handles = MnnvlMemory._create_and_map_mnnvl_handles(
+        record.mem_handles = MnnvlMemory._create_and_map_handles(
             comm_backend,
             record.aligned_size,
             record.start_address,
@@ -980,6 +982,7 @@ class MoeAlltoAll:
             sf_layout,
         )
 
+        # Reset state for next round
         self._state = _A2AState()
 
         return output

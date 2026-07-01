@@ -406,12 +406,12 @@ class MnnvlMemory:  # type: ignore[no-redef]
         return MnnvlMemory.allocated_map[self.ptr].mapped
 
     def as_torch_strided_tensor(self, dtype):
-        record = MnnvlMemory.allocated_map[self.ptr]
+        num_segments = MnnvlMemory.comm.Get_size()
         return pack_strided_memory(
             self.ptr,
             self.segment_size,
             self.rank_stride,
-            record.comm_size,
+            num_segments,
             dtype,
             MnnvlMemory.dev_id,
         )
@@ -483,75 +483,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
         return MnnvlMemory.allocation_granularity
 
     @staticmethod
-    def _exchange_shareable_handles(
-        comm: CommBackend,
-        allocation_prop: cuda.CUmemAllocationProp,
-        allocated_mem_handle: Any,
-    ) -> List[Any]:
-        exported_fabric_handle = checkCudaErrors(
-            cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
-            )
-        )
-        if (
-            allocation_prop.requestedHandleTypes
-            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        ):
-            return comm.allgather(exported_fabric_handle.data)
-
-        exported_fd = int(exported_fabric_handle)
-        remote_fds = []
-        try:
-            all_handles_data = comm.allgather(exported_fd)
-            all_pids = comm.allgather(os.getpid())
-            libc = ctypes.CDLL(None, use_errno=True)
-            syscall = libc.syscall
-            SYS_pidfd_open = 434
-            SYS_pidfd_getfd = 438
-
-            for pid, fd in zip(all_pids, all_handles_data, strict=True):
-                pidfd = syscall(SYS_pidfd_open, pid, 0)
-                if pidfd < 0:
-                    err = ctypes.get_errno()
-                    raise RuntimeError(
-                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                    )
-                try:
-                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                    if remote_fd < 0:
-                        err = ctypes.get_errno()
-                        error_msg = (
-                            f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with "
-                            f"errno {err}: {os.strerror(err)}."
-                        )
-                        if err == 1:  # EPERM
-                            error_msg += (
-                                " Permission denied. If running in a container, "
-                                "try adding --cap-add=SYS_PTRACE to your docker "
-                                "run command."
-                            )
-                        else:
-                            error_msg += (
-                                " This may be due to kernel version "
-                                "(requires Linux 5.6+)."
-                            )
-                        raise RuntimeError(error_msg)
-                    remote_fds.append(remote_fd)
-                finally:
-                    os.close(pidfd)
-
-            # Every rank must duplicate every exported FD before its owner closes it.
-            comm.barrier()
-            return remote_fds
-        except BaseException:
-            for remote_fd in remote_fds:
-                os.close(remote_fd)
-            raise
-        finally:
-            os.close(exported_fd)
-
-    @staticmethod
-    def _create_and_map_mnnvl_handles(
+    def _create_and_map_handles(
         comm: CommBackend,
         aligned_size: int,
         start_address: int,
@@ -570,30 +502,94 @@ class MnnvlMemory:  # type: ignore[no-redef]
         allocated_mem_handle = checkCudaErrors(
             cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
         )
-        all_handles_data = MnnvlMemory._exchange_shareable_handles(
-            comm, allocation_prop, allocated_mem_handle
+        exported_fabric_handle = checkCudaErrors(
+            cuda.cuMemExportToShareableHandle(
+                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
+            )
         )
+        if (
+            allocation_prop.requestedHandleTypes
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        ):
+            all_handles_data = comm.allgather(exported_fabric_handle.data)
+        else:
+            exported_fd = int(exported_fabric_handle)
+            pidfds = []
+            remote_fds = []
+            try:
+                all_handles_data = comm.allgather(exported_fd)
+                all_pids = comm.allgather(os.getpid())
+                libc = ctypes.CDLL(None, use_errno=True)
+                syscall = libc.syscall
+                SYS_pidfd_open = 434
+                SYS_pidfd_getfd = 438
+
+                for pid in all_pids:
+                    pidfd = syscall(SYS_pidfd_open, pid, 0)
+                    if pidfd < 0:
+                        err = ctypes.get_errno()
+                        raise RuntimeError(
+                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                        )
+                    pidfds.append(pidfd)
+
+                for pidfd, fd in zip(pidfds, all_handles_data, strict=True):
+                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                    if remote_fd < 0:
+                        err = ctypes.get_errno()
+                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
+                        if err == 1:  # EPERM
+                            error_msg += (
+                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
+                                "to your docker run command."
+                            )
+                        else:
+                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
+                        raise RuntimeError(error_msg)
+                    remote_fds.append(remote_fd)
+
+                # Every rank must duplicate every exported FD before its owner closes it.
+                comm.barrier()
+                all_handles_data = remote_fds
+            except BaseException:
+                for remote_fd in remote_fds:
+                    os.close(remote_fd)
+                raise
+            finally:
+                for pidfd in pidfds:
+                    os.close(pidfd)
+                os.close(exported_fd)
+        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
+        # can use buf = memoryview(data) to import if using plain buffer for data.
+
+        madesc = cuda.CUmemAccessDesc()
+        madesc.location = allocation_prop.location
+        madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
 
         mem_handles = [None] * comm_size
         try:
-            madesc = cuda.CUmemAccessDesc()
-            madesc.location = allocation_prop.location
-            madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-
             for i, remote_handle_data in enumerate(all_handles_data):
                 rank_ptr = start_address + rank_stride * i + address_offset
                 if i == comm_rank:
+                    # Local memory mapping
                     mem_handles[i] = allocated_mem_handle
+                    checkCudaErrors(
+                        cuda.cuMemMap(
+                            rank_ptr, aligned_size, 0, allocated_mem_handle, 0
+                        )
+                    )
                 else:
+                    # Fabric memory mapping
                     imported_mem_handle = checkCudaErrors(
                         cuda.cuMemImportFromShareableHandle(
                             remote_handle_data, allocation_prop.requestedHandleTypes
                         )
                     )
                     mem_handles[i] = imported_mem_handle
-                checkCudaErrors(
-                    cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handles[i], 0)
-                )
+                    checkCudaErrors(
+                        cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0)
+                    )
+
                 checkCudaErrors(
                     cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1)
                 )
@@ -636,6 +632,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
             f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
         )
         comm = MnnvlMemory.get_comm(mapping)
+        comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
         all_rank_allocate_sizes = comm.allgather(size)
         assert len(all_rank_allocate_sizes) == comm_size
@@ -656,20 +653,19 @@ class MnnvlMemory:  # type: ignore[no-redef]
             <= MnnvlMemory.current_rank_stride
         )
 
-        ptr = MnnvlMemory.current_start_address + MnnvlMemory.current_mem_offset
-        stride = MnnvlMemory.current_rank_stride
-        comm = MnnvlMemory.get_comm(mapping)
-        mem_handles = MnnvlMemory._create_and_map_mnnvl_handles(
+        mem_handles = MnnvlMemory._create_and_map_handles(
             comm,
             aligned_size,
             MnnvlMemory.current_start_address,
             MnnvlMemory.current_rank_stride,
             MnnvlMemory.current_mem_offset,
         )
+        ptr = MnnvlMemory.current_start_address + MnnvlMemory.current_mem_offset
+        stride = MnnvlMemory.current_rank_stride
         MnnvlMemory.allocated_map[ptr] = _MnnvlAllocationRecord(
             comm=comm,
-            comm_size=comm.Get_size(),
-            comm_rank=comm.Get_rank(),
+            comm_size=comm_size,
+            comm_rank=comm_rank,
             aligned_size=aligned_size,
             mem_handles=mem_handles,
             start_address=MnnvlMemory.current_start_address,
@@ -684,7 +680,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
         return ptr, stride
 
     @staticmethod
-    def _unmap_and_release_mnnvl_handles(record: _MnnvlAllocationRecord) -> None:
+    def _unmap_and_release_handles(record: _MnnvlAllocationRecord) -> None:
         for i in range(record.comm_size):
             rank_ptr = (
                 record.start_address + i * record.rank_stride + record.address_offset
@@ -696,8 +692,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
     def close_mnnvl_memory(ptr: int):
         record = MnnvlMemory.allocated_map.pop(ptr)
         if record.mapped:
-            MnnvlMemory._unmap_and_release_mnnvl_handles(record)
-            record.mapped = False
+            MnnvlMemory._unmap_and_release_handles(record)
         MnnvlMemory.address_refcnt[record.start_address] -= 1
 
         if MnnvlMemory.address_refcnt[record.start_address] == 0:
