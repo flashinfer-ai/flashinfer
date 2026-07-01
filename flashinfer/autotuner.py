@@ -732,29 +732,21 @@ _tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
 def set_autotune_process_group(
     group: Optional["torch.distributed.ProcessGroup"],
 ) -> None:
-    """Synchronize per-tactic profile timings across ranks during autotuning.
+    """All-reduce (mean) per-tactic profile timings across ``group`` so every
+    rank's ``argmin`` picks the same tactic.
 
-    Without this, every rank independently picks the locally-fastest tactic
-    from its own noisy ``_profile_single_kernel`` measurements. Under NCCL
-    symmetric memory (``ncclCommWindowRegister`` with
-    ``NCCL_WIN_COLL_SYMMETRIC``) that per-rank divergence deadlocks the
-    collective. When set, timings are all-reduced (mean) across ``group``
-    so every rank's ``argmin`` picks the same tactic.
+    Without it, GPU timing noise makes ranks diverge on tactic choice, which
+    deadlocks NCCL symmetric-memory allocation (``NCCL_WIN_COLL_SYMMETRIC``).
+    Prefer a CPU (``gloo``) subgroup; a NCCL group also works. ``None``
+    disables (default); not thread-safe.
 
-    Caller contract: every rank must enter ``_profile_single_kernel`` the
-    same number of times in the same order — identical
-    ``runner.get_valid_tactics`` and identical shape buckets across ranks
-    — otherwise the reduction itself deadlocks.
-
-    Pass a CPU (``gloo``) subgroup to avoid CUDA-stream interference.
-    ``None`` disables (default). Module state is not thread-safe.
+    Caller contract: every rank must enter ``_profile_single_kernel`` the same
+    number of times in the same order (identical ``get_valid_tactics`` and
+    shape buckets) or the reduction itself deadlocks.
 
     Example::
 
-        import torch.distributed as dist
-
-        cpu_group = dist.new_group(backend="gloo")
-        set_autotune_process_group(cpu_group)
+        set_autotune_process_group(cpu_group)  # gloo subgroup
         try:
             with autotune(True):
                 model(inputs)
@@ -1555,21 +1547,33 @@ class AutoTuner:
                     runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
 
                 avg_time = pure_profile(stream, self.repeat)
-        except BaseException as e:
+        except BaseException as e:  # noqa: BLE001
+            # Catch everything (incl. KeyboardInterrupt / SystemExit): this
+            # rank must still reach the all-reduce below or peers already
+            # waiting on it deadlock. The original error is re-raised after.
             avg_time = float("inf")
             profile_exc = e
 
-        if _tune_process_group is not None:
-            import torch.distributed as dist
+        try:
+            if _tune_process_group is not None:
+                import torch.distributed as dist
 
-            time_tensor = torch.tensor([avg_time], dtype=torch.float64)
-            dist.all_reduce(
-                time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group
-            )
-            avg_time = time_tensor.item() / dist.get_world_size(_tune_process_group)
-
-        if profile_exc is not None:
-            raise profile_exc
+                # NCCL requires a CUDA tensor; a gloo (CPU) subgroup — the
+                # recommended choice — uses a CPU tensor.
+                backend = str(dist.get_backend(_tune_process_group)).lower()
+                device = "cuda" if backend == "nccl" else "cpu"
+                time_tensor = torch.tensor(
+                    [avg_time], dtype=torch.float64, device=device
+                )
+                dist.all_reduce(
+                    time_tensor, op=dist.ReduceOp.SUM, group=_tune_process_group
+                )
+                avg_time = time_tensor.item() / dist.get_world_size(_tune_process_group)
+        finally:
+            # Re-raise even if the collective itself failed, so the original
+            # profiling error is never masked by a secondary reduce error.
+            if profile_exc is not None:
+                raise profile_exc
 
         shapes = self._get_input_sizes(inputs)
         logger.debug(
