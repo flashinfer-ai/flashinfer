@@ -38,6 +38,7 @@ def run_allreduce_fusion_test(
     fusion: bool,
     reference_output: tuple[torch.Tensor, ...],
     workspace: AllReduceFusionWorkspace,
+    trigger_completion_at_end: bool = True,
 ):
     """Test function using the unified API (create_allreduce_fusion_workspace + allreduce_fusion)."""
     MPI.COMM_WORLD.barrier()
@@ -67,6 +68,7 @@ def run_allreduce_fusion_test(
                 workspace=workspace,
                 pattern=AllReduceFusionPattern.kARResidualRMSNorm,
                 launch_with_pdl=use_pdl,
+                trigger_completion_at_end=trigger_completion_at_end,
                 residual_out=residual_out,
                 norm_out=norm_out,
                 residual_in=residual.view(-1, shape[-1]),
@@ -85,6 +87,7 @@ def run_allreduce_fusion_test(
                 workspace=workspace,
                 pattern=AllReduceFusionPattern.kAllReduce,
                 launch_with_pdl=use_pdl,
+                trigger_completion_at_end=trigger_completion_at_end,
                 output=output,
             )
             return (output.view(shape),)
@@ -171,6 +174,7 @@ def run_allreduce_test(
     dtype: torch.dtype,
     hidden_size: int,
     backend: str,
+    trigger_completion_at_end: bool = True,
 ):
     """Core test logic for AllReduce operations using the unified API.
 
@@ -181,6 +185,7 @@ def run_allreduce_test(
         dtype: Data type for tensors
         hidden_size: Hidden dimension size
         backend: Backend to use ("auto", "trtllm", "mnnvl")
+        trigger_completion_at_end: PDL trigger placement (passed to allreduce_fusion)
     """
 
     comm = MPI.COMM_WORLD
@@ -248,6 +253,7 @@ def run_allreduce_test(
                 fusion,
                 reference_output,
                 workspace,
+                trigger_completion_at_end=trigger_completion_at_end,
             )
 
             # Synchronize before next test
@@ -302,3 +308,37 @@ def test_allreduce_unified(
     Run with: mpirun -np <num_gpus> pytest tests/comm/test_allreduce_unified_api.py -vv -s
     """
     run_allreduce_test(monkeypatch, seq_lens, fusion, dtype, hidden_size, backend)
+
+
+@pytest.mark.parametrize("seq_lens", [[4], [128, 512]])
+@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("hidden_size", [2880, 7168])
+@pytest.mark.parametrize("backend", ["mnnvl"])
+@pytest.mark.parametrize("trigger_completion_at_end", [False])
+def test_mnnvl_allreduce_trigger_completion(
+    monkeypatch,
+    seq_lens: list[int],
+    fusion: bool,
+    dtype: torch.dtype,
+    hidden_size: int,
+    backend: str,
+    trigger_completion_at_end: bool,
+):
+    """Exercise the MNNVL backend with ``trigger_completion_at_end=False``.
+
+    The default-True path is already covered by ``test_allreduce_unified``; this
+    test specifically targets the early-trigger code path (one-shot kernel +
+    twoshot AR/rmsNorm chain) which would otherwise be untested.
+
+    Run with: mpirun -np <num_gpus> pytest tests/comm/test_allreduce_unified_api.py::test_mnnvl_allreduce_trigger_completion -vv -s
+    """
+    run_allreduce_test(
+        monkeypatch,
+        seq_lens,
+        fusion,
+        dtype,
+        hidden_size,
+        backend,
+        trigger_completion_at_end=trigger_completion_at_end,
+    )

@@ -57,6 +57,11 @@ struct AllReduceFusionParams {
   uint32_t* bufferFlags;
   bool rmsNormFusion;
   bool launchWithPdl;
+  // When true, the kernel signals PDL launch completion at the END of the
+  // kernel (safe, no overlap with the next PDL-aware kernel). When false,
+  // the kernel signals completion earlier inside the kernel to allow the
+  // next PDL-aware kernel to start before this one finishes.
+  bool triggerCompletionAtEnd = true;
 
   void const* input;
   void const* residualIn;
@@ -816,7 +821,8 @@ inline __device__ void quant_nvfp4(PackedVec<PackedType, T> packedAccum, void* q
 }  // namespace quant
 
 template <uint8_t WorldSize, typename T, bool RMSNormFusion = false,
-          QuantType QType = QuantType::kNone, typename PackedType = float4>
+          QuantType QType = QuantType::kNone, bool TriggerCompletionAtEnd = true,
+          typename PackedType = float4>
 __global__ void __launch_bounds__(1024)
     oneshotAllreduceFusionKernel(AllReduceKernelParams<T> params) {
   static_assert(QType == QuantType::kNone || RMSNormFusion,
@@ -831,6 +837,13 @@ __global__ void __launch_bounds__(1024)
   int threadOffset = token * tokenDim + packedIdx * kELTS_PER_THREAD;
 
   cudaGridDependencySynchronize();
+  // Fire the early trigger here (before any OOB return) so every block in the
+  // grid issues it. This mirrors the TRTLLM oneshot kernel's placement and
+  // gives the next PDL-aware kernel maximum overlap.
+  if constexpr (!TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+
   // We only use 1 stage for the oneshot allreduce
   constexpr bool kUseLamportCGA = true;
   LamportFlags<PackedType, kUseLamportCGA> flag(params.bufferFlags, 1);
@@ -894,7 +907,6 @@ __global__ void __launch_bounds__(1024)
         stagePtrLocal, token, tokenDim, packedIdx * kELTS_PER_THREAD);
   }
 
-  cudaTriggerProgrammaticLaunchCompletion();
   if constexpr (RMSNormFusion) {
     // =============================== Residual ===============================
     PackedVec<PackedType, T> residualIn;
@@ -955,6 +967,11 @@ __global__ void __launch_bounds__(1024)
 #endif
   flag.waitAndUpdate(
       {static_cast<uint32_t>(params.numTokens * tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 }
 
 using utils::adjustGridConfig;
@@ -1011,6 +1028,19 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 #endif
   }
 
+  // Invariant: every block in the cluster must contain at least one in-bounds
+  // thread, otherwise an entirely-OOB block would skip the end PDL trigger and
+  // delay launch dependents until the block "completes normally". The
+  // adjustGridConfig logic sets blockSize = ceil_div(threadsNeeded,
+  // clusterSize) (or larger) so OOB count < clusterSize <= blockSize; this
+  // check guards against future tuning regressions.
+  int const threadsNeeded = ceil_div(tokenDim, eltsPerThread);
+  FLASHINFER_CHECK(threadsNeeded > (clusterSize - 1) * blockSize,
+                   "[MNNVL AllReduceOneShot] grid config has at least one fully-OOB "
+                   "block (threadsNeeded=%d, blockSize=%d, clusterSize=%d); PDL end "
+                   "trigger would not be issued by that block",
+                   threadsNeeded, blockSize, clusterSize);
+
   cudaLaunchAttribute attrs[2];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = params.launchWithPdl ? 1 : 0;
@@ -1028,9 +1058,15 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       .numAttrs = 2,
   };
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, RMSNORM, QTYPE) \
-  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                  \
-      &config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM, QTYPE>, kernelParams));
+#define LAUNCH_ALLREDUCE_KERNEL_TCE(WORLD_SIZE, RMSNORM, QTYPE, TCE) \
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                           \
+      &config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM, QTYPE, TCE>, kernelParams));
+#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, RMSNORM, QTYPE)         \
+  if (params.triggerCompletionAtEnd) {                              \
+    LAUNCH_ALLREDUCE_KERNEL_TCE(WORLD_SIZE, RMSNORM, QTYPE, true);  \
+  } else {                                                          \
+    LAUNCH_ALLREDUCE_KERNEL_TCE(WORLD_SIZE, RMSNORM, QTYPE, false); \
+  }
 #define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE)                                        \
   if (params.rmsNormFusion) {                                                        \
     switch (params.quantType) {                                                      \
@@ -1107,6 +1143,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   }
 #undef DISPATCH_ALLREDUCE_KERNEL
 #undef LAUNCH_ALLREDUCE_KERNEL
+#undef LAUNCH_ALLREDUCE_KERNEL_TCE
   return cudaSuccess;
 }
 
@@ -1118,7 +1155,8 @@ enum MNNVLTwoShotStage : uint8_t {
 
 using utils::copyF4;
 
-template <uint8_t WorldSize, typename T, bool WaitForResults = true, typename PackedType = float4>
+template <uint8_t WorldSize, typename T, bool WaitForResults = true,
+          bool TriggerCompletionAtEnd = true, typename PackedType = float4>
 __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelParams<T> params) {
   constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
   constexpr uint32_t kELT_SIZE = sizeof(T);
@@ -1153,7 +1191,14 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelPar
         val.packed;
   }
 
-  cudaTriggerProgrammaticLaunchCompletion();
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // Early trigger so the next PDL-aware kernel can start before this one
+  // finishes. When the user requested the trailing trigger, defer it to the
+  // end of the kernel instead.
+  if constexpr (!TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
   flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::SCATTER);
 
   if (inBounds && destRank == params.rank) {
@@ -1188,10 +1233,15 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(AllReduceKernelPar
         {static_cast<uint32_t>(round_up(params.numTokens, WorldSize) * params.tokenDim * kELT_SIZE),
          static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), 0, 0});
   }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 }
 
 template <typename T, QuantType QType = QuantType::kNone, bool UseCGA = false,
-          int LoadsPerThread = 1, typename PackedType = float4>
+          int LoadsPerThread = 1, bool TriggerCompletionAtEnd = true, typename PackedType = float4>
 __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> params) {
   constexpr int kELTS_PER_LOAD = sizeof(PackedType) / sizeof(T);
   constexpr uint32_t kELT_SIZE = sizeof(T);
@@ -1224,7 +1274,13 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   T* smemResidual = reinterpret_cast<T*>(&smem[smemBufferSize]);
   T* smemGamma = reinterpret_cast<T*>(&smem[2 * smemBufferSize]);
 
-  cudaTriggerProgrammaticLaunchCompletion();
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // Early trigger so a following PDL-aware kernel can launch eagerly. When the
+  // user asked for the trailing trigger, defer it to the end of the kernel.
+  if constexpr (!TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 
   LamportFlags<PackedType, UseCGA> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
   T* input = reinterpret_cast<T*>(
@@ -1352,6 +1408,11 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   flag.waitAndUpdate({static_cast<uint32_t>(round_up(params.numTokens, params.nRanks) *
                                             params.tokenDim * kELT_SIZE),
                       static_cast<uint32_t>(params.numTokens * params.tokenDim * kELT_SIZE), 0, 0});
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
 }
 
 template <typename T>
@@ -1435,9 +1496,23 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   FLASHINFER_LOG_DEBUG("[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128",
                        numTokens, arNumBlocksPerToken);
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, WAIT_FOR_RESULTS) \
-  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                    \
-      &arConfig, &twoshotAllreduceKernel<WORLD_SIZE, T, WAIT_FOR_RESULTS>, kernelParams));
+  // For the two-shot kernel, the early/late trigger semantics depend on
+  // whether RMSNorm fusion follows. When RMSNorm fusion is enabled, the
+  // rmsNormLamport kernel is the *last* kernel in the chain and should
+  // honor triggerCompletionAtEnd; the intermediate two-shot kernel always
+  // uses early-trigger so the rmsNorm kernel can be launched eagerly via
+  // PDL. When RMSNorm fusion is disabled, the two-shot kernel itself is
+  // the last kernel and applies the user's request.
+  bool const arTriggerCompletionAtEnd = !params.rmsNormFusion && params.triggerCompletionAtEnd;
+#define LAUNCH_ALLREDUCE_KERNEL_TCE(WORLD_SIZE, WAIT_FOR_RESULTS, TCE) \
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                             \
+      &arConfig, &twoshotAllreduceKernel<WORLD_SIZE, T, WAIT_FOR_RESULTS, TCE>, kernelParams));
+#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, WAIT_FOR_RESULTS)         \
+  if (arTriggerCompletionAtEnd) {                                     \
+    LAUNCH_ALLREDUCE_KERNEL_TCE(WORLD_SIZE, WAIT_FOR_RESULTS, true);  \
+  } else {                                                            \
+    LAUNCH_ALLREDUCE_KERNEL_TCE(WORLD_SIZE, WAIT_FOR_RESULTS, false); \
+  }
 #define DISPATCH_ALLREDUCE_KERNEL(WAIT_FOR_RESULTS)                        \
   switch (params.nRanks) {                                                 \
     case 2:                                                                \
@@ -1473,6 +1548,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   }
 #undef DISPATCH_ALLREDUCE_KERNEL
 #undef LAUNCH_ALLREDUCE_KERNEL
+#undef LAUNCH_ALLREDUCE_KERNEL_TCE
 
   auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread, true);
   int rnBlockSize = std::get<0>(gridConfig);
@@ -1524,12 +1600,18 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread,
       ceil_div(tokenDim, numEltsPerThread));
 
-#define LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QTYPE)                                   \
-  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(&rmsNormLamport<T, QTYPE, USE_CGA, LOADS_PER_THREAD>, \
-                                            cudaFuncAttributeMaxDynamicSharedMemorySize,          \
-                                            smemSize));                                           \
-  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                        \
-      &rnConfig, &rmsNormLamport<T, QTYPE, USE_CGA, LOADS_PER_THREAD>, kernelParams));
+#define LAUNCH_RMSNORM_KERNEL_TCE(USE_CGA, LOADS_PER_THREAD, QTYPE, TCE)              \
+  FLASHINFER_CUDA_CALL(                                                               \
+      cudaFuncSetAttribute(&rmsNormLamport<T, QTYPE, USE_CGA, LOADS_PER_THREAD, TCE>, \
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));   \
+  FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                            \
+      &rnConfig, &rmsNormLamport<T, QTYPE, USE_CGA, LOADS_PER_THREAD, TCE>, kernelParams));
+#define LAUNCH_RMSNORM_KERNEL(USE_CGA, LOADS_PER_THREAD, QTYPE)         \
+  if (params.triggerCompletionAtEnd) {                                  \
+    LAUNCH_RMSNORM_KERNEL_TCE(USE_CGA, LOADS_PER_THREAD, QTYPE, true);  \
+  } else {                                                              \
+    LAUNCH_RMSNORM_KERNEL_TCE(USE_CGA, LOADS_PER_THREAD, QTYPE, false); \
+  }
 
 #define DISPATCH_QUANT(USE_CGA, LOADS_PER_THREAD)                                  \
   switch (params.quantType) {                                                      \
@@ -1597,6 +1679,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 #undef DISPATCH_LOADS
 #undef DISPATCH_QUANT
 #undef LAUNCH_RMSNORM_KERNEL
+#undef LAUNCH_RMSNORM_KERNEL_TCE
   return cudaSuccess;
 }
 }  // namespace trtllm_mnnvl_allreduce
