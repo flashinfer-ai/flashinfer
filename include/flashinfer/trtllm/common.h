@@ -197,9 +197,33 @@ inline static bool getBoolEnv(char const* name) {
   return env && env[0] == '1' && env[1] == '\0';
 }
 
+inline static int getIntEnv(char const* name, int defaultVal) {
+  char const* env = std::getenv(name);
+  return env ? std::atoi(env) : defaultVal;
+}
+
 inline bool getEnvUseTileSizeKv64ForTrtllmGen() {
   static bool const useTileSizeKv64 = getBoolEnv("TRTLLM_GEN_ENABLE_TILE_SIZE_KV64");
   return useTileSizeKv64;
+}
+
+// KV split oversubscription tuning (for mixed-length batches).
+// Disabled by default. Set FLASHINFER_KV_OVERSUB_MAX_WAVES=16 to enable.
+inline int getEnvKvOversubMinTokensPerCta() {
+  static int const val = getIntEnv("FLASHINFER_KV_OVERSUB_MIN_TOKENS_PER_CTA", 2048);
+  return val;
+}
+inline int getEnvKvOversubMaxWaves() {
+  static int const val = getIntEnv("FLASHINFER_KV_OVERSUB_MAX_WAVES", 1);
+  return val;
+}
+inline int getEnvKvOversubMaxSplits() {
+  static int const val = getIntEnv("FLASHINFER_KV_OVERSUB_MAX_SPLITS", 32);
+  return val;
+}
+inline int getEnvKvOversubMinDesiredSplits() {
+  static int const val = getIntEnv("FLASHINFER_KV_OVERSUB_MIN_DESIRED_SPLITS", 4);
+  return val;
 }
 template <typename T>
 inline __device__ __host__ T divUp(T m, T n) {
