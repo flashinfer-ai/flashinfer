@@ -442,6 +442,10 @@ struct TllmGenSelectKernelParams {
   bool mUses2CtaMma;
   // Transform mode for BF16 query + FP8 KV generation kernels.
   Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
+  // Prefer the 2Qx1KV Keeps generation kernel for short SlidingWindowCustom shapes.
+  bool mUses2QSlidingWindowKernel;
+  // Do not re-prefer the 2Qx1KV kernel after its cubin was found missing (fallback latch).
+  bool mAvoid2QSlidingWindowKernel;
 
   // The constructor.
   TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -464,5 +468,7 @@ struct TllmGenSelectKernelParams {
         mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false),
-        mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode) {};
+        mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode),
+        mUses2QSlidingWindowKernel(false),
+        mAvoid2QSlidingWindowKernel(false) {};
 };

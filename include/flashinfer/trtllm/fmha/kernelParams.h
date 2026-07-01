@@ -195,7 +195,7 @@ struct KernelParams {
   template <class FmhaOptions>
   static auto makeTmaShapeStrideQ(FmhaOptions const& options, bool groupsHeadsQ,
                                   bool groupsTokensHeadsQ, int32_t tileSizeQ,
-                                  int32_t numEltsInClampedHeadDimQ) {
+                                  int32_t tileSizePerCtaQ, int32_t numEltsInClampedHeadDimQ) {
     //
     // The Q has shape of [numTokens * numHeadsQPerKv, numHeadsKv * 1, headDim]
     // when grouping headsQ, otherwise it would be [numTokens, numHeadsQPerKv * numHeadsKv,
@@ -265,8 +265,10 @@ struct KernelParams {
     // The tile shape for TMA.
     auto tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ), 1, 1,
                                             static_cast<uint32_t>(tileSizeQ)};
-    // The number of tokensQ per CTA.
-    int32_t numTokensPerCtaQ{tileSizeQ};
+    // The number of tokensQ per CTA (the CTA covers all Q tile instances).
+    int32_t numTokensPerCtaQ{tileSizePerCtaQ};
+    // The number of tokensQ loaded by one Q tile instance (the TMA box covers one instance).
+    int32_t numTokensPerTileQ{tileSizeQ};
     // Re-compute the number of tokensQ per CTA if groupsHeadsQ is enabled.
     if (groupsHeadsQ) {
       if (groupsTokensHeadsQ) {
@@ -275,13 +277,15 @@ struct KernelParams {
         // tensor to [numTokensQ, numGroupedHeads, numHeads, headDimQ] and we might want to revisit
         // this in the future.
         numTokensPerCtaQ = static_cast<int32_t>(numTokensPerCtaQ / numGroupedHeads);
+        numTokensPerTileQ = static_cast<int32_t>(numTokensPerTileQ / numGroupedHeads);
       } else {
-        numGroupedHeads = tileSizeQ;
+        numGroupedHeads = tileSizePerCtaQ;
         numTokensPerCtaQ = 1;
+        numTokensPerTileQ = 1;
       }
       tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
                                          static_cast<uint32_t>(numGroupedHeads), 1,
-                                         static_cast<uint32_t>(numTokensPerCtaQ)};
+                                         static_cast<uint32_t>(numTokensPerTileQ)};
     }
 
     return std::make_tuple(shape, stride, tileShapes, numTokensPerCtaQ);
@@ -677,7 +681,7 @@ struct KernelParams {
     // Shape/stride for gmem tensor Q.
     auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] =
         makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ,
-                            kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
+                            kernelMeta.mTileSizeQ, kernelMeta.mStepQ, numEltsInClampedHeadDimQ);
     // Build tma descriptor for Q.
     params.tmaQ_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ,
                                         const_cast<void*>(qPtr));

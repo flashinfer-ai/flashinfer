@@ -1388,6 +1388,10 @@ def test_trtllm_batch_decode_spec_dec_tree(
         (4, 4, 32, 2, 5),
         (4, 8, 64, 4, 1),
         (16, 32, 64, 2, 8),
+        # High-batch wave-transition shape: on 148-SM parts this prefers the 2Qx1KV Keeps
+        # kernel for short windows and exercises the 1Qx2KV fallback when the loaded cubin
+        # set has no 2Q kernels (older artifacts, fp8 dtypes).
+        (64, 32, 64, 2, 8),
     ],
 )
 @pytest.mark.parametrize(
@@ -1421,6 +1425,12 @@ def test_trtllm_batch_decode_spec_dec_tree_window(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("trtllm-gen backend requires SM100 and SM103 GPUs.")
+    if batch_size >= 64 and q_dtype != kv_dtype:
+        pytest.skip(
+            "bf16q+fp8kv at high batch selects a separate-transform MultiCtasKv static "
+            "cubin that current artifacts do not ship; the wave-transition rows target "
+            "the 2Qx1KV preference (bf16) and its dtype gate (fp8)."
+        )
 
     torch.manual_seed(0)
     num_qo_heads = num_kv_heads * head_grp_size

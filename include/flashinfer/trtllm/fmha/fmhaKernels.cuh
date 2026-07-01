@@ -184,7 +184,7 @@ class TllmGenFmhaKernel {
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage,
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
                          bool groupsTokensHeadsQ, int sparseMlaType, bool skipsSoftmax,
-                         int bf16QFp8KvTransformMode) const {
+                         int bf16QFp8KvTransformMode, bool uses2QSlidingWindowKernel) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -221,6 +221,7 @@ class TllmGenFmhaKernel {
     // Bit 58 - 58: dynamicNumTokensPerPage.
     // Bit 59 - 60: BF16Q FP8KV transform mode (0=full, 1=K-only, 2=separate K/V).
     // Bit 61 - 61: groupsTokensHeadsQ.
+    // Bit 62 - 62: uses2QSlidingWindowKernel (Keeps generation 2Qx1KV SlidingWindowCustom).
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
@@ -237,7 +238,17 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(skipsSoftmax) << 57) |
            (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58) |
            (static_cast<uint64_t>(bf16QFp8KvTransformMode) << 59) |
-           (static_cast<uint64_t>(groupsTokensHeadsQ) << 61);
+           (static_cast<uint64_t>(groupsTokensHeadsQ) << 61) |
+           (static_cast<uint64_t>(uses2QSlidingWindowKernel) << 62);
+  }
+
+  // The 2Qx1KV Keeps generation kernels share every legacy hash field with the 1Qx2KV
+  // disabled-reduction kernels, so they get their own hash bit. Keyed narrowly on
+  // token-grouped Keeps generation so no other kernel's hash changes (context kernels also
+  // run two Q instances but are not token-grouped generation kernels).
+  inline bool is2QSlidingWindowKernel(KernelMeta const& kernelMeta) const {
+    return kernelMeta.mKernelType == static_cast<int>(FmhaKernelType::KeepsMmaAbForGeneration) &&
+           kernelMeta.mGroupsTokensHeadsQ && kernelMeta.mStepQ == 2 * kernelMeta.mTileSizeQ;
   }
 
   inline bool isDynamicNumTokensPerPageKernel(KernelMeta const& kernelMeta) const {
@@ -254,7 +265,8 @@ class TllmGenFmhaKernel {
                   kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ, kernelMeta.mSparseAttn,
                   kernelMeta.mSkipsSoftmaxWhenPossible,
                   getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
-                                             kernelMeta.mSeparateTransformedKv));
+                                             kernelMeta.mSeparateTransformedKv),
+                  is2QSlidingWindowKernel(kernelMeta));
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -272,6 +284,12 @@ class TllmGenFmhaKernel {
       info = currentInfo;
       auto const kernelIt = mKernelMetaMap.find(hashId);
       if (kernelIt == mKernelMetaMap.end()) {
+        // The preferred 2Qx1KV cubin can be absent (older artifact or unexported dtype);
+        // match run() and retry with the default schedule before reporting unsupported.
+        if (selectKernelParams.mUses2QSlidingWindowKernel) {
+          selectKernelParams.mAvoid2QSlidingWindowKernel = true;
+          continue;
+        }
         return std::make_pair(false, info);
       }
       computeCtaAndClusterConfig(ctaLaunchParams, params, mKernelMeta[kernelIt->second],
@@ -297,6 +315,17 @@ class TllmGenFmhaKernel {
     KernelMeta kernelMeta{};
     for (int pass = 0; pass < kMaxKernelSelectionPasses; ++pass) {
       selectKernel(params, selectKernelParams);
+      // The preferred 2Qx1KV cubin can be absent (older artifact or unexported dtype); latch
+      // the fallback and re-select the default schedule instead of failing the lookup.
+      if (selectKernelParams.mUses2QSlidingWindowKernel &&
+          mKernelMetaMap.find(hashFromRunnerParams(params, selectKernelParams).first) ==
+              mKernelMetaMap.end()) {
+        selectKernelParams.mAvoid2QSlidingWindowKernel = true;
+        FLASHINFER_CHECK(pass + 1 < kMaxKernelSelectionPasses,
+                         "trtllm-gen kernel selection did not converge in %d passes.",
+                         kMaxKernelSelectionPasses);
+        continue;
+      }
       std::tie(func, kernelMeta) = loadKernel(params, selectKernelParams);
       computeCtaAndClusterConfig(ctaLaunchParams, params, kernelMeta, selectKernelParams);
       if (!selectKernelParams.mSelectNewKernel) {
@@ -1051,6 +1080,34 @@ class TllmGenFmhaKernel {
     }
     selectKernelParams.mTileSizeKv = 128;
     selectKernelParams.mForceGmemReduction = true;
+
+    // Prefer the 2Qx1KV Keeps schedule at the measured high-batch wave transition for short
+    // sliding windows: a fully populated 2Q tile halves the CTA count where the 2Q grid fits
+    // in one wave and the 1Q grid does not. Mirrors trtllm-gen
+    // FmhaAutoTuner::prefers2Qx1KvForSlidingWindow (fp16/bf16 and window <= 256 are the
+    // measured tuning bounds). If the cubin set lacks the 2Q kernel, run() latches
+    // mAvoid2QSlidingWindowKernel and this reverts to the default schedule.
+    int const numCtas2Q = params.mBatchSize * params.mNumHeadsKv;
+    bool const prefers2QSlidingWindowKernel =
+        !selectKernelParams.mAvoid2QSlidingWindowKernel &&
+        selectKernelParams.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
+        isSlidingWindowCustomMask(selectKernelParams.mMaskType) &&
+        (mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16) && mDtypeQ == mDtypeK &&
+        mDtypeK == mDtypeV && mDtypeOut == mDtypeQ && params.mAttentionWindowSize <= 256 &&
+        params.mBatchSize >= 64 && numCtas2Q <= params.mMultiProcessorCount &&
+        2 * numCtas2Q > params.mMultiProcessorCount &&
+        numTokensHeadsQ >= 2 * selectKernelParams.mTileSizeQ;
+    if (prefers2QSlidingWindowKernel) {
+      selectKernelParams.mUses2QSlidingWindowKernel = true;
+      selectKernelParams.mTileScheduler = TileScheduler::Static;
+      selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
+    } else if (selectKernelParams.mUses2QSlidingWindowKernel) {
+      // Fallback re-selection: restore the state the 2Q preference overwrote.
+      selectKernelParams.mUses2QSlidingWindowKernel = false;
+      selectKernelParams.mTileScheduler = params.mTileScheduler;
+      selectKernelParams.mMultiCtasKvMode =
+          params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled;
+    }
   }
 
   // Select a kernel based on the heuristic.
@@ -1132,7 +1189,9 @@ class TllmGenFmhaKernel {
         ", sparseMlaType=" + std::to_string(static_cast<int>(params.mSparseMlaType)) +
         ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) +
         ", bf16QFp8KvTransformMode=" +
-        std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode));
+        std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
+        ", uses2QSlidingWindowKernel=" +
+        std::to_string(selectKernelParams.mUses2QSlidingWindowKernel);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -1149,7 +1208,8 @@ class TllmGenFmhaKernel {
                selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
                selectKernelParams.mGroupsTokensHeadsQ, static_cast<int>(params.mSparseMlaType),
                selectKernelParams.mSkipsSoftmaxWhenPossible,
-               static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)),
+               static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
+               selectKernelParams.mUses2QSlidingWindowKernel),
         info);
   }
 
