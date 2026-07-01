@@ -90,6 +90,14 @@ def _gdn_tflops(total_tokens, h_v, d, time_ms):
     return flops / time_ms / 1e9
 
 
+def get_num_rotating_buffers(num_iters: int, q, k, v) -> int:
+    """Heuristic for number of rotating buffers to use based on total memory footprint."""
+    nbytes = q.nbytes + k.nbytes + v.nbytes
+    total_bytes = 4 * 1024 * 1024 * 1024  # 4 GB
+    # Assume 4 GB per buffer is a reasonable heuristic; adjust as needed.
+    return max(1, min(num_iters, (total_bytes + nbytes - 1) // nbytes))
+
+
 def bench_fi(args, endpoints, h_qk, h_v, d):
     """Benchmark FlashInfer GDN prefill."""
     device = "cuda"
@@ -111,17 +119,18 @@ def bench_fi(args, endpoints, h_qk, h_v, d):
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
     state_out = torch.zeros_like(h0)
 
-    q = [q.clone() for _ in range(args.iters)]
-    k = [k.clone() for _ in range(args.iters)]
-    v = [v.clone() for _ in range(args.iters)]
+    num_buffer = get_num_rotating_buffers(args.iters, q, k, v)
+    q = [q.clone() for _ in range(num_buffer)]
+    k = [k.clone() for _ in range(num_buffer)]
+    v = [v.clone() for _ in range(num_buffer)]
     rotation_buffer_idx = 0
 
     def fn():
         nonlocal rotation_buffer_idx
         chunk_gated_delta_rule(
-            q[rotation_buffer_idx % args.iters],
-            k[rotation_buffer_idx % args.iters],
-            v[rotation_buffer_idx % args.iters],
+            q[rotation_buffer_idx % num_buffer],
+            k[rotation_buffer_idx % num_buffer],
+            v[rotation_buffer_idx % num_buffer],
             g,
             beta,
             None,
@@ -163,18 +172,19 @@ def bench_fla(args, endpoints, h_qk, h_v, d):
     beta = torch.rand(1, T, h_v, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
 
-    q = [q.clone() for _ in range(args.iters)]
-    k = [k.clone() for _ in range(args.iters)]
-    v = [v.clone() for _ in range(args.iters)]
+    num_buffer = get_num_rotating_buffers(args.iters, q, k, v)
+    q = [q.clone() for _ in range(num_buffer)]
+    k = [k.clone() for _ in range(num_buffer)]
+    v = [v.clone() for _ in range(num_buffer)]
 
     rotation_buffer_idx = 0
 
     def fn():
         nonlocal rotation_buffer_idx
         fla_gdn(
-            q[rotation_buffer_idx % args.iters],
-            k[rotation_buffer_idx % args.iters],
-            v[rotation_buffer_idx % args.iters],
+            q[rotation_buffer_idx % num_buffer],
+            k[rotation_buffer_idx % num_buffer],
+            v[rotation_buffer_idx % num_buffer],
             g,
             beta,
             None,
