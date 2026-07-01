@@ -25,7 +25,8 @@ log2-domain LSE weighting:
 
 where ``s`` ranges over the query's valid split slots
 ``[0, split_counts[q, h // group_size])``. Slots >= count hold uninitialized
-memory and are never read. Optionally writes the combined natural-log LSE and a
+memory; their loads are issued (for pipelining) but masked out of the
+reduction. Optionally writes the combined natural-log LSE and a
 separately-accumulated temperature LSE (both converted log2 -> ln at the end).
 
 One CTA per (query token, query head): each thread loads one slot's LSE, then
@@ -41,6 +42,7 @@ import cutlass
 import cutlass.cute as cute
 
 _LN2 = 0.6931471805599453
+_FLT_MAX = 3.4028234663852886e38
 
 
 class SparseCombineSm12x:
@@ -169,6 +171,9 @@ class SparseCombineSm12x:
 
         # Branch-free reduction: partials are allocated for all topk slots, so the
         # loads are unconditional (they pipeline); invalid slots carry weight 0.
+        # Their uninitialized values may be NaN/Inf, which weight 0 cannot mask
+        # (0 * NaN = NaN), so clamp to finite range first — fmin/fmax drop a NaN
+        # operand, keeping the reduction branch-free.
         for i in cutlass.range_constexpr(self._channels_per_thread):
             c = tidx + i * self._num_threads
             acc = cutlass.Float32(0.0)
@@ -178,6 +183,7 @@ class SparseCombineSm12x:
                     ef = e.to(cutlass.Float16).to(cutlass.Float32)
                 else:
                     ef = e.to(cutlass.Float32)
+                ef = cute.arch.fmax(cute.arch.fmin(ef, _FLT_MAX), -_FLT_MAX)
                 acc += w_frag[s] * ef
             mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
 
