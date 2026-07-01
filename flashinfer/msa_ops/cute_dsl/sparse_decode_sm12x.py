@@ -64,6 +64,7 @@ class SparseDecodeForwardSm12x:
         kv_nvfp4: bool = False,
         q_fp8: bool = False,
         fused: bool = False,
+        qoff_default: bool = False,
     ):
         if head_dim != 128 or blk_kv != 128 or sub_block != 64:
             raise ValueError("only head_dim=blk_kv=128, sub_block=64 supported")
@@ -93,6 +94,9 @@ class SparseDecodeForwardSm12x:
         self._kv_nvfp4 = kv_nvfp4
         self._q_fp8 = q_fp8
         self._fused = fused
+        # right-aligned decode (q_offset=None): the offset is seqlen_k - seqlen_q,
+        # computed in-kernel so the wrapper launches no helper kernels to build it.
+        self._qoff_default = qoff_default
         if kv_fp8 and kv_nvfp4:
             raise ValueError("kv_fp8 and kv_nvfp4 are mutually exclusive")
         self._pad_stride = head_dim + 8  # 16B-aligned padded rows
@@ -368,7 +372,10 @@ class SparseDecodeForwardSm12x:
 
             if cutlass.const_expr(self._is_causal):
                 # causal: query global position = q_offset[b] + tok_in_req
-                q_pos_limit = tok_in_req + mQOffset[batch_idx] + 1
+                if cutlass.const_expr(self._qoff_default):
+                    q_pos_limit = tok_in_req + (seqlen_k - seqlen_q) + 1
+                else:
+                    q_pos_limit = tok_in_req + mQOffset[batch_idx] + 1
                 col_limit = cutlass.min(q_pos_limit, seqlen_k)
             else:
                 col_limit = seqlen_k
@@ -964,7 +971,10 @@ class SparseDecodeForwardSm12x:
         row_sum.fill(0.0)
 
         if cutlass.const_expr(self._is_causal):
-            q_pos_limit = tok_in_req + mQOffset[batch_idx] + 1
+            if cutlass.const_expr(self._qoff_default):
+                q_pos_limit = tok_in_req + (seqlen_k - seqlen_q) + 1
+            else:
+                q_pos_limit = tok_in_req + mQOffset[batch_idx] + 1
             col_limit = cutlass.min(q_pos_limit, seqlen_k)
         else:
             col_limit = seqlen_k

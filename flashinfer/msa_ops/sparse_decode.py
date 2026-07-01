@@ -27,12 +27,26 @@ the list position and the split count is the valid prefix length, computed
 in-kernel. The split partials are reduced by the shared combine kernel.
 """
 
+import functools
 from typing import Optional
 
 import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_decode_attention_trace
+
+
+@functools.cache
+def _dummy_tensors(device_index: int):
+    """Per-device signature fillers (page table, scale factors, q_offset) for
+    paths that never read them — cached so each decode call launches no fill
+    kernels."""
+    dev = torch.device("cuda", device_index)
+    return (
+        torch.zeros((1, 1), dtype=torch.int32, device=dev),
+        torch.zeros(1, dtype=torch.uint8, device=dev),
+        torch.zeros(1, dtype=torch.int32, device=dev),
+    )
 
 
 def _decode_num_chunks(base_ctas: int, topk: int, device) -> int:
@@ -123,7 +137,6 @@ def msa_sparse_decode_attention(
         _compile_cache,
         _cutlass_dtype,
         _fake,
-        _q_offset_tensor,
     )
 
     if not is_sm12x_supported(q.device):
@@ -214,7 +227,7 @@ def msa_sparse_decode_attention(
         if k.ndim != 3:
             raise ValueError("flat k/v must be (total_k, num_kv_heads, head_dim)")
         cu_k = cu_seqlens_k.to(dev)
-        pt_dev = torch.zeros((1, 1), dtype=torch.int32, device=dev)
+        pt_dev = _dummy_tensors(dev.index)[0]
 
     # v mirrors k (same layout/dtype for bf16/fp16, fp8, and packed NVFP4); the
     # kernel indexes v with k-derived coordinates, so a mismatched v would read
@@ -222,8 +235,17 @@ def msa_sparse_decode_attention(
     if v.shape != k.shape or v.dtype != k.dtype:
         raise ValueError("v must have the same shape and dtype as k")
 
-    cu_q_loc = torch.arange(0, total_q + 1, seqlen_q, dtype=torch.int32, device=dev)
-    qoff_dev = _q_offset_tensor(q_offset, cu_q_loc, cu_k, dev)
+    # q_offset=None (right-aligned) is computed in-kernel from cu_k/seqlen_q, so
+    # the default path builds no offset tensor at all.
+    qoff_default = q_offset is None
+    if qoff_default:
+        qoff_dev = _dummy_tensors(dev.index)[2]
+    elif isinstance(q_offset, int):
+        qoff_dev = torch.full((batch_size,), q_offset, dtype=torch.int32, device=dev)
+    else:
+        if q_offset.dtype != torch.int32:
+            raise ValueError("q_offset must be int32")
+        qoff_dev = q_offset.to(dev)
 
     if partial_dtype is None:
         partial_dtype = compute_dtype
@@ -282,7 +304,7 @@ def msa_sparse_decode_attention(
         vsf_dev = v_scale.reshape(-1).contiguous()
     else:
         k_pass, v_pass = k, v
-        ksf_dev = torch.zeros(1, dtype=torch.uint8, device=dev)
+        ksf_dev = _dummy_tensors(dev.index)[1]
         vsf_dev = ksf_dev
 
     key = (
@@ -297,6 +319,7 @@ def msa_sparse_decode_attention(
         kv_nvfp4,
         str(partial_dtype),
         fused,
+        qoff_default,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
@@ -326,6 +349,7 @@ def msa_sparse_decode_attention(
             kv_nvfp4=kv_nvfp4,
             q_fp8=q_fp8,
             fused=fused,
+            qoff_default=qoff_default,
         )
         compiled = cute.compile(
             kernel_obj,
