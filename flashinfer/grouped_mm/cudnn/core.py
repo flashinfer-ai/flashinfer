@@ -46,6 +46,11 @@ except OSError as e:
 # ---------------------------------------------------------------------------
 
 _CUDNN_MOE_MIN_VERSION = 91800  # 9.18.0
+# FP8 needs a higher floor than bf16: backends 9.18.0-9.20.0 pass
+# check_support() for the FP8 MOE grouped matmul but silently compute only the
+# first expert group, leaving every other group's output zero (gh #3792,
+# verified on SM120 / RTX PRO 6000; fixed in 9.21.0).
+_CUDNN_MOE_FP8_MIN_VERSION = 92100  # 9.21.0
 _CUDNN_MOE_BLOCK_SCALE_MIN_VERSION = 92100  # 9.21.0
 
 

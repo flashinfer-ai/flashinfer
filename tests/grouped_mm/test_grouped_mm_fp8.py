@@ -8,6 +8,7 @@ from flashinfer.grouped_mm import grouped_mm_fp8
 from .conftest import (
     ref_grouped_mm,
     requires_cudnn_moe,
+    requires_cudnn_moe_fp8,
     requires_grouped_mm_fp8_cc,
 )
 
@@ -20,7 +21,7 @@ class TestGroupedMmFp8:
         t = torch.randn(shape, dtype=torch.float32, device=device).clamp(-1, 1)
         return t.to(dtype)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     @pytest.mark.parametrize("num_experts", [1, 4, 8])
     @pytest.mark.parametrize("tokens_per_expert", [32, 128, 256])
     @pytest.mark.parametrize("k", [256, 512])
@@ -50,7 +51,7 @@ class TestGroupedMmFp8:
 
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
     def test_non_uniform_distribution(self, dtype):
         """Experts get different numbers of tokens."""
@@ -74,7 +75,7 @@ class TestGroupedMmFp8:
 
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     def test_empty_experts(self):
         """Some experts receive zero tokens."""
         torch.manual_seed(1)
@@ -98,7 +99,7 @@ class TestGroupedMmFp8:
 
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     def test_single_expert(self):
         """Degenerate case: only one expert (equivalent to dense mm)."""
         torch.manual_seed(2)
@@ -115,7 +116,7 @@ class TestGroupedMmFp8:
 
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     def test_preallocated_output(self):
         """Pass a pre-allocated output tensor."""
         torch.manual_seed(3)
@@ -135,7 +136,7 @@ class TestGroupedMmFp8:
         assert result.data_ptr() == out.data_ptr()
         torch.testing.assert_close(result, ref, atol=0.125, rtol=0.125)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     @pytest.mark.parametrize(
         "out_dtype", [torch.float16, torch.bfloat16, torch.float32]
     )
@@ -157,7 +158,7 @@ class TestGroupedMmFp8:
         ref = ref_grouped_mm(a, b, m_indptr, out_dtype=out_dtype, alpha=alpha)
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     @pytest.mark.parametrize("alpha_val", [0.5, 1.0, 2.0])
     def test_alpha_scaling(self, alpha_val):
         """Verify the alpha scaling factor is applied correctly."""
@@ -176,7 +177,7 @@ class TestGroupedMmFp8:
 
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     def test_no_alpha(self):
         """FP8 grouped mm without alpha scaling."""
         torch.manual_seed(7)
@@ -193,7 +194,7 @@ class TestGroupedMmFp8:
 
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     def test_graph_cache_reuse(self):
         """Calling twice with identical shapes should reuse the cached graph."""
         torch.manual_seed(5)
@@ -210,7 +211,7 @@ class TestGroupedMmFp8:
         out2 = grouped_mm_fp8(a, b, m_indptr, alpha=alpha)
         torch.testing.assert_close(out1, out2)
 
-    @requires_cudnn_moe
+    @requires_cudnn_moe_fp8
     def test_mixed_fp8_dtypes(self):
         """a and b can use different FP8 sub-types."""
         torch.manual_seed(8)
@@ -228,9 +229,27 @@ class TestGroupedMmFp8:
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
 
+# Argument validation runs in _check_grouped_mm_fp8 BEFORE the runtime
+# version check, so these tests are valid on any MOE-capable backend (>= 9.18)
+# and keep coverage on the 9.18-9.20 installs where the kernel tests skip.
 @requires_cudnn_moe
 @requires_grouped_mm_fp8_cc
 class TestGroupedMmFp8Validation:
+    def test_version_floor_enforced(self, monkeypatch):
+        """grouped_mm_fp8 must refuse cuDNN backends < 9.21.0 (gh #3792).
+
+        Backends 9.18.0-9.20.0 pass check_support() but silently compute only
+        the first expert group; the floor turns that into a loud error.
+        """
+        from flashinfer.grouped_mm.cudnn import core as cudnn_core
+
+        monkeypatch.setattr(cudnn_core.cudnn, "backend_version", lambda: 92000)
+        a = torch.zeros(64, 128, dtype=torch.float8_e4m3fn, device="cuda")
+        b = torch.zeros(2, 64, 128, dtype=torch.float8_e4m3fn, device="cuda")
+        m_indptr = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+        with pytest.raises(RuntimeError, match="92100"):
+            grouped_mm_fp8(a, b, m_indptr)
+
     def test_wrong_input_dtype(self):
         a = torch.randn(64, 128, dtype=torch.float16, device="cuda")
         b = torch.randn(2, 64, 128, dtype=torch.float16, device="cuda")
