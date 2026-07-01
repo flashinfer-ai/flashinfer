@@ -22,34 +22,6 @@ using namespace flashinfer;
 
 using tvm::ffi::Tensor;
 
-namespace {
-
-bool IsStreamCapturing(cudaStream_t stream) {
-  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-  cudaError_t status = cudaStreamIsCapturing(stream, &capture_status);
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "Failed to query CUDA stream capture status: " << cudaGetErrorString(status);
-  return capture_status != cudaStreamCaptureStatusNone;
-}
-
-void CheckPositiveFiniteFloatScalar(TensorView tensor, const char* name, cudaStream_t stream) {
-  if (IsStreamCapturing(stream)) {
-    return;
-  }
-  float value = 0.0f;
-  cudaError_t status =
-      cudaMemcpyAsync(&value, tensor.data_ptr(), sizeof(float), cudaMemcpyDeviceToHost, stream);
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "Failed to copy " << name << " for validation: " << cudaGetErrorString(status);
-  status = cudaStreamSynchronize(stream);
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "Failed to synchronize " << name << " validation: " << cudaGetErrorString(status);
-  TVM_FFI_ICHECK(std::isfinite(value) && value > 0.0f)
-      << name << " must be a positive finite global decode scale";
-}
-
-}  // namespace
-
 void append_paged_kv_cache(TensorView append_key, TensorView append_value, TensorView batch_indices,
                            TensorView positions, TensorView paged_k_cache, TensorView paged_v_cache,
                            TensorView kv_indices, TensorView kv_indptr, TensorView kv_last_page_len,
@@ -343,8 +315,6 @@ void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
 
   ffi::CUDADeviceGuard device_guard(append_key.device().device_id);
   const cudaStream_t stream = get_stream(append_key.device());
-  CheckPositiveFiniteFloatScalar(k_scale, "k_scale", stream);
-  CheckPositiveFiniteFloatScalar(v_scale, "v_scale", stream);
 
   const unsigned int nnz = slot_mapping.size(0);
   TVM_FFI_ICHECK_GE(append_key.size(0), nnz);

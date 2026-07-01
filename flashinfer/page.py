@@ -625,7 +625,7 @@ def _as_float32_scalar_tensor(
             and hasattr(torch.cuda, "is_current_stream_capturing")
             and torch.cuda.is_current_stream_capturing()
         )
-        if not is_capturing:
+        if not value.is_cuda:
             scalar = float(value.item())
             if not math.isfinite(scalar) or scalar <= 0.0:
                 raise ValueError(
@@ -645,6 +645,29 @@ def _as_float32_scalar_tensor(
     if not math.isfinite(scalar) or scalar <= 0.0:
         raise ValueError(f"{name} must be a positive finite global decode scale")
     return torch.tensor([scalar], dtype=torch.float32, device=device)
+
+
+def _validate_cuda_float32_scalar_tensors(
+    values: Tuple[Tuple[str, torch.Tensor], ...],
+) -> None:
+    values = tuple((name, value) for name, value in values if value.is_cuda)
+    if not values:
+        return
+    if (
+        hasattr(torch.cuda, "is_current_stream_capturing")
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        return
+
+    # Validate CUDA scalar tensors with one device-to-host transfer instead of
+    # a separate implicit sync for each tensor.
+    host_values = (
+        torch.stack([value.reshape(()) for _, value in values]).detach().cpu().tolist()
+    )
+    for (name, _), scalar in zip(values, host_values, strict=True):
+        scalar = float(scalar)
+        if not math.isfinite(scalar) or scalar <= 0.0:
+            raise ValueError(f"{name} must be a positive finite global decode scale")
 
 
 @flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace)
@@ -700,11 +723,23 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
             "NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn"
         )
 
+    validate_k_scale_cuda = isinstance(k_scale, torch.Tensor) and k_scale.is_cuda
+    validate_v_scale_cuda = isinstance(v_scale, torch.Tensor) and v_scale.is_cuda
     k_scale_tensor = _as_float32_scalar_tensor(
         k_scale, device=append_key.device, name="k_scale"
     )
     v_scale_tensor = _as_float32_scalar_tensor(
         v_scale, device=append_key.device, name="v_scale"
+    )
+    _validate_cuda_float32_scalar_tensors(
+        tuple(
+            scale
+            for should_validate, scale in (
+                (validate_k_scale_cuda, ("k_scale", k_scale_tensor)),
+                (validate_v_scale_cuda, ("v_scale", v_scale_tensor)),
+            )
+            if should_validate
+        )
     )
 
     _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(

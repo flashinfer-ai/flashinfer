@@ -281,6 +281,10 @@ __device__ __forceinline__ void nvfp4_append_quantize_block(
   }
 }
 
+__device__ __forceinline__ bool nvfp4_append_is_positive_finite_scale(float scale) {
+  return isfinite(scale) && scale > 0.0f;
+}
+
 /*!
  * \brief CUDA kernel to append new keys/values to the paged key-value cache in the decode phase
  * \tparam head_dim The dimension of each head
@@ -505,6 +509,14 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
   const uint32_t head_idx = blockIdx.y;
   if (token_idx >= nnz) return;
 
+  const float k_scale = __ldg(k_scale_ptr);
+  const float v_scale = __ldg(v_scale_ptr);
+  if (!(nvfp4_append_is_positive_finite_scale(k_scale) &&
+        nvfp4_append_is_positive_finite_scale(v_scale))) {
+    asm volatile("trap;");
+    return;
+  }
+
   const IdType slot = slot_mapping[token_idx];
   if (slot < 0 || static_cast<size_t>(slot) >= static_cast<size_t>(max_num_pages) * page_size) {
     return;
@@ -525,8 +537,6 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
                       head_idx * k_sf_stride_h;
   uint8_t* v_sf_out = v_scale_cache + page_idx * v_sf_stride_page + entry_idx * v_sf_stride_n +
                       head_idx * v_sf_stride_h;
-  const float k_scale = __ldg(k_scale_ptr);
-  const float v_scale = __ldg(v_scale_ptr);
 
   for (uint32_t sf_idx = threadIdx.x; sf_idx < NUM_SF_BLOCKS * 2; sf_idx += blockDim.x) {
     const bool is_v = sf_idx >= NUM_SF_BLOCKS;

@@ -15,6 +15,7 @@
 """TraceTemplates for paged-KV cache append operations."""
 
 import math
+from typing import Any, cast
 
 import torch
 
@@ -280,6 +281,12 @@ def _nvfp4_quantize_append_paged_kv_cache_init(
     return base
 
 
+cast(Any, _nvfp4_quantize_append_paged_kv_cache_init)._trace_init_dependencies = (
+    _append_paged_kv_cache_init,
+    _nvfp4_paged_cache_shapes,
+)
+
+
 nvfp4_quantize_append_paged_kv_cache_trace = TraceTemplate(
     op_type="page_append",
     name_prefix="nvfp4_quantize_append_paged_kv_cache",
@@ -412,6 +419,12 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init(
         "k_scale": torch.ones(1, dtype=torch.float32, device=device),
         "v_scale": torch.ones(1, dtype=torch.float32, device=device),
     }
+
+
+cast(
+    Any,
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)._trace_init_dependencies = (_nvfp4_paged_cache_shapes,)
 
 
 nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
