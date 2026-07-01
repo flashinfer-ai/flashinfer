@@ -277,9 +277,6 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
 def download_artifacts() -> None:
     from tqdm.contrib.logging import tqdm_logging_redirect
 
-    # use a shared session to make use of HTTP keep-alive and reuse of
-    # HTTPS connections.
-    session = requests.Session()
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
     with tqdm_logging_redirect(
@@ -291,13 +288,13 @@ def download_artifacts() -> None:
 
         with ThreadPoolExecutor(num_threads) as pool:
             futures = []
-            for name, _ in cubin_files:
+            for name, checksum in cubin_files:
                 source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
                 local_path = FLASHINFER_CUBIN_DIR / name
                 # Ensure parent directory exists
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 fut = pool.submit(
-                    download_file, source, str(local_path), session=session
+                    download_file, source, str(local_path), expected_sha256=checksum
                 )
                 fut.add_done_callback(update_pbar_cb)
                 futures.append(fut)
