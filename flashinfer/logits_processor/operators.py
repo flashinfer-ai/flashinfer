@@ -129,12 +129,13 @@ class ProbsTopKOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
-        # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
-        row_states_buffer = _get_cache_buf(
-            f"top_k_renorm_probs_row_states_{tensor.data.device}",
-            1024 * 1024,
-            tensor.data.device,
-            zero_init=True,
+        # Allocate the row_states scratch per call from the stream-ordered caching
+        # allocator (1MB is enough for any GPU). Concurrent launches on different
+        # streams thus get disjoint buffers and never share the multi-CTA kernel's
+        # synchronization state (#3618). zero-init is required: the kernel reads
+        # the arrival counters before any CTA writes them.
+        row_states_buffer = torch.zeros(
+            1024 * 1024, dtype=torch.uint8, device=tensor.data.device
         )
         renorm_probs = get_sampling_module().top_k_renorm_probs(
             tensor.data, maybe_top_k_arr, top_k_val, row_states_buffer
@@ -175,12 +176,13 @@ class LogitsTopKOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
-        # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
-        row_states_buffer = _get_cache_buf(
-            f"top_k_mask_logits_row_states_{tensor.data.device}",
-            1024 * 1024,
-            tensor.data.device,
-            zero_init=True,
+        # Allocate the row_states scratch per call from the stream-ordered caching
+        # allocator (1MB is enough for any GPU). Concurrent launches on different
+        # streams thus get disjoint buffers and never share the multi-CTA kernel's
+        # synchronization state (#3618). zero-init is required: the kernel reads
+        # the arrival counters before any CTA writes them.
+        row_states_buffer = torch.zeros(
+            1024 * 1024, dtype=torch.uint8, device=tensor.data.device
         )
         masked_logits = get_sampling_module().top_k_mask_logits(
             tensor.data, maybe_top_k_arr, top_k_val, row_states_buffer

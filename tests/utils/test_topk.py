@@ -20,7 +20,6 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.utils as flashinfer_utils
 from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
 
@@ -77,20 +76,6 @@ def verify_topk_correctness(logits, values, indices, k):
         if values[i].min().item() < kth_largest - 1e-6:
             return False
     return True
-
-
-def _get_cached_topk_row_states_buffer(device: torch.device):
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    key = (f"radix_topk_row_states_{device}", device)
-    return flashinfer_utils._cache_buf.get(key)
-
-
-def _clear_cached_topk_row_states_buffer(device: torch.device):
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    key = (f"radix_topk_row_states_{device}", device)
-    flashinfer_utils._cache_buf.pop(key, None)
 
 
 def _build_strictly_descending_logits(
@@ -266,84 +251,73 @@ def test_top_k_large_batch(batch_size, vocab_size, k, det, tie_break):
 
 
 @pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
-@pytest.mark.parametrize(
-    ("first_deterministic", "second_deterministic"),
-    [(False, True), (True, False)],
-)
-def test_multi_cta_reuses_dirty_cached_row_states_buffer_across_mode_transitions(
-    api_kind, set_topk_algo, first_deterministic, second_deterministic
-):
+def test_multi_cta_row_states_not_shared_across_streams(api_kind, set_topk_algo):
+    """Concurrent multi-CTA top-k launches must not share the row_states scratch.
+
+    ``row_states`` holds the kernel's inter-CTA synchronization state. It used to
+    come from a per-device cached buffer, so two launches racing on different
+    streams corrupted each other's reduction (flashinfer-ai/flashinfer#3618). It
+    is now allocated per call from the stream-ordered caching allocator, so every
+    launch gets a disjoint buffer.
+
+    This interleaves launches on two streams without syncing between them, so the
+    sequences actually overlap on the device, and checks every result against a
+    per-stream reference. Distinct (descending vs. ascending) inputs ensure a
+    shared/raced buffer would corrupt at least one stream.
+    """
     set_topk_algo("multi_cta")
     device = torch.device("cuda")
-    _clear_cached_topk_row_states_buffer(device)
+    batch_size, vocab_size, k = 4, 131072, 512
 
-    batch_size = 4
-    vocab_size = 131072
-    k = 512
-    logits = _build_strictly_descending_logits(batch_size, vocab_size, device)
+    logits_a = _build_strictly_descending_logits(batch_size, vocab_size, device)
+    logits_b = torch.flip(logits_a, dims=(-1,)).contiguous()
 
-    if api_kind == "top_k":
-        expected_values = logits[:, :k]
-        expected_indices = (
-            torch.arange(k, device=device, dtype=torch.int64)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-
-        values_a, indices_a = flashinfer.top_k(
-            logits, k, sorted=True, deterministic=first_deterministic
-        )
-        torch.testing.assert_close(values_a, expected_values)
-        assert torch.equal(indices_a, expected_indices)
-        buf_a = _get_cached_topk_row_states_buffer(device)
-        assert buf_a is not None
-
-        values_b, indices_b = flashinfer.top_k(
-            logits, k, sorted=True, deterministic=second_deterministic
-        )
-        torch.testing.assert_close(values_b, expected_values)
-        assert torch.equal(indices_b, expected_indices)
-    else:
+    def run(logits):
+        if api_kind == "top_k":
+            return flashinfer.top_k(logits, k, sorted=True, deterministic=True)
         lengths = torch.full(
             (batch_size,), vocab_size, device=device, dtype=torch.int32
         )
-        expected = torch.arange(k, device=device, dtype=torch.int32).unsqueeze(0)
-        expected = expected.expand(batch_size, -1)
-        src_page_table = None
         offsets = None
-
         if api_kind == "ragged":
             offsets = torch.arange(
-                0, batch_size * vocab_size, vocab_size, device=device, dtype=torch.int32
+                0,
+                batch_size * vocab_size,
+                vocab_size,
+                device=device,
+                dtype=torch.int32,
             )
-            expected = offsets.unsqueeze(1) + expected
-
-        output_a = _run_transform(
-            logits,
-            k,
-            api_kind,
-            lengths=lengths,
-            deterministic=first_deterministic,
-            src_page_table=src_page_table,
-            offsets=offsets,
+        return _run_transform(
+            logits, k, api_kind, lengths=lengths, deterministic=True, offsets=offsets
         )
-        _assert_unordered_indices_match(output_a, expected)
-        buf_a = _get_cached_topk_row_states_buffer(device)
-        assert buf_a is not None
 
-        output_b = _run_transform(
-            logits,
-            k,
-            api_kind,
-            lengths=lengths,
-            deterministic=second_deterministic,
-            src_page_table=src_page_table,
-            offsets=offsets,
-        )
-        _assert_unordered_indices_match(output_b, expected)
+    def equal(x, y):
+        if isinstance(x, tuple):
+            return all(torch.equal(a, b) for a, b in zip(x, y, strict=True))
+        return torch.equal(x, y)
 
-    buf_b = _get_cached_topk_row_states_buffer(device)
-    assert buf_b is buf_a
+    # Per-stream references on the default stream; this also triggers the JIT
+    # compile so the concurrent loop below does not compile on a side stream.
+    ref_a = run(logits_a)
+    ref_b = run(logits_b)
+    torch.cuda.synchronize()
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+
+    outs_a = []
+    outs_b = []
+    for _ in range(32):
+        with torch.cuda.stream(stream_a):
+            outs_a.append(run(logits_a))
+        with torch.cuda.stream(stream_b):
+            outs_b.append(run(logits_b))
+    torch.cuda.synchronize()
+
+    for out in outs_a:
+        assert equal(out, ref_a)
+    for out in outs_b:
+        assert equal(out, ref_b)
 
 
 @pytest.mark.parametrize("k", [256, 1024, 2048])
