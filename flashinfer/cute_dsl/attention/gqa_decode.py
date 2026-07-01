@@ -2427,7 +2427,7 @@ if __name__ == "__main__":
     )
 
     def parse_none_or_int(value):
-        if value.lower() in ("none"):
+        if value.lower() == "none":
             return None
         try:
             return int(value)
