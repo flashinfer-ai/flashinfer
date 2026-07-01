@@ -6,6 +6,7 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import (
     _FP8_GEMM_SM100_TUNING_CONFIG,
     _cudnn_gemm_fp8_runner,
+    _is_cudnn_engine_knob_tactic,
     _get_cache_buf,
     get_gemm_module,
     DEFAULT_WORKSPACE_SIZE,
@@ -120,10 +121,8 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
     assert is_cache_hit == expected_cache_hit
     if is_cache_hit:
         assert runner_id == 0
-        # cuDNN FP8 runner now enumerates multiple execution plans, so the
-        # autotuner can pick any valid plan index (>= 0). Tactic == -1 would
-        # mean the fallback path was chosen (no hit), which contradicts the hit.
-        assert tactic >= 0
+        # cuDNN tactics are stable engine/knob descriptors, not plan indices.
+        assert _is_cudnn_engine_knob_tactic(tactic)
         assert stored_profile is not None
 
 
@@ -131,12 +130,12 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
 def test_autotuner_gemm_cross_bucket_m(backend):
     """Tune at one M bucket, then run inference at a non-bucket M.
 
-    The non-override cuDNN graph (and the cuBLASLt algo list) is enumerated at
-    the *real* shape, so a tactic tuned against a different (bucketed) M may be
-    out of range for the runtime plan/algo list. This must NOT raise (the
-    runner clamps an out-of-range index back to the heuristic default), and the
-    autotuner must still reuse the tuned bucket entry for the non-bucket M
-    (i.e. the workspace scratch size does not leak into the cache key).
+    The cuBLASLt algo list is enumerated at the *real* shape, so an integer
+    tactic tuned against a different (bucketed) M may be out of range at
+    runtime. cuDNN tactics are stable engine/knob descriptors and are resolved
+    against the runtime graph. Both paths must reuse the tuned bucket entry for
+    the non-bucket M (i.e. the workspace scratch size does not leak into the
+    cache key) and produce finite output.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     cc = compute_capability[0] * 10 + compute_capability[1]
@@ -199,5 +198,8 @@ def test_autotuner_gemm_cross_bucket_m(backend):
         inputs=[a8, b8, a_s, b_s, res, workspace_buffer],
     )
     assert is_cache_hit
-    assert tactic >= 0
+    if backend == "cudnn":
+        assert _is_cudnn_engine_knob_tactic(tactic)
+    else:
+        assert tactic >= 0
     assert stored_profile is not None
