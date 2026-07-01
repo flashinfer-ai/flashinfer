@@ -15,7 +15,7 @@
 {{ local_ns_open }}
 #if CUDA_VERSION >= {{ min_cuda_version }}
 
-{{ dma2compute_depth_str }}
+static constexpr int DMA2COMPUTE_DEPTH = 1;
 {{ num_compute_groups_str }}
 static constexpr bool USE_TMA_STORE = {{ use_tma_store_flag }};
 

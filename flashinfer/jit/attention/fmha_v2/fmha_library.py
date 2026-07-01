@@ -267,13 +267,13 @@ def generate_kernel_spec(
                 spec["kv_loop_step"] = 256
                 spec["kv_tile_buffers"] = 4
             elif head_size <= 128:
-                # STEP_KV=256 overflows the in-register score fragment ([64, STEP_KV] fp32) and
-                # spills; STEP_KV=128 avoids the spill, and the smem freed by the smaller K/V tiles
-                # is spent on Q double-buffering (q_tile_buffers=2) so the next q-tile prefetch
-                # overlaps the current KV loop.
-                spec["kv_loop_step"] = 128
+                # STEP_KV=256: the wide KV tile amortizes per-tile barrier/V-transpose overhead,
+                # and the two compute warpgroups' softmax overlaps the other group's BMM1 GMMA
+                # (ordered-mbarrier in compute.h). q_tile_buffers=1 (256-wide smem leaves no room
+                # for Q double-buffering).
+                spec["kv_loop_step"] = 256
                 spec["kv_tile_buffers"] = 2
-                spec["q_tile_buffers"] = 2
+                spec["q_tile_buffers"] = 1
             else:
                 # D=256 (FP8 pads head_size>128 to 256 due to 128-byte alignment):
                 # base smem = 32 + 64 + 64 + 32 = ~192KB with KV_BUF=2.
@@ -651,14 +651,6 @@ def get_kernel_code(kspec: FMHAv2KernelSpec, kname: str, lname: str) -> Optional
     )
     include_str = ""
     num_compute_groups_str = "static constexpr int NUM_COMPUTE_GROUPS = 2;"
-    dma2compute_depth = (
-        2
-        if (kspec.warp_specialization and fp8_kernel and 64 < kspec.head_size <= 128)
-        else 1
-    )
-    dma2compute_depth_str = (
-        f"static constexpr int DMA2COMPUTE_DEPTH = {dma2compute_depth};"
-    )
     fused_multihead_attention_params_v2_str = f"{params_type}"
     const_fused_multihead_attention_params_v2_str = f"const {params_type}"
     setmaxnreg_dma_str = r"""

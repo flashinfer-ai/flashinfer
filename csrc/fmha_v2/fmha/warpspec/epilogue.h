@@ -804,48 +804,40 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
       }
     }
 
-// Softmax Exp.
+// Fused softmax-exp + row-sum: round-robin the adds into 4 partial sums so they form 4
+// independent chains hidden behind the exp, instead of one CORES_N*2-long dependent chain,
+// overlapping the softmax with the GMMA. q_scale_s is folded into the per-row bias
+// (masked_max), so local_sum here is left unscaled by q_scale_s.
 #pragma unroll
-    for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
+    for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+      // A fully-masked row (local_max_ == -FLT_MAX) uses bias 0 so exp yields 0, not 1.
+      float masked_max;
+      if constexpr (!EXP2F_OPTIMIZATION) {
+        masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
+                         ? local_max_[mi] - logf(q_scale_s_)
+                         : 0.f;
+      } else {
+        masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
+                         ? local_max_[mi] * scale - log2f(q_scale_s_)
+                         : 0.f;
+      }
+
+      float psum[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-      for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-        // The equation exp2(scale * x - max) * q_scale_s
-        // equals to:   exp2(scale * x - max) * exp2(log2(q_scale_s))
-        // equals to:   exp2(scale * x - (max - log2(q_scale_s)))
-        //                   ^^^^^   ^   ^^^^^^^^^^^^^^^^^^^^^^^
-        // So instead of per-accumulator muls, we can do per-row subs which saves FP cycles.
-        // As we scale the softmax output early, before doing the local_sum, we have to unscale
-        // the local_sum afterwards.
+      for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
         float& p0 = elt_[mi][2 * ni + 0];
         float& p1 = elt_[mi][2 * ni + 1];
-
-        // When all elts of the tile are -FLT_MAX, we have to make sure
-        //  expf generates 0 for all values instead of 1.
         if constexpr (!EXP2F_OPTIMIZATION) {
-          float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                                 ? local_max_[mi] - logf(q_scale_s_)
-                                 : 0.f;
           p0 = expf(p0 - masked_max);
           p1 = expf(p1 - masked_max);
         } else {
-          // Use exp2f optimization for cases without alibi.
-          float masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                                 ? local_max_[mi] * scale - log2f(q_scale_s_)
-                                 : 0.f;
           p0 = custom_exp2f(p0, scale, masked_max);
           p1 = custom_exp2f(p1, scale, masked_max);
         }
+        psum[(2 * ni + 0) % 4] += p0;
+        psum[(2 * ni + 1) % 4] += p1;
       }
-    }
-
-// Row-wise sum of current tile.
-#pragma unroll
-    for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      local_sum_[mi] = elt_[mi][0];
-#pragma unroll
-      for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++) {
-        local_sum_[mi] += elt_[mi][ni];
-      }
+      local_sum_[mi] = (psum[0] + psum[1]) + (psum[2] + psum[3]);
       local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 1);
       local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 2);
     }
