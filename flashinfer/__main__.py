@@ -15,9 +15,18 @@ limitations under the License.
 """
 
 # flashinfer-cli
+import importlib.util
 import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
 import click
+from packaging.version import InvalidVersion, Version
 from tabulate import tabulate  # type: ignore[import-untyped]
+
+from build_utils import SM_FAMILY_ORDER, jit_cache_sm_family_for_capabilities
 
 from .artifacts import (
     ArtifactPath,
@@ -33,6 +42,9 @@ from .jit.cpp_ext import get_cuda_path, get_cuda_version
 
 # Import __version__ from centralized version module
 from .version import __version__
+
+
+_SOURCE_VERSION_FILE = pathlib.Path(__file__).resolve().parents[1] / "version.txt"
 
 
 def _download_cubin():
@@ -58,6 +70,39 @@ def _ensure_modules_registered():
         except Exception as e:
             click.secho(f"❌ Module registration failed: {e}", fg="red")
     return statuses
+
+
+def _detect_sm_family() -> str:
+    """Return the SM family covering all visible CUDA devices, or raise ClickException.
+
+    Used as the default for `flashinfer install-jit-cache-wheel`.
+    """
+    try:
+        import torch
+    except ImportError as e:  # pragma: no cover - torch is a hard dep but be defensive
+        raise click.ClickException(
+            "PyTorch is required to autodetect the GPU architecture. "
+            "Install torch or pass --sm-family explicitly."
+        ) from e
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        raise click.ClickException(
+            "No CUDA device visible — cannot autodetect SM family. "
+            f"Pass --sm-family {{{'|'.join(SM_FAMILY_ORDER)}}} or run on a host with the target GPU."
+        )
+
+    capabilities = [
+        torch.cuda.get_device_capability(device)
+        for device in range(torch.cuda.device_count())
+    ]
+    try:
+        return jit_cache_sm_family_for_capabilities(capabilities)
+    except ValueError as e:
+        raise click.ClickException(
+            f"{e} Pass --sm-family explicitly if you only want to install a wheel "
+            "for one GPU family, or build flashinfer-jit-cache from source with "
+            "FLASHINFER_CUDA_ARCH_LIST covering all target GPUs."
+        ) from e
 
 
 @click.group(invoke_without_command=True)
@@ -214,6 +259,192 @@ def clear_cubin_cmd():
         click.secho("✅ Cubin cleared successfully.", fg="green")
     except Exception as e:
         click.secho(f"❌ Cubin clear failed: {e}", fg="red")
+
+
+def _parse_cuda_version(cuda_version):
+    """Accepts None / "12.9" / "cu129"; returns a packaging Version."""
+    if cuda_version is None:
+        return get_cuda_version()
+
+    normalized = cuda_version.strip().lower()
+    if normalized.startswith("cu"):
+        digits = normalized[2:]
+        if not digits.isdigit() or len(digits) < 3:
+            raise click.ClickException("CUDA version must look like '12.9' or 'cu129'.")
+        normalized = f"{int(digits[:2])}.{int(digits[2:])}"
+    try:
+        return Version(normalized)
+    except InvalidVersion as e:
+        raise click.ClickException(
+            f"Invalid CUDA version '{cuda_version}'. Use formats like '12.9' or 'cu129'."
+        ) from e
+
+
+def _cuda_index_label(cuda_version: Version) -> str:
+    return f"cu{cuda_version.major}{cuda_version.minor}"
+
+
+def _build_jit_cache_requirement(
+    flashinfer_version: str,
+    cuda_index_label: str,
+    sm_family: str,
+    *,
+    nightly: bool = False,
+) -> str:
+    if flashinfer_version == "0.0.0+unknown":
+        raise click.ClickException(
+            "Could not determine the installed FlashInfer version. "
+            "Pass --flashinfer-version explicitly."
+        )
+    try:
+        parsed = Version(flashinfer_version)
+    except InvalidVersion as e:
+        raise click.ClickException(
+            f"Invalid FlashInfer version '{flashinfer_version}'."
+        ) from e
+    if nightly and parsed.dev is None:
+        raise click.ClickException(
+            "Cannot infer a nightly flashinfer-jit-cache wheel from non-dev "
+            f"FlashInfer version '{flashinfer_version}'. Install flashinfer-python "
+            "from the nightly index or pass --flashinfer-version with a dev "
+            "version such as '0.6.11.devYYYYMMDD'."
+        )
+    return f"flashinfer-jit-cache=={parsed.public}+{cuda_index_label}.{sm_family}"
+
+
+def _build_jit_cache_index_url(cuda_index_label: str, nightly: bool) -> str:
+    if nightly:
+        return f"https://flashinfer.ai/whl/nightly/{cuda_index_label}"
+    return f"https://flashinfer.ai/whl/{cuda_index_label}"
+
+
+def _resolve_flashinfer_version(flashinfer_version: str | None) -> str:
+    if flashinfer_version:
+        return flashinfer_version
+    if __version__ != "0.0.0+unknown":
+        return __version__
+    if _SOURCE_VERSION_FILE.exists():
+        version = _SOURCE_VERSION_FILE.read_text().strip()
+        if version:
+            return version
+    return __version__
+
+
+def _build_package_install_command(
+    index_url: str, requirement: str, nightly: bool
+) -> list[str]:
+    if importlib.util.find_spec("pip") is not None:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--no-deps",
+        ]
+    else:
+        uv = shutil.which("uv")
+        if uv is None:
+            raise click.ClickException(
+                f"{sys.executable} does not provide the pip module, and uv was not "
+                "found on PATH. Install pip in this environment or install uv."
+            )
+        cmd = [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--upgrade",
+            "--no-deps",
+        ]
+    if nightly:
+        cmd.append("--pre")
+    cmd.extend(["--index-url", index_url, requirement])
+    return cmd
+
+
+@cli.command("install-jit-cache-wheel")
+@click.option(
+    "--cuda-version",
+    default=None,
+    help="Override CUDA version detection, e.g. '12.9' or 'cu129'.",
+)
+@click.option(
+    "--sm-family",
+    default=None,
+    type=click.Choice(SM_FAMILY_ORDER),
+    help=(
+        "Override SM family detection. sm9x = Ampere/Ada/Hopper (≤sm90), "
+        "sm10x = Datacenter Blackwell (sm100/103), sm110 = Thor, "
+        "sm12x = Consumer Blackwell (sm120/121)."
+    ),
+)
+@click.option(
+    "--flashinfer-version",
+    default=None,
+    help="Override FlashInfer version (defaults to the installed one).",
+)
+@click.option(
+    "--index-url",
+    default=None,
+    help="Explicit wheel index URL (overrides the autogenerated FlashInfer URL).",
+)
+@click.option(
+    "--nightly",
+    is_flag=True,
+    help="Install from the nightly wheel index instead of the release index.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the pip command without executing it.",
+)
+def install_jit_cache_wheel_cmd(
+    cuda_version, sm_family, flashinfer_version, index_url, nightly, dry_run
+):
+    """Install the matching flashinfer-jit-cache wheel for this GPU + CUDA.
+
+    Detects FlashInfer version, CUDA version, and visible GPU capabilities, then runs
+    `pip install flashinfer-jit-cache==<ver>+cu<XY>.<family>` against the FlashInfer
+    wheel index. Use --sm-family to bypass GPU detection (e.g. when prepping a
+    container image on a CPU-only host).
+    """
+    resolved_cuda = _parse_cuda_version(cuda_version)
+    cuda_label = _cuda_index_label(resolved_cuda)
+    resolved_family = sm_family or _detect_sm_family()
+    resolved_flashinfer_version = _resolve_flashinfer_version(flashinfer_version)
+    requirement = _build_jit_cache_requirement(
+        resolved_flashinfer_version, cuda_label, resolved_family, nightly=nightly
+    )
+    resolved_index_url = index_url or _build_jit_cache_index_url(cuda_label, nightly)
+
+    cmd = _build_package_install_command(resolved_index_url, requirement, nightly)
+
+    click.secho("=== JIT Cache Wheel Install ===", fg="yellow")
+    click.secho("FlashInfer version:", fg="magenta", nl=False)
+    click.secho(f" {resolved_flashinfer_version}", fg="cyan")
+    click.secho("CUDA version:", fg="magenta", nl=False)
+    click.secho(f" {resolved_cuda}", fg="cyan")
+    click.secho("SM family:", fg="magenta", nl=False)
+    click.secho(f" {resolved_family}", fg="cyan")
+    click.secho("Wheel index:", fg="magenta", nl=False)
+    click.secho(f" {resolved_index_url}", fg="cyan")
+    click.secho("Requirement:", fg="magenta", nl=False)
+    click.secho(f" {requirement}", fg="cyan")
+    click.secho("Command:", fg="magenta", nl=False)
+    click.secho(f" {' '.join(cmd)}", fg="cyan")
+
+    if dry_run:
+        click.secho("Dry run requested; pip install was not executed.", fg="yellow")
+        return
+
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise click.ClickException(
+            f"pip install failed with exit code {result.returncode}."
+        )
+    click.secho("✅ flashinfer-jit-cache installed successfully.", fg="green")
 
 
 @cli.command("module-status")

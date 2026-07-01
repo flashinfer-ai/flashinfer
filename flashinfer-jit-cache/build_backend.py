@@ -24,10 +24,54 @@ from wheel.bdist_wheel import bdist_wheel
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from build_utils import get_git_version
+from build_utils import (
+    SM_FAMILY_ORDER,
+    filter_arch_list_for_sm_family,
+    get_git_version,
+)
 
 # Skip version check when building flashinfer-jit-cache package
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
+
+
+def _resolve_sm_family() -> str:
+    """Return the SM family this build targets, or '' for a legacy multi-family build."""
+    family = os.environ.get("FLASHINFER_JIT_CACHE_SM_FAMILY", "").strip().lower()
+    if not family:
+        return ""
+    if family not in SM_FAMILY_ORDER:
+        raise RuntimeError(
+            f"Invalid FLASHINFER_JIT_CACHE_SM_FAMILY={family!r}. "
+            f"Expected one of: {SM_FAMILY_ORDER}"
+        )
+    return family
+
+
+def _apply_sm_family_filter() -> str:
+    """If a family is selected, narrow FLASHINFER_CUDA_ARCH_LIST in-place and return the family suffix."""
+    family = _resolve_sm_family()
+    if not family:
+        return ""
+
+    arch_list = os.environ.get("FLASHINFER_CUDA_ARCH_LIST")
+    if not arch_list:
+        # The downstream build will fail with a clear error in compile_and_package_modules;
+        # we let it raise there to keep error messages consistent.
+        return family
+
+    filtered = filter_arch_list_for_sm_family(arch_list, family)
+    if not filtered:
+        raise RuntimeError(
+            f"FLASHINFER_JIT_CACHE_SM_FAMILY={family} but FLASHINFER_CUDA_ARCH_LIST="
+            f"{arch_list!r} contains no archs in that family. "
+            f"Set FLASHINFER_CUDA_ARCH_LIST to include archs matching {family}."
+        )
+    print(
+        f"SM family {family}: filtering FLASHINFER_CUDA_ARCH_LIST "
+        f"{arch_list!r} -> {filtered!r}"
+    )
+    os.environ["FLASHINFER_CUDA_ARCH_LIST"] = filtered
+    return family
 
 
 def _create_build_metadata():
@@ -49,6 +93,13 @@ def _create_build_metadata():
 
     # Append local version suffix if available
     local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
+
+    # When this build targets a single SM family, append it to the local-version
+    # so users can pin e.g. "flashinfer-jit-cache==0.6.11+cu130.sm10x".
+    family = _resolve_sm_family()
+    if family:
+        local_version = f"{local_version}.{family}" if local_version else family
+
     if local_version:
         # Use + to create a local version identifier that will appear in wheel name
         version = f"{version}+{local_version}"
@@ -157,6 +208,12 @@ def _build_aot_modules():
 
 def _prepare_build():
     """Shared preparation logic for both wheel and editable builds."""
+    _apply_sm_family_filter()
+    # Re-derive the build metadata so the family suffix is reflected in
+    # `_build_meta.py` even when the import-time call ran before the env var
+    # was set (e.g. when callers configure FLASHINFER_JIT_CACHE_SM_FAMILY in
+    # the same process before invoking build_wheel).
+    _create_build_metadata()
     _build_aot_modules()
 
 

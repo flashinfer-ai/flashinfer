@@ -184,7 +184,7 @@ jobs:
   # AOT Build Import Tests (Spot + On-Demand Rerun)
   # ---------------------------------------------------------------------------
   aot-build-import:
-    name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }})
+    name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }}, ${{ matrix.sm_family }})
     needs: [gate, setup]
     if: |
       needs.gate.outputs.authorized == 'true' &&
@@ -202,6 +202,23 @@ jobs:
       matrix:
         arch: [x64, arm64]
         cuda: [cu126, cu128, cu129, cu130]
+        sm_family: [sm9x, sm10x, sm110, sm12x]
+        # cu126 only has sm9x archs (7.5 / 8.0 / 8.9 / 9.0a), so the
+        # sm10x, sm110, and sm12x family builds would have empty arch lists.
+        # sm110 is only built for aarch64 CUDA 13.0 release coverage.
+        exclude:
+          - cuda: cu126
+            sm_family: sm10x
+          - cuda: cu126
+            sm_family: sm110
+          - cuda: cu126
+            sm_family: sm12x
+          - cuda: cu128
+            sm_family: sm110
+          - cuda: cu129
+            sm_family: sm110
+          - arch: x64
+            sm_family: sm110
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
     steps:
@@ -240,6 +257,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         run: |
           bash ci/bash.sh "${DOCKER_IMAGE}" \
+            -e FLASHINFER_JIT_CACHE_SM_FAMILY "${{ matrix.sm_family }}" \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
             -e SCCACHE_REGION "${SCCACHE_REGION}" \
             -e AWS_ACCESS_KEY_ID \
@@ -274,14 +292,25 @@ jobs:
           MATRIX='{"include":['
           for arch in x64 arm64; do
             for cuda in cu126 cu128 cu129 cu130; do
-              MATRIX+='{"arch":"'$arch'","cuda":"'$cuda'"},'
+              for sm_family in sm9x sm10x sm110 sm12x; do
+                # Mirror the cu126 exclude rule from `aot-build-import`.
+                if [ "$cuda" = "cu126" ] && [ "$sm_family" != "sm9x" ]; then
+                  continue
+                fi
+                if [ "$sm_family" = "sm110" ]; then
+                  if [ "$arch" != "arm64" ] || [ "$cuda" != "cu130" ]; then
+                    continue
+                  fi
+                fi
+                MATRIX+='{"arch":"'$arch'","cuda":"'$cuda'","sm_family":"'$sm_family'"},'
+              done
             done
           done
           MATRIX="${MATRIX%,}]}"
           echo "rerun_matrix=$MATRIX" >> $GITHUB_OUTPUT
 
   aot-build-import-rerun:
-    name: AOT Build Import Rerun (${{ matrix.arch }}, ${{ matrix.cuda }})
+    name: AOT Build Import Rerun (${{ matrix.arch }}, ${{ matrix.cuda }}, ${{ matrix.sm_family }})
     needs: [setup, analyze-aot-failure]
     if: |
       !cancelled() &&
@@ -332,6 +361,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
         run: |
           bash ci/bash.sh "${DOCKER_IMAGE}" \
+            -e FLASHINFER_JIT_CACHE_SM_FAMILY "${{ matrix.sm_family }}" \
             -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
             -e SCCACHE_REGION "${SCCACHE_REGION}" \
             -e AWS_ACCESS_KEY_ID \
