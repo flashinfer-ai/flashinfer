@@ -75,6 +75,73 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
         )
 
 
+def _check_fa_mla_cache_shape(
+    ckv_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    page_size: int,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+) -> None:
+    """Validate the paged kv-cache shape for the fa2/fa3 MLA kernels.
+
+    The fa2/fa3 paged MLA kernels index the kv-cache with the layout
+    ``[num_pages, page_size, head_dim]``, deriving each slot offset from the
+    ``page_size`` captured in ``plan()`` -- not from the tensor's own dim-1. A
+    collapsed layout such as ``[num_pages * page_size, 1, head_dim]`` therefore
+    addresses the wrong rows and silently produces all-zero / incorrect output
+    instead of raising. This validates eagerly so the failure is obvious.
+
+    See https://github.com/flashinfer-ai/flashinfer/issues/3219.
+
+    Args:
+        ckv_cache: Compressed-KV cache, expected ``[num_pages, page_size,
+            head_dim_ckv]``.
+        kpe_cache: Key positional-embedding cache, expected ``[num_pages,
+            page_size, head_dim_kpe]``.
+        page_size: Page size passed to ``plan()``; must match dim-1 of both caches.
+        head_dim_ckv: Expected last dim of ``ckv_cache``.
+        head_dim_kpe: Expected last dim of ``kpe_cache``.
+
+    Raises:
+        ValueError: If either cache is not 3D, dim-1 does not equal
+            ``page_size``, the last dim does not match the corresponding head
+            dim, or the two caches disagree on ``num_pages``.
+    """
+    if ckv_cache.ndim != 3 or kpe_cache.ndim != 3:
+        raise ValueError(
+            "ckv_cache and kpe_cache must be 3D "
+            "[num_pages, page_size, head_dim], got "
+            f"ckv_cache.shape={tuple(ckv_cache.shape)}, "
+            f"kpe_cache.shape={tuple(kpe_cache.shape)}"
+        )
+    if ckv_cache.shape[1] != page_size or kpe_cache.shape[1] != page_size:
+        raise ValueError(
+            "ckv_cache/kpe_cache dim-1 must equal the page_size passed to "
+            f"plan() (page_size={page_size}), got "
+            f"ckv_cache.shape={tuple(ckv_cache.shape)}, "
+            f"kpe_cache.shape={tuple(kpe_cache.shape)}. The MLA paged kv-cache "
+            "layout is [num_pages, page_size, head_dim]; a collapsed layout "
+            "such as [num_pages * page_size, 1, head_dim] is a common cause of "
+            "all-zero or incorrect output "
+            "(https://github.com/flashinfer-ai/flashinfer/issues/3219)."
+        )
+    if ckv_cache.shape[2] != head_dim_ckv:
+        raise ValueError(
+            f"ckv_cache last dim must equal head_dim_ckv={head_dim_ckv}, got "
+            f"{ckv_cache.shape[2]}"
+        )
+    if kpe_cache.shape[2] != head_dim_kpe:
+        raise ValueError(
+            f"kpe_cache last dim must equal head_dim_kpe={head_dim_kpe}, got "
+            f"{kpe_cache.shape[2]}"
+        )
+    if ckv_cache.shape[0] != kpe_cache.shape[0]:
+        raise ValueError(
+            "ckv_cache and kpe_cache must have the same num_pages (dim-0), got "
+            f"{ckv_cache.shape[0]} and {kpe_cache.shape[0]}"
+        )
+
+
 @dataclass(frozen=True)
 class MLAHeadDimensions:
     """
@@ -1661,6 +1728,8 @@ class BatchMLAPagedAttentionWrapper:
             self._kv_len_arr_buf = kv_len_arr.to(self.device, non_blocking=True)
         self._causal = causal
         self._page_size = page_size
+        self._head_dim_ckv = head_dim_ckv
+        self._head_dim_kpe = head_dim_kpe
         self._sm_scale = sm_scale
         # Used by run() to reject dtype mismatches; the C++ launcher
         # reinterprets storage by the JIT-template type chosen at plan(),
@@ -1903,6 +1972,13 @@ class BatchMLAPagedAttentionWrapper:
                 )
         num_heads = q_nope.shape[1]
         page_size = self._page_size
+        _check_fa_mla_cache_shape(
+            ckv_cache,
+            kpe_cache,
+            page_size,
+            self._head_dim_ckv,
+            self._head_dim_kpe,
+        )
         sm_scale = self._sm_scale
         causal = self._causal
         mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
