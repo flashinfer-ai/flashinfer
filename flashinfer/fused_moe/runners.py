@@ -255,8 +255,13 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         if hidden_states_scale.dtype == torch.uint8:
             hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
 
-        # Packed pre-routed top-k ids: ((expert_id - offset) << 16) | bf16(weight)
-        ids = act.selected_experts - self._local_expert_offset
+        # Packed pre-routed top-k ids: (GLOBAL expert_id << 16) | bf16(weight).
+        # The kernel expects GLOBAL ids and filters/maps them via the separately
+        # passed ``local_expert_offset`` (mirrors trtllm_bf16_routed_moe in
+        # tests/moe/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
+        # offset: on ranks with local_expert_offset>0 that yields a local id below
+        # the offset, which the kernel treats as non-local and skips → zero output.
+        ids = act.selected_experts
         weight_bf16_bits = (
             act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
         )
@@ -327,3 +332,177 @@ class TrtllmFp4RoutedRunner(TunableRunner):
 
     def __hash__(self):
         return hash(("trtllm_fp4_routed",))
+
+
+# ---------------------------------------------------------------------------
+# TRTLLM BF16 routed runner — canonical trtllm-gen MoERunner, bf16 dtypes
+# ---------------------------------------------------------------------------
+
+
+class TrtllmBf16RoutedRunner(TunableRunner):
+    """Pre-routed BF16 adapter over the canonical trtllm-gen ``MoERunner``.
+
+    Mirrors :class:`TrtllmFp4RoutedRunner` but with ``Bfloat16`` activation +
+    weight dtypes and no scale-factor tensors, wrapping the same inner
+    ``MoERunner`` (whose ``forward`` dispatches to ``moe_op.trtllm_bf16_moe`` when
+    ``dtype_weights == Bfloat16``).  Used for the EP grouped-GEMM bf16 path: the
+    packed pre-routed ids carry ``(GLOBAL expert_id << 16) | bf16(weight)`` (with
+    ``local_expert_offset`` passed separately);
+    with the EP bridge's synthesized ``top_k=1`` + ``weight=1`` and
+    ``do_finalize=True``, the output comes back in input row order.
+
+    The bf16 MoE entry point requires the ``BlockMajorK`` weight layout.
+    """
+
+    backend_key = "trtllm_bf16_routed"
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+        from ..utils import device_support_pdl
+        from .core import get_trtllm_moe_sm100_module
+
+        self.config = config
+        self.device = device
+        self._module = get_trtllm_moe_sm100_module()
+
+        routing = config.routing
+        experts = config.experts
+        execution = config.execution
+        self._num_local_experts = experts.local_num_experts or routing.num_experts
+        self._local_expert_offset = experts.local_expert_offset
+        self._intermediate_size = experts.intermediate_size
+        self._activation_type = int(config.activation.type)
+        self._tune_max_num_tokens = execution.tune_max_num_tokens
+
+        self._dtype_act = DtypeTrtllmGen.Bfloat16
+        self._dtype_weights = DtypeTrtllmGen.Bfloat16
+        self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
+
+        enable_pdl = execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(device)
+        self._enable_pdl = enable_pdl
+
+        self._inner: Any = None
+        self._static_kwargs: dict = {}
+        self.tuning_config: Any = None
+
+    def _ensure_inner(self, hidden_size: int) -> None:
+        if self._inner is not None:
+            return
+        from ..tllm_enums import WeightLayout
+
+        self._inner = self._module.MoERunner(
+            top_k=self.config.routing.top_k,
+            num_local_experts=self._num_local_experts,
+            dtype_act=self._dtype_act,
+            dtype_weights=self._dtype_weights,
+            fp8_quantization_type=self._fp8_quantization_type,
+            hidden_size=hidden_size,
+            intermediate_size=self._intermediate_size,
+            activation_type=self._activation_type,
+            use_shuffled_weight=True,
+            weight_layout=int(WeightLayout.BlockMajorK),
+            use_per_token_scaling=False,
+            num_experts=self.config.routing.num_experts,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self, inputs: List[torch.Tensor], profile: Any
+    ) -> List[Any]:
+        return self._inner.get_valid_tactics(inputs, profile)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._inner.forward(
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            **self._static_kwargs,
+        )
+        return inputs[0]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        """Translate Packs → the ``MoeRunnerInputs`` list for the bf16 path.
+
+        Expected weight view keys: gemm1_weights, gemm2_weights (BlockMajorK,
+        shuffled).  ``act.hidden_states_q`` carries the raw bf16 activations
+        (the EP bridge does not quantize on the bf16 path);
+        ``act.hidden_states_scale`` is unused.
+        """
+        from .core import MoeRunnerInputs, RoutingInputMode
+
+        v = weights.get_view(self.backend_key)
+        routing = self.config.routing
+
+        hidden_states = act.hidden_states_q  # raw bf16 on this path
+        num_tokens, hidden_size = hidden_states.shape
+
+        # Packed pre-routed top-k ids: (GLOBAL expert_id << 16) | bf16(weight).
+        # The kernel expects GLOBAL ids and filters/maps them via the separately
+        # passed ``local_expert_offset`` (mirrors trtllm_bf16_routed_moe in
+        # tests/moe/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
+        # offset: on ranks with local_expert_offset>0 that yields a local id below
+        # the offset, which the kernel treats as non-local and skips → zero output.
+        ids = act.selected_experts
+        weight_bf16_bits = (
+            act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+        )
+        topk_ids = (ids << 16) | (weight_bf16_bits & 0xFFFF)
+
+        output = hidden_states.new_empty((num_tokens, hidden_size))
+        expert_weights = act.final_scales.new_empty(
+            (num_tokens, routing.top_k), dtype=torch.bfloat16
+        )
+        moe_inputs = MoeRunnerInputs(
+            output=output,
+            routing_logits=None,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+        from ..tllm_enums import WeightLayout
+
+        self._static_kwargs = dict(
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+            routing_bias=None,
+            gemm1_weights=v["gemm1_weights"],
+            gemm2_weights=v["gemm2_weights"],
+            gemm1_alpha=v.get("gemm1_alpha"),
+            gemm1_beta=v.get("gemm1_beta"),
+            gemm1_clamp_limit=v.get("gemm1_clamp_limit"),
+            num_experts=routing.num_experts,
+            n_group=routing.n_group,
+            topk_group=routing.topk_group,
+            local_expert_offset=self._local_expert_offset,
+            routed_scaling_factor=routing.routed_scaling_factor,
+            routing_method_type=int(routing.method),
+            use_shuffled_weight=True,
+            weight_layout=int(WeightLayout.BlockMajorK),
+            do_finalize=self.config.execution.do_finalize,
+            enable_pdl=self._enable_pdl,
+            norm_topk_prob=False,
+        )
+
+        self._ensure_inner(hidden_size)
+        self.tuning_config = self._inner._make_tuning_config(
+            moe_inputs,
+            tune_max_num_tokens=self._tune_max_num_tokens,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+        return moe_inputs.to_list()
+
+    def __hash__(self):
+        return hash(("trtllm_bf16_routed",))

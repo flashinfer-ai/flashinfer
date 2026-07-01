@@ -950,12 +950,21 @@ def test_single_decode_torch_compile_cuda_graph():
         torch.cuda.synchronize()
         print("PASS")
     """)
+    import gc
     import os
 
     # torch.compile's inductor calls getpass.getuser() for cache dir, which fails
     # in CI containers where the uid has no /etc/passwd entry. Setting USER avoids this.
     env = os.environ.copy()
     env.setdefault("USER", "ci")
+
+    # The parent pytest process has already run thousands of decode cases in this
+    # file. Release its cached blocks before the subprocess initializes
+    # torch.compile/cudagraph state on memory-constrained A10G runners.
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+
     result = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,
