@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
+from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability
 
 
@@ -14,7 +15,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
 @pytest.mark.parametrize(
-    "backend", ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"]
+    "backend", ["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"]
 )
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_bf16(
@@ -43,6 +44,12 @@ def test_mm_bf16(
     if backend == "cudnn" and not CUDNN_AVAILABLE:
         pytest.skip("cuDNN is not available on this system.")
 
+    if backend == "cutile":
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
+
     if backend == "auto" and (enable_bias or pdl):
         pytest.skip("mm_bf16 with auto backend does not support bias or pdl arguments.")
 
@@ -53,6 +60,10 @@ def test_mm_bf16(
     if backend == "cublaslt" and (enable_bias or pdl):
         pytest.skip(
             "mm_bf16 with cuBLASLt backend does not support bias or pdl arguments."
+        )
+    if backend == "cutile" and (enable_bias or pdl):
+        pytest.skip(
+            "mm_bf16 with cuTile backend does not support bias or pdl arguments."
         )
     if res_dtype != torch.bfloat16 and backend == "tgv":
         pytest.skip(
@@ -87,6 +98,66 @@ def test_mm_bf16(
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+def test_mm_bf16_cutile_rejects_bias_and_pdl():
+    """The v1 cuTile path is alpha=1/beta=0 and ignores bias / pdl — must raise.
+
+    Output dtype, on the other hand, supports bf16 / fp16 / fp32 via the
+    polymorphic store epilogue, so it is exercised in the main parametrized
+    matrix above rather than rejected here.
+    """
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cutile", cc_num):
+        pytest.skip("cuTile backend not supported on current compute capability.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
+
+    # a is (m, k) = (64, 1024); b is (n, k) = (2048, 1024); b.T is (k, n) = (1024, 2048)
+    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(64, 2048, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="ignores `bias`"):
+        mm_bf16(a, b.T, bias, False, out, torch.bfloat16, backend="cutile")
+    with pytest.raises(ValueError, match="ignores `pdl`"):
+        mm_bf16(a, b.T, None, True, out, torch.bfloat16, backend="cutile")
+
+
+def test_mm_bf16_cutile_repeat_uses_tune_cache():
+    """Second call on the same shape must reuse the cached autotune result.
+
+    Cache hits reproduce the first call's output bit-for-bit (no kernel
+    re-tune, no autotune RNG state to diverge). We use ``assert_close`` with
+    rtol=atol=0 — a strict-inequality threshold like ``cos_sim > 0.999`` is
+    unsafe in bf16 because the rhs rounds to 1.0 and ``1.0 > 1.0`` is False
+    even when the kernel is correct.
+    """
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cutile", cc_num):
+        pytest.skip("cuTile backend not supported on current compute capability.")
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
+
+    # Shape (m, n, k) = (64, 2048, 1024). mm_bf16(a, b.T) → (m, n).
+    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(64, 2048, device="cuda", dtype=torch.bfloat16)
+
+    # First call: warms tune cache.
+    mm_bf16(a, b.T, None, False, out, torch.bfloat16, backend="cutile")
+    out_first = out.clone()
+    # Second call: must produce the same result and not raise.
+    mm_bf16(a, b.T, None, False, out, torch.bfloat16, backend="cutile")
+    torch.testing.assert_close(
+        out_first,
+        out,
+        rtol=0,
+        atol=0,
+        msg="tune-cache reuse produced divergent output",
+    )
 
 
 def test_cublaslt_bf16_runner_zero_algos():

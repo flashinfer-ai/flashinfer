@@ -162,8 +162,8 @@ def create_kv_cache(
             dim=1,
         )
     elif kv_dtype == "nvfp4":
-        k_cache, k_scale, k_global_scale = to_nvfp4(k_cache / 4.0)
-        v_cache, v_scale, v_global_scale = to_nvfp4(v_cache / 4.0)
+        k_cache, k_scale, k_global_scale = to_nvfp4(k_cache)
+        v_cache, v_scale, v_global_scale = to_nvfp4(v_cache)
         k_cache_dq = nvfp4_to_float(k_cache, k_scale, k_global_scale)
         v_cache_dq = nvfp4_to_float(v_cache, v_scale, v_global_scale)
         ref_kv_cache = torch.stack(
@@ -581,14 +581,17 @@ def test_xqa_batch_decode(
 
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [12],
-    reason="XQA with NVFP4 KV is only supported on SM120 GPUs",
+    reason="XQA with NVFP4 KV is only supported on SM120/SM121 GPUs",
 )
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
+        (1, 1, 16, 2, 4),
+        (1, 1, 32, 2, 4),
         (4, 4, 64, 4, 2),
         (1, 1, 64, 2, 4),
         (1, 1, 64, 2, 8),
+        (1, 1, 128, 2, 4),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
@@ -601,8 +604,19 @@ def test_xqa_batch_decode(
 )
 @pytest.mark.parametrize("enable_pdl", [False])
 @pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
+# max_in_kv_len must exceed page_size so sequences span multiple pages; otherwise
+# the scale-factor *page* stride is never exercised and the sf_layout="separate"
+# case below cannot catch a wrong SF page stride.
+@pytest.mark.parametrize("max_in_kv_len", [300])
 @pytest.mark.parametrize("kv_layout", ["NHD"])
+# "stacked": SF cache shares the torch.stack([k, v], dim=1) layout of the data
+# cache, so after conversion to head units the SF strides equal the data-cache
+# strides -- this passes identically with or without the SF-stride fix.
+# "separate": K/V scale factors are allocated as independent contiguous tensors
+# (no interleave dim), so the SF page stride differs from the data-cache page
+# stride by the factor-2 stacking. This exercises the dedicated sf_stride_*
+# plumbing and regresses if the kernel falls back to the data-cache strides.
+@pytest.mark.parametrize("sf_layout", ["stacked", "separate"])
 def test_xqa_batch_decode_nvfp4_kv(
     batch_size,
     q_len_per_req,
@@ -617,6 +631,7 @@ def test_xqa_batch_decode_nvfp4_kv(
     enable_sink,
     max_in_kv_len,
     kv_layout,
+    sf_layout,
 ):
     """Test xqa_batch_decode_with_kv_cache function.
 
@@ -651,7 +666,16 @@ def test_xqa_batch_decode_nvfp4_kv(
         )
     )
 
-    kv_cache_sf = torch.stack([k_scale, v_scale], dim=1)
+    if sf_layout == "stacked":
+        # SF cache interleaved like the data cache: kv_cache_sf[:, 0/1] are
+        # non-contiguous views whose head-unit strides match the data cache.
+        kv_cache_sf = torch.stack([k_scale, v_scale], dim=1)
+    else:
+        # SF cache as two independently-allocated contiguous tensors. The SF
+        # page stride (page_size * num_kv_heads * head_dim/16) no longer carries
+        # the factor-2 from interleaving K and V, so it diverges from the data
+        # cache page stride and exercises the separate sf_stride_* path.
+        kv_cache_sf = (k_scale.contiguous(), v_scale.contiguous())
 
     page_table, all_page_ids, page_per_seq = create_page_table(
         batch_size, seq_lens, page_size

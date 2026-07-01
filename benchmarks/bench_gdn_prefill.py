@@ -27,6 +27,8 @@ Usage:
 
 import argparse
 import sys
+import time
+import gc
 
 import numpy as np
 import torch
@@ -41,6 +43,7 @@ try:
 
     _has_fla = True
 except ImportError:
+    fla_gdn = None
     _has_fla = False
 
 HEAD_CONFIGS = [
@@ -63,6 +66,9 @@ HEAD_CONFIGS = [
 SEQ_CONFIGS = [
     # (cu_seqlen_endpoints, label)
     # endpoints are cumulative positions (leading 0 added automatically)
+    ((65536,), "1x65536"),
+    ((32768,), "1x32768"),
+    ((16384,), "1x16384"),
     ((8192,), "1x8192"),
     ((4096,), "1x4096"),
     ((2048,), "1x2048"),
@@ -72,6 +78,9 @@ SEQ_CONFIGS = [
     ((1024 * 1, 8192), "1024+7168"),
     ((2048, 2048 * 2, 2048 * 3, 8192), "2048x4"),
     (tuple(1024 * (i + 1) for i in range(8)), "1024x8"),
+    (tuple(8192 * (i + 1) for i in range(8)), "8192x8"),
+    (tuple(8192 * (i + 1) for i in range(16)), "8192x16"),
+    (tuple(8192 * (i + 1) for i in range(32)), "8192x32"),
 ]
 
 
@@ -81,7 +90,15 @@ def _gdn_tflops(total_tokens, h_v, d, time_ms):
     return flops / time_ms / 1e9
 
 
-def bench_fi(endpoints, h_qk, h_v, d, warmup, iters):
+def get_num_rotating_buffers(num_iters: int, q, k, v) -> int:
+    """Heuristic for number of rotating buffers to use based on total memory footprint."""
+    nbytes = q.nbytes + k.nbytes + v.nbytes
+    total_bytes = 4 * 1024 * 1024 * 1024  # 4 GB
+    # Assume 4 GB per buffer is a reasonable heuristic; adjust as needed.
+    return max(1, min(num_iters, (total_bytes + nbytes - 1) // nbytes))
+
+
+def bench_fi(args, endpoints, h_qk, h_v, d):
     """Benchmark FlashInfer GDN prefill."""
     device = "cuda"
     dtype = torch.float16
@@ -94,22 +111,50 @@ def bench_fi(endpoints, h_qk, h_v, d, warmup, iters):
         torch.randn(T, h_qk, d, dtype=torch.float32, device=device), p=2, dim=-1
     ).to(dtype)
     v = torch.randn((T, h_v, d), dtype=dtype, device=device)
-    g = F.logsigmoid(torch.rand(T, h_v, dtype=torch.float32, device=device))
+    # FlashInfer's g is the linear-space forget gate alpha in (0, 1)
+    # ("defaults to all ones" = no decay). Log-space gates (e.g. logsigmoid)
+    # are out of domain and produce NaN outputs/state.
+    g = torch.rand(T, h_v, dtype=torch.float32, device=device)
     beta = torch.rand(T, h_v, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
     state_out = torch.zeros_like(h0)
 
-    fn = lambda: chunk_gated_delta_rule(
-        q, k, v, g, beta, None, h0, True, cu_seqlens, False, None, state_out
-    )
+    num_buffer = get_num_rotating_buffers(args.iters, q, k, v)
+    q = [q.clone() for _ in range(num_buffer)]
+    k = [k.clone() for _ in range(num_buffer)]
+    v = [v.clone() for _ in range(num_buffer)]
+    rotation_buffer_idx = 0
+
+    def fn():
+        nonlocal rotation_buffer_idx
+        chunk_gated_delta_rule(
+            q[rotation_buffer_idx % num_buffer],
+            k[rotation_buffer_idx % num_buffer],
+            v[rotation_buffer_idx % num_buffer],
+            g,
+            beta,
+            None,
+            h0,
+            True,
+            cu_seqlens,
+            False,
+            None,
+            state_out,
+        )
+        rotation_buffer_idx += 1
+
     times = bench_gpu_time(
-        fn, enable_cupti=True, dry_run_iters=warmup, repeat_iters=iters
+        fn,
+        enable_cupti=args.use_cupti,
+        dry_run_iters=args.warmup,
+        repeat_iters=args.iters,
+        use_cuda_graph=args.use_cuda_graph,
     )
     torch.cuda.empty_cache()
     return np.average(times)
 
 
-def bench_fla(endpoints, h_qk, h_v, d, warmup, iters):
+def bench_fla(args, endpoints, h_qk, h_v, d):
     """Benchmark FLA baseline."""
     device = "cuda"
     dtype = torch.float16
@@ -127,19 +172,34 @@ def bench_fla(endpoints, h_qk, h_v, d, warmup, iters):
     beta = torch.rand(1, T, h_v, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
 
-    fn = lambda: fla_gdn(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        None,
-        initial_state=h0,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-    )
+    num_buffer = get_num_rotating_buffers(args.iters, q, k, v)
+    q = [q.clone() for _ in range(num_buffer)]
+    k = [k.clone() for _ in range(num_buffer)]
+    v = [v.clone() for _ in range(num_buffer)]
+
+    rotation_buffer_idx = 0
+
+    def fn():
+        nonlocal rotation_buffer_idx
+        fla_gdn(
+            q[rotation_buffer_idx % num_buffer],
+            k[rotation_buffer_idx % num_buffer],
+            v[rotation_buffer_idx % num_buffer],
+            g,
+            beta,
+            None,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+        rotation_buffer_idx += 1
+
     times = bench_gpu_time(
-        fn, enable_cupti=True, dry_run_iters=warmup, repeat_iters=iters
+        fn,
+        enable_cupti=args.use_cupti,
+        dry_run_iters=args.warmup,
+        repeat_iters=args.iters,
+        use_cuda_graph=args.use_cuda_graph,
     )
     torch.cuda.empty_cache()
     return np.average(times)
@@ -149,6 +209,9 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark GDN Prefill Kernel")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--cooling-time", type=float, default=0.1)
+    parser.add_argument("--use-cupti", action="store_true")
+    parser.add_argument("--use-cuda-graph", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -162,8 +225,10 @@ def main():
     )
 
     if not _has_fla:
-        print("Error: FLA not installed. Run: pip install flash-linear-attention")
-        sys.exit(1)
+        print(
+            "Warning: FLA not installed (pip install flash-linear-attention). "
+            "Benchmarking FlashInfer only."
+        )
 
     print(f"\nGPU: {torch.cuda.get_device_name(0)} [{arch_label}]")
     print("Models: Qwen3.5 family (397B, 122B, 35B, 27B, 9B, 4B, 2B, 0.8B), d=128")
@@ -172,24 +237,30 @@ def main():
     header = (
         f"{'Heads':<15s}  {'Seqlens':<16s}  {'h_qk':>4s} {'h_v':>4s}"
         f"  {fi_col:>22s}  {'TFLOPS':>7s}"
-        f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
     )
+    if _has_fla:
+        header += f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
     print(header)
     print("-" * len(header))
 
     for h_qk, h_v, d, h_label in HEAD_CONFIGS:
         for endpoints, s_label in SEQ_CONFIGS:
+            gc.collect()
             T = endpoints[-1]
-            fi_ms = bench_fi(endpoints, h_qk, h_v, d, args.warmup, args.iters)
-            fla_ms = bench_fla(endpoints, h_qk, h_v, d, args.warmup, args.iters)
+            fi_ms = bench_fi(args, endpoints, h_qk, h_v, d)
+            time.sleep(args.cooling_time)
             tflops = _gdn_tflops(T, h_v, d, fi_ms)
-            speedup = fla_ms / fi_ms
-            marker = "+" if speedup > 1.0 else "-"
-            print(
+            row = (
                 f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
                 f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
-                f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
             )
+            if _has_fla:
+                fla_ms = bench_fla(args, endpoints, h_qk, h_v, d)
+                time.sleep(args.cooling_time)
+                speedup = fla_ms / fi_ms
+                marker = "+" if speedup > 1.0 else "-"
+                row += f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
+            print(row)
         print()
 
 

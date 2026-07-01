@@ -218,11 +218,15 @@ gqa_paged_decode_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(["batch_size", "num_qo_heads", "head_dim"], dtype_from="q"),
         "lse": Tensor(
             ["batch_size", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -410,11 +414,15 @@ gqa_paged_prefill_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(["total_q", "num_qo_heads", "head_dim"], dtype_from="q"),
         "lse": Tensor(
             ["total_q", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -571,6 +579,9 @@ gqa_ragged_prefill_trace = TraceTemplate(
             optional=True,
             description="Softmax scale. Default is (1/sqrt(head_dim)). Set during plan(), not run().",
         ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(
@@ -580,6 +591,7 @@ gqa_ragged_prefill_trace = TraceTemplate(
         ),
         "lse": Tensor(
             ["total_q", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -769,13 +781,38 @@ mla_paged_decode_trace = TraceTemplate(
                 "based on head dimensions before matrix absorption. Set during plan(), not run()."
             ),
         ),
+        "ckv_scale": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "Per-tensor dequantization scale for the compressed-KV cache when "
+                "kv_data_type is FP8 (real = quantized * ckv_scale). Required "
+                "together with kpe_scale for the FP8 KV cache path on the fa3 "
+                "backend. Set during run(), not plan()."
+            ),
+        ),
+        "kpe_scale": Scalar(
+            "float32",
+            optional=True,
+            description=(
+                "Per-tensor dequantization scale for the rope-K cache when "
+                "kv_data_type is FP8 (real = quantized * kpe_scale). Required "
+                "together with ckv_scale for the FP8 KV cache path on the fa3 "
+                "backend. Set during run(), not plan()."
+            ),
+        ),
+        "return_lse": Scalar(
+            "int32", optional=True, description="Bool: also return LSE."
+        ),
     },
     outputs={
         "output": Tensor(
-            ["batch_size", "num_qo_heads", "head_dim_ckv"], dtype_from="q_nope"
+            ["batch_size", "num_qo_heads", "head_dim_ckv"],
+            dtype_from="q_nope",
         ),
         "lse": Tensor(
             ["batch_size", "num_qo_heads"],
+            optional=True,
             dtype="float32",
             description="The 2-based log-sum-exp of attention logits.",
         ),
@@ -1146,6 +1183,175 @@ dsa_paged_trace = TraceTemplate(
     tags=["status:verified", "sparse:topk"],
     reference=_dsa_paged_reference,
 )
+
+
+# ── Sparse MLA SM120 (DSv4 + DSv3.2 families) ─────────────────────────────────
+
+sparse_mla_sm120_paged_trace = TraceTemplate(
+    op_type="sparse_mla_paged_sm120",
+    name_prefix="sparse_mla_sm120_paged",
+    description=(
+        "Sparse-MLA paged attention on SM120. Byte-packed FP8 KV cache + "
+        "per-token top-K paged slot IDs + optional attn_sink (per-head "
+        "pre-softmax bias). Supports optional dual-cache mode "
+        "(extra_kv_cache + extra_indices + extra_topk_length) for DSv4 "
+        "C4A / C128A layers, sharing a single online-softmax denominator "
+        "across both caches. The 576-dim inline-scale cache supports DSv3.2 "
+        "power-of-2 FP32 scales and GLM arbitrary FP32 scales. "
+        "Auto-dispatches decode (num_tokens <= 64) vs "
+        "prefill internally. This is the backend trace for the SM120 sparse "
+        "MLA implementation routed by flashinfer.mla APIs."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of query tokens (batch * s_q)."),
+        "num_heads": Const(
+            description="Number of query heads after TP split.", abbrev="h"
+        ),
+        "head_dim_qk": Const(
+            description="Query head dim. 512 = DSv4 family, 576 = DSv3.2/GLM family.",
+            abbrev="dqk",
+        ),
+        "head_dim_v": Const(
+            description="Value head dim. 512 for both DSV3_2 and DSV4.",
+            abbrev="dv",
+        ),
+        "topk": Const(
+            description="Number of top-K paged slots per query token.",
+            abbrev="topk",
+        ),
+        "page_block_size": Const(
+            description="KV cache page block size (64 for both DSV4 and DSV3_2).",
+            abbrev="ps",
+        ),
+        "num_pages": Var(description="Total allocated pages in the KV cache."),
+        "extra_num_pages": Var(
+            description="Pages in the optional secondary KV cache (dual-cache mode)."
+        ),
+        "extra_topk": Const(
+            description="Top-K width for the secondary cache. 0 = single-cache.",
+            abbrev="xtopk",
+        ),
+        "extra_page_block_size": Const(
+            description="Page block size of the secondary cache (may differ from main).",
+            abbrev="xps",
+        ),
+        "kv_bytes_per_token": Const(
+            description="Byte-packed FP8 token stride (weights + interleaved scales).",
+            abbrev="kvb",
+        ),
+    },
+    inputs={
+        "q": Tensor(
+            ["num_tokens", "num_heads", "head_dim_qk"],
+            description="Query tensor, dtype bf16.",
+        ),
+        "kv_cache": Tensor(
+            ["num_pages", "page_block_size", "1", "kv_bytes_per_token"],
+            dtype="uint8",
+            description=(
+                "Paged main KV cache. Byte-packed FP8 (weights + interleaved scales). "
+                "The h_kv=1 axis is kept for shape compatibility with FlashMLA layouts."
+            ),
+        ),
+        "indices": Tensor(
+            ["num_tokens", "topk"],
+            dtype="int32",
+            description="Paged slot IDs per query token. -1 marks invalid / out-of-window.",
+        ),
+        "output": Tensor(
+            ["num_tokens", "num_heads", "head_dim_v"],
+            dtype_from="q",
+            description="In-place output buffer.",
+        ),
+        "out_lse": Tensor(
+            ["num_tokens", "num_heads"],
+            dtype="float32",
+            description="In-place log-sum-exp (2-based; merges attn_sink when present).",
+        ),
+        "sm_scale": Scalar(
+            "float32", description="Softmax scale, typically 1/sqrt(head_dim_qk)."
+        ),
+        "topk_length": Tensor(
+            ["num_tokens"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Effective top-k length per query token. Required for sliding-window "
+                "MLA near sequence start; None for uniform top-k."
+            ),
+        ),
+        "attn_sink": Tensor(
+            ["num_heads"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "Per-head learnable bias added pre-softmax. FlashMLA V4 convention: "
+                "output *= sigmoid(lse - sink) and lse' = log(exp(lse) + exp(sink))."
+            ),
+        ),
+        "extra_kv_cache": Tensor(
+            [
+                "extra_num_pages",
+                "extra_page_block_size",
+                "1",
+                "kv_bytes_per_token",
+            ],
+            dtype="uint8",
+            optional=True,
+            description=(
+                "Optional secondary KV cache (DSv4 C4A / C128A dual-cache layers). "
+                "When provided, extra_indices must also be passed. DSV4 only."
+            ),
+        ),
+        "extra_indices": Tensor(
+            ["num_tokens", "extra_topk"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Paged slot IDs for the secondary cache. -1 marks "
+                "invalid / out-of-window slots."
+            ),
+        ),
+        "extra_topk_length": Tensor(
+            ["num_tokens"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Effective top-k length per query token for the secondary cache."
+            ),
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "num_heads", "head_dim_v"],
+            dtype_from="q",
+            description="Attention output (also mutated in place above).",
+        ),
+        "out_lse": Tensor(
+            ["num_tokens", "num_heads"],
+            dtype="float32",
+            description="The 2-based log-sum-exp of attention logits (sink-merged).",
+        ),
+    },
+    constraints=[
+        "indices.shape[0] == num_tokens",
+        "indices.shape[-1] == topk",
+        "kv_cache.shape[1] == page_block_size",
+        "head_dim_qk in (512, 576)",
+        "head_dim_v == 512",
+        "extra_indices.shape[0] == num_tokens",
+        "extra_indices.shape[-1] == extra_topk",
+        "extra_kv_cache.shape[1] == extra_page_block_size",
+    ],
+    tags=[
+        "status:wip",  # init + reference deferred to a follow-up; trace JSON
+        # is still useful as a call-site descriptor.
+        "sparse:topk",
+        "backend:sm120",
+        "model:dsv4_or_dsv32",
+    ],
+)
+
 
 # ── Single prefill / single decode (non-batched) ──────────────────────────────
 
@@ -1698,10 +1904,26 @@ def _trtllm_batch_decode_mla_reference(
     """Reference for trtllm_batch_decode_with_kv_cache_mla.
 
     Query is concatenated [Q_nope, Q_pe] along the head_dim axis; the KV
-    cache is [ckv ‖ kpe]. Output is the K_nope-projected attention
-    (``[batch, q_len, num_heads, kv_lora_rank]``).
+    cache is [ckv ‖ kpe]. Dense calls return the K_nope-projected
+    attention as ``[batch, q_len, num_heads, kv_lora_rank]``; ragged
+    calls return ``[num_tokens, num_heads, kv_lora_rank]``.
     """
-    batch_size, q_len, num_heads, head_dim_qk = query.shape
+    cum_seq_lens_q = kwargs.get("cum_seq_lens_q")
+    if cum_seq_lens_q is None:
+        batch_size, q_len, num_heads, head_dim_qk = query.shape
+        output = torch.zeros(
+            (batch_size, q_len, num_heads, kv_lora_rank),
+            dtype=query.dtype,
+            device=query.device,
+        )
+    else:
+        batch_size = cum_seq_lens_q.numel() - 1
+        num_heads, head_dim_qk = query.shape[1:]
+        output = torch.zeros(
+            (*query.shape[:-1], kv_lora_rank),
+            dtype=query.dtype,
+            device=query.device,
+        )
     assert head_dim_qk == kv_lora_rank + qk_rope_head_dim
     bmm1_scale = kwargs.get("bmm1_scale", 1.0)
     bmm1_scale = (
@@ -1716,11 +1938,6 @@ def _trtllm_batch_decode_mla_reference(
     if kv_cache.dim() == 4:
         kv_cache = kv_cache.squeeze(1)
     page_size = kv_cache.shape[1]
-    output = torch.zeros(
-        (batch_size, q_len, num_heads, kv_lora_rank),
-        dtype=query.dtype,
-        device=query.device,
-    )
     for b in range(batch_size):
         kv_len = int(seq_lens[b].item())
         n_pages = (kv_len + page_size - 1) // page_size
@@ -1729,13 +1946,24 @@ def _trtllm_batch_decode_mla_reference(
         # MLA split: first kv_lora_rank dims = ckv (K_nope), last qk_rope_head_dim dims = kpe
         Kn = flat[:, :kv_lora_rank]
         Kp = flat[:, kv_lora_rank:]
-        for t in range(q_len):
-            q = query[b, t].to(torch.float32)  # [num_heads, head_dim_qk]
+        if cum_seq_lens_q is None:
+            q_start = 0
+            q_end = q_len
+            q_batch = query[b]
+        else:
+            q_start = int(cum_seq_lens_q[b].item())
+            q_end = int(cum_seq_lens_q[b + 1].item())
+            q_batch = query[q_start:q_end]
+        for t in range(q_end - q_start):
+            q = q_batch[t].to(torch.float32)  # [num_heads, head_dim_qk]
             Qn = q[:, :kv_lora_rank]  # [num_heads, kv_lora_rank]
             Qp = q[:, kv_lora_rank:]  # [num_heads, qk_rope_head_dim]
             logits = (Qn @ Kn.T + Qp @ Kp.T) * bmm1_scale
             attn = torch.softmax(logits, dim=-1)
-            output[b, t] = (attn @ Kn * bmm2_scale).to(query.dtype)
+            if cum_seq_lens_q is None:
+                output[b, t] = (attn @ Kn * bmm2_scale).to(query.dtype)
+            else:
+                output[q_start + t] = (attn @ Kn * bmm2_scale).to(query.dtype)
     return output
 
 
@@ -1926,13 +2154,78 @@ def _trtllm_batch_decode_mla_sparse_init(
     }
 
 
-trtllm_batch_decode_mla_trace = TraceTemplate(
+def _trtllm_batch_decode_mla_ragged_init(
+    *,
+    batch_size: int,
+    num_tokens: int,
+    batch_size_plus_1: int,
+    num_heads: int = 128,
+    head_dim_qk: int = 576,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    qk_nope_head_dim: int = 512,
+    num_pages: int = 0,
+    kv_pad_dim: int = 1,
+    page_size: int = 64,
+    max_pages_per_seq: int = 0,
+    workspace_size: int = 256 << 20,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    if batch_size_plus_1 != batch_size + 1:
+        raise ValueError("batch_size_plus_1 must equal batch_size + 1")
+    if num_tokens < batch_size:
+        raise ValueError(
+            "num_tokens must be at least batch_size for non-empty init segments"
+        )
+
+    base_q_len = num_tokens // batch_size
+    extra = num_tokens % batch_size
+    q_lens = torch.full((batch_size,), base_q_len, device=device, dtype=torch.int32)
+    if extra:
+        q_lens[:extra] += 1
+    max_q_len = int(q_lens.max().item())
+
+    dense = _trtllm_batch_decode_mla_init(
+        batch_size=batch_size,
+        q_len_per_request=max_q_len,
+        num_heads=num_heads,
+        head_dim_qk=head_dim_qk,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        num_pages=num_pages,
+        kv_pad_dim=kv_pad_dim,
+        page_size=page_size,
+        max_pages_per_seq=max_pages_per_seq,
+        workspace_size=workspace_size,
+        device=device,
+        seed=seed,
+    )
+    query = dense["query"]
+    cum_seq_lens_q = torch.empty(
+        batch_size_plus_1, device=query.device, dtype=torch.int32
+    )
+    cum_seq_lens_q[0] = 0
+    cum_seq_lens_q[1:] = torch.cumsum(q_lens, dim=0)
+    dense["query"] = torch.cat(
+        [query[i, : int(q_lens[i].item())] for i in range(batch_size)],
+        dim=0,
+    )
+    dense["cum_seq_lens_q"] = cum_seq_lens_q
+    dense["max_q_len"] = max_q_len
+    return dense
+
+
+trtllm_batch_decode_mla_dense_trace = TraceTemplate(
     op_type="mla_paged",
-    name_prefix="trtllm_batch_decode_mla",
+    name_prefix="trtllm_batch_decode_mla_dense",
     description=(
         "SM100+ TRT-LLM MLA paged decode. Query is concatenated [Q_nope, "
         "Q_pe] with head_dim_qk = kv_lora_rank + qk_rope_head_dim; KV cache "
-        "is [ckv ‖ kpe]. Output dim equals kv_lora_rank."
+        "is [ckv ‖ kpe]. Dense API calls pass "
+        "[batch_size, q_len_per_request, num_heads, head_dim_qk] and return "
+        "[batch_size, q_len_per_request, num_heads, kv_lora_rank]."
     ),
     axes={
         "batch_size": Var(),
@@ -1954,7 +2247,7 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
     inputs={
         "query": Tensor(
             ["batch_size", "q_len_per_request", "num_heads", "head_dim_qk"],
-            description="Concatenated [Q_nope, Q_pe] query.",
+            description="Concatenated [Q_nope, Q_pe] dense query.",
         ),
         "kv_cache": Tensor(
             ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
@@ -2000,11 +2293,102 @@ trtllm_batch_decode_mla_trace = TraceTemplate(
         "output": Tensor(
             ["batch_size", "q_len_per_request", "num_heads", "kv_lora_rank"],
             dtype_from="query",
+            description="Dense MLA output.",
         ),
     },
     tags=["status:verified", "stage:decode", "backend:trtllm", "mla"],
     reference=_trtllm_batch_decode_mla_reference,
     init=_trtllm_batch_decode_mla_init,
+)
+
+
+trtllm_batch_decode_mla_ragged_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="trtllm_batch_decode_mla_ragged",
+    description=(
+        "SM100+ TRT-LLM MLA paged decode for variable query lengths. Query is "
+        "concatenated [Q_nope, Q_pe] in flattened "
+        "[num_tokens, num_heads, head_dim_qk] form with cum_seq_lens_q. Output "
+        "dim equals kv_lora_rank."
+    ),
+    axes={
+        "batch_size": Var(),
+        "num_tokens": Var(description="Total query tokens for variable query lengths."),
+        "batch_size_plus_1": Var(description="batch_size + 1 for cum_seq_lens_q."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim_qk": Const(abbrev="d_qk"),
+        "kv_lora_rank": Const(abbrev="ckv"),
+        "qk_rope_head_dim": Const(abbrev="kpe"),
+        "qk_nope_head_dim": Const(abbrev="nope"),
+        "num_pages": Var(),
+        "kv_pad_dim": Const(
+            abbrev="",
+            description="Always 1; backwards-compat singleton dim in the rank-4 kv_cache layout.",
+        ),
+        "page_size": Const(abbrev="ps"),
+        "max_pages_per_seq": Var(),
+        "workspace_size": Var(description="Workspace buffer length in bytes."),
+    },
+    inputs={
+        "query": Tensor(
+            ["num_tokens", "num_heads", "head_dim_qk"],
+            description="Concatenated [Q_nope, Q_pe] flattened ragged query.",
+        ),
+        "kv_cache": Tensor(
+            ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"],
+            description=(
+                "Paged KV cache [ckv ‖ kpe]. The kernel accepts both the 3D "
+                "[num_pages, page_size, head_dim_qk] layout and the rank-4 "
+                "[num_pages, 1, page_size, head_dim_qk] layout for backwards "
+                "compatibility; this template models the rank-4 form."
+            ),
+        ),
+        "workspace_buffer": Tensor(
+            ["workspace_size"],
+            dtype="uint8",
+            description="Workspace scratch (flat byte buffer).",
+        ),
+        "qk_nope_head_dim": Scalar("int32"),
+        "kv_lora_rank": Scalar("int32"),
+        "qk_rope_head_dim": Scalar("int32"),
+        "block_tables": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+            description="Page table mapping per sequence.",
+        ),
+        "seq_lens": Tensor(["batch_size"], dtype="int32"),
+        "max_seq_len": Scalar("int32"),
+        "bmm1_scale": Scalar(
+            "float32",
+            optional=True,
+            description="Fused scale applied after Q @ K^T (includes 1/sqrt(head_dim_qk)).",
+        ),
+        "bmm2_scale": Scalar(
+            "float32",
+            optional=True,
+            description="Scale applied after softmax @ V.",
+        ),
+        "cum_seq_lens_q": Tensor(
+            ["batch_size_plus_1"],
+            dtype="int32",
+            description="Cumulative query sequence lengths for variable query lengths.",
+        ),
+        "max_q_len": Scalar(
+            "int32",
+            optional=True,
+            description="Maximum query sequence length when cum_seq_lens_q is provided.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "num_heads", "kv_lora_rank"],
+            dtype_from="query",
+            description="Flattened ragged MLA output.",
+        ),
+    },
+    tags=["status:verified", "stage:decode", "backend:trtllm", "mla"],
+    reference=_trtllm_batch_decode_mla_reference,
+    init=_trtllm_batch_decode_mla_ragged_init,
 )
 
 
@@ -2104,11 +2488,14 @@ def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
     sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
     if sparse_mla_top_k > 0:
         return trtllm_batch_decode_mla_sparse_trace
-    return trtllm_batch_decode_mla_trace
+    if kwargs.get("cum_seq_lens_q") is None:
+        return trtllm_batch_decode_mla_dense_trace
+    return trtllm_batch_decode_mla_ragged_trace
 
 
 trtllm_batch_decode_mla_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    trtllm_batch_decode_mla_trace,
+    trtllm_batch_decode_mla_dense_trace,
+    trtllm_batch_decode_mla_ragged_trace,
     trtllm_batch_decode_mla_sparse_trace,
 ]
 

@@ -3041,15 +3041,18 @@ def xqa_batch_decode_with_kv_cache(
 
     # Extract shape parameters based on layout
     if kv_layout == "NHD":
-        # NHD: [num_pages, page_size, num_kv_heads, head_dim]
+        # NHD: [num_pages, page_size, num_kv_heads, head_dim] for ordinary KV cache
+        # or [num_pages, page_size, num_kv_heads, head_dim// 2] for NVFP4 KV cache with packed head dim
         page_size = k_cache.shape[1]
         num_kv_heads = k_cache.shape[2]
-        head_dim = k_cache.shape[3]
     else:  # HND
-        # HND: [num_pages, num_kv_heads, page_size, head_dim]
+        # HND: [num_pages, num_kv_heads, page_size, head_dim] for ordinary KV cache
+        # or [num_pages, num_kv_heads, page_size, head_dim// 2] for NVFP4 KV cache with packed head dim
         num_kv_heads = k_cache.shape[1]
         page_size = k_cache.shape[2]
-        head_dim = k_cache.shape[3]
+
+    # query shape: [num_tokens, num_heads, head_dim]
+    head_dim = query.shape[-1]
 
     workspace_u8 = workspace_buffer.view(torch.uint8)
     semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore

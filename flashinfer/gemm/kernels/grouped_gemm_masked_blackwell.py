@@ -3644,6 +3644,26 @@ def grouped_gemm_nt_masked(
 
     c_torch = out
 
+    # The (M, N)-tile TMA C store requires the output contiguous in the c_major
+    # dim; an expert-innermost output (e.g. torch.empty(m, n, l)) silently
+    # corrupts results across experts, so reject it up front (issue #3103).
+    # The combine-fusion path uses a 2D scatter output (not the (M, N) TMA
+    # store), so this layout contract does not apply there.
+    if not is_combine_fusion:
+        _c_major = "m" if is_swap_ab else "n"
+        _c_perm = (2, 1, 0) if _c_major == "m" else (2, 0, 1)
+        if out.dim() != 3 or not out.permute(*_c_perm).is_contiguous():
+            raise ValueError(
+                "grouped_gemm_nt_masked: `out` must be a 3D (m, n, l) tensor that is "
+                f"contiguous in the layout implied by c_major='{_c_major}' (the "
+                f"'{_c_major}' dimension contiguous and the batch/expert dim "
+                "outermost). For c_major='n' allocate e.g. "
+                "`torch.empty(l, m, n, ...).permute(1, 2, 0)`. Got out.shape="
+                f"{tuple(out.shape)}, out.stride()={tuple(out.stride())}. A "
+                "non-compliant layout (e.g. the expert dim innermost) causes silent "
+                "cross-expert output corruption."
+            )
+
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
 

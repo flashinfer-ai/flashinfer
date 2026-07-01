@@ -112,12 +112,24 @@ uv pip install --python "${VENV}/bin/python" \
     "apache-tvm-ffi>=0.1.6,<0.2,!=0.1.8,!=0.1.8.post0" \
     cython pybind11
 
-# moe_ep runtime base libraries — supplied by these pip wheels. The EP
-# plugins ctypes-load libnccl.so.2 / libnixl.so from these wheels at first
-# use.
+# NIXL-EP runtime base library — supplied by this pip wheel; the NIXL-EP
+# plugin loads libnixl.so from it at first use. (NCCL-EP's base libnccl.so.2 +
+# libnccl_ep.so come from the nccl4py wheel installed below.)
 uv pip install --python "${VENV}/bin/python" --no-deps \
-    "nixl-cu13>=1.0.1" \
-    "nvidia-nccl-cu13>=2.30.4"
+    "nixl-cu13>=1.0.1"
+
+# FlashInfer runtime deps + the [nvep] extra, installed explicitly here (WITH
+# their own deps) so the editable flashinfer install below can use --no-deps.
+# Why: torch 2.12's `cuda-toolkit[nvjitlink]` metapackage pin trips uv's
+# resolver during the editable `-e .` resolution (nvidia-nvjitlink METADATA
+# mismatch). Installing the leaf deps first + `--no-deps -e .` sidesteps that.
+# nccl4py>=0.3.1 = NCCL-EP (nccl.ep + bundled libnccl_ep.so); cuda-python and
+# nccl4py's cuda.core/cuda-bindings come along here.
+uv pip install --python "${VENV}/bin/python" \
+    numpy einops ninja nvidia-ml-py click requests tabulate tqdm \
+    "nvidia-cutlass-dsl>=4.5.0" "nvidia-cudnn-frontend>=1.13.0" \
+    "cuda-tile>=1.4.0" "cuda-python>=13.0" "nccl4py>=0.3.1" \
+    "nvidia-nccl-cu13>=2.30.7"   # B200 NCCL-EP needs >=2.30.7; load this first on LD_LIBRARY_PATH
 
 # ---- 6. FlashInfer + both EP backends -------------------------------------
 # Wipe any half-populated meson subproject extracts from prior aborted runs.
@@ -145,18 +157,14 @@ fi
 # may have referenced a removed subproject).
 rm -rf "${REPO_ROOT}/build_nvep/nixl" "${REPO_ROOT}/build_nvep/nccl"
 
-echo "=== building flashinfer + moe_ep backends (this is the long step) ==="
+echo "=== building flashinfer + NIXL-EP (this is the long step) ==="
 cd "${REPO_ROOT}"
-BUILD_NCCL_EP=1 BUILD_NIXL_EP=1 \
+# Build flashinfer + compile NIXL-EP from the submodule. --no-deps because all
+# runtime deps (incl. nccl4py for NCCL-EP) were installed above; this avoids the
+# torch/cuda-toolkit nvjitlink resolution conflict under uv.
+BUILD_NIXL_EP=1 \
     uv pip install --python "${VENV}/bin/python" \
-        --no-build-isolation -e ".[nvep]"
-
-# Post-build editable installs of the NCCL Python wrappers (sys.executable
-# inside the build hook points at uv's isolated env which has no pip).
-uv pip install --python "${VENV}/bin/python" \
-    -e 3rdparty/nccl/contrib/nccl_ep/python
-CUDA_HOME=/usr/local/cuda uv pip install --python "${VENV}/bin/python" \
-    -e "3rdparty/nccl/bindings/nccl4py[cu13]"
+        --no-build-isolation --no-deps -e .
 
 # ---- 7. persist env for subsequent srun on the same container --------------
 cat > /etc/profile.d/flashinfer.sh <<EOF
