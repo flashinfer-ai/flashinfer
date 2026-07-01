@@ -907,8 +907,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
+        *,
         pos_encoding_mode: str = "NONE",
         window_left: int = -1,
+        window_right: int = 0,
         logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
@@ -950,6 +952,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        window_right : int
+            The right (inclusive) window size for the attention window.
+            ``-1`` disables the right bound. Defaults to ``0``. Currently ``window_right != 0``
+            only supported by the ``cute-dsl`` backend.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -1013,6 +1019,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        if window_right != 0 and self._backend != "cute-dsl":
+            raise NotImplementedError(
+                "BatchDecodeWithPagedKVCacheWrapper only supports window_right != 0 "
+                "with backend='cute-dsl'"
+            )
 
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if self.is_cuda_graph_enabled:
@@ -1126,8 +1137,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_splits=kv_splits,
                 reduction="none" if disable_split_kv else "auto",
                 q_len_per_req=q_len_per_req,
-                is_causal=True,
-                window_left=window_left,
+                window_left=(None if window_left < 0 else window_left),
+                window_right=(None if window_right < 0 else window_right),
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
             )
@@ -1269,6 +1280,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale

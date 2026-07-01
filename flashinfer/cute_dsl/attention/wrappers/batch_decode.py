@@ -128,12 +128,15 @@ def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype")
 
 
 def _get_mask_config(
-    is_causal: bool,
-    window_left: int,
+    window_left: Optional[int],
+    window_right: Optional[int],
 ) -> AttentionMask:
-    if window_left >= 0:
-        return SlidingWindowMask(window_left, 0)
-    return CausalMask() if is_causal else DenseMask()
+    if window_left is None and window_right is None:
+        return DenseMask()
+    elif window_left is None and window_right == 0:
+        return CausalMask()
+    else:
+        return SlidingWindowMask(window_left, window_right)
 
 
 def _slice_workspace(
@@ -197,8 +200,8 @@ def _get_compiled_decode_kernel(
     head_dim: int,
     prediction: int,
     reduction: str,
-    window_left: int,
-    is_causal: bool,
+    window_left: Optional[int],
+    window_right: Optional[int],
     use_lse: bool,
 ):
     """Compile and cache the ragged (contiguous-KV) GQA decode kernel."""
@@ -218,7 +221,7 @@ def _get_compiled_decode_kernel(
         sequence_tile=sequence_tile,
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
     )
-    mask_config = _get_mask_config(is_causal, window_left)
+    mask_config = _get_mask_config(window_left, window_right)
     has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
@@ -330,8 +333,8 @@ def _get_compiled_paged_decode_kernel(
     head_dim: int,
     prediction: int,
     reduction: str,
-    window_left: int,
-    is_causal: bool,
+    window_left: Optional[int],
+    window_right: Optional[int],
     use_threshold: bool,
     use_lse: bool,
     use_sink: bool,
@@ -366,7 +369,7 @@ def _get_compiled_paged_decode_kernel(
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
         softmax_warpgroups=softmax_warpgroups,
     )
-    mask_config = _get_mask_config(is_causal, window_left)
+    mask_config = _get_mask_config(window_left, window_right)
     has_workspace = reduction == "kernel"
     acc_dtype = cutlass.Float32
 
@@ -543,6 +546,7 @@ class BatchDecodeCuteDSLWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        *,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
@@ -550,8 +554,8 @@ class BatchDecodeCuteDSLWrapper:
         kv_splits: Optional[int] = None,
         reduction: str = "auto",
         q_len_per_req: int = 1,
-        is_causal: bool = True,
-        window_left: int = -1,
+        window_left: Optional[int] = None,
+        window_right: Optional[int] = 0,
     ) -> None:
         """Compile the ragged-KV decode kernel for the planned configuration.
 
@@ -585,10 +589,10 @@ class BatchDecodeCuteDSLWrapper:
         q_len_per_req : int
             Predicted tokens per request (1 for plain decode, >1 for
             speculative decode).
-        is_causal : bool
-            Causal masking for speculative decode.
         window_left : int
-            Sliding-window left bound. ``-1`` disables sliding-window masking.
+            Sliding-window left bound. ``None`` disables left bound.
+        window_right : int
+            Sliding-window right bound. ``None`` disables right bound.
         """
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
@@ -651,7 +655,7 @@ class BatchDecodeCuteDSLWrapper:
         # write to o_bshd directly (atomic via atomic_add, none via direct
         # store).
         self._has_workspace = reduction == "kernel"
-        self._mask_config = _get_mask_config(is_causal, window_left)
+        self._mask_config = _get_mask_config(window_left, window_right)
         if sm_scale is None:
             sm_scale = head_dim**-0.5
         self._sm_scale = sm_scale
@@ -682,7 +686,7 @@ class BatchDecodeCuteDSLWrapper:
             q_len_per_req,
             reduction,
             window_left,
-            is_causal,
+            window_right,
         )
         self._compiled_fmha_std = _get_compiled_decode_kernel(
             *self._compile_args, False
@@ -890,6 +894,7 @@ class BatchDecodePagedCuteDSLWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
+        *,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: Optional[torch.dtype] = None,
         o_data_type: Optional[torch.dtype] = None,
@@ -898,7 +903,8 @@ class BatchDecodePagedCuteDSLWrapper:
         reduction: str = "auto",
         q_len_per_req: int = 1,
         is_causal: bool = True,
-        window_left: int = -1,
+        window_left: Optional[int] = None,
+        window_right: Optional[int] = 0,
         max_kv_len: Optional[int] = None,
         non_blocking: bool = True,
         precompile_skip_softmax_kernel: bool = False,
@@ -936,7 +942,10 @@ class BatchDecodePagedCuteDSLWrapper:
         is_causal : bool
             Causal masking for speculative decode.
         window_left : int
-            Sliding-window left bound. ``-1`` disables sliding-window masking.
+            Sliding-window left bound. ``None`` disables left bound.
+        window_right : int
+            Sliding-window right bound. ``None`` disables the right bound.
+            Defaults to ``0``.
         max_kv_len : Optional[int]
             Maximum KV sequence length across the batch.  Used to auto-tune
             ``kv_splits``; pass it explicitly to avoid a GPU→CPU sync.
@@ -1035,7 +1044,7 @@ class BatchDecodePagedCuteDSLWrapper:
         # Only kernel-reduction uses workspace tensors; atomic and none
         # write to o_bshd directly.
         self._has_workspace = reduction == "kernel"
-        self._mask_config = _get_mask_config(is_causal, window_left)
+        self._mask_config = _get_mask_config(window_left, window_right)
         if sm_scale is None:
             sm_scale = head_dim**-0.5
         self._sm_scale = sm_scale
@@ -1072,6 +1081,7 @@ class BatchDecodePagedCuteDSLWrapper:
             q_len_per_req,
             reduction,
             window_left,
+            window_right,
             is_causal,
         )
         # Standard (no-BLASST, no-LSE) variant — always compiled at plan().
