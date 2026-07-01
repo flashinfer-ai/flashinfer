@@ -2350,6 +2350,9 @@ def get_trtllm_moe_sm100_module():
             assert topk_weights is not None, (
                 "topk_weights must be provided for UnpackedPrecomputed mode"
             )
+            assert topk_weights.dtype in (torch.bfloat16, torch.float32), (
+                f"topk_weights must be bfloat16 or float32, got {topk_weights.dtype}."
+            )
         else:
             # For Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed), allocate OUTPUT buffers
             if topk_ids is None:
@@ -4056,7 +4059,9 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[seq_len, top_k]`` in packed format ``(expert_id << 16) | weight`` or
         a tuple ``(ids, weights)`` where ``ids`` is int32 of shape
         ``[seq_len, top_k]`` (plain expert indices) and ``weights`` is
-        ``bfloat16`` of the same shape (routing weights).
+        ``bfloat16`` or ``float32`` of the same shape (routing weights). The
+        weights are consumed at their native dtype (no cast), so passing the
+        ``float32`` weights emitted by typical routers is copy-free.
     routing_bias : Optional[torch.Tensor]
         ``[num_experts]`` routing bias.  May be ``None``.
     hidden_states : torch.Tensor
