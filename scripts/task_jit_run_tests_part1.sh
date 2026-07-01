@@ -13,6 +13,11 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   pip install -e . -v
 fi
 
+# Print TVM-FFI version just before running tests
+echo "Checking TVM-FFI version before tests..."
+python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+echo ""
+
 # Run each test file separately to isolate CUDA memory issues
 pytest -s tests/attention/test_logits_cap.py
 pytest -s tests/attention/test_sliding_window.py
