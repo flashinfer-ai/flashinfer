@@ -19,6 +19,8 @@ from ..compilation_context import CompilationContext
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_NINJA_MEMORY_GIB_PER_JOB = 10
+
 
 def parse_env_flags(env_var_name) -> List[str]:
     env_flags = os.environ.get(env_var_name)
@@ -341,10 +343,65 @@ def generate_ninja_build_for_op(
     return "\n".join(lines)
 
 
+def _get_linux_mem_available_gib() -> Optional[float]:
+    """Return Linux MemAvailable in GiB, including reclaimable cache."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024**2)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+    return None
+
+
+def _get_total_memory_gib() -> Optional[float]:
+    """Return total physical memory in GiB when available."""
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return None
+
+    if pages <= 0 or page_size <= 0:
+        return None
+
+    return pages * page_size / (1024**3)
+
+
+def _get_available_memory_gib() -> Optional[float]:
+    """Return the best memory estimate for choosing ninja parallelism."""
+    mem_available_gib = _get_linux_mem_available_gib()
+    if mem_available_gib is not None:
+        return mem_available_gib
+    return _get_total_memory_gib()
+
+
 def _get_num_workers() -> Optional[int]:
+    """Return a ninja worker cap, or None to use ninja's default."""
     max_jobs = os.environ.get("MAX_JOBS")
-    if max_jobs is not None and max_jobs.isdigit():
-        return int(max_jobs)
+    if max_jobs is not None:
+        if max_jobs.isdigit():
+            return int(max_jobs)
+        logger.warning("Ignoring invalid MAX_JOBS=%r; using ninja default.", max_jobs)
+        return None
+
+    cpu_count = os.cpu_count()
+    available_gib = _get_available_memory_gib()
+    if cpu_count is None or available_gib is None:
+        return None
+
+    memory_safe_jobs = max(1, int(available_gib // _DEFAULT_NINJA_MEMORY_GIB_PER_JOB))
+    if memory_safe_jobs < cpu_count:
+        logger.info(
+            "Limiting ninja parallelism to %s jobs based on %.1f GiB available "
+            "memory. Set MAX_JOBS to override.",
+            memory_safe_jobs,
+            available_gib,
+        )
+        return memory_safe_jobs
+
     return None
 
 
