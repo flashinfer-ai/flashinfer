@@ -150,11 +150,13 @@ def _get_cublas_version() -> str:
 def _collect_metadata() -> Dict[str, str]:
     """Collect environment metadata that can affect tactic-to-kernel mappings.
 
-    Tactics in flashinfer's autotune cache are stored as plan indices into
-    cuDNN's ``policy=ALL`` plan list (or backend-internal kernel ids for
-    other backends).  Anything that can shuffle that ordering must be
-    captured here so ``load_configs`` rejects a cache that no longer
-    matches the runtime environment.
+    Tactics in flashinfer's autotune cache are backend-internal identifiers:
+    cuDNN stores structured ``(engine_id, knobs)`` identities (or bare plan
+    indices on frontends without the structured-plan API), other backends
+    store kernel ids / config tuples.  Their engine/knob semantics (and plan
+    ordering, for the index fallback) can differ across cuDNN / cuBLAS
+    versions, so version metadata is captured here and ``load_configs``
+    rejects a cache that no longer matches the runtime environment.
 
     Specifically tracked:
 
