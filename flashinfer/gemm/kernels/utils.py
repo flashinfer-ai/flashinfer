@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from ...fused_moe.utils import next_positive_power_of_2
+from flashinfer.utils import next_positive_power_of_2
 
 _SM100_MMA_TILER_MN_CANDIDATES = [
     (128, 8),
@@ -35,7 +35,7 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
 # M bucket boundaries — powers of 2 for fast bucketing via
-# next_positive_power_of_2 (imported from flashinfer.fused_moe.utils).
+# next_positive_power_of_2 (imported from flashinfer.utils).
 _M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
