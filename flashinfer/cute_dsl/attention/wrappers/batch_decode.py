@@ -902,7 +902,6 @@ class BatchDecodePagedCuteDSLWrapper:
         kv_splits: Optional[int] = None,
         reduction: str = "auto",
         q_len_per_req: int = 1,
-        is_causal: bool = True,
         window_left: Optional[int] = None,
         window_right: Optional[int] = 0,
         max_kv_len: Optional[int] = None,
@@ -939,8 +938,6 @@ class BatchDecodePagedCuteDSLWrapper:
             for compatible dtypes, else kernel).
         q_len_per_req : int
             Predicted tokens per request (1 for plain decode).
-        is_causal : bool
-            Causal masking for speculative decode.
         window_left : int
             Sliding-window left bound. ``None`` disables left bound.
         window_right : int
@@ -1082,7 +1079,6 @@ class BatchDecodePagedCuteDSLWrapper:
             reduction,
             window_left,
             window_right,
-            is_causal,
         )
         # Standard (no-BLASST, no-LSE) variant — always compiled at plan().
         # BLASST and LSE variants compile lazily on first use via the cache.
