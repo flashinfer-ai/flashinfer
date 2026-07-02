@@ -741,8 +741,14 @@ def set_autotune_process_group(
     disables (default); not thread-safe.
 
     Caller contract: every rank must enter ``_profile_single_kernel`` the same
-    number of times in the same order (identical ``get_valid_tactics`` and
-    shape buckets) or the reduction itself deadlocks.
+    number of times in the same order, or the reduction itself deadlocks. Across
+    ranks that requires identical: ``get_valid_tactics`` and shape buckets;
+    ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
+    reduces); and ``profiling_cache`` / loaded ``autotune(cache=...)`` at entry
+    (a cache hit skips that profile's reduce) -- so set the group from the first
+    ``choose_one`` with identical (ideally empty) starting caches. Residual: a
+    per-rank OOM *outside* ``_profile_single_kernel`` (input synthesis /
+    ``do_preparation``) can still early-return and desync.
 
     Example::
 
@@ -1335,7 +1341,24 @@ class AutoTuner:
                                         r, tensors, tac, tuning_config, **kwargs
                                     )
                                 except torch.cuda.OutOfMemoryError:
-                                    raise
+                                    # Distributed autotuning: the per-tactic
+                                    # all-reduce must run the same number of
+                                    # times on every rank. Bubbling OOM up to
+                                    # choose_one's outer handler early-returns
+                                    # runners[0], -1 on this rank while peers
+                                    # keep profiling -- the next tactic's
+                                    # all_reduce then deadlocks. When a tune
+                                    # group is set, treat OOM like any other
+                                    # failed tactic (free memory, disqualify
+                                    # with inf, keep looping in lockstep) so
+                                    # cardinality is preserved. Without a group
+                                    # the original early-return path is kept.
+                                    if _tune_process_group is None:
+                                        raise
+                                    with contextlib.suppress(Exception):
+                                        torch.cuda.empty_cache()
+                                    skipped_count += 1
+                                    time_measured = float("inf")
                                 except Exception as e:
                                     skipped_count += 1
                                     shapes = self._get_input_sizes(tensors)
