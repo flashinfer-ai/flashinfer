@@ -277,6 +277,21 @@ def checkpointing_ssu(
     d_split : Optional[int]
         Per-head DIM split factor.  This is only exposed for benchmarking.
         Do not use it cause it will make things slow.
+    cu_seqlens : Optional[torch.Tensor]
+        Cumulative sequence lengths with shape ``(N + 1,)``, dtype
+        ``torch.int32``, on the same CUDA device as ``x`` (the kernel
+        asserts both). When provided, the new-token inputs (``x``, ``dt``,
+        ``B``, ``C``, ``out``, optionally ``z``) are interpreted in varlen
+        layout where tokens are packed along the **time** axis with batch
+        fixed to 1 — i.e. ``x`` is 4-D with shape
+        ``(1, total_tokens, nheads, dim)`` — instead of the default
+        ``(batch, T, ...)`` layout.
+    max_seqlen : Optional[int]
+        Maximum sequence length present in ``cu_seqlens``, used by the kernel
+        to size its per-sequence work tiles. Only meaningful in varlen mode
+        (``cu_seqlens is not None``); falls back to ``max_window`` when
+        omitted (wider smem than strictly needed but always safe). Must be
+        ``None`` in non-varlen mode (the JIT key is taken from ``x.size(1)``).
     enable_pdl : bool
         When True the kernel is launched with
         `cudaLaunchAttributeProgrammaticStreamSerialization`, enabling the
@@ -289,6 +304,18 @@ def checkpointing_ssu(
     -------
     out : torch.Tensor
         Output tensor, shape (batch, T, nheads, dim).
+
+    Notes
+    -----
+    **In-place updates.** The custom op declares ``mutates_args =
+    ("state", "out", "old_x", "old_B", "old_dt", "old_cumAdt",
+    "state_scale")`` — the four ``old_*`` cache tensors are double-buffered
+    and the kernel writes the *current* step's x / B / dt / cumulative-A·dt
+    back into the slot selected by ``cache_buf_idx`` so the next call can
+    replay them. ``state_scale`` is also written when ``state`` is
+    quantized (int8 / fp8_e4m3fn): the kernel computes new per-block
+    decode scales and stores them here for the caller to dequantize
+    against on read-back.
     """
     # Validate quantized state ↔ state_scale combo.
     # int8 and fp8_e4m3fn use a per-(cache, head, dim) decode-scale tensor

@@ -18,7 +18,11 @@ from .packbits import packbits, segment_packbits
 from ..jit.quantization import gen_quantization_module
 
 # Re-export FP8 quantization
-from .fp8_quantization import mxfp8_quantize, mxfp8_dequantize_host
+from .fp8_quantization import (
+    mxfp8_quantize,
+    mxfp8_grouped_quantize,
+    mxfp8_dequantize_host,
+)
 
 # Re-export FP4 quantization (all public symbols)
 from .fp4_quantization import (
@@ -68,6 +72,7 @@ __all__ = [
     "gen_quantization_module",
     # FP8
     "mxfp8_quantize",
+    "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
     # FP4
     "SfLayout",

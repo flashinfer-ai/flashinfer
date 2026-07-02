@@ -929,7 +929,7 @@ def testRmsnormQuant(args):
         rmsnorm_output = input_tensor.float() / rms * weight.float()
         # Quantize to output dtype
         reference_output = (
-            (rmsnorm_output * scale)
+            (rmsnorm_output / scale)
             .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
             .to(out_dtype)
         )
@@ -1115,18 +1115,14 @@ def testFusedAddRmsnormQuant(args):
     # Reference: PyTorch implementation of fused add + RMSNorm + quantization
     has_reference_output = False
     if run_refcheck:
-        # Clone residual for reference computation since it gets modified
-        ref_residual = residual_tensor.clone()
-        # Step 1: residual += input
-        ref_residual = ref_residual + input_tensor
+        # Compute the add in fp32 to match the CuTe kernel and unit-test reference.
+        ref_residual = input_tensor.float() + residual_tensor.float()
         # Step 2: RMSNorm on residual
-        rms = torch.sqrt(
-            torch.mean(ref_residual.float() ** 2, dim=-1, keepdim=True) + eps
-        )
-        rmsnorm_output = ref_residual.float() / rms * weight.float()
+        rms = torch.sqrt(torch.mean(ref_residual**2, dim=-1, keepdim=True) + eps)
+        rmsnorm_output = ref_residual / rms * weight.float()
         # Quantize to output dtype
         reference_output = (
-            (rmsnorm_output * scale)
+            (rmsnorm_output / scale)
             .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
             .to(out_dtype)
         )
@@ -1874,8 +1870,10 @@ def testFusedDitLayernorm(args):
     res = []
     cur_res = defaultdict(str)
     cur_res["routine"] = args.routine
-    cur_res["median_ms"] = fused_ms
-    cur_res["std_ms"] = float(np.std(fused_times))
+    cur_res["median_time"] = fused_ms
+    cur_res["std_time"] = float(np.std(fused_times))
+    cur_res["tflops"] = 0.0
+    cur_res["tb_per_sec"] = tb_per_sec
     cur_res["batch_size"] = batch_size
     cur_res["hidden_size"] = hidden_dim
     cur_res["input_dtype"] = str(torch.bfloat16)
@@ -1892,6 +1890,7 @@ def testFusedDitLayernorm(args):
         )
 
     res.append(cur_res)
+    return res
 
 
 def testFusedQkRmsnormRope(args):

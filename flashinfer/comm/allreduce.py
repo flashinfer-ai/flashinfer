@@ -532,7 +532,11 @@ def allreduce_fusion(
     Parameters
     ----------
     input : torch.Tensor
-        Input tensor of shape ``[token_num, hidden_dim]``.
+        Input tensor of shape ``[token_num, hidden_dim]`` for standard
+        allreduce patterns. For ``kMoEFinalizeARResidualRMSNorm``, this is
+        the permuted/padded MoE expert output of shape
+        ``[num_permuted_rows, hidden_dim]``; the token output shape is
+        determined by ``residual_in``.
     workspace : AllReduceFusionWorkspace
         Workspace object created by :func:`create_allreduce_fusion_workspace`.
         Its concrete type (TRT-LLM vs MNNVL) determines the backend.
@@ -552,6 +556,12 @@ def allreduce_fusion(
 
         MNNVL supports the standard FP8/NVFP4 quant patterns (2-5). MoE
         and packed group quant patterns remain TRT-LLM only.
+
+        ``kMoEFinalizeARResidualRMSNorm`` is an explicit TRT-LLM fused
+        implementation of MoE finalize + AllReduce + RMSNorm and does not
+        use the MNNVL backend. Fusion is not always the fastest path for every
+        workload; benchmark this pattern on the target hardware, model,
+        tensor-parallel size, and serving mode before enabling it by default.
     launch_with_pdl : bool
         Use Programmatic Dependent Launch.
     trigger_completion_at_end : bool
