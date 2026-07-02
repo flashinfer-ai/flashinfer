@@ -131,16 +131,18 @@ class SparseCombineSm12x:
         neg_inf = -cutlass.Float32.inf
 
         # count <= 0 needs no special case: no slot passes s < count -> weight 0
-        if tidx < self._topk:
-            v = neg_inf
-            if tidx < count:
-                v = mLse2[tidx, q, h]
-            s_lse[tidx] = v
-            if cutlass.const_expr(self._has_lse_t):
-                vt = neg_inf
-                if tidx < count:
-                    vt = mLseT2[tidx, q, h]
-                s_lse_t[tidx] = vt
+        for it in cutlass.range_constexpr(cute.ceil_div(self._topk, self._num_threads)):
+            slot = tidx + it * self._num_threads
+            if slot < self._topk:
+                v = neg_inf
+                if slot < count:
+                    v = mLse2[slot, q, h]
+                s_lse[slot] = v
+                if cutlass.const_expr(self._has_lse_t):
+                    vt = neg_inf
+                    if slot < count:
+                        vt = mLseT2[slot, q, h]
+                    s_lse_t[slot] = vt
         cute.arch.sync_threads()
 
         # weights rebuilt redundantly per thread: at low batch the grid is a

@@ -42,7 +42,7 @@ def _get_compiled_topk(topk: int, small: bool):
             TopKSelectCountRankSm12x as _TopKKernel,
         )
     else:
-        from .cute_dsl.topk_select_radix_sm12x import (  # type: ignore[assignment]
+        from .cute_dsl.topk_select_radix_sm12x import (  # type: ignore[assignment,no-redef]
             TopKSelectRadixSm12x as _TopKKernel,
         )
     kernel_obj = _TopKKernel(topk=topk)
@@ -181,7 +181,9 @@ def msa_topk_select(
         raise ValueError(f"max_k_tiles must be < 12288, got {max_k_tiles}")
     from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
 
-    small = max_k_tiles <= _MAX_BLOCKS
+    # dispatch on the runtime valid-page count: the count-rank kernel only ever
+    # touches blocks below num_valid_pages, regardless of the allocated score dim
+    small = int(num_valid_pages) <= _MAX_BLOCKS
     _get_compiled_topk(topk, small)(
         max_score,
         output,

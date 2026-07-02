@@ -1356,3 +1356,24 @@ def test_fp8_q_decode():
     )
     err = (out.float().cpu() - ref).abs().max().item()
     assert err < 2.5e-2, f"err={err}"
+
+
+def test_msa_topk_select_countrank_matches_radix_on_nan():
+    # both kernels must produce the same, deterministic selection even when the
+    # proxy emits NaN scores (count-rank ranks on the radix bit-key)
+    _skip_if_unsupported()
+    from flashinfer.msa_ops.sparse_topk_select import _get_compiled_topk
+
+    dev = "cuda"
+    H, P, S, topk = 2, 100, 64, 16
+    torch.manual_seed(3)
+    score = torch.randn(H, P, S, device=dev, dtype=torch.float32)
+    score[0, 5, :] = float("nan")
+    score[1, 40, ::3] = float("nan")
+    outs = []
+    for small in (True, False, True):
+        out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
+        _get_compiled_topk(topk, small)(score, out, P, 0, 0, S, H, P)
+        outs.append(out.cpu())
+    assert torch.equal(outs[0], outs[2]), "count-rank nondeterministic on NaN"
+    assert torch.equal(outs[0], outs[1]), "count-rank != radix on NaN scores"

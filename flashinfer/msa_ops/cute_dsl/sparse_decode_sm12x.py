@@ -34,7 +34,6 @@ class SparseDecodeForwardSm12x:
         self,
         head_dim: int = 128,
         blk_kv: int = 128,
-        sub_block: int = 64,
         group_size: int = 1,
         topk: int = 16,
         num_threads: int = 128,
@@ -46,8 +45,8 @@ class SparseDecodeForwardSm12x:
         fused: bool = False,
         qoff_default: bool = False,
     ):
-        if head_dim != 128 or blk_kv != 128 or sub_block != 64:
-            raise ValueError("only head_dim=blk_kv=128, sub_block=64 supported")
+        if head_dim != 128 or blk_kv != 128:
+            raise ValueError("only head_dim=blk_kv=128 supported")
         if group_size > 16:
             raise ValueError("group_size must be <= 16")
         # adaptive-split: when the per-token grid (total_q x num_kv_heads) fills the

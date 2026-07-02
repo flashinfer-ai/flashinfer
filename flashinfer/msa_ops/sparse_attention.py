@@ -41,9 +41,12 @@ def _q_offset_tensor(
             (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
             - (cu_seqlens_q[1:] - cu_seqlens_q[:-1])
         ).to(torch.int32)
+    return _q_offset_explicit(q_offset, cu_seqlens_q.numel() - 1, device)
+
+
+def _q_offset_explicit(q_offset, batch_size: int, device) -> torch.Tensor:
     if isinstance(q_offset, int):
-        n = cu_seqlens_q.numel() - 1
-        return torch.full((n,), q_offset, dtype=torch.int32, device=device)
+        return torch.full((batch_size,), q_offset, dtype=torch.int32, device=device)
     if q_offset.dtype != torch.int32:
         raise ValueError("q_offset must be int32")
     return q_offset.to(device)

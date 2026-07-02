@@ -136,6 +136,7 @@ def msa_sparse_decode_attention(
         _compile_cache,
         _cutlass_dtype,
         _fake,
+        _q_offset_explicit,
     )
 
     if not is_sm12x_supported(q.device):
@@ -238,12 +239,8 @@ def msa_sparse_decode_attention(
     qoff_default = q_offset is None
     if qoff_default:
         qoff_dev = _dummy_tensors(dev.index)[2]
-    elif isinstance(q_offset, int):
-        qoff_dev = torch.full((batch_size,), q_offset, dtype=torch.int32, device=dev)
     else:
-        if q_offset.dtype != torch.int32:
-            raise ValueError("q_offset must be int32")
-        qoff_dev = q_offset.to(dev)
+        qoff_dev = _q_offset_explicit(q_offset, batch_size, dev)
 
     if partial_dtype is None:
         partial_dtype = compute_dtype

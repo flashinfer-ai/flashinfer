@@ -56,16 +56,25 @@ class TopKSelectCountRankSm12x:
         max_k_tiles: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(mMaxScore, mOut, num_valid_pages, force_begin, force_end).launch(
+        mBits = cute.recast_tensor(mMaxScore, cutlass.Uint32)
+        self.kernel(mBits, mOut, num_valid_pages, force_begin, force_end).launch(
             grid=(total_qo_len, num_qo_heads, 1),
             block=(_NTHREADS, 1, 1),
             stream=stream,
         )
 
+    @cute.jit
+    def _radix_key(self, bits):
+        """Order-preserving transform: ascending key == descending float score."""
+        key = (~bits) & cutlass.Uint32(0x7FFFFFFF)
+        if (bits & cutlass.Uint32(0x80000000)) != cutlass.Uint32(0):
+            key = bits
+        return key
+
     @cute.kernel
     def kernel(
         self,
-        mScore: cute.Tensor,  # (H, P, S) f32
+        mScore: cute.Tensor,  # (H, P, S) f32 recast to u32 bits
         mOut: cute.Tensor,  # (S, H, topk) int32
         num_valid_pages: cutlass.Int32,
         force_begin: cutlass.Int32,
@@ -76,7 +85,7 @@ class TopKSelectCountRankSm12x:
 
         @cute.struct
         class SharedStorage:
-            score: cute.struct.MemRange[cutlass.Float32, _MAX_BLOCKS]
+            score: cute.struct.MemRange[cutlass.Uint32, _MAX_BLOCKS]
             sel: cute.struct.MemRange[cutlass.Int32, 16]
             cnt: cute.struct.MemRange[cutlass.Int32, 1]
 
@@ -92,10 +101,12 @@ class TopKSelectCountRankSm12x:
         n_forced = force_begin + force_end
         target = cutlass.Int32(self._topk) - n_forced
 
-        # stage middle scores in SMEM: the rank loop below rereads each one N times
+        # stage the middle scores' radix keys in SMEM: the rank loop rereads each
+        # one N times, and ranking on the bit key keeps the exact radix-kernel
+        # order (including deterministic NaN placement)
         b = mid_lo + tid
         while b < mid_hi:
-            score[b] = mScore[h, b, q]
+            score[b] = self._radix_key(mScore[h, b, q])
             b += _NTHREADS
 
         # forced sink/window blocks bypass ranking; emit slots start after them
@@ -118,15 +129,16 @@ class TopKSelectCountRankSm12x:
             cnt[0] = cutlass.Int32(0)
         cute.arch.barrier()
 
-        # rank = count of strictly-better blocks (ties -> lower index); rank < target selects
+        # rank = count of strictly-better blocks (lower key = higher score;
+        # ties -> lower index); rank < target selects
         b = mid_lo + tid
         while b < mid_hi:
-            sb = score[b]
+            kb = score[b]
             rank = cutlass.Int32(0)
             j = mid_lo
             while j < mid_hi:
-                sj = score[j]
-                if (sj > sb) or ((sj == sb) and (j < b)):
+                kj = score[j]
+                if (kj < kb) or ((kj == kb) and (j < b)):
                     rank += 1
                 j += 1
             if rank < target:
