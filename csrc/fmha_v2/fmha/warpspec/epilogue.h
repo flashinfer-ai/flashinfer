@@ -274,14 +274,17 @@ struct Softmax_base {
     constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
     bool skip = may_skip;
 
-// Row-wise max of current tile.
+// Row-wise max of current tile: 4-way tree reduction splits the single-accumulator serial
+// dependency chain into 4 independent chains, so the pipeline can issue other chains'
+// instructions while waiting for one chain's FMNMX result.
 #pragma unroll
     for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      local_max_[mi] = elt_[mi][0];
+      float pmax[4] = {elt_[mi][0], elt_[mi][1], elt_[mi][2], elt_[mi][3]};
 #pragma unroll
-      for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++) {
-        local_max_[mi] = fmaxf(local_max_[mi], elt_[mi][ni]);
+      for (int ni = 4; ni < Mma_tile_p::CORES_N * 2; ni++) {
+        pmax[ni & 3] = fmaxf(pmax[ni & 3], elt_[mi][ni]);
       }
+      local_max_[mi] = fmaxf(fmaxf(pmax[0], pmax[1]), fmaxf(pmax[2], pmax[3]));
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
 
@@ -751,21 +754,20 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
     bool skip = may_skip;
 
-// Row-wise max of current tile.
+// Row-wise max of current tile: 4-way tree reduction splits the single-accumulator serial
+// dependency chain into 4 independent chains, so the pipeline can issue other chains'
+// instructions while waiting for one chain's FMNMX result.
 #pragma unroll
     for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      local_max_[mi] = elt_[mi][0];
+      float pmax[4] = {elt_[mi][0], elt_[mi][1], elt_[mi][2], elt_[mi][3]};
 #pragma unroll
-      for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++) {
-        local_max_[mi] = fmaxf(local_max_[mi], elt_[mi][ni]);
+      for (int ni = 4; ni < Mma_tile_p::CORES_N * 2; ni++) {
+        pmax[ni & 3] = fmaxf(pmax[ni & 3], elt_[mi][ni]);
       }
+      local_max_[mi] = fmaxf(fmaxf(pmax[0], pmax[1]), fmaxf(pmax[2], pmax[3]));
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
-      // AND(&) the CORES_M results, then `skip` means whether to skip
-      // the CORES_M(=2) rows
       if constexpr (may_skip) {
-        // AND(&) the CORES_M results, then `skip` means whether to skip
-        // the CORES_M(=2) rows
         if constexpr (!EXP2F_OPTIMIZATION) {
           skip &= expf(local_max_[mi] - global_max[mi]) < this->skip_softmax_threshold;
         } else {
@@ -834,8 +836,8 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
           p0 = custom_exp2f(p0, scale, masked_max);
           p1 = custom_exp2f(p1, scale, masked_max);
         }
-        psum[(2 * ni + 0) % 4] += p0;
-        psum[(2 * ni + 1) % 4] += p1;
+        psum[(2 * ni + 0) & 3] += p0;
+        psum[(2 * ni + 1) & 3] += p1;
       }
       local_sum_[mi] = (psum[0] + psum[1]) + (psum[2] + psum[3]);
       local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 1);
