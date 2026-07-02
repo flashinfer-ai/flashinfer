@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer import autotune, bmm_mxfp8
+from flashinfer import SfLayout, autotune, bmm_mxfp8
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
@@ -27,12 +27,16 @@ def test_bmm_mxfp8(
     if backend == "cutlass" and not is_sf_swizzled_layout:
         pytest.skip("bmm_mxfp8 cutlass backend on SM12x only supports swizzled layout.")
 
+    sf_layout = (
+        SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+    )
+
     # Create inputs and quantize them to MXFP8 format
     input_mat = torch.randn([b, m, k], device="cuda", dtype=input_dtype)
 
     # input_mxfp8 dtype will be float8_e4m3fn
     # input_scale dtype will be uint8
-    input_mxfp8, input_scale = mxfp8_quantize(input_mat, is_sf_swizzled_layout)
+    input_mxfp8, input_scale = mxfp8_quantize(input_mat, sf_swizzle_layout=sf_layout)
 
     # Block size is 32 in MXFP8
     assert input_mxfp8.numel() == (input_scale.numel() * 32)
@@ -42,7 +46,7 @@ def test_bmm_mxfp8(
         .transpose(-2, -1)
         .contiguous()
     )
-    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout)
+    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, sf_swizzle_layout=sf_layout)
 
     assert mat2_mxfp8.numel() == (mat2_scale.numel() * 32)
 
@@ -61,6 +65,7 @@ def test_bmm_mxfp8(
             res_dtype,
             res,
             backend=backend,
+            sf_layout=sf_layout,
         )
 
     # Verify output properties
