@@ -337,7 +337,7 @@ def test_cute_dsl_decode_paged_non_causal(
 def test_cute_dsl_decode_paged_non_causal_split_boundary_tile():
     """Non-causal boundary mask on non-zero split and softmax phase."""
     torch.manual_seed(0)
-    seq_lens_host = [16, 256, 511]
+    seq_lens_host = [16, 256, 385]
     batch_size = len(seq_lens_host)
     page_size = 16
     q_len_per_req = 4

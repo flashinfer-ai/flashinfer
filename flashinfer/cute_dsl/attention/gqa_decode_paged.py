@@ -1410,7 +1410,7 @@ class GroupedQueryAttentionDecodePaged:
             tStL = tStL[None, 0, 0, 0, None]
             tSrL_shape = thr_load_l.partition_D(tCtL_phase).shape[:1]
 
-            # Causal masking for spec decode verification
+            # Boundary mask setup for causal and non-causal decode paths.
             masked_iters_s = masked_start_s = masked_coord_s = 0
             check_safe_max = False
             if cutlass.const_expr(not tma_mask):
@@ -1478,7 +1478,7 @@ class GroupedQueryAttentionDecodePaged:
                     cute.arch.fence_view_async_tmem_load()
                     s_handle.release()
 
-                    # Apply causal mask
+                    # Apply boundary mask (causal or non-causal).
                     if cutlass.const_expr(is_masked_loop):
                         masked = cute.make_rmem_tensor(
                             (blk_tile_h, blk_tile_p, tiles_sm), acc_dtype
