@@ -41,6 +41,8 @@ from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 
 from . import utils as moe_utils
 
+pytestmark = pytest.mark.solo
+
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
