@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer import autotune, bmm_mxfp8
+from flashinfer import SfLayout, autotune, bmm_mxfp8
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
@@ -26,6 +26,10 @@ def test_bmm_mxfp8(
         pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
     if backend == "cutlass" and not is_sf_swizzled_layout:
         pytest.skip("bmm_mxfp8 cutlass backend on SM12x only supports swizzled layout.")
+
+    sf_layout = (
+        SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+    )
 
     # Create inputs and quantize them to MXFP8 format
     input_mat = torch.randn([b, m, k], device="cuda", dtype=input_dtype)
@@ -61,6 +65,7 @@ def test_bmm_mxfp8(
             res_dtype,
             res,
             backend=backend,
+            sf_layout=sf_layout,
         )
 
     # Verify output properties
