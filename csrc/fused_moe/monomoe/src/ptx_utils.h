@@ -320,7 +320,7 @@ __device__ static __forceinline__ bool mbarrier_try_wait_parity(std::uint64_t* b
 
 // ── Hopper TMA bulk-tensor copy (sm_90a) ──────────────────────────────────
 //
-// Thin PTX wrapper around `cp.async.bulk.tensor.2d.shared::cta.global.tile.
+// Thin PTX wrapper around `cp.async.bulk.tensor.2d.shared::cluster.global.tile.
 // mbarrier::complete_tx::bytes`. The TMA engine reads a rectangular tile
 // from a tensor in global memory (described by a host-built `CUtensorMap`)
 // and writes it into shared memory, decrementing the transaction-bytes
@@ -357,7 +357,7 @@ __device__ static __forceinline__ bool mbarrier_try_wait_parity(std::uint64_t* b
  * @brief Issue one 2D TMA bulk-tensor load, tracked by an mbarrier.
  *
  * Emits:
- *   `cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes`
+ *   `cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes`
  *   `  [dst_smem_addr], [desc, {coord0, coord1}], [bar_smem_addr];`
  *
  * The instruction returns immediately; the TMA engine performs the copy
@@ -382,8 +382,11 @@ __device__ static __forceinline__ void tma_load_2d(CUtensorMap const& desc, std:
   std::uint32_t dst_addr = cvta_to_shared_u32(dst_smem);
   std::uint32_t bar_addr = cvta_to_shared_u32(bar_smem);
   std::uint64_t desc_addr = reinterpret_cast<std::uint64_t>(&desc);
+  // `.shared::cluster` dst (not `.shared::cta`, which needs PTX ISA 8.6 /
+  // CUDA 12.8+ and fails on older ptxas).  Equivalent for a non-cluster
+  // launch; same form CUTLASS emits in cute/arch/copy_sm90_tma.hpp.
   asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global.tile"
+      "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
       ".mbarrier::complete_tx::bytes"
       " [%0], [%1, {%2, %3}], [%4];\n"
       :
