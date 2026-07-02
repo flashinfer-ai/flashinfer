@@ -395,7 +395,11 @@ __device__ __forceinline__ void add_init_out_ring(SmemT const& smem, TiledMma co
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
   constexpr int M_TILE = cute::tile_size<0>(TiledMma{});  // 16·NUM_WARPS = D_PER_CTA
   static_assert(sizeof(state_t) == 2, "operand-swap OUT.1 needs 2-byte state (A-operand LDSM)");
-  using AView = MMA_prop::operand_t;  // state viewed as the 2-byte MMA operand (bf16)
+  // State smem is VIEWED as the MMA operand type so the 16-bit LDSM atom matches; the actual
+  // element type (state_t — may be f16) is recovered in-registers by pipelined_kloop_gemm's
+  // convert_frag<state_t, MmaT> after the load (no-op when state_t is bf16).  Mirrors the
+  // monolith's add_init_out B-side treatment.
+  using AView = MMA_prop::operand_t;
   // A = state [D_PER_CTA, DSTATE] (dstate contiguous = K-major → x4 non-transpose LDSM),
   // slot-indexed.
   auto const layout_state = make_swizzled_layout_rc<AView, D_PER_CTA, DSTATE>();
@@ -410,7 +414,7 @@ __device__ __forceinline__ void add_init_out_ring(SmemT const& smem, TiledMma co
   Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(
                                   smem.C + state_buf * SmemT::C_ELEMS)),
                               layout_C);
-  pipelined_kloop_gemm<3, NUM_K_TILES, AView, input_t, MMA_prop::operand_t>(
+  pipelined_kloop_gemm<3, NUM_K_TILES, state_t, input_t, MMA_prop::operand_t>(
       tiled_mma, thr_mma, tid, smem_state_ktiled, smem_C, frag_y...);
 }
 

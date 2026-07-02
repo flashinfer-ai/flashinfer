@@ -1087,6 +1087,138 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+def test_two_kernel_f16_state(philox_rounds):
+    """f16 STATE + bf16 activations on the two-kernel path vs the monolithic
+    reference.  The operand-swap OUT.1 LDSMs the state under a bf16-typed view;
+    the real element type must be recovered in-registers
+    (convert_frag<state_t>) — reinterpreting f16 bits as bf16 silently corrupts
+    the output (caught 2026-07-02).
+
+    The window is filled with CONSISTENT rows (softplus dt, true cumsum): the
+    write path replays rows beyond T, and inconsistent random rows push |state|
+    past f16 max (65504) into inf/NaN.  philox_rounds=5 exercises the SR state
+    store (shared store code + same seed ⇒ the two paths bit-match)."""
+    device = "cuda"
+    act_dtype, state_dtype = torch.bfloat16, torch.float16
+    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    max_window = 16
+    batch = 2
+    cache_size = batch
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(
+        torch.randn(nheads, device=device, dtype=act_dtype), "h -> h p", p=head_dim
+    )
+    D = repeat(
+        torch.randn(nheads, device=device, dtype=act_dtype), "h -> h p", p=head_dim
+    )
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+    )
+    x_fill = torch.randn(
+        batch, max_window, nheads, head_dim, device=device, dtype=act_dtype
+    )
+    dt_fill = torch.randn(batch, max_window, nheads, device=device, dtype=act_dtype)
+    B_fill = torch.randn(
+        batch, max_window, ngroups, d_state, device=device, dtype=act_dtype
+    )
+    dt_fill_proc = dt_fill.float() + dt_bias[:, 0].float()[None, None, :]
+    dt_fill_proc = torch.where(
+        dt_fill_proc > 20.0, dt_fill_proc, torch.log1p(torch.exp(dt_fill_proc))
+    )
+    cumAdt_fill = torch.cumsum(A_base.float()[None, None, :] * dt_fill_proc, dim=1)
+    old_x = x_fill.clone()
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=act_dtype
+    )
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+    for slot in range(cache_size):
+        buf = cache_buf_idx[slot].item()
+        old_B[slot, buf] = B_fill[slot]
+        old_dt[slot, buf] = dt_fill_proc[slot].permute(1, 0)
+        old_cumAdt[slot, buf] = cumAdt_fill[slot].permute(1, 0)
+
+    rand_seed = torch.tensor([1234], device=device, dtype=torch.int64)
+    T_pad = 16
+    k_old = ((max_window + 7) // 8) * 8
+
+    def _run(k, *, two_kernel):
+        torch.manual_seed(k + 100)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=act_dtype)
+        dt2 = repeat(
+            torch.randn(batch, T, nheads, device=device, dtype=act_dtype),
+            "b t h -> b t h p",
+            p=head_dim,
+        )
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=act_dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=act_dtype)
+        st = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=act_dtype)
+        ox, ob, odt, oca = (
+            old_x.clone(),
+            old_B.clone(),
+            old_dt.clone(),
+            old_cumAdt.clone(),
+        )
+        kw = {}
+        if philox_rounds > 0:
+            kw["philox_rounds"] = philox_rounds
+            kw["rand_seed"] = rand_seed
+        if two_kernel:
+            kw["cb_scaled"] = torch.empty(
+                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=act_dtype
+            )
+            kw["cumAdt_vec"] = torch.empty(
+                batch, nheads, T_pad, device=device, dtype=torch.float32
+            )
+            kw["cb_old"] = torch.empty(
+                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=act_dtype
+            )
+        checkpointing_ssu(
+            st,
+            ox,
+            ob,
+            odt,
+            oca,
+            cache_buf_idx.clone(),
+            torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            **kw,
+        )
+        return out, st, ox, ob, odt, oca
+
+    names = ("out", "state", "old_x", "old_B", "old_dt", "old_cumAdt")
+    # k=0/2 no-write; k=12 write (12+6 > 16) — replays 12 rows incl. rows ≥ T.
+    for k in (0, 2, 12):
+        ref = _run(k, two_kernel=False)
+        test = _run(k, two_kernel=True)
+        for name, r, t in zip(names, ref, test, strict=True):
+            torch.testing.assert_close(
+                t,
+                r,
+                rtol=2e-2,
+                atol=5e-1,
+                msg=f"{name} mismatch at k={k} (f16 state, philox={philox_rounds})",
+            )
+
+
 def test_checkpointing_ssu_pdl_bf16():
     """PDL smoke: bf16 state.  Runs the kernel twice on the same inputs —
     once with enable_pdl=False, once with True — and asserts the outputs and
