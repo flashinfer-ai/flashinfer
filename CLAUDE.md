@@ -629,6 +629,15 @@ When working with FlashInfer's dependencies and tools, refer to these official d
   - The Cute DSL kernels rely on Python modules from the `nvidia-cutlass-dsl` pip package, not to be confused with Python modules in the `3rdparty/cutlass` submodule
   - Tutorial: <https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL>
 
+- **Quack**: CuTe DSL kernel utility library used by the VSA Blackwell (`blk128`) backend
+  - Repository: <https://github.com/Dao-AILab/quack>
+  - **Not on PyPI under this name** — the `quack` package on PyPI is an unrelated project. Install from source:
+    ```
+    pip install git+https://github.com/Dao-AILab/quack.git
+    ```
+  - Not declared in `requirements.txt`/`pyproject.toml` (PyPI rejects VCS direct-reference dependencies in published package metadata) — install manually before using `flashinfer.sparse` with the `vsa_blackwell` backend
+  - Used in: `flashinfer/cute_dsl/sparse/blk128/*.py` (`copy_utils`, `layout_utils`, `activation`, `ParamsBase`); import is guarded in `flashinfer/cute_dsl/sparse/blk128/__init__.py` with a friendly error if missing
+
 - **PTX ISA (Parallel Thread Execution)**: NVIDIA's PTX instruction set documentation
   - Documentation: <https://docs.nvidia.com/cuda/parallel-thread-execution/>
   - **Index/Table of Contents**: <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html.md>
