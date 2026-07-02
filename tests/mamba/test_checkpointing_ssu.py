@@ -80,6 +80,22 @@ WARP_SIZE = 32
 MMA_FRAG_SIZE = 8
 
 
+def _two_kernel_scratch(batch, nheads, max_window, dtype, device):
+    """Precompute scratch that routes checkpointing_ssu to the two-kernel split.
+
+    Shapes hold for NPREDICTED <= 16 (cumAdt_vec pads to the m16 MMA row count)."""
+    k_old = ((max_window + 7) // 8) * 8
+    return dict(
+        cb_scaled=torch.empty(
+            batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
+        ),
+        cumAdt_vec=torch.empty(batch, nheads, 16, device=device, dtype=torch.float32),
+        cb_old=torch.empty(
+            batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
+        ),
+    )
+
+
 def _make_replay_work_items(
     prev_tokens, cache_buf_idx, seq_len, max_window, batch, state_batch_indices
 ):
@@ -1707,8 +1723,17 @@ def test_checkpointing_ssu_max_window_gt_npredicted(
 # (4, 8) gives must_checkpoint = (prev_k + 4 > 8) = False for prev_k ∈ [0, 4].
 @pytest.mark.parametrize("npredicted,max_window", [(4, 8)], ids=["np4w8"])
 @pytest.mark.parametrize("impl", _TRITON_IMPLS)
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
 def test_checkpointing_ssu_philox_no_checkpoint(
-    impl, nheads, head_dim, d_state, ngroups, paged_cache, npredicted, max_window
+    impl,
+    nheads,
+    head_dim,
+    d_state,
+    ngroups,
+    paged_cache,
+    npredicted,
+    max_window,
+    two_kernel,
 ):
     """Verify Philox SR path skips state HBM write when must_checkpoint=False.
 
@@ -1871,6 +1896,11 @@ def test_checkpointing_ssu_philox_no_checkpoint(
             state_batch_indices=state_batch_indices,
             rand_seed=rand_seed,
             philox_rounds=10,
+            **(
+                _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+                if two_kernel
+                else {}
+            ),
         )
 
         # KEY assertion: state HBM byte-identical to state0.  Kernel must
@@ -1986,6 +2016,7 @@ def test_checkpointing_ssu_philox_no_checkpoint(
     ids=["np10w16_pk7", "np10w16_pk10", "np14w16_pk14", "np14w16_pk3"],
 )
 @pytest.mark.parametrize("impl", _TRITON_IMPLS)
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
 def test_checkpointing_ssu_philox_with_checkpoint(
     impl,
     npredicted,
@@ -1993,6 +2024,7 @@ def test_checkpointing_ssu_philox_with_checkpoint(
     prev_k,
     paged_cache,
     _cfg_idx,
+    two_kernel,
 ):
     """Verify Philox SR path correctly writes state HBM when must_checkpoint=True
     in the non-degenerate MAX_WINDOW > NPREDICTED regime.
@@ -2147,6 +2179,11 @@ def test_checkpointing_ssu_philox_with_checkpoint(
         state_batch_indices=state_batch_indices,
         rand_seed=rand_seed,
         philox_rounds=10,
+        **(
+            _two_kernel_scratch(batch, nheads, max_window, dtype, device)
+            if two_kernel
+            else {}
+        ),
     )
 
     # Sanity guard: the kernel must have written state HBM (gate not inverted).
@@ -3073,7 +3110,10 @@ def test_checkpointing_ssu_rejects_large_T(T):
     "paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"]
 )
 @pytest.mark.parametrize("T", [6, 16], ids=["T6", "T16"])
-def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cache, T):
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
+def test_checkpointing_ssu_philox(
+    nheads, head_dim, d_state, ngroups, paged_cache, T, two_kernel
+):
     """
     Verify that Philox stochastic rounding produces correct results.
 
@@ -3137,6 +3177,9 @@ def test_checkpointing_ssu_philox(nheads, head_dim, d_state, ngroups, paged_cach
         dt_softplus=True,
         state_batch_indices=state_batch_indices,
     )
+    if two_kernel:
+        # Window == T in this test; the scratch reroutes both runs to the split.
+        common_kwargs.update(_two_kernel_scratch(batch, nheads, T, dtype, device))
 
     # --- Run without rounding (deterministic fp16 state store) ---
     state_nornd = state0.clone()
