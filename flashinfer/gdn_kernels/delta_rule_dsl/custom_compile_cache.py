@@ -142,91 +142,30 @@ def _patch_sm120a_tma_ptx(ptx_text: str) -> str:
     return patched
 
 
-def _ptxas_candidates():
-    """Yield candidate ``ptxas`` binaries, best-guess first.
+def _downgrade_ptx_isa_version(ptx_text: str):
+    """Return ``ptx_text`` with the ``.version`` minor set to 0, or ``None``.
 
-    The DSL emits PTX at the ISA of its own bundled toolkit (e.g. 9.1 for a
-    CUDA-13.1 build), which can be newer than both the local CUDA install and
-    the driver.  pip toolchain wheels (``nvidia/cu1x/bin``) and triton's
-    bundled ptxas are therefore tried in addition to ``$CUDA_HOME``; whichever
-    one actually assembles the PTX wins (the assembly attempt is the version
-    check).
+    The DSL stamps its PTX with its own toolkit's ISA (e.g. ``.version 9.1``
+    from a CUDA-13.1 build), which a driver from an older minor (e.g. CUDA
+    13.0, PTX ISA 9.0) refuses to JIT with cudaErrorUnsupportedPtxVersion -
+    even when the code uses no newer-minor instructions, as is the case for
+    these kernels. Downgrading only the header lets such drivers JIT it; if
+    the code ever did use newer-minor instructions the retry would fail
+    loudly at parse, same visibility as the original error.
+
+    Returns ``None`` when the header is already ``<major>.0`` (nothing to
+    retry with) or no ``.version`` line is found.
     """
-    env = os.environ.get("FLASHINFER_PTXAS")
-    if env:
-        if os.path.isfile(env):
-            yield env
-        else:
-            warnings.warn(
-                f"FLASHINFER_PTXAS is set to {env!r} but no such file exists; "
-                "ignoring it.",
-                RuntimeWarning,
-                stacklevel=3,
-            )
-    import contextlib
-    import shutil
-    import site
-    import sysconfig
+    import re
 
-    which = shutil.which("ptxas")
-    if which:
-        yield which
-    site_dirs = []
-    # site.getsitepackages can raise (or return nothing) on non-standard
-    # installations (embedded Python etc.)
-    with contextlib.suppress(AttributeError, RuntimeError, TypeError):
-        site_dirs += [
-            d for d in list(site.getsitepackages()) + [site.getusersitepackages()] if d
-        ]
-    purelib = sysconfig.get_paths().get("purelib")
-    if purelib:
-        site_dirs.append(purelib)
-    for sp in dict.fromkeys(site_dirs):
-        for sub in (
-            "nvidia/cu13/bin",
-            "nvidia/cu12/bin",
-            "nvidia/cuda_nvcc/bin",
-            "triton/backends/nvidia/bin",
-        ):
-            yield os.path.join(sp, sub, "ptxas")
-    cuda_home = os.environ.get("CUDA_HOME") or "/usr/local/cuda"
-    yield os.path.join(cuda_home, "bin", "ptxas")
-
-
-def _assemble_sm120a_cubin(patched_ptx: str):
-    """Assemble the patched PTX to a cubin so the loader hands the driver SASS.
-
-    Loading raw PTX via ``cuLibraryLoadData`` defers to the *driver's* PTX
-    JIT, which rejects PTX newer than the driver's toolkit with
-    ``cudaErrorUnsupportedPtxVersion`` (222) — e.g. a CUDA-13.0 driver cannot
-    JIT the ``.version 9.1`` PTX a CUDA-13.1 DSL emits, even though the same
-    driver runs sm_120a SASS fine.  Assembling with any ptxas at least as new
-    as the DSL's toolkit removes the driver coupling.  Returns ``None`` when
-    no candidate ptxas can assemble the PTX (caller falls back to driver JIT,
-    the previous behavior).
-    """
-    import subprocess
-
-    with tempfile.TemporaryDirectory(prefix="cutedsl_ptxas_") as tmpdir:
-        ptx_path = os.path.join(tmpdir, "patched.ptx")
-        cubin_path = os.path.join(tmpdir, "patched.cubin")
-        with open(ptx_path, "w", encoding="utf-8") as f:
-            f.write(patched_ptx)
-        for ptxas in _ptxas_candidates():
-            if not ptxas or not os.path.isfile(ptxas):
-                continue
-            try:
-                result = subprocess.run(
-                    [ptxas, "-arch=sm_120a", "-o", cubin_path, ptx_path],
-                    capture_output=True,
-                    timeout=120,
-                )
-                if result.returncode == 0:
-                    with open(cubin_path, "rb") as f:
-                        return f.read()
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-    return None
+    match = re.search(r"^\.version (\d+)\.(\d+)$", ptx_text, flags=re.M)
+    if match is None or match.group(2) == "0":
+        return None
+    return (
+        ptx_text[: match.start()]
+        + f".version {match.group(1)}.0"
+        + ptx_text[match.end() :]
+    )
 
 
 def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
@@ -238,24 +177,8 @@ def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
     from cutlass.base_dsl.common import DSLRuntimeError
     from cutlass.base_dsl.runtime.cuda import checkCudaErrors
 
-    cubin = _assemble_sm120a_cubin(patched_ptx)
-    if cubin is not None:
-        load_image = cubin
-        jit_options = []
-        jit_option_values = []
-    else:
-        warnings.warn(
-            "No ptxas able to assemble the sm_120a-patched PTX was found; "
-            "falling back to driver PTX JIT, which requires a driver at least "
-            "as new as the nvidia-cutlass-dsl toolkit (else fails with "
-            "cudaErrorUnsupportedPtxVersion). Set FLASHINFER_PTXAS to a "
-            "matching ptxas to avoid this.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        load_image = patched_ptx.encode("utf-8")
-        jit_options = [cuda_driver.CUjit_option.CU_JIT_TARGET]
-        jit_option_values = [cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A]
+    jit_options = [cuda_driver.CUjit_option.CU_JIT_TARGET]
+    jit_option_values = [cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A]
 
     def _load_cuda_library(self):
         if self.engine is None:
@@ -268,43 +191,63 @@ def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
             cuda_load_to_device
         )
 
-        library_obj = checkCudaErrors(
-            cuda_driver.cuLibraryLoadData(
-                load_image,
-                jit_options,
-                jit_option_values,
-                len(jit_options),
-                None,
-                None,
-                0,
+        def _load(ptx_text: str):
+            library_obj = checkCudaErrors(
+                cuda_driver.cuLibraryLoadData(
+                    ptx_text.encode("utf-8"),
+                    jit_options,
+                    jit_option_values,
+                    len(jit_options),
+                    None,
+                    None,
+                    0,
+                )
             )
-        )
-        library = ctypes.c_void_p(int(library_obj))
-        pointer_to_library = ctypes.pointer(library)
-        pointer_to_pointer_to_library = ctypes.pointer(pointer_to_library)
-        err = ctypes.c_int32(0)
-        pointer_to_err = ctypes.pointer(err)
-        device_id = ctypes.c_int32(0)
-        pointer_to_device_id = ctypes.pointer(device_id)
+            library = ctypes.c_void_p(int(library_obj))
+            pointer_to_library = ctypes.pointer(library)
+            pointer_to_pointer_to_library = ctypes.pointer(pointer_to_library)
+            err = ctypes.c_int32(0)
+            pointer_to_err = ctypes.pointer(err)
+            device_id = ctypes.c_int32(0)
+            pointer_to_device_id = ctypes.pointer(device_id)
 
-        cuda_load_args = [
-            pointer_to_pointer_to_library,
-            pointer_to_device_id,
-            pointer_to_err,
-        ]
-        packed_args = (ctypes.c_void_p * len(cuda_load_args))()
-        for i, arg in enumerate(cuda_load_args):
-            packed_args[i] = ctypes.cast(arg, ctypes.c_void_p)
+            cuda_load_args = [
+                pointer_to_pointer_to_library,
+                pointer_to_device_id,
+                pointer_to_err,
+            ]
+            packed_args = (ctypes.c_void_p * len(cuda_load_args))()
+            for i, arg in enumerate(cuda_load_args):
+                packed_args[i] = ctypes.cast(arg, ctypes.c_void_p)
 
-        for dev in range(self.num_devices):
-            device_id.value = dev
-            cuda_load_to_device(packed_args)
-            checkCudaErrors((cuda_runtime.cudaError_t(err.value),))
+            for dev in range(self.num_devices):
+                device_id.value = dev
+                cuda_load_to_device(packed_args)
+                checkCudaErrors((cuda_runtime.cudaError_t(err.value),))
 
-        return [library_obj]
+            return [library_obj]
+
+        try:
+            return _load(patched_ptx)
+        except Exception as e:
+            # The driver JIT rejects PTX whose ISA is newer than the driver's
+            # toolkit (cudaErrorUnsupportedPtxVersion / error 222): e.g. the
+            # .version 9.1 PTX a CUDA-13.1 DSL emits on a CUDA-13.0 driver.
+            downgraded = _downgrade_ptx_isa_version(patched_ptx)
+            if downgraded is None or "UnsupportedPtxVersion" not in str(e):
+                raise
+            warnings.warn(
+                "Driver rejected the sm_120a-patched PTX ISA version "
+                "(cudaErrorUnsupportedPtxVersion); retrying with the .version "
+                "header downgraded to the major's baseline. Use a driver at "
+                "least as new as the nvidia-cutlass-dsl toolkit to avoid "
+                "this.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return _load(downgraded)
 
     compiled_fn._flat_patched_ptx = patched_ptx
-    compiled_fn._flat_patched_cubin = cubin
     compiled_fn._flat_patched_ptx_jit_options = tuple(jit_options)
     compiled_fn._flat_patched_ptx_jit_option_values = tuple(jit_option_values)
     compiled_fn._load_cuda_library = types.MethodType(_load_cuda_library, compiled_fn)
