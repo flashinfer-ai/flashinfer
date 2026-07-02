@@ -351,35 +351,29 @@ __global__ void moeA2ADispatchKernel(
     int* smem_topk_target_ranks = smem;
     int* smem_topk_send_indices = smem + TOP_K;
 
-    uint64_t already_copied = 0;
-    for (int k = 0; k < TOP_K; k++) {
-      int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-      // Use contiguous partitioning to determine target rank
-      int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+    if (thread_idx < warpSize) {
+      int lane_id = thread_idx;
+      unsigned topk_mask = __ballot_sync(0xffffffff, lane_id < TOP_K);
+      if (lane_id < TOP_K) {
+        int k = lane_id;
+        int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+        int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
 
-      if (already_copied & (1ULL << target_rank)) {
-        if (thread_idx == 0) {
-          ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
-          ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
-          // Mirror to shared memory immediately
-          smem_topk_target_ranks[k] = -1;
-          smem_topk_send_indices[k] = -1;
+        // Elect the first top-k lane for each destination rank.
+        unsigned matching_lanes = __match_any_sync(topk_mask, target_rank);
+        bool is_first = lane_id == __ffs(matching_lanes) - 1;
+        int dst_token_idx = -1;
+        if (is_first) {
+          dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+        } else {
+          target_rank = -1;
         }
-        continue;
-      }
-
-      // Only one thread per warp should increment the counter
-      int dst_token_idx;
-      if (thread_idx == 0) {
-        dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
 
         ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
         ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-        // Mirror to shared memory immediately
         smem_topk_target_ranks[k] = target_rank;
         smem_topk_send_indices[k] = dst_token_idx;
       }
-      already_copied |= 1ULL << target_rank;
     }
     // Sync before dispatching data
     __syncthreads();
