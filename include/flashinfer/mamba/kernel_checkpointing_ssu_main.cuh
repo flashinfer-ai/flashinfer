@@ -1189,19 +1189,27 @@ __global__ __maxnreg__(
   auto const* __restrict__ D_ptr = reinterpret_cast<weight_t const*>(params.D);
   auto const* __restrict__ cbi = reinterpret_cast<int32_t const*>(params.cache_buf_idx);
 
-  // ── SMEM META RING ──
-  // Per-unit metadata {cache_slot, pnat, buf_read, D_val} lives in a 32-slot smem ring
-  // (slot = unit % META_RING) instead of the old register shift-register + per-unit fetch.
-  // fill_meta(base) resolves units [base, base+META_RING) warp-wide — lane l owns unit base+l —
-  // so the sbi[seq] → {prev_num_accepted, cache_buf_idx} dependent chase (+ D[head]) runs 32-wide
-  // ONCE per window instead of per unit (was the top-2 long_scoreboard sites).  ALL warps fill
-  // redundantly with identical values: each warp writes the full window and reads only its own
-  // smem writes, so __syncwarp() is the only fence needed (no block barrier).  Refill every
-  // META_RING−STAGES units: iteration `tile` reads units tile (process) and tile+STAGES
-  // (prefetch), so window [f, f+32) serves iterations f .. f+31−STAGES; the refill at f rewrites
-  // the still-live overlap units [f, f+STAGES) with identical values (same unit → same slot), so
-  // a lagging warp's concurrent read races benignly, and every older slot is dead past the
-  // previous iteration's closing __syncthreads.
+  // ── META PIPELINE: gmem →(32-wide, once per window)→ SMEM RING →(1 LDS/unit, STAGES early)→
+  // REGISTER QUEUE ──
+  // Level 1 — smem ring (slot = unit % META_RING): fill_meta(base) resolves units
+  // [base, base+META_RING) warp-wide — lane l owns unit base+l — so the sbi[seq] →
+  // {prev_num_accepted, cache_buf_idx} dependent chase (+ D[head]) runs 32-wide ONCE per window
+  // instead of per unit (was the top-2 long_scoreboard sites).  ALL warps fill redundantly with
+  // identical values: each warp writes the full window and reads only its own smem writes, so
+  // __syncwarp() is the only fence needed (no block barrier).  Refill every META_RING−STAGES
+  // units: the loop's smem read is load_meta(tile+STAGES) at the iteration bottom, so window
+  // [f, f+32) serves iterations f .. f+31−STAGES; the refill at f rewrites the still-live overlap
+  // units [f, f+STAGES) with identical values (same unit → same slot), so a lagging warp's
+  // concurrent read races benignly, and every older slot is dead past the previous iteration's
+  // closing __syncthreads.
+  // Level 2 — register queue meta_q[STAGES] (meta_q[k] == meta(tile+k)): the ring LDS is
+  // appended at the iteration BOTTOM and not consumed as a process-meta for STAGES iterations,
+  // so is_valid / derive_head / the prefetch address math read pure registers (v27: the raw-LDS
+  // consumers were the #1 short_scoreboard sites — ISETP 12.3%, widen-SHF 10.2%).  CRITICAL:
+  // meta_q is indexed ONLY by compile-time-constant subscripts (meta_q[0], unrolled shift,
+  // meta_q[STAGES-1]) so SROA keeps it in registers — a runtime subscript would demote it to
+  // local memory, reintroducing the very latency this hides (measured on the original
+  // shift-register).
   constexpr int STAGES = MAIN_STATE_PIPE;
   constexpr int META_RING = SmemT::META_RING;
   static_assert(STAGES < META_RING, "meta window must cover the process+prefetch span");
@@ -1286,14 +1294,16 @@ __global__ __maxnreg__(
         smem, params, lane, warp, coords0, /*slot=*/0, must_checkpoint0);
   __pipeline_commit();  // G_post0
 
-  // Prefetch units 1..STAGES-1 (full bundles; gdc already fired) — unit p into smem buffer p.
+  // Prefetch units 1..STAGES-1 (full bundles; gdc already fired) — unit p into smem buffer p,
+  // seeding the register queue (meta_q[k] == meta(tile+k) at the top of steady iteration tile).
+  HeadMetaSSU meta_q[STAGES];
 #pragma unroll
   for (int p = 1; p < STAGES; ++p) {
-    HeadMetaSSU const meta_p = load_meta(p);
-    if (is_valid(meta_p))
+    meta_q[p - 1] = load_meta(p);
+    if (is_valid(meta_q[p - 1]))
       prefetch_async<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                     NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, meta_p,
-                                                      /*slot=*/p, mc_of(meta_p));
+                     NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, meta_q[p - 1],
+                                                      /*slot=*/p, mc_of(meta_q[p - 1]));
     __pipeline_commit();  // G_full_p (empty if pad / past-the-end)
   }
 
@@ -1313,20 +1323,18 @@ __global__ __maxnreg__(
   __syncthreads();  // tile-0 output done reading buffer 0 before the tile-STAGES prefetch
                     // overwrites it
 
-  // Prefetch unit STAGES into buffer 0 (freed by tile-0's output), establishing the steady
-  // invariant for tile == 1.
-  {
-    HeadMetaSSU const meta_stages = load_meta(STAGES);
-    if (is_valid(meta_stages))
-      prefetch_async<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                     NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, meta_stages,
-                                                      /*slot=*/0, mc_of(meta_stages));
-    __pipeline_commit();
-  }
+  // Prefetch unit STAGES into buffer 0 (freed by tile-0's output), completing the queue —
+  // meta_q == {meta(1) .. meta(STAGES)} — and establishing the steady invariant for tile == 1.
+  meta_q[STAGES - 1] = load_meta(STAGES);
+  if (is_valid(meta_q[STAGES - 1]))
+    prefetch_async<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
+                   NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, meta_q[STAGES - 1],
+                                                    /*slot=*/0, mc_of(meta_q[STAGES - 1]));
+  __pipeline_commit();
 
-  // ── STEADY STATE: process unit `tile` from the meta ring, then prefetch unit tile+STAGES into
-  //    the freed buffer `slot`.  Refill the meta window every META_RING−STAGES units (see the
-  //    ring comment above). ──
+  // ── STEADY STATE: process unit `tile` from the register queue, then prefetch unit tile+STAGES
+  //    into the freed buffer `slot`.  Refill the smem meta window every META_RING−STAGES units
+  //    (see the meta-pipeline comment above). ──
   int next_fill = META_RING - STAGES;
   for (int tile = 1; blockIdx.x + tile * stride < total_work; ++tile) {
     int const slot = tile % STAGES;  // smem buffer of unit `tile` (== buffer of unit tile+STAGES)
@@ -1334,9 +1342,9 @@ __global__ __maxnreg__(
       fill_meta(tile);
       next_fill += META_RING - STAGES;
     }
-    HeadMetaSSU const meta = load_meta(tile);
+    HeadMetaSSU const meta = meta_q[0];  // register: appended STAGES iterations ago, LDS drained
+    bool const valid = is_valid(meta);
     __pipeline_wait_prior(STAGES - 1);  // drain unit `tile`'s bundle (the oldest group)
-    bool const valid = is_valid(meta);  // consume the meta LDS AFTER the wait swallowed its latency
     if (valid) {
       __syncthreads();  // publish the drained bundle (state + old-tiles + C/x/cumAdt) cross-warp
       if (mc_of(meta))
@@ -1348,16 +1356,20 @@ __global__ __maxnreg__(
                      PHILOX_ROUNDS, NUM_WARPS, NHEADS, HEADS_PER_GROUP, VARLEN,
                      /*MUST_CHECKPOINT=*/false>(smem, params, lane, warp, meta, slot);
     }
-    // Issue the next unit's meta LDS BEFORE the barrier (ring writes only happen at iteration
-    // tops, and no warp reaches the next fill until all pass this barrier — slot is stable), so
-    // the barrier swallows the LDS latency and the consumers below read ready registers.
-    HeadMetaSSU const meta_next = load_meta(tile + STAGES);
+    // Shift the queue (constant indices → registers) and append unit tile+STAGES from the smem
+    // ring BEFORE the barrier (ring writes only happen at iteration tops, and no warp reaches the
+    // next fill until all pass this barrier — the slot is stable): the barrier swallows the LDS
+    // latency for the prefetch below, and the entry isn't consumed as a process-meta for STAGES
+    // more iterations.
+#pragma unroll
+    for (int k = 0; k < STAGES - 1; ++k) meta_q[k] = meta_q[k + 1];
+    meta_q[STAGES - 1] = load_meta(tile + STAGES);
     __syncthreads();  // output done reading `slot` before the prefetch below overwrites it
 
-    if (is_valid(meta_next))
+    if (is_valid(meta_q[STAGES - 1]))
       prefetch_async<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
-                     NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, meta_next, slot,
-                                                      mc_of(meta_next));
+                     NHEADS, HEADS_PER_GROUP, VARLEN>(smem, params, lane, warp, meta_q[STAGES - 1],
+                                                      slot, mc_of(meta_q[STAGES - 1]));
     __pipeline_commit();  // keep the FIFO at STAGES groups (empty for pad / past-the-end)
   }
 }
