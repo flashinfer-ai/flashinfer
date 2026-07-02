@@ -857,6 +857,52 @@ Write path (PNAT+NPREDICTED > max_window=16): checkpoint cliff to ~90 µs, rough
 monolith — the shared replay + state-write dominates there and the swap's output savings are smallest (the
 split-tax; confirmed NOT the d_split=2 idle-warp guard — d_split=1 was no faster).
 
+### LANDED: meta pipeline — smem ring + register queue (B200, 2026-07-02, `512e9f1a` + `69cae8cd`)
+
+ncu v30.1 (d_split=1) showed the steady loop latency-bound on **per-unit metadata**, not the 16 KB
+state: `long_scoreboard` 26.1% #1, top sites = the `D_ptr[head]` refetch (22.9%) and the
+`sbi[seq] → {prev_num_accepted, cache_buf_idx}` dependent chase (12.7%), issued only STAGES=2 ahead —
+uncoverable at 25% occupancy.
+
+Two-level fix (both occupancy-neutral, `d_split`/pipeline structure untouched):
+
+1. **Smem meta ring** (`512e9f1a`, ncu v26/v27): `fill_meta(base)` resolves 32 units warp-wide
+   (lane l → unit base+l) into a 512 B ring `{cache_slot int32, pnat, buf_read, D}`; refill every
+   `META_RING−STAGES` units with slot wraparound. All 4 warps fill redundantly → each warp reads its
+   own writes → `__syncwarp()` only, **no block barrier**; window overlap `[f, f+STAGES)` rewrites
+   identical values (benign race). Ring sized 512 B deliberately: headroom to the 4-blocks/SM smem
+   cliff is exactly 640 B/block (57,728 B/block ×4 on the 228 KB SM), so `tile` is re-derived and
+   `cache_slot` stored int32 (pads canonicalized to −1). **82.0 → 79.1 µs**, long_scoreboard
+   26.1 → 16.1%.
+2. **Register queue** (`69cae8cd`, ncu v28): v27 showed the cost moved to the ring's LDS consumers
+   (short_scoreboard #1 21.1%: `is_valid` ISETP 12.3%, cache_slot LDS 10.2%) — steady-state
+   `wait_prior` retires instantly, hiding nothing. `meta_q[STAGES]` shift-register (constant-index,
+   SROA) appended at the iteration bottom from `load_meta`, consumed as process-meta STAGES
+   iterations later → `is_valid`/`derive_head`/prefetch address math read pure registers.
+   **79.1 → 77.5 µs**; both v27 short_scoreboard sites gone (residual ISETP 8.3% at the bottom
+   append); regs 119 → 125 (cap 128, no spills).
+
+Also in `512e9f1a`: `derive_head` returns `HeadCoords`, derived ONCE per `prefetch_async` (was
+re-derived in both gdc halves), load-free non-varlen; `j`→`tile`; single-letter rename sweep;
+`test_two_kernel_meta_ring_refill` (CTA_PER_SM=1, ~64 units/CTA → two wraparound refills, random
+per-slot pnat mixes write/no-write inside every window).
+
+**Cumulative main-kernel: 82.0 → 77.5 µs (−5.5%); wall (both kernels) 97.25 → 93.95 µs; gap to
+triton-replay-pm 1.24× → 1.19×** (b=1024 bf16 mtp=8 pnat=4).
+
+ncu v28 residuals — the meta lever is EXHAUSTED, profile is now a broad floor:
+- `short_scoreboard` 19.2%: FMUL@624 (`beta_extra` ← `old_cumAdt[prev_k−1]` LDS→`__expf` chain,
+  22% of cat) + HMMA waits + `cuda_bf16` IMAD — pre-existing compute-consume chains.
+- `long_scoreboard` 17.5%: prologue BAR@1283 (one-time fill+state chase per CTA, 17.4% of cat),
+  IMAD@171 `ox_base` (17.2% — possibly LDC stride rematerialization at 125 regs), fill's own
+  STS@1234 (9.1%, by-design amortized).
+- `mio_throttle` 17.3% + `barrier` 11.2% + `wait` 13.9%: cp.async/LDSM issue pressure + pipeline
+  sync at 25% occupancy — structural.
+
+Next levers, in expected-value order: **K-major state / index math** (INT still ~32% of samples;
+TODO below), the FMUL@624 `beta_extra` chain (hoist the `old_cumAdt` tail read into the meta
+ring/prefetch?), occupancy (needs regs ≤ 102 **and** smem ≤ 45 KB simultaneously — hard).
+
 ## TODO
 
 - [ ] **Implement K-major state for C@stateᵀ (recipe proven by `gemm_cmp.cu` `k_optimal`).** Store the
