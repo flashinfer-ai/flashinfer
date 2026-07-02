@@ -1338,6 +1338,9 @@ void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
                  data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr)
       << "Custom routing kernel expects permuted idx and grouped Gemm launch config buffers";
+  TVM_FFI_ICHECK_LE(data.mTopK, data.mNumExperts)
+      << "Routing kernel expects topK (" << data.mTopK << ") to be <= numExperts ("
+      << data.mNumExperts << ").";
   TVM_FFI_ICHECK_LE(data.mTopK, static_cast<int32_t>(MaxSupportedTopExperts))
       << "Routing kernel expects topK experts <= " << MaxSupportedTopExperts << ", got "
       << data.mTopK;

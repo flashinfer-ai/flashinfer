@@ -1274,6 +1274,138 @@ def test_deepseek_ngroup1_block_per_token_routing(
     )
 
 
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_deepseek_ngroup1_sigmoid_bias_output_uses_unbiased_sigmoid(
+    enable_pdl,
+    cache_permute_indices,
+):
+    """DeepSeek no-group routing weights use sigmoid(raw), not biased top-k keys."""
+    if not torch.cuda.is_available():
+        pytest.skip("TRT-LLM Gen BF16 MoE test requires CUDA.")
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("TRT-LLM Gen BF16 MoE requires SM10.x.")
+
+    device = torch.device("cuda:0")
+    # Eight tokens exercises the warp-per-token route that fixed biased-score
+    # recovery; larger block-per-token shapes already carry sigmoid(raw).
+    num_tokens = 8
+    num_experts = 384
+    top_k = 6
+    hidden_size = 512
+    intermediate_size = 512
+    padding = 8
+    routed_scaling = 2.5
+    activation_type = ActivationType.Relu2
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.BlockMajorK,
+    }
+
+    # This is below fp32 ULP at bias=12, so sigmoid(raw)+bias rounds back to
+    # the bias. A key-minus-bias recovery path therefore loses the nonzero
+    # selected weights, while recomputing sigmoid(raw) remains stable.
+    tiny_sigmoid = torch.tensor(2e-7, device=device, dtype=torch.float32)
+    routing_logits = (
+        torch.logit(tiny_sigmoid).expand(num_tokens, num_experts).contiguous()
+    )
+    routing_bias = torch.full((num_experts,), 12.0, device=device, dtype=torch.float32)
+    hidden_states = torch.zeros(
+        (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
+    )
+    hidden_states[:, 0] = 1
+    gemm1_weights = torch.zeros(
+        (num_experts, intermediate_size, hidden_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.zeros(
+        (num_experts, hidden_size, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm1_weights[:, 0, 0] = 1
+    gemm2_weights[:, 0, 0] = 1
+
+    moe_impl = BF16Moe()
+    moe_impl._cache_permute_indices = cache_permute_indices
+    weights_data = moe_impl.quantize_weights(
+        gemm1_weights, gemm2_weights, hidden_states
+    )
+    inputs_data = moe_impl.quantize_inputs(
+        hidden_states, weights_data["hidden_states_scale_global"]
+    )
+    quant_data = {**weights_data, **inputs_data}
+    args = moe_args(
+        num_tokens,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        padding,
+        quant_data["hidden_states"],
+        quant_data["hidden_states_scale"],
+        quant_data["hidden_states_scale_global"],
+        routing_logits,
+        quant_data["gemm1_weights"],
+        quant_data["gemm1_scales"],
+        quant_data["gemm1_scales_global"],
+        quant_data["gemm2_weights"],
+        quant_data["gemm2_scales"],
+        quant_data["gemm2_scales_global"],
+        {},
+        False,
+        activation_type,
+    )
+    static_data = moe_impl.prepare_static_weights_for_kernel(
+        None,
+        args,
+        gemm1_weights,
+        gemm2_weights,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        weight_processing,
+    )
+
+    routing_replay_out = torch.full(
+        (num_tokens, top_k), -1, device=device, dtype=torch.int16
+    )
+    output = trtllm_bf16_moe(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        hidden_states=quant_data["hidden_states"],
+        gemm1_weights=static_data["gemm1_weights"],
+        gemm2_weights=static_data["gemm2_weights"],
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=1,
+        topk_group=1,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=routed_scaling,
+        routing_method_type=RoutingMethodType.DeepSeekV3.value,
+        use_shuffled_weight=static_data["use_shuffled_weight"],
+        weight_layout=static_data["weight_layout"],
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type.value,
+        norm_topk_prob=True,
+        routing_replay_out=routing_replay_out,
+    )
+
+    assert torch.all((routing_replay_out >= 0) & (routing_replay_out < num_experts))
+    assert torch.isfinite(output).all()
+
+    expected = torch.full((num_tokens,), routed_scaling, device=device)
+    torch.testing.assert_close(output[:, 0].to(torch.float32), expected)
+    torch.testing.assert_close(
+        output[:, 1:].to(torch.float32),
+        torch.zeros_like(output[:, 1:].to(torch.float32)),
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [8])
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("intermediate_size", [512])
