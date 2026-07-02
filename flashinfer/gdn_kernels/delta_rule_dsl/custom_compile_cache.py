@@ -142,6 +142,32 @@ def _patch_sm120a_tma_ptx(ptx_text: str) -> str:
     return patched
 
 
+def _downgrade_ptx_isa_version(ptx_text: str):
+    """Return ``ptx_text`` with the ``.version`` minor set to 0, or ``None``.
+
+    The DSL stamps its PTX with its own toolkit's ISA (e.g. ``.version 9.1``
+    from a CUDA-13.1 build), which a driver from an older minor (e.g. CUDA
+    13.0, PTX ISA 9.0) refuses to JIT with cudaErrorUnsupportedPtxVersion -
+    even when the code uses no newer-minor instructions, as is the case for
+    these kernels. Downgrading only the header lets such drivers JIT it; if
+    the code ever did use newer-minor instructions the retry would fail
+    loudly at parse, same visibility as the original error.
+
+    Returns ``None`` when the header is already ``<major>.0`` (nothing to
+    retry with) or no ``.version`` line is found.
+    """
+    import re
+
+    match = re.search(r"^\.version (\d+)\.(\d+)$", ptx_text, flags=re.M)
+    if match is None or match.group(2) == "0":
+        return None
+    return (
+        ptx_text[: match.start()]
+        + f".version {match.group(1)}.0"
+        + ptx_text[match.end() :]
+    )
+
+
 def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
     import ctypes
 
@@ -154,6 +180,23 @@ def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
     jit_options = [cuda_driver.CUjit_option.CU_JIT_TARGET]
     jit_option_values = [cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A]
 
+    # Both error spaces stringify differently but share the numeric code, and
+    # DSLCudaRuntimeError carries it as a structured attribute; the substring
+    # test is only the fallback for exception types without one.
+    unsupported_ptx_codes = {
+        int(cuda_driver.CUresult.CUDA_ERROR_UNSUPPORTED_PTX_VERSION),
+        int(cuda_runtime.cudaError_t.cudaErrorUnsupportedPtxVersion),
+    }
+
+    def _is_unsupported_ptx_version(e: Exception) -> bool:
+        code = getattr(e, "error_code", None)
+        if code is not None:
+            try:
+                return int(code) in unsupported_ptx_codes
+            except (TypeError, ValueError):
+                pass
+        return "UnsupportedPtxVersion" in str(e)
+
     def _load_cuda_library(self):
         if self.engine is None:
             raise DSLRuntimeError("CUDA JIT engine is not available")
@@ -165,40 +208,61 @@ def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
             cuda_load_to_device
         )
 
-        library_obj = checkCudaErrors(
-            cuda_driver.cuLibraryLoadData(
-                patched_ptx.encode("utf-8"),
-                jit_options,
-                jit_option_values,
-                len(jit_options),
-                None,
-                None,
-                0,
+        def _load(ptx_text: str):
+            library_obj = checkCudaErrors(
+                cuda_driver.cuLibraryLoadData(
+                    ptx_text.encode("utf-8"),
+                    jit_options,
+                    jit_option_values,
+                    len(jit_options),
+                    None,
+                    None,
+                    0,
+                )
             )
-        )
-        library = ctypes.c_void_p(int(library_obj))
-        pointer_to_library = ctypes.pointer(library)
-        pointer_to_pointer_to_library = ctypes.pointer(pointer_to_library)
-        err = ctypes.c_int32(0)
-        pointer_to_err = ctypes.pointer(err)
-        device_id = ctypes.c_int32(0)
-        pointer_to_device_id = ctypes.pointer(device_id)
+            library = ctypes.c_void_p(int(library_obj))
+            pointer_to_library = ctypes.pointer(library)
+            pointer_to_pointer_to_library = ctypes.pointer(pointer_to_library)
+            err = ctypes.c_int32(0)
+            pointer_to_err = ctypes.pointer(err)
+            device_id = ctypes.c_int32(0)
+            pointer_to_device_id = ctypes.pointer(device_id)
 
-        cuda_load_args = [
-            pointer_to_pointer_to_library,
-            pointer_to_device_id,
-            pointer_to_err,
-        ]
-        packed_args = (ctypes.c_void_p * len(cuda_load_args))()
-        for i, arg in enumerate(cuda_load_args):
-            packed_args[i] = ctypes.cast(arg, ctypes.c_void_p)
+            cuda_load_args = [
+                pointer_to_pointer_to_library,
+                pointer_to_device_id,
+                pointer_to_err,
+            ]
+            packed_args = (ctypes.c_void_p * len(cuda_load_args))()
+            for i, arg in enumerate(cuda_load_args):
+                packed_args[i] = ctypes.cast(arg, ctypes.c_void_p)
 
-        for dev in range(self.num_devices):
-            device_id.value = dev
-            cuda_load_to_device(packed_args)
-            checkCudaErrors((cuda_runtime.cudaError_t(err.value),))
+            for dev in range(self.num_devices):
+                device_id.value = dev
+                cuda_load_to_device(packed_args)
+                checkCudaErrors((cuda_runtime.cudaError_t(err.value),))
 
-        return [library_obj]
+            return [library_obj]
+
+        try:
+            return _load(patched_ptx)
+        except Exception as e:
+            # The driver JIT rejects PTX whose ISA is newer than the driver's
+            # toolkit (cudaErrorUnsupportedPtxVersion / error 222): e.g. the
+            # .version 9.1 PTX a CUDA-13.1 DSL emits on a CUDA-13.0 driver.
+            downgraded = _downgrade_ptx_isa_version(patched_ptx)
+            if downgraded is None or not _is_unsupported_ptx_version(e):
+                raise
+            warnings.warn(
+                "Driver rejected the sm_120a-patched PTX ISA version "
+                "(cudaErrorUnsupportedPtxVersion); retrying with the .version "
+                "header downgraded to the major's baseline. Use a driver at "
+                "least as new as the nvidia-cutlass-dsl toolkit to avoid "
+                "this.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return _load(downgraded)
 
     compiled_fn._flat_patched_ptx = patched_ptx
     compiled_fn._flat_patched_ptx_jit_options = tuple(jit_options)
