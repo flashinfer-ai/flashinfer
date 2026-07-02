@@ -34,9 +34,13 @@ uv run pytest tests/mamba/test_checkpointing_ssu.py -v -s -x -k "two_kernel or p
 Don't run the full mamba suite — it's long.
 
 ## Ncu
-This runs the no-write benchmark with ncu
+Source-correlated profile of the precompute + main kernels.  **PNAT is now the ABSOLUTE
+previously-accepted-token count** (`--pnat`, comma list; clamped to `[0, WINDOW]`): PNAT=0 → no-write;
+`PNAT + MTP > WINDOW` → the write/checkpoint path.  `--set full --import-source yes` gives the
+stall/PC-sampling metrics and needs `FLASHINFER_JIT_LINEINFO=1` (NOT `JIT_DEBUG` — see CLAUDE.local.md).
+`--warmup 0 --iters 1 --no-l2-flush --no-cuda-graph` so ncu profiles a single clean launch each.
 ```bash
-export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.0a BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
+export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=30 BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0
 ${CUDA_HOME}/ncu --target-processes all --set full --import-source yes \
     --kernel-name "regex:checkpointing_ssu_(precompute|main)_kernel" \
     --launch-skip 0 --launch-count 100 -f \
@@ -44,23 +48,39 @@ ${CUDA_HOME}/ncu --target-processes all --set full --import-source yes \
     uv run python benchmarks/bench_checkpointing_ssu.py \
     --warmup 0 --iters 1 --no-l2-flush --no-cuda-graph \
     --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
-    --prev-tokens-fracs ${PNAT} \
+    --pnat ${PNAT} \
     --output -
 ```
-
-# Non-mixed single-mode bench
-
+Read the report with the ncu_reader (CLAUDE.local.md), e.g. by kernel-name substring:
 ```bash
-export FLASHINFER_JIT_LINEINFO=1 SSU_TAG=22.1 BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0.1
-    uv run python benchmarks/bench_checkpointing_ssu.py \
+uv run /home/scratch.ishovkun_gpu/code/ncu_reader/ncu_reader.py -i <report>.ncu-rep -f main
+```
+
+# Single-config bench (CUPTI timing)
+
+One (batch, mtp, pnat, dtype) point via CUPTI (auto-falls back to CUDA events).  `--pnat` = absolute
+PNAT list (comma-sep); `--mtp-lengths` = NPREDICTED.  The output table's PNAT column is `pnat`.  Runs
+`cuda-incr` (monolith) + `cuda-incr-2k` (operand-swap split) + the Triton refs.
+```bash
+export FLASHINFER_JIT_LINEINFO=1 BATCH=1024 MTP=6 WINDOW=16 DTYPE=bf16 PNAT=0
+uv run python benchmarks/bench_checkpointing_ssu.py --cupti \
     --batch-sizes ${BATCH} --mtp-lengths ${MTP} --max-window ${WINDOW} --state-dtypes ${DTYPE} \
-    --prev-tokens-fracs ${PNAT}
+    --pnat ${PNAT}
 ```
-This is only to run by the user. It produces a csv for various write/nowrite configs that
-show nicely in his external plot viewer.
+
+# PNAT sweep + plot (collect script)
+
+`collect_checkpointing_ssu_runs.py` sweeps **PNAT on the x-axis** at fixed **NPREDICTED** — one line per
+(kernel, npredicted) — and writes a CSV + PNG to `mamba_decode/` and `mamba_decode/img/` (the user runs
+an external viewer there, so pick a fresh `--tag`, don't clobber).  `--pnat`/`--npredicted` are comma
+lists; `--tag N` suffixes the output `_vN`.  Plots cuda-incr-2k / cuda-incr / triton-incr (kernel→color,
+npredicted→linestyle); other CSV impls (triton-replay-pm etc.) are collected but not drawn.
 ```bash
-uv run python benchmarks/collect_checkpointing_ssu_runs.py --batch-size 512 --state-dtypes bf16 --cupti --output-prefix incremental_ssu_b64_bf16_v23
+uv run python benchmarks/collect_checkpointing_ssu_runs.py \
+    --batch-size 512 --state-dtypes bf16 --cupti \
+    --pnat 0,1,4,8,12,14 --npredicted 4,8 --max-window 16 --tag 25
 ```
+Re-plot from an existing CSV without re-running: `--plot-only <csv>`.
 
 # Mixed benchmark
 ```bash
@@ -630,7 +650,224 @@ pipelined_kloop_gemm; monolith passes nullptr → unchanged).  Bit-exact (4 two-
 recompute (byteoffA was a small slice — the large `pointer_base` 4.49M lives in the B operands /
 partition_C, Stage 1).
 
+### ROOT CAUSE — ldmatrix swizzle-PERIOD mismatch, not the swizzle (instruction-level SASS-diff, B200, 2026-06-30)
+
+Read the paired SASS (`{ours,triton_pm}_main_nw0_b1024.sass.txt`) instruction-by-instruction.
+The 4× integer gap is **operand smem stride vs the swizzle period**, decided per-fragment INSIDE
+each `cute::gemm` — which is exactly why every hoist (byteoffA, head_loop, reg-cap) was noise.
+**It is NOT the swizzle: both kernels use `Swizzle<3,3,3>`.**
+
+**Quantified — integer/address insts interleaved *between* the LDSMs of a matmul burst:**
+
+| | triton-pm | ours |
+|---|---:|---:|
+| LDSM total | 29 | 86 |
+| int/addr insts between LDSM in a burst | **1** | **58** |
+| → integer per ldmatrix | **0.03** | **0.67** |
+| LDSM addressed via a uniform (UR) warp offset | **28/29** | **1/86** |
+| distinct base regs | 10 (R120→8 frags, R119→8 frags) | 32 (~4 frags/base) |
+
+Triton steady-state load (`:0x1bd0`): all 8 frags = `[R120 + UR9 + imm]`, imm ∈ {0,0x800,…,0x3800},
+**zero** integer between the loads; `R120` (per-lane swizzle) computed ONCE, `UR9` (warp K-base) is uniform.
+Ours hot burst (`:0xaf30` → `copy_sm75.hpp:172` → `main.cuh:1165`): a `SEL R81,0x20,-0x20` + `IMAD.IADD`
+chain rebuilds a fresh base every 4 frags; addrs = base±{0,0x20,0x40,0x60} × {0,+0x400}.
+
+**Bit-level why.** `Swizzle<3,3,3>` on bf16 has period `2^(B+M+S)=2^9` elem = **0x400 B**; it XORs
+byte-bits {0x10,0x20,0x40} from source byte-bits {0x80,0x100,0x200}.
+- **Triton** frag step 0x800 (and 0x2000) is *above* both XOR regions ⇒ `swz(x+0x800)=swz(x)+0x800`
+  exactly ⇒ pure immediate, swizzle folded into the base once, still conflict-free. 8×0x800 = 0x4000 =
+  the 16 KB state tile.
+- **Ours** frag step 0x20 (one dstate K-tile = 16 bf16, in a `[T,dstate]` row-major operand) is *inside*
+  the XOR region ⇒ adding it carries into bit 0x80, flipping the mask ⇒ `swz(x+0x20)≠swz(x)+0x20` ⇒ the
+  conditional ±0x20/±0x40. Our `+0x400` step *is* an immediate (0x400 is above the swizzle); the mixed
+  `±0x20 + imm-0x400` pattern is the period boundary showing through.
+
+Plus triton offloads the warp-varying address part to the **uniform datapath** (28/29 vs our 1/86),
+keeping the main integer pipe free.
+
+**Why hoisting was structurally doomed.** The recompute is per-fragment, intrinsic to ONE matmul's
+K-walk — not a per-work-unit invariant — so head_loop/byteoffA hoists cannot touch it (confirmed: count
+didn't move). Same swizzle as triton ⇒ nothing to fix in the swizzle. Second, multiplicative factor:
+**86 vs 29 LDSM** (3 dots vs triton's 2, smaller tiles, grid 2368 vs 888). Gap ≈ (~20× addr-int per
+ldmatrix) × (~3× ldmatrix) = the 4×.
+
+**Fix direction (a real operand-layout redesign, not a hoist).** Lay the matmul operands in smem so
+EVERY MMA-fragment stride is ≥ one swizzle period (0x400 B): make the contraction dim (dstate) the
+**major** smem dim with a fat stride, not the tightly-packed inner dim. That is what triton's
+`state_tma.load` + `tl.trans(state)` give for free — dstate K-tiles land 0x800 apart, the XOR drops out
+of the walk, ptxas folds everything into immediates on a single base. Co-design the cp.async/TMA store
+layout with the ldmatrix read so the K-walk steps over whole periods. **Prototype + inspect ptxas on a
+one-off (confirm the immediate-walk codegen) BEFORE touching the live path.**
+
+### Prototype CONFIRMS the fix at codegen level (standalone, B200, 2026-06-30)
+
+Standalone CuTe probe (`benchmarking/mamba_decode/cstate_swizzle_probe.cu`, copies only the
+swizzle/layout helpers — does NOT include or touch the SHARED `_common.cuh`). Reproduces the exact
+C@state matmul (A=C[16,128], B=state[N,128], `SM80_16x8x16_TN`, `Layout<Shape<_1,_4>>`, 8 K-tiles)
+two ways; `cuobjdump -sass` on the sm_100a cubin:
+
+| | baseline (K-inner, current) | **K-major + LDSM.T** |
+|---|---:|---:|
+| LDSM / HMMA | 16 / 8 | **16 / 8** (same) |
+| distinct base regs | **8** | **2** (one per operand) |
+| integer in burst / ldsm | **0.50** | **0.12** |
+| LDSM uniform-addressed | 2/16 | **16/16** |
+
+- **baseline** emits the af30 pathology verbatim — `SEL R28,R28,0xffffffe0` (±0x20), `SEL R6,R6,0xffffffc0`
+  (±0x40), `IMAD.IADD`/`IADD3` chains building 8 bases interleaved with the LDSMs.
+- **K-major** (store operands `rc<bf16,128(K),64(MN)>`, read via `make_swizzled_layout_rc_transpose`
+  + transpose ldmatrix) → both operands `[R+UR+imm·0x800]`: ONE base + UNIFORM warp offset + immediate
+  K-walk at 0x800 = 2× the 0x400 swizzle period. Triton's signature, **at identical LDSM/HMMA count**.
+- Atom width matters: B with `U16x2_LDSM_T` (half payload) doubled the count to 24 LDSM; the
+  width-matched `U16x4_LDSM_T` (B) / `U16x8_LDSM_T` (A) restore 16. (codegen-only probe; numerics
+  not checked — irrelevant to the address-emission question.)
+
+**Implementation cost discovered — the smem asymmetry:** swz_rc needs COLS ≥ ATOM_COLS(64), so K-major
+stores the operand as `[K=128, MN→pad64]`.
+- **state (B): FREE.** `[128,64]` = 8192 elem = 16 KB = exactly today's `[64,128]` state buffer.
+- **C (A): 4× bloat.** `[16,128]`=4 KB → `[128,64]`=16 KB (M=16 pads to 64). At 8 blocks/20 KB this
+  would wreck occupancy. So C can't naively go K-major; needs packing (e.g. share the 64-col atom across
+  4 d-tiles / heads) or stays K-inner.
+- C is the SHARED A-operand (loaded once, reused across N-tiles); state is reloaded per N-tile → state's
+  LDSMs dominate the integer. **First move: take state K-major only (free smem, kills the dominant
+  half), measure end-to-end; tackle C packing separately.** Also still TBD: the gmem→smem **store** must
+  write K-major (transposed cp.async / TMA descriptor) — the probe used a flat fill, so store-side cost
+  is unmodeled.
+
+### 07-01: prototype reproduces Triton's compile-time LDSM addressing (K-major state + LDSM_T)
+
+Prototypes in `benchmarking/mamba_decode/frag_proto/` (`gemm_cmp.cu` = full C@stateᵀ load+gemm+store,
+`ldsm_addr.cu` = swizzle address probe, `frag_load.cu` = load-only). sm_100a, `cuobjdump` / `-Xptxas -v`.
+
+**1. Swizzle choice is NOT an INT lever** (`ldsm_addr.cu`, state-A `[16,128]`, `LDSM_N x4`, 8 K-tiles):
+`<3,3,3>` = 75 INT / `<3,4,3>` = 80 INT, **both 8 LDSM**. Larger period ⇒ finer per-row phase (m mod 8
+vs m mod 4) ⇒ *more* distinct address offsets (`<3,3,3>`: 4 bases + reused `+0x800` imm + 2-bit SEL;
+`<3,4,3>`: 7 regs via IMAD.IADD chains + 3-bit `R2P` phase). Confirms 06-30 "NOT the swizzle"; `<3,4,3>`
+is a small INT *loss*. (Bank-conflict-freeness for the x4 read is a separate, runtime-only question.)
+
+**2. What Triton actually does (verified from its TTGIR + SASS — NO transpose, NO K-major storage, NO
+different formulation).** State smem = `#ttg.nvmma_shared<swizzlingByteWidth=128, transposed=false>`,
+`[dim, dstate]` (dstate contiguous), TMA-loaded (`async_tma_copy_global_to_local`); the output is
+`init_out = tt.dot(C_tile, tl.trans(state)) = C@stateᵀ = [T, dim]` — identical formulation + layout to
+ours. The 4× is pure CODEGEN: **(a)** TMA does the gmem→smem addressing in hardware (≈0 int), and **(b)**
+Triton lowers `local_load(nvmma_shared) → dot_op(mma)` to LDSM `[base + UR + immediate]` — base computed
+ONCE, warp-varying part on the UNIFORM datapath, K-walk as **compile-time immediates** (step 0x800),
+ZERO int between the 8 loads. Ours (`cute::copy` from `make_swizzled_layout_rc`) re-derives the swizzle
+per K-tile on the main int pipe (`SEL ±0x20` + `IMAD.IADD` chains). So it is NOT the swizzle and NOT a
+layout transpose — it's the ldmatrix ADDRESS EMISSION.
+
+**3. We reproduced Triton's emission in CuTe** (`gemm_cmp.cu` `k_optimal`): store the state operand with
+the contraction dim (dstate) **MAJOR** — physical `[dstate, dim]` — and read it via a transpose view
+(`swz_rc_T`) + transpose ldmatrix (`SM75_U16x8_LDSM_T`). The K(dstate)-tile then walks the major
+(physical-row) dim → step 0x800 ≥ Swizzle period (0x400) → the swizzle folds into the base and the
+**K-walk becomes compile-time immediates**. SASS, state operand, side-by-side:
+
+    k_optimal (ours):  LDSM.16.MT88.4  [R3+UR4]   [R3+UR4+0x800]   ...  [R3+UR4+0x3800]
+    Triton:            LDSM.16.M88.4   [R120+UR9] [R120+UR9+0x800] ...  [R120+UR9+0x3800]
+
+Base computed ONCE, warp-varying offset on the UNIFORM register (UR4), K-walk = compile-time immediates
+(0x800·k), zero int between the 8 loads. Full C@stateᵀ (load+gemm+store, 4 warps):
+
+| variant | total | INT | HMMA | LDSM | regs |
+|---|---:|---:|---:|---:|---:|
+| current `C@stateᵀ` (state=B x2, natural `<3,3,3>`) | 247 | 99 | 16 | 24 | 32 |
+| transp `state@Cᵀ` (state=A x4, natural `<3,3,3>`) | 240 | 109 | 8 | 16 | 30 |
+| transp `state@Cᵀ` (state=A x4, natural `<3,4,3>`) | 249 | 119 | 8 | 16 | 30 |
+| **OPTIMAL `state@Cᵀ` (state=A, K-major + LDSM_T)** | 240 | **106** | 8 | 16 | **28** |
+
+**Isolation masks the payoff (critical).** Even with the perfect `[base+UR+imm]` emission, `k_optimal`'s
+total INT (106) is still ABOVE `current` (99): in a standalone kernel the compiler has the registers to
+strength-reduce `current`'s natural addressing anyway. The 4× only shows up IN-CONTEXT (real kernel:
+118 regs / 4 blocks + head-loop + 3 competing matmuls ⇒ no room to strength-reduce ⇒ the natural layout
+emits the 58-int/burst recompute = the 200 `pointer_base`; K-major forces the immediate emission
+*regardless* of pressure). So the prototype's job is done — the recipe is proven at the codegen level;
+**only an in-context kernel run can show the speedup.** Prototype counts codegen faithfully (real gemm,
+stored, no spills), not numerically verified.
+
+**No runtime transpose.** The state cache is internal — store it **dstate-major**
+`[cache_slots, nheads, dstate, dim]` and have every accessor (main read, replay, checkpoint write) use
+that layout consistently. The cp.async load is then a plain contiguous copy into `[dstate, dim]` smem =
+exactly the K-major smem the recipe needs, with **NO transpose on the load**; the `LDSM_T` is in-hardware
+(free). The mtp≤8 HMMA-halve caveat still applies to the transposed output (NPRED=6→N-pad 8; gate on
+`NPREDICTED ≤ 8`).
+
+### LANDED: operand-swap output `[DIM,NPRED]` — correct + faster (B200, 2026-07-01)
+
+Shipped the operand swap (candidate B) end-to-end. **Precompute** (`scale_store_cb`) stores CB/CB_old
+**fragB-native** via the per-lane register select `{raw[0],raw[1],raw[4],raw[5]}` (proven bit-exact by
+`frag_proto/cb_fragb_select_probe.cu`) — halves the CB store/traffic at mtp≤8. **Main** (`output_head_2k`,
+`add_init_out_ring`, `add_cbx_swapped`, `add_D_skip_swapped`, `compute_z_gating_swapped`):
+- OUT.1 `state@Cᵀ → [d,t]`: state=A (`SM75_U32x4_LDSM_N`), C=B (`SM75_U32x2_LDSM_N`), no transpose/layout
+  change (state smem is already dstate-major), **reusing the shared `pipelined_kloop_gemm`** with A/B
+  swapped (monolith's call untouched).
+- OUT.2/3: x/old_x=A (`SM75_U16x8/U16x4_LDSM_T` transpose from the `[token,d]` smem), CB=B (fragB from smem).
+- Epilogue on `[DIM,NPRED]`: decay broadcast over M-rows (`stride(0,1)`, `cumAdt[t]`), D·x/z via the `[d,token]`
+  transpose views (scalar), **scatter store** (strided `[d,t]`→gmem `[token,d]`, no smem bounce).
+- Both write + no-write share the machinery (write adds `store_state`, skips OUT.3), per user "swap both".
+
+**Generic / d_split:** warps split M via `NUM_M_WARPS = D_PER_CTA/16`; at d_split=2 (D_PER_CTA=32) only 2
+warps do the output MMA (guarded `if (m_active)`), the rest still do `store_state`/`store_old_x`. **mtp>8**
+works: CB is built as a **per-output-N-tile `partition_fragment_B` ARRAY** (one m16n8 N-atom each — a single
+multi-N-tile `partition_fragment_B` trips `make_fragment_like` on the identity tensor), filled by one
+vectorized LDS then distributed (`raw.val[on·REGS_PER + r]`, typed from the fragment element =
+`cutlass::bfloat16_t`, not `MMA_prop::operand_t`).
+
+**Fixed IMA (mtp>8 × d_split=2 × grid-stride, 2026-07-02).** `collect_checkpointing_ssu_runs.py` b=512
+crashed at mtp≥10: the `m_active` (`warp < NUM_M_WARPS=D_PER_CTA/16`) guard was on the `NUM_N_TILES==1`
+branches only — the mtp>8 `==2` branches ran `add_init_out_ring`→`pipelined_kloop_gemm`→`ldmatrix_x4_addr`
+on warps ≥ NUM_M_WARPS with an out-of-range `Shape<NUM_M_WARPS,1>` partition → OOB `__shared__` LDSM
+(silent garbage at small batch; a hard fault once grid-stride kicked in, batch ≳ 74).  compute-sanitizer
+pinned it to warp 2 at `common.cuh:1358` ← `output_head_2k` `==2` branch.  Fix: guard both `==2` branches
+(OUT.1 + epilogues) with `m_active`, `store_state`/`store_old_x` stay cooperative — mirrors the `==1` fix.
+
+**Validated (bit-for-bit vs monolithic, `test_checkpointing_ssu.py`):** `test_two_kernel_matches_monolithic`
+(mhc {1,2,4}, k∈{0,2,T}, ±PDL), `test_two_kernel_pipeline_stages2`, `test_two_kernel_d_split2`; standalone
+mtp=10/mw=16 (d_split=1) and mtp=16/mw=16 **d_split=2, mhc=4, grid-strided b=96** checks (k∈{0,8,16}) match
+monolithic; `collect_checkpointing_ssu_runs.py b=512 bf16 --cupti` completes clean for mtp∈{4..16};
+compute-sanitizer memcheck-clean (0 device faults). **Perf:** win confirmed by the user (exact CUPTI vs the
+104.4/109.3 µs `c4ca6b72` baseline still TBD — rerun `bench_checkpointing_ssu.py` no-write b=1024 mtp=6 with
+`FLASHINFER_JIT_LINEINFO=1`).
+
+**Follow-ups:** ncu INT/HMMA/LDSM vs baseline; the D·x-from-x-A-fragment reuse (TODO below); mtp>8 loads x
+twice (once per output N-tile — redundant but correctness-only path).
+
+### Perf: closed most of the triton-replay-pm gap (B200, b=512, bf16, 2026-07-02)
+
+Benchmark reworked — `collect_checkpointing_ssu_runs.py` now sweeps **PNAT** (previously-accepted tokens,
+`--pnat 0,1,4,8,12,14`) at fixed **NPREDICTED** (`--npredicted 4,8`), one line per (kernel, npredicted);
+`--tag N` suffixes the output `_vN`.  So these are **NOT** directly comparable to the old mtp-swept
+b=1024 104.4/109.3 µs baseline (different batch + x-axis).
+
+No-write (PNAT=0), b=512, bf16, CUPTI, iters=20 — median µs:
+
+| NPREDICTED | incremental (triton) | cuda-incr (mono) | **cuda-incr-2k (swap)** | triton-replay-pm (north star) |
+|---:|---:|---:|---:|---:|
+| 4  | 89.7 | 62.7 | **50.6** | 41.1 |
+| 6  | 91.7 | 62.6 | **51.5** | 41.7 |
+| 8  | 98.5 | 64.8 | **51.7** | 42.1 |
+| 16 | 99.5 | 75.6 | **64.5** | 47.2 |
+
+The operand swap makes **cuda-incr-2k beat the monolithic by ~18–20%** (mtp=8: 51.7 vs 64.8) and beat every
+Triton variant except triton-replay-pm.  Gap to the north-star **triton-replay-pm narrowed from ~1.5×
+(mono) to ~1.24× (swap)** (mtp=8: 64.8→51.7 vs 42.1).  The residual ~1.24× is consistent with the 06-27→07-01
+root cause: triton-pm's remaining edge is the **INDEX MATH** (compile-time-immediate LDSM addressing), which
+the operand swap did *not* touch — that's the still-open **K-major state** lever (TODO below).
+
+Write path (PNAT+NPREDICTED > max_window=16): checkpoint cliff to ~90 µs, roughly at parity with the
+monolith — the shared replay + state-write dominates there and the swap's output savings are smallest (the
+split-tax; confirmed NOT the d_split=2 idle-warp guard — d_split=1 was no faster).
+
 ## TODO
+
+- [ ] **Implement K-major state for C@stateᵀ (recipe proven by `gemm_cmp.cu` `k_optimal`).** Store the
+  state cache **dstate-major** `[cache_slots, nheads, dstate, dim]`, consistently across store_state /
+  replay / main — so the cp.async load is a plain contiguous copy into `[dstate, dim]` smem (**no
+  transpose**). Read the state operand via `swz_rc_T` (transpose view) + `SM75_U16x8_LDSM_T` → the
+  compile-time-immediate LDSM `[base + UR + imm·0x800]` (Triton's emission; 28 regs, no spills in the
+  probe). Gate behind a flag (mirror `SSU_FUSE_WINDOW`/`kHandrollA`, keep old path). Measure **in-context**
+  INT + CUPTI vs baseline 104.4/109.3 µs (c4ca6b72) — the isolated prototype won't show the win. Add a
+  `NPREDICTED ≤ 8` guard for the mtp-dependent HMMA-halve. See the 07-01 + 06-30 sections; prototypes in
+  `frag_proto/` (`gemm_cmp.cu`) and `cstate_swizzle_probe.cu`.
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
   `state_batch_indices=None` (no pads), and no test injects `pad_slot_id`, so the
@@ -642,3 +879,8 @@ partition_C, Stage 1).
   Add a variant to `test_persistent_main_matches_monolithic` with some
   `state_batch_indices` entries = `pad_slot_id` (reference monolith skips them too) to
   cover it.  Believed-correct (skip is CTA-uniform → barriers stay matched), just unproven.
+
+- [ ] **D·x from the x A-fragment (operand-swap main).** Since x's A-fragment `x[d,j]` is
+  already in registers after OUT.2, `D·x[t,d] = D·x[d, j=t]` could be pulled from that
+  fragment instead of a fresh smem read — eliminating the D·x smem load entirely. Register
+  reindex needed; defer unless ncu flags it.
