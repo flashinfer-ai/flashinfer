@@ -73,10 +73,10 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         PagedParams params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
-        paged_kv_t<DTypeKV, IdType> paged_kv(
+        paged_kv_t<DTypeK, IdType, DTypeV> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_VO, batch_size, kv_layout,
-            static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
-            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), k_cache_strides.data(),
+            static_cast<DTypeK*>(paged_k_cache.data_ptr()),
+            static_cast<DTypeV*>(paged_v_cache.data_ptr()), k_cache_strides.data(),
             v_cache_strides.data(), static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
