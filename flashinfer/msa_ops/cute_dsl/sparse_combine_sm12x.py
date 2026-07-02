@@ -175,8 +175,9 @@ class SparseCombineSm12x:
         # Branch-free reduction: partials are allocated for all topk slots, so the
         # loads are unconditional (they pipeline); invalid slots carry weight 0.
         # Their uninitialized values may be NaN/Inf, which weight 0 cannot mask
-        # (0 * NaN = NaN), so clamp to finite range first — fmin/fmax drop a NaN
-        # operand, keeping the reduction branch-free.
+        # (0 * NaN = NaN), so clamp to finite range first — fmax drops a NaN
+        # operand, keeping the reduction branch-free. fmin(x,c) is spelled
+        # -fmax(-x,-c) since cutlass-dsl 4.5.2 has no cute.arch.fmin.
         for i in cutlass.range_constexpr(self._channels_per_thread):
             c = tidx + i * self._num_threads
             acc = cutlass.Float32(0.0)
@@ -186,7 +187,7 @@ class SparseCombineSm12x:
                     ef = e.to(cutlass.Float16).to(cutlass.Float32)
                 else:
                     ef = e.to(cutlass.Float32)
-                ef = cute.arch.fmax(cute.arch.fmin(ef, _FLT_MAX), -_FLT_MAX)
+                ef = cute.arch.fmax(-cute.arch.fmax(-ef, -_FLT_MAX), -_FLT_MAX)
                 acc += w_frag[s] * ef
             mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
 
