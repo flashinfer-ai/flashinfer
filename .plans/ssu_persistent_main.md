@@ -946,6 +946,23 @@ Plumbing (no macros): `NUM_STAGES` is a kernel **template parameter** (default 1
 **`FLASHINFER_SSU_MAIN_PIPELINE_STAGES`** (1 or 2) dispatches the other instantiation —
 `test_two_kernel_pipeline_stages2` now genuinely exercises the depth-2 ring via that env.
 
+**ncu v32 (b=1024 bf16 mtp=8 pnat=4, stages=1/cap 80):** main **77.5 → 63.4 µs** (−18%).
+Occupancy 24.2 → 33.8% — **6 blocks/SM by BOTH walls (regs 77/cap 80, smem 29.2 KB) — the walls
+are re-aligned**.  No spill traffic.  DRAM 55.9 → 68.5% (292 MB reads ≈ 4.6 TB/s ≈ 58% of peak;
+perfectly-BW-bound floor for this traffic ≈ 37 µs ⇒ ~1.7× theoretical headroom left in the main).
+New #1 stall: long_scoreboard 34.9%, 62% of it at the steady-loop `wait_prior(0)`/loop-back —
+the intra-CTA-exposed per-unit state load, i.e. exactly the latency we chose to pay for blocks.
+Residue: beta FMUL still #1 short_scoreboard site (17.6%); prologue BARs; fill_meta STS.
+
+Parked lever — **split async pipelines** (state ring): two independent cp.async pipelines,
+(1) a pure STATE pipeline, depth-STAGES, only the 16 KB state prefetch; (2) a depth-1 pipeline
+for all other per-unit copies.  Hides the state latency again without doubling the whole bundle's
+smem (state-only 2-deep ≈ +16 KB → ~45 KB → 5 blocks @cap 96; untested middle point between the
+measured 79.6 @6 blk exposed and 81.6 @5 blk unprefetched), and simplifies the head-loop group
+accounting (wait on state and non-state independently).  Synergy: with future 1-byte states the
+extra state slot halves to +8 KB — state-depth-2 becomes nearly free.  ON HOLD pending the dtype
+roadmap discussion (bf16 / f16+SR now; e4m3 / int8 + per-channel scaling + SR later).
+
 ## TODO
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
