@@ -185,6 +185,26 @@ def _get_batch_prefill_module_uri(
     )
 
 
+def _kv_uri_fragment(
+    dtype_kv: torch.dtype,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
+) -> str:
+    """Return the KV portion of a JIT URI.
+
+    Preserve the backward-compatible ``dtype_kv_X`` form whenever K and V
+    share a dtype. Emit the split form only for a genuinely asymmetric cache.
+    """
+    effective_k = dtype_k if dtype_k is not None else dtype_kv
+    effective_v = dtype_v if dtype_v is not None else dtype_kv
+    if effective_k == effective_v:
+        return f"dtype_kv_{filename_safe_dtype_map_kv(effective_k)}"
+    return (
+        f"dtype_k_{filename_safe_dtype_map_kv(effective_k)}_"
+        f"dtype_v_{filename_safe_dtype_map_kv(effective_v)}"
+    )
+
+
 def get_single_decode_uri(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -217,10 +237,13 @@ def get_batch_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"{_kv_uri_fragment(dtype_kv, dtype_k, dtype_v)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -416,10 +439,13 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"{_kv_uri_fragment(dtype_kv, dtype_k, dtype_v)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -956,6 +982,9 @@ def gen_batch_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
     uri = get_batch_decode_uri(
         dtype_q,
@@ -967,6 +996,8 @@ def gen_batch_decode_module(
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
     return gen_customize_batch_decode_module(
         uri,
@@ -990,6 +1021,8 @@ def gen_batch_decode_module(
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
 
@@ -1008,6 +1041,8 @@ def _gen_batch_prefill_module(
     *,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode,
     module_surface: BatchPrefillModuleSurface,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
     base_uri = get_batch_prefill_uri(
         backend,
@@ -1021,6 +1056,8 @@ def _gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
     uri = _get_batch_prefill_module_uri(
         base_uri, backend, paged_kv_stride_mode, module_surface
@@ -1127,6 +1164,8 @@ def _gen_batch_prefill_module(
         fp8_enabled=fp8_enabled,
         paged_kv_stride_mode=paged_kv_stride_mode,
         module_surface=module_surface,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
 
@@ -1142,6 +1181,9 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
     """Generate the public full batch-prefill module with runtime stride dispatch."""
     return _gen_batch_prefill_module(
@@ -1158,6 +1200,8 @@ def gen_batch_prefill_module(
         use_fp16_qk_reduction,
         paged_kv_stride_mode="runtime",
         module_surface="full",
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
 
@@ -1932,7 +1976,13 @@ def gen_customize_batch_decode_module(
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
+    effective_k = dtype_k if dtype_k is not None else dtype_kv
+    effective_v = dtype_v if dtype_v is not None else dtype_kv
+    effective_kv = effective_k if effective_k == effective_v else dtype_kv
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
         generate_additional_params(
@@ -1950,7 +2000,9 @@ def gen_customize_batch_decode_module(
         "variant_decl": variant_decl,
         "variant_name": variant_name,
         "dtype_q": dtype_map[dtype_q],
-        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_kv": dtype_map_kv[effective_kv],
+        "dtype_k": dtype_map_kv[effective_k],
+        "dtype_v": dtype_map_kv[effective_v],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
         "head_dim_qk": head_dim_qk,
@@ -1995,7 +2047,9 @@ def gen_customize_batch_decode_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(
+            head_dim_qk, head_dim_vo, effective_kv
+        ),
     )
 
 
@@ -2021,9 +2075,15 @@ def gen_customize_batch_prefill_module(
     fp8_enabled: bool = False,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
     module_surface: BatchPrefillModuleSurface = "full",
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
     _validate_batch_prefill_module_mode(backend, paged_kv_stride_mode, module_surface)
-    require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    effective_k = dtype_k if dtype_k is not None else dtype_kv
+    effective_v = dtype_v if dtype_v is not None else dtype_kv
+    effective_kv = effective_k if effective_k == effective_v else dtype_kv
+    require_fp4_kv_cache = dtype_map_kv[effective_kv] == "__nv_fp4x2_e2m1"
     if require_fp4_kv_cache:
         missing_sf_tensors = [
             name
@@ -2041,7 +2101,9 @@ def gen_customize_batch_prefill_module(
         "variant_decl": variant_decl,
         "variant_name": variant_name,
         "dtype_q": dtype_map[dtype_q],
-        "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_kv": dtype_map_kv[effective_kv],
+        "dtype_k": dtype_map_kv[effective_k],
+        "dtype_v": dtype_map_kv[effective_v],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
         "require_fp4_kv_cache": require_fp4_kv_cache,
@@ -2149,7 +2211,7 @@ def gen_customize_batch_prefill_module(
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
         extra_cuda_cflags = _fa2_prefill_head_dim_nvcc_flags(
-            head_dim_qk, head_dim_vo, dtype_kv
+            head_dim_qk, head_dim_vo, effective_kv
         )
         if kwargs["require_fp4_kv_cache"]:
             # NVFP4 KV kernels need FLASHINFER_ENABLE_FP4_E2M1 (common flags) even
