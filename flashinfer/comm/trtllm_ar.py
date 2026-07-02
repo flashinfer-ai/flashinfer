@@ -91,6 +91,10 @@ class AllReduceFusionPattern:
     kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8
     # Same as kARResidualRMSNormPerTokenGroupFP8PackedQuant, with norm output
     kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9
+    # All-reduce followed by residual add, RMS norm and dynamic per-token FP8 quantization
+    kARResidualRMSNormDynamicFP8Quant = 10
+    # Dynamic per-token FP8 quantization variant that also materializes norm output
+    kARResidualRMSNormOutDynamicFP8Quant = 11
 
 
 class QuantizationSFLayout:

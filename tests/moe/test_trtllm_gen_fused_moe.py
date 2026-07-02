@@ -40,6 +40,8 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     trtllm_fp8_block_scale_routed_moe,
 )
 
+pytestmark = pytest.mark.long_running
+
 
 @pytest.fixture(scope="module")
 def cache_permute_indices():
