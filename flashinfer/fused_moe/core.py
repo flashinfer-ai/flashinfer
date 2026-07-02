@@ -79,6 +79,76 @@ from .utils import (
 )
 
 
+# Module-level initializers for the autotuner's synthetic MoE profiling inputs.
+#
+# The AutoTuner keys its ``_find_nearest_profile`` LRU cache on the
+# ``TuningConfig`` passed to ``choose_one`` on every MoE forward, and a
+# ``DynamicTensorSpec`` hashes/compares its ``map_to_tuning_buckets`` and
+# ``tensor_initializers`` by object identity.  Building those closures fresh
+# inside ``_make_tuning_config`` on each call therefore mints a new cache key
+# every forward, so the (unbounded) cache grows without limit -- a host-side
+# memory leak first observed on MiniMax-M3.  Defining the initializers once at
+# module scope (and memoizing the two that depend on run-time integers) keeps
+# their identity stable across forwards so repeated calls reuse a single cache
+# entry.  See https://github.com/flashinfer-ai/flashinfer/issues/2139.
+_MOE_INITS = {
+    "output": lambda shapes, dtype, device: torch.empty(
+        shapes, dtype=dtype, device=device
+    ),
+    "hidden_states": lambda shapes, dtype, device: torch.randn(
+        shapes, device=device
+    ).to(dtype),
+    "routing_logits": lambda shapes, dtype, device: torch.rand(
+        shapes, dtype=dtype, device=device
+    ),
+    "expert_weights": lambda shapes, dtype, device: torch.ones(
+        shapes, dtype=dtype, device=device
+    ),
+    "hidden_states_scale": lambda shapes, dtype, device: torch.ones(
+        shapes, device=device
+    ).to(dtype),
+    "gemm1_lora_delta": lambda shapes, dtype, device: torch.zeros(
+        shapes, dtype=dtype, device=device
+    ),
+    "per_token_scale": lambda shapes, dtype, device: torch.ones(
+        shapes, device=device
+    ).to(dtype),
+}
+
+
+@functools.lru_cache(maxsize=32)
+def _moe_topk_ids_init(num_experts: int):
+    """Return a stable packed-topk-ids initializer for a given expert count.
+
+    Memoized on ``num_experts`` so the returned closure keeps a stable identity
+    across forwards; see the ``_MOE_INITS`` note above.
+    """
+
+    def _init(shapes, dtype, device):
+        expert_ids = make_random_topk_ids(
+            num_experts=num_experts,
+            num_tokens=math.prod(shapes[:-1]),
+            top_k=shapes[-1],
+            device=device,
+        ).view(shapes)
+        expert_weights = torch.ones(
+            shapes, dtype=torch.bfloat16, device=device
+        ).view(torch.int16)
+        return (expert_ids << 16) | expert_weights
+
+    return _init
+
+
+@functools.lru_cache(maxsize=32)
+def _moe_map_bucket(tune_max_num_tokens: int):
+    """Return a stable num_tokens -> hybrid-bucket mapper for a tuning ceiling.
+
+    Memoized on ``tune_max_num_tokens`` so the returned closure keeps a stable
+    identity across forwards; see the ``_MOE_INITS`` note above.
+    """
+    return lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens)
+
+
 # Routing input modes for FusedMoE launcher
 # Please keep this in sync with the counterpart defined in csrc/trtllm_fused_moe_kernel_launcher.cu
 class RoutingInputMode(IntEnum):
@@ -1227,48 +1297,22 @@ def get_trtllm_moe_sm100_module():
             """
             num_experts = self.num_experts
 
-            def _init_packed_topk_ids(shapes, dtype, device):
-                expert_ids = make_random_topk_ids(
-                    num_experts=num_experts,
-                    num_tokens=math.prod(shapes[:-1]),
-                    top_k=shapes[-1],
-                    device=device,
-                ).view(shapes)
-                expert_weights = torch.ones(
-                    shapes, dtype=torch.bfloat16, device=device
-                ).view(torch.int16)
-                return (expert_ids << 16) | expert_weights
-
-            spec = {
-                "output": lambda shapes, dtype, device: torch.empty(
-                    shapes, dtype=dtype, device=device
-                ),
-                "hidden_states": lambda shapes, dtype, device: torch.randn(
-                    shapes, device=device
-                ).to(dtype),
-            }
+            # Reuse the module-level initializers (and the two memoized,
+            # run-time-dependent ones) so the resulting DynamicTensorSpec keeps
+            # a stable identity/hash across forwards; see the ``_MOE_INITS`` note.
+            spec = {k: _MOE_INITS[k] for k in ("output", "hidden_states")}
             if moe_inputs.routing_logits is not None:
-                spec["routing_logits"] = lambda shapes, dtype, device: torch.rand(
-                    shapes, dtype=dtype, device=device
-                )
+                spec["routing_logits"] = _MOE_INITS["routing_logits"]
             if moe_inputs.topk_ids is not None:
-                spec["topk_ids"] = _init_packed_topk_ids
-            if moe_inputs.expert_weights is not None:
-                spec["expert_weights"] = lambda shapes, dtype, device: torch.ones(
-                    shapes, dtype=dtype, device=device
-                )
-            if moe_inputs.hidden_states_scale is not None:
-                spec["hidden_states_scale"] = lambda shapes, dtype, device: torch.ones(
-                    shapes, device=device
-                ).to(dtype)
-            if moe_inputs.gemm1_lora_delta is not None:
-                spec["gemm1_lora_delta"] = lambda shapes, dtype, device: torch.zeros(
-                    shapes, dtype=dtype, device=device
-                )
-            if moe_inputs.per_token_scale is not None:
-                spec["per_token_scale"] = lambda shapes, dtype, device: torch.ones(
-                    shapes, device=device
-                ).to(dtype)
+                spec["topk_ids"] = _moe_topk_ids_init(num_experts)
+            for name in (
+                "expert_weights",
+                "hidden_states_scale",
+                "gemm1_lora_delta",
+                "per_token_scale",
+            ):
+                if getattr(moe_inputs, name, None) is not None:
+                    spec[name] = _MOE_INITS[name]
 
             sorted_inputs = sorted(
                 (MoeRunnerInputs.idx(name), name, init) for name, init in spec.items()
@@ -1305,7 +1349,7 @@ def get_trtllm_moe_sm100_module():
                         input_idx,
                         dim_idx,
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
+                        _moe_map_bucket(tune_max_num_tokens),
                         initializers,
                     ),
                 ),
