@@ -422,19 +422,18 @@ __device__ __forceinline__ void compute_cb_old_2warp(SmemT& smem, int warp_in_pa
 }
 
 // -----------------------------------------------------------------------------
-// Scale one head's raw C·B (IS_OLD=false → equation C5, new tokens) or C·old_B
-// (IS_OLD=true → equation C6, old tokens, NO-WRITE path) and store it to gmem
-// FRAGMENT-NATIVE, one STG per lane.  Each thread emits the REGS values that ==
-// matmul-4's `fragA` for this lane (mma.m16n8k{2·REGS} A operand), so the MAIN
-// kernel reads them with a single LDG straight into fragA — no LDSM, no swizzle,
-// neither side puts CB in smem as bf16.  The two paths share the ENTIRE fragA
-// mapping + swizzled read + pack + STG; only the per-column scale and the mask
-// differ, so those fold behind `if constexpr (IS_OLD)` (zero runtime cost) — the
-// caller just points cb_smem / gmem_head at the right buffers.
+// FRAGMENT-NATIVE, one STG per lane.  Each thread emits the REGS_B values that ==
+// OUT.2/3's `fragB` for this lane (mma.m16n8k{K} B operand, CB[N=t, K=c]), so the
+// MAIN kernel reads them with a single LDG straight into fragB — no LDSM, no
+// swizzle, neither side puts CB in smem as bf16.  The two paths share the ENTIRE
+// fragB select + pack + STG; only the per-column scale and the mask differ, so
+// those fold behind `if constexpr (IS_OLD)` (zero runtime cost) — the caller just
+// points raw / gmem_head at the right buffers.
 //
-// fragA element e → CB coords (row t, col c), on the fly (folds at unroll):
-//   r0=lane/4, c0=(lane%4)*2; t=r0+(((e>>1)&1)<<3), c=c0+(((e>>2)&1)<<3)+(e&1).
-//   (REGS=8 → 16 cols m16n8k16; REGS=4 → 8 cols m16n8k8 = the [0,8) prefix.)
+// fragB is a per-lane SELECT of the element-major fragC dump `raw` (the operand
+// swap: CB is fragA≡fragC today, fragB after — see the in-body comment + the proof
+// in frag_proto/cb_fragb_select_probe.cu).  REGS_B = NUM_OUT_NTILES·(K/4): mtp≤8
+// new = 4 (STG.64), old = K/4 (2 @ K=8 STG.32, 4 @ K=16 STG.64); mtp>8 doubles.
 // New (C5): CB_scaled[t,c] = (C·B)·exp(cumAdt[t]−cumAdt[c])·dt[c],  mask c≤t
 //   (causal) ∧ c<seq_len ∧ t<seq_len.
 // Old (C6): CB_old[t,c] = (C·old_B)·exp(cumAdt[t]+Σ_old−old_cumAdt[c])·old_dt[c],
@@ -443,39 +442,52 @@ __device__ __forceinline__ void compute_cb_old_2warp(SmemT& smem, int warp_in_pa
 // Both use the SINGLE-__expf form, matching the monolithic bit-for-bit
 // (kernel_checkpointing_ssu_common.cuh:933 new / :1054 old).  Scaling is fp32,
 // cast to bf16 only at the pack.
-// `raw` is this lane's matmul-4 fragA — the unscaled C·B (C5) / C·old_B (C6),
-// loaded ONCE per warp from the element-major smem (raw[e] == CB[(t,c)_e]) and
-// reused across all this group's heads.  REGS = K/2: new = NPREDICTED_PAD_MMA_M/2
-// (=8, STG.128); old = MAX_WINDOW_PAD_MMA_K/2 (4 @ K=8 → STG.64, 8 @ K=16 → .128).
+// `raw` is this lane's element-major fragC dump — the unscaled C·B (C5) / C·old_B
+// (C6), loaded ONCE per warp from smem (raw[e] == CB[(t,c)_e]) and reused across
+// all this group's heads.  REGS = K/2 (the raw dump size, unchanged from fragA).
 template <bool IS_OLD, int REGS, typename input_t, typename SmemT>
 __device__ __forceinline__ void scale_store_cb(SmemT& smem, int h, int lane, int seq_len,
                                                int prev_k, float const (&raw)[REGS],
                                                input_t* __restrict__ gmem_head) {
+  // fragB (OUT.2/3 B-operand) store.  raw[] is the element-major fragC dump (REGS=K/2 =
+  // 2 regs per K-half N-tile).  As the B-operand CB[N=t, K=c], fragB register r within
+  // output N-tile `on` (the t-half) is a PER-LANE SELECT of raw — no smem relayout, no
+  // ldmatrix (proven bit-exact by frag_proto/cb_fragb_select_probe.cu):
+  //   src = ((r>>1)&1)*4 + (on<<1) + (r&1)   // c0/c1 (t=r0) or c2/c3 (t=r0+8) of each K-half
+  //   t   = r0 + on*8,  c = c0 + (((r>>1)&1)<<3) + (r&1)
+  // NUM_OUT_NTILES = NPREDICTED_PAD_MMA_N/N: 1 at mtp≤8 (N-pad 8 → REGS/2 fragB regs, HALF
+  // the old fragA store), 2 at mtp>8 (both t-halves → REGS regs, no shrink but correct).
+  constexpr int NUM_OUT_NTILES = SmemT::NPREDICTED_PAD_MMA_N / MMA_prop::N;
+  constexpr int REGS_B_PER = REGS / 2;  // fragB regs per output N-tile (= K/4)
+  constexpr int REGS_B = NUM_OUT_NTILES * REGS_B_PER;
   float total_old = 0.f;
   if constexpr (IS_OLD) {
     total_old = (prev_k > 0) ? smem.old_cumAdt[h][prev_k - 1] : 0.f;
   }
   int const r0 = lane / 4;
   int const c0 = (lane % 4) * 2;
-  PackedAligned<input_t, REGS> packed;
+  PackedAligned<input_t, REGS_B> packed;
 #pragma unroll
-  for (int e = 0; e < REGS; ++e) {
-    int const t = r0 + (((e >> 1) & 1) << 3);
-    int const c = c0 + (((e >> 2) & 1) << 3) + (e & 1);
+  for (int g = 0; g < REGS_B; ++g) {
+    int const on = g / REGS_B_PER;  // output N-tile (t-half): 0 → t=r0, 1 → t=r0+8
+    int const r = g % REGS_B_PER;   // B-register within the output N-tile
+    int const src = ((r >> 1) & 1) * 4 + (on << 1) + (r & 1);
+    int const t = r0 + on * 8;
+    int const c = c0 + (((r >> 1) & 1) << 3) + (r & 1);
     float val = 0.f;
     if constexpr (IS_OLD) {
       // C6: old tokens all precede the new ones — mask c<prev_k, no causal.
       if (c < prev_k && t < seq_len)
-        val = raw[e] * __expf(smem.cumAdt[h][t] + total_old - smem.old_cumAdt[h][c]) *
+        val = raw[src] * __expf(smem.cumAdt[h][t] + total_old - smem.old_cumAdt[h][c]) *
               smem.old_dt[h][c];
     } else {
       // C5: causal CB_scaled[t,c]; per-head coeffs (this head's PHASE-1/scan data).
       if (c <= t && t < seq_len && c < seq_len)
-        val = raw[e] * __expf(smem.cumAdt[h][t] - smem.cumAdt[h][c]) * smem.dt[h][c];
+        val = raw[src] * __expf(smem.cumAdt[h][t] - smem.cumAdt[h][c]) * smem.dt[h][c];
     }
-    packed.val[e] = static_cast<input_t>(val);
+    packed.val[g] = static_cast<input_t>(val);
   }
-  reinterpret_cast<PackedAligned<input_t, REGS>*>(gmem_head)[lane] = packed;  // one STG
+  reinterpret_cast<PackedAligned<input_t, REGS_B>*>(gmem_head)[lane] = packed;  // one STG
 }
 
 // -----------------------------------------------------------------------------
@@ -608,8 +620,13 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   auto* __restrict__ cb_gmem = reinterpret_cast<input_t*>(params.cb_scaled);   // CB_NEW_REGS/lane
   auto* __restrict__ cb_old_gmem = reinterpret_cast<input_t*>(params.cb_old);  // K_old/2 regs/lane
   auto* __restrict__ cumAdt_gmem = reinterpret_cast<float*>(params.cumAdt_vec);
-  constexpr int CB_NEW_REGS = NPREDICTED_PAD_MMA_M / 2;         // m16n8k16 A-frag size (=8)
-  constexpr int CB_OLD_REGS = SmemT::MAX_WINDOW_PAD_MMA_K / 2;  // m16n8k{K_old} A-frag size
+  constexpr int CB_NEW_REGS = NPREDICTED_PAD_MMA_M / 2;         // element-major raw dump size (=8)
+  constexpr int CB_OLD_REGS = SmemT::MAX_WINDOW_PAD_MMA_K / 2;  // element-major raw dump size
+  // fragB (B-operand) STORE sizes = NUM_OUT_NTILES·(K/4) — the per-head gmem stride.  HALF of
+  // CB_*_REGS at mtp≤8 (1 output N-tile); == CB_*_REGS at mtp>8 (2 t-halves, no shrink).
+  constexpr int NUM_OUT_NTILES = SmemT::NPREDICTED_PAD_MMA_N / MMA_prop::N;
+  constexpr int CB_NEW_REGS_B = NUM_OUT_NTILES * (NPREDICTED_PAD_MMA_M / 4);
+  constexpr int CB_OLD_REGS_B = NUM_OUT_NTILES * (SmemT::MAX_WINDOW_PAD_MMA_K / 4);
 
   // Load the raw C·B / C·old_B fragA ONCE per warp (it's the same for all this
   // group's heads — the per-head decay scaling is applied below).  Element-major
@@ -646,14 +663,15 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
       // Publish dt[h] (softplus) + cumAdt[h] cross-lane for scale_store_cb below.
       __syncwarp();
 
-      // C5: scale the register-resident raw C·B by this head + STG → cb_scaled.
-      auto* cb_gmem_head = cb_gmem + (int64_t)(seq * params.nheads + head) * warpSize * CB_NEW_REGS;
+      // C5: scale the register-resident raw C·B by this head + STG → cb_scaled (fragB).
+      auto* cb_gmem_head =
+          cb_gmem + (int64_t)((seq * params.nheads + head) * warpSize * CB_NEW_REGS_B);
       scale_store_cb</*IS_OLD=*/false, CB_NEW_REGS, input_t>(smem, h, lane, seq_len, prev_k, raw_cb,
                                                              cb_gmem_head);
       // C6 (NO-WRITE): scale the register-resident raw C·old_B + STG → cb_old.
       if (!must_checkpoint) {
         auto* cb_old_head =
-            cb_old_gmem + (int64_t)(seq * params.nheads + head) * warpSize * CB_OLD_REGS;
+            cb_old_gmem + (int64_t)((seq * params.nheads + head) * warpSize * CB_OLD_REGS_B);
         scale_store_cb</*IS_OLD=*/true, CB_OLD_REGS, input_t>(smem, h, lane, seq_len, prev_k,
                                                               raw_cb_old, cb_old_head);
       }
