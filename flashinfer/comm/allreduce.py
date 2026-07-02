@@ -553,9 +553,12 @@ def allreduce_fusion(
         * ``kMoEFinalizeARResidualRMSNorm = 7`` (TRT-LLM only)
         * ``kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8`` (TRT-LLM only)
         * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9`` (TRT-LLM only)
+        * ``kARResidualRMSNormDynamicFP8Quant = 10``
+        * ``kARResidualRMSNormOutDynamicFP8Quant = 11``
 
-        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5). MoE
-        and packed group quant patterns remain TRT-LLM only.
+        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5) and
+        dynamic FP8 patterns (10-11). MoE and packed group quant patterns
+        remain TRT-LLM only.
 
         ``kMoEFinalizeARResidualRMSNorm`` is an explicit TRT-LLM fused
         implementation of MoE finalize + AllReduce + RMSNorm and does not
@@ -583,8 +586,10 @@ def allreduce_fusion(
         ``[token_num, hidden_dim]`` and NVFP4 uses shape
         ``[token_num, hidden_dim / 2]``.
     scale_out : Optional[torch.Tensor]
-        Pre-allocated NVFP4 scale-factor buffer. Not used by per-tensor
-        FP8 quantization.
+        Pre-allocated quantization scale-factor buffer. Dynamic FP8 uses
+        shape ``[token_num, 1]`` and dtype ``torch.float32``. NVFP4 uses
+        the layout selected by ``layout_code``. Per-tensor FP8 does not use
+        ``scale_out``.
     residual_in : Optional[torch.Tensor]
         Residual tensor to add, shape ``[token_num, hidden_dim]``.
     rms_gamma : Optional[torch.Tensor]
@@ -785,12 +790,13 @@ def allreduce_fusion(
 
             return norm_out
 
+        # Extract shape from 2D input for the standard TRT-LLM fusion patterns.
+        token_num, hidden_dim = input.shape
+
         if pattern in [
             AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
             AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant,
         ]:
-            token_num, hidden_dim = input.shape
-
             if block_quant_group_size is None:
                 raise ValueError(
                     f"block_quant_group_size is required for pattern: {pattern}"
@@ -824,12 +830,53 @@ def allreduce_fusion(
                     f"scale_out dtype must be torch.int32, got {scale_out.dtype}"
                 )
 
-        # ---- Standard patterns ----
-        # Extract shape from 2D input
-        token_num, hidden_dim = input.shape
+        dynamic_fp8_patterns = (
+            AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+            AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant,
+        )
+        if pattern in dynamic_fp8_patterns:
+            if residual_in is None:
+                raise ValueError("residual_in is required for dynamic FP8 patterns")
+            if residual_out is None:
+                raise ValueError("residual_out is required for dynamic FP8 patterns")
+            if rms_gamma is None:
+                raise ValueError("rms_gamma is required for dynamic FP8 patterns")
+            if quant_out is None:
+                raise ValueError("quant_out is required for dynamic FP8 patterns")
+            if scale_out is None:
+                raise ValueError("scale_out is required for dynamic FP8 patterns")
+            if quant_out.shape != input.shape:
+                raise ValueError(
+                    "quant_out must have shape [token_num, hidden_dim] for dynamic FP8 patterns"
+                )
+            if quant_out.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "quant_out must have dtype torch.float8_e4m3fn for dynamic FP8 patterns"
+                )
+            if scale_out.dtype != torch.float32:
+                raise ValueError(
+                    "scale_out must have dtype torch.float32 for dynamic FP8 patterns"
+                )
+            if not scale_out.is_contiguous():
+                raise ValueError(
+                    "scale_out must be contiguous for dynamic FP8 patterns"
+                )
+            if scale_out.shape != (token_num, 1):
+                raise ValueError(
+                    "scale_out must have shape [token_num, 1] for dynamic FP8 patterns"
+                )
+            if (
+                pattern == AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant
+                and norm_out is None
+            ):
+                raise ValueError(
+                    "norm_out is required for kARResidualRMSNormOutDynamicFP8Quant"
+                )
 
-        # Allocate output if needed (keep 2D shape)
-        if output is None:
+        # Dynamic FP8 patterns do not materialize allreduce_out, so avoid
+        # allocating an unused tensor. This keeps the preallocated dynamic path
+        # compatible with CUDA Graph capture.
+        if output is None and pattern not in dynamic_fp8_patterns:
             output = torch.empty_like(input)
 
         # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
@@ -842,7 +889,7 @@ def allreduce_fusion(
             return t.view(-1)
 
         input_flat = _flatten_checked(input, "input")
-        output_flat = _flatten_checked(output, "output")
+        output_flat = _flatten_checked(output, "output") if output is not None else None
         residual_in_flat = (
             _flatten_checked(residual_in, "residual_in")
             if residual_in is not None
@@ -924,6 +971,14 @@ def allreduce_fusion(
                 MNNVLQuantType.NVFP4,
                 True,
             ),
+            AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant: (
+                MNNVLQuantType.DYNAMIC_FP8,
+                False,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant: (
+                MNNVLQuantType.DYNAMIC_FP8,
+                True,
+            ),
         }
         if pattern not in (
             AllReduceFusionPattern.kAllReduce,
@@ -999,7 +1054,25 @@ def allreduce_fusion(
                 )
 
             quant_type, has_norm_out = mnnvl_quant_patterns[pattern]
-            if has_norm_out and norm_out is None:
+            is_dynamic_fp8 = quant_type == MNNVLQuantType.DYNAMIC_FP8
+            if is_dynamic_fp8:
+                if residual_out is None:
+                    raise ValueError(
+                        "residual_out is required for MNNVL dynamic FP8 patterns"
+                    )
+                if quant_out is None:
+                    raise ValueError(
+                        "quant_out is required for MNNVL dynamic FP8 patterns"
+                    )
+                if scale_out is None:
+                    raise ValueError(
+                        "scale_out is required for MNNVL dynamic FP8 patterns"
+                    )
+                if has_norm_out and norm_out is None:
+                    raise ValueError(
+                        "norm_out is required for MNNVL dynamic FP8 norm-out pattern"
+                    )
+            elif has_norm_out and norm_out is None:
                 norm_out = torch.empty_like(input)
             if residual_out is None:
                 residual_out = torch.empty_like(input)
