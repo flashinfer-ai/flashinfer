@@ -59,6 +59,7 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm90_module,
@@ -68,6 +69,7 @@ from .jit.fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
@@ -500,6 +502,8 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
+    if has_sm120:
+        jit_specs.append(gen_nvfp4_attention_sm120_module())
 
     if add_act:
         for act_name in act_func_def_str:
@@ -557,6 +561,7 @@ def gen_all_modules(
             # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module_cute_mxfp8())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
@@ -887,8 +892,9 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        # Note: (512, 512): FA2 prefill/decode only; no holistic batch-attention kernel.
-        "fa2_head_dim": [(64, 64), (128, 128), (256, 256), (512, 512)],
+        # Note: head_dim=512 (FA2 prefill/decode, SM100+) excluded to reduce
+        # space in the jit-cache wheel.
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
         "f16_dtype": [torch.float16, torch.bfloat16],
         "f8_dtype": [torch.float8_e4m3fn],
