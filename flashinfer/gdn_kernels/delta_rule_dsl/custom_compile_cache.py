@@ -182,7 +182,12 @@ def _ptxas_candidates():
     if purelib:
         site_dirs.append(purelib)
     for sp in dict.fromkeys(site_dirs):
-        for sub in ("nvidia/cu13/bin", "nvidia/cu12/bin", "triton/backends/nvidia/bin"):
+        for sub in (
+            "nvidia/cu13/bin",
+            "nvidia/cu12/bin",
+            "nvidia/cuda_nvcc/bin",
+            "triton/backends/nvidia/bin",
+        ):
             yield os.path.join(sp, sub, "ptxas")
     cuda_home = os.environ.get("CUDA_HOME") or "/usr/local/cuda"
     yield os.path.join(cuda_home, "bin", "ptxas")
