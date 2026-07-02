@@ -180,6 +180,23 @@ def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
     jit_options = [cuda_driver.CUjit_option.CU_JIT_TARGET]
     jit_option_values = [cuda_driver.CUjit_target.CU_TARGET_COMPUTE_120A]
 
+    # Both error spaces stringify differently but share the numeric code, and
+    # DSLCudaRuntimeError carries it as a structured attribute; the substring
+    # test is only the fallback for exception types without one.
+    unsupported_ptx_codes = {
+        int(cuda_driver.CUresult.CUDA_ERROR_UNSUPPORTED_PTX_VERSION),
+        int(cuda_runtime.cudaError_t.cudaErrorUnsupportedPtxVersion),
+    }
+
+    def _is_unsupported_ptx_version(e: Exception) -> bool:
+        code = getattr(e, "error_code", None)
+        if code is not None:
+            try:
+                return int(code) in unsupported_ptx_codes
+            except (TypeError, ValueError):
+                pass
+        return "UnsupportedPtxVersion" in str(e)
+
     def _load_cuda_library(self):
         if self.engine is None:
             raise DSLRuntimeError("CUDA JIT engine is not available")
@@ -234,7 +251,7 @@ def _install_patched_ptx_loader(compiled_fn, patched_ptx: str):
             # toolkit (cudaErrorUnsupportedPtxVersion / error 222): e.g. the
             # .version 9.1 PTX a CUDA-13.1 DSL emits on a CUDA-13.0 driver.
             downgraded = _downgrade_ptx_isa_version(patched_ptx)
-            if downgraded is None or "UnsupportedPtxVersion" not in str(e):
+            if downgraded is None or not _is_unsupported_ptx_version(e):
                 raise
             warnings.warn(
                 "Driver rejected the sm_120a-patched PTX ISA version "
