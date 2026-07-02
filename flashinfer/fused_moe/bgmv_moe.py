@@ -89,7 +89,14 @@ def bgmv_moe_shrink(
     """
     mod = _get_bgmv_moe_module()
     mod.bgmv_moe_shrink(
-        y, x, w_ptr, sorted_token_ids, expert_ids, lora_indices, lora_stride, per_pair_input
+        y,
+        x,
+        w_ptr,
+        sorted_token_ids,
+        expert_ids,
+        lora_indices,
+        lora_stride,
+        per_pair_input,
     )
 
 

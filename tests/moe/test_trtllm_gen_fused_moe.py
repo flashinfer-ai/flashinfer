@@ -19,6 +19,7 @@ import torch
 
 from flashinfer.utils import get_compute_capability
 
+from flashinfer.fused_moe import fill_w_ptr
 from tests.moe.trtllm_gen_fused_moe_utils import (
     ActivationType,
     BF16Moe,
@@ -30,6 +31,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     QuantMode,
     RoutingMethodType,
     WeightLayout,
+    check_accuracy,
     moe_args,
     pack_topk_for_routed_moe,
     routing_reference_renormalize,
@@ -1988,6 +1990,16 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
 # uses the same `check_accuracy` tolerances as the rest of the suite.
 
 
+def _build_w_ptr_table(weights, num_experts):
+    """Pack LoRA weight banks into a [num_slices, num_experts] int64 base-pointer
+    table (+ shared stride) for bgmv_moe_gemm1_lora_delta."""
+    w_ptr = torch.zeros(len(weights), num_experts, dtype=torch.int64, device="cuda")
+    stride = 0
+    for s, w in enumerate(weights):
+        stride = fill_w_ptr(w_ptr, w, num_experts, s)
+    return w_ptr, stride
+
+
 @pytest.mark.parametrize("num_tokens", [8, 128])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024])
@@ -2060,6 +2072,10 @@ def test_mxfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
     "activation_type",
     [pytest.param(ActivationType.Swiglu, id="Swiglu")],
 )
+@pytest.mark.parametrize(
+    "real_delta",
+    [pytest.param(False, id="fake_delta"), pytest.param(True, id="real_delta")],
+)
 def test_moe_lora_delta(
     num_tokens,
     hidden_size,
@@ -2068,18 +2084,20 @@ def test_moe_lora_delta(
     routing_config,
     weight_processing,
     activation_type,
+    real_delta,
     cache_permute_indices,
 ):
-    """Runs the standard MoE reference/kernel comparison with a non-None
-    `gemm1_lora_delta` threaded through run_moe_test.  We compare a zero delta
-    against a deterministic non-zero delta on the same routed path so the test
-    fails if LoRA is silently dropped from both reference and production."""
+    """MoE reference/kernel comparison with `gemm1_lora_delta` threaded through
+    run_moe_test. `real_delta` selects:
+      * False: zero vs constant delta, so the test fails if LoRA is silently dropped;
+      * True: delta built by bgmv_moe_gemm1_lora_delta inside run_moe_test, whose
+        kernel-vs-reference check validates the injected delta end-to-end."""
     top_k = routing_config["top_k"]
     zero_delta = torch.zeros(
         num_tokens, top_k, 2 * intermediate_size, dtype=torch.bfloat16, device="cuda"
     )
-    delta = torch.full_like(zero_delta, 4)
 
+    # Zero-delta baseline shared by both modes (proves the delta changes the output).
     zero_reference, _, _ = run_moe_test(
         num_tokens,
         hidden_size,
@@ -2092,7 +2110,59 @@ def test_moe_lora_delta(
         gemm1_lora_delta=zero_delta,
     )
 
-    delta_reference, _, delta_args_dequant = run_moe_test(
+    if not real_delta:
+        delta = torch.full_like(zero_delta, 4)
+        delta_reference, _, delta_args_dequant = run_moe_test(
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            moe_impl,
+            routing_config,
+            weight_processing,
+            activation_type,
+            cache_permute_indices,
+            gemm1_lora_delta=delta,
+        )
+        torch.testing.assert_close(delta_args_dequant.gemm1_lora_delta, delta)
+        assert (delta_reference - zero_reference).abs().max().item() > 0.05
+        return
+
+    # Real delta: built inside run_moe_test from the generated hidden states + routing.
+    num_experts = routing_config["num_experts"]
+    rank, num_loras, lora_scale = 16, 4, 0.5
+    torch.manual_seed(1234)
+    lora_a = [
+        torch.randn(
+            num_loras,
+            num_experts,
+            rank,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.02
+        for _ in range(2)
+    ]
+    lora_b = [
+        torch.randn(
+            num_loras,
+            num_experts,
+            intermediate_size,
+            rank,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.02
+        for _ in range(2)
+    ]
+    lora_ids = torch.randint(
+        0, num_loras, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+    lora_ids[num_tokens // 2 :] = -1  # some tokens have no adapter
+    w_ptr_a, stride_a = _build_w_ptr_table(lora_a, num_experts)
+    w_ptr_b, stride_b = _build_w_ptr_table(lora_b, num_experts)
+
+    real_reference, real_actual, real_args = run_moe_test(
         num_tokens,
         hidden_size,
         intermediate_size,
@@ -2101,8 +2171,19 @@ def test_moe_lora_delta(
         weight_processing,
         activation_type,
         cache_permute_indices,
-        gemm1_lora_delta=delta,
+        gemm1_lora_args={
+            "w_ptr_a": w_ptr_a,
+            "lora_stride_a": stride_a,
+            "w_ptr_b": w_ptr_b,
+            "lora_stride_b": stride_b,
+            "lora_ids": lora_ids,
+            "rank": rank,
+            "scale": lora_scale,
+        },
     )
 
-    torch.testing.assert_close(delta_args_dequant.gemm1_lora_delta, delta)
-    assert (delta_reference - zero_reference).abs().max().item() > 0.05
+    # Sanity: delta is non-trivial and changes the output vs no LoRA.
+    assert real_args.gemm1_lora_delta.abs().max().item() > 0
+    assert (real_reference - zero_reference).abs().max().item() > 0.05
+    # Kernel matches the dequant reference (delta injected on both sides).
+    check_accuracy(real_reference, real_actual, **moe_impl.get_tolerances())
