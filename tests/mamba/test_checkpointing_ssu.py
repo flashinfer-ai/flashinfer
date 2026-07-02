@@ -969,6 +969,124 @@ def test_persistent_main_matches_monolithic(monkeypatch):
             )
 
 
+def test_two_kernel_meta_ring_refill(monkeypatch):
+    """Meta-ring REFILL path: with FLASHINFER_SSU_MAIN_CTA_PER_SM=1 the main grid is
+    NUM_SMS CTAs and batch is sized so each CTA grid-strides over ~64 work-units —
+    crossing the meta-window refills at tile 30 and 60 (META_RING=32, STAGES=2) with
+    ring-slot wraparound.  prev_num_accepted is randomized per slot so write and
+    no-write units interleave inside every 32-unit window, and (NUM_SMS not being a
+    multiple of nheads) the head also varies per unit.  Must match the monolithic
+    reference."""
+    monkeypatch.setenv("FLASHINFER_SSU_MAIN_CTA_PER_SM", "1")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
+    max_window = 16
+
+    # units/CTA = batch·nheads / NUM_SMS ≈ 64 > 2·(META_RING−STAGES) ⇒ ≥ 2 refills.
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    batch = (64 * num_sms) // nheads + 1
+    cache_size = batch
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(
+        torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim
+    )
+    D = repeat(torch.randn(nheads, device=device, dtype=dtype), "h -> h p", p=head_dim)
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=dtype
+    )
+
+    # Fill the full window with distinct values so prev_k>T genuinely uses old_x rows.
+    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    old_x = torch.randn(
+        cache_size, max_window, nheads, head_dim, device=device, dtype=dtype
+    )
+    old_x[:, :T] = x1
+    old_B = torch.randn(
+        cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype
+    )
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_cumAdt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.zeros(cache_size, device=device, dtype=torch.int32)
+
+    # Mixed per-slot pnat ∈ [0, max_window]: rows with pnat+T > max_window checkpoint,
+    # the rest replay — interleaved inside every meta window.
+    torch.manual_seed(7)
+    prev_mixed = torch.randint(
+        0, max_window + 1, (cache_size,), device=device, dtype=torch.int32
+    )
+    assert (prev_mixed + T > max_window).any() and (prev_mixed + T <= max_window).any()
+
+    T_pad = 16
+    k_old = ((max_window + 7) // 8) * 8
+
+    def _run(*, two_kernel):
+        torch.manual_seed(300)
+        x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        dt2 = repeat(
+            torch.randn(batch, T, nheads, device=device, dtype=dtype),
+            "b t h -> b t h p",
+            p=head_dim,
+        )
+        B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+        st = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        ox, ob, odt, oca = (
+            old_x.clone(),
+            old_B.clone(),
+            old_dt.clone(),
+            old_cumAdt.clone(),
+        )
+        kw = {}
+        if two_kernel:
+            kw["cb_scaled"] = torch.empty(
+                batch, nheads, WARP_SIZE, MMA_FRAG_SIZE, device=device, dtype=dtype
+            )
+            kw["cumAdt_vec"] = torch.empty(
+                batch, nheads, T_pad, device=device, dtype=torch.float32
+            )
+            kw["cb_old"] = torch.empty(
+                batch, nheads, WARP_SIZE, k_old // 2, device=device, dtype=dtype
+            )
+        checkpointing_ssu(
+            st,
+            ox,
+            ob,
+            odt,
+            oca,
+            cache_buf_idx.clone(),
+            prev_mixed.clone(),
+            x=x2,
+            dt=dt2,
+            A=A,
+            B=B2,
+            C=C2,
+            out=out,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            **kw,
+        )
+        return out, st, ox, ob, odt, oca
+
+    names = ("out", "state", "old_x", "old_B", "old_dt", "old_cumAdt")
+    ref = _run(two_kernel=False)
+    test = _run(two_kernel=True)
+    for name, r, t in zip(names, ref, test, strict=True):
+        torch.testing.assert_close(
+            t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch (meta-ring refill)"
+        )
+
+
 def test_checkpointing_ssu_pdl_bf16():
     """PDL smoke: bf16 state.  Runs the kernel twice on the same inputs —
     once with enable_pdl=False, once with True — and asserts the outputs and
