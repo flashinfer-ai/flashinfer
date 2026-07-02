@@ -154,14 +154,15 @@ def _ptxas_candidates():
     """
     env = os.environ.get("FLASHINFER_PTXAS")
     if env:
-        if not os.path.isfile(env):
+        if os.path.isfile(env):
+            yield env
+        else:
             warnings.warn(
                 f"FLASHINFER_PTXAS is set to {env!r} but no such file exists; "
                 "ignoring it.",
                 RuntimeWarning,
                 stacklevel=3,
             )
-        yield env
     import contextlib
     import shutil
     import site
@@ -171,10 +172,12 @@ def _ptxas_candidates():
     if which:
         yield which
     site_dirs = []
-    # site.getsitepackages can raise on non-standard installations
-    # (embedded Python etc.)
-    with contextlib.suppress(AttributeError, RuntimeError):
-        site_dirs += list(site.getsitepackages()) + [site.getusersitepackages()]
+    # site.getsitepackages can raise (or return nothing) on non-standard
+    # installations (embedded Python etc.)
+    with contextlib.suppress(AttributeError, RuntimeError, TypeError):
+        site_dirs += [
+            d for d in list(site.getsitepackages()) + [site.getusersitepackages()] if d
+        ]
     purelib = sysconfig.get_paths().get("purelib")
     if purelib:
         site_dirs.append(purelib)
@@ -213,11 +216,11 @@ def _assemble_sm120a_cubin(patched_ptx: str):
                     capture_output=True,
                     timeout=120,
                 )
+                if result.returncode == 0:
+                    with open(cubin_path, "rb") as f:
+                        return f.read()
             except (OSError, subprocess.TimeoutExpired):
                 continue
-            if result.returncode == 0:
-                with open(cubin_path, "rb") as f:
-                    return f.read()
     return None
 
 
