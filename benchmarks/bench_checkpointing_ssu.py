@@ -248,7 +248,7 @@ def _build_tensors(
 
     # --- Cache tensors for incremental kernel ---
     # T-axis = max_window (cache capacity), independent of mtp_len (per-step
-    # speculation depth).  must_checkpoint = (prev_k + mtp_len > max_window),
+    # speculation depth).  must_checkpoint = (pnat + mtp_len > max_window),
     # so max_window > mtp_len leaves room for the no-checkpoint branch.
     # old_x: single-buffered (cache, max_window, nheads, dim)
     old_x = torch.randn(
@@ -860,9 +860,10 @@ def _make_run_closure(
         # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
         _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
         # D-split knob (two-kernel only): splits each head's DIM across D_SPLIT CTAs.
-        # DS=2 default: doubles main CTA count (256→512), keeps D_PER_CTA=64 (≥32 required).
-        # Joint sweep (batch=16, B300, 2026-06-24): DS=2 saves 2.04µs vs DS=1 at HPC=8,NW=8,MHC=1.
-        _ds = int(os.environ.get("FLASHINFER_SSU_D_SPLIT", "2")) if _two else 1
+        # DS=1 default (D_PER_CTA=64): the operand-swap output tiles M=DIM across all NUM_WARPS warps;
+        # DS=2 (D_PER_CTA=32) leaves half the warps idle in the output MMA → they stall at the shared
+        # __syncthreads (big barrier-stall regression, ncu v30).  DS was a pre-swap occupancy knob.
+        _ds = int(os.environ.get("FLASHINFER_SSU_D_SPLIT", "1")) if _two else 1
         if with_conv1d:
 
             def _run():
@@ -1097,14 +1098,14 @@ def _make_run_closure(
 
     if kernel == "fi-dump":
         # Write state only at the LAST in-window token for each slot.
-        # The CLI used a single scalar prev_k for the whole batch; with a
+        # The CLI used a single scalar pnat for the whole batch; with a
         # heterogeneous vector we set dst_indices per slot.
         sbi = torch.arange(inputs.batch, dtype=torch.int32, device="cuda")
         out_dump = torch.zeros_like(inputs.out_incr)
         dst_indices = torch.full(
             (inputs.batch, mtp_len), -1, dtype=torch.int32, device="cuda"
         )
-        # Per-slot last position: max(prev_k - 1, 0), clamped to mtp_len-1.
+        # Per-slot last position: max(pnat - 1, 0), clamped to mtp_len-1.
         last_pos = (inputs.prev_tokens_i32 - 1).clamp_(min=0, max=mtp_len - 1)
         row_ix = torch.arange(inputs.batch, dtype=torch.int64, device="cuda")
         dst_indices[row_ix, last_pos.to(torch.int64)] = sbi
@@ -1516,7 +1517,7 @@ def _bench_config(
     batch: int,
     mtp_len: int,
     max_window: int,
-    prev_ks: list[int],
+    pnats: list[int],
     state_dtype: torch.dtype,
     act_dtype: torch.dtype,
     baseline_fn,
@@ -1527,7 +1528,7 @@ def _bench_config(
     Benchmark one (batch, mtp_len, dtype) configuration.
 
     Runs the baseline kernel (if baseline_fn is not None) followed by the
-    incremental kernel for each prev_k value.  Tensors are built once and
+    incremental kernel for each pnat value.  Tensors are built once and
     shared across all runs in this config.
 
     When ``philox_rounds > 0`` (f16 state only), the supporting kernels
@@ -1572,7 +1573,7 @@ def _bench_config(
 
     pt_uniform_i32 = torch.zeros(batch, dtype=torch.int32, device="cuda")
 
-    # --- Baseline (no prev_k dependence; one row total) ---
+    # --- Baseline (no pnat dependence; one row total) ---
     if baseline_fn is not None:
         tag = f"base_b{batch}_mtp{mtp_len}_s{state_dtype_name}_a{act_dtype_name}"
         kernel_name = (
@@ -1614,12 +1615,11 @@ def _bench_config(
     pnw_values = _parse_sweep(args.precompute_num_warps)
     pns_values = _parse_sweep(args.precompute_num_stages)
 
-    # --- Triton incremental kernel, one row per prev_k × autotune-point ---
-    for prev_k in prev_ks:
-        pt_uniform_i32.fill_(prev_k)
+    # --- Triton incremental kernel, one row per pnat × autotune-point ---
+    for pnat in pnats:
+        pt_uniform_i32.fill_(pnat)
         tag = (
-            f"incr_b{batch}_mtp{mtp_len}_k{prev_k}"
-            f"_s{state_dtype_name}_a{act_dtype_name}"
+            f"incr_b{batch}_mtp{mtp_len}_k{pnat}_s{state_dtype_name}_a{act_dtype_name}"
         )
         for bsm in bsm_values:
             for nw in nw_values:
@@ -1663,7 +1663,7 @@ def _bench_config(
                                 "incremental",
                                 batch,
                                 mtp_len,
-                                prev_k,
+                                pnat,
                                 state_dtype_name,
                                 act_dtype_name,
                                 median_us,
@@ -1682,10 +1682,10 @@ def _bench_config(
         if args.two_kernel and state_dtype in (torch.float16, torch.bfloat16):
             cuda_variants.append("cuda-incr-2k")
         for kname in cuda_variants:
-            for prev_k in prev_ks:
-                pt_uniform_i32.fill_(prev_k)
+            for pnat in pnats:
+                pt_uniform_i32.fill_(pnat)
                 tag = (
-                    f"{kname.replace('-', '_')}_b{batch}_mtp{mtp_len}_k{prev_k}"
+                    f"{kname.replace('-', '_')}_b{batch}_mtp{mtp_len}_k{pnat}"
                     f"_s{state_dtype_name}_a{act_dtype_name}"
                 )
                 median_us, p95_us, p99_us = time_kernel(
@@ -1702,7 +1702,7 @@ def _bench_config(
                     kname,
                     batch,
                     mtp_len,
-                    prev_k,
+                    pnat,
                     state_dtype_name,
                     act_dtype_name,
                     median_us,
@@ -1712,10 +1712,10 @@ def _bench_config(
 
     # --- Triton replay (new 5D persistent path) ---
     if args.triton_replay:
-        for prev_k in prev_ks:
-            pt_uniform_i32.fill_(prev_k)
+        for pnat in pnats:
+            pt_uniform_i32.fill_(pnat)
             tag = (
-                f"triton_replay_b{batch}_mtp{mtp_len}_k{prev_k}"
+                f"triton_replay_b{batch}_mtp{mtp_len}_k{pnat}"
                 f"_s{state_dtype_name}_a{act_dtype_name}"
             )
             median_us, p95_us, p99_us = time_kernel(
@@ -1732,7 +1732,7 @@ def _bench_config(
                 "triton-replay",
                 batch,
                 mtp_len,
-                prev_k,
+                pnat,
                 state_dtype_name,
                 act_dtype_name,
                 median_us,
@@ -1742,10 +1742,10 @@ def _bench_config(
 
     # --- Triton replay, persistent_main mode (write/nowrite two-launch split) ---
     if args.triton_replay_pm:
-        for prev_k in prev_ks:
-            pt_uniform_i32.fill_(prev_k)
+        for pnat in pnats:
+            pt_uniform_i32.fill_(pnat)
             tag = (
-                f"triton_replay_pm_b{batch}_mtp{mtp_len}_k{prev_k}"
+                f"triton_replay_pm_b{batch}_mtp{mtp_len}_k{pnat}"
                 f"_s{state_dtype_name}_a{act_dtype_name}"
             )
             median_us, p95_us, p99_us = time_kernel(
@@ -1762,7 +1762,7 @@ def _bench_config(
                 "triton-replay-pm",
                 batch,
                 mtp_len,
-                prev_k,
+                pnat,
                 state_dtype_name,
                 act_dtype_name,
                 median_us,
@@ -1772,10 +1772,10 @@ def _bench_config(
 
     # --- FlashInfer dynamic-dump ---
     if args.flashinfer_dump:
-        for prev_k in prev_ks:
-            pt_uniform_i32.fill_(prev_k)
+        for pnat in pnats:
+            pt_uniform_i32.fill_(pnat)
             tag = (
-                f"fi_dump_b{batch}_mtp{mtp_len}_k{prev_k}"
+                f"fi_dump_b{batch}_mtp{mtp_len}_k{pnat}"
                 f"_s{state_dtype_name}_a{act_dtype_name}"
             )
             median_us, p95_us, p99_us = time_kernel(
@@ -1790,7 +1790,7 @@ def _bench_config(
                 "fi-dump",
                 batch,
                 mtp_len,
-                prev_k,
+                pnat,
                 state_dtype_name,
                 act_dtype_name,
                 median_us,
@@ -1804,7 +1804,7 @@ def _print_row(
     kernel_name,
     batch,
     mtp_len,
-    prev_k,
+    pnat,
     state_dtype_name,
     act_dtype_name,
     median_us,
@@ -1814,7 +1814,7 @@ def _print_row(
 ):
     kernel_col = f"{kernel_name:>11} | " if show_kernel_col else ""
     print(
-        f"| {kernel_col}{batch:>5} | {mtp_len:>7} | {str(prev_k):>6} | "
+        f"| {kernel_col}{batch:>5} | {mtp_len:>7} | {str(pnat):>6} | "
         f"{state_dtype_name:>14} | {act_dtype_name:>9} | "
         f"{median_us:>9.2f} | {p95_us:>7.2f} | {p99_us:>7.2f} |"
         f"{sweep_suffix}"
@@ -1878,7 +1878,7 @@ def _run_benchmark(args) -> None:
     )
     if show_kernel_col:
         print(
-            f"| {'kernel':>11} | {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
+            f"| {'kernel':>11} | {'batch':>5} | {'mtp_len':>7} | {'pnat':>6} | "
             f"{'state_dtype':>14} | {'act_dtype':>9} | "
             f"{'median_us':>9} | {'p95_us':>7} | {'p99_us':>7} |"
         )
@@ -1888,7 +1888,7 @@ def _run_benchmark(args) -> None:
         )
     else:
         print(
-            f"| {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
+            f"| {'batch':>5} | {'mtp_len':>7} | {'pnat':>6} | "
             f"{'state_dtype':>14} | {'act_dtype':>9} | "
             f"{'median_us':>9} | {'p95_us':>7} | {'p99_us':>7} |"
         )
@@ -1899,17 +1899,11 @@ def _run_benchmark(args) -> None:
 
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
-            # Resolve prev_k fractions → clamped integers in [0, max_window].
-            # prev_k is window OCCUPANCY (∈ [0, max_window]), not last-step acceptance, so the
-            # bound is max_window — this lets frac>1 reach the write path (prev_k+mtp_len>max_window)
-            # at the production window (e.g. mw=16 needs prev_k>10).  The kernel asserts the same
-            # [0, max_window] range; the mixed sweep already drives prev_k up to max_window.
-            prev_ks = sorted(
-                set(
-                    min(max_window, max(0, round(f * mtp_len)))
-                    for f in args.prev_tokens_fracs
-                )
-            )
+            # PNAT = previously-accepted-token count = window OCCUPANCY (∈ [0, max_window]), NOT
+            # last-step acceptance — so absolute values are clamped to [0, max_window].  A PNAT with
+            # pnat+mtp_len>max_window hits the write (checkpoint) path (e.g. mw=16, mtp=6 → pnat≥11);
+            # the kernel asserts the same [0, max_window] range.
+            pnats = sorted(set(min(max_window, max(0, p)) for p in args.pnat))
             for state_dtype, philox_rounds, state_label in state_specs:
                 for act_dtype in act_dtypes:
                     _bench_config(
@@ -1917,7 +1911,7 @@ def _run_benchmark(args) -> None:
                         batch,
                         mtp_len,
                         max_window,
-                        prev_ks,
+                        pnats,
                         state_dtype,
                         act_dtype,
                         baseline_fn,
@@ -1979,7 +1973,7 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Cache capacity (T-axis size for old_x/old_B/old_dt/old_cumAdt). "
-        "The CUDA kernel triggers must_checkpoint when prev_k + mtp_len > max_window; "
+        "The CUDA kernel triggers must_checkpoint when pnat + mtp_len > max_window; "
         "Triton receives a matching write_checkpoint flag for apples-to-apples timing. "
         "Must be >= max(mtp_lengths).",
     )
@@ -2041,12 +2035,13 @@ def _parse_args() -> argparse.Namespace:
         "CUDA events if CUPTI is unavailable.",
     )
     parser.add_argument(
-        "--prev-tokens-fracs",
-        default="0,0.5,1.0",
-        type=lambda s: [float(x) for x in s.split(",")],
-        help="Fractions of mtp_len to use as prev_num_accepted_tokens "
-        "for the incremental kernel sweep. Values are rounded "
-        "and clamped to [0, mtp_len].",
+        "--pnat",
+        default="0,4,8",
+        type=lambda s: [int(x) for x in s.split(",")],
+        help="Absolute PNAT (previously-accepted-token counts) to sweep as "
+        "prev_num_accepted_tokens.  Clamped to [0, max_window].  "
+        "pnat + mtp_len > max_window triggers the checkpoint (write) path. "
+        "Example: --pnat 0,1,4,8,12,14",
     )
     parser.add_argument(
         "--baseline",
@@ -2063,7 +2058,8 @@ def _parse_args() -> argparse.Namespace:
         "--output",
         default=None,
         help="Path to save results (file or directory). "
-        "If a directory, writes bench_checkpointing_ssu_<timestamp>.txt inside it.",
+        "If a directory, writes bench_checkpointing_ssu_[<SSU_TAG>_]b<batch>_<dtype>_mtp<mtp>_"
+        "pf<fracs>_<timestamp>.txt inside it (SSU_TAG env optional).",
     )
     parser.add_argument(
         "--block-size-m",
@@ -2119,7 +2115,7 @@ def _parse_args() -> argparse.Namespace:
         "--flashinfer-dump",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run FlashInfer dynamic-dump scenario: write state only at prev_k "
+        help="Run FlashInfer dynamic-dump scenario: write state only at pnat "
         "via dst_state_batch_indices (default: on).",
     )
     return parser.parse_args()
@@ -2147,15 +2143,36 @@ class _Tee:
         self._file.close()
 
 
+def _spec_tag(args) -> str:
+    """Descriptive stem for the auto-generated results filename: an optional ``SSU_TAG``
+    env tag followed by the sweep params (batch / state-dtype / mtp / prev-token fracs), so
+    each run's file is self-identifying.  Lists collapse to ``-``-joined values."""
+
+    def _clean(s) -> str:
+        return str(s).replace(",", "-").replace(" ", "")
+
+    parts = []
+    tag = os.environ.get("SSU_TAG", "").strip()
+    if tag:
+        parts.append(_clean(tag))
+    parts.append("b" + _clean(args.batch_sizes))
+    parts.append(_clean(args.state_dtypes))
+    parts.append("mtp" + _clean(args.mtp_lengths))
+    parts.append("pnat" + "-".join(str(p) for p in args.pnat))
+    return "_".join(parts)
+
+
 if __name__ == "__main__":
     _args = _parse_args()
 
     _out_path = None
     if _args.output != "-":
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _fname = f"bench_checkpointing_ssu_{_ts}.txt"
+        _fname = f"bench_checkpointing_ssu_{_spec_tag(_args)}_{_ts}.txt"
         if _args.output is None:
-            _out_path = os.path.expanduser(f"~/nemo_logs/{_fname}")
+            _out_path = os.path.expanduser(
+                f"/home/scratch.ishovkun_gpu/benchmarks/mamba_decode/{_fname}"
+            )
         elif os.path.isdir(_args.output) or _args.output.endswith("/"):
             _out_path = os.path.join(_args.output, _fname)
         else:
