@@ -161,6 +161,13 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
     config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
+    config.addinivalue_line(
+        "markers",
+        "long_running: front-load this test file at the start of the parallel CI queue",
+    )
+    config.addinivalue_line(
+        "markers", "solo: run this whole test file alone (memory-heavy)"
+    )
 
 
 def pytest_collection_modifyitems(config, items):

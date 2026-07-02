@@ -1478,6 +1478,8 @@ print_execution_summary() {
 execute_dry_run() {
     local test_files=$1
 
+    derive_scheduling_patterns_from_markers
+
     echo "=========================================="
     echo "DRY RUN: Tests that would be executed"
     echo "=========================================="
@@ -1515,10 +1517,11 @@ LONG_RUNNING_TEST_PATTERNS=(
     "test_trtllm_gen_fused_moe_routing_renormalize_fp4.py"
     "test_trtllm_gen_fused_moe_routing_renormalize_fp8.py"
     "test_trtllm_gen_fused_moe_routing_renormalize_bf16.py"
-    "test_trtllm_gen_fused_moe_other.py"
+    "test_trtllm_gen_fused_moe.py"
     "test_trtllm_gen_attention_decode.py"
     "test_trtllm_gen_attention_decode_xqa.py"
     "test_decode_delta_rule.py"
+    "test_fp4_quantize.py"
 )
 
 is_solo_test() {
@@ -1547,8 +1550,48 @@ is_long_running_test() {
     return 1
 }
 
+SCHEDULING_PATTERNS_DERIVED=false
+derive_scheduling_patterns_from_markers() {
+    [ "$SCHEDULING_PATTERNS_DERIVED" = "true" ] && return 0
+    SCHEDULING_PATTERNS_DERIVED=true
+
+    # scripts/test_utils.sh -> repo root is one level up.
+    local repo_root scanner py tests_root long_list solo_list
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    scanner="${repo_root}/scripts/find_marked_tests.py"
+    tests_root="${repo_root}/tests"
+
+    if [ ! -f "$scanner" ] || [ ! -d "$tests_root" ]; then
+        echo "NOTE: marker scanner or tests/ dir not found; using built-in scheduling pattern defaults."
+        return 0
+    fi
+    py="$(command -v python3 || command -v python)" || {
+        echo "NOTE: python not found; using built-in scheduling pattern defaults."
+        return 0
+    }
+
+    long_list="$("$py" "$scanner" long_running "$tests_root" 2>/dev/null)"
+    solo_list="$("$py" "$scanner" solo "$tests_root" 2>/dev/null)"
+
+    if [ -n "$long_list" ]; then
+        mapfile -t LONG_RUNNING_TEST_PATTERNS <<< "$long_list"
+        echo "Derived ${#LONG_RUNNING_TEST_PATTERNS[@]} long-running test pattern(s) from @pytest.mark.long_running."
+    else
+        echo "NOTE: no @pytest.mark.long_running files found; keeping built-in long-running defaults."
+    fi
+    if [ -n "$solo_list" ]; then
+        mapfile -t SOLO_TEST_PATTERNS <<< "$solo_list"
+        echo "Derived ${#SOLO_TEST_PATTERNS[@]} solo test pattern(s) from @pytest.mark.solo."
+    else
+        echo "NOTE: no @pytest.mark.solo files found; keeping built-in solo defaults."
+    fi
+}
+
 execute_tests() {
     local test_files=$1
+
+    # Refresh scheduling buckets from the pytest markers in the test sources.
+    derive_scheduling_patterns_from_markers
 
     mkdir -p "${JUNIT_DIR}"
     if [ "$MONITOR_TEST_MEMORY" = "true" ]; then
