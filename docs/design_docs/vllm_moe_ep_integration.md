@@ -12,10 +12,45 @@ It spans **two repositories**:
 - **vLLM** — branch `feat/flashinfer-ep-all2all` off `Anerudhan/vllm` `main`
   (upstream `vllm-project/vllm` fork), cloned at `/home/scratch.agopal_sw/play/NCCL/vllm`.
 
-> Status: the code in both repos is complete and `py_compile`-clean. Multi-GPU correctness
-> and the perf matrix have **not** been run yet — they require GPUs (lyris). The LL
-> (BatchedExperts) path maps cleanly onto the FlashInfer API; the HT (Standard) path is
-> structurally complete with three on-GPU validation points called out in §6.
+> Status: code complete + **GPU-validated on Pre-Nyx (8×GPU, single node, CUDA 13.2)** — see
+> §0. Both `flashinfer_ep_low_latency` and `flashinfer_ep_high_throughput` pass end-to-end
+> (smoke, GSM8K, throughput). Deferred: DeepEP comparison column (DeepEP's own CUDA-13.2 build
+> fails), raw NCCL-EP backend (not in upstream vLLM), 2-node, and `bench serve` TTFT/TPOT.
+
+---
+
+## 0. Validated results (Pre-Nyx, 8×GPU single node, CUDA 13.2)
+
+Base image `nvcr.io/nvidia/pytorch:26.05-py3`; vLLM built from source (torch gate passed);
+FlashInfer run from the branch. All checks below **pass**:
+
+| Check | LL (`flashinfer_ep_low_latency`) | HT (`flashinfer_ep_high_throughput`) |
+|---|---|---|
+| GAP 1/2/3 unit tests (mocked nccl) | 14/14 | — |
+| EP dispatch+combine `--validate` @ world=8 | ✅ | ✅ |
+| vLLM e2e smoke (OLMoE, coherent output) | ✅ | ✅ |
+| **GSM8K 5-shot, Qwen3-30B-A3B** (flex / strict) | **0.852 / 0.894** | **0.858 / 0.897** |
+
+Both backends clear the GSM8K ≥ 0.80 gate (reference ~0.88).
+
+**Throughput vs DeepEP** (`vllm bench throughput --dataset-name random`, Qwen3-30B-A3B, 8-GPU
+EP, 1000 prompts; total tok/s):
+
+| ISL/OSL | FI-EP LL | FI-EP HT | DeepEP LL | DeepEP HT |
+|---|---|---|---|---|
+| 128 / 128 | 32,506 | 32,050 | 32,535 | 32,050 |
+| 2048 / 128 | 140,823 | 141,744 | 141,786 | 143,238 |
+| 128 / 2048 | 18,515 | 18,461 | 18,891 | 18,764 |
+
+GSM8K accuracy is within noise across all four backends; **throughput is within ~1–2% of
+DeepEP** across all three shapes. **Memory footprint is identical** across all four
+(150.45 GiB / 6.57M-token KV cache at `--gpu-memory-utilization 0.9`) — EP backend choice is
+memory-neutral. See
+[`vllm_moe_ep_results_prenyx.md`](vllm_moe_ep_results_prenyx.md) for the full method,
+per-backend req/s, GSM8K-vs-DeepEP table, multi-node (2-node/16-GPU), and reproduction.
+**Not measured:** raw NCCL-EP (N/A upstream), TTFT/TPOT via `bench serve`. **2-node/16-GPU:**
+Ray+TP=16 plumbing comes up but cross-node engine init stalls — reproduced with plain TP=16
+(no EP), so it's a cluster cross-node NCCL/fabric issue, not the EP integration (see results doc §1.4).
 
 ---
 
@@ -82,28 +117,54 @@ Mirrors the existing DeepEP/NVLink backends. New backend names:
 
 ---
 
-## 4. Build & install (Docker)
+## 4. Build & install
 
 Base image is **forced** to `nvcr.io/nvidia/pytorch:26.05-py3` (CUDA 13.2): cross-node HT
 aborts (`nccl_ep.cc:2884 illegal memory access`) on any non-13.2 stack, and the plan requires
 2-node HT. vLLM is therefore built **from source** against the image's torch.
 
-```bash
-# 1. FlashInfer-EP base (from the FlashInfer repo root)
-docker build -f docker/Dockerfile.flashinfer-ep-pytorch -t flashinfer-ep:pt2605 .
+> **Pre-Nyx (and most SLURM clusters) have no Docker daemon** — images are built with
+> **pyxis/enroot** via `srun --container-save`, not `docker build`. This is how the `.sqsh`
+> images used for all results were produced. The `docker/Dockerfile.*` files remain the
+> canonical build spec and are usable on a machine that *does* have Docker (see the optional
+> block at the end).
 
-# 2. Layer vLLM (from source) + DeepEP on top
-docker build -f docker/Dockerfile.vllm-flashinfer-ep \
-    --build-arg VLLM_REPO=https://github.com/Anerudhan/vllm.git \
-    --build-arg VLLM_REF=feat/flashinfer-ep-all2all \
-    --build-arg BUILD_DEEPEP=1 \
-    -t vllm-flashinfer-ep:pt2605 .
+The three `.sqsh` images (all under a shared-FS work dir `$RW`, mounted `/host` in-container):
+
+```bash
+RW=/lustre/fsw/coreai_libraries_cudnn/agopal-moe-ep   # shared FS work dir
+
+# 1. FlashInfer-EP base (flashinfer-ep-pt2605.sqsh) — for these results it was REUSED
+#    (pre-built). To (re)build it without Docker (enroot registry syntax `nvcr.io#...`,
+#    --container-writable so the in-container installs are captured by --container-save):
+srun -A coreai_libraries_cudnn -p batch -N1 --time=03:00:00 \
+    --container-image="nvcr.io#nvidia/pytorch:26.05-py3" --container-writable \
+    --container-save=$RW/flashinfer-ep-pt2605.sqsh --container-mounts=$RW:/host \
+    bash -lc 'cd /host/flashinfer && bash docker/install/build_flashinfer_ep_pytorch.sh'
+
+# 2. vLLM (from source) and 3. DeepEP images are layered on the base the same way
+#    (srun --container-image=<base>.sqsh --container-save=<new>.sqsh ...).
+#    Full recipes: see vllm_moe_ep_results_prenyx.md §3.2 (vLLM) and §3.3 (DeepEP).
 ```
+
+Notes: whole-node allocations only (**no `--gres`** on this cluster). `--container-writable` is
+required with `--container-save`. Named containers do **not** persist across separate `srun`
+jobs — pass `--container-image=<...>.sqsh` each run.
 
 **First build gate:** upstream vLLM pins `torch==2.11.0`; `use_existing_torch.py` strips that
 so the build uses NGC-26.05's torch. If they are incompatible the vLLM build fails — validate
 before anything else. Runtime env baked in: `NCCL_NET_PLUGIN=none` (HPC-X v8 segfaults NCCL
 ≥2.30), the 2.30.7 `libnccl` symlink, and the HT-JIT toolchain env.
+
+**Optional — on a Docker host / CI** (not Pre-Nyx): the same images build directly from the
+Dockerfiles.
+```bash
+docker build -f docker/Dockerfile.flashinfer-ep-pytorch -t flashinfer-ep:pt2605 .
+docker build -f docker/Dockerfile.vllm-flashinfer-ep \
+    --build-arg VLLM_REPO=https://github.com/Anerudhan/vllm.git \
+    --build-arg VLLM_REF=feat/flashinfer-ep-all2all --build-arg BUILD_DEEPEP=1 \
+    -t vllm-flashinfer-ep:pt2605 .
+```
 
 Sanity inside the container:
 ```bash
@@ -125,17 +186,18 @@ GAP 3 HT `recv_total_counter` binding + `DispatchOutput` surfacing — all again
 `nccl.ep`.
 
 ### 5.2 FlashInfer 8-GPU EP round-trip (single node, 8 GPU)
-Uses the repo's runner (wires NCCL 2.30.7 + DOCA + the HT JIT include tree). Under SLURM,
-**one task per node** (the script owns `torchrun --nproc_per_node=8`):
+Validate dispatch+combine correctness at world=8 via the **comm-matrix `--validate`** path
+(`srun --ntasks-per-node=8`, `file://` rendezvous, `NCCL_GIN_TYPE=3`; whole-node — **no
+`--gres`** on this cluster). See `vllm_moe_ep_results_prenyx.md` §4.2 for the exact runner:
 ```bash
-srun --ntasks-per-node=1 --gres=gpu:8 benchmarks/run_httest_torchrun.sh
-# → tests/moe_ep/test_moe_ep_ht_correctness.py  (HT FLAT dispatch/combine + recv-count)
+srun --ntasks-per-node=8 --container-image=$RW/flashinfer-ep-pt2605.sqsh --container-mounts=$RW:/host \
+  bash -lc 'EP_SYNC=/host/sync_ht NCCL_GIN_TYPE=3 bash /host/<checkout>/benchmarks/run_ep_matrix_one_pt.sh \
+    --algorithm ht --layout fl --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate'
+# LL: --algorithm ll --layout em --tokens 128 --validate
 ```
-Also run the LL/compute correctness + multirank suites on 8 GPU:
-```bash
-torchrun --nproc_per_node=8 tests/moe_ep/test_moe_ep_compute_correctness.py
-torchrun --nproc_per_node=8 tests/moe_ep/test_moe_ep_layer_multirank.py
-```
+> The pytest `tests/moe_ep/test_moe_ep_ht_correctness.py` launched via `torchrun` **hangs** on a
+> default-PG collective on this image — use the comm-matrix `--validate` path above instead
+> (results doc §1.4).
 
 ### 5.3 vLLM smoke (single node, 8 GPU) — both backends
 ```bash
