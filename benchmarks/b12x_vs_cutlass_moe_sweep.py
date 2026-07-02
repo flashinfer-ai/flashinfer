@@ -43,6 +43,12 @@ from flashinfer import (
 from flashinfer.testing.utils import bench_gpu_time
 
 
+ACTIVATION_TYPES = {
+    "silu": ActivationType.Swiglu,
+    "relu2": ActivationType.Relu2,
+}
+
+
 def _round_up(x: int, y: int) -> int:
     return (x + y - 1) // y * y
 
@@ -147,7 +153,13 @@ def main():
     device = torch.device("cuda")
     use_cuda_graph = not args.no_cuda_graph
     is_gated = args.activation == "silu"
-    activation_type = ActivationType.Swiglu if is_gated else ActivationType.Relu2
+    try:
+        activation_type = ACTIVATION_TYPES[args.activation]
+    except KeyError as err:
+        raise ValueError(
+            f"Unsupported activation {args.activation!r}; "
+            f"expected one of {tuple(ACTIVATION_TYPES)}."
+        ) from err
 
     cc_major, cc_minor = torch.cuda.get_device_capability(device)
     if (cc_major, cc_minor) not in ((12, 0), (12, 1)):
@@ -187,6 +199,8 @@ def main():
         is_gated=is_gated,
         device=device,
     )
+    cutlass_w1_long = cutlass_w["w1_q"].contiguous().view(torch.long)
+    cutlass_w2_long = cutlass_w["w2_q"].contiguous().view(torch.long)
 
     # --- Single B12xMoEWrapper covers all m ≤ max_m via internal slicing ---
     moe = (
@@ -209,9 +223,7 @@ def main():
     )
     for m in args.num_tokens:
         torch.manual_seed(args.seed + 100 + m)
-        x_bf16 = (
-            torch.randn(m, args.hidden, dtype=torch.bfloat16, device=device) / 10
-        )
+        x_bf16 = torch.randn(m, args.hidden, dtype=torch.bfloat16, device=device) / 10
         routing_logits = torch.randn(m, args.num_experts, device=device)
         routing_weights, selected_experts = compute_routing(routing_logits, args.top_k)
         selected_experts = selected_experts.to(torch.int32)
@@ -263,27 +275,29 @@ def main():
         if not args.skip_cutlass:
             out = torch.empty(m, args.hidden, dtype=torch.bfloat16, device=device)
             x_q, x_sf = fp4_quantize(x_bf16, cutlass_w["a1_gs"])
+            selected_experts_i32 = selected_experts.to(torch.int)
 
-            def run_cutlass(x, te, rw, w1q, w2q, o):
+            def run_cutlass(x, x_scale, te, rw, w1q, w2q, o):
                 return cutlass_fused_moe(
                     x,
-                    te.to(torch.int),
+                    te,
                     rw,
-                    w1q.contiguous().view(torch.long),
-                    w2q.contiguous().view(torch.long),
+                    w1q,
+                    w2q,
                     torch.bfloat16,
                     quant_scales=cutlass_w["quant_scales"],
-                    input_sf=x_sf,
+                    input_sf=x_scale,
                     output=o,
                     **_activation_kwarg(cutlass_fused_moe, activation_type),
                 )
 
             cutlass_args = (
                 x_q,
-                selected_experts,
+                x_sf,
+                selected_experts_i32,
                 routing_weights,
-                cutlass_w["w1_q"],
-                cutlass_w["w2_q"],
+                cutlass_w1_long,
+                cutlass_w2_long,
                 out,
             )
             cutlass_times = bench_gpu_time(
@@ -333,7 +347,10 @@ def main():
     crossovers = []
     for i in range(1, len(rows)):
         prev, cur = rows[i - 1], rows[i]
-        if prev["winner"] != cur["winner"] and "?" not in (prev["winner"], cur["winner"]):
+        if prev["winner"] != cur["winner"] and "?" not in (
+            prev["winner"],
+            cur["winner"],
+        ):
             crossovers.append((prev["num_tokens"], cur["num_tokens"], cur["winner"]))
     if crossovers:
         print("[INFO] Crossover(s):")

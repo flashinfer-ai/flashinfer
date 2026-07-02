@@ -38,6 +38,7 @@ Example (Wrapper API with CUDA Graph):
 """
 
 import os
+from contextlib import suppress
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -253,9 +254,17 @@ class B12xMoEWrapper:
             kernels. Use to keep b12x's micro/static decode path while routing
             prefill chunks (where b12x's dynamic kernel underperforms) to
             CUTLASS. Requires :meth:`register_cutlass_prefill_weights` to be
-            called before the first prefill call. Default ``0`` disables
-            hybrid dispatch (pure b12x). The env var
-            ``FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD`` overrides this if set.
+            called before the first prefill call. An explicit value, including
+            ``0``, takes precedence over the environment. When omitted, the
+            value is read from ``FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD``;
+            the effective default is ``0`` (pure b12x).
+
+            Hybrid dispatch is available only for NVFP4. It keeps both b12x-
+            and CUTLASS-format FP4 weights resident, roughly doubling weight
+            memory. Backend selection is a host-side decision, so a CUDA graph
+            captures only the path selected by that graph's token shape; use
+            separate graphs for shape buckets on opposite sides of the
+            threshold.
 
     Example:
         >>> moe = B12xMoEWrapper(num_experts=256, top_k=8, ...)
@@ -291,7 +300,7 @@ class B12xMoEWrapper:
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
-        cutlass_prefill_threshold: int = 0,
+        cutlass_prefill_threshold: Optional[int] = None,
     ):
         r"""Configure the b12x fused-MoE wrapper.
 
@@ -336,6 +345,12 @@ class B12xMoEWrapper:
         source_format : str
             Source weight format for ``quant_mode="w4a16"`` —
             ``"modelopt"`` (default) or ``"compressed_tensors"``.
+        cutlass_prefill_threshold : Optional[int]
+            Route calls with at least this many tokens to CUTLASS. Explicit
+            values take precedence over
+            ``FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD``; when both are
+            omitted, the effective default is ``0`` (disabled). Hybrid mode is
+            NVFP4-only and requires separately registered CUTLASS weights.
         """
         from ...jit.cpp_ext import get_cuda_version
         from .blackwell_sm12x.moe_dispatch import (
@@ -383,13 +398,19 @@ class B12xMoEWrapper:
         )
         self.source_format = source_format
 
-        env_override = os.environ.get("FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD")
-        if env_override is not None:
-            try:
-                cutlass_prefill_threshold = int(env_override)
-            except ValueError:
-                pass
+        if cutlass_prefill_threshold is None:
+            cutlass_prefill_threshold = 0
+            env_override = os.environ.get("FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD")
+            if env_override is not None:
+                with suppress(ValueError):
+                    cutlass_prefill_threshold = int(env_override)
         self.cutlass_prefill_threshold = cutlass_prefill_threshold
+        if self.cutlass_prefill_threshold > 0 and self.quant_mode != "nvfp4":
+            raise NotImplementedError(
+                "B12xMoEWrapper hybrid CUTLASS prefill dispatch supports only "
+                f"quant_mode='nvfp4', got {self.quant_mode!r}. Set "
+                "cutlass_prefill_threshold=0 to use pure b12x W4A16."
+            )
 
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
@@ -404,11 +425,14 @@ class B12xMoEWrapper:
 
         # CUTLASS-format prefill weights, registered post-construction via
         # register_cutlass_prefill_weights(). Held alongside the b12x weights
-        # the caller passes to run() — same FP4 numeric values, different
-        # physical layout (gate/up interleave + non-MMA SF for CUTLASS).
+        # the caller passes to run() — the same logical weights quantized into
+        # different physical layouts and scale-factor conventions.
         self._cutlass_w1: Optional[torch.Tensor] = None
         self._cutlass_w2: Optional[torch.Tensor] = None
         self._cutlass_quant_scales: Optional[List[torch.Tensor]] = None
+        self._cutlass_swiglu_alpha: Optional[torch.Tensor] = None
+        self._cutlass_swiglu_beta: Optional[torch.Tensor] = None
+        self._cutlass_swiglu_limit: Optional[torch.Tensor] = None
 
         if use_cuda_graph:
             self._allocate_buffers()
@@ -513,9 +537,9 @@ class B12xMoEWrapper:
 
         Required when ``cutlass_prefill_threshold > 0``. The b12x decode path
         (un-normalized SF + MMA-swizzled layout) and the CUTLASS prefill path
-        (normalized FP8 SF + non-interleave-aware layout) share FP4 numeric
-        values but use different physical packings. The wrapper holds both
-        alive — the caller must FP4-quantize weights twice at load time
+        (normalized FP8 SF + non-interleave-aware layout) represent the same
+        logical weights with different physical packings. The wrapper holds
+        both alive — the caller must FP4-quantize weights twice at load time
         (mirroring TRT-LLM's ``FlashInferFusedMoE.post_load_weights``).
 
         Args:
@@ -536,6 +560,21 @@ class B12xMoEWrapper:
         self._cutlass_w1 = w1_q.contiguous().view(torch.long)
         self._cutlass_w2 = w2_q.contiguous().view(torch.long)
         self._cutlass_quant_scales = quant_scales
+        if self.activation == "swigluoai_uninterleave":
+            param_options = {
+                "device": w1_q.device,
+                "dtype": torch.float32,
+            }
+            self._cutlass_swiglu_alpha = torch.full(
+                (self.num_experts,), self.swiglu_alpha, **param_options
+            )
+            self._cutlass_swiglu_beta = torch.full(
+                (self.num_experts,), self.swiglu_beta, **param_options
+            )
+            if self.swiglu_limit is not None:
+                self._cutlass_swiglu_limit = torch.full(
+                    (self.num_experts,), self.swiglu_limit, **param_options
+                )
 
     def _should_route_to_cutlass(self, num_tokens: int) -> bool:
         return (
@@ -562,13 +601,25 @@ class B12xMoEWrapper:
                 "or set cutlass_prefill_threshold=0 to disable hybrid dispatch."
             )
 
-        activation_type = (
-            ActivationType.Swiglu if self.activation == "silu" else ActivationType.Relu2
-        )
+        activation_types = {
+            "silu": ActivationType.Swiglu,
+            "gelu_tanh": ActivationType.GegluTanh,
+            "swigluoai_uninterleave": ActivationType.Swiglu,
+            "relu2": ActivationType.Relu2,
+        }
+        try:
+            activation_type = activation_types[self.activation]
+        except KeyError as err:
+            raise ValueError(
+                "CUTLASS prefill dispatch does not support activation "
+                f"{self.activation!r}; expected one of {tuple(activation_types)}."
+            ) from err
         # cutlass_fused_moe returns a list (carryover from min-latency mode's
         # multi-output case); it writes into the pre-allocated `output` buffer
         # we pass, so we return that directly to keep our run() contract a
         # single Tensor.
+        # In NVFP4 mode a BF16 input with input_sf=None is quantized internally
+        # using quant_scales[0] as the FC1 activation global scale.
         cutlass_fused_moe(
             input=x,
             token_selected_experts=token_selected_experts.to(torch.int),
@@ -578,6 +629,9 @@ class B12xMoEWrapper:
             output_dtype=self.output_dtype,
             quant_scales=self._cutlass_quant_scales,
             input_sf=None,
+            swiglu_alpha=self._cutlass_swiglu_alpha,
+            swiglu_beta=self._cutlass_swiglu_beta,
+            swiglu_limit=self._cutlass_swiglu_limit,
             output=output,
             activation_type=activation_type,
         )
