@@ -412,13 +412,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   auto block = cg::this_thread_block();
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
-  // Asymmetric K/V plumbing; see SingleDecodeWithKVCacheKernel above for
-  // the shared-memory-layout constraint.
   using DTypeK = typename Params::DTypeK;
   using DTypeV = typename Params::DTypeV;
-  static_assert(std::is_same_v<DTypeK, DTypeV>,
-                "BatchDecodeWithPagedKVCacheDevice does not yet support asymmetric "
-                "K/V dtypes; see the upstream asymmetric-kv-dtype patch plan");
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
   const DTypeQ* q = params.q;
@@ -446,14 +441,19 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
   const uint32_t chunk_size = chunk_end - chunk_start;
 
+  // Asymmetric K/V: K and V tiles may have different byte sizes per element.
+  // k_smem stores K data typed as DTypeK; v_smem stores V data typed as DTypeV.
+  // When DTypeK == DTypeV (the symmetric case), the layout is byte-identical
+  // to the pre-asymmetric code.
+  constexpr size_t kv_tile_elems = num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim;
+  constexpr size_t k_tile_bytes = kv_tile_elems * sizeof(DTypeK);
+  constexpr size_t v_tile_bytes = kv_tile_elems * sizeof(DTypeV);
+
   AttentionVariant variant(params, batch_idx, smem);
-  DTypeKV* k_smem = (DTypeKV*)smem;
-  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
-                                          sizeof(DTypeKV));
-  size_t* kv_offset_smem = (size_t*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
-                                                head_dim * sizeof(DTypeKV));
-  float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
-                                       sizeof(DTypeKV));
+  DTypeK* k_smem = (DTypeK*)smem;
+  DTypeV* v_smem = (DTypeV*)(smem + k_tile_bytes);
+  size_t* kv_offset_smem = (size_t*)(smem + k_tile_bytes + v_tile_bytes);
+  float* smem_md = (float*)(smem + k_tile_bytes + v_tile_bytes);
 
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
@@ -490,7 +490,8 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 
   // preload k/v tiles
   uint32_t stage_idx = 0;
-  constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
+  constexpr uint32_t vec_bits_k = sizeof(DTypeK) * vec_size * 8;
+  constexpr uint32_t vec_bits_v = sizeof(DTypeV) * vec_size * 8;
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   static_assert(num_stages_smem <= bdx);
@@ -514,7 +515,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     }
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+      cp_async::pred_load<vec_bits_k, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.k_data + kv_offset[j],
@@ -523,7 +524,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     cp_async::commit_group();
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+      cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.v_data + kv_offset[j],
@@ -573,7 +574,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // load k tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+      cp_async::pred_load<vec_bits_k, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.k_data + kv_offset[j],
@@ -591,7 +592,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     // load v tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+      cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           paged_kv.v_data + kv_offset[j],
@@ -769,20 +770,21 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
                                                   cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
-  // Asymmetric K/V plumbing; body still requires equal K and V dtypes.
   using DTypeK = typename Params::DTypeK;
   using DTypeV = typename Params::DTypeV;
-  static_assert(std::is_same_v<DTypeK, DTypeV>,
-                "BatchDecodeWithPagedKVCacheDispatched does not yet support "
-                "asymmetric K/V dtypes; the kernel body rewrite is a follow-up "
-                "commit");
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
   const uint32_t padded_batch_size = params.padded_batch_size;
 
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+  // vec_size must be large enough that both K and V cp_async loads reach
+  // the 128-bit minimum.  cp_async::pred_load requires num_bits in {128,256}.
+  // vec_bits = sizeof(DType) * vec_size * 8, so we need
+  //   sizeof(DType) * vec_size * 8 >= 128  =>  vec_size >= 16 / sizeof(DType).
+  // Using the smaller of the two element sizes ensures both meet the bound.
+  constexpr size_t min_kv_sizeof = std::min(sizeof(DTypeK), sizeof(DTypeV));
+  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
   auto compute_capacity = GetCudaComputeCapability();
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
@@ -790,12 +792,17 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
     constexpr uint32_t bdy = GROUP_SIZE;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
+    // tile_size_per_bdx: use the smaller of the two element sizes so that
+    // the smem budget fits both K and V tiles.
+    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (min_kv_sizeof == 1 ? 2U : 4U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
+      // Asymmetric smem: K tiles at sizeof(DTypeK) per element, V tiles at
+      // sizeof(DTypeV) per element.  When DTypeK == DTypeV this simplifies
+      // to the pre-asymmetric formula.
       const uint32_t smem_size =
-          2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-          std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
-                   2 * bdy * bdz * sizeof(float));
+          NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM *
+              (sizeof(DTypeK) + sizeof(DTypeV)) +
+          std::max(tile_size_per_bdx * num_threads * sizeof(size_t), 2 * bdy * bdz * sizeof(float));
       auto kernel =
           BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
                                             vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
