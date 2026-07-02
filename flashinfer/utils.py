@@ -664,6 +664,19 @@ def check_shape_dtype_device(
         )
 
 
+def _check_workspace_buffer_alignment(
+    x: torch.Tensor, name: str, alignment: int = 16
+) -> None:
+    if x.numel() == 0:
+        return
+    data_ptr = x.data_ptr()
+    if data_ptr % alignment != 0:
+        raise ValueError(
+            f"{name} must be {alignment}-byte aligned, got data_ptr % "
+            f"{alignment} = {data_ptr % alignment}"
+        )
+
+
 @functools.cache
 def get_logging_module():
     return gen_spdlog_module().build_and_load()

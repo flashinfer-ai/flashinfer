@@ -66,6 +66,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
+    _check_workspace_buffer_alignment,
     check_shape_dtype_device,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
@@ -152,6 +153,7 @@ def get_single_decode_module(*args):
 @functools.cache
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
+    workspace_size_func = getattr(jit_module, "workspace_size", None)
     run_func = jit_module.run
 
     @register_custom_op(
@@ -222,6 +224,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 
     return SimpleNamespace(
         plan=plan_func,
+        workspace_size=workspace_size_func,
         run=run_batch_decode,
     )
 
@@ -231,6 +234,7 @@ def get_batch_decode_module(*args):
     uri = get_batch_decode_uri(*args)
     mod = gen_batch_decode_module(*args).build_and_load()
     plan_func = mod.plan
+    workspace_size_func = getattr(mod, "workspace_size", None)
     run_func = mod.run
 
     # torch library for batch_decode_with_paged_kv_cache_run
@@ -319,6 +323,7 @@ def get_batch_decode_module(*args):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
+        workspace_size=workspace_size_func,
         run=run_batch_decode,
     )
 
@@ -731,7 +736,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
-            buffer should be the same as the device of the input tensors.
+            buffer should be the same as the device of the input tensors. The buffer must be
+            16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
@@ -774,6 +780,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
         """
+        _check_workspace_buffer_alignment(
+            float_workspace_buffer, "float_workspace_buffer"
+        )
         _check_kv_layout(kv_layout)
 
         if backend == "cute-dsl" and jit_args is not None:
@@ -888,6 +897,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The new int workspace buffer, the device of the new int workspace buffer should
             be the same as the device of the input tensors.
         """
+        _check_workspace_buffer_alignment(
+            float_workspace_buffer, "float_workspace_buffer"
+        )
+        _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
@@ -896,6 +909,192 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+
+    @flashinfer_api
+    def workspace_size(
+        self,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pos_encoding_mode: str = "NONE",
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Optional[Union[str, torch.dtype]] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        data_type: Optional[Union[str, torch.dtype]] = None,
+        sm_scale: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+        q_len_per_req: int = 1,
+    ) -> Tuple[int, int]:
+        r"""Return the caller-owned workspace size required by :meth:`plan`.
+
+        The returned tuple is ``(float_workspace_size, int_workspace_size)`` in
+        bytes.  The inputs follow :meth:`plan`; host-side planning tensors such
+        as ``indptr`` and ``last_page_len`` are copied to CPU in the same way as
+        :meth:`plan`.  The wrapper's float workspace buffer is only used as the
+        device/stream selector for the underlying module query.  This method
+        does not allocate buffers and does not mutate cached plan state.
+
+        Example
+        -------
+        >>> float_bytes, int_bytes = wrapper.workspace_size(...)
+        >>> wrapper.reset_workspace_buffer(
+        ...     torch.empty(float_bytes, dtype=torch.uint8, device="cuda"),
+        ...     torch.empty(int_bytes, dtype=torch.uint8, device="cuda"),
+        ... )
+        >>> wrapper.plan(...)
+        """
+        _check_workspace_buffer_alignment(
+            self._float_workspace_buffer, "float_workspace_buffer"
+        )
+        del block_tables, q_len_per_req, rope_scale, rope_theta, sm_scale
+        batch_size = len(last_page_len)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        if data_type is not None:
+            if q_data_type is None:
+                q_data_type = data_type
+            if kv_data_type is None:
+                kv_data_type = data_type
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        if fixed_split_size is not None and not self.use_tensor_cores:
+            raise ValueError(
+                "fixed_split_size is only supported by tensor core decode for now."
+            )
+        if fixed_split_size is None:
+            fixed_split_size = -1
+        if self.is_cuda_graph_enabled:
+            if batch_size != self._fixed_batch_size:
+                raise ValueError(
+                    "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                    " mismatches the batch size set during initialization {}".format(
+                        batch_size, self._fixed_batch_size
+                    )
+                )
+            if len(indices) > len(self._paged_kv_indices_buf):
+                raise ValueError(
+                    "The size of indices should be less than or equal to the allocated buffer"
+                )
+
+        indptr_host = indptr.to("cpu")
+        last_page_len_host = last_page_len.to("cpu")
+        if seq_lens is None:
+            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+        else:
+            kv_lens_arr_host = seq_lens.cpu()
+
+        backend = self._backend
+        if backend in ("cute-dsl", "trtllm-gen"):
+            raise NotImplementedError(
+                f"workspace_size is not available for decode backend {backend!r}"
+            )
+
+        if self.use_tensor_cores:
+            if self._jit_module is not None:
+                module = self._jit_module
+            else:
+                if backend == "auto":
+                    if {
+                        torch.float8_e4m3fn,
+                        torch.float8_e5m2,
+                    } & {q_data_type, kv_data_type}:
+                        backend = determine_attention_backend(
+                            self.device,
+                            PosEncodingMode[pos_encoding_mode].value,
+                            False,  # use_fp16_qk_reductions
+                            False,  # use_custom_mask
+                            q_data_type,
+                            kv_data_type,
+                        )
+                    else:
+                        backend = "fa2"
+                module = get_batch_prefill_module(
+                    backend,
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    indptr.dtype,
+                    head_dim,
+                    head_dim,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left != -1,
+                    logits_soft_cap > 0,
+                    False,
+                )
+            qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+            args = [
+                self._float_workspace_buffer,
+                qo_indptr_host,
+                indptr_host,
+                kv_lens_arr_host,
+                batch_size,  # total_num_rows
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim,
+                head_dim,
+                False,  # causal
+                window_left,
+            ]
+            if backend == "fa2":
+                args.append(fixed_split_size)
+                args.append(disable_split_kv)
+                args.append(0)  # num_colocated_ctas
+        else:
+            if self._jit_module is not None:
+                module = self._jit_module
+            else:
+                module = get_batch_decode_module(
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    indptr.dtype,
+                    head_dim,
+                    head_dim,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left != -1,
+                    logits_soft_cap > 0,
+                )
+            args = [
+                self._float_workspace_buffer,
+                indptr_host,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                window_left,
+                logits_soft_cap,
+                head_dim,
+                head_dim,
+                torch.empty(0, dtype=q_data_type),
+                torch.empty(0, dtype=kv_data_type),
+            ]
+        if module.workspace_size is None:
+            raise NotImplementedError(
+                f"workspace_size is not available for decode backend {backend!r}"
+            )
+        float_workspace_size, int_workspace_size = module.workspace_size(*args)
+        return int(float_workspace_size), int(int_workspace_size)
 
     @flashinfer_api
     def plan(
@@ -1005,6 +1204,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_workspace_buffer_alignment(
+            self._float_workspace_buffer, "float_workspace_buffer"
+        )
+        _check_workspace_buffer_alignment(
+            self._int_workspace_buffer, "int_workspace_buffer"
+        )
         self._workspace_size = (
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
@@ -1884,7 +2089,8 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
-            buffer should be the same as the device of the input tensors.
+            buffer should be the same as the device of the input tensors. The buffer must be
+            16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         use_cuda_graph : bool
             Whether to enable CUDAGraph for batch decode attention, if enabled, the
