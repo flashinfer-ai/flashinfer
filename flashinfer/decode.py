@@ -907,10 +907,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
-        *,
         pos_encoding_mode: str = "NONE",
         window_left: int = -1,
-        window_right: int = 0,
         logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
@@ -925,6 +923,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        window_right: int = 0,  # Place after window_left after enabling keyword-only args
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
