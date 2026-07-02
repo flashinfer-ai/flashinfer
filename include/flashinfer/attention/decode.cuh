@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 
 #include <iostream>
+#include <type_traits>
 
 #include "../cp_async.cuh"
 #include "../math.cuh"
@@ -217,10 +218,19 @@ template <PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t 
 __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // Asymmetric K/V plumbing. For now DTypeK must equal DTypeV because this
+  // kernel body's shared-memory layout and load vectorization assume a
+  // single KV element size. The plumbing is in place for the follow-up
+  // commit that splits the K and V load paths.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
+  static_assert(std::is_same_v<DTypeK, DTypeV>,
+                "SingleDecodeWithKVCacheKernel does not yet support asymmetric "
+                "K/V dtypes; see the upstream asymmetric-kv-dtype patch plan");
   using DTypeO = typename Params::DTypeO;
   const DTypeQ* q = params.q;
-  const DTypeKV* k = params.k;
-  const DTypeKV* v = params.v;
+  const DTypeK* k = params.k;
+  const DTypeV* v = params.v;
   const uint32_t q_stride_n = params.q_stride_n;
   const uint32_t q_stride_h = params.q_stride_h;
   const uint32_t kv_stride_n = params.kv_stride_n;
@@ -402,6 +412,13 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   auto block = cg::this_thread_block();
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // Asymmetric K/V plumbing; see SingleDecodeWithKVCacheKernel above for
+  // the shared-memory-layout constraint.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
+  static_assert(std::is_same_v<DTypeK, DTypeV>,
+                "BatchDecodeWithPagedKVCacheDevice does not yet support asymmetric "
+                "K/V dtypes; see the upstream asymmetric-kv-dtype patch plan");
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
   const DTypeQ* q = params.q;
@@ -661,6 +678,13 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
                                               cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // Asymmetric K/V plumbing; body still requires equal K and V dtypes.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
+  static_assert(std::is_same_v<DTypeK, DTypeV>,
+                "SingleDecodeWithKVCacheDispatched does not yet support "
+                "asymmetric K/V dtypes; the kernel body rewrite is a follow-up "
+                "commit");
   using DTypeO = typename Params::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
@@ -745,6 +769,13 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
                                                   cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // Asymmetric K/V plumbing; body still requires equal K and V dtypes.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
+  static_assert(std::is_same_v<DTypeK, DTypeV>,
+                "BatchDecodeWithPagedKVCacheDispatched does not yet support "
+                "asymmetric K/V dtypes; the kernel body rewrite is a follow-up "
+                "commit");
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
   const uint32_t num_qo_heads = params.num_qo_heads;

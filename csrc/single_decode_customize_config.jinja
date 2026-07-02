@@ -15,7 +15,11 @@
 using namespace flashinfer;
 
 using DTypeQ = {{ dtype_q }};
-using DTypeKV = {{ dtype_kv }};
+using DTypeK = {{ dtype_k | default(dtype_kv) }};
+using DTypeV = {{ dtype_v | default(dtype_kv) }};
+// Backward-compat alias. `DTypeKV` was the old symmetric-only type name;
+// new code should reference `DTypeK` / `DTypeV`.
+using DTypeKV = DTypeK;
 using DTypeO = {{ dtype_o }};
 using IdType = int32_t;
 constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
@@ -26,12 +30,14 @@ constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
 
 struct Params {
   using DTypeQ = DTypeQ;
-  using DTypeKV = DTypeKV;
+  using DTypeK = DTypeK;
+  using DTypeV = DTypeV;
+  using DTypeKV = DTypeKV;  // backward-compat alias (equal to DTypeK)
   using DTypeO = DTypeO;
   using IdType = int32_t;
   DTypeQ* q;
-  DTypeKV* k;
-  DTypeKV* v;
+  DTypeK* k;
+  DTypeV* v;
   DTypeO* o;
   float* lse;
   {{ additional_params_decl }}

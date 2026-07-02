@@ -17,7 +17,11 @@
 using namespace flashinfer;
 
 using DTypeQ = cutlass_dtype_t<{{ dtype_q }}>;
-using DTypeKV = cutlass_dtype_t<{{ dtype_kv }}>;
+using DTypeK = cutlass_dtype_t<{{ dtype_k | default(dtype_kv) }}>;
+using DTypeV = cutlass_dtype_t<{{ dtype_v | default(dtype_kv) }}>;
+// Backward-compat alias. `DTypeKV` was the old symmetric-only type name;
+// new code should reference `DTypeK` / `DTypeV`.
+using DTypeKV = DTypeK;
 using DTypeO = cutlass_dtype_t<{{ dtype_o }}>;
 using IdType = cutlass_dtype_t<int32_t>;
 
@@ -28,14 +32,16 @@ constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
 
 struct Params {
   using DTypeQ = DTypeQ;
-  using DTypeKV = DTypeKV;
+  using DTypeK = DTypeK;
+  using DTypeV = DTypeV;
+  using DTypeKV = DTypeKV;  // backward-compat alias (equal to DTypeK)
   using DTypeO = DTypeO;
   using IdType = IdType;
 
   // The QKV matrices.
   DTypeQ* q_ptr;
-  DTypeKV* k_ptr;
-  DTypeKV* v_ptr;
+  DTypeK* k_ptr;
+  DTypeV* v_ptr;
   DTypeO* o_ptr;
   float* lse_ptr;
 
