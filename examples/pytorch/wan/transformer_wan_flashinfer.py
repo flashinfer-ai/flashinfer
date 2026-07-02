@@ -727,7 +727,11 @@ class Timesteps(nn.Module):
         exponent = exponent / (half_dim - self.downscale_freq_shift)
 
         emb = timesteps[:, None].float() * exponent[None, :].exp()
-        emb = torch.cat([emb.cos(), emb.sin()], dim=-1)
+        # Match diffusers get_timestep_embedding: [sin, cos] BEFORE the flip,
+        # so flip_sin_to_cos=True yields [cos, sin]. (Starting from [cos, sin]
+        # here would make the flip produce [sin, cos] — swapped halves that
+        # silently scramble the timestep conditioning.)
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
 
         if self.flip_sin_to_cos:
             emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
@@ -1061,6 +1065,25 @@ class FlashInferWanTransformer3DModel(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        # Ulysses sequence parallelism: shard the token sequence across ranks.
+        # Every rank runs the full block stack on its shard; self-attention
+        # inside the blocks uses the all-to-all to attend over the full
+        # sequence (see FlashInferWanAttention). The rotary tables are sliced
+        # to the shard so positions stay correct.
+        ulysses_ctx = _get_ulysses_context()
+        seq_sharded = ulysses_ctx is not None and ulysses_ctx.world_size > 1
+        if seq_sharded:
+            w, r = ulysses_ctx.world_size, ulysses_ctx.rank
+            seq_len = hidden_states.shape[1]
+            assert seq_len % w == 0, (
+                f"sequence length {seq_len} not divisible by ulysses world size {w}"
+            )
+            s_local = seq_len // w
+            hidden_states = hidden_states[:, r * s_local : (r + 1) * s_local]
+            rotary_emb = tuple(
+                f[:, r * s_local : (r + 1) * s_local] for f in rotary_emb
+            )
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
             ts_seq_len = timestep.shape[1]
@@ -1102,6 +1125,18 @@ class FlashInferWanTransformer3DModel(nn.Module):
                 hidden_states = block(
                     hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
                 )
+
+        if seq_sharded:
+            # Reassemble the full sequence for the output projection/unpatchify.
+            import torch.distributed as dist
+
+            gathered = [
+                torch.empty_like(hidden_states) for _ in range(ulysses_ctx.world_size)
+            ]
+            dist.all_gather(
+                gathered, hidden_states.contiguous(), group=ulysses_ctx.group
+            )
+            hidden_states = torch.cat(gathered, dim=1)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:
