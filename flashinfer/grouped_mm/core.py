@@ -21,7 +21,6 @@ import torch
 from ..api_logging import flashinfer_api
 from ..utils import backend_requirement, supported_compute_capability
 from .cudnn import (
-    _CUDNN_MOE_BLOCK_SCALE_MIN_VERSION,
     _CUDNN_MOE_MIN_VERSION,
     _check_cudnn_version,
     _run_cudnn_moe_block_scale_grouped_gemm_fp4,
@@ -406,7 +405,7 @@ def grouped_mm_mxfp8(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_BLOCK_SCALE_MIN_VERSION, "grouped_mm_mxfp8")
+        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_mxfp8")
         return _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
             a,
             b,
@@ -574,7 +573,7 @@ def grouped_mm_fp4(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_BLOCK_SCALE_MIN_VERSION, "grouped_mm_fp4")
+        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_fp4")
         return _run_cudnn_moe_block_scale_grouped_gemm_fp4(
             a,
             b,
