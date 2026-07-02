@@ -2115,8 +2115,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 is_partial_tile = (
                     tile_info[4] < tile_m_start + self.cta_tile_shape_mnk[0]
                 )
-                if is_partial_tile:
-                    self.epilog_sync_barrier.arrive_and_wait()
                 #
                 # Async arrive accumulator buffer empty
                 #
@@ -2124,6 +2122,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     cute.arch.fence_view_async_tmem_load()
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
+
+                if is_partial_tile:
+                    self.epilog_sync_barrier.arrive_and_wait()
 
                 # Whole-row async bulk reduce (smem -> global scatter-add).
                 reduce_row = epi_tidx

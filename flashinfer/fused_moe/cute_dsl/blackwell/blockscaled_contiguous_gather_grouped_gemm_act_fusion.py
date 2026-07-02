@@ -471,16 +471,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.sched_warp_id = 10
         self.sync_transform_warp_id = 11
         self.threads_per_warp = 32
-        active_warp_ids = (
-            self.mma_warp_id,
-            *self.ldgsts_a_warp_id,
-            self.tma_b_warp_id,
-            *self.epilog_warp_id,
-            self.sched_warp_id,
+        self.threads_per_cta = self.threads_per_warp * len(
+            (
+                self.mma_warp_id,
+                *self.ldgsts_a_warp_id,
+                self.tma_b_warp_id,
+                *self.epilog_warp_id,
+                self.sched_warp_id,
+                self.sync_transform_warp_id,
+            )
         )
-        if self.use_2cta_instrs:
-            active_warp_ids += (self.sync_transform_warp_id,)
-        self.threads_per_cta = self.threads_per_warp * len(active_warp_ids)
         self.warps_wo_sched = (
             len(
                 (
@@ -1282,7 +1282,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Pipeline Init:Initialize tile info pipeline (barrier) and states
         tile_info_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            1,
+            self.threads_per_warp * 1,
         )
         tile_info_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
@@ -1499,29 +1499,30 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tiled_mma.thr_id.shape
                     )
                     if mma_tile_coord_m < num_non_exiting_tiles_value:
+                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        cur_tile_coord = work_tile.tile_idx
+                        expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
                         with cute.arch.elect_one():
-                            tile_info_pipeline.producer_acquire(
-                                tile_info_producer_state
-                            )
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
                                 0
                             ]
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
                                 1
                             ]
-                            sInfo[(2, tile_info_producer_state.index)] = (
-                                tile_idx_to_expert_idx[mma_tile_coord_m]
-                            )
+                            sInfo[(2, tile_info_producer_state.index)] = expert_idx
                             sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
                                 work_tile.is_valid_tile
                             )
-                            sInfo[(4, tile_info_producer_state.index)] = (
-                                tile_idx_to_mn_limit[mma_tile_coord_m]
-                            )
-                            cute.arch.fence_proxy("async.shared", space="cta")
-                            tile_info_pipeline.producer_commit(
-                                tile_info_producer_state
-                            )
+                            sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            # fence view async shared
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
+
+                        self.sched_sync_barrier.arrive_and_wait()
+                        tile_info_pipeline.producer_commit(tile_info_producer_state)
                         tile_info_producer_state.advance()
 
                     tile_sched.advance_to_next_work()
@@ -1534,29 +1535,30 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tiled_mma.thr_id.shape
                     )
                     if mma_tile_coord_m < num_non_exiting_tiles_value:
+                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        cur_tile_coord = work_tile.tile_idx
+                        expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
+                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
                         with cute.arch.elect_one():
-                            tile_info_pipeline.producer_acquire(
-                                tile_info_producer_state
-                            )
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
                                 0
                             ]
                             sInfo[(1, tile_info_producer_state.index)] = cur_tile_coord[
                                 1
                             ]
-                            sInfo[(2, tile_info_producer_state.index)] = (
-                                tile_idx_to_expert_idx[mma_tile_coord_m]
-                            )
+                            sInfo[(2, tile_info_producer_state.index)] = expert_idx
                             sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(
                                 work_tile.is_valid_tile
                             )
-                            sInfo[(4, tile_info_producer_state.index)] = (
-                                tile_idx_to_mn_limit[mma_tile_coord_m]
-                            )
-                            cute.arch.fence_proxy("async.shared", space="cta")
-                            tile_info_pipeline.producer_commit(
-                                tile_info_producer_state
-                            )
+                            sInfo[(4, tile_info_producer_state.index)] = mn_limit
+                            # fence view async shared
+                        cute.arch.fence_proxy(
+                            "async.shared",
+                            space="cta",
+                        )
+
+                        self.sched_sync_barrier.arrive_and_wait()
+                        tile_info_pipeline.producer_commit(tile_info_producer_state)
                         tile_info_producer_state.advance()
                     else:
                         is_continue = cutlass.Boolean(0)
@@ -1564,18 +1566,21 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
 
+            tile_info_pipeline.producer_acquire(tile_info_producer_state)
             with cute.arch.elect_one():
-                tile_info_pipeline.producer_acquire(tile_info_producer_state)
                 sInfo[(0, tile_info_producer_state.index)] = work_tile.tile_idx[0]
                 sInfo[(1, tile_info_producer_state.index)] = work_tile.tile_idx[1]
                 sInfo[(2, tile_info_producer_state.index)] = -1
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
                 sInfo[(4, tile_info_producer_state.index)] = -1
-                cute.arch.fence_proxy("async.shared", space="cta")
-                tile_info_pipeline.producer_commit(tile_info_producer_state)
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
+            self.sched_sync_barrier.arrive_and_wait()
+            tile_info_pipeline.producer_commit(tile_info_producer_state)
             tile_info_producer_state.advance()
-            with cute.arch.elect_one():
-                tile_info_pipeline.producer_tail(tile_info_producer_state)
+            tile_info_pipeline.producer_tail(tile_info_producer_state)
 
         #
         # Specialized LDGSTS A/SFA warps (warps 4-7)
