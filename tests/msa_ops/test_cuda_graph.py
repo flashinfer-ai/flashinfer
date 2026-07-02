@@ -1,8 +1,6 @@
-"""CUDA-graph capturability of the MSA decode pipeline (proxy -> topk -> sparse
-decode). Production serving (vLLM) runs the indexer inside a captured decode
-graph, so the pipeline must be sync-free: the proxy's ``max_seqlen_q`` /
-``max_k_tiles`` are the only host-derived dims and must be passed (or come from a
-pre-allocated score buffer) so no ``.cpu()``/``.item()`` runs during capture."""
+"""CUDA-graph capturability of the MSA decode pipeline: with the proxy's
+``max_seqlen_q`` / ``max_k_tiles`` passed, no ``.cpu()``/``.item()`` sync may
+run during capture (vLLM captures the indexer inside the decode graph)."""
 
 import math
 
@@ -26,9 +24,8 @@ def _cu(lens, dev):
 
 
 def _build_decode_pipeline(B, ctx):
-    """Return a callable running proxy_fp4 -> topk -> sparse_decode at the M3
-    decode config (index Hq4/Hkv1 reduced to 1; attention Hq64/Hkv4), with the
-    proxy's plan-time dims passed so the call is capturable."""
+    """Callable running proxy_fp4 -> topk -> sparse_decode at the M3 decode
+    config, with the proxy's plan-time dims passed so the call is capturable."""
     from flashinfer.msa_ops import (
         msa_proxy_score_fp4,
         msa_sparse_decode_attention,
@@ -83,8 +80,7 @@ def _build_decode_pipeline(B, ctx):
 
 
 def test_msa_decode_pipeline_cuda_graph():
-    """Capture proxy_fp4 -> topk -> sparse_decode and confirm graph replay is
-    bit-identical to eager (the pipeline is sync-free with plan-time dims)."""
+    """Graph replay of the captured pipeline must be bit-identical to eager."""
     _skip()
     run = _build_decode_pipeline(B=64, ctx=4096)
 
@@ -105,14 +101,12 @@ def test_msa_decode_pipeline_cuda_graph():
     g.replay()
     torch.cuda.synchronize()
 
-    # graph replay reuses the captured kernels on identical inputs -> exact match
     assert torch.equal(out_g, eager)
 
 
 def test_msa_prefill_union_cuda_graph():
-    """The union prefill kernel is capturable as a single call: it builds its work
-    metadata on device (static work-item bound from shapes, per-tile geometry via a
-    searchsorted over cu_seqlens), so no host copy/sync runs during capture."""
+    """The union prefill is capturable as a single call: work metadata is built
+    on device, so no host copy/sync runs during capture."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 

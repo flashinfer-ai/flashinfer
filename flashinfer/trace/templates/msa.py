@@ -12,28 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplates for Minimax Sparse Attention (MSA) numeric operations.
-
-These cover the four numeric MSA pipeline ops (SM120/SM121):
-
-+------------------------------------+-----------+-------------------------------+
-| Template                           | Stage     | What it computes              |
-+====================================+===========+===============================+
-| ``msa_proxy_score``                | indexer   | per-KV-block max of Q K^T     |
-| ``msa_proxy_score_fp4``            | indexer   | same, NVFP4 Q/K (bandwidth)   |
-| ``msa_sparse_attention``           | prefill   | top-K block attention         |
-| ``msa_sparse_decode_attention``    | decode    | top-K block decode attention  |
-+------------------------------------+-----------+-------------------------------+
-
-The metadata ops (topk select, union/decode metadata builders) produce integer
-indices / dataclasses rather than numeric tensors and have no torch reference, so
-they are intentionally not traced here.
-
-All four ops are varlen-packed: tokens for the whole batch are concatenated and
-``cu_seqlens_*`` (shape ``batch_size + 1``) gives per-sequence offsets. The
-reference functions mirror the torch oracles in ``tests/msa_ops/``
-(``_ref_proxy_score``, ``_ref_proxy_fp4``, ``_ref_sparse_attention``).
-"""
+"""TraceTemplates for the numeric MSA ops; references mirror the torch oracles
+in ``tests/msa_ops/``. Metadata ops (topk select, union builders) produce
+indices, not numeric tensors, so they are not traced."""
 
 import torch
 
@@ -53,9 +34,8 @@ def _msa_score_check(
 ):
     from flashinfer.trace import default_check
 
-    # Matches tests/msa_ops/test_msa_ops.py::test_msa_proxy_score (abs < 1e-2 on
-    # the finite entries; -inf masked blocks must agree exactly, which isclose
-    # handles since isclose(-inf, -inf) is True).
+    # Matches test_msa_proxy_score: abs < 1e-2 on finite entries; -inf masked
+    # blocks agree exactly (isclose(-inf, -inf) is True).
     rtol = 1e-2 if rtol is None else rtol
     atol = 1e-2 if atol is None else atol
     return default_check(
@@ -79,8 +59,7 @@ def _msa_attention_check(
 ):
     from flashinfer.trace import default_check
 
-    # bf16 sparse attention output, matching the tolerance used in
-    # tests/msa_ops/test_msa_ops.py::test_sparse_attention.
+    # bf16 output tolerance, matching test_sparse_attention.
     rtol = 2e-2 if rtol is None else rtol
     atol = 2e-2 if atol is None else atol
     return default_check(
@@ -98,13 +77,7 @@ def _msa_attention_check(
 
 @torch.no_grad()
 def _msa_proxy_score_reference(q, k, cu_seqlens_q, cu_seqlens_k, causal=True):
-    """Per-KV-block max of the unscaled, causally-masked Q K^T logits.
-
-    Output ``max_score[h, t, q]`` is the max logit over the 128 tokens of KV
-    block ``t`` for query token ``q`` and head ``h``; blocks above the causal
-    limit or beyond the sequence are ``-inf``. Mirrors
-    ``tests/msa_ops/test_msa_ops.py::_ref_proxy_score``.
-    """
+    """Per-KV-block max of unscaled causal Q K^T logits (mirrors _ref_proxy_score)."""
     BLK_KV = 128
     total_q, Hq, _ = q.shape
     Hkv = k.shape[1]
@@ -133,8 +106,7 @@ def _msa_proxy_score_reference(q, k, cu_seqlens_q, cu_seqlens_k, causal=True):
 
 
 def _msa_varlen_cu_seqlens(total, batch_size, device):
-    """Split ``total`` tokens across ``batch_size`` sequences and return the
-    int32 ``cu_seqlens`` (length ``batch_size + 1``, tail == total)."""
+    """Split ``total`` tokens across ``batch_size`` sequences; int32 cu_seqlens."""
     base = total // max(1, batch_size)
     rem = total % max(1, batch_size)
     cum = [0]
@@ -157,13 +129,7 @@ def _msa_proxy_score_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.msa_ops.msa_proxy_score``.
-
-    Defaults follow MiniMax-M3's released indexer config
-    (``sparse_num_index_heads=4``, ``sparse_index_dim=128``); the proxy runs
-    one head per index head. Sourced from
-    ``tests/msa_ops/test_msa_ops.py::test_msa_proxy_score``.
-    """
+    """Build msa_proxy_score inputs; defaults follow MiniMax-M3's indexer config."""
     del len_indptr, max_k_tiles  # derived from cu_seqlens / total_k
     torch.manual_seed(seed)
     cu_q = _msa_varlen_cu_seqlens(total_q, batch_size, device)
@@ -239,13 +205,8 @@ def _msa_proxy_score_fp4_reference(
     cu_seqlens_k,
     causal=True,
 ):
-    """Block-max proxy over a torch dequant of the packed NVFP4 Q/K.
-
-    Decodes packed e2m1 + flat e4m3 block scales (cuBLAS 128x4 tiled layout,
-    one scale per 16 elements), folds both per-tensor global scales into the
-    logits, then takes the per-128-block max like the bf16 proxy. Mirrors
-    ``tests/msa_ops/test_proxy_fp4.py`` (``_dequant_128x4`` + ``_ref_proxy_fp4``).
-    """
+    """Block-max proxy over a torch dequant of packed NVFP4 Q/K (mirrors
+    _dequant_128x4 + _ref_proxy_fp4 in tests/msa_ops/test_proxy_fp4.py)."""
     BLK_KV = 128
     HEAD_DIM = 128
     e2m1 = torch.tensor(
@@ -329,11 +290,7 @@ def _msa_proxy_score_fp4_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.msa_ops.msa_proxy_score_fp4``.
-
-    Quantizes random bf16 Q/K to NVFP4 (requires CUDA). Sourced from
-    ``tests/msa_ops/test_proxy_fp4.py``.
-    """
+    """Build msa_proxy_score_fp4 inputs: random bf16 Q/K quantized to NVFP4."""
     del len_indptr, max_k_tiles, q_sf_numel, k_sf_numel, head_dim_half
     from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
 
@@ -432,9 +389,7 @@ msa_proxy_score_fp4_trace = TraceTemplate(
 def _msa_sparse_attention_reference(
     q, k, v, q2k_indices, cu_seqlens_q, cu_seqlens_k, causal=False, softmax_scale=None
 ):
-    """Top-K block sparse attention: each query attends only the KV blocks in
-    ``q2k_indices`` (per kv-head, ascending, -1 padded). Mirrors
-    ``tests/msa_ops/test_msa_ops.py::_ref_sparse_attention``."""
+    """Top-K block sparse attention reference (mirrors _ref_sparse_attention)."""
     BLK_KV = 128
     total_q, Hq, head_dim = q.shape
     Hkv = k.shape[1]
@@ -486,12 +441,8 @@ def _msa_sparse_attention_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for MSA sparse attention.
-
-    Builds random varlen Q/K/V and a per-(kv-head, query) ``q2k_indices`` of
-    ascending in-range block ids (the format produced by ``msa_topk_select``).
-    Sourced from ``tests/msa_ops/test_msa_ops.py::test_sparse_attention``.
-    """
+    """Random varlen Q/K/V plus ascending in-range q2k_indices (msa_topk_select
+    format)."""
     del len_indptr
     BLK_KV = 128
     torch.manual_seed(seed)
@@ -529,7 +480,6 @@ def _msa_sparse_attention_init(
 
 
 def _msa_sparse_attention_inputs():
-    """Shared input schema for the two prefill sparse-attention templates."""
     return {
         "q": Tensor(["total_q", "num_qo_heads", "head_dim"]),
         "k": Tensor(["total_k", "num_kv_heads", "head_dim"]),
@@ -591,10 +541,7 @@ msa_sparse_attention_trace = TraceTemplate(
 def _msa_sparse_decode_attention_reference(
     q, k, v, q2k_indices, cu_seqlens_k, seqlen_q=1, causal=True, softmax_scale=None
 ):
-    """Top-K block decode attention (flat KV). Each request contributes
-    ``seqlen_q`` right-aligned query tokens attending only the KV blocks in
-    ``q2k_indices``. Same block-gather math as the prefill reference, with
-    ``cu_seqlens_q`` reconstructed from the uniform ``seqlen_q``."""
+    """Decode reference: prefill math with right-aligned uniform seqlen_q tokens."""
     BLK_KV = 128
     total_q, Hq, head_dim = q.shape
     Hkv = k.shape[1]
@@ -650,13 +597,7 @@ def _msa_sparse_decode_attention_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for the MSA sparse decode (flat KV).
-
-    ``batch_size = total_q // seqlen_q`` requests, each contributing
-    ``seqlen_q`` query tokens; ``q2k_indices`` selects ascending in-range
-    blocks per (kv-head, query). Defaults follow M3's decode indexer (4 index
-    heads). Sourced from ``tests/msa_ops`` decode tests.
-    """
+    """Decode inputs (flat KV): ``batch_size = total_q // seqlen_q`` requests."""
     del len_indptr
     BLK_KV = 128
     torch.manual_seed(seed)
@@ -744,9 +685,9 @@ msa_sparse_decode_attention_trace = TraceTemplate(
 
 
 def _bind_init_dependency(init_fn):
-    # Inline ``_msa_varlen_cu_seqlens`` (a module-level helper the init snippets
-    # call) into each dumped JSON's "init" field so it stays self-contained. We
-    # leave __signature__ alone, unlike moe.py, to keep the Var-axis init params.
+    # Inline _msa_varlen_cu_seqlens into each dumped JSON's "init" field so it
+    # stays self-contained; unlike moe.py, __signature__ is left alone to keep
+    # the Var-axis init params.
     init_fn._trace_init_dependencies = (_msa_varlen_cu_seqlens,)
     return init_fn
 

@@ -15,11 +15,8 @@ limitations under the License.
 
 ---
 
-NVFP4 MSA proxy-score kernel for SM120/SM121 (MSA's
-``fp4_indexer_block_scores``): same contract as :mod:`proxy_score_sm12x`, with
-K read as packed e2m1 + e4m3 per-16 block scales on the fp4 tensor cores
-(``MmaMXF4NVF4Op``). A general flat/paged split-K schedule plus a 16-head
-q_len<=8 packed decode schedule.
+NVFP4 tensor-core MSA proxy-score kernels for SM120/SM121: same contract as
+:mod:`proxy_score_sm12x`, with a general split-K and a packed-decode schedule.
 """
 
 import cuda.bindings.driver as cuda
@@ -46,14 +43,8 @@ _MIN_BLOCKS_PER_MP = 2
 
 
 class MsaProxyScoreFp4MmaSm12x:
-    """Warp-level NVFP4 tensor-core MMA proxy: the general per-(q-tile, batch, head)
-    schedule.
-
-    Fixed M=128 q-tile, head_dim == kv_block == 128. Handles flat (cu_seqlens) and
-    paged K via ``paged`` (the only difference is a ``mPageTable[batch, kv_block]``
-    lookup). The 16-head packed-decode schedule is its own subclass
-    (:class:`MsaProxyScoreFp4MmaDecodePackedSm12x`).
-    """
+    """General per-(q-tile, batch, head) NVFP4 MMA proxy schedule, flat or paged K.
+    Fixed M = head_dim = kv_block = 128."""
 
     _M = 128  # q-tile rows (== one cuBLAS 128-row SF block, so sfa_tiles_per_block==1)
     _N = 128  # kv-block
@@ -215,7 +206,7 @@ class MsaProxyScoreFp4MmaSm12x:
                     cute.struct.MemRange[self.sf_dtype, cute.cosize(sfb_layout)], 1024
                 ]
                 # warp-epilogue cross-warp scratch: one f32 per (q-row, N-warp).
-                # 1KB vs the old 64KB [M,N] scatter -> smem stops capping occupancy.
+                # 1KB vs a full 64KB [M,N] scatter, so smem stops capping occupancy.
                 sRed: cute.struct.Align[
                     cute.struct.MemRange[cutlass.Float32, self._M * 2], 1024
                 ]
@@ -246,7 +237,6 @@ class MsaProxyScoreFp4MmaSm12x:
             sA_u32 = cute.recast_tensor(sA, Uint32)
             sB_u32 = cute.recast_tensor(sB, Uint32)
 
-            # ----- stage Q (packed fp4 + e4m3 SF) once into smem -----
             # Q is always flat (current query tokens, never paged): read absolute
             # row q_tile0+m, mask on the in-tile position m_block*M+m.
             q_tile0 = q_start + m_block * self._M
@@ -265,7 +255,6 @@ class MsaProxyScoreFp4MmaSm12x:
             )
             self.cta_sync_barrier.arrive_and_wait()
 
-            # ----- MMA fragment / copy setup (from the SM120 blockscaled GEMM) -----
             thr_mma = tiled_mma.get_slice(tidx)
             tCsA = thr_mma.partition_A(sA)
             tCsB = thr_mma.partition_B(sB)
@@ -327,8 +316,8 @@ class MsaProxyScoreFp4MmaSm12x:
             )
 
             # split-K strides kv_block by num_splits (disjoint columns, no reduction).
-            # causal tiling: skip K-load + MMA for kv-blocks above the q-tile's causal
-            # limit (else ~1.9x masked-MMA waste), writing their -inf directly.
+            # causal tiling skips K-load + MMA for kv-blocks above the q-tile's causal
+            # limit (else ~1.9x masked-MMA waste); their -inf is written directly.
             if cutlass.const_expr(self._is_causal):
                 causal_last = (
                     m_block * self._M + (self._M - 1) + mQOffset[batch_idx]
@@ -463,9 +452,8 @@ class MsaProxyScoreFp4MmaSm12x:
 
     @cute.jit
     def _sf_offset(self, srow, scol):
-        """cuBLAS/cuDNN 128x4 tiled SF byte offset (the layout the index-K cache is
-        quantized in). For one 128-row, K=128 tile this equals the SM120 SF smem
-        layout, so we can fill ``sSFA``/``sSFB`` by this offset directly."""
+        """cuBLAS 128x4 tiled SF byte offset; for one 128-row K=128 tile it equals
+        the SM120 SF smem layout, so sSFA/sSFB fill by this offset directly."""
         srow_in = srow % 128
         return (
             ((srow // 128) * self._sf_tiles_n + scol // 4) * 512
@@ -476,9 +464,8 @@ class MsaProxyScoreFp4MmaSm12x:
 
     @cute.jit
     def _load_packed(self, gX_u32, sX_u32, read_base, pos_base, seqlen, tidx):
-        """Stage a packed-fp4 tile into K-major smem. read_base is decoupled from
-        pos_base so the paged path reads a page-local tile (read_base 0) while masking
-        on the global token position pos_base + m (>= seqlen -> zero-filled)."""
+        """read_base is decoupled from pos_base so the paged path reads a page-local
+        tile (read_base 0) but masks on the global token position pos_base + m."""
         rows = cute.size(sX_u32.shape[0])
         total = rows * self._chunks_u32
         for it in cutlass.range_constexpr(total // self._num_threads):
@@ -492,9 +479,8 @@ class MsaProxyScoreFp4MmaSm12x:
 
     @cute.jit
     def _load_sf(self, mXsf, sXsf_u8, pos_base, seqlen, sf_row_base, sf_stride, tidx):
-        """Fill the SM120 SF smem (== cuBLAS 128x4 for one 128-row tile) from the e4m3
-        SF buffer. The flat path passes SF row base token*heads+head, stride num_heads;
-        the paged path passes (page*Hkv + kv_head)*N, stride 1 (valid iff pos < seqlen)."""
+        """Fill the SF smem from the e4m3 buffer: flat passes row base token*heads+head
+        with stride num_heads; paged passes (page*Hkv + kv_head)*N with stride 1."""
         total = self._M * self._sf_per_row
         for it in cutlass.range_constexpr(total // self._num_threads):
             e = tidx + it * self._num_threads
@@ -506,7 +492,7 @@ class MsaProxyScoreFp4MmaSm12x:
             else:
                 sXsf_u8[dst] = Uint8(0)
 
-    # ---- SF fragment partition (from the SM120 blockscaled GEMM) ----
+    # SF fragment partition, from the SM120 blockscaled GEMM
     def _partition_fragment_SFA(self, sfa_tensor, thr_mma, tidx):
         thrfrg = self._thrfrg_SFA(sfa_tensor.layout, thr_mma)
         thr_tensor = cute.make_tensor(sfa_tensor.iterator, thrfrg)
@@ -648,24 +634,8 @@ class MsaProxyScoreFp4MmaSm12x:
 
 
 class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
-    """The head-fused packed-decode schedule on the fp4 tensor cores.
-
-    The fp4-MMA tile is already 128 rows, exactly ``qhead_per_kv x pack_q_len``, so
-    the packed schedule is a pure relabel of the parent fp4-MMA kernel: pack all
-    ``qhead_per_kv`` query heads of one kv_head x ``pack_q_len`` q-tokens into the 128
-    MMA rows so a single CTA scores every head of one ``(batch, kv_head)`` against
-    each KV block, reading the shared index-K **once** (``qhead_per_kv``x less K
-    traffic than the per-query-head general schedule). Only the Q gather, the grid,
-    and the per-row output mapping differ from the parent; the fp4 mainloop, SF
-    plumbing, and warp block-max epilogue are inherited verbatim.
-
-    ``(qhead_per_kv, pack_q_len)`` is any factorization of the 128-row tile with
-    ``qhead_per_kv == group_size`` (defaults to the 16-head ``q_len<=8`` deployment
-    shape, ``16 x 8``; the MiniMax-M3 indexer is ``4 x 32`` -- group_size 4,
-    ``q_len<=32``). Packing: row ``r = local_head * pack_q_len + token``, ``head =
-    kv_head * qhead_per_kv + local_head``, ``q = q_start + token``. Grid is one CTA
-    per ``(split, batch, kv_head)``; split-K applies as in the parent.
-    """
+    """Head-fused packed-decode fp4 schedule: packs qhead_per_kv heads x pack_q_len
+    tokens into the 128 MMA rows so the shared index-K is read once per kv_head."""
 
     _PACK_Q_LEN = 8
     _QHEAD_PER_KV = 16
@@ -806,14 +776,12 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         sA_u32 = cute.recast_tensor(sA, Uint32)
         sB_u32 = cute.recast_tensor(sB, Uint32)
 
-        # ----- gather the qhead_per_kv-head x pack_q_len-q packed Q tile into smem -
         self._load_packed_q(mQ_u32, sA_u32, q_start, kv_head, seqlen_q, tidx)
         self._load_packed_q_sf(
             mQsf, sSFA_u8, q_start, kv_head, num_qo_heads, seqlen_q, tidx
         )
         self.cta_sync_barrier.arrive_and_wait()
 
-        # ----- MMA fragment / copy setup (inherited layouts) -----
         thr_mma = tiled_mma.get_slice(tidx)
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
@@ -1009,9 +977,8 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
     def _load_packed_q_sf(
         self, mQsf, sXsf_u8, q_start, kv_head, num_qo_heads, seqlen_q, tidx
     ):
-        """Fill the SF smem for the packed Q tile. SF logical row =
-        ``(q_start + token) * num_qo_heads + head`` (the flat token*heads+head row
-        order ``nvfp4_quantize`` produces from a ``(total, heads, d)`` reshape)."""
+        """Fill the SF smem for the packed Q tile; SF logical row = (q_start + token)
+        * num_qo_heads + head, the row order nvfp4_quantize produces."""
         total = self._M * self._sf_per_row
         for it in cutlass.range_constexpr(total // self._num_threads):
             e = tidx + it * self._num_threads

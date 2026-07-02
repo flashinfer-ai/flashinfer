@@ -15,16 +15,8 @@ limitations under the License.
 
 ---
 
-Minimax Sparse Attention decode path for SM120/SM121.
-
-A decode step is a varlen batch with a short, uniform ``seqlen_q`` per
-request. Each valid (kv-head, token, t) entry of ``q2k_indices`` becomes one
-work item: one token (x its GQA query heads) attending one selected KV block,
-written to split slot ``t``. The kernel addresses that work directly from a
-static ``(topk, total_q, Hkv)`` grid (no schedule tensors); because
-:func:`msa_topk_select` tail-pads invalid entries with -1, the slot is simply
-the list position and the split count is the valid prefix length, computed
-in-kernel. The split partials are reduced by the shared combine kernel.
+Minimax Sparse Attention decode path for SM120/SM121: one work item per valid
+(kv-head, token, split-slot) entry of ``q2k_indices``, on a static grid.
 """
 
 import functools
@@ -114,7 +106,7 @@ def msa_sparse_decode_attention(
         Override the adaptive split-K decision. By default each token's selected
         list is split into chunks (one CTA per chunk online-softmaxes its blocks
         and writes a partial; the combine kernel reduces them), with the chunk
-        count adapting to fill the SMs — one block per chunk at low batch, a
+        count adapting to fill the SMs: one block per chunk at low batch, a
         single chunk at high batch. A single chunk is the *fused* path: one CTA
         per (token, kv-head) writes the final output directly (no GMEM partials,
         no combine). ``True``/``False`` force fused/split on; ``None`` (default)

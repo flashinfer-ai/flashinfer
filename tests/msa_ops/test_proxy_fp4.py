@@ -13,14 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
----
-
-Tests for the NVFP4 MSA proxy (``msa_proxy_score_fp4``):
-
-1. correctness vs a torch dequant of the *same* packed fp4 inputs (tight);
-2. block selection overlap vs the bf16 proxy (loose, set-based — the deployment
-   metric, since fp4 rounding perturbs only ties / boundaries);
-3. ``reduce_heads`` parity with the manual amax-over-heads.
+Tests for the NVFP4 MSA proxy (``msa_proxy_score_fp4``): torch-dequant
+correctness, selection overlap vs the bf16 proxy, and reduce_heads parity.
 """
 
 import pytest
@@ -42,9 +36,8 @@ def _skip_if_unsupported():
 
 
 def _dequant_128x4(xq, sf_flat, mul, rows, d=128):
-    """Decode packed e2m1 `[rows, d/2]` + flat e4m3 scales in the cuBLAS 128x4
-    tiled layout to f32 `[rows, d]`, scaled by `mul`. SF byte offset matches the
-    kernel's `_sf_offset` (and `_msa_nvfp4_dequant` in test_msa_ops)."""
+    """Decode packed e2m1 + e4m3 scales in the cuBLAS 128x4 tiled layout to f32,
+    scaled by `mul`. SF byte offset matches the kernel's `_sf_offset`."""
     dev = xq.device
     lo = (xq & 0xF).long()
     hi = (xq >> 4).long()
@@ -66,8 +59,7 @@ def _dequant_128x4(xq, sf_flat, mul, rows, d=128):
 
 
 def _ref_proxy_fp4(q_deq, k_deq, seqlen_q, seqlen_k, group_size, causal):
-    """Block-max proxy on pre-dequantized bf16 Q/K. `q_deq` is `(seqlen_q, Hq,
-    128)`, `k_deq` is `(seqlen_k, Hkv, 128)`. Single sequence -> `[Hq, nb, Sq]`."""
+    """Block-max proxy on pre-dequantized bf16 Q/K, single sequence -> [Hq, nb, Sq]."""
     Hq = q_deq.shape[1]
     nb = (seqlen_k + BLK_KV - 1) // BLK_KV
     q_off = seqlen_k - seqlen_q  # right-aligned causal
@@ -86,8 +78,7 @@ def _ref_proxy_fp4(q_deq, k_deq, seqlen_q, seqlen_k, group_size, causal):
 
 
 def _dequant_qk(q_fp4, q_scale, inv_q, k_fp4, k_scale, inv_k):
-    """Dequant full packed Q/K to bf16, folding both globals into Q to match the
-    kernel. Returns `(seqlen_q, Hq, 128)`, `(seqlen_k, Hkv, 128)` (B=1)."""
+    """Dequant packed Q/K to bf16; both global scales fold into Q, as in the kernel."""
     Sq, Hq, _ = q_fp4.shape
     Sk, Hkv, _ = k_fp4.shape
     q_deq = (
@@ -133,7 +124,6 @@ def test_proxy_fp4_correctness(Hq, Hkv, causal):
     ref = _ref_proxy_fp4(q_deq, k_deq, seqlen_q, seqlen_k, group_size, causal)
     got = out.float().cpu()
     assert got.shape == ref.shape
-    # both -inf where invalid
     finite = torch.isfinite(ref)
     assert (torch.isfinite(got) == finite).all(), "finite/-inf mask mismatch"
     diff = (got[finite] - ref[finite]).abs()
@@ -184,13 +174,12 @@ def test_proxy_fp4_selection_overlap_vs_bf16():
     mean_overlap = sum(overlaps) / len(overlaps)
     # Unstructured Gaussian Q/K is the worst case for selection overlap (near-tied
     # block scores, so fp4 rounding flips many boundary blocks). The bar only needs
-    # to separate a working kernel (~0.89) from a broken one (~topk/nb ≈ 0.5).
+    # to separate a working kernel (~0.89) from a broken one (chance ~ topk/nb = 0.5).
     assert mean_overlap > 0.8, f"mean topk overlap {mean_overlap} too low"
 
 
 def test_proxy_fp4_paged():
-    # Validates the paged page_table K-block indirection against the torch dequant
-    # oracle (group_size 4 -> the general, non-packed fp4-MMA schedule).
+    # group_size 4 -> the general, non-packed fp4-MMA schedule
     _skip_if_unsupported()
     from flashinfer import nvfp4_quantize
     from flashinfer.msa_ops import msa_proxy_score_fp4
@@ -270,9 +259,7 @@ def test_proxy_fp4_paged():
 
 @pytest.mark.parametrize("B,seqlen_q", [(1, 8), (2, 5), (3, 1)])
 def test_proxy_fp4_decode_packed(B, seqlen_q):
-    """16-head, q_len<=8 decode -> the wrapper dispatches the packed fp4 tensor-core
-    kernel (MsaProxyScoreFp4MmaDecodePackedSm12x). Validated against the torch
-    fp4-dequant reference per batch."""
+    """group_size 16, q_len <= 8 dispatches the packed fp4 tensor-core kernel."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score_fp4
     from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
@@ -327,10 +314,8 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
 
 @pytest.mark.parametrize("B,seqlen_q", [(1, 1), (4, 1), (2, 8), (1, 32)])
 def test_proxy_fp4_decode_packed_group4(B, seqlen_q):
-    """MiniMax-M3 indexer shape (group_size 4): q_len<=32 decode now dispatches the
-    head-fused packed fp4 kernel (4 heads x 32 q-slots packed into the 128-row tile,
-    index-K read once per kv_head instead of once per head). Validated per batch
-    against the torch fp4-dequant reference -- same numerics as the general path."""
+    """MiniMax-M3 indexer shape (group_size 4): q_len <= 32 dispatches the
+    head-fused packed fp4 kernel (4 heads x 32 q-slots per 128-row tile)."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score_fp4
     from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4
@@ -375,10 +360,8 @@ def test_proxy_fp4_decode_packed_group4(B, seqlen_q):
 
 
 def test_proxy_fp4_paged_packed():
-    """16-head q_len<=8 decode with a paged K cache: the packed schedule plus the
-    page_table indirection (the real vLLM-style decode shape for a 16-index-head
-    deployment). Validates the packed-paged fp4 tensor-core kernel against the torch
-    dequant oracle."""
+    """group_size 16, q_len <= 8 decode with a paged K cache: the packed schedule
+    plus the page_table indirection."""
     _skip_if_unsupported()
     from flashinfer import nvfp4_quantize
     from flashinfer.msa_ops import msa_proxy_score_fp4
@@ -476,9 +459,8 @@ def test_proxy_split_k_heuristic():
 
 @pytest.mark.parametrize("Hq,Hkv", [(4, 1), (32, 2)])
 def test_proxy_fp4_split_k_decode(Hq, Hkv):
-    """Low-batch long-context decode: base grid < SM count, so the wrapper splits
-    the kv-block range across CTAs. Covers the general fp4-MMA schedule (Hq=4/Hkv=1)
-    and the 16-head packed decoder (Hq=32/Hkv=2) against the torch ref."""
+    """Low-batch long-context decode forces split-K; covers the general (Hq=4)
+    and 16-head packed (Hq=32) schedules."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score_fp4
     from flashinfer.msa_ops.proxy_score import _quantize_qk_to_nvfp4

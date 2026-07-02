@@ -15,12 +15,7 @@ limitations under the License.
 
 ---
 
-Union-tile MSA forward (prefill) for SM120/SM121: each CTA owns one
-(batch, query-tile, kv-head), loops the union of the tile's selected KV
-blocks with in-kernel online softmax, and writes the final normalized output
-directly (no GMEM partials or combine pass). A per-union-block membership
-mask forces a token's scores to -inf for blocks it did not select. Warp-level
-mma.sync + cp.async; bf16/fp16, fp8, or nvfp4 KV; flat or paged.
+Union-tile MSA sparse attention forward (prefill) kernel for SM120/SM121.
 """
 
 import cuda.bindings.driver as cuda
@@ -31,14 +26,8 @@ from cutlass.cute.nvgpu import cpasync, warp
 
 
 class SparseAttentionUnionFwdSm12x:
-    """Union-tile (query-major) sparse attention forward for SM12x.
-
-    Static config: head_dim (128), n_block (128 = blk_kv), m tile (64 rows =
-    tokens_per_tile x group_size), GQA group size, causal flag. bf16/fp16. K/V
-    are either flat ``(total_k, Hkv, d)`` or paged ``(num_pages, Hkv, 128, d)``
-    with page_size == n_block (one page per KV block). Writes the final output +
-    optional log2-domain LSE directly.
-    """
+    """One CTA per (batch, q_tile, kv_head) loops the union of the tile's selected
+    KV blocks with online softmax; writes final output directly, no combine pass."""
 
     def __init__(
         self,
@@ -157,9 +146,8 @@ class SparseAttentionUnionFwdSm12x:
         seqlen_k: cutlass.Int32,
         tidx: cutlass.Int32,
     ):
-        """Dequant-on-load NVFP4 K/V (packed e2m1 x cuBLAS-128x4-tiled e4m3 block
-        scale) into the swizzled compute-dtype SMEM. mK/mV are int32 views (8 e2m1
-        / word); global scales are folded into softmax_scale / out_scale."""
+        """Dequant-on-load NVFP4 K/V into the swizzled compute-dtype SMEM. mK/mV are
+        int32 word views (8 e2m1 each); global scales fold into softmax/out_scale."""
         from ...fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import (
             cvt_e4m3_to_f32_via_f16,
             fp4_decode_4bytes,
@@ -424,7 +412,7 @@ class SparseAttentionUnionFwdSm12x:
                 ),
             )
 
-            # ---- gather the query tile once: token i -> G GQA-head rows ----
+            # gather the query tile once: token i -> G GQA-head rows
             zero_chunk = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
             zero_chunk.fill(0)
             chunks_per_row = self._head_dim // 8
@@ -443,7 +431,7 @@ class SparseAttentionUnionFwdSm12x:
                 else:
                     cute.autovec_copy(zero_chunk, sChunk)
 
-            # ---- MMA partitions / staging (Q fragments built once) ----
+            # MMA partitions / staging
             thr_mma = tiled_mma.get_slice(tidx)
             tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
             tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
@@ -493,9 +481,6 @@ class SparseAttentionUnionFwdSm12x:
                     tSrQ_copy_view[None, None, k],
                 )
 
-            # online-softmax running state. row_sum_t is a second running sum with the
-            # MSA-temperature-scaled exponent; it shares row_max and so takes the same
-            # per-update max-shift as row_sum, accumulated online.
             row_max = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
             row_sum = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
             row_sum_t = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
@@ -524,7 +509,6 @@ class SparseAttentionUnionFwdSm12x:
                 tKgK = gmem_thr_copy_KV.partition_S(gK_all)
                 tVgV = gmem_thr_copy_KV.partition_S(gV_all)
 
-            # Loop over the union of KV blocks selected by this tile's tokens
             for u in cutlass.range(union_count):
                 kv_block = mUnionBlocks[work_idx, u]
                 mask_word = mUnionMasks[work_idx, u]
@@ -617,7 +601,6 @@ class SparseAttentionUnionFwdSm12x:
                         tOrVt_copy_view[None, None, k],
                     )
 
-                # S = Q K^T
                 acc_S.fill(0.0)
                 for k in cutlass.range_constexpr(cute.size(tSrQ.shape[2])):
                     cute.gemm(
@@ -666,9 +649,9 @@ class SparseAttentionUnionFwdSm12x:
                     )
                     row_sum[r] = rsum + row_sum[r] * prev_scale
                     if cutlass.const_expr(self._return_temperature_lse):
-                        # temperature-scaled running sum: same masked scores and
-                        # max-shift as row_sum, exponent uses the temperature scale.
-                        # acc_S_row is the masked raw score (read before acc_S_mn).
+                        # same masked scores and max-shift as row_sum, but with the
+                        # temperature-scaled exponent; acc_S_row is the raw masked
+                        # score, read before acc_S_mn is overwritten with p_row.
                         p_row_t = cute.math.exp2(
                             acc_S_row * lse_temp_scale_log2
                             - rmax_safe * lse_temp_scale_log2,
@@ -715,7 +698,6 @@ class SparseAttentionUnionFwdSm12x:
                         acc_O,
                     )
 
-            # Epilogue: normalize and store the final output + LSE directly
             for r in cutlass.range_constexpr(n_rows):
                 m_local = tScS_mn[r, 0][0]
                 tok = m_local // G

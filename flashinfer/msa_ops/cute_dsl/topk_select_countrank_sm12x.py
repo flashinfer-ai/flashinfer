@@ -15,12 +15,8 @@ limitations under the License.
 
 ---
 
-Count-rank MSA top-K KV-block selection for SM120/SM121.
-
-For small ``max_k_tiles`` the radix top-k's fixed per-row cost (three histogram +
-scan passes) dominates, so an O(N^2) rank count (rank = strictly-better blocks,
-ties -> lower index) is cheaper. Dispatched below ``_MAX_BLOCKS``; bit-identical
-to the radix kernel on distinct-score inputs.
+Count-rank MSA top-K KV-block selection for SM120/SM121: O(N^2) rank count,
+dispatched below ``_MAX_BLOCKS`` where it beats the radix kernel's fixed pass cost.
 """
 
 import cuda.bindings.driver as cuda
@@ -101,9 +97,9 @@ class TopKSelectCountRankSm12x:
         n_forced = force_begin + force_end
         target = cutlass.Int32(self._topk) - n_forced
 
-        # stage the middle scores' radix keys in SMEM: the rank loop rereads each
-        # one N times, and ranking on the bit key keeps the exact radix-kernel
-        # order (including deterministic NaN placement)
+        # stage the middle scores' radix keys in SMEM: the rank loop rereads each one
+        # N times, and the bit key preserves the exact radix-kernel order, with
+        # deterministic NaN placement
         b = mid_lo + tid
         while b < mid_hi:
             score[b] = self._radix_key(mScore[h, b, q])

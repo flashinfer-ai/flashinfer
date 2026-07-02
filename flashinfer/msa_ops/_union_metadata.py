@@ -15,17 +15,8 @@ limitations under the License.
 
 ---
 
-Reference metadata builder for the union-tile sparse-attention prefill
-(:mod:`sparse_fwd_union_sm12x`). Groups each sequence's queries into tiles of
-``tokens_per_tile`` and, per (batch, q-tile, kv-head), forms the **union** of the
-KV blocks those tokens selected together with a per-(union-block)
-``tokens_per_tile``-bit membership mask (bit ``i`` set iff tile-token ``i``
-selected that block). The union kernel walks this list with online softmax, so a
-token attends only the blocks it picked.
-
-This host builder is the correctness-first test oracle;
-``build_msa_union_metadata_device`` is the on-device CuTe-DSL builder the forward
-path calls.
+Union-tile metadata builders for the sparse-attention union prefill: host
+reference (test oracle) and the on-device CuTe-DSL builder the forward calls.
 """
 
 from typing import Tuple
@@ -49,12 +40,8 @@ def build_msa_union_metadata(
     tokens_per_tile: int,
     topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Host reference union builder (test oracle). From per-query top-k selections
-    ``q2k_indices`` ``(num_kv_heads, total_q, topk)`` and ``cu_seqlens_q``, returns
-    ``(union_blocks, union_masks, union_count, work_meta, work_items)``: per
-    (batch, q-tile, kv-head) work item, the union's KV-block ids, the
-    ``tokens_per_tile``-bit membership masks, the block count, and
-    ``{batch_idx, q_tile_idx, kv_head}``."""
+    """Host reference union builder (test oracle). Returns per-(batch, q-tile,
+    kv-head) ``(union_blocks, union_masks, union_count, work_meta, work_items)``."""
     num_kv_heads, total_q, topk_in = q2k_indices.shape
     if topk_in != topk:
         raise ValueError(f"q2k_indices topk {topk_in} != {topk}")
@@ -146,16 +133,9 @@ def build_msa_union_metadata_device(
     tokens_per_tile: int,
     topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """On-device equivalent of :func:`build_msa_union_metadata`, called by the
-    forward path (the host reference is the test oracle).
-
-    Same five outputs (work-item order differs but the forward scatters by
-    ``work_meta``). Keeps the q2k selection on the GPU and is CUDA-graph
-    capturable: tensors are sized to the static tile bound ``ceil(total_q / tpt)
-    + batch_size`` and the per-tile geometry is derived on device from
-    ``cu_seqlens`` (a searchsorted), so no host copy/sync. Padding slots get
-    ``tile_ntok == 0`` -> ``union_count == 0`` and are skipped by the forward.
-    """
+    """On-device, CUDA-graph-capturable counterpart of
+    :func:`build_msa_union_metadata`; work-item order differs but the forward
+    scatters by ``work_meta``."""
     num_kv_heads, total_q, topk_in = q2k_indices.shape
     if topk_in != topk:
         raise ValueError(f"q2k_indices topk {topk_in} != {topk}")

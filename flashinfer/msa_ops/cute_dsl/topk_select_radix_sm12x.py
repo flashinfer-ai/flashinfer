@@ -15,13 +15,9 @@ limitations under the License.
 
 ---
 
-Multi-stage MSD radix-select MSA top-K KV-block selection for SM120/SM121:
-CuTe-DSL port of the CUDA ``IndexerTopKWithSortKernel`` (TensorRT-LLM
-``indexerTopK.cu`` lineage), same structure and supported range
-(``max_k_tiles < 12288``). Two output-equivalent departures, validated
-bit-exact on distinct-score inputs: no fp16 pre-pass (a register micro-opt
-only) and no transpose workspace (a float4-coalescing aid only); the final
-ascending index sort is single-thread insertion over the <= topk slots.
+Multi-stage MSD radix-select MSA top-K KV-block selection for SM120/SM121, a CuTe-DSL
+port of TensorRT-LLM's ``IndexerTopKWithSortKernel`` (``max_k_tiles < 12288``). Omits
+the reference's fp16 pre-pass and transpose workspace (perf aids, output-equivalent).
 """
 
 import inspect
@@ -138,7 +134,7 @@ class TopKSelectRadixSm12x:
 
         n_groups = _NUM_BINS // _GROUP
 
-        # thread 0: seed forced indices + sentinel-fill the rest + init counters
+        # forced sink/window blocks bypass ranking; emit slots start after them
         if tid == 0:
             w = cutlass.Int32(0)
             i = cutlass.Int32(0)
@@ -169,7 +165,6 @@ class TopKSelectRadixSm12x:
         for step in (1, 2, 3):
             shift = _STAGE_SHIFT[step]
 
-            # --- setup: refine pattern, reset stage_count, recompute need ----
             if tid == 0:
                 if scal[5] == cutlass.Int32(0):
                     if cutlass.const_expr(step == 2):
@@ -184,7 +179,6 @@ class TopKSelectRadixSm12x:
 
             pattern = pat[0]
 
-            # --- clear histogram ---------------------------------------------
             dn = scal[5]
             if dn == cutlass.Int32(0):
                 bb = tid
@@ -193,7 +187,6 @@ class TopKSelectRadixSm12x:
                     bb += _KTHREADS
             cute.arch.barrier()
 
-            # --- histogram over the pattern-matched candidates ---------------
             dn = scal[5]
             if dn == cutlass.Int32(0):
                 b = mid_lo + tid
@@ -277,7 +270,8 @@ class TopKSelectRadixSm12x:
                         scal[1] = scal[0] + base
             cute.arch.barrier()
 
-            # --- classify: direct-emit (bin<threshold) / stage / refine ------
+            # bins below the threshold emit directly; the threshold bin is staged
+            # for the next stage (stage 3 emits it directly)
             dn = scal[5]
             if dn == cutlass.Int32(0):
                 threshold = scal[2]
@@ -319,7 +313,8 @@ class TopKSelectRadixSm12x:
             cute.arch.barrier()
 
             if cutlass.const_expr(step != 3):
-                # --- insertion-sort the staged threshold-bin items, emit rest
+                # rank the staged threshold-bin items; only the first need-base
+                # by rank still fit the selection
                 dn = scal[5]
                 if dn == cutlass.Int32(0):
                     fbs = scal[4]
@@ -359,7 +354,7 @@ class TopKSelectRadixSm12x:
                     scal[5] = cutlass.Int32(1)
                 cute.arch.barrier()
 
-        # ---- thread 0: ascending-by-index sort (<= topk slots) + write ------
+        # ascending-by-index sort, then write (SENTINEL -> -1)
         if tid == 0:
             a = cutlass.Int32(1)
             while a < self._topk:

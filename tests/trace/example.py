@@ -1161,9 +1161,8 @@ with contextlib.suppress(Exception):
     )
 
 # ── Minimax Sparse Attention (MSA) numeric ops (SM120/SM121) ─────────────────
-# Indexer (proxy) runs on the index heads (M3: 4 heads, 1 index-kv-head → group
-# 4); sparse prefill/decode run on the model attention heads (M3: 64 qo / 4 kv,
-# topk=16 blocks of 128 tokens). Traces dump before launch, so the JSONs appear
+# M3 shapes: indexer 4 index heads / 1 index-kv-head; attention 64 qo / 4 kv,
+# topk=16 blocks of 128 tokens. Traces dump before launch, so the JSONs appear
 # on any GPU; the kernels themselves require SM120/SM121.
 with contextlib.suppress(Exception):
     import flashinfer.msa_ops as _msa
@@ -1171,7 +1170,6 @@ with contextlib.suppress(Exception):
     _msa_BLK = 128
     _msa_dev, _msa_dt = device, torch.bfloat16
 
-    # Indexer: batch=2, prefill, 4 index heads / 1 index-kv-head, causal.
     _idx_seqs_q, _idx_seqs_k = [128, 128], [2048, 2048]
     _idx_cu_q = torch.tensor(
         [0] + list(torch.tensor(_idx_seqs_q).cumsum(0)),
@@ -1208,8 +1206,7 @@ with contextlib.suppress(Exception):
             causal=True,
         )
 
-    # Sparse prefill: model heads (64 qo / 4 kv), topk=16 blocks, ascending
-    # in-range block ids per (kv-head, query) — the msa_topk_select format.
+    # block ids ascending and in range per (kv-head, query): the msa_topk_select format
     _sp_Hq, _sp_Hkv, _sp_topk = 64, 4, 16
     _sp_q = torch.randn(_idx_tq, _sp_Hq, 128, dtype=_msa_dt, device=_msa_dev) / 3
     _sp_k = torch.randn(_idx_tk, _sp_Hkv, 128, dtype=_msa_dt, device=_msa_dev) / 3
@@ -1230,7 +1227,6 @@ with contextlib.suppress(Exception):
             _sp_q, _sp_k, _sp_v, _sp_idx, _idx_cu_q, _idx_cu_k, causal=True
         )
 
-    # Sparse decode: batch=128, seqlen_q=1, model heads (64 qo / 4 kv), topk=16.
     _dec_B, _dec_Hq, _dec_Hkv, _dec_topk = 128, 64, 4, 16
     _dec_seqs_k = [4096] * _dec_B
     _dec_cu_k = torch.tensor(

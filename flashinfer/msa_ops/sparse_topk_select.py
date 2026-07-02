@@ -26,9 +26,8 @@ _topk_compile_cache: dict = {}
 
 
 def _get_compiled_topk(topk: int, small: bool):
-    """Compile the top-k kernel: the O(N^2) count-rank kernel when ``small`` (small
-    ``max_k_tiles``), else the O(max_k_tiles) radix kernel. Same call signature;
-    identical selections on distinct-score inputs."""
+    """``small`` picks the O(N^2) count-rank kernel, else the radix kernel; the
+    two give identical selections only on distinct-score inputs (ties may differ)."""
     import cutlass
     import cutlass.cute as cute
 

@@ -15,10 +15,8 @@ limitations under the License.
 
 ---
 
-MSA q2k -> k2q CSR builder for SM120/SM121: inverts the per-query top-K
-selection into a KV-major CSR (sorted batch-local query indices per (kv-head,
-block) row) plus split-slot packing, valid-block counts, and a flat work
-schedule. Static row geometry is precomputed host-side in the wrapper.
+MSA q2k to k2q CSR builder for SM120/SM121: inverts the per-query top-K
+selection into a KV-major CSR plus split-slot packing and a flat work schedule.
 """
 
 import inspect

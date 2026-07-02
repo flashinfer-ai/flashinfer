@@ -32,9 +32,8 @@ _SF_VEC_SIZE = 16
 
 
 def _resolve_proxy_dims(cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output):
-    """Resolve the grid dims ``(max_seqlen_q, max_k_tiles)`` as Python ints. Passing
-    them (or a pre-allocated ``output``) avoids the ``cu_seqlens`` host read, which
-    is illegal during CUDA-graph capture -- under capture we raise instead."""
+    """Resolve grid dims ``(max_seqlen_q, max_k_tiles)`` as Python ints; deriving
+    them reads ``cu_seqlens`` on host, so under CUDA-graph capture we raise."""
     if max_k_tiles is None and output is not None:
         max_k_tiles = int(output.shape[1])
     if max_seqlen_q is not None and max_k_tiles is not None:
@@ -43,7 +42,7 @@ def _resolve_proxy_dims(cu_seqlens_q, cu_k, max_seqlen_q, max_k_tiles, output):
         raise ValueError(
             "msa_proxy_score[_fp4] needs max_seqlen_q and max_k_tiles during CUDA "
             "graph capture (deriving them from cu_seqlens would sync the stream). "
-            "Pass both -- computed once at plan time -- or pre-allocate `output`."
+            "Pass both (computed once at plan time) or pre-allocate `output`."
         )
     if max_seqlen_q is None:
         cu_q_cpu = cu_seqlens_q.cpu()
@@ -64,20 +63,10 @@ def _proxy_split_k(
     gate_factor: float,
     ceil_to_target: bool,
 ) -> int:
-    """KV-block split factor that fills the GPU when the base proxy grid is small.
-
-    The proxy output is per-(head, kv_block, query), so the kv-block range can be
-    split across CTAs with no cross-split reduction (each split writes disjoint
-    columns). When the base grid underfills the SMs (long context, low batch) the
-    kernel starves; splitting the kv blocks fills it. Returns 1 (unsplit) once the
-    base grid already covers ``gate_factor`` SM-waves, leaving high-batch / prefill
-    unchanged.
-
-    ``wave_target`` is the SM-wave count to fill to. fp4 (less bandwidth-bound, 4-bit
-    K) fills to 2 waves and ceils to actually reach it; bf16 reloads its Q tile at
-    2 B/elem per split so over-splitting regresses, so it targets ~1.5 waves and
-    rounds. Both are measured optima; the per-dtype knobs are bound below.
-    """
+    """KV-block split factor that fills the SMs when the base proxy grid is small
+    (long context, low batch). Splits need no reduction: the per-(head, kv_block,
+    query) output means each split writes disjoint columns. Returns 1 once the
+    base grid already covers ``gate_factor`` SM-waves."""
     if base_ctas <= 0 or max_k_tiles <= 1:
         return 1
     num_sms = get_device_sm_count(device)
@@ -90,7 +79,8 @@ def _proxy_split_k(
     return max(1, min(splits, max_k_tiles))
 
 
-# fp4: fill 2 SM-waves, ceil to reach the target (4-bit K, over-split is cheap).
+# Measured optima. fp4: fill 2 SM-waves, ceil to reach the target (4-bit K,
+# over-split is cheap).
 _proxy_split_k_fp4 = functools.partial(
     _proxy_split_k, wave_target=2.0, gate_factor=2.0, ceil_to_target=True
 )
@@ -101,16 +91,8 @@ _proxy_split_k_bf16 = functools.partial(
 
 
 class _ProxySplitKRunner(TunableRunner):
-    """Autotunes the proxy kv-block split factor (``num_splits``).
-
-    The split factor is a runtime arg (no recompile per tactic), so one compiled
-    kernel covers every candidate. ``tactic`` *is* the split factor; ``tactic==-1``
-    falls back to the closed-form heuristic, so eager (un-tuned) behavior is
-    unchanged. No ``DynamicTensorSpec`` is used: the proxy is varlen, and the
-    autotuner would otherwise synthesize a shape-correct but value-invalid
-    ``cu_seqlens``; with static inputs it profiles the candidates on the caller's
-    real (valid) tensors and caches by shape + ``get_cache_key_extras``.
-    """
+    """Autotunes the proxy kv-block split factor: ``tactic`` *is* the split
+    factor (a runtime arg, so one compiled kernel covers every candidate)."""
 
     def __init__(
         self,
@@ -141,9 +123,8 @@ class _ProxySplitKRunner(TunableRunner):
         return hash(type(self))
 
     def get_valid_tactics(self, inputs, profile):
-        # Candidate split factors: powers of two up to ~4 SM-waves, capped by
-        # max_k_tiles. The closed-form heuristic value is always included (it may be
-        # non-power-of-two) so a tuned op is never worse than eager.
+        # Powers of two up to ~4 SM-waves, capped by max_k_tiles; always include
+        # the closed-form heuristic so a tuned op is never worse than eager.
         num_sms = get_device_sm_count(self._device)
         cap = min(self._mkt, max(1, -(-4 * num_sms // max(self._base, 1))))
         cands = {s for s in (1, 2, 4, 8, 16, 32) if s <= cap}
@@ -156,6 +137,8 @@ class _ProxySplitKRunner(TunableRunner):
         return (self._causal, self._paged, self._reduce, self._msq, self._mkt)
 
     def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
+        # tactic == -1 falls back to the closed-form heuristic, so eager
+        # (un-tuned) behavior is unchanged.
         ns = (
             tactic
             if tactic >= 0
@@ -200,13 +183,8 @@ def _run_proxy_autotuned(
     paged,
     reduce_heads,
 ):
-    """Pick the split factor via the autotuner (cached per shape+device), then run.
-
-    Un-tuned, this uses the closed-form heuristic directly (zero autotuner overhead,
-    matching the pre-autotuner default); under ``with autotune():`` it profiles the
-    candidates and caches the winner, after which choose_one is consulted per call.
-    ``call_fn(inputs, num_splits)`` performs the actual compiled-kernel launch.
-    """
+    """Run the proxy with an autotuned split factor; un-tuned shapes use the
+    closed-form heuristic directly and skip the autotuner entirely."""
     tuner = AutoTuner.get()
     tuning = tuner.is_tuning_mode
     tuned_key = _proxy_tuned_key(
@@ -235,6 +213,9 @@ def _run_proxy_autotuned(
         paged=paged,
         reduce_heads=reduce_heads,
     )
+    # No DynamicTensorSpec: the autotuner would synthesize a shape-correct but
+    # value-invalid varlen cu_seqlens; with static inputs it profiles the
+    # candidates on the caller's real (valid) tensors.
     runner_sel, tactic = tuner.choose_one(op_name, [runner], TuningConfig(), tensors)
     runner_sel(inputs=tensors, tactic=tactic)
 
@@ -267,7 +248,7 @@ def msa_proxy_score(
     There is no softmax and no V: this is MSA pipeline stage 1.
 
     Short-q decode (any ``group_size`` dividing the 64-row q-tile with
-    ``q_len <= 64 // group_size`` -- e.g. MiniMax-M3's group_size 4 at
+    ``q_len <= 64 // group_size``, e.g. MiniMax-M3's group_size 4 at
     ``q_len <= 16``) uses a head-fused packed schedule that scores all
     ``group_size`` heads of a kv_head from one shared index-K read
     (``group_size`` x less K traffic). fp8 K and prefill use the general schedule.
@@ -499,7 +480,6 @@ def msa_proxy_score(
         return per_head
     if output is None:
         output = torch.empty(final_shape, dtype=torch.float32, device=dev)
-    # max over the query-head axis -> one (block, query) score, M3-indexer style.
     torch.amax(per_head, dim=0, keepdim=True, out=output)
     return output
 
@@ -508,15 +488,9 @@ def _quantize_qk_to_nvfp4(
     x: torch.Tensor,
     global_scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
-    """Reshape + :func:`nvfp4_quantize` glue for tests / benchmarks / trace.
-
-    Quantizes a ``(total, num_heads, 128)`` bf16/fp16 proxy Q or K to packed
-    NVFP4 in the 128x4 tiled scale layout the MSA fp4 kernels expect. Returns
-    ``(x_fp4 (total, num_heads, 64) uint8, flat e4m3 block scales,
-    1 / global_scale)``. ``global_scale`` defaults to ``448 * 6 / amax(x)``.
-    Deployment quantizes the index Q/K once upstream; this is only for callers
-    that start from bf16.
-    """
+    """Test/bench/trace glue (deployment quantizes upstream): quantize a
+    ``(total, num_heads, 128)`` bf16/fp16 proxy Q or K to packed NVFP4 in the
+    128x4 tiled scale layout; returns ``(x_fp4, block scales, 1/global_scale)``."""
     from flashinfer import nvfp4_quantize
 
     if x.ndim != 3 or x.shape[2] != 128:
@@ -557,8 +531,8 @@ def msa_proxy_score_fp4(
     """NVFP4 MSA dense proxy pass for SM120/SM121 (the FP4 counterpart of
     :func:`msa_proxy_score`).
 
-    Same contract and output as :func:`msa_proxy_score` — per-KV-block max of
-    the unscaled, causally-masked ``Q K^T`` logits — but Q/K arrive pre-quantized
+    Same contract and output as :func:`msa_proxy_score` (per-KV-block max of
+    the unscaled, causally-masked ``Q K^T`` logits), but Q/K arrive pre-quantized
     as packed NVFP4 (``e2m1`` + per-16 ``e4m3`` block scales + per-tensor global
     scales), so the index K is read from HBM at ~4 bits/elem. The full-KV index
     read is the dominant decode-step cost, so this is the bandwidth path that
@@ -570,7 +544,7 @@ def msa_proxy_score_fp4(
     inputs (not the bf16 reference, which differs by fp4 rounding). The two global
     scales are folded into the logits as ``q_global_scale * k_global_scale`` before
     the block-max. Short-q decode (any ``group_size`` dividing the 128-row tile with
-    ``q_len <= 128 // group_size`` -- e.g. MiniMax-M3's group_size 4 at ``q_len<=32``,
+    ``q_len <= 128 // group_size``, e.g. MiniMax-M3's group_size 4 at ``q_len<=32``,
     or the 16-head deployment at ``q_len<=8``) uses a head-fused packed schedule that
     scores all ``group_size`` heads of a kv_head from one shared index-K read. Both
     flat and paged K are supported.

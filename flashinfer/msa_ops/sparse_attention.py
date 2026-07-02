@@ -33,9 +33,8 @@ def _q_offset_tensor(
     cu_seqlens_k: torch.Tensor,
     device,
 ) -> torch.Tensor:
-    """Per-batch causal offset (MSA q_offset semantics: query global position
-    = q_offset[b] + batch-local index). Defaults to right-aligned
-    (seqlen_k - seqlen_q)."""
+    """Per-batch causal offset (MSA semantics: query global position =
+    q_offset[b] + local index); defaults to right-aligned (seqlen_k - seqlen_q)."""
     if q_offset is None:
         return (
             (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
@@ -66,9 +65,8 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
 
 
 def _fake(dtype, shape, align=16):
-    """Fake compact row-major tensor for TVM-FFI compilation (FlashInfer's
-    established cute-dsl pattern: compile once against symbolic shapes, then
-    pass torch tensors directly at runtime)."""
+    """Fake compact row-major tensor for TVM-FFI compilation (compile once
+    against symbolic shapes, pass torch tensors directly at runtime)."""
     import cutlass.cute as cute
 
     return cute.runtime.make_fake_compact_tensor(
@@ -87,12 +85,9 @@ def _get_compiled_combine(
     has_lse_out: bool,
     has_lse_t: bool,
 ):
-    """Compile (once, cached) the CuTe-DSL combine kernel for a config.
-
-    All fake tensor dims are independent symbols: the kernel's loop bounds
-    (``topk``, ``head_dim``) come from the kernel object, not tensor shapes, so
-    the shapes only fix ndim/strides, so unused optional tensors can be
-    passed as small dummies at runtime without symbol conflicts."""
+    """Compile (cached) the CuTe-DSL combine kernel. Fake dims are independent
+    symbols (loop bounds come from the kernel object, not shapes), so unused
+    optional tensors can be passed as small dummies without symbol conflicts."""
     import cutlass
     import cutlass.cute as cute
 
@@ -198,7 +193,6 @@ def _combine_partials(
     lse_t_partial: Optional[torch.Tensor] = None,
     lse_t_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused LSE-weighted reduction over each query's split slots (CuTe-DSL)."""
     return _combine_partials_cudsl(
         o_partial,
         lse_partial,

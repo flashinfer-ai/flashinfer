@@ -1,6 +1,5 @@
 """Tests for the union-tile sparse-attention prefill path behind the public
-``msa_sparse_attention``: validated against an fp32 torch oracle on a causal
-per-query block selection, plus flat-vs-paged consistency."""
+``msa_sparse_attention``."""
 
 import math
 
@@ -120,9 +119,8 @@ def _compile_union(
 
 
 def _canon_union_meta(ub, um, uc, wm, n):
-    """Map a union-metadata tuple to {(batch, q_tile, kv_head): (blocks, masks)}
-    over its non-empty work items, so two builders can be compared regardless of
-    work-item emission order or empty-item padding."""
+    """Map union metadata to {(batch, q_tile, kv_head): (blocks, masks)} so two
+    builders compare independent of work-item emission order or padding."""
     ub, um, uc, wm = (t.cpu() for t in (ub, um, uc, wm))
     out = {}
     for i in range(n):
@@ -140,8 +138,6 @@ def _canon_union_meta(ub, um, uc, wm, n):
 @pytest.mark.parametrize("tpt", [8, 16])
 @pytest.mark.parametrize("B,S", [(1, 2048), (3, 640)])
 def test_union_metadata_device_matches_host(tpt, B, S):
-    """The on-device union-metadata builder produces the same per-(batch, q-tile,
-    kv-head) unions and membership masks as the host reference builder."""
     _skip()
     from flashinfer.msa_ops._union_metadata import (
         build_msa_union_metadata,
@@ -163,9 +159,8 @@ def test_union_metadata_device_matches_host(tpt, B, S):
 @pytest.mark.parametrize("m_block,num_threads", [(64, 128), (128, 256)])
 @pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
 def test_union_prefill_kernel_matches_public_api_and_oracle(m_block, num_threads, B, S):
-    """The union kernel invoked directly (with the host metadata builder) matches
-    both the public ``msa_sparse_attention`` wrapper (on-device metadata builder)
-    and the fp32 torch oracle."""
+    """Direct kernel with the host metadata builder matches the public wrapper
+    (device builder) and the fp32 oracle."""
     _skip()
     import cutlass
 
@@ -234,9 +229,8 @@ def test_union_prefill_kernel_matches_public_api_and_oracle(m_block, num_threads
 
 @pytest.mark.parametrize("B,S", [(1, 1024), (2, 512)])
 def test_union_paged_matches_flat(B, S):
-    """Paged-KV union (page_size == block == 128, one page per KV block) matches
-    the flat union path bit-for-bit on identical data -- the paged path only
-    remaps the K/V block address through the page table."""
+    """Paged-KV union matches flat bit-for-bit on identical data: the paged path
+    only remaps the K/V block address through the page table."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 
@@ -252,8 +246,7 @@ def test_union_paged_matches_flat(B, S):
 
     flat = msa_sparse_attention(q, k, v, q2k, cu, cu, causal=True, softmax_scale=scale)
 
-    # relay flat K/V into a randomly-permuted paged cache (one 128-token page per
-    # KV block) and build the page table, then run the same union path paged.
+    # relay flat K/V into a randomly permuted paged cache, one 128-token page per block
     npages = [S // BLK] * B
     perm = torch.randperm(sum(npages))
     k_pg = torch.zeros(sum(npages), Hkv, BLK, hd, dtype=k.dtype, device=dev)
@@ -287,8 +280,7 @@ def test_union_paged_matches_flat(B, S):
 @pytest.mark.parametrize("B,S", [(1, 1024), (3, 384)])
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_union_public_api(B, S, return_lse):
-    """msa_sparse_attention (the union prefill path) matches the fp32 torch oracle
-    end to end through the public wrapper, including the LSE."""
+    """Public wrapper vs the fp32 oracle, including the LSE."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 
@@ -320,9 +312,8 @@ def test_union_public_api(B, S, return_lse):
 @pytest.mark.parametrize("Hq,Hkv", [(1, 1), (2, 2), (4, 2)])
 @pytest.mark.parametrize("B,S", [(1, 1024), (2, 384)])
 def test_union_small_group_matches_oracle(Hq, Hkv, B, S):
-    """Small / unit GQA groups, including MHA (group_size=1 -> the 32-row tile,
-    tokens_per_tile=32 = the membership mask's exact capacity), match the fp32
-    torch oracle."""
+    """Small / unit GQA groups. group_size=1 hits the 32-row tile where
+    tokens_per_tile=32 is the membership mask's exact capacity."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 
@@ -349,9 +340,8 @@ def test_union_small_group_matches_oracle(Hq, Hkv, B, S):
 @pytest.mark.parametrize("B,S", [(1, 1024), (3, 384)])
 @pytest.mark.parametrize("causal", [True, False])
 def test_union_temperature_lse(B, S, causal):
-    """return_temperature_lse returns (out, lse, lse_t); the temperature LSE is the
-    log-sum-exp of the temperature-scaled scores over each query's selected (and
-    causally valid) columns, matching a torch oracle."""
+    """lse_t must be the log-sum-exp of the temperature-scaled scores over each
+    query's selected, causally valid columns."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 
@@ -420,12 +410,9 @@ def _nvfp4_quant(x2d):
 
 @pytest.mark.parametrize("quant", ["fp8", "nvfp4"])
 def test_union_paged_quant_matches_flat(quant):
-    """Paged-KV union with fp8 / NVFP4 K/V matches the flat union path on the same
-    values relayed into a permuted paged cache (one 128-token page per block). The
-    paged dequant only changes the K/V block address (page table) and the SF row
-    base; the NVFP4 paged SF lands in (page, head, token) order, which is exactly
-    what quantizing the paged cache reshaped to (-1, head_dim) produces. (Flat
-    fp8/NVFP4 union is validated against the torch oracle in test_msa_ops.py.)"""
+    """Paged fp8/NVFP4 union matches flat on the same values (flat is oracle-checked
+    in test_msa_ops.py). The paged NVFP4 SF lands in (page, head, token) order,
+    which quantizing the paged cache reshaped to (-1, head_dim) produces."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
 

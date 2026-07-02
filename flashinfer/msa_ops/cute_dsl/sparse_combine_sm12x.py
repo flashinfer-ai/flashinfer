@@ -15,15 +15,8 @@ limitations under the License.
 
 ---
 
-MSA fused split-KV combine for SM120/SM121:
-
-    out[q, h, :] = sum_s w_s * o_partial[s, q, h, :] / sum_s w_s
-    w_s          = exp2(lse2[s, q, h] - max_s lse2[s, q, h])
-
-with ``s`` over the valid split slots ``[0, split_counts[q, h // group_size])``;
-slots >= count hold uninitialized memory (loads issued for pipelining, masked
-from the reduction). Optionally writes the combined natural-log LSE and a
-temperature LSE.
+MSA split-KV combine kernel for SM120/SM121: LSE-weighted merge of the
+sparse-decode split partials into the final output.
 """
 
 from typing import Type
@@ -164,12 +157,9 @@ class SparseCombineSm12x:
         if denom > 0.0:
             inv = cutlass.Float32(1.0) / denom
 
-        # Branch-free reduction: partials are allocated for all topk slots, so the
-        # loads are unconditional (they pipeline); invalid slots carry weight 0.
-        # Their uninitialized values may be NaN/Inf, which weight 0 cannot mask
-        # (0 * NaN = NaN), so clamp to finite range first — fmax drops a NaN
-        # operand, keeping the reduction branch-free. fmin(x,c) is spelled
-        # -fmax(-x,-c) since cutlass-dsl 4.5.2 has no cute.arch.fmin.
+        # Branch-free: all topk slots load unconditionally (they pipeline); invalid
+        # slots get weight 0, but 0 * NaN = NaN, so clamp the garbage to finite first
+        # (fmax drops a NaN operand). cutlass-dsl 4.5.2 has no fmin: use -fmax(-x, -c).
         for i in cutlass.range_constexpr(self._channels_per_thread):
             c = tidx + i * self._num_threads
             acc = cutlass.Float32(0.0)

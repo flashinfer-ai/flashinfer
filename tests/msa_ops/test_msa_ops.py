@@ -123,7 +123,7 @@ def test_sparse_attention(B, Hq, Hkv, topk, seqs_q, seqs_k, causal):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3c: paged KV, LSE output, fused combine, fp16/topk32 coverage
+# paged KV, LSE output, fused combine, fp16/topk32 coverage
 # ---------------------------------------------------------------------------
 
 
@@ -211,7 +211,7 @@ def test_sparse_attention_paged():
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_attention
 
-    seqs_q, seqs_k = [150, 90], [2048, 1280]  # multiples of 128
+    seqs_q, seqs_k = [150, 90], [2048, 1280]  # seqs_k multiples of 128
     q, k, v, idx, cu_q, cu_k = _make_case(
         2, 8, 2, 16, seqs_q, seqs_k, torch.bfloat16, seed=40
     )
@@ -321,7 +321,7 @@ def test_sparse_attention_fp8_kv(q_dtype, causal):
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: sparse decode
+# sparse decode
 # ---------------------------------------------------------------------------
 
 
@@ -426,9 +426,8 @@ def test_sparse_decode(B, sq, Hq, Hkv, topk, kv_dtype, paged):
     ],
 )
 def test_sparse_decode_fused(B, sq, Hq, Hkv, topk, kv_dtype, paged):
-    # the fused decode (force_fused=True -> one CTA per token loops all its blocks,
-    # no combine) must match the per-block split+combine path (output and LSE) and
-    # the torch oracle. force_fused exercises it regardless of batch.
+    # fused decode (force_fused=True: one CTA per token, no combine) must match
+    # the per-block split+combine path (output and LSE) and the torch oracle
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_decode_attention
 
@@ -511,7 +510,7 @@ def test_sparse_decode_cuda_graph():
 
 
 # ---------------------------------------------------------------------------
-# Phase 5: NVFP4 KV cache
+# NVFP4 KV cache
 # ---------------------------------------------------------------------------
 
 
@@ -700,16 +699,15 @@ def test_sparse_decode_nvfp4():
 
 
 # ---------------------------------------------------------------------------
-# Coverage additions from the MSA test-suite comparison
+# top-k selection and edge-case coverage
 # ---------------------------------------------------------------------------
 
 
 # P=128 exercises the count-rank kernel, P=256 the radix kernel (crossover at 128).
 @pytest.mark.parametrize("P", [128, 256])
 def test_msa_topk_select_forced_and_clamped(P):
-    """force_begin/force_end blocks must always be selected (within the topk
-    budget) and num_valid_pages must clamp the candidate range, mirrors
-    MSA's smoke/test_sparse_topk_forced.py."""
+    """Forced begin/end blocks are always selected within the topk budget;
+    num_valid_pages clamps the candidate range."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_topk_select
 
@@ -763,12 +761,10 @@ def test_msa_topk_select_input_guards():
     dev = "cuda"
     H, P, S, topk = 2, 64, 8, 16
     max_score = torch.randn(H, P, S, dtype=torch.float32, device=dev)
-    # num_valid_pages out of (0, max_k_tiles]
     with pytest.raises(ValueError, match="num_valid_pages"):
         msa_topk_select(max_score, topk, num_valid_pages=P + 1)
     with pytest.raises(ValueError, match="num_valid_pages"):
         msa_topk_select(max_score, topk, num_valid_pages=0)
-    # forced regions exceeding the topk budget / the valid range
     with pytest.raises(ValueError, match="topk"):
         msa_topk_select(max_score, topk, force_begin_blocks=10, force_end_blocks=10)
     with pytest.raises(ValueError, match="num_valid_pages"):
@@ -778,9 +774,8 @@ def test_msa_topk_select_input_guards():
 
 
 def test_q2k_indices_must_be_contiguous():
-    """Decode and prefill compile for a compact q2k layout; a strided q2k (the
-    natural bare permute of msa_topk_select's output) must be rejected with a
-    clear message."""
+    """Strided q2k (the natural bare permute of msa_topk_select's output) must
+    be rejected with a clear message."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import (
         msa_sparse_attention,
@@ -795,7 +790,7 @@ def test_q2k_indices_must_be_contiguous():
     k = torch.randn(total_k, Hkv, 128, dtype=dtype, device=dev)
     v = torch.randn_like(k)
     cu_q = torch.tensor([0, 1, 2], dtype=torch.int32, device=dev)
-    # (total_q, Hkv, topk) then permute -> (Hkv, total_q, topk) but strided.
+    # (total_q, Hkv, topk) permuted to (Hkv, total_q, topk): right shape, strided
     idx_strided = torch.zeros(
         total_q, Hkv, topk, dtype=torch.int32, device=dev
     ).permute(1, 0, 2)
@@ -809,8 +804,6 @@ def test_q2k_indices_must_be_contiguous():
 
 
 def test_fuzz_random_shapes():
-    """Seeded random-shape sweep (MSA-style fuzzing) with element-wise checks
-    against the reference."""
     _skip_if_unsupported()
     import random
 
@@ -863,9 +856,8 @@ def test_fuzz_random_shapes():
 
 
 def test_fully_masked_selected_blocks():
-    """Queries whose entire selection is above the causal diagonal must
-    produce exact zeros (and -inf LSE), with no NaN/Inf anywhere, the
-    'Q near sequence start' stress from MSA's suite."""
+    """Queries whose entire selection is above the causal diagonal must produce
+    exact zeros and -inf LSE, with no NaN/Inf anywhere."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_attention
 
@@ -918,7 +910,7 @@ def test_fully_masked_selected_blocks():
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: msa_proxy_score (dense proxy, OnlyScore parity)
+# msa_proxy_score (dense proxy)
 # ---------------------------------------------------------------------------
 
 
@@ -989,11 +981,8 @@ def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
     ],
 )
 def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
-    """Short-q decode dispatches the head-fused packed bf16 kernel
-    (MsaProxyScoreDecodePackedSm12x): all group_size heads of a kv_head packed into
-    one 64-row tile, scored against a single index-K read. group_size 4 with
-    q_len <= 16 is the MiniMax-M3 indexer shape. Validated vs the same torch oracle
-    as the general path."""
+    """Short-q decode dispatches the head-fused packed bf16 kernel; group 4 with
+    q_len <= 16 is the MiniMax-M3 indexer shape."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score
 
@@ -1019,10 +1008,8 @@ def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
 
 @pytest.mark.parametrize("Hq,Hkv", [(4, 1), (8, 2)])
 def test_msa_proxy_score_reduce_heads(Hq, Hkv):
-    """``reduce_heads=True`` returns the head-max-reduced (1, max_k_tiles,
-    total_q) score, bit-exactly equal to amax(dim=0) over the per-head output
-    (the M3 lightning-indexer block-score collapse), and the default per-head
-    path is unchanged."""
+    """reduce_heads=True must equal amax(dim=0) over the per-head output
+    bit-exactly, and leave the default per-head path unchanged."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score
 
@@ -1040,7 +1027,6 @@ def test_msa_proxy_score_reduce_heads(Hq, Hkv):
 
     assert per_head.shape == (Hq, per_head.shape[1], total_q)
     assert reduced.shape == (1, per_head.shape[1], total_q)
-    # amax over the same per-head buffer -> bit-exact vs the kernel's reduce_heads
     assert torch.equal(reduced, per_head.amax(dim=0, keepdim=True))
 
     # caller-provided output of the reduced shape is honored
@@ -1098,8 +1084,7 @@ def test_msa_proxy_score_paged_fp8():
 
 
 def test_e2e_full_pipeline_from_raw_tensors():
-    """The complete MSA pipeline natively on SM12x: proxy scores -> top-k
-    selection -> union-tile sparse prefill."""
+    """Full pipeline: proxy scores -> top-k selection -> sparse prefill."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import (
         msa_proxy_score,
@@ -1116,12 +1101,10 @@ def test_e2e_full_pipeline_from_raw_tensors():
     q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
     v = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
-    # proxy Q with one head per KV head (the MSA README configuration)
+    # proxy Q with one head per KV head (the MSA reference configuration)
     proxy_q = torch.randn(seqlen_q, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
 
-    # Stage 1: dense proxy scores (causally masked)
     max_score = msa_proxy_score(proxy_q, k, cu_q, cu_k, causal=True)
-    # Stage 2: top-k selection
     idx_qmajor = msa_topk_select(max_score.contiguous(), topk)
     idx = idx_qmajor.permute(1, 0, 2).contiguous()  # (Hkv, total_q, topk)
     torch.cuda.synchronize()
@@ -1130,7 +1113,6 @@ def test_e2e_full_pipeline_from_raw_tensors():
         q_pos = qi + seqlen_k - seqlen_q
         sel = idx[:, qi][idx[:, qi] >= 0]
         assert (sel * BLK_KV <= q_pos).all(), "selected fully-masked block"
-    # Stage 3: sparse attention over the selection
     scale = 1.0 / math.sqrt(128)
     out = msa_sparse_attention(
         q, k, v, idx, cu_q, cu_k, causal=True, softmax_scale=scale
@@ -1301,9 +1283,8 @@ def test_temperature_lse():
 
 
 def test_fp8_q_decode():
-    """All-fp8 decode inputs (Q, K, V all e4m3), MSA's fp8 serving configuration.
-    Q is upconverted in-kernel; reference uses the dequantized tensors. (Prefill is
-    bf16/fp16 Q only; fp8 K/V prefill is covered by test_sparse_attention_fp8_kv.)"""
+    """All-fp8 decode inputs (Q, K, V all e4m3): Q is upconverted in-kernel;
+    the reference uses the dequantized tensors."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_decode_attention
 

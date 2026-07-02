@@ -15,11 +15,7 @@ limitations under the License.
 
 ---
 
-Sparse decode kernel for SM120/SM121: an M=16 tile (one token's <=16 query
-heads) on a static grid ``(num_chunks, total_q, Hkv)`` driven directly by
-``q2k_indices``. num_chunks==1 is the fused path writing final output + LSE;
-otherwise partials and log2-domain LSE go to the prefill split-slot buffers
-for the combine kernel.
+Sparse decode attention kernels for SM120/SM121: split-KV and fused paths.
 """
 
 import cuda.bindings.driver as cuda
@@ -49,9 +45,9 @@ class SparseDecodeForwardSm12x:
             raise ValueError("only head_dim=blk_kv=128 supported")
         if group_size > 16:
             raise ValueError("group_size must be <= 16")
-        # adaptive-split: when the per-token grid (total_q x num_kv_heads) fills the
-        # SMs, one CTA per (token, kv_head) loops every selected block with in-kernel
-        # online softmax, dropping the GMEM partials + combine pass. nvfp4 KV splits.
+        # fused: when the per-token grid (total_q x Hkv) fills the SMs, one CTA per
+        # (token, kv_head) loops all selected blocks with in-kernel online softmax;
+        # no GMEM partials or combine pass. nvfp4 KV always takes the split path.
         if fused and kv_nvfp4:
             raise ValueError("fused decode does not support nvfp4 KV")
         self._head_dim = head_dim
@@ -347,7 +343,7 @@ class SparseDecodeForwardSm12x:
             row_sum.fill(0.0)
 
             if cutlass.const_expr(self._is_causal):
-                # causal: query global position = q_offset[b] + tok_in_req
+                # global query position = q_offset[b] + tok_in_req
                 if cutlass.const_expr(self._qoff_default):
                     q_pos_limit = tok_in_req + (seqlen_k - seqlen_q) + 1
                 else:
@@ -806,9 +802,8 @@ class SparseDecodeForwardSm12x:
         out_scale: cutlass.Float32,
         seqlen_q: cutlass.Int32,
     ):
-        # fused decode: one CTA per (token, kv_head) attends *all* the token's
-        # selected blocks with a single in-kernel online softmax (the union-tile
-        # prefill's scheme, decode analogue), writing output + LSE directly.
+        # fused: this CTA attends all of the token's selected blocks with one
+        # in-kernel online softmax and writes output + LSE directly, no combine.
         tidx, _, _ = cute.arch.thread_idx()
         _, qi, kv_head = cute.arch.block_idx()  # grid x is 1 (no split slots)
 
@@ -830,7 +825,6 @@ class SparseDecodeForwardSm12x:
             else:
                 in_prefix = cutlass.Boolean(False)
 
-        # SMEM layouts same as the split kernel
         sQ_layout = cute.make_layout(
             (self._m_tile, self._head_dim), stride=(self._pad_stride, 1)
         )
@@ -892,7 +886,7 @@ class SparseDecodeForwardSm12x:
                     qfrag.fill(0)
                     cute.autovec_copy(qfrag, s_chunk)
 
-        # MMA setup (single compute warp; same as split)
+        # MMA setup (single compute warp)
         tiled_mma = cute.make_tiled_mma(
             warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
             (1, 1, 1),
@@ -965,8 +959,7 @@ class SparseDecodeForwardSm12x:
                     tSrQ_copy_view[None, None, k],
                 )
 
-        # Loop over every selected block (online softmax carried across all of them).
-        # cnt is thread-uniform, so the barriers stay collective.
+        # cnt is thread-uniform, so the barriers stay collective
         for it in cutlass.range(cnt):
             kv_block = mQ2K[kv_head, qi, it]
             if cutlass.const_expr(self._paged):
@@ -1107,8 +1100,7 @@ class SparseDecodeForwardSm12x:
                 # protect sK/sV before the next sub-block overwrites them
                 self.cta_sync_barrier.arrive_and_wait()
 
-        # Epilogue: normalize, write final output + natural-log LSE.
-        # Always runs (cnt == 0 -> zero output, -inf LSE).
+        # epilogue always runs: cnt == 0 yields zero output and -inf LSE
         if tidx < 32:
             for r in cutlass.range_constexpr(n_rows):
                 g = tScO_mn[r, 0][0]

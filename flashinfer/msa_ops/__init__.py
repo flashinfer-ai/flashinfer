@@ -1,8 +1,4 @@
-"""
-Minimax Sparse Attention (MSA) operations for FlashInfer.
-
-Supports SM120 and SM121 (Blackwell) GPUs.
-"""
+"""Minimax Sparse Attention (MSA) operations. SM120/SM121 (Blackwell) only."""
 
 from .proxy_score import (
     msa_proxy_score,

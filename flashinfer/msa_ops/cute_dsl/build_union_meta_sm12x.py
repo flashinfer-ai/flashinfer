@@ -15,12 +15,8 @@ limitations under the License.
 
 ---
 
-On-device union-tile metadata builder for SM120/SM121: per (query-tile,
-kv-head) work item, the union of the tile's selected KV blocks (ascending)
-plus a per-block ``tokens_per_tile``-bit membership mask, consumed by
-:mod:`sparse_fwd_union_sm12x`. The work-item layout is precomputed host-side
-from ``cu_seqlens_q`` alone, so the ``(Hkv, total_q, topk)`` selection never
-crosses to the host.
+On-device union-tile metadata builder for SM120/SM121: per (query-tile, kv-head)
+union of selected KV blocks plus membership masks, for :mod:`sparse_fwd_union_sm12x`.
 """
 
 import cuda.bindings.driver as cuda
@@ -122,7 +118,6 @@ class BuildUnionMetaSm12x:
             if head < 0:
                 head = sentinel
 
-            # warp all-reduce of the minimum head (butterfly over 32 lanes).
             m = head
             off = 16
             while off >= 1:

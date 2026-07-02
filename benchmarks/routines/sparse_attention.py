@@ -13,13 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Benchmark routines for Minimax Sparse Attention (MSA).
-
-MSA runs as a pipeline of stage ops rather than a single fused call:
-    proxy_score -> topk_select -> build_k2q_csr -> prefill
-                                                \\-> decode
-plus an end-to-end ``MSAPipeline`` routine. Precision is chosen per op via
-``--q_dtype`` / ``--kv_dtype``.
+Benchmark routines for Minimax Sparse Attention (MSA): per-stage ops plus the
+end-to-end MSAPipeline. Precision is chosen via ``--q_dtype`` / ``--kv_dtype``.
 """
 
 import argparse
@@ -120,7 +115,7 @@ def parse_sparse_attention_args(line, parser):
 # input construction
 # --------------------------------------------------------------------------- #
 def _resolve_backends(args):
-    """Drop backends the routine does not implement, warning once each."""
+    """Drop backends the routine does not implement; warn once for each."""
     supported = _ROUTINE_BACKENDS[args.routine]
     out = []
     for b in args.backends:
@@ -222,14 +217,9 @@ def _record(args, backend, times, *, tflops=0.0, tb_per_sec=0.0, total_q=0, tota
 # per-op routines
 # --------------------------------------------------------------------------- #
 def testMSAProxyScore(args):
-    """Stage 1: dense per-KV-block max logits (the MSA indexer / proxy score).
-
-    Precision is selected by ``--q_dtype`` (like the other routines pick KV
-    precision via ``--kv_dtype``): ``bfloat16`` / ``float16`` runs the bf16 proxy
-    (``msa_proxy_score``), ``nvfp4`` runs the NVFP4 tensor-core proxy
-    (``msa_proxy_score_fp4``) on the same q/k quantized to NVFP4. Both are CuTe-DSL
-    kernels; only the index-K HBM read precision differs (~4 bits/elem vs 16).
-    """
+    """Stage 1: dense per-KV-block max logits (the MSA indexer). ``--q_dtype``
+    picks the kernel: bfloat16/float16 -> ``msa_proxy_score``, nvfp4 ->
+    ``msa_proxy_score_fp4`` on the same q/k quantized to NVFP4."""
     if args.verbose >= 1:
         print(f"[INFO] Running testMSAProxyScore | FlashInfer {flashinfer.__version__}")
     device = _common(args)
