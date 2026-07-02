@@ -19,10 +19,6 @@ _TMA_CTA_LOAD = (
     "cp.async.bulk.tensor.3d.shared::cta.global.tile."
     "mbarrier::complete_tx::bytes.L2::cache_hint"
 )
-_TMA_TILE_STORE = (
-    "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group.L2::cache_hint"
-)
-_TMA_CTA_STORE = "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group"
 
 
 def _as_options_tuple(options):
@@ -121,25 +117,17 @@ def _read_ptx_text(ptx_artifact):
 
 
 def _patch_sm120a_tma_ptx(ptx_text: str) -> str:
-    patched = ptx_text.replace(_TMA_CLUSTER_LOAD, _TMA_CTA_LOAD)
-    if _TMA_TILE_STORE in patched:
-        lines = []
-        for line in patched.splitlines(keepends=True):
-            if _TMA_TILE_STORE not in line:
-                lines.append(line)
-                continue
-
-            line_body = line.rstrip("\r\n")
-            line_end = line[len(line_body) :]
-            line_body = line_body.replace(_TMA_TILE_STORE, _TMA_CTA_STORE)
-            if line_body.endswith(";"):
-                operands, separator, _cache_policy = line_body[:-1].rpartition(", %rd")
-                if separator:
-                    line_body = operands + ";"
-            lines.append(line_body + line_end)
-        patched = "".join(lines)
-
-    return patched
+    # Only the shared::cluster -> shared::cta load rewrite: sm_120a has no
+    # cluster support, and cluster TMA loads trigger a syscall-emulation path
+    # where setmaxnreg is ignored (ptxas C7506) and register reallocation
+    # fails, silently costing ~32% kernel time. Only the CUDA-12.9-compiler
+    # DSL wheel (nvidia-cutlass-dsl-libs-base) emits these; the cu13 wheel
+    # emits none, in which case this returns the text unchanged and the
+    # caller keeps CuTeDSL's original in-process CUBIN (no PTX reload at
+    # all). The former TMA-store cache-hint rewrite was dropped: it does not
+    # affect C7506, and forcing the PTX reload it required measured ~9%
+    # slower than the DSL CUBIN on the cu13 path.
+    return ptx_text.replace(_TMA_CLUSTER_LOAD, _TMA_CTA_LOAD)
 
 
 def _downgrade_ptx_isa_version(ptx_text: str):
