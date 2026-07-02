@@ -1187,15 +1187,15 @@ def gen_batch_attention_module(
 
 
 def _fa2_head_dim_nvcc_flags(head_dim_qk: int, head_dim_vo: int) -> Optional[List[str]]:
-    """head_dim > 256 is only supported on SM100+.
+    """head_dim > 256 is only supported on SM90+.
 
-    Restrict compilation of those modules to SM100/110/120 so pre-SM100
+    Restrict compilation of those modules to SM90/100/110/120 so pre-SM90
     builds neither compile nor expose them; requesting such a module on an
     older GPU raises "No supported CUDA architectures found".
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
         return current_compilation_context.get_nvcc_flags_list(
-            supported_major_versions=[10, 11, 12]
+            supported_major_versions=[9, 10, 11, 12]
         )
     return None
 
