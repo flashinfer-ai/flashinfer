@@ -15,30 +15,12 @@ limitations under the License.
 
 ---
 
-On-device union-tile metadata builder for SM120/SM121.
-
-Production replacement for the host Python reference
-(:func:`..._union_metadata.build_msa_union_metadata`): for each
-(query-tile, kv-head) work item it forms the **union** of the KV blocks the
-tile's ``tokens_per_tile`` queries selected, together with a per-(union-block)
-``tokens_per_tile``-bit membership mask (bit ``i`` set iff tile-token ``i``
-selected that block). The union-tile forward (:mod:`sparse_fwd_union_sm12x`)
-then walks this list with online softmax.
-
-One warp owns one work item; lane ``i`` owns tile-token ``i``'s sorted (ascending,
-``-1`` trailing-padded) top-k list. The warp does a k-way merge by repeatedly
-warp-reducing the minimum head-of-list block id, OR-ing the membership bits of
-every lane sitting on that minimum, emitting one union entry, and advancing the
-matched lanes. The output blocks come out ascending -- identical to the host
-reference's ``sorted()`` -- but order is immaterial: the forward's online softmax
-and per-block causal mask are order-independent.
-
-The work-item layout (which (batch, q-tile, kv-head) and the global query offset
-of each tile) is precomputed host-side from ``cu_seqlens_q`` alone -- a tiny
-``(batch + 1,)`` tensor -- so the expensive ``(Hkv, total_q, topk)`` selection is
-never copied to the host (the whole point vs. the reference builder). The work
-count is therefore statically known (``total_tiles * Hkv``); unlike the CSR
-builder there is no compaction and no atomic work counter.
+On-device union-tile metadata builder for SM120/SM121: per (query-tile,
+kv-head) work item, the union of the tile's selected KV blocks (ascending)
+plus a per-block ``tokens_per_tile``-bit membership mask, consumed by
+:mod:`sparse_fwd_union_sm12x`. The work-item layout is precomputed host-side
+from ``cu_seqlens_q`` alone, so the ``(Hkv, total_q, topk)`` selection never
+crosses to the host.
 """
 
 import cuda.bindings.driver as cuda

@@ -38,13 +38,14 @@ def _get_compiled_topk(topk: int, small: bool):
         return compiled
 
     if small:
-        from .cute_dsl.topk_select_countrank_sm12x import TopKSelectCountRankSm12x
-
-        kernel_obj = TopKSelectCountRankSm12x(topk=topk)
+        from .cute_dsl.topk_select_countrank_sm12x import (
+            TopKSelectCountRankSm12x as _TopKKernel,
+        )
     else:
-        from .cute_dsl.topk_select_radix_sm12x import TopKSelectRadixSm12x
-
-        kernel_obj = TopKSelectRadixSm12x(topk=topk)
+        from .cute_dsl.topk_select_radix_sm12x import (  # type: ignore[assignment]
+            TopKSelectRadixSm12x as _TopKKernel,
+        )
+    kernel_obj = _TopKKernel(topk=topk)
 
     def fk(dtype, ndim, align):
         return cute.runtime.make_fake_compact_tensor(
@@ -178,7 +179,6 @@ def msa_topk_select(
     # its staging buffer is bounded and it supports max_k_tiles < 12288 (~1.5M ctx).
     if max_k_tiles >= 12288:
         raise ValueError(f"max_k_tiles must be < 12288, got {max_k_tiles}")
-    # Small block counts (<= 16k context) go to the cheaper O(N^2) count-rank kernel.
     from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
 
     small = max_k_tiles <= _MAX_BLOCKS

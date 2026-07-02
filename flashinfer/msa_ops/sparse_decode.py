@@ -38,9 +38,8 @@ from ..trace.templates.msa import msa_sparse_decode_attention_trace
 
 @functools.cache
 def _dummy_tensors(device_index: int):
-    """Per-device signature fillers (page table, scale factors, q_offset) for
-    paths that never read them — cached so each decode call launches no fill
-    kernels."""
+    # signature fillers for paths that never read them; cached so decode
+    # calls launch no fill kernels
     dev = torch.device("cuda", device_index)
     return (
         torch.zeros((1, 1), dtype=torch.int32, device=dev),
@@ -235,8 +234,7 @@ def msa_sparse_decode_attention(
     if v.shape != k.shape or v.dtype != k.dtype:
         raise ValueError("v must have the same shape and dtype as k")
 
-    # q_offset=None (right-aligned) is computed in-kernel from cu_k/seqlen_q, so
-    # the default path builds no offset tensor at all.
+    # the right-aligned default is computed in-kernel: no offset tensor built
     qoff_default = q_offset is None
     if qoff_default:
         qoff_dev = _dummy_tensors(dev.index)[2]

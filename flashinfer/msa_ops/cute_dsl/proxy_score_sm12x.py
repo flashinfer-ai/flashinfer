@@ -15,24 +15,12 @@ limitations under the License.
 
 ---
 
-MSA dense proxy-score kernel for SM120/SM121 (the SM12x equivalent of MSA's
-``SparseAttnMode::OnlyScore`` dense FMHA variant).
-
-Computes, for every (query head, KV block, query token):
-
-    max_score[h, t, q] = max over the 128 tokens of KV block t of the
-                         UNSCALED, post-mask QK^T logits
-
-matching MSA's contract (sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp:
-the per-tile max is taken before ``scale_softmax_log2`` is applied, after
-masking). KV blocks beyond a sequence's valid range — and blocks entirely
-above the causal limit — produce ``-inf``, which is what
-:func:`msa_topk_select` expects for invalid tiles.
-
-There is no softmax, no PV matmul and no output tensor: this is a QK GEMM
-with a fused per-block row-max epilogue. Structurally it is the sparse
-attention forward with the selection map, online softmax and V machinery
-removed, and the KV loop made dense.
+MSA dense proxy-score kernel for SM120/SM121 (MSA's
+``SparseAttnMode::OnlyScore``): per (query head, KV block, query token), the
+max over the block's 128 tokens of the UNSCALED post-mask QK^T logits (MSA
+contract: max taken before ``scale_softmax_log2``, after masking). Invalid or
+fully-causally-masked blocks produce -inf, which :func:`msa_topk_select`
+expects.
 """
 
 from typing import Type

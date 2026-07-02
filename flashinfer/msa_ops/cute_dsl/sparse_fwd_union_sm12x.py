@@ -15,24 +15,12 @@ limitations under the License.
 
 ---
 
-Union-tile Minimax Sparse Attention forward kernel for SM120/SM121.
-
-The query-tile counterpart of the KV-block-major ``sparse_fwd_sm12x``. Work is
-distributed over (batch, query-tile, kv-head): each CTA owns ``tokens_per_tile``
-consecutive query tokens (x ``group_size`` GQA heads = the ``m_block`` MMA rows)
-and loops over the **union** of the KV blocks those tokens selected, running an
-**in-kernel online softmax** over that union and writing the **final normalized
-output directly** -- no per-(query, block) GMEM partials and no separate combine
-kernel (contrast ``sparse_fwd_sm12x`` + ``sparse_combine_sm12x``).
-
-A query token attends only the blocks it actually selected: a per-(union-block)
-``tokens_per_tile``-bit membership mask (built by the union-metadata pass) gates
-each row, so a token's scores for a block it didn't pick are forced to -inf.
-This is a query-tile block-union prefill design on the SM12x warp-MMA + cp.async
-mainloop; on sm12x (memory-bound, no partials round-trip) it removes the ~19x
-partial write-amplification of the KV-major path.
-
-Compute core: warp-level mma.sync (m16n8k16) + cp.async. bf16/fp16 flat K/V.
+Union-tile MSA forward (prefill) for SM120/SM121: each CTA owns one
+(batch, query-tile, kv-head), loops the union of the tile's selected KV
+blocks with in-kernel online softmax, and writes the final normalized output
+directly (no GMEM partials or combine pass). A per-union-block membership
+mask forces a token's scores to -inf for blocks it did not select. Warp-level
+mma.sync + cp.async; bf16/fp16, fp8, or nvfp4 KV; flat or paged.
 """
 
 import cuda.bindings.driver as cuda

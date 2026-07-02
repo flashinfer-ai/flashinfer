@@ -15,17 +15,11 @@ limitations under the License.
 
 ---
 
-NVFP4 MSA proxy-score kernel for SM120/SM121: the FP4 counterpart of
-:mod:`proxy_score_sm12x` (porting MSA's ``fp4_indexer_block_scores``), reading the
-index K at ~4 bits/elem. Same contract as the bf16 proxy (per-block max of the
-unscaled post-mask QK^T, -inf for invalid blocks); inputs are pre-quantized (packed
-e2m1 + e4m3 per-16 block scales + per-tensor fp32 global scales).
-
-QK^T runs on the SM120 fp4 tensor cores (``MmaMXF4NVF4Op``); the SF smem layout and
-mainloop are ported from the SM120 blockscaled NVFP4 GEMM with the proxy's own
-block-max epilogue. Two schedules (flat + paged K, split-K): the general per-(q-tile,
-batch, head) :class:`MsaProxyScoreFp4MmaSm12x` and a 16-head q_len<=8
-:class:`MsaProxyScoreFp4MmaDecodePackedSm12x`.
+NVFP4 MSA proxy-score kernel for SM120/SM121 (MSA's
+``fp4_indexer_block_scores``): same contract as :mod:`proxy_score_sm12x`, with
+K read as packed e2m1 + e4m3 per-16 block scales on the fp4 tensor cores
+(``MmaMXF4NVF4Op``). A general flat/paged split-K schedule plus a 16-head
+q_len<=8 packed decode schedule.
 """
 
 import cuda.bindings.driver as cuda

@@ -15,24 +15,15 @@ limitations under the License.
 
 ---
 
-MSA fused split-KV combine for SM120/SM121.
-
-Reduces per-KV-block partial outputs into the final attention output with
-log2-domain LSE weighting:
+MSA fused split-KV combine for SM120/SM121:
 
     out[q, h, :] = sum_s w_s * o_partial[s, q, h, :] / sum_s w_s
     w_s          = exp2(lse2[s, q, h] - max_s lse2[s, q, h])
 
-where ``s`` ranges over the query's valid split slots
-``[0, split_counts[q, h // group_size])``. Slots >= count hold uninitialized
-memory; their loads are issued (for pipelining) but masked out of the
-reduction. Optionally writes the combined natural-log LSE and a
-separately-accumulated temperature LSE (both converted log2 -> ln at the end).
-
-One CTA per (query token, query head): each thread loads one slot's LSE, then
-every thread rebuilds the weights from SMEM and reduces its head_dim channels
-branch-free. The weight build is per-thread (not single-thread) so the low-batch
-sub-wave grid does not serialize on one thread.
+with ``s`` over the valid split slots ``[0, split_counts[q, h // group_size])``;
+slots >= count hold uninitialized memory (loads issued for pipelining, masked
+from the reduction). Optionally writes the combined natural-log LSE and a
+temperature LSE.
 """
 
 from typing import Type
@@ -139,8 +130,7 @@ class SparseCombineSm12x:
 
         neg_inf = -cutlass.Float32.inf
 
-        # One thread per slot loads its LSE (invalid slots -> -inf). count <= 0
-        # falls out for free: no slot passes `s < count`, so every weight is 0.
+        # count <= 0 needs no special case: no slot passes s < count -> weight 0
         if tidx < self._topk:
             v = neg_inf
             if tidx < count:
@@ -153,8 +143,8 @@ class SparseCombineSm12x:
                 s_lse_t[tidx] = vt
         cute.arch.sync_threads()
 
-        # Every thread rebuilds the weights from SMEM (parallel, no global-load
-        # latency) and keeps them in registers for its channel reduction.
+        # weights rebuilt redundantly per thread: at low batch the grid is a
+        # sub-wave, so serializing the build on one thread dominates the kernel
         m = neg_inf
         for s in cutlass.range_constexpr(self._topk):
             if s < count:

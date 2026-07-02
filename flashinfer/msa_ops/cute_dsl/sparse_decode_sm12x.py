@@ -15,31 +15,11 @@ limitations under the License.
 
 ---
 
-Slim sparse decode kernel for SM120/SM121
-
-Decode shape: one query token (x its GQA query heads) attending its selected
-128-token KV blocks. Compared to running decode through the prefill
-``msa_sparse_attention`` kernel, this kernel:
-
-- uses a static grid ``(num_chunks, total_q, Hkv)`` driven directly by
-  ``q2k_indices`` — no schedule tensors at all. Each CTA online-softmaxes a
-  contiguous chunk of the token's selected list; ``num_chunks`` adapts to the
-  batch (one block per chunk at the small-batch extreme, all blocks in one
-  chunk at the large-batch extreme). Split counts are computed in-kernel by
-  the chunk-0 CTA;
-- uses an M=16 tile (the <=16 query heads of one token) instead of a 64-row
-  tile that is mostly padding; multiple query tokens (seqlen_q>1, e.g. MTP) are
-  handled as separate tiles;
-- streams the KV block as online-softmax sub-blocks, halving SMEM (~39KB) so
-  two CTAs fit per SM (the prefill kernel's 85KB forces one CTA/SM, leaving
-  decode latency-bound). The bf16/fp16 path cp.async double-buffers 32-token
-  sub-blocks to overlap the KV load with compute; the fp8/nvfp4/fused paths
-  keep a single 64-token stream (in-kernel dtype convert can't cp.async);
-- loads with all 4 warps while warp 0 does the (tiny) MMA + softmax, so row
-  reductions stay warp-local.
-
-Partial outputs and log2-domain LSE go to the same split-slot buffers as the
-prefill kernel and are reduced by the same fused combine kernel.
+Sparse decode kernel for SM120/SM121: an M=16 tile (one token's <=16 query
+heads) on a static grid ``(num_chunks, total_q, Hkv)`` driven directly by
+``q2k_indices``. num_chunks==1 is the fused path writing final output + LSE;
+otherwise partials and log2-domain LSE go to the prefill split-slot buffers
+for the combine kernel.
 """
 
 import cuda.bindings.driver as cuda
@@ -222,8 +202,7 @@ class SparseDecodeForwardSm12x:
             else:
                 in_prefix = cutlass.Boolean(False)
 
-        # this CTA reduces a contiguous chunk [chunk_start, chunk_end) of the list;
-        # num_chunks == topk degenerates to one block per CTA (per-block split).
+        # num_chunks == topk degenerates to one block per CTA (per-block split)
         chunk_size = (self._topk + num_chunks - 1) // num_chunks
         chunk_start = chunk_idx * chunk_size
         chunk_end = cutlass.min(chunk_start + chunk_size, cnt)
@@ -239,8 +218,6 @@ class SparseDecodeForwardSm12x:
             k_start = mCuK[batch_idx]
             seqlen_k = mCuK[batch_idx + 1] - k_start
 
-            # SMEM: pipelined path double-buffers the KV sub-block (buffer 0 is the
-            # sole buffer on the sync path).
             n_buf = 2 if cutlass.const_expr(self._pipeline) else 1
             sQ_layout = cute.make_layout(
                 (self._m_tile, self._head_dim), stride=(self._pad_stride, 1)
@@ -390,7 +367,6 @@ class SparseDecodeForwardSm12x:
                     cute.make_layout(8),
                 )
 
-            # wait for Q stores from all warps, then preload Q fragments
             self.cta_sync_barrier.arrive_and_wait()
             if tidx < 32:
                 for k in cutlass.range_constexpr(cute.size(tSsQ.shape[2])):
@@ -568,8 +544,8 @@ class SparseDecodeForwardSm12x:
                     self.cta_sync_barrier.arrive_and_wait()
 
             else:
-                # online softmax across this chunk's selected blocks; cnt/chunk bounds
-                # are thread-uniform so the per-sub-block barriers stay collective.
+                # cnt/chunk bounds are thread-uniform, so the per-sub-block
+                # barriers stay collective
                 for it in cutlass.range(chunk_start, chunk_end):
                     kv_block = mQ2K[kv_head, qi, it]
                     if cutlass.const_expr(self._paged):
@@ -702,7 +678,6 @@ class SparseDecodeForwardSm12x:
                         self.cta_sync_barrier.arrive_and_wait()
 
                         if tidx < 32:
-                            # S = Q K^T for this sub-block
                             acc_S.fill(0.0)
                             for k in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
                                 cute.copy(
@@ -719,7 +694,6 @@ class SparseDecodeForwardSm12x:
                                     acc_S,
                                 )
 
-                            # mask + online softmax update
                             for r in cutlass.range_constexpr(n_rows):
                                 for c in cutlass.range_constexpr(
                                     cute.size(tScS_mn.shape[1])
@@ -757,7 +731,6 @@ class SparseDecodeForwardSm12x:
                                 row_max[r] = rmax
                                 acc_S_mn[r, None] = p_row
 
-                            # O += P V
                             rP = cute.make_fragment_like(acc_S, self._dtype)
                             rP.store(acc_S.load().to(self._dtype))
                             rP_div = cute.logical_divide(rP.layout, (None, None, 2))
@@ -792,8 +765,7 @@ class SparseDecodeForwardSm12x:
                                 )
                         # protect sK/sV before the next sub-block overwrites them
                         self.cta_sync_barrier.arrive_and_wait()
-            # combine (PDL dependent) may start its prologue; it gdc-waits before
-            # reading the partials this epilogue writes.
+            # safe before the epilogue: the combine gdc-waits on these partials
             cute.arch.griddepcontrol_launch_dependents()
             # Store normalized partial + log2-domain LSE for this chunk
             if tidx < 32:
@@ -985,7 +957,6 @@ class SparseDecodeForwardSm12x:
         kv_chunks = self._sub_block * chunks_per_row
         kvfrag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
 
-        # wait for Q stores from all warps, then preload Q fragments
         self.cta_sync_barrier.arrive_and_wait()
         if tidx < 32:
             for k in cutlass.range_constexpr(cute.size(tSsQ.shape[2])):

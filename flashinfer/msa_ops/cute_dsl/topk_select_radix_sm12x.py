@@ -15,50 +15,13 @@ limitations under the License.
 
 ---
 
-Faithful multi-stage radix-select MSA top-K KV-block selection for SM120/SM121.
-CuTe-DSL port of the CUDA ``IndexerTopKWithSortKernel``, derived from
-TensorRT-LLM's ``indexerTopK.cu``. This is the sole CuTe-DSL top-k algorithm:
-it matches that kernel's MSD-radix structure and complexity (O(max_k_tiles) per
-row), so no separate fallback path is needed.
-
-Algorithm (one CTA per (head, query) row, ``kThreads`` threads):
-
-1. **Forced blocks** ``[0, fb)`` (sink) and ``[nvp - fe, nvp)`` (window) are
-   pre-placed and excluded from ranking, so the radix ranks only the contiguous
-   middle region ``[fb, nvp - fe)`` and picks the ``target = topk - fb - fe``
-   highest scorers there.
-2. MSD radix-select on the order-preserving float-bit key (ascending key ==
-   descending score), 10 bits per stage:
-     * stage 1: high 10 bits (``key >> 22``), ranks the whole middle region;
-     * stage 2: mid 10 bits (``(key >> 12) & 0x3ff``), only stage-1 threshold-bin elements;
-     * stage 3: low 10 bits (``(key >> 2) & 0x3ff``), only stage-2 threshold-bin elements.
-   Each stage histograms its candidates, then a 2-level scan finds the threshold
-   bin where the running count crosses the remaining ``need``: one warp sums the
-   32 contiguous 32-bin groups, then thread 0 walks the 32 sums and refines the
-   straddling group (a ~64-step critical path, not a 1024-step serial scan).
-3. Classify each candidate: ``bin < threshold`` emits directly; ``bin ==
-   threshold`` either stages it for a tie-break sort (if the bin fits
-   ``_STAGE_CAP``) or defers it to the next finer stage.
-4. When the threshold bin fits ``_STAGE_CAP``, insertion-sort the staged items by
-   score (ties by staging index, as in CUDA) and emit the remaining ``need``.
-   Stage 3 is terminal: a residual threshold bin holds true ties (equal in bits
-   31..2), emitted directly up to ``need``, so the buffer never grows with
-   ``max_k_tiles``.
-5. Sort the selected indices ascending and write, ``-1``-padding empty slots.
-
-Because the threshold bin shrinks by ~10 bits each stage and stage 3 emits
-residual ties directly, the fixed ``_STAGE_CAP`` staging buffer is always
-sufficient: there is no ``max_k_tiles`` ceiling from staging. The supported
-range matches the CUDA dispatcher (``max_k_tiles < 12288``); the Python wrapper
-raises above it.
-
-Two output-equivalent simplifications vs the CUDA reference, validated bit-exact
-on distinct-score inputs. First, no fp16 pre-pass: the three fp32 stages select
-fully on their own (the fp16 pass is only a register micro-opt). Second, no
-transpose workspace: ``max_score`` is read column-strided via a uint32 recast,
-since the transpose only aids float4 coalescing. The final ascending-by-index
-sort is a single-thread insertion sort over the <= topk slots (bit-identical to
-the CUDA warp-bitonic sort at topk=16).
+Multi-stage MSD radix-select MSA top-K KV-block selection for SM120/SM121:
+CuTe-DSL port of the CUDA ``IndexerTopKWithSortKernel`` (TensorRT-LLM
+``indexerTopK.cu`` lineage), same structure and supported range
+(``max_k_tiles < 12288``). Two output-equivalent departures, validated
+bit-exact on distinct-score inputs: no fp16 pre-pass (a register micro-opt
+only) and no transpose workspace (a float4-coalescing aid only); the final
+ascending index sort is single-thread insertion over the <= topk slots.
 """
 
 import inspect
