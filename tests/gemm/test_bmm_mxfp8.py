@@ -37,17 +37,14 @@ def test_bmm_mxfp8(
     # Block size is 32 in MXFP8
     assert input_mxfp8.numel() == (input_scale.numel() * 32)
 
-    mat2 = (
-        torch.randn([b, n, k], device="cuda", dtype=input_dtype)
-        .transpose(-2, -1)
-        .contiguous()
-    )
-    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout)
+    weight = torch.randn([b, n, k], device="cuda", dtype=input_dtype)
+    weight_mxfp8, mat2_scale = mxfp8_quantize(weight, is_sf_swizzled_layout)
+    mat2_mxfp8 = weight_mxfp8.transpose(-2, -1)
 
     assert mat2_mxfp8.numel() == (mat2_scale.numel() * 32)
 
     # Compute reference result
-    reference = torch.bmm(input_mat, mat2)
+    reference = torch.bmm(input_mat, weight.transpose(-2, -1))
 
     # Create output tensor
     res = torch.empty([b, m, n], device="cuda", dtype=res_dtype)
