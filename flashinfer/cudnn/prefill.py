@@ -196,7 +196,13 @@ if CUDNN_AVAILABLE:
             cudnn_q = g.tensor(
                 name="q",
                 dim=(graph_b, h_qo, graph_s_qo, d_qk),
-                stride=(h_qo * d_qk, h_stride, s_stride, d_stride),
+                # The batch stride must cover a full sequence of tokens
+                # (mirroring the O descriptor below). With the previous
+                # one-token stride (h_qo * d_qk), every batch after the first
+                # read its queries from the wrong rows whenever no
+                # batch_offsets_q ragged offset was supplied - silently wrong
+                # outputs for batch_size > 1.
+                stride=(graph_s_qo * s_stride, h_stride, s_stride, d_stride),
                 data_type=cudnn_q_data_type,
             )
 
