@@ -851,7 +851,7 @@ The operand swap makes **cuda-incr-2k beat the monolithic by ~18–20%** (mtp=8:
 Triton variant except triton-replay-pm.  Gap to the north-star **triton-replay-pm narrowed from ~1.5×
 (mono) to ~1.24× (swap)** (mtp=8: 64.8→51.7 vs 42.1).  The residual ~1.24× is consistent with the 06-27→07-01
 root cause: triton-pm's remaining edge is the **INDEX MATH** (compile-time-immediate LDSM addressing), which
-the operand swap did *not* touch — that's the still-open **K-major state** lever (TODO below).
+the operand swap did *not* touch.
 
 Write path (PNAT+NPREDICTED > max_window=16): checkpoint cliff to ~90 µs, roughly at parity with the
 monolith — the shared replay + state-write dominates there and the swap's output savings are smallest (the
@@ -899,21 +899,23 @@ ncu v28 residuals — the meta lever is EXHAUSTED, profile is now a broad floor:
 - `mio_throttle` 17.3% + `barrier` 11.2% + `wait` 13.9%: cp.async/LDSM issue pressure + pipeline
   sync at 25% occupancy — structural.
 
-Next levers, in expected-value order: **K-major state / index math** (INT still ~32% of samples;
-TODO below), the FMUL@624 `beta_extra` chain (hoist the `old_cumAdt` tail read into the meta
-ring/prefetch?), occupancy (needs regs ≤ 102 **and** smem ≤ 45 KB simultaneously — hard).
+**beta_extra hoist tried (2026-07-02): wall-FLAT, but diagnostic.** Moving the
+`old_cumAdt[prev_k−1]` LDS + `__expf` from the no-write epilogue up to `compute_output_and_store`
+(ahead of the CB fragment loads) moved the FMUL stall site verbatim (624 → the hoist line, same
+~20% of short_scoreboard) — ptxas keeps LDS→FMUL adjacent, and under 17% `mio_throttle` the LDS
+waits on the saturated MIO queue wherever it issues.  ⇒ The output phase is **MIO-ISSUE-bound,
+not scheduling-bound**: shuffling LDS consumers is dead; only REMOVING LDS traffic pays.
+Kept anyway: regs 125 → 118 (headroom off the 128 cliff).
+
+Next levers:
+- **beta via the meta ring**: fetch the `old_cumAdt[cache_slot, buf_read, head, prev_k−1]` tail in
+  `fill_meta` (3rd dependent LDG in the 32-wide chase, store `__expf` of it), consume as a register
+  from `meta_q` → deletes the per-unit LDS+FMUL site AND the no-write pre-gdc tail cp.async (less
+  LDGSTS → less mio_throttle).  Race-safe: checkpoint writes target buffer `1−buf_read`, reads
+  `buf_read`.  Smem: pack `pnat|buf_read` into one int32 so the ring stays 512 B (cliff math holds).
+- Occupancy (needs regs ≤ 102 **and** smem ≤ 45 KB simultaneously — hard).
 
 ## TODO
-
-- [ ] **Implement K-major state for C@stateᵀ (recipe proven by `gemm_cmp.cu` `k_optimal`).** Store the
-  state cache **dstate-major** `[cache_slots, nheads, dstate, dim]`, consistently across store_state /
-  replay / main — so the cp.async load is a plain contiguous copy into `[dstate, dim]` smem (**no
-  transpose**). Read the state operand via `swz_rc_T` (transpose view) + `SM75_U16x8_LDSM_T` → the
-  compile-time-immediate LDSM `[base + UR + imm·0x800]` (Triton's emission; 28 regs, no spills in the
-  probe). Gate behind a flag (mirror `SSU_FUSE_WINDOW`/`kHandrollA`, keep old path). Measure **in-context**
-  INT + CUPTI vs baseline 104.4/109.3 µs (c4ca6b72) — the isolated prototype won't show the win. Add a
-  `NPREDICTED ≤ 8` guard for the mtp-dependent HMMA-halve. See the 07-01 + 06-30 sections; prototypes in
-  `frag_proto/` (`gemm_cmp.cu`) and `cstate_swizzle_probe.cu`.
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
   `state_batch_indices=None` (no pads), and no test injects `pad_slot_id`, so the

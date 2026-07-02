@@ -492,7 +492,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
                                                int lane, int warp, int d_tile, int head,
                                                int64_t cache_slot, int prev_k, int64_t out_seq_base,
                                                int write_offset, int seq_len, float D_val,
-                                               int tile_buf, FragCBNew const& frag_CB_new,
+                                               float beta_extra, int tile_buf,
+                                               FragCBNew const& frag_CB_new,
                                                FragCBOld const& frag_CB_old) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "output_head_2k requires 2-byte input type");
@@ -619,10 +620,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
     auto s2r_A_old_x = make_tiled_copy_A(Copy_Atom<LdsmAOld, MMA_prop::operand_t>{}, tiled_mma_old);
     auto s2r_thr_A_old_x = s2r_A_old_x.get_slice(tid);
 
-    float const* old_cumAdt_slot = smem.old_cumAdt + tile_buf * MAX_WINDOW;
-    float const total_old_cumAdt = (prev_k > 0) ? old_cumAdt_slot[prev_k - 1] : 0.f;
-    float const beta_extra = __expf(total_old_cumAdt);
-
+    // beta_extra (= exp of the old_cumAdt tail) arrives as a param, hoisted by the caller ahead
+    // of the CB fragment loads — see compute_output_and_store.
     auto epilogue = [&](auto& frag_y, int n) {
       auto decay_bcast = make_tensor(
           make_smem_ptr(cumAdt_slot + n * N_TILE),
@@ -1075,6 +1074,15 @@ __device__ __forceinline__ void compute_output_and_store(SmemT& smem,
   // but a distinct C++ type — read the gmem/smem bytes AS that type so the assign is well-typed.
   using cb_new_frag_t = cute::remove_cvref_t<decltype(frag_CB_new[0](0))>;
   using cb_old_frag_t = cute::remove_cvref_t<decltype(frag_CB_old[0](0))>;
+  // β = exp(old_cumAdt[prev_k−1]) hoisted AHEAD of the CB fragment loads + the whole output
+  // setup: at its use site (no-write epilogue) ptxas sinks the LDS onto its FMUL consumer to
+  // shorten the live range and the warp stalls there (ncu v28 top short_scoreboard site, 22% of
+  // the category).  One float of live range buys the LDS hundreds of instructions of slack.
+  // __expf(0) == 1.f exactly, so the prev_k==0 constant is bit-identical to the old ternary.
+  float beta_extra = 1.f;
+  if constexpr (!MUST_CHECKPOINT) {
+    if (prev_k > 0) beta_extra = __expf((smem.old_cumAdt + slot * MAX_WINDOW)[prev_k - 1]);
+  }
   {
     input_t const* cb_new_s = smem.cb_new + slot * SmemT::CB_NEW_ELEMS;
     auto const raw =
@@ -1098,9 +1106,9 @@ __device__ __forceinline__ void compute_output_and_store(SmemT& smem,
   int64_t const out_seq_base = outer * params.out_stride_seq;
   int const write_offset = MUST_CHECKPOINT ? 0 : prev_k;
   output_head_2k<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS,
-                 NUM_WARPS, MUST_CHECKPOINT>(smem, params, lane, warp, d_tile, first_head,
-                                             meta.cache_slot, prev_k, out_seq_base, write_offset,
-                                             seq_len, D_val, slot, frag_CB_new, frag_CB_old);
+                 NUM_WARPS, MUST_CHECKPOINT>(
+      smem, params, lane, warp, d_tile, first_head, meta.cache_slot, prev_k, out_seq_base,
+      write_offset, seq_len, D_val, beta_extra, slot, frag_CB_new, frag_CB_old);
 }
 
 // process_head: PURE CONSUMER of a prefetched ring slot — replay (write path) then output.  The
