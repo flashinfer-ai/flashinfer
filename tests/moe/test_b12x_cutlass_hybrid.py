@@ -16,8 +16,6 @@ from flashinfer.fp4_quantization import fp4_quantize
 
 
 SF_VEC_SIZE = 16
-FLOAT8_E4M3_MAX = 448.0
-FLOAT4_E2M1_MAX = 6.0
 
 
 def _is_sm12x_supported() -> bool:
@@ -73,117 +71,89 @@ def _make_bf16_weights(*, num_experts, hidden, intermediate, is_gated, device, s
     return w1_bf16, w2_bf16
 
 
-def _make_b12x_weights(w1_bf16, w2_bf16):
-    """Pack a shared BF16 baseline into b12x's MMA scale-factor layout."""
-    num_experts, w1_rows, hidden = w1_bf16.shape
-    intermediate = w2_bf16.shape[2]
-    global_scale = torch.ones((), device=w1_bf16.device, dtype=torch.float32)
+def _make_matching_fp4_weights(w1_bf16, w2_bf16):
+    """Build both backend views from one quantization of each BF16 weight.
 
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_bf16.view(num_experts * w1_rows, hidden),
-        global_scale=global_scale,
-        sf_vec_size=SF_VEC_SIZE,
-        is_sf_swizzled_layout=True,
-    )
-    w1_q = w1_q_flat.view(num_experts, w1_rows, hidden // 2)
-    w1_sf = convert_sf_to_mma_layout(
-        w1_sf_flat,
-        m=w1_rows,
-        k=hidden,
-        num_groups=num_experts,
-        sf_vec_size=SF_VEC_SIZE,
-    )
-
-    w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_bf16.view(num_experts * hidden, intermediate),
-        global_scale=global_scale,
-        sf_vec_size=SF_VEC_SIZE,
-        is_sf_swizzled_layout=True,
-    )
-    w2_q = w2_q_flat.view(num_experts, hidden, intermediate // 2)
-    w2_sf = convert_sf_to_mma_layout(
-        w2_sf_flat,
-        m=hidden,
-        k=intermediate,
-        num_groups=num_experts,
-        sf_vec_size=SF_VEC_SIZE,
-    )
-
-    return {
-        "w1_weight": w1_q,
-        "w1_weight_sf": w1_sf,
-        "w1_alpha": torch.ones(num_experts, device=w1_bf16.device, dtype=torch.float32),
-        "w2_weight": w2_q,
-        "w2_weight_sf": w2_sf,
-        "w2_alpha": torch.ones(num_experts, device=w1_bf16.device, dtype=torch.float32),
-        "fc2_input_scale": global_scale.reshape(1),
-    }
-
-
-def _make_cutlass_weights(w1_bf16, w2_bf16):
-    """Pack the shared BF16 baseline into CUTLASS's NVFP4 layout."""
+    The packed FP4 values and E4M3 scale-factor samples are shared. CUTLASS
+    consumes the normalized 2D SF storage directly, while b12x consumes an MMA
+    view of that same storage. Non-unit activation global scales make this
+    fixture sensitive to accidentally folding an activation scale into the
+    b12x weight scales.
+    """
     num_experts, w1_rows, hidden = w1_bf16.shape
     intermediate = w2_bf16.shape[2]
     device = w1_bf16.device
 
-    w1_q = torch.empty(
-        (num_experts, w1_rows, hidden // 2), device=device, dtype=torch.uint8
+    weight_gs = torch.ones((), device=device, dtype=torch.float32)
+    w1_q_flat, w1_sf_flat = fp4_quantize(
+        w1_bf16.view(num_experts * w1_rows, hidden),
+        global_scale=weight_gs,
+        sf_vec_size=SF_VEC_SIZE,
+        is_sf_swizzled_layout=True,
     )
-    w2_q = torch.empty(
-        (num_experts, hidden, intermediate // 2),
-        device=device,
-        dtype=torch.uint8,
+    w2_q_flat, w2_sf_flat = fp4_quantize(
+        w2_bf16.view(num_experts * hidden, intermediate),
+        global_scale=weight_gs,
+        sf_vec_size=SF_VEC_SIZE,
+        is_sf_swizzled_layout=True,
     )
-    w1_blockscale = torch.empty(
-        (
-            num_experts,
-            _round_up(w1_rows, 128),
-            _round_up(hidden // SF_VEC_SIZE, 4),
-        ),
-        device=device,
-        dtype=torch.float8_e4m3fn,
+    w1_q = w1_q_flat.view(num_experts, w1_rows, hidden // 2)
+    w2_q = w2_q_flat.view(num_experts, hidden, intermediate // 2)
+    w1_blockscale = w1_sf_flat.view(
+        num_experts,
+        _round_up(w1_rows, 128),
+        _round_up(hidden // SF_VEC_SIZE, 4),
     )
-    w2_blockscale = torch.empty(
-        (
-            num_experts,
-            _round_up(hidden, 128),
-            _round_up(intermediate // SF_VEC_SIZE, 4),
-        ),
-        device=device,
-        dtype=torch.float8_e4m3fn,
+    w2_blockscale = w2_sf_flat.view(
+        num_experts,
+        _round_up(hidden, 128),
+        _round_up(intermediate // SF_VEC_SIZE, 4),
     )
-    w1_gs = torch.empty(num_experts, device=device, dtype=torch.float32)
-    w2_gs = torch.empty(num_experts, device=device, dtype=torch.float32)
 
-    for expert in range(num_experts):
-        w1_gs[expert] = (
-            FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_bf16[expert].abs().max().float()
-        )
-        w2_gs[expert] = (
-            FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_bf16[expert].abs().max().float()
-        )
-        w1_q[expert], w1_blockscale[expert] = fp4_quantize(
-            w1_bf16[expert], w1_gs[expert]
-        )
-        w2_q[expert], w2_blockscale[expert] = fp4_quantize(
-            w2_bf16[expert], w2_gs[expert]
-        )
-
-    a1_gs = torch.ones((), device=device, dtype=torch.float32)
-    a2_gs = torch.ones((), device=device, dtype=torch.float32)
-    quant_scales = [
-        a1_gs,
-        w1_blockscale.view(torch.int32),
-        1.0 / (a1_gs * w1_gs),
-        a2_gs,
-        w2_blockscale.view(torch.int32),
-        1.0 / (a2_gs * w2_gs),
-    ]
-    return {
+    # These are deliberately far from one. CUTLASS consumes the large global
+    # scales; b12x consumes their reciprocals (the small activation scales).
+    # Both kernels must cancel them in their respective quant/dequant paths.
+    a1_gs = torch.tensor(16.0, device=device, dtype=torch.float32)
+    a2_gs = torch.tensor(8.0, device=device, dtype=torch.float32)
+    w1_alpha = (1.0 / a1_gs).expand(num_experts).contiguous()
+    w2_alpha = (1.0 / a2_gs).expand(num_experts).contiguous()
+    b12x = {
+        "w1_weight": w1_q,
+        "w1_weight_sf": convert_sf_to_mma_layout(
+            w1_sf_flat,
+            m=w1_rows,
+            k=hidden,
+            num_groups=num_experts,
+            sf_vec_size=SF_VEC_SIZE,
+        ),
+        "w1_alpha": w1_alpha,
+        "w2_weight": w2_q,
+        "w2_weight_sf": convert_sf_to_mma_layout(
+            w2_sf_flat,
+            m=hidden,
+            k=intermediate,
+            num_groups=num_experts,
+            sf_vec_size=SF_VEC_SIZE,
+        ),
+        "w2_alpha": w2_alpha,
+        "fc2_input_scale": w2_alpha,
+    }
+    cutlass = {
         "w1_q": w1_q,
         "w2_q": w2_q,
-        "quant_scales": quant_scales,
+        "quant_scales": [
+            a1_gs,
+            w1_blockscale.view(torch.int32),
+            w1_alpha.clone(),
+            a2_gs,
+            w2_blockscale.view(torch.int32),
+            w2_alpha.clone(),
+        ],
         "a1_gs": a1_gs,
+    }
+    return {
+        "b12x": b12x,
+        "cutlass": cutlass,
     }
 
 
@@ -215,19 +185,51 @@ def _run(moe, x, b12x_weights, routing=None):
     )
 
 
-def _assert_moe_close(actual, expected, percent_threshold=0.97):
-    """Apply the percentage-based FP4 tolerance used by b12x accuracy tests."""
+def _run_cutlass(x, cutlass_weights, routing):
+    """Run standalone CUTLASS with the exact tensors registered by hybrid."""
+    weights, ids = routing
+    output = torch.empty_like(x)
+    cutlass_fused_moe(
+        input=x,
+        token_selected_experts=ids,
+        token_final_scales=weights,
+        fc1_expert_weights=cutlass_weights["w1_q"].contiguous().view(torch.long),
+        fc2_expert_weights=cutlass_weights["w2_q"].contiguous().view(torch.long),
+        output_dtype=torch.bfloat16,
+        quant_scales=cutlass_weights["quant_scales"],
+        input_sf=None,
+        output=output,
+        activation_type=ActivationType.Relu2,
+    )
+    return output
+
+
+def _assert_cross_backend_close(actual, expected):
+    """Require scale-sensitive agreement between independent FP4 kernels."""
     actual = actual.float()
     expected = expected.float()
-    output_scale = max(expected.std().item(), 0.01)
-    atol = max(0.05, 1.5 * output_scale)
-    abs_diff = torch.abs(actual - expected)
-    rel_diff = abs_diff / (torch.abs(expected) + 1e-8)
-    percent_within = ((abs_diff < atol) | (rel_diff < 0.5)).float().mean().item()
-    assert percent_within >= percent_threshold, (
-        f"only {percent_within:.2%} of values are within FP4 tolerance "
-        f"(required {percent_threshold:.2%}, atol={atol:.5f})"
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    reference_rms = expected.square().mean().sqrt().clamp_min(1e-6)
+    nrmse = ((actual - expected).square().mean().sqrt() / reference_rms).item()
+    cosine = F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0).item()
+    assert nrmse < 0.05, (
+        f"normalized RMSE {nrmse:.5f} exceeds the FP4 parity limit 0.05"
     )
+    assert cosine > 0.999, (
+        f"cosine similarity {cosine:.6f} is below the FP4 parity limit 0.999"
+    )
+
+
+def _assert_b12x_repeatability(actual, expected):
+    """Bound atomic accumulation-order noise between two B12x launches."""
+    actual = actual.float()
+    expected = expected.float()
+    reference_rms = expected.square().mean().sqrt().clamp_min(1e-6)
+    nrmse = ((actual - expected).square().mean().sqrt() / reference_rms).item()
+    cosine = F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0).item()
+    assert nrmse < 0.02, f"B12x repeatability NRMSE {nrmse:.6f} exceeds 0.02"
+    assert cosine > 0.9998, f"B12x repeatability cosine {cosine:.6f} is below 0.9998"
 
 
 # Realistic-but-small Nemotron-Super-shaped config: ReLU2 (non-gated), small E.
@@ -260,12 +262,13 @@ def setup():
         is_gated=_CFG["is_gated"],
         device=device,
     )
-    b12x = _make_b12x_weights(*baseline)
-    cutlass = _make_cutlass_weights(*baseline)
+    packed = _make_matching_fp4_weights(*baseline)
 
-    # Both native packers consume the exact same BF16 baseline. Their E4M3
-    # scale normalization differs, so the packed FP4 bytes need not be equal.
-    return {"device": device, "b12x": b12x, "cutlass": cutlass}
+    # The two paths consume identical packed FP4 bytes and identical E4M3 SF
+    # samples; only the required scale-factor view and alpha contract differ.
+    assert torch.equal(packed["b12x"]["w1_weight"], packed["cutlass"]["w1_q"])
+    assert torch.equal(packed["b12x"]["w2_weight"], packed["cutlass"]["w2_q"])
+    return {"device": device, **packed}
 
 
 def _spy_cutlass(monkeypatch):
@@ -399,33 +402,66 @@ def test_prefill_without_registered_weights_raises(setup):
     assert _run(moe, x_decode, setup["b12x"]).shape == (1, _CFG["hidden"])
 
 
+@pytest.mark.parametrize("num_tokens", [63, 64, 65])
 @cute_dsl_available
 @sm120_required
 @cuda_13_required
-def test_hybrid_matches_pure_b12x_at_threshold(setup):
-    """Hybrid CUTLASS output matches pure b12x at the dispatch boundary."""
+def test_hybrid_branch_matches_corresponding_standalone(setup, num_tokens):
+    """Each hybrid branch numerically matches its standalone backend."""
     threshold = 64
     torch.manual_seed(123)
     x = (
         torch.randn(
-            threshold,
+            num_tokens,
             _CFG["hidden"],
             dtype=torch.bfloat16,
             device=setup["device"],
         )
         / 10
     )
-    routing = _routing(threshold, _CFG["num_experts"], _CFG["top_k"], setup["device"])
+    routing = _routing(num_tokens, _CFG["num_experts"], _CFG["top_k"], setup["device"])
 
-    pure_b12x = _build_wrapper(threshold=0)
     hybrid = _build_wrapper(threshold=threshold)
     _register_cutlass(hybrid, setup["cutlass"])
-
-    expected = _run(pure_b12x, x, setup["b12x"], routing)
     actual = _run(hybrid, x, setup["b12x"], routing)
-    # The backends independently round their native E4M3 scale conventions;
-    # use a slightly lower percentage than single-backend reference tests.
-    _assert_moe_close(actual, expected, percent_threshold=0.95)
+
+    if num_tokens < threshold:
+        standalone = _build_wrapper(threshold=0)
+        expected = _run(standalone, x, setup["b12x"], routing)
+    else:
+        expected = _run_cutlass(x, setup["cutlass"], routing)
+
+    if num_tokens < threshold:
+        # B12x scatters top-k contributions with atomics; independent launches
+        # can differ by a small BF16 accumulation-order error.
+        _assert_b12x_repeatability(actual, expected)
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+def test_cutlass_and_b12x_match_for_identical_quantized_weights(setup):
+    """Standalone kernels agree on one FP4 tensor with non-unit scales."""
+    num_tokens = 64
+    torch.manual_seed(456)
+    x = (
+        torch.randn(
+            num_tokens,
+            _CFG["hidden"],
+            dtype=torch.bfloat16,
+            device=setup["device"],
+        )
+        / 10
+    )
+    routing = _routing(num_tokens, _CFG["num_experts"], _CFG["top_k"], setup["device"])
+
+    b12x = _build_wrapper(threshold=0)
+    b12x_output = _run(b12x, x, setup["b12x"], routing)
+    cutlass_output = _run_cutlass(x, setup["cutlass"], routing)
+
+    _assert_cross_backend_close(cutlass_output, b12x_output)
 
 
 @cute_dsl_available
@@ -474,7 +510,7 @@ def test_cutlass_bf16_input_matches_explicit_fp4_quantization(setup):
         output=fp4_output,
         **common,
     )
-    _assert_moe_close(bf16_output, fp4_output)
+    torch.testing.assert_close(bf16_output, fp4_output, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

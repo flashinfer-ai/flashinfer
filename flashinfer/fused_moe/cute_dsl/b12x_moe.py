@@ -553,7 +553,40 @@ class B12xMoEWrapper:
                 a2_gs, w2_blockscale_int32, 1/(a2_gs*w2_gs)]``. Build with
                 the same recipe as the cutlass NVFP4 benchmark variant
                 (``benchmarks/routines/moe.py::testCutlassFusedMoe``).
+
+                Keep these normalized CUTLASS scales independent from the
+                b12x scales passed to :meth:`run`. For the same packed FP4
+                values, the corresponding unnormalized b12x weight scales are
+                ``cutlass_w1_sf * quant_scales[2] * quant_scales[0]`` and
+                ``cutlass_w2_sf * quant_scales[5] * quant_scales[3]`` before
+                conversion to the MMA layout. The b12x ``w1_alpha`` and both
+                ``fc2_input_scale``/``w2_alpha`` are respectively
+                ``1 / quant_scales[0]`` and ``1 / quant_scales[3]``. In
+                particular, do not leave the activation scale folded into a
+                b12x weight scale or pass CUTLASS's large activation global
+                scale as a b12x alpha: b12x consumes the reciprocal, small
+                activation scale during both input quantization and the GEMM
+                epilogue.
         """
+        if w1_q.dtype != torch.uint8 or w2_q.dtype != torch.uint8:
+            raise TypeError(
+                "CUTLASS NVFP4 weights must be uint8-packed tensors, got "
+                f"w1_q.dtype={w1_q.dtype}, w2_q.dtype={w2_q.dtype}."
+            )
+        if w1_q.device != w2_q.device:
+            raise ValueError(
+                "CUTLASS prefill weights must be on the same device, got "
+                f"w1_q.device={w1_q.device}, w2_q.device={w2_q.device}."
+            )
+        if len(quant_scales) != 6:
+            raise ValueError(
+                "CUTLASS NVFP4 quant_scales must contain exactly 6 tensors, "
+                f"got {len(quant_scales)}."
+            )
+        if any(scale.device != w1_q.device for scale in quant_scales):
+            raise ValueError(
+                "CUTLASS weights and all quant_scales must be on the same device."
+            )
         # Pre-view to long once; the b12x decode path won't touch these
         # tensors, so the view is stable for the lifetime of the wrapper
         # (or until the caller re-registers).
