@@ -8722,6 +8722,9 @@ def _cudnn_bmm_mxfp8_requirement(
     backend: Literal["cudnn", "auto"] = "cudnn",
     sf_layout: SfLayout = SfLayout.layout_128x4,
 ):
+    sf_layout = SfLayout(sf_layout)
+    if sf_layout not in (SfLayout.layout_linear, SfLayout.layout_128x4):
+        return False
     return _cudnn_available_or_raise_for_backend(backend)
 
 
