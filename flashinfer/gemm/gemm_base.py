@@ -1302,7 +1302,7 @@ def bf16_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
-) -> None:
+) -> str:
     use_sm_100f = is_sm100f_supported(a.device)
 
     tuner = AutoTuner.get()
@@ -1313,23 +1313,37 @@ def bf16_gemm_sm100(
     is_b_k_major = b.stride(-2) == 1
 
     runners = []
+    backend_names = []
+
+    def _add(name, runner):
+        runners.append(runner)
+        backend_names.append(name)
+
     if "cudnn" in runner_names:
-        runners.append(
+        _add(
+            "cudnn",
             _cudnn_gemm_bf16_runner(
                 is_a_k_major=is_a_k_major,
                 is_b_k_major=is_b_k_major,
-            )
+            ),
         )
     if "cublaslt" in runner_names:
-        runners.append(get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner())
+        _add(
+            "cublaslt",
+            get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner(),
+        )
     if "cutlass" in runner_names:
-        runners.append(get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner())
+        _add(
+            "cutlass",
+            get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner(),
+        )
     if "tgv" in runner_names:
-        runners.append(
-            get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner()
+        _add(
+            "tgv",
+            get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner(),
         )
     if "tinygemm" in runner_names:
-        runners.append(_tinygemm_bf16_gemm_runner())
+        _add("tinygemm", _tinygemm_bf16_gemm_runner())
     assert runners, "No suitable runners found"
 
     inputs = [a, b, bias, pdl, out, workspace_buffer]
@@ -1341,6 +1355,7 @@ def bf16_gemm_sm100(
     )
 
     runner(inputs=inputs, tactic=tactic)
+    return backend_names[runners.index(runner)]
 
 
 def fp8_gemm_sm100(
@@ -1351,18 +1366,30 @@ def fp8_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
-) -> None:
+) -> str:
     tuner = AutoTuner.get()
 
     runners = []
+    backend_names = []
+
+    def _add(name, runner):
+        runners.append(runner)
+        backend_names.append(name)
+
     if "cutlass_sm10x" in runner_names:
-        runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
+        _add(
+            "cutlass_sm10x",
+            get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner(),
+        )
     if "cutlass_sm12x" in runner_names:
-        runners.append(get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner())
+        _add(
+            "cutlass_sm12x",
+            get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner(),
+        )
     if "cublas" in runner_names:
-        runners.append(get_gemm_module().cublas_fp8_gemm_runner())
+        _add("cublas", get_gemm_module().cublas_fp8_gemm_runner())
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_fp8_runner())
+        _add("cudnn", _cudnn_gemm_fp8_runner())
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
@@ -1374,6 +1401,7 @@ def fp8_gemm_sm100(
     )
 
     runner(inputs=inputs, tactic=tactic)
+    return backend_names[runners.index(runner)]
 
 
 def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
@@ -8679,12 +8707,18 @@ def mxfp8_gemm_sm100(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
-) -> None:
+) -> str:
     tuner = AutoTuner.get()
 
     runners = []
+    backend_names = []
+
+    def _add(name, runner):
+        runners.append(runner)
+        backend_names.append(name)
+
     if "cudnn" in runner_names:
-        runners.append(_cudnn_gemm_mxfp8_runner())
+        _add("cudnn", _cudnn_gemm_mxfp8_runner())
     assert runners, "No suitable runners found"
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
@@ -8696,6 +8730,7 @@ def mxfp8_gemm_sm100(
     )
 
     runner(inputs=inputs, tactic=tactic)
+    return backend_names[runners.index(runner)]
 
 
 @supported_compute_capability([100, 103, 110, 120, 121])
