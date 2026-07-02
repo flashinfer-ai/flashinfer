@@ -18,7 +18,9 @@ limitations under the License.
 
 import json
 from contextlib import suppress
+from pathlib import Path
 
+import pytest
 import torch
 
 from flashinfer.fi_trace import fi_trace
@@ -779,3 +781,30 @@ def test_fi_trace_filename_matches_definition_name(tmp_path):
     expected_file = tmp_path / f"{expected_name}.json"
     assert expected_file.exists()
     assert json.loads(expected_file.read_text())["name"] == expected_name
+
+
+def test_nvfp4_append_trace_json_init_is_self_contained():
+    trace_dir = Path(__file__).parent / "fi_trace_out"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cases = [
+        (
+            "nvfp4_quantize_append_paged_kv_cache_kv2_d64_pd32_sd4_ps4.json",
+            "_nvfp4_quantize_append_paged_kv_cache_init",
+        ),
+        (
+            "nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kv2_d64_pd32_sd4_ps4.json",
+            "_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_init",
+        ),
+    ]
+    for filename, init_name in cases:
+        source = json.loads((trace_dir / filename).read_text())["init"]
+        namespace = {}
+        exec(source, namespace)
+        assert init_name in namespace
+        try:
+            result = namespace[init_name](nnz_kv=1, device=device)
+        except (RuntimeError, NotImplementedError, ValueError, ImportError) as exc:
+            if device == "cpu":
+                pytest.skip(f"{filename} init unsupported on CPU: {exc}")
+            raise
+        assert isinstance(result, dict)
