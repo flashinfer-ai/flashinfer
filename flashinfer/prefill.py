@@ -59,6 +59,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
+    _check_workspace_buffer_alignment,
     check_shape_dtype_device,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
@@ -440,12 +441,14 @@ def get_batch_prefill_module(backend, *args):
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
+        workspace_size_func = None
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
         uri = get_batch_prefill_uri(backend, *args)
         module = gen_batch_prefill_module(backend, *args).build_and_load()
         plan_func = module.plan
+        workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
 
@@ -864,6 +867,7 @@ def get_batch_prefill_module(backend, *args):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
+        workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )
@@ -872,6 +876,7 @@ def get_batch_prefill_module(backend, *args):
 @functools.cache
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
+    workspace_size_func = getattr(jit_module, "workspace_size", None)
     ragged_run_func = jit_module.ragged_run
     paged_run_func = jit_module.paged_run
 
@@ -1013,6 +1018,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     return SimpleNamespace(
         plan=plan_func,
+        workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )
@@ -1588,7 +1594,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor
             The user reserved workspace buffer used to store intermediate attention results in
             split-k algorithm. The recommended size is 128MB, the device of the workspace buffer
-            should be the same as the device of the input tensors.
+            should be the same as the device of the input tensors. The buffer must be 16-byte
+            aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
@@ -1644,6 +1651,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
         """
+        _check_workspace_buffer_alignment(
+            float_workspace_buffer, "float_workspace_buffer"
+        )
         _check_kv_layout(kv_layout)
 
         if backend == "cute-dsl":
@@ -1752,6 +1762,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The new int workspace buffer, the device of the new int workspace buffer should
             be the same as the device of the input tensors.
         """
+        _check_workspace_buffer_alignment(
+            float_workspace_buffer, "float_workspace_buffer"
+        )
+        _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
@@ -1760,6 +1774,188 @@ class BatchPrefillWithPagedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+
+    @flashinfer_api
+    def workspace_size(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        page_size: int,
+        head_dim_vo: Optional[int] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        q_data_type: Union[str, torch.dtype] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        prefix_len_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_len: int = 0,
+        max_item_len_ptr: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        seq_lens_q: Optional[torch.Tensor] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        max_token_per_sequence: Optional[int] = None,
+        max_sequence_kv: Optional[int] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+    ) -> Tuple[int, int]:
+        r"""Return the caller-owned workspace size required by :meth:`plan`.
+
+        The returned tuple is ``(float_workspace_size, int_workspace_size)`` in
+        bytes.  The inputs follow :meth:`plan`; host-side planning tensors such
+        as ``qo_indptr`` and ``paged_kv_indptr`` are copied to CPU in the same
+        way as :meth:`plan`.  The wrapper's float workspace buffer is only used
+        as the device/stream selector for the underlying module query.  This
+        method does not allocate buffers and does not mutate cached plan state.
+
+        Example
+        -------
+        >>> float_bytes, int_bytes = wrapper.workspace_size(...)
+        >>> wrapper.reset_workspace_buffer(
+        ...     torch.empty(float_bytes, dtype=torch.uint8, device="cuda"),
+        ...     torch.empty(int_bytes, dtype=torch.uint8, device="cuda"),
+        ... )
+        >>> wrapper.plan(...)
+        """
+        _check_workspace_buffer_alignment(
+            self._float_workspace_buffer, "float_workspace_buffer"
+        )
+        del (
+            block_tables,
+            max_item_len_ptr,
+            max_token_per_sequence,
+            prefix_len_ptr,
+            rope_scale,
+            rope_theta,
+            seq_lens_q,
+            sm_scale,
+            token_pos_in_items_len,
+            token_pos_in_items_ptr,
+        )
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        if head_dim_vo is None:
+            head_dim_vo = head_dim_qk
+        if fixed_split_size is None:
+            fixed_split_size = -1
+
+        batch_size = len(qo_indptr) - 1
+        qo_indptr_host = qo_indptr.to("cpu")
+        total_num_rows = int(qo_indptr_host[-1])
+        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+        paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+        if seq_lens is None:
+            kv_lens_arr_host = get_seq_lens(
+                paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+            )
+        else:
+            kv_lens_arr_host = seq_lens.cpu().flatten()
+
+        if self.is_cuda_graph_enabled:
+            if batch_size != self._fixed_batch_size:
+                raise ValueError(
+                    "The batch size should be fixed during the lifecycle of the wrapper in "
+                    "cuda graph mode, the runtime batch size {} mismatches the batch size {} "
+                    " set during initialization.".format(
+                        batch_size, self._fixed_batch_size
+                    )
+                )
+            if len(paged_kv_indices) > len(self._paged_kv_indices_buf):
+                raise ValueError(
+                    "The length of paged_kv_indices exceeds the allocated buffer size."
+                )
+            if (
+                self._max_total_num_rows is not None
+                and total_num_rows > self._max_total_num_rows
+            ):
+                raise ValueError(
+                    "The total number of rows in qo_indptr {} in cuda graph mode cannot "
+                    "exceed the number of rows set during initialization {}.".format(
+                        total_num_rows, self._max_total_num_rows
+                    )
+                )
+
+        use_custom_mask = custom_mask is not None or packed_custom_mask is not None
+        backend = self._backend
+        if self._jit_module is not None:
+            module = self._jit_module
+        else:
+            if backend == "auto":
+                backend = determine_attention_backend(
+                    self.device,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    use_fp16_qk_reduction,
+                    use_custom_mask,
+                    q_data_type,
+                    kv_data_type,
+                )
+            if backend == "cudnn":
+                raise NotImplementedError(
+                    "workspace_size is not available for cudnn prefill backend"
+                )
+            module = get_batch_prefill_module(
+                backend,
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                paged_kv_indptr.dtype,
+                head_dim_qk,
+                head_dim_vo,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left >= 0,
+                logits_soft_cap > 0,
+                use_fp16_qk_reduction,
+            )
+        if module.workspace_size is None:
+            raise NotImplementedError(
+                f"workspace_size is not available for prefill backend {backend!r}"
+            )
+
+        del max_sequence_kv
+        total_num_rows_for_plan = self._max_total_num_rows or total_num_rows
+        args = [
+            self._float_workspace_buffer,
+            qo_indptr_host,
+            paged_kv_indptr_host,
+            kv_lens_arr_host,
+            total_num_rows_for_plan,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            self.is_cuda_graph_enabled,
+            head_dim_qk,
+            head_dim_vo,
+            causal,
+            window_left,
+        ]
+        if backend == "fa2":
+            args.append(fixed_split_size)
+            args.append(disable_split_kv)
+            args.append(0)  # num_colocated_ctas
+        float_workspace_size, int_workspace_size = module.workspace_size(*args)
+        return int(float_workspace_size), int(int_workspace_size)
 
     @flashinfer_api
     def plan(
@@ -1920,6 +2116,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_workspace_buffer_alignment(
+            self._float_workspace_buffer, "float_workspace_buffer"
+        )
+        _check_workspace_buffer_alignment(
+            self._int_workspace_buffer, "int_workspace_buffer"
+        )
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -2731,7 +2933,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         float_workspace_buffer : torch.Tensor
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
-            buffer should be the same as the device of the input tensors.
+            buffer should be the same as the device of the input tensors. The buffer must be
+            16-byte aligned; tensors created by ``torch.empty`` satisfy this on supported devices.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.

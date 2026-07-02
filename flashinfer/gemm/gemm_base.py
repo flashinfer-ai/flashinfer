@@ -302,9 +302,8 @@ def _cutlass_mm_bf16_requirement(
     return True
 
 
-# Gated to Blackwell (SM100/SM103) for the initial scope of this backend.
-# cuBLASLt supports BF16 GEMM on SM80+; the gate can be widened in a follow-up.
-@supported_compute_capability([100, 103])
+# cuBLASLt supports BF16 GEMM on SM80+.
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
 def _cublaslt_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
