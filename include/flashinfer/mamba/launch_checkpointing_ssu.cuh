@@ -230,20 +230,18 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       int const main_grid =
           static_cast<int>(main_grid_ll < main_total_work ? main_grid_ll : main_total_work);
 
-      // NGROUPS is the jinja-stamped compile-time group count → the kernel's unflatten divides only
-      // by compile-time constants (no runtime div/mod).
-      auto mfunc =
-          checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                        state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                        HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT,
-                                        VARLEN, NGROUPS>;
-      constexpr size_t msmem =
-          sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
-                                             DSTATE, MAIN_STATE_PIPE>);
-      if constexpr (msmem > 0) {
-        FLASHINFER_CUDA_CHECK(
-            cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
-      }
+      // Ring depth (NUM_STAGES): 1 = single-slot per-unit buffers — the OCCUPANCY regime
+      // (~29 KB/block → 6 blocks/SM at the derived reg cap; default).  2 = double-buffered
+      // cross-unit prefetch ring — the LATENCY regime (~57 KB → 4 blocks; loses at b=1024:
+      // 94.0 vs 79.6 µs no-write).  See main_maxnreg in the kernel header for the sweep.
+      static int const main_stages = [] {
+        char const* e = std::getenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES");
+        int const v = e ? std::atoi(e) : 1;
+        FLASHINFER_CHECK(v == 1 || v == 2,
+                         "FLASHINFER_SSU_MAIN_PIPELINE_STAGES must be 1 or 2, got ", v);
+        return v;
+      }();
+
       // INTERNAL PDL: the main ALWAYS co-launches with the precompute (attr hard-wired to 1,
       // independent of ENABLE_PDL).  The one-shot gdc_wait on a CTA's first work-unit blocks for
       // the precompute before reading cb_scaled / cumAdt_vec.
@@ -253,11 +251,34 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       cudaLaunchConfig_t mcfg;
       mcfg.gridDim = dim3(main_grid);
       mcfg.blockDim = dim3(warpSize, MAIN_NUM_WARPS);
-      mcfg.dynamicSmemBytes = msmem;
       mcfg.stream = stream;
       mcfg.attrs = main_attrs;
       mcfg.numAttrs = 1;
-      FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
+
+      // NGROUPS is the jinja-stamped compile-time group count → the kernel's unflatten divides only
+      // by compile-time constants (no runtime div/mod).
+      auto launch_main = [&](auto stages_tag) {
+        constexpr int MAIN_STAGES = decltype(stages_tag)::value;
+        auto mfunc =
+            checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
+                                          state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
+                                          HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT,
+                                          VARLEN, NGROUPS, MAIN_STAGES>;
+        constexpr size_t msmem =
+            sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
+                                               DSTATE, MAIN_STAGES>);
+        if constexpr (msmem > 0) {
+          FLASHINFER_CUDA_CHECK(
+              cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
+        }
+        mcfg.dynamicSmemBytes = msmem;
+        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
+      };
+      if (main_stages == 2) {
+        launch_main(std::integral_constant<int, 2>{});
+      } else {
+        launch_main(std::integral_constant<int, 1>{});
+      }
       return;
     } else {
       FLASHINFER_CHECK(false,

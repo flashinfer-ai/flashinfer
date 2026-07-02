@@ -913,7 +913,38 @@ Next levers:
   from `meta_q` → deletes the per-unit LDS+FMUL site AND the no-write pre-gdc tail cp.async (less
   LDGSTS → less mio_throttle).  Race-safe: checkpoint writes target buffer `1−buf_read`, reads
   `buf_read`.  Smem: pack `pnat|buf_read` into one int32 so the ring stays 512 B (cliff math holds).
-- Occupancy (needs regs ≤ 102 **and** smem ≤ 45 KB simultaneously — hard).
+- ~~Occupancy~~ → LANDED via NUM_STAGES=1, next section.
+
+### LANDED: NUM_STAGES=1 — the occupancy regime; triton-replay-pm PARITY (B200, 2026-07-02)
+
+With the meta pipeline landed, the profile was a broad latency floor at 25% occupancy (4 blocks/SM,
+~4 waves) — so the experiment flipped the axis: **shrink the ring instead of feeding it**.
+`NUM_STAGES=1` halves every per-unit smem buffer (~57 → ~29 KB/block), fully exposing each unit's
+state-load latency intra-CTA — the bet being that inter-CTA overlap (more resident blocks) covers
+it better than the intra-CTA ring did.  It does, decisively.
+
+Why the smem and reg walls diverged (they used to coincide at ~8 blocks pre-persistent): the
+persistent machinery grew smem ~19 → ~29 KB @depth 1 (cb_new/cb_old staging, x, cumAdt, meta ring
+→ 7 blocks) and natural reg demand ~60 → ~118 (loop state, swap fragments, meta_q → 4 blocks).
+64 K regs/SM ÷ (cap × 128 thr) sets the reg wall, so the cap picks the spill-vs-occupancy point:
+
+| depth 1 cap | blocks/SM | no-write µs |
+|---:|---:|---:|
+| 64 | 8 | 95.7 (spill-bound) |
+| **80** | **6** | **79.6 — optimum** |
+| 96 | 5 | 81.6 |
+| uncapped (~150) | 3 | 95.6 |
+| (depth 2, cap 128) | 4 | 94.0 |
+
+**Results (b=1024 bf16 mtp=8, CUPTI, both kernels):** no-write pnat=4 **94.05 → 79.52 µs**
+(−15.5%) = **1.004× triton-replay-pm (79.22) — PARITY**; write pnat=12 **158.05 → 134.00 µs**
+(−15.2%) = **beats triton-replay-pm (187.44) by 1.40×**.
+
+Plumbing (no macros): `NUM_STAGES` is a kernel **template parameter** (default 1);
+`__maxnreg__(main_maxnreg(NUM_STAGES))` derives the cap in constexpr math (target blocks 6@1 /
+4@≥2 → floor-8 → 80 / 128); the launcher hard-codes 1 and
+**`FLASHINFER_SSU_MAIN_PIPELINE_STAGES`** (1 or 2) dispatches the other instantiation —
+`test_two_kernel_pipeline_stages2` now genuinely exercises the depth-2 ring via that env.
 
 ## TODO
 

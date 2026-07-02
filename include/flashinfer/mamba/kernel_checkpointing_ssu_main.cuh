@@ -123,12 +123,6 @@ struct CheckpointingSsuMainStorage {
   int32_t meta_cache_slot[META_RING];
 };
 
-// Ring depth (STAGES) for the PERSISTENT main's cross-iteration prefetch pipeline.  Each of the
-// STAGES smem slots holds one work-unit's full bundle; the grid loop prefetches STAGES work-units
-// ahead so the 16 KB state load (the long_scoreboard pole) issues well before it's consumed.
-// Higher = deeper overlap but more smem (lower occupancy); 2 is the sweet spot at this footprint.
-constexpr int MAIN_STATE_PIPE = 2;
-
 // -----------------------------------------------------------------------------
 // Main-kernel load — the conv1d-INDEPENDENT (pre-gdc_wait) set: state, old_x, z
 // always; old_B + old_dt + old_cumAdt only when must_checkpoint (they feed the
@@ -1131,30 +1125,33 @@ __device__ __forceinline__ void process_head(SmemT& smem, CheckpointingSsuParams
                            MUST_CHECKPOINT>(smem, params, lane, warp, meta, slot);
 }
 
+// Reg cap derived from the measured-optimal blocks/SM per ring depth (64 K regs/SM, 128
+// threads/block, 8-reg allocation granularity).  The smem and reg walls diverged when the kernel
+// went persistent (smem wall: ~29 KB → 7 blocks at depth 1, ~57 KB → 4 at depth 2; natural reg
+// demand ~118 → 4 blocks), so the cap picks the point on the spill-vs-occupancy curve.  Depth-1
+// sweep (b=1024 bf16 mtp=8 pnat=4): cap 64 / 8 blk = 95.7 µs (spill-bound), 80 / 6 = 79.6
+// (optimum — triton-replay-pm parity), 96 / 5 = 81.6, uncapped → ~150 regs / 3 blk = 95.6.
+// Depth ≥2: 128 / 4 blk tuned earlier (118 regs, no spills; a 96 cap forced per-unit addressing
+// recompute, and uncapping → 150 regs / 3 blocks, +20 µs).
+constexpr int main_maxnreg(int num_stages) {
+  int const target_blocks = (num_stages == 1) ? 6 : 4;
+  int const cap = 65536 / (target_blocks * 128);
+  return cap - cap % 8;
+}
+
 // =============================================================================
 // Main kernel.  Template params mirror checkpointing_ssu_kernel so the launcher
-// dispatches both with the same args.
+// dispatches both with the same args.  NUM_STAGES = per-unit smem ring depth
+// (each stage holds one work-unit's full bundle; the grid loop prefetches
+// NUM_STAGES units ahead).  The launcher hard-codes 1 — the occupancy regime —
+// and FLASHINFER_SSU_MAIN_PIPELINE_STAGES overrides it.
 // =============================================================================
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, int D_SPLIT = 1,
-          bool VARLEN = false, int NGROUPS = 1>
-// __maxnreg__ tracks the ring depth, because the two regimes are opposite:
-//   STATE_PIPE=1: ≈19 KB smem allows >8 blocks/SM, so the kernel is REGISTER-bound — cap at 64 to
-//     hold 8 blocks (65536/(64·128)=8).
-//   STATE_PIPE≥2: SMEM-bound (≈38 KB → 5 blocks at depth 2).  The old 96-cap forced the compiler to
-//     recompute per-work-unit addressing it could otherwise hold in registers.  Lifting to 128 →
-//     4 blocks/SM (118 regs, no spills) lets it hold the addressing: per-work-unit recompute drops
-//     (total executed −6.5%, nw0/nw8 −~6 µs).  The Triton regime (more regs, fewer blocks).  Fully
-//     uncapping (255) is worse: the compiler grabs 150 regs → 3 blocks → +20 µs.  Tune via the
-//     macro.
-#ifndef SSU_MAIN_MAXNREG_PIPE
-#define SSU_MAIN_MAXNREG_PIPE 128
-#endif
-__global__ __maxnreg__(
-    MAIN_STATE_PIPE == 1
-        ? 64
-        : SSU_MAIN_MAXNREG_PIPE) void checkpointing_ssu_main_kernel(CheckpointingSsuParams params) {
+          bool VARLEN = false, int NGROUPS = 1, int NUM_STAGES = 1>
+__global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_kernel(
+    CheckpointingSsuParams params) {
   static_assert(DIM % D_SPLIT == 0, "DIM must be divisible by D_SPLIT");
   constexpr int D_PER_CTA = DIM / D_SPLIT;
   static_assert(D_PER_CTA >= 32, "D_PER_CTA must be >= 32 (output MMA m16n8 with _1×4 layout)");
@@ -1170,7 +1167,7 @@ __global__ __maxnreg__(
   }
 
   using SmemT = CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
-                                            DSTATE, MAIN_STATE_PIPE>;
+                                            DSTATE, NUM_STAGES>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
@@ -1218,7 +1215,7 @@ __global__ __maxnreg__(
   // meta_q[STAGES-1]) so SROA keeps it in registers — a runtime subscript would demote it to
   // local memory, reintroducing the very latency this hides (measured on the original
   // shift-register).
-  constexpr int STAGES = MAIN_STATE_PIPE;
+  constexpr int STAGES = NUM_STAGES;
   constexpr int META_RING = SmemT::META_RING;
   static_assert(STAGES < META_RING, "meta window must cover the process+prefetch span");
   auto fill_meta = [&](int base) {
