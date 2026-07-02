@@ -288,6 +288,20 @@ class WanRotaryPosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
+def _get_ulysses_context():
+    """Lazy accessor for the optional Ulysses sequence-parallel context.
+
+    Returns None (single-GPU behavior, zero overhead) unless the caller has
+    installed a context via ``ulysses.set_ulysses_context``. Imported lazily so
+    the example keeps working without torch.distributed initialized.
+    """
+    try:
+        from ulysses import get_ulysses_context
+    except ImportError:
+        return None
+    return get_ulysses_context()
+
+
 class FlashInferWanAttention(nn.Module):
     """Wan attention module that delegates FlashInfer kernel dispatch."""
 
@@ -408,6 +422,7 @@ class FlashInferWanAttention(nn.Module):
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
+        is_self_attention = encoder_hidden_states is None
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -433,6 +448,24 @@ class FlashInferWanAttention(nn.Module):
             query = query.to(torch.bfloat16)
             key = key.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
+
+        # Ulysses sequence parallelism (self-attention only): the sequence dim
+        # is sharded across ranks; all-to-all scatters heads / gathers sequence
+        # so each rank attends over the full sequence with H/world_size heads,
+        # then the inverse all-to-all restores the [B, S_local, H, D] layout.
+        ulysses_ctx = _get_ulysses_context()
+        use_ulysses = (
+            ulysses_ctx is not None
+            and ulysses_ctx.world_size > 1
+            and not self.is_cross_attention
+            and is_self_attention
+        )
+        if use_ulysses:
+            query = ulysses_ctx.input_all_to_all(query)
+            key = ulysses_ctx.input_all_to_all(key)
+            value = ulysses_ctx.input_all_to_all(value)
+            seq_len_q = query.shape[1]
+            seq_len_kv = key.shape[1]
 
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -476,6 +509,13 @@ class FlashInferWanAttention(nn.Module):
             seq_len_kv,
             use_sparse=use_sparse,
         )
+
+        if use_ulysses:
+            # (B, S_global, H_local*D) -> inverse all-to-all -> (B, S_local, H*D)
+            h_local = self.heads // ulysses_ctx.world_size
+            hidden_states = ulysses_ctx.output_all_to_all(
+                hidden_states.reshape(batch_size, seq_len_q, h_local, self.dim_head)
+            ).reshape(batch_size, -1, self.heads * self.dim_head)
 
         if needs_cast:
             hidden_states = hidden_states.to(orig_dtype)
