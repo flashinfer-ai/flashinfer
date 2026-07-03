@@ -1824,6 +1824,91 @@ class BatchPrefillWithPagedKVCacheWrapper:
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
 
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+        paged_kv_indptr : torch.Tensor
+            The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+        paged_kv_indices : torch.Tensor
+            The page indices of the paged kv-cache, shape: ``[paged_kv_indptr[-1]]``.
+        paged_kv_last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged
+            kv-cache, shape: ``[batch_size]``.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim_qk : int
+            The dimension of the query/key heads.
+        page_size : int
+            The size of each page in the paged kv-cache.
+        head_dim_vo : Optional[int]
+            The dimension of the value/output heads. If not provided, defaults to
+            ``head_dim_qk``.
+        custom_mask : Optional[torch.Tensor]
+            The flattened boolean mask tensor; when provided the packed mask is
+            generated internally. See :meth:`plan` for the full description.
+        packed_custom_mask : Optional[torch.Tensor]
+            The 1D packed uint8 mask tensor. If provided, ``custom_mask`` is ignored.
+        causal : bool
+            Whether to apply a causal mask. Defaults to ``False``.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        use_fp16_qk_reduction : bool
+            Whether to use fp16 for qk reduction. Defaults to ``False``.
+        sm_scale : Optional[float]
+            Softmax scale. If ``None``, defaults to ``1.0 / sqrt(head_dim_qk)``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.),
+            if not provided, will be set to ``0``.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation. Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies. Defaults to ``1e4`` when ``None``.
+        q_data_type : Union[str, torch.dtype]
+            The data type of the query tensor. Defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to ``q_data_type``.
+        prefix_len_ptr : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the prefix length of each prompt,
+            shape: ``[batch_size]``.
+        token_pos_in_items_ptr : Optional[torch.Tensor]
+            A uint16 1D tensor indicating the token position of each item within its item.
+        token_pos_in_items_len : int
+            Zero-padding length for ``token_pos_in_items_ptr``. Defaults to ``0``.
+        max_item_len_ptr : Optional[torch.Tensor]
+            A uint16 vector containing the max token length of all items for each prompt.
+        seq_lens : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt,
+            shape: ``[batch_size]``.
+        seq_lens_q : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the q sequence length of each prompt,
+            shape: ``[batch_size]``.
+        block_tables : Optional[torch.Tensor]
+            A uint32 2D tensor indicating the block table of each prompt,
+            shape: ``[batch_size, max_num_blocks_per_seq]``.
+        max_token_per_sequence : Optional[int]
+            Required for cuDNN backend. The scalar max token length of each sequence.
+        max_sequence_kv : Optional[int]
+            Maximum number of KV tokens per sequence for cuDNN backend.
+        fixed_split_size : Optional[int]
+            The fixed split size for split-kv prefill, in pages.
+        disable_split_kv : bool
+            Whether to disable the split-kv. Defaults to ``False``.
+
+        Returns
+        -------
+        Tuple[int, int]
+            ``(float_workspace_size, int_workspace_size)`` in bytes.
+
         Example
         -------
         >>> float_bytes, int_bytes = wrapper.workspace_size(...)

@@ -84,6 +84,33 @@ def normalize_activation_type(
 
 @flashinfer_api
 def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
+    """Return whether the given activation type is a gated activation (e.g. SwiGLU family).
+
+    Gated activations split their input along the feature dimension into a *gate* branch
+    and a *value* branch; the two are combined element-wise before being passed to the
+    next layer.  This helper mirrors the C++ ``isGatedActivation()`` predicate defined in
+    ``include/flashinfer/trtllm/fused_moe/runner.h``.
+
+    Parameters
+    ----------
+    activation_type : Union[int, ActivationType]
+        The activation type to query.  May be an :class:`ActivationType` member or its
+        integer value.
+
+    Returns
+    -------
+    bool
+        ``True`` if ``activation_type`` belongs to the gated activation family
+        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``); ``False`` otherwise.
+
+    Examples
+    --------
+    >>> from flashinfer.tllm_enums import ActivationType, is_gated_activation
+    >>> is_gated_activation(ActivationType.Swiglu)
+    True
+    >>> is_gated_activation(ActivationType.Relu)
+    False
+    """
     # Keep this in sync with isGatedActivation() in include/flashinfer/trtllm/fused_moe/runner.h.
     return normalize_activation_type(activation_type) in _GATED_ACTIVATION_TYPES
 
