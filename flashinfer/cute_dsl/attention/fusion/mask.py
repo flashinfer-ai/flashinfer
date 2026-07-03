@@ -17,57 +17,43 @@ from cutlass._mlir import ir
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.base_dsl.utils.tree_utils import is_constexpr_field
 from cutlass.cute.typing import Int32, Float32, Optional
 
 
 # TODO: Consider moving this to the wheel
+# TODO: handle Union[Constexpr[int], Int32] in TVM FFI conversion
+# Currently treats Union[int, Int32] as dynamic and adds int to call signature
+# Causing call signature mismatch if some fields are compile time static
 class DataclassJIT:
     """JitArgument and DynamicExpression protocol for generic dataclass."""
 
     def __post_init__(self):
         assert is_dataclass(self), f"{type(self)} must be dataclass"
 
-    # TVM FFI WAR since existing conversion path always treats
-    # Union[int, Int32] as dynamic and adds int to call signature
-    # TODO: handle Union[Constexpr[int], Int32] in TVM FFI conversion
-    @staticmethod
-    def _use_tvm_ffi_placeholder(value, field):
-        return value is not None and not is_constexpr_field(field)
-
     # JitArgument protocol
     def __c_pointers__(self) -> list[ctypes.c_void_p]:
         pointers: list[ctypes.c_void_p] = []
-        tvm_ffi_placeholder = [ctypes.c_void_p()]
         for f in fields(cast(Any, self)):
             v = getattr(self, f.name)
             if hasattr(v, "__c_pointers__"):
                 pointers.extend(v.__c_pointers__())
-            elif self._use_tvm_ffi_placeholder(v, f):
-                pointers.extend(tvm_ffi_placeholder)
         return pointers
 
     def __get_mlir_types__(self) -> list[ir.Type]:
         types: list[ir.Type] = []
-        tvm_ffi_placeholder = Int32(0).__get_mlir_types__()
         for f in fields(cast(Any, self)):
             v = getattr(self, f.name)
             if hasattr(v, "__get_mlir_types__"):
                 types.extend(v.__get_mlir_types__())
-            elif self._use_tvm_ffi_placeholder(v, f):
-                types.extend(tvm_ffi_placeholder)
         return types
 
     # DynamicExpression protocol
     def __extract_mlir_values__(self) -> list[ir.Value]:
         values: list[ir.Value] = []
-        tvm_ffi_placeholder = Int32(0).__extract_mlir_values__()
         for f in fields(cast(Any, self)):
             v = getattr(self, f.name)
             if hasattr(v, "__extract_mlir_values__"):
                 values.extend(v.__extract_mlir_values__())
-            elif self._use_tvm_ffi_placeholder(v, f):
-                values.extend(tvm_ffi_placeholder)
         return values
 
     def __new_from_mlir_values__(self, values: list[ir.Value]) -> "DataclassJIT":
@@ -83,17 +69,13 @@ class DataclassJIT:
                 v_idx += 1
             else:
                 args.extend([v])
-                if self._use_tvm_ffi_placeholder(v, f):
-                    v_idx += 1
 
         return type(self)(*args)
 
 
-#
 # JIT-extendable masking configurations
 # Currently only supports GQA/MHA decode kernel
 # TODO: support skipping fully masked tiles for prefill integration
-#
 class AttentionMask(ABC, DataclassJIT):
     """ABC interface for attention masking configurations."""
 

@@ -264,7 +264,8 @@ def _get_mask_config(
     elif window_left is None and window_right == 0:
         return CausalMask()
     else:
-        return SlidingWindowMask(window_left, window_right)
+        # Runtime sliding window
+        return SlidingWindowMask(Int32(window_left), Int32(window_right))
 
 
 def _slice_workspace(
