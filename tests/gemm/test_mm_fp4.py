@@ -53,6 +53,10 @@ def _test_mm_fp4(
     if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl"]:
         pytest.skip("mx_fp4 is only supported for cudnn, cute-dsl, and auto backends")
 
+    # Seed per test case so every parametrization checks the same data
+    # regardless of suite composition (unseeded draws depend on how many
+    # earlier cases ran/skipped, which made the 0.97 check flaky in CI).
+    torch.manual_seed(123)
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
     a_sf_layout = SfLayout.layout_128x4 if use_128x4_sf_layout else SfLayout.layout_8x4
