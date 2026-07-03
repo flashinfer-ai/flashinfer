@@ -79,18 +79,23 @@ _DECODE_MAX_TOKENS = 64
 _DECODE_DSV4_DISPATCH = frozenset(
     {
         (8, 128),
+        (8, 256),
         (8, 512),
         (8, 1024),
         (16, 128),
+        (16, 256),
         (16, 512),
         (16, 1024),
         (32, 128),
+        (32, 256),
         (32, 512),
         (32, 1024),
         (64, 128),
+        (64, 256),
         (64, 512),
         (64, 1024),
         (128, 128),
+        (128, 256),
         (128, 512),
         (128, 1024),
     }
@@ -376,6 +381,22 @@ def get_sparse_mla_sm120_module():
                 model_type=model_type,
             )
             return
+
+        # Decode shapes (num_tokens <= _DECODE_MAX_TOKENS) must be served by one of
+        # the standalone decode kernels above. The paged orchestrator only supports
+        # prefill (num_tokens > _DECODE_MAX_TOKENS) and hard-asserts that in C++, so
+        # a decode shape reaching here means its (num_heads, topk) is not in the
+        # decode instantiation tables. Raise an actionable error instead of letting
+        # the kernel abort the process.
+        if num_tokens <= _DECODE_MAX_TOKENS:
+            raise ValueError(
+                "SM120 sparse-MLA has no decode kernel for this shape: "
+                f"num_tokens={num_tokens}, num_heads={num_heads}, topk={topk}, "
+                f"d_qk={d_qk}, page_block_size={kv_pbs}, model_type={model_type}, "
+                f"extra_topk={extra_topk}. Supported decode shapes are enumerated in "
+                "_DECODE_DSV4_DISPATCH / _DECODE_DSV3_2_DISPATCH; add the matching "
+                "(num_heads, topk) instantiation to support it."
+            )
 
         module.sparse_mla_sm120_paged_attention(
             q,
