@@ -259,12 +259,17 @@ class B12xMoEWrapper:
             value is read from ``FLASHINFER_B12X_CUTLASS_PREFILL_THRESHOLD``;
             the effective default is ``0`` (pure b12x).
 
-            Hybrid dispatch is available only for NVFP4. It keeps both b12x-
-            and CUTLASS-format FP4 weights resident, roughly doubling weight
-            memory. Backend selection is a host-side decision, so a CUDA graph
-            captures only the path selected by that graph's token shape; use
-            separate graphs for shape buckets on opposite sides of the
-            threshold.
+            Hybrid dispatch is available only for NVFP4. The decode and
+            prefill paths can share the same contiguous packed-FP4 W1/W2
+            tensors; this wrapper stores CUTLASS long views of the registered
+            uint8 tensors. The paths use different scale-factor conventions,
+            so an integration normally retains both B12x and CUTLASS FP8
+            block-scale representations. This adds one scale set, not another
+            packed-FP4 weight set. Supplying distinct packed tensors instead
+            deliberately adds a full weight copy. Backend selection is a
+            host-side decision, so a CUDA graph captures only the path selected
+            by that graph's token shape; use separate graphs for shape buckets
+            on opposite sides of the threshold.
 
     Example:
         >>> moe = B12xMoEWrapper(num_experts=256, top_k=8, ...)
@@ -424,9 +429,9 @@ class B12xMoEWrapper:
         self._moe_output: Optional[torch.Tensor] = None
 
         # CUTLASS-format prefill weights, registered post-construction via
-        # register_cutlass_prefill_weights(). Held alongside the b12x weights
-        # the caller passes to run() — the same logical weights quantized into
-        # different physical layouts and scale-factor conventions.
+        # register_cutlass_prefill_weights(). The decode and prefill paths can
+        # share the same packed FP4 payload; their scale-factor conventions can
+        # require separate scale representations.
         self._cutlass_w1: Optional[torch.Tensor] = None
         self._cutlass_w2: Optional[torch.Tensor] = None
         self._cutlass_quant_scales: Optional[List[torch.Tensor]] = None
@@ -536,11 +541,13 @@ class B12xMoEWrapper:
         """Register CUTLASS-format NVFP4 weights for the prefill dispatch.
 
         Required when ``cutlass_prefill_threshold > 0``. The b12x decode path
-        (un-normalized SF + MMA-swizzled layout) and the CUTLASS prefill path
-        (normalized FP8 SF + non-interleave-aware layout) represent the same
-        logical weights with different physical packings. The wrapper holds
-        both alive — the caller must FP4-quantize weights twice at load time
-        (mirroring TRT-LLM's ``FlashInferFusedMoE.post_load_weights``).
+        uses un-normalized scale factors in an MMA view, while the CUTLASS
+        prefill path uses normalized FP8 scale factors. Both paths can use the
+        same packed FP4 W1/W2 payload: pass the tensors supplied to :meth:`run`
+        here when they are contiguous. The wrapper stores long views of those
+        tensors without copying their data. Retain separate B12x and CUTLASS
+        scale representations when their values differ; do not FP4-quantize
+        the weights twice unless distinct packed tensors are required.
 
         Args:
             w1_q: FC1 FP4 weights, uint8 packed.
