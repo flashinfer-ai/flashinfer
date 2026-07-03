@@ -23,7 +23,7 @@ def _nvfp4_dequant_linear(packed, scales, global_scale):
         sf_vec_size=16,
         is_sf_swizzled_layout=False,
     )
-    return dequant.reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+    return dequant.reshape(*packed.shape[:-1], packed.shape[-1] * 2).to(packed.device)
 
 
 def _assert_nvfp4_quantized_close(actual, expected):
