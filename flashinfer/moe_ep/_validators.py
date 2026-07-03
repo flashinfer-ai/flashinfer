@@ -42,8 +42,14 @@ def validate_arch_for_backend(backend: str) -> None:
     # The EP runtime wheels (nccl4py, nvidia-nccl-cu13, nixl-cu13) are
     # CUDA-13-only, so a torch built for CUDA 12 can't drive either backend —
     # fail here with a clear message instead of a cryptic dlopen error later.
+    # Parse defensively: custom/nightly torch builds can carry version
+    # strings this check shouldn't crash on; skip it when unparseable.
     cuda_ver = torch.version.cuda
-    if cuda_ver is not None and int(cuda_ver.split(".")[0]) < 13:
+    try:
+        cuda_major = int(cuda_ver.split(".")[0]) if cuda_ver else None
+    except ValueError:
+        cuda_major = None
+    if cuda_major is not None and cuda_major < 13:
         raise MoEEpConfigError(
             f"{backend} requires CUDA 13: the EP runtime wheels (nccl4py, "
             f"nvidia-nccl-cu13, nixl-cu13) ship CUDA-13 binaries only, but "

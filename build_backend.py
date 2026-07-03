@@ -92,15 +92,31 @@ _BUILD_NCCL_EP = _backend_enabled("BUILD_NCCL_EP")
 _BUILD_NIXL_EP = _backend_enabled("BUILD_NIXL_EP")
 
 # Missing build-time deps skip the backend with a warning instead of aborting
-# the install — EXCEPT when the user explicitly asked for a backend with
-# BUILD_NCCL_EP=1 / BUILD_NIXL_EP=1; then a missing dep is a hard error. The
-# default-on install and the legacy BUILD_NVEP=1 alias are both best-effort.
-_BUILD_NVEP_BEST_EFFORT = not (
-    _tri_flag("BUILD_NCCL_EP") is True or _tri_flag("BUILD_NIXL_EP") is True
-)
+# the install — EXCEPT when the user explicitly asked for the NIXL-EP build
+# with BUILD_NIXL_EP=1; then a missing dep is a hard error. Only NIXL-EP goes
+# through _gate_backend (NCCL-EP has no build step), so strictness is keyed
+# solely off the NIXL-EP flag — an explicit BUILD_NCCL_EP=1 must not force
+# NIXL-EP into strict mode. The default-on install and the legacy
+# BUILD_NVEP=1 alias are both best-effort.
+_BUILD_NVEP_BEST_EFFORT = _tri_flag("BUILD_NIXL_EP") is not True
 
 _nvep_build_root = _root / "build_nvep"
 _moe_ep_pkg = _root / "flashinfer" / "moe_ep"
+
+
+def _in_isolated_build_env() -> bool:
+    """Heuristic: are we running inside a PEP 517 isolated build env?
+
+    pip's isolated build envs live in a ``pip-build-env-*`` temp dir injected
+    on sys.path; uv's ephemeral build envs live under a ``builds-v0`` cache
+    dir. In such an env, wheels installed by this hook (nixl-cu13) vanish
+    when the build finishes and never reach the user's target environment —
+    and the env usually has no ``pip`` module at all, so the installs fail
+    outright. The moe_ep build path therefore needs --no-build-isolation.
+    """
+    markers = ("pip-build-env-", f"{os.sep}builds-v0{os.sep}")
+    paths = [sys.prefix, *sys.path]
+    return any(m in p for m in markers for p in paths)
 
 
 def _detect_cuda_major() -> int:
@@ -596,6 +612,20 @@ def _build_nvep_if_enabled() -> None:
     ]
     mode = "best-effort" if _BUILD_NVEP_BEST_EFFORT else "strict"
     print(f"[BUILD_NVEP] requested: {', '.join(requested)} (mode: {mode})")
+
+    if _BUILD_NIXL_EP and _in_isolated_build_env():
+        print(
+            "[BUILD_NVEP] WARNING: PEP 517 build isolation detected. Wheels "
+            "installed by this hook (nixl-cu13) land in the throwaway build "
+            "env — the NIXL-EP build will most likely be skipped, and even "
+            "if it succeeds its runtime wheel will NOT persist into the "
+            "target environment. To enable NIXL-EP when installing from "
+            "source, disable isolation:\n"
+            "    pip install --no-build-isolation .\n"
+            "If NIXL-EP libs were still staged, install the runtime wheel "
+            "manually afterwards: pip install --no-deps 'nixl-cu13>=1.0.1'.",
+            flush=True,
+        )
 
     # NCCL-EP is not built from source — it is provided by the released
     # `nccl4py` wheel (>=0.3.1, the `nccl.ep` API + bundled libnccl_ep.so),
