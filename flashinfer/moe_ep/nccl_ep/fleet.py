@@ -46,9 +46,9 @@ def _import_nccl_ep():
         return nccl_ep
     except ImportError as e:  # pragma: no cover - exercised only without build
         raise MoEEpNotBuiltError(
-            "nccl.ep (nccl-ep-v0.1.0) python package unavailable. Rebuild with "
-            "BUILD_NCCL_EP=1 (which builds the nccl4py bindings), or install the "
-            "nccl4py wheel that ships nccl.ep."
+            "nccl.ep (nccl-ep-v0.1.0) python package unavailable. It ships in "
+            "the nccl4py wheel, a base dependency of flashinfer-python — "
+            "install with `pip install 'nccl4py>=0.3.1'`."
         ) from e
 
 

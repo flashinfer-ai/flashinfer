@@ -36,8 +36,20 @@ class MoEEpArchError(MoEEpConfigError):
 
 
 def validate_arch_for_backend(backend: str) -> None:
-    """Check ``torch.cuda.get_device_capability(0)`` is supported by `backend`."""
+    """Check the GPU arch and CUDA version are supported by `backend`."""
     import torch
+
+    # The EP runtime wheels (nccl4py, nvidia-nccl-cu13, nixl-cu13) are
+    # CUDA-13-only, so a torch built for CUDA 12 can't drive either backend —
+    # fail here with a clear message instead of a cryptic dlopen error later.
+    cuda_ver = torch.version.cuda
+    if cuda_ver is not None and int(cuda_ver.split(".")[0]) < 13:
+        raise MoEEpConfigError(
+            f"{backend} requires CUDA 13: the EP runtime wheels (nccl4py, "
+            f"nvidia-nccl-cu13, nixl-cu13) ship CUDA-13 binaries only, but "
+            f"the installed torch was built for CUDA {cuda_ver}. Install a "
+            "CUDA-13 torch build to use flashinfer.moe_ep."
+        )
 
     if not torch.cuda.is_available():
         return  # Mock/test path — let backend probes catch missing libs instead.

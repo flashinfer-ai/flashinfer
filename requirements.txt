@@ -1,12 +1,22 @@
 apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2
 click
+# cuda-python + nccl4py + nvidia-nccl-cu13: runtime deps for the moe_ep EP
+# transport backends (default since the EP install became opt-out; CUDA-13
+# wheels only — see build_backend.py). NCCL-EP is the released nccl4py wheel
+# (`nccl.ep` API + bundled libnccl_ep.so); no in-tree NCCL build.
+cuda-python>=13.0
 cuda-tile>=1.4.0
 einops
+nccl4py>=0.3.1
 ninja
 numpy
 nvidia-cudnn-frontend>=1.13.0
 nvidia-cutlass-dsl>=4.5.0
 nvidia-ml-py
+# NCCL-EP group-create fails on B200 with older NCCL (2.27.x/2.29.x); >=2.30.7
+# carries the B200 EP support. Ensure this wheel's libnccl is loaded (first on
+# LD_LIBRARY_PATH) rather than a base-image system NCCL.
+nvidia-nccl-cu13>=2.30.7
 packaging>=24.2
 requests
 tabulate
