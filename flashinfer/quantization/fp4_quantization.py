@@ -2012,6 +2012,12 @@ def nvfp4_kv_dequantize_paged(
         ``torch.float16`` or ``torch.bfloat16``.
     kv_layout : str
         Layout of the paged input cache, either ``"NHD"`` or ``"HND"``.
+
+    Returns
+    -------
+    None
+        This function writes dequantized K/V values into ``output_k`` and
+        ``output_v`` in place.
     """
     _check_kv_layout(kv_layout)
     paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
