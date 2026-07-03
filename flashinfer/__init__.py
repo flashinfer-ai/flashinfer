@@ -199,7 +199,12 @@ from .sampling import (
 from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
-from .tllm_enums import SfLayout, ActivationType, RoutingMethodType
+from .tllm_enums import (
+    SfLayout,
+    ActivationType,
+    RoutingMethodType,
+    is_gated_activation as is_gated_activation,
+)
 from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
