@@ -71,11 +71,9 @@ class NixlEpHandle(Handle):
         self._recv_hook = hook
         # recv_x is (fp8_tensor, scales) tuple when use_fp8 — pick the data tensor.
         expert_tensors = recv_x[0] if isinstance(recv_x, tuple) else recv_x
-        # In LL mode, num_tokens is bounded; recv_count is the per-expert breakdown.
-        return DispatchOutput(
-            expert_tensors=expert_tensors,
-            num_tokens=int(recv_count.sum().item()),
-        )
+        # recv_count holds the per-expert breakdown; nothing consumes it here, so we
+        # don't reduce it to host.
+        return DispatchOutput(expert_tensors=expert_tensors)
 
     # @flashinfer_api  # disabled per PR #3453 review
     def combine(self, params: CombineInputParams) -> CombineOutput:

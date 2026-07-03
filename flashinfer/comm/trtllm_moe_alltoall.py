@@ -440,6 +440,10 @@ def moe_a2a_combine(
     output_scales : Optional[torch.Tensor]
         Optional output scale tensor for quantized outputs.  Currently
         supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+    output_scalar_scale : float
+        Per-tensor global scale applied before FP4 block scaling
+        (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+        paths.
     sf_layout : SfLayout
         Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
 
@@ -870,6 +874,10 @@ class MoeAlltoAll:
         output_scales : Optional[torch.Tensor]
             Optional output scale tensor for quantized outputs.  Currently
             supports UE8M0 (packed in ``torch.uint8``) with vector size 32.
+        output_scalar_scale : float
+            Per-tensor global scale applied before FP4 block scaling
+            (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
+            paths.
         sf_layout : SfLayout
             Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
 

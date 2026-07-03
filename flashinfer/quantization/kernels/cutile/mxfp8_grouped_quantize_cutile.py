@@ -341,12 +341,12 @@ def _quantize_one_128x128_tile(
 
 @ct.kernel(opt_level=3, occupancy=4)
 def _mxfp8_grouped_quant_cutile_persistent_prefix(
-    input,
+    input: ct.IndexedWithInt64,
     problem_sizes,
     expert_offsets,
     blockscale_offsets,
     tile_offsets,
-    quant_output,
+    quant_output: ct.IndexedWithInt64,
     scale_flat,
 ):
     groups = problem_sizes.shape[0]
