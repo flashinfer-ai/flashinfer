@@ -9,75 +9,22 @@ different kernel variants (prefill, decode).
 """
 
 import enum
-import ctypes
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, is_dataclass, fields
-from typing import Any, cast
-from cutlass._mlir import ir
+from dataclasses import dataclass, is_dataclass
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32, Float32, Optional
 
 
-# TODO: Consider moving this to the wheel
-# TODO: handle Union[Constexpr[int], Int32] in TVM FFI conversion
-# Currently treats Union[int, Int32] as dynamic and adds int to call signature
-# Causing call signature mismatch if some fields are compile time static
-class DataclassJIT:
-    """JitArgument and DynamicExpression protocol for generic dataclass."""
-
-    def __post_init__(self):
-        assert is_dataclass(self), f"{type(self)} must be dataclass"
-
-    # JitArgument protocol
-    def __c_pointers__(self) -> list[ctypes.c_void_p]:
-        pointers: list[ctypes.c_void_p] = []
-        for f in fields(cast(Any, self)):
-            v = getattr(self, f.name)
-            if hasattr(v, "__c_pointers__"):
-                pointers.extend(v.__c_pointers__())
-        return pointers
-
-    def __get_mlir_types__(self) -> list[ir.Type]:
-        types: list[ir.Type] = []
-        for f in fields(cast(Any, self)):
-            v = getattr(self, f.name)
-            if hasattr(v, "__get_mlir_types__"):
-                types.extend(v.__get_mlir_types__())
-        return types
-
-    # DynamicExpression protocol
-    def __extract_mlir_values__(self) -> list[ir.Value]:
-        values: list[ir.Value] = []
-        for f in fields(cast(Any, self)):
-            v = getattr(self, f.name)
-            if hasattr(v, "__extract_mlir_values__"):
-                values.extend(v.__extract_mlir_values__())
-        return values
-
-    def __new_from_mlir_values__(self, values: list[ir.Value]) -> "DataclassJIT":
-        args: list[object] = []
-        v_idx = 0
-        for f in fields(cast(Any, self)):
-            v = getattr(self, f.name)
-            if hasattr(v, "__new_from_mlir_values__"):
-                # Assume fields can only have 1 IR value for now
-                # Otherwise we have to nest or track value counts
-                arg = v.__new_from_mlir_values__(values[v_idx : v_idx + 1])
-                args.extend([arg])
-                v_idx += 1
-            else:
-                args.extend([v])
-
-        return type(self)(*args)
-
-
 # JIT-extendable masking configurations
 # Currently only supports GQA/MHA decode kernel
 # TODO: support skipping fully masked tiles for prefill integration
-class AttentionMask(ABC, DataclassJIT):
+class AttentionMask(ABC):
     """ABC interface for attention masking configurations."""
+
+    def __post_init__(self):
+        assert is_dataclass(self), f"{type(self)} must be dataclass"
 
     @cute.jit
     @abstractmethod
