@@ -848,17 +848,20 @@ class TestUnifiedMoEDispatch:
 
 @sm100_required
 class TestTrtllmEPOffset:
-    """TRTLLM routed packing must shift global expert ids down by the local
-    shard offset.
+    """TRTLLM routed packing keeps GLOBAL expert ids and forwards the local
+    shard offset to the kernel as a separate launch argument.
 
-    The packed int32 top-k id is ``((expert_id - offset) << 16) | bf16(weight)``;
-    the kernel indexes local experts as ``[0, local_num_experts)``.  Before the
-    CR3 fix, ``pack_inputs`` defaulted the offset to 0, so a nonzero local shard
-    produced out-of-range local expert ids.
+    The packed int32 top-k id is ``(global_expert_id << 16) | bf16(weight)`` and
+    ``local_expert_offset`` is passed on its own; the kernel maps global ids into
+    its local ``[offset, offset + local_num_experts)`` range itself.  ``pack_inputs``
+    must NOT pre-subtract the offset — doing so pushes ids below the offset, which
+    the kernel treats as non-local and skips, producing zero output.
     """
 
     @pytest.mark.parametrize("local_expert_offset", [0, 32, 96])
-    def test_pack_inputs_applies_local_expert_offset(self, local_expert_offset):
+    def test_pack_inputs_keeps_global_ids_and_forwards_offset(
+        self, local_expert_offset
+    ):
         device = torch.device("cuda", torch.cuda.current_device())
         num_experts = 128
         local_num_experts = 32
@@ -916,13 +919,15 @@ class TestTrtllmEPOffset:
         inputs = runner.pack_inputs(act_pack, weight_pack)
         topk_ids = MoEInputs.from_list(inputs).topk_ids
 
-        # Upper 16 bits hold the (offset-shifted) local expert id.
-        decoded_local_ids = topk_ids >> 16
-        expected_local_ids = selected_experts - local_expert_offset
-        assert torch.equal(decoded_local_ids, expected_local_ids), (
-            f"offset={local_expert_offset}: packed local ids "
-            f"{decoded_local_ids} != expected {expected_local_ids}"
+        # Upper 16 bits hold the unmodified GLOBAL expert id (the offset is NOT
+        # pre-subtracted); the shard offset is forwarded to the kernel instead.
+        decoded_ids = topk_ids >> 16
+        assert torch.equal(decoded_ids, selected_experts), (
+            f"offset={local_expert_offset}: packed global ids "
+            f"{decoded_ids} != expected {selected_experts}"
         )
-        # Local ids must land inside the kernel's [0, local_num_experts) range.
-        assert int(decoded_local_ids.min()) >= 0
-        assert int(decoded_local_ids.max()) < local_num_experts
+        # Global ids stay within this rank's shard [offset, offset+local_num_experts).
+        assert int(decoded_ids.min()) >= local_expert_offset
+        assert int(decoded_ids.max()) < local_expert_offset + local_num_experts
+        # The shard offset is carried as a separate kernel launch argument.
+        assert runner._static_kwargs["local_expert_offset"] == local_expert_offset
