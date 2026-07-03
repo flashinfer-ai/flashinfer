@@ -555,6 +555,54 @@ def nvfp4_quantize_append_paged_kv_cache(
     ``k_scale`` and ``v_scale`` are the global decode scales consumed by the
     NVFP4 attention kernels, i.e. dequantization reconstructs values as
     ``e2m1_value * block_scale * global_scale``.
+
+    Parameters
+    ----------
+    append_key : torch.Tensor
+        The key tensor to quantize and append, shape
+        ``[nnz, num_kv_heads, head_dim]`` with dtype ``torch.float16`` or
+        ``torch.bfloat16``.
+    append_value : torch.Tensor
+        The value tensor to quantize and append, with the same shape and dtype
+        as ``append_key``.
+    batch_indices : torch.Tensor
+        The batch index for each appended row, shape ``[nnz]``.
+    positions : torch.Tensor
+        The logical token position for each appended row, shape ``[nnz]``.
+    paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned packed NVFP4 K/V cache. For tuple input, each tensor has
+        shape ``[max_num_pages, page_size, num_kv_heads, head_dim // 2]`` when
+        ``kv_layout="NHD"`` and ``[max_num_pages, num_kv_heads, page_size,
+        head_dim // 2]`` when ``kv_layout="HND"``. A stacked 5-D cache is also
+        accepted with K/V on the second dimension.
+    kv_cache_sf : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned FP8 E4M3 scale cache with the same tuple or stacked cache
+        format as ``paged_kv_cache``, replacing ``head_dim // 2`` with
+        ``head_dim // 16``.
+    kv_indices : torch.Tensor
+        The page indices of the paged KV cache, shape ``[kv_indptr[-1]]``.
+    kv_indptr : torch.Tensor
+        The indptr of the paged KV cache, shape ``[batch_size + 1]``.
+    kv_last_page_len : torch.Tensor
+        The number of entries in the last page of each request, shape
+        ``[batch_size]``.
+    k_scale : float
+        Positive finite global decode scale for K.
+    v_scale : float
+        Positive finite global decode scale for V.
+    kv_layout : str
+        Layout of the paged KV cache, either ``"NHD"`` or ``"HND"``.
+
+    Returns
+    -------
+    None
+        This function updates ``paged_kv_cache`` and ``kv_cache_sf`` in place.
+
+    Note
+    ----
+    The function assumes that the space for appended K/V rows has already been
+    allocated and described by ``kv_indices``, ``kv_indptr``, and
+    ``kv_last_page_len``.
     """
     _check_kv_layout(kv_layout)
     if append_key.dtype not in (torch.float16, torch.bfloat16):
@@ -709,6 +757,45 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     ``page_id * page_size + entry_idx``. Negative slots are padding and are
     ignored. ``append_key`` and ``append_value`` may contain additional padded
     rows; only ``slot_mapping.shape[0]`` rows are considered.
+
+    Parameters
+    ----------
+    append_key : torch.Tensor
+        The key tensor to quantize and write, shape
+        ``[num_rows, num_kv_heads, head_dim]`` with dtype ``torch.float16`` or
+        ``torch.bfloat16``. ``num_rows`` must be at least
+        ``slot_mapping.shape[0]``.
+    append_value : torch.Tensor
+        The value tensor to quantize and write, with the same shape and dtype
+        as ``append_key``.
+    slot_mapping : torch.Tensor
+        Flat cache slot for each row to write, shape ``[nnz]`` with dtype
+        ``torch.int32`` or ``torch.int64``. Negative entries are ignored.
+    paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned packed NVFP4 K/V cache. For tuple input, each tensor has
+        shape ``[max_num_pages, page_size, num_kv_heads, head_dim // 2]`` when
+        ``kv_layout="NHD"`` and ``[max_num_pages, num_kv_heads, page_size,
+        head_dim // 2]`` when ``kv_layout="HND"``. A stacked 5-D cache is also
+        accepted with K/V on the second dimension.
+    kv_cache_sf : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned FP8 E4M3 scale cache with the same tuple or stacked cache
+        format as ``paged_kv_cache``, replacing ``head_dim // 2`` with
+        ``head_dim // 16``.
+    k_scale : Union[float, torch.Tensor]
+        Positive finite global decode scale for K. During CUDA graph capture,
+        this must be a contiguous scalar ``torch.float32`` CUDA tensor on the
+        same device as ``append_key``.
+    v_scale : Union[float, torch.Tensor]
+        Positive finite global decode scale for V. During CUDA graph capture,
+        this must be a contiguous scalar ``torch.float32`` CUDA tensor on the
+        same device as ``append_key``.
+    kv_layout : str
+        Layout of the paged KV cache, either ``"NHD"`` or ``"HND"``.
+
+    Returns
+    -------
+    None
+        This function updates ``paged_kv_cache`` and ``kv_cache_sf`` in place.
     """
     _check_kv_layout(kv_layout)
     if append_key.dtype not in (torch.float16, torch.bfloat16):
