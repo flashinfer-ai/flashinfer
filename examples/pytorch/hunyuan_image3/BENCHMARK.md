@@ -266,3 +266,54 @@ For slurm-driven runs the two sbatch scripts under `.bench_runs/`
 (`HOME`, `FLASHINFER_WORKSPACE_BASE`, `XDG_CACHE_HOME`, `TRITON_CACHE_DIR`),
 the `nvidia-cutlass-dsl` force-reinstall on B200, and pass
 `--skip-cutlass-dsl` to the B200 invocation.
+
+## FlashInferFusedMoE backends (2026-07-02, `test_hyimage3_e2e.py`)
+
+Measured with the shared `FlashInferFusedMoE` module at real HunyuanImage-3
+routed-expert shapes (64 experts, top-8, hidden 4096, intermediate 3072,
+BF16 master weights), CUDA-event timing, 5 warmup / 20 iters, container
+`nvcr.io/nvidia/pytorch:26.03-py3`. Correctness is cosine similarity against
+the module's own eager `torch` reference with **identical weights and
+routing** (so only the kernel differs).
+
+### H100 80GB HBM3 (SM90)
+
+| backend | cos_sim | 1024 tok | 4096 tok | 8192 tok |
+| :--- | :--- | ---: | ---: | ---: |
+| `cutlass` (BF16) | 0.99998 | 10.35 ms | 28.27 ms | 49.83 ms |
+| `cutlass_fp8` (W8A8 per-tensor) | 0.9978 | 5.19 ms | 14.29 ms | 24.93 ms |
+
+`trtllm` is Blackwell-only and auto-falls back to `torch` with a warning on
+SM90.
+
+### B200 (SM100)
+
+| backend | cos_sim | 1024 tok | 4096 tok | 8192 tok |
+| :--- | :--- | ---: | ---: | ---: |
+| `cutlass` (BF16) | 0.99998 | 1.16 ms | 3.39 ms | 6.63 ms |
+| `trtllm` (BF16 routed) | 0.99998 | 1.07 ms | 3.15 ms | 5.95 ms |
+| `cutlass_fp8` (W8A8 per-tensor) | 0.9978 | 0.69 ms | 1.86 ms | 3.80 ms |
+
+Takeaways: on B200 the trtllm-gen routed MoE is ~8–11% faster than the
+CUTLASS grouped GEMM at BF16, and per-tensor FP8 W8A8 gives a further
+~1.7x (with the expected W8A8 accuracy cost, cos_sim ≈ 0.998). On H100 the
+FP8 path is ~2x the BF16 path.
+
+### Backbone equivalence (4-layer random-weight stack, S=1024, B=1)
+
+`test_hyimage3_e2e.py --stage backbone` swaps a deep-copied upstream
+`HunyuanImage3DecoderLayer` stack with `replace_backbone_with_flashinfer`
+(GEMM backend `torch`, attention `auto`, MoE per row) and compares against
+the upstream eager model:
+
+| GPU | moe_backend | masked cos | causal cos | baseline | flashinfer | speedup |
+| :-- | :-- | :-- | :-- | ---: | ---: | ---: |
+| H100 | cutlass | 0.99996 | 0.99993 | 17.48 ms | 5.19 ms | 3.36x |
+| H100 | cutlass_fp8 | 0.99974 | 0.99973 | 17.54 ms | 5.69 ms | 3.08x |
+| B200 | cutlass | 0.99995 | 0.99993 | 10.65 ms | 3.24 ms | 3.29x |
+| B200 | cutlass_fp8 | 0.99977 | 0.99974 | 10.60 ms | 3.70 ms | 2.86x |
+| B200 | trtllm | 0.99993 | 0.99993 | 10.86 ms | 4.80 ms | 2.26x |
+
+(The trtllm row is slower here only because the tiny 16-expert test shape
+is far below the kernel's tuned regime — see the real-shape table above
+where it wins.)

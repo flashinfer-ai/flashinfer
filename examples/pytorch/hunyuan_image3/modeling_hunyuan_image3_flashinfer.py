@@ -10,28 +10,33 @@ decoder with:
 - Pre-norm RMSNorm (hidden_size=4096, eps=1e-5) on attention input, post-norm
   RMSNorm before the MLP/MoE.
 - Mixture of Experts: 64 routed experts top-8, plus 1 shared expert per layer.
-  SwiGLU (silu) FFN with intermediate_size=3072. The upstream
-  ``HunyuanMoE`` already knows how to call ``flashinfer.fused_moe.cutlass_fused_moe``
-  when ``moe_impl == 'flashinfer'``; we just stack the weights and flip the flag.
+  SwiGLU (silu) FFN with intermediate_size=3072. We replace the whole
+  ``HunyuanMoE`` with ``FlashInferHunyuanMoE`` (shared ``FlashInferFusedMoE``
+  over stacked expert weights; upstream gate kept bit-identical).
 - AR text generation reuses the same backbone for diffusion-step image
   denoising through a UNet patch in/out (``patch_embed`` / ``final_layer``);
   the VAE and SigLIP-2 ViT stay on the AR path unchanged.
 
-Optimisations applied here:
-- ``HunyuanRMSNorm`` (hidden) -> ``flashinfer.rmsnorm``
-- ``HunyuanRMSNorm`` (per-head QK-norm, head_dim=128) -> ``flashinfer.rmsnorm``
-  on the flattened ``(batch*heads*seq, head_dim)`` tensor.
-- ``nn.Linear`` projections in attention and MLP -> ``FlashInferLinear`` (any
-  of the GEMM backends from ``flashinfer_modules``).
+Optimisations applied here (all built on the shared, model-independent
+modules in ``examples/pytorch/flashinfer_modules.py`` — the same set the wan
+example uses):
+- ``HunyuanRMSNorm`` (hidden and per-head QK-norm) -> shared
+  ``FlashInferRMSNorm`` (``flashinfer.rmsnorm``).
+- ``nn.Linear`` projections in attention and MLP -> shared
+  ``FlashInferLinear`` (any of the GEMM backends from ``flashinfer_modules``).
 - SwiGLU (silu+mul) -> ``flashinfer.silu_and_mul``.
-- ``HunyuanMoE`` -> upstream class with ``moe_impl='flashinfer'`` (calls
-  ``flashinfer.fused_moe.cutlass_fused_moe`` on stacked expert weights).
-- ``HunyuanImage3SDPAAttention`` -> FlashInfer prefill / decode path when the
-  caller doesn't pass a custom attention mask (decode steps and mask-less
-  prefill); falls back to ``torch.nn.functional.scaled_dot_product_attention``
-  when a 4D bool mask is provided, because the multimodal causal+full mask
-  used during ``gen_text``/``gen_image`` prefill has no equivalent on
-  FlashInfer's prefill APIs.
+- ``HunyuanMoE`` -> ``FlashInferHunyuanMoE``: upstream gate (softmax -> top-8
+  -> renormalize) + the shared ``FlashInferFusedMoE``, which dispatches to
+  ``flashinfer.fused_moe.cutlass_fused_moe`` (BF16 or per-tensor FP8 W8A8,
+  SM89/SM90/SM100+) or ``flashinfer.fused_moe.trtllm_bf16_routed_moe``
+  (SM100/SM103) over stacked expert weights.
+- ``HunyuanImage3SDPAAttention`` -> shared ``FlashInferAttentionDispatcher``
+  (single / cudnn / trtllm / torch paths) for mask-less prefill,
+  ``flashinfer.decode.single_decode_with_kv_cache`` for decode steps; falls
+  back to ``torch.nn.functional.scaled_dot_product_attention`` when a 4D bool
+  mask is provided, because the multimodal causal+full mask used during
+  ``gen_text``/``gen_image`` prefill has no equivalent on FlashInfer's
+  prefill APIs.
 
 The 2D RoPE, KV cache (``HunyuanStaticCache``), VAE/UNet, SigLIP-2 ViT, and
 the ``HunyuanImage3ForCausalMM`` generation orchestration are reused as-is
@@ -46,7 +51,7 @@ Usage::
     )
     replace_backbone_with_flashinfer(
         model, gemm_backend="bf16", online_act_quant=True,
-        attention_backend="auto",
+        attention_backend="auto", moe_backend="cutlass",
     )
 """
 
@@ -54,7 +59,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import math
 import os
 import sys
 import warnings
@@ -75,17 +79,18 @@ if str(_EXAMPLES_PYTORCH_DIR) not in sys.path:
 
 from flashinfer_modules import (  # noqa: E402
     GEMMBackend,
+    MoEBackend,
+    FlashInferAttentionDispatcher,
+    FlashInferFusedMoE,
     FlashInferLinear,
+    FlashInferRMSNorm,
     create_linear_layer,
 )
 
 try:
     import flashinfer  # noqa: F401
-    from flashinfer import rmsnorm as _flashinfer_rmsnorm
     from flashinfer import silu_and_mul as _flashinfer_silu_and_mul
-    from flashinfer.prefill import single_prefill_with_kv_cache
     from flashinfer.decode import single_decode_with_kv_cache
-    from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 except Exception as e:  # pragma: no cover
     raise ImportError(
         "FlashInfer is required to use the HunyuanImage-3 FlashInfer example."
@@ -98,6 +103,7 @@ except Exception as e:  # pragma: no cover
 # ----------------------------------------------------------------------------
 
 _GEMM_BACKENDS = tuple(b.value for b in GEMMBackend)
+_MOE_BACKENDS = tuple(b.value for b in MoEBackend) + ("eager",)
 
 
 @dataclass
@@ -113,20 +119,32 @@ class FlashInferBackboneOptions:
     # Attention backend used when the caller supplies no attention mask
     # (typical for ``gen_text`` decode steps). When a 4D mask is provided we
     # always fall back to SDPA, because FlashInfer's prefill APIs do not take
-    # arbitrary boolean masks. The four valid values match the wan dispatcher.
-    attention_backend: Literal["auto", "single", "cudnn", "trtllm", "sdpa"] = "auto"
-    # Force the MoE path. ``flashinfer`` calls
-    # ``flashinfer.fused_moe.cutlass_fused_moe``; ``eager`` keeps the
-    # per-expert loop in the upstream class.
-    moe_impl: Literal["flashinfer", "eager"] = "flashinfer"
+    # arbitrary boolean masks. Valid bases match the shared wan dispatcher
+    # (``torch`` and its legacy alias ``sdpa`` route through SDPA).
+    attention_backend: Literal[
+        "auto", "single", "cudnn", "trtllm", "torch", "sdpa"
+    ] = "auto"
+    # Fused-MoE backend for the routed experts (see
+    # ``flashinfer_modules.MoEBackend``): ``cutlass`` (BF16
+    # cutlass_fused_moe, SM89/SM90/SM100+), ``cutlass_fp8`` (per-tensor FP8
+    # W8A8), ``trtllm`` (trtllm-gen BF16, SM100/SM103), ``torch`` (eager loop
+    # inside FlashInferFusedMoE), or ``eager`` to keep the upstream
+    # per-expert HunyuanMoE loop entirely.
+    moe_backend: Literal[
+        "cutlass", "cutlass_fp8", "trtllm", "torch", "eager"
+    ] = "cutlass"
 
 
 _FLASHINFER_ENV_OVERRIDES = {
     "gemm_backend": "FLASHINFER_GEMM_BACKEND",
     "online_act_quant": "FLASHINFER_ONLINE_ACT_QUANT",
     "attention_backend": "FLASHINFER_ATTENTION_BACKEND",
-    "moe_impl": "FLASHINFER_MOE_IMPL",
+    "moe_backend": "FLASHINFER_MOE_BACKEND",
 }
+
+# Legacy ``moe_impl`` values (pre-FlashInferFusedMoE) mapped onto the new
+# ``moe_backend`` knob for backward compatibility.
+_LEGACY_MOE_IMPL_MAP = {"flashinfer": "cutlass", "eager": "eager"}
 
 
 def _env_bool(name: str) -> Optional[bool]:
@@ -147,9 +165,15 @@ def _resolve_options(**overrides: Any) -> FlashInferBackboneOptions:
     """Build options from defaults + env vars + explicit kwargs.
 
     Same precedence as the wan example: env vars override defaults; explicit
-    keyword arguments override env vars.
+    keyword arguments override env vars. The legacy ``moe_impl`` knob
+    (kwarg or ``FLASHINFER_MOE_IMPL``) is translated onto ``moe_backend``.
     """
     opts = FlashInferBackboneOptions()
+    legacy_moe_impl = os.getenv("FLASHINFER_MOE_IMPL")
+    if legacy_moe_impl is not None:
+        opts.moe_backend = _LEGACY_MOE_IMPL_MAP.get(
+            legacy_moe_impl, legacy_moe_impl
+        )
     for field, env_name in _FLASHINFER_ENV_OVERRIDES.items():
         raw = os.getenv(env_name)
         if raw is None:
@@ -158,6 +182,11 @@ def _resolve_options(**overrides: Any) -> FlashInferBackboneOptions:
             setattr(opts, field, _env_bool(env_name))
         else:
             setattr(opts, field, raw)
+    if "moe_impl" in overrides:
+        legacy = overrides.pop("moe_impl")
+        # The explicit ``moe_backend`` kwarg wins over the deprecated alias.
+        if legacy is not None and overrides.get("moe_backend") is None:
+            overrides["moe_backend"] = _LEGACY_MOE_IMPL_MAP.get(legacy, legacy)
     for k, v in overrides.items():
         if v is None:
             continue
@@ -168,6 +197,11 @@ def _resolve_options(**overrides: Any) -> FlashInferBackboneOptions:
         raise ValueError(
             f"Unsupported gemm_backend {opts.gemm_backend!r}; "
             f"expected one of {_GEMM_BACKENDS}."
+        )
+    if opts.moe_backend not in _MOE_BACKENDS:
+        raise ValueError(
+            f"Unsupported moe_backend {opts.moe_backend!r}; "
+            f"expected one of {_MOE_BACKENDS}."
         )
     return opts
 
@@ -190,42 +224,6 @@ def _device_ctx(t: torch.Tensor):
     if t.is_cuda:
         return torch.cuda.device(t.device)
     return contextlib.nullcontext()
-
-
-class FlashInferHunyuanRMSNorm(nn.Module):
-    """RMSNorm that delegates to ``flashinfer.rmsnorm``.
-
-    The upstream ``HunyuanRMSNorm`` casts to FP32 for the variance reduction
-    and applies a learned ``weight`` of size ``hidden_size``. ``flashinfer.rmsnorm``
-    expects ``(M, N)`` input with weight of shape ``(N,)`` in FP16/BF16.
-
-    We therefore: flatten leading dims, cast FP32 inputs/weights to BF16 for
-    the kernel, run the kernel, and cast the output back to the original
-    dtype. Matches the FP32-accumulated semantics of the upstream
-    implementation up to BF16 quantisation of the affine scale.
-    """
-
-    def __init__(self, hidden_size: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        orig_dtype = hidden_states.dtype
-        orig_shape = hidden_states.shape
-        # ``flashinfer.rmsnorm`` requires 2D input and BF16/FP16 weights.
-        x = hidden_states.reshape(-1, orig_shape[-1])
-        with _device_ctx(x):
-            if x.dtype == torch.float32:
-                x_bf16 = x.to(torch.bfloat16)
-                w_bf16 = self.weight.to(torch.bfloat16)
-                out = _flashinfer_rmsnorm(
-                    x_bf16.contiguous(), w_bf16, self.variance_epsilon
-                ).to(torch.float32)
-            else:
-                w = self.weight.to(x.dtype)
-                out = _flashinfer_rmsnorm(x.contiguous(), w, self.variance_epsilon)
-        return out.view(orig_shape).to(orig_dtype)
 
 
 class _FlashInferHunyuanMLP(nn.Module):
@@ -405,76 +403,31 @@ class FlashInferHunyuanImage3Attention(nn.Module):
             # kernel (raw pointers, no auto host->device move) would fault with
             # "expected device_type=cuda" — especially under device_map sharding
             # where each layer lives on a different GPU.
-            self.query_layernorm = FlashInferHunyuanRMSNorm(
+            self.query_layernorm = FlashInferRMSNorm(
                 self.head_dim, eps=cfg.rms_norm_eps
             ).to(device=device, dtype=dtype)
-            self.key_layernorm = FlashInferHunyuanRMSNorm(
+            self.key_layernorm = FlashInferRMSNorm(
                 self.head_dim, eps=cfg.rms_norm_eps
             ).to(device=device, dtype=dtype)
             with torch.no_grad():
                 self.query_layernorm.weight.copy_(original_attn.query_layernorm.weight)
                 self.key_layernorm.weight.copy_(original_attn.key_layernorm.weight)
 
-        # ``use_skip_softmax_sparse`` etc. are not used here: HunyuanImage-3
-        # uses causal attention with custom masks, so the wan-style sparse
-        # path doesn't apply.
-        self._attention_backend = opts.attention_backend
-        self._workspace: Optional[torch.Tensor] = None
-
-    # ----- attention backend selection --------------------------------------
-
-    def _get_workspace(self, device: torch.device) -> torch.Tensor:
-        if self._workspace is None or self._workspace.device != device:
-            self._workspace = torch.zeros(
-                128 * 1024 * 1024, dtype=torch.uint8, device=device
-            )
-        return self._workspace
-
-    def _resolve_backend(self, q_len: int, has_mask: bool) -> str:
-        """Pick the kernel for this call.
-
-        Decisions:
-        - If the caller passed a custom attention mask (``has_mask``), we
-          can't use FlashInfer's prefill APIs (they only know about
-          ``causal``); fall back to SDPA.
-        - Decode steps (``q_len == 1``) use ``flashinfer.decode``.
-        - Otherwise we honor the option: ``auto`` picks ``single`` (batch=1
-          contexts dominate in this model since CFG runs both branches
-          per-call but each pipeline call is bs=cfg_factor>=1 unbatched).
-        - ``sdpa`` always falls back to PyTorch SDPA.
-        """
-        if has_mask:
-            return "sdpa"
-        if q_len == 1:
-            return "decode"
-        backend = self._attention_backend
-        if backend == "auto":
-            return "single"
+        # Mask-less prefill goes through the shared wan-style dispatcher
+        # ("sdpa" is kept as a legacy alias of its "torch" path).
+        # ``use_skip_softmax_sparse`` is not used here: HunyuanImage-3 uses
+        # causal attention with custom masks, so the wan-style sparse path
+        # doesn't apply.
+        backend = opts.attention_backend
         if backend == "sdpa":
-            return "sdpa"
-        return backend
+            backend = "torch"
+        self.attention_dispatcher = FlashInferAttentionDispatcher(
+            heads=self.num_heads,
+            dim_head=self.head_dim,
+            attention_backend=backend,
+        )
 
     # ----- core attention dispatchers --------------------------------------
-
-    def _attention_single(
-        self,
-        q: torch.Tensor,   # (B, num_heads, q_len, head_dim)
-        k: torch.Tensor,   # (B, num_heads, kv_len, head_dim) — already repeat_kv'd
-        v: torch.Tensor,
-        causal: bool,
-    ) -> torch.Tensor:
-        bsz, _, q_len, _ = q.shape
-        kv_len = k.shape[2]
-        if bsz != 1:
-            raise ValueError("'single' backend requires bsz==1.")
-        # ``single_prefill_with_kv_cache`` expects NHD layout:
-        # q: (q_len, num_heads, head_dim); kv: (kv_len, num_kv_heads, head_dim).
-        q_nhd = q.transpose(1, 2).reshape(q_len, self.num_heads, self.head_dim).contiguous()
-        k_nhd = k.transpose(1, 2).reshape(kv_len, self.num_heads, self.head_dim).contiguous()
-        v_nhd = v.transpose(1, 2).reshape(kv_len, self.num_heads, self.head_dim).contiguous()
-        out = single_prefill_with_kv_cache(q_nhd, k_nhd, v_nhd, causal=causal)
-        # back to (B, num_heads, q_len, head_dim)
-        return out.view(q_len, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
 
     def _attention_decode(
         self,
@@ -496,54 +449,6 @@ class FlashInferHunyuanImage3Attention(nn.Module):
         out = single_decode_with_kv_cache(q_2d, k_nhd, v_nhd)
         # (num_heads, head_dim) -> (1, num_heads, 1, head_dim)
         return out.view(1, self.num_heads, 1, self.head_dim)
-
-    def _attention_cudnn(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        causal: bool,
-    ) -> torch.Tensor:
-        bsz, _, q_len, _ = q.shape
-        kv_len = k.shape[2]
-        device = q.device
-        q_flat = q.transpose(1, 2).reshape(
-            bsz * q_len, self.num_heads, self.head_dim
-        ).contiguous()
-        k_flat = k.transpose(1, 2).reshape(
-            bsz * kv_len, self.num_heads, self.head_dim
-        ).contiguous()
-        v_flat = v.transpose(1, 2).reshape(
-            bsz * kv_len, self.num_heads, self.head_dim
-        ).contiguous()
-        actual_q = torch.full((bsz, 1, 1, 1), q_len, dtype=torch.int32, device=device)
-        actual_kv = torch.full((bsz, 1, 1, 1), kv_len, dtype=torch.int32, device=device)
-        batch_offsets_q = torch.arange(
-            0, (bsz + 1) * q_len, q_len, dtype=torch.int32, device=device
-        )
-        batch_offsets_kv = torch.arange(
-            0, (bsz + 1) * kv_len, kv_len, dtype=torch.int32, device=device
-        )
-        workspace = self._get_workspace(device)
-        sm_scale = 1.0 / math.sqrt(self.head_dim)
-        out, _ = cudnn_batch_prefill_with_kv_cache(
-            q=q_flat,
-            k_cache=k_flat,
-            v_cache=v_flat,
-            scale=sm_scale,
-            workspace_buffer=workspace,
-            max_token_per_sequence=q_len,
-            max_sequence_kv=kv_len,
-            actual_seq_lens_q=actual_q,
-            actual_seq_lens_kv=actual_kv,
-            causal=causal,
-            return_lse=False,
-            batch_offsets_q=batch_offsets_q,
-            batch_offsets_o=batch_offsets_q,
-            batch_offsets_k=batch_offsets_kv,
-            batch_offsets_v=batch_offsets_kv,
-        )
-        return out.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
     @staticmethod
     def _attention_sdpa(
@@ -617,25 +522,43 @@ class FlashInferHunyuanImage3Attention(nn.Module):
             k = _repeat_kv(k, self.num_key_value_groups)
             v = _repeat_kv(v, self.num_key_value_groups)
 
-        backend = self._resolve_backend(q_len, has_mask=attention_mask is not None)
+        kv_len = k.shape[2]
         # For pure FlashInfer paths we use ``causal=True`` only when we know
         # there's no mask AND we're in a prefill step (q_len == kv_len, no
         # cached prefix). The model uses bidirectional attention inside
         # image blocks via a custom mask, so we only hit the FlashInfer
         # branches in mask-less contexts (decode steps and similar).
-        causal = q_len == k.shape[2]
+        causal = q_len == kv_len
 
         with _device_ctx(q):
-            if backend == "single":
-                attn = self._attention_single(q, k, v, causal=causal)
-            elif backend == "cudnn":
-                attn = self._attention_cudnn(q, k, v, causal=causal)
-            elif backend == "decode":
-                attn = self._attention_decode(q, k, v)
-            else:
+            if attention_mask is not None:
+                # Custom 4D bool mask (mixed causal text + full-attention
+                # image blocks) has no FlashInfer prefill equivalent.
                 attn = self._attention_sdpa(q, k, v, attn_mask=attention_mask)
+                attn = attn.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
+            elif q_len == 1:
+                attn = self._attention_decode(q, k, v)
+                attn = attn.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
+            else:
+                # Mask-less prefill: the shared dispatcher handles the
+                # single / cudnn / trtllm / torch selection (incl. per-SM
+                # fallbacks). It consumes (B, S, H, D) and returns
+                # (B, S, H*D).
+                backend, _ = self.attention_dispatcher._resolve_attention_backend(
+                    bsz, q.device
+                )
+                attn = self.attention_dispatcher._dispatch_attention(
+                    backend,
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    bsz,
+                    q_len,
+                    kv_len,
+                    use_sparse=False,
+                    causal=causal,
+                )
 
-        attn = attn.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
         out = self.o_proj(attn)
         return out, None, past_key_value
 
@@ -667,16 +590,117 @@ def _copy_linear_weights(target: nn.Module, source: nn.Module) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Mixture of Experts
+# ----------------------------------------------------------------------------
+
+
+class FlashInferHunyuanMoE(nn.Module):
+    """HunyuanMoE on the shared ``FlashInferFusedMoE``.
+
+    Keeps the upstream routing exactly: the original ``HunyuanTopKGate``
+    module (FP32 ``wg`` linear) is reused as-is with its ``easy_topk``
+    implementation (softmax over all experts -> top-k -> renormalize by the
+    top-k sum), so routing decisions are bit-identical to the upstream
+    ``moe_impl='eager'`` / ``'flashinfer'`` paths. Only the expert
+    computation moves onto the fused FlashInfer kernel.
+
+    The shared expert (``use_mixed_mlp_moe``) stays a dense
+    ``_FlashInferHunyuanMLP`` — it runs on every token, so it benefits from
+    the regular GEMM backends rather than the grouped MoE kernel.
+
+    Upstream ``HunyuanMLP.gate_and_up_proj`` stacks ``[x1, x2]`` with
+    ``out = x1 * silu(x2)``, which is exactly ``FlashInferFusedMoE``'s
+    weight convention — expert weights are stacked into ``w13_weight``
+    without reordering (same as the upstream flashinfer path that fed
+    ``cutlass_fused_moe`` directly).
+    """
+
+    def __init__(self, original_moe: nn.Module, opts: FlashInferBackboneOptions):
+        super().__init__()
+        cfg = original_moe.config
+        self.config = cfg
+        self.layer_idx = original_moe.layer_idx
+        self.moe_topk = original_moe.moe_topk
+        self.num_experts = original_moe.num_experts
+        self.use_mixed_mlp_moe = bool(getattr(cfg, "use_mixed_mlp_moe", False))
+
+        # Reuse the upstream gate (FP32 router linear + easy_topk).
+        self.gate = original_moe.gate
+
+        first_expert = original_moe.experts[0]
+        if first_expert.hidden_act != "silu":
+            raise ValueError(
+                f"FlashInferHunyuanMoE only supports SwiGLU experts, got "
+                f"hidden_act={first_expert.hidden_act!r}."
+            )
+        if first_expert.gate_and_up_proj.bias is not None:
+            raise ValueError(
+                "FlashInferHunyuanMoE does not support expert biases "
+                "(the released HunyuanImage-3 checkpoints use mlp_bias=False)."
+            )
+        hidden_size = first_expert.hidden_size
+        # Upstream doubles ``intermediate_size`` for SwiGLU; the per-branch
+        # width the MoE kernel wants is half of that.
+        intermediate_size = first_expert.intermediate_size // 2
+
+        device = first_expert.gate_and_up_proj.weight.device
+        dtype = first_expert.gate_and_up_proj.weight.dtype
+
+        if self.use_mixed_mlp_moe:
+            _replace_mlp(self, "shared_mlp", original_moe.shared_mlp, opts)
+
+        self.fused_moe = FlashInferFusedMoE(
+            num_experts=self.num_experts,
+            top_k=self.moe_topk,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            moe_backend=opts.moe_backend,
+            online_act_quant=opts.online_act_quant,
+            device=device,
+            dtype=dtype,
+        )
+        with torch.no_grad():
+            for i, expert in enumerate(original_moe.experts):
+                self.fused_moe.w13_weight.data[i].copy_(
+                    expert.gate_and_up_proj.weight
+                )
+                self.fused_moe.w2_weight.data[i].copy_(expert.down_proj.weight)
+                # Free the per-expert weights as we go so peak memory stays
+                # one expert above the stacked copy (the upstream flashinfer
+                # path does the same in _initialize_weights_on_device).
+                expert.gate_and_up_proj.weight.data = torch.empty(0, device=device)
+                expert.down_proj.weight.data = torch.empty(0, device=device)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, hidden_size = hidden_states.shape
+
+        if self.use_mixed_mlp_moe:
+            hidden_states_mlp = self.shared_mlp(hidden_states)
+
+        with _device_ctx(hidden_states):
+            # Upstream gate: FP32 softmax -> top-k -> renormalize.
+            topk_weight, topk_index = self.gate(hidden_states, topk_impl="easy")
+
+        reshaped = hidden_states.reshape(-1, hidden_size)
+        combined = self.fused_moe(reshaped, topk_index, topk_weight)
+        combined = combined.reshape(bsz, seq_len, hidden_size)
+
+        if self.use_mixed_mlp_moe:
+            return hidden_states_mlp + combined
+        return combined
+
+
+# ----------------------------------------------------------------------------
 # Swap pipeline
 # ----------------------------------------------------------------------------
 
 
 def _replace_rmsnorm(parent: nn.Module, name: str, original: nn.Module) -> None:
-    """Replace a single ``HunyuanRMSNorm`` attribute with the FlashInfer
-    equivalent, copying the affine weight in-place."""
+    """Replace a single ``HunyuanRMSNorm`` attribute with the shared
+    ``FlashInferRMSNorm``, copying the affine weight in-place."""
     eps = getattr(original, "variance_epsilon", 1e-5)
     hidden_size = original.weight.shape[0]
-    new = FlashInferHunyuanRMSNorm(hidden_size, eps=eps)
+    new = FlashInferRMSNorm(hidden_size, eps=eps)
     with torch.no_grad():
         new.weight.copy_(original.weight)
     # Move to the same device/dtype as the original parameter, then attach.
@@ -728,26 +752,16 @@ def _replace_attention(parent: nn.Module, name: str, original: nn.Module,
     setattr(parent, name, new)
 
 
-def _flip_moe_to_flashinfer(moe: nn.Module) -> None:
-    """Switch a ``HunyuanMoE`` instance to the FlashInfer fused path.
+def _prepare_flashinfer_weights(model: nn.Module) -> None:
+    """Run ``prepare_weights()`` on every swapped linear and fused MoE.
 
-    The upstream class already implements ``moe_impl='flashinfer'``: setting
-    the attribute triggers a check that flashinfer is importable, and the
-    first forward call stacks the expert weights and calls
-    ``flashinfer.fused_moe.cutlass_fused_moe``. We just flip the flag.
-    """
-    moe.moe_impl = "flashinfer"
-
-
-def _prepare_flashinfer_linear_weights(model: nn.Module) -> None:
-    """Run ``FlashInferLinear.prepare_weights()`` on every swapped linear.
-
-    Some GEMM backends (FP8 / FP4 / MXFP8 / blockscaled / ...) only quantize
-    on the first call. Running ``prepare_weights`` up front means the model
-    forward path doesn't pay quantisation cost on the first inference.
+    Some GEMM backends (FP8 / FP4 / MXFP8 / blockscaled / ...) and the
+    quantized / trtllm MoE backends only prepare on the first call. Running
+    ``prepare_weights`` up front means the model forward path doesn't pay
+    quantisation / weight-shuffle cost on the first inference.
     """
     for mod in model.modules():
-        if isinstance(mod, FlashInferLinear):
+        if isinstance(mod, (FlashInferLinear, FlashInferFusedMoE)):
             mod.prepare_weights()
 
 
@@ -757,6 +771,7 @@ def replace_backbone_with_flashinfer(
     gemm_backend: Optional[str] = None,
     online_act_quant: Optional[bool] = None,
     attention_backend: Optional[str] = None,
+    moe_backend: Optional[str] = None,
     moe_impl: Optional[str] = None,
     prepare_weights: bool = True,
 ) -> FlashInferBackboneOptions:
@@ -766,12 +781,17 @@ def replace_backbone_with_flashinfer(
     swaps:
 
     1. ``input_layernorm`` / ``post_attention_layernorm`` (HunyuanRMSNorm)
-       -> ``FlashInferHunyuanRMSNorm``.
+       -> shared ``FlashInferRMSNorm``.
     2. ``self_attn`` (HunyuanImage3SDPAAttention)
-       -> ``FlashInferHunyuanImage3Attention``.
-    3. ``mlp.shared_mlp`` / each ``mlp.experts[i]`` (HunyuanMLP)
-       -> ``_FlashInferHunyuanMLP`` (only when ``hidden_act == 'silu'``).
-    4. ``mlp`` (HunyuanMoE) -> upstream class with ``moe_impl='flashinfer'``.
+       -> ``FlashInferHunyuanImage3Attention`` (built on the shared
+       ``FlashInferAttentionDispatcher``).
+    3. ``mlp`` (HunyuanMoE) -> ``FlashInferHunyuanMoE`` (shared
+       ``FlashInferFusedMoE`` over stacked expert weights, upstream gate
+       kept as-is); the shared expert becomes a ``_FlashInferHunyuanMLP``.
+       With ``moe_backend='eager'`` the upstream HunyuanMoE loop is kept and
+       only its per-expert MLPs are swapped.
+    4. Dense ``mlp`` (HunyuanMLP) -> ``_FlashInferHunyuanMLP`` (only when
+       ``hidden_act == 'silu'``).
 
     The final ``model.model.ln_f`` (used only for text logits) is also
     swapped. The VAE, SigLIP-2 ViT, time embedders, UNet patch in/out, and
@@ -785,14 +805,21 @@ def replace_backbone_with_flashinfer(
             ``flashinfer_modules.GEMMBackend`` for options. Default: ``torch``.
         online_act_quant: ``True`` (default) computes activation scales from
             the current tensor; ``False`` uses a fixed default scale. Only
-            FP8/FP4-family backends consult this flag.
+            FP8/FP4-family GEMM backends and the ``cutlass_fp8`` MoE backend
+            consult this flag.
         attention_backend: ``auto`` (default), ``single``, ``cudnn``,
-            ``trtllm``, or ``sdpa``. ``sdpa`` always uses PyTorch SDPA.
-        moe_impl: ``flashinfer`` (default, calls
-            ``flashinfer.fused_moe.cutlass_fused_moe``) or ``eager``.
+            ``trtllm``, ``torch``, or its alias ``sdpa``.
+        moe_backend: ``cutlass`` (default; BF16 cutlass_fused_moe,
+            SM89/SM90/SM100+), ``cutlass_fp8`` (per-tensor FP8 W8A8),
+            ``trtllm`` (trtllm-gen BF16 routed MoE, SM100/SM103), ``torch``
+            (eager loop inside FlashInferFusedMoE), or ``eager`` (keep the
+            upstream per-expert HunyuanMoE loop).
+        moe_impl: Deprecated alias — ``flashinfer`` maps to
+            ``moe_backend='cutlass'``, ``eager`` to ``moe_backend='eager'``.
         prepare_weights: If True, eagerly quantize every swapped
-            ``FlashInferLinear`` so the first forward call doesn't pay the
-            cost. Set False if you intend to call ``.to(...)`` afterwards.
+            ``FlashInferLinear`` / ``FlashInferFusedMoE`` so the first
+            forward call doesn't pay the cost. Set False if you intend to
+            call ``.to(...)`` afterwards.
 
     Returns:
         The resolved ``FlashInferBackboneOptions`` (for logging / debugging).
@@ -801,6 +828,7 @@ def replace_backbone_with_flashinfer(
         gemm_backend=gemm_backend,
         online_act_quant=online_act_quant,
         attention_backend=attention_backend,
+        moe_backend=moe_backend,
         moe_impl=moe_impl,
     )
 
@@ -827,14 +855,16 @@ def replace_backbone_with_flashinfer(
         # 3. MLP / MoE
         mlp = layer.mlp
         if hasattr(mlp, "experts"):  # HunyuanMoE
-            # Shared expert and each routed expert: swap to FlashInfer MLP.
-            if getattr(mlp.config, "use_mixed_mlp_moe", False):
-                _replace_mlp(mlp, "shared_mlp", mlp.shared_mlp, opts)
-            for i in range(len(mlp.experts)):
-                _replace_mlp(mlp.experts, str(i), mlp.experts[i], opts)
-            # Switch to the fused cutlass MoE path.
-            if opts.moe_impl == "flashinfer":
-                _flip_moe_to_flashinfer(mlp)
+            if opts.moe_backend == "eager":
+                # Keep the upstream per-expert loop; just swap each expert's
+                # (and the shared expert's) MLP to the FlashInfer version.
+                mlp.moe_impl = "eager"
+                if getattr(mlp.config, "use_mixed_mlp_moe", False):
+                    _replace_mlp(mlp, "shared_mlp", mlp.shared_mlp, opts)
+                for i in range(len(mlp.experts)):
+                    _replace_mlp(mlp.experts, str(i), mlp.experts[i], opts)
+            else:
+                layer.mlp = FlashInferHunyuanMoE(mlp, opts)
         else:  # HunyuanMLP (dense layer)
             # Replace the whole MLP in-place.
             _replace_mlp(layer, "mlp", mlp, opts)
@@ -844,7 +874,7 @@ def replace_backbone_with_flashinfer(
         _replace_rmsnorm(backbone, "ln_f", backbone.ln_f)
 
     if prepare_weights:
-        _prepare_flashinfer_linear_weights(model)
+        _prepare_flashinfer_weights(model)
 
     return opts
 
@@ -878,12 +908,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--attention-backend",
         default=os.getenv("FLASHINFER_ATTENTION_BACKEND", "auto"),
-        choices=["auto", "single", "cudnn", "trtllm", "sdpa"],
+        choices=["auto", "single", "cudnn", "trtllm", "torch", "sdpa"],
     )
     parser.add_argument(
-        "--moe-impl",
-        default=os.getenv("FLASHINFER_MOE_IMPL", "flashinfer"),
-        choices=["flashinfer", "eager"],
+        "--moe-backend",
+        default=os.getenv("FLASHINFER_MOE_BACKEND", "cutlass"),
+        choices=list(_MOE_BACKENDS),
     )
     parser.add_argument("--offline-act-quant", action="store_true")
     parser.add_argument(
@@ -909,7 +939,7 @@ if __name__ == "__main__":
         model,
         gemm_backend=args.gemm_backend,
         attention_backend=args.attention_backend,
-        moe_impl=args.moe_impl,
+        moe_backend=args.moe_backend,
         online_act_quant=not args.offline_act_quant,
         prepare_weights=not args.skip_prepare_weights,
     )
@@ -919,11 +949,15 @@ if __name__ == "__main__":
         1 for m in model.modules() if isinstance(m, FlashInferLinear)
     )
     n_flashinfer_rmsnorm = sum(
-        1 for m in model.modules() if isinstance(m, FlashInferHunyuanRMSNorm)
+        1 for m in model.modules() if isinstance(m, FlashInferRMSNorm)
     )
     n_flashinfer_attn = sum(
         1 for m in model.modules() if isinstance(m, FlashInferHunyuanImage3Attention)
     )
+    n_flashinfer_moe = sum(
+        1 for m in model.modules() if isinstance(m, FlashInferHunyuanMoE)
+    )
     print(f"FlashInferLinear modules: {n_flashinfer_linear}")
-    print(f"FlashInferHunyuanRMSNorm modules: {n_flashinfer_rmsnorm}")
+    print(f"FlashInferRMSNorm modules: {n_flashinfer_rmsnorm}")
     print(f"FlashInferHunyuanImage3Attention modules: {n_flashinfer_attn}")
+    print(f"FlashInferHunyuanMoE modules: {n_flashinfer_moe}")

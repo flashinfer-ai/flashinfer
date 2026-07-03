@@ -12,8 +12,9 @@ decoder backbone instead of vLLM.
 
 | File | Purpose |
 | :--- | :--- |
-| `modeling_hunyuan_image3_flashinfer.py` | Drop-in FlashInfer modules (`FlashInferHunyuanRMSNorm`, `FlashInferHunyuanImage3Attention`, FlashInfer SwiGLU MLP, fused-cutlass MoE wiring) and `replace_backbone_with_flashinfer(...)` which swaps them into a loaded HF model in place. |
+| `modeling_hunyuan_image3_flashinfer.py` | Drop-in FlashInfer modules built on the **shared** `examples/pytorch/flashinfer_modules.py` (same module set as the wan example): `FlashInferHunyuanImage3Attention` (shared `FlashInferAttentionDispatcher`), `FlashInferHunyuanMoE` (shared `FlashInferFusedMoE`), SwiGLU MLP, shared `FlashInferRMSNorm`, plus `replace_backbone_with_flashinfer(...)` which swaps them into a loaded HF model in place. |
 | `pipeline_hunyuan_image3_flashinfer.py` | CLI driver that mirrors vllm-omni's `end2end.py`: loads the model with `trust_remote_code=True`, calls the swap helper, then drives `text2img` / `img2img` / `img2text` / `text2text`. |
+| `test_hyimage3_e2e.py` | End-to-end correctness + perf test runnable on **one GPU without the checkpoint weights**: (1) fused-MoE unit test comparing each `FlashInferFusedMoE` backend against an eager reference with identical weights/routing, with per-backend benchmarks; (2) a small random-weight stack of upstream `HunyuanImage3DecoderLayer`s deep-copied and swapped, comparing masked / mask-less-causal prefill outputs and forward latency (wan-style synthetic e2e testing). |
 | `bench_kernels_isolated.py` | Isolated FlashInfer kernel benchmark (GEMM / RMSNorm / SwiGLU / MoE / attention) at HunyuanImage-3 shapes, sweeping GEMM backends and online/offline activation-quant modes. |
 | [`BENCHMARK.md`](BENCHMARK.md) | H100 PCIe + B200 kernel speedup tables produced by the benchmark above. |
 
@@ -25,12 +26,11 @@ stay upstream). For every `HunyuanImage3DecoderLayer` we replace:
 
 | Upstream module | FlashInfer replacement |
 | :--- | :--- |
-| `HunyuanRMSNorm` (pre-attn, post-attn, final `ln_f`) | `flashinfer.rmsnorm` via `FlashInferHunyuanRMSNorm` |
-| `HunyuanRMSNorm` (per-head QK-norm, head_dim=128) | `flashinfer.rmsnorm` on flattened `(B*H*S, head_dim)` |
+| `HunyuanRMSNorm` (pre-attn, post-attn, final `ln_f`, per-head QK-norm) | shared `FlashInferRMSNorm` (`flashinfer.rmsnorm`) |
 | `nn.Linear` (qkv_proj, o_proj, gate_and_up_proj, down_proj) | `FlashInferLinear` (any GEMM backend in `flashinfer_modules.GEMMBackend`) |
 | SwiGLU activation (silu+mul) | `flashinfer.silu_and_mul` |
-| `HunyuanMoE` (64 routed + 1 shared, top-8) | upstream class with `moe_impl='flashinfer'` (calls `flashinfer.fused_moe.cutlass_fused_moe`) |
-| `HunyuanImage3SDPAAttention` | `FlashInferHunyuanImage3Attention` — GQA-aware path using `flashinfer.prefill.single_prefill_with_kv_cache` for mask-less prefill, `flashinfer.decode.single_decode_with_kv_cache` for single-token steps, and `flashinfer.cudnn.cudnn_batch_prefill_with_kv_cache` for batched prefill. Falls back to `torch.nn.functional.scaled_dot_product_attention` when a 4D bool mask is provided (the multimodal causal+full mask the model uses for `gen_image` prefill has no FlashInfer equivalent). |
+| `HunyuanMoE` (64 routed + 1 shared, top-8) | `FlashInferHunyuanMoE`: the upstream gate (FP32 softmax → top-8 → renormalize) is kept bit-identical; the routed experts run on the shared `FlashInferFusedMoE`, which dispatches to `flashinfer.fused_moe.cutlass_fused_moe` (BF16 or per-tensor FP8 W8A8) or `flashinfer.fused_moe.trtllm_bf16_routed_moe` (SM100/SM103) over stacked expert weights. The shared expert stays a dense FlashInfer SwiGLU MLP. |
+| `HunyuanImage3SDPAAttention` | `FlashInferHunyuanImage3Attention` — GQA-aware wrapper over the shared `FlashInferAttentionDispatcher` (`single_prefill_with_kv_cache` / `cudnn_batch_prefill_with_kv_cache` / `trtllm_batch_context_with_kv_cache` / SDPA) for mask-less prefill (with `causal=True`), plus `flashinfer.decode.single_decode_with_kv_cache` for single-token steps. Falls back to `torch.nn.functional.scaled_dot_product_attention` when a 4D bool mask is provided (the multimodal causal+full mask the model uses for `gen_image` prefill has no FlashInfer equivalent). |
 
 The 2D RoPE, `HunyuanStaticCache` KV cache, VAE / UNet patch in-out, and the
 SigLIP-2 ViT are reused unchanged.
@@ -80,8 +80,9 @@ command-line flags > environment variables > defaults.
 | Flag | Env | Values | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
 | `--gemm-backend` | `FLASHINFER_GEMM_BACKEND` | `torch`, `bf16`, `fp8`, `fp8_sm90`, `bmm_fp8`, `fp8_groupwise`, `fp8_blockscaled`, `batch_deepgemm_fp8`, `fp4`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8` | `torch` | GEMM kernel for swapped Linears. Unsupported backends on this GPU fall back to torch with a warning. |
-| `--attention-backend` | `FLASHINFER_ATTENTION_BACKEND` | `auto`, `single`, `cudnn`, `trtllm`, `sdpa` | `auto` | Mask-less attention path. `auto` uses `single_prefill_with_kv_cache` for batch_size==1 and `cudnn_batch_prefill_with_kv_cache` for batch_size>1. Decode steps always use `single_decode_with_kv_cache`. With a custom 4D mask we always fall back to SDPA. |
-| `--moe-impl` | `FLASHINFER_MOE_IMPL` | `flashinfer`, `eager` | `flashinfer` | `flashinfer` calls `flashinfer.fused_moe.cutlass_fused_moe` on stacked expert weights; `eager` keeps the per-expert Python loop. |
+| `--attention-backend` | `FLASHINFER_ATTENTION_BACKEND` | `auto`, `single`, `cudnn`, `trtllm`, `torch` (alias `sdpa`) | `auto` | Mask-less attention path (shared dispatcher). `auto` uses `single_prefill_with_kv_cache` for batch_size==1 and `cudnn_batch_prefill_with_kv_cache` for batch_size>1; `trtllm` requires SM100/SM103. Decode steps always use `single_decode_with_kv_cache`. With a custom 4D mask we always fall back to SDPA. |
+| `--moe-backend` | `FLASHINFER_MOE_BACKEND` | `cutlass`, `cutlass_fp8`, `trtllm`, `torch`, `eager` | `cutlass` | Fused-MoE backend for the routed experts. `cutlass` = BF16 `cutlass_fused_moe` (SM89/SM90/SM100+); `cutlass_fp8` = per-tensor FP8 W8A8 on the same kernel; `trtllm` = `trtllm_bf16_routed_moe` (SM100/SM103 only); `torch` = eager loop inside `FlashInferFusedMoE`; `eager` keeps the upstream per-expert HunyuanMoE loop. Unsupported backends fall back to `torch` with a warning. |
+| `--moe-impl` | `FLASHINFER_MOE_IMPL` | `flashinfer`, `eager` | — | Deprecated alias: `flashinfer` → `--moe-backend cutlass`, `eager` → `--moe-backend eager`. |
 | `--offline-act-quant` | `FLASHINFER_ONLINE_ACT_QUANT=0` | — | online | Use fixed default activation scale instead of computing it from the current tensor (FP8/FP4 backends only). |
 
 ## Caveats
@@ -113,3 +114,29 @@ model, applies the swap, and reports how many modules were replaced
 ```bash
 python modeling_hunyuan_image3_flashinfer.py --gemm-backend bf16
 ```
+
+## End-to-end test (no checkpoint weights needed)
+
+`test_hyimage3_e2e.py` validates correctness and measures performance on a
+single GPU using the checkpoint's *remote code only* (config + `.py` files —
+never the 165 GB of weights):
+
+```bash
+# Fused-MoE unit test + backbone equivalence, sweeping MoE backends:
+python test_hyimage3_e2e.py --stage all \
+    --moe-backends cutlass cutlass_fp8 trtllm torch
+
+# MoE kernel perf at real HunyuanImage-3 shapes (E=64, top-8, 4096x3072):
+python test_hyimage3_e2e.py --stage moe --moe-shapes real \
+    --moe-backends cutlass cutlass_fp8 trtllm --moe-num-tokens 1024 4096 8192
+```
+
+Stage 1 compares each `FlashInferFusedMoE` backend against an eager
+reference with identical weights and routing. Stage 2 builds a small
+random-weight stack of upstream `HunyuanImage3DecoderLayer`s, deep-copies
+it, applies `replace_backbone_with_flashinfer`, and checks cosine
+similarity / max error on masked and mask-less-causal prefill, then reports
+baseline vs. FlashInfer forward latency. Exit code is non-zero if any check
+falls below `--min-cos`. Point `--model-path` (or
+`FLASHINFER_HYIMAGE3_PATH`) at a local checkout of the checkpoint repo to
+run offline.

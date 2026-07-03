@@ -135,12 +135,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--attention-backend",
         default=os.getenv("FLASHINFER_ATTENTION_BACKEND", "auto"),
-        choices=["auto", "single", "cudnn", "trtllm", "sdpa"],
+        choices=["auto", "single", "cudnn", "trtllm", "torch", "sdpa"],
+    )
+    p.add_argument(
+        "--moe-backend",
+        default=os.getenv("FLASHINFER_MOE_BACKEND", "cutlass"),
+        choices=["cutlass", "cutlass_fp8", "trtllm", "torch", "eager"],
+        help="Fused-MoE backend for the routed experts (see "
+             "flashinfer_modules.MoEBackend). 'eager' keeps the upstream "
+             "per-expert loop.",
     )
     p.add_argument(
         "--moe-impl",
-        default=os.getenv("FLASHINFER_MOE_IMPL", "flashinfer"),
+        default=None,
         choices=["flashinfer", "eager"],
+        help="Deprecated alias for --moe-backend "
+             "(flashinfer -> cutlass, eager -> eager).",
     )
     p.add_argument(
         "--offline-act-quant", action="store_true",
@@ -320,6 +330,7 @@ def main() -> None:
             model,
             gemm_backend=args.gemm_backend,
             attention_backend=args.attention_backend,
+            moe_backend=args.moe_backend,
             moe_impl=args.moe_impl,
             online_act_quant=not args.offline_act_quant,
             prepare_weights=True,

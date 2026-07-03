@@ -25,6 +25,18 @@ import torch.nn.functional as F
 
 import flashinfer
 from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
+from flashinfer.fused_moe import (
+    ActivationType,
+    RoutingMethodType,
+    WeightLayout,
+    convert_to_block_layout,
+    cutlass_fused_moe,
+    trtllm_bf16_routed_moe,
+)
+from flashinfer.fused_moe.core import (
+    _maybe_get_cached_w3_w1_permute_indices,
+    get_w2_permute_indices_with_cache,
+)
 from flashinfer.gemm import (
     batch_deepgemm_fp8_nt_groupwise,
     gemm_fp8_nt_blockscaled,
@@ -1379,6 +1391,439 @@ def create_linear_layer(
     )
 
 
+class MoEBackend(Enum):
+    """Fused Mixture-of-Experts backend selection for FlashInferFusedMoE."""
+
+    TORCH = "torch"  # Eager per-expert loop (fallback, any GPU)
+    CUTLASS = "cutlass"  # flashinfer.fused_moe.cutlass_fused_moe, BF16 (SM89/SM90/SM100+)
+    CUTLASS_FP8 = "cutlass_fp8"  # cutlass_fused_moe with per-tensor FP8 W8A8 (SM89/SM90/SM100+)
+    TRTLLM = "trtllm"  # flashinfer.fused_moe.trtllm_bf16_routed_moe (SM100/SM103 only)
+
+
+# Human-readable per-backend SM requirement, used by the fallback warning.
+# Keep in sync with _check_moe_backend_support below.
+_MOE_BACKEND_REQUIREMENT_STR: Dict[str, str] = {
+    "cutlass": "SM89/SM90/SM100+",
+    "cutlass_fp8": "SM89/SM90/SM100+",
+    "trtllm": "SM100/SM103 (Blackwell)",
+}
+
+
+def _check_moe_backend_support(backend: MoEBackend, device: torch.device) -> bool:
+    """Check if a fused-MoE backend is supported on the current device.
+
+    The CUTLASS fused-MoE JIT modules are generated per-arch for SM89, SM90,
+    SM100, SM103 and SM120 (see flashinfer/jit/fused_moe.py), all with BF16
+    and FP8 kernels enabled. The trtllm-gen MoE cubins only exist for
+    Blackwell (supported_major_versions=[10, 12]; is_trtllm_moe_supported
+    rejects anything below SM100).
+    """
+    if backend == MoEBackend.TORCH:
+        return True
+
+    major, minor = get_compute_capability(device)
+    sm = major * 10 + minor
+
+    if backend in (MoEBackend.CUTLASS, MoEBackend.CUTLASS_FP8):
+        return sm in (89, 90) or sm >= 100
+    if backend == MoEBackend.TRTLLM:
+        return sm in (100, 103)
+    return False
+
+
+class FlashInferFusedMoE(nn.Module):
+    """Model-independent fused Mixture-of-Experts layer on FlashInfer kernels.
+
+    Computes, for each token routed to expert ``e`` with routing weight ``s``:
+
+        ``out += s * (W2_e @ (x1 * silu(x2)))``  with  ``[x1, x2] = W13_e @ x``
+
+    i.e. the SwiGLU convention where the *first* half of the fused FC1 output
+    is the linear ("up") branch and the *second* half is the gated branch.
+    This matches both FlashInfer MoE kernel families (see the ``w31`` chunk
+    order in tests/moe/test_trtllm_cutlass_fused_moe.py and the gated
+    activation in tests/moe/test_trtllm_gen_fused_moe.py's reference) and
+    HunyuanImage-3's ``gate_and_up_proj`` layout — its stacked expert weights
+    load into ``w13_weight`` verbatim.
+
+    Weight shapes:
+        w13_weight: (num_experts, 2 * intermediate_size, hidden_size)
+        w2_weight:  (num_experts, hidden_size, intermediate_size)
+
+    Routing is intentionally *not* fused: ``forward`` takes precomputed
+    per-token ``topk_ids``/``topk_weights`` so every backend (and the torch
+    reference) sees bit-identical routing decisions — the model keeps its own
+    gate. For the trtllm-gen backend we use the ``*_routed_moe`` entry point,
+    which consumes packed ``(expert_id << 16) | bf16(weight)`` ids, for the
+    same reason.
+
+    Args:
+        num_experts: Number of routed experts.
+        top_k: Experts per token (must match topk_ids.shape[-1] at forward).
+        hidden_size: Model hidden dimension.
+        intermediate_size: Per-expert FFN intermediate dimension.
+        moe_backend: One of ``MoEBackend`` values. Unsupported backends on
+            the current GPU fall back to ``torch`` with a warning, mirroring
+            ``FlashInferLinear``.
+        online_act_quant: For ``cutlass_fp8``: True computes the activation
+            scale from the current tensor; False uses a fixed scale of 1.0.
+        device / dtype: Placement for the (BF16) master weights.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        moe_backend: str = "cutlass",
+        online_act_quant: bool = True,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.online_act_quant = online_act_quant
+
+        if device is None:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "FlashInferFusedMoE requires CUDA, but no CUDA device is available."
+                )
+            device = torch.device("cuda")
+        elif torch.device(device).type != "cuda":
+            raise RuntimeError(
+                f"FlashInferFusedMoE requires a CUDA device, got {device!r}."
+            )
+        self.device = device
+        dtype = dtype or torch.bfloat16
+
+        self._backend = MoEBackend(moe_backend)
+        if not _check_moe_backend_support(self._backend, device):
+            major, minor = get_compute_capability(device)
+            warnings.warn(
+                f"{self._backend.value} MoE backend requires "
+                f"{_MOE_BACKEND_REQUIREMENT_STR.get(self._backend.value, 'unspecified')}, "
+                f"but device is SM{major * 10 + minor}; falling back to TORCH.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._backend = MoEBackend.TORCH
+
+        # The trtllm-gen shuffled/block-major weight layout tiles rows in
+        # chunks of 128 and the K dim in 128-byte blocks; non-multiple shapes
+        # have no matching cubin.
+        if self._backend == MoEBackend.TRTLLM and (
+            hidden_size % 128 != 0 or intermediate_size % 128 != 0
+        ):
+            warnings.warn(
+                f"trtllm MoE backend requires hidden_size and intermediate_size "
+                f"to be multiples of 128, got ({hidden_size}, {intermediate_size}); "
+                "falling back to TORCH.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._backend = MoEBackend.TORCH
+
+        self.w13_weight = nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size, hidden_size,
+                device=device, dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.w2_weight = nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, intermediate_size,
+                device=device, dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+
+        # Backend-specific prepared-weight buffers (filled by prepare_weights).
+        self.register_buffer("_w13_fp8", None)
+        self.register_buffer("_w13_scale", None)
+        self.register_buffer("_w2_fp8", None)
+        self.register_buffer("_w2_scale", None)
+        self.register_buffer("_gemm1_shuffled", None)
+        self.register_buffer("_gemm2_shuffled", None)
+        # Permute-index cache shared across experts (same shape -> one entry).
+        self._trtllm_permute_cache: Dict = {}
+        self._offline_act_scale: Optional[torch.Tensor] = None
+        self._fc2_act_scale: Optional[torch.Tensor] = None
+        self._prepared = False
+
+    @property
+    def backend(self) -> str:
+        return self._backend.value
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_experts={self.num_experts}, top_k={self.top_k}, "
+            f"hidden_size={self.hidden_size}, "
+            f"intermediate_size={self.intermediate_size}, "
+            f"backend={self._backend.value}"
+        )
+
+    @torch.no_grad()
+    def prepare_weights(self):
+        """Quantize / reshuffle master weights for the selected backend.
+
+        Call after loading real weights into w13_weight / w2_weight. The
+        cutlass BF16 path consumes the master weights directly and needs no
+        preparation.
+        """
+        if self._prepared:
+            return
+        if self._backend == MoEBackend.CUTLASS_FP8:
+            self._prepare_fp8_weights()
+        elif self._backend == MoEBackend.TRTLLM:
+            self._prepare_trtllm_weights()
+        self._prepared = True
+
+    @torch.no_grad()
+    def _prepare_fp8_weights(self):
+        """Per-expert per-tensor FP8 quantization for cutlass_fused_moe.
+
+        cutlass_fused_moe's FP8 path takes per-expert scalar dequant scales via
+        ``quant_scales`` (see test_trtllm_cutlass_fused_moe.py::test_moe_fp8).
+        """
+        finfo = torch.finfo(torch.float8_e4m3fn)
+
+        def _quant(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            # w: (E, N, K). One scale per expert.
+            amax = w.abs().amax(dim=(1, 2)).float().clamp(min=1e-12)
+            scale = amax / finfo.max  # dequant scale (multiply after GEMM)
+            w_fp8 = (
+                (w / scale.view(-1, 1, 1)).clamp(finfo.min, finfo.max)
+                .to(torch.float8_e4m3fn)
+                .contiguous()
+            )
+            return w_fp8, scale
+
+        self._w13_fp8, self._w13_scale = _quant(self.w13_weight.data)
+        self._w2_fp8, self._w2_scale = _quant(self.w2_weight.data)
+
+    @torch.no_grad()
+    def _prepare_trtllm_weights(self):
+        """Shuffle + block-major-K conversion for the trtllm-gen MoE kernels.
+
+        Mirrors BF16Moe.prepare_static_weights_for_kernel in
+        tests/moe/test_trtllm_gen_fused_moe.py: interleave the two gated
+        halves of W13 row-wise, apply the epilogue-tile shuffle to both
+        weights, then convert to BlockMajorK layout (128-byte K blocks).
+        """
+        epilogue_tile_m = 128  # matches the trtllm-gen kernel epilogue tile
+        block_k = 128
+        gemm1_shuffled = []
+        gemm2_shuffled = []
+        for i in range(self.num_experts):
+            perm1 = _maybe_get_cached_w3_w1_permute_indices(
+                self._trtllm_permute_cache,
+                self.w13_weight.data[i].view(torch.uint8),
+                epilogue_tile_m,
+                is_gated_act_gemm=True,
+            )
+            w1 = (
+                self.w13_weight.data[i]
+                .view(torch.uint8)[perm1.to(self.w13_weight.device)]
+                .contiguous()
+            )
+            perm2 = get_w2_permute_indices_with_cache(
+                self._trtllm_permute_cache,
+                self.w2_weight.data[i].view(torch.uint8),
+                epilogue_tile_m,
+            )
+            w2 = (
+                self.w2_weight.data[i]
+                .view(torch.uint8)[perm2.to(self.w2_weight.device)]
+                .contiguous()
+            )
+            w1 = convert_to_block_layout(w1.view(torch.uint8), block_k)
+            w2 = convert_to_block_layout(w2.view(torch.uint8), block_k)
+            gemm1_shuffled.append(w1.view(torch.bfloat16))
+            gemm2_shuffled.append(w2.view(torch.bfloat16))
+        self._gemm1_shuffled = torch.stack(gemm1_shuffled).contiguous()
+        self._gemm2_shuffled = torch.stack(gemm2_shuffled).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the routed experts.
+
+        Args:
+            hidden_states: (num_tokens, hidden_size), BF16/FP16.
+            topk_ids: (num_tokens, top_k) integer expert indices.
+            topk_weights: (num_tokens, top_k) routing weights (already
+                normalized by the caller's gate).
+
+        Returns:
+            (num_tokens, hidden_size) combined expert output in the input dtype.
+        """
+        if not self._prepared:
+            self.prepare_weights()
+
+        # Pin kernel launches to the activation's GPU (device_map sharding
+        # moves activations without switching the current CUDA context).
+        _dev = (
+            torch.cuda.device(hidden_states.device)
+            if hidden_states.is_cuda
+            else contextlib.nullcontext()
+        )
+        with _dev:
+            if self._backend == MoEBackend.CUTLASS:
+                return self._forward_cutlass(hidden_states, topk_ids, topk_weights)
+            if self._backend == MoEBackend.CUTLASS_FP8:
+                return self._forward_cutlass_fp8(hidden_states, topk_ids, topk_weights)
+            if self._backend == MoEBackend.TRTLLM:
+                return self._forward_trtllm(hidden_states, topk_ids, topk_weights)
+            return self._forward_torch(hidden_states, topk_ids, topk_weights)
+
+    def _forward_torch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Eager per-expert reference (matches the kernels' SwiGLU convention)."""
+        out = torch.zeros_like(hidden_states)
+        for e in range(self.num_experts):
+            token_idx, k_idx = (topk_ids == e).nonzero(as_tuple=True)
+            if token_idx.numel() == 0:
+                continue
+            x_e = hidden_states[token_idx]
+            h = x_e @ self.w13_weight[e].t()
+            x1, x2 = h.chunk(2, dim=-1)
+            inter = x1 * F.silu(x2)
+            o_e = inter @ self.w2_weight[e].t()
+            scale = topk_weights[token_idx, k_idx].to(o_e.dtype).unsqueeze(-1)
+            out.index_add_(0, token_idx, o_e * scale)
+        return out
+
+    def _forward_cutlass(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        output = torch.empty_like(hidden_states)
+        cutlass_fused_moe(
+            hidden_states.contiguous(),
+            topk_ids.to(torch.int).contiguous(),
+            topk_weights.to(torch.float).contiguous(),
+            self.w13_weight.data,
+            self.w2_weight.data,
+            hidden_states.dtype,
+            quant_scales=None,
+            output=output,
+            activation_type=ActivationType.Swiglu,
+        )
+        return output
+
+    def _forward_cutlass_fp8(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        if self.online_act_quant:
+            x_scale = (
+                hidden_states.abs().amax().float().clamp(min=1e-12) / finfo.max
+            )
+        else:
+            # Cache the constant scale so cuda-graph capture doesn't see a
+            # fresh CPU->GPU copy on each call (same trick as FlashInferLinear).
+            if (
+                self._offline_act_scale is None
+                or self._offline_act_scale.device != hidden_states.device
+            ):
+                self._offline_act_scale = torch.ones(
+                    (), device=hidden_states.device, dtype=torch.float32
+                )
+            x_scale = self._offline_act_scale
+        x_fp8 = (
+            (hidden_states / x_scale).clamp(finfo.min, finfo.max)
+            .to(torch.float8_e4m3fn)
+            .contiguous()
+        )
+
+        # quant_scales layout for the per-tensor FP8 path (see
+        # tests/moe/test_trtllm_cutlass_fused_moe.py::test_moe_fp8):
+        #   [0] fc1 dequant, per expert: w13_scale * act_scale
+        #   [1] fc2 activation quant scale (we keep the intermediate at 1.0)
+        #   [2] fc2 dequant, per expert: w2_scale (* fc2 act scale == 1.0)
+        #   [3] input dequant: act_scale
+        if (
+            self._fc2_act_scale is None
+            or self._fc2_act_scale.device != hidden_states.device
+        ):
+            self._fc2_act_scale = torch.ones(
+                (), device=hidden_states.device, dtype=torch.float32
+            )
+        quant_scales = [
+            (self._w13_scale * x_scale).float(),
+            self._fc2_act_scale,
+            self._w2_scale.float(),
+            x_scale.float(),
+        ]
+        output = torch.empty_like(hidden_states)
+        cutlass_fused_moe(
+            x_fp8,
+            topk_ids.to(torch.int).contiguous(),
+            topk_weights.to(torch.float).contiguous(),
+            self._w13_fp8,
+            self._w2_fp8,
+            hidden_states.dtype,
+            quant_scales=quant_scales,
+            output=output,
+            activation_type=ActivationType.Swiglu,
+        )
+        return output
+
+    def _forward_trtllm(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        # Packed routed format: (expert_id << 16) | bf16(weight).view(int16).
+        # Routing weights are softmax outputs (>= 0), so the bf16 sign bit is
+        # clear and the int16 view never sign-extends into the expert id.
+        packed = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
+            torch.bfloat16
+        ).view(torch.int16).to(torch.int32)
+        out = trtllm_bf16_routed_moe(
+            packed,
+            hidden_states.contiguous(),
+            self._gemm1_shuffled,
+            self._gemm2_shuffled,
+            self.num_experts,
+            self.top_k,
+            None,  # n_group
+            None,  # topk_group
+            self.intermediate_size,
+            0,  # local_expert_offset
+            self.num_experts,  # local_num_experts
+            routed_scaling_factor=None,
+            # Softmax -> TopK -> renormalize; only informs weight handling on
+            # the routed entry point since routing itself is precomputed.
+            routing_method_type=RoutingMethodType.RenormalizeNaive.value,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            activation_type=ActivationType.Swiglu.value,
+        )
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        return out.to(hidden_states.dtype)
+
+
 def get_1d_rotary_pos_embed(
     dim: int,
     pos: int,
@@ -1418,13 +1863,31 @@ class FlashInferRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.weight is not None:
-            # FlashInfer rmsnorm only supports FP16/BF16, cast if needed
-            if x.dtype == torch.float32:
-                x_bf16 = x.to(torch.bfloat16)
-                weight_bf16 = self.weight.to(torch.bfloat16)
-                out = flashinfer.rmsnorm(x_bf16.contiguous(), weight_bf16, self.eps)
-                return out.to(torch.float32)
-            return flashinfer.rmsnorm(x.contiguous(), self.weight, self.eps)
+            # ``flashinfer.rmsnorm`` accepts 2D/3D input; flatten anything
+            # higher (e.g. per-head QK-norm on (B, H, S, D) tensors).
+            orig_shape = x.shape
+            if x.dim() > 3:
+                x = x.reshape(-1, orig_shape[-1])
+            # Pin the kernel launch to the input's GPU: under HF device_map
+            # sharding the activation may live on a different device than the
+            # current CUDA context.
+            _dev = (
+                torch.cuda.device(x.device) if x.is_cuda
+                else contextlib.nullcontext()
+            )
+            with _dev:
+                # FlashInfer rmsnorm only supports FP16/BF16, cast if needed
+                if x.dtype == torch.float32:
+                    x_bf16 = x.to(torch.bfloat16)
+                    weight_bf16 = self.weight.to(torch.bfloat16)
+                    out = flashinfer.rmsnorm(
+                        x_bf16.contiguous(), weight_bf16, self.eps
+                    ).to(torch.float32)
+                else:
+                    out = flashinfer.rmsnorm(
+                        x.contiguous(), self.weight.to(x.dtype), self.eps
+                    )
+            return out.view(orig_shape)
         else:
             # Fallback for non-affine case
             variance = x.pow(2).mean(-1, keepdim=True)
@@ -1691,6 +2154,7 @@ class FlashInferAttentionDispatcher(nn.Module):
         batch_size: int,
         seq_len_q: int,
         seq_len_kv: int,
+        causal: bool = False,
     ) -> torch.Tensor:
         if batch_size != 1:
             raise ValueError(
@@ -1704,7 +2168,7 @@ class FlashInferAttentionDispatcher(nn.Module):
             query.squeeze(0).contiguous(),
             key.squeeze(0).contiguous(),
             value.squeeze(0).contiguous(),
-            causal=False,
+            causal=causal,
             **single_kwargs,
         )
         return out.view(1, seq_len_q, -1)
@@ -1717,6 +2181,7 @@ class FlashInferAttentionDispatcher(nn.Module):
         batch_size: int,
         seq_len_q: int,
         seq_len_kv: int,
+        causal: bool = False,
     ) -> torch.Tensor:
         """Reference path using ``F.scaled_dot_product_attention``.
 
@@ -1731,7 +2196,7 @@ class FlashInferAttentionDispatcher(nn.Module):
         q = query.transpose(1, 2)
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
         # (B, H, S, D) -> (B, S, H, D) -> (B, S, H*D)
         return out.transpose(1, 2).contiguous().reshape(batch_size, seq_len_q, -1)
 
@@ -1743,6 +2208,7 @@ class FlashInferAttentionDispatcher(nn.Module):
         batch_size: int,
         seq_len_q: int,
         seq_len_kv: int,
+        causal: bool = False,
     ) -> torch.Tensor:
         device = query.device
 
@@ -1798,7 +2264,7 @@ class FlashInferAttentionDispatcher(nn.Module):
             max_sequence_kv=seq_len_kv,
             actual_seq_lens_q=actual_seq_lens_q,
             actual_seq_lens_kv=actual_seq_lens_kv,
-            causal=False,
+            causal=causal,
             return_lse=False,
             batch_offsets_q=batch_offsets_q,
             batch_offsets_o=batch_offsets_q,
@@ -1822,6 +2288,7 @@ class FlashInferAttentionDispatcher(nn.Module):
         seq_len_q: int,
         seq_len_kv: int,
         use_sparse: bool = False,
+        causal: bool = False,
     ) -> torch.Tensor:
         device = query.device
 
@@ -1896,6 +2363,10 @@ class FlashInferAttentionDispatcher(nn.Module):
             self.skip_softmax_threshold_scale_factor if use_sparse else None
         )
 
+        # ``causal`` must be passed explicitly: the kernel's own default is
+        # causal=True (LLM serving convention), which would silently mask the
+        # upper triangle for diffusion models doing full bidirectional
+        # attention.
         hidden_states = trtllm_batch_context_with_kv_cache(
             query=query_flat,
             kv_cache=kv_cache,
@@ -1911,6 +2382,7 @@ class FlashInferAttentionDispatcher(nn.Module):
             cum_seq_lens_kv=cum_seq_lens_kv,
             kv_layout="HND",
             skip_softmax_threshold_scale_factor=skip_threshold,
+            causal=causal,
         )
         return hidden_states.view(batch_size, seq_len_q, -1)
 
@@ -1924,22 +2396,24 @@ class FlashInferAttentionDispatcher(nn.Module):
         seq_len_q: int,
         seq_len_kv: int,
         use_sparse: bool = False,
+        causal: bool = False,
     ) -> torch.Tensor:
         if backend == "single":
             return self._attention_single(
-                query, key, value, batch_size, seq_len_q, seq_len_kv
+                query, key, value, batch_size, seq_len_q, seq_len_kv, causal
             )
         if backend == "trtllm":
             return self._attention_trtllm_batch(
-                query, key, value, batch_size, seq_len_q, seq_len_kv, use_sparse
+                query, key, value, batch_size, seq_len_q, seq_len_kv, use_sparse,
+                causal,
             )
         if backend == "cudnn":
             return self._attention_cudnn_batch(
-                query, key, value, batch_size, seq_len_q, seq_len_kv
+                query, key, value, batch_size, seq_len_q, seq_len_kv, causal
             )
         if backend == "torch":
             return self._attention_torch(
-                query, key, value, batch_size, seq_len_q, seq_len_kv
+                query, key, value, batch_size, seq_len_q, seq_len_kv, causal
             )
         raise ValueError(
             f"Unsupported resolved attention backend {backend!r}; "
