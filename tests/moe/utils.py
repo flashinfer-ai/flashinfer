@@ -20,7 +20,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 from enum import IntEnum
-from flashinfer import ActivationType, RoutingMethodType
+from flashinfer import ActivationType, RoutingMethodType, is_gated_activation
 from flashinfer.utils import get_compute_capability
 from flashinfer.fused_moe import WeightLayout
 
@@ -92,14 +92,6 @@ NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.FP8_PER_TENSOR,
     QuantMode.BF16,
 ]
-
-
-def is_gated_activation(activation_type: ActivationType) -> bool:
-    return activation_type in [
-        ActivationType.Swiglu,
-        ActivationType.Geglu,
-        ActivationType.SwigluBias,
-    ]
 
 
 def skip_checks(
