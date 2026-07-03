@@ -17,7 +17,8 @@ compilation via :func:`functools.cache` keyed on the static configuration.
 """
 
 import functools
-from typing import Literal, Optional, Tuple, cast
+import warnings
+from typing import Any, Literal, Optional, Tuple, cast
 
 import torch
 
@@ -44,6 +45,133 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e5m2: cutlass.Float8E5M2,
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
 }
+
+_RAGGED_DECODE_PLAN_LEGACY_POS_ARGS = (
+    "q_data_type",
+    "kv_data_type",
+    "o_data_type",
+    "sm_scale",
+    "kv_splits",
+    "reduction",
+    "q_len_per_req",
+    "is_causal",
+)
+
+_RAGGED_DECODE_RUN_LEGACY_POS_ARGS = (
+    "out",
+    "sm_scale",
+    "o_scale",
+    "lse",
+    "enable_pdl",
+)
+
+_PAGED_DECODE_PLAN_LEGACY_POS_ARGS = (
+    "q_data_type",
+    "kv_data_type",
+    "o_data_type",
+    "sm_scale",
+    "kv_splits",
+    "reduction",
+    "q_len_per_req",
+    "is_causal",
+    "max_kv_len",
+    "non_blocking",
+    "precompile_skip_softmax_kernel",
+)
+
+_PAGED_DECODE_RUN_LEGACY_POS_ARGS = (
+    "out",
+    "sm_scale",
+    "o_scale",
+    "skip_softmax_threshold_scale_factor",
+    "lse",
+    "enable_pdl",
+)
+
+
+def _merge_deprecated_kwargs(
+    api_name: str,
+    method_name: str,
+    deprecated_positional_args: Tuple[Any, ...],
+    legacy_positional_names: Tuple[str, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    if len(deprecated_positional_args) > len(legacy_positional_names):
+        raise TypeError(
+            f"{api_name}.{method_name}() accepts at most "
+            f"{len(legacy_positional_names)} deprecated optional positional "
+            "arguments after the required arguments; got "
+            f"{len(deprecated_positional_args)}"
+        )
+
+    merged_kwargs = dict(kwargs)
+    for name, value in zip(
+        legacy_positional_names, deprecated_positional_args, strict=False
+    ):
+        if name in merged_kwargs:
+            raise TypeError(
+                f"{api_name}.{method_name}() got multiple values for argument {name!r}"
+            )
+        merged_kwargs[name] = value
+    return merged_kwargs
+
+
+def _merge_deprecated_plan_kwargs(
+    api_name: str,
+    deprecated_positional_args: Tuple[Any, ...],
+    legacy_positional_names: Tuple[str, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    return _merge_deprecated_kwargs(
+        api_name,
+        "plan",
+        deprecated_positional_args,
+        legacy_positional_names,
+        kwargs,
+    )
+
+
+def _merge_deprecated_run_kwargs(
+    api_name: str,
+    deprecated_positional_args: Tuple[Any, ...],
+    legacy_positional_names: Tuple[str, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    return _merge_deprecated_kwargs(
+        api_name,
+        "run",
+        deprecated_positional_args,
+        legacy_positional_names,
+        kwargs,
+    )
+
+
+def _warn_deprecated_positional_args(api_name: str, method_name: str) -> None:
+    warnings.warn(
+        f"Passing optional arguments to {api_name}.{method_name}() positionally is "
+        "deprecated; pass them as keyword arguments instead. Scheduled for "
+        "removal in a future release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_deprecated_plan_positional_args(api_name: str) -> None:
+    _warn_deprecated_positional_args(api_name, "plan")
+
+
+def _warn_deprecated_run_positional_args(api_name: str) -> None:
+    _warn_deprecated_positional_args(api_name, "run")
+
+
+def _warn_deprecated_is_causal(api_name: str) -> None:
+    warnings.warn(
+        f"Passing `is_causal` to {api_name}.plan() is deprecated; use "
+        "`window_left` and `window_right` instead. Scheduled for removal in "
+        "a future release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 def _torch_to_cutlass(dtype: torch.dtype) -> "cutlass.dtype":
@@ -546,16 +674,8 @@ class BatchDecodeCuteDSLWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        *,
-        q_data_type: torch.dtype = torch.bfloat16,
-        kv_data_type: Optional[torch.dtype] = None,
-        o_data_type: Optional[torch.dtype] = None,
-        sm_scale: Optional[float] = None,
-        kv_splits: Optional[int] = None,
-        reduction: str = "auto",
-        q_len_per_req: int = 1,
-        window_left: Optional[int] = None,
-        window_right: Optional[int] = 0,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> None:
         """Compile the ragged-KV decode kernel for the planned configuration.
 
@@ -582,7 +702,7 @@ class BatchDecodeCuteDSLWrapper:
             ``"none"`` skips flash-decoding entirely (no reduction kernel,
             no cluster atomics) and requires ``kv_splits == 1``. Atomic
             reduction is faster than kernel reduction but requires kv_splits
-            ∈ {1, 2, 4, 8, 16} and an output dtype in {float32, float16,
+            in {1, 2, 4, 8, 16} and an output dtype in {float32, float16,
             bfloat16}. ``"auto"`` picks ``"none"`` when kv_splits == 1,
             ``"atomic"`` for compatible dtypes and small kv_splits, else
             ``"kernel"``.
@@ -593,7 +713,79 @@ class BatchDecodeCuteDSLWrapper:
             Sliding-window left bound. ``None`` disables left bound.
         window_right : int
             Sliding-window right bound. ``None`` disables right bound.
+
+        Note
+        ----
+        Optional arguments after ``head_dim`` are accepted positionally for
+        backward compatibility, but that calling convention is deprecated and
+        scheduled for removal in a future release. Pass them by keyword instead.
+        ``window_left`` and ``window_right`` are keyword-only. The legacy
+        ``is_causal`` argument is deprecated; use ``window_left`` and
+        ``window_right`` instead.
         """
+        if not deprecated_positional_args and "is_causal" not in kwargs:
+            return self._plan_impl(
+                batch_size,
+                max_kv_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                **kwargs,
+            )
+
+        plan_kwargs = _merge_deprecated_plan_kwargs(
+            "BatchDecodeCuteDSLWrapper",
+            deprecated_positional_args,
+            _RAGGED_DECODE_PLAN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        is_causal_was_provided = "is_causal" in plan_kwargs
+        if is_causal_was_provided:
+            window_args = sorted(
+                {"window_left", "window_right"}.intersection(plan_kwargs)
+            )
+            if window_args:
+                raise TypeError(
+                    "BatchDecodeCuteDSLWrapper.plan() got deprecated `is_causal` "
+                    "together with explicit window arguments "
+                    f"{window_args!r}; use `window_left` and `window_right` only"
+                )
+            is_causal = plan_kwargs.pop("is_causal")
+            plan_kwargs["window_left"] = None
+            plan_kwargs["window_right"] = 0 if is_causal else None
+
+        if deprecated_positional_args:
+            _warn_deprecated_plan_positional_args("BatchDecodeCuteDSLWrapper")
+        if is_causal_was_provided:
+            _warn_deprecated_is_causal("BatchDecodeCuteDSLWrapper")
+
+        return self._plan_impl(
+            batch_size,
+            max_kv_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            **plan_kwargs,
+        )
+
+    def _plan_impl(
+        self,
+        batch_size: int,
+        max_kv_len: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        *,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: Optional[torch.dtype] = None,
+        o_data_type: Optional[torch.dtype] = None,
+        sm_scale: Optional[float] = None,
+        kv_splits: Optional[int] = None,
+        reduction: str = "auto",
+        q_len_per_req: int = 1,
+        window_left: Optional[int] = None,
+        window_right: Optional[int] = 0,
+    ) -> None:
         if kv_data_type is not None and kv_data_type != q_data_type:
             raise NotImplementedError(
                 "cute-dsl decode requires kv_data_type == q_data_type"
@@ -699,11 +891,8 @@ class BatchDecodeCuteDSLWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        sm_scale: Optional[float] = None,
-        o_scale: Optional[float] = None,
-        lse: Optional[torch.Tensor] = None,
-        enable_pdl: bool = True,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Run ragged-KV GQA decode.
 
@@ -738,7 +927,37 @@ class BatchDecodeCuteDSLWrapper:
             Default ``True``. Set to ``False`` to disable PDL when the
             target device does not support it. See
             https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+
+        Note
+        ----
+        Optional arguments after ``v`` are accepted positionally for backward
+        compatibility, but that calling convention is deprecated and scheduled
+        for removal in a future release. Pass them by keyword instead.
         """
+        if not deprecated_positional_args:
+            return self._run_impl(q, k, v, **kwargs)
+
+        run_kwargs = _merge_deprecated_run_kwargs(
+            "BatchDecodeCuteDSLWrapper",
+            deprecated_positional_args,
+            _RAGGED_DECODE_RUN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        _warn_deprecated_run_positional_args("BatchDecodeCuteDSLWrapper")
+        return self._run_impl(q, k, v, **run_kwargs)
+
+    def _run_impl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        sm_scale: Optional[float] = None,
+        o_scale: Optional[float] = None,
+        lse: Optional[torch.Tensor] = None,
+        enable_pdl: bool = True,
+    ) -> torch.Tensor:
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
         if (
@@ -894,19 +1113,8 @@ class BatchDecodePagedCuteDSLWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
-        *,
-        q_data_type: torch.dtype = torch.bfloat16,
-        kv_data_type: Optional[torch.dtype] = None,
-        o_data_type: Optional[torch.dtype] = None,
-        sm_scale: Optional[float] = None,
-        kv_splits: Optional[int] = None,
-        reduction: str = "auto",
-        q_len_per_req: int = 1,
-        window_left: Optional[int] = None,
-        window_right: Optional[int] = 0,
-        max_kv_len: Optional[int] = None,
-        non_blocking: bool = True,
-        precompile_skip_softmax_kernel: bool = False,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> None:
         """Plan paged GQA decode for the given problem.
 
@@ -945,14 +1153,95 @@ class BatchDecodePagedCuteDSLWrapper:
             Defaults to ``0``.
         max_kv_len : Optional[int]
             Maximum KV sequence length across the batch.  Used to auto-tune
-            ``kv_splits``; pass it explicitly to avoid a GPU→CPU sync.
+            ``kv_splits``; pass it explicitly to avoid a GPU->CPU sync.
         non_blocking : bool
             Async device copies for the plan-time integer buffers.
         precompile_skip_softmax_kernel : bool
             If True, also compile the BLASST skip-softmax variant of the
             kernel at plan() time, so the first :meth:`run` call that
             passes ``skip_softmax_threshold_scale_factor`` is fast.
+
+        Note
+        ----
+        Optional arguments after ``page_size`` are accepted positionally for
+        backward compatibility, but that calling convention is deprecated and
+        scheduled for removal in a future release. Pass them by keyword instead.
+        ``window_left`` and ``window_right`` are keyword-only. The legacy
+        ``is_causal`` argument is deprecated; use ``window_left`` and
+        ``window_right`` instead.
         """
+        if not deprecated_positional_args and "is_causal" not in kwargs:
+            return self._plan_impl(
+                indptr,
+                indices,
+                seq_lens,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                **kwargs,
+            )
+
+        plan_kwargs = _merge_deprecated_plan_kwargs(
+            "BatchDecodePagedCuteDSLWrapper",
+            deprecated_positional_args,
+            _PAGED_DECODE_PLAN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        is_causal_was_provided = "is_causal" in plan_kwargs
+        if is_causal_was_provided:
+            window_args = sorted(
+                {"window_left", "window_right"}.intersection(plan_kwargs)
+            )
+            if window_args:
+                raise TypeError(
+                    "BatchDecodePagedCuteDSLWrapper.plan() got deprecated "
+                    "`is_causal` together with explicit window arguments "
+                    f"{window_args!r}; use `window_left` and `window_right` only"
+                )
+            is_causal = plan_kwargs.pop("is_causal")
+            plan_kwargs["window_left"] = None
+            plan_kwargs["window_right"] = 0 if is_causal else None
+
+        if deprecated_positional_args:
+            _warn_deprecated_plan_positional_args("BatchDecodePagedCuteDSLWrapper")
+        if is_causal_was_provided:
+            _warn_deprecated_is_causal("BatchDecodePagedCuteDSLWrapper")
+
+        return self._plan_impl(
+            indptr,
+            indices,
+            seq_lens,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            **plan_kwargs,
+        )
+
+    def _plan_impl(
+        self,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        *,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: Optional[torch.dtype] = None,
+        o_data_type: Optional[torch.dtype] = None,
+        sm_scale: Optional[float] = None,
+        kv_splits: Optional[int] = None,
+        reduction: str = "auto",
+        q_len_per_req: int = 1,
+        window_left: Optional[int] = None,
+        window_right: Optional[int] = 0,
+        max_kv_len: Optional[int] = None,
+        non_blocking: bool = True,
+        precompile_skip_softmax_kernel: bool = False,
+    ) -> None:
         if page_size not in (8, 16, 32, 64):
             raise ValueError(
                 f"cute-dsl paged decode supports page_size ∈ {{8,16,32,64}}, got {page_size}"
@@ -1097,13 +1386,8 @@ class BatchDecodePagedCuteDSLWrapper:
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        out: Optional[torch.Tensor] = None,
-        sm_scale: Optional[float] = None,
-        o_scale: Optional[float] = None,
-        sinks: Optional[torch.Tensor] = None,
-        skip_softmax_threshold_scale_factor: Optional[float] = None,
-        lse: Optional[torch.Tensor] = None,
-        enable_pdl: bool = True,
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Run paged GQA decode.
 
@@ -1154,7 +1438,40 @@ class BatchDecodePagedCuteDSLWrapper:
             Default ``True``. Set to ``False`` to disable PDL when the
             target device does not support it. See
             https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+
+        Note
+        ----
+        Optional arguments after ``v_cache`` are accepted positionally for
+        backward compatibility, but that calling convention is deprecated and
+        scheduled for removal in a future release. Pass them by keyword instead.
+        ``sinks`` is keyword-only.
         """
+        if not deprecated_positional_args:
+            return self._run_impl(q, k_cache, v_cache, **kwargs)
+
+        run_kwargs = _merge_deprecated_run_kwargs(
+            "BatchDecodePagedCuteDSLWrapper",
+            deprecated_positional_args,
+            _PAGED_DECODE_RUN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        _warn_deprecated_run_positional_args("BatchDecodePagedCuteDSLWrapper")
+        return self._run_impl(q, k_cache, v_cache, **run_kwargs)
+
+    def _run_impl(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        sm_scale: Optional[float] = None,
+        o_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        lse: Optional[torch.Tensor] = None,
+        enable_pdl: bool = True,
+    ) -> torch.Tensor:
         if not self._planned:
             raise RuntimeError("Call plan() before run().")
         if q.dtype != self._q_data_type:

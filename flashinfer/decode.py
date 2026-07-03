@@ -88,6 +88,61 @@ from .utils import (
 )
 
 
+_BATCH_DECODE_PLAN_LEGACY_POS_ARGS = (
+    "pos_encoding_mode",
+    "window_left",
+    "logits_soft_cap",
+    "q_data_type",
+    "kv_data_type",
+    "o_data_type",
+    "data_type",
+    "sm_scale",
+    "rope_scale",
+    "rope_theta",
+    "non_blocking",
+    "block_tables",
+    "seq_lens",
+    "fixed_split_size",
+    "disable_split_kv",
+    "q_len_per_req",
+)
+
+
+def _merge_deprecated_plan_kwargs(
+    api_name: str,
+    deprecated_positional_args: Tuple[Any, ...],
+    legacy_positional_names: Tuple[str, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    if len(deprecated_positional_args) > len(legacy_positional_names):
+        raise TypeError(
+            f"{api_name}.plan() accepts at most {len(legacy_positional_names)} "
+            "deprecated optional positional arguments after page_size; got "
+            f"{len(deprecated_positional_args)}"
+        )
+
+    merged_kwargs = dict(kwargs)
+    for name, value in zip(
+        legacy_positional_names, deprecated_positional_args, strict=False
+    ):
+        if name in merged_kwargs:
+            raise TypeError(
+                f"{api_name}.plan() got multiple values for argument {name!r}"
+            )
+        merged_kwargs[name] = value
+    return merged_kwargs
+
+
+def _warn_deprecated_plan_positional_args(api_name: str) -> None:
+    warnings.warn(
+        f"Passing optional arguments to {api_name}.plan() positionally is "
+        "deprecated; pass them as keyword arguments instead. Scheduled for "
+        "removal in a future release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
 @functools.cache
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
@@ -1106,23 +1161,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
-        pos_encoding_mode: str = "NONE",
-        window_left: int = -1,
-        logits_soft_cap: Optional[float] = None,
-        q_data_type: Optional[Union[str, torch.dtype]] = "float16",
-        kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        o_data_type: Optional[Union[str, torch.dtype]] = None,
-        data_type: Optional[Union[str, torch.dtype]] = None,
-        sm_scale: Optional[float] = None,
-        rope_scale: Optional[float] = None,
-        rope_theta: Optional[float] = None,
-        non_blocking: bool = True,
-        block_tables: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        fixed_split_size: Optional[int] = None,
-        disable_split_kv: bool = False,
-        q_len_per_req: int = 1,
-        window_right: int = 0,  # Place after window_left after enabling keyword-only args
+        *deprecated_positional_args: Any,
+        **kwargs: Any,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -1208,7 +1248,70 @@ class BatchDecodeWithPagedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
+
+        Optional arguments after ``page_size`` are accepted positionally for
+        backward compatibility, but that calling convention is deprecated and
+        scheduled for removal in a future release. Pass them by keyword instead.
+        ``window_right`` is keyword-only.
         """
+        if not deprecated_positional_args:
+            return self._plan_impl(
+                indptr,
+                indices,
+                last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                **kwargs,
+            )
+
+        plan_kwargs = _merge_deprecated_plan_kwargs(
+            "BatchDecodeWithPagedKVCacheWrapper",
+            deprecated_positional_args,
+            _BATCH_DECODE_PLAN_LEGACY_POS_ARGS,
+            kwargs,
+        )
+        _warn_deprecated_plan_positional_args("BatchDecodeWithPagedKVCacheWrapper")
+        return self._plan_impl(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            **plan_kwargs,
+        )
+
+    def _plan_impl(
+        self,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        *,
+        pos_encoding_mode: str = "NONE",
+        window_left: int = -1,
+        window_right: int = 0,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Optional[Union[str, torch.dtype]] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        data_type: Optional[Union[str, torch.dtype]] = None,
+        sm_scale: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        non_blocking: bool = True,
+        block_tables: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+        q_len_per_req: int = 1,
+    ) -> None:
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
