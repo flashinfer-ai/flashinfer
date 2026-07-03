@@ -26,6 +26,7 @@ from pathlib import Path
 
 from .algo_knobs import (
     AlgoKnob,
+    FleetAlgoKnobAllocator,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobNumQpsPerRank,
     FleetAlgoKnobQuantization,
@@ -70,6 +71,7 @@ __all__ = [
     "EpAlgorithm",
     "EpLayout",
     "Fleet",
+    "FleetAlgoKnobAllocator",
     "FleetAlgoKnobNumChannelsPerRank",
     "FleetAlgoKnobNumQpsPerRank",
     "FleetAlgoKnobQuantization",

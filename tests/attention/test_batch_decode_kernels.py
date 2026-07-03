@@ -27,13 +27,30 @@ from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
 def head_dim_512_supported() -> bool:
-    # head_dim > 256 is only supported on SM100+.
-    return get_compute_capability(torch.device("cuda:0"))[0] >= 10
+    # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
+    return get_compute_capability(torch.device("cuda:0"))[0] >= 8
 
 
 def skip_if_head_dim_unsupported(head_dim: int):
     if head_dim > 256 and not head_dim_512_supported():
-        pytest.skip("head_dim > 256 is only supported on SM100 or newer")
+        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
+
+
+def skip_if_head_dim_dtype_unsupported(head_dim: int, kv_dtype: torch.dtype):
+    skip_if_head_dim_unsupported(head_dim)
+    if (
+        head_dim > 256
+        and kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and get_compute_capability(torch.device("cuda:0"))[0] < 10
+    ):
+        pytest.skip("head_dim > 256 with FP8 KV is only validated on SM100 or newer")
+
+
+def skip_if_nvfp4_large_head_decode_unsupported(head_dim: int):
+    if head_dim > 256 and get_compute_capability(torch.device("cuda:0"))[0] < 10:
+        pytest.skip(
+            "head_dim > 256 with NVFP4 KV decode is only validated on SM100 or newer"
+        )
 
 
 @pytest.fixture(
@@ -98,7 +115,7 @@ def test_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
-    skip_if_head_dim_unsupported(head_dim)
+    skip_if_head_dim_dtype_unsupported(head_dim, kv_dtype)
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
@@ -819,6 +836,19 @@ def test_batch_decode_with_paged_kv_cache_nvfp4(
 
         # NVFP4 is 4-bit; use relaxed tolerance
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-1, atol=1e-1)
+
+
+def test_batch_decode_with_paged_kv_cache_nvfp4_large_head():
+    skip_if_nvfp4_large_head_decode_unsupported(512)
+    test_batch_decode_with_paged_kv_cache_nvfp4(
+        batch_size=4,
+        kv_len=128,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=512,
+        q_dtype=torch.float16,
+    )
 
 
 if __name__ == "__main__":

@@ -403,6 +403,8 @@ class BlockSparseAttentionWrapper:
                     mask_mode == MaskMode.CUSTOM.value,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim,
+                    head_dim_vo=head_dim,
                 )
 
             get_module_args = (
@@ -959,6 +961,8 @@ class VariableBlockSparseAttentionWrapper:
                 self._mask_mode == MaskMode.CUSTOM.value,  # use_custom_mask
                 q_data_type,
                 kv_data_type,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
             )
 
         get_module_args = (
