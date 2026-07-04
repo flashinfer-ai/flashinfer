@@ -86,7 +86,7 @@ Scope:
 - Update `flashinfer/page.py::get_batch_indices_positions()` to call the CUDA page-module helper.
 - Preserve the current Python-facing behavior: keep int32 output allocation and preallocated-output validation, and normalize input index dtypes in Python before calling the int32-only FFI helper.
 - Update docstring examples and validation tests to document the supported CUDA int32 metadata path.
-- Decide whether `flashinfer/triton/page.py` should remain for compatibility or be removed if unused.
+- Leave `flashinfer/triton/page.py` in place. Any cleanup or removal of the Triton helper should be a separate maintainer-owned decision, not part of this PR.
 
 ## Proposed API Shape
 
@@ -442,8 +442,13 @@ flashinfer.append_paged_kv_cache(
 2. Keep Python-wrapper compatibility with the existing implementation: cast `append_indptr` and `seq_lens` to int32 before the FFI call, keep output allocation/validation unchanged, and update the docstring example to use CUDA int32 metadata tensors.
 3. Add or update public wrapper tests.
 4. Strengthen append integration tests if not already done in PR 1.
-5. Decide whether to keep `flashinfer/triton/page.py` for compatibility or remove it if unused.
-6. Run the PR 2 test plan below.
+5. Run the PR 2 test plan below.
+
+## Appendix: Optional Triton Helper Cleanup
+
+Do not remove `flashinfer/triton/page.py` in PR 1 or PR 2. Even if the public Python wrapper no longer imports it after PR 2, removal is a compatibility and maintenance-policy decision for FlashInfer core maintainers.
+
+If maintainers later decide the Triton helper has no remaining compatibility, testing, or debugging value, handle that as a separate cleanup PR with its own deprecation/removal rationale.
 
 ## Test Plan
 
