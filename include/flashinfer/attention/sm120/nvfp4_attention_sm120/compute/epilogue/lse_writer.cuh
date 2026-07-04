@@ -90,47 +90,6 @@ struct LSEWriter {
       }
     }
   }
-
-  template <typename ShapeO, typename Stride>
-  __device__ __forceinline__ static void write_lse_infinity(float* ptr_LSE, ShapeO const& shape_O,
-                                                            Stride const& stride_LSE,
-                                                            int thread_idx, int m_block, int bidh,
-                                                            int bidb) {
-    auto shape_LSE = select<0, 2, 3>(shape_O);
-
-    Tensor mLSE = make_tensor(make_gmem_ptr(ptr_LSE), shape_LSE, stride_LSE);
-    Tensor gLSE = local_tile(mLSE(_, bidh, bidb), Shape<Int<kBlockM>>{}, make_coord(m_block));
-
-    static_assert(kBlockM <= NumMmaThreads);
-
-    if (thread_idx < get<0>(shape_LSE) - m_block * kBlockM) {
-      gLSE(thread_idx) = INFINITY;
-    }
-  }
 };
-
-__device__ __forceinline__ float compute_lse_log2(float row_max, float row_sum,
-                                                  float softmax_scale_log2) {
-  constexpr float log2_e = 1.44269504088896340736f;
-
-  if (row_sum == 0.f || row_sum != row_sum) {
-    return INFINITY;
-  }
-
-  float max_scaled = row_max * softmax_scale_log2;
-  float lse_log2 = max_scaled + log2f(row_sum);
-
-  return lse_log2;
-}
-
-__device__ __forceinline__ float log2_to_ln(float x_log2) {
-  constexpr float ln_2 = 0.69314718055994530942f;
-  return x_log2 * ln_2;
-}
-
-__device__ __forceinline__ float ln_to_log2(float x_ln) {
-  constexpr float log2_e = 1.44269504088896340736f;
-  return x_ln * log2_e;
-}
 
 }  // namespace nvfp4_attention

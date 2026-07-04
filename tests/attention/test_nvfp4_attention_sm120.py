@@ -272,6 +272,29 @@ def test_nvfp4_attention_sm120_output_magnitude():
     assert (lse.float() - math.log(seq_len)).abs().max().item() <= 0.02
 
 
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_rejects_expanded_correction():
+    """The old expanded [B, H, S, S] correction layout (which the kernel never
+    addressed correctly) must be rejected by the shape validation."""
+    _require_sm120()
+
+    torch.manual_seed(42)
+    batch, num_heads, seq_len, head_dim = 1, 2, 256, 128
+    q = torch.randn(
+        (batch, num_heads, seq_len, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    quantized = list(flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v))
+    quantized[6] = quantized[6].repeat_interleave(128, dim=2).contiguous()
+
+    with pytest.raises(ValueError, match="qk_correction"):
+        flashinfer.nvfp4_attention_sm120_fwd(
+            *quantized, sm_scale=head_dim**-0.5, causal=False
+        )
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @torch.inference_mode()
 def test_nvfp4_attention_sm120_lse(causal):
