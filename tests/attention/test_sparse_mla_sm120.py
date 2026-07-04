@@ -890,6 +890,8 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
 
 _DSV4_PREFILL_CONFIGS = [
     (16, 128),
+    (16, 256),
+    (32, 256),
     (32, 512),
     (64, 1024),
     (128, 1024),

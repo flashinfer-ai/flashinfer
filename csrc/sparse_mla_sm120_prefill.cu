@@ -293,6 +293,8 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
   // amortises FP8's higher Tensor-Core throughput.
   if (topk == 128)
     DISPATCH_BY_NH_CM(BF16, 128);
+  else if (topk == 256)
+    DISPATCH_BY_NH_CM(BF16, 256);
   else if (topk == 512)
     DISPATCH_BY_NH_CM(FP8, 512);
   else if (topk == 1024)
