@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -259,13 +261,50 @@ def test_nvfp4_attention_sm120_output_magnitude():
     v = torch.ones_like(q)
 
     quantized = flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v)
-    out, _ = flashinfer.nvfp4_attention_sm120_fwd(
+    out, lse = flashinfer.nvfp4_attention_sm120_fwd(
         *quantized, sm_scale=head_dim**-0.5, causal=False
     )
     torch.cuda.synchronize()
 
     # the only remaining error is V quantization (~3%)
     assert (out.float() - 1.0).abs().max().item() <= 0.05
+    # uniform scores: lse is exactly ln(seq_len)
+    assert (lse.float() - math.log(seq_len)).abs().max().item() <= 0.02
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_lse(causal):
+    """lse must be the log-sum-exp of the scaled scores the kernel attends
+    over (K is mean-centered by quantize_qkv, which shifts each row's lse)."""
+    _require_sm120()
+
+    torch.manual_seed(42)
+    batch, num_heads, seq_len, head_dim = 2, 4, 1024, 128
+    q = torch.randn(
+        (batch, num_heads, seq_len, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    quantized = flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v)
+    _, lse = flashinfer.nvfp4_attention_sm120_fwd(
+        *quantized, sm_scale=head_dim**-0.5, causal=causal
+    )
+    torch.cuda.synchronize()
+
+    k_centered = k.float() - k.float().mean(dim=-2, keepdim=True)
+    scores = torch.matmul(q.float(), k_centered.transpose(-2, -1)) * head_dim**-0.5
+    if causal:
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, device="cuda", dtype=torch.bool), diagonal=1
+        )
+        scores.masked_fill_(mask, float("-inf"))
+    lse_ref = torch.logsumexp(scores, dim=-1)
+
+    diff = (lse.float() - lse_ref).abs()
+    assert diff.mean().item() <= 0.05
+    assert diff.max().item() <= 0.5
 
 
 @torch.inference_mode()

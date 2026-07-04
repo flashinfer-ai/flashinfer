@@ -125,7 +125,11 @@ def _preprocess_qkv(
     # seq_len / 128, seq_len]), or a single row when per_block_mean=False.
     # The kernel's TMA descriptor addresses the tensor this way and
     # broadcasts each row across the 128 rows of the Q tile in smem.
-    qk_correction = torch.matmul(qm, k.transpose(-2, -1)).to(torch.float32)
+    # Multiply in fp32: a float16 matmul output would overflow at 65504
+    # even though the accumulation itself runs in fp32.
+    qk_correction = torch.matmul(
+        qm.to(torch.float32), k.transpose(-2, -1).to(torch.float32)
+    )
     qk_correction = qk_correction.contiguous()
     return q.contiguous(), k.contiguous(), v.contiguous(), qk_correction
 
