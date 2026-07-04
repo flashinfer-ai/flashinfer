@@ -65,7 +65,6 @@ _GATED_ACTIVATION_TYPES = (
     ActivationType.Geglu,
     ActivationType.SwigluBias,
     ActivationType.SwigluStep,
-    ActivationType.GegluTanh,
 )
 
 
@@ -102,8 +101,7 @@ def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
     -------
     bool
         ``True`` if ``activation_type`` belongs to the gated activation family
-        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``);
-        ``False`` otherwise.
+        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``); ``False`` otherwise.
 
     Examples
     --------
