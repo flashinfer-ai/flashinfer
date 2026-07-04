@@ -806,42 +806,51 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
       }
     }
 
-// Fused softmax-exp + row-sum: round-robin the adds into 4 partial sums so they form 4
-// independent chains hidden behind the exp, instead of one CORES_N*2-long dependent chain,
-// overlapping the softmax with the GMMA. q_scale_s is folded into the per-row bias
-// (masked_max), so local_sum here is left unscaled by q_scale_s.
+// Fused softmax-exp + row-sum with row-interleaved scheduling: compute exp for all rows
+// before accumulating the sum, so the MUFU.EX2 results of one row fill the pipeline while
+// another row's results are consumed.
+    {
+      float masked_max[Mma_tile_p::CORES_M];
+      float psum[Mma_tile_p::CORES_M][4];
 #pragma unroll
-    for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      // A fully-masked row (local_max_ == -FLT_MAX) uses bias 0 so exp yields 0, not 1.
-      float masked_max;
-      if constexpr (!EXP2F_OPTIMIZATION) {
-        masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                         ? local_max_[mi] - logf(q_scale_s_)
-                         : 0.f;
-      } else {
-        masked_max = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                         ? local_max_[mi] * scale - log2f(q_scale_s_)
-                         : 0.f;
+      for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+        if constexpr (!EXP2F_OPTIMIZATION) {
+          masked_max[mi] = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
+                               ? local_max_[mi] - logf(q_scale_s_) : 0.f;
+        } else {
+          masked_max[mi] = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
+                               ? local_max_[mi] * scale - log2f(q_scale_s_) : 0.f;
+        }
+        psum[mi][0] = psum[mi][1] = psum[mi][2] = psum[mi][3] = 0.f;
       }
-
-      float psum[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int ni = 0; ni < Mma_tile_p::CORES_N; ni++) {
-        float& p0 = elt_[mi][2 * ni + 0];
-        float& p1 = elt_[mi][2 * ni + 1];
-        if constexpr (!EXP2F_OPTIMIZATION) {
-          p0 = expf(p0 - masked_max);
-          p1 = expf(p1 - masked_max);
-        } else {
-          p0 = custom_exp2f(p0, scale, masked_max);
-          p1 = custom_exp2f(p1, scale, masked_max);
+        // Exp all rows for this ni
+#pragma unroll
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+          float& p0 = elt_[mi][2 * ni + 0];
+          float& p1 = elt_[mi][2 * ni + 1];
+          if constexpr (!EXP2F_OPTIMIZATION) {
+            p0 = expf(p0 - masked_max[mi]);
+            p1 = expf(p1 - masked_max[mi]);
+          } else {
+            p0 = custom_exp2f(p0, scale, masked_max[mi]);
+            p1 = custom_exp2f(p1, scale, masked_max[mi]);
+          }
         }
-        psum[(2 * ni + 0) & 3] += p0;
-        psum[(2 * ni + 1) & 3] += p1;
+        // Sum all rows for this ni
+#pragma unroll
+        for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+          psum[mi][(2 * ni + 0) & 3] += elt_[mi][2 * ni + 0];
+          psum[mi][(2 * ni + 1) & 3] += elt_[mi][2 * ni + 1];
+        }
       }
-      local_sum_[mi] = (psum[0] + psum[1]) + (psum[2] + psum[3]);
-      local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 1);
-      local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 2);
+#pragma unroll
+      for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
+        local_sum_[mi] = (psum[mi][0] + psum[mi][1]) + (psum[mi][2] + psum[mi][3]);
+        local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 1);
+        local_sum_[mi] += __shfl_xor_sync(uint32_t(-1), local_sum_[mi], 2);
+      }
     }
 
     // Initialize or update the global sum and max.
