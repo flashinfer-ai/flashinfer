@@ -27,11 +27,13 @@ license-files = ["LICENSE", "LICENSE*.txt"]
 cu12 = ["nvidia-cutlass-dsl>=4.5.0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.5.0"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
-# working. The moe_ep runtime deps (cuda-python, nccl4py, nvidia-nccl-cu13)
-# are now part of the BASE dependencies (requirements.txt) and the NIXL-EP
-# submodule build runs by default (best-effort) on `pip install .` — see the
-# moe_ep section at the top of build_backend.py. Opt out of the native build
-# with BUILD_NVEP=0 (or per-backend BUILD_NIXL_EP=0 / BUILD_NCCL_EP=0).
+# working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
+# BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
+# default (best-effort) on `pip install .` — see the moe_ep section at the top
+# of build_backend.py. libnccl comes from torch's own nvidia-nccl-cu13 pin;
+# the >=2.30.7 B200 floor is enforced at runtime (moe_ep/_validators.py) and
+# upgraded --no-deps by the build hook on source installs. Opt out of the
+# native build with BUILD_NVEP=0 (or BUILD_NIXL_EP=0 / BUILD_NCCL_EP=0).
 nvep = []
 
 [project.scripts]
