@@ -8,10 +8,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is r
 
 
 def _make_indptr(lengths, device="cuda:0"):
-    if not isinstance(lengths, torch.Tensor):
-        lengths = torch.tensor(lengths, dtype=torch.int32, device=device)
-    else:
-        lengths = lengths.to(device=device, dtype=torch.int32)
+    lengths = torch.as_tensor(lengths, dtype=torch.int32, device=device)
     indptr = torch.empty(lengths.numel() + 1, dtype=torch.int32, device=device)
     indptr[0] = 0
     indptr[1:] = torch.cumsum(lengths, dim=0)
@@ -34,13 +31,13 @@ def _batch_indices_positions_ref(append_indptr, seq_lens):
     return batch_indices.to(append_indptr.device), positions.to(append_indptr.device)
 
 
-def _get_batch_indices_positions_cuda(append_indptr, seq_lens):
+def _get_batch_indices_positions_page_module(append_indptr, seq_lens):
     nnz = int(append_indptr[-1].item())
     batch_indices = torch.full(
         (nnz,), -1, dtype=torch.int32, device=append_indptr.device
     )
     positions = torch.full((nnz,), -2, dtype=torch.int32, device=append_indptr.device)
-    get_page_module().get_batch_indices_positions_cuda(
+    get_page_module().get_batch_indices_positions(
         append_indptr, seq_lens, batch_indices, positions
     )
     return batch_indices, positions
@@ -57,11 +54,11 @@ def _get_batch_indices_positions_cuda(append_indptr, seq_lens):
         ([], []),
     ],
 )
-def test_get_batch_indices_positions_cuda(append_lengths, seq_lens):
+def test_get_batch_indices_positions_page_module(append_lengths, seq_lens):
     _, append_indptr = _make_indptr(append_lengths)
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda:0")
 
-    batch_indices, positions = _get_batch_indices_positions_cuda(
+    batch_indices, positions = _get_batch_indices_positions_page_module(
         append_indptr, seq_lens
     )
     ref_batch_indices, ref_positions = _batch_indices_positions_ref(
@@ -72,14 +69,14 @@ def test_get_batch_indices_positions_cuda(append_lengths, seq_lens):
     torch.testing.assert_close(positions, ref_positions)
 
 
-def test_get_batch_indices_positions_cuda_many_rows():
+def test_get_batch_indices_positions_page_module_many_rows():
     append_lengths = torch.arange(1024, dtype=torch.int32, device="cuda:0") % 9
     seq_lens = append_lengths + (
         torch.arange(1024, dtype=torch.int32, device="cuda:0") % 17
     )
     _, append_indptr = _make_indptr(append_lengths)
 
-    batch_indices, positions = _get_batch_indices_positions_cuda(
+    batch_indices, positions = _get_batch_indices_positions_page_module(
         append_indptr, seq_lens
     )
     ref_batch_indices, ref_positions = _batch_indices_positions_ref(
@@ -90,7 +87,7 @@ def test_get_batch_indices_positions_cuda_many_rows():
     torch.testing.assert_close(positions, ref_positions)
 
 
-def test_get_batch_indices_positions_cuda_rejects_int64_inputs():
+def test_get_batch_indices_positions_page_module_rejects_int64_inputs():
     append_lengths, append_indptr = _make_indptr([1, 2, 3])
     seq_lens = append_lengths.to(torch.int64)
     nnz = int(append_indptr[-1].item())
@@ -98,12 +95,12 @@ def test_get_batch_indices_positions_cuda_rejects_int64_inputs():
     positions = torch.empty((nnz,), dtype=torch.int32, device="cuda:0")
 
     with pytest.raises(Exception):
-        get_page_module().get_batch_indices_positions_cuda(
+        get_page_module().get_batch_indices_positions(
             append_indptr, seq_lens, batch_indices, positions
         )
 
 
-def test_append_paged_kv_cache_with_cuda_batch_indices_positions():
+def test_append_paged_kv_cache_with_page_module_batch_indices_positions():
     torch.manual_seed(0)
     append_lengths, append_indptr = _make_indptr([5, 2, 7])
     seq_lens = append_lengths.clone()
@@ -133,7 +130,7 @@ def test_append_paged_kv_cache_with_cuda_batch_indices_positions():
         dtype=torch.float16,
         device="cuda:0",
     )
-    batch_indices, positions = _get_batch_indices_positions_cuda(
+    batch_indices, positions = _get_batch_indices_positions_page_module(
         append_indptr, seq_lens
     )
 

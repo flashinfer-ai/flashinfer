@@ -21,8 +21,8 @@ using namespace flashinfer;
 
 using tvm::ffi::Tensor;
 
-void get_batch_indices_positions_cuda(TensorView append_indptr, TensorView seq_lens,
-                                      TensorView batch_indices, TensorView positions) {
+void get_batch_indices_positions(TensorView append_indptr, TensorView seq_lens,
+                                 TensorView batch_indices, TensorView positions) {
   CHECK_INPUT_AND_TYPE(append_indptr, dl_int32);
   CHECK_INPUT_AND_TYPE(seq_lens, dl_int32);
   CHECK_INPUT_AND_TYPE(batch_indices, dl_int32);
