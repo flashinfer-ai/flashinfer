@@ -1337,7 +1337,7 @@ def get_trtllm_moe_sm100_module():
             moe_inputs = MoeRunnerInputs.from_list(inputs)
             num_tokens = moe_inputs.hidden_states.shape[0]
 
-            major, _ = get_compute_capability(torch.cuda.current_device())
+            major, _ = get_compute_capability(moe_inputs.hidden_states.device)
             if major == 10 and num_tokens * self.top_k < 2 * self.num_local_experts:
                 return []
 
