@@ -284,6 +284,61 @@ __global__ void AppendPagedKVCacheKernel(paged_kv_t<DType, IdType> paged_kv,
 }
 
 /*!
+ * \brief CUDA kernel to generate batch indices and positions for appended key-value pairs
+ * \tparam IdType The index data type
+ * \param append_indptr The indptr array of the appended ragged tensor
+ * \param seq_lens The final sequence lengths after append
+ * \param batch_indices The output batch indices
+ * \param positions The output positions
+ */
+template <typename IdType, int BLOCK_THREADS>
+__global__ void GetBatchIndicesPositionsKernel(const IdType* __restrict__ append_indptr,
+                                               const IdType* __restrict__ seq_lens,
+                                               IdType* __restrict__ batch_indices,
+                                               IdType* __restrict__ positions) {
+  const uint32_t batch_idx = blockIdx.x;
+  const IdType batch_start = append_indptr[batch_idx];
+  const IdType batch_end = append_indptr[batch_idx + 1];
+  const IdType seq_len = seq_lens[batch_idx];
+
+  for (IdType offset = batch_start + static_cast<IdType>(threadIdx.x); offset < batch_end;
+       offset += BLOCK_THREADS) {
+    batch_indices[offset] = static_cast<IdType>(batch_idx);
+    positions[offset] = offset + seq_len - batch_end;
+  }
+}
+
+/*!
+ * \brief Generate batch indices and positions for appended key-value pairs
+ * \tparam IdType The index data type
+ * \param append_indptr The indptr array of the appended ragged tensor
+ * \param seq_lens The final sequence lengths after append
+ * \param batch_indices The output batch indices
+ * \param positions The output positions
+ * \param batch_size The batch size
+ * \param nnz The number of appended entries
+ * \param stream The CUDA stream to execute kernels.
+ * \return status Indicates whether CUDA calls are successful
+ */
+template <typename IdType>
+cudaError_t GetBatchIndicesPositions(const IdType* append_indptr, const IdType* seq_lens,
+                                     IdType* batch_indices, IdType* positions,
+                                     uint32_t batch_size, uint32_t nnz,
+                                     cudaStream_t stream = nullptr) {
+  if (batch_size == 0 || nnz == 0) {
+    return cudaSuccess;
+  }
+
+  constexpr int BLOCK_THREADS = 128;
+  auto kernel = GetBatchIndicesPositionsKernel<IdType, BLOCK_THREADS>;
+  void* args[] = {(void*)&append_indptr, (void*)&seq_lens, (void*)&batch_indices,
+                  (void*)&positions};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, dim3(batch_size), dim3(BLOCK_THREADS),
+                                        args, 0, stream));
+  return cudaSuccess;
+}
+
+/*!
  * \brief Append new keys/values to the paged key-value cache in the decode phase
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
