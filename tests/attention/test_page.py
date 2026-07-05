@@ -106,7 +106,7 @@ def test_append_paged_kv_cache_with_page_module_batch_indices_positions():
     seq_lens = append_lengths.clone()
     page_size = 4
     num_kv_heads = 2
-    head_dim = 8
+    head_dim = 64
     nnz = int(append_indptr[-1].item())
 
     num_pages_per_req = (seq_lens + page_size - 1) // page_size
