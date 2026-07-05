@@ -3217,7 +3217,15 @@ __device__ __forceinline__ void vosplit_compute_pv(
       a_frag[mma_q][2] = *(uint32_t*)&p_smem[r0 * CTA_TILE_KV + c0 + 8];
       a_frag[mma_q][3] = *(uint32_t*)&p_smem[(r0 + 8) * CTA_TILE_KV + c0 + 8];
     }
-    constexpr bool USE_VEC_V_SCALE = IS_FP4 && NUM_MMA_D_VO_PER_WARP % 4 == 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+    constexpr bool USE_SM8X_VEC_V_SCALE = true;
+#else
+    constexpr bool USE_SM8X_VEC_V_SCALE = false;
+#endif
+    // SM120 measurements show this path can regress there; keep it to the SM8x path where
+    // scalar V-scale loads were measured as the bottleneck.
+    constexpr bool USE_VEC_V_SCALE =
+        USE_SM8X_VEC_V_SCALE && IS_FP4 && NUM_MMA_D_VO_PER_WARP % 4 == 0;
     constexpr uint32_t LOCAL_D_GROUP = USE_VEC_V_SCALE ? 4 : 1;
     // Call sites pass warp_vo_base as a multiple of NUM_MMA_D_VO_PER_WARP,
     // so the vectorized V-scale path is 4-byte aligned whenever it is enabled.
