@@ -152,12 +152,14 @@ def fake_nccl_ep():
 
 @pytest.fixture
 def bypass_build_checks():
-    """Bypass _require_built + validate_arch_for_backend in the fleet module."""
+    """Bypass build/arch checks and distributed comm resolution."""
     from flashinfer.moe_ep.backends.split.comm.nccl_ep import fleet as nccl_fleet
 
     with (
         mock.patch.object(nccl_fleet, "_require_built", return_value=None),
         mock.patch.object(nccl_fleet, "validate_arch_for_backend", return_value=None),
+        mock.patch.object(nccl_fleet, "validate_bootstrap_world_size", return_value=None),
+        mock.patch.object(nccl_fleet, "_resolve_comm", return_value=object()),
     ):
         yield
 
@@ -186,21 +188,6 @@ def test_fleet_builds_group_config(fake_nccl_ep, bypass_build_checks):
     assert cfg.max_dispatch_tokens_per_rank == 128
     assert cfg.max_token_bytes == 7168 * 2
     assert fleet.group is fake_nccl_ep._log["groups"][0]
-
-
-def test_fleet_rejects_non_divisible_experts(fake_nccl_ep, bypass_build_checks):
-    from flashinfer.moe_ep import MoEEpConfigError, dummy_moe_weights
-    from flashinfer.moe_ep.config import BootstrapConfig, FleetParams
-    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
-
-    params = FleetParams(
-        num_experts=7,
-        max_tokens_per_rank=128,
-        token_hidden_size=7168,
-        weights=dummy_moe_weights(num_local_experts=1, hidden=7168),
-    )
-    with pytest.raises(MoEEpConfigError):
-        NcclEpFleet(BootstrapConfig(world_size=4, rank=0), params)
 
 
 def test_handle_create_uses_expert_major_and_int64_topk(

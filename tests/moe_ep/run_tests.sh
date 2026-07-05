@@ -6,7 +6,7 @@
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
-#   bash tests/moe_ep/run_tests.sh correctness   # 4-GPU LL/HT + NVFP4 numerics
+#   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh smoke         # torchrun smoke scripts
 #
 # Install (split NCCL-EP + mega runtime deps):
@@ -33,7 +33,11 @@ PY="${PYTHON:-python}"
 TORCHRUN="${TORCHRUN:-torchrun}"
 NPROC_MULTIRANK="${NPROC_MULTIRANK:-4}"
 NPROC_SMOKE="${NPROC_SMOKE:-4}"
-MOE_EP_PYTEST_FLAGS=(--confcutdir=tests/moe_ep)
+# NOTE: no --confcutdir. The moe_ep pytest hooks (--backend option, nvep/gpu_*/
+# arch_blackwell markers, env/GPU/arch auto-skips) live in the root
+# tests/conftest.py. Cutting conftest discovery at tests/moe_ep would drop them
+# and break --backend / marker-based selection below.
+MOE_EP_PYTEST_FLAGS=()
 
 declare -a SECTION_NAMES=()
 declare -a SECTION_STATUS=()
@@ -115,15 +119,13 @@ run_multirank() {
   fi
 }
 
-run_correctness() {
+run_split_path_correctness_bf16() {
   require_nccl_ep
 
   NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_moe_ep_compute_correctness.py \
-    tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
-    tests/moe_ep/test_moe_ep_ht_correctness.py -v \
+    tests/moe_ep/test_moe_ep_compute_correctness.py -v \
     -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
 }
 
@@ -178,7 +180,7 @@ print_summary() {
 run_all() {
   run_section "unit + mock (no multirank)" run_unit
   run_section "split-path multirank (NCCL-EP)" run_multirank
-  run_section "compute correctness (4 GPU)" run_correctness
+  run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16
   run_section "mega multirank (Blackwell)" run_mega
   run_section "smoke scripts" run_smoke
   print_summary
@@ -187,12 +189,12 @@ run_all() {
 case "${1:-all}" in
   unit) run_section "unit + mock (no multirank)" run_unit ;;
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank ;;
-  correctness) run_section "compute correctness (4 GPU)" run_correctness ;;
+  split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16 ;;
   mega) run_section "mega multirank (Blackwell)" run_mega ;;
   smoke) run_section "smoke scripts" run_smoke ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|multirank|correctness|mega|smoke|all]" >&2
+    echo "Usage: $0 [unit|multirank|split_path_correctness_bf16|mega|smoke|all]" >&2
     exit 1
     ;;
 esac

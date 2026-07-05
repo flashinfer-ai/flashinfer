@@ -98,6 +98,50 @@ def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):
     return MoELayer(cfg)(act, wp)
 
 
+def _torch_dense_reference(x, w1, w2, topk_ids, topk_weights):
+    """Textbook dense MoE in fp32 (diagnostic only — convention-sensitive).
+
+    Mirrors ``tests/moe/test_cute_dsl_fused_moe.py::compute_reference_moe_fp4``
+    (bf16 path): gemm1 → split [linear | gate] → ``silu(gate) * linear`` → gemm2.
+    Used to cross-check the kernel against textbook MoE; NOT the primary assertion
+    (the trtllm-gen gate/up convention may differ from this split).
+    """
+    import os
+
+    import torch
+
+    num_tokens, hidden = x.shape
+    top_k = topk_ids.shape[1]
+    xf, w1f, w2f = x.float(), w1.float(), w2.float()
+    out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=x.device)
+
+    # Progress bar for the slow per-token python loop; only rank 0 draws it, and
+    # it degrades to a plain range() when tqdm isn't installed.
+    token_iter = range(num_tokens)
+    if int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0))) == 0:
+        try:
+            from tqdm import tqdm
+
+            token_iter = tqdm(
+                token_iter, desc="torch dense ref", unit="tok", leave=False
+            )
+        except ImportError:
+            pass
+
+    for t in token_iter:
+        ti = xf[t : t + 1]
+        for k in range(top_k):
+            e = int(topk_ids[t, k].item())
+            s = float(topk_weights[t, k].item())
+            g1 = ti @ w1f[e].T
+            linear = g1[:, :INTERMEDIATE]
+            gate = g1[:, INTERMEDIATE:]
+            act = (gate * torch.sigmoid(gate)) * linear
+            g2 = act @ w2f[e].T
+            out[t] += s * g2.squeeze(0)
+    return out
+
+
 def _run_one_layout(layout_str):
     import torch
     import torch.distributed as dist
@@ -189,19 +233,35 @@ def _run_one_layout(layout_str):
     torch.cuda.synchronize()
     assert y.shape == x.shape
 
+    # Primary reference: the SAME kernel run non-EP (full experts, real top_k).
     y_kernel = _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights)
-    yf, kf = y.float(), y_kernel.float()
+    # Diagnostic reference: textbook torch dense MoE (convention-sensitive).
+    y_torch = _torch_dense_reference(x, w1_full, w2_full, topk_ids, topk_weights)
+
+    yf, kf, tf = y.float(), y_kernel.float(), y_torch.float()
 
     def _rel(a, b):
         return (a - b).abs().amax().item() / b.abs().amax().clamp_min(1e-6).item()
 
     ep_vs_kernel = _rel(yf, kf)
+    kernel_vs_torch = _rel(kf, tf)
+    ep_vs_torch = _rel(yf, tf)
     if rank == 0:
-        print(f"[{layout_str}] EP-vs-kernel rel-err={ep_vs_kernel:.4f}")
+        print(
+            f"[{layout_str}] rel-err  EP-vs-kernel={ep_vs_kernel:.4f}  "
+            f"kernel-vs-torch={kernel_vs_torch:.4f}  EP-vs-torch={ep_vs_torch:.4f}\n"
+            f"[{layout_str}] mean|.|  EP={yf.abs().mean():.4f}  "
+            f"kernel={kf.abs().mean():.4f}  torch={tf.abs().mean():.4f}  "
+            f"shapes EP={tuple(yf.shape)} kernel={tuple(kf.shape)}\n"
+            f"[{layout_str}] sample row0[:4]  EP={yf[0, :4].tolist()}  "
+            f"kernel={kf[0, :4].tolist()}  torch={tf[0, :4].tolist()}"
+        )
 
+    # Primary correctness: EP must reproduce the non-EP kernel MoE exactly
+    # (immune to kernel-convention quirks; tests dispatch/compute/combine).
     torch.testing.assert_close(yf, kf, rtol=RTOL, atol=ATOL)
     layer.destroy()
-    return rank, ep_vs_kernel
+    return rank, ep_vs_kernel, kernel_vs_torch, ep_vs_torch
 
 
 def pytest_generate_tests(metafunc):
@@ -223,9 +283,12 @@ def test_moe_ep_compute_matches_dense_reference(layout):
             f"num_experts={NUM_EXPERTS} not divisible by world_size={world_size}"
         )
 
-    rank, ep_vs_kernel = _run_one_layout(layout)
+    rank, ep_vs_kernel, kernel_vs_torch, ep_vs_torch = _run_one_layout(layout)
     dist.barrier()
-    print(f"rank {rank}: {layout} EP==kernel OK (EP-vs-kernel={ep_vs_kernel:.4f})")
+    print(
+        f"rank {rank}: {layout} EP==kernel OK "
+        f"(EP-vs-kernel={ep_vs_kernel:.4f}, kernel-vs-torch={kernel_vs_torch:.4f})"
+    )
 
 
 def _main():
@@ -242,10 +305,13 @@ def _main():
             )
         return
     for layout in ("expert_major", "rank_major"):
-        r, ep_vs_kernel = _run_one_layout(layout)
+        r, ep_vs_kernel, kernel_vs_torch, ep_vs_torch = _run_one_layout(layout)
         dist.barrier()
         if r == 0:
-            print(f"[OK] {layout}: EP==kernel (rel-err={ep_vs_kernel:.4f})")
+            print(
+                f"[OK] {layout}: EP==kernel (EP-vs-kernel={ep_vs_kernel:.4f}, "
+                f"kernel-vs-torch={kernel_vs_torch:.4f}, EP-vs-torch={ep_vs_torch:.4f})"
+            )
     dist.destroy_process_group()
 
 
