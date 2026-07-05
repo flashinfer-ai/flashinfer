@@ -21,6 +21,37 @@ using namespace flashinfer;
 
 using tvm::ffi::Tensor;
 
+void get_batch_indices_positions(TensorView append_indptr, TensorView seq_lens,
+                                 TensorView batch_indices, TensorView positions) {
+  CHECK_INPUT_AND_TYPE(append_indptr, dl_int32);
+  CHECK_INPUT_AND_TYPE(seq_lens, dl_int32);
+  CHECK_INPUT_AND_TYPE(batch_indices, dl_int32);
+  CHECK_INPUT_AND_TYPE(positions, dl_int32);
+  CHECK_DIM(1, append_indptr);
+  CHECK_DIM(1, seq_lens);
+  CHECK_DIM(1, batch_indices);
+  CHECK_DIM(1, positions);
+
+  uint32_t batch_size = seq_lens.size(0);
+  TVM_FFI_ICHECK_EQ(append_indptr.size(0), batch_size + 1);
+  TVM_FFI_ICHECK_EQ(positions.size(0), batch_indices.size(0));
+  CHECK_DEVICE(seq_lens, append_indptr);
+  CHECK_DEVICE(batch_indices, append_indptr);
+  CHECK_DEVICE(positions, append_indptr);
+
+  ffi::CUDADeviceGuard device_guard(append_indptr.device().device_id);
+  const cudaStream_t stream = get_stream(append_indptr.device());
+  uint32_t nnz = batch_indices.size(0);
+
+  cudaError_t status = GetBatchIndicesPositions<int32_t>(
+      static_cast<const int32_t*>(append_indptr.data_ptr()),
+      static_cast<const int32_t*>(seq_lens.data_ptr()),
+      static_cast<int32_t*>(batch_indices.data_ptr()), static_cast<int32_t*>(positions.data_ptr()),
+      batch_size, nnz, stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "GetBatchIndicesPositions failed with error: " << cudaGetErrorString(status);
+}
+
 void append_paged_kv_cache(TensorView append_key, TensorView append_value, TensorView batch_indices,
                            TensorView positions, TensorView paged_k_cache, TensorView paged_v_cache,
                            TensorView kv_indices, TensorView kv_indptr, TensorView kv_last_page_len,

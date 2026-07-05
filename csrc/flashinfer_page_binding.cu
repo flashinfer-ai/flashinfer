@@ -17,6 +17,9 @@
 
 using tvm::ffi::Tensor;
 
+void get_batch_indices_positions(TensorView append_indptr, TensorView seq_lens,
+                                 TensorView batch_indices, TensorView positions);
+
 void append_paged_kv_cache(TensorView append_key, TensorView append_value, TensorView batch_indices,
                            TensorView positions, TensorView paged_k_cache, TensorView paged_v_cache,
                            TensorView kv_indices, TensorView kv_indptr, TensorView kv_last_page_len,
@@ -27,5 +30,6 @@ void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
                                TensorView kpe_cache, TensorView kv_indices, TensorView kv_indptr,
                                TensorView kv_last_page_len);
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_batch_indices_positions, get_batch_indices_positions);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(append_paged_kv_cache, append_paged_kv_cache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(append_paged_mla_kv_cache, append_paged_mla_kv_cache);
