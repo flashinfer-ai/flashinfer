@@ -44,6 +44,7 @@ from ..algo_knobs import (
     HandleAlgoKnobUserStream,
     _index_knobs,
 )
+from .._validators import MoEEpConfigError
 from ..config import (
     CombineInputParams,
     CombineOutput,
@@ -413,6 +414,21 @@ class NcclEpHandle(Handle):
         # byte consistent with the GroupConfig the library was created with.
         world = self._fleet.params.num_experts // self._num_local_experts
         num_recv = max_per_rank * world
+
+        # The HT staging buffers (and this recv buffer) are sized to max_per_rank,
+        # which the fleet clamps to the library's MAX_SUPPORTED_TOKENS_PER_RANK. A
+        # forward that dispatches more than that per rank would overflow the staging
+        # buffers (and previously hit a C++ abort at group-create for the un-clamped
+        # value). Fail with an actionable error instead of corrupting memory.
+        n_tokens = x.shape[0]
+        if n_tokens > max_per_rank:
+            raise MoEEpConfigError(
+                f"nccl_ep HT dispatch received {n_tokens} tokens on this rank, "
+                f"exceeding max_tokens_per_rank ({max_per_rank} = the library's "
+                "MAX_SUPPORTED_TOKENS_PER_RANK). Reduce the per-forward token count "
+                "per rank (e.g. vLLM --max-num-batched-tokens <= "
+                f"{max_per_rank}), or use the low-latency algorithm."
+            )
 
         tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
         if tw is None:
