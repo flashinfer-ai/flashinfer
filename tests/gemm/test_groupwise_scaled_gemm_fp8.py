@@ -31,6 +31,8 @@ from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
 
+pytestmark = pytest.mark.solo
+
 
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])

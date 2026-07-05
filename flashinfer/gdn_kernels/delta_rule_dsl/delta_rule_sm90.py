@@ -320,7 +320,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             tQKrQK[i] = tQKrQK[i] if pred else cutlass.Float32(0.0)
             tKKrKK[i] = tKKrKK[i] if pred else cutlass.Float32(0.0)
             if cutlass.const_expr(is_final_block):
-                pred = s < B or t < B
+                pred = s < B and t < B
                 tQKrQK[i] = tQKrQK[i] if pred else cutlass.Float32(0.0)
                 tKKrKK[i] = tKKrKK[i] if pred else cutlass.Float32(0.0)
 

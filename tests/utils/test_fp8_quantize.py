@@ -1,3 +1,5 @@
+import gc
+
 import pytest
 import torch
 
@@ -198,6 +200,88 @@ def test_mxfp8_grouped_quantize_empty_group(dtype):
     torch.cuda.synchronize()
 
 
+# Regression for int32 element-offset overflow. Top groups start past 2**31
+# elements, so input and output base offsets require int64 indexing.
+# K and M are 128-aligned, avoiding a padded-input copy.
+_OVERFLOW_B = 64
+_OVERFLOW_M = 2176
+_OVERFLOW_K = 16384
+_OVERFLOW_DTYPE = torch.bfloat16
+assert _OVERFLOW_M % 128 == 0 and _OVERFLOW_K % 128 == 0
+assert (_OVERFLOW_B - 1) * _OVERFLOW_M * _OVERFLOW_K > 2**31
+
+
+def _skip_if_low_vram_for_grouped_overflow():
+    """Skip when free VRAM cannot hold the grouped overflow buffers."""
+    elems = _OVERFLOW_B * _OVERFLOW_M * _OVERFLOW_K
+    scale_bytes = _OVERFLOW_B * _OVERFLOW_M * (_OVERFLOW_K // 32)
+    # bf16 input + fp8 output + uint8 scales.
+    need = elems * 3 + scale_bytes
+    # Drop cached blocks so mem_get_info sees driver-level free memory.
+    gc.collect()
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < int(need * 1.2):
+        pytest.skip(
+            f"Requires ~{need / 1024**3:.1f}GB free VRAM, "
+            f"only {free / 1024**3:.1f}GB available"
+        )
+
+
+@torch.inference_mode()
+def test_mxfp8_grouped_quantize_int32_offset_overflow():
+    """Grouped MXFP8 quantize must handle group bases above 2**31 elements."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 grouped quantization requires compute capability >= 10")
+    if not is_cutile_available():
+        pytest.skip("cuda.tile is not available")
+    _skip_if_low_vram_for_grouped_overflow()
+
+    torch.manual_seed(0)
+    b, m, k = _OVERFLOW_B, _OVERFLOW_M, _OVERFLOW_K
+    padded_k = k  # K is 128-aligned.
+    x = torch.randn((b, m, k), dtype=_OVERFLOW_DTYPE, device="cuda")
+    x.mul_(16.0)
+    # Full masks make the overflowing groups write output.
+    mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
+
+    out, _out_scale = mxfp8_grouped_quantize(x, mask)
+    out = out.permute(2, 0, 1)  # -> [b, m, padded_k]
+    torch.cuda.synchronize()  # Surface async illegal-address errors.
+    assert out.shape == (b, m, padded_k)
+
+    # Check a control row, the first overflowing group, and the last row.
+    group_stride = m * padded_k
+    first_overflow_group = (2**31 + group_stride - 1) // group_stride
+    assert first_overflow_group < b
+    candidate_rows = sorted(
+        {
+            0,
+            first_overflow_group * m,
+            first_overflow_group * m + 1,
+            b * m - 1,
+        }
+    )
+    for global_row in candidate_rows:
+        g, local = divmod(global_row, m)
+        # A single-row reference is enough because quantization is row-local.
+        single_out, _single_scale = mxfp8_quantize_reference(
+            x[g, local : local + 1],
+            alignment=128,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+        torch.testing.assert_close(
+            out[g, local : local + 1].contiguous().view(torch.uint8),
+            single_out.contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("batch_shape", [(2, 128, 256), (3, 256, 128)])
 @torch.inference_mode()
 def test_mxfp8_grouped_quantize_cuda_graph(batch_shape):
@@ -210,7 +294,7 @@ def test_mxfp8_grouped_quantize_cuda_graph(batch_shape):
         pytest.skip("cuda.tile is not available")
 
     torch.manual_seed(0)
-    b, m, k = batch_shape
+    b, m, _ = batch_shape
     x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
@@ -259,7 +343,7 @@ def test_mxfp8_grouped_quantize_cuda_graph_pool_reuse(batch_shape):
     )
 
     torch.manual_seed(0)
-    b, m, k = batch_shape
+    b, m, _ = batch_shape
     x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
@@ -487,7 +571,7 @@ def test_mxfp8_grouped_quantize_fake_op_matches_real(batch_shape):
     )
 
     torch.manual_seed(0)
-    b, m, k = batch_shape
+    b, m, _ = batch_shape
     x = torch.randn(batch_shape, dtype=torch.bfloat16, device="cuda")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
