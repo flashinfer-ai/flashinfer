@@ -500,6 +500,242 @@ gdn_prefill_trace = TraceTemplate(
     init=_gdn_prefill_init,
 )
 
+# ── GDN-2 Prefill ────────────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _gdn2_prefill_reference(q, k, v, g, b, w, cu_seqlens, scale):
+    """
+    Gated Delta Net 2 prefill reference implementation (k-last layout).
+
+    State layout: [N, H, V, K] (k-last, K dimension at the end)
+
+    GDN-2 recurrence (g/b channel-wise on the key axis, w channel-wise on the
+    value axis; g holds raw per-channel decay factors, NOT log space):
+
+    S = S * g_t[:, None]                (per-k-channel decay)
+    v_new = w_t * v_t - (b_t * k_t)^T @ S
+    S = S + k_t (x) v_new
+    output_t = scale * q_t @ S
+    """
+    total_seq_len, num_q_heads, head_size = q.shape
+    num_v_heads = v.shape[1]
+    num_k_heads = k.shape[1]
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    num_seqs = cu_seqlens.size(0) - 1
+    device = q.device
+
+    if scale is None or scale == 0.0:
+        scale = 1.0 / math.sqrt(head_size)
+
+    q_exp = q.repeat_interleave(num_sab_heads // num_q_heads, dim=1)
+    k_exp = k.repeat_interleave(num_sab_heads // num_k_heads, dim=1)
+
+    output = torch.zeros(
+        (total_seq_len, num_sab_heads, head_size), dtype=torch.bfloat16, device=device
+    )
+    new_state = torch.zeros(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    for seq_idx in range(num_seqs):
+        seq_start = int(cu_seqlens[seq_idx].item())
+        seq_end = int(cu_seqlens[seq_idx + 1].item())
+        if seq_end <= seq_start:
+            continue
+        state_HKV = torch.zeros(
+            (num_sab_heads, head_size, head_size), dtype=torch.float32, device=device
+        )
+        for t in range(seq_start, seq_end):
+            state_HKV = state_HKV * g[t].float().unsqueeze(-1)
+            bk = b[t].float() * k_exp[t].float()
+            erase = torch.einsum("hk,hkv->hv", bk, state_HKV)
+            v_new = w[t].float() * v[t].float() - erase
+            state_HKV = state_HKV + torch.einsum("hk,hv->hkv", k_exp[t].float(), v_new)
+            output[t] = (
+                scale * torch.einsum("hk,hkv->hv", q_exp[t].float(), state_HKV)
+            ).to(torch.bfloat16)
+        new_state[seq_idx] = state_HKV.transpose(-1, -2)  # [H,K,V] -> [H,V,K]
+
+    return output, new_state
+
+
+def _gdn2_prefill_init(
+    *,
+    total_seq_len: int,
+    num_seqs: int = 4,
+    len_cu_seqlens: int = 0,  # derived
+    num_q_heads: int = 4,
+    num_k_heads: int = 4,
+    num_v_heads: int = 4,
+    head_size: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gdn2_prefill.chunk_gated_delta_rule2``.
+
+    Same Q/K/V distributions as the GDN prefill init (``multidist_randu`` +
+    L2-normalized k); ``g`` is a raw channel-wise decay in [0, 1] float32,
+    ``beta``/``w`` are channel-wise gates in ``q.dtype`` (beta in [0, 2],
+    w in [0, 1]).
+    """
+    del len_cu_seqlens
+    torch.manual_seed(seed)
+
+    def _multidist_randu(num_dists: int, dim: int) -> torch.Tensor:
+        means = torch.distributions.Normal(0.0, 0.05).sample((num_dists,))
+        data = torch.distributions.Uniform(means - 0.25, means + 0.25).sample((dim,))
+        return data.T.contiguous()
+
+    q = (
+        _multidist_randu(total_seq_len * num_q_heads, head_size)
+        .reshape(total_seq_len, num_q_heads, head_size)
+        .to(torch.bfloat16)
+        .contiguous()
+        .to(device)
+    )
+    k = (
+        _multidist_randu(total_seq_len * num_k_heads, head_size)
+        .reshape(total_seq_len, num_k_heads, head_size)
+        .to(torch.bfloat16)
+        .contiguous()
+        .to(device)
+    )
+    v = (
+        _multidist_randu(total_seq_len * num_v_heads, head_size)
+        .reshape(total_seq_len, num_v_heads, head_size)
+        .to(torch.bfloat16)
+        .contiguous()
+        .to(device)
+    )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+    base = total_seq_len // max(1, num_seqs)
+    rem = total_seq_len % max(1, num_seqs)
+    cum = [0]
+    for i in range(num_seqs):
+        cum.append(cum[-1] + base + (1 if i < rem else 0))
+    cu_seqlens = torch.tensor(cum, dtype=torch.int64, device=device)
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    g = torch.rand(
+        total_seq_len, num_sab_heads, head_size, dtype=torch.float32, device=device
+    )
+    beta = (
+        torch.rand(total_seq_len, num_sab_heads, head_size, device=device).sigmoid()
+        * 2.0
+    ).to(torch.bfloat16)
+    w = (
+        torch.rand(total_seq_len, num_sab_heads, head_size, device=device)
+        .sigmoid()
+        .to(torch.bfloat16)
+    )
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": g,
+        "beta": beta,
+        "w": w,
+        "cu_seqlens": cu_seqlens,
+    }
+
+
+gdn2_prefill_trace = TraceTemplate(
+    op_type="gdn",
+    name_prefix="gdn2_prefill",
+    description=(
+        "Gated Delta Net 2 (GDN-2) prefill with channel-wise forget/erase/write "
+        "gates and k-last state layout. The state is in k-last layout [N, H, V, K]."
+    ),
+    axes={
+        "total_seq_len": Var(
+            description="Total number of tokens across all sequences in the batch."
+        ),
+        "num_seqs": Var(description="Number of sequences in the batch."),
+        "num_q_heads": Const(
+            description="Number of query heads.",
+            abbrev="qk",
+        ),
+        "num_k_heads": Const(description="Number of key heads.", abbrev=""),
+        "num_v_heads": Const(
+            description="Number of value heads.",
+            abbrev="v",
+        ),
+        "head_size": Const(
+            description="Dimension of each attention head (K dimension in query/key space, V dimension in value space).",
+            abbrev="d",
+        ),
+        "len_cu_seqlens": Var(description="Length of cu_seqlens array (num_seqs + 1)."),
+    },
+    inputs={
+        "q": Tensor(
+            ["total_seq_len", "num_q_heads", "head_size"],
+            description="Query tensor.",
+        ),
+        "k": Tensor(
+            ["total_seq_len", "num_k_heads", "head_size"],
+            description="Key tensor.",
+        ),
+        "v": Tensor(
+            ["total_seq_len", "num_v_heads", "head_size"],
+            description="Value tensor.",
+        ),
+        "state": Tensor(
+            ["num_seqs", "num_v_heads", "head_size", "head_size"],
+            param="initial_state",
+            optional=True,
+            description="Recurrent state in k-last layout [N, H, V, K].",
+        ),
+        "g": Tensor(
+            ["total_seq_len", "num_v_heads", "head_size"],
+            dtype="float32",
+            description=(
+                "Channel-wise forget gate on the key axis (raw per-channel decay "
+                "factors in (0, 1], NOT log space)."
+            ),
+        ),
+        "b": Tensor(
+            ["total_seq_len", "num_v_heads", "head_size"],
+            param="beta",
+            description="Channel-wise erase gate on the key axis (typical range [0, 2]).",
+        ),
+        "w": Tensor(
+            ["total_seq_len", "num_v_heads", "head_size"],
+            description="Channel-wise write gate on the value axis (typical range [0, 1]).",
+        ),
+        "cu_seqlens": Tensor(
+            ["len_cu_seqlens"],
+            description="Cumulative sequence lengths for variable-length batching.",
+        ),
+        "scale": Scalar(
+            "float32",
+            optional=True,
+            description="Scale factor. Default is 1/sqrt(head_size).",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["total_seq_len", "num_v_heads", "head_size"],
+            dtype="bfloat16",
+            description="Attention output.",
+        ),
+        "new_state": Tensor(
+            ["num_seqs", "num_v_heads", "head_size", "head_size"],
+            dtype="float32",
+            description="Updated recurrent state in k-last layout [N, H, V, K].",
+        ),
+    },
+    constraints=[
+        "num_k_heads == num_q_heads",
+        "len_cu_seqlens == num_seqs + 1",
+        "total_seq_len == cu_seqlens[-1].item()",
+    ],
+    tags=["stage:prefill", "status:experimental"],
+    reference=_gdn2_prefill_reference,
+    init=_gdn2_prefill_init,
+)
+
 # ── GDN MTP (Multi-Token Prediction) ─────────────────────────────────────────
 
 

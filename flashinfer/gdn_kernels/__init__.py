@@ -63,6 +63,11 @@ except (ImportError, RuntimeError):
     chunk_gated_delta_rule_sm100 = None  # type: ignore
 
 try:
+    from .blackwell import chunk_gated_delta_rule2_sm100
+except (ImportError, RuntimeError):
+    chunk_gated_delta_rule2_sm100 = None  # type: ignore
+
+try:
     from .delta_rule_dsl import (
         chunk_gated_delta_rule_sm90,
         chunk_gated_delta_rule_sm120,
@@ -88,6 +93,7 @@ __all__ = [
     "get_mtp_config",
     "chunk_gated_delta_rule_sm90",
     "chunk_gated_delta_rule_sm100",
+    "chunk_gated_delta_rule2_sm100",
     "chunk_gated_delta_rule_sm120",
     "cp_delta_rule_dsl_sm90",
     "cp_delta_rule_dsl_sm120",

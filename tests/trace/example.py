@@ -19,6 +19,7 @@ fused_add_rmsnorm_quant_h7168.json
 gdn_decode_qk4_v8_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
+gdn2_prefill_qk4_v4_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -555,6 +556,24 @@ with contextlib.suppress(Exception):
     gp_v = torch.randn(gp_T, gp_HV, gp_K, dtype=torch.bfloat16, device=device)
     flashinfer.gdn_prefill.chunk_gated_delta_rule(
         gp_q, gp_k, gp_v, cu_seqlens=cu_seqlens
+    )
+
+# ── GDN-2 prefill (channel-wise gates, chunk prefill) ────────────────────────
+with contextlib.suppress(Exception):
+    import flashinfer.gdn2_prefill  # noqa: PLC0415
+
+    g2_T, g2_H, g2_K = 256, 4, 128
+    g2_cu = torch.tensor([0, 64, 128, 192, 256], dtype=torch.int64, device=device)
+    g2_q = torch.randn(g2_T, g2_H, g2_K, dtype=torch.bfloat16, device=device)
+    g2_k = torch.randn(g2_T, g2_H, g2_K, dtype=torch.bfloat16, device=device)
+    g2_v = torch.randn(g2_T, g2_H, g2_K, dtype=torch.bfloat16, device=device)
+    g2_g = torch.rand(g2_T, g2_H, g2_K, dtype=torch.float32, device=device) * 0.5 + 0.5
+    g2_b = (torch.rand(g2_T, g2_H, g2_K, device=device).sigmoid() * 2.0).to(
+        torch.bfloat16
+    )
+    g2_w = torch.rand(g2_T, g2_H, g2_K, device=device).sigmoid().to(torch.bfloat16)
+    flashinfer.gdn2_prefill.chunk_gated_delta_rule2(
+        g2_q, g2_k, g2_v, g2_g, g2_b, g2_w, cu_seqlens=g2_cu
     )
 
 # ── GDN decode (Qwen3-Next TP=4, qk=4/v=8/d=128) ────────────────────────────
