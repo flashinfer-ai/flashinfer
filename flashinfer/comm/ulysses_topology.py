@@ -21,7 +21,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from .ulysses_a2a import SUPPORTED_WORLD_SIZES
+# world sizes for which the fused-transpose NVLink kernel is instantiated;
+# lives here (the policy layer) so the dependency direction stays
+# ulysses.py -> ulysses_topology.py with no cycle
+SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
 
 ULYSSES_BACKENDS = ("auto", "nvlink", "nccl")
 

@@ -94,7 +94,7 @@ def gloo_pg():
 
 def _forbid_ipc_and_jit(monkeypatch):
     cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
     vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
     jit_comm_mod = importlib.import_module("flashinfer.jit.comm")
 
@@ -275,7 +275,7 @@ def test_raw_init_synchronizes_device(monkeypatch):
     # the raw wrapper must fence the async signal memset before returning
     from types import SimpleNamespace
 
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
     monkeypatch.setattr(
         ulysses_a2a_mod,
         "get_ulysses_a2a_module",
@@ -301,7 +301,7 @@ def test_raw_init_sync_failure_disposes_handle(monkeypatch):
     # cannot dispose it: the wrapper owns the handle and must release it
     from types import SimpleNamespace
 
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
     disposed = []
     monkeypatch.setattr(
         ulysses_a2a_mod,
@@ -326,7 +326,7 @@ def test_raw_init_sync_failure_disposes_handle(monkeypatch):
 @requires_cuda
 def test_raw_a2a_validation(monkeypatch):
     # validation fires before any module lookup: forbid JIT to prove it
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
 
     def _boom(*args, **kwargs):
         raise AssertionError("JIT must not be touched by invalid raw calls")
@@ -598,7 +598,7 @@ def _topology_fallback_body(rank, world_size, group, kind):
         error_rank=(0 if kind == "probe_error" else None),
     )
     cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
     vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
     jit_comm_mod = importlib.import_module("flashinfer.jit.comm")
 
@@ -690,7 +690,7 @@ def _init_fault_body(rank, world_size, group, arg):
         faults={cudart_faults: True} if (cudart_faults and rank == 0) else None
     )
     if fault == "init" and rank == 0:
-        ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+        ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
 
         def bad_init(*a, **k):
             raise RuntimeError("injected init failure")
@@ -903,7 +903,7 @@ def _close_fault_body(rank, world_size, group, scenario):
         # dispose succeeds but the device-guard __exit__ raises: the ledger
         # was already cleared inside the guard, so the drain retry must NOT
         # delete the handle a second time
-        ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+        ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
         dispose_calls = {"n": 0}
         orig_dispose = ulysses_a2a_mod.dispose_ulysses_a2a
 
@@ -942,7 +942,7 @@ def _close_fault_body(rank, world_size, group, scenario):
     elif scenario == "dispose_fault":
         # one-shot dispose failure heals within the drain retry
         if rank == 0:
-            ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+            ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
             orig_dispose = ulysses_a2a_mod.dispose_ulysses_a2a
             state = {"left": 1}
 

@@ -38,12 +38,12 @@ from .vllm_ar import init_custom_ar as vllm_init_custom_ar
 from .vllm_ar import meta_size as vllm_meta_size
 from .vllm_ar import register_buffer as vllm_register_buffer
 from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
-from .ulysses_a2a import dispose_ulysses_a2a as dispose_ulysses_a2a
-from .ulysses_a2a import gen_ulysses_a2a_module as gen_ulysses_a2a_module
-from .ulysses_a2a import get_ulysses_a2a_module as get_ulysses_a2a_module
-from .ulysses_a2a import init_ulysses_a2a as init_ulysses_a2a
-from .ulysses_a2a import ulysses_a2a as ulysses_a2a
 from .ulysses import UlyssesCommunicator as UlyssesCommunicator
+from .ulysses import dispose_ulysses_a2a as dispose_ulysses_a2a
+from .ulysses import gen_ulysses_a2a_module as gen_ulysses_a2a_module
+from .ulysses import get_ulysses_a2a_module as get_ulysses_a2a_module
+from .ulysses import init_ulysses_a2a as init_ulysses_a2a
+from .ulysses import ulysses_a2a as ulysses_a2a
 from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
 from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
 from .ulysses_topology import UlyssesBackendError as UlyssesBackendError

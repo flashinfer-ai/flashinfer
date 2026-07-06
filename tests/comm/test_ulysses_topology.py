@@ -189,10 +189,8 @@ def gloo_pg():
 def _forbid_ipc_and_jit(monkeypatch):
     import importlib
 
-    # importlib, not `import a.b as x`: the function `ulysses_a2a` re-exported
-    # from the package shadows the submodule of the same name.
     cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
     jit_comm_mod = importlib.import_module("flashinfer.jit.comm")
 
     def _boom(*args, **kwargs):
