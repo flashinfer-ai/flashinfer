@@ -37,7 +37,7 @@ from ..utils import (
     pos_encoding_mode_literal,
     write_if_different,
 )
-from .utils import generate_additional_params
+from .utils import _is_nvfp4_kv_dtype, generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
 
@@ -1186,18 +1186,70 @@ def gen_batch_attention_module(
     )
 
 
-def _fa2_head_dim_nvcc_flags(head_dim_qk: int, head_dim_vo: int) -> Optional[List[str]]:
-    """head_dim > 256 is only supported on SM100+.
+def _fa2_head_dim_nvcc_flags(
+    head_dim_qk: int,
+    head_dim_vo: int,
+    dtype_kv: torch.dtype,
+    *,
+    allow_nvfp4_sm8_large_head: bool = False,
+) -> Optional[List[str]]:
+    """Return arch flags for FA2 large-head modules.
 
-    Restrict compilation of those modules to SM100/110/120 so pre-SM100
-    builds neither compile nor expose them; requesting such a module on an
-    older GPU raises "No supported CUDA architectures found".
+    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. NVFP4 KV
+    can opt into the same arch set only for validated FA2 prefill read paths.
+    Other one-byte large-head modules remain restricted to SM100+ until those
+    variants are validated separately.
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
+        if dtype_kv.itemsize == 1:
+            if not (allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)):
+                return current_compilation_context.get_nvcc_flags_list(
+                    supported_major_versions=[10, 11, 12]
+                )
         return current_compilation_context.get_nvcc_flags_list(
-            supported_major_versions=[10, 11, 12]
+            supported_major_versions=[8, 9, 10, 11, 12]
         )
     return None
+
+
+def _fa2_prefill_head_dim_nvcc_flags(
+    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
+) -> Optional[List[str]]:
+    return _fa2_head_dim_nvcc_flags(
+        head_dim_qk,
+        head_dim_vo,
+        dtype_kv,
+        allow_nvfp4_sm8_large_head=True,
+    )
+
+
+def _append_nvfp4_sf_stride_setter(
+    additional_params_setter: str,
+    additional_tensor_names: List[str],
+    params_expr: str = "params",
+) -> str:
+    stride_setters = []
+    if "maybe_k_cache_sf" in additional_tensor_names:
+        stride_setters.append(
+            "if (maybe_k_cache_sf) { const auto& sf_tensor = maybe_k_cache_sf.value(); "
+            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"{params_expr}.k_sf_stride_page = sf_strides.stride_page; "
+            f"{params_expr}.k_sf_stride_n = sf_strides.stride_n; "
+            f"{params_expr}.k_sf_stride_h = sf_strides.stride_h; }}"
+        )
+    if "maybe_v_cache_sf" in additional_tensor_names:
+        stride_setters.append(
+            "if (maybe_v_cache_sf) { const auto& sf_tensor = maybe_v_cache_sf.value(); "
+            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"{params_expr}.v_sf_stride_page = sf_strides.stride_page; "
+            f"{params_expr}.v_sf_stride_n = sf_strides.stride_n; "
+            f"{params_expr}.v_sf_stride_h = sf_strides.stride_h; }}"
+        )
+    if not stride_setters:
+        return additional_params_setter
+    if additional_params_setter:
+        return additional_params_setter + " \\\n" + " \\\n".join(stride_setters)
+    return " \\\n".join(stride_setters)
 
 
 def gen_customize_single_decode_module(
@@ -1286,7 +1338,7 @@ def gen_customize_single_decode_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
     )
 
 
@@ -1385,7 +1437,9 @@ def gen_customize_single_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
+                head_dim_qk, head_dim_vo, dtype_kv
+            ),
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -1538,7 +1592,7 @@ def gen_customize_batch_decode_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
     )
 
 
@@ -1588,6 +1642,9 @@ def gen_customize_batch_prefill_module(
                 additional_scalar_names,
                 additional_scalar_dtypes,
             )
+        )
+        additional_params_setter = _append_nvfp4_sf_stride_setter(
+            additional_params_setter, additional_tensor_names
         )
 
         with open(
@@ -1654,7 +1711,9 @@ def gen_customize_batch_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
+                head_dim_qk, head_dim_vo, dtype_kv
+            ),
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -1888,6 +1947,9 @@ def gen_customize_batch_attention_module(
             )
         ]
         + [f"params[i].{var} = {var};" for var in additional_scalar_names]
+    )
+    batch_additional_params_setter = _append_nvfp4_sf_stride_setter(
+        batch_additional_params_setter, additional_tensor_names, params_expr="params[i]"
     )
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"

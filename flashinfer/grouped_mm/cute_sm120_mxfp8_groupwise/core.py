@@ -146,6 +146,11 @@ def moe_gemm_mxfp8_nt_groupwise(
         ``1`` (per-token scaling along M and N); ``k_granularity`` must be ``32`` or ``128``.
         Anything else raises ``ValueError``.
 
+    scale_major_mode: Literal["MN"]
+        The layout mode of scale tensors.  Currently only ``"MN"`` (MN-major,
+        per-token INT32-packed UE8M0 scales in TMA-aligned layout) is supported.
+        Defaults to ``"MN"``.
+
     backend: Literal["cute"]
         Backend selector. Currently only ``"cute"`` is implemented.
 

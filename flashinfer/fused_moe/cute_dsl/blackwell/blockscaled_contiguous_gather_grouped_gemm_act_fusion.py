@@ -40,13 +40,20 @@ from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import Int32
 
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
+
+from ..moe_utils import normalize_cute_dsl_moe_activation_type
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
-    silu_f32,
 )
 
 """
@@ -404,6 +411,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         topk: cutlass.Int64,
         raster_along_m: bool = False,
         enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         gated: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
@@ -440,6 +451,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type vectorized_f32: bool
         :param topk: Number of experts selected per token (used for token ID mapping).
         :type topk: cutlass.Int64
+        :param raster_along_m: If True, raster persistent tiles along the M dimension.
+        :type raster_along_m: bool
+        :param enable_pdl: Enable Programmatic Dependent Launch.
+        :type enable_pdl: bool
+        :param activation_type: FC1 activation type. Use ActivationType.Swiglu
+            for gated SwiGLU/OAI and ActivationType.Relu2 for non-gated ReLU^2.
+        :type activation_type: int
+        :param swiglu_alpha: Sigmoid multiplier for parameterized SwiGLU.
+        :type swiglu_alpha: float
+        :param swiglu_beta: Up-projection bias for parameterized SwiGLU.
+        :type swiglu_beta: float
+        :param swiglu_limit: Clamp limit for parameterized SwiGLU.
+        :type swiglu_limit: float
+        :param gated: Whether GEMM1 output is split into up/gate halves. If
+            False, the epilogue computes non-gated ReLU^2.
+        :type gated: bool
         """
 
         self.sf_vec_size = sf_vec_size
@@ -525,7 +552,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
+        activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
+            activation_type
+        )
+        if gated != expected_gated:
+            raise ValueError(
+                f"gated={gated} is inconsistent with activation_type {activation_type!r}"
+            )
         self.vectorized_f32 = vectorized_f32
+        self.activation_type = int(activation_type)
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -585,7 +623,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.mma_tiler_sfa = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1],
-            mma_inst_shape_k * mma_inst_tile_k // 16,
+            mma_inst_shape_k * mma_inst_tile_k // self.sf_vec_size,
         )
 
         self.mma_tiler_sfb = (
@@ -1910,7 +1948,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     # Peek (try_wait) a sync transform buffer empty
                     a_sync_transform_producer_state.reset_count()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         # Conditionally wait for A buffer full
                         a_pipeline.consumer_wait(a_consumer_state, peek_a_full_status)
 
@@ -2642,11 +2680,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         acc_vec_up = tTR_rAcc_up.load()
                         acc_vec_gate = tTR_rAcc_gate.load()
 
+                        #
+                        # Gated activation. Represent standard SwiGLU and the
+                        # OAI variant as ActivationType.Swiglu; the
+                        # alpha/beta/limit parameters specialize the same
+                        # formula:
+                        # gate * sigmoid(swiglu_alpha * gate)
+                        # * (up + swiglu_beta).
+                        #
                         tCompute = cute.make_rmem_tensor(
                             acc_vec_gate.shape, self.acc_dtype
                         )
+                        swiglu_alpha = cutlass.Float32(self.swiglu_alpha)
+                        swiglu_beta = cutlass.Float32(self.swiglu_beta)
+                        swiglu_limit = cutlass.Float32(self.swiglu_limit)
+                        LOG2_E = cutlass.Float32(1.4426950408889634)
                         if cutlass.const_expr(self.vectorized_f32):
-                            LOG2_E = cutlass.Float32(1.4426950408889634)
                             for i in cutlass.range_constexpr(
                                 0, cute.size(tTR_rAcc_up), 2
                             ):
@@ -2664,9 +2713,32 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         cutlass.Float32(alpha_val),
                                     ),
                                 )
-                                tCompute_log2e = cute.arch.mul_packed_f32x2(
-                                    (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
-                                    (-LOG2_E, -LOG2_E),
+                                gate_clamped = (
+                                    fmin(acc_vec_gate_alpha[0], swiglu_limit, nan=True),
+                                    fmin(acc_vec_gate_alpha[1], swiglu_limit, nan=True),
+                                )
+                                up_clamped = (
+                                    -fmin(
+                                        -fmin(
+                                            acc_vec_up_alpha[0], swiglu_limit, nan=True
+                                        ),
+                                        swiglu_limit,
+                                        nan=True,
+                                    ),
+                                    -fmin(
+                                        -fmin(
+                                            acc_vec_up_alpha[1], swiglu_limit, nan=True
+                                        ),
+                                        swiglu_limit,
+                                        nan=True,
+                                    ),
+                                )
+                                gate_sigmoid_log2e = cute.arch.mul_packed_f32x2(
+                                    gate_clamped,
+                                    (
+                                        -(swiglu_alpha * LOG2_E),
+                                        -(swiglu_alpha * LOG2_E),
+                                    ),
                                 )
                                 (
                                     tCompute[i],
@@ -2674,10 +2746,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 ) = cute.arch.add_packed_f32x2(
                                     (
                                         cute.math.exp2(
-                                            tCompute_log2e[0], fastmath=True
+                                            gate_sigmoid_log2e[0], fastmath=True
                                         ),
                                         cute.math.exp2(
-                                            tCompute_log2e[1], fastmath=True
+                                            gate_sigmoid_log2e[1], fastmath=True
                                         ),
                                     ),
                                     (1.0, 1.0),
@@ -2689,14 +2761,24 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     tCompute[i + 1],
                                 ) = cute.arch.mul_packed_f32x2(
                                     (tCompute[i], tCompute[i + 1]),
-                                    (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
+                                    gate_clamped,
+                                )
+                                up_biased = cute.arch.add_packed_f32x2(
+                                    up_clamped,
+                                    (
+                                        swiglu_beta,
+                                        swiglu_beta,
+                                    ),
                                 )
                                 (
                                     tCompute[i],
                                     tCompute[i + 1],
                                 ) = cute.arch.mul_packed_f32x2(
                                     (tCompute[i], tCompute[i + 1]),
-                                    (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
+                                    (
+                                        up_biased[0],
+                                        up_biased[1],
+                                    ),
                                 )
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
@@ -2706,8 +2788,25 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(
                                     alpha_val
                                 )
-                                tCompute[i] = acc_vec_up_alpha * silu_f32(
-                                    acc_vec_gate_alpha, fastmath=True
+                                gate_clamped = fmin(
+                                    acc_vec_gate_alpha, swiglu_limit, nan=True
+                                )
+                                up_clamped = -fmin(
+                                    -fmin(acc_vec_up_alpha, swiglu_limit, nan=True),
+                                    swiglu_limit,
+                                    nan=True,
+                                )
+                                sigmoid_gate = cute.arch.rcp_approx(
+                                    1.0
+                                    + cute.math.exp2(
+                                        -(swiglu_alpha * LOG2_E * gate_clamped),
+                                        fastmath=True,
+                                    )
+                                )
+                                tCompute[i] = (
+                                    gate_clamped
+                                    * sigmoid_gate
+                                    * (up_clamped + swiglu_beta)
                                 )
 
                     if cutlass.const_expr(self.generate_sfc):
