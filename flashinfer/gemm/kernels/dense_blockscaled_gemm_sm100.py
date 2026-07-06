@@ -85,6 +85,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         use_prefetch: bool = False,
         enable_pdl: bool = True,
+        split_k_slices: int = 1,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -112,6 +113,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.use_prefetch = use_prefetch
         self.enable_pdl = enable_pdl
+        if split_k_slices not in (1, 2, 4):
+            raise ValueError(f"split_k_slices must be 1, 2, or 4, got {split_k_slices}")
+        if split_k_slices > 1 and cluster_shape_mn != (1, 1):
+            raise ValueError("split-K currently requires cluster_shape_mn=(1, 1)")
+        self.split_k_slices = split_k_slices
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
@@ -779,7 +785,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_block_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
+        total_k_block_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
+        k_block_cnt = total_k_block_cnt
+        if cutlass.const_expr(self.split_k_slices > 1):
+            k_block_cnt = total_k_block_cnt // self.split_k_slices
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -932,27 +941,28 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     cur_tile_coord[2],
                 )
 
+                input_l = mma_tile_coord_mnl[2]
+                k_block_start = cutlass.Int32(0)
+                if cutlass.const_expr(self.split_k_slices > 1):
+                    # C L is the split-K index; dense inputs always use L=0.
+                    input_l = cutlass.Int32(0)
+                    k_block_start = cutlass.Int32(mma_tile_coord_mnl[2]) * k_block_cnt
+
                 #
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), RestK)
-                tAgA_slice = tAgA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
-                ]
+                tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, input_l)]
                 # ((atom_v, rest_v), RestK)
-                tBgB_slice = tBgB[
-                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
-                ]
+                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, input_l)]
 
                 # ((atom_v, rest_v), RestK)
-                tAgSFA_slice = tAgSFA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
-                ]
+                tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None, input_l)]
                 slice_n = mma_tile_coord_mnl[1]
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_mnl[1] // 2
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
+                tBgSFB_slice = tBgSFB[(None, slice_n, None, input_l)]
 
                 if cutlass.const_expr(self.use_prefetch):
                     # Prefetch both A and B (default behavior)
@@ -961,19 +971,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     ):
                         cute.prefetch(
                             tma_atom_a,
-                            tAgA_slice[(None, pf_k_block)],
+                            tAgA_slice[(None, k_block_start + pf_k_block)],
                         )
                         cute.prefetch(
                             tma_atom_b,
-                            tBgB_slice[(None, pf_k_block)],
+                            tBgB_slice[(None, k_block_start + pf_k_block)],
                         )
                         cute.prefetch(
                             tma_atom_sfa,
-                            tAgSFA_slice[(None, pf_k_block)],
+                            tAgSFA_slice[(None, k_block_start + pf_k_block)],
                         )
                         cute.prefetch(
                             tma_atom_sfb,
-                            tBgSFB_slice[(None, pf_k_block)],
+                            tBgSFB_slice[(None, k_block_start + pf_k_block)],
                         )
 
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
@@ -995,28 +1005,28 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     # TMA load A/B/SFA/SFB
                     cute.copy(
                         tma_atom_a,
-                        tAgA_slice[(None, ab_producer_state.count)],
+                        tAgA_slice[(None, k_block_start + ab_producer_state.count)],
                         tAsA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_b,
-                        tBgB_slice[(None, ab_producer_state.count)],
+                        tBgB_slice[(None, k_block_start + ab_producer_state.count)],
                         tBsB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=b_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_sfa,
-                        tAgSFA_slice[(None, ab_producer_state.count)],
+                        tAgSFA_slice[(None, k_block_start + ab_producer_state.count)],
                         tAsSFA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfa_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_sfb,
-                        tBgSFB_slice[(None, ab_producer_state.count)],
+                        tBgSFB_slice[(None, k_block_start + ab_producer_state.count)],
                         tBsSFB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
@@ -1026,7 +1036,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     if cutlass.const_expr(self.use_prefetch):
                         if k_block < k_block_cnt - self.prefetch_dist:
                             future_k_block = (
-                                ab_producer_state.count + self.prefetch_dist
+                                k_block_start
+                                + ab_producer_state.count
+                                + self.prefetch_dist
                             )
                             # Prefetch both A and B (default behavior)
                             cute.prefetch(
@@ -2172,16 +2184,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             b_ptr,
             layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)),
         )
-        # Reshape C to (m, n, l) -- swap_ab is constexpr, determines layout at compile time
+        # In split-K mode C is the FP32 partial workspace and its L
+        # dimension identifies the K slice.
+        c_l = l
+        if cutlass.const_expr(self.split_k_slices > 1):
+            c_l = self.split_k_slices
         if cutlass.const_expr(swap_ab):
             c_tensor = cute.make_tensor(
                 mC.iterator,
-                layout=cute.make_ordered_layout((m, n, l), order=(0, 1, 2)),
+                layout=cute.make_ordered_layout((m, n, c_l), order=(0, 1, 2)),
             )
         else:
             c_tensor = cute.make_tensor(
                 mC.iterator,
-                layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
+                layout=cute.make_ordered_layout((m, n, c_l), order=(1, 0, 2)),
             )
         # Scale factor tensors: 6D BlockScaledBasicChunk layout from pointers
         # (32, 4, sf_m, 4, sf_k, l) with order (2, 1, 4, 0, 3, 5)
