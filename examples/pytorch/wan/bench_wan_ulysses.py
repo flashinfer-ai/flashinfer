@@ -1,17 +1,18 @@
 """Benchmark Ulysses sequence parallelism in the Wan FlashInfer attention.
 
 Runs the example's ``FlashInferWanAttention`` (Wan2.1-14B geometry by default)
-with the sequence sharded across ranks, comparing two all-to-all impls:
+with the sequence sharded across ranks, comparing the public
+``flashinfer.comm.UlyssesCommunicator`` under its two backends:
 
-- ``nccl``:      dist.all_to_all_single + permute/contiguous glue (baseline)
-- ``flashinfer``: flashinfer.comm.UlyssesCommunicator with backend="auto" —
-  the fused-transpose NVLink-P2P kernel on a verified full-NVLink topology,
-  and an automatic NCCL fallback elsewhere. The report prints the *effective*
-  backend and the fallback reason, so NCCL-vs-NCCL results on fallback
-  machines are labeled as such.
+- ``nccl``: forced ``backend="nccl"`` (dist.all_to_all_single + permute glue)
+- ``auto``: the fused-transpose NVLink-P2P kernel on a verified full-NVLink
+  topology, automatic NCCL fallback elsewhere. The report prints the
+  *effective* backend and the fallback reason, so NCCL-vs-NCCL results on
+  fallback machines are labeled as such.
 
-Verifies the two impls produce bit-identical outputs, sanity-checks against
-a single-GPU full-sequence reference, then reports per-iteration latency.
+Verifies the two backends produce bit-identical outputs, sanity-checks
+against a single-GPU full-sequence reference, then reports per-iteration
+latency.
 
 Example (8 GPUs):
     python bench_wan_ulysses.py --world-size 8
@@ -70,7 +71,9 @@ def _time_forward(attn, x_local, iters, warmup, group):
 
 
 def _worker(world_size, rank, port, args):
-    from ulysses import UlyssesContext, set_ulysses_context
+    from transformer_wan_flashinfer import set_ulysses_communicator
+
+    from flashinfer.comm import UlyssesCommunicator
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -100,37 +103,49 @@ def _worker(world_size, rank, port, args):
     outs = {}
     backends = {}
     q_like = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device=device)
-    for impl in ("nccl", "flashinfer"):
-        ctx = UlyssesContext(group, impl=impl, max_elems=max_elems)
-        backends[impl] = (ctx.backend, ctx.fallback_reason)
-        set_ulysses_context(ctx)
-        with torch.no_grad():
-            outs[impl] = attn(x_local).clone()
-            results[impl] = _time_forward(attn, x_local, args.iters, args.warmup, group)
-            # a2a-only: one attention layer issues 3 input a2a (q/k/v) and
-            # 1 output a2a — time that communication pattern in isolation,
-            # warming up with the exact same 3+1 unit as the timed loop.
-            u = ctx.input_all_to_all(q_like)
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            for _ in range(args.warmup):
-                ctx.input_all_to_all(q_like)
-                ctx.input_all_to_all(q_like)
-                ctx.input_all_to_all(q_like)
-                ctx.output_all_to_all(u)
-            torch.cuda.synchronize()
-            dist.barrier(group=group)
-            start.record()
-            for _ in range(args.iters):
-                ctx.input_all_to_all(q_like)
-                ctx.input_all_to_all(q_like)
-                ctx.input_all_to_all(q_like)
-                ctx.output_all_to_all(u)
-            end.record()
-            torch.cuda.synchronize()
-            a2a_results[impl] = start.elapsed_time(end) / args.iters
-        set_ulysses_context(None)
-        ctx.shutdown()
+    for impl, backend in (("nccl", "nccl"), ("flashinfer", "auto")):
+        comm = UlyssesCommunicator(
+            group,
+            max_elems=max_elems,
+            dtype=torch.bfloat16,
+            backend=backend,
+            device=device,
+        )
+        backends[impl] = (comm.backend, comm.fallback_reason)
+        try:
+            set_ulysses_communicator(comm)
+            with torch.no_grad():
+                outs[impl] = attn(x_local).clone()
+                results[impl] = _time_forward(
+                    attn, x_local, args.iters, args.warmup, group
+                )
+                # a2a-only: one attention layer issues 3 scatters (q/k/v) and
+                # 1 gather — time that communication pattern in isolation,
+                # warming up with the exact same 3+1 unit as the timed loop.
+                u = comm.scatter_heads(q_like)
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                for _ in range(args.warmup):
+                    comm.scatter_heads(q_like)
+                    comm.scatter_heads(q_like)
+                    comm.scatter_heads(q_like)
+                    comm.gather_heads(u)
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
+                start.record()
+                for _ in range(args.iters):
+                    comm.scatter_heads(q_like)
+                    comm.scatter_heads(q_like)
+                    comm.scatter_heads(q_like)
+                    comm.gather_heads(u)
+                end.record()
+                torch.cuda.synchronize()
+                a2a_results[impl] = start.elapsed_time(end) / args.iters
+        finally:
+            # clear the registry BEFORE the collective close so a failure
+            # above cannot leave the transformer pointing at a dead comm
+            set_ulysses_communicator(None)
+        comm.close()
 
     # The two backends implement the same permutation -> bit-identical.
     assert torch.equal(outs["nccl"], outs["flashinfer"]), (
@@ -148,6 +163,7 @@ def _worker(world_size, rank, port, args):
         n = results["nccl"]
         f = results["flashinfer"]
         fi_backend, fi_reason = backends["flashinfer"]
+        assert backends["nccl"][0] == "nccl"
         print(
             f"[wan ulysses] ws={world_size} B={B} S_global={S_global} "
             f"H={H} D={D} dim={args.dim} backend={args.attention_backend}"

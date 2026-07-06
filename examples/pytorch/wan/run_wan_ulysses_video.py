@@ -76,7 +76,9 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
     import torch
     import torch.distributed as dist
 
-    from ulysses import UlyssesContext, set_ulysses_context
+    from transformer_wan_flashinfer import set_ulysses_communicator
+
+    from flashinfer.comm import UlyssesCommunicator
 
     # Defense-in-depth preflight (main() already validated before spawning):
     # must run BEFORE set_device / init_process_group so an impossible config
@@ -102,11 +104,17 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
 
     # IPC buffers involve collectives: create while all ranks are in lockstep,
     # before the (slow, unsynchronized) model load.
-    ctx = UlyssesContext(group, impl="flashinfer", max_elems=max_elems)
+    comm = UlyssesCommunicator(
+        group,
+        max_elems=max_elems,
+        dtype=torch.bfloat16,
+        backend="auto",
+        device=device,
+    )
     if rank == 0:
-        print(f"[rank0] ulysses effective backend: {ctx.backend}", flush=True)
-        if ctx.fallback_reason is not None:
-            print(f"[rank0] !! fallback: {ctx.fallback_reason}", flush=True)
+        print(f"[rank0] ulysses effective backend: {comm.backend}", flush=True)
+        if comm.fallback_reason is not None:
+            print(f"[rank0] !! fallback: {comm.fallback_reason}", flush=True)
 
     from pipeline_wan_flashinfer import load_wan_pipeline_with_flashinfer_transformers
 
@@ -123,7 +131,7 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
     dist.barrier(group=group)
 
     try:
-        set_ulysses_context(ctx)
+        set_ulysses_communicator(comm)
         generator = torch.Generator(device=str(device)).manual_seed(args.seed)
         t0 = time.time()
         output = pipe(
@@ -138,13 +146,15 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
         )
         gen_s = time.time() - t0
     finally:
-        set_ulysses_context(None)
+        # cleared BEFORE the collective close: an exception above must not
+        # leave the transformer pointing at a dead communicator
+        set_ulysses_communicator(None)
 
     # Collective teardown BEFORE any rank-0-only export: an I/O failure below
     # must fail rank 0 alone, not strand the other ranks in the barrier or
     # leave IPC mappings open.
     dist.barrier(group=group)
-    ctx.shutdown()
+    comm.close()
     dist.destroy_process_group()
 
     if rank == 0:
