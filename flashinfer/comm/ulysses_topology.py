@@ -240,8 +240,10 @@ def resolve_ulysses_backend(
     """Group-consistent backend selection. Must run *before* any IPC allocation
     or JIT compilation; it performs no CUDA allocations itself.
 
-    Collective-safe outcome protocol: every rank participates in the same fixed
-    sequence of ``all_gather_object`` calls no matter what fails locally —
+    Collective-safe outcome protocol: every rank participates in the same
+    fixed *prefix* of ``all_gather_object`` calls (at most three; a group-wide
+    explicit NCCL request or an invalid/inconsistent request exits jointly
+    after the first) no matter what fails locally —
     rank-local errors are encoded as serializable outcomes and re-raised (or
     turned into an NCCL fallback) *jointly* after the gather, so no rank can
     leave the collective sequence early and deadlock its peers. The only
@@ -266,9 +268,10 @@ def resolve_ulysses_backend(
 
     # ---- gather 1: requested backends (before any local validation) --------
     # No user code may run before the gather: str(backend) would invoke a user
-    # __str__ that could raise on one rank and hang the peers. Only the type
-    # name (interpreter-provided) is used for non-string payloads.
-    if isinstance(backend, str):
+    # __str__ that could raise on one rank and hang the peers. Exact type check
+    # (not isinstance) also excludes str subclasses with custom behavior; only
+    # the interpreter-provided type name is used for invalid payloads.
+    if type(backend) is str:
         request_payload = backend
     else:
         request_payload = f"<invalid type: {type(backend).__name__}>"

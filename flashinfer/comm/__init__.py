@@ -43,6 +43,7 @@ from .ulysses_a2a import gen_ulysses_a2a_module as gen_ulysses_a2a_module
 from .ulysses_a2a import get_ulysses_a2a_module as get_ulysses_a2a_module
 from .ulysses_a2a import init_ulysses_a2a as init_ulysses_a2a
 from .ulysses_a2a import ulysses_a2a as ulysses_a2a
+from .ulysses import UlyssesCommunicator as UlyssesCommunicator
 from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
 from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
 from .ulysses_topology import UlyssesBackendError as UlyssesBackendError

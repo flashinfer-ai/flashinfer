@@ -82,6 +82,14 @@ def init_ulysses_a2a(
 ) -> int:
     r"""Initialize the fused-transpose Ulysses NVLink-P2P all-to-all backend.
 
+    .. note::
+        Advanced / internal API. Prefer
+        :class:`~flashinfer.comm.UlyssesCommunicator`, which selects the
+        backend from the actual GPU topology before any IPC allocation or JIT
+        compilation, owns the IPC workspace lifecycle, and validates operands.
+        This raw entry point assumes the caller has already verified all-pairs
+        NVLink P2P.
+
     The kernel is a *push* model: each rank writes the head/sequence blocks
     destined for its peers directly into the peers' IPC-shared output staging
     buffers over NVLink, with the Ulysses layout permutation folded into the
@@ -145,6 +153,12 @@ def ulysses_a2a(
     mode: int,
 ) -> None:
     r"""Fused-transpose Ulysses all-to-all.
+
+    .. note::
+        Advanced / internal API. Prefer
+        :meth:`UlyssesCommunicator.scatter_heads` (``mode == 0``) and
+        :meth:`UlyssesCommunicator.gather_heads` (``mode == 1``), which derive
+        the geometry from the tensor shapes and validate operands.
 
     The result for this rank is written into ``out`` (bit-identical to the
     equivalent NCCL all-to-all followed by the layout permutation).
