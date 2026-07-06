@@ -1,8 +1,10 @@
 # flashinfer: UlyssesCommunicator public-API tests.
 # Single-rank (gloo) tests cover construction, validation, lifecycle, and the
 # "fallback never touches IPC/JIT" guarantee at the real constructor entry.
-# Multi-rank (NCCL, spawn) tests cover both collectives against independent
-# references on the NVLink and NCCL backends, with timeout + terminate.
+# Multi-rank (spawn) tests cover both collectives against independent
+# references with the actual backend asserted, staged-init fault injection
+# with resource accounting, retryable close, and the device contract — all
+# with timeout + terminate + natural-exit assertions.
 
 import importlib
 import multiprocessing as std_mp
@@ -32,6 +34,21 @@ def _full_mesh(world_size, hostname="hostA"):
         )
         for r in range(world_size)
     ]
+
+
+def _patch_probe_mesh_module(world_size, break_nvlink=False, error_rank=None):
+    """Patch the probe inside a worker process (no monkeypatch fixture)."""
+    topo_mod = importlib.import_module("flashinfer.comm.ulysses_topology")
+
+    def fake_probe(device, r):
+        if error_rank is not None and r == error_rank:
+            raise RuntimeError("injected probe failure")
+        topos = _full_mesh(world_size)
+        if break_nvlink:
+            topos[1].peer_nvlink[topos[0].device_uuid] = False
+        return topos[r]
+
+    topo_mod.probe_ulysses_rank_topology = fake_probe
 
 
 # ---- independent references (do not use the kernel or each other) ------------
@@ -78,14 +95,17 @@ def gloo_pg():
 def _forbid_ipc_and_jit(monkeypatch):
     cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
     ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
     jit_comm_mod = importlib.import_module("flashinfer.jit.comm")
 
     def _boom(*args, **kwargs):
         raise AssertionError("IPC/JIT entry point must not be touched")
 
     monkeypatch.setattr(cuda_ipc_mod, "create_shared_buffer", _boom)
+    monkeypatch.setattr(cuda_ipc_mod.cudart, "cudaMalloc", _boom, raising=False)
     monkeypatch.setattr(ulysses_a2a_mod, "get_ulysses_a2a_module", _boom)
     monkeypatch.setattr(ulysses_a2a_mod, "init_ulysses_a2a", _boom)
+    monkeypatch.setattr(vllm_ar_mod, "meta_size", _boom)
     monkeypatch.setattr(jit_comm_mod, "gen_ulysses_a2a_module", _boom)
 
 
@@ -155,6 +175,7 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         (dict(max_elems=-4, dtype=torch.float16), "max_elems"),
         (dict(max_elems="big", dtype=torch.float16), "max_elems"),
         (dict(max_elems=True, dtype=torch.float16), "max_elems"),
+        (dict(max_elems=2**31, dtype=torch.float16), "int32"),
         (dict(max_elems=1024, dtype=torch.int32), "dtype"),
         (dict(max_elems=1024, dtype="float16"), "dtype"),
         (dict(max_elems=1024, dtype=torch.float16, device="cpu"), "CUDA device"),
@@ -173,6 +194,20 @@ def test_ctor_invalid_backend(gloo_pg, monkeypatch):
         UlyssesCommunicator(
             gloo_pg, max_elems=1024, dtype=torch.float16, backend="magic"
         )
+
+
+@requires_cuda
+def test_ctor_bare_cuda_device_normalized(gloo_pg, monkeypatch):
+    _forbid_ipc_and_jit(monkeypatch)
+    comm = UlyssesCommunicator(
+        gloo_pg, max_elems=1024, dtype=torch.float16, backend="nccl", device="cuda"
+    )
+    # bare "cuda" must be bound to the *current indexed* device so legitimate
+    # cuda:<current> tensors are accepted
+    assert comm.device == torch.device("cuda", torch.cuda.current_device())
+    x = torch.randn(1, 2, 2, 4, dtype=torch.float16, device="cuda")
+    assert comm.scatter_heads(x) is x  # W=1 passthrough, validation passed
+    comm.close()
 
 
 # ---- world_size == 1 passthrough ----------------------------------------------
@@ -220,32 +255,43 @@ def test_op_validation_negatives(gloo_pg, monkeypatch):
     comm.close()
 
 
-@requires_cuda
-def test_op_validation_divisibility():
-    # needs a real multi-rank communicator for H % W checks -> use the NCCL
-    # backend on a 2-rank spawn instead; covered in _worker below. Here only
-    # assert the W=1 case never trips divisibility.
-    pass
+# ---- raw (advanced) API hardening ----------------------------------------------
+
+
+def test_raw_init_rejects_full_nvlink_false():
+    from flashinfer.comm import init_ulysses_a2a
+
+    with pytest.raises(ValueError, match="full_nvlink=False is not supported"):
+        init_ulysses_a2a([0, 0], [0, 0], 0, 2, False)
 
 
 @requires_cuda
-def test_op_int32_range(gloo_pg, monkeypatch):
-    # > 2^31 elements in fp16 is ~4.3 GB: allocatable on serious test GPUs,
-    # skipped (via conftest OOM autoskip) elsewhere.
-    comm = _make_w1(gloo_pg, monkeypatch, max_elems=2**31 + 2**20)
-    free, _total = torch.cuda.mem_get_info()
-    if free < 6 * (1 << 30):
-        comm.close()
-        pytest.skip("needs ~6 GB free GPU memory")
-    big = torch.empty(1, 2**18 + 1, 64, 128, dtype=torch.float16, device="cuda")
-    assert big.numel() > 2**31 - 1
-    with pytest.raises(ValueError, match="int32"):
-        comm.scatter_heads(big)
-    del big
-    comm.close()
+def test_raw_a2a_validation(monkeypatch):
+    # validation fires before any module lookup: forbid JIT to prove it
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("JIT must not be touched by invalid raw calls")
+
+    monkeypatch.setattr(ulysses_a2a_mod, "get_ulysses_a2a_module", _boom)
+    from flashinfer.comm import ulysses_a2a
+
+    good = torch.randn(1, 4, 4, 8, dtype=torch.float16, device="cuda")
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        ulysses_a2a(0, good.cpu(), good, 1, 4, 4, 8, 0)
+    with pytest.raises(ValueError, match="contiguous"):
+        ulysses_a2a(0, good.transpose(1, 2), good, 1, 4, 4, 8, 0)
+    with pytest.raises(ValueError, match="dtype"):
+        ulysses_a2a(0, good, good.float(), 1, 4, 4, 8, 0)
+    with pytest.raises(ValueError, match="mode"):
+        ulysses_a2a(0, good, good.clone(), 1, 4, 4, 8, 2)
+    with pytest.raises(ValueError, match="positive"):
+        ulysses_a2a(0, good, good.clone(), 1, -4, 4, 8, 0)
+    with pytest.raises(ValueError, match="numel"):
+        ulysses_a2a(0, good, good.clone(), 1, 4, 4, 16, 0)
 
 
-# ---- lifecycle -----------------------------------------------------------------
+# ---- lifecycle (single rank) ----------------------------------------------------
 
 
 @requires_cuda
@@ -277,7 +323,7 @@ def test_lifecycle_repeated_init_close(gloo_pg, monkeypatch):
         comm.close()
 
 
-# ---- multi-rank correctness (NCCL process group, spawn) ------------------------
+# ================= multi-rank workers (spawn; all top-level) ====================
 
 # H=24 is divisible by every supported world size (2/4/6/8)
 CORRECTNESS_SHAPES = [
@@ -288,172 +334,413 @@ CORRECTNESS_SHAPES = [
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 
-def _correctness_worker(rank, world_size, port, backend, q):
+def _init_pg(rank, world_size, port, pg_backend="nccl"):
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend=pg_backend,
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    return dist.group.WORLD
+
+
+def _worker_main(rank, world_size, port, body_name, arg, q):
+    """Common worker skeleton (top-level: spawn must pickle it by name):
+    outcome computed, teardown finished, then a single q.put.
+    UlyssesBackendError / 'NVLink backend initialization failed' surface as
+    ('skip', reason) so non-NVLink machines skip instead of fail."""
+    body = globals()[body_name]
     outcome = None
     try:
-        torch.cuda.set_device(rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://127.0.0.1:{port}",
-            rank=rank,
-            world_size=world_size,
-        )
-        group = dist.group.WORLD
+        group = _init_pg(rank, world_size, port)
         try:
-            max_elems = max(B * S * H * D for (B, S, H, D) in CORRECTNESS_SHAPES)
-            for dtype in DTYPES:
-                comm = UlyssesCommunicator(
-                    group, max_elems=max_elems, dtype=dtype, backend=backend
-                )
-                for B, S_local, H, D in CORRECTNESS_SHAPES:
-                    torch.manual_seed(1234 + rank)
-                    x = torch.randn(B, S_local, H, D, dtype=dtype, device="cuda")
-                    out = comm.scatter_heads(x)
-                    ref = _ref_scatter_heads(x, world_size, rank, group)
-                    torch.cuda.synchronize()
-                    assert torch.equal(out, ref), (
-                        f"scatter_heads mismatch ws={world_size} rank={rank} "
-                        f"dtype={dtype} shape={(B, S_local, H, D)}"
-                    )
-                    # independent input for the gather direction (NOT the
-                    # scatter output): gather must hold on its own
-                    torch.manual_seed(4321 + rank)
-                    y = torch.randn(
-                        B,
-                        S_local * world_size,
-                        H // world_size,
-                        D,
-                        dtype=dtype,
-                        device="cuda",
-                    )
-                    out2 = comm.gather_heads(y)
-                    ref2 = _ref_gather_heads(y, world_size, rank, group)
-                    torch.cuda.synchronize()
-                    assert torch.equal(out2, ref2), (
-                        f"gather_heads mismatch ws={world_size} rank={rank} "
-                        f"dtype={dtype} shape={(B, S_local, H, D)}"
-                    )
-                comm.close()
-            outcome = ("ok", "correct")
+            outcome = body(rank, world_size, group, arg)
+        except UlyssesBackendError as e:
+            outcome = ("skip", str(e)[:500])
+        except RuntimeError as e:
+            if "NVLink backend initialization failed" in str(e):
+                outcome = ("skip", str(e)[:500])
+            else:
+                outcome = (type(e).__name__, str(e)[:2000])
+        except Exception as e:  # noqa: BLE001
+            outcome = (type(e).__name__, str(e)[:2000])
         finally:
             dist.destroy_process_group()
     except Exception as e:  # noqa: BLE001
-        outcome = (type(e).__name__, str(e)[:2000])
+        outcome = ("pg-error", str(e)[:2000])
     q.put((rank, outcome))
 
 
-def _api_worker(rank, world_size, port, backend, q):
-    """auto/forced-nccl fallback exposure + lifecycle across real ranks."""
-    outcome = None
-    try:
-        torch.cuda.set_device(rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://127.0.0.1:{port}",
-            rank=rank,
-            world_size=world_size,
+def _correctness_body(rank, world_size, group, backend):
+    max_elems = max(B * S * H * D for (B, S, H, D) in CORRECTNESS_SHAPES)
+    for dtype in DTYPES:
+        comm = UlyssesCommunicator(
+            group, max_elems=max_elems, dtype=dtype, backend=backend
         )
-        group = dist.group.WORLD
-        try:
-            comm = UlyssesCommunicator(
-                group, max_elems=1 << 16, dtype=torch.bfloat16, backend=backend
+        # no fake coverage: the requested backend must actually be in use
+        assert comm.backend == backend, (
+            f"expected backend {backend}, got {comm.backend} ({comm.fallback_reason})"
+        )
+        for B, S_local, H, D in CORRECTNESS_SHAPES:
+            torch.manual_seed(1234 + rank)
+            x = torch.randn(B, S_local, H, D, dtype=dtype, device="cuda")
+            out = comm.scatter_heads(x)
+            ref = _ref_scatter_heads(x, world_size, rank, group)
+            torch.cuda.synchronize()
+            assert torch.equal(out, ref), (
+                f"scatter_heads mismatch ws={world_size} rank={rank} "
+                f"dtype={dtype} shape={(B, S_local, H, D)}"
             )
-            x = torch.randn(1, 4, 6, 8, dtype=torch.bfloat16, device="cuda")
+            # independent input for the gather direction (NOT the scatter
+            # output): gather must hold on its own
+            torch.manual_seed(4321 + rank)
+            y = torch.randn(
+                B,
+                S_local * world_size,
+                H // world_size,
+                D,
+                dtype=dtype,
+                device="cuda",
+            )
+            out2 = comm.gather_heads(y)
+            ref2 = _ref_gather_heads(y, world_size, rank, group)
+            torch.cuda.synchronize()
+            assert torch.equal(out2, ref2), (
+                f"gather_heads mismatch ws={world_size} rank={rank} "
+                f"dtype={dtype} shape={(B, S_local, H, D)}"
+            )
+        comm.close()
+    return ("ok", "correct")
+
+
+def _api_body(rank, world_size, group, backend):
+    comm = UlyssesCommunicator(
+        group, max_elems=1 << 16, dtype=torch.bfloat16, backend=backend
+    )
+    x = torch.randn(1, 4, 6, 8, dtype=torch.bfloat16, device="cuda")
+    out = comm.scatter_heads(x)
+    ref = _ref_scatter_heads(x, world_size, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    info = (comm.backend, comm.fallback_reason)
+    comm.close()
+    comm.close()  # idempotent across ranks
+    try:
+        comm.scatter_heads(x)
+        raise AssertionError("use-after-close must raise")
+    except RuntimeError as e:
+        assert "use-after-close" in str(e)
+    return ("ok", info)
+
+
+def _stream_body(rank, world_size, group, backend):
+    comm = UlyssesCommunicator(
+        group, max_elems=1 << 16, dtype=torch.float16, backend=backend
+    )
+    assert comm.backend == backend
+    x = torch.randn(1, 8, 24, 32, dtype=torch.float16, device="cuda")
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        out = comm.scatter_heads(x)
+        back = comm.gather_heads(out)
+    stream.synchronize()
+    ref = _ref_scatter_heads(x, world_size, rank, group)
+    assert torch.equal(out, ref), "scatter on non-default stream mismatch"
+    assert torch.equal(back, x), "round-trip on non-default stream mismatch"
+    comm.close()
+    return ("ok", comm.backend)
+
+
+def _divisibility_body(rank, world_size, group, _arg):
+    comm = UlyssesCommunicator(
+        group, max_elems=1 << 16, dtype=torch.float16, backend="nccl"
+    )
+    bad_h = torch.randn(1, 4, 5, 8, dtype=torch.float16, device="cuda")  # 5 % 2 != 0
+    try:
+        comm.scatter_heads(bad_h)
+        raise AssertionError("scatter_heads must reject H % W != 0")
+    except ValueError as e:
+        assert "divisible" in str(e) and "world size 2" in str(e)
+    bad_s = torch.randn(1, 5, 4, 8, dtype=torch.float16, device="cuda")  # 5 % 2 != 0
+    try:
+        comm.gather_heads(bad_s)
+        raise AssertionError("gather_heads must reject S_global % W != 0")
+    except ValueError as e:
+        assert "divisible" in str(e) and "world size 2" in str(e)
+    # and a valid call still works after the rejected ones
+    x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
+    out = comm.scatter_heads(x)
+    ref = _ref_scatter_heads(x, world_size, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    comm.close()
+    return ("ok", "divisibility enforced")
+
+
+def _topology_fallback_body(rank, world_size, group, kind):
+    # topology-driven fallback at a *supported* world size must not touch
+    # IPC/JIT: boom every entry point, then construct through the real public
+    # constructor with a broken-mesh / erroring probe.
+    _patch_probe_mesh_module(
+        world_size,
+        break_nvlink=(kind == "missing_nvlink"),
+        error_rank=(0 if kind == "probe_error" else None),
+    )
+    cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
+    jit_comm_mod = importlib.import_module("flashinfer.jit.comm")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("IPC/JIT entry point must not be touched")
+
+    cuda_ipc_mod.create_shared_buffer = _boom
+    cuda_ipc_mod.cudart.cudaMalloc = _boom
+    ulysses_a2a_mod.get_ulysses_a2a_module = _boom
+    ulysses_a2a_mod.init_ulysses_a2a = _boom
+    vllm_ar_mod.meta_size = _boom
+    jit_comm_mod.gen_ulysses_a2a_module = _boom
+
+    comm = UlyssesCommunicator(
+        group, max_elems=1 << 16, dtype=torch.float16, backend="auto"
+    )
+    assert comm.backend == "nccl", comm.backend
+    expect = "no NVLink" if kind == "missing_nvlink" else "probe failed"
+    assert expect in comm.fallback_reason, comm.fallback_reason
+    x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
+    out = comm.scatter_heads(x)
+    ref = _ref_scatter_heads(x, world_size, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    comm.close()
+    return ("ok", comm.fallback_reason)
+
+
+class _ResourceLedger:
+    """Wrap the lazy cudart with counters (and one optional injected fault)."""
+
+    def __init__(self, fault=None, fault_rank_hit=True):
+        self.cuda_ipc = importlib.import_module("flashinfer.comm.cuda_ipc")
+        self.counts = dict(malloc=0, free=0, open=0, close=0)
+        real = self.cuda_ipc.cudart
+        ledger = self
+
+        def wrap(name, counter, fault_key):
+            orig = getattr(real, name)
+
+            def wrapped(*a, **k):
+                if fault_key == fault and fault_rank_hit:
+                    raise RuntimeError(f"injected {fault_key} failure")
+                out = orig(*a, **k)
+                ledger.counts[counter] += 1
+                return out
+
+            setattr(real, name, wrapped)
+
+        wrap("cudaMalloc", "malloc", "malloc")
+        wrap("cudaFree", "free", "free")
+        wrap("cudaIpcOpenMemHandle", "open", "open")
+        wrap("cudaIpcCloseMemHandle", "close", "close")
+        if fault == "get_handle" and fault_rank_hit:
+
+            def bad_handle(*a, **k):
+                raise RuntimeError("injected get_handle failure")
+
+            real.cudaIpcGetMemHandle = bad_handle
+
+    def balanced(self):
+        return (
+            self.counts["malloc"] == self.counts["free"]
+            and self.counts["open"] == self.counts["close"]
+        )
+
+
+def _init_fault_body(rank, world_size, group, arg):
+    fault, requested = arg
+    _patch_probe_mesh_module(world_size)  # decision: nvlink
+    ledger = _ResourceLedger(fault=fault, fault_rank_hit=(rank == 0))
+    if fault == "init" and rank == 0:
+        ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+
+        def bad_init(*a, **k):
+            raise RuntimeError("injected init failure")
+
+        ulysses_a2a_mod.init_ulysses_a2a = bad_init
+
+    if requested == "nvlink":
+        try:
+            UlyssesCommunicator(
+                group, max_elems=1 << 12, dtype=torch.float16, backend="nvlink"
+            )
+            raise AssertionError("forced nvlink must fail when init faults")
+        except RuntimeError as e:
+            assert "NVLink backend initialization failed" in str(e), str(e)
+            assert "injected" in str(e), str(e)
+        assert ledger.balanced(), f"leaked resources: {ledger.counts}"
+        return ("ok", ("raised", ledger.counts["malloc"], ledger.counts["free"]))
+
+    comm = UlyssesCommunicator(
+        group, max_elems=1 << 12, dtype=torch.float16, backend="auto"
+    )
+    assert comm.backend == "nccl", comm.backend
+    assert "nvlink init failed" in comm.fallback_reason, comm.fallback_reason
+    assert "injected" in comm.fallback_reason, comm.fallback_reason
+    assert ledger.balanced(), f"leaked resources after fallback: {ledger.counts}"
+    x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
+    out = comm.scatter_heads(x)
+    ref = _ref_scatter_heads(x, world_size, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    comm.close()
+    return ("ok", ("fell back", comm.backend))
+
+
+def _close_fault_body(rank, world_size, group, _arg):
+    _patch_probe_mesh_module(world_size)
+    comm = UlyssesCommunicator(
+        group, max_elems=1 << 12, dtype=torch.float16, backend="nvlink"
+    )
+    x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
+    comm.scatter_heads(x)
+    torch.cuda.synchronize()
+
+    # inject a one-shot close fault on rank 0
+    cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
+    real = cuda_ipc_mod.cudart
+    orig_close = real.cudaIpcCloseMemHandle
+    state = {"armed": rank == 0}
+
+    def flaky_close(ptr):
+        if state["armed"]:
+            state["armed"] = False
+            raise RuntimeError("injected close failure")
+        return orig_close(ptr)
+
+    real.cudaIpcCloseMemHandle = flaky_close
+
+    try:
+        comm.close()
+        raise AssertionError("close must raise on every rank when one faults")
+    except RuntimeError as e:
+        assert "retry close()" in str(e), str(e)
+
+    # retry must succeed on all ranks (the fault was one-shot)
+    comm.close()
+    comm.close()  # now CLOSED and idempotent
+    try:
+        comm.scatter_heads(x)
+        raise AssertionError("use-after-close must raise")
+    except RuntimeError as e:
+        assert "use-after-close" in str(e)
+    return ("ok", "close retried")
+
+
+def _lifecycle_nvlink_body(rank, world_size, group, scenario):
+    _patch_probe_mesh_module(world_size)
+    mk = lambda: UlyssesCommunicator(  # noqa: E731
+        group, max_elems=1 << 12, dtype=torch.float16, backend="nvlink"
+    )
+    x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
+
+    if scenario == "ctx_exit":
+        # immediate context exit right after an async collective, with NO
+        # explicit synchronize by the user: close must sync internally
+        with mk() as comm:
+            comm.scatter_heads(x)
+    elif scenario == "ctx_body_raises":
+
+        class Boom(Exception):
+            pass
+
+        try:
+            with mk() as comm:
+                comm.scatter_heads(x)
+                raise Boom()
+        except Boom:
+            pass
+        try:
+            comm.scatter_heads(x)
+            raise AssertionError("must be closed after context exit")
+        except RuntimeError as e:
+            assert "use-after-close" in str(e)
+    elif scenario == "repeat":
+        for _ in range(2):
+            comm = mk()
             out = comm.scatter_heads(x)
             ref = _ref_scatter_heads(x, world_size, rank, group)
             torch.cuda.synchronize()
             assert torch.equal(out, ref)
-            info = (comm.backend, comm.fallback_reason)
             comm.close()
-            comm.close()  # idempotent across ranks
-            try:
-                comm.scatter_heads(x)
-                raise AssertionError("use-after-close must raise")
-            except RuntimeError as e:
-                assert "use-after-close" in str(e)
-            outcome = ("ok", info)
-        finally:
-            dist.destroy_process_group()
-    except Exception as e:  # noqa: BLE001
-        outcome = (type(e).__name__, str(e)[:2000])
-    q.put((rank, outcome))
+    elif scenario == "double_close":
+        comm = mk()
+        comm.close()
+        comm.close()
+    return ("ok", scenario)
 
 
-def _stream_worker(rank, world_size, port, backend, q):
-    """collectives issued on a non-default CUDA stream."""
-    outcome = None
+def _config_fault_body(rank, world_size, group, kind):
+    if kind == "invalid_one_rank":
+        max_elems = -1 if rank == 0 else 1024
+        expect = "invalid UlyssesCommunicator config"
+    else:  # inconsistent
+        max_elems = 1024 if rank == 0 else 2048
+        expect = "inconsistent UlyssesCommunicator config"
     try:
-        torch.cuda.set_device(rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://127.0.0.1:{port}",
-            rank=rank,
-            world_size=world_size,
+        UlyssesCommunicator(
+            group, max_elems=max_elems, dtype=torch.float16, backend="nccl"
         )
-        group = dist.group.WORLD
-        try:
-            comm = UlyssesCommunicator(
-                group, max_elems=1 << 16, dtype=torch.float16, backend=backend
-            )
-            x = torch.randn(1, 8, 24, 32, dtype=torch.float16, device="cuda")
-            stream = torch.cuda.Stream()
-            with torch.cuda.stream(stream):
-                out = comm.scatter_heads(x)
-                back = comm.gather_heads(out)
-            stream.synchronize()
-            ref = _ref_scatter_heads(x, world_size, rank, group)
-            assert torch.equal(out, ref), "scatter on non-default stream mismatch"
-            assert torch.equal(back, x), "round-trip on non-default stream mismatch"
-            comm.close()
-            outcome = ("ok", comm.backend)
-        finally:
-            dist.destroy_process_group()
-    except Exception as e:  # noqa: BLE001
-        outcome = (type(e).__name__, str(e)[:2000])
-    q.put((rank, outcome))
+        raise AssertionError("constructor must reject the config")
+    except ValueError as e:
+        assert expect in str(e), str(e)
+        return ("ok", str(e)[:200])
 
 
-def _ipc_gather_count_worker(rank, world_size, port, _backend, q):
-    """create_shared_buffer must all-gather IPC handles exactly once."""
-    outcome = None
-    try:
-        torch.cuda.set_device(rank)
-        dist.init_process_group(
+def _device_contract_body(rank, world_size, group, mode):
+    if mode == "explicit":
+        comm = UlyssesCommunicator(
+            group,
+            max_elems=1 << 16,
+            dtype=torch.float16,
             backend="nccl",
-            init_method=f"tcp://127.0.0.1:{port}",
-            rank=rank,
-            world_size=world_size,
+            device=f"cuda:{rank}",
         )
-        group = dist.group.WORLD
-        try:
-            cuda_ipc = importlib.import_module("flashinfer.comm.cuda_ipc")
-            calls = {"n": 0}
-            orig = dist.all_gather_object
+        assert comm.device == torch.device(f"cuda:{rank}")
+    elif mode == "bare":
+        comm = UlyssesCommunicator(
+            group,
+            max_elems=1 << 16,
+            dtype=torch.float16,
+            backend="nccl",
+            device="cuda",
+        )
+        assert comm.device == torch.device(f"cuda:{rank}"), comm.device
+    else:  # switch: current device changed between construction and use/close
+        _patch_probe_mesh_module(world_size)
+        comm = UlyssesCommunicator(
+            group,
+            max_elems=1 << 16,
+            dtype=torch.float16,
+            backend="nvlink",
+            device=f"cuda:{rank}",
+        )
+        torch.cuda.set_device((rank + 1) % torch.cuda.device_count())
+    x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device=f"cuda:{rank}")
+    out = comm.scatter_heads(x)
+    ref = _ref_scatter_heads(x, world_size, rank, group)
+    torch.cuda.synchronize(f"cuda:{rank}")
+    assert torch.equal(out, ref)
+    back = comm.gather_heads(out.contiguous())
+    torch.cuda.synchronize(f"cuda:{rank}")
+    assert torch.equal(back, x)
+    comm.close()
+    return ("ok", str(comm.device))
 
-            def counting(obj_list, obj, group=None):
-                calls["n"] += 1
-                return orig(obj_list, obj, group=group)
 
-            cuda_ipc.dist.all_gather_object = counting
-            try:
-                ptrs = cuda_ipc.create_shared_buffer(4096, group=group)
-                n_after_create = calls["n"]
-                cuda_ipc.free_shared_buffer(ptrs, group=group)
-            finally:
-                cuda_ipc.dist.all_gather_object = orig
-            assert n_after_create == 1, (
-                f"create_shared_buffer performed {n_after_create} handle "
-                "all-gathers, expected exactly 1"
-            )
-            outcome = ("ok", n_after_create)
-        finally:
-            dist.destroy_process_group()
-    except Exception as e:  # noqa: BLE001
-        outcome = (type(e).__name__, str(e)[:2000])
-    q.put((rank, outcome))
+# ---- multi-rank runner ----------------------------------------------------------
 
 
-def _run_multi_rank(worker, world_size, backend, timeout=300):
+def _run_multi_rank(body_name, world_size, arg, timeout=300):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs, have {torch.cuda.device_count()}")
     ctx = std_mp.get_context("spawn")
@@ -462,7 +749,7 @@ def _run_multi_rank(worker, world_size, backend, timeout=300):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     procs = [
-        ctx.Process(target=worker, args=(r, world_size, port, backend, q))
+        ctx.Process(target=_worker_main, args=(r, world_size, port, body_name, arg, q))
         for r in range(world_size)
     ]
     results = {}
@@ -493,43 +780,114 @@ def _run_multi_rank(worker, world_size, backend, timeout=300):
     assert all(code == 0 for code in exitcodes), (
         f"workers must exit naturally with code 0, got {exitcodes} (results: {results})"
     )
+    if all(kind == "skip" for kind, _ in results.values()):
+        pytest.skip(f"NVLink path unavailable: {results[0][1]}")
     for rank, (kind, payload) in results.items():
         assert kind == "ok", f"rank {rank} failed: {kind}: {payload}"
     return results
 
 
+# ---- multi-rank tests ------------------------------------------------------------
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 6, 8])
-def test_correctness_auto_nvlink(world_size):
-    # On a full-NVLink machine auto selects the fused kernel; on others it
-    # falls back to NCCL — both must match the independent references.
-    _run_multi_rank(_correctness_worker, world_size, "auto")
+def test_correctness_forced_nvlink(world_size):
+    # forced NVLink: skips (not silently passes via NCCL) on non-NVLink boxes
+    _run_multi_rank("_correctness_body", world_size, "nvlink")
 
 
 @pytest.mark.parametrize("world_size", [2, 3])
 def test_correctness_forced_nccl(world_size):
     # W=3 also proves the NCCL backend covers world sizes the fused kernel
     # does not support.
-    _run_multi_rank(_correctness_worker, world_size, "nccl")
+    _run_multi_rank("_correctness_body", world_size, "nccl")
 
 
 def test_api_auto_ws3_falls_back_to_nccl():
     # 3 is not a fused-kernel world size: auto must fall back and say why.
-    results = _run_multi_rank(_api_worker, 3, "auto")
+    results = _run_multi_rank("_api_body", 3, "auto")
     for _rank, (_kind, (backend, reason)) in results.items():
         assert backend == "nccl"
         assert reason is not None and "world size 3" in reason
 
 
 def test_api_forced_nccl_reason_is_none():
-    results = _run_multi_rank(_api_worker, 2, "nccl")
+    results = _run_multi_rank("_api_body", 2, "nccl")
     for _rank, (_kind, (backend, reason)) in results.items():
         assert backend == "nccl"
         assert reason is None
 
 
-def test_nondefault_stream_auto():
-    _run_multi_rank(_stream_worker, 2, "auto")
+def test_nondefault_stream_forced_nvlink():
+    _run_multi_rank("_stream_body", 2, "nvlink")
+
+
+def test_op_divisibility_enforced_two_ranks():
+    _run_multi_rank("_divisibility_body", 2, None)
+
+
+@pytest.mark.parametrize("kind", ["missing_nvlink", "probe_error"])
+def test_topology_fallback_supported_ws_never_touches_ipc_jit(kind):
+    # fallback driven by *topology* (not an unsupported world size) at W=2,
+    # through the real public constructor, with all IPC/JIT entries booby-trapped
+    _run_multi_rank("_topology_fallback_body", 2, kind)
+
+
+@pytest.mark.parametrize("fault", ["malloc", "get_handle", "open", "init"])
+@pytest.mark.parametrize("requested", ["nvlink", "auto"])
+def test_init_fault_one_rank(fault, requested):
+    # a single rank failing at any init stage: all ranks exit the constructor
+    # together (joint raise for forced, joint NCCL fallback for auto) with
+    # rank-local resource counters balanced (malloc==free, open==close)
+    _run_multi_rank("_init_fault_body", 2, (fault, requested))
+
+
+def test_close_fault_is_retryable():
+    _run_multi_rank("_close_fault_body", 2, None)
+
+
+@pytest.mark.parametrize(
+    "scenario", ["ctx_exit", "ctx_body_raises", "repeat", "double_close"]
+)
+def test_lifecycle_nvlink_two_ranks(scenario):
+    _run_multi_rank("_lifecycle_nvlink_body", 2, scenario)
+
+
+@pytest.mark.parametrize("kind", ["invalid_one_rank", "inconsistent"])
+def test_config_fault_collective_safe(kind):
+    _run_multi_rank("_config_fault_body", 2, kind)
+
+
+@pytest.mark.parametrize("mode", ["explicit", "bare", "switch"])
+def test_device_contract(mode):
+    # per-rank cuda:rank devices are legitimate and must not be rejected by
+    # the cross-rank config check; bare "cuda" binds to the current device;
+    # switching the current device after construction must not break ops/close
+    _run_multi_rank("_device_contract_body", 2, mode)
+
+
+def _ipc_gather_count_body(rank, world_size, group, _arg):
+    cuda_ipc = importlib.import_module("flashinfer.comm.cuda_ipc")
+    calls = {"n": 0}
+    orig = dist.all_gather_object
+
+    def counting(obj_list, obj, group=None):
+        calls["n"] += 1
+        return orig(obj_list, obj, group=group)
+
+    cuda_ipc.dist.all_gather_object = counting
+    try:
+        ptrs = cuda_ipc.create_shared_buffer(4096, group=group)
+        n_after_create = calls["n"]
+        cuda_ipc.free_shared_buffer(ptrs, group=group)
+    finally:
+        cuda_ipc.dist.all_gather_object = orig
+    assert n_after_create == 1, (
+        f"create_shared_buffer performed {n_after_create} handle all-gathers, "
+        "expected exactly 1"
+    )
+    return ("ok", n_after_create)
 
 
 def test_ipc_create_gathers_once():
-    _run_multi_rank(_ipc_gather_count_worker, 2, None)
+    _run_multi_rank("_ipc_gather_count_body", 2, None)

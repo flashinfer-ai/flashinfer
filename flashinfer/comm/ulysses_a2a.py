@@ -132,6 +132,13 @@ def init_ulysses_a2a(
         raise ValueError(
             f"ulysses a2a only supports world size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
         )
+    if not full_nvlink:
+        raise ValueError(
+            "full_nvlink=False is not supported: the fused kernel pushes over "
+            "all-pairs NVLink P2P and has no non-P2P path. Use "
+            "UlyssesCommunicator(backend='auto') for topology-aware NCCL "
+            "fallback instead."
+        )
     return get_ulysses_a2a_module().init_ulysses_a2a(
         out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink
     )
@@ -169,6 +176,27 @@ def ulysses_a2a(
 
     where ``H`` is the *global* head count, ``H_local = H // world_size`` and
     ``S_global = S_local * world_size``. Both tensors must be contiguous CUDA
-    tensors of the same dtype (float32/float16/bfloat16).
+    tensors of the same dtype (float32/float16/bfloat16). All ranks must call
+    with consistent geometry in the same order; a mismatch is a collective
+    failure (hang or corruption), as with any collective.
     """
+    for name, t in (("inp", inp), ("out", out)):
+        if not (isinstance(t, torch.Tensor) and t.is_cuda):
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if inp.device != out.device:
+        raise ValueError(f"inp is on {inp.device} but out is on {out.device}")
+    if inp.dtype != out.dtype:
+        raise ValueError(f"inp dtype {inp.dtype} != out dtype {out.dtype}")
+    if mode not in (0, 1):
+        raise ValueError(f"mode must be 0 or 1, got {mode}")
+    if min(B, S_local, H, D) <= 0:
+        raise ValueError(f"B/S_local/H/D must be positive, got {(B, S_local, H, D)}")
+    expected = B * S_local * H * D
+    if inp.numel() != expected or out.numel() != expected:
+        raise ValueError(
+            f"inp/out numel ({inp.numel()}/{out.numel()}) do not match "
+            f"B*S_local*H*D = {expected}"
+        )
     get_ulysses_a2a_module().ulysses_a2a(fa, inp, out, B, S_local, H, D, mode)
