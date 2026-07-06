@@ -133,19 +133,17 @@ class NcclEpHandle(Handle):
         _t = _pc() if _HP else None
         self._fleet = fleet
         self._ep = fleet.nccl_ep
-        # Cross-handle host-path cache. vLLM creates a fresh Handle every MoE
-        # layer x step (routing binds at create_handle), so per-handle caches
-        # never hit; anchoring them on the long-lived Fleet makes the recv
-        # buffers, counter tensors and FFI descriptor objects reusable across
-        # forwards. Tensor wrappers are memoized by (data_ptr, dtype, shape),
-        # so an entry can only ever describe the same memory layout it was
-        # built for; the dict is cleared when it grows past a bound (entries
-        # are then rebuilt, which is always safe — each handle only needs
-        # address stability within its own lifetime).
-        hot = getattr(fleet, "_hot_cache", None)
-        if hot is None:
-            hot = fleet._hot_cache = {}
-        self._hot = hot
+        # Cross-handle host-path cache (declared on NcclEpFleet). vLLM creates
+        # a fresh Handle every MoE layer x step (routing binds at
+        # create_handle), so per-handle caches never hit; anchoring them on the
+        # long-lived Fleet makes the recv buffers, counter tensors and FFI
+        # descriptor objects reusable across forwards. Tensor wrappers are
+        # memoized by (data_ptr, dtype, shape), so an entry can only ever
+        # describe the same memory layout it was built for; the dict is cleared
+        # when it grows past a bound (entries are then rebuilt, which is always
+        # safe — each handle only needs address stability within its own
+        # lifetime).
+        self._hot = fleet._hot_cache
         self._handle_knobs = _index_knobs(algo_knobs)
         self._stream = self._knob_stream()
         self._staged = HandleAlgoKnobSplitOperation in self._handle_knobs

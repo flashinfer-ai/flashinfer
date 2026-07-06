@@ -168,6 +168,12 @@ class NcclEpFleet(Fleet):
         self._nccl_ep = _import_nccl_ep()
         self._comm = _resolve_comm(bootstrap)  # keepalive: Group borrows it
 
+        # Cross-handle host-path cache (recv buffers, counter tensors, FFI
+        # descriptor memos), populated and consumed by NcclEpHandle. Anchored on
+        # the Fleet because callers (e.g. vLLM) create a fresh Handle every
+        # forward while the Fleet persists — per-handle caches never hit.
+        self._hot_cache: dict = {}
+
         self._group = self._nccl_ep.Group.create(self._comm, self._build_group_config())
         self._destroyed = False
 
@@ -288,6 +294,9 @@ class NcclEpFleet(Fleet):
         self._bootstrap = bootstrap
         self._stream = bootstrap.stream
         self._comm = _resolve_comm(bootstrap)
+        # Topology (world size) changed — drop the cross-handle host caches so
+        # recv buffers / counters / FFI descriptors are rebuilt at the new sizes.
+        self._hot_cache.clear()
         self._group = self._nccl_ep.Group.create(self._comm, self._build_group_config())
         self._destroyed = False
 
