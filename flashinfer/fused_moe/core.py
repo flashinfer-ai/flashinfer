@@ -1180,6 +1180,11 @@ def _unpack_trtllm_moe_output(
         ]
 
 
+@functools.lru_cache(maxsize=None)
+def _get_map_to_hybrid_bucket(tune_max_num_tokens: int):
+    return lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens)
+
+
 @functools.cache
 def get_trtllm_moe_sm100_module():
     module = gen_trtllm_gen_fused_moe_sm100_module()
@@ -1322,7 +1327,7 @@ def get_trtllm_moe_sm100_module():
                         input_idx,
                         dim_idx,
                         get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
-                        lambda x: map_to_hybrid_bucket(x, tune_max_num_tokens),
+                        _get_map_to_hybrid_bucket(tune_max_num_tokens),
                         initializers,
                     ),
                 ),

@@ -229,7 +229,7 @@ class DynamicTensorSpec:
     dim_idx: Tuple[int, ...]
     gen_tuning_buckets: Union[Tuple[int, ...], Callable]
     map_to_tuning_buckets: Callable
-    tensor_initializers: List[Callable] = field(default_factory=lambda: None)
+    tensor_initializers: List[Callable] = field(default_factory=lambda: None, compare=False)
 
     def __post_init__(self):
         # Set default tensor_initializers if not provided
