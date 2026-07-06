@@ -21,7 +21,8 @@ FlashInfer's unified AllReduce API (create_allreduce_fusion_workspace +
 allreduce_fusion). Designed to run with mpirun for multi-GPU benchmarking.
 
 Supports backends: trtllm, mnnvl, auto
-Supports patterns: allreduce, ar_residual_rmsnorm, ar_residual_rmsnorm_dynamic_fp8
+Supports patterns: allreduce, ar_residual_rmsnorm, ar_residual_rmsnorm_dynamic_fp8,
+    ar_residual_rmsnorm_group_fp8
 
 Launch examples:
     # Basic allreduce with auto backend
@@ -68,6 +69,7 @@ from flashinfer.comm import (
     create_allreduce_fusion_workspace,
 )
 from flashinfer.comm.mnnvl import MnnvlMemory, TorchDistBackend
+from flashinfer.comm.trtllm_mnnvl_ar import MNNVLAllreduceFusionStrategy
 from flashinfer.norm import rmsnorm
 from flashinfer.testing.utils import bench_gpu_time
 
@@ -90,9 +92,50 @@ PATTERN_NAME_TO_CODE = {
     "ar_residual_rmsnorm_dynamic_fp8": (
         AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant
     ),
+    "ar_residual_rmsnorm_group_fp8": (
+        AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant
+    ),
 }
 
 PATTERN_CODE_TO_NAME = {v: k for k, v in PATTERN_NAME_TO_CODE.items()}
+
+
+def _allocate_group_scale_out(
+    num_tokens: int,
+    hidden_size: int,
+    group_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate packed UE8M0 scales in the DeepGEMM-compatible layout."""
+    groups_per_row = hidden_size // group_size
+    k_num_packed = (groups_per_row + 3) // 4
+    tma_aligned_mn = ((num_tokens + 3) // 4) * 4
+    return torch.empty_strided(
+        (num_tokens, k_num_packed),
+        (1, tma_aligned_mn),
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+def _unpack_group_scales(
+    scale_out: torch.Tensor,
+    hidden_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Unpack UE8M0 exponent bytes to float32 scales on the input device."""
+    groups_per_row = hidden_size // group_size
+    shifts = torch.arange(4, dtype=torch.int64, device=scale_out.device) * 8
+    exponents = (
+        ((scale_out.to(torch.int64).unsqueeze(-1) >> shifts) & 0xFF)
+        .flatten(1)[:, :groups_per_row]
+        .to(torch.int32)
+    )
+    return torch.where(
+        exponents > 0,
+        torch.exp2(exponents.float() - 127.0),
+        torch.zeros_like(exponents, dtype=torch.float32),
+    )
 
 
 def _setup_mpi_and_device() -> Tuple[MPI.Comm, int, int, int]:
@@ -106,7 +149,7 @@ def _setup_mpi_and_device() -> Tuple[MPI.Comm, int, int, int]:
 
 
 def _init_torch_distributed(rank: int, world_size: int):
-    """Initialize torch.distributed for TRTLLM backend (uses NCCL for IPC)."""
+    """Initialize the NCCL process group used by allreduce workspaces."""
     import os
 
     import torch.distributed as dist
@@ -163,6 +206,7 @@ def _validate_allreduce(
     world_size: int,
     rank: int,
     comm: MPI.Comm,
+    block_quant_group_size: int,
     verbose: int = 0,
 ) -> bool:
     """Validate allreduce correctness via comparison with torch sum reference."""
@@ -199,6 +243,7 @@ def _validate_allreduce(
     elif pattern_code in (
         AllReduceFusionPattern.kARResidualRMSNorm,
         AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+        AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
     ):
         residual = torch.randn(
             (num_tokens, hidden_size), dtype=input_dtype, device="cuda"
@@ -219,10 +264,22 @@ def _validate_allreduce(
         is_dynamic_fp8 = (
             pattern_code == AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant
         )
+        is_group_fp8 = (
+            pattern_code
+            == AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant
+        )
         quant_out = scale_out = None
         if is_dynamic_fp8:
             quant_out = torch.empty_like(x_local, dtype=torch.float8_e4m3fn)
             scale_out = torch.empty(num_tokens, 1, dtype=torch.float32, device="cuda")
+        elif is_group_fp8:
+            quant_out = torch.empty_like(x_local, dtype=torch.float8_e4m3fn)
+            scale_out = _allocate_group_scale_out(
+                num_tokens,
+                hidden_size,
+                block_quant_group_size,
+                torch.device("cuda"),
+            )
 
         allreduce_fusion(
             input=x_local,
@@ -230,13 +287,14 @@ def _validate_allreduce(
             pattern=pattern_code,
             launch_with_pdl=False,
             residual_out=residual_out,
-            norm_out=None if is_dynamic_fp8 else norm_out,
+            norm_out=None if is_dynamic_fp8 or is_group_fp8 else norm_out,
             quant_out=quant_out,
             scale_out=scale_out,
             residual_in=residual,
             rms_gamma=norm_weight,
             rms_eps=eps,
             use_oneshot=use_oneshot,
+            block_quant_group_size=(block_quant_group_size if is_group_fp8 else None),
         )
         torch.cuda.synchronize()
 
@@ -269,6 +327,25 @@ def _validate_allreduce(
                     ref_quant.float() * ref_scale,
                     atol=0.5,
                     rtol=0.5,
+                )
+            elif is_group_fp8:
+                groups_per_row = hidden_size // block_quant_group_size
+                fused_scales = _unpack_group_scales(
+                    scale_out,
+                    hidden_size,
+                    block_quant_group_size,
+                )
+                dequant = (
+                    quant_out.float().reshape(
+                        num_tokens, groups_per_row, block_quant_group_size
+                    )
+                    * fused_scales.unsqueeze(-1)
+                ).reshape(num_tokens, hidden_size)
+                torch.testing.assert_close(
+                    dequant,
+                    ref_norm_out.float(),
+                    atol=0.8,
+                    rtol=0.05,
                 )
             else:
                 torch.testing.assert_close(norm_out, ref_norm_out, atol=0.15, rtol=0.05)
@@ -310,8 +387,19 @@ def _benchmark_single_config(
     device = torch.device("cuda")
 
     # Check workspace capacity
+    workspace_strategy = use_oneshot
+    if workspace.backend == "mnnvl":
+        workspace_strategy = (
+            MNNVLAllreduceFusionStrategy.AUTO
+            if use_oneshot is None
+            else (
+                MNNVLAllreduceFusionStrategy.ONESHOT
+                if use_oneshot
+                else MNNVLAllreduceFusionStrategy.TWOSHOT
+            )
+        )
     if not workspace.is_buffer_size_sufficient(
-        world_size, num_tokens, hidden_size, input_dtype, use_oneshot
+        world_size, num_tokens, hidden_size, input_dtype, workspace_strategy
     ):
         if rank == 0 and args.verbose >= 1:
             print(
@@ -340,6 +428,7 @@ def _benchmark_single_config(
     elif pattern_code in (
         AllReduceFusionPattern.kARResidualRMSNorm,
         AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+        AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
     ):
         residual = torch.randn_like(x)
         norm_weight = torch.randn((hidden_size,), dtype=input_dtype, device=device)
@@ -348,10 +437,22 @@ def _benchmark_single_config(
         is_dynamic_fp8 = (
             pattern_code == AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant
         )
+        is_group_fp8 = (
+            pattern_code
+            == AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant
+        )
         quant_out = scale_out = None
         if is_dynamic_fp8:
             quant_out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
             scale_out = torch.empty(num_tokens, 1, dtype=torch.float32, device=device)
+        elif is_group_fp8:
+            quant_out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+            scale_out = _allocate_group_scale_out(
+                num_tokens,
+                hidden_size,
+                args.block_quant_group_size,
+                device,
+            )
 
         def run_allreduce(inp):
             allreduce_fusion(
@@ -360,15 +461,18 @@ def _benchmark_single_config(
                 pattern=pattern_code,
                 launch_with_pdl=True,
                 residual_out=residual_out,
-                norm_out=None if is_dynamic_fp8 else norm_out,
+                norm_out=None if is_dynamic_fp8 or is_group_fp8 else norm_out,
                 quant_out=quant_out,
                 scale_out=scale_out,
                 residual_in=residual,
                 rms_gamma=norm_weight,
                 rms_eps=1e-5,
                 use_oneshot=use_oneshot,
+                block_quant_group_size=(
+                    args.block_quant_group_size if is_group_fp8 else None
+                ),
             )
-            return quant_out if is_dynamic_fp8 else norm_out
+            return quant_out if is_dynamic_fp8 or is_group_fp8 else norm_out
 
     else:
         if rank == 0:
@@ -501,6 +605,12 @@ def parse_allreduce_comm_args(line, parser):
         default=False,
         help="Run correctness validation before benchmarking.",
     )
+    parser.add_argument(
+        "--block_quant_group_size",
+        type=int,
+        default=128,
+        help="Hidden-dimension group size for packed per-token-group FP8.",
+    )
 
     args = parser.parse_args(line)
     return args
@@ -536,7 +646,7 @@ def test_allreduce_fusion(args):
     torch_dist_initialized = False
 
     needs_mnnvl = any(b in ("mnnvl", "auto") for b in backend_list)
-    needs_trtllm = any(b in ("trtllm", "auto") for b in backend_list)
+    needs_torch_dist = any(b in ("trtllm", "mnnvl", "auto") for b in backend_list)
 
     if needs_mnnvl:
         try:
@@ -550,20 +660,15 @@ def test_allreduce_fusion(args):
                     print("[ERROR] No backends available after MNNVL init failure")
                 return []
 
-    if needs_trtllm:
+    if needs_torch_dist:
         try:
             _init_torch_distributed(rank, world_size)
             torch_dist_initialized = True
         except Exception as e:
             if rank == 0:
                 print(f"[WARNING] torch.distributed initialization failed: {e}")
-            backend_list = [b for b in backend_list if b != "trtllm"]
-            if not backend_list:
-                if rank == 0:
-                    print(
-                        "[ERROR] No backends available after torch.distributed init failure"
-                    )
-                return []
+                print("[ERROR] No backends available without torch.distributed")
+            return []
 
     try:
         for backend in backend_list:
@@ -599,11 +704,12 @@ def test_allreduce_fusion(args):
                 for pattern_name in pattern_list:
                     pattern_code = PATTERN_NAME_TO_CODE[pattern_name]
 
-                    # MNNVL supports allreduce, AR+RMSNorm, and dynamic FP8 AR+RMSNorm.
+                    # MNNVL supports allreduce, AR+RMSNorm, and quantized variants.
                     if workspace.backend == "mnnvl" and pattern_code not in (
                         AllReduceFusionPattern.kAllReduce,
                         AllReduceFusionPattern.kARResidualRMSNorm,
                         AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
+                        AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
                     ):
                         if rank == 0 and args.verbose >= 1:
                             print(
@@ -640,6 +746,7 @@ def test_allreduce_fusion(args):
                                 world_size=world_size,
                                 rank=rank,
                                 comm=comm,
+                                block_quant_group_size=args.block_quant_group_size,
                                 verbose=args.verbose,
                             )
                             if not valid:

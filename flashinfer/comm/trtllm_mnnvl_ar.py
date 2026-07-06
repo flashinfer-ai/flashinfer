@@ -57,6 +57,7 @@ class MNNVLQuantType:
     FP8 = 1
     NVFP4 = 2
     DYNAMIC_FP8 = 3
+    PER_TOKEN_GROUP_FP8_PACKED = 4
 
 
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
@@ -294,6 +295,7 @@ def get_trtllm_mnnvl_comm_module():
             "sf_out",
             "output_scale",
             "layout_code",
+            "block_quant_group_size",
         ],
     )
     def trtllm_mnnvl_allreduce_fusion(
@@ -318,6 +320,7 @@ def get_trtllm_mnnvl_comm_module():
         sf_out: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         layout_code: int = QuantizationSFLayout.SWIZZLED_128x4,
+        block_quant_group_size: Optional[int] = None,
     ) -> None:
         """
         Perform a multi-node NVLink all-reduce operation with fusion.
@@ -359,6 +362,7 @@ def get_trtllm_mnnvl_comm_module():
             sf_out,
             output_scale,
             layout_code,
+            block_quant_group_size,
         )
 
     return SimpleNamespace(
@@ -583,8 +587,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
     launch_with_pdl: bool = False,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
     weight_bias: float = 0.0,
+    block_quant_group_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
-    """Perform MNNVL AllReduce + Residual + RMSNorm + FP8/NVFP4 quantization.
+    """Perform MNNVL AllReduce + Residual + RMSNorm + quantization.
 
     Quantization is applied after RMSNorm. ``output`` is optional; pass it only
     when the normalized non-quantized tensor is also needed. The quantized result
@@ -607,17 +612,23 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
         scale_out: Optional scale output. Dynamic FP8 uses ``[num_tokens, 1]``
             float32. NVFP4 uses ``[num_tokens, hidden_dim // 16]`` for
             ``LINEAR`` layout, or a 1-D tensor large enough for the padded
-            ``SWIZZLED_128x4`` layout. Static FP8 ignores this argument.
+            ``SWIZZLED_128x4`` layout. Per-token-group FP8 uses packed UE8M0
+            scales with shape ``[num_tokens, ceil(groups_per_row / 4)]``, dtype
+            ``torch.int32``, and stride ``(1, ceil(num_tokens / 4) * 4)``.
+            Static FP8 ignores this argument.
         output_scale: Scalar float or float32 tensor used as the quantization
             output scale. Defaults to ``1.0``.
         layout_code: NVFP4 scale layout. MNNVL supports ``SWIZZLED_128x4`` and
             ``LINEAR``; ``SWIZZLED_8x4`` is not supported.
         quant_type: ``MNNVLQuantType.FP8``, ``MNNVLQuantType.NVFP4``, or
-            ``MNNVLQuantType.DYNAMIC_FP8``.
+            ``MNNVLQuantType.DYNAMIC_FP8``, or
+            ``MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED``.
         launch_with_pdl: Whether to launch with PDL.
         strategy: MNNVL execution strategy. ``AUTO`` uses internal heuristics.
         weight_bias: Bias added to gamma before scaling. ``0.0`` for standard
             RMSNorm; ``1.0`` for Gemma / Qwen3.5 RMSNorm.
+        block_quant_group_size: Group size along the hidden dimension for
+            per-token-group FP8 quantization.
 
     Returns:
         A tuple ``(quant_out, scale_out, residual_out, output)``. ``scale_out``
@@ -626,7 +637,10 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
 
     if epsilon is None:
         epsilon = torch.finfo(input.dtype).eps
-    if output_scale is None and quant_type != MNNVLQuantType.DYNAMIC_FP8:
+    if output_scale is None and quant_type not in (
+        MNNVLQuantType.DYNAMIC_FP8,
+        MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+    ):
         output_scale = 1.0
 
     if len(input.shape) != 2:
@@ -663,7 +677,10 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             f"output shape must match input shape, got {output.shape} and {input.shape}."
         )
 
-    if quant_type == MNNVLQuantType.DYNAMIC_FP8:
+    if quant_type in (
+        MNNVLQuantType.DYNAMIC_FP8,
+        MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+    ):
         output_scale_tensor = None
     elif isinstance(output_scale, torch.Tensor):
         if output_scale.numel() < 1:
@@ -769,6 +786,52 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             )
         if not scale_out.is_contiguous():
             raise ValueError("scale_out must be contiguous for dynamic FP8.")
+    elif quant_type == MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED:
+        if block_quant_group_size is None or block_quant_group_size <= 0:
+            raise ValueError(
+                "block_quant_group_size must be provided and positive for group FP8."
+            )
+        if hidden_dim % block_quant_group_size != 0:
+            raise ValueError(
+                f"hidden_dim must be divisible by block_quant_group_size, got {hidden_dim} and {block_quant_group_size}."
+            )
+        if quant_out is None:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        elif quant_out.shape != input.shape:
+            raise ValueError(
+                f"quant_out shape must be {tuple(input.shape)} for group FP8, got {tuple(quant_out.shape)}."
+            )
+        if quant_out.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"quant_out dtype for group FP8 must be float8_e4m3fn, got {quant_out.dtype}."
+            )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for group FP8.")
+
+        groups_per_row = hidden_dim // block_quant_group_size
+        k_num_packed = (groups_per_row + 3) // 4
+        tma_aligned_mn = ((token_num + 3) // 4) * 4
+        expected_scale_shape = (token_num, k_num_packed)
+        expected_scale_stride = (1, tma_aligned_mn)
+        if scale_out is None:
+            scale_out = torch.empty_strided(
+                expected_scale_shape,
+                expected_scale_stride,
+                dtype=torch.int32,
+                device=input.device,
+            )
+        elif tuple(scale_out.shape) != expected_scale_shape:
+            raise ValueError(
+                f"scale_out shape must be {expected_scale_shape} for group FP8, got {tuple(scale_out.shape)}."
+            )
+        if scale_out.stride() != expected_scale_stride:
+            raise ValueError(
+                f"scale_out stride must be {expected_scale_stride} for group FP8, got {scale_out.stride()}."
+            )
+        if scale_out.dtype != torch.int32:
+            raise ValueError(
+                f"scale_out dtype for group FP8 must be int32, got {scale_out.dtype}."
+            )
     else:
         raise ValueError(f"Unsupported MNNVL quant_type: {quant_type}")
 
@@ -817,6 +880,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
         scale_out,
         output_scale_tensor,
         layout_code,
+        block_quant_group_size,
     )
     return quant_out, scale_out, residual_out, output
 

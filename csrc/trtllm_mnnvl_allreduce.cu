@@ -27,16 +27,14 @@ using tvm::ffi::Optional;
     }                                                                               \
   }()
 
-void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_ptr,
-                                   int64_t buffer_ptrs_dev, int64_t buffer_ptr_local,
-                                   TensorView buffer_flags_mnnvl, int64_t nranks, int64_t rank,
-                                   bool rmsnorm_fusion, bool launch_with_pdl, bool use_oneshot,
-                                   Optional<TensorView> output, Optional<TensorView> residual_out,
-                                   Optional<TensorView> residual_in, Optional<TensorView> gamma,
-                                   Optional<double> epsilon, Optional<double> weight_bias,
-                                   Optional<int64_t> quant_type, Optional<TensorView> quant_out,
-                                   Optional<TensorView> sf_out, Optional<TensorView> output_scale,
-                                   Optional<int64_t> layout_code) {
+void trtllm_mnnvl_allreduce_fusion(
+    TensorView input, int64_t multicast_buffer_ptr, int64_t buffer_ptrs_dev,
+    int64_t buffer_ptr_local, TensorView buffer_flags_mnnvl, int64_t nranks, int64_t rank,
+    bool rmsnorm_fusion, bool launch_with_pdl, bool use_oneshot, Optional<TensorView> output,
+    Optional<TensorView> residual_out, Optional<TensorView> residual_in, Optional<TensorView> gamma,
+    Optional<double> epsilon, Optional<double> weight_bias, Optional<int64_t> quant_type,
+    Optional<TensorView> quant_out, Optional<TensorView> sf_out, Optional<TensorView> output_scale,
+    Optional<int64_t> layout_code, Optional<int64_t> block_quant_group_size) {
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   auto stream = get_stream(input.device());
 
@@ -79,6 +77,7 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
         << "MNNVL quantization fusion requires rmsnorm_fusion=true";
     TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone ||
                    quant_type_enum == QuantType::kDynamicFP8 ||
+                   quant_type_enum == QuantType::kPerTokenGroupFP8Packed ||
                    (output_scale.has_value() &&
                     encode_dlpack_dtype(output_scale.value().dtype()) == float32_code))
         << "output_scale must be provided for static MNNVL quantization fusion and must be float32";
@@ -150,6 +149,36 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
         TVM_FFI_ICHECK(encode_dlpack_dtype(sf_out.value().dtype()) == float32_code)
             << "scale_out for dynamic FP8 must have dtype float32";
         break;
+      case QuantType::kPerTokenGroupFP8Packed: {
+        TVM_FFI_ICHECK(block_quant_group_size.has_value() && block_quant_group_size.value() > 0)
+            << "block_quant_group_size must be provided and positive for group FP8";
+        int64_t const group_size = block_quant_group_size.value();
+        TVM_FFI_ICHECK(token_dim % group_size == 0)
+            << "token_dim must be divisible by block_quant_group_size";
+        TVM_FFI_ICHECK(quant_out.value().size(0) == num_tokens &&
+                       quant_out.value().size(1) == token_dim)
+            << "quant_out shape mismatch for group FP8: expected (" << num_tokens << ", "
+            << token_dim << ") but got (" << quant_out.value().size(0) << ", "
+            << quant_out.value().size(1) << ")";
+        TVM_FFI_ICHECK(encode_dlpack_dtype(quant_out.value().dtype()) == float8_e4m3fn_code)
+            << "quant_out for group FP8 must have dtype float8_e4m3fn";
+        TVM_FFI_ICHECK(sf_out.has_value())
+            << "scale_out must be provided for group FP8 MNNVL quantization fusion";
+        int64_t const groups_per_row = token_dim / group_size;
+        int64_t const k_num_packed = (groups_per_row + 3) / 4;
+        int64_t const tma_aligned_mn = ((num_tokens + 3) / 4) * 4;
+        TVM_FFI_ICHECK(sf_out.value().size(0) == num_tokens &&
+                       sf_out.value().size(1) == k_num_packed)
+            << "scale_out shape mismatch for group FP8: expected (" << num_tokens << ", "
+            << k_num_packed << ") but got (" << sf_out.value().size(0) << ", "
+            << sf_out.value().size(1) << ")";
+        TVM_FFI_ICHECK(sf_out.value().stride(0) == 1 && sf_out.value().stride(1) == tma_aligned_mn)
+            << "scale_out stride mismatch for group FP8: expected (1, " << tma_aligned_mn
+            << ") but got (" << sf_out.value().stride(0) << ", " << sf_out.value().stride(1) << ")";
+        TVM_FFI_ICHECK(encode_dlpack_dtype(sf_out.value().dtype()) == int32_code)
+            << "scale_out for group FP8 must have dtype int32";
+        break;
+      }
       default:
         TVM_FFI_LOG_AND_THROW(NotImplementedError)
             << "Unsupported MNNVL quantization type " << static_cast<int>(quant_type_enum);
@@ -171,6 +200,9 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
     params.launchWithPdl = launch_with_pdl;
     params.sfLayout = sf_layout;
     params.quantType = quant_type_enum;
+    params.blockQuantGroupSize =
+        block_quant_group_size.has_value() ? static_cast<int>(block_quant_group_size.value()) : 0;
+    params.tmaAlignedMn = static_cast<int>(((num_tokens + 3) / 4) * 4);
 
     // input data
     params.input = const_cast<void const*>(input.data_ptr());
