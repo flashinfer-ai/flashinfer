@@ -265,8 +265,15 @@ def resolve_ulysses_backend(
     world_size = dist.get_world_size(group=group)
 
     # ---- gather 1: requested backends (before any local validation) --------
+    # No user code may run before the gather: str(backend) would invoke a user
+    # __str__ that could raise on one rank and hang the peers. Only the type
+    # name (interpreter-provided) is used for non-string payloads.
+    if isinstance(backend, str):
+        request_payload = backend
+    else:
+        request_payload = f"<invalid type: {type(backend).__name__}>"
     requests: List[Optional[str]] = [None] * world_size
-    dist.all_gather_object(requests, str(backend), group=group)
+    dist.all_gather_object(requests, request_payload, group=group)
 
     invalid = {r: req for r, req in enumerate(requests) if req not in ULYSSES_BACKENDS}
     if invalid:
@@ -310,10 +317,17 @@ def resolve_ulysses_backend(
     dist.all_gather_object(outcomes, outcome, group=group)
 
     # Joint resolution: identical gathered list => identical result on every
-    # rank, whether that is a raise or a decision.
+    # rank, whether that is a raise or a decision. Invariants: only
+    # requested="nvlink" may raise here (auto always degrades to NCCL, even if
+    # a buggy decision layer raised UlyssesBackendError under auto), and
+    # requested="nvlink" never silently returns anything but NVLink.
     backend_errors = [o for o in outcomes if o and o[0] == "backend_error"]
     if backend_errors:
-        raise UlyssesBackendError(backend_errors[0][1])
+        if requested == "nvlink":
+            raise UlyssesBackendError(backend_errors[0][1])
+        return UlyssesBackendDecision(
+            "nccl", f"backend decision error: {backend_errors[0][1]}"
+        )
     errors = {r: o[1] for r, o in enumerate(outcomes) if o and o[0] == "error"}
     if errors:
         reason = f"backend decision failed on rank(s) {errors}"
@@ -326,4 +340,11 @@ def resolve_ulysses_backend(
             raise UlyssesBackendError(f"backend='nvlink' requested but {reason}")
         return UlyssesBackendDecision("nccl", reason)
 
-    return UlyssesBackendDecision(outcomes[0][1], outcomes[0][2])
+    final = UlyssesBackendDecision(outcomes[0][1], outcomes[0][2])
+    if requested == "nvlink" and final.backend != "nvlink":
+        raise UlyssesBackendError(
+            f"backend='nvlink' requested but the decision layer selected "
+            f"{final.backend!r} ({final.reason}); refusing to silently violate "
+            "the forced backend"
+        )
+    return final

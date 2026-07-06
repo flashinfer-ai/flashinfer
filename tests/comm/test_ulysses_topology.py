@@ -240,6 +240,13 @@ def test_exports():
 # hung worker means a rank left the collective sequence early.
 
 
+class _EvilBackend:
+    """Non-string backend whose __str__ raises: resolve must never call it."""
+
+    def __str__(self):
+        raise RuntimeError("user __str__ must not be invoked before the gather")
+
+
 def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q):
     mod = importlib.import_module("flashinfer.comm.ulysses_topology")
 
@@ -271,6 +278,20 @@ def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q
                 raise RuntimeError("decision exploded")
 
             mod.decide_ulysses_backend = raising_decide
+    elif patch == "decide_backend_error_under_auto":
+        # buggy decision layer raising the forced-only exception under auto
+        mod.probe_ulysses_rank_topology = mesh_probe
+
+        def bogus_forced_raise(*args, **kwargs):
+            raise mod.UlyssesBackendError("bogus forced error under auto")
+
+        mod.decide_ulysses_backend = bogus_forced_raise
+    elif patch == "decide_returns_nccl_under_forced":
+        # buggy decision layer returning NCCL although nvlink was forced
+        mod.probe_ulysses_rank_topology = mesh_probe
+        mod.decide_ulysses_backend = lambda *a, **k: mod.UlyssesBackendDecision(
+            "nccl", "buggy decision ignored the forced backend"
+        )
     elif patch == "probe_marker":
 
         def marker_probe(device, r):
@@ -282,6 +303,14 @@ def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q
     elif patch == "mesh":
         mod.probe_ulysses_rank_topology = mesh_probe
 
+    backend = backends[rank]
+    if backend == "__EVIL__":
+        backend = _EvilBackend()
+
+    # Compute the outcome, then finish a clean teardown, and only report to
+    # the parent as the last step: a worker that hangs or crashes in teardown
+    # must be observable (missing message / nonzero exitcode), not masked by
+    # an early q.put.
     try:
         dist.init_process_group(
             backend="gloo",
@@ -290,21 +319,29 @@ def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q
             world_size=world_size,
         )
         try:
-            d = mod.resolve_ulysses_backend(backends[rank])
-            q.put((rank, "ok", (d.backend, d.reason)))
+            d = mod.resolve_ulysses_backend(backend)
+            outcome = ("ok", (d.backend, d.reason))
         except mod.UlyssesBackendError as e:
-            q.put((rank, "UlyssesBackendError", str(e)))
+            outcome = ("UlyssesBackendError", str(e))
         except ValueError as e:
-            q.put((rank, "ValueError", str(e)))
+            outcome = ("ValueError", str(e))
         except Exception as e:  # noqa: BLE001
-            q.put((rank, type(e).__name__, str(e)))
+            outcome = (type(e).__name__, str(e))
         finally:
             dist.destroy_process_group()
-    except Exception as e:  # noqa: BLE001 — process-group setup failure
-        q.put((rank, "pg-error", str(e)))
+    except Exception as e:  # noqa: BLE001 — process-group setup/teardown failure
+        outcome = ("pg-error", str(e))
+    q.put((rank, outcome))
 
 
 def _run_resolve_case(backends, patch=None, marker_path=None, timeout=120):
+    """Run one resolve scenario across len(backends) gloo ranks.
+
+    Asserts every worker reports exactly once, exits *naturally* with
+    exitcode 0 (terminate/kill in the finally block is cleanup for failures,
+    not a pass condition), and that all ranks produced the *identical*
+    outcome. Returns that single common outcome.
+    """
     world_size = len(backends)
     ctx = std_mp.get_context("spawn")
     q = ctx.Queue()
@@ -318,92 +355,121 @@ def _run_resolve_case(backends, patch=None, marker_path=None, timeout=120):
         )
         for r in range(world_size)
     ]
-    for p in procs:
-        p.start()
     results = {}
-    deadline = time.time() + timeout
-    while len(results) < world_size and time.time() < deadline:
-        try:
-            rank, kind, payload = q.get(timeout=1)
-            results[rank] = (kind, payload)
-        except queue_mod.Empty:
-            pass
-    hung = [p for p in procs if p.is_alive() and len(results) < world_size]
-    for p in procs:
-        p.join(timeout=10)
-        if p.is_alive():
-            p.terminate()
-            p.join(timeout=10)
+    try:
+        for p in procs:
+            p.start()
+        deadline = time.time() + timeout
+        while len(results) < world_size and time.time() < deadline:
+            try:
+                rank, outcome = q.get(timeout=1)
+                results[rank] = outcome
+            except queue_mod.Empty:
+                pass
+        for p in procs:
+            p.join(timeout=max(1.0, deadline - time.time()))
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=10)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=10)
+
     assert len(results) == world_size, (
-        f"only ranks {sorted(results)} finished within {timeout}s "
-        f"(hung={bool(hung)}, likely a rank left the collective sequence early); "
-        f"results so far: {results}"
+        f"only ranks {sorted(results)} reported within {timeout}s "
+        f"(likely a rank left the collective sequence early or hung in "
+        f"teardown); results so far: {results}"
     )
-    return results
+    exitcodes = [p.exitcode for p in procs]
+    assert all(code == 0 for code in exitcodes), (
+        f"workers must exit naturally with code 0, got {exitcodes} (results: {results})"
+    )
+    outcomes = set(results.values())
+    assert len(outcomes) == 1, f"ranks disagree on the outcome: {results}"
+    return next(iter(outcomes))
 
 
 def test_resolve_2rank_invalid_backend_one_rank():
-    results = _run_resolve_case(["magic", "auto"])
-    for rank in (0, 1):
-        kind, payload = results[rank]
-        assert kind == "ValueError", results
-        assert "invalid request" in payload
+    kind, payload = _run_resolve_case(["magic", "auto"])
+    assert kind == "ValueError"
+    assert "invalid request" in payload
+
+
+def test_resolve_2rank_invalid_backend_type_with_raising_str():
+    # rank 0 passes a non-string object whose __str__ raises; resolve must not
+    # invoke it, and both ranks must jointly reject the request by type name
+    kind, payload = _run_resolve_case(["__EVIL__", "auto"])
+    assert kind == "ValueError"
+    assert "invalid request" in payload and "_EvilBackend" in payload
 
 
 def test_resolve_2rank_inconsistent_requests():
-    results = _run_resolve_case(["nvlink", "auto"], patch="mesh")
-    for rank in (0, 1):
-        kind, payload = results[rank]
-        assert kind == "ValueError", results
-        assert "inconsistent backend requests" in payload
+    kind, payload = _run_resolve_case(["nvlink", "auto"], patch="mesh")
+    assert kind == "ValueError"
+    assert "inconsistent backend requests" in payload
 
 
 def test_resolve_2rank_forced_nvlink_unsatisfied():
-    results = _run_resolve_case(["nvlink", "nvlink"], patch="nvlink_pair_missing")
-    for rank in (0, 1):
-        kind, payload = results[rank]
-        assert kind == "UlyssesBackendError", results
-        assert "no NVLink" in payload
+    kind, payload = _run_resolve_case(["nvlink", "nvlink"], patch="nvlink_pair_missing")
+    assert kind == "UlyssesBackendError"
+    assert "no NVLink" in payload
 
 
 def test_resolve_2rank_probe_raises_one_rank():
-    results = _run_resolve_case(["auto", "auto"], patch="probe_raises_rank0")
-    for rank in (0, 1):
-        kind, payload = results[rank]
-        assert kind == "ok", results
-        backend, reason = payload
-        assert backend == "nccl"
-        assert "rank 0" in reason and "probe exploded" in reason
+    kind, (backend, reason) = _run_resolve_case(
+        ["auto", "auto"], patch="probe_raises_rank0"
+    )
+    assert kind == "ok"
+    assert backend == "nccl"
+    assert "rank 0" in reason and "probe exploded" in reason
 
 
 def test_resolve_2rank_decision_raises_one_rank():
-    results = _run_resolve_case(["auto", "auto"], patch="decide_raises_rank1")
-    for rank in (0, 1):
-        kind, payload = results[rank]
-        assert kind == "ok", results
-        backend, reason = payload
-        assert backend == "nccl"
-        assert "decision failed on rank(s)" in reason and "decision exploded" in reason
+    kind, (backend, reason) = _run_resolve_case(
+        ["auto", "auto"], patch="decide_raises_rank1"
+    )
+    assert kind == "ok"
+    assert backend == "nccl"
+    assert "decision failed on rank(s)" in reason and "decision exploded" in reason
+
+
+def test_resolve_2rank_auto_never_raises_on_backend_error():
+    # invariant: under auto, even the forced-only exception class coming out of
+    # a buggy decision layer degrades to a group-wide NCCL fallback
+    kind, (backend, reason) = _run_resolve_case(
+        ["auto", "auto"], patch="decide_backend_error_under_auto"
+    )
+    assert kind == "ok"
+    assert backend == "nccl"
+    assert "bogus forced error under auto" in reason
+
+
+def test_resolve_2rank_forced_nvlink_never_silently_downgrades():
+    # invariant: under forced nvlink, a unanimous ("ok", "nccl", ...) decision
+    # must still raise on every rank, never silently violate the request
+    kind, payload = _run_resolve_case(
+        ["nvlink", "nvlink"], patch="decide_returns_nccl_under_forced"
+    )
+    assert kind == "UlyssesBackendError"
+    assert "refusing to silently violate" in payload
 
 
 def test_resolve_2rank_explicit_nccl_skips_probe(tmp_path):
     marker = str(tmp_path / "probe_touched")
-    results = _run_resolve_case(
+    kind, payload = _run_resolve_case(
         ["nccl", "nccl"], patch="probe_marker", marker_path=marker
     )
-    for rank in (0, 1):
-        kind, payload = results[rank]
-        assert kind == "ok", results
-        assert payload[0] == "nccl" and "requested" in payload[1]
+    assert kind == "ok"
+    assert payload[0] == "nccl" and "requested" in payload[1]
     assert not os.path.exists(marker), "explicit NCCL must not touch the probe"
 
 
 def test_resolve_2rank_auto_full_mesh_selects_nvlink():
-    results = _run_resolve_case(["auto", "auto"], patch="mesh")
-    for rank in (0, 1):
-        kind, payload = results[rank]
-        assert kind == "ok", results
-        assert payload[0] == "nvlink"
+    kind, payload = _run_resolve_case(["auto", "auto"], patch="mesh")
+    assert kind == "ok"
+    assert payload[0] == "nvlink"
 
 
 # ---- probe device handling ---------------------------------------------------
