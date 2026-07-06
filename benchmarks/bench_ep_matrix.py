@@ -76,6 +76,7 @@ def main() -> int:
         FleetParams,
         HandleParams,
         create_fleet,
+        dummy_moe_weights,
     )
     from flashinfer.moe_ep.algo_knobs import (
         HandleAlgoKnobTopKWeights,
@@ -179,6 +180,12 @@ def main() -> int:
             dtype_bytes=2,
             algorithm=algo,
             layout=layout,
+            # Comm-only benchmark (no expert FFN): FleetParams.weights is now a
+            # required field, so supply placeholder weights that pass
+            # validate_fleet_weights() without allocating real expert matrices.
+            weights=dummy_moe_weights(
+                num_local_experts=local_n, hidden=hidden, device=device
+            ),
         ),
         backend="nccl_ep",
     )
