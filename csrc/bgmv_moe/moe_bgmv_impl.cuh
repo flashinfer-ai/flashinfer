@@ -378,8 +378,12 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
 // reduced across the FEAT_IN/8 lanes of a column group, then atomic-added (one add per output
 // column per pair). fp32 accumulate; no shared-memory W staging.
 // ============================================================
+// __launch_bounds__(BLK, 4): min 4 blocks/SM (not 8). At BLK=256, requiring 8 blocks/SM caps the
+// compiler at 32 regs/thread (256*8 = 2048 = max threads/SM), which spills to local memory at
+// FEAT_IN=64 (uint4 raw[PASSES] alone is 32 regs) — measured 84 B spill and ~1.5x slower. This
+// kernel is bandwidth-bound, so 4 blocks/SM (64 regs) is ample occupancy and spill-free.
 template <int FEAT_IN, int FEAT_OUT, int BLK, int COLS_PER_BLOCK, typename in_T, typename W_T>
-__global__ void __launch_bounds__(BLK, 8) moe_bgmv_expand_opt_kernel(
+__global__ void __launch_bounds__(BLK, 4) moe_bgmv_expand_opt_kernel(
     float* __restrict__ Y, const in_T* __restrict__ X, W_T** __restrict__ w_ptr,
     const int64_t* __restrict__ sorted_token_ids, const int64_t* __restrict__ expert_ids,
     const int64_t* __restrict__ lora_indices, const float* __restrict__ topk_weights,
@@ -388,6 +392,16 @@ __global__ void __launch_bounds__(BLK, 8) moe_bgmv_expand_opt_kernel(
   constexpr int KVEC = 8;                  // 8 bf16 = 128-bit
   constexpr int KGROUPS = FEAT_IN / KVEC;  // K-slices per column (rank/8)
   constexpr int PASSES = COLS_PER_BLOCK / (BLK / KGROUPS);
+  // Shape invariants the reduction layout relies on (dispatcher only advertises FEAT_IN % 8 == 0).
+  // A future rank whose KGROUPS is not a power of two, or that does not tile BLK / COLS_PER_BLOCK
+  // evenly, would silently mis-reduce columns; fail fast at compile time instead.
+  static_assert(FEAT_IN % KVEC == 0, "moe_bgmv_expand_opt_kernel requires FEAT_IN % 8 == 0");
+  static_assert((KGROUPS & (KGROUPS - 1)) == 0,
+                "moe_bgmv_expand_opt_kernel requires power-of-two KGROUPS");
+  static_assert(BLK % KGROUPS == 0,
+                "moe_bgmv_expand_opt_kernel requires BLK to be divisible by KGROUPS");
+  static_assert(COLS_PER_BLOCK % (BLK / KGROUPS) == 0,
+                "moe_bgmv_expand_opt_kernel requires an integral number of passes");
   const int pair_idx = blockIdx.x;
   const int64_t token_idx = sorted_token_ids[pair_idx];
   if (token_idx < 0 || token_idx >= num_tokens) return;
