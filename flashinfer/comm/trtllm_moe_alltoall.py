@@ -488,8 +488,9 @@ def moe_a2a_combine(
     sf_layout : SfLayout
         Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
     output : Optional[torch.Tensor]
-        Caller-provided output tensor. Its shape and dtype must match the
-        requested combine output.
+        Caller-provided contiguous output tensor. Its shape and dtype must
+        match the requested combine output, and it must be on the same device
+        as ``payload``.
 
     Returns
     -------
@@ -931,8 +932,9 @@ class MoeAlltoAll:
         sf_layout : SfLayout
             Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
         output : Optional[torch.Tensor]
-            Caller-provided output tensor. Its shape and dtype must match the
-            requested combine output.
+            Caller-provided contiguous output tensor. Its shape and dtype must
+            match the requested combine output, and it must be on the same
+            device as ``payload``.
 
         Returns
         -------

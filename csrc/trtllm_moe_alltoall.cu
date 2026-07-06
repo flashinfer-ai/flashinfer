@@ -331,8 +331,10 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   TVM_FFI_ICHECK_EQ(output.ndim(), 2) << "output must be a 2D tensor";
   TVM_FFI_ICHECK_EQ(output.size(0), output_shape[0]);
   TVM_FFI_ICHECK_EQ(output.size(1), output_shape[1]);
-  TVM_FFI_ICHECK(output.dtype() == outputDtype_.value_or(payload.dtype()))
-      << "output dtype does not match output_dtype";
+  auto const expectedOutputDtype = outputDtype_.value_or(payload.dtype());
+  TVM_FFI_ICHECK(output.dtype() == expectedOutputDtype)
+      << "output dtype must match " << (outputDtype_.has_value() ? "output_dtype" : "payload dtype")
+      << " (expected " << expectedOutputDtype << ", got " << output.dtype() << ")";
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);
