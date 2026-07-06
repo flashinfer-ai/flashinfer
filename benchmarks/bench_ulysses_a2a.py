@@ -10,19 +10,30 @@ bench:
 - per-sample timing (one CUDA event pair per iteration), not a single-window
   mean; every sample is reduced to the max across ranks (the collective is
   only done when the slowest rank is done), not rank 0's local time
-- >= 5 repeats x 30 iters with the implementation order alternating between
-  repeats to decorrelate thermal/clock drift from the impl identity
-- p50 / p95 / std / mean over the rank-max samples, machine-readable JSON and
-  CSV output
+- methodology minimums are *enforced*, not defaults: >= 5 repeats x >= 30
+  iters, known+available implementations, valid world size — the run refuses
+  to start otherwise
+- the measurement order rotates across repeats so every implementation
+  occupies every position (Latin-square style), decorrelating position and
+  thermal/clock drift from the impl identity; the actual per-repeat orders
+  are recorded in the artifact
+- p50 (conventional median) / p95 / std / mean over the rank-max samples,
+  machine-readable JSON and CSV with full provenance (package commit + dirty
+  state + import path, harness schema version + script hash)
+- ``compare`` is fail-closed: it refuses to gate unless both artifacts come
+  from the same harness/schema, identical workload/methodology metadata,
+  *different* labels and commits, and every required gate pair is present
 
 Implementations:
 
-- ``raw``:           init_ulysses_a2a / ulysses_a2a (works on the c83e4204
-                     baseline checkout and on current builds)
-- ``communicator``:  UlyssesCommunicator public API (current builds only;
-                     auto-skipped where unavailable)
-- ``nccl``:          dist.all_to_all_single + permute glue (self-contained,
-                     no dependency on flashinfer beyond torch)
+- ``raw``:              init_ulysses_a2a / ulysses_a2a (works on the c83e4204
+                        baseline checkout and on current builds)
+- ``communicator``:     UlyssesCommunicator public API, forced NVLink
+                        (current builds only)
+- ``communicator_nccl``: UlyssesCommunicator public API, forced NCCL —
+                        measures the public fallback path / API overhead
+- ``nccl_ref``:         self-contained dist.all_to_all_single + permute glue
+                        algorithm control (no flashinfer dependency)
 
 Also reports a secondary end-to-end proxy ("e2e_attn"): the same pattern with
 a scaled_dot_product_attention between the scatters and the gather.
@@ -30,11 +41,12 @@ a scaled_dot_product_attention between the scatters and the gather.
 Usage (run on the current checkout, then on a baseline worktree, then gate):
 
     python benchmarks/bench_ulysses_a2a.py run --world-size 8 \
-        --impls raw,communicator,nccl --label new --out /tmp/ulysses_new_w8
+        --impls raw,communicator,communicator_nccl,nccl_ref \
+        --label new --out /tmp/ulysses_new_w8
 
     PYTHONPATH=/path/to/c83e4204-worktree \
     python benchmarks/bench_ulysses_a2a.py run --world-size 8 \
-        --impls raw,nccl --label baseline --out /tmp/ulysses_base_w8
+        --impls raw,nccl_ref --label baseline --out /tmp/ulysses_base_w8
 
     python benchmarks/bench_ulysses_a2a.py compare \
         /tmp/ulysses_base_w8.json /tmp/ulysses_new_w8.json --threshold-pct 3
@@ -44,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import multiprocessing as mp
 import socket
@@ -54,7 +67,46 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+SCHEMA_VERSION = "ulysses-a2a-m3-v2"
 PRIMARY_UNIT = "a2a"  # regression gate applies to this unit only
+UNITS = ["a2a", "e2e_attn"]
+MIN_REPEATS = 5
+MIN_ITERS = 30
+SUPPORTED_WS = (2, 4, 6, 8)
+
+# gate pairs the contract requires; compare fails if any is absent
+REQUIRED_GATES = [
+    ("raw->raw (kernel+raw path)", "raw", "raw"),
+    ("raw->communicator (user-visible API)", "raw", "communicator"),
+    ("nccl_ref control", "nccl_ref", "nccl_ref"),
+]
+# informational pairs, reported when present but never gated / required
+OPTIONAL_PAIRS = [
+    (
+        "nccl_ref->communicator_nccl (public fallback API)",
+        "nccl_ref",
+        "communicator_nccl",
+    ),
+]
+# metadata fields that must be identical between compared artifacts
+COMPAT_META_FIELDS = [
+    "schema",
+    "harness_sha",
+    "world_size",
+    "workload",
+    "unit",
+    "sample_reduction",
+    "order_policy",
+    "repeats",
+    "iters",
+    "warmup",
+    "torch",
+    "device",
+]
+
+
+def harness_sha() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 
 
 def default_workload(world_size: int) -> dict:
@@ -68,10 +120,12 @@ def default_workload(world_size: int) -> dict:
 # ---- implementations ----------------------------------------------------------
 
 
-class NcclImpl:
-    """all_to_all_single + permute glue; self-contained baseline."""
+class NcclRefImpl:
+    """all_to_all_single + permute glue; self-contained algorithm control
+    (NOT the public UlyssesCommunicator NCCL backend — see
+    ``communicator_nccl`` for that)."""
 
-    name = "nccl"
+    name = "nccl_ref"
 
     def __init__(self, group, ws, shapes, device, dtype):
         self.group = group
@@ -125,6 +179,11 @@ class RawImpl:
         self.fa = comm.init_ulysses_a2a(
             self.out_ptrs, self.sig_ptrs, dist.get_rank(group), ws, True
         )
+        # The signal zeroing inside init is an async cudaMemset; the baseline
+        # (c83e4204) wrapper returns before it completes and a process-group
+        # barrier is NOT a CUDA fence. Fence unconditionally (redundant but
+        # harmless on current wrappers, required for the baseline).
+        torch.cuda.synchronize()
         dist.barrier(group=group)
 
     def scatter(self, x):
@@ -151,10 +210,8 @@ class RawImpl:
         self.comm.free_shared_buffer(self.sig_ptrs, group=self.group)
 
 
-class CommunicatorImpl:
-    """UlyssesCommunicator public API (current builds only)."""
-
-    name = "communicator"
+class _CommunicatorImplBase:
+    backend = "nvlink"
 
     def __init__(self, group, ws, shapes, device, dtype):
         from flashinfer.comm import UlyssesCommunicator
@@ -164,7 +221,7 @@ class CommunicatorImpl:
             group,
             max_elems=B * S_local * H * D,
             dtype=dtype,
-            backend="nvlink",
+            backend=self.backend,
             device=device,
         )
 
@@ -179,17 +236,146 @@ class CommunicatorImpl:
         self.comm.close()
 
 
-IMPLS = {c.name: c for c in (RawImpl, CommunicatorImpl, NcclImpl)}
+class CommunicatorImpl(_CommunicatorImplBase):
+    """UlyssesCommunicator public API, forced NVLink (current builds only)."""
+
+    name = "communicator"
+    backend = "nvlink"
+
+
+class CommunicatorNcclImpl(_CommunicatorImplBase):
+    """UlyssesCommunicator public API, forced NCCL: the public fallback path
+    (its delta vs nccl_ref is the public API overhead)."""
+
+    name = "communicator_nccl"
+    backend = "nccl"
+
+
+IMPLS = {
+    c.name: c for c in (RawImpl, CommunicatorImpl, CommunicatorNcclImpl, NcclRefImpl)
+}
 
 
 def impl_available(name: str) -> bool:
-    if name == "nccl":
+    if name == "nccl_ref":
         return True
     import flashinfer.comm as comm
 
-    if name == "communicator":
+    if name in ("communicator", "communicator_nccl"):
         return hasattr(comm, "UlyssesCommunicator")
     return hasattr(comm, "init_ulysses_a2a")
+
+
+# ---- methodology validation (pure; unit-tested on CPU) -------------------------
+
+
+def validate_run_args(
+    world_size: int,
+    impls: list[str],
+    repeats: int,
+    iters: int,
+    warmup: int,
+    device_count: int,
+    available=impl_available,
+) -> None:
+    """Enforce the contract's methodology minimums before any worker starts."""
+    if world_size not in SUPPORTED_WS:
+        raise ValueError(f"world_size must be one of {SUPPORTED_WS}, got {world_size}")
+    if device_count < world_size:
+        raise ValueError(f"needs {world_size} GPUs, have {device_count}")
+    if repeats < MIN_REPEATS:
+        raise ValueError(f"repeats must be >= {MIN_REPEATS}, got {repeats}")
+    if iters < MIN_ITERS:
+        raise ValueError(f"iters must be >= {MIN_ITERS}, got {iters}")
+    if warmup < 1:
+        raise ValueError(f"warmup must be >= 1, got {warmup}")
+    if not impls:
+        raise ValueError("at least one implementation is required")
+    unknown = [n for n in impls if n not in IMPLS]
+    if unknown:
+        raise ValueError(f"unknown implementation(s) {unknown}; known: {sorted(IMPLS)}")
+    unavailable = [n for n in impls if not available(n)]
+    if unavailable:
+        raise ValueError(
+            f"implementation(s) {unavailable} unavailable in this flashinfer build"
+        )
+    wl = default_workload(world_size)
+    if wl["S_global"] % world_size or wl["H"] % world_size:
+        raise ValueError(f"workload {wl} not divisible by world_size {world_size}")
+
+
+def rotation_order(impls: list[str], rep: int) -> list[str]:
+    """Rotate the measurement order each repeat so every impl occupies every
+    position across the run (with repeats >= len(impls))."""
+    off = rep % len(impls)
+    return impls[off:] + impls[:off]
+
+
+def validate_compare(base: dict, new: dict) -> None:
+    """Fail-closed compatibility check; raises ValueError on any mismatch."""
+    for payload, role in ((base, "baseline"), (new, "new")):
+        if "meta" not in payload or "results" not in payload:
+            raise ValueError(f"{role} artifact is missing meta/results")
+    bm, nm = base["meta"], new["meta"]
+    for field in COMPAT_META_FIELDS:
+        if bm.get(field) != nm.get(field):
+            raise ValueError(
+                f"meta field {field!r} differs: baseline={bm.get(field)!r} "
+                f"new={nm.get(field)!r}; artifacts are not comparable"
+            )
+    if bm.get("label") == nm.get("label"):
+        raise ValueError(
+            f"baseline and new labels are identical ({bm.get('label')!r}); "
+            "refusing to gate an artifact against itself"
+        )
+    if bm.get("commit") == nm.get("commit"):
+        raise ValueError(
+            f"baseline and new package commits are identical ({bm.get('commit')!r}); "
+            "the gate must compare different code"
+        )
+    missing = []
+    for pair_name, b_impl, n_impl in REQUIRED_GATES:
+        if b_impl not in base["results"]:
+            missing.append(f"{pair_name}: {b_impl} missing from baseline")
+        elif PRIMARY_UNIT not in base["results"][b_impl]:
+            missing.append(f"{pair_name}: baseline {b_impl} lacks {PRIMARY_UNIT}")
+        if n_impl not in new["results"]:
+            missing.append(f"{pair_name}: {n_impl} missing from new")
+        elif PRIMARY_UNIT not in new["results"][n_impl]:
+            missing.append(f"{pair_name}: new {n_impl} lacks {PRIMARY_UNIT}")
+    if missing:
+        raise ValueError(
+            "required gate pair(s) incomplete (the gate is fail-closed): "
+            + "; ".join(missing)
+        )
+
+
+def compare_payloads(base: dict, new: dict, threshold_pct: float):
+    """Returns (report_lines, gate_failed). Raises on incompatible inputs."""
+    validate_compare(base, new)
+    lines = []
+    failed = False
+    for pair_name, b_impl, n_impl in REQUIRED_GATES + OPTIONAL_PAIRS:
+        if b_impl not in base["results"] or n_impl not in new["results"]:
+            continue  # only possible for OPTIONAL_PAIRS after validation
+        for unit in base["results"][b_impl]:
+            if unit not in new["results"][n_impl]:
+                continue
+            b = base["results"][b_impl][unit]["p50"]
+            n = new["results"][n_impl][unit]["p50"]
+            delta = (n - b) / b * 100.0
+            gated = unit == PRIMARY_UNIT and (pair_name, b_impl, n_impl) in [
+                tuple(g) for g in REQUIRED_GATES
+            ]
+            verdict = ""
+            if gated and delta > threshold_pct:
+                verdict = "  << REGRESSION GATE EXCEEDED"
+                failed = True
+            lines.append(
+                f"  {pair_name:48s} {unit:8s} {b:8.3f} -> {n:8.3f} ms "
+                f"({delta:+6.2f}%){' [gated]' if gated else ''}{verdict}"
+            )
+    return lines, failed
 
 
 # ---- references (independent of all impls) ------------------------------------
@@ -230,10 +416,7 @@ def _measure_unit(impl, unit, q, k, v, iters, group):
         a = impl.scatter(q)
         b = impl.scatter(k)
         c = impl.scatter(v)
-        if unit == "e2e_attn":
-            o = _sdpa(a, b, c)
-        else:
-            o = a
+        o = _sdpa(a, b, c) if unit == "e2e_attn" else a
         return impl.gather(o)
 
     torch.cuda.synchronize()
@@ -250,7 +433,7 @@ def _stats(samples):
     s = sorted(samples)
     n = len(s)
     return dict(
-        p50=s[n // 2],
+        p50=statistics.median(s),
         p95=s[min(n - 1, int(round(0.95 * (n - 1))))],
         mean=statistics.fmean(s),
         std=statistics.stdev(s) if n > 1 else 0.0,
@@ -270,10 +453,7 @@ def _worker(rank, ws, port, args, q_out):
         )
         group = dist.group.WORLD
         wl = default_workload(ws)
-        if args.heads:
-            wl["H"] = args.heads
         B, S_global, H, D = wl["B"], wl["S_global"], wl["H"], wl["D"]
-        assert S_global % ws == 0 and H % ws == 0, (S_global, H, ws)
         S_local = S_global // ws
         dtype = getattr(torch, wl["dtype"])
         device = torch.device(f"cuda:{rank}")
@@ -284,7 +464,7 @@ def _worker(rank, ws, port, args, q_out):
         )
         q, k, v = mk(), mk(), mk()
 
-        impl_names = [n for n in args.impls.split(",") if impl_available(n)]
+        impl_names = args.impls.split(",")
         impls = {
             n: IMPLS[n](group, ws, (B, S_local, H, D), device, dtype)
             for n in impl_names
@@ -301,14 +481,13 @@ def _worker(rank, ws, port, args, q_out):
             torch.cuda.synchronize()
             assert torch.equal(back, ref2), f"{name} gather mismatch on rank {rank}"
 
-        units = ["a2a", "e2e_attn"]
-        samples = {n: {u: [] for u in units} for n in impl_names}
+        samples = {n: {u: [] for u in UNITS} for n in impl_names}
+        orders = []
         for rep in range(args.repeats):
-            # alternate the measurement order between repeats so slow drift
-            # (clocks, thermals) does not systematically favor one impl
-            order = impl_names if rep % 2 == 0 else impl_names[::-1]
+            order = rotation_order(impl_names, rep)
+            orders.append(order)
             for name in order:
-                for unit in units:
+                for unit in UNITS:
                     _measure_unit(  # warmup, same unit as timed
                         impls[name], unit, q, k, v, args.warmup, group
                     )
@@ -321,7 +500,7 @@ def _worker(rank, ws, port, args, q_out):
         reduced = {}
         for name in impl_names:
             reduced[name] = {}
-            for unit in units:
+            for unit in UNITS:
                 t = torch.tensor(samples[name][unit], device=device)
                 gathered = [torch.empty_like(t) for _ in range(ws)]
                 dist.all_gather(gathered, t, group=group)
@@ -330,7 +509,7 @@ def _worker(rank, ws, port, args, q_out):
 
         for impl in impls.values():
             impl.close()
-        result = ("ok", reduced if rank == 0 else None)
+        result = ("ok", (reduced, orders) if rank == 0 else None)
         dist.destroy_process_group()
     except Exception as e:  # noqa: BLE001
         import traceback
@@ -342,10 +521,31 @@ def _worker(rank, ws, port, args, q_out):
     q_out.put((rank, result))
 
 
+def _package_provenance() -> dict:
+    import flashinfer
+
+    pkg_dir = Path(flashinfer.__file__).resolve().parent
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=pkg_dir, text=True
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"], cwd=pkg_dir, text=True
+            ).strip()
+        )
+    except Exception:  # noqa: BLE001
+        commit, dirty = "unknown", True
+    return {"commit": commit, "dirty": dirty, "import_path": str(pkg_dir)}
+
+
 def cmd_run(args):
     ws = args.world_size
-    if torch.cuda.device_count() < ws:
-        raise SystemExit(f"needs {ws} GPUs, have {torch.cuda.device_count()}")
+    impl_names = [n for n in args.impls.split(",") if n]
+    validate_run_args(
+        ws, impl_names, args.repeats, args.iters, args.warmup, torch.cuda.device_count()
+    )
+    args.impls = ",".join(impl_names)
     mp.set_start_method("spawn", force=True)
     q = mp.Queue()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -366,36 +566,29 @@ def cmd_run(args):
     if errs:
         raise SystemExit(f"workers failed: {errs}")
 
-    reduced = results[0][1]
-    try:
-        # the commit of the flashinfer actually under test (PYTHONPATH may
-        # point at a baseline worktree), not of this script's checkout
-        import flashinfer
-
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=Path(flashinfer.__file__).resolve().parent,
-            text=True,
-        ).strip()
-    except Exception:  # noqa: BLE001
-        commit = "unknown"
-    wl = default_workload(ws)
-    if args.heads:
-        wl["H"] = args.heads
+    reduced, orders = results[0][1]
+    prov = _package_provenance()
     payload = {
         "meta": {
+            "schema": SCHEMA_VERSION,
+            "harness_sha": harness_sha(),
             "label": args.label,
-            "commit": commit,
+            "commit": prov["commit"],
+            "package_dirty": prov["dirty"],
+            "package_import_path": prov["import_path"],
             "torch": torch.__version__,
             "device": torch.cuda.get_device_name(0),
             "world_size": ws,
-            "workload": wl,
+            "workload": default_workload(ws),
             "unit": "3x scatter_heads + 1x gather_heads (+sdpa for e2e_attn), ms",
             "repeats": args.repeats,
             "iters": args.iters,
             "warmup": args.warmup,
             "sample_reduction": "max across ranks per iteration",
-            "order": "impl order alternates per repeat",
+            "order_policy": "rotation per repeat (every impl visits every position)",
+            "requested_impls": args.impls.split(","),
+            "run_impls": list(reduced.keys()),
+            "repeat_orders": orders,
         },
         "results": {
             name: {
@@ -440,7 +633,7 @@ def cmd_run(args):
     for name, units in payload["results"].items():
         for unit, st in units.items():
             print(
-                f"  ws={ws} {name:12s} {unit:8s} p50={st['p50']:8.3f} ms "
+                f"  ws={ws} {name:18s} {unit:8s} p50={st['p50']:8.3f} ms "
                 f"p95={st['p95']:8.3f} std={st['std']:6.3f} n={st['n']}"
             )
 
@@ -448,37 +641,15 @@ def cmd_run(args):
 def cmd_compare(args):
     base = json.loads(Path(args.baseline).read_text())
     new = json.loads(Path(args.new).read_text())
-    ws_b, ws_n = base["meta"]["world_size"], new["meta"]["world_size"]
-    if ws_b != ws_n:
-        raise SystemExit(f"world sizes differ: {ws_b} vs {ws_n}")
+    lines, failed = compare_payloads(base, new, args.threshold_pct)
+    bm, nm = base["meta"], new["meta"]
     print(
-        f"[compare] ws={ws_b} baseline={base['meta']['label']}@{base['meta']['commit']} "
-        f"new={new['meta']['label']}@{new['meta']['commit']} "
+        f"[compare] ws={bm['world_size']} baseline={bm['label']}@{bm['commit'][:8]} "
+        f"new={nm['label']}@{nm['commit'][:8]} "
         f"gate: {PRIMARY_UNIT} p50 regression <= {args.threshold_pct}%"
     )
-    failed = False
-    for pair_name, b_impl, n_impl in [
-        ("raw->raw (kernel+raw path)", "raw", "raw"),
-        ("raw->communicator (user-visible API)", "raw", "communicator"),
-        ("nccl->nccl (fallback path)", "nccl", "nccl"),
-    ]:
-        if b_impl not in base["results"] or n_impl not in new["results"]:
-            continue
-        for unit in base["results"][b_impl]:
-            if unit not in new["results"][n_impl]:
-                continue
-            b = base["results"][b_impl][unit]["p50"]
-            n = new["results"][n_impl][unit]["p50"]
-            delta = (n - b) / b * 100.0
-            gate = unit == PRIMARY_UNIT
-            verdict = ""
-            if gate and delta > args.threshold_pct:
-                verdict = "  << REGRESSION GATE EXCEEDED"
-                failed = True
-            print(
-                f"  {pair_name:42s} {unit:8s} {b:8.3f} -> {n:8.3f} ms "
-                f"({delta:+6.2f}%){' [gated]' if gate else ''}{verdict}"
-            )
+    for line in lines:
+        print(line)
     if failed:
         raise SystemExit(1)
     print("[compare] PASS")
@@ -489,11 +660,10 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--world-size", type=int, required=True)
-    r.add_argument("--impls", default="raw,communicator,nccl")
-    r.add_argument("--repeats", type=int, default=5)
-    r.add_argument("--iters", type=int, default=30)
+    r.add_argument("--impls", default="raw,communicator,communicator_nccl,nccl_ref")
+    r.add_argument("--repeats", type=int, default=MIN_REPEATS)
+    r.add_argument("--iters", type=int, default=MIN_ITERS)
     r.add_argument("--warmup", type=int, default=5)
-    r.add_argument("--heads", type=int, default=0, help="override head count")
     r.add_argument("--label", required=True)
     r.add_argument("--out", required=True, help="output path prefix (no suffix)")
     r.set_defaults(func=cmd_run)
