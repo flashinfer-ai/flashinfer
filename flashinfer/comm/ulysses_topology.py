@@ -41,12 +41,15 @@ class UlyssesRankTopology:
     """
 
     rank: int
-    hostname: str
-    device_index: int
-    device_uuid: str  # "GPU-xxxx..." or "" when unknown
-    pci_bus_id: str
+    hostname: str = ""
+    device_index: int = -1
+    device_uuid: str = ""  # "GPU-xxxx..." or "" when unknown
+    pci_bus_id: str = ""
     peer_p2p: Dict[str, bool] = field(default_factory=dict)
     peer_nvlink: Dict[str, bool] = field(default_factory=dict)
+    # peer uuid -> NVML error text for that concrete pair probe; distinguishes
+    # "probe broke for this pair" from "pair verified to have no NVLink"
+    pair_errors: Dict[str, str] = field(default_factory=dict)
     probe_error: Optional[str] = None
 
 
@@ -63,30 +66,47 @@ class UlyssesBackendDecision:
     reason: str
 
 
-def probe_ulysses_rank_topology(device: torch.device, rank: int) -> UlyssesRankTopology:
+def probe_ulysses_rank_topology(
+    device: Optional[torch.device], rank: int
+) -> UlyssesRankTopology:
     """Probe this rank's GPU identity and its P2P/NVLink reachability to every
     other CUDA device visible to this process.
 
-    Never raises: any probing failure is recorded in ``probe_error`` so the
-    (conservative) decision layer falls back to NCCL.
+    Never raises: the whole probe (including hostname and device resolution)
+    runs inside an exception envelope, so any failure lands in ``probe_error``
+    and the (conservative) decision layer falls back to NCCL.
     """
-    hostname = socket.gethostname()
-    device_index = device.index if device.index is not None else 0
-    topo = UlyssesRankTopology(
-        rank=rank,
-        hostname=hostname,
-        device_index=device_index,
-        device_uuid="",
-        pci_bus_id="",
-    )
+    topo = UlyssesRankTopology(rank=rank)
     try:
+        topo.hostname = socket.gethostname()
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(
+                f"Ulysses topology probe requires a CUDA device, got {device!r}"
+            )
+        # index=None means the *current* device, not GPU 0
+        device_index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        topo.device_index = device_index
+
         import pynvml
 
         pynvml.nvmlInit()
         try:
 
             def _uuid(idx: int) -> str:
-                return f"GPU-{torch.cuda.get_device_properties(idx).uuid}"
+                props = torch.cuda.get_device_properties(idx)
+                uuid = getattr(props, "uuid", None)
+                if uuid is None:
+                    raise RuntimeError(
+                        "torch.cuda.get_device_properties(...).uuid unavailable "
+                        "(torch too old); cannot establish physical GPU identity"
+                    )
+                return f"GPU-{uuid}"
 
             def _handle(idx: int):
                 return pynvml.nvmlDeviceGetHandleByUUID(_uuid(idx).encode())
@@ -112,8 +132,11 @@ def probe_ulysses_rank_topology(device: torch.device, rank: int) -> UlyssesRankT
                         my_handle, _handle(peer), pynvml.NVML_P2P_CAPS_INDEX_NVLINK
                     )
                     topo.peer_nvlink[peer_uuid] = status == pynvml.NVML_P2P_STATUS_OK
-                except pynvml.NVMLError:
+                except pynvml.NVMLError as pair_err:
+                    # record the diagnostic instead of silently pretending the
+                    # physical link is absent
                     topo.peer_nvlink[peer_uuid] = False
+                    topo.pair_errors[peer_uuid] = str(pair_err)
         finally:
             pynvml.nvmlShutdown()
     except Exception as e:  # noqa: BLE001 — any probe failure => conservative fallback
@@ -191,6 +214,11 @@ def decide_ulysses_backend(
                     f"no P2P access from rank {src.rank} ({src.device_uuid}) to "
                     f"rank {dst.rank} ({dst.device_uuid})"
                 )
+            if dst.device_uuid in src.pair_errors:
+                return fallback(
+                    f"NVLink probe failed between rank {src.rank} and rank "
+                    f"{dst.rank}: {src.pair_errors[dst.device_uuid]}"
+                )
             if not src.peer_nvlink.get(dst.device_uuid, False):
                 return fallback(
                     f"no NVLink between rank {src.rank} ({src.device_uuid}) and "
@@ -212,36 +240,90 @@ def resolve_ulysses_backend(
     """Group-consistent backend selection. Must run *before* any IPC allocation
     or JIT compilation; it performs no CUDA allocations itself.
 
-    Every rank probes its local topology, the probes are all-gathered, and each
-    rank evaluates the same pure decision function on the same gathered list.
-    The resulting decisions are all-gathered again and cross-checked; any
-    disagreement (which indicates non-deterministic probing, e.g. racing driver
-    state) conservatively selects NCCL — or raises for ``backend="nvlink"``.
+    Collective-safe outcome protocol: every rank participates in the same fixed
+    sequence of ``all_gather_object`` calls no matter what fails locally —
+    rank-local errors are encoded as serializable outcomes and re-raised (or
+    turned into an NCCL fallback) *jointly* after the gather, so no rank can
+    leave the collective sequence early and deadlock its peers. The only
+    uncoordinated failure mode left is the process group itself failing.
+
+    Sequence:
+
+    1. gather every rank's *requested* backend; jointly reject invalid or
+       inconsistent requests. A group-wide explicit ``"nccl"`` request returns
+       here, without touching CUDA/NVML at all.
+    2. gather every rank's probe outcome (the probe never raises; even a buggy
+       probe implementation is caught into the outcome).
+    3. every rank evaluates the same pure decision on the same gathered list,
+       catches the result into an outcome, gathers, and cross-checks. Any
+       disagreement conservatively selects NCCL — or raises for
+       ``backend="nvlink"``.
     """
-    if backend not in ULYSSES_BACKENDS:
-        raise ValueError(f"backend must be one of {ULYSSES_BACKENDS}, got {backend!r}")
     if group is None:
         group = dist.group.WORLD
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
 
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    local = probe_ulysses_rank_topology(device, rank)
+    # ---- gather 1: requested backends (before any local validation) --------
+    requests: List[Optional[str]] = [None] * world_size
+    dist.all_gather_object(requests, str(backend), group=group)
+
+    invalid = {r: req for r, req in enumerate(requests) if req not in ULYSSES_BACKENDS}
+    if invalid:
+        # every rank raises the same error together
+        raise ValueError(
+            f"backend must be one of {ULYSSES_BACKENDS}; invalid request(s) "
+            f"by rank: {invalid}"
+        )
+    if len(set(requests)) > 1:
+        raise ValueError(
+            f"inconsistent backend requests across ranks: {requests}; all ranks "
+            "must pass the same backend"
+        )
+    requested = requests[0]
+    if requested == "nccl":
+        return UlyssesBackendDecision("nccl", "backend='nccl' requested")
+
+    # ---- gather 2: probe outcomes ------------------------------------------
+    # probe_ulysses_rank_topology never raises by contract, but a buggy or
+    # monkeypatched probe must not break the collective sequence either.
+    try:
+        local = probe_ulysses_rank_topology(device, rank)
+    except Exception as e:  # noqa: BLE001
+        local = UlyssesRankTopology(rank=rank, probe_error=f"{type(e).__name__}: {e}")
 
     topologies: List[Optional[UlyssesRankTopology]] = [None] * world_size
     dist.all_gather_object(topologies, local, group=group)
 
-    # Deterministic in the gathered list, so on forced-NVLink failure every
-    # rank raises here together — before any IPC allocation or JIT compile.
-    decision = decide_ulysses_backend(backend, topologies)
+    # ---- gather 3: decision outcomes (unconditional) ------------------------
+    # ("ok", backend, reason) | ("backend_error", msg) | ("error", msg)
+    outcome: Tuple[str, ...]
+    try:
+        decision = decide_ulysses_backend(requested, topologies)
+        outcome = ("ok", decision.backend, decision.reason)
+    except UlyssesBackendError as e:
+        outcome = ("backend_error", str(e))
+    except Exception as e:  # noqa: BLE001
+        outcome = ("error", f"{type(e).__name__}: {e}")
 
-    decisions: List[Optional[Tuple[str, str]]] = [None] * world_size
-    dist.all_gather_object(decisions, (decision.backend, decision.reason), group=group)
-    if any(d != decisions[0] for d in decisions):
-        reason = f"inconsistent backend decisions across ranks: {decisions}"
-        if backend == "nvlink":
+    outcomes: List[Optional[Tuple[str, ...]]] = [None] * world_size
+    dist.all_gather_object(outcomes, outcome, group=group)
+
+    # Joint resolution: identical gathered list => identical result on every
+    # rank, whether that is a raise or a decision.
+    backend_errors = [o for o in outcomes if o and o[0] == "backend_error"]
+    if backend_errors:
+        raise UlyssesBackendError(backend_errors[0][1])
+    errors = {r: o[1] for r, o in enumerate(outcomes) if o and o[0] == "error"}
+    if errors:
+        reason = f"backend decision failed on rank(s) {errors}"
+        if requested == "nvlink":
+            raise UlyssesBackendError(f"backend='nvlink' requested but {reason}")
+        return UlyssesBackendDecision("nccl", reason)
+    if any(o != outcomes[0] for o in outcomes):
+        reason = f"inconsistent backend decisions across ranks: {outcomes}"
+        if requested == "nvlink":
             raise UlyssesBackendError(f"backend='nvlink' requested but {reason}")
         return UlyssesBackendDecision("nccl", reason)
 
-    return decision
+    return UlyssesBackendDecision(outcomes[0][1], outcomes[0][2])

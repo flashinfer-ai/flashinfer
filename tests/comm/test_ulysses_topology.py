@@ -2,7 +2,12 @@
 # The decision function is pure (probe results injected), so most of this file
 # runs without any GPU; the last test probes the real machine when it can.
 
+import importlib
+import multiprocessing as std_mp
+import os
+import queue as queue_mod
 import socket
+import time
 
 import pytest
 import torch
@@ -92,6 +97,18 @@ def test_missing_nvlink_pair_falls_back():
     d = decide_ulysses_backend("auto", topos)
     assert d.backend == "nccl"
     assert "no NVLink between rank 0" in d.reason
+
+
+def test_pair_probe_error_reported_as_diagnostic():
+    topos = _full_mesh(4)
+    # NVML broke for this concrete pair: must surface the diagnostic, not
+    # masquerade as a verified missing physical link
+    topos[0].peer_nvlink[topos[2].device_uuid] = False
+    topos[0].pair_errors[topos[2].device_uuid] = "NVML unknown error"
+    d = decide_ulysses_backend("auto", topos)
+    assert d.backend == "nccl"
+    assert "NVLink probe failed between rank 0 and rank 2" in d.reason
+    assert "NVML unknown error" in d.reason
 
 
 def test_unknown_identity_falls_back():
@@ -215,6 +232,201 @@ def test_resolve_invalid_backend(gloo_pg):
 def test_exports():
     assert comm.resolve_ulysses_backend is resolve_ulysses_backend
     assert comm.UlyssesBackendError is UlyssesBackendError
+
+
+# ---- collective safety (2-rank gloo, timeout + terminate) --------------------
+# Every rank must reach the same outcome (same exception class or same
+# decision) within the time limit no matter which single rank misbehaves; a
+# hung worker means a rank left the collective sequence early.
+
+
+def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q):
+    mod = importlib.import_module("flashinfer.comm.ulysses_topology")
+
+    def mesh_probe(device, r):
+        return _full_mesh(world_size)[r]
+
+    if patch == "nvlink_pair_missing":
+
+        def broken_probe(device, r):
+            topos = _full_mesh(world_size)
+            topos[1].peer_nvlink[topos[0].device_uuid] = False
+            return topos[r]
+
+        mod.probe_ulysses_rank_topology = broken_probe
+    elif patch == "probe_raises_rank0":
+        if rank == 0:
+
+            def raising_probe(device, r):
+                raise RuntimeError("probe exploded")
+
+            mod.probe_ulysses_rank_topology = raising_probe
+        else:
+            mod.probe_ulysses_rank_topology = mesh_probe
+    elif patch == "decide_raises_rank1":
+        mod.probe_ulysses_rank_topology = mesh_probe
+        if rank == 1:
+
+            def raising_decide(*args, **kwargs):
+                raise RuntimeError("decision exploded")
+
+            mod.decide_ulysses_backend = raising_decide
+    elif patch == "probe_marker":
+
+        def marker_probe(device, r):
+            with open(marker_path, "w") as f:
+                f.write(f"probe touched by rank {r}")
+            return mesh_probe(device, r)
+
+        mod.probe_ulysses_rank_topology = marker_probe
+    elif patch == "mesh":
+        mod.probe_ulysses_rank_topology = mesh_probe
+
+    try:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        try:
+            d = mod.resolve_ulysses_backend(backends[rank])
+            q.put((rank, "ok", (d.backend, d.reason)))
+        except mod.UlyssesBackendError as e:
+            q.put((rank, "UlyssesBackendError", str(e)))
+        except ValueError as e:
+            q.put((rank, "ValueError", str(e)))
+        except Exception as e:  # noqa: BLE001
+            q.put((rank, type(e).__name__, str(e)))
+        finally:
+            dist.destroy_process_group()
+    except Exception as e:  # noqa: BLE001 — process-group setup failure
+        q.put((rank, "pg-error", str(e)))
+
+
+def _run_resolve_case(backends, patch=None, marker_path=None, timeout=120):
+    world_size = len(backends)
+    ctx = std_mp.get_context("spawn")
+    q = ctx.Queue()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    procs = [
+        ctx.Process(
+            target=_resolve_case_worker,
+            args=(r, world_size, port, backends, patch, marker_path, q),
+        )
+        for r in range(world_size)
+    ]
+    for p in procs:
+        p.start()
+    results = {}
+    deadline = time.time() + timeout
+    while len(results) < world_size and time.time() < deadline:
+        try:
+            rank, kind, payload = q.get(timeout=1)
+            results[rank] = (kind, payload)
+        except queue_mod.Empty:
+            pass
+    hung = [p for p in procs if p.is_alive() and len(results) < world_size]
+    for p in procs:
+        p.join(timeout=10)
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=10)
+    assert len(results) == world_size, (
+        f"only ranks {sorted(results)} finished within {timeout}s "
+        f"(hung={bool(hung)}, likely a rank left the collective sequence early); "
+        f"results so far: {results}"
+    )
+    return results
+
+
+def test_resolve_2rank_invalid_backend_one_rank():
+    results = _run_resolve_case(["magic", "auto"])
+    for rank in (0, 1):
+        kind, payload = results[rank]
+        assert kind == "ValueError", results
+        assert "invalid request" in payload
+
+
+def test_resolve_2rank_inconsistent_requests():
+    results = _run_resolve_case(["nvlink", "auto"], patch="mesh")
+    for rank in (0, 1):
+        kind, payload = results[rank]
+        assert kind == "ValueError", results
+        assert "inconsistent backend requests" in payload
+
+
+def test_resolve_2rank_forced_nvlink_unsatisfied():
+    results = _run_resolve_case(["nvlink", "nvlink"], patch="nvlink_pair_missing")
+    for rank in (0, 1):
+        kind, payload = results[rank]
+        assert kind == "UlyssesBackendError", results
+        assert "no NVLink" in payload
+
+
+def test_resolve_2rank_probe_raises_one_rank():
+    results = _run_resolve_case(["auto", "auto"], patch="probe_raises_rank0")
+    for rank in (0, 1):
+        kind, payload = results[rank]
+        assert kind == "ok", results
+        backend, reason = payload
+        assert backend == "nccl"
+        assert "rank 0" in reason and "probe exploded" in reason
+
+
+def test_resolve_2rank_decision_raises_one_rank():
+    results = _run_resolve_case(["auto", "auto"], patch="decide_raises_rank1")
+    for rank in (0, 1):
+        kind, payload = results[rank]
+        assert kind == "ok", results
+        backend, reason = payload
+        assert backend == "nccl"
+        assert "decision failed on rank(s)" in reason and "decision exploded" in reason
+
+
+def test_resolve_2rank_explicit_nccl_skips_probe(tmp_path):
+    marker = str(tmp_path / "probe_touched")
+    results = _run_resolve_case(
+        ["nccl", "nccl"], patch="probe_marker", marker_path=marker
+    )
+    for rank in (0, 1):
+        kind, payload = results[rank]
+        assert kind == "ok", results
+        assert payload[0] == "nccl" and "requested" in payload[1]
+    assert not os.path.exists(marker), "explicit NCCL must not touch the probe"
+
+
+def test_resolve_2rank_auto_full_mesh_selects_nvlink():
+    results = _run_resolve_case(["auto", "auto"], patch="mesh")
+    for rank in (0, 1):
+        kind, payload = results[rank]
+        assert kind == "ok", results
+        assert payload[0] == "nvlink"
+
+
+# ---- probe device handling ---------------------------------------------------
+
+
+def test_probe_cpu_device_records_error():
+    t = probe_ulysses_rank_topology(torch.device("cpu"), 0)
+    assert t.probe_error is not None
+    assert "CUDA device" in t.probe_error
+
+
+def test_probe_default_device_uses_current():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs >= 2 GPUs")
+    prev = torch.cuda.current_device()
+    try:
+        torch.cuda.set_device(1)
+        # device=None and bare torch.device("cuda") must mean the *current*
+        # device, not GPU 0
+        assert probe_ulysses_rank_topology(None, 0).device_index == 1
+        assert probe_ulysses_rank_topology(torch.device("cuda"), 0).device_index == 1
+    finally:
+        torch.cuda.set_device(prev)
 
 
 # ---- real-machine probe ------------------------------------------------------
