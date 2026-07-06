@@ -372,8 +372,6 @@ jobs:
           twine check dist-python/*
           echo "✓ Package validation passed"
 
-      # Note: flashinfer-cubin is no longer published to PyPI; it is served from
-      # https://flashinfer.ai/whl (see update-wheel-index job).
       - name: Upload flashinfer-python to PyPI
         env:
           TWINE_USERNAME: __token__
