@@ -2,7 +2,6 @@
 
 Package layout::
 
-<<<<<<< HEAD
     moe_ep/
       core/                 shared comm + kernel abstractions and validation
       backends/
@@ -12,23 +11,6 @@ Package layout::
         mega/
           kernel/           fused comm + local MoE kernels
       modes/                split and mega orchestration layers
-=======
-- ``flashinfer.moe_ep.nccl_ep``  — primary backend, wraps NVIDIA's nccl4py
-  ``nccl.ep`` API (nccl-ep-v0.1.0; built from ``3rdparty/nccl/bindings/nccl4py``).
-- ``flashinfer.moe_ep.nixl_ep``  — alternate backend, wraps ai-dynamo's
-  ``nixl_ep`` (built in-tree from ``3rdparty/nixl/examples/device/ep``).
-
-NCCL-EP availability is the importability of ``nccl.ep`` (no in-tree
-``libnccl_ep.so`` as of v0.1.0); NIXL-EP still ships a staged ``nixl_ep_cpp*.so``.
-Both are produced by the FlashInfer build only when ``BUILD_NVEP=1`` (or the
-per-backend ``BUILD_NCCL_EP`` / ``BUILD_NIXL_EP``) is set at install time:
-
-    BUILD_NVEP=1 pip install -e ".[nvep]"
-
-Without a built backend the package imports succeed but calling
-:func:`create_fleet` raises :class:`MoEEpNotBuiltError` with rebuild
-instructions.
->>>>>>> upstream/main
 """
 
 from __future__ import annotations
@@ -208,19 +190,8 @@ def _nixl_libs_dir() -> Path:
 
 
 def _probe_nccl_ep() -> bool:
-<<<<<<< HEAD
     import importlib.util
 
-=======
-    """True if the NCCL-EP backend is available.
-
-    As of nccl-ep-v0.1.0 the backend is the nccl4py ``nccl.ep`` package (no
-    in-tree libnccl_ep.so).  Probe with ``find_spec`` so we don't import/execute
-    ``nccl.ep`` (and pull in its native lib) just to answer availability.
-    """
-    import importlib.util
-
->>>>>>> upstream/main
     try:
         return importlib.util.find_spec("nccl.ep") is not None
     except (ImportError, ModuleNotFoundError, ValueError):
@@ -279,17 +250,6 @@ if _set_build_flags and not available_backends():
         stacklevel=2,
     )
 
-<<<<<<< HEAD
 from . import backends as _backends  # noqa: E402,F401
 from .backends.split.comm.nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
 from .backends.split.comm.nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
-=======
-# Trigger backend registration. Importing these modules populates
-# ``_BACKEND_REGISTRY`` via module-level assignments. Both imports are
-# pure-Python and don't touch the nccl.ep native lib / nixl_ep_cpp.so — those
-# only load when a Fleet is actually instantiated. Must happen AFTER
-# MoEEpNotBuiltError / _require_built are defined above (the backend
-# modules `from .. import` them).
-from .nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
-from .nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
->>>>>>> upstream/main

@@ -71,7 +71,6 @@ class NixlEpHandle(Handle):
         self._recv_hook = hook
         # recv_x is (fp8_tensor, scales) tuple when use_fp8 — pick the data tensor.
         expert_tensors = recv_x[0] if isinstance(recv_x, tuple) else recv_x
-<<<<<<< HEAD:flashinfer/moe_ep/backends/split/comm/nixl_ep/handle.py
         world = self._fleet._bootstrap.world_size
         num_local = self._fleet.params.num_experts // world
         num_tokens = num_local * self._fleet.params.max_tokens_per_rank * world
@@ -79,11 +78,6 @@ class NixlEpHandle(Handle):
             expert_tensors=expert_tensors,
             num_tokens=num_tokens,
         )
-=======
-        # recv_count holds the per-expert breakdown; nothing consumes it here, so we
-        # don't reduce it to host.
-        return DispatchOutput(expert_tensors=expert_tensors)
->>>>>>> upstream/main:flashinfer/moe_ep/nixl_ep/handle.py
 
     # @flashinfer_api  # disabled per PR #3453 review
     def combine(self, params: CombineInputParams) -> CombineOutput:
