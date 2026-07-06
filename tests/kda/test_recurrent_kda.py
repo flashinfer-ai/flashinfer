@@ -1065,21 +1065,56 @@ def assert_spec_states(
 
 
 @pytest.mark.parametrize(
-    ("N", "H", "HV", "D", "num_spec_tokens", "use_qk_l2norm_in_kernel"),
+    (
+        "N",
+        "H",
+        "HV",
+        "D",
+        "num_spec_tokens",
+        "use_qk_l2norm_in_kernel",
+        "use_chunk_major",
+    ),
     [
-        pytest.param(4, 8, 8, 64, 1, True, id="N4-H8-D64-S1"),
-        pytest.param(4, 8, 8, 64, 3, True, id="N4-H8-D64-S3"),
-        pytest.param(4, 8, 8, 64, 1, False, id="N4-H8-D64-S1-no-qk-l2"),
-        pytest.param(8, 16, 16, 128, 2, True, id="N8-H16-D128-S2"),
-        pytest.param(8, 16, 16, 128, 4, True, id="N8-H16-D128-S4"),
-        pytest.param(8, 16, 16, 128, 2, False, id="N8-H16-D128-S2-no-qk-l2"),
-        pytest.param(4, 4, 8, 64, 2, True, id="N4-H4-HV8-D64-S2-GQA"),
+        pytest.param(4, 8, 8, 64, 1, True, False, id="N4-H8-D64-S1"),
+        pytest.param(4, 8, 8, 64, 3, True, False, id="N4-H8-D64-S3"),
+        pytest.param(4, 8, 8, 64, 1, False, False, id="N4-H8-D64-S1-no-qk-l2"),
+        pytest.param(8, 16, 16, 128, 2, True, False, id="N8-H16-D128-S2"),
+        pytest.param(8, 16, 16, 128, 4, True, False, id="N8-H16-D128-S4"),
+        pytest.param(8, 16, 16, 128, 2, False, False, id="N8-H16-D128-S2-no-qk-l2"),
+        pytest.param(4, 4, 8, 64, 2, True, False, id="N4-H4-HV8-D64-S2-GQA"),
+        pytest.param(4, 8, 8, 128, 3, True, True, id="N4-H8-D128-S3-chunk-major"),
     ],
 )
-def test_spec_decode_basic(N, H, HV, D, num_spec_tokens, use_qk_l2norm_in_kernel):
+def test_spec_decode_basic(
+    N,
+    H,
+    HV,
+    D,
+    num_spec_tokens,
+    use_qk_l2norm_in_kernel,
+    use_chunk_major,
+    monkeypatch,
+):
     """Single spec-decode call matches T sequential naive calls."""
     torch.manual_seed(42)
     device = torch.device("cuda")
+
+    if use_chunk_major:
+        import importlib
+
+        recurrent_kda_backend = importlib.import_module(
+            "flashinfer.kda_kernels.recurrent_kda"
+        )
+
+        get_compiled_kernel = recurrent_kda_backend._get_compiled_kernel
+
+        def get_chunk_major_kernel(*args):
+            return get_compiled_kernel(*args[:-1], 1)
+
+        monkeypatch.setenv("KDA_USE_VTILE", "0")
+        monkeypatch.setattr(
+            recurrent_kda_backend, "_get_compiled_kernel", get_chunk_major_kernel
+        )
 
     q, k, v, g, beta, cu_seqlens, ssm_state_indices, state_pool, scale, T = (
         make_spec_decode_inputs(N, H, HV, D, num_spec_tokens, device)
