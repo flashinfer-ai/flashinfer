@@ -950,13 +950,17 @@ inline __device__ void quant_per_token_group_fp8_packed(
         localAbsmax = fmaxf(localAbsmax, fabsf(values[i]));
       }
     }
-    int const laneIdx = threadIdx.x & 31;
-    int const groupFirstLane = laneIdx & ~(groupThreads - 1);
-    unsigned int const groupMask =
-        groupThreads == 32 ? 0xffffffffu : ((1u << groupThreads) - 1u) << groupFirstLane;
-    for (int offset = groupThreads / 2; offset > 0; offset /= 2) {
-      localAbsmax =
-          fmaxf(localAbsmax, __shfl_xor_sync(groupMask, localAbsmax, offset, groupThreads));
+    int const fullWarpThreadCount = blockDim.x & ~31;
+    if (threadIdx.x < fullWarpThreadCount) {
+      for (int offset = groupThreads / 2; offset > 0; offset /= 2) {
+        localAbsmax = fmaxf(localAbsmax, __shfl_xor_sync(0xffffffffu, localAbsmax, offset));
+      }
+    } else {
+      int const partialWarpThreads = blockDim.x - fullWarpThreadCount;
+      unsigned int const partialWarpMask = (1u << partialWarpThreads) - 1u;
+      for (int offset = groupThreads / 2; offset > 0; offset /= 2) {
+        localAbsmax = fmaxf(localAbsmax, __shfl_xor_sync(partialWarpMask, localAbsmax, offset));
+      }
     }
   } else {
     int const groupsInBlock = blockValidElements / groupSize;
