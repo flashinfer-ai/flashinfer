@@ -37,7 +37,9 @@ def test_native_window_probe_checks_forced_keeps_variant(monkeypatch):
         uses_shared_paged_kv_idx=True,
         force_keeps=True,
     )
-    assert calls[0][-4:] == (8, True, True, True)
+    # Tail: window_left, uses_shared_paged_kv_idx, force_keeps,
+    # custom_mask_uses_sliding_window, use_2q (defaults to False).
+    assert calls[0][-5:] == (8, True, True, True, False)
 
 
 def test_untrimmed_swa_spec_dec_tree_capability_flag():

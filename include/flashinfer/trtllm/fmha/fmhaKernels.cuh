@@ -284,12 +284,8 @@ class TllmGenFmhaKernel {
       info = currentInfo;
       auto const kernelIt = mKernelMetaMap.find(hashId);
       if (kernelIt == mKernelMetaMap.end()) {
-        // The preferred 2Qx1KV cubin can be absent (older artifact or unexported dtype);
-        // match run() and retry with the default schedule before reporting unsupported.
-        if (selectKernelParams.mUses2QSlidingWindowKernel) {
-          selectKernelParams.mAvoid2QSlidingWindowKernel = true;
-          continue;
-        }
+        // With mUses2InstsQDecodeKernels this reports the 2Qx1KV cubin's absence (older
+        // artifact or unexported dtype); the caller falls back to the 1Q layout before packing.
         return std::make_pair(false, info);
       }
       computeCtaAndClusterConfig(ctaLaunchParams, params, mKernelMeta[kernelIt->second],
@@ -315,17 +311,6 @@ class TllmGenFmhaKernel {
     KernelMeta kernelMeta{};
     for (int pass = 0; pass < kMaxKernelSelectionPasses; ++pass) {
       selectKernel(params, selectKernelParams);
-      // The preferred 2Qx1KV cubin can be absent (older artifact or unexported dtype); latch
-      // the fallback and re-select the default schedule instead of failing the lookup.
-      if (selectKernelParams.mUses2QSlidingWindowKernel &&
-          mKernelMetaMap.find(hashFromRunnerParams(params, selectKernelParams).first) ==
-              mKernelMetaMap.end()) {
-        selectKernelParams.mAvoid2QSlidingWindowKernel = true;
-        FLASHINFER_CHECK(pass + 1 < kMaxKernelSelectionPasses,
-                         "trtllm-gen kernel selection did not converge in %d passes.",
-                         kMaxKernelSelectionPasses);
-        continue;
-      }
       std::tie(func, kernelMeta) = loadKernel(params, selectKernelParams);
       computeCtaAndClusterConfig(ctaLaunchParams, params, kernelMeta, selectKernelParams);
       if (!selectKernelParams.mSelectNewKernel) {
@@ -1027,12 +1012,12 @@ class TllmGenFmhaKernel {
   }
 
   // Selects the generation kernel for custom-mask (spec-dec tree) attention.
-  // Mirrors trtllm-gen FmhaAutoTuner::selectSpecDecTreeKernel. SwapsMmaAb
+  // Mirrors the TRTLLM kernel autotuner's spec-dec tree selection. SwapsMmaAb
   // uses one draft token per CTA and packs the custom mask in the Swaps LDTM
   // bit layout; KeepsMmaAb uses the Q128 row-major custom-mask layout. The
   // Python mask packer mirrors this same threshold table.
-  // CgaSmemReduction is feasible for some Swaps cases, but trtllm-gen selects
-  // GmemReduction for spec-dec tree, so keep the reduction mode aligned.
+  // CgaSmemReduction is feasible for some Swaps cases, but the TRTLLM autotuner
+  // selects GmemReduction for spec-dec tree, so keep the reduction mode aligned.
   void selectSpecDecTreeGenerationKernel(RunnerParams const& params,
                                          SelectKernelParams& selectKernelParams) const {
     FLASHINFER_CHECK(params.mHeadDimQk == 64 || params.mHeadDimQk == 128,
@@ -1081,32 +1066,19 @@ class TllmGenFmhaKernel {
     selectKernelParams.mTileSizeKv = 128;
     selectKernelParams.mForceGmemReduction = true;
 
-    // Prefer the 2Qx1KV Keeps schedule at the measured high-batch wave transition for short
-    // sliding windows: a fully populated 2Q tile halves the CTA count where the 2Q grid fits
-    // in one wave and the 1Q grid does not. Mirrors trtllm-gen
-    // FmhaAutoTuner::prefers2Qx1KvForSlidingWindow (fp16/bf16 and window <= 256 are the
-    // measured tuning bounds). If the cubin set lacks the 2Q kernel, run() latches
-    // mAvoid2QSlidingWindowKernel and this reverts to the default schedule.
-    int const numCtas2Q = params.mBatchSize * params.mNumHeadsKv;
-    bool const prefers2QSlidingWindowKernel =
-        !selectKernelParams.mAvoid2QSlidingWindowKernel &&
-        selectKernelParams.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
-        isSlidingWindowCustomMask(selectKernelParams.mMaskType) &&
-        (mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16) && mDtypeQ == mDtypeK &&
-        mDtypeK == mDtypeV && mDtypeOut == mDtypeQ && params.mAttentionWindowSize <= 256 &&
-        params.mBatchSize >= 64 && numCtas2Q <= params.mMultiProcessorCount &&
-        2 * numCtas2Q > params.mMultiProcessorCount &&
-        numTokensHeadsQ >= 2 * selectKernelParams.mTileSizeQ;
-    if (prefers2QSlidingWindowKernel) {
+    // Select the 2Qx1KV Keeps schedule when the caller asks for it. The caller owns the
+    // decision (the wave-transition tuning heuristic lives in Python next to the mask packing)
+    // because the packed custom mask must be laid out for the schedule's instance split; a
+    // silent fallback here would run a 1Q kernel against a 2Q-packed mask. Callers probe
+    // checkIfKernelExist with the flag before packing, so a missing cubin at run() is an error.
+    if (params.mUses2InstsQDecodeKernels) {
+      FLASHINFER_CHECK(
+          selectKernelParams.mKernelType == FmhaKernelType::KeepsMmaAbForGeneration &&
+              isSlidingWindowCustomMask(selectKernelParams.mMaskType),
+          "mUses2InstsQDecodeKernels requires the Keeps SlidingWindowCustom spec-dec tree path.");
       selectKernelParams.mUses2QSlidingWindowKernel = true;
       selectKernelParams.mTileScheduler = TileScheduler::Static;
       selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
-    } else if (selectKernelParams.mUses2QSlidingWindowKernel) {
-      // Fallback re-selection: restore the state the 2Q preference overwrote.
-      selectKernelParams.mUses2QSlidingWindowKernel = false;
-      selectKernelParams.mTileScheduler = params.mTileScheduler;
-      selectKernelParams.mMultiCtasKvMode =
-          params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled;
     }
   }
 

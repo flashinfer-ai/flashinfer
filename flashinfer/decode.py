@@ -2368,6 +2368,7 @@ class TrtllmGenDecodeModule:
             None,  # first_sparse_mask_offsets_kv
             False,  # force_spec_dec_tree_keeps
             False,  # custom_mask_uses_sliding_window
+            False,  # use_spec_dec_tree_2q
         )
         return out
 
@@ -2541,6 +2542,9 @@ class _SpecDecTreeKernelLayout(NamedTuple):
     tile_size_q: int
     num_insts_kv: int
     num_heads_q_per_kv: int
+    # stepQ / tileSizeQ of the selected cubin: 2 selects the 2Qx1KV Keeps
+    # schedule (which always has num_insts_kv == 1), else 1.
+    num_insts_q: int = 1
 
     @property
     def layout_id(self) -> int:
@@ -2567,8 +2571,12 @@ class _SpecDecTreeKernelLayout(NamedTuple):
                 self.num_insts_kv * 128 * ceil_div(self.tile_size_q, 32)
             )
         else:
-            num_tiles_q = ceil_div(q_len * self.num_heads_q_per_kv, 128)
-            words_per_tile_block = self.num_insts_kv * (128 * 128 // 32)
+            num_tiles_q = ceil_div(
+                q_len * self.num_heads_q_per_kv, 128 * self.num_insts_q
+            )
+            words_per_tile_block = (
+                self.num_insts_q * self.num_insts_kv * (128 * 128 // 32)
+            )
         return num_tiles_q * max_mask_tiles_kv * words_per_tile_block
 
 
@@ -2626,6 +2634,47 @@ def _should_force_trtllm_gen_spec_dec_tree_keeps(
 trtllm_gen_supports_untrimmed_swa_spec_dec_tree = True
 
 
+def _prefers_trtllm_gen_spec_dec_tree_2q(
+    layout: _SpecDecTreeKernelLayout,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    batch_size: int,
+    num_kv_heads: int,
+    q_len: int,
+    window_left: int,
+    custom_mask_uses_sliding_window: bool,
+    sm_count: int,
+) -> bool:
+    """Wave-transition tuning heuristic for the 2Qx1KV Keeps schedule.
+
+    A fully populated 2Q tile halves the CTA count, which wins when the 2Q
+    grid fits in one wave and the 1Q grid does not. This decision lives here,
+    next to the mask packing, because the packed custom mask must be laid out
+    for the selected schedule's instance split; the C++ runner obeys the
+    resulting flag instead of re-deciding. fp16/bf16 and window <= 256 are
+    the measured tuning bounds.
+    """
+    if layout.kernel_layout != "keeps":
+        return False
+    if not custom_mask_uses_sliding_window:
+        return False
+    if q_dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if kv_dtype != q_dtype or o_dtype != q_dtype:
+        return False
+    # The runner maps window_left to mAttentionWindowSize = window_left + 1.
+    if window_left + 1 > 256:
+        return False
+    num_ctas_2q = batch_size * num_kv_heads
+    return (
+        batch_size >= 64
+        and num_ctas_2q <= sm_count
+        and 2 * num_ctas_2q > sm_count
+        and q_len * layout.num_heads_q_per_kv >= 2 * layout.tile_size_q
+    )
+
+
 def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
     query: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2637,6 +2686,7 @@ def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
     window_left: int,
     uses_shared_paged_kv_idx: bool,
     force_keeps: bool,
+    use_2q: bool = False,
 ) -> bool:
     return bool(
         get_trtllm_gen_fmha_module().trtllm_fmha_has_spec_dec_tree_kernel(
@@ -2651,6 +2701,7 @@ def _has_trtllm_gen_native_spec_dec_tree_window_kernel(
             uses_shared_paged_kv_idx,
             force_keeps,
             True,
+            use_2q,
         )
     )
 
@@ -2666,8 +2717,9 @@ def _pack_trtllm_gen_spec_dec_mask(
     window_left: int = -1,
     max_seq_len: Optional[int] = None,
     force_keeps: bool = False,
+    use_2q: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack a dense spec-dec tree mask into the TRTLLM-GEN custom-mask layout.
+    """Pack a dense spec-dec tree mask into the TRTLLM custom-mask layout.
 
     The packed bit layout matches the Q128 KeepsMmaAbForGeneration custom-mask
     cubins and mirrors TRT-LLM's prepareCustomMask.cu: rows are
@@ -2716,9 +2768,16 @@ def _pack_trtllm_gen_spec_dec_mask(
                 "seq_lens contains values larger than max_seq_len; trim the "
                 "presented KV/page table and pass the trimmed bound."
             )
-    kernel_layout = _select_trtllm_gen_spec_dec_tree_kernel(
-        q_dtype, kv_dtype, num_heads_q_per_kv, q_len_per_req, force_keeps
-    )
+    if use_2q:
+        # The 2Qx1KV Keeps schedule needs its own mask layout: two Q instances
+        # per CTA (per-instance rows) and a single KV instance.
+        kernel_layout = _SpecDecTreeKernelLayout(
+            "keeps", 128, 1, num_heads_q_per_kv, num_insts_q=2
+        )
+    else:
+        kernel_layout = _select_trtllm_gen_spec_dec_tree_kernel(
+            q_dtype, kv_dtype, num_heads_q_per_kv, q_len_per_req, force_keeps
+        )
     words_per_seq = kernel_layout.words_per_sequence(
         q_len_per_req, max_seq_len, window_left
     )
@@ -2741,6 +2800,7 @@ def _pack_trtllm_gen_spec_dec_mask(
         mask.contiguous(),
         seq_lens.to(device=mask.device, dtype=torch.int32),
         num_heads_q_per_kv,
+        kernel_layout.num_insts_q,
         kernel_layout.num_insts_kv,
         kernel_layout.tile_size_q,
         kernel_layout.layout_id,
@@ -2880,7 +2940,7 @@ def trtllm_batch_decode_with_kv_cache(
           Row ``i`` masks draft token ``i`` against the draft tail; the KV
           prefix before the draft tail is always attended. Requires uniform
           query lengths (``q_len_per_req``), paged KV cache, and head_dim 64
-          or 128. When the loaded TRTLLM-GEN artifact contains native
+          or 128. When the loaded TRTLLM artifact contains native
           ``SlidingWindowCustom`` kernels, ``window_left >= 0`` keeps the full
           presented KV range and applies the window in-kernel using the same
           slot-index rule as non-tree window paths (kv visible iff
@@ -3182,11 +3242,10 @@ def trtllm_batch_decode_with_kv_cache(
         first_sparse_mask_offsets_kv = None
         force_spec_dec_tree_keeps = False
         custom_mask_uses_sliding_window = False
+        use_spec_dec_tree_2q = False
         if mask is not None:
             if q_len_per_req is None or q_len_per_req <= 1:
-                raise ValueError(
-                    "TRTLLM-GEN spec-dec tree mask requires q_len_per_req > 1"
-                )
+                raise ValueError("TRTLLM spec-dec tree mask requires q_len_per_req > 1")
             num_kv_heads = k_cache.shape[-3]
             spec_dec_tree_layout = _select_trtllm_gen_spec_dec_tree_kernel(
                 query.dtype,
@@ -3226,6 +3285,34 @@ def trtllm_batch_decode_with_kv_cache(
                 q_len_per_req,
                 mask_pack_window_left,
             )
+            # The 2Qx1KV schedule decision is made here, before packing,
+            # because the packed mask layout must match the schedule's
+            # instance split; the C++ runner obeys the flag. Only take it
+            # when the loaded artifact actually has the 2Q cubin.
+            use_spec_dec_tree_2q = _prefers_trtllm_gen_spec_dec_tree_2q(
+                spec_dec_tree_layout,
+                query.dtype,
+                k_cache.dtype,
+                out.dtype if isinstance(out, torch.Tensor) else query.dtype,
+                batch_size,
+                num_kv_heads,
+                q_len_per_req,
+                window_left,
+                custom_mask_uses_sliding_window,
+                sm_count,
+            ) and _has_trtllm_gen_native_spec_dec_tree_window_kernel(
+                query,
+                k_cache,
+                v_cache,
+                out,
+                batch_size,
+                max_q_len,
+                max_seq_len,
+                window_left,
+                uses_shared_paged_kv_idx,
+                native_force_spec_dec_tree_keeps,
+                use_2q=True,
+            )
             packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv = (
                 _pack_trtllm_gen_spec_dec_mask(
                     mask,
@@ -3238,6 +3325,7 @@ def trtllm_batch_decode_with_kv_cache(
                     mask_pack_window_left,
                     max_seq_len,
                     force_spec_dec_tree_keeps,
+                    use_2q=use_spec_dec_tree_2q,
                 )
             )
             if not custom_mask_uses_sliding_window:
@@ -3299,6 +3387,7 @@ def trtllm_batch_decode_with_kv_cache(
             first_sparse_mask_offsets_kv,
             force_spec_dec_tree_keeps,
             custom_mask_uses_sliding_window,
+            use_spec_dec_tree_2q,
         )
 
         result_out = (

@@ -112,7 +112,8 @@ void trtllm_paged_attention_launcher(
     int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens, int64_t lse_stride_heads,
     int64_t bf16q_fp8kv_transform_mode, const uint32_t* packed_custom_mask,
     const int64_t* custom_mask_offsets, const int32_t* first_sparse_mask_offsets_kv,
-    bool force_spec_dec_tree_keeps, bool custom_mask_uses_sliding_window, cudaStream_t stream) {
+    bool force_spec_dec_tree_keeps, bool custom_mask_uses_sliding_window,
+    bool uses_2insts_q_decode_kernels, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -160,6 +161,7 @@ void trtllm_paged_attention_launcher(
   runner_params.mBatchSize = batch_size;
   runner_params.mMaxSeqLenKv = max_kv_len;
   runner_params.mForceSpecDecTreeKeeps = force_spec_dec_tree_keeps;
+  runner_params.mUses2InstsQDecodeKernels = uses_2insts_q_decode_kernels;
   runner_params.mMaxNumPagesPerSeqKv = max_num_blocks_per_seq;
   runner_params.mNumTokensPerPage = page_size;
   runner_params.mQkvLayout = QkvLayout::PagedKv;
@@ -346,7 +348,7 @@ void trtllm_paged_attention_decode(
     int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode,
     Optional<TensorView> packed_custom_mask, Optional<TensorView> custom_mask_offsets,
     Optional<TensorView> first_sparse_mask_offsets_kv, bool force_spec_dec_tree_keeps,
-    bool custom_mask_uses_sliding_window) {
+    bool custom_mask_uses_sliding_window, bool uses_2insts_q_decode_kernels) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -495,16 +497,14 @@ void trtllm_paged_attention_decode(
       v_sf_stride_batch, /*is_causal=*/true, lse_stride_tokens, lse_stride_heads,
       bf16q_fp8kv_transform_mode, packed_custom_mask_ptr, custom_mask_offsets_ptr,
       first_sparse_mask_offsets_kv_ptr, force_spec_dec_tree_keeps, custom_mask_uses_sliding_window,
-      stream);
+      uses_2insts_q_decode_kernels, stream);
 }
 
-bool trtllm_fmha_has_spec_dec_tree_kernel(TensorView query, TensorView key_cache,
-                                          TensorView value_cache, TensorView out,
-                                          int64_t batch_size, int64_t max_q_len, int64_t max_kv_len,
-                                          int64_t attention_window_size,
-                                          Optional<bool> uses_shared_paged_kv_idx,
-                                          bool force_spec_dec_tree_keeps,
-                                          bool custom_mask_uses_sliding_window) {
+bool trtllm_fmha_has_spec_dec_tree_kernel(
+    TensorView query, TensorView key_cache, TensorView value_cache, TensorView out,
+    int64_t batch_size, int64_t max_q_len, int64_t max_kv_len, int64_t attention_window_size,
+    Optional<bool> uses_shared_paged_kv_idx, bool force_spec_dec_tree_keeps,
+    bool custom_mask_uses_sliding_window, bool uses_2insts_q_decode_kernels) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto k_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto v_data_type = dl_dtype_to_tllm_data_type(value_cache.dtype());
@@ -575,6 +575,7 @@ bool trtllm_fmha_has_spec_dec_tree_kernel(TensorView query, TensorView key_cache
   runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx.value_or(true);
   runner_params.mSkipsSoftmaxWhenPossible = false;
   runner_params.mForceSpecDecTreeKeeps = force_spec_dec_tree_keeps;
+  runner_params.mUses2InstsQDecodeKernels = uses_2insts_q_decode_kernels;
   runner_params.mSkipSoftmaxThresholdScaleFactor = 0.0f;
   runner_params.mScaleSfKv = 1.0f;
   runner_params.mScaleSfO = -1.0f;
@@ -740,7 +741,7 @@ void trtllm_paged_attention_context(
       /*bf16q_fp8kv_transform_mode=*/0, /*packed_custom_mask=*/nullptr,
       /*custom_mask_offsets=*/nullptr, /*first_sparse_mask_offsets_kv=*/nullptr,
       /*force_spec_dec_tree_keeps=*/false,
-      /*custom_mask_uses_sliding_window=*/false, stream);
+      /*custom_mask_uses_sliding_window=*/false, /*uses_2insts_q_decode_kernels=*/false, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -1095,7 +1096,7 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0,
       /*packed_custom_mask=*/nullptr, /*custom_mask_offsets=*/nullptr,
       /*first_sparse_mask_offsets_kv=*/nullptr, /*force_spec_dec_tree_keeps=*/false,
-      /*custom_mask_uses_sliding_window=*/false, stream);
+      /*custom_mask_uses_sliding_window=*/false, /*uses_2insts_q_decode_kernels=*/false, stream);
 }
 
 namespace trtllm_cubin_loader {

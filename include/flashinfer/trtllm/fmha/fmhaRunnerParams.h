@@ -324,6 +324,11 @@ struct TllmGenFmhaRunnerParams {
   // Force the spec-dec tree custom-mask path onto KeepsMmaAb when a runtime
   // sequence shape cannot be represented safely by the Swaps packed layout.
   bool mForceSpecDecTreeKeeps;
+  // Select the 2Qx1KV Keeps schedule for spec-dec tree SlidingWindowCustom decode. The caller
+  // owns this decision because the packed custom mask must be laid out for the schedule's
+  // instance split (numInstsQ=2, numInstsKv=1); probe checkIfKernelExist with this flag before
+  // packing.
+  bool mUses2InstsQDecodeKernels;
   // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
   int mSumOfSeqLensQ;
   int mSumOfSeqLensKv;
@@ -442,10 +447,9 @@ struct TllmGenSelectKernelParams {
   bool mUses2CtaMma;
   // Transform mode for BF16 query + FP8 KV generation kernels.
   Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
-  // Prefer the 2Qx1KV Keeps generation kernel for short SlidingWindowCustom shapes.
+  // Select the 2Qx1KV Keeps generation kernel (caller-owned via
+  // RunnerParams::mUses2InstsQDecodeKernels; the packed mask layout must match).
   bool mUses2QSlidingWindowKernel;
-  // Do not re-prefer the 2Qx1KV kernel after its cubin was found missing (fallback latch).
-  bool mAvoid2QSlidingWindowKernel;
 
   // The constructor.
   TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -469,6 +473,5 @@ struct TllmGenSelectKernelParams {
         mTileSizeKv(128),
         mUses2CtaMma(false),
         mBf16QFp8KvTransformMode(params.mBf16QFp8KvTransformMode),
-        mUses2QSlidingWindowKernel(false),
-        mAvoid2QSlidingWindowKernel(false) {};
+        mUses2QSlidingWindowKernel(false) {};
 };
