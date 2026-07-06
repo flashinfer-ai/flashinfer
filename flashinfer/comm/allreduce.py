@@ -633,7 +633,10 @@ def allreduce_fusion(
         Optional shared-expert output to add, shape
         ``[token_num, hidden_dim]``.
     block_quant_group_size : Optional[int]
-        Group size for per-token-group FP8 packed quantization patterns.
+        Group size for per-token-group FP8 packed quantization patterns. The
+        MNNVL backend requires an exact row partition in which each CTA owns an
+        integral number of groups; unsupported ``(hidden_dim, group_size)``
+        pairs raise ``ValueError`` before launch.
     weight_bias : float
         Bias added to ``rms_gamma`` before scaling.
 
@@ -1070,19 +1073,19 @@ def allreduce_fusion(
             if requires_preallocated_outputs:
                 if residual_out is None:
                     raise ValueError(
-                        "residual_out is required for MNNVL dynamic quantization patterns"
+                        "residual_out is required for MNNVL preallocated quantization patterns"
                     )
                 if quant_out is None:
                     raise ValueError(
-                        "quant_out is required for MNNVL dynamic quantization patterns"
+                        "quant_out is required for MNNVL preallocated quantization patterns"
                     )
                 if scale_out is None:
                     raise ValueError(
-                        "scale_out is required for MNNVL dynamic quantization patterns"
+                        "scale_out is required for MNNVL preallocated quantization patterns"
                     )
                 if has_norm_out and norm_out is None:
                     raise ValueError(
-                        "norm_out is required for MNNVL dynamic quantization norm-out patterns"
+                        "norm_out is required for MNNVL preallocated quantization norm-out patterns"
                     )
             elif has_norm_out and norm_out is None:
                 norm_out = torch.empty_like(input)

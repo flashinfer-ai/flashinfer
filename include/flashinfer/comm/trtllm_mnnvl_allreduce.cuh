@@ -934,6 +934,11 @@ inline __device__ void quant_per_token_group_fp8_packed(
     uint32_t blockFirstElement, uint32_t blockValidElements, int groupSize, int tmaAlignedMn,
     void* quantOutPtr, void* sfOutPtr, unsigned int* smemGroupAbsmax) {
   static_assert(ELTS_PER_THREAD == 8 || ELTS_PER_THREAD == 4, "ELTS_PER_THREAD must be 8 or 4");
+  // Dispatch guarantees an exact row partition: every launched thread owns a full vector,
+  // every CTA spans whole quantization groups, and warp-reduced groups use a power-of-two
+  // thread count no larger than a warp. The inBounds/blockValidElements plumbing is retained
+  // for a future tail-capable path; relaxing the dispatch checks also requires updating both
+  // reductions below.
   bool const useWarpShuffle = utils::useWarpGroupReduction(groupSize, ELTS_PER_THREAD);
   int const groupThreads = groupSize / ELTS_PER_THREAD;
   float localAbsmax = 0.F;
@@ -945,9 +950,13 @@ inline __device__ void quant_per_token_group_fp8_packed(
         localAbsmax = fmaxf(localAbsmax, fabsf(values[i]));
       }
     }
-    unsigned int const activeMask = __activemask();
+    int const laneIdx = threadIdx.x & 31;
+    int const groupFirstLane = laneIdx & ~(groupThreads - 1);
+    unsigned int const groupMask =
+        groupThreads == 32 ? 0xffffffffu : ((1u << groupThreads) - 1u) << groupFirstLane;
     for (int offset = groupThreads / 2; offset > 0; offset /= 2) {
-      localAbsmax = fmaxf(localAbsmax, __shfl_xor_sync(activeMask, localAbsmax, offset));
+      localAbsmax =
+          fmaxf(localAbsmax, __shfl_xor_sync(groupMask, localAbsmax, offset, groupThreads));
     }
   } else {
     int const groupsInBlock = blockValidElements / groupSize;
@@ -1545,7 +1554,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
       ceil_div(params.tokenDim, clusterSize * kELTS_PER_LOAD) * kELTS_PER_LOAD;
   uint32_t const baseTokenOffset = clusterBlockRank * blockChunkSize;
 
-  extern __shared__ uint8_t smem[];
+  extern __shared__ __align__(alignof(float4)) uint8_t smem[];
   uint32_t const smemBufferSize = blockSize * elemsPerThread * sizeof(T);
   T* smemInput = reinterpret_cast<T*>(&smem[0]);
   T* smemResidual = reinterpret_cast<T*>(&smem[smemBufferSize]);
@@ -1686,6 +1695,8 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
   if constexpr (QType == QuantType::kPerTokenGroupFP8Packed) {
     static_assert(LoadsPerThread == 1,
                   "Per-token-group FP8 quantization requires one load per thread");
+    static_assert((3 * kELTS_PER_LOAD * sizeof(T)) % alignof(unsigned int) == 0,
+                  "Group-FP8 scratch must be uint32-aligned");
     uint32_t const tokenOffset = baseTokenOffset + threadOffset * kELTS_PER_LOAD;
     bool const inBounds = tokenOffset < params.tokenDim;
     uint32_t const blockElements = blockDim.x * kELTS_PER_LOAD;

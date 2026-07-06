@@ -50,6 +50,30 @@ class MNNVLAllreduceFusionStrategy(Enum):
 
 # Empirical result calculated from num_tokens * hidden_dim * tp_size * elem_size
 MNNVL_ONE_SHOT_THRESHOLD = 64 * 1024 * 8 * 2
+_MNNVL_MAX_CLUSTER_SIZE = 8
+_MNNVL_MAX_THREADS_PER_BLOCK = 1024
+_MNNVL_VECTOR_BYTES = 16
+
+
+def _supports_exact_group_quant_partition(
+    hidden_dim: int, group_size: int, element_size: int
+) -> bool:
+    """Return whether MNNVL can assign whole quantization groups to each CTA."""
+    elements_per_thread = _MNNVL_VECTOR_BYTES // element_size
+    if hidden_dim % elements_per_thread != 0:
+        return False
+
+    threads_needed = hidden_dim // elements_per_thread
+    for cluster_size in (1, 2, 4, _MNNVL_MAX_CLUSTER_SIZE):
+        if threads_needed % cluster_size != 0:
+            continue
+        block_size = threads_needed // cluster_size
+        if (
+            block_size <= _MNNVL_MAX_THREADS_PER_BLOCK
+            and (block_size * elements_per_thread) % group_size == 0
+        ):
+            return True
+    return False
 
 
 class MNNVLQuantType:
@@ -628,7 +652,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
         weight_bias: Bias added to gamma before scaling. ``0.0`` for standard
             RMSNorm; ``1.0`` for Gemma / Qwen3.5 RMSNorm.
         block_quant_group_size: Group size along the hidden dimension for
-            per-token-group FP8 quantization.
+            per-token-group FP8 quantization. MNNVL requires an exact row
+            partition into at most eight CTAs, with at most 1024 vector threads
+            per CTA and an integral number of groups owned by each CTA.
 
     Returns:
         A tuple ``(quant_out, scale_out, residual_out, output)``. ``scale_out``
@@ -794,6 +820,15 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
         if hidden_dim % block_quant_group_size != 0:
             raise ValueError(
                 f"hidden_dim must be divisible by block_quant_group_size, got {hidden_dim} and {block_quant_group_size}."
+            )
+        if not _supports_exact_group_quant_partition(
+            hidden_dim, block_quant_group_size, input.element_size()
+        ):
+            raise ValueError(
+                "MNNVL packed group FP8 has no exact CTA partition for "
+                f"hidden_dim={hidden_dim}, group_size={block_quant_group_size}, "
+                f"and dtype={input.dtype}; each CTA must have at most 1024 "
+                "threads and own whole quantization groups."
             )
         if quant_out is None:
             quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)

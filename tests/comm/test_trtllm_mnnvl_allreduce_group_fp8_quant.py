@@ -122,9 +122,13 @@ def _reference_group_quant(
     groups_per_row = hidden_dim // group_size
     grouped = norm_out.float().reshape(token_num, groups_per_row, group_size)
     absmax = grouped.abs().amax(dim=-1)
-    scales = torch.exp2(
-        torch.ceil(torch.log2((absmax / FP8_E4M3_MAX).clamp(min=1e-10)))
-    )
+    scale_input = (absmax / FP8_E4M3_MAX).clamp(min=1e-10).contiguous()
+    scale_bits = scale_input.view(torch.int32)
+    scales = torch.where(
+        (scale_bits & 0x7FFFFF) != 0,
+        (scale_bits + 0x800000) & 0x7F800000,
+        scale_bits,
+    ).view(torch.float32)
     quant = (
         (grouped / scales.unsqueeze(-1))
         .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
@@ -254,7 +258,7 @@ def test_mnnvl_allreduce_group_fp8_quant(
             )
 
         if expected_error is not None:
-            with pytest.raises(RuntimeError, match=expected_error):
+            with pytest.raises(ValueError, match=expected_error):
                 run_op()
             return
 

@@ -646,7 +646,11 @@ def test_allreduce_fusion(args):
     torch_dist_initialized = False
 
     needs_mnnvl = any(b in ("mnnvl", "auto") for b in backend_list)
-    needs_torch_dist = any(b in ("trtllm", "mnnvl", "auto") for b in backend_list)
+    # Validation uses torch.distributed as an independent all-reduce reference.
+    # MNNVL-only timing can still use its MPI handle-exchange backend.
+    needs_torch_dist = args.validate or any(
+        b in ("trtllm", "auto") for b in backend_list
+    )
 
     if needs_mnnvl:
         try:
