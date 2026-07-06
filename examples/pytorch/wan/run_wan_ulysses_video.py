@@ -53,6 +53,11 @@ def validate_ulysses_video_config(
         raise ValueError(
             f"world size {world_size} exceeds visible GPU count {device_count}"
         )
+    if seq_global <= 0:
+        raise ValueError(
+            f"token count must be positive, got {seq_global}; "
+            "check --height/--width/--num-frames"
+        )
     if seq_global % world_size != 0:
         raise ValueError(
             f"token count {seq_global} not divisible by world size {world_size}; "
@@ -73,6 +78,13 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
 
     from ulysses import UlyssesContext, set_ulysses_context
 
+    # Defense-in-depth preflight (main() already validated before spawning):
+    # must run BEFORE set_device / init_process_group so an impossible config
+    # cannot strand peers in a process-group init that times out in hours.
+    lat_t = (args.num_frames - 1) // 4 + 1
+    seq_global = lat_t * (args.height // 16) * (args.width // 16)
+    validate_ulysses_video_config(world_size, seq_global, torch.cuda.device_count())
+
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
@@ -83,12 +95,6 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
         timeout=timedelta(minutes=120),
     )
     group = dist.group.WORLD
-
-    # Token-sequence geometry after VAE + patchify (Wan: p_t=1 on 4x-compressed
-    # latents, p_h=p_w=2 on 8x-compressed pixels).
-    lat_t = (args.num_frames - 1) // 4 + 1
-    seq_global = lat_t * (args.height // 16) * (args.width // 16)
-    validate_ulysses_video_config(world_size, seq_global, torch.cuda.device_count())
     # Largest single a2a operand: B * S_local * heads * dim_head elements
     # (input and output numel are equal), with B up to 2 for CFG batching.
     seq_local = seq_global // world_size
@@ -198,6 +204,17 @@ def main() -> None:
     p.add_argument("--output-type", default="np", choices=["np", "latent"])
     p.add_argument("--output", default="wan_ulysses.mp4")
     args = p.parse_args()
+
+    # CLI preflight: reject impossible configs before creating ANY worker —
+    # range(0) would otherwise spawn nothing and exit 0 silently, and an
+    # oversized world size would strand ranks in process-group init.
+    import torch
+
+    lat_t = (args.num_frames - 1) // 4 + 1
+    seq_global = lat_t * (args.height // 16) * (args.width // 16)
+    validate_ulysses_video_config(
+        args.world_size, seq_global, torch.cuda.device_count()
+    )
 
     mp.set_start_method("spawn", force=True)
     port = get_open_port()

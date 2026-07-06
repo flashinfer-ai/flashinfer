@@ -85,6 +85,34 @@ def test_video_preflight_geometry():
         mod.validate_ulysses_video_config(8, seq + 1, device_count=8)
 
 
+def test_video_cli_world_size_zero_exits_nonzero():
+    # placement regression: --world-size 0 used to spawn range(0) workers and
+    # exit 0 silently; the CLI preflight must fail BEFORE any worker exists
+    import subprocess
+
+    r = subprocess.run(
+        [
+            sys.executable,
+            str(_WAN_DIR / "run_wan_ulysses_video.py"),
+            "--world-size",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "must be positive" in (r.stdout + r.stderr)
+    # the failure comes from main()'s preflight, not from a spawned worker
+    assert "init_process_group" not in (r.stdout + r.stderr)
+
+
+def test_video_preflight_rejects_nonpositive_tokens():
+    mod = _video_module()
+    with pytest.raises(ValueError, match="token count must be positive"):
+        mod.validate_ulysses_video_config(8, 0, device_count=8)
+
+
 def test_scan_found_the_known_consumers():
     consumers = {s.name for s in _SCRIPTS if list(_calls(s, "UlyssesContext"))}
     assert {"bench_wan_ulysses.py", "run_wan_ulysses_video.py"} <= consumers, consumers
