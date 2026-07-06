@@ -8721,3 +8721,74 @@ def bmm_mxfp8(
         return out
 
     raise ValueError(f"Invalid backend: {backend}")
+
+
+def prepare_svdquant_state(
+    M,
+    Rq,
+    sf_w_bytes,
+    L1,
+    L2,
+    gscale_x,
+    gscale_w,
+    r,
+    enable_lora=True,
+    pre_quant_scale=None,
+    num_ab_stage=None,
+    use_2cta=None,
+):
+    """Build the reusable per-shape dispatch state for the fused NVFP4-SVDQuant linear.
+
+    This is the once-per-shape host setup of the kernel's single entrance: call
+    ``prepare_svdquant_state`` once for a layer shape ``(M, I, O, r)``, then call
+    :func:`mm_fp4_svdquant` per step with the live activation and the returned state.
+    Off the hot path it derives ``I, O`` from the prepacked weight, host-swizzles the
+    constant weight scale factor once, pre-allocates the quantizer / down / main operands,
+    JIT-compiles the per-shape kernels, and folds the static global scales -- so the
+    per-call path needs no host sync or allocation.
+
+    The CuTe-DSL kernel module is imported lazily here (not at flashinfer import time) so
+    flashinfer carries no hard dependency on the optional CuTe-DSL backend; availability is
+    gated by ``flashinfer.gemm.__init__``.
+
+    See the underlying ``flashinfer.gemm.kernels.svdquant_nvfp4.prepare_svdquant_state`` for
+    the full argument semantics. Returns an opaque state dict consumed by
+    :func:`mm_fp4_svdquant`.
+    """
+    from .kernels.svdquant_nvfp4 import prepare_svdquant_state as _prepare
+
+    return _prepare(
+        M,
+        Rq,
+        sf_w_bytes,
+        L1,
+        L2,
+        gscale_x,
+        gscale_w,
+        r,
+        enable_lora=enable_lora,
+        pre_quant_scale=pre_quant_scale,
+        num_ab_stage=num_ab_stage,
+        use_2cta=use_2cta,
+    )
+
+
+def mm_fp4_svdquant(x, state):
+    """Run the fused NVFP4-SVDQuant linear for activation ``x`` using a prepared ``state``.
+
+    The per-call fast path of the kernel's single entrance (NVFP4 main GEMM + bf16 low-rank
+    SVDQuant up-projection, fused-add epilogue): pass the live activation ``x`` (CUDA tensor,
+    shape ``[M, I]``) and the ``state`` returned by :func:`prepare_svdquant_state`, and it
+    returns the output ``Y`` (``[M, O]`` bf16). Graph-safe -- no ``torch.cuda.synchronize``,
+    ``.cpu()``, ``.item()``, or per-call CUDA allocation.
+
+    The output is a view into the state's reusable storage; consume or clone it before the
+    next ``mm_fp4_svdquant`` call on the same state.
+
+    The CuTe-DSL kernel module is imported lazily here so flashinfer carries no hard
+    dependency on the optional CuTe-DSL backend; availability is gated by
+    ``flashinfer.gemm.__init__``.
+    """
+    from .kernels.svdquant_nvfp4 import mm_fp4_svdquant as _mm
+
+    return _mm(x, state)

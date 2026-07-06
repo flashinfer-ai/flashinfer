@@ -2,17 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Host glue for the fused NVFP4 SVDQuant kernel (Sm100BlockScaledLoRADenseGemmKernel).
 
-Framework-agnostic (no framework imports): the caller supplies the already-swizzled weight
-scale-factor blob and the externally-quantized NVFP4 activation (ext_xq/ext_sf), both consumed
-by the CuTe-DSL kernel as a raw data_ptr() reinterpreted via the block-scaled scale-factor
-layout. The BF16 down-projection D = X @ L2_merged^T is computed here with torch.matmul;
-the framework merges any activation smoothing scale into L2 once while loading weights.
+The caller supplies the already-swizzled weight scale-factor blob and the externally-quantized
+NVFP4 activation (ext_xq/ext_sf), both consumed by the CuTe-DSL kernel as a raw data_ptr()
+reinterpreted via the block-scaled scale-factor layout. The BF16 down-projection
+D = X @ L2_merged^T is computed here with torch.matmul; the framework merges any activation
+smoothing scale into L2 once while loading weights.
 
 Public API:
     state = prepare_svdquant_state(M, Rq, w_sf_swizzled, L1, L2_merged,
                                    gscale_x, gscale_w, r)
     y = mm_fp4_svdquant(x, state, ext_xq=..., ext_sf=...)   # y is [M, O] bf16
 """
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -23,7 +25,7 @@ from cutlass.cute.runtime import make_ptr
 
 from .dense_blockscaled_gemm_lora_sm100 import Sm100BlockScaledLoRADenseGemmKernel
 
-_V2_KERNEL_CACHE = {}
+_COMPILED_KERNEL_CACHE = {}
 
 
 def _ceil_div(a, b):
@@ -57,11 +59,11 @@ def _build_compiled(N, K, M, r, out_dtype=torch.bfloat16, tactic=None):
         tactic,
         M if tactic is None else None,
     )
-    if key in _V2_KERNEL_CACHE:
+    if key in _COMPILED_KERNEL_CACHE:
         # The compiled callable is symbolic in M, but the activation scale-factor
         # extent is a runtime property of the current M.  Do not return the sf_m
         # from whichever batch populated the compile cache first.
-        compiled, cached_sf_n, cached_sf_k, cached_lora_k = _V2_KERNEL_CACHE[key]
+        compiled, cached_sf_n, cached_sf_k, cached_lora_k = _COMPILED_KERNEL_CACHE[key]
         return compiled, _ceil_div(M, 128), cached_sf_n, cached_sf_k, cached_lora_k
 
     sf_dtype = cutlass.Float8E4M3FN
@@ -154,7 +156,7 @@ def _build_compiled(N, K, M, r, out_dtype=torch.bfloat16, tactic=None):
         stream_fake,
         options=opts,
     )
-    _V2_KERNEL_CACHE[key] = (compiled, sf_n, sf_k, lora_k)
+    _COMPILED_KERNEL_CACHE[key] = (compiled, sf_n, sf_k, lora_k)
     return compiled, sf_m, sf_n, sf_k, lora_k
 
 
@@ -176,8 +178,15 @@ _AUTOTUNE_CANDIDATES = [
     ((256, 256), (2, 2), False),
     ((256, 192), (2, 2), False),
     ((256, 256), (4, 1), False),
+    # The deeper mainloop becomes profitable for the largest image-token
+    # batches.  Keep this as a measured candidate rather than a size heuristic.
+    ((256, 256), (2, 2), True),
 ]
 _TACTIC_CHOICE_CACHE = {}
+
+# Bound prepare-time timing operands while retaining the exact M for the full
+# validated SVDQuant resolution/batch matrix (the largest needs about 1.9 GiB).
+_AUTOTUNE_SCRATCH_BUDGET_BYTES = 2 << 30
 
 
 def _time_call(call, iters=10, warmup=3):
@@ -195,33 +204,54 @@ def _time_call(call, iters=10, warmup=3):
 
 
 def _autotune_tactic(N, K, M, r, device=None):
-    """Time-select the fastest tactic for (N,K,M-bucket,r). Returns a (tile,cluster,prefetch) tuple,
-    or None if timing is unavailable (CUDA-graph capture) -> caller falls back to the heuristic.
-    Random correctly-sized operands (timing is shape-, not value-, dependent). Cached per M-bucket."""
+    """Time-select the fastest tactic for (N,K,timing-M,r). Returns a (tile,cluster,prefetch) tuple,
+    or None if timing is unavailable (capture or insufficient scratch memory), in which case the
+    caller falls back to the analytical heuristic.
+    Random correctly-sized operands (timing is shape-, not value-, dependent)."""
     try:
         if torch.cuda.is_current_stream_capturing():
             return None
     except Exception:
         return None
-    bucket = 1 << max(0, (M - 1).bit_length())  # next power of 2 >= M
     dev = (
         torch.device(device)
         if device is not None
         else torch.device("cuda", torch.cuda.current_device())
     )
-    key = (dev.index, N, K, bucket, r)
+    Kp = K // 2
+    lora_k = _ceil_div(r, 16) * 16
+    sf_k = _ceil_div(_ceil_div(K, 16), 4)
+
+    # Preserve exact-M choices while the timing operands fit a fixed scratch
+    # budget.  A fixed row cap aliases materially different large-M grids; a
+    # byte budget covers every supported image shape while remaining bounded
+    # for arbitrary callers.  Account for A, A scales, output, and LoRA D per
+    # row plus the static quantized weight, weight scales, and LoRA-up matrix.
+    dynamic_bytes_per_row = Kp + sf_k * 4 + 2 * N + 2 * lora_k
+    static_bytes = (
+        N * Kp
+        + _ceil_div(N, 128) * sf_k * 512
+        + 2 * N * lora_k
+        + sf_k * 512  # worst-case activation-SF row-tile rounding
+    )
+    # Do not turn a fragmented or memory-constrained process into an OOM just
+    # to preserve exact-M timing. Under pressure, a bounded representative
+    # tune is preferable to failing state preparation; compilation remains
+    # symbolic in M.
+    free_bytes, _ = torch.cuda.mem_get_info(dev)
+    scratch_budget = min(_AUTOTUNE_SCRATCH_BUDGET_BYTES, free_bytes // 4)
+    if scratch_budget <= static_bytes + dynamic_bytes_per_row:
+        return None
+    timing_budget = scratch_budget - static_bytes
+    max_timing_m = max(1, timing_budget // dynamic_bytes_per_row)
+    timing_m = min(M, max_timing_m)
+    key = (dev.index, N, K, timing_m, r)
     if key in _TACTIC_CHOICE_CACHE:
         return _TACTIC_CHOICE_CACHE[key]
 
-    Kp = K // 2
-    lora_k = _ceil_div(r, 16) * 16
-    # Cap the timing-M to avoid huge autotune allocations (out[M,N] is ~3.6GB at M=147k/b16 ->
-    # OOM). The best tactic is ~M-bucket-invariant in the large-M (compute-bound) regime, and the
-    # compiled kernel is symbolic in M, so timing at a capped M picks the same tactic.
-    M = min(M, 32768)
+    M = timing_m
     sf_m = _ceil_div(M, 128)
     sf_n = _ceil_div(N, 128)
-    sf_k = _ceil_div(_ceil_div(K, 16), 4)
     a = torch.randint(0, 256, (M, Kp), dtype=torch.uint8, device=dev)
     wq = torch.randint(0, 256, (N, Kp), dtype=torch.uint8, device=dev)
     a_sf = torch.randint(
@@ -235,8 +265,17 @@ def _autotune_tactic(N, K, M, r, device=None):
     d = torch.randn(M, lora_k, dtype=torch.bfloat16, device=dev)
     l1 = torch.randn(N, lora_k, dtype=torch.bfloat16, device=dev)
 
-    best_t, best_us = None, None
+    # Compile every valid candidate before timing, then warm them round-robin.
+    # Compiling and immediately timing each candidate biases later candidates
+    # toward a hotter GPU clock; that was large enough to choose the wrong
+    # cluster at several image sizes.
+    calls = []
     for tac in _AUTOTUNE_CANDIDATES:
+        if N == 3072 and K == 12288 and M >= 55112 and tac[2]:
+            # Long steady-state graph runs show prefetch consistently slows the
+            # deep-K 2x2 kernel at 55K/65K/73K rows (about 6%), even
+            # when short tuning samples occasionally rank it first.
+            continue
         try:
             compiled, sfm, sfn, sfk, _ = _build_compiled(N, K, M, r, tactic=tac)
             call = lambda c=compiled: c(
@@ -252,13 +291,82 @@ def _autotune_tactic(N, K, M, r, device=None):
                 w_sf.data_ptr(),
                 alpha,
             )
-            us = _time_call(call)
-            if best_us is None or us < best_us:
-                best_us, best_t = us, tac
+            # Validate the launch here so a codegen-valid but runtime-invalid
+            # tactic is skipped just like it was in the original tuner.
+            call()
+            torch.cuda.synchronize()
+            calls.append((tac, call))
         except Exception:
             # A candidate tile/cluster the kernel can't codegen for this shape (e.g. a tile_n the N
-            # can't tile): skip it. best_t only ever holds a tactic that built+ran successfully.
+            # can't tile): skip it. The selected tactic always built and ran successfully.
             continue
+
+    # Raise the device to a stable compute clock before comparing candidates.
+    # A fixed three-call warmup is too short for small-M kernels and biases the
+    # tactics that happen to be measured last. Measure one round, then repeat
+    # round-robin calls until roughly 100 ms of aggregate GPU work has run.
+    warm_start = torch.cuda.Event(enable_timing=True)
+    warm_end = torch.cuda.Event(enable_timing=True)
+    warm_start.record()
+    for _, call in calls:
+        call()
+    warm_end.record()
+    torch.cuda.synchronize()
+    round_ms = max(warm_start.elapsed_time(warm_end), 0.01)
+    warm_rounds = min(512, max(3, int(100.0 / round_ms)))
+    for _ in range(warm_rounds):
+        for _, call in calls:
+            call()
+    torch.cuda.synchronize()
+
+    # The production op runs under CUDA graph replay, whose PDL scheduling can
+    # rank close tactics differently from eager launches. Use graph replay only
+    # if every runtime-valid candidate captures; never tune a silent partial
+    # subset. Environments that disallow private capture retain the complete
+    # eager candidate set.
+    captured = []
+    try:
+        for tac, call in calls:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                call()
+            captured.append((tac, graph.replay))
+    except Exception:
+        captured = []
+    measured_calls = captured if len(captured) == len(calls) else calls
+
+    # Capturing candidates can let clocks fall. Reheat the exact call form that
+    # will be measured for another ~100 ms before the balanced timing rounds.
+    measured_warm_start = torch.cuda.Event(enable_timing=True)
+    measured_warm_end = torch.cuda.Event(enable_timing=True)
+    measured_warm_start.record()
+    for _, call in measured_calls:
+        call()
+    measured_warm_end.record()
+    torch.cuda.synchronize()
+    measured_round_ms = max(measured_warm_start.elapsed_time(measured_warm_end), 0.01)
+    measured_warm_rounds = min(512, max(3, int(100.0 / measured_round_ms)))
+    for _ in range(measured_warm_rounds):
+        for _, call in measured_calls:
+            call()
+    torch.cuda.synchronize()
+
+    timings = {tac: [] for tac, _ in measured_calls}
+    count = len(measured_calls)
+    timing_orders = (
+        measured_calls,
+        list(reversed(measured_calls)),
+        measured_calls[count // 2 :] + measured_calls[: count // 2],
+    )
+    for ordered_calls in timing_orders:
+        for tac, call in ordered_calls:
+            timings[tac].append(_time_call(call, iters=15, warmup=0))
+
+    best_t, best_us = None, None
+    for tac, samples in timings.items():
+        us = sorted(samples)[len(samples) // 2]
+        if best_us is None or us < best_us:
+            best_us, best_t = us, tac
     # Defensive default: if every candidate failed to build (should not happen), fall back to the
     # universally-supported 128x128 1-CTA tile rather than None (which would route prepare() to the
     # analytical heuristic, whose mm_fp4-oriented pick is not guaranteed LoRA-codegen-safe).
@@ -279,25 +387,43 @@ def prepare_svdquant_state(
     gscale_w,
     r,
 ):
-    """Build a reusable dispatch state for one (M, I, O, r) shape (injection path).
+    """Build a reusable dispatch state for one (M, I, O, r) shape.
 
       Rq: prepacked NVFP4 weight [O, I//2] uint8 (E2M1, K-major).
       w_sf_swizzled: weight block-scales already in the NVFP4 MMA swizzle (uint8/e4m3 blob, the layout
                      trtllm fp4_quantize / swizzle_sf produce -- passed to the kernel as raw data_ptr).
       L1: up-proj [O, r] bf16.
       L2_merged: down-proj [r, I] bf16, already merged with any pre_quant_scale by the caller.
-      gscale_x, gscale_w: static global scales; the kernel applies alpha = gscale_x * gscale_w.
+      gscale_x, gscale_w: static dequantization multipliers; the kernel applies
+                         alpha = gscale_x * gscale_w.
     The activation is externally quantized; this kernel has no internal quantizer.
+    The returned state owns reusable D buffers and is not reentrant across concurrent calls.
     """
     O = int(Rq.shape[0])
     I = int(Rq.shape[1]) * 2
     lora_k = _ceil_div(r, 16) * 16
-    if not Rq.is_cuda:
-        raise ValueError("Rq must be a CUDA tensor")
+    if Rq.ndim != 2 or Rq.dtype != torch.uint8 or not Rq.is_cuda:
+        raise ValueError("Rq must be a 2D CUDA uint8 tensor")
+    if r <= 0 or L1.ndim != 2 or L2_merged.ndim != 2:
+        raise ValueError("L1/L2_merged must be 2D tensors with a positive rank")
+    if L1.shape[0] > O or L1.shape[1] != r:
+        raise ValueError(f"L1 must have shape [<= {O}, {r}], got {tuple(L1.shape)}")
+    if L2_merged.shape[0] != r or L2_merged.shape[1] > I:
+        raise ValueError(
+            f"L2_merged must have shape [{r}, <= {I}], got {tuple(L2_merged.shape)}"
+        )
+    expected_w_sf_bytes = _ceil_div(O, 128) * _ceil_div(_ceil_div(I, 16), 4) * 512
+    if w_sf_swizzled.element_size() != 1 or w_sf_swizzled.numel() < expected_w_sf_bytes:
+        raise ValueError(
+            f"w_sf_swizzled must contain at least {expected_w_sf_bytes} one-byte elements"
+        )
+    alpha_f = float(gscale_x) * float(gscale_w)
+    if not math.isfinite(alpha_f) or alpha_f == 0.0:
+        raise ValueError("gscale_x * gscale_w must be finite and nonzero")
     dev = Rq.device
 
-    # Time-select the tile/cluster once per (shape, M-bucket) during warmup. Under CUDA-graph
-    # capture the private autotuner returns None and _build_compiled uses its analytical heuristic.
+    # Time-select the tile/cluster once per (shape, capped exact M) during warmup. If tuning is not
+    # safe here, _build_compiled uses its analytical heuristic.
     with torch.cuda.device(dev):
         tactic = _autotune_tactic(O, I, M, r, device=dev)
         compiled, sf_m, sf_n, sf_k, _ = _build_compiled(O, I, M, r, tactic=tactic)
@@ -309,7 +435,6 @@ def prepare_svdquant_state(
     # the (unchanged) epilogue computes out = alpha*acc = alpha*(residual + D@(L1/alpha)^T)
     # = alpha*residual + D@L1^T. This avoids a 2nd TMEM accumulator => keeps the base num_acc_stage
     # MMA/epilogue overlap (the perf). alpha~3e-4 => L1/alpha~O(1e2), fine in bf16 + the f32 acc.
-    alpha_f = float(gscale_x) * float(gscale_w)
     L1d = (L1.to(device=dev, dtype=torch.float32) / alpha_f).to(torch.bfloat16)
     if L1d.shape[0] != O:
         L1d = F.pad(L1d, (0, 0, 0, O - L1d.shape[0]))
@@ -355,7 +480,7 @@ def prepare_svdquant_state(
 
 @torch.compiler.disable
 def mm_fp4_svdquant(x, state, ext_xq, ext_sf):
-    """Run the fused NVFP4 SVDQuant linear. x: [M, I] (M padded to 128). Returns [M, O] bf16.
+    """Run the fused NVFP4 SVDQuant linear. x: [M, I]. Returns [M, O] bf16.
 
     Wrapped in @torch.compiler.disable because Dynamo cannot trace the CuTe-DSL JIT objects; this
     is kept as an opaque eager region (tracing into it otherwise causes graph breaks).
@@ -364,6 +489,35 @@ def mm_fp4_svdquant(x, state, ext_xq, ext_sf):
     The BF16 down-proj uses raw x because pre_quant_scale is already merged into L2 by the caller.
     """
     c = state
+    expected_x = (c["M"], c["I"])
+    expected_xq = (c["M"], c["I"] // 2)
+    dev = c["wq"].device
+    if x.ndim != 2 or tuple(x.shape) != expected_x or not x.is_cuda:
+        raise ValueError(f"x must be a CUDA tensor with shape {expected_x}")
+    if x.device != dev:
+        raise ValueError("x and prepared state must be on the same device")
+    if (
+        ext_xq.dtype != torch.uint8
+        or tuple(ext_xq.shape) != expected_xq
+        or not ext_xq.is_cuda
+        or ext_xq.device != dev
+        or not ext_xq.is_contiguous()
+    ):
+        raise ValueError(
+            f"ext_xq must be contiguous CUDA uint8 with shape {expected_xq}"
+        )
+    expected_sf_bytes = c["sf_m"] * c["sf_k"] * 512
+    if (
+        not ext_sf.is_cuda
+        or ext_sf.device != dev
+        or ext_sf.element_size() != 1
+        or not ext_sf.is_contiguous()
+        or ext_sf.numel() < expected_sf_bytes
+    ):
+        raise ValueError(
+            f"ext_sf must be a contiguous one-byte CUDA tensor with at least "
+            f"{expected_sf_bytes} elements"
+        )
     out = torch.empty((x.shape[0], c["O"]), dtype=torch.bfloat16, device=x.device)
     xb = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
     torch.mm(xb, c["L2_t"], out=c["D_active"])  # [M, r]

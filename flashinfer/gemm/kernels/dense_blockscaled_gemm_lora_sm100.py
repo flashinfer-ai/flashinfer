@@ -33,7 +33,7 @@
 # Fused NVFP4 SVDQuant GEMM: a copy of dense_blockscaled_gemm_sm100.py extended with a fused
 # rank-r BF16 LoRA up-projection. The NVFP4 residual K-loop is the same as the production kernel
 # (flashinfer's mm_fp4); on top of it an extra bf16 cute.gemm accumulates D @ L1^T
-# (D = X_hat @ L2^T, precomputed) into the SAME main block-scaled accumulator after the K-loop.
+# (D = X @ L2_merged^T, precomputed) into the SAME main block-scaled accumulator after the K-loop.
 # 1/alpha is folded into L1 host-side, so the UNCHANGED epilogue out = alpha*acc yields
 # alpha*residual + D@L1^T. Using the main accumulator (instead of a 2nd TMEM accumulator) means
 # no TMEM-budget pressure and no change to num_acc_stage, so the production kernel's
@@ -156,7 +156,7 @@ class Sm100BlockScaledLoRADenseGemmKernel:
         # const_expr kept True so the compile-time-guarded LoRA paths below stay active. ---
         self.enable_lora = True
         self.lora_rank = lora_rank
-        self.lora_dtype = cutlass.BFloat16  # D (= X_hat @ L2^T) and L1 are bf16
+        self.lora_dtype = cutlass.BFloat16  # D (= X @ L2_merged^T) and L1 are bf16
         # bf16 MMA contracts K in 16-wide atoms; pad rank up to a multiple of 16.
         self.lora_k = ((lora_rank + 15) // 16) * 16
         self.num_lora_stage = 1  # K=r is a single tile; one smem buffer for D/L1
@@ -415,7 +415,7 @@ class Sm100BlockScaledLoRADenseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
-        d_tensor: Optional[cute.Tensor] = None,  # LoRA down-proj output D = X_hat @ L2^T, [M, lora_k]
+        d_tensor: Optional[cute.Tensor] = None,  # LoRA down output D = X @ L2_merged^T, [M, lora_k]
         l1_tensor: Optional[cute.Tensor] = None,  # LoRA up-proj weight L1, [N, lora_k]
     ):
         """Execute the GEMM operation in steps:
@@ -581,7 +581,7 @@ class Sm100BlockScaledLoRADenseGemmKernel:
         ) * atom_thr_size
 
         # --- LoRA: bf16 low-rank MMA + TMA atoms for D [M, lora_k] and L1 [N, lora_k] ---
-        # (1-CTA bf16 trivial MMA; the down-proj D = X_hat @ L2^T is precomputed by the caller.)
+        # (The down-projection D = X @ L2_merged^T is precomputed by the caller.)
         lora_mma = None
         tma_atom_d = tma_tensor_d = tma_atom_l1 = tma_tensor_l1 = None
         if cutlass.const_expr(self.enable_lora):
@@ -2591,7 +2591,7 @@ class Sm100BlockScaledLoRADenseGemmKernel:
         """Like ``wrapper`` but also passes the LoRA operands D [m, lora_k] and L1 [n, lora_k]
         (bf16, K-major, via TVM-FFI dlpack like C). This is the entry point the SVDQuant glue
         (mm_fp4_svdquant) compiles. The NVFP4 residual A/B/SF handling is identical to ``wrapper``;
-        no swap_ab (LoRA targets 1-CTA tiles).
+        no swap_ab (the LoRA operand mapping does not support transposed A/B scheduling).
         """
         m = cute.size(mA, mode=[0])
         k = cute.size(mA, mode=[1]) * 2  # FP4 packed as uint8
