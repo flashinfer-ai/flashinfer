@@ -399,7 +399,10 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
 
   // Decode fast-path: one block per (pair, rank, slice) with vectorized contraction.
   // All compiled `wide` (feat_in) values are multiples of 8, so 128-bit loads apply.
-  if (decode) {
+  // Gated on `extended` (sm_90+): the fast-path is only measured/tuned on Hopper+, and the
+  // baseline decode tuning is likewise gated on `extended`. On sm_80 and below we keep the
+  // proven pipelined sliced kernel rather than silently rerouting an unbenchmarked path.
+  if (extended && decode) {
     constexpr int FUSED_NT = 128;
     constexpr size_t FUSED_VEC = 8;
     if constexpr (feat_in % FUSED_VEC == 0) {
