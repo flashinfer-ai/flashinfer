@@ -296,6 +296,34 @@ def test_raw_init_synchronizes_device(monkeypatch):
 
 
 @requires_cuda
+def test_raw_init_sync_failure_disposes_handle(monkeypatch):
+    # if the wrapper's own fence fails, the caller never receives fa and
+    # cannot dispose it: the wrapper owns the handle and must release it
+    from types import SimpleNamespace
+
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    disposed = []
+    monkeypatch.setattr(
+        ulysses_a2a_mod,
+        "get_ulysses_a2a_module",
+        lambda: SimpleNamespace(
+            init_ulysses_a2a=lambda *a: 42,
+            dispose_ulysses_a2a=lambda fa: disposed.append(fa),
+        ),
+    )
+
+    def failing_sync(*a, **k):
+        raise RuntimeError("injected async CUDA error")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", failing_sync)
+    from flashinfer.comm import init_ulysses_a2a
+
+    with pytest.raises(RuntimeError, match="injected async CUDA error"):
+        init_ulysses_a2a([0, 0], [0, 0], 0, 2, True)
+    assert disposed == [42], f"handle must be disposed exactly once: {disposed}"
+
+
+@requires_cuda
 def test_raw_a2a_validation(monkeypatch):
     # validation fires before any module lookup: forbid JIT to prove it
     ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
@@ -871,6 +899,46 @@ def _close_fault_body(rank, world_size, group, scenario):
             assert "retry close()" in str(e), str(e)
             assert rank != 0 or "synchronize" in str(e), str(e)
         comm.close()
+    elif scenario == "dispose_guard_exit":
+        # dispose succeeds but the device-guard __exit__ raises: the ledger
+        # was already cleared inside the guard, so the drain retry must NOT
+        # delete the handle a second time
+        ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+        dispose_calls = {"n": 0}
+        orig_dispose = ulysses_a2a_mod.dispose_ulysses_a2a
+
+        def counting_dispose(fa):
+            dispose_calls["n"] += 1
+            return orig_dispose(fa)
+
+        ulysses_a2a_mod.dispose_ulysses_a2a = counting_dispose
+        if rank == 0:
+            orig_device = torch.cuda.device
+            state = {"raise_after_dispose": True}
+
+            class FlakyGuard:
+                def __init__(self, dev):
+                    self._inner = orig_device(dev)
+
+                def __enter__(self):
+                    return self._inner.__enter__()
+
+                def __exit__(self, *args):
+                    r = self._inner.__exit__(*args)
+                    if state["raise_after_dispose"] and dispose_calls["n"] > 0:
+                        state["raise_after_dispose"] = False
+                        raise RuntimeError("injected guard-exit failure")
+                    return r
+
+            torch.cuda.device = FlakyGuard
+        # the one-shot guard-exit raise is enveloped by the protocol and the
+        # drain retry converges without a second dispose
+        comm.close()
+        if rank == 0:
+            torch.cuda.device = orig_device
+        assert dispose_calls["n"] == 1, (
+            f"handle must be disposed exactly once, got {dispose_calls['n']}"
+        )
     elif scenario == "dispose_fault":
         # one-shot dispose failure heals within the drain retry
         if rank == 0:
@@ -936,6 +1004,28 @@ def _lifecycle_nvlink_body(rank, world_size, group, scenario):
     elif scenario == "double_close":
         comm = mk()
         comm.close()
+        comm.close()
+    elif scenario == "raw_shape_reject":
+        # C++ global-operand exact-shape rejection with a REAL handle: the
+        # Python wrapper cannot know W, so a same-numel-wrong-shape global
+        # operand passes Python and must be rejected by the binding
+        from flashinfer.comm import ulysses_a2a as raw_a2a
+
+        comm = mk()
+        inp = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
+        # legal global operand for W=2 is (1, 8, 3, 8); this one matches
+        # batch/D/numel only
+        bad_out = torch.empty(1, 4, 6, 8, dtype=torch.float16, device="cuda")
+        try:
+            raw_a2a(comm._fa, inp, bad_out, 1, 4, 6, 8, 0)
+            raise AssertionError("C++ binding must reject the global shape")
+        except RuntimeError as e:
+            assert "expected" in str(e), str(e)
+        # a correct call still works afterwards
+        out = comm.scatter_heads(inp)
+        ref = _ref_scatter_heads(inp, world_size, rank, group)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref)
         comm.close()
     return ("ok", scenario)
 
@@ -1161,6 +1251,7 @@ def test_init_fault_one_rank(fault, requested):
         "persistent_free",
         "sync_fault",
         "dispose_fault",
+        "dispose_guard_exit",
         "helper_transient",
         "helper_persistent",
     ],
@@ -1186,7 +1277,8 @@ def test_init_cleanup_fault(cleanup_fault, requested):
 
 
 @pytest.mark.parametrize(
-    "scenario", ["ctx_exit", "ctx_body_raises", "repeat", "double_close"]
+    "scenario",
+    ["ctx_exit", "ctx_body_raises", "repeat", "double_close", "raw_shape_reject"],
 )
 def test_lifecycle_nvlink_two_ranks(scenario):
     _run_multi_rank("_lifecycle_nvlink_body", 2, scenario, allow_skip=True)

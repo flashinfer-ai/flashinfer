@@ -17,6 +17,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import functools
 from types import SimpleNamespace
 from typing import List
@@ -143,11 +144,19 @@ def init_ulysses_a2a(
             "UlyssesCommunicator(backend='auto') for topology-aware NCCL "
             "fallback instead."
         )
-    fa = get_ulysses_a2a_module().init_ulysses_a2a(
+    module = get_ulysses_a2a_module()
+    fa = module.init_ulysses_a2a(
         out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink
     )
     # make the signal zeroing a real completion fence on this device
-    torch.cuda.synchronize()
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        # the caller never receives fa on this path and could not dispose it:
+        # ownership stays here, so release the handle before re-raising
+        with contextlib.suppress(Exception):  # surface the sync error, not this
+            module.dispose_ulysses_a2a(fa)
+        raise
     return fa
 
 

@@ -528,10 +528,15 @@ class UlyssesCommunicator:
 
             with torch.cuda.device(self.device):
                 dispose_ulysses_a2a(self._fa)
-            self._fa = None
+                # ledger update inside the guard: a __exit__ raise after a
+                # successful dispose must not lead to a double-delete on retry
+                self._fa = None
             return (0, None)
         except Exception as e:  # noqa: BLE001
-            return (1, f"rank {self.rank} dispose: {type(e).__name__}: {e}")
+            return (
+                0 if self._fa is None else 1,
+                f"rank {self.rank} dispose: {type(e).__name__}: {e}",
+            )
 
     # The release helpers update the resource ledger immediately after each
     # successful release (inside the per-pointer try, device guard included),
