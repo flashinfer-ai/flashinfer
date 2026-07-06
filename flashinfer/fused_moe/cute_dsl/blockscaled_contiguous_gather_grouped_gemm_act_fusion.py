@@ -50,6 +50,12 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
 from flashinfer.utils import get_compute_capability
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -58,6 +64,7 @@ from flashinfer.cute_dsl.utils import (
     get_max_active_clusters,
     make_ptr,
 )
+from .moe_utils import normalize_cute_dsl_moe_activation_type
 
 from .blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     BlockScaledContiguousGatherGroupedGemmKernel,
@@ -220,6 +227,10 @@ def _get_compiled_gather_kernel(
     vectorized_f32: bool,
     raster_along_m: bool,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     gated: bool = True,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
@@ -236,6 +247,13 @@ def _get_compiled_gather_kernel(
     overhead during autotuning.
     """
     global _gather_kernel_cache
+    activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
+        activation_type
+    )
+    if gated != expected_gated:
+        raise ValueError(
+            f"gated={gated} is inconsistent with activation_type {activation_type!r}"
+        )
 
     # Cache key includes dtype and tactic parameters, NOT problem dimensions
     cache_key = (
@@ -250,6 +268,10 @@ def _get_compiled_gather_kernel(
         vectorized_f32,
         raster_along_m,
         enable_pdl,
+        activation_type.value,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         gated,
     )
 
@@ -263,6 +285,10 @@ def _get_compiled_gather_kernel(
             topk=topk,
             raster_along_m=raster_along_m,
             enable_pdl=enable_pdl,
+            activation_type=activation_type.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             gated=gated,
         )
 
@@ -327,6 +353,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     gated: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled Contiguous Gather Grouped GEMM with SwiGLU Fusion for MoE workloads.
@@ -370,6 +400,15 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         vectorized_f32: Use vectorized f32x2 operations. Default: True
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        activation_type: Activation type for the epilogue. Use
+            ActivationType.Swiglu for gated mode and ActivationType.Relu2 for
+            non-gated mode; swiglu_oai is represented as Swiglu with
+            non-default swiglu_alpha/beta/limit.
+        swiglu_alpha: SwiGLU sigmoid multiplier.
+        swiglu_beta: SwiGLU up-projection bias.
+        swiglu_limit: SwiGLU clamp limit.
+        gated: Whether to run the gated SwiGLU path. If False, run non-gated
+            ReLU2.
 
     Returns:
         Tuple of:
@@ -412,6 +451,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     # Validate inputs
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
+    activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
+        activation_type
+    )
+    if gated != expected_gated:
+        raise ValueError(
+            f"gated={gated} is inconsistent with activation_type {activation_type!r}"
+        )
 
     # Get dimensions
     seq_len = a.shape[0]
@@ -591,6 +637,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         vectorized_f32=vectorized_f32,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
+        activation_type=activation_type.value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
         gated=gated,
     )
 

@@ -16,6 +16,8 @@ from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
 
+pytestmark = pytest.mark.long_running
+
 DTYPE_MAP = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
