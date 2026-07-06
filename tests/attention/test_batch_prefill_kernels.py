@@ -1366,6 +1366,170 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4(
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-1, atol=1e-1)
 
 
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views(kv_layout):
+    """NVFP4 scale tensors may be strided views sharing a packed KV parent."""
+    torch.manual_seed(42)
+    batch_size = 2
+    kv_len = 33
+    qo_len = 17
+    page_size = 16
+    num_kv_heads = 2
+    num_qo_heads = 4
+    head_dim = 128
+    q_dtype = torch.float16
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=q_dtype,
+    )
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+    custom_mask = torch.tril(
+        torch.full((batch_size, qo_len, kv_len), True, device="cuda:0"),
+        diagonal=(kv_len - qo_len),
+    ).reshape(-1)
+
+    kv_shape = (total_num_pages, page_size, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+    v_packed, v_sf, v_global_scale = create_nvfp4_kv(kv_shape, "cuda:0")
+
+    if kv_layout == "NHD":
+        compact_k = k_packed
+        compact_v = v_packed
+        compact_k_sf = k_sf
+        compact_v_sf = v_sf
+        packed_parent = torch.empty(
+            (
+                total_num_pages,
+                2,
+                page_size,
+                num_kv_heads,
+                head_dim // 2 + head_dim // 16,
+            ),
+            dtype=torch.uint8,
+            device="cuda:0",
+        )
+        packed_parent[:, 0, :, :, : head_dim // 2].copy_(compact_k)
+        packed_parent[:, 0, :, :, head_dim // 2 :].copy_(compact_k_sf)
+        packed_parent[:, 1, :, :, : head_dim // 2].copy_(compact_v)
+        packed_parent[:, 1, :, :, head_dim // 2 :].copy_(compact_v_sf)
+        strided_k = packed_parent[:, 0, :, :, : head_dim // 2]
+        strided_k_sf = packed_parent[:, 0, :, :, head_dim // 2 :]
+        strided_v = packed_parent[:, 1, :, :, : head_dim // 2]
+        strided_v_sf = packed_parent[:, 1, :, :, head_dim // 2 :]
+    else:
+        compact_k = k_packed.permute(0, 2, 1, 3).contiguous()
+        compact_v = v_packed.permute(0, 2, 1, 3).contiguous()
+        compact_k_sf = k_sf.permute(0, 2, 1, 3).contiguous()
+        compact_v_sf = v_sf.permute(0, 2, 1, 3).contiguous()
+        packed_parent = torch.empty(
+            (
+                total_num_pages,
+                2,
+                num_kv_heads,
+                page_size,
+                head_dim // 2 + head_dim // 16,
+            ),
+            dtype=torch.uint8,
+            device="cuda:0",
+        )
+        packed_parent[:, 0, :, :, : head_dim // 2].copy_(compact_k)
+        packed_parent[:, 0, :, :, head_dim // 2 :].copy_(compact_k_sf)
+        packed_parent[:, 1, :, :, : head_dim // 2].copy_(compact_v)
+        packed_parent[:, 1, :, :, head_dim // 2 :].copy_(compact_v_sf)
+        strided_k = packed_parent[:, 0, :, :, : head_dim // 2]
+        strided_k_sf = packed_parent[:, 0, :, :, head_dim // 2 :]
+        strided_v = packed_parent[:, 1, :, :, : head_dim // 2]
+        strided_v_sf = packed_parent[:, 1, :, :, head_dim // 2 :]
+
+    assert strided_k.stride(0) == strided_k_sf.stride(0)
+    assert strided_v.stride(0) == strided_v_sf.stride(0)
+
+    compact_cache = torch.stack([compact_k, compact_v], dim=1)
+    compact_cache_sf = torch.stack([compact_k_sf, compact_v_sf], dim=1)
+    strided_cache = (strided_k, strided_v)
+    strided_cache_sf = (strided_k_sf, strided_v_sf)
+
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        custom_mask=custom_mask,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        kv_data_type=torch.uint8,
+        q_data_type=q_dtype,
+    )
+    compact_out = wrapper.run(
+        q,
+        compact_cache,
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_cache_sf=compact_cache_sf,
+    )
+    strided_out = wrapper.run(
+        q,
+        strided_cache,
+        k_scale=k_global_scale.item(),
+        v_scale=v_global_scale.item(),
+        kv_cache_sf=strided_cache_sf,
+    )
+
+    assert torch.isfinite(strided_out).all()
+    torch.testing.assert_close(strided_out, compact_out, rtol=1e-3, atol=1e-3)
+
+    bad_k_sf_parent = torch.empty(
+        *strided_k_sf.shape[:-1],
+        strided_k_sf.shape[-1] * 2,
+        dtype=torch.uint8,
+        device="cuda:0",
+    )
+    bad_v_sf_parent = torch.empty(
+        *strided_v_sf.shape[:-1],
+        strided_v_sf.shape[-1] * 2,
+        dtype=torch.uint8,
+        device="cuda:0",
+    )
+    bad_k_sf = bad_k_sf_parent[..., ::2]
+    bad_v_sf = bad_v_sf_parent[..., ::2]
+    assert bad_k_sf.shape == strided_k_sf.shape
+    assert bad_v_sf.shape == strided_v_sf.shape
+    assert bad_k_sf.stride(-1) == 2
+    assert bad_v_sf.stride(-1) == 2
+    with pytest.raises(Exception, match="innermost stride must be 1"):
+        wrapper.run(
+            q,
+            strided_cache,
+            k_scale=k_global_scale.item(),
+            v_scale=v_global_scale.item(),
+            kv_cache_sf=(bad_k_sf, bad_v_sf),
+        )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_len", [128, 256])
 @pytest.mark.parametrize("qo_len", [64, 128])
