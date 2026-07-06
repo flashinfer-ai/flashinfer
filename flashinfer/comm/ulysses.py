@@ -123,6 +123,7 @@ class UlyssesCommunicator:
         device: Optional[torch.device] = None,
     ):
         self._state = _CLOSED  # flipped to OPEN only when construction succeeds
+        self._nvlink_armed = False  # joint property: set on all ranks or none
         self._fa: Optional[int] = None
         self._out_ptrs: Optional[List[int]] = None
         self._sig_ptrs: Optional[List[int]] = None
@@ -162,9 +163,13 @@ class UlyssesCommunicator:
             self.device = torch.device("cuda", index)
 
         # ---- backend selection: strictly before any IPC/JIT -----------------
-        self.decision: UlyssesBackendDecision = resolve_ulysses_backend(
+        # topology_decision is what the probe concluded; decision is the
+        # *effective* backend after runtime initialization (they differ only
+        # when NVLink init failed at runtime and auto fell back to NCCL).
+        self.topology_decision: UlyssesBackendDecision = resolve_ulysses_backend(
             backend, group=group, device=self.device
         )
+        self.decision: UlyssesBackendDecision = self.topology_decision
         self.backend = self.decision.backend
         self.fallback_reason = (
             self.decision.reason
@@ -175,11 +180,13 @@ class UlyssesCommunicator:
         if self.backend == "nvlink":
             err = self._nvlink_init_transaction()
             if err is not None:
-                # all ranks cleaned up and hold the same joint error
+                # all ranks cleaned up (verified group-wide by the staged
+                # cleanup) and hold the same joint error
                 if backend == "nvlink":
                     raise RuntimeError(f"NVLink backend initialization failed: {err}")
                 self.backend = "nccl"
                 self.fallback_reason = f"nvlink init failed: {err}"
+                self.decision = UlyssesBackendDecision("nccl", self.fallback_reason)
 
         # NCCL fallback needs a group that can move CUDA tensors; deterministic
         # in the (identical) group object, so a plain raise is group-uniform.
@@ -197,7 +204,14 @@ class UlyssesCommunicator:
 
     def _gather(self, payload: Any) -> List[Any]:
         out: List[Any] = [None] * self.world_size
-        dist.all_gather_object(out, payload, group=self.group)
+        # once the communicator device is resolved, metadata collectives must
+        # not run on whatever the caller's current device happens to be
+        device = getattr(self, "device", None)
+        if device is not None:
+            with torch.cuda.device(device):
+                dist.all_gather_object(out, payload, group=self.group)
+        else:
+            dist.all_gather_object(out, payload, group=self.group)
         return out
 
     @staticmethod
@@ -214,7 +228,21 @@ class UlyssesCommunicator:
             dev = "cuda"
         elif isinstance(device, (torch.device, str, int)):
             try:
-                dev = str(torch.device(device))
+                parsed = torch.device(device)
+                dev = str(parsed)
+                # reject out-of-range indices jointly at config time, not as a
+                # late CUDA failure inside init/teardown
+                # note: torch packs the index into a signed byte, so an
+                # out-of-range ordinal like cuda:999 wraps to a negative index
+                if (
+                    parsed.type == "cuda"
+                    and parsed.index is not None
+                    and not (0 <= parsed.index < torch.cuda.device_count())
+                ):
+                    dev = (
+                        f"<invalid device: index {parsed.index} outside visible "
+                        f"device count {torch.cuda.device_count()}>"
+                    )
             except (RuntimeError, ValueError, TypeError) as e:
                 dev = f"<invalid device: {e}>"
         else:
@@ -320,6 +348,10 @@ class UlyssesCommunicator:
             return self._staged_cleanup(err)
 
         # stage C: create the kernel handle (zeroes this rank's signal buffer)
+        # and synchronize the bound device before reporting success — the
+        # zeroing uses cudaMemset, which is asynchronous with respect to the
+        # host, so neither the API returning nor the following host-side
+        # gather is a CUDA completion fence on its own.
         try:
             from .ulysses_a2a import init_ulysses_a2a
 
@@ -327,18 +359,19 @@ class UlyssesCommunicator:
                 self._fa = init_ulysses_a2a(
                     out_ptrs, sig_ptrs, self.rank, self.world_size, True
                 )
+                torch.cuda.synchronize()
             outcome = ("ok",)
         except Exception as e:  # noqa: BLE001
             outcome = ("err", f"rank {self.rank} init: {type(e).__name__}: {e}")
-        # this gather is also the required post-init synchronization point: the
-        # signal zeroing is a synchronous memset, and no rank can pass this
-        # gather before every rank finished stage C.
+        # once every rank passes this gather, every rank's signal buffer is
+        # both zeroed on-device (explicit synchronize above) and visible.
         err = self._first_error(self._gather(outcome))
         if err is not None:
             return self._staged_cleanup(err)
 
         self._out_ptrs = out_ptrs
         self._sig_ptrs = sig_ptrs
+        self._nvlink_armed = True
         return None
 
     @staticmethod
@@ -347,109 +380,142 @@ class UlyssesCommunicator:
         return "; ".join(errs) if errs else None
 
     def _staged_cleanup(self, err: str) -> str:
-        """Joint failure cleanup: all ranks arrive here together (they all saw
-        the same failed outcome gather). Close imports first, confirm via
-        gather, then free exports — never free an export while a peer may
-        still have it mapped."""
-        self._release_local(imports=True, exports=False)
-        self._gather(("cleanup-imports-done",))
-        self._release_local(imports=False, exports=True)
-        self._gather(("cleanup-exports-done",))
+        """Joint init-failure cleanup: all ranks arrive here together (they
+        all saw the same failed outcome gather) and run the full teardown
+        protocol. Cleanup completion is *verified* group-wide; if it cannot
+        be completed the constructor fails jointly on every rank (auto is not
+        allowed to fall back to NCCL while NVLink resources may linger)."""
+        cleanup_err = self._teardown_protocol(sync_first=True)
+        if cleanup_err is not None:
+            raise RuntimeError(
+                f"NVLink backend initialization failed ({err}) and cleanup "
+                f"could not be completed: {cleanup_err}"
+            )
         return err
 
-    def _release_local(self, *, imports: bool, exports: bool) -> None:
-        from .cuda_ipc import cudart
+    # ---- staged teardown protocol ---------------------------------------------
+    #
+    # Fixed stage sequence executed by EVERY rank whenever it runs, regardless
+    # of how many resources the rank still holds locally (a rank with nothing
+    # left still participates in every gather — otherwise a retry after a
+    # partial failure deadlocks the ranks that do have work left). Each stage
+    # drains with bounded retries; the retry/stop decision is taken from the
+    # gathered remaining-counts, so every rank takes the same branch.
 
-        if self._fa is not None:
+    _TEARDOWN_ATTEMPTS = 3
+
+    def _teardown_protocol(self, *, sync_first: bool) -> Optional[str]:
+        stages = []
+        if sync_first:
+            # collectives/memsets are async enqueues: never unmap while the
+            # bound device may still be executing one
+            stages.append(("synchronize device", self._try_sync))
+        stages.append(("dispose kernel handle", self._try_dispose))
+        stages.append(("close peer mappings", self._try_close_imports))
+        # exports are freed only after the gathered remaining-import count is
+        # zero on EVERY rank: freeing a buffer a peer still has mapped is
+        # undefined behavior
+        stages.append(("free exports", self._try_free_exports))
+
+        for name, step in stages:
+            for attempt in range(1, self._TEARDOWN_ATTEMPTS + 1):
+                remaining, detail = step()
+                outcomes = self._gather((remaining, detail))
+                if all(r == 0 for (r, _d) in outcomes):
+                    break  # stage complete on every rank
+                if attempt == self._TEARDOWN_ATTEMPTS:
+                    per_rank = {r: d for r, (n, d) in enumerate(outcomes) if n > 0}
+                    return f"stage '{name}' incomplete after {attempt} attempts: {per_rank}"
+        return None
+
+    def _try_sync(self) -> Tuple[int, Optional[str]]:
+        try:
+            with torch.cuda.device(self.device):
+                torch.cuda.synchronize()
+            return (0, None)
+        except Exception as e:  # noqa: BLE001
+            return (1, f"rank {self.rank} synchronize: {type(e).__name__}: {e}")
+
+    def _try_dispose(self) -> Tuple[int, Optional[str]]:
+        if self._fa is None:
+            return (0, None)
+        try:
             from .ulysses_a2a import dispose_ulysses_a2a
 
-            dispose_ulysses_a2a(self._fa)
+            with torch.cuda.device(self.device):
+                dispose_ulysses_a2a(self._fa)
             self._fa = None
+            return (0, None)
+        except Exception as e:  # noqa: BLE001
+            return (1, f"rank {self.rank} dispose: {type(e).__name__}: {e}")
+
+    def _try_close_imports(self) -> Tuple[int, Optional[str]]:
+        from .cuda_ipc import cudart
+
+        last = None
+        remaining: List[int] = []
         with torch.cuda.device(self.device):
-            if imports:
-                remaining = []
-                for ptr in self._imports:
-                    try:
-                        cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
-                    except Exception:  # noqa: BLE001 — keep for retry
-                        remaining.append(ptr)
-                self._imports = remaining
-            if exports:
-                remaining = []
-                for ptr in self._exports:
-                    try:
-                        cudart.cudaFree(ctypes.c_void_p(ptr))
-                    except Exception:  # noqa: BLE001 — keep for retry
-                        remaining.append(ptr)
-                self._exports = remaining
+            for ptr in self._imports:
+                try:
+                    cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
+                except Exception as e:  # noqa: BLE001 — keep for retry
+                    remaining.append(ptr)
+                    last = f"rank {self.rank} close import: {type(e).__name__}: {e}"
+        self._imports = remaining
+        return (len(remaining), last)
+
+    def _try_free_exports(self) -> Tuple[int, Optional[str]]:
+        from .cuda_ipc import cudart
+
+        last = None
+        remaining: List[int] = []
+        with torch.cuda.device(self.device):
+            for ptr in self._exports:
+                try:
+                    cudart.cudaFree(ctypes.c_void_p(ptr))
+                except Exception as e:  # noqa: BLE001 — keep for retry
+                    remaining.append(ptr)
+                    last = f"rank {self.rank} free export: {type(e).__name__}: {e}"
+        self._exports = remaining
+        return (len(remaining), last)
 
     # ---- lifecycle -----------------------------------------------------------
 
     def close(self) -> None:
         r"""Release the communicator. Idempotent once fully closed.
 
-        Collective for the NVLink backend: every rank must call ``close``
-        together. The bound device is synchronized first (collectives are
-        asynchronous kernel launches; unmapping a peer buffer still in use
-        would be undefined behavior), then teardown proceeds in stages with
-        group outcome exchanges: close peer mappings -> confirm -> free own
-        allocations -> confirm. If any rank reports a failure the call raises
-        on **all** ranks, already-released resources stay released, and every
-        rank may retry ``close()``; the state becomes CLOSED only after a
-        fully successful teardown. The NCCL backend holds no resources and
-        closes locally.
+        Collective when the NVLink backend was armed: every rank must call
+        ``close`` together, and every rank runs the same fixed teardown stage
+        sequence even if it holds no resources locally — synchronize the
+        bound device (collectives are asynchronous kernel launches; unmapping
+        a peer buffer still in use would be undefined behavior), dispose the
+        kernel handle, close peer mappings, and only after the group confirms
+        all mappings are closed, free the exports. Each stage drains with
+        bounded group-coordinated retries. If teardown still cannot complete,
+        the call raises the same error on **all** ranks and the state stays
+        CLOSING; every rank may retry ``close()``. The state becomes CLOSED
+        only after a fully successful group-wide teardown. The pure-NCCL
+        backend holds no resources and closes locally.
         """
         if self._state == _CLOSED:
             return
         self._state = _CLOSING
 
-        has_resources = bool(self._imports or self._exports or self._fa)
-        if self.backend != "nvlink" or not has_resources:
+        if not getattr(self, "_nvlink_armed", False):
+            # never held NVLink resources on ANY rank (armed is a joint
+            # property: the init transaction either succeeds or cleans up on
+            # every rank together), so closing locally cannot desync peers
             self._state = _CLOSED
             return
 
-        # collectives are async enqueues: never unmap while the device may
-        # still be executing one
-        with torch.cuda.device(self.device):
-            torch.cuda.synchronize()
-
-        # stage 1: close peer imports everywhere
-        self._release_local(imports=True, exports=False)
-        o1 = (
-            ("ok",)
-            if not self._imports
-            else (
-                "err",
-                f"rank {self.rank} failed to close {len(self._imports)} peer mapping(s)",
-            )
-        )
-        outcomes1 = self._gather(o1)
-
-        # stage 2: free own exports only after every rank confirmed stage 1
-        # (freeing a buffer a peer still has mapped is undefined behavior; if
-        # any rank failed stage 1 we still must not free, so skip and report)
-        err1 = self._first_error(outcomes1)
-        if err1 is None:
-            self._release_local(imports=False, exports=True)
-            o2 = (
-                ("ok",)
-                if not self._exports
-                else (
-                    "err",
-                    f"rank {self.rank} failed to free {len(self._exports)} export(s)",
-                )
-            )
-        else:
-            o2 = ("err", f"rank {self.rank} skipped export free: peers failed stage 1")
-        outcomes2 = self._gather(o2)
-
-        err = self._first_error(outcomes1) or self._first_error(outcomes2)
+        err = self._teardown_protocol(sync_first=True)
         if err is not None:
             raise RuntimeError(
                 f"UlyssesCommunicator.close failed (retry close() on all ranks): {err}"
             )
         self._out_ptrs = None
         self._sig_ptrs = None
+        self._nvlink_armed = False
         self._state = _CLOSED
 
     def __enter__(self) -> "UlyssesCommunicator":

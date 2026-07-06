@@ -179,6 +179,7 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         (dict(max_elems=1024, dtype=torch.int32), "dtype"),
         (dict(max_elems=1024, dtype="float16"), "dtype"),
         (dict(max_elems=1024, dtype=torch.float16, device="cpu"), "CUDA device"),
+        (dict(max_elems=1024, dtype=torch.float16, device="cuda:999"), "device count"),
     ],
 )
 def test_ctor_invalid_config(gloo_pg, monkeypatch, kwargs, match):
@@ -277,18 +278,46 @@ def test_raw_a2a_validation(monkeypatch):
     from flashinfer.comm import ulysses_a2a
 
     good = torch.randn(1, 4, 4, 8, dtype=torch.float16, device="cuda")
+    fa = 12345  # nonzero placeholder; validation fires before any module use
+    with pytest.raises(ValueError, match="nonzero handle"):
+        ulysses_a2a(0, good, good.clone(), 1, 4, 4, 8, 0)
+    with pytest.raises(ValueError, match="nonzero handle"):
+        ulysses_a2a("fa", good, good.clone(), 1, 4, 4, 8, 0)
+    with pytest.raises(ValueError, match="must be an int"):
+        ulysses_a2a(fa, good, good.clone(), 1.0, 4, 4, 8, 0)
+    with pytest.raises(ValueError, match="must be an int"):
+        ulysses_a2a(fa, good, good.clone(), True, 4, 4, 8, 0)
     with pytest.raises(ValueError, match="CUDA tensor"):
-        ulysses_a2a(0, good.cpu(), good, 1, 4, 4, 8, 0)
+        ulysses_a2a(fa, good.cpu(), good, 1, 4, 4, 8, 0)
     with pytest.raises(ValueError, match="contiguous"):
-        ulysses_a2a(0, good.transpose(1, 2), good, 1, 4, 4, 8, 0)
+        ulysses_a2a(fa, good.transpose(1, 2), good, 1, 4, 4, 8, 0)
+    with pytest.raises(ValueError, match="4-D"):
+        ulysses_a2a(fa, good[0], good, 1, 4, 4, 8, 0)
     with pytest.raises(ValueError, match="dtype"):
-        ulysses_a2a(0, good, good.float(), 1, 4, 4, 8, 0)
+        ulysses_a2a(fa, good, good.float(), 1, 4, 4, 8, 0)
+    bad_dtype = torch.zeros(1, 4, 4, 8, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="float16/bfloat16/float32"):
+        ulysses_a2a(fa, bad_dtype, bad_dtype.clone(), 1, 4, 4, 8, 0)
     with pytest.raises(ValueError, match="mode"):
-        ulysses_a2a(0, good, good.clone(), 1, 4, 4, 8, 2)
+        ulysses_a2a(fa, good, good.clone(), 1, 4, 4, 8, 2)
     with pytest.raises(ValueError, match="positive"):
-        ulysses_a2a(0, good, good.clone(), 1, -4, 4, 8, 0)
-    with pytest.raises(ValueError, match="numel"):
-        ulysses_a2a(0, good, good.clone(), 1, 4, 4, 16, 0)
+        ulysses_a2a(fa, good, good.clone(), 1, -4, 4, 8, 0)
+    # same numel but wrong exact shape for the mode-checked operand
+    with pytest.raises(ValueError, match="does not match"):
+        ulysses_a2a(fa, good.reshape(1, 4, 8, 4), good.clone(), 1, 4, 4, 8, 0)
+    with pytest.raises(ValueError, match="does not match"):
+        ulysses_a2a(fa, good, good.reshape(1, 4, 8, 4), 1, 4, 4, 8, 1)
+    with pytest.raises(ValueError, match="inconsistent"):
+        ulysses_a2a(
+            fa,
+            good,
+            torch.randn(2, 4, 4, 4, dtype=torch.float16, device="cuda"),
+            1,
+            4,
+            4,
+            8,
+            0,
+        )
 
 
 # ---- lifecycle (single rank) ----------------------------------------------------
@@ -347,9 +376,10 @@ def _init_pg(rank, world_size, port, pg_backend="nccl"):
 
 def _worker_main(rank, world_size, port, body_name, arg, q):
     """Common worker skeleton (top-level: spawn must pickle it by name):
-    outcome computed, teardown finished, then a single q.put.
-    UlyssesBackendError / 'NVLink backend initialization failed' surface as
-    ('skip', reason) so non-NVLink machines skip instead of fail."""
+    outcome computed, teardown finished, then a single q.put. Only the
+    *topology* rejection class (UlyssesBackendError) becomes ('skip', ...)
+    for non-NVLink machines; runtime init/JIT/IPC failures must FAIL, not
+    skip, or real regressions get silently swallowed."""
     body = globals()[body_name]
     outcome = None
     try:
@@ -358,11 +388,6 @@ def _worker_main(rank, world_size, port, body_name, arg, q):
             outcome = body(rank, world_size, group, arg)
         except UlyssesBackendError as e:
             outcome = ("skip", str(e)[:500])
-        except RuntimeError as e:
-            if "NVLink backend initialization failed" in str(e):
-                outcome = ("skip", str(e)[:500])
-            else:
-                outcome = (type(e).__name__, str(e)[:2000])
         except Exception as e:  # noqa: BLE001
             outcome = (type(e).__name__, str(e)[:2000])
         finally:
@@ -506,6 +531,7 @@ def _topology_fallback_body(rank, world_size, group, kind):
         group, max_elems=1 << 16, dtype=torch.float16, backend="auto"
     )
     assert comm.backend == "nccl", comm.backend
+    assert comm.decision.backend == "nccl", comm.decision
     expect = "no NVLink" if kind == "missing_nvlink" else "probe failed"
     assert expect in comm.fallback_reason, comm.fallback_reason
     x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
@@ -513,25 +539,40 @@ def _topology_fallback_body(rank, world_size, group, kind):
     ref = _ref_scatter_heads(x, world_size, rank, group)
     torch.cuda.synchronize()
     assert torch.equal(out, ref)
+    # gather direction verified independently on the fallback path too
+    y = torch.randn(1, 4 * world_size, 3, 8, dtype=torch.float16, device="cuda")
+    out2 = comm.gather_heads(y)
+    ref2 = _ref_gather_heads(y, world_size, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(out2, ref2)
     comm.close()
     return ("ok", comm.fallback_reason)
 
 
 class _ResourceLedger:
-    """Wrap the lazy cudart with counters (and one optional injected fault)."""
+    """Wrap the lazy cudart with counters and injected faults.
 
-    def __init__(self, fault=None, fault_rank_hit=True):
+    ``faults`` maps op name ("malloc" | "free" | "open" | "close" |
+    "get_handle") to how many calls should fail: an int fails the first N
+    calls, True fails every call.
+    """
+
+    def __init__(self, faults=None):
         self.cuda_ipc = importlib.import_module("flashinfer.comm.cuda_ipc")
         self.counts = dict(malloc=0, free=0, open=0, close=0)
+        self.faults = dict(faults or {})
+        self.fired = {k: 0 for k in self.faults}
         real = self.cuda_ipc.cudart
         ledger = self
 
-        def wrap(name, counter, fault_key):
+        def wrap(name, counter, key):
             orig = getattr(real, name)
 
             def wrapped(*a, **k):
-                if fault_key == fault and fault_rank_hit:
-                    raise RuntimeError(f"injected {fault_key} failure")
+                times = ledger.faults.get(key)
+                if times is not None and (times is True or ledger.fired[key] < times):
+                    ledger.fired[key] += 1
+                    raise RuntimeError(f"injected {key} failure")
                 out = orig(*a, **k)
                 ledger.counts[counter] += 1
                 return out
@@ -542,7 +583,7 @@ class _ResourceLedger:
         wrap("cudaFree", "free", "free")
         wrap("cudaIpcOpenMemHandle", "open", "open")
         wrap("cudaIpcCloseMemHandle", "close", "close")
-        if fault == "get_handle" and fault_rank_hit:
+        if "get_handle" in self.faults:
 
             def bad_handle(*a, **k):
                 raise RuntimeError("injected get_handle failure")
@@ -559,7 +600,7 @@ class _ResourceLedger:
 def _init_fault_body(rank, world_size, group, arg):
     fault, requested = arg
     _patch_probe_mesh_module(world_size)  # decision: nvlink
-    ledger = _ResourceLedger(fault=fault, fault_rank_hit=(rank == 0))
+    ledger = _ResourceLedger(faults={fault: True} if rank == 0 else None)
     if fault == "init" and rank == 0:
         ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
 
@@ -584,6 +625,8 @@ def _init_fault_body(rank, world_size, group, arg):
         group, max_elems=1 << 12, dtype=torch.float16, backend="auto"
     )
     assert comm.backend == "nccl", comm.backend
+    assert comm.decision.backend == "nccl", comm.decision  # effective decision
+    assert comm.topology_decision.backend == "nvlink"  # what the probe said
     assert "nvlink init failed" in comm.fallback_reason, comm.fallback_reason
     assert "injected" in comm.fallback_reason, comm.fallback_reason
     assert ledger.balanced(), f"leaked resources after fallback: {ledger.counts}"
@@ -596,8 +639,49 @@ def _init_fault_body(rank, world_size, group, arg):
     return ("ok", ("fell back", comm.backend))
 
 
-def _close_fault_body(rank, world_size, group, _arg):
+def _init_cleanup_fault_body(rank, world_size, group, arg):
+    # main init failure (rank0 IPC open) PLUS a cleanup fault; cleanup
+    # completion must be verified group-wide, with drain-retry healing
+    # transient faults and a deterministic joint failure otherwise.
+    cleanup_fault, requested = arg
     _patch_probe_mesh_module(world_size)
+    if cleanup_fault == "oneshot_close_rank1":
+        # rank1's first import-close fails once during cleanup: drain retry
+        # heals it, so the constructor reports only the main init error
+        faults = {"open": True} if rank == 0 else {"close": 1}
+        ledger = _ResourceLedger(faults=faults)
+        try:
+            UlyssesCommunicator(
+                group, max_elems=1 << 12, dtype=torch.float16, backend=requested
+            )
+            if requested == "nvlink":
+                raise AssertionError("forced nvlink must fail")
+            # auto: cleanup completed -> fallback allowed
+        except RuntimeError as e:
+            assert requested == "nvlink", str(e)
+            assert "NVLink backend initialization failed" in str(e), str(e)
+            assert "cleanup could not be completed" not in str(e), str(e)
+        assert ledger.balanced(), f"leaked resources: {ledger.counts}"
+        return ("ok", ledger.counts)
+    else:  # persistent_free_rank1
+        # rank1 cannot free its exports at all: cleanup is incomplete, so the
+        # constructor must fail JOINTLY on every rank — auto must NOT fall
+        # back to NCCL while NVLink resources may linger
+        faults = {"open": True} if rank == 0 else {"free": True}
+        _ResourceLedger(faults=faults)
+        try:
+            UlyssesCommunicator(
+                group, max_elems=1 << 12, dtype=torch.float16, backend=requested
+            )
+            raise AssertionError("constructor must fail jointly")
+        except RuntimeError as e:
+            assert "cleanup could not be completed" in str(e), str(e)
+        return ("ok", "joint cleanup failure")
+
+
+def _close_fault_body(rank, world_size, group, scenario):
+    # real probe (forced nvlink -> genuine topology skip on non-NVLink boxes)
+    ledger = _ResourceLedger()
     comm = UlyssesCommunicator(
         group, max_elems=1 << 12, dtype=torch.float16, backend="nvlink"
     )
@@ -605,39 +689,75 @@ def _close_fault_body(rank, world_size, group, _arg):
     comm.scatter_heads(x)
     torch.cuda.synchronize()
 
-    # inject a one-shot close fault on rank 0
-    cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    real = cuda_ipc_mod.cudart
-    orig_close = real.cudaIpcCloseMemHandle
-    state = {"armed": rank == 0}
-
-    def flaky_close(ptr):
-        if state["armed"]:
-            state["armed"] = False
-            raise RuntimeError("injected close failure")
-        return orig_close(ptr)
-
-    real.cudaIpcCloseMemHandle = flaky_close
-
-    try:
+    if scenario == "oneshot_close":
+        # a single transient import-close failure is healed by the in-stage
+        # drain retry: close() succeeds on the first call
+        if rank == 0:
+            ledger.faults["close"] = 1
+            ledger.fired["close"] = 0
         comm.close()
-        raise AssertionError("close must raise on every rank when one faults")
-    except RuntimeError as e:
-        assert "retry close()" in str(e), str(e)
+    elif scenario == "persistent_free":
+        # rank0's cudaFree fails through all in-stage retries: close() must
+        # raise on EVERY rank (including rank1, which by then holds no
+        # resources — this is exactly the retry-deadlock scenario), then a
+        # retry after the fault clears must succeed
+        if rank == 0:
+            # 2 exports x 3 in-stage attempts: 6 failures exhaust the drain
+            ledger.faults["free"] = 6
+            ledger.fired["free"] = 0
+        try:
+            comm.close()
+            raise AssertionError("close must raise on every rank")
+        except RuntimeError as e:
+            assert "retry close()" in str(e), str(e)
+        comm.close()  # fault exhausted: full protocol re-run succeeds
+    elif scenario == "sync_fault":
+        if rank == 0:
+            orig_sync = torch.cuda.synchronize
+            state = {"left": 3}
 
-    # retry must succeed on all ranks (the fault was one-shot)
-    comm.close()
-    comm.close()  # now CLOSED and idempotent
+            def flaky_sync(*a, **k):
+                if state["left"] > 0:
+                    state["left"] -= 1
+                    raise RuntimeError("injected synchronize failure")
+                return orig_sync(*a, **k)
+
+            torch.cuda.synchronize = flaky_sync
+        try:
+            comm.close()
+            raise AssertionError("close must raise on every rank")
+        except RuntimeError as e:
+            assert "retry close()" in str(e), str(e)
+            assert rank != 0 or "synchronize" in str(e), str(e)
+        comm.close()
+    elif scenario == "dispose_fault":
+        # one-shot dispose failure heals within the drain retry
+        if rank == 0:
+            ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+            orig_dispose = ulysses_a2a_mod.dispose_ulysses_a2a
+            state = {"left": 1}
+
+            def flaky_dispose(fa):
+                if state["left"] > 0:
+                    state["left"] -= 1
+                    raise RuntimeError("injected dispose failure")
+                return orig_dispose(fa)
+
+            ulysses_a2a_mod.dispose_ulysses_a2a = flaky_dispose
+        comm.close()
+
+    comm.close()  # CLOSED and idempotent
+    assert ledger.balanced(), f"leaked resources: {ledger.counts}"
     try:
         comm.scatter_heads(x)
         raise AssertionError("use-after-close must raise")
     except RuntimeError as e:
         assert "use-after-close" in str(e)
-    return ("ok", "close retried")
+    return ("ok", scenario)
 
 
 def _lifecycle_nvlink_body(rank, world_size, group, scenario):
-    _patch_probe_mesh_module(world_size)
+    # real probe: forced nvlink -> topology skip on non-NVLink machines
     mk = lambda: UlyssesCommunicator(  # noqa: E731
         group, max_elems=1 << 12, dtype=torch.float16, backend="nvlink"
     )
@@ -716,7 +836,7 @@ def _device_contract_body(rank, world_size, group, mode):
         )
         assert comm.device == torch.device(f"cuda:{rank}"), comm.device
     else:  # switch: current device changed between construction and use/close
-        _patch_probe_mesh_module(world_size)
+        # real probe: forced nvlink -> topology skip on non-NVLink machines
         comm = UlyssesCommunicator(
             group,
             max_elems=1 << 16,
@@ -725,6 +845,32 @@ def _device_contract_body(rank, world_size, group, mode):
             device=f"cuda:{rank}",
         )
         torch.cuda.set_device((rank + 1) % torch.cuda.device_count())
+        # metadata collectives (teardown etc.) must run bound to the
+        # communicator device, not whatever device is current
+        gather_devices = []
+        orig_gather = dist.all_gather_object
+
+        def recording_gather(obj_list, obj, group=None):
+            gather_devices.append(torch.cuda.current_device())
+            return orig_gather(obj_list, obj, group=group)
+
+        ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+        ulysses_mod.dist.all_gather_object = recording_gather
+        try:
+            x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device=f"cuda:{rank}")
+            out = comm.scatter_heads(x)
+            ref = _ref_scatter_heads(x, world_size, rank, group)
+            torch.cuda.synchronize(f"cuda:{rank}")
+            assert torch.equal(out, ref)
+            comm.close()
+        finally:
+            ulysses_mod.dist.all_gather_object = orig_gather
+        assert gather_devices, "close must have exchanged outcomes"
+        assert all(d == rank for d in gather_devices), (
+            f"metadata collectives ran on devices {set(gather_devices)}, "
+            f"expected the bound device {rank}"
+        )
+        return ("ok", str(comm.device))
     x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device=f"cuda:{rank}")
     out = comm.scatter_heads(x)
     ref = _ref_scatter_heads(x, world_size, rank, group)
@@ -822,6 +968,10 @@ def test_nondefault_stream_forced_nvlink():
     _run_multi_rank("_stream_body", 2, "nvlink")
 
 
+def test_nondefault_stream_forced_nccl():
+    _run_multi_rank("_stream_body", 2, "nccl")
+
+
 def test_op_divisibility_enforced_two_ranks():
     _run_multi_rank("_divisibility_body", 2, None)
 
@@ -842,8 +992,27 @@ def test_init_fault_one_rank(fault, requested):
     _run_multi_rank("_init_fault_body", 2, (fault, requested))
 
 
-def test_close_fault_is_retryable():
-    _run_multi_rank("_close_fault_body", 2, None)
+@pytest.mark.parametrize(
+    "scenario", ["oneshot_close", "persistent_free", "sync_fault", "dispose_fault"]
+)
+def test_close_fault_scenarios(scenario):
+    # oneshot faults heal inside the drain retry; persistent free / sync
+    # faults raise the same error on EVERY rank (a resource-less rank still
+    # runs the full stage sequence, so the retry cannot deadlock) and a
+    # subsequent close() succeeds
+    _run_multi_rank("_close_fault_body", 2, scenario)
+
+
+@pytest.mark.parametrize("requested", ["nvlink", "auto"])
+@pytest.mark.parametrize(
+    "cleanup_fault", ["oneshot_close_rank1", "persistent_free_rank1"]
+)
+def test_init_cleanup_fault(cleanup_fault, requested):
+    # main init failure + cleanup fault: transient cleanup faults drain to
+    # zero (ledger balanced, forced raises the init error / auto falls back);
+    # a cleanup that cannot complete is a deterministic JOINT constructor
+    # failure on every rank — auto never falls back with lingering resources
+    _run_multi_rank("_init_cleanup_fault_body", 2, (cleanup_fault, requested))
 
 
 @pytest.mark.parametrize(

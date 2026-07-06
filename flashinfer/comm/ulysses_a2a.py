@@ -180,23 +180,51 @@ def ulysses_a2a(
     with consistent geometry in the same order; a mismatch is a collective
     failure (hang or corruption), as with any collective.
     """
+    if type(fa) is not int or fa == 0:
+        raise ValueError(
+            f"fa must be a nonzero handle returned by init_ulysses_a2a, got {fa!r}"
+        )
+    for v, vname in (
+        (B, "B"),
+        (S_local, "S_local"),
+        (H, "H"),
+        (D, "D"),
+        (mode, "mode"),
+    ):
+        if type(v) is not int:  # bool is an int subclass: reject it too
+            raise ValueError(f"{vname} must be an int, got {type(v).__name__}")
     for name, t in (("inp", inp), ("out", out)):
         if not (isinstance(t, torch.Tensor) and t.is_cuda):
             raise ValueError(f"{name} must be a CUDA tensor")
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+        if t.dim() != 4:
+            raise ValueError(f"{name} must be 4-D, got shape {tuple(t.shape)}")
     if inp.device != out.device:
         raise ValueError(f"inp is on {inp.device} but out is on {out.device}")
     if inp.dtype != out.dtype:
         raise ValueError(f"inp dtype {inp.dtype} != out dtype {out.dtype}")
+    if inp.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"dtype must be float16/bfloat16/float32, got {inp.dtype}")
     if mode not in (0, 1):
         raise ValueError(f"mode must be 0 or 1, got {mode}")
     if min(B, S_local, H, D) <= 0:
         raise ValueError(f"B/S_local/H/D must be positive, got {(B, S_local, H, D)}")
-    expected = B * S_local * H * D
-    if inp.numel() != expected or out.numel() != expected:
+    # exact-shape checks: the [B, S_local, H, D]-layout operand of each mode is
+    # fully determined by the geometry args; the other operand's split of
+    # (S_global, H_local) depends on world_size (unknown here), so check its
+    # batch/D dims and total size
+    local_shape = (B, S_local, H, D)
+    checked, other = (inp, out) if mode == 0 else (out, inp)
+    if tuple(checked.shape) != local_shape:
         raise ValueError(
-            f"inp/out numel ({inp.numel()}/{out.numel()}) do not match "
-            f"B*S_local*H*D = {expected}"
+            f"{'inp' if mode == 0 else 'out'} shape {tuple(checked.shape)} does "
+            f"not match [B, S_local, H, D] = {local_shape} for mode {mode}"
+        )
+    if other.shape[0] != B or other.shape[3] != D or other.numel() != checked.numel():
+        raise ValueError(
+            f"{'out' if mode == 0 else 'inp'} shape {tuple(other.shape)} is "
+            f"inconsistent with [B, S_local, H, D] = {local_shape} "
+            f"(batch/D dims and total size must match)"
         )
     get_ulysses_a2a_module().ulysses_a2a(fa, inp, out, B, S_local, H, D, mode)
