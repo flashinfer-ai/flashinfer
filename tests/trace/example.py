@@ -800,6 +800,84 @@ with contextlib.suppress(Exception):
         _last,
     )
 
+# nvfp4_quantize_append_paged_kv_cache: tuple packed cache plus scale cache.
+with contextlib.suppress(Exception):
+    from flashinfer import nvfp4_quantize_append_paged_kv_cache
+
+    _nqap_B, _nqap_H, _nqap_D, _nqap_PS = 2, 2, 64, 4
+    _nqap_nnz = 4
+    _nqap_k_cache = torch.zeros(
+        4, _nqap_PS, _nqap_H, _nqap_D // 2, dtype=torch.uint8, device=device
+    )
+    _nqap_v_cache = torch.zeros_like(_nqap_k_cache)
+    _nqap_k_sf = torch.zeros(
+        4,
+        _nqap_PS,
+        _nqap_H,
+        _nqap_D // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _nqap_v_sf = torch.zeros_like(_nqap_k_sf)
+    _nqap_k = torch.randn(
+        _nqap_nnz, _nqap_H, _nqap_D, dtype=torch.bfloat16, device=device
+    )
+    _nqap_v = torch.randn_like(_nqap_k)
+    _nqap_bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+    _nqap_pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+    _nqap_kv_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    _nqap_kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    _nqap_last = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    nvfp4_quantize_append_paged_kv_cache(
+        _nqap_k,
+        _nqap_v,
+        _nqap_bidx,
+        _nqap_pos,
+        (_nqap_k_cache, _nqap_v_cache),
+        (_nqap_k_sf, _nqap_v_sf),
+        _nqap_kv_idx,
+        _nqap_kv_indptr,
+        _nqap_last,
+        1.0,
+        1.0,
+    )
+
+# nvfp4_quantize_append_paged_kv_cache_with_slot_mapping: flat slot mapping.
+with contextlib.suppress(Exception):
+    from flashinfer import nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
+
+    _nqsm_H, _nqsm_D, _nqsm_PS = 2, 64, 4
+    _nqsm_nnz = 4
+    _nqsm_k_cache = torch.zeros(
+        4, _nqsm_PS, _nqsm_H, _nqsm_D // 2, dtype=torch.uint8, device=device
+    )
+    _nqsm_v_cache = torch.zeros_like(_nqsm_k_cache)
+    _nqsm_k_sf = torch.zeros(
+        4,
+        _nqsm_PS,
+        _nqsm_H,
+        _nqsm_D // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _nqsm_v_sf = torch.zeros_like(_nqsm_k_sf)
+    _nqsm_k = torch.randn(
+        _nqsm_nnz, _nqsm_H, _nqsm_D, dtype=torch.bfloat16, device=device
+    )
+    _nqsm_v = torch.randn_like(_nqsm_k)
+    _nqsm_slots = torch.tensor([0, 1, 4, 5], dtype=torch.int32, device=device)
+    _nqsm_k_scale = torch.ones(1, dtype=torch.float32, device=device)
+    _nqsm_v_scale = torch.ones(1, dtype=torch.float32, device=device)
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        _nqsm_k,
+        _nqsm_v,
+        _nqsm_slots,
+        (_nqsm_k_cache, _nqsm_v_cache),
+        (_nqsm_k_sf, _nqsm_v_sf),
+        _nqsm_k_scale,
+        _nqsm_v_scale,
+    )
+
 # SegmentGEMMWrapper: small per-segment matmul.
 with contextlib.suppress(Exception):
     ws = torch.empty(WORKSPACE, dtype=torch.uint8, device=device)
