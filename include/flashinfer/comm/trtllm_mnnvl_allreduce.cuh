@@ -118,14 +118,15 @@ constexpr float kFP8E4M3Max = 448.0f;
 constexpr float kFP8E4M3MinSubnormal = 1.0f / 512.0f;
 constexpr float kDynamicFP8MinScale = kFP8E4M3MinSubnormal / kFP8E4M3Max;
 
-inline __host__ __device__ bool useWarpGroupReduction(int groupSize, int eltsPerThread) {
+inline __host__ __device__ bool useWarpGroupReduction(int groupSize, int eltsPerThread,
+                                                      int blockSize) {
   int groupThreads = groupSize / eltsPerThread;
-  return groupSize % eltsPerThread == 0 && groupThreads <= 32 &&
+  return blockSize % 32 == 0 && groupSize % eltsPerThread == 0 && groupThreads <= 32 &&
          (groupThreads & (groupThreads - 1)) == 0;
 }
 
 inline size_t groupQuantSmemSize(int blockSize, int groupSize, int eltsPerThread) {
-  if (useWarpGroupReduction(groupSize, eltsPerThread)) {
+  if (useWarpGroupReduction(groupSize, eltsPerThread, blockSize)) {
     return 0;
   }
   return blockSize * eltsPerThread / groupSize * sizeof(unsigned int);
@@ -935,11 +936,11 @@ inline __device__ void quant_per_token_group_fp8_packed(
     void* quantOutPtr, void* sfOutPtr, unsigned int* smemGroupAbsmax) {
   static_assert(ELTS_PER_THREAD == 8 || ELTS_PER_THREAD == 4, "ELTS_PER_THREAD must be 8 or 4");
   // Dispatch guarantees an exact row partition: every launched thread owns a full vector,
-  // every CTA spans whole quantization groups, and warp-reduced groups use a power-of-two
-  // thread count no larger than a warp. The inBounds/blockValidElements plumbing is retained
-  // for a future tail-capable path; relaxing the dispatch checks also requires updating both
-  // reductions below.
-  bool const useWarpShuffle = utils::useWarpGroupReduction(groupSize, ELTS_PER_THREAD);
+  // every CTA spans whole quantization groups, and warp-reduced groups use full warps with a
+  // power-of-two thread count per group. Partial-warp CTAs use shared memory. The
+  // inBounds/blockValidElements plumbing is retained for a future tail-capable path; relaxing
+  // the dispatch checks also requires updating both reductions below.
+  bool const useWarpShuffle = utils::useWarpGroupReduction(groupSize, ELTS_PER_THREAD, blockDim.x);
   int const groupThreads = groupSize / ELTS_PER_THREAD;
   float localAbsmax = 0.F;
 
@@ -950,17 +951,8 @@ inline __device__ void quant_per_token_group_fp8_packed(
         localAbsmax = fmaxf(localAbsmax, fabsf(values[i]));
       }
     }
-    int const fullWarpThreadCount = blockDim.x & ~31;
-    if (threadIdx.x < fullWarpThreadCount) {
-      for (int offset = groupThreads / 2; offset > 0; offset /= 2) {
-        localAbsmax = fmaxf(localAbsmax, __shfl_xor_sync(0xffffffffu, localAbsmax, offset));
-      }
-    } else {
-      int const partialWarpThreads = blockDim.x - fullWarpThreadCount;
-      unsigned int const partialWarpMask = (1u << partialWarpThreads) - 1u;
-      for (int offset = groupThreads / 2; offset > 0; offset /= 2) {
-        localAbsmax = fmaxf(localAbsmax, __shfl_xor_sync(partialWarpMask, localAbsmax, offset));
-      }
+    for (int offset = groupThreads / 2; offset > 0; offset /= 2) {
+      localAbsmax = fmaxf(localAbsmax, __shfl_xor_sync(0xffffffffu, localAbsmax, offset));
     }
   } else {
     int const groupsInBlock = blockValidElements / groupSize;
