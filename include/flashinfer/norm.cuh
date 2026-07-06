@@ -1006,6 +1006,11 @@ __global__ void __launch_bounds__(THREADS)
   for (int mask = 16; mask > 0; mask >>= 1)
     local_var += __shfl_xor_sync(FULL_MASK, local_var, mask, 32);
 
+  // Reuse of the shared warp_sums[] buffer: the mean phase above read it after
+  // its __syncthreads(), and we are about to overwrite it with variance partials.
+  // Without a barrier here a fast warp could clobber warp_sums[] while a slower
+  // warp is still reading it for the mean reduction (WAR hazard) -> wrong output.
+  __syncthreads();
   if (lane == 0) warp_sums[wid] = local_var;
   __syncthreads();
   if (lane < NUM_WARPS)
