@@ -206,3 +206,5 @@ docs/sg_execution_times.rst
 build_nvep/
 flashinfer/moe_ep/*/_libs/
 flashinfer/moe_ep/*/_vendored/
+.pair-programming/
+Pair_Programming.html
