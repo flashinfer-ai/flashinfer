@@ -1,11 +1,14 @@
+import inspect
+import random
+
 import pytest
 import torch
 import torch.nn.functional as F
-import random
 
 import flashinfer
 from flashinfer.mla import (
     MLALayerDimensions,
+    deepseek_mla_dimensions,
     supported_mla_layer_dimensions,
     smaller_mla_dimensions,
 )
@@ -21,6 +24,14 @@ workspace_size = 128 * 1024 * 1024
 
 # Guard region we zero past the softmax slab so we can detect OOB writes.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
+
+
+def test_grouped_mla_selection_is_not_a_public_option():
+    parameters = inspect.signature(
+        flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
+    ).parameters
+
+    assert "selects_grouped_mla" not in parameters
 
 
 def trtllm_gen_workspace_softmax_end_bytes_decode(
@@ -1004,6 +1015,95 @@ def test_trtllm_batch_decode_mla(
         skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         use_cum_seq_lens_q=False,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+@pytest.mark.parametrize("q_len_per_request", [2, 3, 4, 5, 6, 7, 8, 9, 16, 32])
+def test_trtllm_batch_decode_grouped_mla(
+    dtype: torch.dtype,
+    num_heads: int,
+    q_len_per_request: int,
+):
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, num_heads),
+        batch_size=1,
+        scale=1.0,
+        dtype=dtype,
+        page_size=32,
+        q_len_per_request=q_len_per_request,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_trtllm_batch_decode_grouped_mla_batch_16(dtype: torch.dtype):
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 32),
+        batch_size=16,
+        scale=1.0,
+        dtype=dtype,
+        page_size=32,
+        q_len_per_request=8,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_q1_mla():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 16),
+        batch_size=1,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=1,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_grouped_mla_fixed_q_batch_stride():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 8),
+        batch_size=2,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=2,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+    )
+
+
+def test_trtllm_batch_decode_grouped_mla_variable_q_lengths():
+    trtllm_batch_decode_mla(
+        MLALayerDimensions(deepseek_mla_dimensions, 16),
+        batch_size=3,
+        scale=1.0,
+        dtype=torch.bfloat16,
+        page_size=32,
+        q_len_per_request=8,
+        dynamic_scale=False,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        MAX_SEQ_LEN=1024,
+        skips_softmax=False,
+        use_cum_seq_lens_q=True,
     )
 
 

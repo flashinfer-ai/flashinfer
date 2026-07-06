@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -418,6 +418,8 @@ struct TllmGenSelectKernelParams {
   int mTileSizeQ;
   // The tile size for Kv.
   int mTileSizeKv;
+  // Group query tokens and heads in one CTA.
+  bool mGroupsTokensHeadsQ;
   // Use 2 CTA MMA or not.
   bool mUses2CtaMma;
 
@@ -439,5 +441,6 @@ struct TllmGenSelectKernelParams {
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
+        mGroupsTokensHeadsQ(false),
         mUses2CtaMma(false) {};
 };
