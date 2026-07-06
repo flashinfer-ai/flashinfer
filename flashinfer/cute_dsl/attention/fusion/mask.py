@@ -26,6 +26,10 @@ class AttentionMask(ABC):
     def __post_init__(self):
         assert is_dataclass(self), f"{type(self)} must be dataclass"
 
+    # Optionally implemented for subclasses
+    def can_implement(self, seqlen_q, seqlen_kv, tile_q, tile_kv):
+        return
+
     @cute.jit
     @abstractmethod
     def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
@@ -86,6 +90,12 @@ class NoMask(AttentionMask):
     OOB logits are TMA masked to 0 and will contribute to softmax denominator.
     Valid for when KV sequence is a multiple of KV sequence tile.
     """
+
+    def can_implement(self, seqlen_q, seqlen_kv, tile_q, tile_kv):
+        if seqlen_kv % tile_kv != 0:
+            raise ValueError(
+                f"NoMask requires seqlen_kv({seqlen_kv}) multiple of tile_kv({tile_kv})"
+            )
 
     @cute.jit
     def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
@@ -153,6 +163,14 @@ class DenseMask(AttentionMask):  # aka ResidualMask
 @dataclass(frozen=True)
 class CausalMask(AttentionMask):
     """Current tokens only attend to past tokens and itself."""
+
+    def can_implement(self, seqlen_q, seqlen_kv, tile_q, tile_kv):
+        # Only causal mask up to two tiles
+        # Revisit this for prefill integration
+        if seqlen_q > tile_kv:
+            raise ValueError(
+                f"seqlen_q({seqlen_q}) with causal mask can be at most tile_kv({tile_kv})"
+            )
 
     @cute.jit
     def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:

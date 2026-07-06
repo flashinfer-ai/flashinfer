@@ -99,7 +99,13 @@ class GroupedQueryAttentionDecode:
     ##############################
     # Runtime implementable check
     def can_implement(
-        self, kv_splits, qo_shape_bshd, kv_shape_bshd, qkv_dtype, o_dtype
+        self,
+        kv_splits,
+        qo_shape_bshd,
+        kv_shape_bshd,
+        qkv_dtype,
+        o_dtype,
+        mask_config,
     ):
         b_k, s_q, h_q, d_q = qo_shape_bshd
         b_q, s_k, h_k, d_k = kv_shape_bshd
@@ -120,12 +126,6 @@ class GroupedQueryAttentionDecode:
                 f"non-zero seqlen({s_k}) must be at least prediction({s_q})"
             )
 
-        # Only causal mask up to two tiles
-        if s_q > self.sequence_tile:
-            raise ValueError(
-                f"prediction({s_q}) with causal mask can be at most {self.sequence_tile}"
-            )
-
         if b_k != b_q:
             raise ValueError(f"batches_k({b_k}) and batches_q({b_q}) mismatch")
 
@@ -142,6 +142,8 @@ class GroupedQueryAttentionDecode:
 
         if self.do_none_red and kv_splits != 1:
             raise ValueError("KV splits must be 1 if flash decoding is disabled")
+
+        mask_config.can_implement(s_q, s_k, self.prediction_tile, self.sequence_tile)
 
     # Pack grouped heads with predicted tokens (s_q)
     @staticmethod
@@ -2174,7 +2176,9 @@ def run(
     qo_shape = (kv_splits, batches, seqlen_q, heads_q, headdim)
     kv_shape = (batches, seqlen_k, heads_k, headdim)
 
-    fmha.can_implement(qo_shape[0], qo_shape[1:], kv_shape, qkv_dtype, o_dtype)
+    fmha.can_implement(
+        qo_shape[0], qo_shape[1:], kv_shape, qkv_dtype, o_dtype, mask_config
+    )
 
     #
     # Allocate Tensors

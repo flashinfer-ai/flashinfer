@@ -113,9 +113,18 @@ class GroupedQueryAttentionDecodePaged:
         assert self.do_kernel_red ^ self.do_atomic_red ^ self.do_none_red
 
     def can_implement(
-        self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype, threshold_scale_factor
+        self,
+        kv_splits,
+        qo_shape,
+        kv_shape,
+        qkv_dtype,
+        o_dtype,
+        mask_config,
+        threshold_scale_factor,
     ):
-        GqaDecode.can_implement(self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype)
+        GqaDecode.can_implement(
+            self, kv_splits, qo_shape, kv_shape, qkv_dtype, o_dtype, mask_config
+        )
 
         if threshold_scale_factor is not None and not threshold_scale_factor > 0:
             raise ValueError(
@@ -2066,6 +2075,7 @@ def run(
         kv_shape,
         qkv_dtype,
         o_dtype,
+        mask_config,
         threshold_scale_factor,
     )
 
