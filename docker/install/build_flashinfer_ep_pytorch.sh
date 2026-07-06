@@ -10,13 +10,21 @@
 #
 # Env:
 #   FI_SRC        FlashInfer checkout (default /host/flashinfer)
-#   NCCL_VERSION  nvidia-nccl-cu13 pin (default 2.30.7)
-#   NCCL4PY_SPEC  nccl4py pin (default nccl4py[cu13]==0.3.1)
+#   CUDA_MAJOR    CUDA major for the cuXX wheel suffix (default: auto from torch.version.cuda)
+#   NCCL_VERSION  nvidia-nccl-<cuXX> pin (default 2.30.7)
+#   NCCL4PY_SPEC  nccl4py pin (default nccl4py[<cuXX>]==0.3.1)
 set -euo pipefail
+
+# Derive the CUDA major (cu12 / cu13 / ...) from the base image's torch so the
+# wheel suffixes below track the base image instead of being hardcoded. Override
+# with CUDA_MAJOR=<n> if torch can't be imported for some reason.
+CUDA_MAJOR="${CUDA_MAJOR:-$(python -c 'import torch; v = torch.version.cuda or ""; print(v.split(".")[0])' 2>/dev/null || true)}"
+: "${CUDA_MAJOR:?could not detect CUDA major from torch.version.cuda; set CUDA_MAJOR explicitly}"
+CU="cu${CUDA_MAJOR}"
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"
 NCCL_VERSION="${NCCL_VERSION:-2.30.7}"
-NCCL4PY_SPEC="${NCCL4PY_SPEC:-nccl4py[cu13]==0.3.1}"
+NCCL4PY_SPEC="${NCCL4PY_SPEC:-nccl4py[${CU}]==0.3.1}"
 CUDA_CORE_VERSION="${CUDA_CORE_VERSION:-1.0.1}"
 CUDA_BINDINGS_VERSION="${CUDA_BINDINGS_VERSION:-13.2.0}"
 DEEPGEMM_SRC="${DEEPGEMM_SRC:-/tmp/DeepGEMM}"
@@ -29,12 +37,12 @@ nvcc --version | grep release || true
 
 echo "== pin NCCL-EP runtime wheels to ep_bench's verified set =="
 # PIP_CONSTRAINT= overrides the NVIDIA base image's constraint file (which pins
-# nvidia-nccl-cu13 to torch's 2.30.4) so we install the 2.30.7 that nccl4py 0.3.1's
+# nvidia-nccl-<cuXX> to torch's 2.30.4) so we install the 2.30.7 that nccl4py 0.3.1's
 # libnccl_ep.so expects. --no-deps on the NCCL wheels keeps the base torch intact;
 # nccl.ep additionally imports cuda.core / cuda.bindings, installed explicitly at
 # ep_bench's exact versions (cuda-core 1.0.1, cuda-bindings 13.2.0).
 PIP_CONSTRAINT="" pip install --no-cache-dir --no-deps \
-    "nvidia-nccl-cu13==${NCCL_VERSION}" \
+    "nvidia-nccl-${CU}==${NCCL_VERSION}" \
     "${NCCL4PY_SPEC}"
 PIP_CONSTRAINT="" pip install --no-cache-dir \
     "cuda-core==${CUDA_CORE_VERSION}" \
@@ -43,11 +51,11 @@ python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep + 
 
 echo "== install DeepGEMM + NVSHMEM / CUTLASS DSL deps =="
 PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
-    nvshmem4py-cu13 \
+    "nvshmem4py-${CU}" \
     pytest \
-    nvidia-nvshmem-cu13 \
+    "nvidia-nvshmem-${CU}" \
     filelock \
-    "nvidia-cutlass-dsl[cu13]==4.5.0"
+    "nvidia-cutlass-dsl[${CU}]==4.5.0"
 (
     if [ ! -d "${DEEPGEMM_SRC}/.git" ]; then
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git "${DEEPGEMM_SRC}"

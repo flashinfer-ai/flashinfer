@@ -36,6 +36,13 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 
 **Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune transport. Fleet is lazy-created on first `forward()`; a new Handle per forward. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms in `last_timings_ms`.
 
+**Split compute:** the `fused_moe` kernel bridges the 3D EP dispatch buffer to `flashinfer.fused_moe` (a token-major `MoEActivationPack`) via `backends/split/kernel/fused_moe/bridge.py`:
+
+- LL **EXPERT_MAJOR** — `[num_local_experts, cap, hidden]` (`cap = max_tokens_per_rank * world`), each row pre-assigned to one expert; the bridge synthesizes `top_k=1` / `final_scales=1` and **combine owns the real top-k reweight**.
+- LL **RANK_MAJOR** / **HT FLAT** — `[world, max_tokens_per_rank, hidden]` carrying received `topk_idx` / `topk_weights`; the runner uses the real `top_k` with non-local picks masked to weight 0, and combine just sums across ranks.
+
+Both bf16 and NVFP4 are supported in the compute path (`MoEConfig.quant.variant`); NVFP4 activations are quantized in the bridge (linear SF layout). Correctness is currently validated for bf16 only (see **Tests**).
+
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required on `fleet_params`. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
 ## Architecture
@@ -72,7 +79,7 @@ classDiagram
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |
 | Split kernel | `identity` | `IdentityConfig` — comm-only; `dummy_moe_weights` OK |
-| Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe.MoELayer` |
+| Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; bf16 + NVFP4; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
 | Mega kernel | `deep_gemm_mega` | `DeepGemmMegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `nvfp4_cutedsl` | `Nvfp4CutedslMegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `mxfp8_cutedsl` | `Mxfp8CutedslMegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
@@ -96,7 +103,9 @@ When `auto_bootstrap=False`: dist must be up at layer construction if `process_g
 
 ## Build / availability
 
-Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`. Missing libs raise `MoEEpNotBuiltError`. Rebuild: `BUILD_NVEP=1 pip install -e ".[nvep]"`.
+Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`. Missing libs raise `MoEEpNotBuiltError`.
+
+**Recommended build:** `docker/install/build_flashinfer_ep_pytorch.sh` builds the full NCCL-EP + Mega environment inside the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch`): it pins the NCCL-EP runtime wheels (`nvidia-nccl-cu13`, `nccl4py`, `cuda-core`, `cuda-bindings`), installs the mega deps (DeepGEMM, NVSHMEM, CUTLASS DSL), then runs `BUILD_NCCL_EP=1 pip install --no-build-isolation -e ".[nvep]"`. Set `BUILD_NIXL_EP=1` to also build NIXL-EP. For a bare rebuild of just the transport libs: `BUILD_NCCL_EP=1 pip install -e ".[nvep]"` (`BUILD_NVEP=1` builds all backends).
 
 ## Lifetimes
 
@@ -144,15 +153,17 @@ Raw megakernel or split-kernel configs cannot be passed as `backend=`; wrap in `
 
 ## Tests
 
-`tests/moe_ep/run_tests.sh [unit|multirank|correctness|mega|smoke|all]`:
+`tests/moe_ep/run_tests.sh [unit|multirank|split_path_correctness_bf16|mega|smoke|all]`:
 
-- **unit** — host-only pytest (no multirank)
-- **multirank** — 4-GPU split path (NCCL-EP layer + split kernels)
-- **correctness** — 4-GPU LL/HT + NVFP4 numerics (Blackwell)
-- **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity (Blackwell, sm_100+)
-- **smoke** — quick NCCL-EP smoke scripts
+- **unit** — host-only pytest (mocks + single-GPU; no multirank)
+- **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
+- **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR) vs a single-process `MoELayer` reference (Blackwell)
+- **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity, plus a single-rank MXFP8 preprocess-vs-reference check (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
+- **smoke** — NCCL-EP smoke script (and NIXL-EP when built)
 
-Requires `BUILD_NVEP=1` install for multirank/smoke; mega needs Blackwell, deep_gemm, triton.
+Split-path numerics are **bf16-only for now** (the `split_path_correctness_bf16` target above). An HT FLAT test (`test_moe_ep_ht_correctness.py`, bf16) and an NVFP4 split test (`test_moe_ep_compute_correctness_nvfp4.py`) exist in the tree but are not yet wired into a target / enabled.
+
+Multirank/smoke/correctness need the NCCL-EP build (see **Build / availability** — `docker/install/build_flashinfer_ep_pytorch.sh`); mega additionally needs Blackwell, deep_gemm, triton.
 
 ## Forward flow
 
