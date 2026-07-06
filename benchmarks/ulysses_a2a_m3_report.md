@@ -54,10 +54,15 @@ python benchmarks/bench_ulysses_a2a.py compare base_w8.json new_w8.json --thresh
 The NCCL control stayed within **±1.4%** across all world sizes (the earlier
 run set spanned −1.3%..+0.35%; a previous summary overstated this as ±0.4%).
 The fused kernel remains **1.25x (W=2) to 1.45x (W=8)** faster than the
-NCCL reference on the a2a unit. The public NCCL fallback
-(`UlyssesCommunicator(backend="nccl")` vs the inline `nccl_ref`) costs at
-most **+0.17%** — the public API adds no measurable overhead on either
-backend.
+NCCL reference on the a2a unit.
+
+The pairs in the table above are the *regression contract* (baseline code vs
+new code). Pure **public API overhead** is a same-artifact comparison
+instead: within the `new` artifacts, `nccl_ref` -> `communicator_nccl`
+(identical NCCL algorithm, once inline and once through
+`UlyssesCommunicator(backend="nccl")`) measures −1.22%..+0.09% across
+W=2/4/6/8 — noise range, i.e. the public API adds no measurable per-call
+overhead.
 
 Secondary `e2e_attn` (ungated): flat on most pairs, but individual runs show
 ±13..23% swings on the raw/communicator paths (e.g. W=4 raw->communicator

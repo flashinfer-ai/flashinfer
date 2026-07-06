@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
-import os
 import socket
 import sys
 from pathlib import Path
@@ -91,19 +90,17 @@ def _worker(world_size, rank, port, args):
     x_global = torch.randn(B, S_global, args.dim, dtype=torch.bfloat16, device=device)
     x_local = x_global[:, rank * S_local : (rank + 1) * S_local].contiguous()
 
-    max_elems = B * S_global * H * D  # largest a2a operand
+    max_elems = B * S_local * H * D  # largest a2a operand (input numel == output numel)
     results = {}
     a2a_results = {}
     outs = {}
     q_like = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device=device)
     for impl in ("nccl", "flashinfer"):
-        ctx = UlyssesContext(group, impl=impl, max_elems=max_elems, elem_bytes=2)
+        ctx = UlyssesContext(group, impl=impl, max_elems=max_elems)
         set_ulysses_context(ctx)
         with torch.no_grad():
             outs[impl] = attn(x_local).clone()
-            results[impl] = _time_forward(
-                attn, x_local, args.iters, args.warmup, group
-            )
+            results[impl] = _time_forward(attn, x_local, args.iters, args.warmup, group)
             # a2a-only: one attention layer issues 3 input a2a (q/k/v) and
             # 1 output a2a — time that communication pattern in isolation.
             u = ctx.input_all_to_all(q_like)
@@ -153,8 +150,10 @@ def _worker(world_size, rank, port, args):
         print(f"  a2a only 3xin+1xout (nccl)      : {an:8.3f} ms/iter")
         print(f"  a2a only 3xin+1xout (flashinfer): {af:8.3f} ms/iter")
         print(f"  a2a speedup: {an / af:.3f}x")
-        print("  correctness: flashinfer == nccl (bit-identical); "
-              "matches single-GPU reference (allclose)")
+        print(
+            "  correctness: flashinfer == nccl (bit-identical); "
+            "matches single-GPU reference (allclose)"
+        )
 
     dist.barrier(group=group)
     dist.destroy_process_group()
@@ -169,8 +168,9 @@ def main():
     p.add_argument("--dim", type=int, default=5120)
     p.add_argument("--heads", type=int, default=40)
     p.add_argument("--dim-head", type=int, default=128)
-    p.add_argument("--attention-backend", default="torch",
-                   help="torch|cudnn|trtllm|single|auto")
+    p.add_argument(
+        "--attention-backend", default="torch", help="torch|cudnn|trtllm|single|auto"
+    )
     p.add_argument("--iters", type=int, default=30)
     p.add_argument("--warmup", type=int, default=10)
     args = p.parse_args()

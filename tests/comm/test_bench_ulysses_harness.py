@@ -36,6 +36,7 @@ def _payload(bench, label, commit, impls, ws=8, p50=1.0):
         "order_policy": "rotation per repeat (every impl visits every position)",
         "torch": "2.x",
         "device": "H20",
+        "package_dirty": False,
     }
     results = {
         name: {
@@ -104,6 +105,13 @@ def test_compare_rejects_meta_mismatch(bench, field, value):
     base = _payload(bench, "baseline", "c83e4204", BASE_IMPLS)
     new = _payload(bench, "new", "deadbeef", NEW_IMPLS)
     new["meta"][field] = value
+    if field in ("repeats", "iters"):
+        # keep the artifact internally consistent (n == repeats*iters) so the
+        # cross-artifact meta mismatch is what fires, not the n sanity check
+        n = new["meta"]["repeats"] * new["meta"]["iters"]
+        for units in new["results"].values():
+            for st in units.values():
+                st["n"] = n
     with pytest.raises(ValueError, match=f"meta field '{field}'"):
         bench.compare_payloads(base, new, 3.0)
 
@@ -166,6 +174,32 @@ def test_stats_median_is_conventional(bench):
     st = bench._stats([1.0, 2.0, 3.0, 4.0])
     assert st["p50"] == 2.5
     assert st["n"] == 4
+
+
+def test_compare_rejects_bad_data_and_provenance(bench):
+    base = _payload(bench, "baseline", "c83e4204", BASE_IMPLS)
+    good = _payload(bench, "new", "deadbeef", NEW_IMPLS)
+
+    dirty = copy.deepcopy(good)
+    dirty["meta"]["package_dirty"] = True
+    with pytest.raises(ValueError, match="dirty/unknown package provenance"):
+        bench.compare_payloads(base, dirty, 3.0)
+
+    unknown = copy.deepcopy(good)
+    unknown["meta"]["commit"] = "unknown"
+    with pytest.raises(ValueError, match="dirty/unknown package provenance"):
+        bench.compare_payloads(base, unknown, 3.0)
+
+    for bad_p50 in (float("nan"), float("inf"), 0.0, -1.0):
+        bad = copy.deepcopy(good)
+        bad["results"]["raw"]["a2a"]["p50"] = bad_p50
+        with pytest.raises(ValueError, match="invalid p50"):
+            bench.compare_payloads(base, bad, 3.0)
+
+    short = copy.deepcopy(good)
+    short["results"]["raw"]["a2a"]["n"] = 149
+    with pytest.raises(ValueError, match="truncated or padded"):
+        bench.compare_payloads(base, short, 3.0)
 
 
 def test_payload_copy_is_not_mutated(bench):

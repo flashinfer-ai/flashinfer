@@ -313,9 +313,31 @@ def rotation_order(impls: list[str], rep: int) -> list[str]:
 
 def validate_compare(base: dict, new: dict) -> None:
     """Fail-closed compatibility check; raises ValueError on any mismatch."""
+    import math
+
     for payload, role in ((base, "baseline"), (new, "new")):
         if "meta" not in payload or "results" not in payload:
             raise ValueError(f"{role} artifact is missing meta/results")
+        meta = payload["meta"]
+        if meta.get("package_dirty") or meta.get("commit") in (None, "", "unknown"):
+            raise ValueError(
+                f"{role} artifact has dirty/unknown package provenance "
+                f"(commit={meta.get('commit')!r}, dirty={meta.get('package_dirty')!r}); "
+                "gate only committed, clean builds"
+            )
+        expected_n = meta.get("repeats", 0) * meta.get("iters", 0)
+        for impl, units in payload["results"].items():
+            for unit, st in units.items():
+                p50 = st.get("p50")
+                if not (
+                    isinstance(p50, (int, float)) and math.isfinite(p50) and p50 > 0
+                ):
+                    raise ValueError(f"{role} {impl}/{unit} has invalid p50={p50!r}")
+                if st.get("n") != expected_n:
+                    raise ValueError(
+                        f"{role} {impl}/{unit} has n={st.get('n')} but "
+                        f"repeats*iters={expected_n}; truncated or padded data"
+                    )
     bm, nm = base["meta"], new["meta"]
     for field in COMPAT_META_FIELDS:
         if bm.get(field) != nm.get(field):
