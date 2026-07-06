@@ -183,6 +183,12 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         params.max_total_num_rows = 0;
         params.padded_batch_size = 0;
         params.partition_kv = false;
+        params.k_sf_stride_page = 0;
+        params.k_sf_stride_n = 0;
+        params.k_sf_stride_h = 0;
+        params.v_sf_stride_page = 0;
+        params.v_sf_stride_n = 0;
+        params.v_sf_stride_h = 0;
 
         ADDITIONAL_PARAMS_SETTER
 
@@ -316,6 +322,12 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.max_total_num_rows = 0;
         params.padded_batch_size = 0;
         params.partition_kv = false;
+        params.k_sf_stride_page = 0;
+        params.k_sf_stride_n = 0;
+        params.k_sf_stride_h = 0;
+        params.v_sf_stride_page = 0;
+        params.v_sf_stride_n = 0;
+        params.v_sf_stride_h = 0;
 
         ADDITIONAL_PARAMS_SETTER
 

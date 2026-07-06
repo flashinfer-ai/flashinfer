@@ -1223,6 +1223,35 @@ def _fa2_prefill_head_dim_nvcc_flags(
     )
 
 
+def _append_nvfp4_sf_stride_setter(
+    additional_params_setter: str,
+    additional_tensor_names: List[str],
+    params_expr: str = "params",
+) -> str:
+    stride_setters = []
+    if "maybe_k_cache_sf" in additional_tensor_names:
+        stride_setters.append(
+            "if (maybe_k_cache_sf) { const auto& sf_tensor = maybe_k_cache_sf.value(); "
+            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"{params_expr}.k_sf_stride_page = sf_strides.stride_page; "
+            f"{params_expr}.k_sf_stride_n = sf_strides.stride_n; "
+            f"{params_expr}.k_sf_stride_h = sf_strides.stride_h; }}"
+        )
+    if "maybe_v_cache_sf" in additional_tensor_names:
+        stride_setters.append(
+            "if (maybe_v_cache_sf) { const auto& sf_tensor = maybe_v_cache_sf.value(); "
+            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"{params_expr}.v_sf_stride_page = sf_strides.stride_page; "
+            f"{params_expr}.v_sf_stride_n = sf_strides.stride_n; "
+            f"{params_expr}.v_sf_stride_h = sf_strides.stride_h; }}"
+        )
+    if not stride_setters:
+        return additional_params_setter
+    if additional_params_setter:
+        return additional_params_setter + " \\\n" + " \\\n".join(stride_setters)
+    return " \\\n".join(stride_setters)
+
+
 def gen_customize_single_decode_module(
     uri: str,
     dtype_q: torch.dtype,
@@ -1614,6 +1643,9 @@ def gen_customize_batch_prefill_module(
                 additional_scalar_dtypes,
             )
         )
+        additional_params_setter = _append_nvfp4_sf_stride_setter(
+            additional_params_setter, additional_tensor_names
+        )
 
         with open(
             jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_customize_config.jinja"
@@ -1915,6 +1947,9 @@ def gen_customize_batch_attention_module(
             )
         ]
         + [f"params[i].{var} = {var};" for var in additional_scalar_names]
+    )
+    batch_additional_params_setter = _append_nvfp4_sf_stride_setter(
+        batch_additional_params_setter, additional_tensor_names, params_expr="params[i]"
     )
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
