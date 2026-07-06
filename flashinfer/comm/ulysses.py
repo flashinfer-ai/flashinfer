@@ -16,7 +16,7 @@ limitations under the License.
 
 import ctypes
 import re
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -132,7 +132,7 @@ class UlyssesCommunicator:
         max_elems: int,
         dtype: torch.dtype,
         backend: str = "auto",
-        device: Optional[torch.device] = None,
+        device: Optional[Union[torch.device, str, int]] = None,
     ):
         self._state = _CLOSED  # flipped to OPEN only when construction succeeds
         self._nvlink_armed = False  # joint property: set on all ranks or none

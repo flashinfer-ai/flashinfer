@@ -85,7 +85,7 @@ REQUIRED_GATES = [
 # overhead: communicator_nccl vs nccl_ref on identical NCCL algorithm.
 OPTIONAL_INTRA_NEW_PAIRS = [
     (
-        "communicator_nccl vs nccl_ref (intra-new: public fallback API overhead)",
+        "nccl_ref->communicator_nccl (intra-new: public fallback API overhead)",
         "nccl_ref",
         "communicator_nccl",
     ),
@@ -382,6 +382,19 @@ def validate_compare(base: dict, new: dict) -> None:
 
 def compare_payloads(base: dict, new: dict, threshold_pct: float):
     """Returns (report_lines, gate_failed). Raises on incompatible inputs."""
+    import math
+
+    # fail-closed: a NaN/Inf/negative/bool threshold would make every
+    # `delta > threshold` comparison false and turn the gate into a no-op
+    if (
+        isinstance(threshold_pct, bool)
+        or not isinstance(threshold_pct, (int, float))
+        or not math.isfinite(threshold_pct)
+        or threshold_pct < 0
+    ):
+        raise ValueError(
+            f"threshold_pct must be a finite non-negative number, got {threshold_pct!r}"
+        )
     validate_compare(base, new)
     lines = []
     failed = False

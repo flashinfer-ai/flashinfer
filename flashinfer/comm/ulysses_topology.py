@@ -16,7 +16,7 @@ limitations under the License.
 
 import socket
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -58,8 +58,9 @@ class UlyssesBackendDecision:
     """Outcome of backend selection.
 
     ``backend`` is the backend actually chosen (``"nvlink"`` or ``"nccl"``);
-    ``reason`` explains why — for NCCL it is the fallback reason, for NVLink it
-    records what was verified.
+    ``reason`` is the *selection* reason: for NVLink it records what was
+    verified; for NCCL it is a fallback reason only under ``backend="auto"``
+    (an explicit ``backend="nccl"`` request simply reports "requested").
     """
 
     backend: str
@@ -67,7 +68,7 @@ class UlyssesBackendDecision:
 
 
 def probe_ulysses_rank_topology(
-    device: Optional[torch.device], rank: int
+    device: Optional[Union[torch.device, str, int]], rank: int
 ) -> UlyssesRankTopology:
     """Probe this rank's GPU identity and its P2P/NVLink reachability to every
     other CUDA device visible to this process.
@@ -80,16 +81,16 @@ def probe_ulysses_rank_topology(
     try:
         topo.hostname = socket.gethostname()
         if device is None:
-            device = torch.device("cuda", torch.cuda.current_device())
+            parsed = torch.device("cuda", torch.cuda.current_device())
         else:
-            device = torch.device(device)
-        if device.type != "cuda":
+            parsed = torch.device(device)
+        if parsed.type != "cuda":
             raise ValueError(
-                f"Ulysses topology probe requires a CUDA device, got {device!r}"
+                f"Ulysses topology probe requires a CUDA device, got {parsed!r}"
             )
         # index=None means the *current* device, not GPU 0
         device_index = (
-            device.index if device.index is not None else torch.cuda.current_device()
+            parsed.index if parsed.index is not None else torch.cuda.current_device()
         )
         topo.device_index = device_index
 
@@ -235,7 +236,7 @@ def decide_ulysses_backend(
 def resolve_ulysses_backend(
     backend: str = "auto",
     group: Optional[dist.ProcessGroup] = None,
-    device: Optional[torch.device] = None,
+    device: Optional[Union[torch.device, str, int]] = None,
 ) -> UlyssesBackendDecision:
     """Group-consistent backend selection. Must run *before* any IPC allocation
     or JIT compilation. It allocates no IPC workspace and compiles nothing;

@@ -1,10 +1,13 @@
 """Generate a full Wan T2V video with Ulysses sequence parallelism on N GPUs.
 
 Every rank loads the full pipeline (text encoder / VAE / scheduler replicated),
-shards the transformer token sequence 1/N per rank, and runs self-attention via
-the fused-transpose NVLink-P2P all-to-all (``flashinfer.comm.ulysses_a2a``).
-All ranks hold the identical full output after each transformer call, so the
-scheduler/VAE stay in lockstep; rank 0 exports the video.
+shards the transformer token sequence 1/N per rank, and runs self-attention
+through :class:`flashinfer.comm.UlyssesCommunicator` with ``backend="auto"``:
+the fused-transpose NVLink-P2P kernel on a verified full-NVLink topology, an
+automatic NCCL fallback elsewhere (rank 0 prints the effective backend and
+the fallback reason). All ranks hold the identical full output after each
+transformer call, so the scheduler/VAE stay in lockstep; rank 0 exports the
+video.
 
 Example (8 GPUs, 480x832, 81 frames):
     python run_wan_ulysses_video.py --world-size 8 --output wan_ulysses.mp4
@@ -14,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
-import os
 import socket
 import sys
 import time
@@ -59,11 +61,18 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
         "adjust --height/--width/--num-frames"
     )
     heads, dim_head = 40, 128  # Wan A14B attention geometry
-    max_elems = 2 * seq_global * heads * dim_head  # B up to 2 (CFG batching)
+    # Largest single a2a operand: B * S_local * heads * dim_head elements
+    # (input and output numel are equal), with B up to 2 for CFG batching.
+    seq_local = seq_global // world_size
+    max_elems = 2 * seq_local * heads * dim_head
 
     # IPC buffers involve collectives: create while all ranks are in lockstep,
     # before the (slow, unsynchronized) model load.
-    ctx = UlyssesContext(group, impl="flashinfer", max_elems=max_elems, elem_bytes=2)
+    ctx = UlyssesContext(group, impl="flashinfer", max_elems=max_elems)
+    if rank == 0:
+        print(f"[rank0] ulysses effective backend: {ctx.backend}", flush=True)
+        if ctx.fallback_reason is not None:
+            print(f"[rank0] !! fallback: {ctx.fallback_reason}", flush=True)
 
     from pipeline_wan_flashinfer import load_wan_pipeline_with_flashinfer_transformers
 

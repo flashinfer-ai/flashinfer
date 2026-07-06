@@ -214,6 +214,44 @@ def test_compare_rejects_bad_data_and_provenance(bench):
         bench.compare_payloads(base, short, 3.0)
 
 
+@pytest.mark.parametrize(
+    "bad", [float("nan"), float("inf"), float("-inf"), -1.0, "3", None, True]
+)
+def test_compare_rejects_invalid_threshold(bench, bad):
+    # NaN/Inf make every `delta > threshold` false: the gate would fail open
+    base = _payload(bench, "baseline", "c83e4204", BASE_IMPLS, p50=1.0)
+    new = _payload(bench, "new", "deadbeef", NEW_IMPLS, p50=99.0)  # huge regression
+    with pytest.raises(ValueError, match="threshold_pct"):
+        bench.compare_payloads(base, new, bad)
+
+
+def test_compare_cli_invalid_threshold_exits_nonzero(bench, tmp_path):
+    import json
+    import subprocess
+    import sys as _sys
+
+    base = _payload(bench, "baseline", "c83e4204", BASE_IMPLS, p50=1.0)
+    new = _payload(bench, "new", "deadbeef", NEW_IMPLS, p50=99.0)
+    bp, np_ = tmp_path / "b.json", tmp_path / "n.json"
+    bp.write_text(json.dumps(base))
+    np_.write_text(json.dumps(new))
+    r = subprocess.run(
+        [
+            _sys.executable,
+            str(_HARNESS),
+            "compare",
+            str(bp),
+            str(np_),
+            "--threshold-pct",
+            "nan",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "threshold_pct" in (r.stdout + r.stderr)
+
+
 def test_optional_pair_is_intra_new(bench):
     # the informational overhead pair must compare two impls of the NEW
     # artifact, never baseline vs new: give baseline a wildly different
@@ -226,6 +264,8 @@ def test_optional_pair_is_intra_new(bench):
     assert intra, lines
     assert all("1.000 vs    1.000" in ln for ln in intra), intra
     assert all("100.000" not in ln for ln in intra), intra
+    # label direction must match the value order: nccl_ref first
+    assert all("nccl_ref->communicator_nccl" in ln for ln in intra), intra
 
 
 def test_payload_copy_is_not_mutated(bench):
