@@ -89,10 +89,8 @@ class GroupedQueryAttentionDecodePaged:
         softmax_warpgroups
             Number of softmax warpgroups (1 or 2).
         tma_mask
-            Disable causal masking — out-of-bounds scores are masked to 0
-            instead of -inf. Mathematically equivalent softmax, but may
-            produce subnormal exponentiations if non-oob scores are all
-            negative (max goes to 0).
+            Disable causal masking. KV lanes beyond the per-request sequence
+            length are masked to ``-inf`` by the boundary-mask loop.
         """
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
@@ -1412,7 +1410,7 @@ class GroupedQueryAttentionDecodePaged:
             tStL = tStL[None, 0, 0, 0, None]
             tSrL_shape = thr_load_l.partition_D(tCtL_phase).shape[:1]
 
-            # Causal masking for spec decode verification
+            # Boundary mask setup for causal and non-causal decode paths.
             masked_iters_s = masked_start_s = masked_coord_s = 0
             check_safe_max = False
             if cutlass.const_expr(not tma_mask):
@@ -1444,6 +1442,14 @@ class GroupedQueryAttentionDecodePaged:
                         masked_start_s = 0
                         masked_iters_s = 1
                         masked_coord_s = tiles_s - 1
+            else:
+                # Non-causal boundary mask.
+                is_last_split = kv_split_idx == (tiles_s - 1) % kv_splits
+                is_last_phase = softmax_phase == (iters_s - 1) % softmax_warpgroups
+                if seqlen % blk_tile_s != 0 and is_last_split and is_last_phase:
+                    masked_start_s = 0
+                    masked_iters_s = 1
+                    masked_coord_s = tiles_s - 1
 
             if cutlass.const_expr(enable_blasst):
                 # Tile skip tracking
@@ -1454,8 +1460,8 @@ class GroupedQueryAttentionDecodePaged:
                     Float32(seqlen)
                 )
 
-            # Sequence loop
-            num_loops = 2 if not tma_mask else 1
+            # Loop 1 applies the boundary mask.
+            num_loops = 2
             for loop in cutlass.range_constexpr(num_loops):
                 is_masked_loop = loop == 1
                 for s in cutlass.range(
@@ -1472,7 +1478,7 @@ class GroupedQueryAttentionDecodePaged:
                     cute.arch.fence_view_async_tmem_load()
                     s_handle.release()
 
-                    # Apply causal mask
+                    # Apply boundary mask (causal or non-causal).
                     if cutlass.const_expr(is_masked_loop):
                         masked = cute.make_rmem_tensor(
                             (blk_tile_h, blk_tile_p, tiles_sm), acc_dtype
@@ -1483,7 +1489,11 @@ class GroupedQueryAttentionDecodePaged:
                         for sm in cutlass.range_constexpr(tiles_sm):
                             for p in cutlass.range_constexpr(blk_tile_p):
                                 masked_p = masked[None, p, sm]
-                                is_oob = offset_s + sm * mma_tile_m > offset_p + p
+                                key_pos = offset_s + sm * mma_tile_m
+                                if cutlass.const_expr(not tma_mask):
+                                    is_oob = key_pos > offset_p + p
+                                else:
+                                    is_oob = key_pos >= seqlen
                                 mask = -Float32.inf if is_oob else Float32(0)
                                 masked_p.store(masked_p.load() + mask)
                         scores = masked.load().reshape((blk_tile_n, tiles_sm))
