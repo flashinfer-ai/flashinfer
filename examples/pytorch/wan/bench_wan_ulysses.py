@@ -71,12 +71,16 @@ def _time_forward(attn, x_local, iters, warmup, group):
 
 
 def _worker(world_size, rank, port, args):
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    # heavy imports (transformer pulls the full FlashInfer stack) only AFTER
+    # this rank is bound to its device, so nothing initializes on GPU 0;
+    # _build_attention below reuses the same cached module identity
     from transformer_wan_flashinfer import set_ulysses_communicator
 
     from flashinfer.comm import UlyssesCommunicator
 
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://localhost:{port}",

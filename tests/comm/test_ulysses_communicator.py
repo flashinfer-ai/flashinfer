@@ -94,19 +94,19 @@ def gloo_pg():
 
 def _forbid_ipc_and_jit(monkeypatch):
     cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
     vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
-    jit_comm_mod = importlib.import_module("flashinfer.jit.comm")
 
     def _boom(*args, **kwargs):
         raise AssertionError("IPC/JIT entry point must not be touched")
 
     monkeypatch.setattr(cuda_ipc_mod, "create_shared_buffer", _boom)
     monkeypatch.setattr(cuda_ipc_mod.cudart, "cudaMalloc", _boom, raising=False)
-    monkeypatch.setattr(ulysses_a2a_mod, "get_ulysses_a2a_module", _boom)
-    monkeypatch.setattr(ulysses_a2a_mod, "init_ulysses_a2a", _boom)
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_a2a_module", _boom)
+    monkeypatch.setattr(ulysses_mod, "init_ulysses_a2a", _boom)
     monkeypatch.setattr(vllm_ar_mod, "meta_size", _boom)
-    monkeypatch.setattr(jit_comm_mod, "gen_ulysses_a2a_module", _boom)
+    # merged module binds gen at import: patch the local binding
+    monkeypatch.setattr(ulysses_mod, "gen_ulysses_a2a_module", _boom)
 
 
 def _patch_probe_mesh(monkeypatch, world_size):
@@ -275,9 +275,9 @@ def test_raw_init_synchronizes_device(monkeypatch):
     # the raw wrapper must fence the async signal memset before returning
     from types import SimpleNamespace
 
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
     monkeypatch.setattr(
-        ulysses_a2a_mod,
+        ulysses_mod,
         "get_ulysses_a2a_module",
         lambda: SimpleNamespace(init_ulysses_a2a=lambda *a: 42),
     )
@@ -301,10 +301,10 @@ def test_raw_init_sync_failure_disposes_handle(monkeypatch):
     # cannot dispose it: the wrapper owns the handle and must release it
     from types import SimpleNamespace
 
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
     disposed = []
     monkeypatch.setattr(
-        ulysses_a2a_mod,
+        ulysses_mod,
         "get_ulysses_a2a_module",
         lambda: SimpleNamespace(
             init_ulysses_a2a=lambda *a: 42,
@@ -326,12 +326,12 @@ def test_raw_init_sync_failure_disposes_handle(monkeypatch):
 @requires_cuda
 def test_raw_a2a_validation(monkeypatch):
     # validation fires before any module lookup: forbid JIT to prove it
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
 
     def _boom(*args, **kwargs):
         raise AssertionError("JIT must not be touched by invalid raw calls")
 
-    monkeypatch.setattr(ulysses_a2a_mod, "get_ulysses_a2a_module", _boom)
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_a2a_module", _boom)
     from flashinfer.comm import ulysses_a2a
 
     good = torch.randn(1, 4, 4, 8, dtype=torch.float16, device="cuda")
@@ -598,19 +598,19 @@ def _topology_fallback_body(rank, world_size, group, kind):
         error_rank=(0 if kind == "probe_error" else None),
     )
     cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
     vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
-    jit_comm_mod = importlib.import_module("flashinfer.jit.comm")
 
     def _boom(*args, **kwargs):
         raise AssertionError("IPC/JIT entry point must not be touched")
 
     cuda_ipc_mod.create_shared_buffer = _boom
     cuda_ipc_mod.cudart.cudaMalloc = _boom
-    ulysses_a2a_mod.get_ulysses_a2a_module = _boom
-    ulysses_a2a_mod.init_ulysses_a2a = _boom
+    ulysses_mod.get_ulysses_a2a_module = _boom
+    ulysses_mod.init_ulysses_a2a = _boom
     vllm_ar_mod.meta_size = _boom
-    jit_comm_mod.gen_ulysses_a2a_module = _boom
+    # merged module binds gen at import: patch the local binding
+    ulysses_mod.gen_ulysses_a2a_module = _boom
 
     comm = UlyssesCommunicator(
         group, max_elems=1 << 16, dtype=torch.float16, backend="auto"
@@ -690,12 +690,12 @@ def _init_fault_body(rank, world_size, group, arg):
         faults={cudart_faults: True} if (cudart_faults and rank == 0) else None
     )
     if fault == "init" and rank == 0:
-        ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
+        ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
 
         def bad_init(*a, **k):
             raise RuntimeError("injected init failure")
 
-        ulysses_a2a_mod.init_ulysses_a2a = bad_init
+        ulysses_mod.init_ulysses_a2a = bad_init
     elif fault == "jit" and rank == 0:
         # rank-local stage-J failure: nothing may be allocated anywhere
         vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
@@ -903,15 +903,15 @@ def _close_fault_body(rank, world_size, group, scenario):
         # dispose succeeds but the device-guard __exit__ raises: the ledger
         # was already cleared inside the guard, so the drain retry must NOT
         # delete the handle a second time
-        ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
+        ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
         dispose_calls = {"n": 0}
-        orig_dispose = ulysses_a2a_mod.dispose_ulysses_a2a
+        orig_dispose = ulysses_mod.dispose_ulysses_a2a
 
         def counting_dispose(fa):
             dispose_calls["n"] += 1
             return orig_dispose(fa)
 
-        ulysses_a2a_mod.dispose_ulysses_a2a = counting_dispose
+        ulysses_mod.dispose_ulysses_a2a = counting_dispose
         if rank == 0:
             orig_device = torch.cuda.device
             state = {"raise_after_dispose": True}
@@ -942,8 +942,8 @@ def _close_fault_body(rank, world_size, group, scenario):
     elif scenario == "dispose_fault":
         # one-shot dispose failure heals within the drain retry
         if rank == 0:
-            ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
-            orig_dispose = ulysses_a2a_mod.dispose_ulysses_a2a
+            ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+            orig_dispose = ulysses_mod.dispose_ulysses_a2a
             state = {"left": 1}
 
             def flaky_dispose(fa):
@@ -952,7 +952,7 @@ def _close_fault_body(rank, world_size, group, scenario):
                     raise RuntimeError("injected dispose failure")
                 return orig_dispose(fa)
 
-            ulysses_a2a_mod.dispose_ulysses_a2a = flaky_dispose
+            ulysses_mod.dispose_ulysses_a2a = flaky_dispose
         comm.close()
 
     comm.close()  # CLOSED and idempotent

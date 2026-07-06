@@ -1,5 +1,9 @@
 """
-Copyright (c) 2026 by FlashInfer team.
+Copyright (c) 2025-2026 by FlashInfer team.
+
+The raw all-to-all entry points (merged from the former ulysses_a2a.py) wrap
+a CUDA kernel adapted from ThunderKittens' NVLink all-to-all:
+https://github.com/HazyResearch/ThunderKittens/blob/main/kernels/parallel/all_to_all/all_to_all.cu
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -762,7 +766,9 @@ class UlyssesCommunicator:
 # function `ulysses_a2a` exported from flashinfer.comm used to shadow that
 # submodule of the same name, breaking attribute-based module access. Custom
 # op names, lazy JIT timing, the post-init memset fence and handle ownership
-# are unchanged.
+# are unchanged. The underlying CUDA kernel is adapted from ThunderKittens'
+# NVLink all-to-all:
+# https://github.com/HazyResearch/ThunderKittens/blob/main/kernels/parallel/all_to_all/all_to_all.cu
 
 
 @functools.cache

@@ -190,15 +190,16 @@ def _forbid_ipc_and_jit(monkeypatch):
     import importlib
 
     cuda_ipc_mod = importlib.import_module("flashinfer.comm.cuda_ipc")
-    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses")
-    jit_comm_mod = importlib.import_module("flashinfer.jit.comm")
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
 
     def _boom(*args, **kwargs):
         raise AssertionError("IPC/JIT entry point must not be touched")
 
     monkeypatch.setattr(cuda_ipc_mod, "create_shared_buffer", _boom)
-    monkeypatch.setattr(ulysses_a2a_mod, "get_ulysses_a2a_module", _boom)
-    monkeypatch.setattr(jit_comm_mod, "gen_ulysses_a2a_module", _boom)
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_a2a_module", _boom)
+    # the merged module binds gen_ulysses_a2a_module at import: patch the
+    # local binding, not flashinfer.jit.comm (which would not intercept)
+    monkeypatch.setattr(ulysses_mod, "gen_ulysses_a2a_module", _boom)
 
 
 def test_resolve_auto_world_size_1_no_ipc_jit(gloo_pg, monkeypatch):

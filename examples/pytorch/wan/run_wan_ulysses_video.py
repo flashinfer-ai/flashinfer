@@ -76,10 +76,6 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
     import torch
     import torch.distributed as dist
 
-    from transformer_wan_flashinfer import set_ulysses_communicator
-
-    from flashinfer.comm import UlyssesCommunicator
-
     # Defense-in-depth preflight (main() already validated before spawning):
     # must run BEFORE set_device / init_process_group so an impossible config
     # cannot strand peers in a process-group init that times out in hours.
@@ -89,6 +85,14 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
+
+    # heavy imports (transformer pulls the full FlashInfer stack) only AFTER
+    # the preflight and the device binding, so nothing initializes on GPU 0;
+    # the pipeline loader below reuses the same cached module identity
+    from transformer_wan_flashinfer import set_ulysses_communicator
+
+    from flashinfer.comm import UlyssesCommunicator
+
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://localhost:{port}",
