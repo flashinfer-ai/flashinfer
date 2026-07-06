@@ -16,7 +16,7 @@ limitations under the License.
 
 import socket
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -266,6 +266,28 @@ def resolve_ulysses_backend(
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
 
+    # Metadata collectives must run bound to the caller's device: NCCL object
+    # collectives stage through a tensor on the *current* device, so without a
+    # guard every rank could land on GPU 0 when the caller relies on device=
+    # instead of set_device. Any guard failure is a probe-level concern; keep
+    # the guard best-effort and never raise before a gather.
+    def _guarded_gather(payload: Any) -> List[Any]:
+        out: List[Any] = [None] * world_size
+        guard_index: Optional[int] = None
+        try:
+            if device is not None:
+                parsed = torch.device(device)
+                if parsed.type == "cuda" and parsed.index is not None:
+                    guard_index = parsed.index
+        except Exception:  # noqa: BLE001 — invalid device surfaces via probe
+            guard_index = None
+        if guard_index is not None:
+            with torch.cuda.device(guard_index):
+                dist.all_gather_object(out, payload, group=group)
+        else:
+            dist.all_gather_object(out, payload, group=group)
+        return out
+
     # ---- gather 1: requested backends (before any local validation) --------
     # No user code may run before the gather: str(backend) would invoke a user
     # __str__ that could raise on one rank and hang the peers. Exact type check
@@ -275,8 +297,7 @@ def resolve_ulysses_backend(
         request_payload = backend
     else:
         request_payload = f"<invalid type: {type(backend).__name__}>"
-    requests: List[Optional[str]] = [None] * world_size
-    dist.all_gather_object(requests, request_payload, group=group)
+    requests: List[Optional[str]] = _guarded_gather(request_payload)
 
     invalid = {r: req for r, req in enumerate(requests) if req not in ULYSSES_BACKENDS}
     if invalid:
@@ -302,8 +323,7 @@ def resolve_ulysses_backend(
     except Exception as e:  # noqa: BLE001
         local = UlyssesRankTopology(rank=rank, probe_error=f"{type(e).__name__}: {e}")
 
-    topologies: List[Optional[UlyssesRankTopology]] = [None] * world_size
-    dist.all_gather_object(topologies, local, group=group)
+    topologies: List[Optional[UlyssesRankTopology]] = _guarded_gather(local)
 
     # ---- gather 3: decision outcomes (unconditional) ------------------------
     # ("ok", backend, reason) | ("backend_error", msg) | ("error", msg)
@@ -316,8 +336,7 @@ def resolve_ulysses_backend(
     except Exception as e:  # noqa: BLE001
         outcome = ("error", f"{type(e).__name__}: {e}")
 
-    outcomes: List[Optional[Tuple[str, ...]]] = [None] * world_size
-    dist.all_gather_object(outcomes, outcome, group=group)
+    outcomes: List[Optional[Tuple[str, ...]]] = _guarded_gather(outcome)
 
     # Joint resolution: identical gathered list => identical result on every
     # rank, whether that is a raise or a decision. Invariants: only

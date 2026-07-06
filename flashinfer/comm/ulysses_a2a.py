@@ -124,9 +124,13 @@ def init_ulysses_a2a(
 
     Note
     ----
-    ``init`` zeroes this rank's own signal buffer. Callers must issue a
-    process-group barrier (e.g. ``torch.distributed.barrier``) after all ranks
-    return from init and before the first all-to-all call.
+    ``init`` zeroes this rank's own signal buffer with a ``cudaMemset``, which
+    is asynchronous with respect to the host. This wrapper therefore
+    synchronizes the *current* CUDA device before returning (call it with the
+    target device current). Callers still must issue a process-group barrier
+    (e.g. ``torch.distributed.barrier``) after all ranks return from init and
+    before the first all-to-all call — the barrier alone is not a CUDA
+    completion fence, and the device sync alone is not group-wide.
     """
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(
@@ -139,9 +143,12 @@ def init_ulysses_a2a(
             "UlyssesCommunicator(backend='auto') for topology-aware NCCL "
             "fallback instead."
         )
-    return get_ulysses_a2a_module().init_ulysses_a2a(
+    fa = get_ulysses_a2a_module().init_ulysses_a2a(
         out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink
     )
+    # make the signal zeroing a real completion fence on this device
+    torch.cuda.synchronize()
+    return fa
 
 
 def dispose_ulysses_a2a(fa: int) -> None:

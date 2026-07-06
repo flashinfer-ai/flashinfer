@@ -180,6 +180,10 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         (dict(max_elems=1024, dtype="float16"), "dtype"),
         (dict(max_elems=1024, dtype=torch.float16, device="cpu"), "CUDA device"),
         (dict(max_elems=1024, dtype=torch.float16, device="cuda:999"), "device count"),
+        # torch.device would silently wrap these into valid ordinals
+        # (cuda:256 == cuda:0); the raw string/int must be validated first
+        (dict(max_elems=1024, dtype=torch.float16, device="cuda:256"), "device count"),
+        (dict(max_elems=1024, dtype=torch.float16, device=256), "device count"),
     ],
 )
 def test_ctor_invalid_config(gloo_pg, monkeypatch, kwargs, match):
@@ -264,6 +268,31 @@ def test_raw_init_rejects_full_nvlink_false():
 
     with pytest.raises(ValueError, match="full_nvlink=False is not supported"):
         init_ulysses_a2a([0, 0], [0, 0], 0, 2, False)
+
+
+@requires_cuda
+def test_raw_init_synchronizes_device(monkeypatch):
+    # the raw wrapper must fence the async signal memset before returning
+    from types import SimpleNamespace
+
+    ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
+    monkeypatch.setattr(
+        ulysses_a2a_mod,
+        "get_ulysses_a2a_module",
+        lambda: SimpleNamespace(init_ulysses_a2a=lambda *a: 42),
+    )
+    calls = {"n": 0}
+    orig = torch.cuda.synchronize
+
+    def counting_sync(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", counting_sync)
+    from flashinfer.comm import init_ulysses_a2a
+
+    assert init_ulysses_a2a([0, 0], [0, 0], 0, 2, True) == 42
+    assert calls["n"] == 1, "init wrapper must synchronize the device"
 
 
 @requires_cuda
@@ -363,6 +392,11 @@ CORRECTNESS_SHAPES = [
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 
+# bodies that need a specific process-group backend (None = torch default
+# multi-backend group, used to prove capability detection handles "undefined")
+_PG_BACKEND_OVERRIDES = {"_none_backend_body": None}
+
+
 def _init_pg(rank, world_size, port, pg_backend="nccl"):
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -374,20 +408,27 @@ def _init_pg(rank, world_size, port, pg_backend="nccl"):
     return dist.group.WORLD
 
 
-def _worker_main(rank, world_size, port, body_name, arg, q):
+def _worker_main(rank, world_size, port, body_name, arg, allow_skip, q):
     """Common worker skeleton (top-level: spawn must pickle it by name):
-    outcome computed, teardown finished, then a single q.put. Only the
-    *topology* rejection class (UlyssesBackendError) becomes ('skip', ...)
-    for non-NVLink machines; runtime init/JIT/IPC failures must FAIL, not
-    skip, or real regressions get silently swallowed."""
+    outcome computed, teardown finished, then a single q.put. The *topology*
+    rejection class (UlyssesBackendError) becomes ('skip', ...) only for
+    tests that explicitly opted in (real-probe forced-NVLink tests on
+    non-NVLink machines); fake-topology and fault-injection tests must FAIL
+    on it — a regressed resolver rejecting a fake full mesh is a bug, not a
+    hardware limitation. Runtime init/JIT/IPC failures always FAIL."""
     body = globals()[body_name]
     outcome = None
     try:
-        group = _init_pg(rank, world_size, port)
+        group = _init_pg(
+            rank, world_size, port, _PG_BACKEND_OVERRIDES.get(body_name, "nccl")
+        )
         try:
             outcome = body(rank, world_size, group, arg)
         except UlyssesBackendError as e:
-            outcome = ("skip", str(e)[:500])
+            if allow_skip:
+                outcome = ("skip", str(e)[:500])
+            else:
+                outcome = ("UlyssesBackendError", str(e)[:2000])
         except Exception as e:  # noqa: BLE001
             outcome = (type(e).__name__, str(e)[:2000])
         finally:
@@ -503,6 +544,22 @@ def _divisibility_body(rank, world_size, group, _arg):
     return ("ok", "divisibility enforced")
 
 
+def _none_backend_body(rank, world_size, group, _arg):
+    # process group created with backend=None (multi-backend); the capability
+    # check must detect the CUDA-bound ProcessGroupNCCL behind "undefined"
+    comm = UlyssesCommunicator(
+        group, max_elems=1 << 16, dtype=torch.float16, backend="nccl"
+    )
+    assert comm.backend == "nccl"
+    x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
+    out = comm.scatter_heads(x)
+    ref = _ref_scatter_heads(x, world_size, rank, group)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    comm.close()
+    return ("ok", "none-backend group accepted")
+
+
 def _topology_fallback_body(rank, world_size, group, kind):
     # topology-driven fallback at a *supported* world size must not touch
     # IPC/JIT: boom every entry point, then construct through the real public
@@ -600,7 +657,10 @@ class _ResourceLedger:
 def _init_fault_body(rank, world_size, group, arg):
     fault, requested = arg
     _patch_probe_mesh_module(world_size)  # decision: nvlink
-    ledger = _ResourceLedger(faults={fault: True} if rank == 0 else None)
+    cudart_faults = fault if fault in ("malloc", "get_handle", "open") else None
+    ledger = _ResourceLedger(
+        faults={cudart_faults: True} if (cudart_faults and rank == 0) else None
+    )
     if fault == "init" and rank == 0:
         ulysses_a2a_mod = importlib.import_module("flashinfer.comm.ulysses_a2a")
 
@@ -608,6 +668,29 @@ def _init_fault_body(rank, world_size, group, arg):
             raise RuntimeError("injected init failure")
 
         ulysses_a2a_mod.init_ulysses_a2a = bad_init
+    elif fault == "jit" and rank == 0:
+        # rank-local stage-J failure: nothing may be allocated anywhere
+        vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
+
+        def bad_meta(*a, **k):
+            raise RuntimeError("injected JIT/meta failure")
+
+        vllm_ar_mod.meta_size = bad_meta
+    elif fault == "sync_after_init" and rank == 0:
+        # stage-C synchronize fails AFTER init returned a live handle: the
+        # cleanup must dispose it and drain everything (ledger balanced)
+        # The raw init wrapper itself synchronizes once internally; let that
+        # first call pass so self._fa is really set, and fail the stage-C one.
+        orig_sync = torch.cuda.synchronize
+        state = {"calls": 0}
+
+        def flaky_sync(*a, **k):
+            state["calls"] += 1
+            if state["calls"] == 2:
+                raise RuntimeError("injected post-init synchronize failure")
+            return orig_sync(*a, **k)
+
+        torch.cuda.synchronize = flaky_sync
 
     if requested == "nvlink":
         try:
@@ -619,6 +702,10 @@ def _init_fault_body(rank, world_size, group, arg):
             assert "NVLink backend initialization failed" in str(e), str(e)
             assert "injected" in str(e), str(e)
         assert ledger.balanced(), f"leaked resources: {ledger.counts}"
+        if fault == "jit":
+            assert ledger.counts["malloc"] == 0, (
+                f"stage-J failure must precede any allocation: {ledger.counts}"
+            )
         return ("ok", ("raised", ledger.counts["malloc"], ledger.counts["free"]))
 
     comm = UlyssesCommunicator(
@@ -689,7 +776,61 @@ def _close_fault_body(rank, world_size, group, scenario):
     comm.scatter_heads(x)
     torch.cuda.synchronize()
 
-    if scenario == "oneshot_close":
+    if scenario == "persistent_close":
+        # rank0 cannot close its imports through all in-stage retries: close()
+        # must raise on every rank and — crucially — NO rank may have freed
+        # any export while imports were still open anywhere in the group
+        if rank == 0:
+            # 2 imports x 3 in-stage attempts
+            ledger.faults["close"] = 6
+            ledger.fired["close"] = 0
+        try:
+            comm.close()
+            raise AssertionError("close must raise on every rank")
+        except RuntimeError as e:
+            assert "retry close()" in str(e), str(e)
+        assert ledger.counts["free"] == 0, (
+            f"exports were freed while imports were still open: {ledger.counts}"
+        )
+        comm.close()  # fault exhausted: converges
+    elif scenario == "helper_transient":
+        # the WHOLE step helper raising (not a per-pointer failure) must be
+        # enveloped at the protocol layer and heal on the drain retry
+        if rank == 0:
+            orig_step = UlyssesCommunicator._try_close_imports
+            state = {"left": 1}
+
+            def flaky_step(self_):
+                if state["left"] > 0:
+                    state["left"] -= 1
+                    raise RuntimeError("injected helper failure")
+                return orig_step(self_)
+
+            UlyssesCommunicator._try_close_imports = flaky_step
+        comm.close()
+        if rank == 0:
+            UlyssesCommunicator._try_close_imports = orig_step
+    elif scenario == "helper_persistent":
+        if rank == 0:
+            orig_step = UlyssesCommunicator._try_close_imports
+            state = {"left": 3}
+
+            def flaky_step(self_):
+                if state["left"] > 0:
+                    state["left"] -= 1
+                    raise RuntimeError("injected helper failure")
+                return orig_step(self_)
+
+            UlyssesCommunicator._try_close_imports = flaky_step
+        try:
+            comm.close()
+            raise AssertionError("close must raise on every rank")
+        except RuntimeError as e:
+            assert "retry close()" in str(e), str(e)
+        comm.close()  # fault exhausted: full protocol re-run converges
+        if rank == 0:
+            UlyssesCommunicator._try_close_imports = orig_step
+    elif scenario == "oneshot_close":
         # a single transient import-close failure is healed by the in-stage
         # drain retry: close() succeeds on the first call
         if rank == 0:
@@ -835,6 +976,21 @@ def _device_contract_body(rank, world_size, group, mode):
             device="cuda",
         )
         assert comm.device == torch.device(f"cuda:{rank}"), comm.device
+    elif mode == "unset_current":
+        # the current device is deliberately NOT the explicit device= on any
+        # rank: metadata collectives must still run bound to the explicit
+        # device (NCCL object collectives stage on the current device without
+        # the guard, landing every rank on GPU 0)
+        torch.cuda.set_device(0)
+        comm = UlyssesCommunicator(
+            group,
+            max_elems=1 << 16,
+            dtype=torch.float16,
+            backend="nvlink",
+            device=f"cuda:{rank}",
+        )
+        assert comm.device == torch.device(f"cuda:{rank}")
+        assert torch.cuda.current_device() == 0, "guard must not leak set_device"
     else:  # switch: current device changed between construction and use/close
         # real probe: forced nvlink -> topology skip on non-NVLink machines
         comm = UlyssesCommunicator(
@@ -886,7 +1042,7 @@ def _device_contract_body(rank, world_size, group, mode):
 # ---- multi-rank runner ----------------------------------------------------------
 
 
-def _run_multi_rank(body_name, world_size, arg, timeout=300):
+def _run_multi_rank(body_name, world_size, arg, timeout=300, allow_skip=False):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs, have {torch.cuda.device_count()}")
     ctx = std_mp.get_context("spawn")
@@ -895,7 +1051,10 @@ def _run_multi_rank(body_name, world_size, arg, timeout=300):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     procs = [
-        ctx.Process(target=_worker_main, args=(r, world_size, port, body_name, arg, q))
+        ctx.Process(
+            target=_worker_main,
+            args=(r, world_size, port, body_name, arg, allow_skip, q),
+        )
         for r in range(world_size)
     ]
     results = {}
@@ -939,7 +1098,7 @@ def _run_multi_rank(body_name, world_size, arg, timeout=300):
 @pytest.mark.parametrize("world_size", [2, 4, 6, 8])
 def test_correctness_forced_nvlink(world_size):
     # forced NVLink: skips (not silently passes via NCCL) on non-NVLink boxes
-    _run_multi_rank("_correctness_body", world_size, "nvlink")
+    _run_multi_rank("_correctness_body", world_size, "nvlink", allow_skip=True)
 
 
 @pytest.mark.parametrize("world_size", [2, 3])
@@ -965,7 +1124,7 @@ def test_api_forced_nccl_reason_is_none():
 
 
 def test_nondefault_stream_forced_nvlink():
-    _run_multi_rank("_stream_body", 2, "nvlink")
+    _run_multi_rank("_stream_body", 2, "nvlink", allow_skip=True)
 
 
 def test_nondefault_stream_forced_nccl():
@@ -983,7 +1142,9 @@ def test_topology_fallback_supported_ws_never_touches_ipc_jit(kind):
     _run_multi_rank("_topology_fallback_body", 2, kind)
 
 
-@pytest.mark.parametrize("fault", ["malloc", "get_handle", "open", "init"])
+@pytest.mark.parametrize(
+    "fault", ["malloc", "get_handle", "open", "init", "jit", "sync_after_init"]
+)
 @pytest.mark.parametrize("requested", ["nvlink", "auto"])
 def test_init_fault_one_rank(fault, requested):
     # a single rank failing at any init stage: all ranks exit the constructor
@@ -993,14 +1154,23 @@ def test_init_fault_one_rank(fault, requested):
 
 
 @pytest.mark.parametrize(
-    "scenario", ["oneshot_close", "persistent_free", "sync_fault", "dispose_fault"]
+    "scenario",
+    [
+        "oneshot_close",
+        "persistent_close",
+        "persistent_free",
+        "sync_fault",
+        "dispose_fault",
+        "helper_transient",
+        "helper_persistent",
+    ],
 )
 def test_close_fault_scenarios(scenario):
     # oneshot faults heal inside the drain retry; persistent free / sync
     # faults raise the same error on EVERY rank (a resource-less rank still
     # runs the full stage sequence, so the retry cannot deadlock) and a
     # subsequent close() succeeds
-    _run_multi_rank("_close_fault_body", 2, scenario)
+    _run_multi_rank("_close_fault_body", 2, scenario, allow_skip=True)
 
 
 @pytest.mark.parametrize("requested", ["nvlink", "auto"])
@@ -1019,7 +1189,7 @@ def test_init_cleanup_fault(cleanup_fault, requested):
     "scenario", ["ctx_exit", "ctx_body_raises", "repeat", "double_close"]
 )
 def test_lifecycle_nvlink_two_ranks(scenario):
-    _run_multi_rank("_lifecycle_nvlink_body", 2, scenario)
+    _run_multi_rank("_lifecycle_nvlink_body", 2, scenario, allow_skip=True)
 
 
 @pytest.mark.parametrize("kind", ["invalid_one_rank", "inconsistent"])
@@ -1027,12 +1197,26 @@ def test_config_fault_collective_safe(kind):
     _run_multi_rank("_config_fault_body", 2, kind)
 
 
-@pytest.mark.parametrize("mode", ["explicit", "bare", "switch"])
+@pytest.mark.parametrize("mode", ["explicit", "bare", "switch", "unset_current"])
 def test_device_contract(mode):
     # per-rank cuda:rank devices are legitimate and must not be rejected by
     # the cross-rank config check; bare "cuda" binds to the current device;
-    # switching the current device after construction must not break ops/close
-    _run_multi_rank("_device_contract_body", 2, mode)
+    # switching the current device after construction must not break ops/close;
+    # an explicit device= must be honored even when the current device was
+    # never set to it (metadata collectives bound to the explicit device)
+    _run_multi_rank(
+        "_device_contract_body",
+        2,
+        mode,
+        allow_skip=(mode in ("switch", "unset_current")),
+    )
+
+
+def test_group_backend_none_supports_cuda_alltoall():
+    # init_process_group(backend=None) reports "undefined" from get_backend
+    # but carries a ProcessGroupNCCL for CUDA: the capability check must
+    # accept it and the NCCL backend must work on it
+    _run_multi_rank("_none_backend_body", 2, None)
 
 
 def _ipc_gather_count_body(rank, world_size, group, _arg):

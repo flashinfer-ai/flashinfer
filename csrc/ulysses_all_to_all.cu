@@ -86,6 +86,26 @@ void ulysses_a2a(fptr_t _fa, TensorView inp, TensorView out, int64_t B, int64_t 
   TVM_FFI_ICHECK_EQ(H % W, 0) << "global head count must be divisible by world size";
   const int H_local = static_cast<int>(H / W);
 
+  // Full 4-D shape validation for both operands (the Python wrapper cannot:
+  // it does not know the world size behind the opaque handle).
+  //   mode 0: inp [B, S_local, H, D]        -> out [B, W*S_local, H_local, D]
+  //   mode 1: inp [B, W*S_local, H_local, D] -> out [B, S_local, H, D]
+  TVM_FFI_ICHECK_EQ(inp.ndim(), 4) << "inp must be 4-D";
+  TVM_FFI_ICHECK_EQ(out.ndim(), 4) << "out must be 4-D";
+  const auto& local_op = (mode == 0) ? inp : out;   // [B, S_local, H, D]
+  const auto& global_op = (mode == 0) ? out : inp;  // [B, W*S_local, H_local, D]
+  TVM_FFI_ICHECK(local_op.size(0) == B && local_op.size(1) == S_local && local_op.size(2) == H &&
+                 local_op.size(3) == D)
+      << "the [B, S_local, H, D] operand of mode " << mode << " has shape (" << local_op.size(0)
+      << ", " << local_op.size(1) << ", " << local_op.size(2) << ", " << local_op.size(3)
+      << "), expected (" << B << ", " << S_local << ", " << H << ", " << D << ")";
+  TVM_FFI_ICHECK(global_op.size(0) == B && global_op.size(1) == W * S_local &&
+                 global_op.size(2) == H_local && global_op.size(3) == D)
+      << "the [B, S_global, H_local, D] operand of mode " << mode << " has shape ("
+      << global_op.size(0) << ", " << global_op.size(1) << ", " << global_op.size(2) << ", "
+      << global_op.size(3) << "), expected (" << B << ", " << W * S_local << ", " << H_local << ", "
+      << D << ")";
+
   const int64_t num_rows = B * static_cast<int64_t>(W) * S_local;
   const int blocks =
       static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(fi::kMaxBlocks, num_rows)));

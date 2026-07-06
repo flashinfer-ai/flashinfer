@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ctypes
+import re
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -138,6 +139,14 @@ class UlyssesCommunicator:
         self.world_size = dist.get_world_size(group=group)
 
         # ---- collective-safe config validation ------------------------------
+        # The bound device must be resolved BEFORE the first collective: NCCL
+        # object collectives stage through a tensor on the *current* device,
+        # so an explicit device="cuda:rank" without a prior set_device(rank)
+        # would otherwise land every rank's metadata collective on GPU 0.
+        # _resolve_device never raises; an unparsable input yields the current
+        # device as a safe gather guard and the joint config validation right
+        # after rejects it on every rank together.
+        self.device = self._resolve_device(device)
         # Encode the local config with zero user code (exact type checks and
         # interpreter/torch-provided names only), gather, then validate the
         # identical list jointly so an invalid single-rank config raises the
@@ -150,17 +159,6 @@ class UlyssesCommunicator:
 
         self.max_elems = max_elems
         self.dtype = dtype
-        if device is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
-        else:
-            device = torch.device(device)
-            # bare "cuda" means the *current* device, not GPU 0
-            index = (
-                device.index
-                if device.index is not None
-                else (torch.cuda.current_device())
-            )
-            self.device = torch.device("cuda", index)
 
         # ---- backend selection: strictly before any IPC/JIT -----------------
         # topology_decision is what the probe concluded; decision is the
@@ -191,16 +189,39 @@ class UlyssesCommunicator:
         # NCCL fallback needs a group that can move CUDA tensors; deterministic
         # in the (identical) group object, so a plain raise is group-uniform.
         if self.backend == "nccl" and self.world_size > 1:
-            pg_backend = str(dist.get_backend(self.group))
-            if "nccl" not in pg_backend.lower():
+            supported, observed = self._group_supports_cuda_alltoall()
+            if not supported:
                 raise ValueError(
                     "the Ulysses NCCL backend requires a process group "
-                    f"supporting CUDA all-to-all (nccl), got '{pg_backend}'"
+                    f"supporting CUDA all-to-all (nccl), got '{observed}'"
                 )
 
         self._state = _OPEN
 
     # ---- collective helpers ---------------------------------------------------
+
+    def _group_supports_cuda_alltoall(self) -> Tuple[bool, str]:
+        """A plain get_backend substring check would reject legitimate
+        multi-backend groups (init_process_group(backend=None) reports
+        "undefined" while its CUDA backend is ProcessGroupNCCL); check the
+        backend actually bound to the CUDA device in that case. Deterministic
+        in the group, so the resulting raise is group-uniform."""
+        try:
+            observed = str(dist.get_backend(self.group))
+        except Exception as e:  # noqa: BLE001
+            observed = f"<error: {type(e).__name__}: {e}>"
+        if "nccl" in observed.lower():
+            return True, observed
+        try:
+            cuda_backend = self.group._get_backend(torch.device("cuda"))
+            if (
+                cuda_backend is not None
+                and "nccl" in type(cuda_backend).__name__.lower()
+            ):
+                return True, f"{observed} (cuda: {type(cuda_backend).__name__})"
+        except Exception:  # noqa: BLE001 — no CUDA backend bound
+            pass
+        return False, observed
 
     def _gather(self, payload: Any) -> List[Any]:
         out: List[Any] = [None] * self.world_size
@@ -215,7 +236,67 @@ class UlyssesCommunicator:
         return out
 
     @staticmethod
-    def _encode_config(max_elems, dtype, device) -> Tuple[str, str, str]:
+    def _parse_cuda_ordinal(device) -> Tuple[Optional[int], Optional[str]]:
+        """Strictly parse a device spec into a CUDA ordinal.
+
+        Returns ``(index_or_None_for_current, error_or_None)``. torch.device
+        wraps ordinals into a signed byte (``cuda:256`` silently becomes
+        ``cuda:0``), so raw str/int ordinals are validated BEFORE any torch
+        normalization; pre-built torch.device objects can only be checked for
+        the surviving (possibly wrapped) index range.
+        """
+        count = torch.cuda.device_count()
+        if device is None:
+            return None, None
+        if isinstance(device, bool):
+            return None, f"invalid type: {type(device).__name__}"
+        if isinstance(device, int):
+            if 0 <= device < count:
+                return device, None
+            return None, f"ordinal {device} outside visible device count {count}"
+        if isinstance(device, str):
+            m = re.fullmatch(r"\s*cuda(?::(\d+))?\s*", device)
+            if m is None:
+                try:
+                    parsed = torch.device(device)
+                except (RuntimeError, ValueError, TypeError) as e:
+                    return None, f"unparsable device: {e}"
+                if parsed.type != "cuda":
+                    return None, f"device must be a CUDA device, got {parsed}"
+                return parsed.index, None
+            if m.group(1) is None:
+                return None, None  # bare "cuda" == current device
+            idx = int(m.group(1))
+            if 0 <= idx < count:
+                return idx, None
+            return None, f"ordinal {idx} outside visible device count {count}"
+        if isinstance(device, torch.device):
+            if device.type != "cuda":
+                return None, f"device must be a CUDA device, got {device}"
+            if device.index is None:
+                return None, None
+            if 0 <= device.index < count:
+                return device.index, None
+            return None, f"index {device.index} outside visible device count {count}"
+        return None, f"invalid type: {type(device).__name__}"
+
+    @classmethod
+    def _resolve_device(cls, device) -> torch.device:
+        """Never raises: yields the bound device for valid input and a safe
+        gather-guard device (the current one) otherwise — the joint config
+        validation rejects the invalid input right after."""
+        try:
+            index, err = cls._parse_cuda_ordinal(device)
+            if err is not None:
+                index = None
+            if index is None:
+                index = torch.cuda.current_device()
+            return torch.device("cuda", index)
+        except Exception:  # noqa: BLE001
+            return torch.device("cuda", 0)
+
+    @classmethod
+    def _encode_config(cls, max_elems, dtype, device) -> Tuple[str, str, str]:
         if type(max_elems) is not int:  # bool is an int subclass: reject it too
             elems = f"<invalid type: {type(max_elems).__name__}>"
         else:
@@ -224,29 +305,16 @@ class UlyssesCommunicator:
             dt = str(dtype)
         else:
             dt = f"<invalid type: {type(dtype).__name__}>"
-        if device is None:
+        try:
+            index, err = cls._parse_cuda_ordinal(device)
+        except Exception as e:  # noqa: BLE001
+            index, err = None, f"{type(e).__name__}: {e}"
+        if err is not None:
+            dev = f"<invalid device: {err}>"
+        elif index is None:
             dev = "cuda"
-        elif isinstance(device, (torch.device, str, int)):
-            try:
-                parsed = torch.device(device)
-                dev = str(parsed)
-                # reject out-of-range indices jointly at config time, not as a
-                # late CUDA failure inside init/teardown
-                # note: torch packs the index into a signed byte, so an
-                # out-of-range ordinal like cuda:999 wraps to a negative index
-                if (
-                    parsed.type == "cuda"
-                    and parsed.index is not None
-                    and not (0 <= parsed.index < torch.cuda.device_count())
-                ):
-                    dev = (
-                        f"<invalid device: index {parsed.index} outside visible "
-                        f"device count {torch.cuda.device_count()}>"
-                    )
-            except (RuntimeError, ValueError, TypeError) as e:
-                dev = f"<invalid device: {e}>"
         else:
-            dev = f"<invalid type: {type(device).__name__}>"
+            dev = f"cuda:{index}"
         return (elems, dt, dev)
 
     def _validate_configs_jointly(self, configs) -> None:
@@ -286,9 +354,10 @@ class UlyssesCommunicator:
     # of ranks.
 
     def _nvlink_init_transaction(self) -> Optional[str]:
-        from .cuda_ipc import cudart
-
-        # stage J: JIT compile / load both modules and read the signal size
+        # stage J: JIT compile / load both modules and read the signal size.
+        # Every import (including cudart below) lives inside a stage envelope:
+        # an import failing on one rank must become a gathered outcome, not an
+        # exception escaping before a gather.
         try:
             from .ulysses_a2a import get_ulysses_a2a_module
             from .vllm_ar import meta_size
@@ -307,6 +376,8 @@ class UlyssesCommunicator:
         out_bytes = self.max_elems * self.dtype.itemsize
         handles: Optional[Tuple[Any, Any]] = None
         try:
+            from .cuda_ipc import cudart
+
             with torch.cuda.device(self.device):
                 out_ptr = cudart.cudaMalloc(out_bytes)
                 self._exports.append(out_ptr.value)
@@ -328,6 +399,8 @@ class UlyssesCommunicator:
         out_ptrs: List[int] = [0] * self.world_size
         sig_ptrs: List[int] = [0] * self.world_size
         try:
+            from .cuda_ipc import cudart
+
             with torch.cuda.device(self.device):
                 for i, pair in enumerate(all_handles):
                     if i == self.rank:
@@ -419,7 +492,18 @@ class UlyssesCommunicator:
 
         for name, step in stages:
             for attempt in range(1, self._TEARDOWN_ATTEMPTS + 1):
-                remaining, detail = step()
+                # broad envelope around the WHOLE step: a helper that raises
+                # (module import, device-guard enter/exit, anything) must
+                # become a nonzero remaining-count, never skip the gather and
+                # strand the peers
+                try:
+                    remaining, detail = step()
+                except Exception as e:  # noqa: BLE001
+                    remaining = 1
+                    detail = (
+                        f"rank {self.rank} stage '{name}' raised: "
+                        f"{type(e).__name__}: {e}"
+                    )
                 outcomes = self._gather((remaining, detail))
                 if all(r == 0 for (r, _d) in outcomes):
                     break  # stage complete on every rank
@@ -449,35 +533,38 @@ class UlyssesCommunicator:
         except Exception as e:  # noqa: BLE001
             return (1, f"rank {self.rank} dispose: {type(e).__name__}: {e}")
 
+    # The release helpers update the resource ledger immediately after each
+    # successful release (inside the per-pointer try, device guard included),
+    # so a later failure — even a device-guard __exit__ raising — can never
+    # lead to a double-close/double-free on the next attempt.
+
     def _try_close_imports(self) -> Tuple[int, Optional[str]]:
         from .cuda_ipc import cudart
 
         last = None
-        remaining: List[int] = []
-        with torch.cuda.device(self.device):
-            for ptr in self._imports:
-                try:
+        for ptr in list(self._imports):
+            try:
+                with torch.cuda.device(self.device):
                     cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
-                except Exception as e:  # noqa: BLE001 — keep for retry
-                    remaining.append(ptr)
-                    last = f"rank {self.rank} close import: {type(e).__name__}: {e}"
-        self._imports = remaining
-        return (len(remaining), last)
+                    # ledger update inside the guard: even a __exit__ raise
+                    # after a successful close cannot cause a double-close
+                    self._imports.remove(ptr)
+            except Exception as e:  # noqa: BLE001 — keep for retry
+                last = f"rank {self.rank} close import: {type(e).__name__}: {e}"
+        return (len(self._imports), last)
 
     def _try_free_exports(self) -> Tuple[int, Optional[str]]:
         from .cuda_ipc import cudart
 
         last = None
-        remaining: List[int] = []
-        with torch.cuda.device(self.device):
-            for ptr in self._exports:
-                try:
+        for ptr in list(self._exports):
+            try:
+                with torch.cuda.device(self.device):
                     cudart.cudaFree(ctypes.c_void_p(ptr))
-                except Exception as e:  # noqa: BLE001 — keep for retry
-                    remaining.append(ptr)
-                    last = f"rank {self.rank} free export: {type(e).__name__}: {e}"
-        self._exports = remaining
-        return (len(remaining), last)
+                    self._exports.remove(ptr)
+            except Exception as e:  # noqa: BLE001 — keep for retry
+                last = f"rank {self.rank} free export: {type(e).__name__}: {e}"
+        return (len(self._exports), last)
 
     # ---- lifecycle -----------------------------------------------------------
 
