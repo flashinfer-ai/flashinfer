@@ -337,7 +337,8 @@ def validate_compare(base: dict, new: dict) -> None:
         for impl, units in payload["results"].items():
             for unit, st in units.items():
                 p50 = st.get("p50")
-                if not (
+                # bool is an int subclass: JSON `true` must not pass as 1.0
+                if isinstance(p50, bool) or not (
                     isinstance(p50, (int, float)) and math.isfinite(p50) and p50 > 0
                 ):
                     raise ValueError(f"{role} {impl}/{unit} has invalid p50={p50!r}")

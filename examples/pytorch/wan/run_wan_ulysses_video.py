@@ -35,6 +35,38 @@ def get_open_port() -> int:
         return s.getsockname()[1]
 
 
+WAN_HEADS, WAN_DIM_HEAD = 40, 128  # Wan A14B attention geometry
+
+
+def validate_ulysses_video_config(
+    world_size: int, seq_global: int, device_count: int, heads: int = WAN_HEADS
+) -> None:
+    """Pure preflight: reject impossible run configs before any communicator
+    construction or (slow) model load. Notably, Wan's 40-head attention needs
+    ``heads % world_size == 0`` — the fused kernel also supports W=6, and the
+    default token count divides by 6, so without this check ``--world-size 6``
+    would construct the communicator, load the model, and only fail at the
+    first scatter."""
+    if world_size <= 0:
+        raise ValueError(f"world size must be positive, got {world_size}")
+    if device_count < world_size:
+        raise ValueError(
+            f"world size {world_size} exceeds visible GPU count {device_count}"
+        )
+    if seq_global % world_size != 0:
+        raise ValueError(
+            f"token count {seq_global} not divisible by world size {world_size}; "
+            "adjust --height/--width/--num-frames"
+        )
+    if heads % world_size != 0:
+        usable = [w for w in (2, 4, 6, 8) if heads % w == 0]
+        raise ValueError(
+            f"Wan attention has {heads} heads; the Ulysses world size must "
+            f"divide it (of the fused-kernel sizes 2/4/6/8, this model can use "
+            f"{usable} — world size {world_size} cannot)"
+        )
+
+
 def _worker(world_size: int, rank: int, port: int, args) -> None:
     import torch
     import torch.distributed as dist
@@ -56,15 +88,11 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
     # latents, p_h=p_w=2 on 8x-compressed pixels).
     lat_t = (args.num_frames - 1) // 4 + 1
     seq_global = lat_t * (args.height // 16) * (args.width // 16)
-    assert seq_global % world_size == 0, (
-        f"token count {seq_global} not divisible by world size {world_size}; "
-        "adjust --height/--width/--num-frames"
-    )
-    heads, dim_head = 40, 128  # Wan A14B attention geometry
+    validate_ulysses_video_config(world_size, seq_global, torch.cuda.device_count())
     # Largest single a2a operand: B * S_local * heads * dim_head elements
     # (input and output numel are equal), with B up to 2 for CFG batching.
     seq_local = seq_global // world_size
-    max_elems = 2 * seq_local * heads * dim_head
+    max_elems = 2 * seq_local * WAN_HEADS * WAN_DIM_HEAD
 
     # IPC buffers involve collectives: create while all ranks are in lockstep,
     # before the (slow, unsynchronized) model load.
@@ -88,21 +116,30 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
         print(f"[rank0] pipeline loaded in {time.time() - t0:.0f}s", flush=True)
     dist.barrier(group=group)
 
-    set_ulysses_context(ctx)
-    generator = torch.Generator(device=str(device)).manual_seed(args.seed)
-    t0 = time.time()
-    output = pipe(
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        height=args.height,
-        width=args.width,
-        num_frames=args.num_frames,
-        num_inference_steps=args.num_inference_steps,
-        generator=generator,
-        output_type=args.output_type,
-    )
-    gen_s = time.time() - t0
-    set_ulysses_context(None)
+    try:
+        set_ulysses_context(ctx)
+        generator = torch.Generator(device=str(device)).manual_seed(args.seed)
+        t0 = time.time()
+        output = pipe(
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            num_inference_steps=args.num_inference_steps,
+            generator=generator,
+            output_type=args.output_type,
+        )
+        gen_s = time.time() - t0
+    finally:
+        set_ulysses_context(None)
+
+    # Collective teardown BEFORE any rank-0-only export: an I/O failure below
+    # must fail rank 0 alone, not strand the other ranks in the barrier or
+    # leave IPC mappings open.
+    dist.barrier(group=group)
+    ctx.shutdown()
+    dist.destroy_process_group()
 
     if rank == 0:
         if args.output_type == "latent":
@@ -128,10 +165,6 @@ def _worker(world_size: int, rank: int, port: int, args) -> None:
                 f"({args.num_inference_steps} steps, ws={world_size}) -> {args.output}",
                 flush=True,
             )
-
-    dist.barrier(group=group)
-    ctx.shutdown()
-    dist.destroy_process_group()
 
 
 def main() -> None:

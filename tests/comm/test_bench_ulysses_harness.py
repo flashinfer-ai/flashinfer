@@ -202,7 +202,7 @@ def test_compare_rejects_bad_data_and_provenance(bench):
     with pytest.raises(ValueError, match="dirty/unknown package provenance"):
         bench.compare_payloads(base, missing, 3.0)
 
-    for bad_p50 in (float("nan"), float("inf"), 0.0, -1.0):
+    for bad_p50 in (float("nan"), float("inf"), 0.0, -1.0, True):
         bad = copy.deepcopy(good)
         bad["results"]["raw"]["a2a"]["p50"] = bad_p50
         with pytest.raises(ValueError, match="invalid p50"):

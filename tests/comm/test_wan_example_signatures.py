@@ -58,6 +58,33 @@ def test_example_ulysses_context_calls_bind(script):
             ) from e
 
 
+def _video_module():
+    spec = importlib.util.spec_from_file_location(
+        "wan_example_video", _WAN_DIR / "run_wan_ulysses_video.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)  # CPU-only: torch/diffusers import lazily
+    return mod
+
+
+def test_video_preflight_geometry():
+    mod = _video_module()
+    seq = 32760  # default 480x832x81f token count: divisible by 6 AND 8
+    # W=8 divides 40 heads: accepted
+    mod.validate_ulysses_video_config(8, seq, device_count=8)
+    # W=6 is a fused-kernel size and divides the token count, but 40 % 6 != 0:
+    # must be rejected BEFORE communicator construction / model load
+    with pytest.raises(ValueError, match="40 heads"):
+        mod.validate_ulysses_video_config(6, seq, device_count=8)
+    with pytest.raises(ValueError, match="positive"):
+        mod.validate_ulysses_video_config(0, seq, device_count=8)
+    with pytest.raises(ValueError, match="visible GPU count"):
+        mod.validate_ulysses_video_config(8, seq, device_count=4)
+    with pytest.raises(ValueError, match="not divisible"):
+        mod.validate_ulysses_video_config(8, seq + 1, device_count=8)
+
+
 def test_scan_found_the_known_consumers():
     consumers = {s.name for s in _SCRIPTS if list(_calls(s, "UlyssesContext"))}
     assert {"bench_wan_ulysses.py", "run_wan_ulysses_video.py"} <= consumers, consumers
