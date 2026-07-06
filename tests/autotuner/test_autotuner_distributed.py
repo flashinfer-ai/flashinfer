@@ -20,22 +20,12 @@ Uses ``gloo`` (CPU) to avoid depending on CUDA or NCCL. No GPU required.
 
 import ast
 import inspect
-import multiprocessing as mp
 import os
-import socket
+import subprocess
+import sys
 import textwrap
 
-import pytest
-import torch
-
-from flashinfer.autotuner import AutoTuner, set_autotune_process_group
-
-
-def _find_free_port() -> int:
-    """Ask the OS for an unused TCP port (avoids races under pytest-xdist)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from flashinfer.autotuner import AutoTuner
 
 
 def test_profile_single_kernel_preserves_collective_cardinality_on_exception():
@@ -225,88 +215,104 @@ def test_choose_one_oom_preserves_cardinality_under_group():
     )
 
 
-def _gloo_worker_exception_path(
-    rank: int,
-    world_size: int,
-    port: int,
-    queue: "mp.Queue",
-) -> None:
-    """Standalone gloo reimplementation of the exception-path reduce pattern.
+# Standalone worker for the runtime gloo check. Run as ``python -c`` in its own
+# subprocess so it imports ONLY torch — never this test module — which makes it
+# independent of how the harness imported the tests (a ``spawn`` worker that
+# re-imports the test module dies with ``ModuleNotFoundError: No module named
+# 'tests'`` when the package isn't importable in the fresh interpreter). Uses a
+# FileStore rendezvous (``file://``) so there is no TCP-port race, and a bounded
+# ``init_process_group`` timeout so a failed rendezvous errors instead of hanging.
+# It reimplements ``_profile_single_kernel``'s try/except→``inf``→all-reduce shape
+# (the production structure itself is guarded by the AST tests above).
+_GLOO_WORKER_SRC = r"""
+import datetime, os, sys
+import torch
+import torch.distributed as dist
 
-    This does NOT call the production ``_profile_single_kernel`` (which needs
-    CUDA); it re-creates the same try/except→``inf``→all-reduce shape so the
-    gloo runtime behavior can be exercised on CPU. The production function's
-    structure is guarded separately by the AST test above. Rank 0 raises; rank
-    1 succeeds. Both ranks must still reach the all-reduce (cardinality
-    preserved) and observe the reduced ``inf``.
-    """
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+store_file = os.environ["GLOO_STORE_FILE"]
 
-    import torch.distributed as dist
-
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+dist.init_process_group(
+    backend="gloo",
+    init_method="file://" + store_file,
+    rank=rank,
+    world_size=world_size,
+    timeout=datetime.timedelta(seconds=60),
+)
+try:
+    group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+    profile_exc = None
     try:
-        group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
-        set_autotune_process_group(group)
-        try:
-            profile_exc = None
-            try:
-                if rank == 0:
-                    raise RuntimeError("simulated tactic failure on rank 0")
-                avg_time = 2.0
-            except Exception as e:
-                avg_time = float("inf")
-                profile_exc = e
+        if rank == 0:
+            raise RuntimeError("simulated tactic failure on rank 0")
+        avg_time = 2.0
+    except Exception as e:
+        avg_time = float("inf")
+        profile_exc = e
 
-            t = torch.tensor([avg_time], dtype=torch.float64)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
-            reduced = t.item() / dist.get_world_size(group)
+    t = torch.tensor([avg_time], dtype=torch.float64)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM, group=group)
+    reduced = t.item() / dist.get_world_size(group)
 
-            queue.put((rank, reduced, profile_exc is not None))
-        finally:
-            set_autotune_process_group(None)
-    finally:
-        dist.destroy_process_group()
+    expect_raised = rank == 0
+    if (profile_exc is not None) != expect_raised:
+        sys.exit("rank %d: unexpected raised=%s" % (rank, profile_exc is not None))
+    if reduced != float("inf"):
+        sys.exit("rank %d: reduced=%r != inf" % (rank, reduced))
+    print("rank %d: OK reduced=inf" % rank)
+finally:
+    dist.destroy_process_group()
+"""
 
 
-@pytest.mark.timeout(60)
-def test_exception_path_does_not_deadlock_the_reduce():
+def test_exception_path_does_not_deadlock_the_reduce(tmp_path):
     """Empirical: one rank raising must NOT block peers on the cross-rank reduce.
 
-    Exercises the reduce *pattern* on gloo (see ``_gloo_worker_exception_path``),
-    not the production ``_profile_single_kernel`` itself (guarded by the AST test
-    above). Rank 0 simulates a failing tactic; rank 1 succeeds with
-    ``avg_time=2``. Both ranks must still reach the all-reduce and observe the
-    mean ``(inf + 2) / 2 == inf``. If the failing rank skipped the reduce, rank 1
-    would time out and the test would fail via pytest-timeout.
+    Runs the reduce *pattern* (see module docstring) on a real 2-rank gloo group,
+    each rank in its own subprocess importing only torch — independent of how the
+    harness imported this module — with a FileStore rendezvous (no TCP-port race).
+    The production ``_profile_single_kernel`` / ``choose_one`` structure is guarded
+    by the AST tests above. Rank 0 fails (``inf``) while rank 1 succeeds with
+    ``avg_time=2``; both must still reach the all-reduce and observe the mean
+    ``(inf + 2) / 2 == inf``. A hung reduce is caught by the subprocess timeout.
     """
+    store_file = str(tmp_path / "gloo_rendezvous")
     world_size = 2
-    port = _find_free_port()
-    ctx = mp.get_context("spawn")
-    queue: "mp.Queue" = ctx.Queue()
-    procs = [
-        ctx.Process(
-            target=_gloo_worker_exception_path,
-            args=(rank, world_size, port, queue),
+    procs = []
+    for rank in range(world_size):
+        env = dict(os.environ)
+        env.update(
+            RANK=str(rank), WORLD_SIZE=str(world_size), GLOO_STORE_FILE=store_file
         )
-        for rank in range(world_size)
-    ]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join(timeout=45)
-        assert p.exitcode == 0, f"worker exited with {p.exitcode}"
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-c", _GLOO_WORKER_SRC],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        )
 
-    results = {}
-    for _ in range(world_size):
-        rank, reduced, raised = queue.get(timeout=10)
-        results[rank] = (reduced, raised)
+    outputs = {}
+    for rank, p in enumerate(procs):
+        try:
+            out, _ = p.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate()
+            raise AssertionError(
+                f"rank {rank} did not finish (possible reduce deadlock):\n{out}"
+            ) from None
+        outputs[rank] = out
+        assert p.returncode == 0, (
+            f"rank {rank} worker failed (exit {p.returncode}):\n{out}"
+        )
 
-    assert set(results.keys()) == {0, 1}
-    assert results[0][0] == float("inf")
-    assert results[1][0] == float("inf")
-    assert results[0][1] is True
-    assert results[1][1] is False
+    # Both ranks reaching "OK reduced=inf" proves the failing rank did not skip
+    # the reduce (else the peer would have hung and hit the timeout above).
+    for rank in range(world_size):
+        assert "OK reduced=inf" in outputs[rank], (
+            f"rank {rank} unexpected output:\n{outputs[rank]}"
+        )
