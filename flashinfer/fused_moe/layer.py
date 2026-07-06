@@ -55,7 +55,8 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
 }
 
-# Quant variants each runner can execute.
+# Quant variants each runner can execute.  Used by _validate_mvp_scope to accept
+# a config only when at least one configured backend supports its quant variant.
 _RUNNER_QUANTS: Dict[type, Tuple[QuantVariant, ...]] = {
     CuteDslConfig: (QuantVariant.NVFP4,),
     TrtllmFp4Config: (QuantVariant.NVFP4,),
@@ -89,6 +90,11 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
+            # Skip backends that cannot execute the configured quant variant, so a
+            # mixed candidate list (e.g. BF16 with (CuteDslConfig, TrtllmBf16Config))
+            # never instantiates a runner that would mis-handle the pack contract.
+            if config.quant.variant not in _RUNNER_QUANTS.get(type(backend_cfg), ()):
+                continue
             self.runners.append(runner_cls(config, device=self.device))
 
         if not self.runners:
@@ -108,7 +114,14 @@ class MoELayer:
 
     @staticmethod
     def _validate_mvp_scope(config: MoEConfig) -> None:
-        """Fail fast on configs no configured backend can execute."""
+        """Fail fast on configs no configured backend can execute (CR6).
+
+        Surfacing this at construction time turns a deep C++ crash or silent
+        backend skip into a clear, actionable Python error.  NVFP4 (CuteDSL /
+        TRTLLM-FP4) and BF16 (TRTLLM-BF16, the EP grouped-GEMM path) are
+        supported; FP8 / MXFP4 / MxInt4 remain post-MVP.  Only the Swiglu
+        activation is supported.
+        """
         variant = config.quant.variant
         supported = {
             q for cfg in config.backend for q in _RUNNER_QUANTS.get(type(cfg), ())

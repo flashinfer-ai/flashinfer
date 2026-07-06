@@ -5,6 +5,14 @@ GPU comm or the nccl4py native lib. They inject a fake ``nccl.ep`` module (with
 recording stand-ins for ``Group`` / ``Tensor`` / the config dataclasses / the
 enums) plus a fake ``nccl.ep.interop.torch.get_nccl_comm_from_group``, and patch
 the package build/arch checks.
+<<<<<<< HEAD
+=======
+
+What they verify is **marshaling and call sequencing**, not numerics:
+``GroupConfig`` receives the expected field values, ``Group.create`` /
+``create_handle`` are called with the right layout + int64 topk_idx.  Real
+end-to-end correctness is covered by the on-cluster smoke + multirank tests.
+>>>>>>> upstream/main
 """
 
 from __future__ import annotations
@@ -17,6 +25,14 @@ from unittest import mock
 import pytest
 
 
+<<<<<<< HEAD
+=======
+# ---------------------------------------------------------------------------
+# Fake nccl.ep module
+# ---------------------------------------------------------------------------
+
+
+>>>>>>> upstream/main
 class _RecordingConfig:
     """Base for fake config dataclasses — stores kwargs for assertions."""
 
@@ -152,8 +168,13 @@ def fake_nccl_ep():
 
 @pytest.fixture
 def bypass_build_checks():
+<<<<<<< HEAD
     """Bypass build/arch checks and distributed comm resolution."""
     from flashinfer.moe_ep.backends.split.comm.nccl_ep import fleet as nccl_fleet
+=======
+    """Bypass _require_built + validate_arch_for_backend in the fleet module."""
+    from flashinfer.moe_ep.nccl_ep import fleet as nccl_fleet
+>>>>>>> upstream/main
 
     with (
         mock.patch.object(nccl_fleet, "_require_built", return_value=None),
@@ -164,16 +185,30 @@ def bypass_build_checks():
         yield
 
 
+<<<<<<< HEAD
 def test_fleet_builds_group_config(fake_nccl_ep, bypass_build_checks):
     from flashinfer.moe_ep import dummy_moe_weights
     from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm, FleetParams
     from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+=======
+# ---------------------------------------------------------------------------
+# Fleet config marshaling (host-only)
+# ---------------------------------------------------------------------------
+
+
+def test_fleet_builds_group_config(fake_nccl_ep, bypass_build_checks):
+    from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm, FleetParams
+    from flashinfer.moe_ep.nccl_ep.fleet import NcclEpFleet
+>>>>>>> upstream/main
 
     params = FleetParams(
         num_experts=8,
         max_tokens_per_rank=128,
         token_hidden_size=7168,
+<<<<<<< HEAD
         weights=dummy_moe_weights(num_local_experts=2, hidden=7168),
+=======
+>>>>>>> upstream/main
         dtype_bytes=2,
         algorithm=EpAlgorithm.LOW_LATENCY,
     )
@@ -190,6 +225,28 @@ def test_fleet_builds_group_config(fake_nccl_ep, bypass_build_checks):
     assert fleet.group is fake_nccl_ep._log["groups"][0]
 
 
+<<<<<<< HEAD
+=======
+def test_fleet_rejects_non_divisible_experts(fake_nccl_ep, bypass_build_checks):
+    from flashinfer.moe_ep._validators import MoEEpConfigError
+    from flashinfer.moe_ep.config import BootstrapConfig, FleetParams
+    from flashinfer.moe_ep.nccl_ep.fleet import NcclEpFleet
+
+    params = FleetParams(
+        num_experts=7,  # not divisible by world_size=4
+        max_tokens_per_rank=128,
+        token_hidden_size=7168,
+    )
+    with pytest.raises(MoEEpConfigError):
+        NcclEpFleet(BootstrapConfig(world_size=4, rank=0), params)
+
+
+# ---------------------------------------------------------------------------
+# Handle create-time sequencing (needs a CUDA device for buffer allocation)
+# ---------------------------------------------------------------------------
+
+
+>>>>>>> upstream/main
 def test_handle_create_uses_expert_major_and_int64_topk(
     fake_nccl_ep, bypass_build_checks
 ):
@@ -198,6 +255,7 @@ def test_handle_create_uses_expert_major_and_int64_topk(
     if not torch.cuda.is_available():
         pytest.skip("handle alloc needs a CUDA device")
 
+<<<<<<< HEAD
     from flashinfer.moe_ep import dummy_moe_weights
     from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobTopKWeights
     from flashinfer.moe_ep.config import BootstrapConfig, FleetParams, HandleParams
@@ -220,6 +278,25 @@ def test_handle_create_uses_expert_major_and_int64_topk(
 
     fake_handle = fake_nccl_ep._log["handles"][-1]
     assert fake_handle.layout == fake_nccl_ep.Layout.EXPERT_MAJOR
+=======
+    from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobTopKWeights
+    from flashinfer.moe_ep.config import BootstrapConfig, FleetParams, HandleParams
+    from flashinfer.moe_ep.nccl_ep.fleet import NcclEpFleet
+
+    params = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=7168)
+    fleet = NcclEpFleet(BootstrapConfig(world_size=4, rank=0), params)
+
+    topk_ids = torch.zeros(16, 2, dtype=torch.int32, device="cuda")
+    weights = torch.ones(16, 2, dtype=torch.float32, device="cuda")
+    fleet.create_handle(
+        HandleParams(topk_ids=topk_ids),
+        algo_knobs=[HandleAlgoKnobTopKWeights(weights=weights)],
+    )
+
+    fake_handle = fake_nccl_ep._log["handles"][-1]
+    assert fake_handle.layout == fake_nccl_ep.Layout.EXPERT_MAJOR
+    # topk_idx is wrapped in a fake Tensor; the underlying buffer is int64.
+>>>>>>> upstream/main
     assert fake_handle.topk_idx.buffer.dtype == torch.int64
 
 
@@ -229,7 +306,10 @@ def test_handle_create_uses_rank_major_layout(fake_nccl_ep, bypass_build_checks)
     if not torch.cuda.is_available():
         pytest.skip("handle alloc needs a CUDA device")
 
+<<<<<<< HEAD
     from flashinfer.moe_ep import dummy_moe_weights
+=======
+>>>>>>> upstream/main
     from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobTopKWeights
     from flashinfer.moe_ep.config import (
         BootstrapConfig,
@@ -238,13 +318,20 @@ def test_handle_create_uses_rank_major_layout(fake_nccl_ep, bypass_build_checks)
         FleetParams,
         HandleParams,
     )
+<<<<<<< HEAD
     from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+=======
+    from flashinfer.moe_ep.nccl_ep.fleet import NcclEpFleet
+>>>>>>> upstream/main
 
     params = FleetParams(
         num_experts=8,
         max_tokens_per_rank=128,
         token_hidden_size=7168,
+<<<<<<< HEAD
         weights=dummy_moe_weights(num_local_experts=2, hidden=7168),
+=======
+>>>>>>> upstream/main
         algorithm=EpAlgorithm.LOW_LATENCY,
         layout=EpLayout.RANK_MAJOR,
     )
@@ -263,7 +350,10 @@ def test_handle_create_uses_rank_major_layout(fake_nccl_ep, bypass_build_checks)
 
 
 def test_fleet_params_rejects_rank_major_under_ht():
+<<<<<<< HEAD
     from flashinfer.moe_ep import dummy_moe_weights
+=======
+>>>>>>> upstream/main
     from flashinfer.moe_ep.config import EpAlgorithm, EpLayout, FleetParams
 
     with pytest.raises(ValueError):
@@ -271,7 +361,10 @@ def test_fleet_params_rejects_rank_major_under_ht():
             num_experts=8,
             max_tokens_per_rank=128,
             token_hidden_size=7168,
+<<<<<<< HEAD
             weights=dummy_moe_weights(num_local_experts=2, hidden=7168),
+=======
+>>>>>>> upstream/main
             algorithm=EpAlgorithm.HIGH_THROUGHPUT,
             layout=EpLayout.RANK_MAJOR,
         )

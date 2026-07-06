@@ -55,6 +55,17 @@ import sys
 _here = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _here]
 
+
+# Canonical benchmark cases, mirroring the NCCL-EP `ep_bench` reference
+# (contrib/nccl_ep/README.md): BF16 dispatch+combine, LL mode, 128 tokens/rank,
+# hidden 7168, top-k 8, 256 experts, swept over 8/16/32/64 GPUs (1/2/4/8 nodes @
+# 8 GPU/node; on GB200 that's 2/4/8/16 nodes @ 4 GPU/node). `--reference` selects
+# this geometry; the GPU count comes from the launcher (torchrun world size).
+#
+# Algorithm: NCCL-EP supports two algorithms — Low-Latency (LL) and
+# High-Throughput (HT). The reference table is LL-only. `--algorithm {ll,ht}`
+# selects which to benchmark; run once per algorithm to produce the LL and HT
+# tables. (HT requires the backend's FLAT-layout handle path.)
 _REFERENCE = dict(
     num_experts=256, top_k=8, hidden=7168, intermediate=2048, tokens_per_rank=128
 )
@@ -92,6 +103,8 @@ def _parse_args() -> argparse.Namespace:
         "the geometry the nccl_ep_b200_ib HT benchmark uses (resolved in main() once "
         "world size is known); overrides --num-experts / --top-k.",
     )
+    # Sizing. --tokens-per-rank (preferred, matches the reference) wins over the
+    # global --tokens; the reference uses 128 tokens/rank.
     p.add_argument("--tokens-per-rank", type=int, default=None)
     p.add_argument("--tokens", type=int, default=8192, help="global token count")
     p.add_argument("--num-experts", type=int, default=256)
@@ -103,7 +116,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--baseline",
         action="store_true",
-        help="time the comm-only identity path (IdentityConfig kernel)",
+        help="time the comm-only identity path (no compute_config)",
     )
     args = p.parse_args()
     if args.reference:
@@ -117,7 +130,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, device):
-    """Build (MoEConfig, canonical MoEWeightPack) for the requested quant."""
+    """Build (MoEConfig, MoEWeightPack) for the requested quant, or (None, None)."""
     import torch
 
     from flashinfer.fused_moe.api import (
@@ -126,6 +139,7 @@ def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, 
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
+        MoEWeightPack,
         QuantConfig,
         QuantVariant,
         RoutingConfig,
@@ -258,7 +272,6 @@ def main() -> int:
         stream=torch.cuda.current_stream().cuda_stream,
         tcp_store=tcp_store,
     )
-
     if ep_layout is EpLayout.RANK_MAJOR:
         compute_max_tokens = per_rank * world_size
     else:

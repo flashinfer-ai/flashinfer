@@ -64,6 +64,7 @@ class BootstrapConfig:
     """Inputs each backend needs to construct a Fleet.
 
     Backends consume only the fields they care about (NCCL-EP uses
+<<<<<<< HEAD
     ``nccl_comm`` + ``stream``; NIXL-EP uses ``tcp_store``). Carrying both
     here lets a single bootstrap config drive either backend.
 
@@ -71,6 +72,23 @@ class BootstrapConfig:
     framework uses a non-WORLD process group (e.g. vLLM expert parallel within
     a PP stage), pass that group via ``process_group``; mega kernels then use
     it for symmetric-memory setup and collectives instead of WORLD.
+=======
+    ``nccl_comm`` / ``process_group`` + ``stream``; NIXL-EP uses
+    ``tcp_store``). Carrying all of them here lets a single bootstrap config
+    drive either backend.
+
+    Communicator resolution (NCCL-EP), in priority order:
+
+    * ``nccl_comm`` — an existing ``ncclComm_t`` (as an int). The Fleet
+      *adopts* it (wraps without taking ownership; it is never destroyed or
+      aborted by the Fleet), so a host — e.g. vLLM — can share the exact
+      communicator its process group already owns.
+    * ``process_group`` — a torch ``ProcessGroup`` to mirror. The Fleet
+      creates a *fresh* NCCL communicator over that group's membership (the
+      torch-version-robust pattern), letting the caller target a specific EP
+      subgroup rather than the default ``WORLD`` group.
+    * neither set — mirror the default process group.
+>>>>>>> upstream/main
     """
 
     world_size: int
@@ -80,6 +98,9 @@ class BootstrapConfig:
     nccl_comm: Optional[int] = (
         None  # int representation of ncclComm_t; None = derive from PG
     )
+    # Torch process group to mirror when nccl_comm is not supplied. None =
+    # default group. Adopting an existing nccl_comm takes precedence.
+    process_group: Optional["torch.distributed.ProcessGroup"] = None
     tcp_store: Optional["torch.distributed.TCPStore"] = None
     process_group: Optional["torch.distributed.ProcessGroup"] = field(
         default=None,
@@ -110,6 +131,10 @@ class FleetParams:
     weights: "MoEWeightPack"
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
+<<<<<<< HEAD
+=======
+    # LL receive layout. Ignored by HT (always FLAT). RANK_MAJOR is LL-only.
+>>>>>>> upstream/main
     layout: EpLayout = EpLayout.EXPERT_MAJOR
 
     def __post_init__(self) -> None:
@@ -157,14 +182,20 @@ class DispatchInputParams:
 class DispatchOutput:
     """Outputs from :meth:`Handle.dispatch`.
 
+<<<<<<< HEAD
     ``expert_tensors`` is the dispatched token tensor on the local rank.
     ``num_tokens`` is the actual receive count (= ``max_tokens_per_rank`` in
     fixed-size LL mode; queried via ``ncclEpHandleGetNumRecvTokens`` otherwise).
+=======
+    ``expert_tensors`` is the dispatched token tensor on the local rank
+    (shape: ``[num_recv_tokens, hidden]``).
+>>>>>>> upstream/main
 
     ``recv_topk_idx`` / ``recv_topk_weights`` are the per-received-token routing
     returned by the LL RANK_MAJOR (and HT) layouts — ``[num_recv_tokens, top_k]``
     int64 / fp32. They are ``None`` for the LL EXPERT_MAJOR layout (whose rows are
     pre-assigned to experts by position, so no per-token routing is returned).
+<<<<<<< HEAD
     """
 
     expert_tensors: "torch.Tensor"
@@ -176,6 +207,30 @@ class DispatchOutput:
         """Resolve ``num_tokens`` to an int, evaluating a deferred thunk if present."""
         nt = self.num_tokens
         return nt() if callable(nt) else nt
+=======
+
+    ``expert_counts`` is the per-shard received-token count written by the library
+    during dispatch — ``[num_local_experts]`` int32 for LL EXPERT_MAJOR (per-expert)
+    or ``[world_size]`` int32 for LL RANK_MAJOR (per-source-rank). ``None`` when the
+    layout does not expose it. It is a device tensor; reading it host-side forces a
+    sync, so consumers that don't need it can ignore it at no cost.
+
+    ``recv_total_counter`` is a scalar ``[1]`` int32/int64 device tensor holding the
+    *actual* total received-token count for HT FLAT. It is populated only when the
+    caller opts in via :class:`HandleAlgoKnobNumReceivedTokens` (which binds the
+    counter at handle-create time so the HT metadata step fills it); otherwise
+    ``None``. It lets an HT consumer trim its compute to ``recv_x[:actual_recv]``
+    (the received tokens are front-packed) while the transport buffer stays sized to
+    the static ``max_recv_tokens_per_rank`` budget (nccl-ep v0.1 does not resize the
+    buffer itself). ``None`` → the consumer must fall back to the full static buffer.
+    """
+
+    expert_tensors: "torch.Tensor"
+    recv_topk_idx: Optional["torch.Tensor"] = None
+    recv_topk_weights: Optional["torch.Tensor"] = None
+    expert_counts: Optional["torch.Tensor"] = None
+    recv_total_counter: Optional["torch.Tensor"] = None
+>>>>>>> upstream/main
 
 
 @dataclass(frozen=True)

@@ -1,24 +1,14 @@
-"""NCCL-EP backend.
+"""NCCL-EP backend (nccl-ep-v0.1.0).
 
-Two pieces matter for import-time success:
+As of ``nccl-ep-v0.1.0`` the backend is driven entirely by the **nccl4py**
+Python package's ``nccl.ep`` API — there is no longer an in-tree
+``libnccl_ep.so`` to dlopen or a flat ``nccl_ep`` ctypes module to import.
+The ``nccl`` package (built with ``BUILD_NCCL4PY`` and shipped as a wheel, or
+installed editable from ``3rdparty/nccl/bindings/nccl4py``) self-loads its
+native library; we just import ``nccl.ep`` lazily in :mod:`.fleet` / :mod:`.handle`.
 
-1. The base NCCL runtime library, ``libnccl.so.2`` — *not* shipped inside this
-   package. It's expected to come from the ``nvidia-nccl-cu13`` pip wheel,
-   installed automatically when the user runs ``BUILD_NVEP=1 pip install ...``
-   (see ``build_backend._install_nvep_runtime_wheels``).
-
-2. The EP plugin, ``libnccl_ep.so`` — built in-tree from
-   ``3rdparty/nccl/contrib/nccl_ep`` and staged into ``_libs/`` here.
-
-The two ``_preload_*`` helpers below are intentionally module-level but
-**not invoked at import time** — calling them eagerly would force libnccl
-to load whenever Python touches this package (e.g. on ``from flashinfer
-import *``), which we don't want. The Fleet/Handle wrapper code (Part B,
-not yet landed) will call ``_load_libnccl_ep()`` lazily on first use.
-
-Until that lands, importing this module always succeeds. Attempting to
-actually exercise the backend will raise ``MoEEpNotBuiltError`` (see
-``flashinfer.moe_ep``) if the lib staging is incomplete.
+Availability is probed via :func:`flashinfer.moe_ep._probe_nccl_ep`, which checks
+that ``nccl.ep`` is importable.
 """
 
 from __future__ import annotations

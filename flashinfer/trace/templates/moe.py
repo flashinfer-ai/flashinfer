@@ -18,6 +18,13 @@ import inspect
 
 import torch
 
+from ...tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    normalize_activation_type,
+)
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
 from .quantize import _fp4_quantize_reference
@@ -39,6 +46,9 @@ def _fp8_moe_run_experts(
     topk_idx,
     local_expert_offset,
     E_global,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """FP8 block-scale dequantization + SwiGLU + GEMM for all routing types.
 
@@ -91,8 +101,22 @@ def _fp8_moe_run_experts(
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W13[le].t())
         X1, X2 = G1[:, :I], G1[:, I:]
-        silu_X2 = X2 / (1.0 + torch.exp(-X2))
-        O = (silu_X2 * X1).matmul(W2[le].t())
+        if gemm1_clamp_limit is not None:
+            limit = gemm1_clamp_limit[le].to(device=X1.device, dtype=torch.float32)
+            X1 = torch.clamp(X1, min=-limit, max=limit)
+            X2 = torch.clamp(X2, max=limit)
+        alpha = (
+            1.0
+            if gemm1_alpha is None
+            else gemm1_alpha[le].to(device=X2.device, dtype=torch.float32)
+        )
+        beta = (
+            0.0
+            if gemm1_beta is None
+            else gemm1_beta[le].to(device=X1.device, dtype=torch.float32)
+        )
+        silu_X2 = X2 * torch.sigmoid(alpha * X2)
+        O = (silu_X2 * (X1 + beta)).matmul(W2[le].t())
         # per-expert contribution weight for each token
         w_tok = weights.index_select(0, token_idx)
         # find which slot in topk_idx[token_idx] corresponds to ge
@@ -123,6 +147,10 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     topk_group,
     local_expert_offset,
     routed_scaling_factor,
+    *,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """
     FP8 block-scale MoE with DeepSeek-V3 routing:
@@ -183,6 +211,9 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -199,6 +230,10 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    *,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """
     FP8 block-scale MoE with Default routing: Softmax → TopK.
@@ -223,6 +258,9 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -239,6 +277,10 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    *,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """
     FP8 block-scale MoE with Renormalize routing: TopK → Softmax.
@@ -264,6 +306,9 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -280,6 +325,10 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    *,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """
     FP8 block-scale MoE with Llama4 routing: Top1 → Sigmoid.
@@ -305,6 +354,9 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -321,6 +373,10 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    *,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """
     FP8 block-scale MoE with RenormalizeNaive routing: Softmax → TopK → Renormalize.
@@ -347,6 +403,9 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -363,6 +422,10 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor,
+    *,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
 ):
     """
     FP8 block-scale MoE with TopK-only routing: TopK, uniform weights.
@@ -392,6 +455,9 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -451,6 +517,24 @@ _STANDARD_INPUTS = {
     "gemm1_weights_scale": Tensor(
         ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
         description="Block-wise scaling factors for first GEMM weights.",
+    ),
+    "gemm1_alpha": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
+        optional=True,
+    ),
+    "gemm1_beta": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        description="Optional MxFp8-only per-expert SwiGLU OA beta.",
+        optional=True,
+    ),
+    "gemm1_clamp_limit": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
+        optional=True,
     ),
     "gemm2_weights": Tensor(
         ["num_local_experts", "hidden_size", "intermediate_size"],
@@ -549,6 +633,9 @@ def _moe_fp8_block_scale_standard_init(
         "hidden_states_scale": hs_scale,
         "gemm1_weights": w1,
         "gemm1_weights_scale": w1s,
+        "gemm1_alpha": None,
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
         "gemm2_weights": w2,
         "gemm2_weights_scale": w2s,
         "top_k": int(top_k),
@@ -687,6 +774,9 @@ def _moe_fp8_block_scale_ds_init(
         "hidden_states_scale": hs_scale,
         "gemm1_weights": w1,
         "gemm1_weights_scale": w1s,
+        "gemm1_alpha": None,
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
         "gemm2_weights": w2,
         "gemm2_weights_scale": w2s,
         "top_k": int(top_k),
@@ -763,6 +853,24 @@ trtllm_fp8_block_scale_moe_ds_routing_trace = TraceTemplate(
         "gemm1_weights_scale": Tensor(
             ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
             description="Block-wise scaling factors for first GEMM weights.",
+        ),
+        "gemm1_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
+            optional=True,
+        ),
+        "gemm1_beta": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Optional MxFp8-only per-expert SwiGLU OA beta.",
+            optional=True,
+        ),
+        "gemm1_clamp_limit": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
+            optional=True,
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "intermediate_size"],
@@ -1808,6 +1916,17 @@ _MOE_COMMON_AXES: dict[str, Var | Const] = {
 # ---------------------------------------------------------------------------
 
 
+def _moe_expert_param(value, expert_idx, default, device):
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        value = value.reshape(-1)
+        if value.numel() == 1:
+            return value[0].to(device=device, dtype=torch.float32)
+        return value[expert_idx].to(device=device, dtype=torch.float32)
+    return float(value)
+
+
 @torch.no_grad()
 def _moe_bf16_run_experts(
     hidden_states,
@@ -1817,8 +1936,18 @@ def _moe_bf16_run_experts(
     topk_idx,
     local_expert_offset,
     E_global,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
+    activation_type=ActivationType.Swiglu.value,
 ):
-    """Un-quantized (bf16) MoE expert computation with SwiGLU."""
+    """Un-quantized (bf16) MoE expert computation (SwiGLU/OAI or ReLU^2)."""
+    activation_type = normalize_activation_type(activation_type)
+    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
+        raise ValueError(
+            f"Unsupported activation_type {activation_type!r}; "
+            f"expected {ActivationType.Swiglu!r} or {ActivationType.Relu2!r}"
+        )
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
     I = gemm1_out // 2
@@ -1838,13 +1967,23 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
-        X1, X2 = G1[:, :I], G1[:, I:]
-        silu_X2 = X2 / (1.0 + torch.exp(-X2))
-        O = (silu_X2 * X1).matmul(W2[le].t())
+        if activation_type == ActivationType.Relu2:
+            act = torch.relu(G1) ** 2
+        else:
+            X1, X2 = G1[:, :I], G1[:, I:]
+            limit = _moe_expert_param(
+                gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
+            )
+            alpha = _moe_expert_param(gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device)
+            beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
+            up = torch.clamp(X1, min=-limit, max=limit)
+            gate = torch.clamp(X2, max=limit)
+            act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+        expert_out = act.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
         w_e = (w_tok * match).sum(dim=1)
-        output.index_add_(0, token_idx, O * w_e.unsqueeze(1))
+        output.index_add_(0, token_idx, expert_out * w_e.unsqueeze(1))
     return output.to(torch.bfloat16)
 
 
@@ -1891,6 +2030,9 @@ def _trtllm_bf16_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for TRT-LLM BF16 MoE (Default routing)."""
@@ -1905,6 +2047,9 @@ def _trtllm_bf16_moe_reference(
         topk_idx,
         local_expert_offset,
         int(num_experts),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -1918,6 +2063,9 @@ def _trtllm_bf16_routed_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for TRT-LLM BF16 MoE with precomputed topk_ids."""
@@ -1938,6 +2086,9 @@ def _trtllm_bf16_routed_moe_reference(
         topk_ids.to(torch.int64),
         local_expert_offset,
         int(num_experts),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -1997,6 +2148,9 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    gemm1_alpha=None,
+    gemm1_beta=None,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for TRT-LLM FP8 block-scale routed MoE (precomputed topk_ids).
@@ -2025,6 +2179,9 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
         topk_ids.to(torch.int64),
         local_expert_offset,
         int(num_experts),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -2225,13 +2382,34 @@ _TRTLLM_MOE_COMMON_OUTPUTS: dict[str, Tensor | Scalar] = {
     ),
 }
 
+_TRTLLM_BF16_SWIGLU_OA_INPUTS: dict[str, Tensor] = {
+    "gemm1_alpha": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        optional=True,
+        description="Optional per-expert SwiGLU OA alpha.",
+    ),
+    "gemm1_beta": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        optional=True,
+        description="Optional per-expert SwiGLU OA beta.",
+    ),
+    "gemm1_clamp_limit": Tensor(
+        ["num_local_experts"],
+        dtype="float32",
+        optional=True,
+        description="Optional per-expert SwiGLU OA clamp limit.",
+    ),
+}
+
 # BF16 MoE (no quantization)
 trtllm_bf16_moe_trace = TraceTemplate(
     op_type="moe",
     name_prefix="trtllm_bf16_moe",
     description="TRT-LLM BF16 MoE (no quantization).",
     axes=dict(_TRTLLM_MOE_COMMON_AXES),
-    inputs=dict(_TRTLLM_MOE_COMMON_INPUTS),
+    inputs={**_TRTLLM_MOE_COMMON_INPUTS, **_TRTLLM_BF16_SWIGLU_OA_INPUTS},
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm"],
     reference=_trtllm_bf16_moe_reference,
@@ -2265,6 +2443,7 @@ trtllm_bf16_routed_moe_trace = TraceTemplate(
         "top_k": _TRTLLM_MOE_COMMON_INPUTS["top_k"],
         "local_expert_offset": _TRTLLM_MOE_COMMON_INPUTS["local_expert_offset"],
         "routed_scaling_factor": _TRTLLM_MOE_COMMON_INPUTS["routed_scaling_factor"],
+        **_TRTLLM_BF16_SWIGLU_OA_INPUTS,
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm"],
@@ -2333,6 +2512,24 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
         "gemm1_weights_scale": Tensor(
             ["num_local_experts", "num_gemm1_out_blocks", "num_hidden_blocks"],
             description="FC1 block-wise scale.",
+        ),
+        "gemm1_alpha": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Optional MxFp8-only per-expert SwiGLU OA alpha.",
+        ),
+        "gemm1_beta": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Optional MxFp8-only per-expert SwiGLU OA beta.",
+        ),
+        "gemm1_clamp_limit": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Optional MxFp8-only per-expert SwiGLU OA clamp limit.",
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "intermediate_size"],
@@ -2492,7 +2689,13 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "num_fp4_intermediate_blocks": Var(
             description="NvFP4 scale-factor count along intermediate_size."
         ),
-        "gemm1_out_size": Const(abbrev="", description="2 * intermediate_size."),
+        "gemm1_out_size": Const(
+            abbrev="",
+            description=(
+                "FC1 output rows: 2 * intermediate_size for gated SwiGLU, "
+                "intermediate_size for non-gated ReLU^2."
+            ),
+        ),
     },
     inputs={
         "x": Tensor(
@@ -2549,6 +2752,30 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "local_expert_offset": Scalar(
             "int32", optional=True, description="Offset of local experts."
         ),
+        "activation_type": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "GEMM1 activation type: ActivationType.Swiglu for gated "
+                "SwiGLU/OAI or ActivationType.Relu2 for non-gated ReLU^2. "
+                "Determines gemm1_out_size."
+            ),
+        ),
+        "swiglu_alpha": Scalar(
+            "float32",
+            optional=True,
+            description="SwiGLU sigmoid multiplier.",
+        ),
+        "swiglu_beta": Scalar(
+            "float32",
+            optional=True,
+            description="SwiGLU up-projection bias.",
+        ),
+        "swiglu_limit": Scalar(
+            "float32",
+            optional=True,
+            description="SwiGLU clamp limit.",
+        ),
     },
     outputs={
         "output": Tensor(
@@ -2572,6 +2799,26 @@ _cute_dsl_wrapper_inputs["num_experts"] = Scalar(
 )
 _cute_dsl_wrapper_inputs["top_k"] = Scalar(
     "int32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["activation_type"] = Scalar(
+    "int32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["swiglu_alpha"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["swiglu_beta"] = Scalar(
+    "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
+    "float32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
@@ -2756,6 +3003,10 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     w2_alpha,
     num_experts,
     top_k,
+    activation_type=ActivationType.Swiglu.value,
+    swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta=DEFAULT_SWIGLU_BETA,
+    swiglu_limit=DEFAULT_SWIGLU_LIMIT,
     **_unused,
 ):
     """Reference for CuteDSL NvFP4 fused MoE — bridges to the FP4
@@ -2776,6 +3027,10 @@ def _cute_dsl_fused_moe_nvfp4_reference(
         token_selected_experts.to(torch.int64),
         local_expert_offset=0,
         E_global=int(num_experts),
+        activation_type=activation_type,
+        gemm1_alpha=swiglu_alpha,
+        gemm1_beta=swiglu_beta,
+        gemm1_clamp_limit=swiglu_limit,
     )
 
 

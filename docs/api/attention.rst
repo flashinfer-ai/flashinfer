@@ -120,6 +120,18 @@ single kernel launch.
     .. automethod:: __init__
 
 
+SM120 NVFP4 Attention
+---------------------
+
+.. currentmodule:: flashinfer.nvfp4_attention_sm120
+
+.. autosummary::
+    :toctree: ../generated
+
+    nvfp4_attention_sm120_quantize_qkv
+    nvfp4_attention_sm120_fwd
+
+
 flashinfer.mla
 ==============
 

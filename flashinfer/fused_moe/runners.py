@@ -255,8 +255,13 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         if hidden_states_scale.dtype == torch.uint8:
             hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
 
-        # Packed pre-routed top-k ids: ((expert_id - offset) << 16) | bf16(weight)
-        ids = act.selected_experts - self._local_expert_offset
+        # Packed pre-routed top-k ids: (GLOBAL expert_id << 16) | bf16(weight).
+        # The kernel expects GLOBAL ids and filters/maps them via the separately
+        # passed ``local_expert_offset`` (mirrors trtllm_bf16_routed_moe in
+        # tests/moe/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
+        # offset: on ranks with local_expert_offset>0 that yields a local id below
+        # the offset, which the kernel treats as non-local and skips → zero output.
+        ids = act.selected_experts
         weight_bf16_bits = (
             act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)
         )
@@ -329,8 +334,25 @@ class TrtllmFp4RoutedRunner(TunableRunner):
         return hash(("trtllm_fp4_routed",))
 
 
+# ---------------------------------------------------------------------------
+# TRTLLM BF16 routed runner — canonical trtllm-gen MoERunner, bf16 dtypes
+# ---------------------------------------------------------------------------
+
+
 class TrtllmBf16RoutedRunner(TunableRunner):
-    """Pre-routed BF16 adapter over the canonical trtllm-gen ``MoERunner``."""
+    """Pre-routed BF16 adapter over the canonical trtllm-gen ``MoERunner``.
+
+    Mirrors :class:`TrtllmFp4RoutedRunner` but with ``Bfloat16`` activation +
+    weight dtypes and no scale-factor tensors, wrapping the same inner
+    ``MoERunner`` (whose ``forward`` dispatches to ``moe_op.trtllm_bf16_moe`` when
+    ``dtype_weights == Bfloat16``).  Used for the EP grouped-GEMM bf16 path: the
+    packed pre-routed ids carry ``(GLOBAL expert_id << 16) | bf16(weight)`` (with
+    ``local_expert_offset`` passed separately);
+    with the EP bridge's synthesized ``top_k=1`` + ``weight=1`` and
+    ``do_finalize=True``, the output comes back in input row order.
+
+    The bf16 MoE entry point requires the ``BlockMajorK`` weight layout.
+    """
 
     backend_key = "trtllm_bf16_routed"
 
@@ -408,14 +430,27 @@ class TrtllmBf16RoutedRunner(TunableRunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        """Translate Packs → the ``MoeRunnerInputs`` list for the bf16 path.
+
+        Expected weight view keys: gemm1_weights, gemm2_weights (BlockMajorK,
+        shuffled).  ``act.hidden_states_q`` carries the raw bf16 activations
+        (the EP bridge does not quantize on the bf16 path);
+        ``act.hidden_states_scale`` is unused.
+        """
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
         routing = self.config.routing
 
-        hidden_states = act.hidden_states_q
+        hidden_states = act.hidden_states_q  # raw bf16 on this path
         num_tokens, hidden_size = hidden_states.shape
 
+        # Packed pre-routed top-k ids: (GLOBAL expert_id << 16) | bf16(weight).
+        # The kernel expects GLOBAL ids and filters/maps them via the separately
+        # passed ``local_expert_offset`` (mirrors trtllm_bf16_routed_moe in
+        # tests/moe/test_trtllm_gen_routed_fused_moe.py). Do NOT pre-subtract the
+        # offset: on ranks with local_expert_offset>0 that yields a local id below
+        # the offset, which the kernel treats as non-local and skips → zero output.
         ids = act.selected_experts
         weight_bf16_bits = (
             act.final_scales.to(torch.bfloat16).view(torch.int16).to(torch.int32)

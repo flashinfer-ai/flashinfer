@@ -30,14 +30,15 @@ _data_dir = _root / "flashinfer" / "data"
 
 
 # moe_ep build infra. Three opt-in switches, all `0` by default:
-#   BUILD_NCCL_EP=1   → build NCCL-EP from 3rdparty/nccl
-#   BUILD_NIXL_EP=1   → build NIXL-EP from 3rdparty/nixl
+#   BUILD_NCCL_EP=1   → enable NCCL-EP (provided by the `nccl4py>=0.3.1` wheel;
+#                       NO in-tree build — see the `[nvep]` extra in pyproject)
+#   BUILD_NIXL_EP=1   → build NIXL-EP from 3rdparty/nixl (meson)
 #   BUILD_NVEP=1      → legacy alias: turns BOTH on (back-compat with earlier docs)
 #
-# Each backend has independent system-dep requirements (NIXL needs DOCA
-# gpunetio + UCX 1.21.x; NCCL doesn't). Hosts that only have one backend's
-# deps should opt in with the matching flag instead of BUILD_NVEP, so a
-# failing build on the missing backend doesn't abort the whole install.
+# Only NIXL-EP is built in-tree (it needs DOCA gpunetio + UCX 1.21.x). NCCL-EP is
+# a pure pip dependency (`nccl4py`, which ships the `nccl.ep` API + bundled
+# libnccl_ep.so). Hosts that only have one backend's deps should opt in with the
+# matching flag instead of BUILD_NVEP.
 def _flag(name: str) -> bool:
     v = os.environ.get(name, "")
     return v == "1" or v.lower() in ("true", "yes", "on")
@@ -511,33 +512,6 @@ def _nixl_buildable() -> tuple[bool, str]:
     return True, ""
 
 
-def _nccl_buildable() -> tuple[bool, str]:
-    """Probe for hard NCCL-EP build-time deps. Returns (ok, reason_if_not).
-
-    In the default (wheel-driven) flow, contrib/nccl_ep links against the
-    nvidia-nccl-cu13 pip wheel — so it must be importable. In hermetic
-    mode (BUILD_NCCL_EP_HERMETIC=1), we build libnccl from source and the
-    wheel isn't required.
-    """
-    if not shutil.which("make"):
-        return False, "make not on PATH (apt install build-essential)"
-    if not shutil.which("nvcc"):
-        return False, (
-            "nvcc not on PATH (install CUDA toolkit and put "
-            "/usr/local/cuda/bin on $PATH)"
-        )
-    if not shutil.which("git"):
-        return False, "git not on PATH; needed for `git apply` of patch overlays"
-    if not _flag("BUILD_NCCL_EP_HERMETIC"):
-        if _find_nccl_wheel_root() is None:
-            return False, (
-                "nvidia-nccl-cu13 pip wheel not importable; install with "
-                "`uv pip install --no-deps 'nvidia-nccl-cu13>=2.30.4'` "
-                "or set BUILD_NCCL_EP_HERMETIC=1 to build libnccl from source"
-            )
-    return True, ""
-
-
 def _install_nvep_runtime_wheels(built_nixl: bool, built_nccl: bool) -> None:
     """Install the EP-related runtime wheels with --no-deps, gated per backend.
 
@@ -607,6 +581,92 @@ def _install_nvep_runtime_wheels(built_nixl: bool, built_nccl: bool) -> None:
         ) from e
 
 
+def _install_cuda_tile_compile_deps() -> None:
+    """Install cuda-tile's compile chain with ``--no-deps`` to dodge libcudart.so.13.
+
+    Background: ``cuda-tile[tileiras]>=1.4.0`` transitively pulls
+    ``cuda-toolkit[nvcc,nvvm,tileiras]<13.4,>=13.2``, which in turn pulls
+    ``nvidia-cuda-runtime==13.3.*`` (libcudart.so.13). That conflicts at
+    *cudnn import* time with ``nvidia-cuda-runtime-cu12`` (libcudart.so.12)
+    shipped by torch — cudnn's helper raises ``Multiple libcudart libraries
+    found: libcudart.so.12 and libcudart.so.13`` and every cudnn_decode /
+    cudnn_prefill test in the suite fails.
+
+    To work around this we drop the ``[tileiras]`` extra from
+    ``requirements.txt`` and instead install the compile-side wheels here
+    with ``--no-deps``. The chain (nvcc + tileiras + nvvm + nvjitlink + crt)
+    doesn't need libcudart at *compile* time — nvcc emits PTX/cubin; cubins
+    run against whatever libcudart torch ships (cu12) at *test* time. So
+    skipping the transitive ``nvidia-cuda-runtime`` (cu13) install is safe.
+
+    Mirrors ``_install_nvep_runtime_wheels`` for the uv-first / pip-fallback
+    path.
+
+    Best-effort — PEP 517 build isolation limits what we can install here.
+    When ``pip install`` runs without ``--no-build-isolation`` (the default),
+    pip creates a **clean isolated build environment** that contains only the
+    declared build dependencies (such as ``setuptools`` and ``packaging``) and
+    does *not* include ``pip`` itself or ``uv``.  As a result, we cannot invoke
+    ``pip install`` from within that environment to resolve the
+    ``nvidia-cuda-runtime`` version conflict described above.
+
+    In such isolated builds (e.g. the AOT Build Import workflow) the compile
+    chain is already present on flashinfer-ci images, so we *warn and continue*
+    instead of blocking the build.  A clean PyPI install on a system that lacks
+    both ``uv`` and the compile chain will surface a clear ``ImportError`` the
+    first time the user calls a cuTile kernel — a better failure mode than
+    aborting the install entirely.
+    """
+    wheels = [
+        "nvidia-cuda-nvcc<13.4,>=13.2",
+        "nvidia-cuda-tileiras<13.4,>=13.2",
+        "nvidia-nvvm<13.4,>=13.2",
+        "nvidia-nvjitlink<14,>=13.3",
+        "nvidia-cuda-crt<13.4,>=13.2",
+    ]
+    print(f"[BUILD] cuda-tile compile deps (--no-deps): {' '.join(wheels)}", flush=True)
+
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        cmd = [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--no-deps",
+            *wheels,
+        ]
+        print(f"[BUILD] $ {' '.join(cmd)}", flush=True)
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(
+                f"[BUILD] WARNING: uv pip install of cuda-tile compile deps "
+                f"failed ({e}); continuing — wheels may already be present.",
+                flush=True,
+            )
+        return
+
+    cmd = [sys.executable, "-m", "pip", "install", "--no-deps", *wheels]
+    print(f"[BUILD] $ {' '.join(cmd)}", flush=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        # PEP 517 isolated build envs (the default when ``pip install -e .`` is
+        # invoked without ``--no-build-isolation``) have no ``pip`` module and
+        # no ``uv``. Don't block the build — log and continue. The compile
+        # chain is preinstalled in flashinfer-ci images, and a clean PyPI
+        # install would surface a clear ImportError at first cuTile use.
+        print(
+            f"[BUILD] WARNING: could not install cuda-tile compile deps "
+            f"(no `uv` on PATH and no `pip` module in this venv: {e}). "
+            f"Skipping — install these wheels manually if cuTile JIT compile "
+            f"fails at runtime: {wheels}",
+            flush=True,
+        )
+
+
 def _gate_backend(name: str, requested: bool, probe) -> bool:
     """Decide whether to actually build `name` given its requested flag.
 
@@ -638,17 +698,29 @@ def _build_nvep_if_enabled() -> None:
         return
 
     requested = [
-        b for b, on in (("NIXL-EP", _BUILD_NIXL_EP), ("NCCL-EP", _BUILD_NCCL_EP)) if on
+        b
+        for b, is_enabled in (("NIXL-EP", _BUILD_NIXL_EP), ("NCCL-EP", _BUILD_NCCL_EP))
+        if is_enabled
     ]
     mode = "best-effort" if _BUILD_NVEP_BEST_EFFORT else "strict"
     print(f"[BUILD_NVEP] requested: {', '.join(requested)} (mode: {mode})")
 
-    # Pre-flight gating — probe each backend's hard build-time deps.
-    will_build_nixl = _gate_backend("NIXL-EP", _BUILD_NIXL_EP, _nixl_buildable)
-    will_build_nccl = _gate_backend("NCCL-EP", _BUILD_NCCL_EP, _nccl_buildable)
+    # NCCL-EP is no longer built from the submodule — it is provided by the
+    # released `nccl4py` wheel (>=0.3.1, the `nccl.ep` API + bundled
+    # libnccl_ep.so), declared in the `[nvep]` extra. So BUILD_NCCL_EP requires
+    # no in-tree build step; we only note it here.
+    if _BUILD_NCCL_EP:
+        print(
+            "[BUILD_NVEP] NCCL-EP is provided by the nccl4py wheel (>=0.3.1); "
+            "no submodule build. Ensure it is installed (e.g. `pip install "
+            "\".[nvep]\"` or `pip install 'nccl4py>=0.3.1'`)."
+        )
 
-    if not (will_build_nixl or will_build_nccl):
-        print("[BUILD_NVEP] nothing to build after pre-flight probe; skipping")
+    # Pre-flight gating — probe the NIXL-EP build-time deps (NCCL-EP needs none).
+    will_build_nixl = _gate_backend("NIXL-EP", _BUILD_NIXL_EP, _nixl_buildable)
+
+    if not will_build_nixl:
+        print("[BUILD_NVEP] no submodule backend to build after pre-flight; skipping")
         return
 
     # Make sure each backend's submodule is initialized. Only fetch what we
@@ -670,19 +742,6 @@ def _build_nvep_if_enabled() -> None:
             cwd=_root,
             check=True,
         )
-    if will_build_nccl and not (_root / "3rdparty/nccl/Makefile").exists():
-        if not in_git_repo:
-            raise RuntimeError(
-                "3rdparty/nccl/Makefile is missing and this is not a git "
-                "checkout (likely an sdist install where the submodule wasn't "
-                "packaged). Either install from a git clone or fetch the "
-                "submodule tree manually into 3rdparty/nccl."
-            )
-        subprocess.run(
-            ["git", "submodule", "update", "--init", "--recursive", "3rdparty/nccl"],
-            cwd=_root,
-            check=True,
-        )
 
     # Actual builds. If best-effort and the build raises despite the probe
     # passing, swallow the error so the other backend still has a chance.
@@ -698,22 +757,11 @@ def _build_nvep_if_enabled() -> None:
                 raise
             print(f"[BUILD_NVEP] NIXL-EP build failed in best-effort mode: {e}")
 
-    built_nccl = False
-    if will_build_nccl:
-        try:
-            with _time_phase("_build_nccl_ep"):
-                _build_nccl_ep()
-            built_nccl = True
-        except Exception as e:
-            if not _BUILD_NVEP_BEST_EFFORT:
-                raise
-            print(f"[BUILD_NVEP] NCCL-EP build failed in best-effort mode: {e}")
-
-    if built_nixl or built_nccl:
+    if built_nixl:
         with _time_phase("_fix_rpaths"):
             _fix_rpaths()
         with _time_phase("_install_nvep_runtime_wheels"):
-            _install_nvep_runtime_wheels(built_nixl=built_nixl, built_nccl=built_nccl)
+            _install_nvep_runtime_wheels(built_nixl=built_nixl, built_nccl=False)
 
     print(
         f"[BUILD_NVEP] total build phase wall time: "
@@ -721,7 +769,9 @@ def _build_nvep_if_enabled() -> None:
         flush=True,
     )
 
-    built = [b for b, on in (("NIXL-EP", built_nixl), ("NCCL-EP", built_nccl)) if on]
+    built = [b for b, is_enabled in (("NIXL-EP", built_nixl),) if is_enabled]
+    if _BUILD_NCCL_EP:
+        built.append("NCCL-EP (via nccl4py wheel)")
     print(f"[BUILD_NVEP] done — built: {', '.join(built) if built else 'nothing'}")
 
 
@@ -812,6 +862,7 @@ def _create_data_dir(use_symlinks=True):
 
 def _prepare_for_wheel():
     # For wheel, copy actual files instead of symlinks so they are included in the wheel
+    _install_cuda_tile_compile_deps()
     _build_nvep_if_enabled()
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
@@ -829,6 +880,7 @@ def _prepare_for_wheel():
 
 def _prepare_for_editable():
     # For editable install, use symlinks so changes are reflected immediately
+    _install_cuda_tile_compile_deps()
     _build_nvep_if_enabled()
     if _data_dir.exists():
         shutil.rmtree(_data_dir)

@@ -5,6 +5,55 @@ from __future__ import annotations
 import pytest
 
 
+<<<<<<< HEAD
+=======
+@pytest.fixture
+def stubbed_fleet_registry():
+    """Inject a stub Fleet class that records the dispatch/combine/complete
+    sequence into a list."""
+    from flashinfer.moe_ep.fleet import _BACKEND_REGISTRY
+
+    log: list[str] = []
+
+    class _StubHandle:
+        def dispatch(self, params):
+            log.append("dispatch")
+            from flashinfer.moe_ep import DispatchOutput
+
+            return DispatchOutput(expert_tensors=params.x[0])
+
+        def combine(self, params):
+            log.append("combine")
+            from flashinfer.moe_ep import CombineOutput
+
+            return CombineOutput(x=params.x[0] if params.out is None else params.out)
+
+        def complete(self):
+            log.append("complete")
+
+    class _StubFleet:
+        def __init__(self, bootstrap, params, algo_knobs):
+            log.append("fleet_init")
+            self.params = params
+
+        def create_handle(self, params, algo_knobs=()):
+            log.append("create_handle")
+            return _StubHandle()
+
+        def update_topology(self, bootstrap, algo_knobs=()):
+            pass
+
+        def destroy(self):
+            log.append("destroy")
+
+    saved = _BACKEND_REGISTRY.get("nccl_ep")
+    _BACKEND_REGISTRY["nccl_ep"] = _StubFleet
+    yield log
+    if saved is not None:
+        _BACKEND_REGISTRY["nccl_ep"] = saved
+
+
+>>>>>>> upstream/main
 def test_forward_call_order(stubbed_fleet_registry):
     import torch
 
