@@ -31,6 +31,8 @@ namespace tensorrt_llm::kernels::moe_alltoall {
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
 
+constexpr int kEp4Size = 4;
+
 #ifndef DISABLE_TIMEOUT
 #define DISABLE_TIMEOUT 0
 #endif
@@ -321,13 +323,10 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 
 // ============================================================================
 // Generic Dispatch Kernel Implementation
-// One warp per token design:
-// - Each CTA has 256 threads = 8 warps
-// - Each warp independently processes one token and all its payloads
-// - Better GPU utilization and reduced synchronization overhead
+// One CTA processes one token and all its payloads.
 // ============================================================================
 
-template <int TOP_K>
+template <int TOP_K, bool COMPACT_EP4>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
@@ -349,10 +348,21 @@ __global__ void moeA2ADispatchKernel(
     // Prepare per-policy shared-memory tiles for this token
     extern __shared__ int smem[];
     int* smem_topk_target_ranks = smem;
-    int* smem_topk_send_indices = smem + TOP_K;
+    int* smem_topk_send_indices = nullptr;
+    int* smem_compact_send_indices = smem;
+    if constexpr (!COMPACT_EP4) {
+      smem_topk_send_indices = smem + TOP_K;
+    }
 
     if (thread_idx < warpSize) {
       int lane_id = thread_idx;
+      if constexpr (COMPACT_EP4) {
+        if (lane_id < kEp4Size) {
+          smem_compact_send_indices[lane_id] = -1;
+        }
+        __syncwarp();
+      }
+
       unsigned topk_mask = __ballot_sync(0xffffffff, lane_id < TOP_K);
       if (lane_id < TOP_K) {
         int k = lane_id;
@@ -365,36 +375,51 @@ __global__ void moeA2ADispatchKernel(
         int dst_token_idx = -1;
         if (is_first) {
           dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+          if constexpr (COMPACT_EP4) {
+            smem_compact_send_indices[target_rank] = dst_token_idx;
+          }
         } else {
           target_rank = -1;
         }
 
         ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
         ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-        smem_topk_target_ranks[k] = target_rank;
-        smem_topk_send_indices[k] = dst_token_idx;
+        if constexpr (!COMPACT_EP4) {
+          smem_topk_target_ranks[k] = target_rank;
+          smem_topk_send_indices[k] = dst_token_idx;
+        }
       }
     }
     // Sync before dispatching data
     __syncthreads();
 
-    // Read staged routing once into registers per thread
-    int topk_target_ranks[TOP_K];
-    int topk_send_indices[TOP_K];
+    // EP4 has at most four unique destinations, regardless of TOP_K. The compact
+    // specialization avoids expanding those destinations back to TOP_K entries.
+    constexpr int NUM_DESTINATIONS = COMPACT_EP4 ? kEp4Size : TOP_K;
+    int target_ranks[NUM_DESTINATIONS];
+    int send_indices[NUM_DESTINATIONS];
+    if constexpr (COMPACT_EP4) {
 #pragma unroll
-    for (int k = 0; k < TOP_K; ++k) {
-      topk_target_ranks[k] = smem_topk_target_ranks[k];
-      topk_send_indices[k] = smem_topk_send_indices[k];
+      for (int target_rank = 0; target_rank < NUM_DESTINATIONS; ++target_rank) {
+        target_ranks[target_rank] = target_rank;
+        send_indices[target_rank] = smem_compact_send_indices[target_rank];
+      }
+    } else {
+#pragma unroll
+      for (int k = 0; k < TOP_K; ++k) {
+        target_ranks[k] = smem_topk_target_ranks[k];
+        send_indices[k] = smem_topk_send_indices[k];
+      }
     }
 
-    // Perform a single source load and TOP_K fanout per payload
+    // Perform a single source load and fan out to each unique destination.
     for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
       uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
       int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
       uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-      vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                 payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+      vectorized_dispatch<NUM_DESTINATIONS>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                            payload_idx, ptrs, target_ranks, send_indices);
     }
 
     __syncthreads();
@@ -520,7 +545,26 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
 
-  int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+  int block_size = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+
+  bool const is_ep4_topk22 = params.ep_size == kEp4Size && params.top_k == 22;
+  // H2048 NVFP4 dispatch carries packed activations (1024 B), scales (128 B),
+  // expert IDs (88 B), and routing weights (88 B). Callers may order the
+  // auxiliary payloads differently.
+  bool const has_h2048_nvfp4_payloads = params.num_payloads == 4 &&
+                                        kernel_ptrs.payload_bytes_per_token[0] == 1024 &&
+                                        ((kernel_ptrs.payload_bytes_per_token[1] == 128 &&
+                                          kernel_ptrs.payload_bytes_per_token[2] == 88 &&
+                                          kernel_ptrs.payload_bytes_per_token[3] == 88) ||
+                                         (kernel_ptrs.payload_bytes_per_token[1] == 88 &&
+                                          kernel_ptrs.payload_bytes_per_token[2] == 88 &&
+                                          kernel_ptrs.payload_bytes_per_token[3] == 128));
+  bool const use_compact_ep4 = is_ep4_topk22 && has_h2048_nvfp4_payloads;
+  // H2048 NVFP4 has only 64 aligned 16-byte activation vectors. More than four warps
+  // leaves most threads idle during the dominant payload copy.
+  if (use_compact_ep4 && block_size > 128) {
+    block_size = 128;
+  }
 
   // Configure kernel launch: one block per token
   int grid_size = params.local_num_tokens;
@@ -529,12 +573,20 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   if (grid_size == 0) {
     grid_size = 1;
   }
-  int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-  SWITCH_TOP_K(params.top_k, TOP_K,
-               moeA2ADispatchKernel<TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                   params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                   params.ep_size, params.num_experts_per_rank))
+  if (use_compact_ep4) {
+    int shared_bytes = kEp4Size * (int)sizeof(int);
+    moeA2ADispatchKernel<22, true><<<grid_size, block_size, shared_bytes, params.stream>>>(
+        params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
+        params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts_per_rank);
+  } else {
+    int shared_bytes = 2 * params.top_k * (int)sizeof(int);
+    SWITCH_TOP_K(params.top_k, TOP_K,
+                 moeA2ADispatchKernel<TOP_K, false>
+                 <<<grid_size, block_size, shared_bytes, params.stream>>>(
+                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                     params.ep_size, params.num_experts_per_rank))
+  }
 }
 
 // ============================================================================
