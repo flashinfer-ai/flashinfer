@@ -40,13 +40,20 @@ from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import Int32
 
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
+
+from ..moe_utils import normalize_cute_dsl_moe_activation_type
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
-    silu_f32,
 )
 
 """
@@ -404,9 +411,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         topk: cutlass.Int64,
         raster_along_m: bool = False,
         enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        gated: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
-        gather operation and SwiGLU fusion.
+        gather operation and FC1 activation fusion.
 
         This configuration includes several key aspects:
 
@@ -439,11 +451,29 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type vectorized_f32: bool
         :param topk: Number of experts selected per token (used for token ID mapping).
         :type topk: cutlass.Int64
+        :param raster_along_m: If True, raster persistent tiles along the M dimension.
+        :type raster_along_m: bool
+        :param enable_pdl: Enable Programmatic Dependent Launch.
+        :type enable_pdl: bool
+        :param activation_type: FC1 activation type. Use ActivationType.Swiglu
+            for gated SwiGLU/OAI and ActivationType.Relu2 for non-gated ReLU^2.
+        :type activation_type: int
+        :param swiglu_alpha: Sigmoid multiplier for parameterized SwiGLU.
+        :type swiglu_alpha: float
+        :param swiglu_beta: Up-projection bias for parameterized SwiGLU.
+        :type swiglu_beta: float
+        :param swiglu_limit: Clamp limit for parameterized SwiGLU.
+        :type swiglu_limit: float
+        :param gated: Whether GEMM1 output is split into up/gate halves. If
+            False, the epilogue computes non-gated ReLU^2.
+        :type gated: bool
         """
 
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
         self.topk = topk
+        self.gated = gated
+        self.out_n_factor = 2 if gated else 1
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -522,7 +552,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
+        activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
+            activation_type
+        )
+        if gated != expected_gated:
+            raise ValueError(
+                f"gated={gated} is inconsistent with activation_type {activation_type!r}"
+            )
         self.vectorized_f32 = vectorized_f32
+        self.activation_type = int(activation_type)
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.swiglu_limit = swiglu_limit
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -582,7 +623,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.mma_tiler_sfa = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1],
-            mma_inst_shape_k * mma_inst_tile_k // 16,
+            mma_inst_shape_k * mma_inst_tile_k // self.sf_vec_size,
         )
 
         self.mma_tiler_sfb = (
@@ -593,7 +634,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.mma_tiler_c = (
             self.mma_inst_shape_mn[0],
-            self.mma_inst_shape_mn[1] // 2,
+            self.mma_inst_shape_mn[1] // self.out_n_factor,
             mma_inst_shape_k * mma_inst_tile_k,
         )
 
@@ -714,7 +755,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         )
 
-        self.epi_tile_n_required = 2 * cute.size(self.epi_tile[1])
+        self.epi_tile_n_required = self.out_n_factor * cute.size(self.epi_tile[1])
         # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
         self.iter_acc_early_release_in_epilogue = (
             self.num_sf_tmem_cols // self.epi_tile_n_required
@@ -1260,8 +1301,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         # Pipeline Init: Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (
-            2 if use_2cta_instrs else 1
+        num_acc_consumer_threads = (
+            len(self.epilog_warp_id)
+            * self.threads_per_warp
+            * (2 if use_2cta_instrs else 1)
         )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
@@ -1665,8 +1708,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(5, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+            tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -1840,8 +1884,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(5, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -1881,10 +1926,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 )
 
                 # Get the first tile info
-                valid_tile_info = cute.make_rmem_tensor((1,), cutlass.Int32)
+                tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                valid_tile_info[0] = sInfo[(3, tile_info_consumer_state.index)]
-                is_valid_tile = valid_tile_info[0] == 1
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
                     space="cta",
@@ -1903,7 +1948,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     # Peek (try_wait) a sync transform buffer empty
                     a_sync_transform_producer_state.reset_count()
 
-                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         # Conditionally wait for A buffer full
                         a_pipeline.consumer_wait(a_consumer_state, peek_a_full_status)
 
@@ -1924,8 +1969,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     # Advance to next tile
                     #
                     tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                    valid_tile_info[0] = sInfo[(3, tile_info_consumer_state.index)]
-                    is_valid_tile = valid_tile_info[0] == 1
+                    tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                    is_valid_tile = tile_info[3] == 1
                     cute.arch.fence_proxy(
                         "async.shared",
                         space="cta",
@@ -1964,8 +2009,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+            tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+            tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -2047,8 +2094,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+                tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+                tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -2148,8 +2197,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Get the first tile info from pipeline (scheduler has filtered out tiles >= num_non_exiting_tiles)
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+            tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+            tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -2364,8 +2415,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+                tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+                tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -2476,8 +2529,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
 
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+            tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+            tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -2554,116 +2609,205 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
-                #
-                # Process accumulator subtiles with SwiGLU fusion and store to global memory
-                # Each iteration processes a pair of subtiles (up, gate) and computes
-                # up * silu(gate)
-                #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
-                for subtile_idx in cutlass.range(0, subtile_cnt, 2):
-                    real_subtile_idx = subtile_idx // 2
+                for subtile_idx in cutlass.range(
+                    0, subtile_cnt, 2 if self.gated else 1
+                ):
+                    if cutlass.const_expr(self.gated):
+                        real_subtile_idx = subtile_idx // 2
+                    else:
+                        real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
                             real_subtile_idx = (
                                 self.cta_tile_shape_mnk[1] // self.epi_tile_n_required
                                 - 1
-                                - subtile_idx // 2
+                                - real_subtile_idx
                             )
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
-                    tTR_tAcc_mn_up = tTR_tAcc[(None, None, None, real_subtile_idx * 2)]
-                    tTR_tAcc_mn_gate = tTR_tAcc[
-                        (None, None, None, real_subtile_idx * 2 + 1)
-                    ]
-
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+                    if cutlass.const_expr(self.gated):
+                        tTR_tAcc_mn_up = tTR_tAcc[
+                            (None, None, None, real_subtile_idx * 2)
+                        ]
+                        tTR_tAcc_mn_gate = tTR_tAcc[
+                            (None, None, None, real_subtile_idx * 2 + 1)
+                        ]
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_up, tTR_rAcc_up)
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn_gate, tTR_rAcc_gate)
+                    else:
+                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, real_subtile_idx)]
+                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc_up)
 
                     #
                     # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
                     if cutlass.const_expr(self.overlapping_accum):
-                        if subtile_idx // 2 == self.iter_acc_early_release_in_epilogue:
+                        if real_subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
-                            with cute.arch.elect_one():
-                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
-                    acc_vec_up = tTR_rAcc_up.load()
-                    acc_vec_gate = tTR_rAcc_gate.load()
-
-                    #
-                    # SwiGLU activation: output = up * silu(gate)
-                    # where silu(x) = x * sigmoid(x)
-                    # up and gate are extracted from interleaved accumulator subtiles
-                    #
-                    tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.vectorized_f32):
-                        # SwiGLU Packed Version: uses f32x2 packed operations for better performance
-                        # Computes: output = (alpha * up) * silu(alpha * gate)
-                        # where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-                        LOG2_E = cutlass.Float32(1.4426950408889634)
-                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc_up), 2):
-                            acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
-                                (acc_vec_up[i], acc_vec_up[i + 1]),
+                    if cutlass.const_expr(not self.gated):
+                        acc_vec = tTR_rAcc_up.load()
+                        tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
+                        if cutlass.const_expr(self.vectorized_f32):
+                            for i in cutlass.range_constexpr(
+                                0, cute.size(tTR_rAcc_up), 2
+                            ):
+                                acc_alpha = cute.arch.mul_packed_f32x2(
+                                    (acc_vec[i], acc_vec[i + 1]),
+                                    (
+                                        cutlass.Float32(alpha_val),
+                                        cutlass.Float32(alpha_val),
+                                    ),
+                                )
+                                r0 = cute.arch.fmax(acc_alpha[0], cutlass.Float32(0.0))
+                                r1 = cute.arch.fmax(acc_alpha[1], cutlass.Float32(0.0))
                                 (
-                                    cutlass.Float32(alpha_val),
-                                    cutlass.Float32(alpha_val),
-                                ),
-                            )
-                            acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
-                                (acc_vec_gate[i], acc_vec_gate[i + 1]),
-                                (
-                                    cutlass.Float32(alpha_val),
-                                    cutlass.Float32(alpha_val),
-                                ),
-                            )
-                            tCompute_log2e = cute.arch.mul_packed_f32x2(
-                                (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
-                                (-LOG2_E, -LOG2_E),
-                            )
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.add_packed_f32x2(
-                                (
-                                    cute.math.exp2(tCompute_log2e[0], fastmath=True),
-                                    cute.math.exp2(tCompute_log2e[1], fastmath=True),
-                                ),
-                                (1.0, 1.0),
-                            )
-                            tCompute[i] = cute.arch.rcp_approx(tCompute[i])
-                            tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.mul_packed_f32x2(
-                                (tCompute[i], tCompute[i + 1]),
-                                (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
-                            )
-                            (
-                                tCompute[i],
-                                tCompute[i + 1],
-                            ) = cute.arch.mul_packed_f32x2(
-                                (tCompute[i], tCompute[i + 1]),
-                                (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
-                            )
+                                    tCompute[i],
+                                    tCompute[i + 1],
+                                ) = cute.arch.mul_packed_f32x2((r0, r1), (r0, r1))
+                        else:
+                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
+                                v = acc_vec[i] * cutlass.Float32(alpha_val)
+                                v = cute.arch.fmax(v, cutlass.Float32(0.0))
+                                tCompute[i] = v * v
                     else:
-                        # SwiGLU Unpacked Version: scalar operations
-                        # Computes: output = (alpha * up) * silu(alpha * gate)
-                        for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                            acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(
-                                alpha_val
-                            )
-                            acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(
-                                alpha_val
-                            )
-                            tCompute[i] = acc_vec_up_alpha * silu_f32(
-                                acc_vec_gate_alpha, fastmath=True
-                            )
+                        acc_vec_up = tTR_rAcc_up.load()
+                        acc_vec_gate = tTR_rAcc_gate.load()
+
+                        #
+                        # Gated activation. Represent standard SwiGLU and the
+                        # OAI variant as ActivationType.Swiglu; the
+                        # alpha/beta/limit parameters specialize the same
+                        # formula:
+                        # gate * sigmoid(swiglu_alpha * gate)
+                        # * (up + swiglu_beta).
+                        #
+                        tCompute = cute.make_rmem_tensor(
+                            acc_vec_gate.shape, self.acc_dtype
+                        )
+                        swiglu_alpha = cutlass.Float32(self.swiglu_alpha)
+                        swiglu_beta = cutlass.Float32(self.swiglu_beta)
+                        swiglu_limit = cutlass.Float32(self.swiglu_limit)
+                        LOG2_E = cutlass.Float32(1.4426950408889634)
+                        if cutlass.const_expr(self.vectorized_f32):
+                            for i in cutlass.range_constexpr(
+                                0, cute.size(tTR_rAcc_up), 2
+                            ):
+                                acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
+                                    (acc_vec_up[i], acc_vec_up[i + 1]),
+                                    (
+                                        cutlass.Float32(alpha_val),
+                                        cutlass.Float32(alpha_val),
+                                    ),
+                                )
+                                acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
+                                    (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                                    (
+                                        cutlass.Float32(alpha_val),
+                                        cutlass.Float32(alpha_val),
+                                    ),
+                                )
+                                gate_clamped = (
+                                    fmin(acc_vec_gate_alpha[0], swiglu_limit, nan=True),
+                                    fmin(acc_vec_gate_alpha[1], swiglu_limit, nan=True),
+                                )
+                                up_clamped = (
+                                    -fmin(
+                                        -fmin(
+                                            acc_vec_up_alpha[0], swiglu_limit, nan=True
+                                        ),
+                                        swiglu_limit,
+                                        nan=True,
+                                    ),
+                                    -fmin(
+                                        -fmin(
+                                            acc_vec_up_alpha[1], swiglu_limit, nan=True
+                                        ),
+                                        swiglu_limit,
+                                        nan=True,
+                                    ),
+                                )
+                                gate_sigmoid_log2e = cute.arch.mul_packed_f32x2(
+                                    gate_clamped,
+                                    (
+                                        -(swiglu_alpha * LOG2_E),
+                                        -(swiglu_alpha * LOG2_E),
+                                    ),
+                                )
+                                (
+                                    tCompute[i],
+                                    tCompute[i + 1],
+                                ) = cute.arch.add_packed_f32x2(
+                                    (
+                                        cute.math.exp2(
+                                            gate_sigmoid_log2e[0], fastmath=True
+                                        ),
+                                        cute.math.exp2(
+                                            gate_sigmoid_log2e[1], fastmath=True
+                                        ),
+                                    ),
+                                    (1.0, 1.0),
+                                )
+                                tCompute[i] = cute.arch.rcp_approx(tCompute[i])
+                                tCompute[i + 1] = cute.arch.rcp_approx(tCompute[i + 1])
+                                (
+                                    tCompute[i],
+                                    tCompute[i + 1],
+                                ) = cute.arch.mul_packed_f32x2(
+                                    (tCompute[i], tCompute[i + 1]),
+                                    gate_clamped,
+                                )
+                                up_biased = cute.arch.add_packed_f32x2(
+                                    up_clamped,
+                                    (
+                                        swiglu_beta,
+                                        swiglu_beta,
+                                    ),
+                                )
+                                (
+                                    tCompute[i],
+                                    tCompute[i + 1],
+                                ) = cute.arch.mul_packed_f32x2(
+                                    (tCompute[i], tCompute[i + 1]),
+                                    (
+                                        up_biased[0],
+                                        up_biased[1],
+                                    ),
+                                )
+                        else:
+                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
+                                acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(
+                                    alpha_val
+                                )
+                                acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(
+                                    alpha_val
+                                )
+                                gate_clamped = fmin(
+                                    acc_vec_gate_alpha, swiglu_limit, nan=True
+                                )
+                                up_clamped = -fmin(
+                                    -fmin(acc_vec_up_alpha, swiglu_limit, nan=True),
+                                    swiglu_limit,
+                                    nan=True,
+                                )
+                                sigmoid_gate = cute.arch.rcp_approx(
+                                    1.0
+                                    + cute.math.exp2(
+                                        -(swiglu_alpha * LOG2_E * gate_clamped),
+                                        fastmath=True,
+                                    )
+                                )
+                                tCompute[i] = (
+                                    gate_clamped
+                                    * sigmoid_gate
+                                    * (up_clamped + swiglu_beta)
+                                )
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
@@ -2833,16 +2977,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Async arrive accumulator buffer empty
                 #
                 if cutlass.const_expr(not self.overlapping_accum):
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
                 #
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+                tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+                tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -3520,7 +3665,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         scale_k = k // scaling_vector_size
-        interm_size = n // 2
+        interm_size = n // self.out_n_factor
         num_tiles = m // tile_size
         a = cute.make_tensor(
             a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))

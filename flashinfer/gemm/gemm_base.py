@@ -302,9 +302,8 @@ def _cutlass_mm_bf16_requirement(
     return True
 
 
-# Gated to Blackwell (SM100/SM103) for the initial scope of this backend.
-# cuBLASLt supports BF16 GEMM on SM80+; the gate can be widened in a follow-up.
-@supported_compute_capability([100, 103])
+# cuBLASLt supports BF16 GEMM on SM80+.
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
 def _cublaslt_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -359,6 +358,20 @@ def _tgv_gemm_requirement(
         raise ValueError(
             "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
         )
+    # The TGV backend dispatches to the CuTeDSL (cute_ext) implementation
+    # by default (see ``_TGV_DEBUG_USE_CPP`` in this module), which requires
+    # nvidia-cutlass-dsl. Surface a clear error here when cute_ext is the
+    # active path and the dependency is missing.
+    if not _TGV_DEBUG_USE_CPP:
+        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+        if not is_cute_dsl_available():
+            raise LibraryError(
+                "TGV backend defaults to the CuTeDSL (cute_ext) implementation, "
+                "which requires nvidia-cutlass-dsl. Install it with "
+                "`pip install 'nvidia-cutlass-dsl[cu13]'` or flip "
+                "_TGV_DEBUG_USE_CPP in flashinfer/gemm/gemm_base.py."
+            )
     return True
 
 
@@ -655,7 +668,7 @@ def _cutlass_bmm_bf16_requirement(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
 
@@ -668,7 +681,7 @@ def _cudnn_bmm_bf16_requirement(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
     return _cudnn_available_or_raise_for_backend(backend)
@@ -680,7 +693,7 @@ def _cutile_bmm_bf16_requirement(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     # The cuTile ragged-BMM kernel's epilogue uses ``ct.astype(dot_acc, c.dtype)``,
     # so the store dtype is whatever the caller passes in. We accept the three
@@ -693,12 +706,34 @@ def _cutile_bmm_bf16_requirement(
     return True
 
 
+@supported_compute_capability([100, 103])
+def _tgv_bmm_bf16_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
+):
+    if out_dtype != torch.bfloat16:
+        raise ValueError("The TGV backend for bmm_bf16 only supports bfloat16 output.")
+    # The C++ TGV kernel is 2D-only, so bmm_bf16 always dispatches to the
+    # cute_ext implementation regardless of ``_TGV_DEBUG_USE_CPP``.
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise LibraryError(
+            "TGV backend for bmm_bf16 requires nvidia-cutlass-dsl. "
+            "Install it with `pip install 'nvidia-cutlass-dsl[cu13]'`."
+        )
+    return True
+
+
 def _check_bmm_bf16_problem_size(
     A: torch.Tensor,
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     if A.dtype != torch.bfloat16:
         raise ValueError(
@@ -733,13 +768,15 @@ def _heuristic_func_bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     heuristic_backends = []
     if "cudnn" in suitable_backends:
         heuristic_backends.append("cudnn")
     if "cutlass" in suitable_backends:
         heuristic_backends.append("cutlass")
+    if "tgv" in suitable_backends:
+        heuristic_backends.append("tgv")
     return heuristic_backends
 
 
@@ -748,6 +785,7 @@ def _heuristic_func_bmm_bf16(
         "cutlass": _cutlass_bmm_bf16_requirement,
         "cudnn": _cudnn_bmm_bf16_requirement,
         "cutile": _cutile_bmm_bf16_requirement,
+        "tgv": _tgv_bmm_bf16_requirement,
     },
     common_check=_check_bmm_bf16_problem_size,
     heuristic_func=_heuristic_func_bmm_bf16,
@@ -758,7 +796,7 @@ def bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ) -> torch.Tensor:
     r"""BMM BF16
 
@@ -776,7 +814,7 @@ def bmm_bf16(
     out_dtype: torch.dtype
         Output dtype, bf16 (default), fp16, or fp32.
 
-    backend: Literal["cudnn", "cutlass", "auto"]
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"]
         Backend to use, defaults to "cudnn". ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -803,6 +841,10 @@ def bmm_bf16(
     torch.Size([16, 48, 80])
     >>> out.dtype
     torch.bfloat16
+    >>> # using the TGV (cute_ext) backend
+    >>> out = flashinfer.bmm_bf16(input, weight, backend="tgv")
+    >>> out.shape
+    torch.Size([16, 48, 80])
     """
 
     expected_shape = (A.shape[0], A.shape[1], B.shape[2])
@@ -1294,6 +1336,72 @@ def _tinygemm_bf16_gemm_runner():
     return TinyGemmBf16GemmRunner()
 
 
+# DEBUG-ONLY toggle (not a public knob): set True to force the legacy C++
+# TGV kernel instead of the default CuTeDSL (cute_ext) impl, for local
+# comparison/benchmarking. Edit here in source; keep the default False for
+# normal use. The C++ kernel is 2D-only, so batched (3D) inputs always fall
+# back to cute_ext even when this is True.
+_TGV_DEBUG_USE_CPP: bool = False
+
+
+@functools.cache
+def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
+    """Unified TGV runner: internally dispatches to either the CuTeDSL
+    (``cute_ext``) implementation or the legacy C++ kernel based on
+    ``_TGV_DEBUG_USE_CPP``. The 11 tactic ids match across both backends (see
+    ``_TGV_CUTE_EXT_TACTIC_CONFIGS`` in ``kernels/tgv_gemm_cute_ext.py``
+    and ``SUPPORTED_TGV_GEMM_CONFIGS`` in ``csrc/tgv_gemm.cu``), so a
+    tactic selected by the autotuner under one impl is meaningful under
+    the other.
+
+    Both implementation modules are imported / built lazily on first use,
+    so flipping ``_TGV_DEBUG_USE_CPP`` doesn't penalize the unused side.
+    """
+    cpp_runner: List[TunableRunner] = []  # box for lazy init
+
+    def _get_cpp_runner() -> TunableRunner:
+        if not cpp_runner:
+            cpp_runner.append(
+                get_tgv_gemm_sm10x_module(dtype, use_sm_100f).tgv_gemm_runner()
+            )
+        return cpp_runner[0]
+
+    class TGVRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            from .kernels.tgv_gemm_cute_ext import get_tgv_cute_ext_tactic_num
+
+            return list(range(get_tgv_cute_ext_tactic_num()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, *_ = inputs
+            # The C++ TGV kernel is 2D-only — always fall back to cute_ext
+            # for batched inputs regardless of the toggle.
+            if _TGV_DEBUG_USE_CPP and a.dim() == 2:
+                return _get_cpp_runner().forward(
+                    inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+                )
+            from .kernels.tgv_gemm_cute_ext import (
+                get_tgv_cute_ext_default_tactic,
+                run_tgv_cute_ext,
+            )
+
+            if tactic < 0:
+                tactic = get_tgv_cute_ext_default_tactic()
+            return run_tgv_cute_ext(a, b, bias, out, bool(pdl), tactic)
+
+    return TGVRunner()
+
+
 def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1325,9 +1433,9 @@ def bf16_gemm_sm100(
     if "cutlass" in runner_names:
         runners.append(get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner())
     if "tgv" in runner_names:
-        runners.append(
-            get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner()
-        )
+        # Single TGV runner; dispatches to cute_ext or C++ internally
+        # based on ``_TGV_DEBUG_USE_CPP`` (see ``_tgv_gemm_runner``).
+        runners.append(_tgv_gemm_runner(a.dtype, use_sm_100f))
     if "tinygemm" in runner_names:
         runners.append(_tinygemm_bf16_gemm_runner())
     assert runners, "No suitable runners found"
@@ -4433,16 +4541,13 @@ def _get_sm100_block_scaled_tactics(
     )
 
     batch_size = 1
-    m_aligned = m % 8 == 0
     n_aligned = n % 8 == 0
 
     valid_tactics = []
     for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
         for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
             for swap_ab in (False, True):
-                if not swap_ab and not n_aligned:
-                    continue
-                if swap_ab and not m_aligned:
+                if not n_aligned:
                     continue
 
                 if swap_ab:
@@ -5491,7 +5596,7 @@ def _cutlass_gemm_fp4_requirement(
 @supported_compute_capability([100, 103])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,  # unused
-    b: torch.Tensor,  # unused
+    b: torch.Tensor,
     a_descale: torch.Tensor,  # unused
     b_descale: torch.Tensor,  # unused
     alpha: Optional[torch.Tensor] = None,  # unused
@@ -5499,9 +5604,7 @@ def _cute_dsl_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -5511,6 +5614,11 @@ def _cute_dsl_gemm_fp4_requirement(
     # preparation for 128x4 layout.
     if use_8x4_sf_layout:
         raise ValueError("cute_dsl FP4 GEMM only supports 128x4 scale factor layout.")
+    # N must be 8-aligned; raise only for explicit cute-dsl (never auto-selected).
+    if b.shape[1] % 8 != 0:
+        if backend != "cute-dsl":
+            return False
+        raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={b.shape[1]}")
     _check_cute_dsl_availability()
     return True
 
@@ -5645,15 +5753,7 @@ def _cute_dsl_gemm_fp4_runner(
                 a.device,
             )
 
-            if m == 1:
-                if n <= 1024:
-                    allowed_tiles = {(256, 64)}
-                elif n >= 8192:
-                    allowed_tiles = {(128, 128)}
-                else:
-                    allowed_tiles = {(128, 64)}
-                sm100_base = [t for t in sm100_base if t[0] in allowed_tiles]
-            elif m in (8, 16):
+            if m <= 32:
                 allowed_tiles = {
                     (128, 8),
                     (128, 16),
@@ -6133,6 +6233,8 @@ def _mxfp8_swizzled_scale_len(m: int, k: int, swizzle_layout: SfLayout) -> int:
 
 
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -6162,6 +6264,8 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
 
 
 _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index
@@ -7242,6 +7346,11 @@ def group_gemm_fp8_nt_groupwise(
 
     out_dtype: Optional[torch.dtype]
         The data type of the output tensor, must be ``torch.bfloat16`` or ``torch.float16``.
+
+    backend: Literal["trtllm", "cutile"]
+        Backend implementation to use.  ``"trtllm"`` uses the TensorRT-LLM
+        grouped GEMM kernel; ``"cutile"`` uses the cuTile Python kernel.
+        Defaults to ``"trtllm"``.
 
     Returns
     -------

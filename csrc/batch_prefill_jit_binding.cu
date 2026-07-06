@@ -27,6 +27,13 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
     bool disable_split_kv, int64_t num_colocated_ctas);
 
+Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
+    TensorView device_buffer, TensorView qo_indptr, TensorView kv_indptr, TensorView kv_len_arr,
+    int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo,
+    bool causal, int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
+    int64_t num_colocated_ctas);
+
 void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
                                       TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
                                       TensorView q, TensorView k, TensorView v,
@@ -46,5 +53,6 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                      bool enable_pdl ADDITIONAL_FUNC_PARAMS);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchPrefillWithKVCachePlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(workspace_size, BatchPrefillWithKVCacheWorkspaceSize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ragged_run, BatchPrefillWithRaggedKVCacheRun);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(paged_run, BatchPrefillWithPagedKVCacheRun);

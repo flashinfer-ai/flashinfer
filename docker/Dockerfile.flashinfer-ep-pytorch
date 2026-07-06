@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# FlashInfer + MoE-EP (NCCL-EP) on the NVIDIA PyTorch base image.
+#
+# WHY THIS IMAGE EXISTS
+# ---------------------
+# The CUDA-devel-based image (docker/Dockerfile.flashinfer-nvep) builds NCCL-EP
+# against the nvidia-nccl-cu13 wheel (NCCL 2.30.7 "+cuda13.3") but ships only a
+# CUDA *13.0* toolkit/runtime stack. With that image, NCCL-EP HIGH_THROUGHPUT
+# (GIN/GDAKI) **cross-node** dispatch aborts at runtime with
+# `CUDA error nccl_ep.cc:2884 'an illegal memory access was encountered'`.
+#
+# Root cause (verified Pre-Nyx 2026-06-17): the *identical* pure-nccl.ep repro
+# (tests/moe_ep/repro_ht_crossnode.py) PASSES cross-node at 16 GPU when run in a
+# container based on nvcr.io/nvidia/pytorch:26.05-py3 (CUDA 13.2 + the matching
+# IB-RDMA-GDAKI / GPUDirect userspace stack) and FAILS 2884 in the CUDA-13.0
+# image — same byte-identical libnccl_ep.so, same NCCL 2.30.7 runtime. The defect
+# is the base image's runtime/system stack, not FlashInfer code (single-node HT
+# and all LL cases pass on both images). Mounting a complete CUDA 13.2 *toolkit*
+# into the 13.0 image did NOT fix it, so it is the broader runtime stack, not the
+# JIT nvcc version. Hence: rebase the EP container on the PyTorch image that is
+# known to run cross-node HT.
+#
+# This image targets the **NCCL-EP** backend. The NVIDIA PyTorch base already
+# ships CUDA 13.2, a matching torch, and the IB/HPC-X/GPUDirect stack NCCL-EP's
+# GDAKI path needs, so the heavyweight DOCA / UCX-from-source / GDRCopy steps
+# from the NIXL image are unnecessary here. To also build NIXL-EP, use
+# docker/Dockerfile.flashinfer-nvep (which provisions UCX v1.21.x + DOCA), or
+# extend this file with those layers behind BUILD_NIXL_EP.
+#
+# Usage:
+#   docker build -f docker/Dockerfile.flashinfer-ep-pytorch -t flashinfer-ep:pt2605 .
+#   docker run --gpus all --rm -it flashinfer-ep:pt2605 bash
+#
+# On SLURM/pyxis, build a .sqsh by running the install steps inside the base and
+# --container-save (mirrors how ep_bench/scripts/setup_container.sh builds its
+# image) — see docker/install/build_flashinfer_ep_pytorch.sh.
+#
+# Build args:
+#   CUDA_IMAGE   — base image (default: the 26.05 PyTorch image).
+#   NCCL_VERSION — nvidia-nccl-cu13 pin (default 2.30.7, matching nccl4py 0.3.1).
+#   NCCL4PY_SPEC — nccl4py pin (default nccl4py[cu13]==0.3.1).
+
+ARG CUDA_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
+FROM ${CUDA_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# Minimal build tooling. The PyTorch base already provides python3 + torch + the
+# CUDA toolkit + the RDMA/IB userspace stack; we only need a compiler/build tools
+# for FlashInfer's editable build (ninja) and git for the submodule trees.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build patchelf pkg-config \
+        git git-lfs ca-certificates curl wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Use the base image's own python + torch (do NOT create a venv or reinstall
+# torch — the whole point of this image is a single, self-consistent CUDA/NCCL/
+# torch/IB stack). Pin the NCCL-EP runtime wheels to exactly what ep_bench's
+# known-good container uses (verified on Pre-Nyx). PIP_CONSTRAINT= overrides the
+# NVIDIA base image's constraint file (which pins nvidia-nccl-cu13 to torch's
+# 2.30.4) so we get the 2.30.7 libnccl_ep.so expects. --no-deps on the NCCL wheels
+# keeps the base torch intact; nccl.ep also imports cuda.core / cuda.bindings,
+# installed explicitly at ep_bench's exact versions.
+ARG NCCL_VERSION=2.30.7
+ARG NCCL4PY_SPEC=nccl4py[cu13]==0.3.1
+ARG CUDA_CORE_VERSION=1.0.1
+ARG CUDA_BINDINGS_VERSION=13.2.0
+RUN PIP_CONSTRAINT= pip install --no-cache-dir --no-deps \
+        "nvidia-nccl-cu13==${NCCL_VERSION}" \
+        "${NCCL4PY_SPEC}" \
+    && PIP_CONSTRAINT= pip install --no-cache-dir \
+        "cuda-core==${CUDA_CORE_VERSION}" \
+        "cuda-bindings==${CUDA_BINDINGS_VERSION}" \
+    && python -c "import nccl.ep; from nccl.core import Communicator; \
+import nvidia.nccl, ctypes, os, glob; \
+so=glob.glob(os.path.join(list(nvidia.nccl.__path__)[0],'lib','libnccl.so.2'))[0]; \
+l=ctypes.CDLL(so); v=ctypes.c_int(); l.ncclGetVersion(ctypes.byref(v)); \
+print('nccl.ep OK; libnccl', v.value); assert v.value>=23007"
+
+# Build & install FlashInfer with the NCCL-EP backend only.
+# --no-build-isolation uses the base image's python/torch for the build hook
+# (so meson/torch are found); BUILD_NCCL_EP=1 + BUILD_NIXL_EP=0 selects the
+# NCCL-EP path, which links contrib's Makefile against the nvidia-nccl-cu13
+# wheel (no in-tree NCCL build). The [nvep] extra pulls nccl4py (already pinned
+# above; the >= constraint no-ops).
+ARG BUILD_NCCL_EP=1
+ARG BUILD_NIXL_EP=0
+ARG FLASHINFER_SRC=/workspace/flashinfer
+COPY . ${FLASHINFER_SRC}
+WORKDIR ${FLASHINFER_SRC}
+# Submodule trees are copied as-is (see .dockerignore); no `git submodule update`.
+RUN BUILD_NVEP=0 \
+    BUILD_NCCL_EP=${BUILD_NCCL_EP} \
+    BUILD_NIXL_EP=${BUILD_NIXL_EP} \
+    pip install --no-cache-dir --no-build-isolation -e ".[nvep]"
+
+# Smoke probe — fail the build if NCCL-EP didn't actually come up.
+RUN python -c "\
+from flashinfer.moe_ep import available_backends; \
+b = available_backends(); print('moe_ep backends:', b); \
+assert 'nccl_ep' in b, 'nccl_ep backend missing'"
+
+CMD ["bash"]

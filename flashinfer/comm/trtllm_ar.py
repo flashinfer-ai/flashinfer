@@ -91,6 +91,10 @@ class AllReduceFusionPattern:
     kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8
     # Same as kARResidualRMSNormPerTokenGroupFP8PackedQuant, with norm output
     kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9
+    # All-reduce followed by residual add, RMS norm and dynamic per-token FP8 quantization
+    kARResidualRMSNormDynamicFP8Quant = 10
+    # Dynamic per-token FP8 quantization variant that also materializes norm output
+    kARResidualRMSNormOutDynamicFP8Quant = 11
 
 
 class QuantizationSFLayout:
@@ -1206,7 +1210,10 @@ def trtllm_moe_finalize_allreduce_fusion(
 ) -> None:
     """
     Parameters:
-    - allreduce_in: the input tensor. [token_num, top_k, hidden_dim]
+    - allreduce_in: the permuted/padded MoE expert output tensor.
+      Shape [num_permuted_rows, hidden_dim]. Rows are referenced by
+      expanded_idx_to_permuted_idx; num_permuted_rows may be larger than
+      token_num * top_k due to expert padding.
     - residual_in: the residual input tensor. [token_num, hidden_dim]
     - norm_weight: the norm weight tensor. [hidden_dim]
     - expanded_idx_to_permuted_idx: the expanded index to permuted index tensor. [token_num, top_k]
@@ -1227,7 +1234,11 @@ def trtllm_moe_finalize_allreduce_fusion(
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
     """
 
-    required_lamport_comm_size = allreduce_in.numel() * 2 * world_size
+    # The Lamport allreduce payload is the finalized token output [token_num, hidden_dim],
+    # not the padded/permuted expert buffer allreduce_in.
+    required_lamport_comm_size = (
+        residual_in.numel() * residual_in.element_size() * world_size
+    )
 
     # Note: only one-shot is supported for moe allreduce fusion.
     if required_lamport_comm_size > MAX_COMM_SIZE:

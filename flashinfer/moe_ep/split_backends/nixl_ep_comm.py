@@ -15,3 +15,9 @@ class NvepConfig:
     """Pass into ``MoEEpLayer(..., backend=NvepConfig())`` to select NIXL-EP."""
 
     backend_name: str = "nixl_ep"
+
+
+# Spelling aliases: ``NIXLEPConfig`` matches the user-facing / mega_moe_integration
+# naming; ``NixlEpConfig`` matches the CamelCase convention of ``NcclEpConfig``.
+NIXLEPConfig = NvepConfig
+NixlEpConfig = NvepConfig
