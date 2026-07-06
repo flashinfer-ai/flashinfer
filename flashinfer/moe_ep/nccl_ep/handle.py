@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from ..algo_knobs import (
     AlgoKnob,
+    HandleAlgoKnobNumReceivedTokens,
     HandleAlgoKnobSplitOperation,
     HandleAlgoKnobTopKWeights,
     HandleAlgoKnobUserStream,
@@ -177,10 +178,41 @@ class NcclEpHandle(Handle):
             layout = self._ep.Layout.RANK_MAJOR
         else:
             layout = self._ep.Layout.EXPERT_MAJOR
+
+        # GAP 3 (opt-in): expose HT's actual received-token count. When the caller
+        # sets HandleAlgoKnobNumReceivedTokens, bind its target as
+        # LayoutInfo.recv_total_counter so ncclEpCreateHandle -> ncclEpUpdateHandle
+        # -> metadata preprocessing writes the actual total into it (nccl_ep.cc
+        # ~2316-2357). This works in the static max_tokens mode too — only dynamic
+        # *buffer sizing* is unsupported in v0.1, not the count readback — letting an
+        # HT consumer trim compute to recv_x[:actual_recv] on the static buffer.
+        # HT-only: LL rejects handle-time layout_info (nccl_ep.cc:2201), and without
+        # the knob HT keeps the verified layout_info=None path unchanged.
+        self._recv_total_target = None
+        create_layout_info = None
+        num_recv_knob = self._handle_knobs.get(HandleAlgoKnobNumReceivedTokens)
+        if num_recv_knob is not None and self._is_ht:
+            tgt = num_recv_knob.target  # type: ignore[attr-defined]
+            if tgt.dtype not in (torch.int32, torch.int64):
+                raise ValueError(
+                    "HandleAlgoKnobNumReceivedTokens.target must be int32 or int64, "
+                    f"got {tgt.dtype}"
+                )
+            if tgt.numel() < 1:
+                raise ValueError(
+                    "HandleAlgoKnobNumReceivedTokens.target must have >= 1 element, "
+                    f"got shape {tuple(tgt.shape)}"
+                )
+            self._recv_total_target = tgt
+            create_layout_info = self._ep.LayoutInfo(
+                recv_total_counter=self._ep.Tensor(tgt)
+            )
+        self._create_layout_info = create_layout_info  # keepalive across create
+
         self._handle = fleet.group.create_handle(
             layout,
             self._topk_idx_t,
-            layout_info=None,  # max_tokens enabled → no handle-time layout_info
+            layout_info=create_layout_info,  # HT recv-count opt-in; None otherwise
             config=None,
             stream=self._stream,
         )
@@ -268,9 +300,10 @@ class NcclEpHandle(Handle):
         self._dispatch_output_t = out_t
 
         # The library wrote per-expert recv counts into self._recv_count_t (via the
-        # LayoutInfo above), but nothing consumes them — combine masks padding via
-        # the routing, not a count — so we skip the device->host readback entirely.
-        return DispatchOutput(expert_tensors=out_t)
+        # LayoutInfo above). combine masks padding via the routing (not a count), so
+        # we never read them host-side here; but we surface the device tensor for
+        # consumers that want it (no forced sync unless they read it).
+        return DispatchOutput(expert_tensors=out_t, expert_counts=self._recv_count_t)
 
     def _dispatch_ll_rank_major(self, x) -> DispatchOutput:
         """LL RANK_MAJOR dispatch.
@@ -353,6 +386,7 @@ class NcclEpHandle(Handle):
             expert_tensors=out_t,
             recv_topk_idx=out_idx.reshape(m, self._top_k),
             recv_topk_weights=out_w.reshape(m, self._top_k),
+            expert_counts=self._recv_count_t,  # per-source-rank counts [world]
         )
 
     def _dispatch_ht(self, x) -> DispatchOutput:
@@ -463,6 +497,10 @@ class NcclEpHandle(Handle):
             expert_tensors=out_3d,
             recv_topk_idx=out_idx,
             recv_topk_weights=out_w,
+            # Populated at handle-create when the caller opted in via
+            # HandleAlgoKnobNumReceivedTokens; None otherwise. Lets an HT consumer
+            # trim compute to recv_x[:recv_total_counter] on the static buffer.
+            recv_total_counter=self._recv_total_target,
         )
 
     # ----------------------------------------------------------------- combine

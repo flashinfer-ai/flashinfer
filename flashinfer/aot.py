@@ -46,6 +46,7 @@ from .jit.attention import (
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
+from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
@@ -120,6 +121,7 @@ def gen_fa2(
     head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    prefill_only: bool = False,
 ) -> Iterator[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
         return
@@ -153,28 +155,29 @@ def gen_fa2(
         use_fp16_qk_reduction=False,
     )
 
-    yield gen_single_decode_module(
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-    )
+    if not prefill_only:
+        yield gen_single_decode_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=0,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+        )
 
-    yield gen_batch_decode_module(
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        dtype_idx=torch.int32,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-    )
+        yield gen_batch_decode_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            dtype_idx=torch.int32,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=0,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+        )
 
 
 def gen_fa3(
@@ -226,11 +229,15 @@ def gen_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
 
-    # head_dim > 256 FA2 modules are SM100+-only; skip them entirely when no
-    # SM100+ architecture is being targeted.
+    # For 16-bit KV, head_dim > 256 FA2 modules use the Ampere+ large-head path.
+    # NVFP4 KV large-head is validated for FA2 batch prefill on SM8+; other
+    # one-byte large-head modules stay SM100+-only until validated separately.
     from .jit.core import current_compilation_context
 
-    has_sm100_or_newer = any(
+    has_sm8_or_newer = any(
+        major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    )
+    has_sm10_or_newer = any(
         major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
     )
 
@@ -248,8 +255,14 @@ def gen_attention(
         use_sliding_window_,
         use_logits_soft_cap_,
     ):
-        if (head_dim_qk > 256 or head_dim_vo > 256) and not has_sm100_or_newer:
-            continue
+        large_head = head_dim_qk > 256 or head_dim_vo > 256
+        nvfp4_large_head = large_head and _is_nvfp4_kv_dtype(dtype_kv)
+        if large_head:
+            if dtype_kv.itemsize == 1 and not nvfp4_large_head:
+                if not has_sm10_or_newer:
+                    continue
+            elif not has_sm8_or_newer:
+                continue
         yield from gen_fa2(
             dtype_qo=dtype_qo,
             dtype_kv=dtype_kv,
@@ -257,6 +270,7 @@ def gen_attention(
             head_dim_vo=head_dim_vo,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
+            prefill_only=nvfp4_large_head and not has_sm10_or_newer,
         )
         # The holistic (persistent) batch-attention kernel
         # does not support head_dim=512.

@@ -1400,6 +1400,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             False,  # use_custom_mask
                             q_data_type,
                             kv_data_type,
+                            head_dim_qk=head_dim,
+                            head_dim_vo=head_dim,
                         )
                     else:
                         self._backend = "fa2"

@@ -358,6 +358,20 @@ def _tgv_gemm_requirement(
         raise ValueError(
             "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
         )
+    # The TGV backend dispatches to the CuTeDSL (cute_ext) implementation
+    # by default (see ``_TGV_DEBUG_USE_CPP`` in this module), which requires
+    # nvidia-cutlass-dsl. Surface a clear error here when cute_ext is the
+    # active path and the dependency is missing.
+    if not _TGV_DEBUG_USE_CPP:
+        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+        if not is_cute_dsl_available():
+            raise LibraryError(
+                "TGV backend defaults to the CuTeDSL (cute_ext) implementation, "
+                "which requires nvidia-cutlass-dsl. Install it with "
+                "`pip install 'nvidia-cutlass-dsl[cu13]'` or flip "
+                "_TGV_DEBUG_USE_CPP in flashinfer/gemm/gemm_base.py."
+            )
     return True
 
 
@@ -654,7 +668,7 @@ def _cutlass_bmm_bf16_requirement(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
 
@@ -667,7 +681,7 @@ def _cudnn_bmm_bf16_requirement(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
     return _cudnn_available_or_raise_for_backend(backend)
@@ -679,7 +693,7 @@ def _cutile_bmm_bf16_requirement(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     # The cuTile ragged-BMM kernel's epilogue uses ``ct.astype(dot_acc, c.dtype)``,
     # so the store dtype is whatever the caller passes in. We accept the three
@@ -692,12 +706,34 @@ def _cutile_bmm_bf16_requirement(
     return True
 
 
+@supported_compute_capability([100, 103])
+def _tgv_bmm_bf16_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
+):
+    if out_dtype != torch.bfloat16:
+        raise ValueError("The TGV backend for bmm_bf16 only supports bfloat16 output.")
+    # The C++ TGV kernel is 2D-only, so bmm_bf16 always dispatches to the
+    # cute_ext implementation regardless of ``_TGV_DEBUG_USE_CPP``.
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        raise LibraryError(
+            "TGV backend for bmm_bf16 requires nvidia-cutlass-dsl. "
+            "Install it with `pip install 'nvidia-cutlass-dsl[cu13]'`."
+        )
+    return True
+
+
 def _check_bmm_bf16_problem_size(
     A: torch.Tensor,
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     if A.dtype != torch.bfloat16:
         raise ValueError(
@@ -732,13 +768,15 @@ def _heuristic_func_bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     heuristic_backends = []
     if "cudnn" in suitable_backends:
         heuristic_backends.append("cudnn")
     if "cutlass" in suitable_backends:
         heuristic_backends.append("cutlass")
+    if "tgv" in suitable_backends:
+        heuristic_backends.append("tgv")
     return heuristic_backends
 
 
@@ -747,6 +785,7 @@ def _heuristic_func_bmm_bf16(
         "cutlass": _cutlass_bmm_bf16_requirement,
         "cudnn": _cudnn_bmm_bf16_requirement,
         "cutile": _cutile_bmm_bf16_requirement,
+        "tgv": _tgv_bmm_bf16_requirement,
     },
     common_check=_check_bmm_bf16_problem_size,
     heuristic_func=_heuristic_func_bmm_bf16,
@@ -757,7 +796,7 @@ def bmm_bf16(
     B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cudnn", "cutlass", "cutile", "auto"] = "cudnn",
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ) -> torch.Tensor:
     r"""BMM BF16
 
@@ -775,7 +814,7 @@ def bmm_bf16(
     out_dtype: torch.dtype
         Output dtype, bf16 (default), fp16, or fp32.
 
-    backend: Literal["cudnn", "cutlass", "auto"]
+    backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"]
         Backend to use, defaults to "cudnn". ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -802,6 +841,10 @@ def bmm_bf16(
     torch.Size([16, 48, 80])
     >>> out.dtype
     torch.bfloat16
+    >>> # using the TGV (cute_ext) backend
+    >>> out = flashinfer.bmm_bf16(input, weight, backend="tgv")
+    >>> out.shape
+    torch.Size([16, 48, 80])
     """
 
     expected_shape = (A.shape[0], A.shape[1], B.shape[2])
@@ -1293,6 +1336,72 @@ def _tinygemm_bf16_gemm_runner():
     return TinyGemmBf16GemmRunner()
 
 
+# DEBUG-ONLY toggle (not a public knob): set True to force the legacy C++
+# TGV kernel instead of the default CuTeDSL (cute_ext) impl, for local
+# comparison/benchmarking. Edit here in source; keep the default False for
+# normal use. The C++ kernel is 2D-only, so batched (3D) inputs always fall
+# back to cute_ext even when this is True.
+_TGV_DEBUG_USE_CPP: bool = False
+
+
+@functools.cache
+def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
+    """Unified TGV runner: internally dispatches to either the CuTeDSL
+    (``cute_ext``) implementation or the legacy C++ kernel based on
+    ``_TGV_DEBUG_USE_CPP``. The 11 tactic ids match across both backends (see
+    ``_TGV_CUTE_EXT_TACTIC_CONFIGS`` in ``kernels/tgv_gemm_cute_ext.py``
+    and ``SUPPORTED_TGV_GEMM_CONFIGS`` in ``csrc/tgv_gemm.cu``), so a
+    tactic selected by the autotuner under one impl is meaningful under
+    the other.
+
+    Both implementation modules are imported / built lazily on first use,
+    so flipping ``_TGV_DEBUG_USE_CPP`` doesn't penalize the unused side.
+    """
+    cpp_runner: List[TunableRunner] = []  # box for lazy init
+
+    def _get_cpp_runner() -> TunableRunner:
+        if not cpp_runner:
+            cpp_runner.append(
+                get_tgv_gemm_sm10x_module(dtype, use_sm_100f).tgv_gemm_runner()
+            )
+        return cpp_runner[0]
+
+    class TGVRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            from .kernels.tgv_gemm_cute_ext import get_tgv_cute_ext_tactic_num
+
+            return list(range(get_tgv_cute_ext_tactic_num()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, pdl, out, *_ = inputs
+            # The C++ TGV kernel is 2D-only — always fall back to cute_ext
+            # for batched inputs regardless of the toggle.
+            if _TGV_DEBUG_USE_CPP and a.dim() == 2:
+                return _get_cpp_runner().forward(
+                    inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+                )
+            from .kernels.tgv_gemm_cute_ext import (
+                get_tgv_cute_ext_default_tactic,
+                run_tgv_cute_ext,
+            )
+
+            if tactic < 0:
+                tactic = get_tgv_cute_ext_default_tactic()
+            return run_tgv_cute_ext(a, b, bias, out, bool(pdl), tactic)
+
+    return TGVRunner()
+
+
 def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1324,9 +1433,9 @@ def bf16_gemm_sm100(
     if "cutlass" in runner_names:
         runners.append(get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner())
     if "tgv" in runner_names:
-        runners.append(
-            get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner()
-        )
+        # Single TGV runner; dispatches to cute_ext or C++ internally
+        # based on ``_TGV_DEBUG_USE_CPP`` (see ``_tgv_gemm_runner``).
+        runners.append(_tgv_gemm_runner(a.dtype, use_sm_100f))
     if "tinygemm" in runner_names:
         runners.append(_tinygemm_bf16_gemm_runner())
     assert runners, "No suitable runners found"
