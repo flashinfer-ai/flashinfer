@@ -202,87 +202,6 @@ jobs:
           path: flashinfer-jit-cache/dist/*.whl
           retention-days: 7
 
-  create-release:
-    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Create GitHub Release (empty first)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${{ needs.setup.outputs.release_tag }}"
-
-          # Delete existing release and tag if they exist
-          if gh release view "$TAG" &>/dev/null; then
-            echo "Deleting existing release: $TAG"
-            gh release delete "$TAG" --yes --cleanup-tag
-          fi
-
-          # Create new release without assets first
-          gh release create "$TAG" \
-            --title "Nightly Release v${{ needs.setup.outputs.version }}-${{ needs.setup.outputs.dev_suffix }}" \
-            --notes "Automated nightly build for version ${{ needs.setup.outputs.version }} (dev${{ needs.setup.outputs.dev_suffix }})" \
-            --prerelease
-
-      - name: Download flashinfer-python artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: flashinfer-python-dist
-          path: dist-python/
-
-      - name: Upload flashinfer-python to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* --clobber
-
-      - name: Download flashinfer-cubin artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: flashinfer-cubin-wheel
-          path: dist-cubin/
-
-      - name: Upload flashinfer-cubin to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* --clobber
-
-      - name: Upload flashinfer-jit-cache wheels to release (one at a time to avoid OOM)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Upload jit-cache wheels one at a time to avoid OOM
-          # Each wheel can be several GB, so we download, upload, delete, repeat
-          mkdir -p dist-jit-cache
-
-          for cuda in 128 129 130; do
-            for arch in x86_64 aarch64; do
-              ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}"
-              echo "Processing ${ARTIFACT_NAME}..."
-
-              # Download this specific artifact
-              gh run download ${{ github.run_id }} -n "${ARTIFACT_NAME}" -D dist-jit-cache/ || {
-                echo "Warning: Failed to download ${ARTIFACT_NAME}, skipping..."
-                continue
-              }
-
-              # Upload to release
-              if [ -n "$(ls -A dist-jit-cache/)" ]; then
-                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
-                echo "✅ Uploaded ${ARTIFACT_NAME}"
-              fi
-
-              # Clean up to save disk space before next iteration
-              rm -rf dist-jit-cache/*
-            done
-          done
-
   test-nightly-build:
     needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
     strategy:
@@ -392,7 +311,7 @@ jobs:
           fi
 
   update-wheel-index:
-    needs: [setup, create-release, test-nightly-build]
+    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache, test-nightly-build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flashinfer repo
