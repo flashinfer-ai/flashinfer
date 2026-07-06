@@ -238,7 +238,9 @@ def resolve_ulysses_backend(
     device: Optional[torch.device] = None,
 ) -> UlyssesBackendDecision:
     """Group-consistent backend selection. Must run *before* any IPC allocation
-    or JIT compilation; it performs no CUDA allocations itself.
+    or JIT compilation. It allocates no IPC workspace and compiles nothing;
+    the ``all_gather_object`` metadata collectives may themselves stage
+    through CUDA buffers on NCCL process groups.
 
     Collective-safe outcome protocol: every rank participates in the same
     fixed *prefix* of ``all_gather_object`` calls (at most three; a group-wide
@@ -253,7 +255,8 @@ def resolve_ulysses_backend(
 
     1. gather every rank's *requested* backend; jointly reject invalid or
        inconsistent requests. A group-wide explicit ``"nccl"`` request returns
-       here, without touching CUDA/NVML at all.
+       here, skipping the CUDA/NVML topology probe entirely (the gather
+       itself may stage through CUDA on NCCL groups).
     2. gather every rank's probe outcome (the probe never raises; even a buggy
        probe implementation is caught into the outcome).
     3. every rank evaluates the same pure decision on the same gathered list,

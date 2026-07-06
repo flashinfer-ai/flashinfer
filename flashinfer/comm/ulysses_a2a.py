@@ -107,8 +107,8 @@ def init_ulysses_a2a(
         all-to-all output for this group.
     signal_ipc_ptrs : list[int]
         Per-rank device pointers to the signal buffers used for the inter-GPU
-        barrier. Each buffer must be ``meta_size()`` bytes (same ``Signal``
-        layout as the vLLM custom all-reduce).
+        barrier. Each buffer must be :func:`flashinfer.comm.vllm_meta_size`
+        bytes (same ``Signal`` layout as the vLLM custom all-reduce).
     rank : int
         Current rank within the Ulysses group.
     world_size : int

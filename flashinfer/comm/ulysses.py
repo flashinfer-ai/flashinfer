@@ -35,8 +35,10 @@ _OPEN, _CLOSING, _CLOSED = "open", "closing", "closed"
 class UlyssesCommunicator:
     r"""Ulysses sequence-parallelism all-to-all communicator.
 
-    Provides the two collectives of Ulysses attention over the 4-D layout
-    ``[B, S, H, D]``:
+    Provides the two layout transforms of Ulysses attention over the 4-D
+    layout ``[B, S, H, D]`` (a typical attention layer makes four collective
+    calls: q/k/v through :meth:`scatter_heads`, the output through
+    :meth:`gather_heads`):
 
     - :meth:`scatter_heads`: ``[B, S_local, H, D] -> [B, S_global, H_local, D]``
       (each rank keeps a head slice of the *full* sequence)
@@ -58,21 +60,28 @@ class UlyssesCommunicator:
       :attr:`backend` and :attr:`fallback_reason` for the outcome.
     - ``backend="nvlink"``: force the fused kernel; raises on every rank
       (before any IPC/JIT for topology failures) when it cannot be used.
-    - ``backend="nccl"``: force the ``dist.all_to_all_single`` path; never
-      probes CUDA/NVML. Supports any world size.
+    - ``backend="nccl"``: force the ``dist.all_to_all_single`` path; skips
+      the topology/NVML probe and all IPC/JIT entirely (the constructor
+      still resolves and guards the CUDA device and performs CUDA-backed
+      metadata collectives over ``group``). Supports any world size.
 
-    The NCCL path with ``world_size > 1`` requires ``group`` to support CUDA
-    all-to-all (an NCCL process group); this is checked at construction.
+    All ranks must request the same ``backend``. The NCCL path with
+    ``world_size > 1`` requires ``group`` to support CUDA all-to-all (an
+    NCCL process group); this is checked at construction.
     ``world_size == 1`` is a passthrough: both collectives return the input
     tensor unchanged (no copy).
 
     Constraints
     -----------
-    - The constructor and :meth:`close` are collective: every rank of
-      ``group`` must call them together. Rank-local failures inside the
-      constructor's NVLink initialization or inside ``close`` are exchanged as
-      group outcomes, so all ranks jointly clean up and raise (or fall back)
-      instead of deadlocking; a failed ``close`` may be retried by all ranks.
+    - The constructor is always collective: every rank of ``group`` must
+      call it together. :meth:`close` is collective only when the NVLink
+      backend was armed (its resources are IPC-shared); for the pure NCCL
+      backend, ``world_size == 1``, or an auto fallback whose NVLink cleanup
+      already completed, ``close`` is local and idempotent. Rank-local
+      failures inside the constructor's NVLink initialization or inside a
+      collective ``close`` are exchanged as group outcomes, so all ranks
+      jointly clean up and raise (or fall back) instead of deadlocking; a
+      failed ``close`` may be retried by all ranks.
     - Collectives run on the *current* CUDA stream of this rank; every rank
       must issue the same sequence of calls with consistently-shaped operands
       (a shape or call-order mismatch across ranks is a collective failure:
@@ -81,10 +90,12 @@ class UlyssesCommunicator:
       NVLink signal buffers assume serialized calls); do not call one
       communicator concurrently from multiple streams or threads.
     - Operand tensors must be contiguous 4-D CUDA tensors of the construction
-      ``dtype`` on the construction device, with every dim positive and total
-      elements at most ``max_elems``.
+      ``dtype`` (float16 / bfloat16 / float32) on the construction device,
+      with every dim positive and total elements at most ``max_elems``;
+      :meth:`scatter_heads` additionally requires ``H % world_size == 0`` and
+      :meth:`gather_heads` requires ``S_global % world_size == 0``.
     - Each rank may use a different CUDA device (e.g. ``cuda:rank``); ranks
-      must agree on ``max_elems`` and ``dtype``.
+      must agree on ``max_elems``, ``dtype`` and ``backend``.
 
     Parameters
     ----------
@@ -101,10 +112,10 @@ class UlyssesCommunicator:
         on every call.
     backend : str
         ``"auto"`` | ``"nvlink"`` | ``"nccl"`` (see above).
-    device : torch.device, optional
+    device : torch.device or str or int, optional
         CUDA device of this rank; normalized to an explicit index (bare
-        ``"cuda"`` means the current device). Defaults to the current CUDA
-        device.
+        ``"cuda"`` means the current device, an int is a CUDA ordinal).
+        Defaults to the current CUDA device.
 
     Examples
     --------

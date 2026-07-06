@@ -112,7 +112,9 @@ Ulysses Sequence-Parallel All-to-All
 .. currentmodule:: flashinfer.comm
 
 Communication for Ulysses sequence parallelism over the 4-D layout
-``[B, S, H, D]``. One attention layer issues two collectives:
+``[B, S, H, D]``. Two layout transforms are provided; a typical attention
+layer makes four collective calls (q/k/v through ``scatter_heads``, the
+output through ``gather_heads``):
 
 - ``scatter_heads``: ``[B, S_local, H, D] -> [B, S_global, H_local, D]`` —
   each rank keeps head slice ``[rank * H_local, (rank+1) * H_local)`` of the
@@ -136,8 +138,10 @@ constructor, strictly before any IPC allocation or JIT compilation:
                ``.topology_decision``.
 ``"nvlink"``   force the fused kernel; raises on every rank (before IPC/JIT for
                topology failures) when it cannot be used.
-``"nccl"``     force ``dist.all_to_all_single`` + permute; never probes
-               CUDA/NVML; any world size.
+``"nccl"``     force ``dist.all_to_all_single`` + permute; skips the
+               topology/NVML probe and all IPC/JIT (the constructor still
+               resolves/guards the CUDA device and performs CUDA-backed
+               metadata collectives); any world size.
 ============== ==================================================================
 
 Typical fallback reasons reported by ``.fallback_reason`` (all conservative —
@@ -149,16 +153,26 @@ link"), duplicate or unknown physical GPU identity, a topology probe error,
 inconsistent per-rank decisions, or a runtime NVLink initialization failure
 after a positive topology decision.
 
-**Constraints.** The constructor and :meth:`UlyssesCommunicator.close` are
-collective (all ranks together); rank-local failures are exchanged as group
-outcomes so all ranks jointly clean up and raise (or fall back) instead of
-deadlocking, and a failed ``close`` may be retried. Operands must be
-contiguous 4-D CUDA tensors of the construction ``dtype`` on the construction
-device, with at most ``max_elems`` (≤ 2^31 − 1) elements. Collectives run on
-the current CUDA stream; all ranks must issue the same call sequence with
-consistent shapes, one collective in flight per communicator at a time. Each
-rank may bind a different CUDA device (e.g. ``cuda:rank``); ranks must agree
-on ``max_elems`` and ``dtype``.
+**Constraints.** The constructor is always collective (all ranks together);
+:meth:`UlyssesCommunicator.close` is collective only when the NVLink backend
+was armed — for the pure NCCL backend, ``world_size == 1``, or an auto
+fallback whose NVLink cleanup already completed, ``close`` is local and
+idempotent. Rank-local failures inside the NVLink initialization or a
+collective ``close`` are exchanged as group outcomes so all ranks jointly
+clean up and raise (or fall back) instead of deadlocking, and a failed
+``close`` may be retried. All ranks must request the same ``backend`` and
+agree on ``max_elems`` and ``dtype``; each rank may bind a different CUDA
+device (``device`` accepts ``torch.device``, ``str`` or an ``int`` ordinal,
+e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL backend (forced or
+fallen back to) requires ``group`` to support CUDA all-to-all (an NCCL
+process group), checked at construction. Operands must be contiguous 4-D
+CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
+only) on the construction device, every dim positive, at most ``max_elems``
+(≤ 2^31 − 1) elements; ``scatter_heads`` requires ``H % world_size == 0``
+and ``gather_heads`` requires ``S_global % world_size == 0``. Collectives
+run on the current CUDA stream; all ranks must issue the same call sequence
+with consistent shapes, one collective in flight per communicator at a
+time.
 
 **Known limitations.**
 
@@ -177,9 +191,12 @@ on ``max_elems`` and ``dtype``.
   can still desynchronize ranks (never observed in tests; tracked as a
   hardening note).
 
-**Example** (Wan2.1-style attention; see ``examples/pytorch/wan`` and the
-benchmark harness ``benchmarks/bench_ulysses_a2a.py`` with its methodology
-report ``benchmarks/ulysses_a2a_m3_report.md``)::
+**Example** (Wan2.1-style attention; see the
+`wan example <https://github.com/flashinfer-ai/flashinfer/tree/main/examples/pytorch/wan>`_
+and the
+`benchmark harness <https://github.com/flashinfer-ai/flashinfer/blob/main/benchmarks/bench_ulysses_a2a.py>`_
+with its
+`methodology report <https://github.com/flashinfer-ai/flashinfer/blob/main/benchmarks/ulysses_a2a_m3_report.md>`_)::
 
     with UlyssesCommunicator(group, max_elems=B * S_local * H * D,
                              dtype=torch.bfloat16) as comm:

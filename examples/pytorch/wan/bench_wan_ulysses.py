@@ -1,12 +1,16 @@
 """Benchmark Ulysses sequence parallelism in the Wan FlashInfer attention.
 
 Runs the example's ``FlashInferWanAttention`` (Wan2.1-14B geometry by default)
-with the sequence sharded across ranks, comparing two all-to-all backends:
+with the sequence sharded across ranks, comparing two all-to-all impls:
 
 - ``nccl``:      dist.all_to_all_single + permute/contiguous glue (baseline)
-- ``flashinfer``: fused-transpose NVLink-P2P kernel (flashinfer.comm.ulysses_a2a)
+- ``flashinfer``: flashinfer.comm.UlyssesCommunicator with backend="auto" —
+  the fused-transpose NVLink-P2P kernel on a verified full-NVLink topology,
+  and an automatic NCCL fallback elsewhere. The report prints the *effective*
+  backend and the fallback reason, so NCCL-vs-NCCL results on fallback
+  machines are labeled as such.
 
-Verifies the two backends produce bit-identical outputs, sanity-checks against
+Verifies the two impls produce bit-identical outputs, sanity-checks against
 a single-GPU full-sequence reference, then reports per-iteration latency.
 
 Example (8 GPUs):
@@ -94,19 +98,24 @@ def _worker(world_size, rank, port, args):
     results = {}
     a2a_results = {}
     outs = {}
+    backends = {}
     q_like = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device=device)
     for impl in ("nccl", "flashinfer"):
         ctx = UlyssesContext(group, impl=impl, max_elems=max_elems)
+        backends[impl] = (ctx.backend, ctx.fallback_reason)
         set_ulysses_context(ctx)
         with torch.no_grad():
             outs[impl] = attn(x_local).clone()
             results[impl] = _time_forward(attn, x_local, args.iters, args.warmup, group)
             # a2a-only: one attention layer issues 3 input a2a (q/k/v) and
-            # 1 output a2a — time that communication pattern in isolation.
+            # 1 output a2a — time that communication pattern in isolation,
+            # warming up with the exact same 3+1 unit as the timed loop.
             u = ctx.input_all_to_all(q_like)
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             for _ in range(args.warmup):
+                ctx.input_all_to_all(q_like)
+                ctx.input_all_to_all(q_like)
                 ctx.input_all_to_all(q_like)
                 ctx.output_all_to_all(u)
             torch.cuda.synchronize()
@@ -138,10 +147,14 @@ def _worker(world_size, rank, port, args):
     if rank == 0:
         n = results["nccl"]
         f = results["flashinfer"]
+        fi_backend, fi_reason = backends["flashinfer"]
         print(
             f"[wan ulysses] ws={world_size} B={B} S_global={S_global} "
             f"H={H} D={D} dim={args.dim} backend={args.attention_backend}"
         )
+        print(f"  flashinfer effective backend: {fi_backend}")
+        if fi_reason is not None:
+            print(f"  !! fallback ({fi_reason}): the comparison below is NCCL vs NCCL")
         print(f"  self-attn fwd (nccl a2a)      : {n:8.3f} ms/iter")
         print(f"  self-attn fwd (flashinfer a2a): {f:8.3f} ms/iter")
         print(f"  speedup: {n / f:.3f}x   ({(n - f) / n * 100:.1f}% faster)")

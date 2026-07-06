@@ -190,6 +190,18 @@ def test_compare_rejects_bad_data_and_provenance(bench):
     with pytest.raises(ValueError, match="dirty/unknown package provenance"):
         bench.compare_payloads(base, unknown, 3.0)
 
+    # fail-closed: dirty state must be explicitly False; missing/None/0/""
+    # are unknown provenance, not clean
+    for not_clean in (None, 0, ""):
+        weird = copy.deepcopy(good)
+        weird["meta"]["package_dirty"] = not_clean
+        with pytest.raises(ValueError, match="dirty/unknown package provenance"):
+            bench.compare_payloads(base, weird, 3.0)
+    missing = copy.deepcopy(good)
+    del missing["meta"]["package_dirty"]
+    with pytest.raises(ValueError, match="dirty/unknown package provenance"):
+        bench.compare_payloads(base, missing, 3.0)
+
     for bad_p50 in (float("nan"), float("inf"), 0.0, -1.0):
         bad = copy.deepcopy(good)
         bad["results"]["raw"]["a2a"]["p50"] = bad_p50
@@ -200,6 +212,20 @@ def test_compare_rejects_bad_data_and_provenance(bench):
     short["results"]["raw"]["a2a"]["n"] = 149
     with pytest.raises(ValueError, match="truncated or padded"):
         bench.compare_payloads(base, short, 3.0)
+
+
+def test_optional_pair_is_intra_new(bench):
+    # the informational overhead pair must compare two impls of the NEW
+    # artifact, never baseline vs new: give baseline a wildly different
+    # nccl_ref p50 and assert it does not leak into the optional line
+    base = _payload(bench, "baseline", "c83e4204", BASE_IMPLS, p50=100.0)
+    new = _payload(bench, "new", "deadbeef", NEW_IMPLS, p50=1.0)
+    # gated raw->raw uses baseline (100 -> 1); the intra-new line must be 1 vs 1
+    lines, _failed = bench.compare_payloads(base, new, threshold_pct=1e9)
+    intra = [ln for ln in lines if "intra-new" in ln]
+    assert intra, lines
+    assert all("1.000 vs    1.000" in ln for ln in intra), intra
+    assert all("100.000" not in ln for ln in intra), intra
 
 
 def test_payload_copy_is_not_mutated(bench):

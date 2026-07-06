@@ -71,9 +71,11 @@ while the gated a2a numbers and both NCCL controls stay flat; the sdpa proxy
 itself (backend/clock variance), not the communication, is unstable at this
 sample size.
 
-Artifacts: `/home/claude/m3_results/final/{base,new}_w{2,4,6,8}.{json,csv}`
-(full per-sample data, provenance, per-repeat orders); earlier exploratory
-runs in `/home/claude/m3_results/`.
+Artifacts: the full per-sample JSON/CSV (provenance, per-repeat orders) for
+every run above live at `/home/claude/m3_results/final/` **on the review
+host only** — they are uncommitted temporary evidence for this review, not
+repository content; the numbers in this report are the complete gated
+summary, and any run is reproducible with the commands above.
 
 ## Profiler evidence and optimization attempt (rejected)
 

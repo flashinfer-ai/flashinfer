@@ -80,10 +80,12 @@ REQUIRED_GATES = [
     ("raw->communicator (user-visible API)", "raw", "communicator"),
     ("nccl_ref control", "nccl_ref", "nccl_ref"),
 ]
-# informational pairs, reported when present but never gated / required
-OPTIONAL_PAIRS = [
+# informational pairs, never gated / required. These compare two impls
+# WITHIN the new artifact (same code, same run), e.g. pure public-API
+# overhead: communicator_nccl vs nccl_ref on identical NCCL algorithm.
+OPTIONAL_INTRA_NEW_PAIRS = [
     (
-        "nccl_ref->communicator_nccl (public fallback API)",
+        "communicator_nccl vs nccl_ref (intra-new: public fallback API overhead)",
         "nccl_ref",
         "communicator_nccl",
     ),
@@ -319,7 +321,13 @@ def validate_compare(base: dict, new: dict) -> None:
         if "meta" not in payload or "results" not in payload:
             raise ValueError(f"{role} artifact is missing meta/results")
         meta = payload["meta"]
-        if meta.get("package_dirty") or meta.get("commit") in (None, "", "unknown"):
+        # fail-closed: the dirty flag must be *explicitly recorded* False —
+        # a missing/None/0/"" value is unknown provenance, not clean
+        if meta.get("package_dirty") is not False or meta.get("commit") in (
+            None,
+            "",
+            "unknown",
+        ):
             raise ValueError(
                 f"{role} artifact has dirty/unknown package provenance "
                 f"(commit={meta.get('commit')!r}, dirty={meta.get('package_dirty')!r}); "
@@ -377,25 +385,35 @@ def compare_payloads(base: dict, new: dict, threshold_pct: float):
     validate_compare(base, new)
     lines = []
     failed = False
-    for pair_name, b_impl, n_impl in REQUIRED_GATES + OPTIONAL_PAIRS:
-        if b_impl not in base["results"] or n_impl not in new["results"]:
-            continue  # only possible for OPTIONAL_PAIRS after validation
+    for pair_name, b_impl, n_impl in REQUIRED_GATES:
         for unit in base["results"][b_impl]:
             if unit not in new["results"][n_impl]:
                 continue
             b = base["results"][b_impl][unit]["p50"]
             n = new["results"][n_impl][unit]["p50"]
             delta = (n - b) / b * 100.0
-            gated = unit == PRIMARY_UNIT and (pair_name, b_impl, n_impl) in [
-                tuple(g) for g in REQUIRED_GATES
-            ]
+            gated = unit == PRIMARY_UNIT
             verdict = ""
             if gated and delta > threshold_pct:
                 verdict = "  << REGRESSION GATE EXCEEDED"
                 failed = True
             lines.append(
-                f"  {pair_name:48s} {unit:8s} {b:8.3f} -> {n:8.3f} ms "
+                f"  {pair_name:60s} {unit:8s} {b:8.3f} -> {n:8.3f} ms "
                 f"({delta:+6.2f}%){' [gated]' if gated else ''}{verdict}"
+            )
+    # intra-new informational pairs: BOTH sides from the new artifact (same
+    # code, same run) — never cross-version, never gated
+    for pair_name, a_impl, b_impl2 in OPTIONAL_INTRA_NEW_PAIRS:
+        if a_impl not in new["results"] or b_impl2 not in new["results"]:
+            continue
+        for unit in new["results"][a_impl]:
+            if unit not in new["results"][b_impl2]:
+                continue
+            a = new["results"][a_impl][unit]["p50"]
+            b = new["results"][b_impl2][unit]["p50"]
+            delta = (b - a) / a * 100.0
+            lines.append(
+                f"  {pair_name:60s} {unit:8s} {a:8.3f} vs {b:8.3f} ms ({delta:+6.2f}%)"
             )
     return lines, failed
 
