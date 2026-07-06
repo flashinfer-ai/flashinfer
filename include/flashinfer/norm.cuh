@@ -945,11 +945,12 @@ void dispatch_layernorm_type(T const* input, Tw const* gemma, Tw const* beta, T*
 // (no shared-memory data staging, no global re-read), and writes back via
 // 128-bit stores.  Template parameters: CHUNKS = hidden/(8*THREADS), THREADS.
 // ============================================================================
-template <int CHUNKS, int THREADS>
+template <typename T, int CHUNKS, int THREADS>
 __global__ void __launch_bounds__(THREADS)
     LayerNormRegBlocked(const int4* __restrict__ input, const float4* __restrict__ gamma,
                         const float4* __restrict__ beta, int4* __restrict__ output, float eps,
                         int hidden_dim) {
+  // T is the 2-byte input/output element type (half or __nv_bfloat16); an int4 packs 8 of them.
   const int tid = threadIdx.x;
   // number of int4 vectors per row = hidden_dim / 8
   const int nvec = hidden_dim >> 3;
@@ -961,10 +962,10 @@ __global__ void __launch_bounds__(THREADS)
 #pragma unroll
   for (int i = 0; i < CHUNKS; ++i) {
     int4 raw = input[row + tid + i * THREADS];
-    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    const T* h = reinterpret_cast<const T*>(&raw);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      float x = __bfloat162float(h[j]);
+      float x = cuda_cast<float>(h[j]);
       v[i * 8 + j] = x;
       local_sum += x;
     }
@@ -1036,21 +1037,21 @@ __global__ void __launch_bounds__(THREADS)
     const float* bp0 = reinterpret_cast<const float*>(&b0);
     const float* bp1 = reinterpret_cast<const float*>(&b1);
     int4 outraw;
-    __nv_bfloat16* oh = reinterpret_cast<__nv_bfloat16*>(&outraw);
+    T* oh = reinterpret_cast<T*>(&outraw);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      oh[j] = __float2bfloat16((v[i * 8 + j] - mean) * inv * gp0[j] + bp0[j]);
+      oh[j] = cuda_cast<T>((v[i * 8 + j] - mean) * inv * gp0[j] + bp0[j]);
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      oh[j + 4] = __float2bfloat16((v[i * 8 + j + 4] - mean) * inv * gp1[j] + bp1[j]);
+      oh[j + 4] = cuda_cast<T>((v[i * 8 + j + 4] - mean) * inv * gp1[j] + bp1[j]);
     }
     output[row + vi] = outraw;
   }
 }
 
 // Dispatch helper: select CHUNKS at compile-time via switch
-template <int THREADS>
+template <typename T, int THREADS>
 inline bool dispatchLayerNormRegBlocked(const void* input, const void* gamma, const void* beta,
                                         void* output, float eps, int hidden_dim, int tokens,
                                         cudaStream_t stream) {
@@ -1060,7 +1061,7 @@ inline bool dispatchLayerNormRegBlocked(const void* input, const void* gamma, co
   dim3 block(THREADS);
 #define CASE_CHUNKS(C)                                                                            \
   case C:                                                                                         \
-    LayerNormRegBlocked<C, THREADS><<<grid, block, 0, stream>>>(                                  \
+    LayerNormRegBlocked<T, C, THREADS><<<grid, block, 0, stream>>>(                               \
         reinterpret_cast<const int4*>(input), reinterpret_cast<const float4*>(gamma),             \
         reinterpret_cast<const float4*>(beta), reinterpret_cast<int4*>(output), eps, hidden_dim); \
     return true;
@@ -1105,14 +1106,14 @@ cudaError_t LayerNorm(T* input, Tw* gemma, Tw* beta, T* out, uint32_t tokens, ui
       // Only supported for bf16/half input with float weights
       if constexpr (sizeof(T) == 2 && sizeof(Tw) == 4) {
         if (threads == 128) {
-          return dispatchLayerNormRegBlocked<128>(input, gemma, beta, out, eps, hidden_dim, tokens,
-                                                  stream);
+          return dispatchLayerNormRegBlocked<T, 128>(input, gemma, beta, out, eps, hidden_dim,
+                                                     tokens, stream);
         } else if (threads == 64) {
-          return dispatchLayerNormRegBlocked<64>(input, gemma, beta, out, eps, hidden_dim, tokens,
-                                                 stream);
+          return dispatchLayerNormRegBlocked<T, 64>(input, gemma, beta, out, eps, hidden_dim,
+                                                    tokens, stream);
         } else if (threads == 32) {
-          return dispatchLayerNormRegBlocked<32>(input, gemma, beta, out, eps, hidden_dim, tokens,
-                                                 stream);
+          return dispatchLayerNormRegBlocked<T, 32>(input, gemma, beta, out, eps, hidden_dim,
+                                                    tokens, stream);
         }
       }
       return false;
