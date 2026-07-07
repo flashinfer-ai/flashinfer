@@ -1172,6 +1172,16 @@ def get_mm_bf16_cublaslt_module():
                 self._algo_cache: dict = {}
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+                # Must be synthesis-invariant: including a.shape (dynamic M)
+                # makes the runtime key miss the bucketed profile key, so the
+                # tuned tactic is dropped for tactic=-1. Shapes are already in
+                # the autotuner's input_shapes; add only dtypes.
+                a, b, _, _, out, _ = inputs
+                return (a.dtype, b.dtype, self._compute_dtype(out.dtype))
+
+            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
+                # Internal cuBLASLt algo-enumeration cache: this one is
+                # shape-specific, so key on full shapes (incl. M).
                 a, b, _, _, out, _ = inputs
                 return (
                     a.shape[0],
@@ -1192,7 +1202,7 @@ def get_mm_bf16_cublaslt_module():
             def _get_algos(self, inputs):
                 a, b, _, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
-                key = self.get_cache_key_extras(inputs)
+                key = self._algo_cache_key(inputs)
                 cached = self._algo_cache.get(key)
                 if cached is not None:
                     return cached
@@ -1255,13 +1265,11 @@ def get_mm_bf16_cublaslt_module():
                         f"dtype={compute_out.dtype}. "
                         "This shape/dtype combination may not be supported."
                     )
-                if tactic >= count:
-                    raise ValueError(
-                        f"Requested tactic {tactic} but only {count} algorithms "
-                        f"available for M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
-                        f"dtype={compute_out.dtype}."
-                    )
-                if tactic < 0:
+                # The cuBLASLt algo list is enumerated per-shape, so a tactic
+                # tuned at a different (bucketed) M may be out of range here.
+                # Fall back to the heuristic-best algo (index 0) rather than
+                # raising.
+                if tactic < 0 or tactic >= count:
                     tactic = 0
                 module.mm_bf16_cublaslt_run_with_algo(
                     a,
@@ -1298,6 +1306,11 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
             -2,
             lambda shapes: shapes[0][-2],
         ),
+        ConstraintSpec(
+            5,  # workspace_buffer index: scratch buffer that a backend may
+            0,  # resize during profiling. Wildcard its size out of the cache
+            lambda shapes: shapes[5][0],  # key so a mid-tune resize never
+        ),  # changes the key (would otherwise cause a silent cache miss).
     ),
 )
 
