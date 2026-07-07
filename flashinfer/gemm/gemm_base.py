@@ -4809,6 +4809,11 @@ def _cute_dsl_gemm_mxfp8_runner(
     sm_version = sm_major * 10 + sm_minor
 
     class CuteDSLMxfp8GemmRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            _, _, _, _, _, out, _ = inputs
+            # Invalidate eager/hot-L2 results created before graph+cold-L2 tuning.
+            return (str(out.dtype), enable_pdl, "graph_cold_l2_v1")
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -6443,6 +6448,8 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
 
 
 _MM_MXFP8_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),  # a_tensor_index

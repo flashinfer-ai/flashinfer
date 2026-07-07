@@ -17,7 +17,7 @@ from cutlass.cute.arch import (
 
 
 _THREADS = 256
-_VALUES_PER_THREAD = 4
+_VALUES_PER_THREAD = 1
 
 
 @cute.kernel
