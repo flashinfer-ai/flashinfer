@@ -226,3 +226,98 @@ def test_batch_prefill_cute_dsl_alibi_fallback():
     o = w.run(q, k, v)
     assert o.shape == (total, H, D)
     assert torch.isfinite(o.float()).all()
+
+
+def _blockscaled_dequant(x_bshd, qk_mode):
+    """Dequantized (f32) logical Q/K values the block-scaled kernel operates on.
+
+    Mirrors quantize.py's pad/transpose, but requests the *linear* SF layout so the
+    per-block scales are directly decodable here (kept out of the production path).
+    """
+    from flashinfer.quantization import fp4_quantize, mxfp8_quantize
+
+    b, s, h, d = x_bshd.shape
+    x_bhsd = x_bshd.transpose(1, 2).contiguous()
+    s_pad = ((s + 127) // 128) * 128
+    if s_pad != s:
+        pad = torch.zeros(b, h, s_pad - s, d, dtype=x_bhsd.dtype, device=x_bhsd.device)
+        x_bhsd = torch.cat([x_bhsd, pad], dim=2)
+    x2d = x_bhsd.reshape(b * h * s_pad, d)
+    m = x2d.shape[0]
+
+    if qk_mode == "mxfp8":
+        data, sf = mxfp8_quantize(
+            x2d, is_sf_swizzled_layout=False, alignment=32, backend="cute-dsl"
+        )
+        vals = data.float()
+        sf_k, vec, glob = d // 32, 32, 1.0
+        sf_lin = sf.view(torch.float8_e8m0fnu).float().reshape(m, sf_k)
+    else:
+        amax = x2d.float().abs().amax().clamp(min=1e-6)
+        glob = float(amax / (448.0 * 6.0))
+        gsf = (448.0 * 6.0 / amax).to(torch.float32).reshape(1)
+        data, sf = fp4_quantize(
+            x2d, gsf, sf_vec_size=16, is_sf_swizzled_layout=False, backend="cute-dsl"
+        )
+        u8 = data.reshape(m, d // 2).to(torch.int32)
+        codes = torch.stack([u8 & 0xF, (u8 >> 4) & 0xF], dim=-1).reshape(m, d)
+        # Brute-force decode e2m1 values.
+        e2m1_levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+        vals = (
+            torch.where((codes & 0x8) != 0, -1.0, 1.0)
+            * e2m1_levels.to(x2d.device)[codes & 0x7]
+        )
+        sf_k, vec = d // 16, 16
+        sf_lin = sf.view(torch.float8_e4m3fn).float().reshape(m, sf_k)
+    sf_bcast = sf_lin.unsqueeze(-1).expand(m, sf_k, vec).reshape(m, d)
+    deq = (vals * sf_bcast * glob).reshape(b, h, s_pad, d)
+    return deq[:, :, :s, :].transpose(1, 2).contiguous()
+
+
+@pytest.mark.parametrize("qk_mode", ["mxfp8", "nvfp4"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_blockscaled_quantize_and_prefill(qk_mode, causal):
+    """End-to-end block-scaled path: fused quantizer -> SF -> FMHA kernel."""
+    from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
+    from flashinfer.cute_dsl.attention.fmha.runner import (
+        cute_dsl_fmha_blockscaled_prefill,
+    )
+
+    torch.manual_seed(0)
+    b, s, H, D = 2, 128, 4, 128
+    sm = 1.0 / math.sqrt(D)
+    q = torch.randn(b, s, H, D, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(b, s, H, D, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(b, s, H, D, device=DEVICE, dtype=torch.bfloat16)
+
+    q_store, k_store, q_sf, k_sf, q_scale, k_scale = quantize_blockscaled_qk(
+        q, k, qk_mode
+    )
+    v_store = v.to(torch.float8_e4m3fn)
+    v_deq = v_store.float()
+    o = torch.empty(b, s, H, D, device=DEVICE, dtype=torch.bfloat16)
+    cute_dsl_fmha_blockscaled_prefill(
+        q_store,
+        k_store,
+        q_sf,
+        k_sf,
+        v_store,
+        o,
+        qk_mode=qk_mode,
+        is_causal=causal,
+        sm_scale=sm,
+        scale_q=q_scale,
+        scale_k=k_scale,
+    )
+
+    # Reference on the dequantized logical values (matches kernel semantics exactly).
+    q_deq = _blockscaled_dequant(q, qk_mode)
+    k_deq = _blockscaled_dequant(k, qk_mode)
+    s_logits = torch.einsum("bqhd,bkhd->bhqk", q_deq, k_deq) * sm
+    if causal:
+        row = torch.arange(s, device=DEVICE).view(-1, 1)
+        col = torch.arange(s, device=DEVICE).view(1, -1)
+        s_logits = s_logits.masked_fill((col > row).view(1, 1, s, s), float("-inf"))
+    p = torch.softmax(s_logits, dim=-1)
+    o_ref = torch.einsum("bhqk,bkhd->bqhd", p, v_deq)
+    torch.testing.assert_close(o.float(), o_ref, atol=0.1, rtol=1e-2)
