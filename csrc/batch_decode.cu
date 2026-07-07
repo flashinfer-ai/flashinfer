@@ -80,6 +80,52 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
   return Array(plan_info.ToVector());
 }
 
+Array<int64_t> BatchDecodeWithPagedKVCacheWorkspaceSize(
+    TensorView device_buffer, TensorView indptr, int64_t batch_size, int64_t num_qo_heads,
+    int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t window_left,
+    double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo, TensorView empty_q_data,
+    TensorView empty_kv_data) {
+  (void)window_left;
+  (void)logits_soft_cap;
+  (void)empty_q_data;
+  (void)empty_kv_data;
+  CHECK_INPUT_TYPE(indptr, dl_int32);
+
+  TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)
+      << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
+         "cores template for different head dim";
+
+  ffi::CUDADeviceGuard device_guard(device_buffer.device().device_id);
+  const cudaStream_t stream = get_stream(device_buffer.device());
+  size_t float_workspace_size_in_bytes = 0;
+  size_t int_workspace_size_in_bytes = 0;
+
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
+        DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+          auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
+              GROUP_SIZE, HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>;
+          cudaError_t status =
+              DecodePlanWorkspaceSize<HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>(
+                  float_workspace_size_in_bytes, int_workspace_size_in_bytes,
+                  static_cast<IdType*>(indptr.data_ptr()), batch_size, num_qo_heads, page_size,
+                  enable_cuda_graph, /*stream=*/stream, work_estimation_func);
+
+          TVM_FFI_ICHECK(status == cudaSuccess)
+              << "BatchDecodeWithPagedKVCache workspace size failed with error "
+              << cudaGetErrorString(status);
+          return true;
+        });
+      });
+
+  std::vector<int64_t> workspace_sizes = {
+      static_cast<int64_t>(float_workspace_size_in_bytes),
+      static_cast<int64_t>(int_workspace_size_in_bytes),
+  };
+  return Array(workspace_sizes);
+}
+
 void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                     TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
                                     TensorView q, TensorView paged_k_cache,

@@ -29,6 +29,25 @@ class EpAlgorithm(enum.Enum):
     HIGH_THROUGHPUT = 1
 
 
+class EpLayout(enum.Enum):
+    """LL receive-buffer layout, mirroring ``nccl.ep.Layout`` for the LL paths.
+
+    * ``EXPERT_MAJOR`` — recv buffer ``[num_local_experts, max_tokens_per_rank *
+      world, hidden]``; each padded row is pre-assigned to one local expert and
+      combine reweights per-token on receive.
+    * ``RANK_MAJOR`` — recv buffer ``[world, max_tokens_per_rank, hidden]``;
+      tokens grouped by source rank (received once each, carrying their
+      ``topk_idx`` / ``topk_weights``). The caller pre-reduces across local
+      experts before combine; combine then just sums across ranks.
+
+    HT always uses the library's ``FLAT`` layout regardless of this field; it is
+    only consulted on the LL path.
+    """
+
+    EXPERT_MAJOR = 1
+    RANK_MAJOR = 2
+
+
 class QuantType(enum.Enum):
     """Quantization variants surfaced via FleetAlgoKnobQuantization."""
 
@@ -43,8 +62,21 @@ class BootstrapConfig:
     """Inputs each backend needs to construct a Fleet.
 
     Backends consume only the fields they care about (NCCL-EP uses
-    ``nccl_comm`` + ``stream``; NIXL-EP uses ``tcp_store``). Carrying both
-    here lets a single bootstrap config drive either backend.
+    ``nccl_comm`` / ``process_group`` + ``stream``; NIXL-EP uses
+    ``tcp_store``). Carrying all of them here lets a single bootstrap config
+    drive either backend.
+
+    Communicator resolution (NCCL-EP), in priority order:
+
+    * ``nccl_comm`` — an existing ``ncclComm_t`` (as an int). The Fleet
+      *adopts* it (wraps without taking ownership; it is never destroyed or
+      aborted by the Fleet), so a host — e.g. vLLM — can share the exact
+      communicator its process group already owns.
+    * ``process_group`` — a torch ``ProcessGroup`` to mirror. The Fleet
+      creates a *fresh* NCCL communicator over that group's membership (the
+      torch-version-robust pattern), letting the caller target a specific EP
+      subgroup rather than the default ``WORLD`` group.
+    * neither set — mirror the default process group.
     """
 
     world_size: int
@@ -53,6 +85,9 @@ class BootstrapConfig:
     nccl_comm: Optional[int] = (
         None  # int representation of ncclComm_t; None = derive from PG
     )
+    # Torch process group to mirror when nccl_comm is not supplied. None =
+    # default group. Adopting an existing nccl_comm takes precedence.
+    process_group: Optional["torch.distributed.ProcessGroup"] = None
     tcp_store: Optional["torch.distributed.TCPStore"] = None
 
     def __post_init__(self) -> None:
@@ -77,6 +112,8 @@ class FleetParams:
     token_hidden_size: int
     dtype_bytes: int = 2  # bf16 default; FP8 path overrides
     algorithm: EpAlgorithm = EpAlgorithm.LOW_LATENCY
+    # LL receive layout. Ignored by HT (always FLAT). RANK_MAJOR is LL-only.
+    layout: EpLayout = EpLayout.EXPERT_MAJOR
 
     def __post_init__(self) -> None:
         for name in (
@@ -88,6 +125,14 @@ class FleetParams:
             v = getattr(self, name)
             if v <= 0:
                 raise ValueError(f"FleetParams.{name} must be positive, got {v}")
+        if (
+            self.layout is EpLayout.RANK_MAJOR
+            and self.algorithm is not EpAlgorithm.LOW_LATENCY
+        ):
+            raise ValueError(
+                "FleetParams.layout=RANK_MAJOR is only valid with "
+                "algorithm=LOW_LATENCY (HT uses the FLAT layout)."
+            )
 
 
 @dataclass(frozen=True)
@@ -116,13 +161,34 @@ class DispatchOutput:
     """Outputs from :meth:`Handle.dispatch`.
 
     ``expert_tensors`` is the dispatched token tensor on the local rank
-    (shape: ``[num_recv_tokens, hidden]``). ``num_tokens`` is the actual
-    receive count (= ``max_tokens_per_rank`` in fixed-size LL mode; queried
-    via ``ncclEpHandleGetNumRecvTokens`` otherwise).
+    (shape: ``[num_recv_tokens, hidden]``).
+
+    ``recv_topk_idx`` / ``recv_topk_weights`` are the per-received-token routing
+    returned by the LL RANK_MAJOR (and HT) layouts — ``[num_recv_tokens, top_k]``
+    int64 / fp32. They are ``None`` for the LL EXPERT_MAJOR layout (whose rows are
+    pre-assigned to experts by position, so no per-token routing is returned).
+
+    ``expert_counts`` is the per-shard received-token count written by the library
+    during dispatch — ``[num_local_experts]`` int32 for LL EXPERT_MAJOR (per-expert)
+    or ``[world_size]`` int32 for LL RANK_MAJOR (per-source-rank). ``None`` when the
+    layout does not expose it. It is a device tensor; reading it host-side forces a
+    sync, so consumers that don't need it can ignore it at no cost.
+
+    ``recv_total_counter`` is a scalar ``[1]`` int32/int64 device tensor holding the
+    *actual* total received-token count for HT FLAT. It is populated only when the
+    caller opts in via :class:`HandleAlgoKnobNumReceivedTokens` (which binds the
+    counter at handle-create time so the HT metadata step fills it); otherwise
+    ``None``. It lets an HT consumer trim its compute to ``recv_x[:actual_recv]``
+    (the received tokens are front-packed) while the transport buffer stays sized to
+    the static ``max_recv_tokens_per_rank`` budget (nccl-ep v0.1 does not resize the
+    buffer itself). ``None`` → the consumer must fall back to the full static buffer.
     """
 
     expert_tensors: "torch.Tensor"
-    num_tokens: int
+    recv_topk_idx: Optional["torch.Tensor"] = None
+    recv_topk_weights: Optional["torch.Tensor"] = None
+    expert_counts: Optional["torch.Tensor"] = None
+    recv_total_counter: Optional["torch.Tensor"] = None
 
 
 @dataclass(frozen=True)

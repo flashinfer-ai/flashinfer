@@ -75,9 +75,14 @@ from .quantization.fp4_quantization import (
     scaled_fp4_grouped_quantize,
     get_fp4_quantization_module,
     nvfp4_kv_dequantize,
+    nvfp4_kv_dequantize_paged,
     nvfp4_kv_quantize,
 )
-from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .quantization.fp8_quantization import (
+    mxfp8_dequantize_host,
+    mxfp8_grouped_quantize,
+    mxfp8_quantize,
+)
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
@@ -90,7 +95,7 @@ from .fused_moe import (
     trtllm_fp8_per_tensor_scale_moe,
 )
 
-# CuteDSL MoE high-level APIs (conditionally if cute_dsl available)
+# CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
@@ -98,7 +103,7 @@ with contextlib.suppress(ImportError):
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
-from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+    from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
@@ -152,6 +157,12 @@ from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
 from .page import get_seq_lens as get_seq_lens
+from .page import (
+    nvfp4_quantize_append_paged_kv_cache as nvfp4_quantize_append_paged_kv_cache,
+)
+from .page import (
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+)
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper
 from .prefill import (
@@ -195,7 +206,12 @@ from .sampling import (
 from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs
 from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
-from .tllm_enums import SfLayout, ActivationType, RoutingMethodType
+from .tllm_enums import (
+    SfLayout,
+    ActivationType,
+    RoutingMethodType,
+    is_gated_activation as is_gated_activation,
+)
 from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform

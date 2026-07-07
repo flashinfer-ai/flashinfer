@@ -1694,11 +1694,10 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
             num_sab_heads * 64 * 64,
         ),
     )
-    workspace_ctor = torch.empty if num_seqs == 1 else torch.zeros
-    transfer_t = workspace_ctor(
+    transfer_t = torch.empty(
         (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
     )
-    state_t = workspace_ctor(
+    state_t = torch.empty(
         (total_cp_chunks, num_sab_heads, d, d), dtype=torch.float32, device=k.device
     )
     if total_cp_chunks == 0:
@@ -2330,11 +2329,7 @@ def cp_delta_rule_fixup_dsl_sm90(
             raise RuntimeError("cu_seqlens must be contiguous")
     num_seqs = cu_seqlens.shape[0] - 1
 
-    fixed_state = (
-        torch.empty_like(local_state)
-        if num_seqs == 1
-        else torch.zeros_like(local_state)
-    )
+    fixed_state = torch.empty_like(local_state)
     if total_cp_chunks == 0:
         return fixed_state
 
@@ -2485,40 +2480,38 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         tQKrQK: cute.Tensor,
         tQKcMqk: cute.Tensor,
         sT: cute.Tensor,
+        sQK: cute.Tensor,
         sKK_opd: cute.Tensor,
         sAlpha: cute.Tensor,
         alpha_stage: cutlass.Int32,
         is_final_block: bool,
         B: cutlass.Int32,
         scale: cutlass.Float32,
+        qk_tiled_mma,
         kk_tiled_mma,
-        tKKcMkk: cute.Tensor,
         aux_tidx: cutlass.Int32,
     ):
         alpha_log = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
-        for i in cutlass.range_constexpr(cute.size(tQKrQK)):
-            s, t = tQKcMqk[i]
-            alpha = cute.math.exp2(
-                cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
-                fastmath=True,
-            )
-            pred = s >= t
-            if cutlass.const_expr(is_final_block):
-                pred = pred and (s < B or t < B)
-            tQKrQK[i] = tQKrQK[i] * alpha * scale if pred else cutlass.Float32(0.0)
-
         stsm_atom = cute.make_copy_atom(
             warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype
         )
-        tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
-        thr_store = tiled_store.get_slice(aux_tidx)
-        tKKsKK = thr_store.partition_D(sKK_opd)
-        tKKcMkk_cv = thr_store.retile(tKKcMkk)
+        qk_tiled_store = cute.make_tiled_copy_C(stsm_atom, qk_tiled_mma)
+        kk_tiled_store = cute.make_tiled_copy_C(stsm_atom, kk_tiled_mma)
+        qk_thr_store = qk_tiled_store.get_slice(aux_tidx)
+        kk_thr_store = kk_tiled_store.get_slice(aux_tidx)
+        tQKsQK = qk_thr_store.partition_D(sQK)
+        tKKsKK = kk_thr_store.partition_D(sKK_opd)
+        tQKcMqk_cv = kk_thr_store.retile(tQKcMqk)
+        tQKrQK_cv = kk_thr_store.retile(tQKrQK)
+        tQKrQK_cvt = cute.make_fragment_like(tQKrQK, self.dtype)
+        tQKrQK_cvt_cv = kk_thr_store.retile(tQKrQK_cvt)
         tKKrT = cute.make_fragment_like(tKKsKK, self.dtype)
 
         for i in cutlass.range_constexpr(cute.size(tKKrT)):
-            s, t = tKKcMkk_cv[i]
-            value = cutlass.Float32(0.0)
+            s, t = tQKcMqk_cv[i]
+            gamma = cutlass.Float32(0.0)
+            qk_value = cutlass.Float32(0.0)
+            t_value = cutlass.Float32(0.0)
             pred = s >= t
             if cutlass.const_expr(is_final_block):
                 pred = pred and s < B and t < B
@@ -2527,9 +2520,16 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                     cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
                     fastmath=True,
                 )
-                value = -gamma * cutlass.Float32(sT[t, s])
-            tKKrT[i] = self.dtype(value)
-        cute.copy(tiled_store, tKKrT, tKKsKK)
+            qk_value = tQKrQK_cv[i] * gamma * scale
+            t_value = -gamma * cutlass.Float32(sT[t, s])
+            if cutlass.const_expr(is_final_block):
+                qk_value = qk_value if pred else cutlass.Float32(0.0)
+                t_value = t_value if pred else cutlass.Float32(0.0)
+
+            tQKrQK_cvt_cv[i] = self.dtype(qk_value)
+            tKKrT[i] = self.dtype(t_value)
+        cute.copy(qk_tiled_store, qk_thr_store.retile(tQKrQK_cvt), tQKsQK)
+        cute.copy(kk_tiled_store, tKKrT, tKKsKK)
 
     @cute.jit
     def run_aux_loop_body(
@@ -2592,18 +2592,20 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         cute.arch.fence_view_async_shared()
 
         kk_pipeline.producer_acquire(kk_producer_state)
+        qk_pipeline.producer_acquire(qk_producer_state)
         self.cp_qk_and_t_epi(
             tQKrQK,
             tQKcMqk,
             sT[None, None, t_consumer_state.index],
+            sQK[None, None, qk_producer_state.index],
             sKK_opd[None, None, kk_producer_state.index],
             sAlpha,
             alpha_consumer_state.index,
             is_final_block,
             B,
             scale,
+            qk_tiled_mma,
             kk_tiled_mma,
-            tKKcMkk,
             aux_tidx,
         )
         cute.arch.fence_view_async_shared()
@@ -2611,15 +2613,6 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
         kk_producer_state.advance()
         t_pipeline.consumer_release(t_consumer_state)
         t_consumer_state.advance()
-
-        qk_pipeline.producer_acquire(qk_producer_state)
-        self.qk_store(
-            tQKrQK,
-            sQK[None, None, qk_producer_state.index],
-            qk_tiled_mma,
-            aux_tidx,
-        )
-        cute.arch.fence_view_async_shared()
         qk_pipeline.producer_commit(qk_producer_state)
         qk_producer_state.advance()
 
@@ -3982,8 +3975,6 @@ def cp_delta_rule_dsl_sm90(
         _skip_check=True,
     )
 
-    if num_seqs != 1:
-        state.zero_()
     cp_delta_rule_prefill_dsl_sm90(
         o,
         state,

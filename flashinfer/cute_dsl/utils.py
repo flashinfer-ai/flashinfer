@@ -82,6 +82,21 @@ def torch_to_cutlass_dtype(dtype: torch.dtype) -> cutlass.dtype:
     return dtype_map[dtype]
 
 
+def _as_cute_dsl_workspace_i8(
+    workspace_buffer: torch.Tensor,
+    *,
+    name: str = "workspace_buffer",
+) -> torch.Tensor:
+    if workspace_buffer.dtype not in (torch.int8, torch.uint8):
+        raise ValueError(
+            f"{name} must be a torch.int8 or torch.uint8 byte tensor, "
+            f"got {workspace_buffer.dtype}"
+        )
+    if not workspace_buffer.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    return workspace_buffer.view(-1).view(torch.int8)
+
+
 def cutlass_to_torch_dtype(cutlass_dtype):
     """
     Return the corresponding torch.dtype per the given DSL type

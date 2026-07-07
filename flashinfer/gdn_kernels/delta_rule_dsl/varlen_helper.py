@@ -4,6 +4,10 @@ import cutlass.cute as cute
 
 
 CP_CHUNK_LEN_GRANULARITY = 512
+CP_HBM_PARALLELISM_THRESHOLD_NUMERATOR = 1
+CP_HBM_PARALLELISM_THRESHOLD_DENOMINATOR = 2
+CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR = 1
+CP_GDDR_PARALLELISM_THRESHOLD_DENOMINATOR = 3
 
 
 def chunk_bound_host(num_items: int, total: int, chunk_size: int) -> int:
@@ -26,18 +30,51 @@ def max_num_chunks_host(max_seqlen: int, chunk_size: int) -> int:
     return (max_seqlen + chunk_size - 1) // chunk_size
 
 
+def is_gddr_device_host(device_name: str) -> bool:
+    """Best-effort device-class check for host-side CP dispatch.
+
+    Unknown datacenter names default to the HBM threshold. Consumer/workstation
+    names default to the GDDR threshold.
+    """
+    lowered = device_name.lower()
+    gddr_markers = ("geforce", "rtx", "workstation")
+    return any(marker in lowered for marker in gddr_markers)
+
+
+def cp_parallelism_threshold_host(device_name: str) -> tuple[int, int]:
+    if is_gddr_device_host(device_name):
+        return (
+            CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR,
+            CP_GDDR_PARALLELISM_THRESHOLD_DENOMINATOR,
+        )
+    return (
+        CP_HBM_PARALLELISM_THRESHOLD_NUMERATOR,
+        CP_HBM_PARALLELISM_THRESHOLD_DENOMINATOR,
+    )
+
+
+def should_use_cp_host(num_parallel_work: int, num_sms: int, device_name: str) -> bool:
+    """Return whether a public wrapper should dispatch to the CP path.
+
+    `num_parallel_work` is the non-CP kernel parallelism, typically batch times
+    output/state heads. CP is selected only when that parallelism is strictly
+    below the card-specific threshold.
+    """
+    threshold_num, threshold_den = cp_parallelism_threshold_host(device_name)
+    return num_parallel_work * threshold_den < num_sms * threshold_num
+
+
 def choose_cp_chunk_len_host(
     max_seqlen: int,
     num_heads: int,
     num_sms: int,
     chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
 ) -> int:
-    """Choose a CP chunk length that keeps MN precompute in one CTA wave.
+    """Choose a CP chunk length for the CP workspace kernels.
 
     The TTFT path is usually one long sequence. For that case, MN precompute
     launches `ceil_div(max_seqlen, chunk_len) * num_heads` CTAs. Pick the
-    smallest granularity-aligned chunk length whose CTA count does not exceed
-    the SM count, preserving as much CP parallelism as possible within one wave.
+    smallest granularity-aligned chunk length whose CTA count is at most one wave.
     """
     if max_seqlen <= 0:
         raise RuntimeError(f"max_seqlen must be positive, got {max_seqlen}")

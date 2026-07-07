@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 from typing import Optional, Tuple, Union
 
 import torch
@@ -23,6 +24,8 @@ from .api_logging import flashinfer_api
 from .trace.templates.page import (
     append_paged_kv_cache_trace,
     append_paged_mla_kv_cache_trace,
+    nvfp4_quantize_append_paged_kv_cache_trace,
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace,
 )
 from .jit.page import gen_page_module
 from .utils import (
@@ -119,6 +122,126 @@ def _fake_append_paged_kv_cache_kernel(
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
+    layout: int,
+) -> None:
+    pass
+
+
+@register_custom_op(
+    "flashinfer::nvfp4_quantize_append_paged_kv_cache",
+    mutates_args=(
+        "paged_k_cache",
+        "paged_v_cache",
+        "k_scale_cache",
+        "v_scale_cache",
+    ),
+)
+def _nvfp4_quantize_append_paged_kv_cache_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
+    layout: int,
+) -> None:
+    batch_indices = batch_indices.int()
+    positions = positions.int()
+    kv_indices = kv_indices.int()
+    kv_indptr = kv_indptr.int()
+    kv_last_page_len = kv_last_page_len.int()
+    get_page_module().nvfp4_quantize_append_paged_kv_cache(
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        paged_k_cache,
+        paged_v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        k_scale,
+        v_scale,
+        layout,
+    )
+
+
+@register_fake_op("flashinfer::nvfp4_quantize_append_paged_kv_cache")
+def _fake_nvfp4_quantize_append_paged_kv_cache_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
+    layout: int,
+) -> None:
+    pass
+
+
+@register_custom_op(
+    "flashinfer::nvfp4_quantize_append_paged_kv_cache_with_slot_mapping",
+    mutates_args=(
+        "paged_k_cache",
+        "paged_v_cache",
+        "k_scale_cache",
+        "v_scale_cache",
+    ),
+)
+def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    layout: int,
+) -> None:
+    slot_mapping = slot_mapping.contiguous()
+    get_page_module().nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        append_key,
+        append_value,
+        slot_mapping,
+        paged_k_cache,
+        paged_v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        k_scale,
+        v_scale,
+        layout,
+    )
+
+
+@register_fake_op("flashinfer::nvfp4_quantize_append_paged_kv_cache_with_slot_mapping")
+def _fake_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    paged_v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
     layout: int,
 ) -> None:
     pass
@@ -402,5 +525,326 @@ def append_paged_kv_cache(
         kv_indices,
         kv_indptr,
         kv_last_page_len,
+        TensorLayout[kv_layout].value,
+    )
+
+
+@flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_trace)
+def nvfp4_quantize_append_paged_kv_cache(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_cache_sf: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    k_scale: float,
+    v_scale: float,
+    kv_layout: str = "NHD",
+) -> None:
+    r"""Quantize and append K/V rows into an NVFP4 paged KV cache.
+
+    ``append_key`` and ``append_value`` must be fp16/bf16 tensors with shape
+    ``[nnz, num_kv_heads, head_dim]``. The function writes packed E2M1 data
+    into uint8 paged K/V cache tensors with last dimension ``head_dim // 2``
+    and writes FP8 E4M3 block scales into ``kv_cache_sf`` tensors with last
+    dimension ``head_dim // 16``.
+
+    ``k_scale`` and ``v_scale`` are the global decode scales consumed by the
+    NVFP4 attention kernels, i.e. dequantization reconstructs values as
+    ``e2m1_value * block_scale * global_scale``.
+
+    Parameters
+    ----------
+    append_key : torch.Tensor
+        The key tensor to quantize and append, shape
+        ``[nnz, num_kv_heads, head_dim]`` with dtype ``torch.float16`` or
+        ``torch.bfloat16``.
+    append_value : torch.Tensor
+        The value tensor to quantize and append, with the same shape and dtype
+        as ``append_key``.
+    batch_indices : torch.Tensor
+        The batch index for each appended row, shape ``[nnz]``.
+    positions : torch.Tensor
+        The logical token position for each appended row, shape ``[nnz]``.
+    paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned packed NVFP4 K/V cache. For tuple input, each tensor has
+        shape ``[max_num_pages, page_size, num_kv_heads, head_dim // 2]`` when
+        ``kv_layout="NHD"`` and ``[max_num_pages, num_kv_heads, page_size,
+        head_dim // 2]`` when ``kv_layout="HND"``. A stacked 5-D cache is also
+        accepted with K/V on the second dimension.
+    kv_cache_sf : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned FP8 E4M3 scale cache with the same tuple or stacked cache
+        format as ``paged_kv_cache``, replacing ``head_dim // 2`` with
+        ``head_dim // 16``.
+    kv_indices : torch.Tensor
+        The page indices of the paged KV cache, shape ``[kv_indptr[-1]]``.
+    kv_indptr : torch.Tensor
+        The indptr of the paged KV cache, shape ``[batch_size + 1]``.
+    kv_last_page_len : torch.Tensor
+        The number of entries in the last page of each request, shape
+        ``[batch_size]``.
+    k_scale : float
+        Positive finite global decode scale for K.
+    v_scale : float
+        Positive finite global decode scale for V.
+    kv_layout : str
+        Layout of the paged KV cache, either ``"NHD"`` or ``"HND"``.
+
+    Returns
+    -------
+    None
+        This function updates ``paged_kv_cache`` and ``kv_cache_sf`` in place.
+
+    Note
+    ----
+    The function assumes that the space for appended K/V rows has already been
+    allocated and described by ``kv_indices``, ``kv_indptr``, and
+    ``kv_last_page_len``.
+    """
+    _check_kv_layout(kv_layout)
+    if append_key.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"append_key must be float16 or bfloat16, got {append_key.dtype}"
+        )
+    if append_value.dtype != append_key.dtype:
+        raise ValueError(
+            f"append_key and append_value must have the same dtype, got "
+            f"{append_key.dtype} and {append_value.dtype}"
+        )
+    paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
+    k_scale_cache, v_scale_cache = _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
+    if paged_k_cache.dtype != torch.uint8 or paged_v_cache.dtype != torch.uint8:
+        raise ValueError("NVFP4 paged K/V cache tensors must have dtype torch.uint8")
+    if (
+        k_scale_cache.dtype != torch.float8_e4m3fn
+        or v_scale_cache.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError(
+            "NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn"
+        )
+    k_scale = float(k_scale)
+    v_scale = float(v_scale)
+    if (
+        not math.isfinite(k_scale)
+        or not math.isfinite(v_scale)
+        or k_scale <= 0.0
+        or v_scale <= 0.0
+    ):
+        raise ValueError(
+            "k_scale and v_scale must be positive finite global decode scales"
+        )
+
+    _nvfp4_quantize_append_paged_kv_cache_kernel(
+        append_key,
+        append_value,
+        batch_indices,
+        positions,
+        paged_k_cache,
+        paged_v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        k_scale,
+        v_scale,
+        TensorLayout[kv_layout].value,
+    )
+
+
+def _as_float32_scalar_tensors(
+    values: Tuple[Tuple[str, Union[float, torch.Tensor]], ...],
+    *,
+    device: torch.device,
+) -> Tuple[torch.Tensor, ...]:
+    stream_capturing = _is_stream_capturing_on_device(device)
+
+    tensors = []
+    cuda_tensors_to_validate = []
+    for name, value in values:
+        if not isinstance(value, torch.Tensor):
+            if stream_capturing:
+                raise ValueError(
+                    f"{name} must be a contiguous float32 CUDA tensor on {device} "
+                    "during CUDA graph capture"
+                )
+            scalar = float(value)
+            if not math.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError(
+                    f"{name} must be a positive finite global decode scale"
+                )
+            tensors.append(torch.tensor([scalar], dtype=torch.float32, device=device))
+            continue
+
+        if value.numel() != 1:
+            raise ValueError(
+                f"{name} must have exactly one element, got {value.numel()}"
+            )
+        if value.dtype != torch.float32:
+            raise ValueError(f"{name} must be torch.float32, got {value.dtype}")
+        is_cuda_tensor = value.is_cuda
+        is_capturing = stream_capturing
+        if is_capturing and (
+            not is_cuda_tensor or value.device != device or not value.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous float32 CUDA tensor on {device} "
+                "during CUDA graph capture"
+            )
+        if not is_cuda_tensor:
+            scalar = float(value.item())
+            if not math.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError(
+                    f"{name} must be a positive finite global decode scale"
+                )
+        if value.device != device:
+            value = value.to(device=device)
+        value = value.contiguous()
+        tensors.append(value)
+        if is_capturing:
+            continue
+        if is_cuda_tensor:
+            cuda_tensors_to_validate.append((name, value))
+
+    # Validate CUDA scalar tensors with one device-to-host transfer instead of
+    # a separate implicit sync for each tensor.
+    if cuda_tensors_to_validate:
+        host_values = (
+            torch.stack([value.reshape(()) for _, value in cuda_tensors_to_validate])
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        for (name, _), scalar in zip(
+            cuda_tensors_to_validate, host_values, strict=True
+        ):
+            scalar = float(scalar)
+            if not math.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError(
+                    f"{name} must be a positive finite global decode scale"
+                )
+
+    return tuple(tensors)
+
+
+def _is_stream_capturing_on_device(device: torch.device) -> bool:
+    if not hasattr(torch.cuda, "is_current_stream_capturing"):
+        return False
+    if device.type != "cuda":
+        return False
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+@flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace)
+def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_cache_sf: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    k_scale: Union[float, torch.Tensor],
+    v_scale: Union[float, torch.Tensor],
+    kv_layout: str = "NHD",
+) -> None:
+    r"""Quantize and write K/V rows into an NVFP4 paged KV cache by slot mapping.
+
+    This variant is intended for runtimes that already assign each token to a
+    flat cache slot. ``slot_mapping[i]`` is interpreted as
+    ``page_id * page_size + entry_idx``. Negative slots are padding and are
+    ignored. ``append_key`` and ``append_value`` may contain additional padded
+    rows; only ``slot_mapping.shape[0]`` rows are considered.
+
+    Parameters
+    ----------
+    append_key : torch.Tensor
+        The key tensor to quantize and write, shape
+        ``[num_rows, num_kv_heads, head_dim]`` with dtype ``torch.float16`` or
+        ``torch.bfloat16``. ``num_rows`` must be at least
+        ``slot_mapping.shape[0]``.
+    append_value : torch.Tensor
+        The value tensor to quantize and write, with the same shape and dtype
+        as ``append_key``.
+    slot_mapping : torch.Tensor
+        Flat cache slot for each row to write, shape ``[nnz]`` with dtype
+        ``torch.int32`` or ``torch.int64``. Negative entries are ignored.
+    paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned packed NVFP4 K/V cache. For tuple input, each tensor has
+        shape ``[max_num_pages, page_size, num_kv_heads, head_dim // 2]`` when
+        ``kv_layout="NHD"`` and ``[max_num_pages, num_kv_heads, page_size,
+        head_dim // 2]`` when ``kv_layout="HND"``. A stacked 5-D cache is also
+        accepted with K/V on the second dimension.
+    kv_cache_sf : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned FP8 E4M3 scale cache with the same tuple or stacked cache
+        format as ``paged_kv_cache``, replacing ``head_dim // 2`` with
+        ``head_dim // 16``.
+    k_scale : Union[float, torch.Tensor]
+        Positive finite global decode scale for K. During CUDA graph capture,
+        this must be a contiguous scalar ``torch.float32`` CUDA tensor on the
+        same device as ``append_key``.
+    v_scale : Union[float, torch.Tensor]
+        Positive finite global decode scale for V. During CUDA graph capture,
+        this must be a contiguous scalar ``torch.float32`` CUDA tensor on the
+        same device as ``append_key``.
+    kv_layout : str
+        Layout of the paged KV cache, either ``"NHD"`` or ``"HND"``.
+
+    Returns
+    -------
+    None
+        This function updates ``paged_kv_cache`` and ``kv_cache_sf`` in place.
+    """
+    _check_kv_layout(kv_layout)
+    if append_key.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"append_key must be float16 or bfloat16, got {append_key.dtype}"
+        )
+    if append_value.dtype != append_key.dtype:
+        raise ValueError(
+            f"append_key and append_value must have the same dtype, got "
+            f"{append_key.dtype} and {append_value.dtype}"
+        )
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}"
+        )
+    if (
+        append_key.shape[0] < slot_mapping.shape[0]
+        or append_value.shape[0] < slot_mapping.shape[0]
+    ):
+        raise ValueError(
+            "append_key and append_value must have at least slot_mapping.shape[0] rows"
+        )
+
+    paged_k_cache, paged_v_cache = _unpack_paged_kv_cache(paged_kv_cache, kv_layout)
+    k_scale_cache, v_scale_cache = _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
+    if paged_k_cache.dtype != torch.uint8 or paged_v_cache.dtype != torch.uint8:
+        raise ValueError("NVFP4 paged K/V cache tensors must have dtype torch.uint8")
+    if (
+        k_scale_cache.dtype != torch.float8_e4m3fn
+        or v_scale_cache.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError(
+            "NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn"
+        )
+
+    k_scale_tensor, v_scale_tensor = _as_float32_scalar_tensors(
+        (("k_scale", k_scale), ("v_scale", v_scale)),
+        device=append_key.device,
+    )
+
+    _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
+        append_key,
+        append_value,
+        slot_mapping,
+        paged_k_cache,
+        paged_v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        k_scale_tensor,
+        v_scale_tensor,
         TensorLayout[kv_layout].value,
     )
