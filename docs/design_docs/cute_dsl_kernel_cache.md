@@ -50,7 +50,7 @@ directory, and the in-process compiled function is returned directly.
 
 CuTe-DSL modules live in `cached_ops/` next to the nvcc modules, one directory per op family:
 
-```
+```text
 ~/.cache/flashinfer/<version>/<archs>/cached_ops/
 ├── fp4_quantization_100/                 # nvcc module (JitSpec + ninja)
 │   ├── fp4_quantization_100.so           #   one multi-function fatbin .so
@@ -123,6 +123,7 @@ compiles on the first run and is compile-free on every subsequent run.
 ## 5. Limitations and future work
 
 - **Rollout**: only nvfp4_quantize is currently wired up. Other cute-dsl call sites should follow the same pattern: wrap the existing `cute.compile` call in a closure and name the specialization.
-- **No `JitSpecRegistry` / AOT integration**: cute-dsl kernels are invisible to `flashinfer aot` and `flashinfer-jit-cache` packaging, and do not honor `FLASHINFER_DISABLE_JIT`. AOT support would prebuild the module directories (or link them into `.so`s, see 3.2).
+- **No `JitSpecRegistry` / AOT integration**: cute-dsl kernels are invisible to `flashinfer aot` and `flashinfer-jit-cache` packaging, and do not honor `FLASHINFER_DISABLE_JIT`. AOT support would prebuild the module directories (or link them into `.so`s, see 3.1).
 - **Cross-compile keying**: the arch key mirrors `CUTE_DSL_ARCH`-else-device, but a per-compile `gpu_arch` override passed through `cute.compile` options would not be reflected. No current call site does this.
+- **Single-target-arch assumption (heterogeneous multi-GPU)**: the cache key records what `cute.compile` actually compiles for — the DSL's resolved target (`CUTE_DSL_ARCH`, else the *current* device). Compiling for a non-current device in a mixed-arch process is not supported: it would require steering the compilation itself (per-compile `gpu_arch`) together with the key, not just parameterizing the key. The in-process `@functools.cache` level has the same current-device assumption today, so the disk cache does not regress multi-GPU behavior.
 - **Module-granular wipes**: a single source edit recompiles every cached specialization of that module on next use. Acceptable for development (matches nvcc behavior); irrelevant for deployments with immutable packages.

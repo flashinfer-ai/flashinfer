@@ -12,23 +12,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
-Disk cache for JIT-compiled CuTe-DSL kernels
-============================================
-
-Mirrors the two-level caching used by ``JitSpec`` for nvcc-compiled modules
-(in-memory ``functools.cache`` + on-disk artifact under
-``FLASHINFER_JIT_DIR``), but for kernels compiled with
-``cute.compile(..., options="--enable-tvm-ffi")``.
-
-Invalidation is module-granular, mirroring ninja's module rebuilds: when the
-nvidia-cutlass-dsl version or the SHA256 of the kernel-defining source files
-changes, the whole module directory is wiped and repopulated lazily.
-FlashInfer version changes are handled by ``FLASHINFER_WORKSPACE_DIR``.
-A kernel artifact is valid iff its ``.o`` exists AND ``meta.json`` matches;
-``.o`` files are written atomically, and ``meta.json`` is only written after
-the first successful export, so a crash never leaves a loadable partial
-entry.
 """
 
 import functools
@@ -63,7 +46,6 @@ def _get_cute_dsl_version() -> str:
         return "unknown"
 
 
-@functools.cache
 def _hash_source_files(paths: tuple) -> str:
     sha = hashlib.sha256()
     for path in sorted(str(p) for p in paths):
@@ -130,6 +112,15 @@ def build_and_load_cute_dsl_kernel(
     if cute_dsl_cache_disabled():
         return compile_fn()
 
+    try:
+        source_sha256 = _hash_source_files(tuple(extra_key_files))
+    except (OSError, TypeError) as e:
+        logger.warning(
+            f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
+            f"({e}); bypassing the disk cache for this kernel."
+        )
+        return compile_fn()
+
     kernel_name = sanitize_symbol_name(kernel_name)
     module_dir_name = sanitize_symbol_name(
         f"{module_name}_{_get_compile_arch()}_cute_dsl"
@@ -141,7 +132,7 @@ def build_and_load_cute_dsl_kernel(
         "module": module_dir_name,
         "arch": _get_compile_arch(),
         "cute_dsl_version": _get_cute_dsl_version(),
-        "source_sha256": _hash_source_files(tuple(extra_key_files)),
+        "source_sha256": source_sha256,
     }
 
     kernel = _try_load_cached_kernel(module_dir, object_path, symbol, expected_meta)
@@ -158,8 +149,10 @@ def build_and_load_cute_dsl_kernel(
 
         # Stale module (dsl version / source change): wipe it, like a ninja
         # rebuild of the whole module. Open .o files stay mapped (POSIX).
+        # Also wipes a module with missing meta.json (crash before the meta
+        # write): an orphaned .o must not be adopted by fresh metadata.
         meta_path = module_dir / _META_FILENAME
-        if meta_path.exists() and _read_meta(meta_path) != expected_meta:
+        if module_dir.exists() and _read_meta(meta_path) != expected_meta:
             logger.info(f"Invalidating stale CuTe-DSL module {module_dir_name}")
             shutil.rmtree(module_dir, ignore_errors=True)
 
