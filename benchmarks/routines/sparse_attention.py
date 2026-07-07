@@ -279,7 +279,6 @@ def testMSAProxyScore(args):
     b_per_elem = 0.5625 if is_fp4 else 2.0
 
     res = []
-    # one CuTe-DSL implementation; the loop is a single pass (precision is q_dtype).
     for b in _resolve_backends(args):
         times = bench_gpu_time(
             fn=run,
@@ -290,8 +289,8 @@ def testMSAProxyScore(args):
             input_args=(b,),
         )
         median = float(np.median(times))  # milliseconds
-        # dense QK over the proxy: 2 * total_q * total_kv * Hq * head_dim (per
-        # request). times are in ms, so 1e9*ms == 1e12*s gives TFLOPs / TB/s.
+        # Dense QK over the proxy: 2 * s_qo * s_kv * Hq * head_dim per request.
+        # times are in ms, so flops / (1e9 * ms) gives TFLOPs (not 1e12).
         flops = 2 * bs * s_qo * s_kv * Hq * 128
         tflops = flops / (1e9 * median)
         # Physical HBM K bytes: the index K is one kv_head wide, read once per
@@ -342,7 +341,7 @@ def testMSAProxyScore(args):
 
 
 def testMSASparseAttention(args):
-    """Stage 3: KV-major sparse prefill (hot path); auto-builds CSR + combine."""
+    """Stage 3: union-tile sparse prefill on the selected KV blocks."""
     if args.verbose >= 1:
         print(
             f"[INFO] Running testMSASparseAttention | FlashInfer {flashinfer.__version__}"
@@ -388,7 +387,8 @@ def testMSASparseAttention(args):
             use_cuda_graph=False,
             input_args=(b,),
         )
-        # selected work: ~ total_q * topk blocks of 128 tokens; QK + PV ~ 4 flops/MAC
+        # Selected work: total_q * topk blocks of 128 tokens; QK + PV are two
+        # GEMMs, so 4 flops per (token, column, channel).
         flops = 4 * total_q * args.topk * BLK_KV * Hq * 128
         tflops = flops / (1e9 * float(np.median(times)))
         res.append(
@@ -495,13 +495,13 @@ def testMSAPipeline(args):
     cu_q, cu_k = _cu_seqlens(bs, s_qo, device), _cu_seqlens(bs, s_kv, device)
     k_in, v_in, extra = _maybe_quantize_kv(k, v, kv_dtype)
     scale = 1.0 / math.sqrt(128)
-    # proxy uses unquantized K (the cheap proxy pass)
+    # The bf16 proxy reads unquantized K; --kv_dtype applies to the attention stage.
     proxy_k = k
 
     def run(_b):
         max_score = msa_proxy_score(q, proxy_k, cu_q, cu_k, causal=args.causal)
         sel = msa_topk_select(max_score, args.topk)  # (total_q, Hq, topk)
-        # map per-(qo-head) selection onto the per-kv-head q2k layout the
+        # Map the per-(qo-head) selection onto the per-kv-head q2k layout the
         # attention kernel consumes: take the first kv-group head's selection.
         q2k = sel[:, :: (Hq // Hkv), :].transpose(0, 1).contiguous().to(torch.int32)
         return msa_sparse_attention(

@@ -249,12 +249,36 @@ def test_sparse_attention_paged():
     assert torch.equal(out_paged, out_flat)
 
 
+def _combine_partials_torch(
+    o_partial, lse_partial, split_counts, group_size, out_dtype
+):
+    """LSE-weighted reduction over each query's split slots (torch reference
+    for the CUDA combine kernel). ``lse_partial`` is in the log2 domain."""
+    topk = o_partial.shape[0]
+    counts = split_counts.repeat_interleave(group_size, dim=1)  # [total_q, Hq]
+    slots = torch.arange(topk, device=o_partial.device).view(topk, 1, 1)
+    mask = slots < counts.unsqueeze(0)  # [topk, total_q, Hq]
+    neg_inf = torch.finfo(torch.float32).min
+    lse = torch.where(mask, lse_partial, neg_inf)
+    lse_max = lse.max(dim=0, keepdim=True).values
+    w = torch.exp2(lse - lse_max)
+    w = torch.where(mask, w, 0.0)
+    denom = w.sum(dim=0)
+    # Mask the partials too: slots >= count hold uninitialized memory, and
+    # 0 * inf/NaN would poison the sum.
+    o_masked = torch.where(mask.unsqueeze(-1), o_partial.float(), 0.0)
+    out = (o_masked * w.unsqueeze(-1)).sum(dim=0)
+    out = out / denom.unsqueeze(-1)
+    out = torch.nan_to_num(out, nan=0.0)  # queries with zero valid splits
+    return out.to(out_dtype)
+
+
 def test_fused_combine_matches_torch():
     _skip_if_unsupported()
     import importlib
 
-    # the msa_sparse_attention *function* shadows the submodule on attribute import
-    sa = importlib.import_module("flashinfer.msa_ops.sparse_attention")
+    # The msa_sparse_attention *function* shadows the submodule on attribute import.
+    sa = importlib.import_module("flashinfer.msa_ops.sparse_decode")
 
     torch.manual_seed(50)
     dev = "cuda"
@@ -263,7 +287,7 @@ def test_fused_combine_matches_torch():
     o_p = torch.randn(topk, total_q, Hq, d, dtype=torch.bfloat16, device=dev)
     lse_p = torch.randn(topk, total_q, Hq, dtype=torch.float32, device=dev) * 4
     counts = torch.randint(0, topk + 1, (total_q, Hkv), dtype=torch.int32, device=dev)
-    ref = sa._combine_partials_torch(o_p, lse_p, counts, G, torch.bfloat16)
+    ref = _combine_partials_torch(o_p, lse_p, counts, G, torch.bfloat16)
     got = sa._combine_partials(o_p, lse_p, counts, G, torch.bfloat16)
     torch.cuda.synchronize()
     err = (got.float() - ref.float()).abs().max().item()
@@ -305,7 +329,7 @@ def test_sparse_attention_fp8_kv(q_dtype, causal):
         q, k8, v8, idx, cu_q, cu_k, causal=causal, softmax_scale=scale
     )
     torch.cuda.synchronize()
-    # reference uses the dequantized K/V (quantization error cancels)
+    # Reference uses the dequantized K/V so the quantization error cancels.
     ref = _ref_sparse_attention(
         q.cpu(),
         k8.to(q_dtype).cpu(),
@@ -426,8 +450,8 @@ def test_sparse_decode(B, sq, Hq, Hkv, topk, kv_dtype, paged):
     ],
 )
 def test_sparse_decode_fused(B, sq, Hq, Hkv, topk, kv_dtype, paged):
-    # fused decode (force_fused=True: one CTA per token, no combine) must match
-    # the per-block split+combine path (output and LSE) and the torch oracle
+    """Fused decode (force_fused=True: one CTA per token, no combine) must match
+    the per-block split+combine path (output and LSE) and the torch oracle."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_sparse_decode_attention
 
@@ -469,7 +493,7 @@ def test_sparse_decode_fused(B, sq, Hq, Hkv, topk, kv_dtype, paged):
         q.cpu(), k_ref.cpu(), v_ref.cpu(), idx.cpu(), cu_q, cu_k.cpu(), True, scale
     )
     assert (out_fused.float().cpu() - ref).abs().max().item() < 2.5e-2
-    # fused must agree with the proven split path to ~bf16 precision
+    # Fused must agree with the split path to ~bf16 precision.
     assert (out_fused.float() - out_split.float()).abs().max().item() < 5e-3
     finite = torch.isfinite(lse_split) & torch.isfinite(lse_fused)
     assert (lse_fused[finite] - lse_split[finite]).abs().max().item() < 5e-3
@@ -515,7 +539,8 @@ def test_sparse_decode_cuda_graph():
 
 
 def _msa_nvfp4_dequant(packed_u8, sf_u8, global_scale, rows, d):
-    """Reference dequant per the MSA contract (quantize.py)."""
+    """Reference NVFP4 dequant: e2m1 nibbles + e4m3 block scales in the
+    cuBLAS 128x4 tiled layout."""
     dev = packed_u8.device
     lut = torch.tensor(
         [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
@@ -717,7 +742,7 @@ def test_msa_topk_select_forced_and_clamped(P):
     topk, nvp, fb, fe = 16, P - 56, 3, 2
     max_score = torch.randn(H, P, S, dtype=torch.float32, device=dev)
     max_score[:, nvp:, :] = float("-inf")
-    # give the forced regions the WORST scores: they must still be selected
+    # Give the forced regions the WORST scores: they must still be selected.
     max_score[:, :fb, :] = -1e10
     max_score[:, nvp - fe : nvp, :] = -1e10
 
@@ -739,17 +764,46 @@ def test_msa_topk_select_forced_and_clamped(P):
             assert (valid < nvp).all(), "num_valid_pages clamp violated"
             sel = set(valid.tolist())
             assert forced <= sel, f"forced blocks missing: q={qi} h={h}"
-            # the rest must be the top-(topk - forced) of the middle region
+            # The rest must be the top-(topk - forced) of the middle region.
             rest = sorted(sel - forced)
             mid_scores = max_score[h, fb : nvp - fe, qi]
             expect = torch.topk(mid_scores, topk - fb - fe).indices + fb
             assert rest == sorted(expect.tolist()), f"q={qi} h={h}"
 
-    # clamping alone (no forced blocks)
+    # Clamping alone, no forced blocks.
     out2 = msa_topk_select(max_score, topk, num_valid_pages=nvp)
     torch.cuda.synchronize()
     v = out2[out2 >= 0]
     assert (v < nvp).all()
+
+
+def test_msa_topk_select_large_max_k_tiles():
+    """Radix top-k at large max_k_tiles (16384 blocks = 2M-token context),
+    including scores that share the top key bits so every radix stage's
+    threshold bin overflows the staging buffer and falls through to the next.
+    Exact ties make index sets ambiguous, so compare the selected VALUES; the
+    kernel drops key bits 0-1, so allow 3 ulp per value."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_topk_select
+
+    torch.manual_seed(140)
+    dev = "cuda"
+    H, P, S, topk = 2, 16384, 32, 16
+    random_scores = torch.randn(H, P, S, dtype=torch.float32, device=dev)
+    # All values in [1.0, 1.0 + 2^-13): identical key bits 31..12, so all P
+    # items land in one bin at stage 1 AND stage 2.
+    tied_scores = 1.0 + torch.rand(H, P, S, device=dev) * (2.0**-13)
+    for score in (random_scores, tied_scores):
+        out = msa_topk_select(score, topk)
+        torch.cuda.synchronize()
+        assert (out >= 0).all() and (out < P).all()
+        assert (out.diff(dim=-1) > 0).all(), "indices must be ascending"
+        ref_vals = torch.topk(score.permute(2, 0, 1), topk, dim=-1).values
+        for q in range(0, S, 5):
+            for h in range(H):
+                got = score[h, out[q, h].long(), q].sort(descending=True).values
+                ulp = (got.view(torch.int32) - ref_vals[q, h].view(torch.int32)).abs()
+                assert ulp.max().item() <= 3, f"q={q} h={h} ulp {ulp.max().item()}"
 
 
 def test_msa_topk_select_input_guards():
@@ -872,10 +926,10 @@ def test_fully_masked_selected_blocks():
     k = torch.randn(seqlen, Hkv, 128, dtype=dtype, device=dev) / 3
     v = torch.randn(seqlen, Hkv, 128, dtype=dtype, device=dev) / 3
     idx = torch.full((Hkv, seqlen, topk), -1, dtype=torch.int32, device=dev)
-    # first 64 tokens select ONLY the last two blocks -> fully causally masked
+    # First 64 tokens select ONLY the last two blocks -> fully causally masked.
     idx[0, :64, 0] = nb - 2
     idx[0, :64, 1] = nb - 1
-    # remaining tokens select a mix (some masked, some visible)
+    # Remaining tokens select a mix (some masked, some visible).
     for qi in range(64, seqlen):
         nsel = min((qi % topk) + 1, nb)
         sel = torch.randperm(nb)[:nsel].sort().values
@@ -898,7 +952,7 @@ def test_fully_masked_selected_blocks():
         assert torch.isfinite(out.float()).all(), f"NaN/Inf in {name}"
         assert (out[:64].float() == 0).all(), f"{name}: masked rows must be zero"
     assert (lse[:64] == float("-inf")).all(), "LSE of masked rows must be -inf"
-    # rows 64+ select >=1 block, but some selections may be fully causally masked
+    # Rows 64+ select >=1 block, but some selections may be fully causally masked
     # (-> LSE -inf). The real invariant is "no NaN": LSE must be finite or -inf.
     assert not torch.isnan(lse[64:]).any(), "LSE must be finite or -inf, never NaN"
     ref = _ref_sparse_attention(
@@ -1029,7 +1083,7 @@ def test_msa_proxy_score_reduce_heads(Hq, Hkv):
     assert reduced.shape == (1, per_head.shape[1], total_q)
     assert torch.equal(reduced, per_head.amax(dim=0, keepdim=True))
 
-    # caller-provided output of the reduced shape is honored
+    # A caller-provided output of the reduced shape is honored.
     out = torch.empty_like(reduced)
     ret = msa_proxy_score(q, k, cu_q, cu_k, causal=True, reduce_heads=True, output=out)
     torch.cuda.synchronize()
@@ -1061,7 +1115,7 @@ def test_msa_proxy_score_paged_fp8():
     out_deq = msa_proxy_score(q, k8.to(torch.bfloat16), cu_q, cu_k, causal=True)
     torch.cuda.synchronize()
     assert torch.equal(out_fp8, out_deq)
-    # paged (permuted pages) == flat, bit-identical
+    # Paged (permuted pages) == flat, bit-identical.
     npg = [s // BLK_KV for s in seqs_k]
     tp = sum(npg)
     perm = torch.randperm(tp)
@@ -1101,14 +1155,14 @@ def test_e2e_full_pipeline_from_raw_tensors():
     q = torch.randn(seqlen_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
     v = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
-    # proxy Q with one head per KV head (the MSA reference configuration)
+    # Proxy Q with one head per KV head.
     proxy_q = torch.randn(seqlen_q, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
 
     max_score = msa_proxy_score(proxy_q, k, cu_q, cu_k, causal=True)
     idx_qmajor = msa_topk_select(max_score.contiguous(), topk)
     idx = idx_qmajor.permute(1, 0, 2).contiguous()  # (Hkv, total_q, topk)
     torch.cuda.synchronize()
-    # causal proxy => selected blocks never start beyond the query position
+    # Causal proxy => selected blocks never start beyond the query position.
     for qi in range(0, seqlen_q, 37):
         q_pos = qi + seqlen_k - seqlen_q
         sel = idx[:, qi][idx[:, qi] >= 0]
@@ -1219,7 +1273,7 @@ def test_q_offset_override():
         err = (out.float().cpu() - ref).abs().max().item()
         assert err < 2.5e-2, f"{name}: err={err}"
 
-    # proxy with offsets: -inf exactly where the block is fully masked
+    # Proxy with offsets: -inf exactly where the block is fully masked.
     ms = msa_proxy_score(q, k, cu_q, cu_k, causal=True, q_offset=q_offsets)
     torch.cuda.synchronize()
     for b in range(B):
@@ -1340,8 +1394,8 @@ def test_fp8_q_decode():
 
 
 def test_msa_topk_select_countrank_matches_radix_on_nan():
-    # both kernels must produce the same, deterministic selection even when the
-    # proxy emits NaN scores (count-rank ranks on the radix bit-key)
+    """Both kernels must produce the same, deterministic selection even when the
+    proxy emits NaN scores (count-rank ranks on the radix bit-key)."""
     _skip_if_unsupported()
     from flashinfer.msa_ops.sparse_topk_select import _get_compiled_topk
 
@@ -1354,7 +1408,7 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
     outs = []
     for small in (True, False, True):
         out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
-        _get_compiled_topk(topk, small)(score, out, P, 0, 0, S, H, P)
+        _get_compiled_topk(topk, small)(score, out, P, 0, 0, S, H)
         outs.append(out.cpu())
     assert torch.equal(outs[0], outs[2]), "count-rank nondeterministic on NaN"
     assert torch.equal(outs[0], outs[1]), "count-rank != radix on NaN scores"

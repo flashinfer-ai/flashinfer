@@ -64,7 +64,6 @@ def _get_compiled_topk(topk: int, small: bool):
         cutlass.Int32(0),  # force_end
         cutlass.Int32(1),  # total_qo_len
         cutlass.Int32(1),  # num_qo_heads
-        cutlass.Int32(1),  # max_k_tiles
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -174,14 +173,11 @@ def msa_topk_select(
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
 
-    # Multi-stage radix select refines the threshold bin ~10 bits per stage, so
-    # its staging buffer is bounded and it supports max_k_tiles < 12288 (~1.5M ctx).
-    if max_k_tiles >= 12288:
-        raise ValueError(f"max_k_tiles must be < 12288, got {max_k_tiles}")
     from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
 
-    # dispatch on the runtime valid-page count: the count-rank kernel only ever
-    # touches blocks below num_valid_pages, regardless of the allocated score dim
+    # Dispatch on the runtime valid-page count: the count-rank kernel only ever
+    # touches blocks below num_valid_pages, regardless of the allocated score
+    # dimension.
     small = int(num_valid_pages) <= _MAX_BLOCKS
     _get_compiled_topk(topk, small)(
         max_score,
@@ -191,7 +187,6 @@ def msa_topk_select(
         int(force_end_blocks),
         int(total_qo_len),
         int(num_qo_heads),
-        int(max_k_tiles),
     )
 
     return output

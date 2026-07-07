@@ -21,216 +21,13 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
 from ..utils import is_sm12x_supported
-
-_BLK_KV = 128
-
-_compile_cache: dict = {}
-
-
-def _q_offset_tensor(
-    q_offset,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    device,
-) -> torch.Tensor:
-    """Per-batch causal offset (MSA semantics: query global position =
-    q_offset[b] + local index); defaults to right-aligned (seqlen_k - seqlen_q)."""
-    if q_offset is None:
-        return (
-            (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
-            - (cu_seqlens_q[1:] - cu_seqlens_q[:-1])
-        ).to(torch.int32)
-    return _q_offset_explicit(q_offset, cu_seqlens_q.numel() - 1, device)
-
-
-def _q_offset_explicit(q_offset, batch_size: int, device) -> torch.Tensor:
-    if isinstance(q_offset, int):
-        return torch.full((batch_size,), q_offset, dtype=torch.int32, device=device)
-    if q_offset.dtype != torch.int32:
-        raise ValueError("q_offset must be int32")
-    return q_offset.to(device)
-
-
-def _cutlass_dtype(torch_dtype: torch.dtype):
-    import cutlass
-
-    return {
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float16: cutlass.Float16,
-        torch.float32: cutlass.Float32,
-        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-        torch.uint8: cutlass.Uint8,
-        torch.int32: cutlass.Int32,
-    }[torch_dtype]
-
-
-def _fake(dtype, shape, align=16):
-    """Fake compact row-major tensor for TVM-FFI compilation (compile once
-    against symbolic shapes, pass torch tensors directly at runtime)."""
-    import cutlass.cute as cute
-
-    return cute.runtime.make_fake_compact_tensor(
-        dtype,
-        shape,
-        stride_order=tuple(reversed(range(len(shape)))),
-        assumed_align=align,
-    )
-
-
-def _get_compiled_combine(
-    partial_dtype: torch.dtype,
-    out_dtype: torch.dtype,
-    topk: int,
-    head_dim: int,
-    has_lse_out: bool,
-    has_lse_t: bool,
-):
-    """Compile (cached) the CuTe-DSL combine kernel. Fake dims are independent
-    symbols (loop bounds come from the kernel object, not shapes), so unused
-    optional tensors can be passed as small dummies without symbol conflicts."""
-    import cutlass
-    import cutlass.cute as cute
-
-    from .cute_dsl.sparse_combine_sm12x import SparseCombineSm12x
-
-    key = (
-        "combine",
-        str(partial_dtype),
-        str(out_dtype),
-        topk,
-        head_dim,
-        has_lse_out,
-        has_lse_t,
-    )
-    compiled = _compile_cache.get(key)
-    if compiled is not None:
-        return compiled
-
-    def fsyms(dtype, ndim, align=16):
-        return _fake(
-            _cutlass_dtype(dtype),
-            tuple(cute.sym_int() for _ in range(ndim)),
-            align=align,
-        )
-
-    kernel_obj = SparseCombineSm12x(
-        head_dim=head_dim,
-        topk=topk,
-        partial_is_fp8=partial_dtype == torch.float8_e4m3fn,
-        has_lse_out=has_lse_out,
-        has_lse_t=has_lse_t,
-        num_threads=128,
-    )
-    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    compiled = cute.compile(
-        kernel_obj,
-        fsyms(partial_dtype, 4),  # o_partial (topk, total_q, Hq, d)
-        fsyms(torch.float32, 3, align=4),  # lse_partial
-        fsyms(torch.int32, 2, align=4),  # split_counts
-        fsyms(out_dtype, 3),  # out
-        fsyms(torch.float32, 2, align=4),  # lse_out (or dummy)
-        fsyms(torch.float32, 3, align=4),  # lse_t_partial (or dummy)
-        fsyms(torch.float32, 2, align=4),  # lse_t_out (or dummy)
-        cutlass.Float32(1.0),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        cutlass.Int32(1),
-        stream_fake,
-        options="--enable-tvm-ffi",
-    )
-    _compile_cache[key] = compiled
-    return compiled
-
-
-def _combine_partials_cudsl(
-    o_partial: torch.Tensor,  # [topk, total_q, Hq, d]
-    lse_partial: torch.Tensor,  # [topk, total_q, Hq] f32, log2 domain
-    split_counts: torch.Tensor,  # [total_q, Hkv] int32
-    group_size: int,
-    out_dtype: torch.dtype,
-    lse_out: Optional[torch.Tensor] = None,
-    out_scale: float = 1.0,
-    lse_t_partial: Optional[torch.Tensor] = None,
-    lse_t_out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Fused CuTe-DSL LSE-weighted reduction over each query's split slots."""
-    topk, total_q, num_qo_heads, head_dim = o_partial.shape
-    out = torch.empty(
-        (total_q, num_qo_heads, head_dim), dtype=out_dtype, device=o_partial.device
-    )
-    has_lse_out = lse_out is not None
-    has_lse_t = lse_t_out is not None
-    dev = o_partial.device
-    dummy2 = torch.empty((1, 1), dtype=torch.float32, device=dev)
-    dummy3 = torch.empty((1, 1, 1), dtype=torch.float32, device=dev)
-    compiled = _get_compiled_combine(
-        o_partial.dtype, out_dtype, topk, head_dim, has_lse_out, has_lse_t
-    )
-    compiled(
-        o_partial,
-        lse_partial,
-        split_counts,
-        out,
-        lse_out if has_lse_out else dummy2,
-        lse_t_partial if has_lse_t else dummy3,
-        lse_t_out if has_lse_t else dummy2,
-        float(out_scale),
-        int(total_q),
-        int(num_qo_heads),
-        int(group_size),
-    )
-    return out
-
-
-def _combine_partials(
-    o_partial: torch.Tensor,  # [topk, total_q, Hq, d]
-    lse_partial: torch.Tensor,  # [topk, total_q, Hq] f32, log2 domain
-    split_counts: torch.Tensor,  # [total_q, Hkv] int32
-    group_size: int,
-    out_dtype: torch.dtype,
-    lse_out: Optional[torch.Tensor] = None,
-    out_scale: float = 1.0,
-    lse_t_partial: Optional[torch.Tensor] = None,
-    lse_t_out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    return _combine_partials_cudsl(
-        o_partial,
-        lse_partial,
-        split_counts,
-        group_size,
-        out_dtype,
-        lse_out=lse_out,
-        out_scale=out_scale,
-        lse_t_partial=lse_t_partial,
-        lse_t_out=lse_t_out,
-    )
-
-
-def _combine_partials_torch(
-    o_partial: torch.Tensor,  # [topk, total_q, Hq, d]
-    lse_partial: torch.Tensor,  # [topk, total_q, Hq] f32, log2 domain
-    split_counts: torch.Tensor,  # [total_q, Hkv] int32
-    group_size: int,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    """LSE-weighted reduction over each query's split slots (torch reference)."""
-    topk = o_partial.shape[0]
-    counts = split_counts.repeat_interleave(group_size, dim=1)  # [total_q, Hq]
-    slots = torch.arange(topk, device=o_partial.device).view(topk, 1, 1)
-    mask = slots < counts.unsqueeze(0)  # [topk, total_q, Hq]
-    neg_inf = torch.finfo(torch.float32).min
-    lse = torch.where(mask, lse_partial, neg_inf)
-    lse_max = lse.max(dim=0, keepdim=True).values
-    w = torch.exp2(lse - lse_max)
-    w = torch.where(mask, w, 0.0)
-    denom = w.sum(dim=0)
-    # mask the partials too: slots >= count hold uninitialized memory, and
-    # 0 * inf/NaN would poison the sum
-    o_masked = torch.where(mask.unsqueeze(-1), o_partial.float(), 0.0)
-    out = (o_masked * w.unsqueeze(-1)).sum(dim=0)
-    out = out / denom.unsqueeze(-1)
-    out = torch.nan_to_num(out, nan=0.0)  # queries with zero valid splits
-    return out.to(out_dtype)
+from ._common import (
+    _BLK_KV,
+    _compile_cache,
+    _cutlass_dtype,
+    _fake,
+    _q_offset_tensor,
+)
 
 
 @flashinfer_api(trace=msa_sparse_attention_trace)
@@ -257,10 +54,9 @@ def msa_sparse_attention(
     """Minimax Sparse Attention forward (prefill) for SM120/SM121.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
-    Runs the query-tile **union** kernel: a CTA owns a tile of query tokens and
-    runs an in-kernel online softmax over the *union* of the blocks they selected,
-    writing the final output directly (no GMEM partials, no combine pass). The
-    union metadata is built internally from ``q2k_indices``.
+    Query tokens are processed in tiles: each tile runs one online softmax over
+    the *union* of the blocks its tokens selected, writing the final output
+    directly. The union metadata is built internally from ``q2k_indices``.
 
     ``q``/``k``/``v`` are ``(total_tokens, num_heads, head_dim)`` with varlen
     offsets ``cu_seqlens_q``/``cu_seqlens_k``; ``q2k_indices`` is
@@ -309,8 +105,8 @@ def msa_sparse_attention(
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be a multiple of num_kv_heads")
     group_size = num_qo_heads // num_kv_heads
-    # union metadata uses a per-token bit mask -> reject a strided q2k (e.g. a bare
-    # permute of msa_topk_select's output).
+    # The union builder indexes q2k_indices as a flat contiguous buffer, so reject
+    # a strided view (e.g. a bare permute of msa_topk_select's output).
     if q2k_indices.dtype != torch.int32 or q2k_indices.ndim != 3:
         raise ValueError("q2k_indices must be int32 of shape (Hkv, total_q, topk)")
     if not q2k_indices.is_contiguous():
@@ -379,7 +175,7 @@ def msa_sparse_attention(
     cu_q_dev = cu_seqlens_q.to(dev, non_blocking=True)
     cu_k_dev = cu_seqlens_k.to(dev, non_blocking=True)
     qoff_dev = _q_offset_tensor(q_offset, cu_q_dev, cu_k_dev, dev)
-    return _msa_sparse_attention_union(
+    return _msa_sparse_prefill(
         q,
         k,
         v,
@@ -404,7 +200,7 @@ def msa_sparse_attention(
     )
 
 
-# int32 union membership mask -> at most 32 query tokens may share one tile.
+# The union membership mask is int32, so at most 32 query tokens may share a tile.
 _UNION_MAX_TOKENS_PER_TILE = 32
 _LN2 = 0.6931471805599453
 
@@ -423,7 +219,117 @@ def _union_tile_config(group_size: int):
     )
 
 
-def _msa_sparse_attention_union(
+def _get_compiled_union(topk: int, tokens_per_tile: int):
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.sparse_prefill_sm12x import BuildUnionMetaSm12x
+
+    key = ("union_meta", topk, tokens_per_tile)
+    compiled = _compile_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    def fake_i32(ndim):
+        return _fake(cutlass.Int32, tuple(cute.sym_int() for _ in range(ndim)), align=4)
+
+    kernel_obj = BuildUnionMetaSm12x(topk=topk, tokens_per_tile=tokens_per_tile)
+    compiled = cute.compile(
+        kernel_obj,
+        fake_i32(3),  # q2k
+        fake_i32(1),  # tile_batch
+        fake_i32(1),  # tile_t
+        fake_i32(1),  # tile_qbase
+        fake_i32(1),  # tile_ntok
+        fake_i32(2),  # union_blocks (out)
+        fake_i32(2),  # union_masks (out)
+        fake_i32(1),  # union_count (out)
+        fake_i32(2),  # work_meta (out)
+        cutlass.Int32(1),  # H
+        cutlass.Int32(1),  # total_tiles
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+    _compile_cache[key] = compiled
+    return compiled
+
+
+def _build_union_metadata_device(
+    q2k_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    tokens_per_tile: int,
+    topk: int,
+):
+    """On-device, CUDA-graph-capturable union-metadata builder. Returns
+    per-(batch, q-tile, kv-head) ``(union_blocks, union_masks, union_count,
+    work_meta, work_items)``; work-item order is arbitrary — the forward
+    scatters by ``work_meta``."""
+    num_kv_heads, total_q, topk_in = q2k_indices.shape
+    if topk_in != topk:
+        raise ValueError(f"q2k_indices topk {topk_in} != {topk}")
+    dev = q2k_indices.device
+    max_union = tokens_per_tile * topk
+    tpt = tokens_per_tile
+    batch_size = cu_seqlens_q.shape[0] - 1
+
+    # Static upper bound on the (batch, q-tile) count, from shapes only so it is
+    # capture-safe: sum_b ceil(seqlen_b / tpt) <= ceil(total_q / tpt) + batch_size.
+    # The extra slots stay empty.
+    total_tiles = (total_q + tpt - 1) // tpt + batch_size
+    work_items = total_tiles * num_kv_heads
+
+    if work_items == 0:
+        zeros2 = torch.empty((0, max_union), dtype=torch.int32, device=dev)
+        return (
+            zeros2,
+            zeros2.clone(),
+            torch.empty((0,), dtype=torch.int32, device=dev),
+            torch.empty((0, 3), dtype=torch.int32, device=dev),
+            0,
+        )
+
+    # Per-tile geometry, computed on device (no cu_seqlens host copy, so it is
+    # capture-safe): map each flat tile index to its batch via searchsorted over
+    # the per-batch tile cumsum. Padding indices clamp to the last batch and get
+    # tile_ntok = 0.
+    cu = cu_seqlens_q.to(dtype=torch.int64)
+    seqlens = cu[1:] - cu[:-1]
+    ntiles = (seqlens + tpt - 1) // tpt
+    offsets = torch.cumsum(ntiles, 0)  # exclusive-end tile index per batch
+    t = torch.arange(total_tiles, dtype=torch.int64, device=dev)
+    tile_batch = torch.clamp(
+        torch.searchsorted(offsets, t, right=True), max=batch_size - 1
+    )
+    tile_t = t - (offsets - ntiles)[tile_batch]  # within-batch tile index
+    tile_qbase = cu[:-1][tile_batch] + tile_t * tpt
+    tile_ntok = torch.clamp(seqlens[tile_batch] - tile_t * tpt, min=0, max=tpt)
+
+    def _to_dev(t: torch.Tensor) -> torch.Tensor:
+        return t.to(dtype=torch.int32, device=dev)
+
+    union_blocks = torch.empty((work_items, max_union), dtype=torch.int32, device=dev)
+    union_masks = torch.empty((work_items, max_union), dtype=torch.int32, device=dev)
+    union_count = torch.empty((work_items,), dtype=torch.int32, device=dev)
+    work_meta = torch.empty((work_items, 3), dtype=torch.int32, device=dev)
+
+    compiled = _get_compiled_union(topk, tpt)
+    compiled(
+        q2k_indices,
+        _to_dev(tile_batch),
+        _to_dev(tile_t),
+        _to_dev(tile_qbase),
+        _to_dev(tile_ntok),
+        union_blocks,
+        union_masks,
+        union_count,
+        work_meta,
+        int(num_kv_heads),
+        int(total_tiles),
+    )
+    return union_blocks, union_masks, union_count, work_meta, work_items
+
+
+def _msa_sparse_prefill(
     q,
     k,
     v,
@@ -448,18 +354,17 @@ def _msa_sparse_attention_union(
     v_global_scale=None,
 ):
     """Union-tile prefill path. See
-    :class:`...cute_dsl.sparse_fwd_union_sm12x.SparseAttentionUnionFwdSm12x`."""
+    :class:`...cute_dsl.sparse_prefill_sm12x.SparsePrefillSm12x`."""
     import cutlass
     import cutlass.cute as cute
 
-    from .cute_dsl.sparse_fwd_union_sm12x import SparseAttentionUnionFwdSm12x
-    from ._union_metadata import build_msa_union_metadata_device
+    from .cute_dsl.sparse_prefill_sm12x import SparsePrefillSm12x
 
     total_q, num_qo_heads, head_dim = q.shape
     dev = q.device
     paged = page_table is not None
-    # page table is read only on the paged path; a (1, 1) dummy keeps the call
-    # signature uniform for the flat kernel.
+    # The page table is read only on the paged path; a (1, 1) dummy keeps the
+    # call signature uniform for the flat kernel.
     page_table_arg = (
         page_table if paged else torch.zeros((1, 1), dtype=torch.int32, device=dev)
     )
@@ -474,19 +379,18 @@ def _msa_sparse_attention_union(
         k_pass, v_pass = k, v
         ksf_dev = torch.zeros(1, dtype=torch.uint8, device=dev)
         vsf_dev = ksf_dev
-    # V's global scale is applied to the output for any KV dtype (the union has no
-    # combine kernel); K's was pre-folded into softmax_scale by the caller.
+    # V's global scale is applied to the output here, since prefill has no combine
+    # pass to fold it into; K's was pre-folded into softmax_scale by the caller.
     out_scale = float(v_global_scale) if v_global_scale is not None else 1.0
     m_block, num_threads = _union_tile_config(group_size)
     tokens_per_tile = m_block // group_size
 
-    ub, um, uc, wm, n = build_msa_union_metadata_device(
+    ub, um, uc, wm, n = _build_union_metadata_device(
         q2k_indices, cu_q_dev, tokens_per_tile, topk
     )
-    # outputs default to 0 / -inf so query tiles that emit no work item (or rows a
+    # Outputs default to 0 / -inf so query tiles that emit no work item (or rows a
     # tile masks out entirely) read back as a zero output with -inf LSE.
     out = torch.zeros((total_q, num_qo_heads, head_dim), dtype=q.dtype, device=dev)
-    # LSE buffers: full (Hq, total_q) log2-domain when requested, else a (1, 1) dummy.
     # The temperature LSE forces the plain LSE on (it is returned alongside it).
     need_lse = return_softmax_lse or return_temperature_lse
 
@@ -501,7 +405,7 @@ def _msa_sparse_attention_union(
     lse2_t = _lse_buf(return_temperature_lse)
 
     key = (
-        "sparse_attn_union",
+        "sparse_prefill",
         str(q.dtype),
         str(k_pass.dtype),
         group_size,
@@ -524,7 +428,7 @@ def _msa_sparse_attention_union(
         s = [cute.sym_int() for _ in range(19)]
         kv_last = k_pass.shape[-1]  # head_dim (bf16/fp8) or 16 int32 words (NVFP4)
         kv_shape = (s[9], s[10], _BLK_KV, kv_last) if paged else (s[2], s[3], kv_last)
-        kernel_obj = SparseAttentionUnionFwdSm12x(
+        kernel_obj = SparsePrefillSm12x(
             head_dim=head_dim,
             m_block_size=m_block,
             n_block_size=_BLK_KV,
@@ -566,7 +470,7 @@ def _msa_sparse_attention_union(
         )
         _compile_cache[key] = compiled
 
-    # device-native fill (no host->device copy) so the single-call path stays
+    # Device-native fill (no host->device copy) so the single-call path stays
     # CUDA-graph capturable; n is the static work-item upper bound.
     wc = torch.full((1,), n, dtype=torch.int32, device=dev)
     compiled(
@@ -592,8 +496,8 @@ def _msa_sparse_attention_union(
         float(lse_temperature_scale),
         int(n),
     )
-    # kernel writes log2-domain LSE as (Hq, total_q); the public contract is
-    # natural-log (total_q, num_qo_heads).
+    # The kernel writes the log2-domain LSE as (Hq, total_q); the public contract
+    # is natural-log (total_q, num_qo_heads).
     if return_temperature_lse:
         lse_out = (lse2 * _LN2).t().contiguous()
         lse_t_out = (lse2_t * _LN2).t().contiguous()

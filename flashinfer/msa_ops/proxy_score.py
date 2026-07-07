@@ -26,8 +26,9 @@ from ..trace.templates.msa import (
     msa_proxy_score_trace,
 )
 from ..utils import get_device_sm_count, is_sm12x_supported
+from ._common import _BLK_KV
 
-_BLK_KV = 128
+# NVFP4 scale granularity: one e4m3 block scale per 16 e2m1 elements.
 _SF_VEC_SIZE = 16
 
 
@@ -79,12 +80,13 @@ def _proxy_split_k(
     return max(1, min(splits, max_k_tiles))
 
 
-# Measured optima. fp4: fill 2 SM-waves, ceil to reach the target (4-bit K,
-# over-split is cheap).
+# Split-K heuristics, tuned empirically. fp4: fill two SM-waves and ceil to the
+# target (4-bit K reads make over-splitting cheap).
 _proxy_split_k_fp4 = functools.partial(
     _proxy_split_k, wave_target=2.0, gate_factor=2.0, ceil_to_target=True
 )
-# bf16: target ~1.5 waves and round (Q reload per split makes over-split regress).
+# bf16: target ~1.5 waves and round (the Q reload per split makes over-splitting
+# regress).
 _proxy_split_k_bf16 = functools.partial(
     _proxy_split_k, wave_target=1.5, gate_factor=1.0, ceil_to_target=False
 )
@@ -147,9 +149,10 @@ class _ProxySplitKRunner(TunableRunner):
         return self._call(inputs, int(ns))
 
 
-# (op, shape) keys already through the autotuner this process. Until a shape is
-# tuned the proxy uses its closed-form heuristic and skips choose_one, whose
-# per-call lock/bookkeeping (~tens of us) would dominate the tiny low-batch decode.
+# (op, shape) keys that already went through the autotuner in this process. Until
+# a shape is tuned the proxy uses its closed-form heuristic and skips choose_one,
+# whose per-call lock/bookkeeping (~tens of us) would dominate the tiny low-batch
+# decode.
 _PROXY_TUNED: set = set()
 
 
@@ -237,7 +240,7 @@ def msa_proxy_score(
     q_offset=None,
 ) -> torch.Tensor:
     """MSA dense proxy pass for SM120/SM121: per-KV-block max attention
-    logits (MSA's ``OnlyScore`` mode).
+    logits.
 
     Computes ``max_score[h, t, q]``, the maximum of the unscaled,
     causally-masked ``Q K^T`` logits over the 128 tokens of KV block ``t``,
@@ -265,8 +268,7 @@ def msa_proxy_score(
     cu_seqlens_q, cu_seqlens_k : torch.Tensor
         ``(batch_size + 1,)`` int32 cumulative lengths.
     causal : bool
-        Right-aligned causal masking (mask applied *before* the block max,
-        matching MSA).
+        Right-aligned causal masking, applied *before* the block max.
     max_k_tiles : int, optional
         Number of KV-block columns in the output; defaults to the maximum
         ``ceil(seqlen_k / 128)`` over the batch.
@@ -276,13 +278,11 @@ def msa_proxy_score(
         ``(1, max_k_tiles, total_q)`` when ``reduce_heads=True``.
     reduce_heads : bool
         If ``True``, max-reduce the per-head ``max_score`` over the query-head
-        axis and return a single ``(1, max_k_tiles, total_q)`` score, recovering
-        the *one selection per query* that the MiniMax-M3 lightning indexer
-        produces (its ``block_scores = scores.amax(-1).amax(over index heads)``).
-        Use this when the query heads are an indexer's proxy heads that collapse
-        to a shared block selection. Defaults to ``False``, the per-head
-        ``max_score`` of MSA's canonical *one-proxy-head-per-KV-head* pipeline,
-        where each head selects its own blocks.
+        axis and return a single ``(1, max_k_tiles, total_q)`` score. Use this
+        when the query heads are an indexer's proxy heads that collapse to one
+        shared block selection per query (MiniMax-M3 indexer semantics).
+        Defaults to ``False``: per-head ``max_score``, where each head selects
+        its own blocks.
 
         The reduction is currently a post-kernel ``amax`` over the per-head
         buffer (the kernel is one CTA per head, so a cross-head epilogue would
@@ -303,7 +303,7 @@ def msa_proxy_score(
         MsaProxyScoreDecodePackedSm12x,
         MsaProxyScoreSm12x,
     )
-    from .sparse_attention import (
+    from ._common import (
         _compile_cache,
         _cutlass_dtype,
         _fake,
@@ -436,7 +436,7 @@ def msa_proxy_score(
         )
         _compile_cache[key] = compiled
 
-    # base grid CTAs (feeds split-K, see _proxy_split_k): the packed path is one
+    # Base grid CTAs (feeds split-K, see _proxy_split_k): the packed path is one
     # CTA per (batch, kv_head); the general path one per (q-tile, batch, head) with
     # 64-row q-tiles. num_splits is a runtime arg, not part of the cache key.
     if use_packed:
@@ -500,7 +500,7 @@ def _quantize_qk_to_nvfp4(
     if global_scale is None:
         global_scale = (448.0 * 6.0) / x2d.float().abs().max().clamp_min(1e-12)
     gsf = torch.as_tensor([float(global_scale)], dtype=torch.float32, device=x.device)
-    # default sfLayout is the cuBLAS 128x4 tiled layout; SF row = token*num_heads
+    # Default sfLayout is the cuBLAS 128x4 tiled layout; SF row = token*num_heads
     # + head (the natural (total, num_heads, d).reshape(-1, d) row order).
     xq, sf = nvfp4_quantize(x2d, gsf, sf_vec_size=_SF_VEC_SIZE)
     x_fp4 = xq.view(torch.uint8).reshape(total, num_heads, head_dim // 2)
@@ -535,9 +535,8 @@ def msa_proxy_score_fp4(
     the unscaled, causally-masked ``Q K^T`` logits), but Q/K arrive pre-quantized
     as packed NVFP4 (``e2m1`` + per-16 ``e4m3`` block scales + per-tensor global
     scales), so the index K is read from HBM at ~4 bits/elem. The full-KV index
-    read is the dominant decode-step cost, so this is the bandwidth path that
-    matches MSA's deployed ``fp4_indexer_block_scores``; :func:`msa_proxy_score`
-    stays as the bf16 precision reference.
+    read is the dominant decode-step cost, so this is the bandwidth-saving
+    path; :func:`msa_proxy_score` stays as the bf16 precision reference.
 
     The kernel computes ``Q K^T`` on the SM120 fp4 tensor cores
     (``MmaMXF4NVF4Op``), so numerics equal a torch dequant of the same packed
@@ -582,7 +581,7 @@ def msa_proxy_score_fp4(
         MsaProxyScoreFp4MmaDecodePackedSm12x,
         MsaProxyScoreFp4MmaSm12x,
     )
-    from .sparse_attention import (
+    from ._common import (
         _compile_cache,
         _cutlass_dtype,
         _fake,
@@ -647,10 +646,9 @@ def msa_proxy_score_fp4(
     else:
         per_head = output
 
-    # Head-fused decode path: pack group_size heads x pack_q_len q-tokens into one
-    # 128-row MMA tile so index-K is read once per (batch, kv_head). Outside the
-    # regime (prefill, group_size not dividing 128) use the general schedule.
-    _PACK_ROWS = MsaProxyScoreFp4MmaSm12x._M  # 128-row fp4-MMA tile
+    # Head-fused decode path, as in msa_proxy_score, but on the 128-row fp4-MMA
+    # tile and with no fp8-K exclusion.
+    _PACK_ROWS = MsaProxyScoreFp4MmaSm12x._M
     group_size = num_qo_heads // num_kv_heads
     use_packed = (
         group_size >= 2
@@ -659,16 +657,12 @@ def msa_proxy_score_fp4(
     )
     pack_q_len = _PACK_ROWS // group_size if use_packed else 0
 
-    # base grid CTAs (feeds split-K, see _proxy_split_k): the packed path is one
-    # CTA per (batch, kv_head); the general path one per (q-tile, batch, head) with
-    # 128-row q-tiles. num_splits is a runtime arg, not part of the cache key.
+    # Base grid CTAs (feeds split-K) and cache key, as in msa_proxy_score.
     if use_packed:
         base_ctas = batch_size * num_kv_heads
     else:
         base_ctas = ((max_seqlen_q + 127) // 128) * batch_size * num_qo_heads
 
-    # group_size keys the packed schedule: pack_q_len = 128 // group_size is
-    # constexpr-baked into the gather/epilogue, so each factorization is its own kernel.
     key = ("proxy_fp4", causal, paged, use_packed, pack_q_len)
     compiled = _compile_cache.get(key)
     if compiled is None:

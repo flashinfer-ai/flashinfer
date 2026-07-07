@@ -13,8 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
----
-
 NVFP4 tensor-core MSA proxy-score kernels for SM120/SM121: same contract as
 :mod:`proxy_score_sm12x`, with a general split-K and a packed-decode schedule.
 """
@@ -36,18 +34,20 @@ from flashinfer.cute_dsl.utils import (
 # NVFP4: 16-element scale groups (head_dim 128 -> 8 groups/row).
 _SF_VEC_SIZE = 16
 
-# Launch bound: cap registers so >=2 CTAs/SM stay resident (mb=1 loses on
-# latency-bound shapes, mb=3 spills). The split-K host heuristic in proxy_score.py
-# assumes this value (target = 2 * num_sms).
+# Launch bound: cap registers so two CTAs stay resident per SM; one CTA cannot
+# hide the K-load latency and three would force spills. The split-K host
+# heuristic in proxy_score.py assumes this occupancy (target = 2 * num_sms).
 _MIN_BLOCKS_PER_MP = 2
 
 
 class MsaProxyScoreFp4MmaSm12x:
-    """General per-(q-tile, batch, head) NVFP4 MMA proxy schedule, flat or paged K.
-    Fixed M = head_dim = kv_block = 128."""
+    """General NVFP4 tensor-core proxy schedule (any q length, flat or paged K);
+    every query head scores independently."""
 
-    _M = 128  # q-tile rows (== one cuBLAS 128-row SF block, so sfa_tiles_per_block==1)
-    _N = 128  # kv-block
+    # The cuBLAS SF layout groups rows in blocks of 128, so a 128-row q-tile's
+    # scale factors are a single contiguous block.
+    _M = 128
+    _N = 128  # kv-block: MSA scores per 128-token KV block
     _NUM_THREADS = 256  # 8 MMA warps for the (4,2,1) atom
 
     def __init__(
@@ -126,9 +126,7 @@ class MsaProxyScoreFp4MmaSm12x:
         num_splits: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        # split-K: fold a kv-block split factor into grid x to fill the SMs when the
-        # base grid (1, batch, heads) starves at low batch. Output is per-(head,
-        # kv_block, query) so splits write disjoint columns, no reduction.
+        # Split-K grid, as in proxy_score_sm12x.
         self.kernel(
             mQ,
             mK,
@@ -150,8 +148,6 @@ class MsaProxyScoreFp4MmaSm12x:
             ),
             block=[self._num_threads, 1, 1],
             stream=stream,
-            # cap registers so >=2 CTAs/SM fit (smem is only ~19KB; the warp
-            # epilogue pushed regs to 168 -> reg-limited to 1 CTA otherwise).
             min_blocks_per_mp=self._min_blocks,
         )
 
@@ -173,8 +169,7 @@ class MsaProxyScoreFp4MmaSm12x:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bx, batch_idx, qo_head = cute.arch.block_idx()
-        # grid x packs (m_block, split): splits of one m_block are adjacent so
-        # they share the same Q tile in L2 (only the kv-block subset differs).
+        # grid x packs (m_block, split), as in the bf16 kernel.
         m_block = bx // num_splits
         split_idx = bx % num_splits
 
@@ -205,7 +200,7 @@ class MsaProxyScoreFp4MmaSm12x:
                 sSFB: cute.struct.Align[
                     cute.struct.MemRange[self.sf_dtype, cute.cosize(sfb_layout)], 1024
                 ]
-                # warp-epilogue cross-warp scratch: one f32 per (q-row, N-warp).
+                # Warp-epilogue cross-warp scratch: one f32 per (q-row, N-warp).
                 # 1KB vs a full 64KB [M,N] scatter, so smem stops capping occupancy.
                 sRed: cute.struct.Align[
                     cute.struct.MemRange[cutlass.Float32, self._M * 2], 1024
@@ -315,9 +310,7 @@ class MsaProxyScoreFp4MmaSm12x:
                 cute.filter_zeros(tCrSFA_cp),
             )
 
-            # split-K strides kv_block by num_splits (disjoint columns, no reduction).
-            # causal tiling skips K-load + MMA for kv-blocks above the q-tile's causal
-            # limit (else ~1.9x masked-MMA waste); their -inf is written directly.
+            # Split-K stride + causal skip, as in the bf16 kernel.
             if cutlass.const_expr(self._is_causal):
                 causal_last = (
                     m_block * self._M + (self._M - 1) + mQOffset[batch_idx]
@@ -402,9 +395,9 @@ class MsaProxyScoreFp4MmaSm12x:
                                     acc[None, mt, nt],
                                 )
 
-                    # warp-level block-max epilogue (no scatter buffer): each thread
-                    # reduces its N columns + a thread-quad shuffle -> per-q-row warp
-                    # max; the 2 N-warps combine through sRed[q-row, n-warp] (1KB smem).
+                    # Warp-level block-max epilogue (no scatter buffer): each thread
+                    # reduces its N columns, a thread-quad shuffle yields the per-q-row
+                    # warp max, and the two N-warps combine through sRed.
                     acc_mn = self._make_acc_tensor_mn_view(acc)
                     tScS_mn = self._make_acc_tensor_mn_view(tCcC)
                     n_rows = cute.size(acc_mn.shape[0])
@@ -432,7 +425,8 @@ class MsaProxyScoreFp4MmaSm12x:
                         tile_max = self._threadquad_reduce_max(tile_max)
                         sRed[row, nwarp] = tile_max
                     self.cta_sync_barrier.arrive_and_wait()
-                    # combine the 2 N-warps; one writer per q-row (nwarp 0 owner)
+                    # Combine the two N-warps; one writer per q-row (the nwarp-0
+                    # warp owns the write).
                     if nwarp == 0:
                         for r in cutlass.range_constexpr(n_rows):
                             row = tScS_mn[r, 0][0]
@@ -492,7 +486,6 @@ class MsaProxyScoreFp4MmaSm12x:
             else:
                 sXsf_u8[dst] = Uint8(0)
 
-    # SF fragment partition, from the SM120 blockscaled GEMM
     def _partition_fragment_SFA(self, sfa_tensor, thr_mma, tidx):
         thrfrg = self._thrfrg_SFA(sfa_tensor.layout, thr_mma)
         thr_tensor = cute.make_tensor(sfa_tensor.iterator, thrfrg)
@@ -606,7 +599,7 @@ class MsaProxyScoreFp4MmaSm12x:
 
     @cute.jit
     def _threadquad_reduce_max(self, val):
-        # max across the 4 lanes of an m16n8 row-quad (the N lanes within a warp)
+        # Max across the 4 lanes of an m16n8 row-quad (the N lanes within a warp)
         val = cute.arch.fmax(
             val,
             cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31),
@@ -654,7 +647,7 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
                 f"qhead_per_kv * pack_q_len must equal the {self._M}-row MMA tile, "
                 f"got {qhead_per_kv} x {pack_q_len}"
             )
-        # instance attrs shadow the class defaults; they are constexpr-baked into the
+        # Instance attrs shadow the class defaults; they are constexpr-baked into the
         # gather/epilogue, so each factorization compiles to its own kernel.
         self._QHEAD_PER_KV = qhead_per_kv
         self._PACK_Q_LEN = pack_q_len
@@ -662,15 +655,15 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (total_q, Hq, head_dim//2) packed e2m1, uint8
-        mK: cute.Tensor,  # flat (total_k,Hkv,hd/2) | paged (pages,Hkv,128,hd/2) u8
-        mQsf: cute.Tensor,  # uint8 e4m3 scales, cuBLAS 128x4 tiled
-        mKsf: cute.Tensor,  # uint8 e4m3 scales, cuBLAS 128x4 tiled
-        mPageTable: cute.Tensor,  # (B, max_pages) int32 paged; dummy (1,1) flat
-        mMaxScore: cute.Tensor,  # (Hq, max_k_tiles, total_q) f32
-        mCuQ: cute.Tensor,  # (B + 1,) int32
-        mCuK: cute.Tensor,  # (B + 1,) int32
-        mQOffset: cute.Tensor,  # (B,) int32 causal offset
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mQsf: cute.Tensor,
+        mKsf: cute.Tensor,
+        mPageTable: cute.Tensor,
+        mMaxScore: cute.Tensor,
+        mCuQ: cute.Tensor,
+        mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
         q_global_scale: cutlass.Float32,
         k_global_scale: cutlass.Float32,
         max_seqlen_q: cutlass.Int32,
@@ -680,9 +673,8 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         num_splits: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        # one CTA per (split, batch, kv_head): all qhead_per_kv heads of a kv_head
-        # are packed into the single 128-row tile, so the index-K is read once per
-        # kv_head (qhead_per_kv x less K traffic than the per-head general schedule).
+        # One CTA per (split, batch, kv_head), as in the bf16 packed kernel:
+        # the shared index-K is read once per kv_head.
         self.kernel(
             mQ,
             mK,
@@ -907,7 +899,8 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
                                 acc[None, mt, nt],
                             )
 
-                # warp block-max epilogue; packed row -> (local_head, token)
+                # Warp block-max epilogue, as in the general kernel; a packed row
+                # maps to (local_head, token).
                 acc_mn = self._make_acc_tensor_mn_view(acc)
                 tScS_mn = self._make_acc_tensor_mn_view(tCcC)
                 n_rows = cute.size(acc_mn.shape[0])

@@ -13,8 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
----
-
 MSA dense proxy-score kernels (bf16/fp16) for SM120/SM121: per (head, KV block,
 query) max of the unscaled post-mask QK^T logits; masked blocks yield -inf.
 """
@@ -29,6 +27,9 @@ from cutlass.cute.nvgpu import cpasync, warp
 
 
 class MsaProxyScoreSm12x:
+    """General bf16/fp16 proxy schedule (any q length, fp8 K, flat or paged):
+    every query head scores against its kv_head's index-K independently."""
+
     def __init__(
         self,
         head_dim: int = 128,
@@ -103,7 +104,7 @@ class MsaProxyScoreSm12x:
             raise TypeError("Only Float16 or BFloat16 q is supported")
         self._dtype: Type[cutlass.Numeric] = mQ.element_type
 
-        # split-K: fold a kv-block split factor into grid x to fill the SMs when the
+        # Split-K: fold a kv-block split factor into grid x to fill the SMs when the
         # base grid (1, batch, heads) starves at low batch. Output is per-(head,
         # kv_block, query) so splits write disjoint columns, no reduction.
         self.kernel(
@@ -141,7 +142,8 @@ class MsaProxyScoreSm12x:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bx, batch_idx, qo_head = cute.arch.block_idx()
-        # grid x packs (m_block, split): splits of one m_block are adjacent.
+        # grid x packs (m_block, split): splits of one m_block are adjacent so
+        # they share the same Q tile in L2 (only the kv-block subset differs).
         m_block = bx // num_splits
         split_idx = bx % num_splits
 
@@ -242,8 +244,8 @@ class MsaProxyScoreSm12x:
             acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
             n_rows = cute.size(acc_S_mn.shape[0])
 
-            # K gmem views (block mode indexed after partitioning so copy tile
-            # shapes stay static)
+            # K gmem views; the block mode is indexed after partitioning so the
+            # copy tile shapes stay static.
             if cutlass.const_expr(not self._kv_fp8):
                 if cutlass.const_expr(self._paged):
                     pass  # per-block page lookup happens inside the loop
@@ -267,9 +269,9 @@ class MsaProxyScoreSm12x:
                     tSrQ_copy_view[None, None, kk],
                 )
 
-            # split-K strides kv_block by num_splits (disjoint columns, no reduction).
-            # causal tiling skips K-load + MMA for kv-blocks above the q-tile's causal
-            # limit (else ~1.9x masked-MMA waste); their -inf is written directly.
+            # Split-K CTAs stride kv_block by num_splits. Causal skip: kv-blocks
+            # entirely above the q-tile's causal limit get their -inf written directly,
+            # with no K load or MMA (masking after the MMA would waste the work).
             if cutlass.const_expr(self._is_causal):
                 causal_last = (
                     m_block * self._m_block_size
@@ -284,7 +286,6 @@ class MsaProxyScoreSm12x:
             for it in cutlass.range(n_iter):
                 kv_block = split_idx + it * num_splits
                 if kv_block <= last_block:
-                    # previous iteration's K fragment reads must be complete
                     self.cta_sync_barrier.arrive_and_wait()
                     if cutlass.const_expr(self._kv_fp8):
                         if cutlass.const_expr(self._paged):
@@ -322,8 +323,8 @@ class MsaProxyScoreSm12x:
                                 cvt_frag.fill(0)
                             cute.autovec_copy(cvt_frag, sK_chunk)
                     else:
-                        # branch bodies keep their own tensor names: aliasing an outer
-                        # tensor in this dynamic loop would make it loop-carried
+                        # Branch bodies keep their own tensor names: aliasing an outer
+                        # tensor in this dynamic loop would make it loop-carried.
                         if cutlass.const_expr(self._paged):
                             page = mPageTable[batch_idx, kv_block]
                             gK_pg = cute.local_tile(
@@ -396,11 +397,11 @@ class MsaProxyScoreSm12x:
                         )
                         tile_max = self._threadquad_reduce_max(tile_max)
                         if q_loc < seqlen_q:
-                            # all 4 quad threads hold the same value; the
-                            # duplicate stores are idempotent
+                            # All 4 quad threads hold the same value; the
+                            # duplicate stores are idempotent.
                             mMaxScore[qo_head, kv_block, q_start + q_loc] = tile_max
                 elif kv_block < max_k_tiles:
-                    # blocks past last_block (causally future or padding) get -inf, no
+                    # Blocks past last_block (causally future or padding) get -inf, no
                     # MMA. Bounded by max_k_tiles so split-K overshoot writes nothing.
                     for r in cutlass.range_constexpr(n_rows):
                         row_local2 = tScS_mn[r, 0][0]
@@ -468,21 +469,21 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                 f"qhead_per_kv * pack_q_len must equal the {m_block_size}-row MMA "
                 f"tile, got {qhead_per_kv} x {pack_q_len}"
             )
-        # constexpr-baked into the gather/epilogue, so each factorization compiles
-        # to its own kernel.
+        # These attrs are constexpr-baked into the gather/epilogue, so each
+        # factorization compiles to its own kernel.
         self._qhead_per_kv = qhead_per_kv
         self._pack_q_len = pack_q_len
 
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (total_q, Hq, d)
-        mK: cute.Tensor,  # (total_k, Hkv, d) flat | (pages, Hkv, 128, d) paged
-        mPageTable: cute.Tensor,  # (B, max_pages) int32 (dummy (1,1) if flat)
-        mMaxScore: cute.Tensor,  # (Hq, max_k_tiles, total_q) f32
-        mCuQ: cute.Tensor,  # (B + 1,) int32
-        mCuK: cute.Tensor,  # (B + 1,) int32
-        mQOffset: cute.Tensor,  # (B,) int32 causal offset (MSA q_offset)
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mPageTable: cute.Tensor,
+        mMaxScore: cute.Tensor,
+        mCuQ: cute.Tensor,
+        mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
         max_seqlen_q: cutlass.Int32,
         batch_size: cutlass.Int32,
         num_qo_heads: cutlass.Int32,
@@ -499,7 +500,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
             raise TypeError("Only Float16 or BFloat16 q is supported")
         self._dtype: Type[cutlass.Numeric] = mQ.element_type
 
-        # one CTA per (split, batch, kv_head): all qhead_per_kv heads of a kv_head
+        # One CTA per (split, batch, kv_head): all qhead_per_kv heads of a kv_head
         # are packed into the single m_block_size-row tile, so the index-K is read
         # once per kv_head (qhead_per_kv x less K traffic than the per-head schedule).
         self.kernel(
@@ -563,7 +564,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         sQ = storage.sQ.get_tensor(sQ_layout)
         sK = storage.sK.get_tensor(sK_layout)
 
-        # tiled copy covers K only; Q is gathered per-head below
+        # Tiled copy covers K only; Q is gathered per-head below
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self._dtype.width
         atom_async_copy = cute.make_copy_atom(
@@ -612,8 +613,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
         acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
         n_rows = cute.size(acc_S_mn.shape[0])
 
-        # K gmem views (block mode indexed after partitioning so copy tile shapes
-        # stay static)
+        # K gmem views, as in the general kernel.
         if cutlass.const_expr(not self._kv_fp8):
             if cutlass.const_expr(self._paged):
                 pass  # per-block page lookup happens inside the loop
@@ -627,7 +627,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
             cKV = cute.make_identity_tensor((self._n_block_size, self._head_dim))
             tKVcKV = gmem_thr_copy.partition_S(cKV)
 
-        # gather stores are synchronous; order them before the Q fragment reads,
+        # Gather stores are synchronous; order them before the Q fragment reads,
         # then preload the Q fragments once (sQ reused across all kv-blocks).
         self.cta_sync_barrier.arrive_and_wait()
         for kk in cutlass.range_constexpr(cute.size(tSsQ.shape[2])):
@@ -637,14 +637,13 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                 tSrQ_copy_view[None, None, kk],
             )
 
-        # split-K: this CTA strides kv_block by num_splits (disjoint columns, no
-        # reduction). No causal skip here: packed decode attends every kv-block
-        # and masks the per-token causal tail in the epilogue.
+        # Split-K CTAs stride kv_block by num_splits, as in the general kernel.
+        # No causal skip here: packed decode attends every kv-block and masks
+        # the per-token causal tail in the epilogue.
         n_iter = cute.ceil_div(max_k_tiles, num_splits)
         for it in cutlass.range(n_iter):
             kv_block = split_idx + it * num_splits
             if kv_block < num_kv_blocks:
-                # previous iteration's K fragment reads must be complete
                 self.cta_sync_barrier.arrive_and_wait()
                 if cutlass.const_expr(self._kv_fp8):
                     if cutlass.const_expr(self._paged):
@@ -732,8 +731,8 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                         acc_S,
                     )
 
-                # packed row maps to (local_head, token); a packed query's causal
-                # position is its token index (the decode q within this step)
+                # A packed row maps to (local_head, token); a packed query's causal
+                # position is its token index (the decode q within this step).
                 for r in cutlass.range_constexpr(n_rows):
                     row = tScS_mn[r, 0][0]
                     token = row % self._pack_q_len
@@ -756,11 +755,11 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                     local_head = row // self._pack_q_len
                     head = kv_head * self._qhead_per_kv + local_head
                     if cute.elem_less(token, seqlen_q):
-                        # all 4 quad threads hold the same value; the duplicate
-                        # stores are idempotent
+                        # All 4 quad threads hold the same value; the duplicate
+                        # stores are idempotent.
                         mMaxScore[head, kv_block, q_start + token] = tile_max
             elif kv_block < max_k_tiles:
-                # padding tile in [num_kv_blocks, max_k_tiles) -> -inf. Bounded by
+                # Padding tile in [num_kv_blocks, max_k_tiles) -> -inf. Bounded by
                 # max_k_tiles because split-K can stride kv_block past the last
                 # output column (those overshoot blocks write nothing).
                 for r in cutlass.range_constexpr(n_rows):

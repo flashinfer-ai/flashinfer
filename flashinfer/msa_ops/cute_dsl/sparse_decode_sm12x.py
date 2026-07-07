@@ -13,10 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
----
-
-Sparse decode attention kernels for SM120/SM121: split-KV and fused paths.
+Sparse decode attention kernels for SM120/SM121: split-KV and fused paths,
+plus the LSE-weighted combine kernel that merges the split partials.
 """
+
+from typing import Type
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -24,8 +25,16 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp
 
+_LN2 = 0.6931471805599453  # 1 / log2(e): converts a log2-domain LSE to natural log
+_FLT_MAX = 3.4028234663852886e38
+
 
 class SparseDecodeForwardSm12x:
+    """Sparse decode forward. Parallelism comes from splitting each token's
+    selected KV blocks into chunks; the split path writes per-chunk partials
+    for the combine kernel, the fused path (all blocks in one chunk) writes
+    the output directly."""
+
     def __init__(
         self,
         head_dim: int = 128,
@@ -45,9 +54,6 @@ class SparseDecodeForwardSm12x:
             raise ValueError("only head_dim=blk_kv=128 supported")
         if group_size > 16:
             raise ValueError("group_size must be <= 16")
-        # fused: when the per-token grid (total_q x Hkv) fills the SMs, one CTA per
-        # (token, kv_head) loops all selected blocks with in-kernel online softmax;
-        # no GMEM partials or combine pass. nvfp4 KV always takes the split path.
         if fused and kv_nvfp4:
             raise ValueError("fused decode does not support nvfp4 KV")
         self._head_dim = head_dim
@@ -65,11 +71,10 @@ class SparseDecodeForwardSm12x:
         self._is_causal = is_causal
         self._paged = paged
         self._kv_fp8 = kv_fp8
-        # NVFP4: packed e2m1 K/V (int32 word views) + e4m3 128x4 block scales
         self._kv_nvfp4 = kv_nvfp4
         self._q_fp8 = q_fp8
         self._fused = fused
-        # right-aligned decode (q_offset=None): the offset is seqlen_k - seqlen_q,
+        # Right-aligned decode (q_offset=None): the offset is seqlen_k - seqlen_q,
         # computed in-kernel so the wrapper launches no helper kernels to build it.
         self._qoff_default = qoff_default
         if kv_fp8 and kv_nvfp4:
@@ -187,8 +192,8 @@ class SparseDecodeForwardSm12x:
 
         G = self._group_size
 
-        # valid blocks = leading run before the first -1 (msa_topk_select tail-pads
-        # with -1, so a hole stops the count rather than skipping past it).
+        # Number of valid (leading, contiguous) selected blocks: msa_topk_select
+        # tail-pads with -1, so a -1 hole stops the count rather than skipping past.
         cnt = cutlass.Int32(0)
         in_prefix = cutlass.Boolean(True)
         for t in cutlass.range_constexpr(self._topk):
@@ -197,12 +202,12 @@ class SparseDecodeForwardSm12x:
             else:
                 in_prefix = cutlass.Boolean(False)
 
-        # num_chunks == topk degenerates to one block per CTA (per-block split)
+        # num_chunks == topk degenerates to one block per CTA (per-block split).
         chunk_size = (self._topk + num_chunks - 1) // num_chunks
         chunk_start = chunk_idx * chunk_size
         chunk_end = cutlass.min(chunk_start + chunk_size, cnt)
 
-        # chunk-0 CTA publishes the active-chunk count combine reduces over.
+        # The chunk-0 CTA publishes the active-chunk count that combine reduces over.
         if chunk_idx == 0:
             if tidx == 0:
                 mSplitCounts[qi, kv_head] = (cnt + chunk_size - 1) // chunk_size
@@ -343,7 +348,6 @@ class SparseDecodeForwardSm12x:
             row_sum.fill(0.0)
 
             if cutlass.const_expr(self._is_causal):
-                # global query position = q_offset[b] + tok_in_req
                 if cutlass.const_expr(self._qoff_default):
                     q_pos_limit = tok_in_req + (seqlen_k - seqlen_q) + 1
                 else:
@@ -372,8 +376,7 @@ class SparseDecodeForwardSm12x:
                     )
 
             if cutlass.const_expr(self._pipeline):
-                # cp.async double-buffer: prefetch sub-block s while computing s-1, so
-                # the KV-load latency overlaps compute.
+                # cp.async double-buffer: prefetch sub-block s while computing s-1.
                 num_sub = (chunk_end - chunk_start) * self._n_sub
                 for s in cutlass.range(num_sub + 1):
                     if s < num_sub:
@@ -540,7 +543,7 @@ class SparseDecodeForwardSm12x:
 
             else:
                 # cnt/chunk bounds are thread-uniform, so the per-sub-block
-                # barriers stay collective
+                # barriers stay collective.
                 for it in cutlass.range(chunk_start, chunk_end):
                     kv_block = mQ2K[kv_head, qi, it]
                     if cutlass.const_expr(self._paged):
@@ -557,8 +560,8 @@ class SparseDecodeForwardSm12x:
                             mV[None, kv_head, None],
                         )
                     if cutlass.const_expr(self._kv_nvfp4):
-                        # scale-row flattening per MSA quantize.py: paged caches are
-                        # quantized as (page, head, token) rows; flat as (token, head)
+                        # Scale-row flattening per MSA quantize.py: paged caches are
+                        # quantized as (page, head, token) rows; flat as (token, head).
                         if cutlass.const_expr(self._paged):
                             sf_row_base = (page * mK.shape[1] + kv_head) * self._blk_kv
                             sf_row_stride = cutlass.Int32(1)
@@ -758,9 +761,9 @@ class SparseDecodeForwardSm12x:
                                     tOrVt[None, None, k],
                                     acc_O,
                                 )
-                        # protect sK/sV before the next sub-block overwrites them
                         self.cta_sync_barrier.arrive_and_wait()
-            # safe before the epilogue: the combine gdc-waits on these partials
+            # PDL: let the combine grid start its preamble now; its griddepcontrol
+            # wait still orders its reads after this kernel's stores complete.
             cute.arch.griddepcontrol_launch_dependents()
             # Store normalized partial + log2-domain LSE for this chunk
             if tidx < 32:
@@ -802,21 +805,17 @@ class SparseDecodeForwardSm12x:
         out_scale: cutlass.Float32,
         seqlen_q: cutlass.Int32,
     ):
-        # fused: this CTA attends all of the token's selected blocks with one
-        # in-kernel online softmax and writes output + LSE directly, no combine.
         tidx, _, _ = cute.arch.thread_idx()
         _, qi, kv_head = cute.arch.block_idx()  # grid x is 1 (no split slots)
 
         G = self._group_size
-        LN2 = 0.6931471805599453  # 1 / log2(e); log2-domain LSE -> natural log
 
         batch_idx = qi // seqlen_q
         tok_in_req = qi - batch_idx * seqlen_q
         k_start = mCuK[batch_idx]
         seqlen_k = mCuK[batch_idx + 1] - k_start
 
-        # number of valid (leading, contiguous) selected blocks: msa_topk_select
-        # tail-pads with -1, so a -1 hole stops the count rather than skipping past.
+        # Valid-block count, as in the split kernel above.
         cnt = cutlass.Int32(0)
         in_prefix = cutlass.Boolean(True)
         for t in cutlass.range_constexpr(self._topk):
@@ -959,7 +958,7 @@ class SparseDecodeForwardSm12x:
                     tSrQ_copy_view[None, None, k],
                 )
 
-        # cnt is thread-uniform, so the barriers stay collective
+        # cnt is thread-uniform, so the barriers stay collective.
         for it in cutlass.range(cnt):
             kv_block = mQ2K[kv_head, qi, it]
             if cutlass.const_expr(self._paged):
@@ -1097,10 +1096,9 @@ class SparseDecodeForwardSm12x:
                             tOrVt[None, None, k],
                             acc_O,
                         )
-                # protect sK/sV before the next sub-block overwrites them
                 self.cta_sync_barrier.arrive_and_wait()
 
-        # epilogue always runs: cnt == 0 yields zero output and -inf LSE
+        # The epilogue always runs: cnt == 0 yields zero output and -inf LSE.
         if tidx < 32:
             for r in cutlass.range_constexpr(n_rows):
                 g = tScO_mn[r, 0][0]
@@ -1120,7 +1118,7 @@ class SparseDecodeForwardSm12x:
                     mLseOut[qi, hq] = (
                         rmax_safe * softmax_scale_log2
                         + cute.math.log2(rs, fastmath=True)
-                    ) * LN2
+                    ) * _LN2
 
     @cute.jit
     def _threadquad_reduce_max(self, val):
@@ -1158,3 +1156,174 @@ class SparseDecodeForwardSm12x:
         )
         acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
         return cute.make_tensor(acc.iterator, acc_layout_mn)
+
+
+class SparseCombineSm12x:
+    """LSE-weighted merge of the split-decode partials into the final output."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        topk: int,
+        partial_is_fp8: bool,
+        has_lse_out: bool,
+        has_lse_t: bool,
+        num_threads: int = 128,
+    ):
+        if head_dim % num_threads != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be a multiple of num_threads "
+                f"({num_threads})"
+            )
+        self._head_dim = head_dim
+        self._topk = topk
+        self._partial_is_fp8 = partial_is_fp8
+        self._has_lse_out = has_lse_out
+        self._has_lse_t = has_lse_t
+        self._num_threads = num_threads
+        self._channels_per_thread = head_dim // num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mO_partial: cute.Tensor,  # (topk, total_q, Hq, d)
+        mLse2: cute.Tensor,  # (topk, total_q, Hq) f32, log2 domain
+        mSplitCounts: cute.Tensor,  # (total_q, Hkv) int32
+        mOut: cute.Tensor,  # (total_q, Hq, d)
+        mLseOut: cute.Tensor,  # (total_q, Hq) f32 or dummy
+        mLseT2: cute.Tensor,  # (topk, total_q, Hq) f32 or dummy
+        mLseTOut: cute.Tensor,  # (total_q, Hq) f32 or dummy
+        out_scale: cutlass.Float32,
+        total_q: cutlass.Int32,
+        num_qo_heads: cutlass.Int32,
+        group_size: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._partial_dtype: Type[cutlass.Numeric] = mO_partial.element_type
+        self.kernel(
+            mO_partial,
+            mLse2,
+            mSplitCounts,
+            mOut,
+            mLseOut,
+            mLseT2,
+            mLseTOut,
+            out_scale,
+            group_size,
+        ).launch(
+            grid=(total_q, num_qo_heads, 1),
+            block=[self._num_threads, 1, 1],
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mO_partial: cute.Tensor,
+        mLse2: cute.Tensor,
+        mSplitCounts: cute.Tensor,
+        mOut: cute.Tensor,
+        mLseOut: cute.Tensor,
+        mLseT2: cute.Tensor,
+        mLseTOut: cute.Tensor,
+        out_scale: cutlass.Float32,
+        group_size: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        q, h, _ = cute.arch.block_idx()
+
+        # PDL: this kernel launches while the forward is still running; wait for
+        # its partial stores before reading them.
+        cute.arch.griddepcontrol_wait()
+        hkv = h // group_size
+        count = mSplitCounts[q, hkv]
+        if count > self._topk:
+            count = cutlass.Int32(self._topk)
+
+        lse_t_slots = self._topk if self._has_lse_t else 1
+
+        @cute.struct
+        class SharedStorage:
+            s_lse: cute.struct.MemRange[cutlass.Float32, self._topk]
+            s_lse_t: cute.struct.MemRange[cutlass.Float32, lse_t_slots]
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        s_lse = storage.s_lse.get_tensor(cute.make_layout(self._topk))
+        s_lse_t = storage.s_lse_t.get_tensor(cute.make_layout(lse_t_slots))
+
+        neg_inf = -cutlass.Float32.inf
+
+        # count <= 0 needs no special case: no slot passes s < count, so every
+        # weight stays 0.
+        for it in cutlass.range_constexpr(cute.ceil_div(self._topk, self._num_threads)):
+            slot = tidx + it * self._num_threads
+            if slot < self._topk:
+                v = neg_inf
+                if slot < count:
+                    v = mLse2[slot, q, h]
+                s_lse[slot] = v
+                if cutlass.const_expr(self._has_lse_t):
+                    vt = neg_inf
+                    if slot < count:
+                        vt = mLseT2[slot, q, h]
+                    s_lse_t[slot] = vt
+        cute.arch.sync_threads()
+
+        # Every thread rebuilds the LSE weights redundantly: at low batch the grid
+        # is a sub-wave, and building them once on one thread would serialize it.
+        m = neg_inf
+        for s in cutlass.range_constexpr(self._topk):
+            if s < count:
+                m = cute.arch.fmax(m, s_lse[s])
+        m_finite = m > neg_inf
+        w_frag = cute.make_rmem_tensor(cute.make_layout(self._topk), cutlass.Float32)
+        denom = cutlass.Float32(0.0)
+        for s in cutlass.range_constexpr(self._topk):
+            w = cutlass.Float32(0.0)
+            if s < count and m_finite:
+                w = cute.math.exp2(s_lse[s] - m, fastmath=True)
+            w_frag[s] = w
+            denom += w
+        inv = cutlass.Float32(0.0)
+        if denom > 0.0:
+            inv = cutlass.Float32(1.0) / denom
+
+        # Branch-free: all topk slots load unconditionally (they pipeline); invalid
+        # slots get weight 0, but 0 * NaN = NaN, so clamp the garbage to finite first
+        # (fmax drops a NaN operand). cutlass-dsl 4.5.2 has no fmin: use -fmax(-x, -c).
+        for i in cutlass.range_constexpr(self._channels_per_thread):
+            c = tidx + i * self._num_threads
+            acc = cutlass.Float32(0.0)
+            for s in cutlass.range_constexpr(self._topk):
+                e = mO_partial[s, q, h, c]
+                if cutlass.const_expr(self._partial_is_fp8):
+                    ef = e.to(cutlass.Float16).to(cutlass.Float32)
+                else:
+                    ef = e.to(cutlass.Float32)
+                ef = cute.arch.fmax(-cute.arch.fmax(-ef, -_FLT_MAX), -_FLT_MAX)
+                acc += w_frag[s] * ef
+            mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
+
+        if cutlass.const_expr(self._has_lse_out):
+            if tidx == 0:
+                lse = neg_inf
+                if denom > 0.0:
+                    lse = (m + cute.math.log2(denom)) * _LN2
+                mLseOut[q, h] = lse
+        if cutlass.const_expr(self._has_lse_t):
+            if tidx == 0:
+                mt = neg_inf
+                for s in cutlass.range_constexpr(self._topk):
+                    if s < count:
+                        mt = cute.arch.fmax(mt, s_lse_t[s])
+                dt = cutlass.Float32(0.0)
+                if mt > neg_inf:
+                    for s in cutlass.range_constexpr(self._topk):
+                        if s < count:
+                            dt += cute.math.exp2(s_lse_t[s] - mt, fastmath=True)
+                lse_t = neg_inf
+                if dt > 0.0:
+                    lse_t = (mt + cute.math.log2(dt)) * _LN2
+                mLseTOut[q, h] = lse_t

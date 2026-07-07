@@ -13,10 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
----
-
-Minimax Sparse Attention decode path for SM120/SM121: one work item per valid
-(kv-head, token, split-slot) entry of ``q2k_indices``, on a static grid.
+Minimax Sparse Attention decode wrapper for SM120/SM121. Decode has too few
+query tokens to fill the GPU, so work is split across each token's selected KV
+blocks and the partials are merged by an LSE-weighted combine kernel; the
+launch shape depends only on tensor shapes, keeping the whole path CUDA-graph
+capturable.
 """
 
 import functools
@@ -26,12 +27,118 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_decode_attention_trace
+from ._common import _compile_cache, _cutlass_dtype, _fake
+
+
+def _get_compiled_combine(
+    partial_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    topk: int,
+    head_dim: int,
+    has_lse_out: bool,
+    has_lse_t: bool,
+):
+    """Compile (cached) the CuTe-DSL combine kernel. Fake dims are independent
+    symbols (loop bounds come from the kernel object, not shapes), so unused
+    optional tensors can be passed as small dummies without symbol conflicts."""
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.sparse_decode_sm12x import SparseCombineSm12x
+
+    key = (
+        "combine",
+        str(partial_dtype),
+        str(out_dtype),
+        topk,
+        head_dim,
+        has_lse_out,
+        has_lse_t,
+    )
+    compiled = _compile_cache.get(key)
+    if compiled is not None:
+        return compiled
+
+    def fsyms(dtype, ndim, align=16):
+        return _fake(
+            _cutlass_dtype(dtype),
+            tuple(cute.sym_int() for _ in range(ndim)),
+            align=align,
+        )
+
+    kernel_obj = SparseCombineSm12x(
+        head_dim=head_dim,
+        topk=topk,
+        partial_is_fp8=partial_dtype == torch.float8_e4m3fn,
+        has_lse_out=has_lse_out,
+        has_lse_t=has_lse_t,
+        num_threads=128,
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled = cute.compile(
+        kernel_obj,
+        fsyms(partial_dtype, 4),  # o_partial (topk, total_q, Hq, d)
+        fsyms(torch.float32, 3, align=4),  # lse_partial
+        fsyms(torch.int32, 2, align=4),  # split_counts
+        fsyms(out_dtype, 3),  # out
+        fsyms(torch.float32, 2, align=4),  # lse_out (or dummy)
+        fsyms(torch.float32, 3, align=4),  # lse_t_partial (or dummy)
+        fsyms(torch.float32, 2, align=4),  # lse_t_out (or dummy)
+        cutlass.Float32(1.0),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    _compile_cache[key] = compiled
+    return compiled
+
+
+def _combine_partials(
+    o_partial: torch.Tensor,  # [topk, total_q, Hq, d]
+    lse_partial: torch.Tensor,  # [topk, total_q, Hq] f32, log2 domain
+    split_counts: torch.Tensor,  # [total_q, Hkv] int32
+    group_size: int,
+    out_dtype: torch.dtype,
+    lse_out: Optional[torch.Tensor] = None,
+    out_scale: float = 1.0,
+    lse_t_partial: Optional[torch.Tensor] = None,
+    lse_t_out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused CuTe-DSL LSE-weighted reduction over each query's split slots."""
+    topk, total_q, num_qo_heads, head_dim = o_partial.shape
+    out = torch.empty(
+        (total_q, num_qo_heads, head_dim), dtype=out_dtype, device=o_partial.device
+    )
+    has_lse_out = lse_out is not None
+    has_lse_t = lse_t_out is not None
+    dev = o_partial.device
+    dummy2 = torch.empty((1, 1), dtype=torch.float32, device=dev)
+    dummy3 = torch.empty((1, 1, 1), dtype=torch.float32, device=dev)
+    compiled = _get_compiled_combine(
+        o_partial.dtype, out_dtype, topk, head_dim, has_lse_out, has_lse_t
+    )
+    compiled(
+        o_partial,
+        lse_partial,
+        split_counts,
+        out,
+        lse_out if has_lse_out else dummy2,
+        lse_t_partial if has_lse_t else dummy3,
+        lse_t_out if has_lse_t else dummy2,
+        float(out_scale),
+        int(total_q),
+        int(num_qo_heads),
+        int(group_size),
+    )
+    return out
 
 
 @functools.cache
 def _dummy_tensors(device_index: int):
-    # signature fillers for paths that never read them; cached so decode
-    # calls launch no fill kernels
+    # Signature fillers for paths that never read them; cached so repeat decode
+    # calls do not launch fill kernels.
     dev = torch.device("cuda", device_index)
     return (
         torch.zeros((1, 1), dtype=torch.int32, device=dev),
@@ -123,13 +230,7 @@ def msa_sparse_decode_attention(
 
     from ..utils import is_sm12x_supported
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
-    from .sparse_attention import (
-        _combine_partials,
-        _compile_cache,
-        _cutlass_dtype,
-        _fake,
-        _q_offset_explicit,
-    )
+    from ._common import _q_offset_explicit
 
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
@@ -163,8 +264,8 @@ def msa_sparse_decode_attention(
         or q2k_indices.shape[:2] != (num_kv_heads, total_q)
     ):
         raise ValueError("q2k_indices must be int32 (num_kv_heads, total_q, topk)")
-    # Compiled for a compact layout; reject a strided q2k (e.g. a bare permute of
-    # msa_topk_select's output) here, matching msa_sparse_attention's guard.
+    # Compiled for a compact layout; reject a strided q2k (e.g. a bare permute
+    # of msa_topk_select's output).
     if not q2k_indices.is_contiguous():
         raise ValueError("q2k_indices must be contiguous")
     topk = q2k_indices.shape[2]
@@ -227,7 +328,8 @@ def msa_sparse_decode_attention(
     if v.shape != k.shape or v.dtype != k.dtype:
         raise ValueError("v must have the same shape and dtype as k")
 
-    # the right-aligned default is computed in-kernel: no offset tensor built
+    # The right-aligned default offset is computed in-kernel, so no offset
+    # tensor is built for it.
     qoff_default = q_offset is None
     if qoff_default:
         qoff_dev = _dummy_tensors(dev.index)[2]
@@ -244,7 +346,7 @@ def msa_sparse_decode_attention(
     ):
         raise ValueError(f"unsupported partial_dtype {partial_dtype}")
 
-    # adaptive split-K: num_chunks fills the (chunk x token x kv-head) grid at low
+    # Adaptive split-K: num_chunks fills the (chunk x token x kv-head) grid at low
     # batch; num_chunks==1 is the fused path (no GMEM partials/combine) at high
     # batch. NVFP4 keeps the per-block split.
     if force_fused and kv_nvfp4:
@@ -260,13 +362,13 @@ def msa_sparse_decode_attention(
         fused = num_chunks == 1
 
     if fused:
-        # one CTA per (token, kv-head) writes the final output + LSE directly;
-        # the split-path partial buffers collapse to dummies.
+        # The split-path partial buffers collapse to dummies.
         out_buf = torch.empty(
             (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=dev
         )
         lse_buf = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
-        # topk (shape[0]) and head_dim (shape[3]) are static in the signature
+        # topk (shape[0]) and head_dim (shape[3]) are static in the compiled
+        # signature.
         o_partial = torch.empty((topk, 1, 1, head_dim), dtype=partial_dtype, device=dev)
         lse_partial = torch.empty((topk, 1, 1), dtype=torch.float32, device=dev)
         split_counts = torch.empty((1, 1), dtype=torch.int32, device=dev)
@@ -280,7 +382,6 @@ def msa_sparse_decode_attention(
         split_counts = torch.empty(
             (total_q, num_kv_heads), dtype=torch.int32, device=dev
         )
-        # last dim must match the kernel's static head_dim in the signature
         out_buf = torch.empty((1, 1, head_dim), dtype=compute_dtype, device=dev)
         lse_buf = torch.empty((1, 1), dtype=torch.float32, device=dev)
 
@@ -389,7 +490,7 @@ def msa_sparse_decode_attention(
     )
 
     if fused:
-        # the kernel already wrote the final, scaled output + natural-log LSE.
+        # The kernel already wrote the final, scaled output and natural-log LSE.
         if return_softmax_lse:
             return out_buf, lse_buf
         return out_buf

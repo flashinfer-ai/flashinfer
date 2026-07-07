@@ -1,6 +1,22 @@
-"""CUDA-graph capturability of the MSA decode pipeline: with the proxy's
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+CUDA-graph capturability of the MSA decode pipeline: with the proxy's
 ``max_seqlen_q`` / ``max_k_tiles`` passed, no ``.cpu()``/``.item()`` sync may
-run during capture (vLLM captures the indexer inside the decode graph)."""
+run during capture (vLLM captures the indexer inside the decode graph).
+"""
 
 import math
 
@@ -104,8 +120,8 @@ def test_msa_decode_pipeline_cuda_graph():
     assert torch.equal(out_g, eager)
 
 
-def test_msa_prefill_union_cuda_graph():
-    """The union prefill is capturable as a single call: work metadata is built
+def test_msa_prefill_cuda_graph():
+    """The prefill is capturable as a single call: work metadata is built
     on device, so no host copy/sync runs during capture."""
     _skip()
     from flashinfer.msa_ops import msa_sparse_attention
@@ -158,7 +174,7 @@ def test_proxy_capture_requires_plan_dims():
     qf, qs, iq = _quantize_qk_to_nvfp4(qi)
     kf, ks, ik = _quantize_qk_to_nvfp4(ki)
 
-    # warm up (compile) outside capture
+    # Warm up (compile) outside capture.
     msa_proxy_score_fp4(
         qf, kf, qs, ks, iq, ik, cuq, cuk, causal=True, reduce_heads=True
     )
@@ -172,7 +188,7 @@ def test_proxy_capture_requires_plan_dims():
         pytest.raises(ValueError, match="max_seqlen_q and max_k_tiles"),
         torch.cuda.graph(g),
     ):
-        # no max_seqlen_q / max_k_tiles -> would sync -> must raise
+        # No max_seqlen_q / max_k_tiles -> would sync -> must raise.
         msa_proxy_score_fp4(
             qf,
             kf,

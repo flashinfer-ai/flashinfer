@@ -13,8 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
----
-
 Count-rank MSA top-K KV-block selection for SM120/SM121: O(N^2) rank count,
 dispatched below ``_MAX_BLOCKS`` where it beats the radix kernel's fixed pass cost.
 """
@@ -25,15 +23,18 @@ import cutlass.cute as cute
 
 from .topk_select_radix_sm12x import _atomic_add_i32
 
-# SMEM-resident score cap and dispatch threshold: count-rank's O(N^2) beats the radix
-# O(N) up to N=128 (16k context), loses by N=256. Crossover measured on 5080 (84 SMs);
-# higher-SM parts amortize the quadratic further, so 128 is conservative.
+# SMEM-resident score cap and dispatch threshold. Below this many candidate blocks
+# (128 blocks = 16k context) the O(N^2) rank count beats the radix kernel's fixed
+# multi-pass cost; the crossover was measured empirically, and 128 is conservative
+# for parts with more SMs.
 _MAX_BLOCKS = 128
 _NTHREADS = 256
-_SENTINEL = 0x7FFFFFFF  # empty slot; written out as -1
+_SENTINEL = 0x7FFFFFFF  # INT32_MAX: empty slots sort to the tail, unlike -1
 
 
 class TopKSelectCountRankSm12x:
+    """O(N^2) count-rank top-K selection for small candidate counts."""
+
     def __init__(self, topk: int):
         if topk != 16:
             raise ValueError(f"topk must be 16, got {topk}")
@@ -49,7 +50,6 @@ class TopKSelectCountRankSm12x:
         force_end: cutlass.Int32,
         total_qo_len: cutlass.Int32,
         num_qo_heads: cutlass.Int32,
-        max_k_tiles: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         mBits = cute.recast_tensor(mMaxScore, cutlass.Uint32)
@@ -97,15 +97,15 @@ class TopKSelectCountRankSm12x:
         n_forced = force_begin + force_end
         target = cutlass.Int32(self._topk) - n_forced
 
-        # stage the middle scores' radix keys in SMEM: the rank loop rereads each one
-        # N times, and the bit key preserves the exact radix-kernel order, with
-        # deterministic NaN placement
+        # Stage the middle scores' radix keys in SMEM: the rank loop rereads each
+        # one N times, and the bit key preserves the exact radix-kernel order,
+        # with deterministic NaN placement.
         b = mid_lo + tid
         while b < mid_hi:
             score[b] = self._radix_key(mScore[h, b, q])
             b += _NTHREADS
 
-        # forced sink/window blocks bypass ranking; emit slots start after them
+        # Forced sink/window blocks bypass ranking; emit slots start after them
         if tid == 0:
             w = cutlass.Int32(0)
             i = cutlass.Int32(0)
@@ -125,8 +125,8 @@ class TopKSelectCountRankSm12x:
             cnt[0] = cutlass.Int32(0)
         cute.arch.barrier()
 
-        # rank = count of strictly-better blocks (lower key = higher score;
-        # ties -> lower index); rank < target selects
+        # rank = count of strictly-better blocks (lower key = higher score, ties
+        # broken toward the lower index); a block is selected iff rank < target.
         b = mid_lo + tid
         while b < mid_hi:
             kb = score[b]
@@ -144,7 +144,7 @@ class TopKSelectCountRankSm12x:
             b += _NTHREADS
         cute.arch.barrier()
 
-        # ascending-by-index sort, then write (SENTINEL -> -1)
+        # Ascending-by-index sort, then write.
         if tid == 0:
             a = cutlass.Int32(1)
             while a < self._topk:

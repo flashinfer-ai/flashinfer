@@ -4,7 +4,7 @@ from .proxy_score import (
     msa_proxy_score,
     msa_proxy_score_fp4,
 )
-from .sparse_attention import msa_sparse_attention
+from .sparse_prefill import msa_sparse_attention
 from .sparse_decode import msa_sparse_decode_attention
 from .sparse_topk_select import msa_topk_select
 

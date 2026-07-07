@@ -13,9 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
----
-
-Union-tile MSA sparse attention forward (prefill) kernel for SM120/SM121.
+Union-tile MSA sparse attention forward (prefill) kernel for SM120/SM121,
+plus the on-device union-metadata builder that feeds it.
 """
 
 import cuda.bindings.driver as cuda
@@ -25,9 +24,10 @@ import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, warp
 
 
-class SparseAttentionUnionFwdSm12x:
-    """One CTA per (batch, q_tile, kv_head) loops the union of the tile's selected
-    KV blocks with online softmax; writes final output directly, no combine pass."""
+class SparsePrefillSm12x:
+    """Union-tile sparse prefill: a query tile processes the union of its
+    tokens' selected KV blocks in one online-softmax pass, so each block loads
+    once per tile and the final output is written directly."""
 
     def __init__(
         self,
@@ -70,7 +70,7 @@ class SparseAttentionUnionFwdSm12x:
         )
 
     def _make_skv_layout(self):
-        """Bank-swizzled K/V SMEM layout (same as the KV-major bf16 path)."""
+        """Bank-swizzled K/V SMEM layout."""
         atom = cute.make_composed_layout(
             cute.make_swizzle(3, 3, 3),
             0,
@@ -158,14 +158,14 @@ class SparseAttentionUnionFwdSm12x:
             mK_h4 = mK[page, kv_head, None, None]
             mV_h4 = mV[page, kv_head, None, None]
             row_off4 = cutlass.Int32(0)
-            # scale rows flatten (page, head, token)
+            # Scale rows are flattened in (page, head, token) order (paged cache).
             sf_row_base = (page * mK.shape[1] + kv_head) * self._n_block_size
             sf_row_stride = cutlass.Int32(1)
         else:
             mK_h4 = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
             mV_h4 = cute.domain_offset((k_start, 0), mV[None, kv_head, None])
             row_off4 = kv_block * self._n_block_size
-            # scale rows flatten (token, head)
+            # Scale rows are flattened in (token, head) order (flat cache).
             sf_row_base = (k_start + kv_block * self._n_block_size) * mK.shape[
                 1
             ] + kv_head
@@ -412,7 +412,7 @@ class SparseAttentionUnionFwdSm12x:
                 ),
             )
 
-            # gather the query tile once: token i -> G GQA-head rows
+            # Gather the query tile once: token i -> G GQA-head rows
             zero_chunk = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
             zero_chunk.fill(0)
             chunks_per_row = self._head_dim // 8
@@ -497,7 +497,7 @@ class SparseAttentionUnionFwdSm12x:
             cKV = cute.make_identity_tensor((self._n_block_size, self._head_dim))
             tKVcKV = gmem_thr_copy_KV.partition_S(cKV)
             if cutlass.const_expr(not self._paged):
-                # flat: one batch-contiguous K/V tile, blocks indexed at read time.
+                # Flat: one batch-contiguous K/V tile, blocks indexed at read time.
                 mK_h = cute.domain_offset((k_start, 0), mK[None, kv_head, None])
                 mV_h = cute.domain_offset((k_start, 0), mV[None, kv_head, None])
                 gK_all = cute.local_tile(
@@ -514,10 +514,10 @@ class SparseAttentionUnionFwdSm12x:
                 mask_word = mUnionMasks[work_idx, u]
                 base = kv_block * self._n_block_size
 
-                # previous block's K/V fragment reads must be done first
                 self.cta_sync_barrier.arrive_and_wait()
                 if cutlass.const_expr(self._kv_fp8):
-                    # synchronous (no cp.async group)
+                    # fp8/NVFP4 load+dequant is synchronous (no cp.async group to
+                    # commit); only the bf16/fp16 branch below pipelines with cp.async.
                     self._load_kv_fp8(
                         mK,
                         mV,
@@ -532,7 +532,6 @@ class SparseAttentionUnionFwdSm12x:
                         tidx,
                     )
                 elif cutlass.const_expr(self._kv_nvfp4):
-                    # synchronous (no cp.async group)
                     self._load_kv_nvfp4(
                         mK,
                         mV,
@@ -549,7 +548,7 @@ class SparseAttentionUnionFwdSm12x:
                         tidx,
                     )
                 else:
-                    # bf16/fp16: cp.async load. paged remaps the block through the
+                    # bf16/fp16: cp.async load. Paged remaps the block through the
                     # page table (block coord 0); flat reuses the batch tile.
                     if cutlass.const_expr(self._paged):
                         gK_b = cute.local_tile(
@@ -620,7 +619,7 @@ class SparseAttentionUnionFwdSm12x:
                         col_limit = cutlass.min(q_loc + q_off + 1, seqlen_k)
                     else:
                         col_limit = seqlen_k
-                    # union membership: fold the token's bit into col_limit (bit==0 ->
+                    # Union membership: fold the token's bit into col_limit (bit==0 ->
                     # col_limit 0 -> the causal test masks the whole row) so an
                     # unselected block's scores go -inf without a separate branch.
                     bit = (mask_word >> tok) & cutlass.Int32(1)
@@ -649,7 +648,7 @@ class SparseAttentionUnionFwdSm12x:
                     )
                     row_sum[r] = rsum + row_sum[r] * prev_scale
                     if cutlass.const_expr(self._return_temperature_lse):
-                        # same masked scores and max-shift as row_sum, but with the
+                        # Same masked scores and max-shift as row_sum, but with the
                         # temperature-scaled exponent; acc_S_row is the raw masked
                         # score, read before acc_S_mn is overwritten with p_row.
                         p_row_t = cute.math.exp2(
@@ -712,9 +711,8 @@ class SparseAttentionUnionFwdSm12x:
                     inv = 0.0 if (rs == 0.0 or rs != rs) else cute.arch.rcp_approx(rs)
                     q_global = q_start + q_loc
                     hq = kv_head * G + g
-                    # out_scale folds the NVFP4 V global scale (the split path's
-                    # combine applies it; the union writes the output directly). It
-                    # is 1.0 for bf16/fp16/fp8, so this is a no-op off the NVFP4 path.
+                    # out_scale folds in the NVFP4 V global scale (1.0 otherwise);
+                    # unlike decode there is no combine kernel to apply it.
                     for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                         d_pos = tScS_mn[0, c][1]
                         mO[q_global, hq, d_pos] = (acc_O_mn[r, c] * inv * out_scale).to(
@@ -766,3 +764,126 @@ class SparseAttentionUnionFwdSm12x:
         )
         acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
         return cute.make_tensor(acc.iterator, acc_layout_mn)
+
+
+# Sentinel head value for an exhausted / inactive lane in the k-way merge. KV
+# block ids are bounded by seqlen/128, far below this, so it never collides.
+_SENTINEL = (1 << 31) - 1
+
+
+class BuildUnionMetaSm12x:
+    """Warp-synchronous k-way merge of a tile's per-token top-k lists into
+    union blocks plus membership masks; lane i owns token i's list, so the
+    merge needs only shuffles and ballots (no shared memory)."""
+
+    def __init__(self, topk: int, tokens_per_tile: int):
+        if topk not in (4, 8, 16, 32):
+            raise ValueError(f"topk must be 4, 8, 16, or 32, got {topk}")
+        if not 1 <= tokens_per_tile <= 32:
+            raise ValueError(
+                f"tokens_per_tile must be in [1, 32], got {tokens_per_tile}"
+            )
+        self._topk = topk
+        self._tpt = tokens_per_tile
+        # Distinct blocks in a union are bounded by the total list length.
+        self._max_union = tokens_per_tile * topk
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ2k: cute.Tensor,  # (Hkv, total_q, topk) int32, ascending / -1 trailing
+        mTileBatch: cute.Tensor,  # (total_tiles,) int32, batch of each global tile
+        mTileT: cute.Tensor,  # (total_tiles,) int32, within-batch tile index
+        mTileQBase: cute.Tensor,  # (total_tiles,) int32, global query idx of token 0
+        mTileNtok: cute.Tensor,  # (total_tiles,) int32, valid tokens in the tile
+        mUnionBlocks: cute.Tensor,  # (work_items, max_union) int32 (out)
+        mUnionMasks: cute.Tensor,  # (work_items, max_union) int32 (out)
+        mUnionCount: cute.Tensor,  # (work_items,) int32 (out)
+        mWorkMeta: cute.Tensor,  # (work_items, 3) int32 {batch, q_tile, kv_head} (out)
+        H: cutlass.Int32,
+        total_tiles: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self._k_build(
+            mQ2k,
+            mTileBatch,
+            mTileT,
+            mTileQBase,
+            mTileNtok,
+            mUnionBlocks,
+            mUnionMasks,
+            mUnionCount,
+            mWorkMeta,
+            H,
+        ).launch(
+            grid=(total_tiles, H, 1),
+            block=(32, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def _k_build(
+        self,
+        mQ2k: cute.Tensor,
+        mTileBatch: cute.Tensor,
+        mTileT: cute.Tensor,
+        mTileQBase: cute.Tensor,
+        mTileNtok: cute.Tensor,
+        mUnionBlocks: cute.Tensor,
+        mUnionMasks: cute.Tensor,
+        mUnionCount: cute.Tensor,
+        mWorkMeta: cute.Tensor,
+        H: cutlass.Int32,
+    ):
+        lane, _, _ = cute.arch.thread_idx()
+        gt, h, _ = cute.arch.block_idx()
+        work_idx = gt * H + h
+
+        batch_idx = mTileBatch[gt]
+        q_tile = mTileT[gt]
+        qbase = mTileQBase[gt]
+        ntok = mTileNtok[gt]
+
+        # Lane i owns tile-token i; lanes >= ntok are inactive (head == SENTINEL)
+        # and only participate in the warp shuffles / ballots.
+        active = lane < ntok
+        sentinel = cutlass.Int32(_SENTINEL)
+        p = cutlass.Int32(0)  # cursor into this lane's top-k list
+
+        u = cutlass.Int32(0)
+        # A rolled loop over the fixed union bound keeps the warp trip count
+        # uniform without unrolling 128-256 bodies; exhausted iterations no-op.
+        for _ in cutlass.range(self._max_union):
+            head = sentinel
+            if active:
+                if p < self._topk:
+                    head = mQ2k[h, qbase + lane, p]
+            # Ascending lists pad with trailing -1, so a negative head means this
+            # lane is exhausted; pin it to the sentinel so it never wins the min.
+            if head < 0:
+                head = sentinel
+
+            m = head
+            off = 16
+            while off >= 1:
+                nbr = cute.arch.shuffle_sync(m, lane ^ off)
+                m = cutlass.min(m, nbr)
+                off >>= 1
+
+            # m is uniform across the warp, so this branch is uniform: every lane
+            # either emits this iteration or skips it together (ballot is safe).
+            if m != sentinel:
+                eq = active and head == m
+                mask = cute.arch.vote_ballot_sync(eq)
+                if lane == 0:
+                    mUnionBlocks[work_idx, u] = m
+                    mUnionMasks[work_idx, u] = mask
+                if eq:
+                    p += 1
+                u += 1
+
+        if lane == 0:
+            mUnionCount[work_idx] = u
+            mWorkMeta[work_idx, 0] = batch_idx
+            mWorkMeta[work_idx, 1] = q_tile
+            mWorkMeta[work_idx, 2] = h

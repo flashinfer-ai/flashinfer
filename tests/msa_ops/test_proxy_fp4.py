@@ -163,7 +163,7 @@ def test_proxy_fp4_selection_overlap_vs_bf16():
     sel_fp4 = msa_topk_select(fp4_score, topk)
     torch.cuda.synchronize()
 
-    # set overlap over (query, head) where the full topk is available
+    # Set overlap over (query, head) pairs where the full topk is available.
     overlaps = []
     for qi in range(0, seqlen_q, 7):
         for h in range(Hq):
@@ -179,7 +179,7 @@ def test_proxy_fp4_selection_overlap_vs_bf16():
 
 
 def test_proxy_fp4_paged():
-    # group_size 4 -> the general, non-packed fp4-MMA schedule
+    """group_size 4 dispatches the general, non-packed fp4-MMA schedule."""
     _skip_if_unsupported()
     from flashinfer import nvfp4_quantize
     from flashinfer.msa_ops import msa_proxy_score_fp4
@@ -198,7 +198,7 @@ def test_proxy_fp4_paged():
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
     q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
 
-    # scatter logical K into shuffled pages, then quantize page-major so the SF
+    # Scatter logical K into shuffled pages, then quantize page-major so the SF
     # lands in the (page*Hkv+head)*128+token row order the paged kernel reads.
     perm = torch.randperm(nb)
     k_pg_bf16 = torch.zeros(nb, Hkv, BLK_KV, 128, dtype=torch.bfloat16, device=dev)
@@ -229,7 +229,7 @@ def test_proxy_fp4_paged():
     )
     torch.cuda.synchronize()
 
-    # reference: dequant page-major K, gather into logical block order
+    # Reference: dequant page-major K, gather into logical block order.
     k_pg_deq = (
         _dequant_128x4(
             k_pg.reshape(-1, 64).cpu(), k_pg_scale.cpu(), 1.0, nb * Hkv * BLK_KV
@@ -295,7 +295,7 @@ def test_proxy_fp4_decode_packed(B, seqlen_q):
     assert out.shape == (Hq, nb, total_q)
 
     got = out.float().cpu()
-    # SF row = token*heads+head spans all batches, so dequant whole then slice per batch
+    # SF row = token*heads+head spans all batches, so dequant whole then slice per batch.
     q_deq, k_deq = _dequant_qk(
         q_fp4.cpu(), q_scale.cpu(), inv_q, k_fp4.cpu(), k_scale.cpu(), inv_k
     )
@@ -380,8 +380,8 @@ def test_proxy_fp4_paged_packed():
     k = torch.randn(seqlen_k, Hkv, 128, dtype=torch.bfloat16, device=dev) * 2
     q_fp4, q_scale, inv_q = _quantize_qk_to_nvfp4(q)
 
-    # scatter logical K into shuffled pages, quantize page-major (same SF row order
-    # the paged kernel reads): (page*Hkv + head)*128 + token_in_page.
+    # Scatter logical K into shuffled pages and quantize page-major, as in
+    # test_proxy_fp4_paged.
     perm = torch.randperm(nb)
     k_pg_bf16 = torch.zeros(nb, Hkv, BLK_KV, 128, dtype=torch.bfloat16, device=dev)
     ptab = torch.zeros((1, nb), dtype=torch.int32, device=dev)
@@ -447,12 +447,12 @@ def test_proxy_split_k_heuristic():
 
     dev = torch.device("cuda")
     sm = torch.cuda.get_device_properties(dev).multi_processor_count
-    # large base grid -> no split
+    # Large base grid -> no split.
     assert _proxy_split_k_fp4(4 * sm, 512, dev) == 1
-    # trivial / degenerate -> no split
+    # Trivial / degenerate -> no split.
     assert _proxy_split_k_fp4(8, 1, dev) == 1
     assert _proxy_split_k_fp4(0, 512, dev) == 1
-    # small base grid -> split enough to reach ~2 CTAs/SM, capped by max_k_tiles
+    # Small base grid -> split enough to reach ~2 CTAs/SM, capped by max_k_tiles.
     assert _proxy_split_k_fp4(8, 512, dev) == -(-2 * sm // 8)
     assert _proxy_split_k_fp4(4, 8, dev) == 8  # clamped to max_k_tiles
 
@@ -474,7 +474,7 @@ def test_proxy_fp4_split_k_decode(Hq, Hkv):
     cu_q = torch.tensor([0, seqlen_q], dtype=torch.int32, device=dev)
     cu_k = torch.tensor([0, seqlen_k], dtype=torch.int32, device=dev)
 
-    # base grid << 2*SMs here, so the split-K heuristic must pick split > 1
+    # The base grid is << 2*SMs here, so the split-K heuristic must pick split > 1.
     # fp4-MMA uses a 128-row q-tile for both the general and packed schedules.
     base = (1 if group_size == 16 else -(-seqlen_q // 128)) * (
         Hkv if group_size == 16 else Hq

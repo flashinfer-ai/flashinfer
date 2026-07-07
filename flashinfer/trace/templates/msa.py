@@ -77,7 +77,7 @@ def _msa_attention_check(
 
 @torch.no_grad()
 def _msa_proxy_score_reference(q, k, cu_seqlens_q, cu_seqlens_k, causal=True):
-    """Per-KV-block max of unscaled causal Q K^T logits (mirrors _ref_proxy_score)."""
+    """Per-KV-block max of unscaled causal Q K^T logits."""
     BLK_KV = 128
     total_q, Hq, _ = q.shape
     Hkv = k.shape[1]
@@ -205,8 +205,7 @@ def _msa_proxy_score_fp4_reference(
     cu_seqlens_k,
     causal=True,
 ):
-    """Block-max proxy over a torch dequant of packed NVFP4 Q/K (mirrors
-    _dequant_128x4 + _ref_proxy_fp4 in tests/msa_ops/test_proxy_fp4.py)."""
+    """Block-max proxy over a torch dequant of packed NVFP4 Q/K."""
     BLK_KV = 128
     HEAD_DIM = 128
     e2m1 = torch.tensor(
@@ -321,7 +320,7 @@ msa_proxy_score_fp4_trace = TraceTemplate(
         "NVFP4 MSA dense proxy / indexer: same per-KV-block max as "
         "msa_proxy_score, but Q/K arrive pre-quantized as packed NVFP4 (e2m1 + "
         "per-16 e4m3 block scales + per-tensor global scales), so the index K is "
-        "read from HBM at ~4 bits/elem. Matches MSA's deployed fp4 indexer."
+        "read from HBM at ~4 bits/elem."
     ),
     axes={
         "total_q": Var(description="Total query tokens across the batch."),
@@ -389,7 +388,7 @@ msa_proxy_score_fp4_trace = TraceTemplate(
 def _msa_sparse_attention_reference(
     q, k, v, q2k_indices, cu_seqlens_q, cu_seqlens_k, causal=False, softmax_scale=None
 ):
-    """Top-K block sparse attention reference (mirrors _ref_sparse_attention)."""
+    """Top-K block sparse attention reference."""
     BLK_KV = 128
     total_q, Hq, head_dim = q.shape
     Hkv = k.shape[1]
@@ -513,9 +512,9 @@ msa_sparse_attention_trace = TraceTemplate(
     name_prefix="msa_sparse_attention",
     description=(
         "MSA sparse attention (prefill): each query attends only its top-K "
-        "selected KV blocks (128 tokens each) from q2k_indices. Work is "
-        "distributed over (kv-head, KV block) CSR rows so each block is loaded "
-        "once and shared by all queries that selected it."
+        "selected KV blocks (128 tokens each) from q2k_indices. Query tiles "
+        "process the union of their queries' selected blocks, so a block loads "
+        "once per tile that references it."
     ),
     axes=_msa_sparse_attention_axes(),
     inputs=_msa_sparse_attention_inputs(),

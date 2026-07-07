@@ -13,11 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
----
-
-Multi-stage MSD radix-select MSA top-K KV-block selection for SM120/SM121, a CuTe-DSL
-port of TensorRT-LLM's ``IndexerTopKWithSortKernel`` (``max_k_tiles < 12288``). Omits
-the reference's fp16 pre-pass and transpose workspace (perf aids, output-equivalent).
+Multi-stage MSD radix-select MSA top-K KV-block selection for SM120/SM121.
 """
 
 import inspect
@@ -35,13 +31,12 @@ _NUM_BINS = 1024  # 10-bit radix digit per stage
 _STAGE_CAP = 2048  # threshold-bin staging capacity (per stage, not per row)
 _KTHREADS = 256
 _GROUP = 32  # bins per group for the 2-level threshold scan (_NUM_BINS / _GROUP groups)
-_SENTINEL = 0x7FFFFFFF  # sorts to the tail; written out as -1
+_SENTINEL = 0x7FFFFFFF  # INT32_MAX: empty slots sort to the tail, unlike -1
 
 # Per-stage radix-digit shift of the 32-bit key: stage 1 bits 31..22, stage 2
 # bits 21..12, stage 3 bits 11..2 (bits 0-1 dropped, they are true ties).
 _STAGE_SHIFT = {1: 22, 2: 12, 3: 2}
-# Shift to filter candidates to the previous stage's threshold bin (stage 1 ranks
-# everything, so no filter).
+# Filter shift to the previous stage's threshold bin (stage 1 ranks everything).
 _MATCH_SHIFT = {2: 22, 3: 12}
 
 
@@ -56,6 +51,8 @@ def _atomic_add_i32(a, ptr: cute.Pointer) -> cutlass.Int32:
 
 
 class TopKSelectRadixSm12x:
+    """Multi-stage MSD radix top-K selection over per-block proxy scores."""
+
     def __init__(self, topk: int):
         if topk != 16:
             raise ValueError(f"topk must be 16, got {topk}")
@@ -71,13 +68,10 @@ class TopKSelectRadixSm12x:
         force_end: cutlass.Int32,
         total_qo_len: cutlass.Int32,
         num_qo_heads: cutlass.Int32,
-        max_k_tiles: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         mBits = cute.recast_tensor(mMaxScore, cutlass.Uint32)
-        self.kernel(
-            mBits, mOut, num_valid_pages, force_begin, force_end, max_k_tiles
-        ).launch(
+        self.kernel(mBits, mOut, num_valid_pages, force_begin, force_end).launch(
             grid=(total_qo_len, num_qo_heads, 1),
             block=(_KTHREADS, 1, 1),
             stream=stream,
@@ -99,7 +93,6 @@ class TopKSelectRadixSm12x:
         num_valid_pages: cutlass.Int32,
         force_begin: cutlass.Int32,
         force_end: cutlass.Int32,
-        max_k_tiles: cutlass.Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         q, h, _ = cute.arch.block_idx()
@@ -123,8 +116,15 @@ class TopKSelectRadixSm12x:
         sel = st.sel.get_tensor(cute.make_layout(16))
         scal = st.scal.get_tensor(cute.make_layout(8))
         pat = st.pat.get_tensor(cute.make_layout(1))
-        # scal slots: 0=found, 1=stage_count, 2=threshold, 3=base,
-        #             4=finalBinSize, 5=done, 6=need
+        # scal holds the block-uniform selection state, one int32 slot each
+        # (readers name them: found = scal[0], threshold = scal[2], ...):
+        #   [0] found: blocks selected so far (emit cursor into sel)
+        #   [1] stage_count: items staged into stage_key/stage_idx this stage
+        #   [2] threshold: histogram bin where the running count crosses `need`
+        #   [3] base: number of items strictly below the threshold bin
+        #   [4] fbs: item count of the threshold bin itself
+        #   [5] done: selection complete, remaining stages no-op
+        #   [6] need: slots still to fill this stage (target - found)
 
         nvp = num_valid_pages
         mid_lo = force_begin
@@ -134,7 +134,7 @@ class TopKSelectRadixSm12x:
 
         n_groups = _NUM_BINS // _GROUP
 
-        # forced sink/window blocks bypass ranking; emit slots start after them
+        # Forced sink/window blocks bypass ranking; emit slots start after them.
         if tid == 0:
             w = cutlass.Int32(0)
             i = cutlass.Int32(0)
@@ -204,11 +204,12 @@ class TopKSelectRadixSm12x:
                     b += _KTHREADS
             cute.arch.barrier()
 
-            # 2-level threshold scan: phase A sums contiguous _GROUP-bin groups (one
-            # per thread); phase B/C has thread 0 find and refine within the
-            # threshold's group. Critical serial path ~ 2*_GROUP, not _NUM_BINS.
+            # 2-level threshold scan: find the histogram bin where the running
+            # count crosses `need`, with a critical serial path of ~ 2*_GROUP
+            # bins instead of _NUM_BINS.
             dn = scal[5]
             if dn == cutlass.Int32(0):
+                # Phase A: each thread sums one contiguous _GROUP-bin group.
                 if tid < n_groups:
                     gs = cutlass.Int32(0)
                     gi = cutlass.Int32(0)
@@ -270,8 +271,8 @@ class TopKSelectRadixSm12x:
                         scal[1] = scal[0] + base
             cute.arch.barrier()
 
-            # bins below the threshold emit directly; the threshold bin is staged
-            # for the next stage (stage 3 emits it directly)
+            # Bins below the threshold emit directly; the threshold bin is staged
+            # for the next stage (stage 3 emits it directly).
             dn = scal[5]
             if dn == cutlass.Int32(0):
                 threshold = scal[2]
@@ -297,9 +298,8 @@ class TopKSelectRadixSm12x:
                                 sel[n_forced + slot] = b
                         elif binv == threshold:
                             if cutlass.const_expr(step == 3):
-                                # Terminal stage: residual ties (equal in bits
-                                # 31..2) emit directly via the separate counter
-                                # (slot 1), capped at the topk slots.
+                                # Terminal stage: residual ties (equal in bits 31..2)
+                                # emit via the separate counter, capped at topk slots.
                                 slot = _atomic_add_i32(1, scal.iterator + 1)
                                 if n_forced + slot < cutlass.Int32(self._topk):
                                     sel[n_forced + slot] = b
@@ -313,8 +313,8 @@ class TopKSelectRadixSm12x:
             cute.arch.barrier()
 
             if cutlass.const_expr(step != 3):
-                # rank the staged threshold-bin items; only the first need-base
-                # by rank still fit the selection
+                # Rank the staged threshold-bin items; only the best (need - base)
+                # of them, by rank, still fit in the selection.
                 dn = scal[5]
                 if dn == cutlass.Int32(0):
                     fbs = scal[4]
@@ -329,7 +329,7 @@ class TopKSelectRadixSm12x:
                             jj = cutlass.Int32(0)
                             while jj < stage_count:
                                 tj = stage_key[jj]
-                                # higher score == smaller key; ties by stage index
+                                # Higher score == smaller key; ties by stage index
                                 if (ti > tj) or ((ti == tj) and (ii < jj)):
                                     rank += 1
                                 jj += 1
@@ -349,12 +349,11 @@ class TopKSelectRadixSm12x:
                             scal[5] = cutlass.Int32(1)
                 cute.arch.barrier()
             else:
-                # stage 3 is terminal regardless of bin size
                 if tid == 0:
                     scal[5] = cutlass.Int32(1)
                 cute.arch.barrier()
 
-        # ascending-by-index sort, then write (SENTINEL -> -1)
+        # Ascending-by-index sort, then write.
         if tid == 0:
             a = cutlass.Int32(1)
             while a < self._topk:

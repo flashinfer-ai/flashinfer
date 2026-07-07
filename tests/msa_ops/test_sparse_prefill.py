@@ -1,5 +1,21 @@
-"""Tests for the union-tile sparse-attention prefill path behind the public
-``msa_sparse_attention``."""
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Tests for the union-tile sparse-attention prefill path behind the public
+``msa_sparse_attention``.
+"""
 
 import math
 
@@ -70,17 +86,17 @@ def _compile_union(
     import cutlass
     import cutlass.cute as cute
 
-    from flashinfer.msa_ops.cute_dsl.sparse_fwd_union_sm12x import (
-        SparseAttentionUnionFwdSm12x,
+    from flashinfer.msa_ops.cute_dsl.sparse_prefill_sm12x import (
+        SparsePrefillSm12x,
     )
-    from flashinfer.msa_ops.sparse_attention import _cutlass_dtype, _fake
+    from flashinfer.msa_ops._common import _cutlass_dtype, _fake
 
     cdt = _cutlass_dtype(torch.bfloat16)
     i32 = _cutlass_dtype(torch.int32)
     u8 = _cutlass_dtype(torch.uint8)
     f32 = _cutlass_dtype(torch.float32)
     s = [cute.sym_int() for _ in range(15)]
-    obj = SparseAttentionUnionFwdSm12x(
+    obj = SparsePrefillSm12x(
         head_dim=hd,
         m_block_size=m_block,
         n_block_size=128,
@@ -118,6 +134,58 @@ def _compile_union(
     )
 
 
+def _host_union_metadata(q2k_indices, cu_seqlens_q, tokens_per_tile, topk):
+    """Host reference union builder (oracle for the device builder). Returns
+    per-(batch, q-tile, kv-head)
+    ``(union_blocks, union_masks, union_count, work_meta, work_items)``."""
+    num_kv_heads, total_q, topk_in = q2k_indices.shape
+    assert topk_in == topk
+    max_union = tokens_per_tile * topk
+    q2k = q2k_indices.cpu().tolist()
+    cuq = cu_seqlens_q.cpu().tolist()
+    batch_size = len(cuq) - 1
+
+    blocks, masks, counts, meta = [], [], [], []
+    for b in range(batch_size):
+        qs, qe = cuq[b], cuq[b + 1]
+        seqlen_q = qe - qs
+        n_tiles = (seqlen_q + tokens_per_tile - 1) // tokens_per_tile
+        for h in range(num_kv_heads):
+            for t in range(n_tiles):
+                union: dict = {}
+                for i in range(tokens_per_tile):
+                    ql = t * tokens_per_tile + i
+                    if ql >= seqlen_q:
+                        break
+                    for bid in q2k[h][qs + ql]:
+                        if bid < 0:
+                            continue
+                        union[bid] = union.get(bid, 0) | (1 << i)
+                if not union:
+                    continue
+                items = sorted(union.items())
+                bl = [bid for bid, _ in items]
+                mk = [m for _, m in items]
+                counts.append(len(bl))
+                blocks.append(bl + [0] * (max_union - len(bl)))
+                masks.append(mk + [0] * (max_union - len(mk)))
+                meta.append([b, t, h])
+
+    dev = q2k_indices.device
+    n = len(counts)
+    # Masks are built as int64 (bit 31 -> 2**31 overflows int32 at construction),
+    # then cast to int32 to keep the kernel's 32-bit membership bit pattern.
+    return (
+        torch.tensor(blocks, dtype=torch.int32, device=dev).reshape(n, max_union),
+        torch.tensor(masks, dtype=torch.int64, device=dev)
+        .reshape(n, max_union)
+        .to(torch.int32),
+        torch.tensor(counts, dtype=torch.int32, device=dev),
+        torch.tensor(meta, dtype=torch.int32, device=dev).reshape(n, 3),
+        n,
+    )
+
+
 def _canon_union_meta(ub, um, uc, wm, n):
     """Map union metadata to {(batch, q_tile, kv_head): (blocks, masks)} so two
     builders compare independent of work-item emission order or padding."""
@@ -139,18 +207,15 @@ def _canon_union_meta(ub, um, uc, wm, n):
 @pytest.mark.parametrize("B,S", [(1, 2048), (3, 640)])
 def test_union_metadata_device_matches_host(tpt, B, S):
     _skip()
-    from flashinfer.msa_ops._union_metadata import (
-        build_msa_union_metadata,
-        build_msa_union_metadata_device,
-    )
+    from flashinfer.msa_ops.sparse_prefill import _build_union_metadata_device
 
     dev = "cuda"
     Hkv, topk = 4, 16
     cu = torch.tensor([S * i for i in range(B + 1)], dtype=torch.int32, device=dev)
     q2k = _rand_q2k_causal(cu, cu, Hkv, topk, BLK, dev, seed=13)
 
-    host = build_msa_union_metadata(q2k, cu, tpt, topk)
-    devb = build_msa_union_metadata_device(q2k, cu, tpt, topk)
+    host = _host_union_metadata(q2k, cu, tpt, topk)
+    devb = _build_union_metadata_device(q2k, cu, tpt, topk)
     torch.cuda.synchronize()
 
     assert _canon_union_meta(*host) == _canon_union_meta(*devb)
@@ -165,8 +230,7 @@ def test_union_prefill_kernel_matches_public_api_and_oracle(m_block, num_threads
     import cutlass
 
     from flashinfer.msa_ops import msa_sparse_attention
-    from flashinfer.msa_ops._union_metadata import build_msa_union_metadata
-    from flashinfer.msa_ops.sparse_attention import _q_offset_tensor
+    from flashinfer.msa_ops._common import _q_offset_tensor
 
     dev = "cuda"
     Hq, Hkv, topk, hd = 64, 4, 16, 128
@@ -183,7 +247,7 @@ def test_union_prefill_kernel_matches_public_api_and_oracle(m_block, num_threads
     ref = msa_sparse_attention(q, k, v, q2k, cu, cu, causal=True, softmax_scale=scale)
     oracle = _torch_oracle(q, k, v, q2k, cu, cu, BLK, G, scale)
 
-    ub, um, uc, wm, n = build_msa_union_metadata(q2k, cu, tpt, topk)
+    ub, um, uc, wm, n = _host_union_metadata(q2k, cu, tpt, topk)
     qoff = _q_offset_tensor(None, cu, cu, dev)
     wc = torch.tensor([n], dtype=torch.int32, device=dev)
     out = torch.empty(B * S, Hq, hd, dtype=torch.bfloat16, device=dev)
@@ -220,7 +284,7 @@ def test_union_prefill_kernel_matches_public_api_and_oracle(m_block, num_threads
     mae_oracle = (out.float() - oracle).abs().mean().item()
     mae_api_oracle = (ref.float() - oracle).abs().mean().item()
     mae_vs_api = (out.float() - ref.float()).abs().mean().item()
-    # direct kernel and public API run the same union math (host vs device metadata
+    # Direct kernel and public API run the same union math (host vs device metadata
     # builder), so they agree to bf16 precision and track the fp32 oracle equally.
     assert mae_oracle < 5e-3, mae_oracle
     assert mae_api_oracle < 5e-3, mae_api_oracle
@@ -246,7 +310,7 @@ def test_union_paged_matches_flat(B, S):
 
     flat = msa_sparse_attention(q, k, v, q2k, cu, cu, causal=True, softmax_scale=scale)
 
-    # relay flat K/V into a randomly permuted paged cache, one 128-token page per block
+    # Relay flat K/V into a randomly permuted paged cache, one 128-token page per block.
     npages = [S // BLK] * B
     perm = torch.randperm(sum(npages))
     k_pg = torch.zeros(sum(npages), Hkv, BLK, hd, dtype=k.dtype, device=dev)
@@ -301,7 +365,7 @@ def test_union_public_api(B, S, return_lse):
     if return_lse:
         got, got_lse = got
         assert got_lse.shape == (B * S, Hq)
-        # finite LSE for queries that selected at least one block
+        # Finite LSE for queries that selected at least one block.
         assert torch.isfinite(got_lse).any()
     torch.cuda.synchronize()
 
@@ -429,7 +493,7 @@ def test_union_paged_quant_matches_flat(quant):
     perm = torch.randperm(npages)
     ptab = torch.full((B, npages), -1, dtype=torch.int32, device=dev)
     seqused = torch.tensor([S] * B, dtype=torch.int32, device=dev)
-    # relay flat K/V into a permuted paged bf16 cache (one 128-token page per block)
+    # Relay flat K/V into a permuted paged bf16 cache (one 128-token page per block).
     kpg = torch.zeros(npages, Hkv, BLK, hd, dtype=torch.bfloat16, device=dev)
     vpg = torch.zeros_like(kpg)
     for blk in range(npages):
@@ -446,7 +510,7 @@ def test_union_paged_quant_matches_flat(quant):
         k_pg = kpg.to(torch.float8_e4m3fn).contiguous()
         v_pg = vpg.to(torch.float8_e4m3fn).contiguous()
     else:
-        # quantize the flat and paged caches identically (same global scale)
+        # Quantize the flat and paged caches identically (same global scale).
         kq, ksf, kg = _nvfp4_quant(k.reshape(-1, hd))
         vq, vsf, vg = _nvfp4_quant(v.reshape(-1, hd))
         kf = kq.reshape(B * S, Hkv, hd // 2)
