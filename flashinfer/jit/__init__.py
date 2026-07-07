@@ -102,6 +102,8 @@ from .nvfp4_attention_sm120 import (
 )
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
+from .monomoe import gen_monomoe_module as gen_monomoe_module
+from .monomoe import load_monomoe_module as load_monomoe_module
 
 
 cuda_lib_path = os.environ.get(
