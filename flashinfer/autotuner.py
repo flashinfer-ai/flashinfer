@@ -796,6 +796,12 @@ def load_from_file(key):
     return False, 0, -1, None
 
 
+# Inference-mode replay table: (custom_op, profile_sig) -> (runner, tactic).
+# choose_one()'s slow path builds per-runner cache keys under a lock even on
+# a hit; repeat lookups go through this flat dict instead.
+_REPLAY_CACHE: dict = {}
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -1141,6 +1147,24 @@ class AutoTuner:
                 raise ValueError(f"No runners provided for op '{custom_op}'")
             return runners[0], -1
 
+        # Replay fast path: one signature computation, no lock, no per-runner
+        # key construction on repeat inference lookups.
+        _sig = None
+        if (
+            not self.is_tuning_mode
+            and self._override_tuning_buckets is None
+            and not self._override_round_up
+        ):
+            _sig = (
+                custom_op,
+                AutoTuner._find_nearest_profile(
+                    tuple(self._get_input_sizes(inputs)), tuning_config
+                ),
+            )
+            _hit = _REPLAY_CACHE.get(_sig)
+            if _hit is not None:
+                return _hit
+
         with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
             if self._override_tuning_buckets is not None or self._override_round_up:
@@ -1217,6 +1241,8 @@ class AutoTuner:
                                 f"max_num_tokens during the next tuning "
                                 f"pass to avoid this perf cliff."
                             )
+                if is_cache_hit and _sig is not None:
+                    _REPLAY_CACHE[_sig] = (runner, tactic)
                 return runner, tactic
 
             assert len(runners) > 0, "At least one runner is required"
@@ -1936,6 +1962,7 @@ class AutoTuner:
 
     def clear_cache(self) -> None:
         """Clear the profiling cache and user-loaded file configs."""
+        _REPLAY_CACHE.clear()
         with self._lock:
             self.profiling_cache.clear()
             self._file_configs.clear()
