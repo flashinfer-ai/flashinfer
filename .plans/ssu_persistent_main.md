@@ -1067,6 +1067,41 @@ switched off it cost ~1.7 µs in remap reads + smem).  Kept:
 monolith).  The residual ~5 µs mixed gap to triton-pm at b=1024 stays on the
 optional-levers list; we win b≤16 outright.
 
+### Tried + REJECTED: hand-rolled wide-A LDS.64 addressing (B200, 2026-07-06)
+
+Extended the byteoffA X-invariant trick to the f32 A-operand's 4 LDS.64/tile.
+Two lessons, one of them load-bearing for any future handroll:
+
+1. **The per-thread SLICED layout already absorbs the swizzle into SIGNED
+   per-lane strides** — the thread offset lives in the iterator and e.g. an
+   odd-row lane's kh-step is −8 (not +8^X); `layout()(coord0)` is 0 and the
+   X = swz0^off0 recovery yields nothing.  The slice is linear and separable
+   (offset(j,k) = off_j + off_k, verified against cute per access), so the
+   correct handroll is two layout-evaluated signed tables + one IADD per
+   access — no XOR machinery at all.
+2. The correct version is NOISE: 122.94→123.07 no-write, 230.64→229.77 write,
+   163.55→163.62 mixed (f32, b=1024).  At STAGES=2 the kernel is latency/
+   queue-bound, not address-ALU-bound — cute's per-access recompute is off the
+   critical path.  (Beware the wrong-but-fast trap: the initial buggy
+   addressing measured 5–7 µs FASTER — bogus odd-lane loads collapsing onto
+   shared lines.)  Rejected per the accept/reject protocol; bit-perfect at
+   rejection (probe: max_abs=0 on every tensor).
+
+### LANDED: cp.async.cg for the read-once state prefetch (B200, 2026-07-06)
+
+One-line atom swap in `load_state_per_warp`/`load_state_cta`
+(SM80_CP_ASYNC_CACHEALWAYS → CACHEGLOBAL): the state cache is touched exactly
+once per step, and pulling 32 KB/unit (f32) through L1 evicts the tiles that
+ARE reused (C / group old_B) while slowing the L1TEX path that drains the
+cp.async queue.  Wins everywhere, biggest where reuse-interleave is densest:
+
+    f32  b=1024:  no-write 122.9→114.5   write 230.6→228.3   mixed 163.6→148.8
+    bf16 b=1024:  2k 79.5→77.4 / 134.0→131.7    monolith 119.6→96.6 / 168.3→136.5
+
+Mixed f32 now beats triton-pm by ~11 µs (148.8 vs 159.7, no conv1d) and bf16
+2k sets a new best (77.4 vs triton-pm 79.3).  Both kernels share the loaders,
+so the monolith gets it for free (it was the most L1-thrashed: 67% L1/TEX).
+
 ## TODO
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
