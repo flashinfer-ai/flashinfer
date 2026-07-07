@@ -1039,6 +1039,34 @@ Remaining (optional, ~10 µs pool): hand-rolled wide-A LDS.64 addressing (kill
 cute's per-access swizzle recompute), cp.async.cg for the read-once state stream,
 state-width-aware `main_maxnreg`, TMA state loads.
 
+### Tried + REVERTED: write-first / interleaved slot visiting order (B200, 2026-07-06)
+
+Mixed-batch decomposition (b=1024, mtp=6, f32, write_frac=0.31, no conv1d): our
+mixed 163.5 µs vs own composition 156.0 (+7.5 interleave penalty); triton-pm
+159.7 vs its 161.3 (its split write/nowrite launches overlap).  ncu showed a
+straggler tail — `sm__cycles_active` max/avg 1.062 mixed vs ~1.025 uniform
+(≈9.5 µs; per-CTA write counts are binomial(28, 0.31) under the grid-stride
+deal, the kernel waits on the unluckiest CTA, and 2 blocks/SM can't rebalance).
+
+Fix attempt: a smem `slot_order[]` permutation (built once per CTA from
+prev_num_accepted — pre-gdc-legal — remapped in fill_meta/derive_head).  Both
+variants LOST to the natural ascending order:
+
+    unsorted             165.2 µs
+    write-first          169.3   (balanced ±1, but every resident CTA hits its
+                                  heavy write units SIMULTANEOUSLY — globally
+                                  phase-aligned MIO bursts)
+    Bresenham-interleave 171.4   (balanced + staggered — still loses)
+
+Lesson: the ascending-seq walk is LOAD-BEARING — adjacent CTAs co-process the
+same slot-group's tiles (the head-fastest L2-hot design) and state reads walk
+memory contiguously; any seq permutation trades that locality for balance and
+loses more than the ~5 µs tail it can recover.  Machinery fully reverted (even
+switched off it cost ~1.7 µs in remap reads + smem).  Kept:
+`test_two_kernel_f32_mixed_batch` (per-slot pnat vs the order-independent
+monolith).  The residual ~5 µs mixed gap to triton-pm at b=1024 stays on the
+optional-levers list; we win b≤16 outright.
+
 ## TODO
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
