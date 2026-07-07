@@ -187,7 +187,9 @@ class SparseDecodeForwardSm12x:
     ):
         """Dequant one sub-block of NVFP4 K/V into compute-dtype SMEM. mK_blk/mV_blk
         are (128, words) int32 views of one KV block (8 e2m1 per word); global scales
-        fold into softmax_scale/out_scale."""
+        fold into softmax_scale/out_scale. row0 is the sub-block's first row within
+        the block view; base is its absolute token position (used only for the
+        seqlen mask) -- for paged caches the two differ."""
         from ...fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_fp4_helpers import (
             cvt_e4m3_to_f32_via_f16,
             fp4_decode_4bytes,
@@ -636,8 +638,8 @@ class SparseDecodeForwardSm12x:
                             mV[None, kv_head, None],
                         )
                     if cutlass.const_expr(self._kv_nvfp4):
-                        # Scale-row flattening per MSA quantize.py: paged caches are
-                        # quantized as (page, head, token) rows; flat as (token, head).
+                        # Scale-row flattening: paged caches are quantized as
+                        # (page, head, token) rows; flat as (token, head).
                         if cutlass.const_expr(self._paged):
                             sf_row_base = (page * mK.shape[1] + kv_head) * self._blk_kv
                             sf_row_stride = cutlass.Int32(1)

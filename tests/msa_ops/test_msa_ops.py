@@ -836,7 +836,7 @@ def test_sparse_decode_nvfp4_intermediate_chunks(monkeypatch):
             force_fused=force_fused,
         )
 
-    monkeypatch.setattr(sd, "_decode_num_chunks", lambda *a: 4)  # 4 blocks/chunk
+    monkeypatch.setattr(sd, "_decode_num_chunks", lambda *a: 4)  # 16 topk / 4 chunks
     out_mid = run()
     out_per_block = run(force_fused=False)
     torch.cuda.synchronize()

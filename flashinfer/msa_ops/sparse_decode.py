@@ -151,8 +151,8 @@ def _decode_num_chunks(
     base_ctas: int, topk: int, device, kv_nvfp4: bool = False
 ) -> int:
     """Top-k split factor: fill the SMs at low batch, 1 (fused) when already full.
-    NVFP4 always splits per block: the in-kernel dequant dominates, so the extra
-    parallelism beats the fused path even when the base grid fills the SMs."""
+    NVFP4 always splits per block: the in-kernel dequant dominates, and per-block
+    parallelism measured faster than fused even with the base grid full."""
     from ..utils import get_device_sm_count
 
     if base_ctas <= 0 or topk <= 1:
@@ -215,6 +215,15 @@ def msa_sparse_decode_attention(
         decoding).
     causal : bool
         Right-aligned causal masking (default True for decode).
+    k_scale, v_scale : torch.Tensor, optional
+        NVFP4 only: e4m3 block scales as uint8 bytes in the swizzled 128x4
+        layout produced by :func:`flashinfer.nvfp4_quantize` (one scale per
+        16 elements, rows padded to a multiple of 128). Scale rows follow the
+        cache layout: ``(token, head)`` order for flat K/V, ``(page, head,
+        token)`` for paged.
+    k_global_scale, v_global_scale : float, optional
+        NVFP4 global dequant scales; folded into the softmax scale and the
+        output scale respectively, so the kernel applies only block scales.
     force_fused : bool, optional
         Override the adaptive split-K decision. By default each token's selected
         list is split into chunks (one CTA per chunk online-softmaxes its blocks
@@ -336,9 +345,8 @@ def msa_sparse_decode_attention(
         raise ValueError("v must have the same shape and dtype as k")
 
     if kv_nvfp4:
-        # The kernel indexes scales through the swizzled 128x4 tiled layout
-        # produced by nvfp4_quantize, which pads rows to a multiple of 128; an
-        # undersized scale tensor would be read out of bounds.
+        # The kernel walks the swizzled 128x4 scale layout (rows padded to a
+        # multiple of 128), so an undersized scale tensor reads out of bounds.
         sf_rows = k.shape[0] * k.shape[1] * (k.shape[2] if paged else 1)
         sf_numel = -(sf_rows // -128) * 128 * (head_dim // 16)
         if k_scale.numel() < sf_numel or v_scale.numel() < sf_numel:
@@ -366,7 +374,7 @@ def msa_sparse_decode_attention(
     ):
         raise ValueError(f"unsupported partial_dtype {partial_dtype}")
 
-    # Adaptive split-K: num_chunks fills the (chunk x token x kv-head) grid at low
+    # Adaptive split-K: num_chunks fills the (token x chunk x kv-head) grid at low
     # batch; num_chunks==1 is the fused path (no GMEM partials/combine) at high
     # batch.
     if force_fused is True:
