@@ -79,6 +79,13 @@ void ulysses_a2a(fptr_t _fa, TensorView inp, TensorView out, int64_t B, int64_t 
   ffi::CUDADeviceGuard device_guard(inp.device().device_id);
   auto stream = get_stream(inp.device());
 
+  // The kernel and the staging copy-out assume contiguous CUDA operands; the
+  // Python wrapper checks this too, but the FFI binding must not rely on any
+  // particular frontend.
+  CHECK_INPUT(inp);
+  CHECK_INPUT(out);
+  TVM_FFI_ICHECK_EQ(inp.device().device_id, out.device().device_id)
+      << "inp and out must be on the same CUDA device";
   TVM_FFI_ICHECK_EQ(inp.dtype(), out.dtype());
   TVM_FFI_ICHECK_EQ(inp.numel(), out.numel());
   TVM_FFI_ICHECK(mode == 0 || mode == 1) << "ulysses_a2a mode must be 0 or 1";
