@@ -148,6 +148,9 @@ __device__ __forceinline__ Pair<__nv_bfloat16> pack_float2<__nv_bfloat16>(float2
 struct Copy_prop {
   using Atom = cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>;
   using AtomZFill = cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<cute::uint128_t>;
+  // L2-only (.cg) variant for read-once streams: the state cache is touched
+  // exactly once per step, so pulling it through L1 evicts the reused tiles.
+  using AtomCG = cute::SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
   static constexpr int vec_bytes = sizeof(std::remove_extent_t<typename Atom::SRegisters>);
 };
 
@@ -416,7 +419,7 @@ __device__ __forceinline__ void load_state_per_warp(SmemT& smem,
 
   constexpr int VAL_COLS = Copy_prop::vec_bytes / sizeof(state_t);
   auto g2s =
-      make_tiled_copy(Copy_Atom<Copy_prop::Atom, state_t>{},
+      make_tiled_copy(Copy_Atom<Copy_prop::AtomCG, state_t>{},
                       Layout<Shape<_4, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, Int<VAL_COLS>>>{});
   auto thr = g2s.get_slice(lane);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
@@ -440,7 +443,7 @@ __device__ __forceinline__ void load_state_cta(SmemT& smem, state_t const* __res
   constexpr int THR_ROWS = decltype(size<0>(ThrLayout{}))::value;
   static_assert(D_PER_CTA % THR_ROWS == 0,
                 "D_PER_CTA must be divisible by the thread layout's row count");
-  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::Atom, state_t>{}, ThrLayout{},
+  auto g2s = make_tiled_copy(Copy_Atom<Copy_prop::AtomCG, state_t>{}, ThrLayout{},
                              Layout<Shape<_1, Int<VAL_COLS>>>{});
   auto thr = g2s.get_slice(tid);
   copy(g2s, thr.partition_S(gState), thr.partition_D(sState));
