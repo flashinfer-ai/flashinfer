@@ -77,6 +77,13 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrRoutingBias = routingBias;
     routingData.mDtypeBias = dtypeBias;
     routingData.mRouteScale = routedScalingFactor;
+    // Floor the renorm denominator. ScaledSumNormalizePostprocess computes
+    // sigmoid * routeScale / (sum + mSumEpsilon). If a token's top-K selected experts all have
+    // strongly negative pre-bias logits, their sigmoids underflow to exactly 0.0 (bf16) so sum ==
+    // 0, and mSumEpsilon's 0.0f default makes this 0/0 = NaN across the token's whole output row.
+    // 1e-20f matches DeepSeek-V3's reference gate (modeling_deepseek.py: sum + 1e-20) and the
+    // MiniMax2 branch.
+    routingData.mSumEpsilon = 1e-20f;
 
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
     routingData.mPtrTopKIds = expertIds;

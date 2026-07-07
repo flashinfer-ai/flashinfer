@@ -421,15 +421,15 @@ struct DecodePlanInfo {
   }
 };
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
-          typename Params, typename WorkEstimationFunc>
-inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
-                              void* int_buffer, void* page_locked_int_buffer,
-                              size_t int_workspace_size_in_bytes, DecodePlanInfo& plan_info,
-                              typename Params::IdType* indptr_h, uint32_t batch_size,
-                              uint32_t num_qo_heads, uint32_t page_size, bool enable_cuda_graph,
-                              cudaStream_t stream, WorkEstimationFunc work_estimation_func) {
-  using DTypeO = typename Params::DTypeO;
+template <bool MATERIALIZE, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+          typename AttentionVariant, typename Params, typename WorkEstimationFunc>
+inline cudaError_t DecodePlanImpl(size_t& float_workspace_size_out, size_t& int_workspace_size_out,
+                                  void* float_buffer, size_t float_workspace_size_in_bytes,
+                                  void* int_buffer, void* page_locked_int_buffer,
+                                  size_t int_workspace_size_in_bytes, DecodePlanInfo& plan_info,
+                                  typename Params::IdType* indptr_h, uint32_t batch_size,
+                                  uint32_t num_qo_heads, uint32_t page_size, bool enable_cuda_graph,
+                                  cudaStream_t stream, WorkEstimationFunc work_estimation_func) {
   using IdType = typename Params::IdType;
   bool split_kv;
   uint32_t max_grid_size, kv_chunk_size_in_pages, new_batch_size, gdy;
@@ -446,7 +446,8 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
   auto [request_indices_vec, kv_tile_indices_vec, o_indptr_vec] =
       DecodeSplitKVIndptr(indptr_h, batch_size, kv_chunk_size_in_pages);
 
-  AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+  AlignedAllocator int_allocator =
+      MATERIALIZE ? AlignedAllocator(int_buffer, int_workspace_size_in_bytes) : AlignedAllocator();
   plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
       padded_batch_size * sizeof(IdType), 16, "batch_decode_request_indices");
   plan_info.kv_tile_indices_offset = int_allocator.aligned_alloc_offset(
@@ -455,21 +456,32 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
       (padded_batch_size + 1) * sizeof(IdType), 16, "batch_decode_o_indptr");
   plan_info.kv_chunk_size_ptr_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "batch_decode_kv_chunk_size_ptr");
-  IdType* request_indices_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
-  IdType* kv_tile_indices_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
-  IdType* o_indptr_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
-  IdType* kv_chunk_size_ptr_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
-  std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
-  std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
-  std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
-  kv_chunk_size_ptr_h[0] = kv_chunk_size_in_pages * page_size;
+  if constexpr (MATERIALIZE) {
+    IdType* request_indices_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
+    IdType* kv_tile_indices_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
+    IdType* o_indptr_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
+    IdType* kv_chunk_size_ptr_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
+    std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
+    std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
+    std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
+    kv_chunk_size_ptr_h[0] = kv_chunk_size_in_pages * page_size;
+  } else {
+    (void)kv_chunk_size_in_pages;
+    (void)new_batch_size;
+    (void)request_indices_vec;
+    (void)kv_tile_indices_vec;
+    (void)o_indptr_vec;
+  }
 
+  AlignedAllocator float_allocator;
   if (split_kv) {
-    AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
+    if constexpr (MATERIALIZE) {
+      float_allocator = AlignedAllocator(float_buffer, float_workspace_size_in_bytes);
+    }
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(float), 16, "batch_decode_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
@@ -477,18 +489,56 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
 
     plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
         padded_batch_size * sizeof(bool), 16, "batch_decode_block_valid_mask");
-    bool* block_valid_mask_h =
-        GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
-    for (uint32_t i = 0; i < padded_batch_size; ++i) {
-      block_valid_mask_h[i] = i < new_batch_size;
+    if constexpr (MATERIALIZE) {
+      bool* block_valid_mask_h =
+          GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
+      for (uint32_t i = 0; i < padded_batch_size; ++i) {
+        block_valid_mask_h[i] = i < new_batch_size;
+      }
     }
   }
 
-  size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
-
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
-                                       cudaMemcpyHostToDevice, stream));
+  float_workspace_size_out = float_allocator.num_allocated_bytes();
+  int_workspace_size_out = int_allocator.num_allocated_bytes();
+  if constexpr (MATERIALIZE) {
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, int_workspace_size_out,
+                                         cudaMemcpyHostToDevice, stream));
+  }
   return cudaSuccess;
+}
+
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
+          typename Params, typename WorkEstimationFunc>
+inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
+                              void* int_buffer, void* page_locked_int_buffer,
+                              size_t int_workspace_size_in_bytes, DecodePlanInfo& plan_info,
+                              typename Params::IdType* indptr_h, uint32_t batch_size,
+                              uint32_t num_qo_heads, uint32_t page_size, bool enable_cuda_graph,
+                              cudaStream_t stream, WorkEstimationFunc work_estimation_func) {
+  size_t used_float_workspace_size = 0;
+  size_t used_int_workspace_size = 0;
+  return DecodePlanImpl<true, HEAD_DIM, POS_ENCODING_MODE, AttentionVariant, Params>(
+      used_float_workspace_size, used_int_workspace_size, float_buffer,
+      float_workspace_size_in_bytes, int_buffer, page_locked_int_buffer,
+      int_workspace_size_in_bytes, plan_info, indptr_h, batch_size, num_qo_heads, page_size,
+      enable_cuda_graph, stream, work_estimation_func);
+}
+
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
+          typename Params, typename WorkEstimationFunc>
+inline cudaError_t DecodePlanWorkspaceSize(size_t& float_workspace_size_in_bytes,
+                                           size_t& int_workspace_size_in_bytes,
+                                           typename Params::IdType* indptr_h, uint32_t batch_size,
+                                           uint32_t num_qo_heads, uint32_t page_size,
+                                           bool enable_cuda_graph, cudaStream_t stream,
+                                           WorkEstimationFunc work_estimation_func) {
+  DecodePlanInfo plan_info;
+  return DecodePlanImpl<false, HEAD_DIM, POS_ENCODING_MODE, AttentionVariant, Params>(
+      float_workspace_size_in_bytes, int_workspace_size_in_bytes,
+      /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
+      /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
+      /*int_workspace_size_in_bytes=*/0, plan_info, indptr_h, batch_size, num_qo_heads, page_size,
+      enable_cuda_graph, stream, work_estimation_func);
 }
 
 template <typename IdType>
@@ -690,18 +740,20 @@ struct PrefillPlanInfo {
   }
 };
 
-template <typename IdType>
-inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
-                               void* int_buffer, void* page_locked_int_buffer,
-                               size_t int_workspace_size_in_bytes, PrefillPlanInfo& plan_info,
-                               IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t total_num_rows,
-                               uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-                               uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
-                               bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
-                               int32_t fixed_split_size, bool disable_split_kv,
-                               int64_t num_colocated_ctas,  // for POD attention, limit prefill
-                                                            // splits by #colocated decode CTAs
-                               cudaStream_t stream) {
+template <bool MATERIALIZE, typename IdType>
+inline cudaError_t PrefillPlanImpl(
+    size_t& float_workspace_size_out, size_t& int_workspace_size_out, void* float_buffer,
+    size_t float_workspace_size_in_bytes, void* int_buffer, void* page_locked_int_buffer,
+    size_t int_workspace_size_in_bytes, PrefillPlanInfo& plan_info, IdType* qo_indptr_h,
+    IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
+    bool disable_split_kv,
+    int64_t num_colocated_ctas,  // for POD attention, limit prefill
+                                 // splits by #colocated decode CTAs
+    cudaStream_t stream) {
+  (void)head_dim_qk;
+  (void)sizeof_dtype_o;
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -732,7 +784,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   plan_info.padded_batch_size = padded_batch_size;
   plan_info.split_kv = split_kv;
 
-  AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+  AlignedAllocator int_allocator =
+      MATERIALIZE ? AlignedAllocator(int_buffer, int_workspace_size_in_bytes) : AlignedAllocator();
   plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * padded_batch_size, 16, "batch_prefill_request_indices");
   plan_info.qo_tile_indices_offset = int_allocator.aligned_alloc_offset(
@@ -747,28 +800,43 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   if (plan_info.enable_cuda_graph) {
     plan_info.total_num_rows_offset =
         int_allocator.aligned_alloc_offset(sizeof(uint32_t), 16, "batch_prefill_total_num_rows");
-    uint32_t* total_num_rows_h =
-        GetPtrFromBaseOffset<uint32_t>(page_locked_int_buffer, plan_info.total_num_rows_offset);
-    *total_num_rows_h = qo_indptr_h[batch_size];
+    if constexpr (MATERIALIZE) {
+      uint32_t* total_num_rows_h =
+          GetPtrFromBaseOffset<uint32_t>(page_locked_int_buffer, plan_info.total_num_rows_offset);
+      *total_num_rows_h = qo_indptr_h[batch_size];
+    }
   }
 
-  IdType* request_indices_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
-  IdType* qo_tile_indices_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
-  IdType* kv_tile_indices_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
-  IdType* o_indptr_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
-  IdType* kv_chunk_size_ptr_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
-  std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
-  std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), qo_tile_indices_h);
-  std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
-  std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
-  kv_chunk_size_ptr_h[0] = kv_chunk_size;
+  if constexpr (MATERIALIZE) {
+    IdType* request_indices_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
+    IdType* qo_tile_indices_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
+    IdType* kv_tile_indices_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
+    IdType* o_indptr_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
+    IdType* kv_chunk_size_ptr_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
+    std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
+    std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), qo_tile_indices_h);
+    std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
+    std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
+    kv_chunk_size_ptr_h[0] = kv_chunk_size;
+  } else {
+    (void)new_batch_size;
+    (void)kv_chunk_size;
+    (void)request_indices_vec;
+    (void)qo_tile_indices_vec;
+    (void)kv_tile_indices_vec;
+    (void)o_indptr_vec;
+  }
+
+  AlignedAllocator float_allocator;
   if (split_kv) {
-    AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
+    if constexpr (MATERIALIZE) {
+      float_allocator = AlignedAllocator(float_buffer, float_workspace_size_in_bytes);
+    }
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
         "batch_prefill_tmp_v");
@@ -779,21 +847,70 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
     plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
         sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
 
-    IdType* merge_indptr_h =
-        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
-    bool* block_valid_mask_h =
-        GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
-    std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
-    for (uint32_t i = 0; i < padded_batch_size; ++i) {
-      block_valid_mask_h[i] = i < new_batch_size;
+    if constexpr (MATERIALIZE) {
+      IdType* merge_indptr_h =
+          GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
+      bool* block_valid_mask_h =
+          GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
+      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
+      for (uint32_t i = 0; i < padded_batch_size; ++i) {
+        block_valid_mask_h[i] = i < new_batch_size;
+      }
+    } else {
+      (void)merge_indptr_vec;
     }
   }
 
-  size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
-                                       cudaMemcpyHostToDevice, stream));
+  float_workspace_size_out = float_allocator.num_allocated_bytes();
+  int_workspace_size_out = int_allocator.num_allocated_bytes();
+  if constexpr (MATERIALIZE) {
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, int_workspace_size_out,
+                                         cudaMemcpyHostToDevice, stream));
+  } else {
+    (void)stream;
+  }
 
   return cudaSuccess;
+}
+
+template <typename IdType>
+inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
+                               void* int_buffer, void* page_locked_int_buffer,
+                               size_t int_workspace_size_in_bytes, PrefillPlanInfo& plan_info,
+                               IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t total_num_rows,
+                               uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                               uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
+                               bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
+                               int32_t fixed_split_size, bool disable_split_kv,
+                               int64_t num_colocated_ctas,  // for POD attention, limit prefill
+                                                            // splits by #colocated decode CTAs
+                               cudaStream_t stream) {
+  size_t used_float_workspace_size = 0;
+  size_t used_int_workspace_size = 0;
+  return PrefillPlanImpl<true>(
+      used_float_workspace_size, used_int_workspace_size, float_buffer,
+      float_workspace_size_in_bytes, int_buffer, page_locked_int_buffer,
+      int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows, batch_size,
+      num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
+      sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas, stream);
+}
+
+template <typename IdType>
+inline cudaError_t PrefillPlanWorkspaceSize(
+    size_t& float_workspace_size_in_bytes, size_t& int_workspace_size_in_bytes, IdType* qo_indptr_h,
+    IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
+    bool disable_split_kv, int64_t num_colocated_ctas, cudaStream_t stream) {
+  PrefillPlanInfo plan_info;
+  return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
+                                /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
+                                /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
+                                /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h,
+                                kv_indptr_h, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
+                                head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
+                                sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
+                                num_colocated_ctas, stream);
 }
 
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
