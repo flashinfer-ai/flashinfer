@@ -32,6 +32,8 @@ namespace tensorrt_llm::kernels::moe_alltoall {
 #define DISABLE_SYNC_FOR_PROFILING 0
 
 constexpr int kEp4Size = 4;
+constexpr int kCompactDispatchMaxPayloadBytes = 1024;
+constexpr int kCompactDispatchBlockSize = 128;
 
 #ifndef DISABLE_TIMEOUT
 #define DISABLE_TIMEOUT 0
@@ -333,6 +335,7 @@ __global__ void moeA2ADispatchKernel(
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank) {
+  static_assert(!COMPACT_EP4 || TOP_K > kEp4Size);
   int thread_idx = threadIdx.x;
   int local_token_idx = blockIdx.x;
 
@@ -547,23 +550,19 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
 
   int block_size = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
 
-  bool const is_ep4_topk22 = params.ep_size == kEp4Size && params.top_k == 22;
-  // H2048 NVFP4 dispatch carries packed activations (1024 B), scales (128 B),
-  // expert IDs (88 B), and routing weights (88 B). Callers may order the
-  // auxiliary payloads differently.
-  bool const has_h2048_nvfp4_payloads = params.num_payloads == 4 &&
-                                        kernel_ptrs.payload_bytes_per_token[0] == 1024 &&
-                                        ((kernel_ptrs.payload_bytes_per_token[1] == 128 &&
-                                          kernel_ptrs.payload_bytes_per_token[2] == 88 &&
-                                          kernel_ptrs.payload_bytes_per_token[3] == 88) ||
-                                         (kernel_ptrs.payload_bytes_per_token[1] == 88 &&
-                                          kernel_ptrs.payload_bytes_per_token[2] == 88 &&
-                                          kernel_ptrs.payload_bytes_per_token[3] == 128));
-  bool const use_compact_ep4 = is_ep4_topk22 && has_h2048_nvfp4_payloads;
-  // H2048 NVFP4 has only 64 aligned 16-byte activation vectors. More than four warps
-  // leaves most threads idle during the dominant payload copy.
-  if (use_compact_ep4 && block_size > 128) {
-    block_size = 128;
+  bool const use_compact_ep4 = params.ep_size == kEp4Size && params.top_k > kEp4Size;
+
+  int max_payload_bytes_per_token = 0;
+  for (int i = 0; i < params.num_payloads; ++i) {
+    if (kernel_ptrs.payload_bytes_per_token[i] > max_payload_bytes_per_token) {
+      max_payload_bytes_per_token = kernel_ptrs.payload_bytes_per_token[i];
+    }
+  }
+  // Small payloads do not have enough 16-byte vectors to use larger CTAs. A GB200
+  // sweep found 128 threads faster than both 64 and 256 at prefill token counts.
+  if (use_compact_ep4 && max_payload_bytes_per_token <= kCompactDispatchMaxPayloadBytes &&
+      block_size > kCompactDispatchBlockSize) {
+    block_size = kCompactDispatchBlockSize;
   }
 
   // Configure kernel launch: one block per token
@@ -575,9 +574,12 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   }
   if (use_compact_ep4) {
     int shared_bytes = kEp4Size * (int)sizeof(int);
-    moeA2ADispatchKernel<22, true><<<grid_size, block_size, shared_bytes, params.stream>>>(
-        params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
-        params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts_per_rank);
+    SWITCH_TOP_K(params.top_k, TOP_K,
+                 moeA2ADispatchKernel<TOP_K, true>
+                 <<<grid_size, block_size, shared_bytes, params.stream>>>(
+                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                     params.ep_size, params.num_experts_per_rank))
   } else {
     int shared_bytes = 2 * params.top_k * (int)sizeof(int);
     SWITCH_TOP_K(params.top_k, TOP_K,
