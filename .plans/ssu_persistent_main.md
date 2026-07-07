@@ -963,6 +963,82 @@ accounting (wait on state and non-state independently).  Synergy: with future 1-
 extra state slot halves to +8 KB — state-depth-2 becomes nearly free.  ON HOLD pending the dtype
 roadmap discussion (bf16 / f16+SR now; e4m3 / int8 + per-channel scaling + SR later).
 
+### LANDED: f32 state cache on the two-kernel path (B200, 2026-07-06)
+
+Support, not perf: state HBM + smem ring in f32, matmuls stay bf16.  Decided via
+tiler.py (extended to model smem dtype ≠ frag dtype: LDS fallback + a bank simulator
+on the exact m16n8k16 fragment lane map, phase-split per LDS width):
+
+- **Operand swap survives f32 unchanged.**  State-as-A (swap) and state-as-B
+  (monolith form) cost identically for f32 — 32 LDS.64 + 8 LDSM per warp either
+  way — so the swap's wins ([DIM,NPRED] output stores, transpose-view epilogue,
+  M=64 filling 4 warps) all carry over.  No ldmatrix exists for this dtype combo:
+  ldmatrix's fixed distribution hands each lane ONE f32 (= the tf32 fragment),
+  not the k-adjacent pair the bf16 fragment needs — repair = shfl chains costing
+  more than LDS (and shfl shares the MIO pipe anyway).
+- **SmemSwizzle M floored at 3** → f32 gets `<3,3,3>` (computed default was
+  `<3,2,3>`, which 2-way conflicts EVERY float2 pair access: OUT.1 A-operand
+  LDS.64s, replay accumulator loads, replay STS.64 writeback — a 16-lane 8B
+  phase covers only 4 fragment rows, and the M=2 XOR keeps each row's pair-set
+  inside an XOR-closed 16B-chunk set).  `<3,3,3>` rotates 32B chunks → the 4
+  rows land on disjoint bank quarters (tiler-verified CF).  Monolith's B-side
+  scalar LDS.32 stays 2-way under ANY swizzle (8 rows × 32B > 128B window —
+  fixable only by vectorizing to LDS.64; left untouched, status quo).
+- **pipelined_kloop_gemm A-side got the B-side's wide treatment**: `make_a_s2r`
+  (2B → LDSM x4 unchanged; 4B → `Copy_Atom<UniversalCopy<uint64_t>, float>` =
+  one LDS.64 per k-pair) + `FragAStg` staging + two-arg `convert_frag` narrow;
+  `kHandrollA` gated `!kWideA`.  2-byte instantiations are bit-identical (wide
+  staging is `if constexpr`-dead).
+- `add_init_out_ring` / `output_head_2k` 2-byte asserts relaxed (AView =
+  bf16-view for 2B, native float for 4B — mirrors monolith `add_init_out`);
+  launcher accepts `sizeof(state_t) ∈ {2,4}` on the split.  Occupancy price
+  accepted: state slot 16K→32K (~29K→~45K/block at STATE_PIPE=1).
+- Tests: new `test_two_kernel_f32_state` (body shared with the f16 test via
+  `_run_two_kernel_state_dtype_case`); full batch green — 52 passed (two-kernel
+  bf16/f16/f32 × write/no-write, persistent grid-stride, monolith f32 ×
+  Triton refs under the new swizzle, monolith bf16 d_split2/hpg/contig, int8).
+
+### f32 perf root-cause + the STAGES=2 flip (B200, 2026-07-06)
+
+First f32 numbers (b=1024, mtp=8, CUPTI e2e) were BAD: no-write 157.7 vs monolith
+145.4 vs triton-pm 125.0 (bf16: 79.5 / 119.5 / 79.3).  ncu
+(`ssu_2k_v33_b1024_f32_8_pnat4.ncu-rep` vs `v32` bf16): main kernel 135.2 vs bf16
+63.4 µs — went **mio_throttle-bound** (36.3% of stalls vs 10%; issue-active 19.3%
+vs 35.9%) with NOTHING saturated (LSU 16%, DRAM 58%) — a latency-coverage
+shortfall, not a bandwidth wall.  Deltas vs bf16 (nvdisasm -gi inline-chain
+attribution; ncu's leaf attribution merges every cp.async into copy_sm80.hpp:62):
++32 LDS.64 + 32 F2FP per OUT.1 pass (wide-A, cute per-access swizzle recompute),
++8 LDGSTS/lane state prefetch (16B width already max), −1 block occupancy — all
+phase-locked by the per-unit `wait_prior + __syncthreads` cadence, so the bursts
+spike the queue together.  The monolith absorbs f32 gracefully (mio 7.4%) only via
+wave-stagger + its 40 µs of pre-existing slack (its f32 increment +25.9 is *below*
+the +33 physics floor); kernel-vs-kernel the main still beat it (135.2 vs 140.1) —
+the e2e flip was the precompute (14.8 µs) no longer covered by the shrunken margin.
+Triton-pm's f32 recipe: TMA state loads + a separate no-write rectangle kernel; its
+state→MMA path is otherwise clumsier than ours (extra smem round-trip: LDS.64 +
+F2FP + STS.64 + LDSM).
+
+**The fix was provisioning, not plumbing**: `STAGES=2` + a SMALL grid.  Depth 2
+covers the doubled prefetch; cps=4 (~2 waves at the 2-block/SM residency) keeps
+CTAs long-lived so the deep ring stays warm.  Sweep (f32, b=1024, e2e µs):
+
+    stages=1: cps 5..32 → 150.5–158 (flat, slightly favors BIG grid)
+    stages=2: cps=4 122.8/227.4 (nw/w), 8: 126.3/232, 16: 132.0/239.8, 32: 136.9/243.2
+
+LANDED as state-width-aware launcher defaults (4-byte state → `main_stages=2`,
+`main_cta_per_sm=4`; 2-byte unchanged; envs still override).  Result: **2k is the
+fastest f32 impl on both paths** — no-write 122.8 (monolith 145.4, triton-pm
+125.0), write 227.4 (239.6 / 260.1).  Non-physics f32 overhead vs bf16 dropped
+from +45 to ~+10 µs.  Exactly inverse of bf16, where depth 2 LOSES (79.6 → 94.0)
+— the shallow ring already covers the bf16 bundle, so depth costs occupancy for
+nothing.  CAVEAT: tuned at b=1024; at small batch the grid caps at total_work
+(~1 unit/CTA), the ring never engages but still halves occupancy — mixed-batch
+sweep pending; the stages heuristic may need to become batch-aware.
+
+Remaining (optional, ~10 µs pool): hand-rolled wide-A LDS.64 addressing (kill
+cute's per-access swizzle recompute), cp.async.cg for the read-once state stream,
+state-width-aware `main_maxnreg`, TMA state loads.
+
 ## TODO
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
