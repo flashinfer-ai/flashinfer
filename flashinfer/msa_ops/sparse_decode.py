@@ -147,12 +147,18 @@ def _dummy_tensors(device_index: int):
     )
 
 
-def _decode_num_chunks(base_ctas: int, topk: int, device) -> int:
-    """Top-k split factor: fill the SMs at low batch, 1 (fused) when already full."""
+def _decode_num_chunks(
+    base_ctas: int, topk: int, device, kv_nvfp4: bool = False
+) -> int:
+    """Top-k split factor: fill the SMs at low batch, 1 (fused) when already full.
+    NVFP4 always splits per block: the in-kernel dequant dominates, so the extra
+    parallelism beats the fused path even when the base grid fills the SMs."""
     from ..utils import get_device_sm_count
 
     if base_ctas <= 0 or topk <= 1:
         return 1
+    if kv_nvfp4:
+        return topk
     num_sms = get_device_sm_count(device)
     if base_ctas >= num_sms:
         return 1
@@ -217,7 +223,8 @@ def msa_sparse_decode_attention(
         single chunk at high batch. A single chunk is the *fused* path: one CTA
         per (token, kv-head) writes the final output directly (no GMEM partials,
         no combine). ``True``/``False`` force fused/split on; ``None`` (default)
-        adapts.
+        adapts. NVFP4 KV defaults to the per-block split at every batch size
+        (the in-kernel dequant favors the extra parallelism).
 
     Returns
     -------
@@ -328,6 +335,19 @@ def msa_sparse_decode_attention(
     if v.shape != k.shape or v.dtype != k.dtype:
         raise ValueError("v must have the same shape and dtype as k")
 
+    if kv_nvfp4:
+        # The kernel indexes scales through the swizzled 128x4 tiled layout
+        # produced by nvfp4_quantize, which pads rows to a multiple of 128; an
+        # undersized scale tensor would be read out of bounds.
+        sf_rows = k.shape[0] * k.shape[1] * (k.shape[2] if paged else 1)
+        sf_numel = -(sf_rows // -128) * 128 * (head_dim // 16)
+        if k_scale.numel() < sf_numel or v_scale.numel() < sf_numel:
+            raise ValueError(
+                f"k_scale/v_scale must hold the 128-row-padded swizzled scale "
+                f"layout for {sf_rows} KV rows ({sf_numel} bytes), got "
+                f"{k_scale.numel()}/{v_scale.numel()}"
+            )
+
     # The right-aligned default offset is computed in-kernel, so no offset
     # tensor is built for it.
     qoff_default = q_offset is None
@@ -354,7 +374,7 @@ def msa_sparse_decode_attention(
     elif force_fused is False:
         fused, num_chunks = False, topk
     else:
-        num_chunks = _decode_num_chunks(total_q * num_kv_heads, topk, dev)
+        num_chunks = _decode_num_chunks(total_q * num_kv_heads, topk, dev, kv_nvfp4)
         fused = num_chunks == 1
 
     if fused:

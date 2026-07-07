@@ -495,7 +495,10 @@ def test_sparse_decode_fused(B, sq, Hq, Hkv, topk, kv_dtype, paged):
     assert (out_fused.float().cpu() - ref).abs().max().item() < 2.5e-2
     # Fused must agree with the split path to ~bf16 precision.
     assert (out_fused.float() - out_split.float()).abs().max().item() < 5e-3
-    finite = torch.isfinite(lse_split) & torch.isfinite(lse_fused)
+    # Non-finite (empty-selection) slots must agree exactly; masking first would
+    # hide a path that goes NaN/-inf where the other stays finite.
+    assert torch.equal(torch.isfinite(lse_split), torch.isfinite(lse_fused))
+    finite = torch.isfinite(lse_split)
     assert (lse_fused[finite] - lse_split[finite]).abs().max().item() < 5e-3
 
 
@@ -579,6 +582,21 @@ def _nvfp4_quant(x2d):
     return xq.view(torch.uint8), sf.view(torch.uint8), float(1.0 / gsf)
 
 
+def _nvfp4_dequant_kv(kq, ksf, kg, vq, vsf, vg, total_k, Hkv):
+    """Dequantize packed K/V back to bf16 (total_k, Hkv, 128) for the oracle."""
+    k_deq = (
+        _msa_nvfp4_dequant(kq, ksf, kg, total_k * Hkv, 128)
+        .reshape(total_k, Hkv, 128)
+        .to(torch.bfloat16)
+    )
+    v_deq = (
+        _msa_nvfp4_dequant(vq, vsf, vg, total_k * Hkv, 128)
+        .reshape(total_k, Hkv, 128)
+        .to(torch.bfloat16)
+    )
+    return k_deq, v_deq
+
+
 @pytest.mark.parametrize("causal", [False, True])
 def test_sparse_attention_nvfp4(causal):
     _skip_if_unsupported()
@@ -627,16 +645,7 @@ def test_sparse_attention_nvfp4(causal):
         v_global_scale=vg,
     )
     torch.cuda.synchronize()
-    k_deq = (
-        _msa_nvfp4_dequant(kq, ksf, kg, total_k * Hkv, 128)
-        .reshape(total_k, Hkv, 128)
-        .to(torch.bfloat16)
-    )
-    v_deq = (
-        _msa_nvfp4_dequant(vq, vsf, vg, total_k * Hkv, 128)
-        .reshape(total_k, Hkv, 128)
-        .to(torch.bfloat16)
-    )
+    k_deq, v_deq = _nvfp4_dequant_kv(kq, ksf, kg, vq, vsf, vg, total_k, Hkv)
     ref = _ref_sparse_attention(
         q.cpu(),
         k_deq.cpu(),
@@ -693,16 +702,7 @@ def test_sparse_decode_nvfp4():
     )
     out = call()
     torch.cuda.synchronize()
-    k_deq = (
-        _msa_nvfp4_dequant(kq, ksf, kg, total_k * Hkv, 128)
-        .reshape(total_k, Hkv, 128)
-        .to(torch.bfloat16)
-    )
-    v_deq = (
-        _msa_nvfp4_dequant(vq, vsf, vg, total_k * Hkv, 128)
-        .reshape(total_k, Hkv, 128)
-        .to(torch.bfloat16)
-    )
+    k_deq, v_deq = _nvfp4_dequant_kv(kq, ksf, kg, vq, vsf, vg, total_k, Hkv)
     cu_q = torch.arange(0, total_q + 1, sq, dtype=torch.int32)
     ref = _ref_sparse_attention(
         q.cpu(), k_deq.cpu(), v_deq.cpu(), idx.cpu(), cu_q, cu_k.cpu(), True, scale
@@ -786,16 +786,7 @@ def test_sparse_decode_fused_nvfp4(paged):
     out_fused, lse_fused = run(True)
     torch.cuda.synchronize()
 
-    k_deq = (
-        _msa_nvfp4_dequant(kq, ksf, kg, total_k * Hkv, 128)
-        .reshape(total_k, Hkv, 128)
-        .to(torch.bfloat16)
-    )
-    v_deq = (
-        _msa_nvfp4_dequant(vq, vsf, vg, total_k * Hkv, 128)
-        .reshape(total_k, Hkv, 128)
-        .to(torch.bfloat16)
-    )
+    k_deq, v_deq = _nvfp4_dequant_kv(kq, ksf, kg, vq, vsf, vg, total_k, Hkv)
     cu_q = torch.arange(0, total_q + 1, sq, dtype=torch.int32)
     ref = _ref_sparse_attention(
         q.cpu(), k_deq.cpu(), v_deq.cpu(), idx.cpu(), cu_q, cu_k.cpu(), True, scale
@@ -803,8 +794,88 @@ def test_sparse_decode_fused_nvfp4(paged):
     assert (out_fused.float().cpu() - ref).abs().max().item() < 2.5e-2
     # Fused must agree with the split path to ~bf16 precision.
     assert (out_fused.float() - out_split.float()).abs().max().item() < 5e-3
-    finite = torch.isfinite(lse_split) & torch.isfinite(lse_fused)
+    # Non-finite (empty-selection) slots must agree exactly; masking first would
+    # hide a path that goes NaN/-inf where the other stays finite.
+    assert torch.equal(torch.isfinite(lse_split), torch.isfinite(lse_fused))
+    finite = torch.isfinite(lse_split)
     assert (lse_fused[finite] - lse_split[finite]).abs().max().item() < 5e-3
+
+
+def test_sparse_decode_nvfp4_intermediate_chunks(monkeypatch):
+    """The split kernel must handle intermediate chunking for NVFP4
+    (1 < num_chunks < topk: several dequant blocks per chunk, online-softmax
+    carry across them). The default heuristic picks per-block for NVFP4, so
+    pin num_chunks and check against the per-block split and the dequant
+    oracle."""
+    _skip_if_unsupported()
+    import flashinfer.msa_ops.sparse_decode as sd
+
+    B, sq, Hq, Hkv, topk = 8, 1, 8, 2, 16
+    q, k_flat, v_flat, idx, seqused, cu_k, _, _ = _make_decode_case(
+        B, sq, Hq, Hkv, topk, torch.bfloat16, False, seed=117
+    )
+    total_q, total_k = B * sq, k_flat.shape[0]
+    scale = 1.0 / math.sqrt(128)
+    kq, ksf, kg = _nvfp4_quant(k_flat.reshape(-1, 128))
+    vq, vsf, vg = _nvfp4_quant(v_flat.reshape(-1, 128))
+
+    def run(force_fused=None):
+        return sd.msa_sparse_decode_attention(
+            q,
+            kq.reshape(total_k, Hkv, 64),
+            vq.reshape(total_k, Hkv, 64),
+            idx,
+            cu_seqlens_k=cu_k,
+            seqlen_q=sq,
+            causal=True,
+            softmax_scale=scale,
+            k_scale=ksf,
+            v_scale=vsf,
+            k_global_scale=kg,
+            v_global_scale=vg,
+            force_fused=force_fused,
+        )
+
+    monkeypatch.setattr(sd, "_decode_num_chunks", lambda *a: 4)  # 4 blocks/chunk
+    out_mid = run()
+    out_per_block = run(force_fused=False)
+    torch.cuda.synchronize()
+
+    k_deq, v_deq = _nvfp4_dequant_kv(kq, ksf, kg, vq, vsf, vg, total_k, Hkv)
+    cu_q = torch.arange(0, total_q + 1, sq, dtype=torch.int32)
+    ref = _ref_sparse_attention(
+        q.cpu(), k_deq.cpu(), v_deq.cpu(), idx.cpu(), cu_q, cu_k.cpu(), True, scale
+    )
+    assert (out_mid.float().cpu() - ref).abs().max().item() < 2.5e-2
+    assert (out_mid.float() - out_per_block.float()).abs().max().item() < 5e-3
+
+
+def test_sparse_decode_nvfp4_scale_size_guard():
+    """An undersized k_scale/v_scale (not the 128-row-padded swizzled layout)
+    must be rejected before launch instead of read out of bounds."""
+    _skip_if_unsupported()
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    B, sq, Hq, Hkv, topk = 4, 1, 8, 2, 16
+    q, k_flat, v_flat, idx, seqused, cu_k, _, _ = _make_decode_case(
+        B, sq, Hq, Hkv, topk, torch.bfloat16, False, seed=118
+    )
+    total_k = k_flat.shape[0]
+    kq, ksf, kg = _nvfp4_quant(k_flat.reshape(-1, 128))
+    vq, vsf, vg = _nvfp4_quant(v_flat.reshape(-1, 128))
+    with pytest.raises(ValueError, match="swizzled scale"):
+        msa_sparse_decode_attention(
+            q,
+            kq.reshape(total_k, Hkv, 64),
+            vq.reshape(total_k, Hkv, 64),
+            idx,
+            cu_seqlens_k=cu_k,
+            seqlen_q=sq,
+            k_scale=ksf.reshape(-1)[:-64],
+            v_scale=vsf,
+            k_global_scale=kg,
+            v_global_scale=vg,
+        )
 
 
 # ---------------------------------------------------------------------------
