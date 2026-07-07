@@ -175,14 +175,23 @@ struct MMA_prop {
 // Swizzled smem layout for mma.sync operands (row-major).
 // =============================================================================
 // The swizzle picks the `M` parameter to make each ldmatrix / cp.async atom
-// exactly 16 bytes of contiguous element data (one 128-bit vector), and keeps
+// at least 16 bytes of contiguous element data (one 128-bit vector), and keeps
 // B = S = 3 so that each 8-row block XORs row↔column bits to stay
 // bank-conflict-free on the 128-byte bank cycle.
 //
 //   sizeof(T)  Swizzle<B,M,S>     atom rows × cols    row bytes
 //     2B       Swizzle<3, 3, 3>       8  × 64             128
-//     4B       Swizzle<3, 2, 3>       8  × 32             128
+//     4B       Swizzle<3, 3, 3>       8  × 64             256
 //     1B       Swizzle<3, 4, 3>       8  × 128            128
+//
+// M is floored at 3 (8 contiguous elements).  For 4-byte elements the natural
+// M=2 (16B chunks) is NOT conflict-free for the fragment loads the f32 state
+// path emits: an LDS.64 float2 wavefront phase is 16 lanes = 4 fragment rows,
+// and the M=2 XOR moves each row's pair-set within an XOR-closed 16B-chunk set
+// — two rows per phase land on the same 16 banks (2-way, every access).  M=3
+// rotates 32B chunks, mapping the 4 rows of a phase onto 4 disjoint 32B bank
+// ranges (verified in tiler.py's fragment-map bank simulator).  16B cp.async /
+// LDS vectors stay intact under M=3 (32B ⊃ 16B).
 //
 // The MMA operand element type dictates the smem buffer element type, which in
 // turn dictates the swizzle — so every call site passes its own element type.
@@ -200,7 +209,8 @@ struct SmemSwizzle {
   static_assert(Copy_prop::vec_bytes % sizeof(Elem) == 0,
                 "element size must divide LDSM atom (16 bytes)");
   static constexpr int ELEMS_PER_ATOM = Copy_prop::vec_bytes / sizeof(Elem);
-  using type = cute::Swizzle<3, log2_pow2(ELEMS_PER_ATOM), 3>;
+  static constexpr int SWIZZLE_BASE = log2_pow2(ELEMS_PER_ATOM) < 3 ? 3 : log2_pow2(ELEMS_PER_ATOM);
+  using type = cute::Swizzle<3, SWIZZLE_BASE, 3>;
   static constexpr int ATOM_ROWS = 1 << type::num_bits;
   static constexpr int ATOM_COLS = 1 << (type::num_base + type::num_shft);
 };
@@ -1206,6 +1216,28 @@ __device__ __forceinline__ auto make_state_b_s2r(TiledMma const& tm) {
   }
 }
 
+// MMA A operand: dtype-aware TiledCopy.  A = C in the monolith's matmul 3
+// (always 2-byte) and A = state in the persistent main's operand-swapped OUT.1
+// (2- or 4-byte f32 cache).
+//   2-byte smem: LDSM (SM75_U32x4_LDSM_N) — vectorized 16-bit ldmatrix.
+//   4-byte smem: UniversalCopy<uint64_t> — one LDS.64 per k-adjacent float2
+//     pair (the fragment's innermost value mode).  ldmatrix cannot feed a
+//     16-bit MMA from 32-bit elements: its fixed distribution hands each lane
+//     ONE whole f32 (the tf32 fragment layout), not the k-adjacent pair the
+//     bf16 fragment wants — repairing that costs cross-lane shfl chains that
+//     exceed the LDS path.  Pairs are narrowed to bf16 in registers by
+//     `convert_frag` after the load (mirrors the B side).
+template <typename state_t, typename MmaT, typename TiledMma>
+__device__ __forceinline__ auto make_a_s2r(TiledMma const& tm) {
+  using namespace cute;
+  if constexpr (sizeof(state_t) == 2) {
+    return make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MmaT>{}, tm);
+  } else {
+    static_assert(sizeof(state_t) == 4, "wide state path expects 4-byte smem");
+    return make_tiled_copy_A(Copy_Atom<UniversalCopy<uint64_t>, state_t>{}, tm);
+  }
+}
+
 // Src → dst fragment conversion — a strict superset of the in-place overload
 // above: supports narrowing (e.g. f32 → bf16) via a separate src fragment.
 // Three paths:
@@ -1392,7 +1424,7 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
 
   // ── S2R copies ──
-  auto s2r_A = make_tiled_copy_A(Copy_Atom<SM75_U32x4_LDSM_N, MmaT>{}, tiled_mma);
+  auto s2r_A = make_a_s2r<ATypeIn, MmaT>(tiled_mma);
   auto s2r_thr_A = s2r_A.get_slice(tid);
   auto s2r_B = make_state_b_s2r<BTypeIn, MmaT>(tiled_mma);
   auto s2r_thr_B = s2r_B.get_slice(tid);
@@ -1410,12 +1442,26 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
     smem_B_s2r[n] = s2r_thr_B.partition_S(smem_B_tiled(_, _, n, _));
   }
 
+  // A staging is only live when ATypeIn is wider than MmaT (f32 state as the
+  // swapped OUT.1 A operand): the LDS.64 copy lands raw f32 pairs in FragAStg
+  // and `convert_frag` narrows them into the MMA fragment.  2-byte ATypeIn
+  // keeps the landed direct-load + in-place-convert path bit-identical (the
+  // staging arrays below are dead and eliminated).
+  constexpr bool kWideA = sizeof(ATypeIn) != sizeof(MmaT);
+
   // ── Fragment / view types ──
   using FragA = decltype(thr_mma.partition_fragment_A(smem_A_ktiled(_, _, _0{})));
   using FragB = decltype(thr_mma.partition_fragment_B(sample_smem_B_n(_, _, _0{})));
+  using a_view_t = std::conditional_t<sizeof(ATypeIn) == sizeof(MmaT), MmaT, ATypeIn>;
   using b_view_t = std::conditional_t<sizeof(BTypeIn) == sizeof(MmaT), MmaT, BTypeIn>;
+  using FragAStg = decltype(make_fragment_like<a_view_t>(std::declval<FragA>()));
   using FragBStg = decltype(make_fragment_like<b_view_t>(std::declval<FragB>()));
-  using FragAView = decltype(s2r_thr_A.retile_D(std::declval<FragA&>()));
+  // The direct A view only exists on the 2-byte path (retiling the MmaT
+  // fragment against the wide copy atom would be ill-formed) — resolve the
+  // conditional BEFORE taking the decltype so it is never instantiated.
+  using FragAView =
+      decltype(s2r_thr_A.retile_D(std::declval<std::conditional_t<kWideA, FragAStg, FragA>&>()));
+  using FragAStgView = decltype(s2r_thr_A.retile_D(std::declval<FragAStg&>()));
   using FragBStgView = decltype(s2r_thr_B.retile_D(std::declval<FragBStg&>()));
 
   // ── Multi-stage register fragments ──
@@ -1425,12 +1471,18 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
   // in-place reinterpret).
   FragA frag_A[NumStages];
   FragB frag_B[NumNTiles][NumStages];
+  FragAStg frag_A_stg[NumStages];
   FragBStg frag_B_stg[NumNTiles][NumStages];
   FragAView frag_A_view[NumStages];
+  FragAStgView frag_A_stg_view[NumStages];
   FragBStgView frag_B_stg_view[NumNTiles][NumStages];
   CUTE_UNROLL
   for (int s = 0; s < NumStages; ++s) {
-    frag_A_view[s] = s2r_thr_A.retile_D(frag_A[s]);
+    if constexpr (!kWideA) {
+      frag_A_view[s] = s2r_thr_A.retile_D(frag_A[s]);
+    } else {
+      frag_A_stg_view[s] = s2r_thr_A.retile_D(frag_A_stg[s]);
+    }
     CUTE_UNROLL
     for (int n = 0; n < NumNTiles; ++n) {
       frag_B_stg_view[n][s] = s2r_thr_B.retile_D(frag_B_stg[n][s]);
@@ -1457,7 +1509,9 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
 #if defined(SSU_NO_HANDROLL_A)
   constexpr bool kHandrollA = false;  // A/B switch: -DSSU_NO_HANDROLL_A reverts to cute::copy
 #else
-  constexpr bool kHandrollA = (SwizA::num_bits > 0) && (sizeof(MmaT) == 2);
+  // Hand-rolled addressing is the ldmatrix path — 2-byte A only (wide f32 A
+  // loads via the LDS.64 tiled copy below).
+  constexpr bool kHandrollA = (SwizA::num_bits > 0) && (sizeof(MmaT) == 2) && !kWideA;
 #endif
   uint32_t const A_base = cast_smem_ptr_to_uint(raw_pointer_cast(smem_A_s2r.data()));
   // byteoffA[k] is the stored swizzled byte offset (swizzle + offset baked in); per
@@ -1491,6 +1545,8 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
       assert(A_base + byteoffA[k_src] ==
              cast_smem_ptr_to_uint(&smem_A_s2r(_0{}, _0{}, _0{}, k_src)));
 #endif
+    } else if constexpr (kWideA) {
+      cute::copy(s2r_A, smem_A_s2r(_, _, _, k_src), frag_A_stg_view[slot]);
     } else {
       cute::copy(s2r_A, smem_A_s2r(_, _, _, k_src), frag_A_view[slot]);
     }
@@ -1500,7 +1556,11 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
     }
   };
   auto convert_one = [&](int slot) {
-    convert_frag<ATypeIn, MmaT>(frag_A[slot]);
+    if constexpr (kWideA) {
+      convert_frag<ATypeIn, MmaT>(frag_A_stg[slot], frag_A[slot]);
+    } else {
+      convert_frag<ATypeIn, MmaT>(frag_A[slot]);
+    }
     CUTE_UNROLL
     for (int n = 0; n < NumNTiles; ++n) {
       convert_frag<BTypeIn, MmaT>(frag_B_stg[n][slot], frag_B[n][slot]);

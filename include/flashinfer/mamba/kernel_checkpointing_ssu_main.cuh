@@ -379,11 +379,12 @@ __device__ __forceinline__ void output_head(SmemT& smem, CheckpointingSsuParams 
 }
 
 // add_init_out_ring (OPERAND SWAP): OUT.1 = state @ Cᵀ → frag_y[d, t] = Σ_n state[d,n]·C[t,n].
-// A = state (SM75_U32x4_LDSM_N; state smem is dstate=K contiguous → non-transpose), B = C
+// A = state (2-byte: SM75_U32x4_LDSM_N; 4-byte f32: LDS.64 float2 pairs + in-reg narrow — see
+// make_a_s2r; state smem is dstate=K contiguous → non-transpose either way), B = C
 // (SM75_U32x2_LDSM_N).  Reuses the shared, operand-generic pipelined_kloop_gemm with A/B swapped
 // (the monolith's add_init_out call A=C,B=state is untouched).  Warps split M=DIM (tiled_mma
 // Shape<NUM_WARPS,1>); C is the broadcast B operand.  Both C and state are slot-indexed for the
-// persistent ring.  2-byte state only — the A-operand LDSM path (4-byte would need UniversalCopy).
+// persistent ring.
 template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
           typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out_ring(SmemT const& smem, TiledMma const& tiled_mma,
@@ -394,12 +395,14 @@ __device__ __forceinline__ void add_init_out_ring(SmemT const& smem, TiledMma co
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
   constexpr int M_TILE = cute::tile_size<0>(TiledMma{});  // 16·NUM_WARPS = D_PER_CTA
-  static_assert(sizeof(state_t) == 2, "operand-swap OUT.1 needs 2-byte state (A-operand LDSM)");
-  // State smem is VIEWED as the MMA operand type so the 16-bit LDSM atom matches; the actual
-  // element type (state_t — may be f16) is recovered in-registers by pipelined_kloop_gemm's
-  // convert_frag<state_t, MmaT> after the load (no-op when state_t is bf16).  Mirrors the
-  // monolith's add_init_out B-side treatment.
-  using AView = MMA_prop::operand_t;
+  static_assert(sizeof(state_t) != 1, "8-bit state goes through the dedicated 8-bit kernel");
+  // 2-byte state smem is VIEWED as the MMA operand type so the 16-bit LDSM atom matches; the
+  // actual element type (state_t — may be f16) is recovered in-registers by
+  // pipelined_kloop_gemm's convert_frag<state_t, MmaT> after the load (no-op when state_t is
+  // bf16).  4-byte (f32) state keeps its native view: the k-loop loads k-adjacent float2
+  // pairs via LDS.64 and narrows to bf16 in registers (no A-operand ldmatrix exists for
+  // 32-bit elements — see make_a_s2r).  Mirrors the monolith's add_init_out B-side treatment.
+  using AView = std::conditional_t<sizeof(state_t) == 2, MMA_prop::operand_t, state_t>;
   // A = state [D_PER_CTA, DSTATE] (dstate contiguous = K-major → x4 non-transpose LDSM),
   // slot-indexed.
   auto const layout_state = make_swizzled_layout_rc<AView, D_PER_CTA, DSTATE>();
@@ -495,7 +498,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
                                                FragCBOld const& frag_CB_old) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "output_head_2k requires 2-byte input type");
-  static_assert(sizeof(state_t) == 2, "operand-swap output requires 2-byte state");
+  static_assert(sizeof(state_t) == 2 || sizeof(state_t) == 4,
+                "operand-swap output supports 2-byte (LDSM) or 4-byte (LDS.64) state");
 
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int NPREDICTED_PAD_MMA_N = SmemT::NPREDICTED_PAD_MMA_N;

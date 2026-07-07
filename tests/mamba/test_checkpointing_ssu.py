@@ -1103,20 +1103,13 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("philox_rounds", [0, 5])
-def test_two_kernel_f16_state(philox_rounds):
-    """f16 STATE + bf16 activations on the two-kernel path vs the monolithic
-    reference.  The operand-swap OUT.1 LDSMs the state under a bf16-typed view;
-    the real element type must be recovered in-registers
-    (convert_frag<state_t>) — reinterpreting f16 bits as bf16 silently corrupts
-    the output (caught 2026-07-02).
-
-    The window is filled with CONSISTENT rows (softplus dt, true cumsum): the
-    write path replays rows beyond T, and inconsistent random rows push |state|
-    past f16 max (65504) into inf/NaN.  philox_rounds=5 exercises the SR state
-    store (shared store code + same seed ⇒ the two paths bit-match)."""
+def _run_two_kernel_state_dtype_case(state_dtype, philox_rounds):
+    """Two-kernel path vs the monolithic reference with a non-bf16 STATE dtype
+    (bf16 activations).  The window is filled with CONSISTENT rows (softplus
+    dt, true cumsum): the write path replays rows beyond T, and inconsistent
+    random rows push |state| past f16 max (65504) into inf/NaN."""
     device = "cuda"
-    act_dtype, state_dtype = torch.bfloat16, torch.float16
+    act_dtype = torch.bfloat16
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
     max_window = 16
     batch = 2
@@ -1231,8 +1224,30 @@ def test_two_kernel_f16_state(philox_rounds):
                 r,
                 rtol=2e-2,
                 atol=5e-1,
-                msg=f"{name} mismatch at k={k} (f16 state, philox={philox_rounds})",
+                msg=f"{name} mismatch at k={k} ({state_dtype} state, philox={philox_rounds})",
             )
+
+
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+def test_two_kernel_f16_state(philox_rounds):
+    """f16 STATE + bf16 activations on the two-kernel path vs the monolithic
+    reference.  The operand-swap OUT.1 LDSMs the state under a bf16-typed view;
+    the real element type must be recovered in-registers
+    (convert_frag<state_t>) — reinterpreting f16 bits as bf16 silently corrupts
+    the output (caught 2026-07-02).  philox_rounds=5 exercises the SR state
+    store (shared store code + same seed ⇒ the two paths bit-match)."""
+    _run_two_kernel_state_dtype_case(torch.float16, philox_rounds)
+
+
+def test_two_kernel_f32_state():
+    """f32 STATE + bf16 activations on the two-kernel path vs the monolithic
+    reference — the wide-A path: OUT.1 loads the state as k-adjacent float2
+    pairs via LDS.64 and narrows to bf16 in registers (no ldmatrix exists for
+    32-bit elements feeding a 16-bit MMA), the f32 smem ring uses the
+    M=3-floored Swizzle<3,3,3>, and the launcher accepts 4-byte state on the
+    split.  philox SR is meaningless for f32 (stores from f32 registers are
+    exact) — RN only."""
+    _run_two_kernel_state_dtype_case(torch.float32, 0)
 
 
 def test_checkpointing_ssu_pdl_bf16():

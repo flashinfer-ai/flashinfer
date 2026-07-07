@@ -110,8 +110,10 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
   attrs[0].val.programmaticStreamSerializationAllowed = ENABLE_PDL ? 1 : 0;
 
   // ── Two-kernel split: precompute → main, when the caller provides scratch ──
-  // (cb_scaled/cb_old/cumAdt_vec).  bf16/fp16 only (precompute + main require
-  // 2-byte input + state).
+  // (cb_scaled/cb_old/cumAdt_vec).  Requires 2-byte input (bf16/fp16
+  // activations); state may be 2-byte (LDSM path) or 4-byte f32 (LDS.64 +
+  // in-register narrow — see make_a_s2r).  8-bit state has no two-kernel
+  // split (the monolithic checkpointing_ssu_kernel_8bit handles it).
   //
   // INTERNAL PDL (precompute → main) is ALWAYS on — it is the split's mechanism,
   // not a user knob: the main co-launches with the precompute (its attr below is
@@ -125,7 +127,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
   // The precompute fires cudaTriggerProgrammaticLaunchCompletion() at its TOP
   // (unconditional) so the main becomes eligible to launch immediately.
   if (params.cb_scaled != nullptr) {
-    if constexpr (sizeof(state_t) == 2 && sizeof(input_t) == 2) {
+    if constexpr ((sizeof(state_t) == 2 || sizeof(state_t) == 4) && sizeof(input_t) == 2) {
       // Precompute: grid (batch, ngroups, ceil(HEADS_PER_GROUP/HEADS_PER_CTA)).
       // Heads are tiled across grid.z to fill the GPU at small batch (heuristic
       // below).  HEADS_PER_CTA is picked at runtime, dispatched to a template arg;
@@ -218,11 +220,16 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       }();
       int const main_cta_per_sm = [] {
         char const* e = std::getenv("FLASHINFER_SSU_MAIN_CTA_PER_SM");
-        // Default 16 ⇒ grid = 16·NUM_SMS (≈2× the 8-block/SM resident set, so each CTA grid-strides
-        // and there are ~2 launch-waves).  Measured best at b=1024 (133.6µs) — slightly
-        // oversubscribed schedules better than exactly-resident (cps=8: 139.6).  Below occupancy
-        // (8) under-occupies and is catastrophic.  Heuristic refined later.
-        return e ? std::atoi(e) : 16;
+        if (e) return std::atoi(e);
+        // 2-byte state: 16 ⇒ grid = 16·NUM_SMS (≈2× the 8-block/SM resident set, so each CTA
+        // grid-strides and there are ~2 launch-waves).  Measured best at b=1024 bf16 (133.6µs) —
+        // slightly oversubscribed schedules better than exactly-resident (cps=8: 139.6).  Below
+        // occupancy (8) under-occupies and is catastrophic.
+        // 4-byte state runs STAGES=2 (below), where only ~2 blocks/SM are smem-resident and the
+        // deep ring wants LONG-LIVED CTAs, not churn: small grid wins, monotonically (b=1024 f32
+        // no-write: cps=4 122.8µs, 8: 126.3, 16: 132.0, 32: 136.9; write path same ordering).
+        // Heuristic refined later (small batches cap the grid at total_work anyway).
+        return sizeof(state_t) == 4 ? 4 : 16;
       }();
       int const main_total_work =
           D_SPLIT * static_cast<int>(params.batch) * static_cast<int>(params.nheads);
@@ -230,13 +237,19 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       int const main_grid =
           static_cast<int>(main_grid_ll < main_total_work ? main_grid_ll : main_total_work);
 
-      // Ring depth (NUM_STAGES): 1 = single-slot per-unit buffers — the OCCUPANCY regime
-      // (~29 KB/block → 6 blocks/SM at the derived reg cap; default).  2 = double-buffered
-      // cross-unit prefetch ring — the LATENCY regime (~57 KB → 4 blocks; loses at b=1024:
-      // 94.0 vs 79.6 µs no-write).  See main_maxnreg in the kernel header for the sweep.
+      // Ring depth (NUM_STAGES) — default is state-width-aware:
+      //   2-byte state: 1 — the OCCUPANCY regime (~29 KB/block → 6 blocks/SM at the derived reg
+      //   cap).  Depth 2 (~57 KB → 4 blocks) loses at b=1024 bf16: 94.0 vs 79.6 µs no-write.
+      //   4-byte state: 2 — the LATENCY regime.  f32 doubles the state prefetch (the largest
+      //   bundle tensor) and the 1-deep ring stops covering it: warps block at the per-unit
+      //   __pipeline_wait_prior and the MIO queue saturates (36% mio_throttle; see the plan doc).
+      //   Depth 2 wins despite dropping to 2 blocks/SM (~89 KB): b=1024 f32 no-write 153.5 →
+      //   132.3 µs (cps=16), → 122.8 with the cps=4 grid above; write 276 → 227.  Small batches
+      //   (grid capped at total_work → ~1 unit/CTA, ring never engages) may prefer 1 — override
+      //   via the env until the heuristic is batch-aware.
       static int const main_stages = [] {
         char const* e = std::getenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES");
-        int const v = e ? std::atoi(e) : 1;
+        int const v = e ? std::atoi(e) : (sizeof(state_t) == 4 ? 2 : 1);
         FLASHINFER_CHECK(v == 1 || v == 2,
                          "FLASHINFER_SSU_MAIN_PIPELINE_STAGES must be 1 or 2, got ", v);
         return v;
@@ -282,8 +295,9 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int main_heads_p
       return;
     } else {
       FLASHINFER_CHECK(false,
-                       "two-kernel SSU split (cb_scaled provided) requires 2-byte input + state "
-                       "(bf16/fp16); got sizeof(input_t)=",
+                       "two-kernel SSU split (cb_scaled provided) requires 2-byte input "
+                       "(bf16/fp16) and 2- or 4-byte state (bf16/fp16/fp32); got "
+                       "sizeof(input_t)=",
                        sizeof(input_t), ", sizeof(state_t)=", sizeof(state_t));
     }
   }
