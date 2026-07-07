@@ -574,12 +574,13 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   }
   if (use_compact_ep4) {
     int shared_bytes = kEp4Size * (int)sizeof(int);
-    SWITCH_TOP_K(params.top_k, TOP_K,
-                 moeA2ADispatchKernel<TOP_K, true>
-                 <<<grid_size, block_size, shared_bytes, params.stream>>>(
-                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+    SWITCH_TOP_K(
+        params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size) {
+          moeA2ADispatchKernel<TOP_K, true><<<grid_size, block_size, shared_bytes, params.stream>>>(
+              params.token_selected_experts, kernel_ptrs, params.num_payloads,
+              params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size,
+              params.num_experts_per_rank);
+        })
   } else {
     int shared_bytes = 2 * params.top_k * (int)sizeof(int);
     SWITCH_TOP_K(params.top_k, TOP_K,
