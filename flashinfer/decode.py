@@ -945,6 +945,65 @@ class BatchDecodeWithPagedKVCacheWrapper:
         device/stream selector for the underlying module query.  This method
         does not allocate buffers and does not mutate cached plan state.
 
+        Parameters
+        ----------
+        indptr : torch.Tensor
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
+        indices : torch.Tensor
+            The page indices of the paged kv cache, shape: ``[indptr[-1]]``, dtype: ``torch.int32``
+        last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged kv
+            cache, shape: ``[batch_size]``, dtype: ``torch.int32``
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
+        page_size : int
+            The page size of the paged kv cache.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+            provided, will be set to ``0``.
+        q_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the query tensor, defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to ``q_data_type``.
+        data_type : Optional[Union[str, torch.dtype]]
+            Deprecated alias — sets both ``q_data_type`` and ``kv_data_type`` when
+            they are not provided explicitly.
+        sm_scale : Optional[float]
+            Softmax scale. If ``None``, defaults to ``1 / sqrt(head_dim)``.
+        rope_scale : Optional[float]
+            Scale factor applied during RoPE interpolation. Defaults to ``1.0`` when ``None``.
+        rope_theta : Optional[float]
+            Base value for the RoPE frequencies. Defaults to ``1e4`` when ``None``.
+        block_tables : Optional[torch.Tensor]
+            Unused by this method; accepted for signature compatibility with :meth:`plan`.
+        seq_lens : Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt,
+            shape: ``[batch_size]``.
+        fixed_split_size : Optional[int]
+            The fixed split size for FA2 split-kv decode, in pages.
+        disable_split_kv : bool
+            Whether to disable the split-kv for determinism in CUDA Graph. Defaults to ``False``.
+        q_len_per_req : int
+            The number of query tokens per request. Defaults to ``1``.
+
+        Returns
+        -------
+        Tuple[int, int]
+            ``(float_workspace_size, int_workspace_size)`` in bytes.
+
         Example
         -------
         >>> float_bytes, int_bytes = wrapper.workspace_size(...)
@@ -1130,7 +1189,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         indptr : torch.Tensor
             The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``, dtype: ``torch.int32``
+            The page indices of the paged kv cache, shape: ``[indptr[-1]]``, dtype: ``torch.int32``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
             cache, shape: ``[batch_size]``, dtype: ``torch.int32``
