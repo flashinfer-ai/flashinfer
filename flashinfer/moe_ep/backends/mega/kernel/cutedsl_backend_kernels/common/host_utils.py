@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: BSD-3-Clause OR Apache-2.0
 """Host utility helpers shared across NVFP4 and MXFP8 runners."""
 
 import argparse
