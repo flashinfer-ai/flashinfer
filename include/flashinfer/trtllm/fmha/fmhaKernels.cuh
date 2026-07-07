@@ -548,20 +548,32 @@ class TllmGenFmhaKernel {
         } else {
           maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mChunkedAttentionSize);
         }
-      } else if (isSlidingWindowCustomMask(selectKernelParams.mMaskType)) {
-        int const windowAttention =
-            std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
-        int const windowCtas = flashinfer::ceil_div(windowAttention, 2 * kernelMeta.mStepKv);
-        if (windowCtas == 1) {
-          maxAttentionWindow = windowAttention;
-        }
       }
 
       // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
       // The factor of 2 is applied here to ensure the reduction overhead does not outweigh the
       // benefits of a shorter mainloop.
-      int const maxNumCtasPerSeqKv =
+      int maxNumCtasPerSeqKv =
           (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
+      // For sliding-window custom masks, the kernels skip the below-window KV tiles and divide
+      // only the window-region work among the KV CTAs: the runtime recomputes
+      // numCtasKv = min(divUp(validSeqLenKv, stepKv), maxNumCtasKv) and CTAs beyond it exit
+      // before the mainloop. Cap the split at the window's step count so we never launch CTAs
+      // the runtime will prune; this cannot change the active split. Do not apply the factor-2
+      // minimum work per CTA to the window region: halving the window's steps doubles each CTA's
+      // mainloop depth and measures 1.3-1.5x slower on B200 at small batch (window 640,
+      // maxSeqLenKv 8192 and 131072). A window that fits one minimum-work CTA clamps to a single
+      // CTA to select the disabled-reduction kernel (also the config the 2-instsQ decode kernels
+      // require).
+      if (isSlidingWindowCustomMask(selectKernelParams.mMaskType)) {
+        int const windowSpanKv =
+            std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
+        int const windowCapKv =
+            (windowSpanKv + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv) == 1
+                ? 1
+                : flashinfer::ceil_div(windowSpanKv, kernelMeta.mStepKv);
+        maxNumCtasPerSeqKv = std::min(maxNumCtasPerSeqKv, windowCapKv);
+      }
       int tunedMaxNumCtasPerSeqKv = maxNumCtasPerSeqKv;
       // Cap BF16Q+FP8KV separate-transform splits so the runtime key selects
       // CGA reduction when the smaller split is expected.
