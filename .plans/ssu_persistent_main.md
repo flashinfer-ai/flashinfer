@@ -1102,6 +1102,42 @@ Mixed f32 now beats triton-pm by ~11 µs (148.8 vs 159.7, no conv1d) and bf16
 2k sets a new best (77.4 vs triton-pm 79.3).  Both kernels share the loaders,
 so the monolith gets it for free (it was the most L1-thrashed: 67% L1/TEX).
 
+With .cg the MONOLITH became the mixed-f32 small-batch champion: b1/8/16/32/64
+= 5.41/6.37/8.11/11.55/19.12 µs vs 2k 6.53/7.73/9.55/14.19/19.58 and triton-pm
+5.15/9.74/10.66/13.62/19.38 (only b=1 trails triton-pm, by the two-launch
+floor the 2k pays and triton dodges).
+
+### Tried + REJECTED: operand-swap output in the MONOLITH (B200, 2026-07-06)
+
+Full port of the main's `state @ Cᵀ` formulation into the monolith's phase 3
+(`compute_*_output_swapped`: warps split M=DIM, x/old_x via transpose LDSM,
+CB LDSM'd as the B operand from the SAME swizzled smem — no layout change,
+`add_init_out_swapped` reusing pipelined_kloop_gemm so f32 state got the
+LDS.64 wide path too).  Correct across the whole matrix (187 tests incl.
+Triton refs, d_split2, philox, varlen) — and SLOWER nearly everywhere:
+
+    mixed f32  b1/8/16/32/64: 5.86/6.83/8.61/11.94/19.30  (vs 5.41/6.37/8.11/11.55/19.12)
+    uniform f32 b1024 mtp6:   158.9/264.5 nw/w            (vs ≤147.8/235.0 pre-.cg)
+    uniform bf16 b1024 mtp8:  92.9 nw (−3.7) / 141.1 w (+4.7)
+
+Lesson (rhymes with the slot-order episode): the swap's win in the main was
+the BUNDLE — fragB-native CB LDG'd from the precompute, register meta queue,
+hand-rolled LDSM addressing, and stores tuned around it.  The bare formulation
+transplant trades the monolith's vectorized paired [t, d] output stores and
+single-fragA CB load for scalar [d, t] stores and per-N-tile B loads, and
+loses.  Fully reverted; the swapped-helper sharing (add_cbx_swapped & co. in
+common.cuh) was reverted with it.
+
+### LANDED: test-suite JIT pre-warm (tests/mamba/conftest.py, 2026-07-06)
+
+Each test used to lazily JIT its URI (~2 min, one cicc at a time) — a kernel-
+header edit cost 30–40 min of SEQUENTIAL rebuilds per suite run.  A session-
+scoped autouse fixture now gen's the suite's 64-URI matrix and batch-builds it
+via `build_jit_specs` — ONE ninja graph, every TU in parallel (28-way here).
+The matrix is data (regenerable by parsing cached URI names); missing rows
+build lazily as before; `FLASHINFER_TEST_WARM_JIT=0` disables.  Cold CI gets
+the same parallelism.
+
 ## TODO
 
 - [ ] **Pad-slot test coverage for the N-stage ring.** The persistent test runs
