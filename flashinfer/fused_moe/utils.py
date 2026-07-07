@@ -1,9 +1,10 @@
 import contextlib
+import functools
 import logging
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Callable
 
 import torch
 
@@ -290,6 +291,18 @@ def map_to_hybrid_bucket(x: int, max_num_tokens: int) -> int:
     if x <= _PHASE3_END:
         return min(_ceil_to_step(x, _PHASE3_STEP), max_num_tokens)
     return min(next_positive_power_of_2(x), max_num_tokens)
+
+
+@functools.cache
+def make_hybrid_bucket_mapper(max_num_tokens: int) -> Callable[[int], int]:
+    """Return a stable callable that maps token counts to hybrid buckets.
+
+    Cached by ``max_num_tokens`` so the same object is returned on every call
+    with the same argument.  This keeps AutoTuner._find_nearest_profile's
+    lru_cache key stable — a fresh ``lambda`` or ``partial`` on every inference
+    call would produce a new key each time and cause unbounded cache growth.
+    """
+    return functools.partial(map_to_hybrid_bucket, max_num_tokens=max_num_tokens)
 
 
 def map_to_hybrid_bucket_uncapped(x: int) -> int:
