@@ -1085,6 +1085,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         backend = "fa2"
+                if q_len_per_req > 1 and backend == "fa3":
+                    raise NotImplementedError(
+                        "q_len_per_req > 1 is currently only supported on the "
+                        "fa2 tensor-core backend."
+                    )
                 module = get_batch_prefill_module(
                     backend,
                     q_data_type,
@@ -1099,6 +1104,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     False,
                 )
             qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+            # Multi-token requests are causal within each request's block;
+            # DFlash-style non-causal multi-token is not wired up yet.
+            is_causal = q_len_per_req > 1
             if q_len_per_req > 1:
                 qo_indptr_host = qo_indptr_host * q_len_per_req
             args = [
@@ -1114,7 +1122,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim,
                 head_dim,
-                q_len_per_req > 1,  # causal
+                is_causal,  # causal
                 window_left,
             ]
             if backend == "fa2":
@@ -1255,6 +1263,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
+            ``q_len_per_req > 1`` is currently supported on the fa2
+            tensor-core backend (and natively by trtllm-gen/cute-dsl).
+            Under ``use_cuda_graph``, this value is part of the frozen
+            shape (like the batch size): once the wrapper has been
+            planned, re-planning with a different value raises.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1284,6 +1297,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if q_len_per_req < 1:
             raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
+        # Multi-token requests are causal within each request's block;
+        # DFlash-style non-causal multi-token is not wired up yet.
+        is_causal = q_len_per_req > 1
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
             if not self.use_tensor_cores:
@@ -1293,6 +1309,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
             qo_indptr_host = qo_indptr_host * q_len_per_req
         if self.is_cuda_graph_enabled:
+            frozen_q_len = getattr(self, "_q_len_per_req", None)
+            if frozen_q_len is not None and frozen_q_len != q_len_per_req:
+                raise ValueError(
+                    "q_len_per_req is part of the frozen cudagraph shape: "
+                    f"this wrapper was planned with {frozen_q_len}, got "
+                    f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
+                )
             if batch_size != self._fixed_batch_size:
                 raise ValueError(
                     "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
@@ -1479,6 +1502,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         self._backend = "fa2"
+                if q_len_per_req > 1 and self._backend == "fa3":
+                    raise NotImplementedError(
+                        "q_len_per_req > 1 is currently only supported on the "
+                        "fa2 tensor-core backend."
+                    )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -1508,7 +1536,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim,
                 head_dim,
-                q_len_per_req > 1,  # causal
+                is_causal,  # causal
                 window_left,
             ]
             if self._backend == "fa2":
@@ -1658,7 +1686,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ----------
         q : torch.Tensor
             The query tensor, shape: ``[batch_size * q_len_per_req, num_qo_heads, head_dim]``
-            q_len_per_req doesn't need to match the value passed to plan()
+            On the trtllm-gen and cute-dsl backends the q_len_per_req implied
+            by ``q.shape[0]`` may differ from the planned value; the fa2/fa3
+            tensor-core path requires it to match :meth:`plan`.
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             The paged KV-Cache stored as a tuple of tensors or a single tensor:
 
@@ -3476,6 +3506,29 @@ def fast_decode_plan(
             "q_len_per_req > 1 requires tensor-core decode "
             "(use_tensor_cores=True or the trtllm-gen/cute-dsl backend)."
         )
+    if q_len_per_req > 1:
+        backend = getattr(self, "_backend", "auto")
+        if backend == "auto":
+            # fast_decode_plan reuses the module cached by plan(); without
+            # that resolution the backend gate below cannot be trusted.
+            raise ValueError(
+                "fast_decode_plan with q_len_per_req > 1 requires a prior "
+                "plan() call that resolves the backend."
+            )
+        if backend == "fa3":
+            raise NotImplementedError(
+                "q_len_per_req > 1 is currently only supported on the fa2 "
+                "tensor-core backend."
+            )
+    if self.is_cuda_graph_enabled:
+        frozen_q_len = getattr(self, "_q_len_per_req", None)
+        if frozen_q_len is not None and frozen_q_len != q_len_per_req:
+            raise ValueError(
+                "q_len_per_req is part of the frozen cudagraph shape: "
+                f"this wrapper was planned with {frozen_q_len}, got "
+                f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
+            )
+    is_causal = q_len_per_req > 1
     self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -3579,7 +3632,7 @@ def fast_decode_plan(
                     self.is_cuda_graph_enabled,
                     head_dim,
                     head_dim,
-                    q_len_per_req > 1,  # causal
+                    is_causal,  # causal
                     window_left,
                 ]
                 if self._backend == "fa2":

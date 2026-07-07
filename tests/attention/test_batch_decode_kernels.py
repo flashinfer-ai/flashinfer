@@ -1188,3 +1188,73 @@ def test_tensor_core_decode_rejects_mismatched_q_len():
             kv_data_type=dtype,
             q_len_per_req=2,
         )
+
+    fa3_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True, backend="fa3"
+    )
+    with pytest.raises(NotImplementedError, match="fa2"):
+        fa3_wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
+
+    graph_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty(
+            batch_size + 1, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_indices_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+        paged_kv_last_page_len_buffer=torch.empty(
+            batch_size, dtype=torch.int32, device="cuda:0"
+        ),
+    )
+
+    def plan_graph(q_len):
+        graph_wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=q_len,
+        )
+
+    plan_graph(2)
+    plan_graph(2)  # same value re-plans fine
+    with pytest.raises(ValueError, match="frozen"):
+        plan_graph(3)
+
+    unplanned = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "NHD", use_tensor_cores=True
+    )
+    with pytest.raises(ValueError, match="prior plan"):
+        flashinfer.decode.fast_decode_plan(
+            unplanned,
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            q_len_per_req=2,
+        )
