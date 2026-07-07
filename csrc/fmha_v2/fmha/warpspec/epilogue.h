@@ -806,9 +806,9 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
       }
     }
 
-// Fused softmax-exp + row-sum with row-interleaved scheduling: compute exp for all rows
-// before accumulating the sum, so the MUFU.EX2 results of one row fill the pipeline while
-// another row's results are consumed.
+    // Fused softmax-exp + row-sum with row-interleaved scheduling: compute exp for all rows
+    // before accumulating the sum, so the MUFU.EX2 results of one row fill the pipeline while
+    // another row's results are consumed.
     {
       float masked_max[Mma_tile_p::CORES_M];
       float psum[Mma_tile_p::CORES_M][4];
@@ -816,10 +816,12 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
       for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
         if constexpr (!EXP2F_OPTIMIZATION) {
           masked_max[mi] = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                               ? local_max_[mi] - logf(q_scale_s_) : 0.f;
+                               ? local_max_[mi] - logf(q_scale_s_)
+                               : 0.f;
         } else {
           masked_max[mi] = (!CHECK_IF_NEG_INF_EXISTS || local_max_[mi] != -FLT_MAX)
-                               ? local_max_[mi] * scale - log2f(q_scale_s_) : 0.f;
+                               ? local_max_[mi] * scale - log2f(q_scale_s_)
+                               : 0.f;
         }
         psum[mi][0] = psum[mi][1] = psum[mi][2] = psum[mi][3] = 0.f;
       }
