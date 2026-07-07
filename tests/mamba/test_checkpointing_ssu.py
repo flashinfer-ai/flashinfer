@@ -1103,16 +1103,21 @@ def test_two_kernel_meta_ring_refill(monkeypatch):
         )
 
 
-def _run_two_kernel_state_dtype_case(state_dtype, philox_rounds):
+def _run_two_kernel_state_dtype_case(
+    state_dtype, philox_rounds, batch=2, k_cases=(0, 2, 12)
+):
     """Two-kernel path vs the monolithic reference with a non-bf16 STATE dtype
     (bf16 activations).  The window is filled with CONSISTENT rows (softplus
     dt, true cumsum): the write path replays rows beyond T, and inconsistent
-    random rows push |state| past f16 max (65504) into inf/NaN."""
+    random rows push |state| past f16 max (65504) into inf/NaN.
+
+    ``k_cases`` entries are uniform pnat ints or the string "mixed" (per-slot
+    random pnat straddling the write threshold — exercises the main's
+    write-first slot visiting order)."""
     device = "cuda"
     act_dtype = torch.bfloat16
     nheads, head_dim, d_state, ngroups, T = 16, 64, 128, 1, 6
     max_window = 16
-    batch = 2
     cache_size = batch
 
     torch.manual_seed(42)
@@ -1161,7 +1166,7 @@ def _run_two_kernel_state_dtype_case(state_dtype, philox_rounds):
     k_old = ((max_window + 7) // 8) * 8
 
     def _run(k, *, two_kernel):
-        torch.manual_seed(k + 100)
+        torch.manual_seed((int(k.sum().item()) if torch.is_tensor(k) else k) + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=act_dtype)
         dt2 = repeat(
             torch.randn(batch, T, nheads, device=device, dtype=act_dtype),
@@ -1199,7 +1204,9 @@ def _run_two_kernel_state_dtype_case(state_dtype, philox_rounds):
             odt,
             oca,
             cache_buf_idx.clone(),
-            torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            k.clone()
+            if torch.is_tensor(k)
+            else torch.full((cache_size,), k, device=device, dtype=torch.int32),
             x=x2,
             dt=dt2,
             A=A,
@@ -1214,17 +1221,25 @@ def _run_two_kernel_state_dtype_case(state_dtype, philox_rounds):
         return out, st, ox, ob, odt, oca
 
     names = ("out", "state", "old_x", "old_B", "old_dt", "old_cumAdt")
-    # k=0/2 no-write; k=12 write (12+6 > 16) — replays 12 rows incl. rows ≥ T.
-    for k in (0, 2, 12):
-        ref = _run(k, two_kernel=False)
-        test = _run(k, two_kernel=True)
+    # k=0/2 no-write; k=12 write (12+6 > 16) — replays 12 rows incl. rows ≥ T;
+    # "mixed" = per-slot random pnat with ~40% writes (slot_order visiting path).
+    for k in k_cases:
+        if isinstance(k, str):
+            torch.manual_seed(1234)
+            kv = torch.randint(0, 8, (cache_size,), device=device, dtype=torch.int32)
+            kv[torch.rand(cache_size, device=device) < 0.4] = 12
+            k_arg, k_label = kv, "mixed"
+        else:
+            k_arg, k_label = k, k
+        ref = _run(k_arg, two_kernel=False)
+        test = _run(k_arg, two_kernel=True)
         for name, r, t in zip(names, ref, test, strict=True):
             torch.testing.assert_close(
                 t,
                 r,
                 rtol=2e-2,
                 atol=5e-1,
-                msg=f"{name} mismatch at k={k} ({state_dtype} state, philox={philox_rounds})",
+                msg=f"{name} mismatch at k={k_label} ({state_dtype} state, philox={philox_rounds})",
             )
 
 
@@ -1248,6 +1263,16 @@ def test_two_kernel_f32_state():
     split.  philox SR is meaningless for f32 (stores from f32 registers are
     exact) — RN only."""
     _run_two_kernel_state_dtype_case(torch.float32, 0)
+
+
+def test_two_kernel_f32_mixed_batch():
+    """Mixed write/no-write batch (per-slot pnat, ~40% writes) on the f32
+    two-kernel path vs the monolithic reference.  batch=64 gives the persistent
+    main a genuinely interleaved grid-stride deal — exercises the write-first
+    slot visiting order (build_slot_order + remap_seq): the monolith is
+    visit-order independent, so any remap/partition/pad bug shows as a
+    mismatch."""
+    _run_two_kernel_state_dtype_case(torch.float32, 0, batch=64, k_cases=("mixed",))
 
 
 def test_checkpointing_ssu_pdl_bf16():
