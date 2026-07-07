@@ -231,49 +231,37 @@ def test_xqa_mtp_decode_supports_hopper_q_len_two(monkeypatch):
         flashinfer.decode, "get_compute_capability", lambda device: (9, 0)
     )
 
-    assert flashinfer.decode._is_xqa_mtp_decode_supported(
-        torch.device("cuda"),
-        "fa2",
-        True,
-        2,
-        torch.bfloat16,
-        torch.bfloat16,
-        128,
-        16,
-        "NONE",
-        0.0,
-        -1,
-        False,
-    )
+    def is_supported(**overrides):
+        kwargs = {
+            "device": torch.device("cuda"),
+            "backend": "fa2",
+            "use_tensor_cores": True,
+            "q_len_per_req": 2,
+            "q_data_type": torch.bfloat16,
+            "kv_data_type": torch.bfloat16,
+            "head_dim": 128,
+            "page_size": 16,
+            "pos_encoding_mode": "NONE",
+            "logits_soft_cap": 0.0,
+            "fixed_split_size": -1,
+            "has_jit_module": False,
+        }
+        kwargs.update(overrides)
+        return flashinfer.decode._is_xqa_mtp_decode_supported(**kwargs)
 
-    assert not flashinfer.decode._is_xqa_mtp_decode_supported(
-        torch.device("cuda"),
-        "fa2",
-        True,
-        1,
-        torch.bfloat16,
-        torch.bfloat16,
-        128,
-        16,
-        "NONE",
-        0.0,
-        -1,
-        False,
-    )
-    assert not flashinfer.decode._is_xqa_mtp_decode_supported(
-        torch.device("cuda"),
-        "fa2",
-        True,
-        2,
-        torch.bfloat16,
-        torch.bfloat16,
-        128,
-        16,
-        "ROPE_LLAMA",
-        0.0,
-        -1,
-        False,
-    )
+    assert is_supported()
+    assert not is_supported(use_tensor_cores=False)
+    assert not is_supported(backend="trtllm-gen")
+    assert not is_supported(q_len_per_req=1)
+    assert not is_supported(q_data_type=torch.float32)
+    assert not is_supported(kv_data_type=torch.float32)
+    assert not is_supported(head_dim=8)
+    assert not is_supported(head_dim=272)
+    assert not is_supported(page_size=8)
+    assert not is_supported(pos_encoding_mode="ROPE_LLAMA")
+    assert not is_supported(logits_soft_cap=1.0)
+    assert not is_supported(fixed_split_size=1)
+    assert not is_supported(has_jit_module=True)
 
 
 def test_xqa_mtp_causal_mask_q_len_two():
@@ -282,6 +270,18 @@ def test_xqa_mtp_causal_mask_q_len_two():
     assert mask.dtype == torch.uint16
     assert mask.shape == (1, 2, 2)
     assert mask.view(torch.uint32).squeeze(-1).tolist() == [[1, 3]]
+
+
+def test_xqa_mtp_block_tables_from_indptr_preserves_offset():
+    indptr_host = torch.tensor([2, 4, 7], dtype=torch.int32)
+    indices = torch.arange(10, dtype=torch.int32)
+
+    block_tables = flashinfer.decode._make_block_tables_from_indptr(
+        indptr_host, indices, 2, torch.device("cpu")
+    )
+
+    assert block_tables.dtype == torch.int32
+    assert block_tables.tolist() == [[2, 3, 0], [4, 5, 6]]
 
 
 def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):

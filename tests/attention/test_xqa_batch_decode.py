@@ -661,6 +661,37 @@ def test_batch_decode_tensor_cores_mtp_uses_xqa_decode_path():
         atol=1e-2,
     )
 
+    workspace_implicit = torch.empty(
+        workspace_size, dtype=torch.int8, device=GPU_DEVICE
+    )
+    wrapper_implicit = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_implicit, kv_layout, use_tensor_cores=True, backend="fa2"
+    )
+    wrapper_implicit.plan(
+        kv_indptr,
+        all_page_ids,
+        kv_last_page_len.to(GPU_DEVICE),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len_per_req,
+    )
+    assert wrapper_implicit._use_xqa_mtp_decode
+    torch.testing.assert_close(wrapper_implicit._block_tables, page_table)
+
+    output_wrapper_implicit = wrapper_implicit.run(q, kv_cache)
+
+    torch.testing.assert_close(
+        output_wrapper_implicit.float(),
+        output_direct.float(),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
 
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [12],
