@@ -385,6 +385,19 @@ URI computed as: `hash(operation_type + parameters + source_hashes + flags + cud
 - Clear cache: `rm -rf ~/.cache/flashinfer/`
 - Override location: `export FLASHINFER_WORKSPACE_BASE="/scratch"`
 
+**CuTe-DSL kernels** (`flashinfer/jit/cute_dsl_core.py`): `cute.compile()` has no
+persistent cache, so `build_and_load_cute_dsl_kernel()` exports compiled kernels as
+object files (`export_to_c()`) and reloads them with `cute.runtime.load_module(...,
+enable_tvm_ffi=True)`. Artifacts live in `cached_ops/` next to the nvcc modules, one
+directory per op family — `cached_ops/<module>_<arch>_cute_dsl/` (e.g.
+`nvfp4_quantize_sm100a_cute_dsl/`) holding one `meta.json` plus one `.o` per
+specialization. The arch comes from the DSL's compile target (`CUTE_DSL_ARCH` or the
+current device) since the artifacts are single-arch, unlike nvcc fatbins.
+Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
+kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
+`flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
+`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`.
+
 ### Dispatch Macros
 
 Handle combinatorial parameter spaces:
@@ -479,6 +492,7 @@ match what the code uses today; values are strings unless noted.
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
+| `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the AOT/JIT-cache version check that pins flashinfer-jit-cache to the installed flashinfer-python. Bypass only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
 | `FLASHINFER_NVCC` | `$cuda_home/bin/nvcc` | `flashinfer/jit/cpp_ext.py` | Override the nvcc binary used by the JIT (useful for sccache wrappers or non-default CUDA installs). |
