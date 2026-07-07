@@ -226,6 +226,64 @@ def test_determine_attention_backend_respects_fa3_prefill_head_dim(
     assert backend == expected_backend
 
 
+def test_xqa_mtp_decode_supports_hopper_q_len_two(monkeypatch):
+    monkeypatch.setattr(
+        flashinfer.decode, "get_compute_capability", lambda device: (9, 0)
+    )
+
+    assert flashinfer.decode._is_xqa_mtp_decode_supported(
+        torch.device("cuda"),
+        "fa2",
+        True,
+        2,
+        torch.bfloat16,
+        torch.bfloat16,
+        128,
+        16,
+        "NONE",
+        0.0,
+        -1,
+        False,
+    )
+
+    assert not flashinfer.decode._is_xqa_mtp_decode_supported(
+        torch.device("cuda"),
+        "fa2",
+        True,
+        1,
+        torch.bfloat16,
+        torch.bfloat16,
+        128,
+        16,
+        "NONE",
+        0.0,
+        -1,
+        False,
+    )
+    assert not flashinfer.decode._is_xqa_mtp_decode_supported(
+        torch.device("cuda"),
+        "fa2",
+        True,
+        2,
+        torch.bfloat16,
+        torch.bfloat16,
+        128,
+        16,
+        "ROPE_LLAMA",
+        0.0,
+        -1,
+        False,
+    )
+
+
+def test_xqa_mtp_causal_mask_q_len_two():
+    mask = flashinfer.decode._make_xqa_mtp_causal_mask(1, 2, torch.device("cpu"))
+
+    assert mask.dtype == torch.uint16
+    assert mask.shape == (1, 2, 2)
+    assert mask.view(torch.uint32).squeeze(-1).tolist() == [[1, 3]]
+
+
 def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     calls = []
 
