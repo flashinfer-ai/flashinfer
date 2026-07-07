@@ -1734,7 +1734,7 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
     return transfer_t, state_t
 
 
-class CPDeltaRuleFixupSm120(KeyedCompileMixin):
+class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
     class WarpGroupRole(IntEnum):
         LOAD = 0
         MATH = 1
@@ -2663,7 +2663,14 @@ def cp_delta_rule_fixup_dsl_sm120(
         if needs_initial_state
         else None
     )
-    kernel = CPDeltaRuleFixupSm120(needs_initial_state)
+    # NCU on SM120 shows row4 is best for H <= 8 and row8 wins for H = 16.
+    # HMMA remains the fallback above that.
+    if num_heads <= 8:
+        kernel = CPDeltaRuleFixupSimtSm120(needs_initial_state, 4)
+    elif num_heads <= 16:
+        kernel = CPDeltaRuleFixupSimtSm120(needs_initial_state, 8)
+    else:
+        kernel = CPDeltaRuleFixupHmmaSm120(needs_initial_state)
     kernel_args = (
         from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
             leading_dim=1
