@@ -146,6 +146,14 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(d, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(l1, dl_bfloat16);
+  CHECK_DEVICE(b, a);
+  CHECK_DEVICE(a_sf, a);
+  CHECK_DEVICE(b_sf, a);
+  CHECK_DEVICE(alpha, a);
+  CHECK_DEVICE(d, a);
+  CHECK_DEVICE(l1, a);
+  CHECK_DEVICE(out, a);
+  CHECK_DEVICE(workspace_buffer, a);
 
   TVM_FFI_ICHECK_EQ(a.ndim(), 2) << "a must be [m, k/2]";
   TVM_FFI_ICHECK_EQ(b.ndim(), 2) << "b must be [n, k/2]";
@@ -154,6 +162,7 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
   int64_t const k = kPacked * 2;
   int64_t const n = b.size(0);
   TVM_FFI_ICHECK_EQ(b.size(1), kPacked) << "a and b inner dimensions mismatch";
+  TVM_FFI_ICHECK(n > 0 && k > 0) << "n and k must be positive";
   TVM_FFI_ICHECK(n % 32 == 0 && k % 32 == 0) << "n and k must be divisible by 32";
   TVM_FFI_ICHECK_GE(alpha.numel(), 1) << "alpha must contain at least one element";
   TVM_FFI_ICHECK_GE(a_sf.numel(), swizzled_sf_size(m, k / 16))
@@ -166,6 +175,8 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
       << "d must be 16-byte aligned for TMA";
   TVM_FFI_ICHECK(l1.ndim() == 2 && l1.size(0) == n && l1.size(1) == 32)
       << "l1 must have shape [n, 32] (rank-32 LoRA-up weight, pre-divided by alpha)";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<std::uintptr_t>(l1.data_ptr()) % 16, 0)
+      << "l1 must be 16-byte aligned for TMA";
   TVM_FFI_ICHECK(out.ndim() == 2 && out.size(0) == m && out.size(1) == n)
       << "out must have shape [m, n]";
   TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(out.dtype()), bfloat16_code)
@@ -175,6 +186,7 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
   if (bias.has_value()) {
     auto const& biasTensor = bias.value();
     CHECK_INPUT_AND_TYPE(biasTensor, dl_bfloat16);
+    CHECK_DEVICE(biasTensor, a);
     TVM_FFI_ICHECK(biasTensor.ndim() == 1 && biasTensor.size(0) == n) << "bias must have shape [n]";
     biasPtr = biasTensor.data_ptr();
   }
@@ -182,6 +194,9 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
   TVM_FFI_ICHECK(tactic >= -1 && tactic < flashinfer::gemm::kNvfp4SvdquantGemmNumTactics)
       << "invalid NVFP4 SVDQuant tactic: " << tactic;
   int const tacticId = tactic < 0 ? 0 : static_cast<int>(tactic);
+
+  // Empty batch: out is [0, n], nothing to compute.
+  if (m == 0) return;
 
   size_t const requiredWorkspaceBytes = flashinfer::gemm::nvfp4_svdquant_gemm_workspace_size(
       static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), tacticId);

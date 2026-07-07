@@ -33,7 +33,11 @@ from ..fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_nvfp4_svdquant
-from ..trace.templates.gemm import mm_nvfp4_svdquant_trace
+from ..trace.templates.gemm import (
+    mm_nvfp4_svdquant_trace,
+    nvfp4_quantize_smooth_trace,
+    svdquant_linear_trace,
+)
 from ..utils import (
     _get_cache_buf,
     backend_requirement,
@@ -291,7 +295,7 @@ def _check_nvfp4_quantize_smooth_problem(
     {"cutlass": _cutlass_nvfp4_svdquant_requirement},
     common_check=_check_nvfp4_quantize_smooth_problem,
 )
-@flashinfer_api
+@flashinfer_api(trace=nvfp4_quantize_smooth_trace)
 def nvfp4_quantize_smooth(
     x: torch.Tensor,
     pre_quant_scale: torch.Tensor,
@@ -336,7 +340,7 @@ def nvfp4_quantize_smooth(
     return xq, sf
 
 
-@flashinfer_api
+@flashinfer_api(trace=svdquant_linear_trace)
 def svdquant_linear(
     x: torch.Tensor,
     weight_fp4: torch.Tensor,

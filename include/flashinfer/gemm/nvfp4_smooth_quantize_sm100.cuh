@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <type_traits>
 
 namespace flashinfer {
@@ -453,6 +454,13 @@ __global__ void __launch_bounds__(512, 4)
   }
 
   cudaTriggerProgrammaticLaunchCompletion();
+#else
+  // Fail loudly instead of silently leaving out/SFout uninitialized if a build for an
+  // unsupported architecture is ever launched.
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("nvfp4_smooth_quantize requires SM100 or newer\n");
+    __trap();
+  }
 #endif
 }
 
@@ -496,6 +504,11 @@ __global__ void __launch_bounds__(512, 4)
     }
   }
   cudaTriggerProgrammaticLaunchCompletion();
+#else
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("nvfp4_smooth_quantize requires SM100 or newer\n");
+    __trap();
+  }
 #endif
 }
 
@@ -542,7 +555,7 @@ inline void nvfp4_smooth_quantize(void* out, void* sf_out, void const* in, void 
                                   cudaStream_t stream, bool enable_pdl) {
   using namespace smooth_quantize_detail;
 
-  if (m == 0) return;
+  if (m == 0 || n == 0) return;
 
   bool const enablePDL = enable_pdl;
   bool const useFastPath = (n == 3072 || n == 12288);
