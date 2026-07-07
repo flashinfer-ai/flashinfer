@@ -400,20 +400,56 @@ def cute_dsl_fmha_ragged_prefill(
 
     if kernel_fn is None:
         gpu_arch = _get_gpu_arch(q.device)
-        kernel_fn = get_cute_dsl_fmha_kernel(
-            gpu_arch,
-            q.dtype,
-            o.dtype,
-            D,
-            is_causal,
-            is_persistent=False,  # varlen always uses non-persistent
-            varlen=True,
-            enable_tvm_ffi=enable_tvm_ffi,
-            with_lse=lse is not None,
-            enable_skip_softmax=use_skip_softmax,
-            enable_sink=attention_sinks is not None,
-            use_pdl=enable_pdl,
-        )
+        try:
+            if q.dtype != k.dtype or k.dtype != v.dtype:
+                raise RuntimeError("Separate dtype_qk / dtype_vo requires JIT")
+            kernel_fn = get_cute_dsl_fmha_kernel(
+                gpu_arch,
+                q.dtype,
+                o.dtype,
+                D,
+                is_causal,
+                is_persistent=False,  # varlen always uses non-persistent
+                varlen=True,
+                enable_tvm_ffi=enable_tvm_ffi,
+                with_lse=lse is not None,
+                enable_skip_softmax=use_skip_softmax,
+                enable_sink=attention_sinks is not None,
+                use_pdl=enable_pdl,
+            )
+        except (RuntimeError, FileNotFoundError) as e:
+            # Cubin variant not published / repo unreachable: JIT-compile the
+            # vendored kernel from source instead.
+            logger.info(
+                f"DSL FMHA cubin unavailable ({e}); falling back to JIT runner."
+            )
+            from flashinfer.cute_dsl.attention.fmha.runner import (
+                cute_dsl_fmha_prefill as jit_runner,
+            )
+
+            jit_runner(
+                q,
+                k,
+                v,
+                o,
+                qo_indptr,
+                kv_indptr,
+                is_causal=is_causal,
+                sm_scale=sm_scale,
+                window_left=window_left,
+                window_right=window_right,
+                lse=lse,
+                attention_sinks=attention_sinks,
+                scale_q=scale_q,
+                scale_k=scale_k,
+                scale_v=scale_v,
+                scale_o=scale_o,
+                max_qo_len=max_qo_len,
+                max_kv_len=max_kv_len,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                enable_pdl=enable_pdl,
+            )
+            return
 
     # Compute scale factors
     if sm_scale is None:
