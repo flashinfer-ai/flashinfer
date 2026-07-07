@@ -1365,6 +1365,12 @@ def get_trtllm_gen_fmha_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
+    assert (
+        op.trtllm_fmha_counter_workspace_bytes() == _TRTLLM_GEN_MLA_COUNTER_REGION_BYTES
+    ), (
+        "_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES is out of sync with the C++ "
+        "counter workspace size"
+    )
     return op
 
 
@@ -1960,9 +1966,10 @@ _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 # Size of the trtllm-gen workspace counter region (multi-block semaphores)
 # per csrc/trtllm_fmha_kernel_launcher.cu:200: max_batch_size * max_num_qo_heads
 # * sizeof(uint32_t) = 8192 * 256 * 4 = 8 MB. trtllm-gen places this counter
-# slab at the head of the workspace_buffer and self-resets it at the end of
-# every launch, so back-to-back trtllm-gen launches keep it valid without any
-# host-side zeroing.
+# slab at the head of the workspace_buffer. It must be zeroed before every
+# launch: other sharers of the same workspace (e.g. cute-dsl scratch) can
+# dirty this region between calls, so callers zero it on each launch rather
+# than relying on one-time initialization.
 _TRTLLM_GEN_MLA_COUNTER_REGION_BYTES = 8192 * 256 * 4
 
 
@@ -2344,13 +2351,10 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
-        # Zero the counter region on every call. Other runners (cute-dsl)
-        # may share this workspace_buffer and write scratch into the first
-        # bytes, which would leave non-zero values in trtllm-gen's
-        # mandatory-zero semaphore region and cause kernel hangs. Done
-        # inside forward() rather than only at dispatcher final-call time so
-        # that autotune profile-loop invocations are also protected.
-        # The 8 MB memset is ~5us on B200, negligible vs kernel time.
+        # Other runners (e.g. cute-dsl) may share this workspace_buffer and
+        # dirty trtllm-gen's mandatory-zero semaphore region between calls,
+        # so it must be re-zeroed on every launch, including autotune
+        # profile-loop invocations.
         self.workspace_buffer.view(torch.uint8)[
             :_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES
         ].zero_()
@@ -2586,8 +2590,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         backend, this is a packed uint8 cache with 656 bytes per token, shaped
         ``[num_pages, page_size, 656]`` or ``[num_pages, 1, page_size, 656]``.
     workspace_buffer : torch.Tensor
-        Pre-allocated workspace buffer. Must be zero-initialized on first use
-        by kernels that use semaphore state.
+        Pre-allocated workspace buffer. TRTLLM-GEN's semaphore counter region
+        is zeroed internally before every launch; callers do not need to
+        pre-zero it.
     qk_nope_head_dim : int
         Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
         ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
@@ -2949,6 +2954,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "out",
             )
 
+        workspace_buffer.view(torch.uint8)[
+            :_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES
+        ].zero_()
         get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
             out,
             None,  # fp4 output (unsupported by wrapper)
