@@ -602,8 +602,14 @@ class TllmGenFmhaKernel {
       // Disable the multiCtasKvMode if there is only one CtaKv.
       if (numCtasPerSeqKv <= 1) {
         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
-        // Enable the persistent scheduler for better performance.
-        selectKernelParams.mTileScheduler = TileScheduler::Persistent;
+        // Enable the persistent scheduler for better performance. Spec-dec custom-mask
+        // generation kernels keep the static scheduler chosen at selection: their grids are
+        // small (batch x kvHeads) and an underfilled persistent grid only adds tile-scheduler
+        // overhead per launch.
+        if (!isCustomMask(selectKernelParams.mMaskType) &&
+            !isSlidingWindowCustomMask(selectKernelParams.mMaskType)) {
+          selectKernelParams.mTileScheduler = TileScheduler::Persistent;
+        }
         // Need to select a different kernel.
         selectKernelParams.mSelectNewKernel = true;
       } else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) &&
