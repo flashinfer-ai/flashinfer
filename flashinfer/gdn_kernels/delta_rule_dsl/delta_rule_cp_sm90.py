@@ -2559,6 +2559,7 @@ def cp_delta_rule_fixup_dsl_sm90(
     initial_state: torch.Tensor | None = None,
     *,
     _skip_check: bool = False,
+    _kernel_kind: str | None = None,
 ):
     """Fix CP precompute chunk artifacts into global chunk-boundary states.
 
@@ -2661,12 +2662,21 @@ def cp_delta_rule_fixup_dsl_sm90(
         if needs_initial_state
         else None
     )
-    if num_heads <= 8:
+    if _kernel_kind is None:
+        if num_heads <= 8:
+            _kernel_kind = "simt_row4"
+        elif num_heads <= 16:
+            _kernel_kind = "simt_row8"
+        else:
+            _kernel_kind = "hmma"
+    if _kernel_kind == "simt_row4":
         kernel = CPDeltaRuleFixupSimtSm90(needs_initial_state, 4)
-    elif num_heads <= 16:
+    elif _kernel_kind == "simt_row8":
         kernel = CPDeltaRuleFixupSimtSm90(needs_initial_state, 8)
-    else:
+    elif _kernel_kind == "hmma":
         kernel = CPDeltaRuleFixupHmmaSm90(needs_initial_state)
+    else:
+        raise ValueError(f"Unsupported fixup kernel kind: {_kernel_kind}")
     kernel_args = (
         from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
             leading_dim=1
