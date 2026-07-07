@@ -29,10 +29,13 @@ export MAX_JOBS
 # cuda-python<=12.9 pin downgrading cuda-bindings on cu13 images) — on aarch64
 # pip backtracks to the CPU-only PyPI wheel and tests fail later with "Torch
 # not compiled with CUDA enabled". A constraints file makes any resolution that
-# would replace torch fail loudly at install time instead. Build-isolation
-# envs are unaffected (torch is not in [build-system].requires).
+# would replace torch fail loudly at install time instead. The +cuXXX local
+# tag is stripped: PEP 440 lets the installed 2.X.Y+cuNNN satisfy ==2.X.Y, but
+# PEP-517 build envs (flashinfer-jit-cache's build-system.requires includes
+# torch) inherit PIP_CONSTRAINT and must be able to resolve the pin from PyPI,
+# where local-version wheels don't exist.
 if [ -z "${PIP_CONSTRAINT:-}" ]; then
-    _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__)" 2>/dev/null || true)
+    _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
     if [ -n "${_torch_pin}" ]; then
         _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
         echo "${_torch_pin}" > "${_constraint_file}"
