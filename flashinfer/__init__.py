@@ -110,6 +110,9 @@ from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
+from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
+from .gemm import svdquant_linear as svdquant_linear
 from .gemm import mm_bf16_fp4 as mm_bf16_fp4
 from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import mm_fp8 as mm_fp8

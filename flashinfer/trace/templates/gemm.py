@@ -1916,3 +1916,117 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
     reference=_trtllm_ragged_attention_deepseek_reference,
     init=_trtllm_ragged_attention_deepseek_init,
 )
+
+
+# ── SVDQuant fused NVFP4 GEMM (SM100) ────────────────────────────────────────
+
+
+def _mm_nvfp4_svdquant_init(
+    *,
+    M: int,
+    N: int = 3072,
+    K: int = 3072,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_nvfp4_svdquant``.
+
+    Mirrors the SVDQuant linear decomposition W ~= R + L1 @ L2 at Qwen-Image
+    shapes: the residual weight is NVFP4-quantized (via ``nvfp4_quantize_smooth``
+    with a unit smoothing scale, which is byte-identical to the stock NVFP4
+    quantizer), the activation is smooth-quantized, and the rank-32 LoRA factors
+    follow the host-side folding contract (``d = x_hat @ L2ᵀ``, ``l1 = L1 / alpha``).
+    """
+    from flashinfer import nvfp4_quantize_smooth  # noqa: PLC0415
+
+    torch.manual_seed(seed)
+    rank = 32
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+    pqs = torch.rand(K, dtype=torch.bfloat16, device=device) + 0.5
+    l1 = torch.randn(N, rank, dtype=torch.bfloat16, device=device) / math.sqrt(rank)
+    l2 = torch.randn(rank, K, dtype=torch.bfloat16, device=device) / math.sqrt(K)
+
+    x_hat = (x.float() * pqs.float()).to(torch.bfloat16)
+    x_gs = (
+        ((448 * 6) / x_hat.float().abs().nan_to_num().max())
+        .to(torch.float32)
+        .reshape(1)
+    )
+    w_gs = ((448 * 6) / w.float().abs().nan_to_num().max()).to(torch.float32).reshape(1)
+    ones = torch.ones(K, dtype=torch.bfloat16, device=device)
+
+    a, a_sf = nvfp4_quantize_smooth(x, pqs, x_gs)
+    b, b_sf = nvfp4_quantize_smooth(w, ones, w_gs)
+    alpha = (1.0 / (x_gs * w_gs)).to(torch.float32).reshape(1)
+    d = torch.mm(x_hat, l2.t().contiguous().to(torch.bfloat16))
+    l1_scaled = (l1.float() / alpha.item()).to(torch.bfloat16)
+    return {
+        "a": a,
+        "b": b,
+        "a_sf": a_sf,
+        "b_sf": b_sf,
+        "alpha": alpha,
+        "d": d,
+        "l1": l1_scaled,
+    }
+
+
+mm_nvfp4_svdquant_trace = TraceTemplate(
+    op_type="gemm_nvfp4_svdquant",
+    description=(
+        "SVDQuant fused NVFP4 GEMM (SM100): out = alpha * (a @ bᵀ) + d @ l1ᵀ. "
+        "The block-scaled NVFP4 residual GEMM fused with a rank-32 BF16 LoRA-up "
+        "correction in the same accumulator; 1/alpha is pre-folded into l1."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K_packed": Const(description="K / 2 (two e2m1 values per byte)."),
+        "SF_A": Const(description="128x4-swizzled activation scale buffer size."),
+        "SF_B": Const(description="128x4-swizzled weight scale buffer size."),
+        "rank": Const(description="LoRA rank, fixed at 32 by the kernel."),
+    },
+    inputs={
+        "a": Tensor(
+            ["M", "K_packed"],
+            param="a",
+            description="Smooth-quantized activation, packed e2m1 as uint8.",
+        ),
+        "b": Tensor(
+            ["N", "K_packed"],
+            param="b",
+            description="NVFP4 residual weight, packed e2m1 as uint8, row-major.",
+        ),
+        "a_sf": Tensor(
+            ["SF_A"],
+            param="a_sf",
+            description="Activation block scales, ue4m3 as uint8, 128x4 swizzled.",
+        ),
+        "b_sf": Tensor(
+            ["SF_B"],
+            param="b_sf",
+            description="Weight block scales, ue4m3 as uint8, 128x4 swizzled.",
+        ),
+        "alpha": Tensor(
+            ["1"],
+            param="alpha",
+            description="Per-tensor residual dequant scale, float32 device scalar.",
+        ),
+        "d": Tensor(
+            ["M", "rank"],
+            param="d",
+            description="LoRA-down output x_hat @ L2ᵀ, bf16.",
+        ),
+        "l1": Tensor(
+            ["N", "rank"],
+            param="l1",
+            description="LoRA-up weight pre-divided by alpha, bf16.",
+        ),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype="bfloat16"),
+    },
+    tags=["quantization:fp4"],
+    init=_mm_nvfp4_svdquant_init,
+)
