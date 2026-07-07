@@ -1016,7 +1016,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
-        del block_tables, q_len_per_req, rope_scale, rope_theta, sm_scale
+        del block_tables, rope_scale, rope_theta, sm_scale
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1098,12 +1098,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     False,
                 )
             qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+            if q_len_per_req > 1:
+                qo_indptr_host = qo_indptr_host * q_len_per_req
             args = [
                 self._float_workspace_buffer,
                 qo_indptr_host,
                 indptr_host,
                 kv_lens_arr_host,
-                batch_size,  # total_num_rows
+                batch_size * q_len_per_req,  # total_num_rows
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
@@ -1111,13 +1113,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim,
                 head_dim,
-                False,  # causal
+                q_len_per_req > 1,  # causal
                 window_left,
             ]
             if backend == "fa2":
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
+                args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
         else:
             if self._jit_module is not None:
                 module = self._jit_module
@@ -1279,6 +1282,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
 
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+        if q_len_per_req > 1:
+            qo_indptr_host = qo_indptr_host * q_len_per_req
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
                 raise ValueError(
@@ -1298,6 +1303,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf[: len(indices)].copy_(
                 indices, non_blocking=(indices.device == self.device) and non_blocking
             )
+            if self.use_tensor_cores and q_len_per_req > 1:
+                self._qo_indptr_buf.copy_(qo_indptr_host, non_blocking=non_blocking)
         else:
             self._paged_kv_indptr_buf = indptr.to(
                 self.device, non_blocking=non_blocking
@@ -1485,7 +1492,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 qo_indptr_host,
                 indptr_host,
                 kv_lens_arr_host,
-                batch_size,  # total_num_rows
+                batch_size * q_len_per_req,  # total_num_rows
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
@@ -1493,13 +1500,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim,
                 head_dim,
-                False,  # causal
+                q_len_per_req > 1,  # causal
                 window_left,
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
+                args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -1762,6 +1770,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # Infer runtime q_len from q.size(0). Doesn't need to match planned q_len
             q_len_per_req = q.size(0) // actual_batch_size
 
+        planned_q_len = getattr(self, "_q_len_per_req", 1) or 1
+        if (
+            self.use_tensor_cores
+            and self._backend not in ("trtllm-gen", "cute-dsl")
+            and q_len_per_req != planned_q_len
+        ):
+            # The fa2/fa3 tensor-core path bakes q_len into the planned
+            # qo_indptr and mask mode, so a mismatched q cannot be remapped
+            # at run time.
+            raise ValueError(
+                f"q implies q_len_per_req={q_len_per_req} but plan() used "
+                f"{planned_q_len}; re-plan with the matching q_len_per_req."
+            )
+
         # Convert NHD layout to HND for trtllm-gen backend
         if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
             k_cache = k_cache.transpose(-3, -2)
@@ -1876,7 +1898,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_last_page_len_buf,
                 out,
                 lse,
-                MaskMode.NON_CAUSAL.value,
+                (
+                    MaskMode.CAUSAL.value
+                    if planned_q_len > 1
+                    else MaskMode.NON_CAUSAL.value
+                ),
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
@@ -3420,6 +3446,7 @@ def fast_decode_plan(
     non_blocking: bool = True,
     fixed_split_size: Optional[int] = None,
     disable_split_kv: bool = False,
+    q_len_per_req: int = 1,
     global_override_indptr_cpu: Optional[torch.Tensor] = None,
 ) -> None:
     """
@@ -3429,6 +3456,7 @@ def fast_decode_plan(
     - Remove unnecessary host-to-device copy for the metadata buffers.
     """
     batch_size = len(last_page_len)
+    self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
 
@@ -3446,6 +3474,8 @@ def fast_decode_plan(
 
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+        if q_len_per_req > 1:
+            qo_indptr_host = qo_indptr_host * q_len_per_req
         # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
         if fixed_split_size is None:
             fixed_split_size = -1
@@ -3462,6 +3492,8 @@ def fast_decode_plan(
             raise ValueError(
                 "The size of indices should be less than or equal to the allocated buffer"
             )
+        if self.use_tensor_cores and q_len_per_req > 1:
+            self._qo_indptr_buf.copy_(qo_indptr_host, non_blocking=non_blocking)
     else:
         self._paged_kv_indptr_buf = indptr
         self._paged_kv_indices_buf = indices
@@ -3519,7 +3551,7 @@ def fast_decode_plan(
                     qo_indptr_host,
                     indptr_host,
                     kv_lens_arr_host,
-                    batch_size,  # total_num_rows
+                    batch_size * q_len_per_req,  # total_num_rows
                     batch_size,
                     num_qo_heads,
                     num_kv_heads,
@@ -3527,13 +3559,16 @@ def fast_decode_plan(
                     self.is_cuda_graph_enabled,
                     head_dim,
                     head_dim,
-                    False,  # causal
+                    q_len_per_req > 1,  # causal
                     window_left,
                 ]
                 if self._backend == "fa2":
                     args.append(fixed_split_size)
                     args.append(disable_split_kv)
                     args.append(0)  # num_colocated_ctas
+                    args.append(
+                        q_len_per_req if q_len_per_req > 1 else 0
+                    )  # uniform_q_len
                 self._plan_info = self._cached_module.plan(
                     *args,
                 )
