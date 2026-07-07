@@ -193,10 +193,7 @@ time.
 
 **Example** (Wan2.1-style attention; see the
 `wan example <https://github.com/flashinfer-ai/flashinfer/tree/main/examples/pytorch/wan>`_
-and the
-`benchmark harness <https://github.com/flashinfer-ai/flashinfer/blob/main/benchmarks/bench_ulysses_a2a.py>`_
-with its
-`methodology report <https://github.com/flashinfer-ai/flashinfer/blob/main/benchmarks/ulysses_a2a_m3_report.md>`_)::
+for the full integration)::
 
     with UlyssesCommunicator(group, max_elems=B * S_local * H * D,
                              dtype=torch.bfloat16) as comm:

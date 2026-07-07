@@ -293,11 +293,10 @@ class WanRotaryPosEmbed(nn.Module):
 
 # ---- Ulysses sequence-parallel wiring (example mechanism) --------------------
 # Process-global and non-reentrant: one communicator per process, installed by
-# the launchers (bench_wan_ulysses.py / run_wan_ulysses_video.py) around the
-# sequence-sharded forward passes and cleared in their finally blocks BEFORE
-# the communicator is closed. The default None keeps single-GPU behavior with
-# zero overhead and adds no imports (the flashinfer.comm import above is
-# type-checking only).
+# the launcher around the sequence-sharded forward passes and cleared (in a
+# finally block, BEFORE the communicator is closed) when done. The default
+# None keeps single-GPU behavior with zero overhead and adds no imports (the
+# flashinfer.comm import above is type-checking only).
 _ULYSSES_COMM: Optional["UlyssesCommunicator"] = None
 
 
