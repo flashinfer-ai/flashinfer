@@ -4863,6 +4863,9 @@ def cp_delta_rule_dsl_sm120(
             num_heads,
             num_sms,
             chunk_len_granularity=cp_chunk_len_granularity,
+            device_capability=torch.cuda.get_device_capability(q.device),
+            total_seqlen=total_seqlen,
+            device_name=torch.cuda.get_device_properties(q.device).name,
         )
     if q.ndim != 3:
         raise RuntimeError(
